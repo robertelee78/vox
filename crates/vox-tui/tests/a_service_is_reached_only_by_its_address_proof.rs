@@ -53,11 +53,18 @@
 //!     is refused on carol's machine (he names alice `nas-box`, she does not), which is checked
 //!     first, so a copy of the readable form could not pass. Mutation: the commands carry the
 //!     readable address.
+//! 15. A canonical address inside a message reads as the reader writes it (ADR-028 S-1a, #488):
+//!     alice posts nas-ssh's, and bob's `vox room read` shows `nas-ssh.nas-box.family.vox`.
+//! 16. A part that would be ambiguous is shown canonical: once bob calls carol `Nas Box` too, his
+//!     `vox service list` shows nas-ssh with alice's whole fingerprint.
+//! 17. A node the reader has no name for is shown by its short fingerprint, and that address
+//!     reaches it: carol, who has not trusted bob, is shown `bob-web.<bob's 12>.family.vox`.
 //!
-//! **Mutations that must turn it red** (#487): the room part resolved by this machine's own name
-//! only, the room id refused, and carol's paste of bob's canonical address fails at her proxy:
+//! **Mutations that must turn it red**: the room part resolved by this machine's own name only,
+//! the room id refused (#487): carol's paste of bob's canonical address fails at her proxy, and
 //! (10) is red as PRODUCT. The host resolving a service by its name only: carol's paste in (12b)
-//! is refused, red as PRODUCT.
+//! is refused, red as PRODUCT. The fingerprint shown where an alias exists (#488): (4) is red. A
+//! message's address left canonical (#488): (15) is red.
 //!
 //! **A red names its side.** A `vox` command that fails while the scene is set is PRODUCT
 //! (staging); what this proof claims is PRODUCT, quoting what vox said; the proof's own files,
@@ -102,14 +109,20 @@ fn vox(dir: &std::path::Path, argv: &[&str], stdin: Option<&str>) -> (bool, Stri
 }
 
 fn vox_plain(dir: &Path, argv: &[&str], stdin: Option<&str>) -> (bool, String, String) {
-    let mut child = Command::new(VOX)
-        .args(argv)
+    let mut cmd = Command::new(VOX);
+    cmd.args(argv)
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
         .env_remove("VOX_ROOM")
         .env_remove("VOX_ANCHORS")
-        .env_remove("VOX_ROOM_PASSPHRASE")
+        .env_remove("VOX_ROOM_PASSPHRASE");
+    // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
+    if world::typed::is_keyring_change(argv) {
+        let (ok, shown) = world::typed::keyring(&cmd);
+        return (ok, shown.clone(), shown);
+    }
+    let mut child = cmd
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
@@ -598,6 +611,19 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
         "PRODUCT: vox serve must print nas-ssh's canonical address, <service fingerprint>.<node \
          fingerprint>.<room id>.vox (ADR-028 S-1); it printed {printed_line:?}"
     );
+    // (4) first: (10) reads the canonical address beneath the readable row (4) claims.
+    assert!(
+        bob_list.0,
+        "PRODUCT: bob's `vox service list` does not show both services in his own words \
+         ({bob_wants:?}): {}",
+        bob_list.1
+    );
+    assert!(
+        carol_list.0,
+        "PRODUCT: carol's `vox service list` does not show both services in her own words \
+         ({carol_wants:?}): {}",
+        carol_list.1
+    );
     assert_eq!(
         bob_canonical, printed_ssh,
         "PRODUCT: bob's `vox service list` must show nas-ssh's canonical address beneath its \
@@ -630,18 +656,6 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
              service: {line:?}"
         );
     }
-    assert!(
-        bob_list.0,
-        "PRODUCT: bob's `vox service list` does not show both services in his own words \
-         ({bob_wants:?}): {}",
-        bob_list.1
-    );
-    assert!(
-        carol_list.0,
-        "PRODUCT: carol's `vox service list` does not show both services in her own words \
-         ({carol_wants:?}): {}",
-        carol_list.1
-    );
     assert!(
         !dup_ok
             && format!("{dup_out}{dup_err}").contains("nas-ssh")
@@ -1213,6 +1227,42 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
     );
     drop(wrong);
 
+    // (15) A canonical address inside a message reads as this machine writes it (ADR-028 S-1a,
+    // #488): alice posts nas-ssh's, and bob's `vox room read` shows `nas-ssh.nas-box.family.vox`.
+    let (ok, out, err) = vox(
+        &alice_dir,
+        &[
+            "room",
+            "post",
+            &room,
+            &format!("ssh to {printed_ssh} please"),
+        ],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): alice posts nas-ssh's address: {out}{err}"
+    );
+    let deadline = Instant::now() + SETUP;
+    let bob_read = loop {
+        let (_, out, err) = vox(&bob_dir, &["room", "read", &room], None);
+        let said = format!("{out}{err}");
+        if said.contains("ssh to ") || Instant::now() >= deadline {
+            break said;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert!(
+        bob_read.contains("ssh to "),
+        "PRODUCT (staging): alice's post never reached bob's `vox room read` within {SETUP:?}: \
+         {bob_read}"
+    );
+    assert!(
+        bob_read.contains("ssh to nas-ssh.nas-box.family.vox please"),
+        "PRODUCT: the canonical address in alice's message must read as bob writes it, \
+         nas-ssh.nas-box.family.vox; his `vox room read` said:\n{bob_read}"
+    );
+
     // (13) A readable part that names two things is refused, saying which: bob now calls carol
     // `Nas Box`, which as a label is `nas-box`, his name for alice too.
     trust(&bob_dir, "bob", &carol_fp, "Nas Box");
@@ -1226,11 +1276,45 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
         "PRODUCT: an address whose node part names two trusted nodes must be refused, saying so: \
          {amb_said}"
     );
+    // (16) ...and shown with that part canonical (S-1a): bob's `vox service list` now writes
+    // alice's whole fingerprint where his alias for her names two nodes.
+    let clash = format!("nas-ssh.{alice_fp}.family.vox  by ");
+    let (clash_shown, clash_list) = listed(&bob_dir, &room, std::slice::from_ref(&clash));
+    assert!(
+        clash_shown,
+        "PRODUCT: bob calls two nodes nas-box, so his `vox service list` must show nas-ssh as \
+         {clash}…: {clash_list}"
+    );
+
+    // (17) A node this machine has no name for is shown by its short fingerprint (S-1a), and
+    // that address reaches it (S-1b): bob shares bob-web; carol has not trusted bob, and bob,
+    // whose decision reach is, trusts her.
+    let bob_web_at = echo("bobweb");
+    let (ok, out, err) = vox(
+        &bob_dir,
+        &["service", "add", &room, "bob-web", &bob_web_at.to_string()],
+        None,
+    );
+    assert!(ok, "PRODUCT (staging): bob shares bob-web: {out}{err}");
+    let short = format!("bob-web.{}.family.vox", &bob_fp[..12]);
+    let (short_shown, short_list) = listed(&carol_dir, &room, &[format!("{short}  by ")]);
+    assert!(
+        short_shown,
+        "PRODUCT: carol has no name for bob, so her `vox service list` must show bob-web as \
+         {short}: {short_list}"
+    );
+    let short_reached = who_answers(carol_proxy, &short);
+    assert_eq!(
+        short_reached,
+        Ok("bobweb".to_owned()),
+        "PRODUCT: the address carol is shown, {short}, must reach bob-web through her proxy"
+    );
     eprintln!(
         "[proof] 2 services reached by 7 addresses through 2 members' own words and one copied \
          canonical address; 4 shorter names resolved to nothing; a duplicate name and a bare port \
          refused; forward by address only; absent TCP and UDP shares refused at once; an unknown \
-         and an ambiguous part refused; a canonical paste before the share reached it once synced"
+         and an ambiguous part refused; a canonical paste before the share reached it once synced; \
+         an address in a message, an ambiguous alias and an unnamed node shown readable"
     );
     let _ = (
         bob_daemon.transcript(),

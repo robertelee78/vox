@@ -16,13 +16,14 @@ vox node create claude-mbp
 vox node attach claude-mbp
 ```
 
-The agent's hook registers its session with the daemon at each turn, starting the daemon if
-none runs, and the daemon attaches the node if it is not attached: with no passphrase, or with
-the one in `VOX_IDENTITY_PASSPHRASE` in the harness's environment. A node attached this way
-detaches when its last session ends. If you give the node a passphrase and do not want it in an
-environment variable, attach it yourself; `vox node attach claude-mbp --keep --passphrase-file
-PATH` also attaches it again whenever the daemon starts, reading the passphrase from that
-private file.
+Run both in a terminal outside the agent's session: each asks for the node's passphrase, which
+every node has. The agent's hook registers its session with the daemon at each turn, starting the
+daemon if none runs, but it never attaches the node and never takes a passphrase: with the node
+not attached, it tells the agent so, with the command for you to run, `vox node attach
+claude-mbp`. `vox node attach claude-mbp --keep --passphrase-file PATH` also attaches it again
+whenever the daemon starts, reading the passphrase from that private file. A keyring change for
+the agent's node, such as `vox trust add <fingerprint> --node claude-mbp`, is typed by you in a
+terminal too.
 
 Join the intended room as that node, substituting the full room link, then exchange the compared
 fingerprints and trust decisions with the other participants:

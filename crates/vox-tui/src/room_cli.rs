@@ -273,11 +273,22 @@ pub(crate) async fn post(
     room: &str,
     text: Option<&str>,
     card: bool,
+    session: Option<String>,
 ) -> Result<(), AppError> {
     let body = body_of(text)?;
     if body.trim().is_empty() {
         return Err(AppError::Usage("refusing to post an empty message".into()));
     }
+    // **A message from a harness session says which** (ADR-029 MD-1, MD-2): its `from` is the
+    // session's id, whatever the agent wrote, and the node fills in its name. A message that
+    // already names a session, and one no session sends (a person's), is posted as given.
+    let body = match (session, vox_agentcomms::envelope::Envelope::parse(&body)) {
+        (Some(s), Ok(mut env)) if env.from.trim().is_empty() => {
+            env.from = s;
+            env.to_text()
+        }
+        _ => body,
+    };
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
     match client
@@ -729,7 +740,14 @@ pub async fn post_cmd(
                 }
             }
         }
-        return post(paths, room, Some(&body), !opts.no_card).await;
+        return post(
+            paths,
+            room,
+            Some(&body),
+            !opts.no_card,
+            coord::session(opts.coord.session.as_deref()),
+        )
+        .await;
     }
 
     let PostReport {
@@ -1042,6 +1060,20 @@ fn row_value(
     })
 }
 
+/// This node's names for its rooms, their members and shares, and its keyring, as its snapshot
+/// gives them: what an address is written readable with (ADR-028 S-1a). None when the node does
+/// not say, so an address is left canonical.
+async fn names_in(client: &mut IpcClient) -> vox_core::node::resolver::VoxResolver {
+    let body = vox_core::node::snapshot::request_body();
+    let Ok(reply) = client.exchange(&body).await else {
+        return vox_core::node::resolver::VoxResolver::new();
+    };
+    match vox_core::node::snapshot::NodeSnapshot::from_bytes(&reply) {
+        Ok(Some(snap)) => vox_core::node::resolver::VoxResolver::of_snapshot(&snap),
+        _ => vox_core::node::resolver::VoxResolver::new(),
+    }
+}
+
 /// Who has read this node's own recent messages in `room`, and who has pulled its shares there
 /// whole (ADR-028 R-6, F-7), by entry, from one snapshot of the node. Empty when it does not say.
 async fn own_in(
@@ -1272,8 +1304,18 @@ pub async fn read(
             );
         }
         let take = if take == 0 { usize::MAX } else { take };
-        for r in rows.iter().filter(|r| r.late || !only_late).take(take) {
-            let _ = writeln!(out, "{}", plain_row(r));
+        // An address in a message, readable in this node's names (ADR-028 S-1a); `--json` keeps
+        // the canonical form a program copies (S-1). A Session's opening and end are not the
+        // room's conversation (ADR-029 CL-2): `vox room sessions` lists Sessions; `--json` keeps
+        // every row for programs.
+        let names = names_in(&mut client).await;
+        for r in rows
+            .iter()
+            .filter(|r| r.late || !only_late)
+            .filter(|r| !crate::agent_hook::is_session_record(r))
+            .take(take)
+        {
+            let _ = writeln!(out, "{}", names.readable_in(&plain_row(r)));
             // Under a share this node sent, who has pulled it whole (ADR-028 F-7).
             if let Some(line) = pulled_by.get(&r.entry_hash).and_then(|w| pulled_by_line(w)) {
                 let _ = writeln!(out, "  {line}");
@@ -1429,6 +1471,67 @@ pub async fn roster(paths: &Paths, room: &str) -> Result<(), AppError> {
         Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
+}
+
+/// `vox room sessions` — the room's Sessions (ADR-029 SE-3, SE-5): open ones first, then the
+/// ended ones apart, each labelled as every client labels it
+/// ([`vox_agentcomms::envelope::session_label`]): this node's name for the session's node, the
+/// session's name and its short id. With `--json`, one object per Session.
+///
+/// # Errors
+/// If the node cannot be reached, or the room is unknown or not open.
+pub async fn sessions(paths: &Paths, room: &str, json: bool) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    crate::ident::load_names(&mut client).await;
+    let rows = match client.request(&Request::Sessions { channel_id }).await {
+        Ok(Frame::Sessions { sessions }) => sessions,
+        Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
+        Err(e) => return Err(AppError::Usage(e.to_string())),
+    };
+    let label = |s: &vox_core::node::sessions::SessionRow| {
+        vox_agentcomms::envelope::session_label(
+            &crate::ident::name_of(&s.node),
+            s.name.as_deref(),
+            &s.id,
+        )
+    };
+    if json {
+        for s in &rows {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "node": id(&s.node),
+                    "id": s.id,
+                    "name": s.name,
+                    "harness": s.harness,
+                    "label": label(s),
+                    "open": s.open,
+                    "opened_millis": s.opened_millis,
+                    "ended_millis": s.ended_millis,
+                    "can_drive": s.can_drive,
+                })
+            );
+        }
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("(no Sessions in this room)");
+        return Ok(());
+    }
+    for s in rows.iter().filter(|s| s.open) {
+        println!("open   {}", label(s));
+    }
+    // **An ended Session is set apart** (SE-5), kept as long as the room keeps messages.
+    let ended: Vec<_> = rows.iter().filter(|s| !s.open).collect();
+    if !ended.is_empty() {
+        println!("ended:");
+        for s in ended {
+            println!("ended  {}", label(s));
+        }
+    }
+    Ok(())
 }
 
 /// `vox room tail` — every row after a cursor, then every row as it lands, **with no
@@ -3871,7 +3974,7 @@ async fn who_reads_whom(client: &mut IpcClient, channel_id: Digest32) {
         return;
     };
     let keyring = match client.trusted("").await {
-        Ok(Frame::Trusted { entries }) => entries,
+        Ok(Frame::Trusted { entries }) => crate::ident::names_of(entries),
         _ => Vec::new(),
     };
     let me = client.me();
@@ -4167,25 +4270,34 @@ pub async fn link(paths: &Paths, room: &str) -> Result<(), AppError> {
 // ---------------------------------------------------------------- the trust keyring
 
 /// Send a keyring change, giving the identity passphrase only when the node says it needs it
-/// (V210-159): within 30 minutes of its last entry none is needed. `given` is what the command line
-/// gave (`--identity-passphrase-file`, `VOX_IDENTITY_PASSPHRASE`); it is sent at once, and a right
-/// one starts the window again. With none given and the window passed, it is asked for at the
-/// terminal and the change sent again; with no terminal, the node's reason is the answer.
+/// (V210-159): within 30 minutes of one typed for a keyring change none is needed (ADR-028 K-12).
+/// **It is typed, at a terminal, and taken from nothing else** (ADR-028 K-13): not
+/// `VOX_IDENTITY_PASSPHRASE`, not a file, not the Keychain. With no terminal the change is refused,
+/// with the command to run in one.
 async fn keyring_change(
     client: &mut IpcClient,
-    given: Option<String>,
     request: impl Fn(zeroize::Zeroizing<String>) -> Request,
 ) -> Result<Frame, AppError> {
-    let asked = given.is_none();
     let reply = client
-        .request(&request(zeroize::Zeroizing::new(given.unwrap_or_default())))
+        .request(&request(zeroize::Zeroizing::new(String::new())))
         .await
         .map_err(|e| AppError::Usage(e.to_string()))?;
     let needed = vox_core::node::api::Fault::PassphraseNeeded.explain();
     match reply {
-        Frame::Error { reason }
-            if asked && reason == needed && std::io::IsTerminal::is_terminal(&std::io::stdin()) =>
-        {
+        Frame::Error { reason } if reason == needed => {
+            if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                return Err(AppError::Usage(format!(
+                    "{}\n       {}",
+                    reason.lines().next().unwrap_or_default(),
+                    typed_only()
+                )));
+            }
+            if std::env::var_os("VOX_IDENTITY_PASSPHRASE").is_some() {
+                eprintln!(
+                    "vox: VOX_IDENTITY_PASSPHRASE is not read for a keyring change; type the \
+                     passphrase"
+                );
+            }
             eprintln!("vox: {}", reason.lines().next().unwrap_or_default());
             let passphrase = crate::tunnel_cli::ask_identity_passphrase()?;
             client
@@ -4195,6 +4307,19 @@ async fn keyring_change(
         }
         other => Ok(other),
     }
+}
+
+/// What a keyring change that needs the passphrase says with no terminal to type it at: the
+/// command, to run in a terminal (ADR-028 K-13).
+pub(crate) fn typed_only() -> String {
+    let command: Vec<String> = std::iter::once("vox".to_owned())
+        .chain(std::env::args().skip(1))
+        .collect();
+    format!(
+        "it is typed at a terminal, and taken from nothing else (not VOX_IDENTITY_PASSPHRASE, not \
+         a file). Run it in a terminal: {}",
+        command.join(" ")
+    )
 }
 
 // ------------------------------------------------- what a change of access touches (ADR-028 E-5)
@@ -4360,8 +4485,8 @@ pub async fn trust_add(
     paths: &Paths,
     target: Digest32,
     petname: &str,
-    given: Option<String>,
     full_history: bool,
+    drive: bool,
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     crate::ident::check_new_name(crate::ident::names(), &target, petname)?;
@@ -4388,18 +4513,25 @@ pub async fn trust_add(
             "your services in a room you share, once you offer one"
         )
     );
-    match keyring_change(&mut client, given, |identity_passphrase| Request::Trust {
+    match keyring_change(&mut client, |identity_passphrase| Request::Trust {
         target,
         petname: petname.to_owned(),
         identity_passphrase,
         full_history,
+        drive,
     })
     .await
     {
         Ok(Frame::Ok) => {
             println!(
-                "vox: trusting {} as {petname:?}",
-                crate::ident::author_id(&target)
+                "vox: trusting {} as {petname:?}: {}",
+                crate::ident::author_id(&target),
+                if drive {
+                    vox_core::node::trust::Capability::ReadDrive
+                } else {
+                    vox_core::node::trust::Capability::Read
+                }
+                .words()
             );
             if full_history {
                 println!("     with full history: it may also read what you wrote before now");
@@ -4428,16 +4560,11 @@ pub async fn trust_add(
 /// `vox trust rename`, asked of the running node: only an identity already trusted. A keyring
 /// change, so the identity passphrase is asked for only when the node says it is needed
 /// (V210-159), as `vox trust add` and `remove` do.
-pub async fn trust_rename(
-    paths: &Paths,
-    fingerprint: &str,
-    name: &str,
-    given: Option<String>,
-) -> Result<(), AppError> {
+pub async fn trust_rename(paths: &Paths, fingerprint: &str, name: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     // A read, so no passphrase (V210-165).
     let entries = match client.trusted("").await {
-        Ok(Frame::Trusted { entries }) => entries,
+        Ok(Frame::Trusted { entries }) => crate::ident::names_of(entries),
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
         Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
@@ -4450,7 +4577,7 @@ pub async fn trust_rename(
         ))
     })?;
     crate::ident::check_new_name(&entries, &target, name)?;
-    match keyring_change(&mut client, given, |identity_passphrase| Request::Rename {
+    match keyring_change(&mut client, |identity_passphrase| Request::Rename {
         target,
         petname: name.to_owned(),
         identity_passphrase,
@@ -4472,12 +4599,57 @@ pub async fn trust_rename(
     }
 }
 
-/// `vox trust remove`, asked of the running node.
-pub async fn trust_remove(
+/// `vox trust drive` and `vox trust read`, asked of the running node (ADR-028 K-14): only an
+/// identity already trusted. A keyring change, so the identity passphrase is asked for only when
+/// the node says it is needed.
+pub async fn trust_capability(
     paths: &Paths,
-    target: Digest32,
-    given: Option<String>,
+    fingerprint: &str,
+    drive: bool,
 ) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    // A read, so no passphrase (V210-165).
+    let entries = match client.trusted("").await {
+        Ok(Frame::Trusted { entries }) => entries,
+        Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
+        Err(e) => return Err(AppError::Usage(e.to_string())),
+    };
+    let ids: Vec<Digest32> = entries.iter().map(|(id, _, _)| *id).collect();
+    let target = resolve_prefix(fingerprint, &ids).map_err(|_| {
+        AppError::Usage(format!(
+            "no trusted identity matches {fingerprint:?}, so it has nothing to change — \
+             `vox trust add` it first"
+        ))
+    })?;
+    let capability = if drive {
+        vox_core::node::trust::Capability::ReadDrive
+    } else {
+        vox_core::node::trust::Capability::Read
+    };
+    match keyring_change(&mut client, |identity_passphrase| Request::SetCapability {
+        target,
+        drive,
+        identity_passphrase,
+    })
+    .await
+    {
+        Ok(Frame::Ok) => {
+            println!(
+                "vox: {} now has {}",
+                crate::ident::author_id(&target),
+                capability.words()
+            );
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
+        Ok(other) => Err(crate::client::unexpected(&other)),
+        Err(e) => Err(e),
+    }
+}
+
+/// `vox trust remove`, asked of the running node.
+pub async fn trust_remove(paths: &Paths, target: Digest32) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     // What it is to stop, said before it is done (ADR-028 E-5).
     let rooms = rooms_with(&mut client, &target).await;
@@ -4513,7 +4685,7 @@ pub async fn trust_remove(
         "     its live sessions into your services are to be cut: {}",
         listed(&said, "none is open")
     );
-    match keyring_change(&mut client, given, |identity_passphrase| Request::Untrust {
+    match keyring_change(&mut client, |identity_passphrase| Request::Untrust {
         target,
         identity_passphrase,
     })
@@ -4559,8 +4731,13 @@ pub async fn trust_list(paths: &Paths) -> Result<(), AppError> {
                 println!("     nobody can read what you write until you `vox trust add` them");
                 return Ok(());
             }
-            for (id, petname) in entries {
-                println!("{}  {petname}", vox_core::node::link::b32_encode(&id));
+            // What each entry grants, read or read + drive (ADR-028 K-14).
+            for (id, petname, capability) in entries {
+                println!(
+                    "{}  {petname}  {}",
+                    vox_core::node::link::b32_encode(&id),
+                    capability.words()
+                );
             }
             Ok(())
         }

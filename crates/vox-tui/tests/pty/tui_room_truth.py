@@ -30,6 +30,8 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             q-mid, and the TUI shows it under "┆ alice: q-mid…", one level, not q-root, with q-mid
             itself off screen (ADR-028 R-9, #485);
   jump      Bob selects q-answer and presses Enter: the view moves to q-mid, selected;
+  address   a canonical address Alice posts reads as Bob's node writes it: "open
+            nas-web.alice.family.vox please" (ADR-028 S-1a, #488);
   consent   Carol, whom Bob never trusted, reads "not in keyring: trust to read each other";
             Dave, whom he trusts and who trusts nobody, "waiting for the other side"; Alice,
             whom he did and who trusts him, "trusted both ways" (ADR-028 R-5, #481;
@@ -37,6 +39,8 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             "? unverified" on every row and "← in-only" for Carol, though nothing comes in from her);
             and no row of the members pane names a verified, TOFU or key-changed state, a consent
             or a block: one trust state, in the keyring or not (ADR-028 K-2, K-6, #473);
+  capability under each member's state line, what Bob's keyring grants it: Alice "read", Dave
+            "read + drive", Carol (not in his keyring) nothing (ADR-028 K-14, #525);
   look      in truecolour, Alice's row is "⇄ alice" (each trusts the other) and Dave's "→ dave" (only
             Bob trusts him), both in text.primary bold, and Carol's "· <her fingerprint>" in
             text.secondary, not bold (ADR-028 L-4); the accent is on the focused
@@ -117,6 +121,10 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             are each named "image <name> <w>×<h> — drawn once it is pulled and verified", and no
             kitty graphics are written; one she shares to the room is drawn as kitty graphics once
             bob's node has pulled and verified it (ADR-028 F-11, #502).
+  gone      the pty's master closed under bob's TUI, attached and in the room, as a closed window
+            closes it: the TUI has exited within 5 s (#557);
+  signals   SIGHUP, and SIGTERM, each sent to a running TUI of bob's: it exits 0 within 5 s
+            (V210-93, #557);
 
 `vox room join` is given JOIN_SECS (490 s), what a member waits for a joiner's proof of work plus
 its slack; every other verb 120 s. A verb past its time is a named RED, not a hang.
@@ -132,7 +140,7 @@ import base64, json, os, re, signal, socket, subprocess, sys, threading, time, t
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vox_pty import Gone, Hung, Tui, arm, disarm, pane, pyte, stage  # noqa: E402
+from vox_pty import Gone, Hung, Tui, arm, disarm, pane, pyte, stage, is_keyring_change, typed_run  # noqa: E402
 
 # The colours the TUI is built from (ADR-028 L-1), read as pyte reads a cell: lowercase hex.
 TOKENS = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -171,6 +179,9 @@ def env(w):
 
 def run(w, *args, stdin=None):
     secs = JOIN_SECS if args[:2] == ("room", "join") else 120
+    if is_keyring_change(args):
+        # A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
+        return typed_run([VOX, *args], env(w), secs)
     return subprocess.run([VOX, *args], env=env(w), input=stdin, capture_output=True, text=True, timeout=secs)
 
 def spawn(w, *args, out):
@@ -315,9 +326,12 @@ try:
     # Carol trusts Bob, so what her label says is Bob's trust alone: a node reads only whom its
     # owner trusts (V210-118).
     # Bob trusts Dave, and Dave trusts nobody: the one way of the three (ADR-028 L-4's `→`).
+    # Bob trusts Dave with drive and Alice with read (ADR-028 K-14).
     for (w, other, name) in (("bob", "alice", "alice"), ("alice", "bob", "bob"), ("carol", "bob", "bob"),
                              ("bob", "dave", "dave"), ("bob", "erin", "erin")):
-        t = run(w, "trust", "add", fp[other], "--name", name, "--identity-passphrase-file", f"{S}/idpass")
+        drive = ["--drive"] if (w, other) == ("bob", "dave") else []
+        t = run(w, "trust", "add", fp[other], "--name", name, *drive,
+                "--identity-passphrase-file", f"{S}/idpass")
         if t.returncode != 0: product(f"{w}'s `vox trust add` failed: {t.stderr.strip()}")
     stage("alice shares an ssh stand-in")
     # It greets as sshd does, so Alice's node detects it as ssh (ADR-028 S-2).
@@ -554,6 +568,27 @@ try:
     tui.until(lambda: has(timeline(), f"f-{FILL:03d}"), 5, 0.2)
     focus("Timeline")  # where the stages below begin
 
+    stage("address")
+    # A canonical address inside a message reads as Bob's node writes it (ADR-028 S-1a, #488):
+    # Alice shares nas-web and posts the canonical address her `vox service list` gives, and his
+    # timeline shows `nas-web.alice.family.vox`, by his name for her and the room's name.
+    svc = __import__("socket").socket()
+    svc.bind(("127.0.0.1", 0))
+    svc.listen(4)
+    r = run("alice", "service", "add", room, "nas-web", f"127.0.0.1:{svc.getsockname()[1]}")
+    if r.returncode != 0: product(f"alice's `vox service add` failed: {r.stderr.strip()}")
+    listed = run("alice", "service", "list", room).stdout.splitlines()
+    canon = next((listed[i + 1].strip() for i, l in enumerate(listed[:-1])
+                  if l.strip().startswith("nas-web.")), "")
+    if len(canon) != 52 * 3 + 6: product(f"alice's `vox service list` gives no canonical address "
+                                         f"under nas-web: {listed!r}")
+    r = run("alice", "room", "post", room, f"open {canon} please")
+    if r.returncode != 0: product(f"alice's `vox room post` of the address failed: {r.stderr.strip()}")
+    want = "open nas-web.alice.family.vox please"
+    shown = tui.until(lambda: want in timeline(), 60, 1)
+    claim("address", shown, f"{want!r} in bob's timeline within 60 s: {shown}; its last rows: "
+          f"{[r.strip() for r in timeline().splitlines() if r.strip()][-3:]!r}")
+
     tui.key("\t", 1)   # timeline -> composer
     tui.key("\t", 1)   # composer -> members
     members_pane = lambda: [row.rstrip() for row in pane(tui.display(), "Members")]
@@ -631,6 +666,16 @@ try:
     claim("consent", bare(carol_label) == CAROL and bare(dave_label) == DAVE and not stated,
           f"alice: {label_of('alice')[0].strip()!r}; carol: {carol_label.strip()!r}; "
           f"dave: {(dave_label or '').strip()!r}; rows naming another trust state: {stated!r}")
+
+    stage("capability")
+    # What Bob's keyring entry grants each member, on the line under its state (ADR-028 K-14,
+    # #525): Alice read, Dave read + drive; Carol, not in his keyring, nothing.
+    def granted(who):
+        rows, (_, _, i) = members_pane(), label_of(who)
+        return bare(rows[i + 2]) if i is not None and i + 2 < len(rows) else None
+    claim("capability", granted("alice") == "read" and granted("dave") == "read + drive"
+          and granted("carol") not in ("read", "read + drive"),
+          f"alice: {granted('alice')!r}; dave: {granted('dave')!r}; under carol: {granted('carol')!r}")
 
     stage("look")
     # Alice's key reaches Bob once her node has released it: wait for her ⇄ before judging.
@@ -1222,6 +1267,59 @@ try:
           f"kitty graphics written before theirs.png was shared: {before}; after, once bob's node "
           f"had pulled and verified it: {drew}")
     stop(daemons["alice"])
+
+    stage("gone")
+    # A TUI whose terminal has gone exits (#557): an orphaned `vox tui`, its pty closed and its
+    # parent dead, spun for a day in a read of the hung-up terminal, deaf to SIGTERM and SIGHUP.
+    # The pty's master is closed under bob's TUI, attached and in the room, as a closed window
+    # or a dropped ssh session closes it; the TUI must have exited within 5 s.
+    def exited(t, secs, drain):
+        """`t`'s exit status once it has exited within `secs`, else None. The pty is read
+        meanwhile while it is open: a macOS exit with unread output waits on it."""
+        end = time.time() + secs
+        while time.time() < end:
+            if drain:
+                t.pump(0.05)
+            else:
+                time.sleep(0.05)
+            done, status = os.waitpid(t.pid, os.WNOHANG)
+            if done:
+                return status
+        return None
+    shown = tui.text()
+    os.close(tui.fd)
+    tui.fd, tui.closed = None, True
+    status = exited(tui, 5, False)
+    if status is None:
+        cpu = subprocess.run(["ps", "-o", "stat=,%cpu=", "-p", str(tui.pid)], capture_output=True,
+                             text=True).stdout.strip()
+        os.kill(tui.pid, signal.SIGKILL)
+        os.waitpid(tui.pid, 0)
+    claim("gone", status is not None,
+          f"bob's `vox tui` (pid {tui.pid}), its pty closed: "
+          + (f"exited within 5 s, status {status}" if status is not None
+             else f"still running 5 s later (state and CPU: {cpu!r}); it showed:\n{shown}"))
+
+    stage("signals")
+    # SIGHUP and SIGTERM stop a running TUI cleanly (V210-93, the decider: SIGHUP is a clean
+    # stop): it exits 0 within 5 s.
+    stopped = {}
+    for name, sig in (("SIGHUP", signal.SIGHUP), ("SIGTERM", signal.SIGTERM)):
+        tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0"], tui_env())
+        tui.pump(4)
+        unlock(tui)
+        if not tui.until(lambda: "Rooms" in tui.text(), 30, 0.5):
+            product(f"bob's `vox tui`, opened for {name}, never drew its rooms:\n{tui.text()}")
+        os.kill(tui.pid, sig)
+        status = exited(tui, 5, True)
+        if status is None:
+            stopped[name] = "still running 5 s later"
+            tui.stop()
+        else:
+            stopped[name] = (f"exit {os.WEXITSTATUS(status)}" if os.WIFEXITED(status)
+                             else f"killed by signal {os.WTERMSIG(status)}")
+            tui.close()
+    claim("signals", all(v == "exit 0" for v in stopped.values()), f"{stopped!r}")
 
     print(f"{TAG} the TUI drew {tui.bytes} bytes")
     print(f"{TAG} screen at the end:")

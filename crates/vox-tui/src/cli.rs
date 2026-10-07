@@ -185,6 +185,11 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
             a.identity_passphrase.clone(),
             a.identity_passphrase_file.clone(),
         ),
+        TrustCmd::Drive(a) | TrustCmd::Read(a) => (
+            a.profile.clone(),
+            a.identity_passphrase.clone(),
+            a.identity_passphrase_file.clone(),
+        ),
     };
     let paths = match profile.paths() {
         Ok(p) => p,
@@ -193,15 +198,26 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // Only what the command line gave. A read needs none, and a change asks for it only when
-    // the node says it is needed (V210-159, V210-165).
-    let given = match crate::tunnel_cli::identity_passphrase_given(pass, pass_file) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("vox: {e}");
+    // **A keyring change's passphrase is typed** (ADR-028 K-13): a read needs none, and a change
+    // asks for it at the terminal only when the node says it is needed (V210-159, V210-165). A
+    // passphrase given on the command line or in a file is refused, saying so.
+    if !matches!(sub, TrustCmd::List(_)) {
+        if pass.is_some() {
+            eprintln!(
+                "vox: --identity-passphrase is refused: a keyring change's passphrase is typed at \
+                 a terminal (ADR-028 K-13)"
+            );
             return ExitCode::FAILURE;
         }
-    };
+        if pass_file.is_some() {
+            eprintln!(
+                "vox: --identity-passphrase-file is refused: a keyring change's passphrase is \
+                 typed at a terminal, never read from a file (ADR-028 K-13)"
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    drop((pass, pass_file));
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -218,14 +234,21 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
             TrustCmd::List(_) => crate::room_cli::trust_list(&paths).await,
             TrustCmd::Add(a) => {
                 let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
-                crate::room_cli::trust_add(&paths, target, &name, given, a.history == "full").await
+                crate::room_cli::trust_add(&paths, target, &name, a.history == "full", a.drive)
+                    .await
             }
             TrustCmd::Remove(a) => {
                 let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
-                crate::room_cli::trust_remove(&paths, target, given).await
+                crate::room_cli::trust_remove(&paths, target).await
             }
             TrustCmd::Rename(a) => {
-                crate::room_cli::trust_rename(&paths, &a.fingerprint, &a.name, given).await
+                crate::room_cli::trust_rename(&paths, &a.fingerprint, &a.name).await
+            }
+            TrustCmd::Drive(a) => {
+                crate::room_cli::trust_capability(&paths, &a.fingerprint, true).await
+            }
+            TrustCmd::Read(a) => {
+                crate::room_cli::trust_capability(&paths, &a.fingerprint, false).await
             }
         }
     });
@@ -372,6 +395,17 @@ enum RoomCmd {
     Tail(RoomTailArgs),
     /// Print the fingerprints of the room's members.
     Roster(RoomRefArgs),
+    /// The room's Sessions (ADR-029): one per harness session working in the room, each by your
+    /// name for its node, the session's name and its short id; open ones first, ended ones apart.
+    Sessions(RoomSessionsArgs),
+    /// Read one Session of the room: what that harness session did, one line per activity
+    /// (ADR-029 SC-1).
+    ///
+    /// Tool calls with what they returned, the replies, the end of each turn, what was typed at
+    /// the terminal or in Vox, approvals and questions with who answered them, files either way.
+    /// `--details` prints each entry's full input and output under its line. Only members the
+    /// session's node trusts with drive see inside a Session; anyone else is told so.
+    Session(RoomSessionArgs),
     /// Ask a member's node which agent sessions it holds, and whether each can be reached.
     ///
     /// The ping is answered by that node's **daemon**, never by a model: it lists each session,
@@ -916,6 +950,12 @@ enum AgentCmd {
     /// vox agent doctor --room <room>
     /// ```
     Doctor(AgentDoctorArgs),
+    /// Set the room this harness session works in, or move it to another (ADR-029 RB-5).
+    ///
+    /// Run from the session, when its hook says it works in no room, or to move it: its
+    /// Session ends in the room it worked in and opens in this one. The room is one the
+    /// node holds. A session works in one room at a time.
+    Room(AgentRoomArgs),
 }
 
 /// `vox agent doctor`
@@ -1001,6 +1041,21 @@ pub struct AgentPluginArgs {
     pub node: String,
 }
 
+/// `vox agent room`
+#[derive(Args, Debug, Clone)]
+pub struct AgentRoomArgs {
+    #[command(flatten)]
+    pub profile: AccountArgs,
+    /// The room: its id, a unique start of it, or its name.
+    pub room: String,
+    /// The agent's own node, as its hook names it; `VOX_NODE` in the session's environment.
+    #[arg(long, env = "VOX_NODE", required = true)]
+    pub node: String,
+    /// The harness session to move; else `VOX_SESSION`, or the harness's own id.
+    #[arg(long)]
+    pub session: Option<String>,
+}
+
 /// `vox agent hook`
 #[derive(Args, Debug, Clone)]
 pub struct AgentHookArgs {
@@ -1043,6 +1098,95 @@ pub struct RoomRefArgs {
     pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
+}
+
+/// `vox room session`
+#[derive(Args, Debug, Clone)]
+pub struct RoomSessionArgs {
+    #[command(flatten)]
+    pub profile: NodeArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// The Session: its session id, at least 8 characters of it, or its name.
+    pub session: String,
+    /// Print each entry's full input and output under its line.
+    #[arg(long)]
+    pub details: bool,
+    /// Print one JSON object per line instead.
+    #[arg(long)]
+    pub json: bool,
+    /// Drive the session instead of reading it (ADR-029 §3), as a member its node trusts with
+    /// drive. Each input reaches that session alone, or is refused with the reason.
+    #[command(flatten)]
+    pub drive: SessionDriveArgs,
+}
+
+/// What `vox room session` sends to the session, when it drives it: at most one of these.
+#[derive(Args, Debug, Clone, Default)]
+#[group(multiple = false)]
+pub struct SessionDriveArgs {
+    /// Type TEXT into the session as its operator, and submit it.
+    #[arg(long, value_name = "TEXT")]
+    pub say: Option<String>,
+    /// Interrupt the turn it is running (Esc).
+    #[arg(long)]
+    pub interrupt: bool,
+    /// Stop it (Ctrl-C).
+    #[arg(long)]
+    pub stop: bool,
+    /// Send it a slash command, as typed: "/compact", "/clear", "/rename NAME".
+    #[arg(long, value_name = "COMMAND")]
+    pub slash: Option<String>,
+    /// Approve the tool call the Session shows as waiting, by its ref.
+    #[arg(long, value_name = "REF")]
+    pub approve: Option<String>,
+    /// Reject the tool call waiting under REF, optionally saying why: `--reject REF "reason"`.
+    #[arg(long, value_name = "REF", num_args = 1..=2)]
+    pub reject: Option<Vec<String>>,
+    /// Answer the question waiting under REF: `--answer REF "QUESTION=ANSWER" …`, one pair per
+    /// question (a question by its id or its text; several choices joined with ", ").
+    #[arg(long, value_name = "REF", num_args = 2..)]
+    pub answer: Option<Vec<String>>,
+}
+
+impl SessionDriveArgs {
+    /// The input asked for, or `None` for a read; a malformed answer is said.
+    ///
+    /// # Errors
+    /// A `--answer` pair without `=`.
+    pub fn action(&self) -> Result<Option<crate::drive::Action>, String> {
+        use crate::drive::Action;
+        Ok(Some(if let Some(t) = &self.say {
+            Action::Text { text: t.clone() }
+        } else if self.interrupt {
+            Action::Interrupt
+        } else if self.stop {
+            Action::Stop
+        } else if let Some(t) = &self.slash {
+            Action::Slash { text: t.clone() }
+        } else if let Some(r) = &self.approve {
+            Action::Approve { r#ref: r.clone() }
+        } else if let Some(v) = &self.reject {
+            Action::Reject {
+                r#ref: v[0].clone(),
+                why: v.get(1).cloned(),
+            }
+        } else if let Some(v) = &self.answer {
+            let mut answers = std::collections::BTreeMap::new();
+            for pair in &v[1..] {
+                let (q, a) = pair
+                    .split_once('=')
+                    .ok_or_else(|| format!("--answer takes QUESTION=ANSWER, not {pair:?}"))?;
+                answers.insert(q.trim().to_owned(), a.trim().to_owned());
+            }
+            Action::Answer {
+                r#ref: v[0].clone(),
+                answers,
+            }
+        } else {
+            return Ok(None);
+        }))
+    }
 }
 
 /// `vox room post`
@@ -1090,6 +1234,18 @@ pub struct RoomPostArgs {
     pub no_card: bool,
     #[command(flatten)]
     pub coord: CoordArgs,
+}
+
+/// `vox room sessions`
+#[derive(Args, Debug, Clone)]
+pub struct RoomSessionsArgs {
+    #[command(flatten)]
+    pub profile: NodeArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// One JSON object per Session, one per line.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `vox room read`
@@ -1501,6 +1657,26 @@ enum TrustCmd {
     /// `<service>.<name>.<room>.vox`; it is local to this machine and never
     /// leaves it. Grants nothing: only an identity already trusted can be renamed.
     Rename(TrustRenameArgs),
+    /// Let a trusted identity drive this node's Sessions as well as read (ADR-028 K-14): its
+    /// keyring entry becomes read + drive. A keyring change, behind the passphrase.
+    Drive(TrustCapabilityArgs),
+    /// Take drive back from a trusted identity: its keyring entry grants read only.
+    Read(TrustCapabilityArgs),
+}
+
+/// `vox trust drive` and `vox trust read`
+#[derive(Args, Debug, Clone)]
+pub struct TrustCapabilityArgs {
+    #[command(flatten)]
+    pub profile: NodeArgs,
+    /// The trusted identity (base32, or a unique prefix).
+    pub fingerprint: String,
+    /// **Refused.** Use `--identity-passphrase-file`, `VOX_IDENTITY_PASSPHRASE`, or the prompt.
+    #[arg(long)]
+    pub identity_passphrase: Option<String>,
+    /// Read the identity passphrase from this file (first line).
+    #[arg(long)]
+    pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
 /// `vox trust rename`
@@ -1538,6 +1714,10 @@ pub struct TrustAddArgs {
     /// for, so it also reads what you wrote before. Your messages only — nobody else's.
     #[arg(long, value_parser = ["now", "full"], default_value = "now")]
     pub history: String,
+    /// Grant read + drive: it may also drive this node's Sessions (ADR-028 K-14). Without it
+    /// the entry grants read, the default.
+    #[arg(long)]
+    pub drive: bool,
     /// **Refused.** A command line is world-readable while the process runs — `ps`, or
     /// `/proc/<pid>/cmdline` — so a passphrase here is disclosed to every process on the
     /// machine, and lands in the shell's history besides. It is still accepted by the
@@ -2039,6 +2219,8 @@ pub fn run() -> ExitCode {
                 RoomCmd::Post(a) => &a.profile,
                 RoomCmd::Read(a) => &a.profile,
                 RoomCmd::Roster(a) => &a.profile,
+                RoomCmd::Sessions(a) => &a.profile,
+                RoomCmd::Session(a) => &a.profile,
                 RoomCmd::Ping(a) => &a.profile,
                 RoomCmd::Tail(a) => &a.profile,
                 RoomCmd::Board(a) => &a.profile,
@@ -2112,6 +2294,21 @@ pub fn run() -> ExitCode {
                             crate::room_cli::tail(&paths, &a.room, a.since.as_deref(), a.json).await
                         }
                         RoomCmd::Roster(a) => crate::room_cli::roster(&paths, &a.room).await,
+                        RoomCmd::Session(a) => match a.drive.action() {
+                            Err(e) => Err(crate::app::AppError::Usage(e)),
+                            Ok(Some(action)) => {
+                                crate::drive::run(&paths, &a.room, &a.session, action).await
+                            }
+                            Ok(None) => {
+                                crate::session_cli::show(
+                                    &paths, &a.room, &a.session, a.details, a.json,
+                                )
+                                .await
+                            }
+                        },
+                        RoomCmd::Sessions(a) => {
+                            crate::room_cli::sessions(&paths, &a.room, a.json).await
+                        }
                         RoomCmd::Ping(a) => {
                             crate::ping::ping(
                                 &paths,
@@ -2404,6 +2601,28 @@ pub fn run() -> ExitCode {
             // Not `rt` dropping: stdin's reader thread may still be blocked in a read, and
             // the runtime would wait for it.
             rt.shutdown_background();
+            match outcome {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Cmd::Agent(AgentCmd::Room(args)) => {
+            let outcome = vox_core::node::paths::NodeName::parse(&args.node)
+                .map_err(AppError::from)
+                .and_then(|node| {
+                    let account = vox_core::node::paths::Account::of(
+                        args.profile.data_dir.as_deref(),
+                        args.profile.config_dir.as_deref(),
+                    )?;
+                    vox_core::node::layout::refuse_old_layout(&account)?;
+                    block_on_client(async move {
+                        crate::agent_room::run(&account, &node, args.session.as_deref(), &args.room)
+                            .await
+                    })
+                });
             match outcome {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {

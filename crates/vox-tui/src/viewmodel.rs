@@ -48,6 +48,9 @@ pub struct MemberView {
     pub nickname: String,
     /// Where the member stands with you.
     pub trust: Trust,
+    /// What your keyring entry for it grants, read or read + drive (ADR-028 K-14); `None` for
+    /// you and for a member not in your keyring.
+    pub capability: Option<vox_core::node::trust::Capability>,
 }
 
 /// One line the timeline tells about the room, not a message (ADR-028 E-5).

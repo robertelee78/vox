@@ -475,6 +475,92 @@ pub struct FileShare {
     pub fetched: u64,
 }
 
+/// One Session of a room (ADR-029): a harness session working in it, as its node says.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSession {
+    /// The fingerprint of the node whose session it is, base32.
+    pub node_fingerprint: String,
+    /// This node's name for that node (ADR-028 K-3); empty for none.
+    pub node_alias: String,
+    /// The harness's own session id, as its node claims it.
+    pub session_id: String,
+    /// The first 8 characters of the id.
+    pub short_id: String,
+    /// The session's current name, as its node last gave it.
+    pub name: Option<String>,
+    /// How every client labels it (SE-3): `codex@device-2 · gso-cap · 3f0c25bf`.
+    pub label: String,
+    /// Open, or ended (SE-5).
+    pub open: bool,
+    /// When it opened, milliseconds since the Unix epoch.
+    pub opened_at_ms: u64,
+    /// When it ended, if it has.
+    pub ended_at_ms: Option<u64>,
+    /// Whether this node may drive it (ADR-029 §3).
+    pub can_drive: bool,
+}
+
+/// What a member with drive sends a session (ADR-029 DR-1), as `vox room session --say …` does.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum DriveAction {
+    /// Typed as the operator's input, and submitted.
+    Text {
+        /// What is typed.
+        text: String,
+    },
+    /// Esc: interrupt the turn it is running.
+    Interrupt,
+    /// Ctrl-C.
+    Stop,
+    /// A slash command, as typed: `/compact`, `/clear`, `/rename NAME`.
+    Slash {
+        /// The command and its arguments.
+        command: String,
+    },
+    /// Approve the tool call waiting under `reference` (the request entry's `ref`).
+    Approve {
+        /// The request's `ref`.
+        reference: String,
+    },
+    /// Reject it, with the reason the model is given.
+    Reject {
+        /// The request's `ref`.
+        reference: String,
+        /// Why.
+        why: Option<String>,
+    },
+    /// Answer the question waiting under `reference`: question (its id or its text) → answer.
+    Answer {
+        /// The request's `ref`.
+        reference: String,
+        /// Each question's answer; several choices joined with ", ".
+        answers: HashMap<String, String>,
+    },
+}
+
+/// Whether a drive reached its session's node, and what that node said (DR-6).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum DriveDelivery {
+    /// The session's node answered: [`DriveAnswer::ok`] says whether the input was delivered.
+    Answered,
+    /// The session's node could not be reached, or would not take drive input from this node.
+    /// Nothing was sent.
+    Unreachable,
+    /// The request went out and no answer came: whether it was delivered is not known.
+    NoAnswer,
+}
+
+/// The outcome of a drive.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DriveAnswer {
+    /// Whether the input reached the session.
+    pub ok: bool,
+    /// What happened, or why not, in words to show as they are.
+    pub said: String,
+    /// Whether the session's node answered at all.
+    pub delivery: DriveDelivery,
+}
+
 /// A share this node pulled by itself and verified (ADR-028 F-3, F-4).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct PulledFile {
@@ -694,7 +780,7 @@ async fn names(client: &mut IpcClient) -> Result<HashMap<Digest32, String>, VoxE
     )? {
         Frame::Trusted { entries } => Ok(entries
             .into_iter()
-            .map(|(fp, name)| (fp, shown_name(&name)))
+            .map(|(fp, name, _)| (fp, shown_name(&name)))
             .collect()),
         other => Err(unexpected(&other)),
     }
@@ -1400,6 +1486,7 @@ impl VoxClient {
             petname: name,
             identity_passphrase: copy_of(identity_passphrase.as_ref()),
             full_history: false,
+            drive: false,
         };
         on_held!(self, |c| done(c, &req).await)
     }
@@ -1800,6 +1887,133 @@ impl VoxClient {
                 other => Err(unexpected(&other)),
             }
         })
+    }
+
+    /// The Sessions of `room`, oldest opening first (ADR-029; `vox room sessions`).
+    ///
+    /// # Errors
+    /// A malformed id, or the node's refusal (a room not open).
+    pub async fn sessions(&self, room: String) -> Result<Vec<FfiSession>, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        on_held!(self, |c| {
+            let names = names(c).await?;
+            match ask(c, &Request::Sessions { channel_id }).await? {
+                Frame::Sessions { sessions } => Ok(sessions
+                    .into_iter()
+                    .map(|s| {
+                        let alias = names.get(&s.node).cloned().unwrap_or_default();
+                        let shown = if alias.is_empty() {
+                            b32_encode(&s.node).chars().take(12).collect()
+                        } else {
+                            alias.clone()
+                        };
+                        FfiSession {
+                            node_fingerprint: b32_encode(&s.node),
+                            node_alias: alias,
+                            short_id: s.id.chars().take(8).collect(),
+                            label: vox_agentcomms::envelope::session_label(
+                                &shown,
+                                s.name.as_deref(),
+                                &s.id,
+                            ),
+                            session_id: s.id,
+                            name: s.name,
+                            open: s.open,
+                            opened_at_ms: s.opened_millis,
+                            ended_at_ms: s.ended_millis,
+                            can_drive: s.can_drive,
+                        }
+                    })
+                    .collect()),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
+    /// Drive the open Session `session` (its whole id) of `room` (ADR-029 §3, #544): the input
+    /// reaches that session alone, or the session's node says why not. A refusal is an answer
+    /// (`ok` false, the reason in `said`), not an error.
+    ///
+    /// # Errors
+    /// A malformed room id, no open Session with that id, or the node's refusal to list them.
+    pub async fn drive(
+        &self,
+        room: String,
+        session: String,
+        action: DriveAction,
+    ) -> Result<DriveAnswer, VoxError> {
+        use vox_agentcomms::drive::{Action, Request as Drive};
+        let channel_id = digest(&room, "room id")?;
+        let action = match action {
+            DriveAction::Text { text } => Action::Text { text },
+            DriveAction::Interrupt => Action::Interrupt,
+            DriveAction::Stop => Action::Stop,
+            DriveAction::Slash { command } => Action::Slash { text: command },
+            DriveAction::Approve { reference } => Action::Approve { r#ref: reference },
+            DriveAction::Reject { reference, why } => Action::Reject {
+                r#ref: reference,
+                why,
+            },
+            DriveAction::Answer { reference, answers } => Action::Answer {
+                r#ref: reference,
+                answers: answers.into_iter().collect(),
+            },
+        };
+        let held = Arc::clone(&self.held);
+        self.on_rt(async move {
+            let (at, node, trusted) = {
+                let mut slot = held.lock().await;
+                let h = slot.as_mut().ok_or_else(not_attached)?;
+                let names = names(&mut h.client).await?;
+                let sessions = match ask(&mut h.client, &Request::Sessions { channel_id }).await? {
+                    Frame::Sessions { sessions } => sessions,
+                    other => return Err(unexpected(&other)),
+                };
+                let row = sessions
+                    .into_iter()
+                    .find(|s| s.id == session && s.open)
+                    .ok_or_else(|| failed("no open Session in this room has that id"))?;
+                (h.at.clone(), row.node, names.contains_key(&row.node))
+            };
+            // The app gate opens a stream only between nodes that trust each other; a member
+            // with drive trusts the session's node already, since it reads the Session only
+            // through that node's drive key (#543).
+            if !trusted {
+                return Ok(DriveAnswer {
+                    ok: false,
+                    said: format!(
+                        "you do not trust {}, so you cannot drive or read its Sessions",
+                        b32_encode(&node).chars().take(12).collect::<String>()
+                    ),
+                    delivery: DriveDelivery::Unreachable,
+                });
+            }
+            let request = Drive {
+                v: 1,
+                session,
+                action,
+            };
+            Ok(
+                match vox_core::node::drive_input::send(&at, channel_id, node, &request).await {
+                    Ok(a) => DriveAnswer {
+                        ok: a.ok,
+                        said: a.said,
+                        delivery: DriveDelivery::Answered,
+                    },
+                    Err(vox_core::node::drive_input::Unsent::Unreachable(said)) => DriveAnswer {
+                        ok: false,
+                        said,
+                        delivery: DriveDelivery::Unreachable,
+                    },
+                    Err(vox_core::node::drive_input::Unsent::NoAnswer(said)) => DriveAnswer {
+                        ok: false,
+                        said,
+                        delivery: DriveDelivery::NoAnswer,
+                    },
+                },
+            )
+        })
+        .await
     }
 
     /// This node's shares in `room` (`vox share list`).

@@ -67,6 +67,9 @@ pub struct OpenRoomSnap {
     /// ([`crate::node::api::ChannelDetail::retention`]): what the room's header always shows
     /// (ADR-028 R-7).
     pub retention: u64,
+    /// The room's Sessions, oldest opening first (ADR-029;
+    /// [`crate::node::sessions::fold`]).
+    pub sessions: Vec<crate::node::sessions::SessionRow>,
 }
 
 /// One node as a client draws it.
@@ -82,6 +85,8 @@ pub struct NodeSnapshot {
     pub open: Vec<OpenRoomSnap>,
     /// The trust keyring: `(fingerprint, petname)`.
     pub trusted: Vec<(Digest32, String)>,
+    /// The keyring entries that carry drive (ADR-028 K-14); every other entry grants read.
+    pub drive: Vec<Digest32>,
     /// The peers it holds a connection to now, in fingerprint order.
     pub connected_peers: Vec<Digest32>,
     /// Its live tunnels.
@@ -129,9 +134,11 @@ impl NodeSnapshot {
                     trusted_by: d.trusted_by.clone(),
                     pulled_by: handle.shares().pulled_by(&d.channel_id),
                     retention: d.retention,
+                    sessions: crate::node::sessions::fold(d),
                 })
                 .collect(),
             trusted: nv.trusted.clone(),
+            drive: nv.drive.clone(),
             connected_peers: nv.connected_peers.clone(),
             tunnels: me
                 .map(|me| crate::transport::quic::live_tunnels(&me))
@@ -147,7 +154,7 @@ impl NodeSnapshot {
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(10).uint(T_SNAPSHOT_REPLY);
+        e.array(11).uint(T_SNAPSHOT_REPLY);
         e.bytes(self.me.as_ref().map_or(&[][..], |d| &d[..]));
         e.uint(u64::from(self.mlock_active));
         e.array(self.rooms.len());
@@ -160,7 +167,7 @@ impl NodeSnapshot {
         }
         e.array(self.open.len());
         for o in &self.open {
-            e.array(13)
+            e.array(14)
                 .bytes(&o.channel_id)
                 .text(o.name.as_deref().unwrap_or_default());
             digests(&mut e, &o.members);
@@ -206,11 +213,13 @@ impl NodeSnapshot {
                 digests(&mut e, who);
             }
             e.uint(o.retention);
+            crate::node::sessions::put_rows(&mut e, &o.sessions);
         }
         e.array(self.trusted.len());
         for (fp, name) in &self.trusted {
             e.array(2).bytes(fp).text(name);
         }
+        digests(&mut e, &self.drive);
         digests(&mut e, &self.connected_peers);
         e.array(self.tunnels.len());
         for t in &self.tunnels {
@@ -248,7 +257,7 @@ impl NodeSnapshot {
     /// If it is a snapshot reply that does not decode.
     pub fn from_bytes(body: &[u8]) -> Result<Option<Self>> {
         let mut d = Decoder::new(body);
-        if !matches!((d.array(), d.uint()), (Ok(10), Ok(T_SNAPSHOT_REPLY))) {
+        if !matches!((d.array(), d.uint()), (Ok(11), Ok(T_SNAPSHOT_REPLY))) {
             return Ok(None);
         }
         let bad = |what: &'static str| move |_| Error::MalformedIpc(what);
@@ -276,7 +285,7 @@ impl NodeSnapshot {
         }
         let mut open = Vec::new();
         for _ in 0..d.array().map_err(bad("ipc snapshot open rooms"))? {
-            want(&mut d, 13, "ipc snapshot open room")?;
+            want(&mut d, 14, "ipc snapshot open room")?;
             let channel_id = digest(&mut d)?;
             let name = Some(d.text().map_err(bad("ipc snapshot open name"))?.to_owned())
                 .filter(|n| !n.is_empty());
@@ -342,6 +351,7 @@ impl NodeSnapshot {
                 pulled_by.push((entry, read_digests(&mut d)?));
             }
             let retention = d.uint().map_err(bad("ipc snapshot retention"))?;
+            let sessions = crate::node::sessions::read_rows(&mut d)?;
             open.push(OpenRoomSnap {
                 channel_id,
                 name,
@@ -356,6 +366,7 @@ impl NodeSnapshot {
                 trusted_by,
                 pulled_by,
                 retention,
+                sessions,
             });
         }
         let mut trusted = Vec::new();
@@ -365,6 +376,7 @@ impl NodeSnapshot {
             let name = d.text().map_err(bad("ipc snapshot petname"))?.to_owned();
             trusted.push((fp, name));
         }
+        let drive = read_digests(&mut d)?;
         let connected_peers = read_digests(&mut d)?;
         let mut tunnels = Vec::new();
         for _ in 0..d.array().map_err(bad("ipc snapshot tunnels"))? {
@@ -410,6 +422,7 @@ impl NodeSnapshot {
             rooms,
             open,
             trusted,
+            drive,
             connected_peers,
             tunnels,
             closed_tunnels,
@@ -536,8 +549,10 @@ mod tests {
                 trusted_by: vec![([4; 32], vec![[1; 32]])],
                 pulled_by: vec![([6; 32], vec![[4; 32]])],
                 retention: 604_800,
+                sessions: Vec::new(),
             }],
             trusted: vec![([4; 32], "bob".into())],
+            drive: vec![[4; 32]],
             connected_peers: vec![[4; 32]],
             tunnels: vec![LiveTunnel {
                 id: 3,

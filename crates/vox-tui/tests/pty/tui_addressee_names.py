@@ -23,7 +23,7 @@ import json, os, re, subprocess, sys, time
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vox_pty import Hung, Tui, arm, disarm, pane, pyte, stage  # noqa: E402
+from vox_pty import Hung, Tui, arm, disarm, pane, pyte, stage, is_keyring_change, typed_run  # noqa: E402
 
 VOX, TAG = sys.argv[1], sys.argv[2]
 # Sized for the debug build, as `tui_member_names.py` is: two joins at JOIN_SECS each, and the rest.
@@ -50,6 +50,9 @@ def env(w):
 
 def run(w, *args, stdin=None):
     secs = JOIN_SECS if args[:2] == ("room", "join") else 120
+    if is_keyring_change(args):
+        # A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
+        return typed_run([VOX, *args], env(w), secs)
     return subprocess.run([VOX, *args], env=env(w), input=stdin, capture_output=True, text=True, timeout=secs)
 
 def spawn(w, *args, out):

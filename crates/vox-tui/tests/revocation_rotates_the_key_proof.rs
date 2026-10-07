@@ -64,6 +64,8 @@ mod watchdog;
 
 #[path = "support/layout.rs"]
 mod layout;
+#[path = "support/typed.rs"]
+mod typed;
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -94,13 +96,20 @@ struct Member {
 
 impl Member {
     fn vox(&self, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
-        let mut child = Command::new(VOX)
-            .args(args)
+        let mut cmd = Command::new(VOX);
+        cmd.args(args)
             .env("VOX_DATA_DIR", &self.data)
             .env("VOX_CONFIG_DIR", self.data.join("cfg"))
             .env_remove("VOX_ROOM")
             .env_remove("VOX_SESSION")
-            .env_remove("VOX_ROOM_PASSPHRASE")
+            .env_remove("VOX_ROOM_PASSPHRASE");
+        // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028
+        // K-13).
+        if typed::is_keyring_change(args) {
+            let (ok, shown) = typed::keyring(&cmd);
+            return (ok, shown.clone(), shown);
+        }
+        let mut child = cmd
             .stdin(if stdin.is_some() {
                 Stdio::piped()
             } else {

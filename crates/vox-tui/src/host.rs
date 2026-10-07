@@ -96,6 +96,24 @@ struct Inner {
     /// Held while `.daemon/attach` is rewritten and while a Keychain item is stored or removed:
     /// one writer at a time, and a removal never overtakes a later store of the same item.
     keep_file: tokio::sync::Mutex<()>,
+    /// Each node's joins of its sessions' rooms under way (ADR-029 RB-3).
+    joins: Mutex<BTreeMap<NodeName, Arc<vox_core::node::room_join::Joins>>>,
+    /// Where harness sessions' activity is numbered and posted, and approvals wait (ADR-029).
+    sink: Arc<crate::session_sink::Sink>,
+    /// One queue per (node, session) into its Session, so its entries keep their order.
+    posting: Mutex<BTreeMap<(NodeName, String), tokio::sync::mpsc::UnboundedSender<String>>>,
+    /// Codex sessions' activity, read from Codex's app-server as a peer client (ADR-029 #541).
+    codex: Arc<crate::codex_mirror::CodexMirror>,
+    /// OpenCode sessions' activity, read through Vox's OpenCode plugin (ADR-029 #542).
+    opencode: Arc<crate::opencode_mirror::OpenCodeMirror>,
+}
+
+/// A member's answer as the sink took it: handed to the harness, or why not.
+fn handed(h: crate::session_sink::Handed) -> Result<String, String> {
+    match h {
+        crate::session_sink::Handed::ToHarness => Ok("handed to the session; it decides".into()),
+        crate::session_sink::Handed::Refused(why) => Err(why),
+    }
 }
 
 /// One node's place in its life (L-1). A node with no slot is detached.
@@ -139,7 +157,8 @@ enum Want {
     Explicit(Option<KeepSource>),
     /// A held connection: attached implicitly if need be, and held while the connection is open.
     Hold,
-    /// An agent session: attached implicitly if need be, and held while it is registered.
+    /// An agent session: only if attached already (ADR-028 K-13), and held while it is
+    /// registered.
     Session(Box<crate::wake::Session>),
     /// Kept with its passphrase in the Keychain: attached by hand when this request attaches it,
     /// which proves the passphrase; found attached, left as it is, for the asker to check the
@@ -238,21 +257,38 @@ impl Router {
             .proxy
             .map(|bind| Arc::new(crate::daemon_proxy::DaemonProxy::new(bind)));
         let router = Self {
-            inner: Arc::new(Inner {
-                account,
-                rt,
-                defaults,
-                slots: Mutex::new(BTreeMap::new()),
-                events: broadcast::channel(256).0,
-                metrics: Arc::new(DaemonMetrics::default()),
-                stopping: AtomicBool::new(false),
-                next_generation: AtomicU64::new(1),
-                stop_asked: tokio::sync::Notify::new(),
-                serve_only: Mutex::default(),
-                unfinished_stop: AtomicBool::new(false),
-                connections: Arc::default(),
-                proxy,
-                keep_file: tokio::sync::Mutex::new(()),
+            inner: Arc::new_cyclic(|weak: &std::sync::Weak<Inner>| {
+                let weak = weak.clone();
+                let sink = crate::session_sink::Sink::new(Arc::new(
+                    move |node: &NodeName, session: &str, bodies: Vec<String>| {
+                        if let Some(inner) = weak.upgrade() {
+                            Router { inner }.post_session(node, session, bodies);
+                        }
+                    },
+                ));
+                let codex = crate::codex_mirror::CodexMirror::new(Arc::clone(&sink));
+                let opencode = crate::opencode_mirror::OpenCodeMirror::new(Arc::clone(&sink));
+                Inner {
+                    codex,
+                    opencode,
+                    account,
+                    rt,
+                    defaults,
+                    slots: Mutex::new(BTreeMap::new()),
+                    events: broadcast::channel(256).0,
+                    metrics: Arc::new(DaemonMetrics::default()),
+                    stopping: AtomicBool::new(false),
+                    next_generation: AtomicU64::new(1),
+                    stop_asked: tokio::sync::Notify::new(),
+                    serve_only: Mutex::default(),
+                    unfinished_stop: AtomicBool::new(false),
+                    connections: Arc::default(),
+                    proxy,
+                    keep_file: tokio::sync::Mutex::new(()),
+                    sink,
+                    posting: Mutex::default(),
+                    joins: Mutex::default(),
+                }
             }),
         };
         router.follow_attached_with_the_proxy();
@@ -505,7 +541,8 @@ impl Router {
     }
 
     /// Register an agent session of `node` (ADR-020 6.10): store its record and count it as a
-    /// holder, attaching the node implicitly if it is not attached.
+    /// holder. **A session never attaches its node** (ADR-028 K-13): one not attached is refused
+    /// [`Refusal::NotAttached`], and its operator attaches it outside the session.
     ///
     /// # Errors
     /// The [`Refusal`] the hook is told.
@@ -513,19 +550,487 @@ impl Router {
         &self,
         node: &NodeName,
         session: crate::wake::Session,
-        passphrase: Option<Zeroizing<String>>,
-        anchors: Vec<String>,
-    ) -> Result<NodeInfo, Refusal> {
+        join: Option<(String, Zeroizing<String>)>,
+    ) -> Result<DaemonFrame, Refusal> {
+        // A node that does not exist is said as that, not as one to attach.
+        if !self.inner.account.nodes_on_disk().contains(node) {
+            return Err(Refusal::NoSuchNode { node: node.clone() });
+        }
+        // Whether this node knew the session before this turn: its registration on disk.
+        let known = self
+            .inner
+            .account
+            .node_paths(node)
+            .is_ok_and(|p| p.session_file(&session.session).is_file());
+        let id = session.session.clone();
+        let asked = session.room.clone();
+        // The tmux pane the hook claims is proven here, from tmux and the process table, while the
+        // hook waits (ADR-029 DR-5): never stored as claimed.
+        let mut session = session;
+        if let Some(claim) = session.tmux_claim.take() {
+            let proven =
+                tokio::task::spawn_blocking(move || crate::claude_injector::prove(&claim)).await;
+            match proven {
+                Ok(Ok(pane)) => session.tmux = Some(pane),
+                Ok(Err(why)) => session.tmux_why = Some(why),
+                Err(e) => session.tmux_why = Some(format!("the pane could not be proven: {e}")),
+            }
+        }
         let g = self
             .want(
                 node,
                 Want::Session(Box::new(session)),
-                passphrase,
+                None,
                 Vec::new(),
-                anchors,
+                Vec::new(),
             )
             .await?;
-        Ok(g.info)
+        let handle = self.handle_of(node);
+        // A room the hook named by a prefix of its id is resolved against the node's rooms, now
+        // that the node is attached, and kept by its whole id.
+        if let (Some(h), Ok(paths)) = (handle.as_ref(), self.inner.account.node_paths(node)) {
+            let named = crate::wake::registration(&paths, &id).and_then(|r| r.room);
+            if let Some(prefix) =
+                named.filter(|r| vox_core::node::link::b32_decode(r, "room").is_err())
+            {
+                let whole: Vec<String> = h
+                    .view()
+                    .channels
+                    .iter()
+                    .map(|c| vox_core::node::link::b32_encode(&c.channel_id))
+                    .filter(|c| c.starts_with(prefix.trim()))
+                    .collect();
+                if let [one] = whole.as_slice() {
+                    crate::wake::store_room(&paths, &id, one);
+                }
+            }
+        }
+        // The record as stored: the room a session works in is kept for its life (RB-4).
+        let stored = self
+            .inner
+            .account
+            .node_paths(node)
+            .ok()
+            .and_then(|p| crate::wake::registration(&p, &id));
+        let room = stored.as_ref().and_then(|r| r.room.clone());
+        let mut joining = None;
+        // A join is for the room this turn named, and only when that is the session's room: a
+        // session keeps the room it started with (RB-4), so a later lookup joins nothing.
+        let join = join.filter(|_| asked.is_some() && asked == room);
+        if let (Some(handle), Some(reg)) = (handle.as_ref(), stored.as_ref()) {
+            joining = self.open_session(node, handle, reg, join).await;
+        }
+        // **New** is new to this node: no registration before, and no Session of it in any room
+        // its log holds, so a daemon restarted mid-session still knows it (ADR-029 RB-5).
+        let seen = handle.as_ref().is_some_and(|h| {
+            let me = h.view().identity.as_ref().map(|i| i.fingerprint);
+            h.view().open_channels.iter().any(|d| {
+                vox_core::node::sessions::fold(d)
+                    .iter()
+                    .any(|s| Some(s.node) == me && s.id == id)
+            })
+        });
+        Ok(DaemonFrame::SessionRegistered {
+            info: g.info,
+            room,
+            new: !known && !seen,
+            joining,
+        })
+    }
+
+    /// Open `reg`'s Session in its room (ADR-029 SE-1): at once when the node is a member, or once
+    /// a join from the room map (`join`) makes it one. A headless session gets none. What a join
+    /// under way says, for the session.
+    async fn open_session(
+        &self,
+        node: &NodeName,
+        handle: &vox_core::node::actor::NodeHandle,
+        reg: &crate::wake::Session,
+        join: Option<(String, Zeroizing<String>)>,
+    ) -> Option<String> {
+        let room_b32 = reg.room.as_ref()?;
+        if !reg.interactive {
+            return None;
+        }
+        let room = vox_core::node::link::b32_decode(room_b32, "room").ok()?;
+        let opening = vox_core::node::sessions::Opening {
+            id: reg.session.clone(),
+            harness: reg.harness.clone(),
+            name: reg.name.clone(),
+        };
+        let member = handle.view().channels.iter().any(|c| c.channel_id == room);
+        let joins = Arc::clone(lock(&self.inner.joins).entry(node.clone()).or_default());
+        if member {
+            joins.set_status(room_b32, None);
+            if let Err(e) = vox_core::node::sessions::open_when_member(handle, room, &opening).await
+            {
+                return Some(format!(
+                    "could not open this session's Session in its room: {e}"
+                ));
+            }
+            return None;
+        }
+        if let Some((link, passphrase)) = join {
+            vox_core::node::room_join::join_in_background(
+                handle, &joins, room_b32, &link, passphrase, opening,
+            );
+        }
+        joins.status(room_b32)
+    }
+
+    /// Move `session` of `node` to `room` (ADR-029 RB-5): its Session ends in the room it worked in,
+    /// and one opens in `room`.
+    ///
+    /// # Errors
+    /// The [`Refusal`] the caller is told.
+    pub async fn session_room(
+        &self,
+        node: &NodeName,
+        session: &str,
+        room: &str,
+    ) -> Result<DaemonFrame, Refusal> {
+        let failed = |why: String| Refusal::Failed {
+            node: node.clone(),
+            why,
+        };
+        let paths = self
+            .inner
+            .account
+            .node_paths(node)
+            .map_err(|e| failed(e.to_string()))?;
+        let handle = self
+            .handle_of(node)
+            .ok_or_else(|| Refusal::NotAttached { node: node.clone() })?;
+        vox_core::node::link::b32_decode(room, "room").map_err(|e| failed(e.to_string()))?;
+        let before = crate::wake::store_room(&paths, session, room)
+            .ok_or_else(|| failed(format!("no session {session} is registered")))?;
+        if let Some(old) = before.filter(|old| old != room) {
+            if let Ok(old) = vox_core::node::link::b32_decode(&old, "room") {
+                let _ = vox_core::node::sessions::end(&handle, old, session, "moved").await;
+            }
+        }
+        let reg = crate::wake::registration(&paths, session)
+            .ok_or_else(|| failed(format!("no session {session} is registered")))?;
+        let joining = self.open_session(node, &handle, &reg, None).await;
+        Ok(DaemonFrame::SessionRegistered {
+            info: self
+                .nodes()
+                .into_iter()
+                .find(|n| n.name == *node)
+                .ok_or_else(|| Refusal::NotAttached { node: node.clone() })?,
+            room: Some(room.to_owned()),
+            new: false,
+            joining,
+        })
+    }
+
+    /// Listen for drive input to `node`'s sessions ([`crate::drive`]) until the node detaches.
+    fn serve_drive(
+        &self,
+        node: &NodeName,
+        handle: &NodeHandle,
+        mut detached: watch::Receiver<bool>,
+    ) {
+        let hub = Arc::clone(handle.app());
+        let mut listener = match hub.listen(None, crate::drive::LABEL) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("vox daemon: node {node} takes no drive input: {e}");
+                return;
+            }
+        };
+        let router = self.clone();
+        let node = node.clone();
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            loop {
+                let incoming = tokio::select! {
+                    i = listener.next() => i,
+                    _ = detached.wait_for(|d| *d) => None,
+                };
+                let Some(incoming) = incoming else { return };
+                let (router, node, handle, hub) = (
+                    router.clone(),
+                    node.clone(),
+                    handle.clone(),
+                    Arc::clone(&hub),
+                );
+                tokio::spawn(async move {
+                    let Ok(stream) = hub.accept(incoming.id).await else {
+                        return;
+                    };
+                    router.drive_stream(&node, &handle, stream).await;
+                });
+            }
+        });
+    }
+
+    /// One drive request on `stream`: read it, act on it, answer it, and say it in the Session.
+    async fn drive_stream(
+        &self,
+        node: &NodeName,
+        handle: &NodeHandle,
+        stream: vox_core::node::app::AppStream,
+    ) {
+        use crate::drive::{Answer, MAX_REQUEST, PATIENCE};
+        let info = stream.info().clone();
+        let mut buf = Vec::new();
+        let mut chunk = vec![0u8; 16 * 1024];
+        let read = tokio::time::timeout(PATIENCE, async {
+            while !buf.contains(&b'\n') && buf.len() <= MAX_REQUEST {
+                match stream.read(&mut chunk).await {
+                    Ok(Some(n)) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                    _ => break,
+                }
+            }
+        })
+        .await;
+        let line = buf.split(|b| *b == b'\n').next().unwrap_or_default();
+        let answer = match (read, serde_json::from_slice::<crate::drive::Request>(line)) {
+            (Err(_), _) => Answer {
+                ok: false,
+                said: "no drive request arrived in time".into(),
+            },
+            (_, Err(_)) if buf.len() > MAX_REQUEST => Answer {
+                ok: false,
+                said: "the drive request is too long".into(),
+            },
+            (_, Err(_)) => Answer {
+                ok: false,
+                said: "not a drive request this vox reads".into(),
+            },
+            (Ok(()), Ok(req)) => self.drive(node, handle, &info, req).await,
+        };
+        if let Ok(mut out) = serde_json::to_vec(&answer) {
+            out.push(b'\n');
+            let _ = stream.write_all(&out).await;
+        }
+        stream.finish().await;
+    }
+
+    /// Check a drive request and hand it to its session alone (ADR-029 DR-2, DR-5, DR-6, DR-7),
+    /// writing what was driven and, when it was not delivered, why into the Session.
+    async fn drive(
+        &self,
+        node: &NodeName,
+        handle: &NodeHandle,
+        info: &vox_core::node::app::AppInfo,
+        req: crate::drive::Request,
+    ) -> crate::drive::Answer {
+        use crate::drive::{Action, Answer};
+        let refuse = |said: String| Answer { ok: false, said };
+        if req.v != 1 {
+            return refuse(format!(
+                "drive protocol {} is not one this vox speaks",
+                req.v
+            ));
+        }
+        let view = handle.view();
+        // DR-2: only a member this node trusts with drive.
+        if !view.drive.contains(&info.peer) {
+            return refuse(format!(
+                "{} does not trust you with drive; it trusts you to read only, or not at all",
+                node
+            ));
+        }
+        let Ok(paths) = self.inner.account.node_paths(node) else {
+            return refuse("this node's files cannot be read".into());
+        };
+        // DR-5 and TA-5: exactly this session, open on this node, and none other.
+        let Some(reg) = crate::wake::registration(&paths, &req.session) else {
+            return refuse(
+                "that session is not open on its node: it ended, or never registered there;                  nothing was sent to any other session"
+                    .into(),
+            );
+        };
+        let room = vox_core::node::link::b32_encode(&info.channel_id);
+        if reg.room.as_deref() != Some(room.as_str()) {
+            return refuse("that session does not work in this room; nothing was sent".into());
+        }
+        let by = vox_core::node::link::b32_encode(&info.peer);
+        let alias = view
+            .trusted
+            .iter()
+            .find(|(fp, _)| *fp == info.peer)
+            .map_or_else(|| by.chars().take(8).collect(), |(_, n)| n.clone());
+        let sink = &self.inner.sink;
+        let outcome: Result<String, String> = match &req.action {
+            Action::Approve { r#ref } => handed(sink.answer(
+                node,
+                &req.session,
+                r#ref,
+                &by,
+                &alias,
+                crate::session_sink::Given::Approve {
+                    allow: true,
+                    why: None,
+                },
+            )),
+            Action::Reject { r#ref, why } => handed(sink.answer(
+                node,
+                &req.session,
+                r#ref,
+                &by,
+                &alias,
+                crate::session_sink::Given::Approve {
+                    allow: false,
+                    why: why.clone(),
+                },
+            )),
+            Action::Answer { r#ref, answers } => handed(sink.answer(
+                node,
+                &req.session,
+                r#ref,
+                &by,
+                &alias,
+                crate::session_sink::Given::Answer(answers.clone()),
+            )),
+            input => self.steer(node, &reg, input).await,
+        };
+        // What was driven, as this node's claim of who drove it (ADR-029 MD-3), and what came of
+        // it when it was not delivered (DR-6). An answer shows on its request's line.
+        let mut copy = serde_json::Map::new();
+        copy.insert(
+            "v".into(),
+            serde_json::json!(vox_agentcomms::activity::VERSION),
+        );
+        copy.insert("session".into(), serde_json::json!(req.session));
+        copy.insert("kind".into(), serde_json::json!("drive"));
+        copy.insert("by".into(), serde_json::json!(by));
+        copy.insert("action".into(), serde_json::json!(req.action.name()));
+        match &req.action {
+            Action::Text { text } => {
+                copy.insert("text".into(), serde_json::json!(text));
+            }
+            Action::Slash { text } => {
+                copy.insert("cmd".into(), serde_json::json!(crate::drive::slash(text).0));
+                copy.insert("text".into(), serde_json::json!(text));
+            }
+            Action::Approve { r#ref }
+            | Action::Reject { r#ref, .. }
+            | Action::Answer { r#ref, .. } => {
+                copy.insert("ref".into(), serde_json::json!(r#ref));
+            }
+            Action::Interrupt | Action::Stop => {}
+        }
+        let mut bodies =
+            vox_agentcomms::activity::split(copy, "text", vox_core::node::content::MAX_TEXT_LEN);
+        // Every drive's outcome, beside it (DR-6): what happened, or why it was not delivered.
+        let mut result = serde_json::json!({
+            "v": vox_agentcomms::activity::VERSION, "session": req.session,
+            "kind": "drive-result", "by": by, "action": req.action.name(),
+            "ok": outcome.is_ok(),
+        });
+        match &outcome {
+            Ok(said) => result["said"] = serde_json::json!(said),
+            Err(why) => result["why"] = serde_json::json!(why),
+        }
+        bodies.push(result.to_string());
+        sink.activity(node, &req.session, bodies, None);
+        match outcome {
+            Ok(said) => Answer { ok: true, said },
+            Err(said) => Answer { ok: false, said },
+        }
+    }
+
+    /// Typed text, an interrupt, a stop or a slash command, to `reg`'s harness alone.
+    async fn steer(
+        &self,
+        node: &NodeName,
+        reg: &crate::wake::Session,
+        action: &crate::drive::Action,
+    ) -> Result<String, String> {
+        use crate::codex_mirror::Steer;
+        use crate::drive::Action;
+        let steer = match action {
+            Action::Text { text } => Steer::Text(text.clone()),
+            Action::Interrupt => Steer::Interrupt,
+            Action::Stop => Steer::Stop,
+            Action::Slash { text } => {
+                let (cmd, args) = crate::drive::slash(text);
+                Steer::Slash { cmd, args }
+            }
+            _ => return Err("not an input for the session's terminal".into()),
+        };
+        let typed = match &steer {
+            Steer::Text(t) => Some(t.clone()),
+            _ => None,
+        };
+        let done = match reg.harness.as_str() {
+            "codex" if !reg.codex_home.is_empty() => {
+                self.inner
+                    .codex
+                    .steer(std::path::Path::new(&reg.codex_home), &reg.session, steer)
+                    .await
+            }
+            "opencode" => self.inner.opencode.steer(&reg.session, steer).await,
+            "claude" => {
+                use crate::claude_injector::Act;
+                let act = match steer {
+                    Steer::Text(t) => Act::Text(t),
+                    Steer::Interrupt => Act::Interrupt,
+                    Steer::Stop => Act::Stop,
+                    Steer::Slash { cmd, args } if args.is_empty() => Act::Slash(format!("/{cmd}")),
+                    Steer::Slash { cmd, args } => Act::Slash(format!("/{cmd} {args}")),
+                };
+                let reg = reg.clone();
+                tokio::task::spawn_blocking(move || crate::claude_injector::drive(&reg, &act))
+                    .await
+                    .unwrap_or_else(|_| Err("the delivery to the terminal failed".into()))
+                    .map(|()| "delivered to its terminal".to_owned())
+            }
+            "codex" => Err(
+                "this Codex session registered no CODEX_HOME, so Vox cannot reach its app-server"
+                    .into(),
+            ),
+            other => Err(format!("Vox cannot drive a {other} session")),
+        };
+        if let (Ok(_), Some(t)) = (&done, typed) {
+            self.inner.sink.delivered_text(node, &reg.session, &t);
+        }
+        done
+    }
+
+    /// Follow a registered session's activity where its harness offers it (ADR-029 SC-1): a
+    /// Codex session from its `CODEX_HOME`'s app-server, an OpenCode session through Vox's
+    /// plugin's socket. Claude Code's comes through its hooks.
+    fn watch_harness(&self, node: &NodeName, s: &crate::wake::Session) {
+        match s.harness.as_str() {
+            "codex" if !s.codex_home.is_empty() => {
+                self.inner
+                    .codex
+                    .watch(std::path::Path::new(&s.codex_home), node, &s.session);
+            }
+            "opencode" if !s.mirror.is_empty() => {
+                self.inner
+                    .opencode
+                    .watch(node, &s.session, &s.mirror, &s.token);
+            }
+            _ => {}
+        }
+    }
+
+    /// Post `bodies`, numbered, to `session`'s Session: sealed to the members `node` trusts with
+    /// drive (ADR-029 SC-2), in the room the session works in. One task per session posts them in
+    /// order, so a split entry's parts stay together.
+    fn post_session(&self, node: &NodeName, session: &str, bodies: Vec<String>) {
+        let mut posting = lock(&self.inner.posting);
+        let key = (node.clone(), session.to_owned());
+        let tx = match posting.get(&key).filter(|tx| !tx.is_closed()) {
+            Some(tx) => tx.clone(),
+            None => {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let weak = Arc::downgrade(&self.inner);
+                self.inner
+                    .rt
+                    .spawn(post_in_order(weak, key.0.clone(), key.1.clone(), rx));
+                posting.insert(key, tx.clone());
+                tx
+            }
+        };
+        for b in bodies {
+            let _ = tx.send(b);
+        }
     }
 
     /// Unregister an agent session of `node`, and detach the node if it was attached implicitly
@@ -534,7 +1039,28 @@ impl Router {
     /// moment either comes first (and the node stays) or finds the node detaching and waits.
     ///
     /// Returns whether the session was registered, and whether the node detached.
-    pub async fn session_end(&self, node: &NodeName, session: &str) -> (bool, bool) {
+    pub async fn session_end(&self, node: &NodeName, session: &str, reason: &str) -> (bool, bool) {
+        // **A resume is not an end** (ADR-029 SE-4): the session goes on, registered, its Session
+        // open.
+        if vox_core::node::sessions::keeps_open(reason) {
+            return (true, false);
+        }
+        // Whatever it was asking, nobody can answer now.
+        self.inner.sink.session_end(node, session);
+        // Its queue closes once what it holds is posted.
+        lock(&self.inner.posting).remove(&(node.clone(), session.to_owned()));
+        // Its Session ends first, while the node is still attached to say so.
+        if let (Some(handle), Ok(paths)) =
+            (self.handle_of(node), self.inner.account.node_paths(node))
+        {
+            let room = crate::wake::registration(&paths, session).and_then(|r| r.room);
+            if let Some(room) = room.and_then(|r| vox_core::node::link::b32_decode(&r, "room").ok())
+            {
+                let _ = vox_core::node::sessions::end(&handle, room, session, reason).await;
+            }
+        }
+        self.inner.codex.end(session);
+        self.inner.opencode.end(session);
         let going = {
             let mut slots = lock(&self.inner.slots);
             match slots.get_mut(node) {
@@ -629,6 +1155,15 @@ impl Router {
     /// node's stop finished within the patience.
     pub async fn stop_all(&self) -> bool {
         self.inner.stopping.store(true, Ordering::SeqCst);
+        // A proof of a daemon started while this one stops holds that moment open (test builds
+        // only, V210-105).
+        #[cfg(feature = "test-knobs")]
+        if let Some(ms) = std::env::var("VOX_TEST_STOP_HOLD_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
         let names: Vec<NodeName> = lock(&self.inner.slots).keys().cloned().collect();
         let mut all = tokio::task::JoinSet::new();
         for node in names {
@@ -723,7 +1258,11 @@ impl Router {
                     }
                     Some(Slot::Attaching(rx)) => Step::WaitAttach(rx.clone()),
                     Some(Slot::Detaching(rx)) => Step::WaitDetach(rx.clone()),
-                    None if matches!(want, Some(Want::IfAttached)) => Step::NotAttached,
+                    // Neither a one-shot verb nor an agent's session attaches a node (L-2;
+                    // ADR-028 K-13).
+                    None if matches!(want, Some(Want::IfAttached | Want::Session(_))) => {
+                        Step::NotAttached
+                    }
                     None => {
                         let (tx, rx) = watch::channel(None);
                         slots.insert(node.clone(), Slot::Attaching(rx));
@@ -766,6 +1305,13 @@ impl Router {
                             granted.notes = a.notes.clone();
                             granted.attached_now = true;
                             let fingerprint = a.fingerprint;
+                            // Codex sessions registered before this daemon started are read
+                            // again from their app-server at once, not at their next turn.
+                            for s in crate::wake::registered(&a.paths) {
+                                self.watch_harness(node, &s);
+                            }
+                            // Drive input from members with drive (ADR-029 §3), while attached.
+                            self.serve_drive(node, &a.handle, a.detached.subscribe());
                             slots.insert(node.clone(), Slot::Attached(a));
                             drop(slots);
                             self.inner
@@ -824,6 +1370,7 @@ impl Router {
             }
             Want::Session(s) => {
                 crate::wake::store(&a.paths, &s);
+                self.watch_harness(node, &s);
                 a.sessions.insert(s.session.clone());
                 None
             }
@@ -1359,8 +1906,7 @@ impl Dispatch for Router {
                 node,
                 session,
                 record,
-                passphrase,
-                anchors,
+                join,
             } => {
                 let record = match serde_json::from_str::<crate::wake::Session>(&record) {
                     Ok(r) if r.session == session => r,
@@ -1372,16 +1918,25 @@ impl Dispatch for Router {
                         })
                     }
                 };
-                match self
-                    .session_register(&node, record, passphrase, anchors)
-                    .await
-                {
-                    Ok(info) => DaemonFrame::Attached(info, Vec::new()),
+                match self.session_register(&node, record, join).await {
+                    Ok(frame) => frame,
                     Err(r) => refused(r),
                 }
             }
-            DaemonRequest::SessionEnd { node, session } => {
-                let (was_registered, detached) = self.session_end(&node, &session).await;
+            DaemonRequest::SessionRoom {
+                node,
+                session,
+                room,
+            } => match self.session_room(&node, &session, &room).await {
+                Ok(frame) => frame,
+                Err(r) => refused(r),
+            },
+            DaemonRequest::SessionEnd {
+                node,
+                session,
+                reason,
+            } => {
+                let (was_registered, detached) = self.session_end(&node, &session, &reason).await;
                 DaemonFrame::SessionEnded {
                     was_registered,
                     detached,
@@ -1410,6 +1965,41 @@ impl Dispatch for Router {
                 self.inner.stop_asked.notify_one();
                 DaemonFrame::Ok
             }
+            DaemonRequest::SessionActivity {
+                node,
+                session,
+                bodies,
+                call,
+            } => {
+                // A Codex session read from its app-server: its hooks' copy of the same activity
+                // is not posted again. The prompt is the hook's alone (see codex_mirror).
+                let bodies = if self.inner.codex.subscribed(&session) {
+                    bodies
+                        .into_iter()
+                        .filter(|b| {
+                            serde_json::from_str::<serde_json::Value>(b).is_ok_and(|v| {
+                                v.get("kind").and_then(|k| k.as_str()) == Some("user")
+                            })
+                        })
+                        .collect()
+                } else {
+                    bodies
+                };
+                self.inner.sink.activity(&node, &session, bodies, call);
+                DaemonFrame::Ok
+            }
+            DaemonRequest::SessionAsk {
+                node,
+                session,
+                body,
+                call,
+                transcript,
+            } => DaemonFrame::SessionAnswer(
+                self.inner
+                    .sink
+                    .ask(&node, &session, body, call, transcript)
+                    .await,
+            ),
         }
     }
 
@@ -1426,6 +2016,60 @@ impl Dispatch for Router {
 /// the daemon process): concurrent attaches, holders and the implicit detach, a session's end with
 /// its detach, a detach answering connections "node detached", and one node's panic leaving the
 /// other running. Production Argon2id: run in release.
+/// Post one session's entries into its Session, in the order they were queued. Each goes to the
+/// room its session works in now; a session in no room, or headless (ADR-029 SE-1), has no
+/// Session, and its entries go nowhere. A failure is said in the daemon's log, naming the entry's
+/// kind: the session goes on.
+async fn post_in_order(
+    weak: std::sync::Weak<Inner>,
+    node: NodeName,
+    session: String,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+) {
+    while let Some(body) = rx.recv().await {
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
+        let router = Router { inner };
+        let Some(handle) = router.handle_of(&node) else {
+            continue;
+        };
+        let reg = router
+            .inner
+            .account
+            .node_paths(&node)
+            .ok()
+            .and_then(|p| crate::wake::registration(&p, &session));
+        let Some(room) = reg
+            .filter(|r| r.interactive)
+            .and_then(|r| r.room)
+            .and_then(|r| vox_core::node::link::b32_decode(&r, "room").ok())
+        else {
+            continue;
+        };
+        let outcome = handle
+            .apply(vox_core::node::api::NodeCommand::AppendSession {
+                channel_id: room,
+                session_id: session.clone(),
+                body: body.clone(),
+            })
+            .await;
+        if !matches!(
+            outcome,
+            vox_core::node::api::Outcome::Done | vox_core::node::api::Outcome::Appended(_)
+        ) {
+            let kind = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(str::to_owned))
+                .unwrap_or_default();
+            eprintln!(
+                "vox daemon: {node}: session {session}: a {kind} entry did not reach its Session: \
+                 {outcome}"
+            );
+        }
+    }
+}
+
 /// Bring the proxy up if any node is attached, down if none is.
 fn proxy_follow(weak: &std::sync::Weak<Inner>) {
     let Some(inner) = weak.upgrade() else {
@@ -1628,37 +2272,27 @@ mod tests {
         });
     }
 
-    /// An agent session holds its node; the session's end is its last holder going, and the node
-    /// detaches in the same decision (L-3, ADR-020 6.10). A node attached by hand stays.
+    /// An agent session never attaches its node (ADR-028 K-13); one attached by hand stays
+    /// attached when the session ends (L-3, ADR-020 6.10).
     #[test]
-    fn a_sessions_end_detaches_its_implicit_node_and_not_a_kept_one() {
+    fn a_session_attaches_nothing_and_its_end_leaves_a_node_attached_by_hand() {
         rt().block_on(async {
             let dir = tempfile::tempdir().unwrap();
             let r = router(account(dir.path(), &["agent", "person"]).await);
             let s = crate::wake::Session::from_env("s-1", true);
-            r.session_register(&n("agent"), s, pass(), Vec::new())
-                .await
-                .expect("PRODUCT: register");
-            let lease = r.use_node(hold("agent")).await.unwrap();
-            drop(lease);
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            assert_eq!(
-                state(&r, "agent"),
-                NodeState::Attached,
-                "PRODUCT: a registered session did not hold its node"
+            let refused = r.session_register(&n("agent"), s, None).await;
+            assert!(
+                matches!(refused, Err(Refusal::NotAttached { .. })),
+                "PRODUCT: a session attached its node: {refused:?}"
             );
-            let (was, detached) = r.session_end(&n("agent"), "s-1").await;
-            assert!(was && detached, "PRODUCT: end said {was} {detached}");
             assert_eq!(state(&r, "agent"), NodeState::Detached);
 
             r.attach(&n("person"), pass(), None, Vec::new(), Vec::new())
                 .await
                 .unwrap();
             let s = crate::wake::Session::from_env("s-2", true);
-            r.session_register(&n("person"), s, None, Vec::new())
-                .await
-                .unwrap();
-            let (_, detached) = r.session_end(&n("person"), "s-2").await;
+            r.session_register(&n("person"), s, None).await.unwrap();
+            let (_, detached) = r.session_end(&n("person"), "s-2", "").await;
             assert!(
                 !detached,
                 "PRODUCT: a node attached by hand detached with a session"

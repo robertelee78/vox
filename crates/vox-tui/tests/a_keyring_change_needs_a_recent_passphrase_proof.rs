@@ -8,25 +8,35 @@
 //! 1. right after the attach, a `vox trust add` with no passphrase and no terminal is refused at
 //!    once saying the passphrase is needed, nothing changes, and `vox status` says the keyring asks
 //!    for the passphrase (K-12: the attach's passphrase opens no window);
-//! 2. a `vox trust add --identity-passphrase-file` is made; then `vox status` says `keyring open
-//!    Nm` (K-9), and a second trust add with no passphrase is made;
+//! 2. **the passphrase is typed, and taken from nothing else** (K-13): a `vox trust add` with
+//!    `VOX_IDENTITY_PASSPHRASE` set, and one with `--identity-passphrase-file`, are refused and
+//!    change nothing; the same add typed at a terminal (a pty) is made; then `vox status` says
+//!    `keyring open Nm` (K-9), and a second trust add with no passphrase is made;
 //! 3. past the window, `vox trust remove` with no passphrase is refused at once and nothing
 //!    changes, and `vox status` says the keyring asks for the passphrase;
 //! 4. past the window, a raw control-socket `Trust` with no passphrase is refused the same way; one
 //!    with a wrong passphrase is refused; one with the right passphrase succeeds;
-//! 5. past the window again, a `vox trust add` with none is refused, and `vox trust remove
-//!    --identity-passphrase-file` succeeds.
+//! 5. past the window again, a `vox trust add` with none is refused, and a `vox trust remove`
+//!    typed at a terminal succeeds.
 //!
 //! **A change given the right passphrase is always made.** Every change whose passphrase was just
 //! checked waits [`PROVED_DELAY`], longer than [`WINDOW`], between the check and the change
 //! (`VOX_TEST_PROVED_CHANGE_DELAY_MS`), as when the clock moves on between the two. The
 //! right-passphrase changes of 2, 4 and 5 must still succeed.
 //!
+//! **What an entry grants is part of it** (ADR-028 K-14, #525): in 2 bob is trusted with `--drive`
+//! and `vox trust list` says `read + drive`; in 3, past the window, `vox trust read` with no
+//! passphrase is refused for it and bob still has drive; in 4 carol is trusted with drive over the
+//! raw socket; in 5, typed at a terminal, `vox trust read` makes bob `read`; and 6, carol still
+//! has drive after the daemon restarts, when the keyring is read back from the disk.
+//!
 //! Mutations: the window opened at the attach — red, PRODUCT (1: the change with no passphrase is
-//! made). No window check in the node — red, PRODUCT (the change past the window is made). A
-//! change given the right passphrase put through the window like one given none — red, PRODUCT (it
-//! is refused as needing the passphrase it was given). The window reported open after it closed —
-//! red, PRODUCT.
+//! made). `VOX_IDENTITY_PASSPHRASE` read for a keyring change again — red, PRODUCT (2: the change
+//! given the variable is made). No window check in the node — red, PRODUCT (the change past the
+//! window is made). A change given the right passphrase put through the window like one given none
+//! — red, PRODUCT (it is refused as needing the passphrase it was given). The window reported open after it closed —
+//! red, PRODUCT. The capability dropped when the keyring is saved — red, PRODUCT (6: carol reads
+//! `read` after the restart).
 
 #![cfg(unix)]
 
@@ -38,6 +48,9 @@ mod attach;
 
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
+
+#[path = "support/typed.rs"]
+mod typed;
 
 use std::io::BufRead as _;
 use std::path::Path;
@@ -127,6 +140,38 @@ fn profile(root: &Path, name: &str) -> (std::path::PathBuf, String) {
     (dir, String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
+/// The line `vox trust list` gives `fp`, or nothing.
+fn entry<'a>(list: &'a str, fp: &str) -> &'a str {
+    list.lines().find(|l| l.starts_with(fp)).unwrap_or_default()
+}
+
+/// `vox daemon` on `dir`, unlocked from the environment with the shortened window, and where its
+/// control socket is, if it said.
+fn start_daemon(dir: &Path) -> (std::process::Child, Option<std::path::PathBuf>) {
+    let mut daemon = vox_cmd(dir, &["daemon", "--listen", "127.0.0.1:0"])
+        .env("VOX_IDENTITY_PASSPHRASE", IDPASS)
+        .env(KNOB, WINDOW.as_secs().to_string())
+        .env(DELAY_KNOB, PROVED_DELAY.as_millis().to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("APPARATUS: spawn vox daemon");
+    std::mem::forget(daemon.stdin.take());
+    let mut out = std::io::BufReader::new(daemon.stdout.take().expect("APPARATUS: stdout"));
+    let mut line = String::new();
+    while out.read_line(&mut line).is_ok_and(|n| n > 0) {
+        if let Some(at) = line.trim().strip_prefix("vox daemon: control socket ") {
+            let sock = std::path::PathBuf::from(at);
+            // Drained, so the daemon never blocks on a full pipe.
+            std::thread::spawn(move || std::io::copy(&mut out, &mut std::io::sink()));
+            return (daemon, Some(sock));
+        }
+        line.clear();
+    }
+    (daemon, None)
+}
+
 fn trusted(dir: &Path) -> String {
     let (ok, said) = run(&mut vox_cmd(dir, &["trust", "list"]));
     assert!(
@@ -137,7 +182,7 @@ fn trusted(dir: &Path) -> String {
 }
 
 /// A raw `Trust` request on the control socket, as any client of it sends one.
-fn raw_trust(sock: &Path, target: &str, petname: &str, passphrase: &str) -> Frame {
+fn raw_trust(sock: &Path, target: &str, petname: &str, passphrase: &str, drive: bool) -> Frame {
     let target =
         vox_core::node::link::b32_decode(target, "fingerprint").expect("APPARATUS: a fingerprint");
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -156,6 +201,7 @@ fn raw_trust(sock: &Path, target: &str, petname: &str, passphrase: &str) -> Fram
                 petname: petname.to_owned(),
                 identity_passphrase: zeroize::Zeroizing::new(passphrase.to_owned()),
                 full_history: false,
+                drive,
             }),
         )
         .await
@@ -236,23 +282,48 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
         );
     }
 
-    // 2. A change given the passphrase opens the window: the next change needs none.
-    let (ok, said) = run(&mut vox_cmd(
+    // 2. K-13: the passphrase is typed, never taken from the environment or a file.
+    let add_bob = ["trust", "add", bob.as_str(), "--name", "bob", "--drive"];
+    let (by_variable, variable_said) =
+        run(vox_cmd(&alice, &add_bob).env("VOX_IDENTITY_PASSPHRASE", IDPASS));
+    let (by_file, file_said) = run(&mut vox_cmd(
         &alice,
         &[
-            "trust",
-            "add",
-            &bob,
-            "--name",
-            "bob",
-            "--identity-passphrase-file",
-            pass_file.to_str().expect("APPARATUS: path"),
-        ],
+            &add_bob[..],
+            &[
+                "--identity-passphrase-file",
+                pass_file.to_str().expect("APPARATUS: path"),
+            ],
+        ]
+        .concat(),
     ));
+    let list = trusted(&alice);
+    if by_variable || by_file || list.contains(&bob) {
+        kill(daemon);
+        panic!(
+            "PRODUCT: a keyring change must take its passphrase only as typed at a terminal \
+             (ADR-028 K-13): with VOX_IDENTITY_PASSPHRASE set it succeeded {by_variable}, \
+             saying:\n{variable_said}\nwith --identity-passphrase-file it succeeded {by_file}, \
+             saying:\n{file_said}\nthe keyring now:\n{list}"
+        );
+    }
+    // Typed at a terminal: made, and the window opens.
+    let (ok, said) = typed::typed(&vox_cmd(&alice, &add_bob), IDPASS);
     let entered = Instant::now();
     if !ok {
         kill(daemon);
-        panic!("PRODUCT: `vox trust add --identity-passphrase-file` was refused: {said}");
+        panic!(
+            "PRODUCT: `vox trust add` with the passphrase typed at a terminal was refused: {said}"
+        );
+    }
+    // K-14: bob was trusted with drive, and the list says so.
+    let drive_list = trusted(&alice);
+    if !entry(&drive_list, &bob).ends_with("bob  read + drive") {
+        kill(daemon);
+        panic!(
+            "PRODUCT: bob was trusted with --drive, and `vox trust list` must say `read + drive` \
+             for him; it said:\n{drive_list}"
+        );
     }
     let (ok, open_said) = run(&mut vox_cmd(&alice, &["status"]));
     let (again_ok, again_said) = run(&mut vox_cmd(
@@ -287,6 +358,20 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
         );
     }
 
+    // K-14: changing what an entry grants is a keyring change, refused past the window for want
+    // of the passphrase, and nothing changes.
+    let (read_ok, read_said) = run(&mut vox_cmd(&alice, &["trust", "read", &bob]));
+    let list = trusted(&alice);
+    if read_ok || !read_said.contains(needed_first) || !entry(&list, &bob).ends_with("read + drive")
+    {
+        kill(daemon);
+        panic!(
+            "PRODUCT: past the window, `vox trust read` with no passphrase must be refused for it \
+             and leave bob with drive (succeeded {read_ok}); it said:\n{read_said}\nthe \
+             keyring now:\n{list}"
+        );
+    }
+
     // K-9: past the window, `vox status` says a keyring change will ask for the passphrase.
     let (ok, closed_said) = run(&mut vox_cmd(&alice, &["status"]));
     if !(ok
@@ -307,11 +392,12 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
         closed_said.lines().find(|l| l.starts_with("keyring"))
     );
 
-    // 4. Past the window, a raw socket request: none given, then a wrong one, then the right one.
-    let none = raw_trust(&sock, &carol, "carol", "");
-    let wrong = raw_trust(&sock, &carol, "carol", "not the passphrase");
+    // 4. Past the window, a raw socket request: none given, then a wrong one, then the right one,
+    // which trusts carol with drive (K-14).
+    let none = raw_trust(&sock, &carol, "carol", "", true);
+    let wrong = raw_trust(&sock, &carol, "carol", "not the passphrase", true);
     let after_refusals = trusted(&alice);
-    let right = raw_trust(&sock, &carol, "carol", IDPASS);
+    let right = raw_trust(&sock, &carol, "carol", IDPASS, true);
     let after_right = trusted(&alice);
     let refused = |f: &Frame| matches!(f, Frame::Error { .. });
     if !matches!(&none, Frame::Error { reason } if reason == needed)
@@ -329,24 +415,23 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
         );
     }
 
-    // 5. Past the window again: the CLI given the passphrase in a file.
+    // 5. Past the window again: the CLI given the passphrase typed at a terminal.
     std::thread::sleep(WINDOW + Duration::from_secs(2));
     let (refused_ok, refused_said) = run(&mut vox_cmd(
         &alice,
         &["trust", "add", &dave, "--name", "d"],
     ));
-    let given = run(&mut vox_cmd(
-        &alice,
-        &[
-            "trust",
-            "remove",
-            &bob,
-            "--identity-passphrase-file",
-            pass_file.to_str().expect("APPARATUS: path"),
-        ],
-    ));
+    // K-14: typed at a terminal, `vox trust read` makes bob read only.
+    let (to_read, to_read_said) = typed::typed(&vox_cmd(&alice, &["trust", "read", &bob]), IDPASS);
+    let read_list = trusted(&alice);
+    let given = typed::typed(&vox_cmd(&alice, &["trust", "remove", &bob]), IDPASS);
     let list = trusted(&alice);
     kill(daemon);
+    assert!(
+        to_read && entry(&read_list, &bob).ends_with("bob  read"),
+        "PRODUCT: `vox trust read` typed at a terminal must make bob `read`: \
+         {to_read_said}\nthe keyring:\n{read_list}"
+    );
     assert!(
         !refused_ok && refused_said.contains(needed_first) && !list.contains(&dave),
         "PRODUCT: past the window again, `vox trust add` with no passphrase was not refused for \
@@ -354,9 +439,24 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
     );
     assert!(
         given.0 && !list.contains(&bob),
-        "PRODUCT: past the window, `vox trust remove --identity-passphrase-file` did not make the \
+        "PRODUCT: past the window, `vox trust remove` typed at a terminal did not make the \
          change: {}\nthe keyring:\n{list}",
         given.1
     );
     eprintln!("the window held for the CLI and the control socket alike; the keyring:\n{list}");
+
+    // 6. K-14: what an entry grants is saved with it. The daemon starts again and reads the
+    // keyring back from the disk: carol, trusted with drive over the socket, still has it.
+    let (again, sock_again) = start_daemon(&alice);
+    if sock_again.is_none() {
+        kill(again);
+        panic!("CANNOT MEASURE: the restarted daemon never said where its control socket is");
+    }
+    let restarted = trusted(&alice);
+    kill(again);
+    assert!(
+        entry(&restarted, &carol).ends_with("carol  read + drive"),
+        "PRODUCT: carol was trusted with drive, and after the daemon restarted `vox trust list` \
+         must still say `read + drive` for her; it said:\n{restarted}"
+    );
 }

@@ -959,6 +959,13 @@ fn render_members(
                     theme::fg(theme::TEXT_SECONDARY),
                 )));
             }
+            // What your keyring entry grants it, on a line of its own (ADR-028 K-14).
+            if let Some(capability) = m.capability {
+                lines.push(Line::from(Span::styled(
+                    format!("    {}", capability.words()),
+                    theme::fg(theme::TEXT_SECONDARY),
+                )));
+            }
             // The selected member's card (ADR-028 K-1, L-9): its fingerprint whole and grouped,
             // with its art beside it, never the art alone.
             if selected == Some(m.id) && focus {

@@ -69,6 +69,22 @@ pub fn auth_json() -> Option<std::path::PathBuf> {
 /// and `rw` (the run's sandbox root, plus the run's vox profile for the plugin's hook). Writes
 /// go only to `rw`. Nothing under `/Users`, `/opt`, `/private/tmp` or another run's temp
 /// directory is readable, by any path to it.
+///
+/// **Nothing of the operator's is reachable, either**, though the file rules alone allowed it
+/// (measured 2026-10-06: under them a shell reached the operator's running Codex app-server,
+/// which serves `thread/read` of every session and `turn/start` into them):
+///
+/// - a Unix socket connects only under `rw` (the run's own daemon, wake and app-server
+///   sockets), plus `mDNSResponder` for name lookups; never the operator's Codex app-server,
+///   Claude Code messaging sockets, Vox daemons, ssh-agent or any other;
+/// - nothing on `localhost` is reachable over IP: the operator's local services (a browser's
+///   debugging port, Codex's, a VM's) listen there. The internet stays open for the provider.
+///   A service listening on every address is still reachable through the machine's own LAN
+///   address, which a profile cannot name;
+/// - no Apple event is sent and nothing is opened through Launch Services (`osascript`, `open`),
+///   either of which runs a command outside the sandbox, and the pasteboard is not read.
+///
+/// [`probe_profile`] shows the socket, `localhost` and pasteboard rules hold before any turn.
 pub fn sandbox_profile(rw: &[&Path], r: &[&Path]) -> String {
     let q = |p: &Path| format!("{:?}", real(p).display().to_string());
     let mut s = String::from(
@@ -88,6 +104,19 @@ pub fn sandbox_profile(rw: &[&Path], r: &[&Path]) -> String {
     for p in rw {
         s += &format!("(allow file-read-data file-write* (subpath {}))\n", q(p));
     }
+    s += "(deny network-outbound (remote unix-socket))\n\
+          (allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n";
+    for p in rw {
+        s += &format!(
+            "(allow network-outbound (remote unix-socket (subpath {})))\n",
+            q(p)
+        );
+    }
+    s += "(deny network-outbound (remote ip \"localhost:*\"))\n\
+          (deny appleevent-send)\n\
+          (deny lsopen)\n\
+          (deny mach-lookup (global-name \"com.apple.pasteboard.1\") \
+          (global-name \"com.apple.coreservices.appleevents\"))\n";
     s
 }
 
@@ -427,6 +456,101 @@ pub fn probe_profile(path: &Path, canary: &Canary, name: &str) {
     println!(
         "[proof] sandbox probe ({name}): the canary in the real HOME is unreadable and unfound"
     );
+    probe_reach(path, name);
+}
+
+/// **Nothing of the operator's is reachable from the profile at `path`**: a Unix socket outside
+/// the run and a TCP port on `localhost`, both opened here outside the sandbox, see no connection
+/// from a sandboxed `nc`, and a sandboxed `pbpaste` fails. Each is checked unconfined first, so
+/// a refusal is the profile's, not a broken `nc` or pasteboard.
+fn probe_reach(path: &Path, name: &str) {
+    use std::process::Stdio;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    // Outside every run's root: a sibling of the temporary directories proofs make.
+    let dir = std::env::temp_dir().join(format!("vox-sbp-{}-{nonce:x}", std::process::id()));
+    std::fs::create_dir_all(&dir)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make the reach probe's {dir:?}: {e}"));
+    let sock = dir.join("s");
+    let unix = std::os::unix::net::UnixListener::bind(&sock)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot listen on {sock:?}: {e}"));
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot listen on 127.0.0.1: {e}"));
+    let port = tcp
+        .local_addr()
+        .unwrap_or_else(|e| panic!("APPARATUS: no address for the TCP probe: {e}"))
+        .port()
+        .to_string();
+    for l in [unix.set_nonblocking(true), tcp.set_nonblocking(true)] {
+        l.unwrap_or_else(|e| panic!("APPARATUS: cannot make a probe listener non-blocking: {e}"));
+    }
+    let sock_arg = sock.display().to_string();
+    let nc_unix = ["/usr/bin/nc", "-U", "-w", "2", sock_arg.as_str()];
+    let nc_tcp = ["/usr/bin/nc", "-z", "-G", "2", "127.0.0.1", port.as_str()];
+    let run = |confined: bool, argv: &[&str]| {
+        let mut cmd = if confined {
+            let mut c = Command::new("/usr/bin/sandbox-exec");
+            c.arg("-f").arg(path).args(argv);
+            c
+        } else {
+            let mut c = Command::new(argv[0]);
+            c.args(&argv[1..]);
+            c
+        };
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot run {}: {e}", argv[0]))
+    };
+    // Whether a connection arrived since the last look: the listener's own account of it.
+    let arrived_unix = || unix.accept().is_ok();
+    let arrived_tcp = || tcp.accept().is_ok();
+
+    run(false, &nc_unix);
+    assert!(
+        arrived_unix(),
+        "APPARATUS: an unconfined nc did not reach the probe's own Unix socket, so the reach \
+         probe cannot tell the profile's refusal from a broken nc"
+    );
+    run(true, &nc_unix);
+    assert!(
+        !arrived_unix(),
+        "APPARATUS: the sandbox leaked: a sandboxed shell connected to a Unix socket outside \
+         the run, where the operator's Codex app-server, Claude Code and ssh-agent listen. Stop \
+         every live-model run until it is fixed."
+    );
+    run(false, &nc_tcp);
+    assert!(
+        arrived_tcp(),
+        "APPARATUS: an unconfined nc did not reach the probe's own port on 127.0.0.1"
+    );
+    run(true, &nc_tcp);
+    assert!(
+        !arrived_tcp(),
+        "APPARATUS: the sandbox leaked: a sandboxed shell connected to a port on localhost, \
+         where the operator's local services listen. Stop every live-model run until it is fixed."
+    );
+    if run(false, &["/usr/bin/pbpaste"]).success() {
+        assert!(
+            !run(true, &["/usr/bin/pbpaste"]).success(),
+            "APPARATUS: the sandbox leaked: a sandboxed shell read the operator's pasteboard. \
+             Stop every live-model run until it is fixed."
+        );
+        println!(
+            "[proof] sandbox probe ({name}): no Unix socket outside the run, no port on \
+             localhost and no pasteboard is reachable"
+        );
+    } else {
+        println!(
+            "[proof] sandbox probe ({name}): no Unix socket outside the run and no port on \
+             localhost is reachable; CANNOT MEASURE the pasteboard rule (pbpaste fails here \
+             unconfined)"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// One run's OpenCode sandbox: its root (the fixture, HOME and TMPDIR a turn may use), the canary

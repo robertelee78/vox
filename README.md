@@ -147,12 +147,12 @@ already in it.
 
 ### Passphrases
 
-There are two, and both are optional:
+There are two: every node has an identity passphrase, and a room's passphrase is optional.
 
 - **The identity passphrase** protects your keys at rest. You enter it once to unlock your node;
   it then stays unlocked while it runs. Changing who you trust (`vox trust add|remove`) asks for it
-  unless you entered it for such a change in the last 30 minutes; attaching does not count.
-  Reading never does.
+  unless you entered it for such a change in the last 30 minutes; attaching does not count. It is
+  typed at a terminal, never taken from a file or the environment. Reading never asks.
 - **A room's passphrase** is the second factor for joining that room.
 
 At a terminal, Vox asks for them without echo. In a script or an agent there is no terminal, so give

@@ -268,3 +268,55 @@ class Tui:
         if self.fd is not None:
             os.close(self.fd)
             self.fd = None
+
+
+KEYRING_VERBS = ("add", "remove", "rename", "drive", "read")
+
+
+def typed_run(argv, env, timeout=120):
+    """`vox trust add|remove|rename …` run as a person runs it: at a terminal, the identity
+    passphrase typed at its prompt (ADR-028 K-13: a keyring change takes it from nothing else).
+    The passphrase is read from the `--identity-passphrase-file` in `argv`, which is taken out, or
+    from `VOX_IDENTITY_PASSPHRASE` in `env`, which is taken out too. Returns an object with
+    `returncode`, `stdout` and `stderr` (both what the terminal showed), as `subprocess.run` does."""
+    argv, env, secret = list(argv), dict(env), env.get("VOX_IDENTITY_PASSPHRASE", "")
+    if "--identity-passphrase-file" in argv:
+        i = argv.index("--identity-passphrase-file")
+        with open(argv[i + 1]) as f:
+            secret = f.readline().rstrip("\n")
+        del argv[i:i + 2]
+    env.pop("VOX_IDENTITY_PASSPHRASE", None)
+    pid, fd = os.forkpty()
+    if pid == 0:
+        os.execve(argv[0], argv, env)
+    out, sent, deadline = b"", False, time.time() + timeout
+    while time.time() < deadline:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if not r:
+            continue
+        try:
+            d = os.read(fd, 4096)
+        except OSError:
+            break
+        if not d:
+            break
+        out += d
+        if not sent and out.rstrip().endswith(b"passphrase:"):
+            time.sleep(0.5)  # as a person reads the prompt: never before its terminal is raw
+            os.write(fd, secret.encode() + b"\r")
+            sent = True
+    else:
+        os.kill(pid, signal.SIGKILL)
+    _, st = os.waitpid(pid, 0)
+    shown = out.decode("utf-8", "replace")
+
+    class Ran:
+        returncode = os.waitstatus_to_exitcode(st)
+        stdout = shown
+        stderr = shown
+    return Ran()
+
+
+def is_keyring_change(args):
+    """Whether `args` (without the program) is `trust add|remove|rename`."""
+    return len(args) > 1 and args[0] == "trust" and args[1] in KEYRING_VERBS

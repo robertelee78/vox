@@ -12,6 +12,11 @@
 //! the entries its author was shown since its last record, strictly ascending. Sealed like any
 //! message, so only a member holding its author's sender key can open it (RR-2, RR-3), and never
 //! a row of the timeline (RR-4).
+//!
+//! `kind = 3` is a **Session entry** (ADR-029 SC-1, SC-2): `[version, 3, created_millis, [session
+//! id, body]]`, one item of a harness session's activity. It is sealed under its node's **drive
+//! key** ([`crate::node::drive`]), never its sender key, so only members its node trusts with
+//! drive open it; and it is never a row of the room's timeline (SC-4).
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
@@ -38,6 +43,54 @@ pub const KIND_READ: u64 = 2;
 /// The most entries one read record names. More wait for the next record: at 34 bytes a hash this
 /// keeps a record about 35 KB, inside a message's bound.
 pub const MAX_READ_HASHES: usize = 1024;
+
+/// `kind` for a Session entry (ADR-029 SC-1).
+pub const KIND_SESSION: u64 = 3;
+/// The longest session id a Session entry carries, in bytes: a harness's own id is far shorter.
+pub const MAX_SESSION_ID_LEN: usize = 256;
+
+/// A decoded Session entry (ADR-029 SC-1): one item of a harness session's activity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEntry {
+    /// Wall-clock send time, milliseconds since the Unix epoch, as the author recorded it.
+    pub created_millis: u64,
+    /// The harness's own session id (SE-2).
+    pub session_id: String,
+    /// The activity item, in the harnesses' shared format; Vox carries it as it is.
+    pub body: String,
+}
+
+impl SessionEntry {
+    /// An entry of `session_id`. Fails on an empty or overlong id, or a body over
+    /// [`MAX_TEXT_LEN`]: longer content is split across entries (SC-1).
+    pub fn new(created_millis: u64, session_id: &str, body: &str) -> Result<Self> {
+        if session_id.is_empty() || session_id.len() > MAX_SESSION_ID_LEN {
+            return Err(Error::MalformedBundle("session id"));
+        }
+        if body.len() > MAX_TEXT_LEN {
+            return Err(Error::SizeLimitExceeded("session entry"));
+        }
+        Ok(Self {
+            created_millis,
+            session_id: session_id.to_owned(),
+            body: body.to_owned(),
+        })
+    }
+
+    /// Canonical bytes: `[VERSION, KIND_SESSION, created_millis, [session id, body]]`.
+    #[must_use]
+    pub fn to_canonical_vec(&self) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(4)
+            .uint(VERSION)
+            .uint(KIND_SESSION)
+            .uint(self.created_millis)
+            .array(2)
+            .text(&self.session_id)
+            .text(&self.body);
+        e.finish()
+    }
+}
 
 /// A decoded content envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +202,8 @@ pub enum Decoded {
     Text(Content),
     /// A read record ([`KIND_READ`]).
     Read(ReadRecord),
+    /// A Session entry ([`KIND_SESSION`]).
+    Session(SessionEntry),
 }
 
 /// Strict decode of either kind of content envelope.
@@ -185,6 +240,16 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded> {
                 created_millis,
                 read,
             }))
+        }
+        KIND_SESSION => {
+            let created_millis = d.uint()?;
+            if d.array()? != 2 {
+                return Err(Error::MalformedBundle("session entry arity"));
+            }
+            let session_id = d.text()?;
+            let body = d.text()?;
+            d.finish()?;
+            SessionEntry::new(created_millis, session_id, body).map(Decoded::Session)
         }
         _ => Err(Error::MalformedBundle("content envelope kind")),
     }

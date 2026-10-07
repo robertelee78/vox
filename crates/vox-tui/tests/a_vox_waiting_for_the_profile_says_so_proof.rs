@@ -25,8 +25,8 @@
 //! 1. **CLI, create**: two `vox id`s on a fresh data root. B says it waits for the node's
 //!    directory; once A has made the identity, B is refused, naming the concurrent creation.
 //! 2. **CLI, daemon**: `vox daemon` (A) attaches a node this build made, and is stopped holding
-//!    it; `vox trust add` (B) says it waits for the daemon, and once A is resumed is served: B
-//!    exits 0, `vox trust list` names the trusted identity, and A, stopped afterwards, exits 0.
+//!    it; `vox room create` (B) says it waits for the daemon, and once A is resumed is served: B
+//!    exits 0, `vox room list` names the room, and A, stopped afterwards, exits 0.
 //! 3. **TUI, create** (`tests/pty/tui_lock_wait.py`): `vox id` holds the node's directory, `vox
 //!    tui` is given a passphrase at its first-run prompt and says it waits in its status line; then
 //!    names the concurrent creation.
@@ -488,11 +488,14 @@ fn a_vox_waiting_for_the_profile_says_so() {
         assert!(ok, "PRODUCT (staging): `vox id` failed: {out}{err}");
         d
     };
-    let y_fp = {
-        let (ok, out, err) = vox_once(&dir("y"), &args(&["id"]));
-        assert!(ok, "PRODUCT (staging): `vox id` failed: {out}{err}");
-        out.trim().to_owned()
-    };
+    // A room passphrase for arm 2's B: a change to the node that asks for no identity passphrase
+    // (ADR-028 K-11), so a person runs it from any shell.
+    let room_pass = tmp.path().join("room.pass");
+    std::fs::write(&room_pass, "a room passphrase\n").expect("APPARATUS: a staging file");
+    let room_pass = room_pass
+        .to_str()
+        .expect("APPARATUS: a UTF-8 path")
+        .to_owned();
     let mut red = Vec::new();
 
     // ---- 1. CLI, create ---------------------------------------------------------------------
@@ -505,37 +508,37 @@ fn a_vox_waiting_for_the_profile_says_so() {
         &Then::ARefusesB,
     ));
 
-    // ---- 2. CLI, daemon: the daemon attaches the node; B's `trust add` waits ----------------
+    // ---- 2. CLI, daemon: the daemon attaches the node; B's `room create` waits ---------------
     let carol = made("carol");
     red.extend(cli_arm(
         "cli-daemon",
         &carol,
         &["daemon", "--listen", "127.0.0.1:0"],
-        &["trust", "add", &y_fp, "--name", "y"],
+        &[
+            "room",
+            "create",
+            "--name",
+            "waited",
+            "--passphrase-file",
+            &room_pass,
+        ],
         DAEMON_WAITING,
         &Then::DaemonServesB,
     ));
-    let (ok, listed, err) = vox_once(&carol, &args(&["trust", "list"]));
+    let (ok, listed, err) = vox_once(&carol, &args(&["room", "list"]));
     println!(
-        "[proof] cli-daemon: `vox trust list` afterwards: {}",
+        "[proof] cli-daemon: `vox room list` afterwards: {}",
         listed.trim()
     );
     assert!(
         ok,
-        "PRODUCT: cli-daemon: `vox trust list` afterwards failed: {listed}{err}"
+        "PRODUCT: cli-daemon: `vox room list` afterwards failed: {listed}{err}"
     );
-    if red.iter().all(|r| !r.contains("cli-daemon")) {
-        for name in ["y"] {
-            if !listed
-                .lines()
-                .any(|l| l.trim_end().ends_with(&format!("  {name}")))
-            {
-                red.push(format!(
-                    "PRODUCT: cli-daemon: `trust add` exited 0, and `trust list` does not \
-                     name {name}: {listed}"
-                ));
-            }
-        }
+    if red.iter().all(|r| !r.contains("cli-daemon")) && !listed.contains("waited") {
+        red.push(format!(
+            "PRODUCT: cli-daemon: `room create` exited 0, and `room list` does not name the \
+             room waited: {listed}"
+        ));
     }
 
     // ---- 3. TUI, create ---------------------------------------------------------------------

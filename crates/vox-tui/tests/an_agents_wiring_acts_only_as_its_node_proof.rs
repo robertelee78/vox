@@ -15,11 +15,19 @@
 //! at a real terminal (a pty) as an operator types it: with Claude Code and OpenCode on `PATH` and
 //! Codex not, it says Codex is not found and makes no node for it; it makes `claude-<host>` and
 //! `opencode-<host>` with the passphrases typed; it installs each one's hook where the harness
-//! reads it, which `vox agent doctor` passes, keeping what Claude's settings already held and
+//! reads it, which `vox agent doctor` passes, keeping what Claude's settings already held, in its
+//! order, and
 //! replacing the Vox hook for another node there; on macOS it offers a node for the person, and
 //! skipping it makes none (`vox node list` lists exactly the two); and it prints each node's
 //! fingerprint, grouped with its art, as `vox id` has it, with its alias, harness, host, OS and
 //! Vox version. Mutant: a harness not on `PATH` taken as found (a node made for Codex).
+//!
+//! And **`vox setup` keeps Codex's app-server running** when it wires Codex (the decider,
+//! 2026-10-06): it says first that it will, and that this runs no model; it asks the `codex` it
+//! found on `PATH` for `app-server daemon start` under the Codex home it wires, waits for the
+//! app-server's control socket to take a connection, and says it is running. The `codex` here is a
+//! stand-in that records what it was asked and, on that command, listens on the control socket;
+//! the real Codex is never run. Mutant: setup wires Codex without starting its app-server.
 //!
 //! No harness and no model runs: the harnesses' settings are files in this test's directories,
 //! and the harnesses' programs on `PATH` are stand-ins that only exist.
@@ -439,9 +447,91 @@ fn setup_makes_a_node_for_each_installed_harness() {
         );
     }
     let kept = std::fs::read_to_string(d.claude_settings()).unwrap_or_default();
+    // In the order the person had it: `theme` was first, then `hooks`.
+    let in_order = matches!(
+        (kept.find("\"theme\""), kept.find("\"hooks\"")),
+        (Some(t), Some(h)) if t < h
+    );
     assert!(
-        kept.contains("echo mine") && kept.contains("\"theme\"") && !kept.contains("someone-else"),
-        "PRODUCT: `vox setup` must keep what Claude's settings held and replace the Vox hook for \
-         another node: {kept}"
+        kept.contains("echo mine") && in_order && !kept.contains("someone-else"),
+        "PRODUCT: `vox setup` must keep what Claude's settings held, in its order, and replace \
+         the Vox hook for another node: {kept}"
+    );
+}
+
+/// A stand-in `codex`: it records each command it is given in `$CODEX_HOME/asked`, and on
+/// `app-server daemon start` it leaves a process listening on the app-server's control socket, its
+/// pid in `$CODEX_HOME/listener.pid`, as Codex's daemon would. Never the real Codex.
+const CODEX_STANDIN: &str = r#"#!/usr/bin/env python3
+import os, socket, sys, time
+home = os.environ.get("CODEX_HOME") or os.path.join(os.environ["HOME"], ".codex")
+os.makedirs(home, exist_ok=True)
+with open(os.path.join(home, "asked"), "a") as f:
+    f.write(" ".join(sys.argv[1:]) + "\n")
+if sys.argv[1:4] == ["app-server", "daemon", "start"]:
+    d = os.path.join(home, "app-server-control")
+    os.makedirs(d, exist_ok=True)
+    if os.fork() == 0:
+        os.setsid()
+        null = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+        s = socket.socket(socket.AF_UNIX)
+        s.bind(os.path.join(d, "app-server-control.sock"))
+        s.listen(4)
+        with open(os.path.join(home, "listener.pid"), "w") as f:
+            f.write(str(os.getpid()))
+        time.sleep(300)
+        os._exit(0)
+"#;
+
+#[test]
+#[ignore = "real binary, production Argon2id, a pty; run in release"]
+fn setup_keeps_codex_app_server_running() {
+    let d = Dirs::new();
+    let bin = d.root.join("bin");
+    std::fs::create_dir_all(&bin).expect("APPARATUS: a bin directory");
+    let codex = bin.join("codex");
+    write(&codex, CODEX_STANDIN);
+    std::fs::set_permissions(
+        &codex,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .expect("APPARATUS: make the stand-in executable");
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let codex_home = d.root.join("codex");
+
+    let mut setup = Setup::spawn(&d, &path);
+    setup.answer("wire Codex to it?", 1, "\r");
+    setup.answer("passphrase for codex-", 1, "codex passphrase\r");
+    setup.answer("again:", 1, "codex passphrase\r");
+    if cfg!(target_os = "macos") {
+        setup.answer("Create a node for you?", 1, "\r");
+    }
+    let status = setup.finish();
+    let said = setup.said();
+    let asked = std::fs::read_to_string(codex_home.join("asked")).unwrap_or_default();
+    // The stand-in's listener is this test's to stop, by its own pid.
+    if let Ok(pid) = std::fs::read_to_string(codex_home.join("listener.pid")) {
+        let _ = Command::new("kill").arg(pid.trim()).status();
+    }
+    println!("[proof] vox setup said:\n{said}\n[proof] the stand-in codex was asked:\n{asked}");
+    assert!(
+        status.success(),
+        "PRODUCT: `vox setup` failed ({status:?}):\n{said}"
+    );
+    let before = said.find("Codex's app-server is to be kept running");
+    let after = said.find("Codex's app-server is running");
+    assert!(
+        matches!((before, after), (Some(b), Some(a)) if b < a) && said.contains("it runs no model"),
+        "PRODUCT: `vox setup` must say first that it is to keep Codex's app-server running and \
+         that this runs no model, then that it is running:\n{said}"
+    );
+    assert!(
+        asked.lines().any(|l| l.trim() == "app-server daemon start")
+            && !asked.contains("bootstrap")
+            && !asked.contains("restart"),
+        "PRODUCT: `vox setup` must ask the `codex` on PATH for `app-server daemon start`, and \
+         never bootstrap or restart; it asked:\n{asked}"
     );
 }

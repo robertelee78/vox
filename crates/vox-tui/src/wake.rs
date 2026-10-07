@@ -92,6 +92,100 @@ pub struct Session {
     /// When its drain last ran, in Unix milliseconds: the last time it read its rooms.
     #[serde(default)]
     pub last_drained_ms: u64,
+    /// The room this session works in (ADR-029 §6), its id in base32; `None` for none. Kept for
+    /// the session's life once set (RB-4): a later registration without one never clears it, and
+    /// only `vox agent room` moves it (RB-5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<String>,
+    /// The directory the session started in, as its first registration gave it (ADR-029 RB-2):
+    /// what `vox agent room` offers to save in the room map. Kept, like `room`, for its life.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<String>,
+    /// The session's current name, as its harness gives it (ADR-029 MD-1); `None` when it gives
+    /// none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Whether a person is at the session (ADR-029 SE-1): a headless run (`claude -p`, an SDK,
+    /// `codex exec`) gets no Session.
+    #[serde(default = "interactive_by_default")]
+    pub interactive: bool,
+    /// The tmux pane the session runs in, proven, when it runs in one (ADR-029 DR-1, DR-5): how a
+    /// driver's input reaches a Claude Code session, as ctm's injector does. Refreshed by every
+    /// hook. `None` outside tmux, or when the pane could not be proven ([`Session::tmux_why`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux: Option<TmuxPane>,
+    /// Why the session's pane could not be proven, when it runs in tmux but could not be bound:
+    /// what a driver is told.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_why: Option<String>,
+    /// What the hook's environment says of its pane, for the daemon to prove
+    /// ([`crate::claude_injector::prove`]) before it stores the registration. Never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_claim: Option<TmuxClaim>,
+    /// A Codex session's `CODEX_HOME`, whose app-server the daemon reads it from (ADR-029 #541).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub codex_home: String,
+    /// The Vox OpenCode plugin's mirror socket, through which the daemon follows the session
+    /// (ADR-029 #542). Its token is [`Self::token`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mirror: String,
+}
+
+/// What a hook's environment says of its tmux pane: claimed, not proven. The daemon proves it
+/// from the process table and tmux itself, since a hook may run where neither can be read (a
+/// sandbox refuses the setuid `ps`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TmuxClaim {
+    /// `$TMUX`'s first field.
+    pub socket: String,
+    /// `$TMUX_PANE`.
+    pub pane: String,
+    /// The `tmux` the hook's `PATH` finds.
+    pub bin: String,
+    /// The hook's own process, waiting for the daemon's answer while it proves: its ancestry is
+    /// the session's.
+    pub hook_pid: u32,
+}
+
+/// Where a session's terminal is, in tmux, and the process that ties the session to it: found by
+/// the session's own hook ([`crate::claude_injector::bind_here`]) and checked again at every send.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TmuxPane {
+    /// The tmux server's socket: the first field of `$TMUX`.
+    pub socket: String,
+    /// The pane: `$TMUX_PANE`, as `%<n>`.
+    pub pane: String,
+    /// The `tmux` the hook's `PATH` finds, so the daemon, whose environment is not the
+    /// harness's, runs the same one.
+    pub bin: String,
+    /// The pane's own process (`#{pane_pid}`), as tmux said when the hook bound it.
+    pub pane_pid: u32,
+    /// The session's process: the hook's ancestor that is the pane's process or its child (a
+    /// wrapper such as `npx` or a version shim is that child, and lives as long as the session).
+    pub process: u32,
+    /// When that process started, as the process table says: a reused pid is not the session.
+    pub process_start: String,
+    /// What that process is called, as the process table says (for the driver's words).
+    pub process_name: String,
+}
+
+/// A record written before Sessions said nothing of it: it was registered by a hook a person ran.
+fn interactive_by_default() -> bool {
+    true
+}
+
+/// Whether the harness this hook runs inside has a person at it (ADR-029 SE-1).
+///
+/// **Claude Code** sets `CLAUDE_CODE_ENTRYPOINT` for its hooks: `sdk-cli` for a non-interactive
+/// run (`claude -p`), `sdk-ts` / `sdk-py` for the Agent SDK, `cli` for a person at the terminal
+/// (read from Claude Code 2.1.292: `set("CLAUDE_CODE_ENTRYPOINT", e ? "sdk-cli" : "cli")`).
+/// Codex and OpenCode are taken as interactive until their own signals are measured.
+#[must_use]
+pub fn interactive_now() -> bool {
+    !matches!(
+        std::env::var("CLAUDE_CODE_ENTRYPOINT").as_deref(),
+        Ok("sdk-cli" | "sdk-ts" | "sdk-py")
+    )
 }
 
 /// How a registered session can be reached now (V030-16), as `vox agent doctor` and a pong
@@ -226,11 +320,35 @@ pub fn store(paths: &Paths, reg: &Session) {
     let session = session.as_str();
     // When the session was first seen outlives this turn's rewrite (V030-16).
     let now = now_millis();
-    reg.first_seen_ms = load(paths, session)
+    let earlier = load(paths, session);
+    reg.first_seen_ms = earlier
+        .as_ref()
         .map(|b| b.first_seen_ms)
         .filter(|&t| t != 0)
         .unwrap_or(now);
+    // **A session's room is the one it started with, for its life** (ADR-029 RB-4, RB-5): a
+    // session that started in no room stays in none, however it moves about later; only
+    // [`store_room`] (`vox agent room`) changes it. A record from before Sessions had no room to
+    // keep.
+    if let Some(b) = earlier
+        .as_ref()
+        .filter(|b| b.room.is_some() || b.first_seen_ms != 0)
+    {
+        reg.room.clone_from(&b.room);
+        reg.start.clone_from(&b.start);
+    }
+    // **A name, once given, stays until the harness gives another** (ADR-029 MD-1): a turn whose
+    // harness said nothing of it (a sub-agent's event, a transcript not yet written) keeps it.
+    if reg.name.is_none() {
+        reg.name = earlier.and_then(|b| b.name);
+    }
     reg.last_drained_ms = now;
+    // **One session per pane** (ADR-029 DR-5): the newest hook in a pane claims it, and every other
+    // session of this node bound there loses its binding. Case: a new session (or `/clear`) in the
+    // pane of one that ended without a SessionEnd while its process lives on.
+    if let Some(mine) = reg.tmux.as_ref() {
+        unbind_pane(paths, session, &mine.socket, &mine.pane);
+    }
     let dir = paths.session_dir();
     if std::fs::create_dir_all(&dir).is_err() {
         return;
@@ -241,12 +359,39 @@ pub fn store(paths: &Paths, reg: &Session) {
     }
 }
 
+/// Move `session`'s registration to `room` (ADR-029 RB-5, `vox agent room`): the one way a
+/// session's room changes. `None` when the session is not registered; else the room it worked in
+/// before, if any.
+pub fn store_room(paths: &Paths, session: &str, room: &str) -> Option<Option<String>> {
+    let mut reg = load(paths, session)?;
+    let before = reg.room.replace(room.to_owned());
+    if let Ok(body) = serde_json::to_vec(&reg) {
+        let _ =
+            vox_core::node::paths::write_private_file_unique(&paths.session_file(session), &body);
+    }
+    Some(before)
+}
+
 impl Session {
     /// The registration a hook builds from its harness's environment (the client's half of
     /// [`register`]; the daemon stores it with [`store`], since the daemon's environment is not
     /// the harness's).
     #[must_use]
     pub fn from_env(session: &str, codex: bool) -> Self {
+        let mut s = Self::from_env_untmuxed(session, codex);
+        match crate::claude_injector::claim_here() {
+            Ok(claim) => s.tmux_claim = claim,
+            Err(why) => s.tmux_why = Some(why),
+        }
+        // Claude Code sets `CLAUDE_CODE_ENTRYPOINT` for its hooks even when its messaging socket
+        // is off.
+        if s.harness == "unknown" && std::env::var_os("CLAUDE_CODE_ENTRYPOINT").is_some() {
+            s.harness = "claude".into();
+        }
+        s
+    }
+
+    fn from_env_untmuxed(session: &str, codex: bool) -> Self {
         if codex {
             Session {
                 session: session.to_owned(),
@@ -257,6 +402,15 @@ impl Session {
                 state_ms: now_millis(),
                 first_seen_ms: 0,
                 last_drained_ms: 0,
+                room: None,
+                start: None,
+                name: None,
+                interactive: interactive_now(),
+                tmux: None,
+                tmux_why: None,
+                tmux_claim: None,
+                codex_home: crate::codex_mirror::codex_home_from_env(),
+                mirror: String::new(),
             }
         } else if let (Ok(endpoint), Ok(token)) = (
             std::env::var("CLAUDE_CODE_MESSAGING_SOCKET"),
@@ -271,6 +425,15 @@ impl Session {
                 state_ms: now_millis(),
                 first_seen_ms: 0,
                 last_drained_ms: 0,
+                room: None,
+                start: None,
+                name: None,
+                interactive: interactive_now(),
+                tmux: None,
+                tmux_why: None,
+                tmux_claim: None,
+                codex_home: String::new(),
+                mirror: String::new(),
             }
         } else if let (Ok(endpoint), Ok(token)) = (
             std::env::var("VOX_OPENCODE_WAKE_SOCKET"),
@@ -285,6 +448,15 @@ impl Session {
                 state_ms: now_millis(),
                 first_seen_ms: 0,
                 last_drained_ms: 0,
+                room: None,
+                start: None,
+                name: None,
+                interactive: interactive_now(),
+                tmux: None,
+                tmux_why: None,
+                tmux_claim: None,
+                codex_home: String::new(),
+                mirror: std::env::var("VOX_OPENCODE_MIRROR_SOCKET").unwrap_or_default(),
             }
         } else {
             Session {
@@ -296,7 +468,47 @@ impl Session {
                 state_ms: now_millis(),
                 first_seen_ms: 0,
                 last_drained_ms: 0,
+                room: None,
+                start: None,
+                name: None,
+                interactive: interactive_now(),
+                tmux: None,
+                tmux_why: None,
+                tmux_claim: None,
+                codex_home: String::new(),
+                mirror: String::new(),
             }
+        }
+    }
+}
+
+/// Drop the tmux binding of every session of this node but `keep` bound to `pane` on `socket`.
+fn unbind_pane(paths: &Paths, keep: &str, socket: &str, pane: &str) {
+    let Ok(dir) = std::fs::read_dir(paths.session_dir()) else {
+        return;
+    };
+    for f in dir.flatten() {
+        let Ok(body) = std::fs::read(f.path()) else {
+            continue;
+        };
+        let Ok(mut other) = serde_json::from_slice::<Session>(&body) else {
+            continue;
+        };
+        if other.session == keep
+            || !other
+                .tmux
+                .as_ref()
+                .is_some_and(|t| t.socket == socket && t.pane == pane)
+        {
+            continue;
+        }
+        other.tmux = None;
+        other.tmux_why = Some(format!(
+            "tmux pane {pane} now runs another session, so this one cannot be typed into until \
+             its next turn"
+        ));
+        if let Ok(body) = serde_json::to_vec(&other) {
+            let _ = vox_core::node::paths::write_private_file_unique(&f.path(), &body);
         }
     }
 }
@@ -375,6 +587,12 @@ pub fn forget(paths: &Paths, session: &Session) -> bool {
 }
 
 /// `session`'s registration, if it has one.
+/// `session`'s registration as stored, if it is registered.
+#[must_use]
+pub fn registration(paths: &Paths, session: &str) -> Option<Session> {
+    load(paths, session)
+}
+
 fn load(paths: &Paths, session: &str) -> Option<Session> {
     let body = std::fs::read(paths.session_file(session)).ok()?;
     serde_json::from_slice(&body).ok()

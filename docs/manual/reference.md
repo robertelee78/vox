@@ -86,8 +86,8 @@ command, use its supported passphrase-file option and restrict the file to the i
 `node create` and `node attach` read the identity passphrase from `--passphrase-file`; `room
 create` and `room join` read the room passphrase from `--passphrase-file`, where `-` selects
 stdin. Without a terminal or that explicit input, they fail rather than wait on an unattended
-prompt. Commands that change the keyring or a room's retention take
-`--identity-passphrase-file`.
+prompt. A keyring change (`vox trust add`, `remove`, `rename`) takes the identity passphrase only
+typed at a terminal; a room's retention or name asks for none.
 
 To keep a node attached across daemon restarts:
 
@@ -115,8 +115,8 @@ source-reviewed in the daemon parser, not exercised by the manual's command chec
 
 `--identity-passphrase` and room `--passphrase` are intentionally refused: process arguments
 and shell history expose secrets. `VOX_ROOM_PASSPHRASE` is also refused.
-`VOX_IDENTITY_PASSPHRASE` is supported, but an environment can be read by same-user processes and
-inherited by children. A supported mechanism is not a promise that it is equally private.
+`VOX_IDENTITY_PASSPHRASE` is supported for attaching a node, never for a keyring change, but an
+environment can be read by same-user processes and inherited by children. A supported mechanism is not a promise that it is equally private.
 
 Do not write a real passphrase into a documentation example, paste it to a model, or capture
 it in a screenshot. Empty passphrases change at-rest/join protection; an example should not

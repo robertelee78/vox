@@ -59,6 +59,16 @@ struct HookInput {
     /// Whether the input is Codex's ([`crate::wake::codex_input`]): its `transcript_path` names
     /// a Codex rollout, or it carries Codex's `turn_id`.
     codex: bool,
+    /// `SessionEnd`'s reason, as the harness gives it (ADR-029 SE-4); empty otherwise.
+    reason: String,
+    /// The input is Claude Code's: it names its `hook_event_name`, which Codex's does not.
+    claude: bool,
+    /// The harness's transcript of the session, as its payload names it: Claude Code keeps the
+    /// session's name there (ADR-029 MD-1).
+    transcript: String,
+    /// The session's working directory: the payload's `cwd` (Claude Code's and Codex's carry it),
+    /// else this process's (OpenCode's plugin runs the hook in OpenCode's own directory).
+    cwd: String,
 }
 
 fn parse_input(raw: &str) -> HookInput {
@@ -80,6 +90,27 @@ fn parse_input(raw: &str) -> HookInput {
                 .unwrap_or_default(),
             v.get("turn_id").is_some(),
         ),
+        reason: v
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        claude: v.get("hook_event_name").is_some() && v.get("turn_id").is_none(),
+        transcript: v
+            .get("transcript_path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        cwd: v
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|d| d.display().to_string())
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -378,6 +409,15 @@ pub const LINE_BREAKS: &[char] = &[
 ];
 
 /// Whether `row` is a [`vox_agentcomms::envelope::PING`] or `PONG`, which no model is shown.
+/// Whether `row` is a Session's opening or end (ADR-029): a room's conversation (General) never
+/// shows one; `vox room sessions` and a client's All do.
+pub(crate) fn is_session_record(row: &vox_core::node::api::MessageRow) -> bool {
+    vox_agentcomms::envelope::Envelope::parse(&row.text).is_ok_and(|e| {
+        e.kind == vox_agentcomms::envelope::SESSION
+            || e.kind == vox_agentcomms::envelope::SESSION_END
+    })
+}
+
 fn is_plumbing(row: &vox_core::node::api::MessageRow) -> bool {
     vox_agentcomms::envelope::Envelope::parse(&row.text)
         .is_ok_and(|e| vox_agentcomms::envelope::is_plumbing(&e.kind))
@@ -609,6 +649,24 @@ pub(crate) fn words(text: &str) -> String {
                 _ => what,
             };
         }
+    }
+    // **A Session's opening and end** (ADR-029), said as what they are: the session by its name,
+    // else its short id.
+    if e.kind == vox_agentcomms::envelope::SESSION
+        || e.kind == vox_agentcomms::envelope::SESSION_END
+    {
+        let short: String = e.from.chars().take(8).collect();
+        let who =
+            e.at.session_name
+                .as_deref()
+                .map_or(short.clone(), |n| format!("{n} \u{b7} {short}"));
+        // After its author's name, as a reader's line starts, this reads as the label does:
+        // `codex@device-2 gso-cap · 3f0c25bf opened` (CL-1).
+        return if e.kind == vox_agentcomms::envelope::SESSION {
+            format!("{who} opened")
+        } else {
+            format!("{who} ended")
+        };
     }
     let work = e.data.get(WORK_KEY).and_then(serde_json::Value::as_str);
     let head = match (e.kind == SAY, work) {
@@ -1154,20 +1212,64 @@ pub async fn run(
         input.session_id = s.trim().to_owned();
     }
 
+    // A Codex session starts: Codex's app-server is kept running (the decider, 2026-10-06), so
+    // the next `codex` joins it and can be read and driven from Vox (ADR-029 #541). It is not
+    // this session's turn yet, and its drain runs at its prompt, so nothing is read here.
+    if input.codex && input.event == "SessionStart" {
+        crate::codex_mirror::ensure_app_server();
+        return Ok(());
+    }
+
+    // ADR-029 SC-1: what the session does goes to its Session (#540), and an approval or a
+    // question waits there for an answer from either side (#545).
+    let mirrored = crate::session_mirror::Event::parse(&raw)
+        .filter(|ev| crate::session_mirror::mirrors(&ev.name));
+    if let Some(ev) = &mirrored {
+        if ev.name != "UserPromptSubmit" {
+            // **Every hook binds the session** (ADR-029 DR-5): its registration, with the tmux pane
+            // it proves, is refreshed on each event, so a session first seen by a tool call is
+            // known, and a session resumed in another pane is rebound at once.
+            if let Err(e) = daemon.register(&input, room_arg).await {
+                eprintln!("vox agent hook: {e}");
+            }
+            if ev.name == "Stop" {
+                crate::wake::record_idle(paths, &input.session_id);
+            }
+            if let Some(out) = crate::session_mirror::hook(daemon, ev, &input.session_id).await {
+                println!("{out}");
+            }
+            return Ok(());
+        }
+    }
+
     match input.event.as_str() {
         "Stop" => {
             crate::wake::record_idle(paths, &input.session_id);
             return Ok(());
         }
         "SessionEnd" => {
-            daemon.session_end(paths, &input.session_id).await;
+            daemon
+                .session_end(paths, &input.session_id, &input.reason)
+                .await;
             return Ok(());
         }
         _ => {}
     }
 
-    let drained = match daemon.register(&input).await {
-        Ok(()) => drain(paths, room_arg, &input, &raw, format).await,
+    let drained = match daemon.register(&input, room_arg).await {
+        Ok(answer) => {
+            // The prompt goes to the Session first: it is what the turn the drain starts answers.
+            if let Some(ev) = &mirrored {
+                crate::session_mirror::hook(daemon, ev, &input.session_id).await;
+            }
+            let note = crate::room_map::note(
+                answer.room.as_deref(),
+                answer.new,
+                answer.joining.as_deref(),
+                &daemon.account.data_root,
+            );
+            drain(paths, room_arg, &input, &raw, format, note).await
+        }
         Err(e) => Err(e),
     };
     if let Err(e) = drained {
@@ -1201,28 +1303,38 @@ pub struct Daemon {
     pub node: vox_core::node::paths::NodeName,
     /// Where a daemon this hook starts listens.
     pub listen: std::net::SocketAddr,
-    /// The anchors a daemon this hook starts, or the node it attaches, is given.
+    /// The anchors a daemon this hook starts is given.
     pub anchors: Vec<String>,
 }
 
 impl Daemon {
     /// Register this turn's session in the daemon, starting the daemon if none runs: the session
-    /// then holds the hook's node, which the daemon attaches if it is not attached, with the
-    /// identity passphrase from `VOX_IDENTITY_PASSPHRASE` (resolved here, never by the daemon,
-    /// ADR-026 C-6). How the harness can wake the session is read from this process's
-    /// environment, which is the harness's, and stored by the daemon.
-    async fn register(&self, input: &HookInput) -> Result<(), AppError> {
+    /// then holds the hook's node. **A hook never attaches its node, and takes no passphrase**
+    /// (ADR-028 K-13): a node not attached is said to the agent with the command its operator
+    /// runs in a terminal outside the session. How the harness can wake the session is read from
+    /// this process's environment, which is the harness's, and stored by the daemon.
+    async fn register(
+        &self,
+        input: &HookInput,
+        room_arg: Option<&str>,
+    ) -> Result<Registered, AppError> {
         use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
         crate::daemon_client::ensure_daemon(&self.account, self.listen, &self.anchors).await?;
-        let record = crate::wake::Session::from_env(&input.session_id, input.codex);
+        let mut record = crate::wake::Session::from_env(&input.session_id, input.codex);
+        // **The harness, from its own input** when its environment named no wake channel: Claude
+        // Code's payload names its event (ADR-029 SE-3 labels a Session by it).
+        if record.harness == "unknown" && input.claude && !input.codex {
+            record.harness = "claude".into();
+        }
+        record.name = session_name(input);
+        let (room, join) = session_room(&self.account, input, room_arg);
+        record.room = room;
+        record.start = Some(input.cwd.clone()).filter(|c| !c.is_empty());
         let record = serde_json::to_string(&record)
             .map_err(|e| AppError::Usage(format!("the session's record: {e}")))?;
         let mut d = DaemonClient::open(&self.account.socket())
             .await
             .map_err(|e| AppError::Usage(e.to_string()))?;
-        let passphrase = std::env::var("VOX_IDENTITY_PASSPHRASE")
-            .ok()
-            .map(zeroize::Zeroizing::new);
         // **Never without a bound** (#408): the hook runs inside a model's turn, and a wait with
         // no end hangs the harness. The daemon refuses a node still detaching after
         // DETACHING_PATIENCE; this bounds everything else the registration can wait on.
@@ -1232,8 +1344,7 @@ impl Daemon {
                 node: self.node.clone(),
                 session: input.session_id.clone(),
                 record,
-                passphrase,
-                anchors: self.anchors.clone(),
+                join,
             }),
         )
         .await
@@ -1245,10 +1356,18 @@ impl Daemon {
         })?
         .map_err(|e| AppError::Usage(e.to_string()))?;
         match asked {
-            DaemonFrame::Attached(..) => Ok(()),
+            DaemonFrame::SessionRegistered {
+                room, new, joining, ..
+            } => Ok(Registered { room, new, joining }),
             DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::StillDetaching { node }) => {
                 Err(AppError::Usage(format!(
                     "node {node} is still detaching; this turn reads nothing"
+                )))
+            }
+            DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::NotAttached { node }) => {
+                Err(AppError::Usage(format!(
+                    "node {node} is not attached, and a hook never attaches it. Ask the operator \
+                     to run, in a terminal outside this session: vox node attach {node}"
                 )))
             }
             DaemonFrame::Refused(r) => Err(AppError::Usage(r.to_string())),
@@ -1259,7 +1378,7 @@ impl Daemon {
     /// `SessionEnd`: the daemon unregisters the session, and detaches the node if that was its
     /// last holder, in one decision (L-3). With no daemon running there is nothing it holds, and
     /// the record is removed here.
-    async fn session_end(&self, paths: &Paths, session: &str) {
+    async fn session_end(&self, paths: &Paths, session: &str, reason: &str) {
         use vox_core::node::daemonipc::{DaemonClient, DaemonRequest};
         match DaemonClient::open(&self.account.socket()).await {
             Ok(mut d) => {
@@ -1267,11 +1386,109 @@ impl Daemon {
                     .request(DaemonRequest::SessionEnd {
                         node: self.node.clone(),
                         session: session.to_owned(),
+                        reason: reason.to_owned(),
                     })
                     .await;
             }
             Err(_) => crate::wake::end(paths, session),
         }
+    }
+}
+
+/// How many of a room's plumbing rows (a ping, a pong, a Session's opening or end) arrived after
+/// `arrival`: rows a turn never shows, so never counted among what waits past its page either. Read
+/// from the node's index of structured posts; `0` when the node does not say.
+async fn plumbing_after(client: &mut IpcClient, channel_id: Digest32, arrival: u64) -> usize {
+    use vox_agentcomms::envelope::{PING, PONG, SESSION, SESSION_END};
+    match client
+        .request(&vox_core::node::ipc::Request::Structured {
+            channel_id,
+            types: [PING, PONG, SESSION, SESSION_END]
+                .iter()
+                .map(|t| (*t).to_owned())
+                .collect(),
+            ops: Vec::new(),
+            since: None,
+        })
+        .await
+    {
+        Ok(Frame::Rows { rows, .. }) => rows.iter().filter(|r| r.arrival > arrival).count(),
+        _ => 0,
+    }
+}
+
+/// What the daemon said of a session it registered (ADR-029 §6): the room it works in, whether it
+/// is new to its node, and what a join of its room under way says.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Registered {
+    /// The room the session works in, its id in base32; `None` for none.
+    pub room: Option<String>,
+    /// The session is new to its node.
+    pub new: bool,
+    /// `joining <room>…`, or why the join could not; `None` when none is under way.
+    pub joining: Option<String>,
+}
+
+/// The session's current name, as its harness gives it (ADR-029 MD-1), read every turn so a rename
+/// shows on the next message; `None` when it gives none.
+///
+/// **Claude Code** writes it into the session's transcript (`transcript_path`): a `/rename` as a
+/// `{"type":"custom-title","customTitle":…}` line, and the title it makes itself as
+/// `{"type":"ai-title","aiTitle":…}` (measured from Claude Code 2.1.29x transcripts). The last
+/// custom title wins, else the last made one. Codex's and OpenCode's names are to be read by their
+/// own hooks (harness2).
+fn session_name(input: &HookInput) -> Option<String> {
+    use std::io::BufRead as _;
+    if !input.claude || input.transcript.is_empty() {
+        return None;
+    }
+    let file = std::fs::File::open(&input.transcript).ok()?;
+    let (mut custom, mut made) = (None, None);
+    for line in std::io::BufReader::new(file).lines() {
+        let Ok(line) = line else { break };
+        if !line.contains("-title\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        match v["type"].as_str() {
+            Some("custom-title") => custom = v["customTitle"].as_str().map(str::to_owned),
+            Some("ai-title") => made = v["aiTitle"].as_str().map(str::to_owned),
+            _ => {}
+        }
+    }
+    custom
+        .or(made)
+        .map(|n| n.trim().to_owned())
+        .filter(|n| !n.is_empty())
+}
+
+/// The room this session works in (ADR-029 §6), and, for a room the node is not a member of, the
+/// link and passphrase to join it with. `None` keeps whatever room the session already has
+/// (RB-4).
+///
+/// **Today**: the hook's `--room`, else `VOX_ROOM` (a room id, or a unique prefix of one, which the
+/// daemon resolves). The room map (RB-1–RB-3, #550) is to replace this body.
+fn session_room(
+    account: &vox_core::node::paths::Account,
+    input: &HookInput,
+    room_arg: Option<&str>,
+) -> (Option<String>, Option<(String, zeroize::Zeroizing<String>)>) {
+    let named = room_arg.map(str::to_owned).or_else(|| {
+        std::env::var("VOX_ROOM")
+            .ok()
+            .filter(|r| !r.trim().is_empty())
+    });
+    if let Some(r) = named {
+        return (Some(r.trim().to_owned()), None);
+    }
+    // The room map gives the room of the directory the session started in, exactly (ADR-029
+    // RB-2), with what joining it takes (RB-3). A map that cannot be read gives none: the session
+    // is told why (`room_map::note`).
+    match crate::room_map::room_for(&account.data_root, std::path::Path::new(&input.cwd)) {
+        Ok(Some((room, link, passphrase))) => (Some(room), Some((link, passphrase))),
+        Ok(None) | Err(_) => (None, None),
     }
 }
 
@@ -1419,6 +1636,7 @@ async fn drain(
     input: &HookInput,
     raw_input: &str,
     format: Format,
+    note: Option<String>,
 ) -> Result<(), AppError> {
     // Over the account socket as this node, which the session's registration attached (ADR-026
     // C-1, N-6): never attaching anything itself.
@@ -1470,7 +1688,7 @@ async fn drain(
     }
 
     let news: Vec<&RoomDrain> = drains.iter().filter(|d| d.has_news()).collect();
-    if news.is_empty() && unread.is_empty() {
+    if news.is_empty() && unread.is_empty() && note.is_none() {
         // Nothing new: emit nothing at all rather than "no new messages". An
         // agent's context is not the place for a heartbeat, and a quiet room
         // should cost zero tokens per turn.
@@ -1481,7 +1699,9 @@ async fn drain(
     }
 
     // Who does what is settled in the room; progress is recorded on the issue (V210-131).
-    let mut context = String::from(ROOM_AND_ISSUE);
+    // A word about this session's room (ADR-029 RB-5): before anything else, in the one emit.
+    let mut context = note.map(|n| format!("{n}\n")).unwrap_or_default();
+    context.push_str(ROOM_AND_ISSUE);
     context.push_str(&unread.concat());
     // **The notices sit under a framing line** (V210-123): they quote session and resource
     // names that room members chose, so, like the messages, they say first whose words
@@ -1690,7 +1910,9 @@ async fn read_room(
             })
             .await
         {
-            Ok(Frame::Count { n, .. }) => usize::try_from(n).unwrap_or(usize::MAX),
+            Ok(Frame::Count { n, .. }) => usize::try_from(n)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(plumbing_after(client, channel_id, last.arrival).await),
             _ => 0,
         },
         _ => 0,
@@ -1905,13 +2127,43 @@ async fn read_room(
 }
 
 /// The hook entries `vox agent plugin claude` prints, for `~/.claude/settings.json`: one per event
-/// `vox agent hook` acts on (see [`run`]).
+/// `vox agent hook` acts on (see [`run`]). The tool events and `PermissionRequest` feed the
+/// session's Session (ADR-029 SC-1, DR-3); `PermissionRequest` waits for an answer from it for up
+/// to an hour, while the terminal's own prompt stays live, so its timeout is that long.
 pub const CLAUDE_HOOKS: &str = r#"{
   "hooks": {
     "UserPromptSubmit": [
       {
         "hooks": [
           { "type": "command", "command": "vox agent hook" }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          { "type": "command", "command": "vox agent hook" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          { "type": "command", "command": "vox agent hook" }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          { "type": "command", "command": "vox agent hook" }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          { "type": "command", "command": "vox agent hook", "timeout": 3600 }
         ]
       }
     ],
@@ -1961,14 +2213,34 @@ pub fn claude_settings(node: &vox_core::node::paths::NodeName) -> String {
     text
 }
 
-/// Codex's `hooks.json` entry for `node`, as `vox agent plugin codex --node <name>` prints it.
-/// `async` MUST be false: an async hook's output is observed and discarded.
+/// Codex's `hooks.json` entries for `node`, as `vox agent plugin codex --node <name>` prints them.
+///
+/// - `UserPromptSubmit` drains the rooms into the turn, so it MUST be synchronous: an async
+///   hook's output is observed and discarded. It also posts the prompt to the Session.
+/// - `PreToolUse`, `PostToolUse` and `Stop` feed the Session (ADR-029 SC-1) when the session
+///   cannot be read from Codex's app-server (one was not running when `codex` started); the
+///   daemon drops them for a session it reads there. Async: a mirror never holds a turn up.
+/// - `SessionEnd` ends the Session (SE-4). Codex runs it synchronously, whatever it is told.
+/// - `SessionStart` keeps Codex's app-server running, so the next `codex` joins it (async).
+/// - No `PermissionRequest`: a hook that decided would take the prompt from the terminal, and
+///   Codex's request carries no id to answer it by. An approval is answered from Vox only
+///   through the app-server.
 #[must_use]
 pub fn codex_hooks(node: &vox_core::node::paths::NodeName) -> String {
+    let entry = |sync: bool| {
+        serde_json::json!([ { "hooks": [
+            { "type": "command", "command": hook_command(node), "async": !sync }
+        ] } ])
+    };
     let v = serde_json::json!({
-        "hooks": { "UserPromptSubmit": [ { "hooks": [
-            { "type": "command", "command": hook_command(node), "async": false }
-        ] } ] }
+        "hooks": {
+            "SessionStart": entry(false),
+            "UserPromptSubmit": entry(true),
+            "PreToolUse": entry(false),
+            "PostToolUse": entry(false),
+            "Stop": entry(false),
+            "SessionEnd": entry(true),
+        }
     });
     let mut text = serde_json::to_string_pretty(&v).unwrap_or_default();
     text.push('\n');

@@ -35,12 +35,50 @@
 //! 6. **every failure still exits 0**: no node running, an unknown room, no room
 //!    given. A hook that breaks the turn it rides on is worse than one that does
 //!    nothing.
+//! 7. **a hook never attaches its node** (ADR-028 K-13): with the node detached, and its
+//!    passphrase in `VOX_IDENTITY_PASSPHRASE` and a file beside it, the hook tells the agent the
+//!    node is not attached and the command for the operator to run outside the session, `vox
+//!    node attach default`, and the node stays detached; once the operator runs it, the hook reads
+//!    the room. Mutant: the hook attaches the node with the variable — red, PRODUCT.
 //!
 //! **Which side a red is on.** A red that quotes what `vox` printed is `PRODUCT:`; a fixture that
 //! could not be made (a directory, a spawn, a pipe) is `APPARATUS:`; setup that the product
 //! refused before the claim could be reached (`vox id`, the daemon, the room) is
 //! `PRODUCT (staging):` with what it said. Every `vox` here runs with the harness's own session variables
 //! removed, so the hook under test never picks up the session of the agent running the proof.
+//!
+//! **A Session per interactive harness session** (ADR-029 SE-1–SE-5,
+//! [`a_session_opens_with_its_hook_and_ends_only_on_a_real_end`]): the hook of a session a person
+//! is at (Claude Code's `CLAUDE_CODE_ENTRYPOINT=cli`) opens one Session in its room, named by the
+//! harness's own session id; a headless run's (`sdk-cli`) opens none; a sub-agent's event, which
+//! carries its parent's session id, opens no other. `Stop` and a `SessionEnd` whose reason is
+//! `resume` leave it open; a real `SessionEnd` ends it, set apart under "ended", and what was said
+//! in the room stays readable. Every message from a session carries its id and the name its harness
+//! gives (Claude Code's last `/rename` in its transcript): a plain `vox room post` from it, and none
+//! from a session with no name, which is shown by its short id. A daemon restarted mid-session
+//! opens no second Session. Mutants: end the Session on `Stop`; omit the name on plain posts.
+//!
+//! **The room a session works in comes from the room map** (ADR-029 RB-1–RB-5, #550,
+//! [`a_session_works_in_the_room_its_start_directory_is_mapped_to`]): an agent's node with no room
+//! and a `<data root>/rooms` naming a directory and Alice's room. A session started in that
+//! directory is told on its first turn that the room is being joined; its node joins Alice's room
+//! by itself and opens the session's Session there. A session started in a subfolder of it is
+//! told it works in no room, with `vox agent room <room>`, and gets no Session. The first session,
+//! later working in another mapped directory, stays where it is: its Session stays open and its
+//! node joins nothing else. Mutant: a start path matched as a prefix.
+//!
+//! **`vox agent room` sets or moves a session's room** (ADR-029 RB-5, #551, the same test): run as
+//! the session in no room, it says what it is to do, sets the room, and opens the session's
+//! Session there, and its next turn is no longer told it works in no room. Run again for another
+//! room its node holds, it moves the session: its Session in the first room ends and one opens in
+//! the second, so it works in one room at a time. Mutant: the old Session kept open after a move.
+//! Run by the agent, with no terminal, it says how the operator can also save the session's start
+//! directory in the room map; run by the operator at a terminal (a pty), it offers to, says what
+//! that changes, and on yes saves it with the room's passphrase typed there, so the next session
+//! started in that directory works in the room by itself. Mutant: the save writes nothing.
+//! A session started in a mapped directory whose room's host is gone is told the join is under way,
+//! then, on a later turn, why it could not join, though that turn tries again. Mutant: the retry's
+//! "joining" overwrites the failure before the turn reads it.
 //!
 //! Not proved here, and stated rather than implied: that a harness actually
 //! *shows* the model what it injects. The probe could not confirm it because this
@@ -50,6 +88,9 @@
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+
+#[path = "support/typed.rs"]
+mod typed;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -73,6 +114,7 @@ const HARNESS_VARS: &[&str] = &[
     "VOX_LISTEN",
     "CLAUDE_CODE_MESSAGING_SOCKET",
     "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_ENTRYPOINT",
     "OPENCODE_SERVER_URL",
 ];
 
@@ -221,8 +263,14 @@ fn hook(
     args: &[&str],
     stdin: &str,
 ) -> (bool, String, String) {
-    let mut child = vox(data, cfg)
-        .args(args)
+    let mut cmd = vox(data, cfg);
+    cmd.args(args);
+    // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
+    if typed::is_keyring_change(args) {
+        let (ok, shown) = typed::keyring(&cmd);
+        return (ok, shown.clone(), shown);
+    }
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -242,6 +290,80 @@ fn hook(
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+/// (7) ADR-028 K-13: a hook never attaches its node, and takes no passphrase from anywhere; it
+/// says the command the operator runs outside the session.
+#[test]
+#[ignore = "production Argon2id at setup + drives the real binary; CI runs it in release"]
+fn a_hook_never_attaches_its_node_and_says_how_to() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let (data, cfg) = (tmp.path().join("data"), tmp.path().join("cfg"));
+    std::fs::create_dir_all(&cfg).expect("APPARATUS: cannot make the profile directory");
+    let pass = tmp.path().join("identity.pass");
+    std::fs::write(&pass, "identity passphrase\n")
+        .expect("APPARATUS: cannot write the passphrase file");
+    let pass = pass.to_str().expect("APPARATUS: a UTF-8 path");
+    let (ok, _, err) = hook(
+        &data,
+        &cfg,
+        &["node", "create", "default", "--passphrase-file", pass],
+        "",
+    );
+    assert!(ok, "PRODUCT (staging): vox node create failed: {err}");
+    let node_list = || hook(&data, &cfg, &["node", "list"], "").1;
+    let turn = |session: &str| {
+        let mut c = vox(&data, &cfg);
+        // Everything a hook could take a passphrase from, there to be taken: it must take none.
+        c.args(["agent", "hook", "--node", "default", "--format", "text"])
+            .env("VOX_IDENTITY_PASSPHRASE", "identity passphrase")
+            .env("VOX_IDENTITY_PASSPHRASE_FILE", pass)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = c.spawn().expect("APPARATUS: cannot start vox agent hook");
+        child
+            .stdin
+            .as_mut()
+            .expect("APPARATUS: vox has no stdin")
+            .write_all(claude_input(session).as_bytes())
+            .expect("APPARATUS: cannot write the hook's stdin");
+        let out = child.wait_with_output().expect("APPARATUS: the hook");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+    let (ok, told) = turn("k13-1");
+    let listed = node_list();
+    println!("[proof] (7) the hook told the agent: {told:?}; `vox node list`: {listed:?}");
+    assert!(
+        ok && told.contains("node default is not attached")
+            && told.contains("in a terminal outside this session: vox node attach default")
+            && listed.lines().any(|l| l.starts_with("default detached")),
+        "PRODUCT: with node default detached, the hook must leave it detached and tell the agent \
+         the command for the operator, `vox node attach default` (ADR-028 K-13); it exited ok \
+         {ok}, told the agent {told:?}, and `vox node list` says {listed:?}"
+    );
+    // The operator attaches it, outside the session: the next turn reads.
+    let (ok, _, err) = hook(
+        &data,
+        &cfg,
+        &["node", "attach", "default", "--passphrase-file", pass],
+        "",
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): vox node attach default failed: {err}"
+    );
+    let (ok, told) = turn("k13-2");
+    let (_, _, _) = hook(&data, &cfg, &["node", "detach", "default"], "");
+    assert!(
+        ok && !told.contains("not attached") && !told.contains("could not read"),
+        "PRODUCT: once the operator attached node default, the hook must read its rooms; it told \
+         the agent {told:?}"
+    );
 }
 
 #[test]
@@ -1761,7 +1883,16 @@ fn a_drain_posts_read_records_that_nobody_is_shown() {
         "read-me three",
         "read-me four",
     ];
-    let rows: Vec<String> = shown_rows(&alice).into_iter().map(|(_, t)| t).collect();
+    // A Session's opening and end are rows of their own (ADR-029): a read record is never one.
+    let is_session = |t: &String| {
+        vox_agentcomms::envelope::Envelope::parse(t).is_ok_and(|e| {
+            e.kind == vox_agentcomms::envelope::SESSION
+                || e.kind == vox_agentcomms::envelope::SESSION_END
+        })
+    };
+    let every: Vec<String> = shown_rows(&alice).into_iter().map(|(_, t)| t).collect();
+    let session_rows = every.iter().filter(|t| is_session(t)).count() as u64;
+    let rows: Vec<String> = every.into_iter().filter(|t| !is_session(t)).collect();
     assert_eq!(
         rows, all,
         "PRODUCT: alice's `vox room read` must show her four posts and nothing else; it shows \
@@ -1779,8 +1910,9 @@ fn a_drain_posts_read_records_that_nobody_is_shown() {
         .and_then(|v| v["position"]["entries"].as_u64());
     assert_eq!(
         counted,
-        Some(4),
-        "PRODUCT: alice's room must count her four posts, never a read record; \
+        Some(4 + session_rows),
+        "PRODUCT: alice's room must count her four posts (and the {session_rows} Session \
+         record(s) its sessions' turns made), never a read record; \
          `vox room board --json` said {board}"
     );
     let out = drain_as(&alice, "watcher");
@@ -1797,4 +1929,655 @@ fn a_drain_posts_read_records_that_nobody_is_shown() {
         out.trim().is_empty(),
         "PRODUCT: a read record must never reach an agent's turn; alice's next turn was told: {out}"
     );
+}
+
+/// [`hook`], with `env` set for that one `vox`: what a harness puts in its hook's environment.
+fn hook_env(
+    data: &Path,
+    cfg: &Path,
+    args: &[&str],
+    stdin: &str,
+    env: &[(&str, &str)],
+) -> (bool, String, String) {
+    let mut child = vox(data, cfg)
+        .args(args)
+        .envs(env.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: cannot start vox");
+    child
+        .stdin
+        .as_mut()
+        .expect("APPARATUS: vox has no stdin")
+        .write_all(stdin.as_bytes())
+        .expect("APPARATUS: cannot write vox's stdin");
+    let out = child
+        .wait_with_output()
+        .expect("APPARATUS: cannot wait for vox");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// A Claude Code hook payload for `event` in `session`, with `extra` JSON fields; its transcript is
+/// `/tmp/t.jsonl`, which holds no title.
+fn claude_event(session: &str, event: &str, extra: &str) -> String {
+    claude_event_at(session, event, extra, Path::new("/tmp/t.jsonl"))
+}
+
+/// [`claude_event`] with the session's transcript at `transcript`.
+fn claude_event_at(session: &str, event: &str, extra: &str, transcript: &Path) -> String {
+    format!(
+        r#"{{"session_id":"{session}","hook_event_name":"{event}","cwd":"/tmp","transcript_path":{}{extra}}}"#,
+        serde_json::Value::from(transcript.display().to_string())
+    )
+}
+
+/// Stop `d`'s daemon, as a crash does (by its PID), and start it again on the same profile.
+fn restart(d: &mut Daemon, root: &Path) {
+    let _ = d.child.kill();
+    let _ = d.child.wait();
+    let err_file = root.join("daemon-2.err");
+    d.child = vox(&d.data, &d.cfg)
+        .args(["daemon", "--listen", "127.0.0.1:0", "--passphrase-file"])
+        .arg(root.join("identity.pass"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(&err_file)
+                .expect("APPARATUS: cannot create the daemon's stderr file"),
+        ))
+        .spawn()
+        .expect("APPARATUS: cannot start vox daemon again");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !hook(&d.data, &d.cfg, &["room", "list"], "").0 {
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT (staging): the restarted daemon never answered `vox room list` in 60 s; it \
+             said:\n{}",
+            std::fs::read_to_string(&err_file).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+#[test]
+#[ignore = "production Argon2id at setup + drives the real binary; CI runs it in release"]
+fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let mut daemon = Daemon::start(tmp.path());
+    let (data, cfg) = (daemon.data.clone(), daemon.cfg.clone());
+    let room: String = daemon.room_key.chars().take(12).collect();
+    let person = [("CLAUDE_CODE_ENTRYPOINT", "cli")];
+    // The session's transcript, as Claude Code writes it: a title it made, then the person's
+    // `/rename` (ADR-029 MD-1).
+    let transcript = tmp.path().join("transcript.jsonl");
+    std::fs::write(
+        &transcript,
+        "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n\
+         {\"type\":\"ai-title\",\"aiTitle\":\"porting the codec\",\"sessionId\":\"x\"}\n\
+         {\"type\":\"custom-title\",\"customTitle\":\"gso-cap\",\"sessionId\":\"x\"}\n",
+    )
+    .expect("APPARATUS: cannot write the transcript");
+    let headless = [("CLAUDE_CODE_ENTRYPOINT", "sdk-cli")];
+    let hook_args = [
+        "agent",
+        "hook",
+        "--node",
+        "default",
+        "--room",
+        room.as_str(),
+    ];
+    let at = "3f0c25bf-aaaa-4bbb-8ccc-dddddddddddd";
+    let run = |payload: String, env: &[(&str, &str)]| {
+        let (ok, out, err) = hook_env(&data, &cfg, &hook_args, &payload, env);
+        assert!(ok, "PRODUCT: the hook must exit 0; it said {out}{err}");
+    };
+    let sessions = || -> Vec<serde_json::Value> {
+        let (ok, out, err) = hook(&data, &cfg, &["room", "sessions", &room, "--json"], "");
+        assert!(ok, "PRODUCT: `vox room sessions --json` failed: {err}");
+        out.lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    };
+    let of = |rows: &[serde_json::Value], id: &str| -> Vec<serde_json::Value> {
+        rows.iter().filter(|r| r["id"] == id).cloned().collect()
+    };
+
+    // (1) A session a person is at: its first turn opens its Session, named as its harness names it.
+    run(
+        claude_event_at(at, "UserPromptSubmit", r#","prompt":"hi""#, &transcript),
+        &person,
+    );
+    // (2) A headless run in the same room: no Session.
+    run(
+        claude_event("headless-run-0001", "UserPromptSubmit", r#","prompt":"hi""#),
+        &headless,
+    );
+    // (3) A sub-agent's event, under its parent's session id: no other Session.
+    run(
+        claude_event_at(
+            at,
+            "SubagentStop",
+            r#","agent_id":"agent-7","agent_type":"Explore""#,
+            &transcript,
+        ),
+        &person,
+    );
+    let after_open = sessions();
+    // (7) Every message from a session carries its id and name, whatever verb posts it
+    // (ADR-029 MD-1, MD-2): a plain `vox room post` from it, and one from a session with no name.
+    let post_as = |session: &str, text: &str| {
+        let (ok, out, err) = hook_env(
+            &data,
+            &cfg,
+            &["room", "post", &room, text],
+            "",
+            &[("VOX_SESSION", session)],
+        );
+        assert!(
+            ok,
+            "PRODUCT (staging): `vox room post` from {session}: {out}{err}"
+        );
+    };
+    run(
+        claude_event("0a1b2c3d-nameless", "UserPromptSubmit", r#","prompt":"hi""#),
+        &person,
+    );
+    post_as(at, "PLAIN-FROM-NAMED the codec is ported");
+    post_as("0a1b2c3d-nameless", "PLAIN-FROM-NAMELESS done here");
+    let envelope_of = |marker: &str| {
+        shown_rows(&daemon)
+            .into_iter()
+            .find(|(_, t)| t.contains(marker))
+            .and_then(|(_, t)| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .unwrap_or_default()
+    };
+    let named = envelope_of("PLAIN-FROM-NAMED");
+    let nameless = envelope_of("PLAIN-FROM-NAMELESS");
+    let (_, nameless_listed, _) = hook(&data, &cfg, &["room", "sessions", &room], "");
+    // (8) The daemon restarts mid-session; the session's next turn opens no second Session.
+    restart(&mut daemon, tmp.path());
+    run(
+        claude_event_at(at, "UserPromptSubmit", r#","prompt":"again""#, &transcript),
+        &person,
+    );
+    let after_restart = sessions();
+    // On the log itself: one opening, however many turns and restarts.
+    let openings = shown_rows(&daemon)
+        .into_iter()
+        .filter_map(|(_, t)| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .filter(|v| v["type"] == "session" && v["from"] == at)
+        .count();
+    // (4) The turn ends: `Stop`. (5) A resume: `SessionEnd` whose reason is `resume`.
+    run(claude_event(at, "Stop", ""), &person);
+    run(
+        claude_event(at, "SessionEnd", r#","reason":"resume""#),
+        &person,
+    );
+    let after_resume = sessions();
+    // What the room said stays readable after its end.
+    daemon.post("SAID-WHILE-OPEN the codec is ported");
+    // (6) The real end.
+    run(
+        claude_event(at, "SessionEnd", r#","reason":"prompt_input_exit""#),
+        &person,
+    );
+    let after_end = sessions();
+    let (_, listed, _) = hook(&data, &cfg, &["room", "sessions", &room], "");
+    let (_, read, _) = hook(&data, &cfg, &["room", "read", &room], "");
+    eprintln!(
+        "[proof] a plain post from the named session: {named}\n[proof] from the nameless one: \
+         {nameless}\n[proof] after a restart: {after_restart:?}\n[proof] sessions listed: \
+         {nameless_listed}"
+    );
+    eprintln!(
+        "[proof] after opening: {after_open:?}\n[proof] after Stop and a resume: \
+         {after_resume:?}\n[proof] after the real end: {after_end:?}\n[proof] `vox room \
+         sessions`:\n{listed}\n[proof] `vox room read`:\n{read}"
+    );
+
+    let opened = of(&after_open, at);
+    assert!(
+        opened.len() == 1 && opened[0]["open"] == true && opened[0]["harness"] == "claude",
+        "PRODUCT: a session a person is at must open exactly one Session, named by the harness's \
+         own id, even after a sub-agent's event under that id; the room lists {after_open:?}"
+    );
+    assert!(
+        after_open.len() == 1,
+        "PRODUCT: a headless run must open no Session; the room lists {after_open:?}"
+    );
+    assert!(
+        opened[0]["name"] == "gso-cap",
+        "PRODUCT: a Session must carry the name its harness gives (the last `/rename`); the room \
+         lists {after_open:?}"
+    );
+    assert!(
+        named["from"] == at && named["at"]["session_name"] == "gso-cap",
+        "PRODUCT: a plain `vox room post` from a renamed session must carry its id and its name; \
+         it carried {named}"
+    );
+    assert!(
+        nameless["from"] == "0a1b2c3d-nameless" && nameless["at"]["session_name"].is_null(),
+        "PRODUCT: a post from a session with no name must carry its id and no name; it carried \
+         {nameless}"
+    );
+    assert!(
+        nameless_listed.contains("0a1b2c3d") && !nameless_listed.contains("nameless ·"),
+        "PRODUCT: a Session with no name must be shown by its short id; `vox room sessions` \
+         printed:\n{nameless_listed}"
+    );
+    assert!(
+        of(&after_restart, at).len() == 1 && openings == 1,
+        "PRODUCT: a daemon restarted mid-session must not open the session's Session again; the \
+         room's log holds {openings} opening(s) for it, and lists {after_restart:?}"
+    );
+    assert!(
+        of(&after_resume, at).len() == 1 && of(&after_resume, at)[0]["open"] == true,
+        "PRODUCT: `Stop` and a `SessionEnd` whose reason is `resume` must leave the Session open; \
+         the room lists {after_resume:?}"
+    );
+    let ended = of(&after_end, at);
+    assert!(
+        ended.len() == 1 && ended[0]["open"] == false && ended[0]["ended_millis"].is_u64(),
+        "PRODUCT: a real `SessionEnd` must end the Session, and keep it; the room lists \
+         {after_end:?}"
+    );
+    let short = &at[..8];
+    let ended_part = listed.split("ended:").nth(1).unwrap_or_default();
+    assert!(
+        ended_part.contains(short)
+            && !listed
+                .split("ended:")
+                .next()
+                .unwrap_or_default()
+                .contains(short),
+        "PRODUCT: an ended Session must be set apart under \"ended\", by its short id; `vox room \
+         sessions` printed:\n{listed}"
+    );
+    assert!(
+        read.contains("SAID-WHILE-OPEN the codec is ported"),
+        "PRODUCT: what was said in the room must stay readable after the Session ends; `vox room \
+         read` printed:\n{read}"
+    );
+}
+
+#[test]
+#[ignore = "production Argon2id at setup + two real daemons and a join; CI runs it in release"]
+fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    // Alice holds two rooms; the agent's node holds none.
+    let alice = Daemon::start(&tmp.path().join("alice"));
+    let (ok, _, err) = hook(
+        &alice.data,
+        &alice.cfg,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "elsewhere",
+        ],
+        "other passphrase",
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's second `vox room create` failed: {err}"
+    );
+    let (_, listed, _) = hook(&alice.data, &alice.cfg, &["room", "list"], "");
+    let home: String = alice.room_key.chars().take(12).collect();
+    let other = listed
+        .lines()
+        .find(|l| l.contains("elsewhere"))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_else(|| panic!("PRODUCT (staging): alice lists no second room: {listed}"))
+        .to_owned();
+    let (link_home, link_other) = (alice.link(&home), alice.link(&other));
+    let agent = Daemon::start_bare(&tmp.path().join("agent"));
+    let (data, cfg) = (agent.data.clone(), agent.cfg.clone());
+
+    // The agent's data root maps two directories: the repository to Alice's first room, and
+    // another repository to her second.
+    let repo = tmp.path().join("repo");
+    let other_repo = tmp.path().join("other-repo");
+    for d in [repo.join("sub"), other_repo.clone()] {
+        std::fs::create_dir_all(&d).expect("APPARATUS: cannot make a repository directory");
+    }
+    let map = data.join("rooms");
+    std::fs::write(
+        &map,
+        format!(
+            "repo {}\n    room       {link_home}\n    passphrase channel passphrase\n\n\
+             repo {}\n    room       {link_other}\n    passphrase other passphrase\n",
+            repo.display(),
+            other_repo.display()
+        ),
+    )
+    .expect("APPARATUS: cannot write the room map");
+    std::fs::set_permissions(
+        &map,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .expect("APPARATUS: cannot make the room map private");
+
+    let person = [("CLAUDE_CODE_ENTRYPOINT", "cli")];
+    let turn = |session: &str, cwd: &Path| -> String {
+        let payload = format!(
+            r#"{{"session_id":"{session}","hook_event_name":"UserPromptSubmit","cwd":"{}","prompt":"hi","transcript_path":"/tmp/t.jsonl"}}"#,
+            cwd.display()
+        );
+        let (ok, out, err) = hook_env(
+            &data,
+            &cfg,
+            &["agent", "hook", "--node", "default"],
+            &payload,
+            &person,
+        );
+        assert!(ok, "PRODUCT: the hook must exit 0; it said {out}{err}");
+        out
+    };
+    let rooms = || hook(&data, &cfg, &["room", "list"], "").1;
+    let sessions = |room: &str| -> Vec<serde_json::Value> {
+        let (_, out, _) = hook(&data, &cfg, &["room", "sessions", room, "--json"], "");
+        out.lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    };
+    let open_in = |room: &str, id: &str| {
+        sessions(room)
+            .iter()
+            .any(|r| r["id"] == id && r["open"] == true)
+    };
+
+    // (1) A session started in the mapped directory: its node joins the room by itself.
+    let mapped = "11111111-aaaa-4bbb-8ccc-000000000001";
+    let first = turn(mapped, &repo);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut turns = 1;
+    while !(rooms().contains(&home) && open_in(&home, mapped)) {
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: a session started in {} (mapped to room {home}) never worked there within \
+             120 s: the node's rooms {:?}, the room's Sessions {:?}; its first turn was told \
+             {first:?}",
+            repo.display(),
+            rooms(),
+            sessions(&home)
+        );
+        std::thread::sleep(Duration::from_secs(2));
+        turn(mapped, &repo);
+        turns += 1;
+    }
+    eprintln!("[proof] (1) first turn told: {first:?}; working in {home} after {turns} turns");
+    assert!(
+        first.contains("joining room"),
+        "PRODUCT: a session whose room is being joined must be told so on its turn; it was told \
+         {first:?}"
+    );
+
+    // (2) A session started in a subfolder of the mapped directory: no room.
+    let below = "22222222-aaaa-4bbb-8ccc-000000000002";
+    let told = turn(below, &repo.join("sub"));
+    eprintln!("[proof] (2) a session started in repo/sub was told: {told:?}");
+    assert!(
+        told.contains("this session works in no room") && told.contains("vox agent room <room>"),
+        "PRODUCT: a session started in a subfolder of a mapped directory must be told it works in \
+         no room, with the command that sets one; it was told {told:?}"
+    );
+    assert!(
+        !sessions(&home).iter().any(|r| r["id"] == below),
+        "PRODUCT: a session started below a mapped directory must open no Session in its room: \
+         {:?}",
+        sessions(&home)
+    );
+
+    // (3) The first session, later working in another mapped repository, stays where it was.
+    let later = turn(mapped, &other_repo);
+    std::thread::sleep(Duration::from_secs(5));
+    let later2 = turn(mapped, &other_repo);
+    eprintln!("[proof] (3) its turns in other-repo were told: {later:?} / {later2:?}");
+    assert!(
+        open_in(&home, mapped) && !rooms().contains(&other) && !later.contains("no room"),
+        "PRODUCT: a session's room must not change because of where it works later: its Session \
+         in {home} {:?}, the node's rooms {:?}",
+        sessions(&home),
+        rooms()
+    );
+
+    // (4) `vox agent room`, run as the session in no room, sets its room.
+    let as_below = [("VOX_SESSION", below), ("VOX_NODE", "default")];
+    let (ok, set, err) = hook_env(&data, &cfg, &["agent", "room", &home], "", &as_below);
+    eprintln!("[proof] (4) `vox agent room {home}` said: {set}{err}");
+    let said_before = set
+        .lines()
+        .position(|l| l.starts_with("vox: about to set the room") && l.contains(&home));
+    let said_after = set.lines().position(|l| {
+        l.starts_with("vox: session") && l.contains(&format!("now works in room {home}"))
+    });
+    assert!(
+        ok && matches!((said_before, said_after), (Some(b), Some(a)) if b < a),
+        "PRODUCT: `vox agent room` must say what it is to do, then that the session works in the \
+         room: {set}{err}"
+    );
+    assert!(
+        set.contains("run this in a terminal: vox agent room"),
+        "PRODUCT: run with no terminal, `vox agent room` must say how the operator can also save \
+         the start directory in the room map: {set}"
+    );
+    let next = turn(below, &repo.join("sub"));
+    assert!(
+        open_in(&home, below) && !next.contains("works in no room"),
+        "PRODUCT: after `vox agent room`, the session must work in that room: its Session {:?}; \
+         its next turn was told {next:?}",
+        sessions(&home)
+    );
+
+    // (4b) The operator, at a terminal, saves repo/sub → that room in the room map.
+    let saved = in_terminal(
+        &data,
+        &cfg,
+        &[
+            "agent",
+            "room",
+            &home,
+            "--node",
+            "default",
+            "--session",
+            below,
+        ],
+        &[
+            ("in the room map? [y/N]", "y\r"),
+            ("Enter if it has none", "channel passphrase\r"),
+        ],
+    );
+    eprintln!("[proof] (4b) at a terminal it said: {saved}");
+    assert!(
+        saved.contains("every node of this data root can read the map")
+            && saved.contains("vox: saved"),
+        "PRODUCT: at a terminal, `vox agent room` must say what saving changes, then save: {saved}"
+    );
+    // The next session started there works in that room by itself.
+    let fresh = "33333333-aaaa-4bbb-8ccc-000000000003";
+    let first_fresh = turn(fresh, &repo.join("sub"));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !open_in(&home, fresh) {
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: after the room map saved repo/sub, a session started there must work in \
+             room {home} by itself: its Sessions {:?}; its first turn was told {first_fresh:?}",
+            sessions(&home)
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    assert!(
+        !first_fresh.contains("works in no room"),
+        "PRODUCT: a session started in a saved directory must not be told it works in no room: \
+         {first_fresh:?}"
+    );
+
+    // (5) Run again for another room the node holds, it moves the session.
+    let (ok, _, err) = hook(
+        &data,
+        &cfg,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "scratch",
+        ],
+        "scratch passphrase",
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): the agent node's `vox room create` failed: {err}"
+    );
+    let scratch = rooms()
+        .lines()
+        .find(|l| l.contains("scratch"))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_default()
+        .to_owned();
+    let (ok, moved, err) = hook_env(&data, &cfg, &["agent", "room", &scratch], "", &as_below);
+    eprintln!("[proof] (5) `vox agent room {scratch}` said: {moved}{err}");
+    let ended_in_home = sessions(&home)
+        .iter()
+        .any(|r| r["id"] == below && r["open"] == false);
+    assert!(
+        ok && moved.contains("about to move session")
+            && open_in(&scratch, below)
+            && ended_in_home
+            && !open_in(&home, below),
+        "PRODUCT: moving a session must end its Session in the room it worked in and open one in \
+         the new room: in {home} {:?}, in {scratch} {:?}; it said {moved}{err}",
+        sessions(&home),
+        sessions(&scratch)
+    );
+
+    // (6) A mapped room whose host is gone: the join fails, and the session is told why on a
+    // later turn, even though that turn tries the join again.
+    let ghost = Daemon::start(&tmp.path().join("ghost"));
+    let ghost_room: String = ghost.room_key.chars().take(12).collect();
+    let ghost_link = ghost.link(&ghost_room);
+    drop(ghost); // its daemon, killed by its own handle
+    let gone_repo = tmp.path().join("gone-repo");
+    std::fs::create_dir_all(&gone_repo).expect("APPARATUS: cannot make a repository directory");
+    let mut text = std::fs::read_to_string(&map).expect("APPARATUS: cannot read the room map");
+    text.push_str(&format!(
+        "\nrepo {}\n    room       {ghost_link}\n    passphrase channel passphrase\n",
+        gone_repo.display()
+    ));
+    std::fs::write(&map, text).expect("APPARATUS: cannot write the room map");
+    let stranded = "44444444-aaaa-4bbb-8ccc-000000000004";
+    let first_try = turn(stranded, &gone_repo);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut told = String::new();
+    while !told.contains("could not join room") {
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: a session whose mapped room could not be joined must be told why on a later \
+             turn; within 120 s its turns were told only {told:?} (first: {first_try:?})"
+        );
+        std::thread::sleep(Duration::from_secs(5));
+        told = turn(stranded, &gone_repo);
+    }
+    eprintln!("[proof] (6) a turn after the join failed was told: {told:?}");
+    assert!(
+        first_try.contains("joining room")
+            && told.contains(&format!("could not join room {ghost_room}")),
+        "PRODUCT: the session must be told the join is under way, then why it failed: first \
+         {first_try:?}, later {told:?}"
+    );
+}
+
+/// Run `vox args` on a pseudo-terminal, as an operator types at one, answering each prompt that
+/// `answers` names (a piece of the question, the keys) in order: everything it printed.
+fn in_terminal(data: &Path, cfg: &Path, args: &[&str], answers: &[(&str, &str)]) -> String {
+    use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem as _};
+    use std::io::Read;
+    use std::sync::{Arc, Mutex};
+    let pair = NativePtySystem::default()
+        .openpty(PtySize {
+            rows: 50,
+            cols: 200,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("APPARATUS: open a pty");
+    let mut cmd = CommandBuilder::new(VOX);
+    cmd.args(args);
+    cmd.env("VOX_DATA_DIR", data);
+    cmd.env("VOX_CONFIG_DIR", cfg);
+    cmd.env("TERM", "xterm-256color");
+    for v in HARNESS_VARS {
+        cmd.env_remove(v);
+    }
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("APPARATUS: spawn vox on a pty");
+    drop(pair.slave);
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("APPARATUS: pty reader");
+    let mut input = pair.master.take_writer().expect("APPARATUS: pty writer");
+    let said = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&said);
+    let master = pair.master;
+    std::thread::spawn(move || {
+        let _master = master;
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => sink
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n])),
+            }
+        }
+    });
+    let text = || said.lock().unwrap().replace('\r', "");
+    for (question, keys) in answers {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !text().contains(question) {
+            if Instant::now() >= deadline || child.try_wait().ok().flatten().is_some() {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "PRODUCT: `vox {args:?}` at a terminal never asked {question:?}; it said:\n{}",
+                    text()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        input
+            .write_all(keys.as_bytes())
+            .and_then(|()| input.flush())
+            .expect("APPARATUS: type at the pty");
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while child.try_wait().ok().flatten().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "PRODUCT: `vox {args:?}` at a terminal did not finish within 60 s; it said:\n{}",
+                text()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    text()
 }

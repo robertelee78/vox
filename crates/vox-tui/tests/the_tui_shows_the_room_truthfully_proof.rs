@@ -4,7 +4,7 @@
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob, Carol and
 //! Dave (Alice and Bob trust each other, nobody trusts Carol, Bob trusts Dave and Dave nobody),
 //! Alice posts 70 lines, and Bob's real `vox tui` is read through the `pyte` terminal emulator at
-//! 160x50. It checks thirty-four claims, each
+//! 160x50. It checks thirty-seven claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -44,12 +44,16 @@
 //!   Ctrl-R and sends q-answer. His post's `re` names q-mid, and the TUI shows it under "┆ alice:
 //!   q-mid…", one level, never q-root, while q-mid itself is off screen (ADR-028 R-9, #485);
 //! - `jump`: Bob selects q-answer and presses Enter, and q-mid is scrolled to and selected;
+//! - `address`: a canonical address Alice posts reads as Bob's node writes it, "open
+//!   nas-web.alice.family.vox please" (ADR-028 S-1a, #488);
 //! - `consent`: who reads whom, in words (ADR-028 R-5, #481): Carol, whom Bob never trusted, reads
 //!   "not in keyring: trust to read each other", Dave, whom he trusts and who trusts nobody,
 //!   "waiting for the other side", and Alice "trusted both ways" (the pane said "consented" for
 //!   everyone, then "? unverified" on every row and "← in-only" for Carol, though Bob's node
 //!   refuses her key; V210-155); and no row of the pane names a verified, TOFU or key-changed
 //!   state, a consent or a block: one trust state, in the keyring or not (ADR-028 K-2, K-6, #473);
+//! - `capability`: under each member's state line, what Bob's keyring grants it: Alice "read",
+//!   Dave "read + drive", Carol (not in his keyring) nothing (ADR-028 K-14, #525);
 //! - `look`: in truecolour, Alice's row reads "⇄ alice" (each trusts the other) and Dave's
 //!   "→ dave" (only Bob trusts him), both in text.primary bold, and Carol's "· <fingerprint>" in
 //!   text.secondary, not bold; the accent is on the focused members pane's border and nowhere
@@ -108,13 +112,18 @@
 //!   does not pull, are each named ("image carols.png 96×64 — drawn once it is pulled and
 //!   verified") and no kitty graphics are written; one she shares to the room is drawn as kitty
 //!   graphics once Bob's node has pulled and verified it (ADR-028 F-11, #502).
+//! - `gone`: the pty's master closed under Bob's TUI, attached and in the room, as a closed window
+//!   or a dropped ssh session closes it, the TUI has exited within 5 s (#557: an orphaned TUI spun
+//!   in a read of its hung-up terminal for a day, deaf to SIGTERM and SIGHUP);
+//! - `signals`: SIGHUP, and SIGTERM, sent to a running TUI of Bob's, each stops it with exit 0
+//!   within 5 s (V210-93, #557).
 //!
 //! The `target`, `delivers` and `revoke` claims are gone with `:consent grant|revoke` (V210-148): a
 //! key goes only to a member the owner trusts, so the TUI has no per-room grant to aim.
 //!
 //! Each claim turns red against a product that restores its defect: the timeline drawn from the
 //! top, a scroll not clamped to the oldest line, the room's own lines (who named it) not drawn,
-//! every member shown `Trust::Trusted`, a stub command restored, the message pane's `reveal` removed, a member whose read records Bob cannot open named
+//! an address in a message left canonical, every member shown `Trust::Trusted`, a stub command restored, the message pane's `reveal` removed, a member whose read records Bob cannot open named
 //! as not having read, every message marked read whether drawn or not, a message called held by a
 //! node that has not said it holds it, a read record named by a read record, `SyncStatus`
 //! hard-coded (idle, or any one count), `Reachability` hard-coded either way, a notification that
@@ -127,9 +136,11 @@
 //! composer's To: and urgent left off what it sends, an attach's note posted as a message of its own, a quote of the thread's root rather than `re`, Enter on a reply not
 //! moving the selection, a trusted member shown as "verified" (`consent`), `:node <name>` acting as
 //! another node again, a copied command that is not the service's canonical address (`copies`), or
-//! a pasted fingerprint that is not the node's let through to the keyring (`trust`), or an image
-//! drawn before this node's copy is verified (`inline`). It passes only on the script's PASS with
-//! all 34 claims ok.
+//! a pasted fingerprint that is not the node's let through to the keyring (`trust`), an image
+//! drawn before this node's copy is verified (`inline`), a member's keyring capability not
+//! drawn (`capability`), or a read of a hung-up terminal that never returns (`gone`). It passes
+//! only on the script's PASS with
+//! all 38 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -225,7 +236,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (34 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (38 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -239,8 +250,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (34, 34),
-                "APPARATUS: the driver said PASS without all 34 claims ok: {said}"
+                (38, 38),
+                "APPARATUS: the driver said PASS without all 38 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),

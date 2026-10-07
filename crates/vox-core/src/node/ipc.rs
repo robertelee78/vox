@@ -165,6 +165,8 @@ const T_NEW_ENTRY: u64 = 10;
 const T_CHANNEL_OPENED: u64 = 13;
 const T_CHANNEL_CLOSED: u64 = 14;
 const T_PEER_JOINED: u64 = 15;
+/// `[2525, fingerprint, drive]` — [`NodeEvent::CapabilityChanged`] (ADR-028 K-14).
+const T_CAPABILITY_CHANGED: u64 = 2525;
 const T_SENDER_KEY: u64 = 16;
 const T_FORWARDING: u64 = 17;
 const T_INVITE_LINK: u64 = 18;
@@ -298,6 +300,8 @@ const T_RETENTION: u64 = 23;
 const T_ORDER: u64 = 24;
 // Renaming a trusted identity keeps its history grant (PRD-001 R12, R20's `vox name`).
 const T_RENAME: u64 = 25;
+/// `[525, target, drive, identity_passphrase]` — [`Request::SetCapability`] (ADR-028 K-14).
+const T_SET_CAPABILITY: u64 = 525;
 // **Liveness** (V210-83). Answered by the actor and changes nothing, so a client waiting on a long
 // request can tell a node at work from a suspended or stuck one. Not a protocol bump: a node that
 // does not know it answers with an error, and any answer is proof of life.
@@ -348,6 +352,17 @@ const T_SHARE_STOP: u64 = 4931;
 const T_SHARE_LIST: u64 = 4932;
 /// [`Frame::Shares`].
 const T_SHARES: u64 = 4933;
+// Session entries, sealed to members with drive (ADR-029 SC-1, SC-2). Additive.
+/// `[5430, channel_id, session_id, body]` — [`Request::AppendSession`].
+const T_SESSION_APPEND: u64 = 5430;
+/// `[5431, channel_id]` — [`Request::SessionEntries`].
+const T_SESSION_ENTRIES: u64 = 5431;
+/// [`Frame::SessionEntries`].
+const T_SESSION_ROWS: u64 = 5432;
+const T_SESSIONS_REQ: u64 = 4940;
+const T_SESSIONS: u64 = 4941;
+/// [`Frame::Appended`].
+const T_APPENDED: u64 = 5433;
 
 /// What a client sends.
 ///
@@ -466,6 +481,28 @@ pub enum Request {
         /// The room.
         channel_id: Digest32,
     },
+    /// Append one entry of a Session (ADR-029 SC-1), sealed under this node's drive key so only
+    /// members it trusts with drive read it (SC-2). The session's hook sends it; it never shows in
+    /// the room's timeline (SC-4).
+    AppendSession {
+        /// The room the session works in.
+        channel_id: Digest32,
+        /// The harness's own session id (SE-2).
+        session_id: String,
+        /// The activity item, in the harnesses' shared format.
+        body: String,
+    },
+    /// The Session entries this node can read in a room (ADR-029 SC-2): its own, and those of
+    /// each node that released it its drive key. Answered with [`Frame::SessionEntries`].
+    SessionEntries {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// A room's Sessions (ADR-029), as its log says, answered with [`Frame::Sessions`].
+    Sessions {
+        /// The room.
+        channel_id: Digest32,
+    },
     /// Stop offering a service.
     RemoveService {
         /// The room.
@@ -548,9 +585,20 @@ pub enum Request {
         petname: String,
         /// The identity passphrase, or empty for none: within the window none is needed.
         identity_passphrase: zeroize::Zeroizing<String>,
-        /// Whether its consents release this node's full history (PRD-001 R12). On the
-        /// wire only when `true`, so an older client's request still decodes.
+        /// Whether its consents release this node's full history (PRD-001 R12).
         full_history: bool,
+        /// Whether the entry carries drive as well as read (ADR-028 K-14, K-16).
+        drive: bool,
+    },
+    /// Change what a trusted identity's entry grants, read or read + drive (ADR-028 K-14): a
+    /// keyring change, behind the passphrase gate as [`Request::Trust`] is.
+    SetCapability {
+        /// The trusted identity, as a full fingerprint.
+        target: Digest32,
+        /// Whether its entry carries drive from now on.
+        drive: bool,
+        /// The identity passphrase, or empty for none: within the window none is needed.
+        identity_passphrase: zeroize::Zeroizing<String>,
     },
     /// Set a room's retention (ADR-023 decision 2). **Not gated on the identity passphrase**
     /// (ADR-028 K-11, ADR-010 AR-28 as amended): the passphrase is asked for only to attach a node
@@ -818,8 +866,25 @@ impl Request {
                     .bytes(channel_id)
                     .text(selector);
             }
+            Request::Sessions { channel_id } => {
+                e.array(2).uint(T_SESSIONS_REQ).bytes(channel_id);
+            }
             Request::ShareList { channel_id } => {
                 e.array(2).uint(T_SHARE_LIST).bytes(channel_id);
+            }
+            Request::AppendSession {
+                channel_id,
+                session_id,
+                body,
+            } => {
+                e.array(4)
+                    .uint(T_SESSION_APPEND)
+                    .bytes(channel_id)
+                    .text(session_id)
+                    .text(body);
+            }
+            Request::SessionEntries { channel_id } => {
+                e.array(2).uint(T_SESSION_ENTRIES).bytes(channel_id);
             }
             Request::Rooms { after } => {
                 e.array(2)
@@ -922,15 +987,26 @@ impl Request {
                 petname,
                 identity_passphrase,
                 full_history,
+                drive,
             } => {
-                e.array(if *full_history { 5 } else { 4 })
+                e.array(6)
                     .uint(T_TRUST)
                     .bytes(target)
                     .text(petname)
+                    .text(identity_passphrase)
+                    .uint(u64::from(*full_history))
+                    .uint(u64::from(*drive));
+            }
+            Request::SetCapability {
+                target,
+                drive,
+                identity_passphrase,
+            } => {
+                e.array(4)
+                    .uint(T_SET_CAPABILITY)
+                    .bytes(target)
+                    .uint(u64::from(*drive))
                     .text(identity_passphrase);
-                if *full_history {
-                    e.uint(1);
-                }
             }
             Request::Rename {
                 target,
@@ -1157,14 +1233,12 @@ impl Request {
                     entries,
                 })
             }
-            (T_TRUST, n @ (4 | 5)) => {
+            (T_TRUST, 6) => {
                 let target = digest(&mut d)?;
                 let petname = text(&mut d, "ipc petname")?;
                 let identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
-                let full_history = n == 5
-                    && d.uint()
-                        .map_err(|_| Error::MalformedBundle("ipc history"))?
-                        == 1;
+                let full_history = flag(&mut d, "ipc history")?;
+                let drive = flag(&mut d, "ipc drive")?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Trust {
@@ -1172,6 +1246,19 @@ impl Request {
                     petname,
                     identity_passphrase,
                     full_history,
+                    drive,
+                })
+            }
+            (T_SET_CAPABILITY, 4) => {
+                let target = digest(&mut d)?;
+                let drive = flag(&mut d, "ipc drive")?;
+                let identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::SetCapability {
+                    target,
+                    drive,
+                    identity_passphrase,
                 })
             }
             (T_RENAME, 4) => {
@@ -1263,6 +1350,30 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::ShareList { channel_id })
+            }
+            (T_SESSION_APPEND, 4) => {
+                let channel_id = digest(&mut d)?;
+                let session_id = text(&mut d, "ipc session id")?;
+                let body = text(&mut d, "ipc session entry")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::AppendSession {
+                    channel_id,
+                    session_id,
+                    body,
+                })
+            }
+            (T_SESSION_ENTRIES, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::SessionEntries { channel_id })
+            }
+            (T_SESSIONS_REQ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Sessions { channel_id })
             }
             (T_ADD_SERVICE, 5) => {
                 let channel_id = digest(&mut d)?;
@@ -1515,8 +1626,8 @@ pub enum Frame {
     },
     /// The trust keyring a [`Request::TrustList`] asked for.
     Trusted {
-        /// `(fingerprint, petname)` in fingerprint order.
-        entries: Vec<(Digest32, String)>,
+        /// `(fingerprint, petname, capability)` in fingerprint order (ADR-028 K-14).
+        entries: Vec<(Digest32, String, crate::node::trust::Capability)>,
     },
     /// The rooms a [`Request::Rooms`] asked for.
     Rooms {
@@ -1539,6 +1650,22 @@ pub enum Frame {
     Shares {
         /// Each share.
         shares: Vec<crate::node::shares::ShareRow>,
+    },
+    /// The Session entry a [`Request::AppendSession`] appended.
+    Appended {
+        /// Its entry hash.
+        entry: Digest32,
+    },
+    /// Session entries, as a [`Request::SessionEntries`] asked for, in the order this node
+    /// opened or wrote them.
+    SessionEntries {
+        /// Each entry.
+        rows: Vec<crate::node::drive::SessionRow>,
+    },
+    /// A room's Sessions, oldest opening first, as a [`Request::Sessions`] asked for.
+    Sessions {
+        /// Each Session.
+        sessions: Vec<crate::node::sessions::SessionRow>,
     },
 }
 
@@ -1645,8 +1772,11 @@ impl Frame {
             }
             Frame::Trusted { entries } => {
                 e.array(2).uint(T_TRUSTED).array(entries.len());
-                for (id, petname) in entries {
-                    e.array(2).bytes(id).text(petname);
+                for (id, petname, capability) in entries {
+                    e.array(3)
+                        .bytes(id)
+                        .text(petname)
+                        .uint(u64::from(capability.drive()));
                 }
             }
             Frame::Services {
@@ -1682,6 +1812,24 @@ impl Frame {
                         .uint(r.fetched)
                         .uint(r.files);
                 }
+            }
+            Frame::Appended { entry } => {
+                e.array(2).uint(T_APPENDED).bytes(entry);
+            }
+            Frame::SessionEntries { rows } => {
+                e.array(2).uint(T_SESSION_ROWS).array(rows.len());
+                for r in rows {
+                    e.array(5)
+                        .bytes(&r.entry_hash)
+                        .bytes(&r.author)
+                        .uint(r.created_millis)
+                        .text(&r.session_id)
+                        .text(&r.body);
+                }
+            }
+            Frame::Sessions { sessions } => {
+                e.array(2).uint(T_SESSIONS);
+                crate::node::sessions::put_rows(&mut e, sessions);
             }
         }
         e.finish()
@@ -1758,6 +1906,12 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         }
         NodeEvent::WaitingForProfile => {
             e.array(1).uint(T_WAITING_FOR_PROFILE);
+        }
+        NodeEvent::CapabilityChanged { fingerprint, drive } => {
+            e.array(3)
+                .uint(T_CAPABILITY_CHANGED)
+                .bytes(fingerprint)
+                .uint(u64::from(*drive));
         }
         NodeEvent::Shutdown => {
             e.array(1).uint(T_SHUTDOWN);
@@ -2257,6 +2411,43 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             }
             return Ok(Frame::Shares { shares });
         }
+        (T_APPENDED, 2) => {
+            let entry = digest(d)?;
+            return Ok(Frame::Appended { entry });
+        }
+        (T_SESSION_ROWS, 2) => {
+            let count = d
+                .array()
+                .map_err(|_| Error::MalformedIpc("ipc session entries array"))?;
+            let mut rows = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                if d.array()
+                    .map_err(|_| Error::MalformedIpc("ipc session entry row"))?
+                    != 5
+                {
+                    return Err(Error::MalformedIpc("ipc session entry arity"));
+                }
+                let entry_hash = digest(d)?;
+                let author = digest(d)?;
+                let created_millis = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc session entry time"))?;
+                let session_id = text(d, "ipc session id")?;
+                let body = text(d, "ipc session entry body")?;
+                rows.push(crate::node::drive::SessionRow {
+                    entry_hash,
+                    author,
+                    created_millis,
+                    session_id,
+                    body,
+                });
+            }
+            return Ok(Frame::SessionEntries { rows });
+        }
+        (T_SESSIONS, 2) => {
+            let sessions = crate::node::sessions::read_rows(d)?;
+            return Ok(Frame::Sessions { sessions });
+        }
         (T_TRUSTED, 2) => {
             let count = d
                 .array()
@@ -2266,7 +2457,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 let arity = d
                     .array()
                     .map_err(|_| Error::MalformedIpc("ipc trusted row"))?;
-                if arity != 2 {
+                if arity != 3 {
                     return Err(Error::MalformedIpc("ipc trusted row arity"));
                 }
                 let id = digest(d)?;
@@ -2274,7 +2465,12 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                     .text()
                     .map_err(|_| Error::MalformedIpc("ipc trusted petname"))?
                     .to_owned();
-                entries.push((id, petname));
+                let capability = if flag(d, "ipc trusted capability")? {
+                    crate::node::trust::Capability::ReadDrive
+                } else {
+                    crate::node::trust::Capability::Read
+                };
+                entries.push((id, petname, capability));
             }
             return Ok(Frame::Trusted { entries });
         }
@@ -2308,6 +2504,10 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
         (T_SHUTDOWN, 1) => NodeEvent::Shutdown,
         (T_CHANNEL_OPENED, 2) => NodeEvent::ChannelOpened {
             channel_id: digest(d)?,
+        },
+        (T_CAPABILITY_CHANGED, 3) => NodeEvent::CapabilityChanged {
+            fingerprint: digest(d)?,
+            drive: flag(d, "ipc event drive")?,
         },
         (T_CHANNEL_CLOSED, 2) => NodeEvent::ChannelClosed {
             channel_id: digest(d)?,
@@ -3473,6 +3673,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             petname,
             identity_passphrase,
             full_history,
+            drive,
         } => match verify_given(handle, identity_passphrase).await {
             Err(f) => f,
             Ok(proved) => match handle
@@ -3487,6 +3688,11 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                             } else {
                                 crate::node::trust::HistoryGrant::Now
                             },
+                            capability: Some(if drive {
+                                crate::node::trust::Capability::ReadDrive
+                            } else {
+                                crate::node::trust::Capability::Read
+                            }),
                         },
                     )
                     .await,
@@ -3573,10 +3779,53 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         // **A read, so no passphrase** (V210-162, V210-165): the names this node gave its
         // members are how every surface on this account names an author, the agent drain
         // included, and the OS account is the boundary. Only a change to the keyring is gated.
-        Request::TrustList { after, .. } => Frame::Trusted {
-            entries: page(handle.view().trusted, after, |(id, petname)| {
-                (*id, petname.len())
-            }),
+        Request::TrustList { after, .. } => {
+            let view = handle.view();
+            let rows = view
+                .trusted
+                .into_iter()
+                .map(|(id, petname)| {
+                    let capability = if view.drive.contains(&id) {
+                        crate::node::trust::Capability::ReadDrive
+                    } else {
+                        crate::node::trust::Capability::Read
+                    };
+                    (id, petname, capability)
+                })
+                .collect();
+            Frame::Trusted {
+                entries: page(rows, after, |(id, petname, _)| (*id, petname.len())),
+            }
+        }
+        // A keyring change (ADR-028 K-14), gated as `Request::Trust` is.
+        Request::SetCapability {
+            target,
+            drive,
+            identity_passphrase,
+        } => match verify_given(handle, identity_passphrase).await {
+            Err(f) => f,
+            Ok(proved) => match handle
+                .apply(
+                    proved_if(
+                        proved,
+                        crate::node::api::NodeCommand::SetCapability {
+                            fingerprint: target,
+                            capability: if drive {
+                                crate::node::trust::Capability::ReadDrive
+                            } else {
+                                crate::node::trust::Capability::Read
+                            },
+                        },
+                    )
+                    .await,
+                )
+                .await
+            {
+                crate::node::api::Outcome::Done => Frame::Ok,
+                other => Frame::Error {
+                    reason: other.to_string(),
+                },
+            },
         },
         Request::MarkRead {
             channel_id,
@@ -3605,6 +3854,9 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             } else {
                 text
             };
+            // **The session's name, filled by its node** (ADR-029 MD-2): whatever verb or client
+            // posted, a message from a registered session carries the name its harness gives.
+            let text = crate::node::sessions::fill_name(handle.paths(), &text);
             // A room just joined is written to once its first sync with another member has ended
             // (V210-164), usually within a second: `vox room join … && vox room post …` waits for
             // that rather than failing.
@@ -3919,6 +4171,44 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         Request::ShareList { channel_id } => Frame::Shares {
             shares: handle.shares().list(&channel_id).await,
         },
+        Request::AppendSession {
+            channel_id,
+            session_id,
+            body,
+        } => match handle
+            .apply(crate::node::api::NodeCommand::AppendSession {
+                channel_id,
+                session_id,
+                body,
+            })
+            .await
+        {
+            crate::node::api::Outcome::Appended(entry) => Frame::Appended { entry },
+            other => Frame::Error {
+                reason: other.to_string(),
+            },
+        },
+        Request::SessionEntries { channel_id } => match handle.session_rows(channel_id).await {
+            Some(rows) => Frame::SessionEntries { rows },
+            None => Frame::Error {
+                reason: "room not open".into(),
+            },
+        },
+        Request::Sessions { channel_id } => {
+            if !handle
+                .view()
+                .open_channels
+                .iter()
+                .any(|d| d.channel_id == channel_id)
+            {
+                return Frame::Error {
+                    reason: "room not open".into(),
+                };
+            }
+            Frame::Sessions {
+                sessions: crate::node::sessions::of_room(handle, &channel_id),
+            }
+        }
         Request::Services { channel_id } => match handle.open_detail(channel_id).await {
             Some(detail) => Frame::Services {
                 room: crate::node::resolver::room_shown_here(

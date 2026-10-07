@@ -503,6 +503,9 @@ pub struct ChannelDetail {
     /// What this node's person has not read here, oldest first
     /// ([`crate::node::channel::ChannelState::unread`]): what a client counts at its start.
     pub unread: Vec<Digest32>,
+    /// The nodes whose Sessions this node can read inside here (ADR-029 SC-2), sorted: itself, and
+    /// each node whose drive key it holds. What a Session's `can_drive` is said from.
+    pub drive_from: Vec<Digest32>,
 }
 
 /// The node's latest-wins view (published over a `watch`).
@@ -532,6 +535,9 @@ pub struct NodeView {
     /// The trust keyring: `(fingerprint, petname)` in fingerprint order, empty
     /// while locked because the keyring is sealed under the identity (ADR-020 §3).
     pub trusted: Vec<(Digest32, String)>,
+    /// The keyring entries that carry drive (ADR-028 K-14), in fingerprint order; every other
+    /// entry in [`NodeView::trusted`] grants read.
+    pub drive: Vec<Digest32>,
     /// Peers this node currently reaches **through a relay** rather than directly.
     ///
     /// Worth surfacing rather than hiding: a relayed path means a third party is carrying
@@ -749,6 +755,18 @@ pub enum NodeCommand {
         petname: String,
         /// What its consents release.
         history: crate::node::trust::HistoryGrant,
+        /// What the entry grants (ADR-028 K-14); `None` keeps what it grants now, and read for a
+        /// new entry.
+        capability: Option<crate::node::trust::Capability>,
+    },
+    /// Change what a trusted identity's keyring entry grants, read or read + drive (ADR-028
+    /// K-14): a keyring change, behind the passphrase gate. Fails with [`Fault::NotConsented`]
+    /// for an identity that is not trusted.
+    SetCapability {
+        /// The trusted identity.
+        fingerprint: Digest32,
+        /// What its entry grants from now on.
+        capability: crate::node::trust::Capability,
     },
     /// Stop trusting an identity node-wide, and **change the lock** (ADR-020 §3).
     ///
@@ -869,6 +887,16 @@ pub enum NodeCommand {
         channel_id: Digest32,
         /// The new name, one DNS label (ADR-028 R-2).
         name: String,
+    },
+    /// Append one entry of a Session (ADR-029 SC-1), sealed under this node's drive key so only
+    /// members it trusts with drive read it (SC-2).
+    AppendSession {
+        /// The channel.
+        channel_id: Digest32,
+        /// The harness's own session id.
+        session_id: String,
+        /// The activity item.
+        body: String,
     },
     /// Reconcile a channel's log with the members this node can reach (ADR-008
     /// frontier sync).
@@ -1113,7 +1141,7 @@ impl Fault {
             }
             Fault::WrongPassphrase => "the passphrase is wrong",
             Fault::PassphraseNeeded => {
-                "changing who you trust needs your identity passphrase: it was not entered for a keyring change in the last 30 minutes\n       give it, and the change is made: `vox trust` asks at a terminal, or takes --identity-passphrase-file or VOX_IDENTITY_PASSPHRASE"
+                "changing who you trust needs your identity passphrase: it was not entered for a keyring change in the last 30 minutes\n       type it, and the change is made: `vox trust` asks for it at a terminal"
             }
             Fault::PassphraseEmpty => {
                 "every node has an identity passphrase, and an empty one is refused; nothing was created"
@@ -1415,6 +1443,9 @@ pub enum Outcome {
         /// The room's retention, seconds (`0` = forever).
         room: u64,
     },
+    /// A Session entry was appended (ADR-029 SC-1): its entry hash, which a later entry's `re`
+    /// names.
+    Appended(Digest32),
     /// The command failed for the given reason.
     Failed(Fault),
 }
@@ -1446,7 +1477,7 @@ impl Outcome {
     pub fn is_done(self) -> bool {
         matches!(
             self,
-            Outcome::Done | Outcome::Bound(_) | Outcome::OwnRetention { .. }
+            Outcome::Done | Outcome::Bound(_) | Outcome::OwnRetention { .. } | Outcome::Appended(_)
         )
     }
 }
@@ -1456,6 +1487,9 @@ impl std::fmt::Display for Outcome {
         match self {
             Outcome::Done => f.write_str("done"),
             Outcome::Bound(local) => write!(f, "bound at {local}"),
+            Outcome::Appended(entry) => {
+                write!(f, "appended {}", crate::node::link::b32_encode(entry))
+            }
             Outcome::OwnRetention { own, room } => write!(
                 f,
                 "this node keeps the room's messages for {own} s; the room keeps them for {room} s"
@@ -1469,6 +1503,16 @@ impl std::fmt::Display for Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NodeEvent {
+    /// Whether a keyring entry carries drive changed (ADR-028 K-14): granted, taken back, or gone
+    /// with the entry. Raised once per change that moves it, so a node's Sessions can release
+    /// their key to a member that gained drive and rotate it away from one that lost it (ADR-029
+    /// SC-2a, SC-2b).
+    CapabilityChanged {
+        /// The identity whose entry changed.
+        fingerprint: Digest32,
+        /// Whether it now carries drive.
+        drive: bool,
+    },
     /// Creating the identity has waited more than a second for another vox that holds this
     /// profile's lock (it is creating the identity, or holds the profile, or is stopped while
     /// doing so). Sent once per wait; the command goes on when the lock is free. Each front end
@@ -1856,6 +1900,16 @@ impl NodeEvent {
         match self {
             NodeEvent::WaitingForProfile => {
                 "waiting for another vox that is using this identity's files".into()
+            }
+            NodeEvent::CapabilityChanged { fingerprint, drive } => {
+                if *drive {
+                    format!("{} can now drive this node's Sessions", short(fingerprint))
+                } else {
+                    format!(
+                        "{} can no longer drive this node's Sessions",
+                        short(fingerprint)
+                    )
+                }
             }
             NodeEvent::NewEntry { channel_id, .. } => {
                 format!("a new message in room {}", short(channel_id))

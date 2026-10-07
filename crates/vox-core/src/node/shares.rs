@@ -509,7 +509,8 @@ impl Shares {
                 }
             }
         }
-        let text = envelope.to_string();
+        // The sharing session's name, as on every message from it (ADR-029 MD-2).
+        let text = crate::node::sessions::fill_name(&self.paths, &envelope.to_string());
         let fail = |e: String| e;
         let (stop, stopping) = watch::channel(false);
         let fetched = Arc::new(AtomicU64::new(0));

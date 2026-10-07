@@ -78,6 +78,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/typed.rs"]
+mod typed;
+
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 
@@ -110,13 +113,19 @@ fn vox_stdin(
     args: &[&str],
     input: Option<&str>,
 ) -> (bool, String, String) {
-    let mut child = Command::new(VOX)
-        .args(args)
+    let mut cmd = Command::new(VOX);
+    cmd.args(args)
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", cfg)
         // In the environment, not argv: a command line is world-readable (ADR-015).
         .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
-        .env_remove("VOX_ROOM")
+        .env_remove("VOX_ROOM");
+    // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
+    if typed::is_keyring_change(args) {
+        let (ok, shown) = typed::keyring(&cmd);
+        return (ok, shown.clone(), shown);
+    }
+    let mut child = cmd
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
