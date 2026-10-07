@@ -1286,6 +1286,7 @@ impl Daemon {
         }
         let (room, join) = session_room(&self.account, input, room_arg);
         record.room = room;
+        record.start = Some(input.cwd.clone()).filter(|c| !c.is_empty());
         let record = serde_json::to_string(&record)
             .map_err(|e| AppError::Usage(format!("the session's record: {e}")))?;
         let mut d = DaemonClient::open(&self.account.socket())

@@ -59,6 +59,16 @@
 //! later working in another mapped directory, stays where it is: its Session stays open and its
 //! node joins nothing else. Mutant: a start path matched as a prefix.
 //!
+//! **`vox agent room` sets or moves a session's room** (ADR-029 RB-5, #551, the same test): run as
+//! the session in no room, it says what it is to do, sets the room, and opens the session's
+//! Session there, and its next turn is no longer told it works in no room. Run again for another
+//! room its node holds, it moves the session: its Session in the first room ends and one opens in
+//! the second, so it works in one room at a time. Mutant: the old Session kept open after a move.
+//! Run by the agent, with no terminal, it says how the operator can also save the session's start
+//! directory in the room map; run by the operator at a terminal (a pty), it offers to, says what
+//! that changes, and on yes saves it with the room's passphrase typed there, so the next session
+//! started in that directory works in the room by itself. Mutant: the save writes nothing.
+//!
 //! Not proved here, and stated rather than implied: that a harness actually
 //! *shows* the model what it injects. The probe could not confirm it because this
 //! machine's API key returned 401, so no model ran. That is the rehearsal's job.
@@ -2126,4 +2136,199 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         sessions(&home),
         rooms()
     );
+
+    // (4) `vox agent room`, run as the session in no room, sets its room.
+    let as_below = [("VOX_SESSION", below), ("VOX_NODE", "default")];
+    let (ok, set, err) = hook_env(&data, &cfg, &["agent", "room", &home], "", &as_below);
+    eprintln!("[proof] (4) `vox agent room {home}` said: {set}{err}");
+    let said_before = set
+        .lines()
+        .position(|l| l.starts_with("vox: about to set the room") && l.contains(&home));
+    let said_after = set.lines().position(|l| {
+        l.starts_with("vox: session") && l.contains(&format!("now works in room {home}"))
+    });
+    assert!(
+        ok && matches!((said_before, said_after), (Some(b), Some(a)) if b < a),
+        "PRODUCT: `vox agent room` must say what it is to do, then that the session works in the \
+         room: {set}{err}"
+    );
+    assert!(
+        set.contains("run this in a terminal: vox agent room"),
+        "PRODUCT: run with no terminal, `vox agent room` must say how the operator can also save \
+         the start directory in the room map: {set}"
+    );
+    let next = turn(below, &repo.join("sub"));
+    assert!(
+        open_in(&home, below) && !next.contains("works in no room"),
+        "PRODUCT: after `vox agent room`, the session must work in that room: its Session {:?}; \
+         its next turn was told {next:?}",
+        sessions(&home)
+    );
+
+    // (4b) The operator, at a terminal, saves repo/sub → that room in the room map.
+    let saved = in_terminal(
+        &data,
+        &cfg,
+        &[
+            "agent",
+            "room",
+            &home,
+            "--node",
+            "default",
+            "--session",
+            below,
+        ],
+        &[
+            ("in the room map? [y/N]", "y\r"),
+            ("Enter if it has none", "channel passphrase\r"),
+        ],
+    );
+    eprintln!("[proof] (4b) at a terminal it said: {saved}");
+    assert!(
+        saved.contains("every node of this data root can read the map")
+            && saved.contains("vox: saved"),
+        "PRODUCT: at a terminal, `vox agent room` must say what saving changes, then save: {saved}"
+    );
+    // The next session started there works in that room by itself.
+    let fresh = "33333333-aaaa-4bbb-8ccc-000000000003";
+    let first_fresh = turn(fresh, &repo.join("sub"));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !open_in(&home, fresh) {
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: after the room map saved repo/sub, a session started there must work in \
+             room {home} by itself: its Sessions {:?}; its first turn was told {first_fresh:?}",
+            sessions(&home)
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    assert!(
+        !first_fresh.contains("works in no room"),
+        "PRODUCT: a session started in a saved directory must not be told it works in no room: \
+         {first_fresh:?}"
+    );
+
+    // (5) Run again for another room the node holds, it moves the session.
+    let (ok, _, err) = hook(
+        &data,
+        &cfg,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "scratch",
+        ],
+        "scratch passphrase",
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): the agent node's `vox room create` failed: {err}"
+    );
+    let scratch = rooms()
+        .lines()
+        .find(|l| l.contains("scratch"))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_default()
+        .to_owned();
+    let (ok, moved, err) = hook_env(&data, &cfg, &["agent", "room", &scratch], "", &as_below);
+    eprintln!("[proof] (5) `vox agent room {scratch}` said: {moved}{err}");
+    let ended_in_home = sessions(&home)
+        .iter()
+        .any(|r| r["id"] == below && r["open"] == false);
+    assert!(
+        ok && moved.contains("about to move session")
+            && open_in(&scratch, below)
+            && ended_in_home
+            && !open_in(&home, below),
+        "PRODUCT: moving a session must end its Session in the room it worked in and open one in \
+         the new room: in {home} {:?}, in {scratch} {:?}; it said {moved}{err}",
+        sessions(&home),
+        sessions(&scratch)
+    );
+}
+
+/// Run `vox args` on a pseudo-terminal, as an operator types at one, answering each prompt that
+/// `answers` names (a piece of the question, the keys) in order: everything it printed.
+fn in_terminal(data: &Path, cfg: &Path, args: &[&str], answers: &[(&str, &str)]) -> String {
+    use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem as _};
+    use std::io::Read;
+    use std::sync::{Arc, Mutex};
+    let pair = NativePtySystem::default()
+        .openpty(PtySize {
+            rows: 50,
+            cols: 200,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("APPARATUS: open a pty");
+    let mut cmd = CommandBuilder::new(VOX);
+    cmd.args(args);
+    cmd.env("VOX_DATA_DIR", data);
+    cmd.env("VOX_CONFIG_DIR", cfg);
+    cmd.env("TERM", "xterm-256color");
+    for v in HARNESS_VARS {
+        cmd.env_remove(v);
+    }
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("APPARATUS: spawn vox on a pty");
+    drop(pair.slave);
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("APPARATUS: pty reader");
+    let mut input = pair.master.take_writer().expect("APPARATUS: pty writer");
+    let said = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&said);
+    let master = pair.master;
+    std::thread::spawn(move || {
+        let _master = master;
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => sink
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n])),
+            }
+        }
+    });
+    let text = || said.lock().unwrap().replace('\r', "");
+    for (question, keys) in answers {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !text().contains(question) {
+            if Instant::now() >= deadline || child.try_wait().ok().flatten().is_some() {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "PRODUCT: `vox {args:?}` at a terminal never asked {question:?}; it said:\n{}",
+                    text()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        input
+            .write_all(keys.as_bytes())
+            .and_then(|()| input.flush())
+            .expect("APPARATUS: type at the pty");
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while child.try_wait().ok().flatten().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "PRODUCT: `vox {args:?}` at a terminal did not finish within 60 s; it said:\n{}",
+                text()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    text()
 }

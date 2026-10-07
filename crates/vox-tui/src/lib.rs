@@ -18,6 +18,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod agent_hook;
+pub mod agent_room;
 pub mod app;
 pub mod app_cli;
 pub mod cli;
