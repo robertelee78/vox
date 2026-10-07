@@ -149,6 +149,9 @@ struct Tui {
     child: std::process::Child,
     stdin: std::process::ChildStdin,
     lines: std::sync::mpsc::Receiver<String>,
+    /// What the terminal drew, and where a copy is kept once the run's directory is gone.
+    screen: PathBuf,
+    keep: PathBuf,
 }
 
 impl Tui {
@@ -180,6 +183,7 @@ impl Tui {
 
 impl Drop for Tui {
     fn drop(&mut self) {
+        self.keep();
         let _ = writeln!(self.stdin, "quit");
         let t0 = Instant::now();
         while t0.elapsed() < Duration::from_secs(10) {
@@ -190,6 +194,18 @@ impl Drop for Tui {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+impl Tui {
+    /// Keep what the terminal drew outside the run's directory, and say where.
+    fn keep(&self) {
+        if std::fs::copy(&self.screen, &self.keep).is_ok() {
+            println!(
+                "[proof] what the terminal drew is kept at {}",
+                self.keep.display()
+            );
+        }
     }
 }
 
@@ -278,14 +294,21 @@ fn a_live_opencode_session_is_mirrored_and_driven() {
         .next()
         .unwrap_or_else(|| panic!("APPARATUS (staging): `vox room list` shows no room: {list:?}"))
         .to_owned();
-    let link = staged_as(&data, &cfg, PERSON, &["room", "link", &room], None)
-        .trim()
+    let said = staged_as(&data, &cfg, PERSON, &["room", "link", &room], None);
+    let link = said
+        .split_whitespace()
+        .find(|w| w.starts_with("vox://"))
+        .unwrap_or_else(|| panic!("APPARATUS (staging): `vox room link` printed no link: {said}"))
         .to_owned();
     let person_fp = staged_as(&data, &cfg, PERSON, &["id"], None)
-        .trim()
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
         .to_owned();
     let agent_fp = staged_as(&data, &cfg, NODE, &["id"], None)
-        .trim()
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
         .to_owned();
     staged_as(
         &data,
@@ -385,10 +408,16 @@ fn a_live_opencode_session_is_mirrored_and_driven() {
             }
         }
     });
+    let keep = PathBuf::from(format!(
+        "/private/tmp/vc/kept-{}-tui.screen",
+        std::process::id()
+    ));
     let mut tui = Tui {
         child,
         stdin,
         lines,
+        screen: screen.clone(),
+        keep,
     };
     tui.ask(
         "wait 60 (?i)(opencode|ask anything|kimi)",

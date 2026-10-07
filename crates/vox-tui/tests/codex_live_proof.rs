@@ -851,6 +851,9 @@ struct Tui {
     child: std::process::Child,
     stdin: std::process::ChildStdin,
     lines: std::sync::mpsc::Receiver<String>,
+    /// What the terminal drew, and where a copy is kept once the run's directory is gone.
+    screen: PathBuf,
+    keep: PathBuf,
 }
 
 impl Tui {
@@ -881,6 +884,7 @@ impl Tui {
 
 impl Drop for Tui {
     fn drop(&mut self) {
+        self.keep();
         let _ = writeln!(self.stdin, "quit");
         let t0 = Instant::now();
         while t0.elapsed() < Duration::from_secs(10) {
@@ -891,6 +895,18 @@ impl Drop for Tui {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+impl Tui {
+    /// Keep what the terminal drew outside the run's directory, and say where.
+    fn keep(&self) {
+        if std::fs::copy(&self.screen, &self.keep).is_ok() {
+            println!(
+                "[proof] what the terminal drew is kept at {}",
+                self.keep.display()
+            );
+        }
     }
 }
 
@@ -999,14 +1015,21 @@ fn a_live_codex_session_is_mirrored_and_driven() {
         .next()
         .unwrap_or_else(|| panic!("APPARATUS (staging): `vox room list` shows no room: {list:?}"))
         .to_owned();
-    let link = staged_as(&data, &cfg, PERSON, &["room", "link", &room], None)
-        .trim()
+    let said = staged_as(&data, &cfg, PERSON, &["room", "link", &room], None);
+    let link = said
+        .split_whitespace()
+        .find(|w| w.starts_with("vox://"))
+        .unwrap_or_else(|| panic!("APPARATUS (staging): `vox room link` printed no link: {said}"))
         .to_owned();
     let person_fp = staged_as(&data, &cfg, PERSON, &["id"], None)
-        .trim()
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
         .to_owned();
     let agent_fp = staged_as(&data, &cfg, NODE, &["id"], None)
-        .trim()
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
         .to_owned();
     staged_as(
         &data,
@@ -1071,7 +1094,16 @@ fn a_live_codex_session_is_mirrored_and_driven() {
     let profile = root.join("codex.sb");
     std::fs::write(
         &profile,
-        oc_sandbox::sandbox_profile(&[&root, &socket, &lock], &[&codex_release]),
+        // The run's own app-server socket and its lock, which Codex keeps outside CODEX_HOME:
+        // these two paths alone, by name (they do not exist yet, so they cannot be resolved).
+        format!(
+            "{}(allow file-read-data file-write* (literal {:?}) (literal {:?}))\n\
+             (allow network-outbound (remote unix-socket (path-literal {:?})))\n",
+            oc_sandbox::sandbox_profile(&[&root], &[&codex_release]),
+            socket.display().to_string(),
+            lock.display().to_string(),
+            socket.display().to_string(),
+        ),
     )
     .unwrap_or_else(|e| panic!("APPARATUS: cannot write the sandbox profile: {e}"));
     oc_sandbox::probe_profile(&profile, &canary, "codex session");
@@ -1165,10 +1197,16 @@ fn a_live_codex_session_is_mirrored_and_driven() {
             }
         }
     });
+    let keep = PathBuf::from(format!(
+        "/private/tmp/vc/kept-{}-tui.screen",
+        std::process::id()
+    ));
     let mut tui = Tui {
         child,
         stdin,
         lines,
+        screen: screen.clone(),
+        keep,
     };
     tui.ask("wait 30 (?i)(context|codex)", Duration::from_secs(60));
     std::thread::sleep(Duration::from_secs(3));
@@ -1272,9 +1310,15 @@ fn a_live_codex_session_is_mirrored_and_driven() {
         &id,
         Duration::from_secs(240),
         "the typed turn running its command",
-        |p, _| p.contains("typed in Vox by") && p.contains("sleep 120"),
+        // The command itself running, not only the prompt that asks for it: an interrupt is
+        // for a turn at work.
+        |p, _| {
+            p.contains("typed in Vox by")
+                && p.lines()
+                    .any(|l| l.starts_with("command:") && l.contains("sleep 120"))
+        },
     );
-    let tui_saw = tui.ask("wait 60 sleep 120", Duration::from_secs(90));
+    let tui_saw = tui.ask(r"wait 60 sleep\s*120", Duration::from_secs(90));
     println!("[proof] (5) Codex's own terminal shows the typed turn: {tui_saw}");
     let (ok, said) = vox_as(
         &data,
@@ -1295,7 +1339,7 @@ fn a_live_codex_session_is_mirrored_and_driven() {
         &room,
         &id,
         Duration::from_secs(60),
-        "the interrupted turn's end",
+        "the interrupted turn's end, its command stopped",
         |p, _| p.matches("— turn ended —").count() >= 2,
     );
     println!(

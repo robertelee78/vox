@@ -741,6 +741,39 @@ impl Router {
             .find(|(fp, _)| *fp == info.peer)
             .map_or_else(|| by.chars().take(8).collect(), |(_, n)| n.clone());
         let sink = &self.inner.sink;
+        // What is driven, as this node's claim of who drove it (ADR-029 MD-3), written before it
+        // is handed to the harness, so the Session shows it ahead of what it caused. An answer
+        // shows on its request's line.
+        let mut copy = serde_json::Map::new();
+        copy.insert(
+            "v".into(),
+            serde_json::json!(vox_agentcomms::activity::VERSION),
+        );
+        copy.insert("session".into(), serde_json::json!(req.session));
+        copy.insert("kind".into(), serde_json::json!("drive"));
+        copy.insert("by".into(), serde_json::json!(by));
+        copy.insert("action".into(), serde_json::json!(req.action.name()));
+        match &req.action {
+            Action::Text { text } => {
+                copy.insert("text".into(), serde_json::json!(text));
+            }
+            Action::Slash { text } => {
+                copy.insert("cmd".into(), serde_json::json!(crate::drive::slash(text).0));
+                copy.insert("text".into(), serde_json::json!(text));
+            }
+            Action::Approve { r#ref }
+            | Action::Reject { r#ref, .. }
+            | Action::Answer { r#ref, .. } => {
+                copy.insert("ref".into(), serde_json::json!(r#ref));
+            }
+            Action::Interrupt | Action::Stop => {}
+        }
+        sink.activity(
+            node,
+            &req.session,
+            vox_agentcomms::activity::split(copy, "text", vox_core::node::content::MAX_TEXT_LEN),
+            None,
+        );
         let outcome: Result<String, String> = match &req.action {
             Action::Approve { r#ref } => handed(sink.answer(
                 node,
@@ -774,34 +807,6 @@ impl Router {
             )),
             input => self.steer(node, &reg, input).await,
         };
-        // What was driven, as this node's claim of who drove it (ADR-029 MD-3), and what came of
-        // it when it was not delivered (DR-6). An answer shows on its request's line.
-        let mut copy = serde_json::Map::new();
-        copy.insert(
-            "v".into(),
-            serde_json::json!(vox_agentcomms::activity::VERSION),
-        );
-        copy.insert("session".into(), serde_json::json!(req.session));
-        copy.insert("kind".into(), serde_json::json!("drive"));
-        copy.insert("by".into(), serde_json::json!(by));
-        copy.insert("action".into(), serde_json::json!(req.action.name()));
-        match &req.action {
-            Action::Text { text } => {
-                copy.insert("text".into(), serde_json::json!(text));
-            }
-            Action::Slash { text } => {
-                copy.insert("cmd".into(), serde_json::json!(crate::drive::slash(text).0));
-                copy.insert("text".into(), serde_json::json!(text));
-            }
-            Action::Approve { r#ref }
-            | Action::Reject { r#ref, .. }
-            | Action::Answer { r#ref, .. } => {
-                copy.insert("ref".into(), serde_json::json!(r#ref));
-            }
-            Action::Interrupt | Action::Stop => {}
-        }
-        let mut bodies =
-            vox_agentcomms::activity::split(copy, "text", vox_core::node::content::MAX_TEXT_LEN);
         // Every drive's outcome, beside it (DR-6): what happened, or why it was not delivered.
         let mut result = serde_json::json!({
             "v": vox_agentcomms::activity::VERSION, "session": req.session,
@@ -812,8 +817,7 @@ impl Router {
             Ok(said) => result["said"] = serde_json::json!(said),
             Err(why) => result["why"] = serde_json::json!(why),
         }
-        bodies.push(result.to_string());
-        sink.activity(node, &req.session, bodies, None);
+        sink.activity(node, &req.session, vec![result.to_string()], None);
         match outcome {
             Ok(said) => Answer { ok: true, said },
             Err(said) => Answer { ok: false, said },

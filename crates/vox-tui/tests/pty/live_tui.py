@@ -31,7 +31,9 @@ LOGIN = re.compile(
     r"do you trust|trust this folder|trust the files)",
     re.IGNORECASE,
 )
-ANSI = re.compile(rb"\x1b\[[0-9;?<>=]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|\x1b[()][0-9A-Za-z]")
+ANSI = re.compile(
+    rb"\x1b\[[0-9;?<>=]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|\x1b[()][0-9A-Za-z]|\x1b[78=>DEHMNOZc]"
+)
 KEYS = {"enter": b"\r", "esc": b"\x1b", "ctrl-c": b"\x03"}
 
 
@@ -96,8 +98,15 @@ def main():
                 end = time.time() + float(secs)
                 found = False
                 while time.time() < end and not login[0]:
-                    text = ANSI.sub(b"", bytes(drawn)).decode("utf-8", "replace")
-                    if rx.search(text):
+                    # A terminal UI moves the cursor where a space would be, so what it drew is
+                    # read twice: escape codes taken out, and escape codes read as a space.
+                    raw = bytes(drawn)
+                    text = ANSI.sub(b"", raw).decode("utf-8", "replace")
+                    spaced = ANSI.sub(b" ", raw).decode("utf-8", "replace")
+                    # And with every space taken out: a UI that draws a character at a time (Codex
+                    # saves and restores the cursor around each) leaves no words to read.
+                    squeezed = re.sub(r"\s+", "", text)
+                    if rx.search(text) or rx.search(spaced) or rx.search(squeezed):
                         found = True
                         break
                     if not pump(0.5):
