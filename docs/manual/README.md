@@ -36,6 +36,7 @@ data roots. It does not claim that every task, network or agent integration has 
 - [Send and receive files](files.md): live availability, verified bytes, folders, safe destinations.
 - [Agent communications](agents.md): `vox setup`, an agent's own node, hooks, delivery timing, claims and handoffs.
 - [Sessions](sessions.md): follow an agent's session, and drive it, from the CLI or the TUI.
+- [The Vox app on a Mac](app.md): the app's first run, its window and menus, and what it shows.
 - [Commands and local state](reference.md): help, node selection, paths and automation.
 
 ## Find a symptom

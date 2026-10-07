@@ -136,6 +136,29 @@ reported to the lead as staging rather than product, and a second run was green.
 | A Session keeps what its session did while its room was joining | `agent_hook_proof::a_session_works_in_the_room_its_start_directory_is_mapped_to`, release, `--ignored`, at `48b1c743` (2026-10-07) | passed in 70.9 s: the first prompt, typed before the node was a member, is read in the Session once the room opens; the dropped-entries sentence is quoted from `host.rs` (b2f4bd42), not run (it needs over 4 MiB held) |
 | `--to member/session` on `vox share` | `vox share --help` at `48b1c743` (f60207c0) | `Or address one session of a member as <member>/<session>, the session named as vox room sessions names it` … `For example: --to bob/gso-cap` |
 
+### The app chapter (`v040/app-stack` 6e909d10, not merged)
+
+[The Vox app on a Mac](manual/app.md) was written on 2026-10-07 against app2's candidate
+`v040/app-stack` at `6e909d10`, before it merged. No Vox.app was launched and no login item was
+registered: its words come from the app's Swift source at that commit and from
+`scripts/app-screenshots.sh`, which renders the app's own views offscreen from a demo data root it
+makes (scratch `VOX_DATA_DIR` and `VOX_CONFIG_DIR`, its daemon stopped by PID). The renders show
+the look; they are not product proof. The two checkers on #437 ran the daemon side of attach and
+quit with the release `vox`. Sessions in the app (#554) and the Finder Share menu and Services item
+(#449, `v040/share-extension`) are not in this candidate, and the chapter says so.
+
+| Manual claim | Where and how | Observed |
+|---|---|---|
+| The timeline title | screenshot render, room `family` with `vox room retention … 1w` | `Timeline · ⏱ 1 week` |
+| What was done to the room, among the messages | same render | `you named the room family`; `you set the room's retention to 1 week: messages older than 1 week are removed from now on` |
+| Sidebar groups, nodes on this Mac, status bar | same render | `node ann, attached`; `NEEDS YOU (0)`, `ACTIVE (0)`, `QUIET (1)`; `ann attached` …; `node ann  3 peers  keyring open 30m` |
+| File cards, link card, members | same render | `shopping-list.txt  41 bytes · sha256 435e42cc…` with `Quick Look` and `Show in Finder`; the image's preview; `Leek and potato soup` / `Forty minutes, one pot, serves six.`; `⇄ builder`, `⇄ ben` |
+| The keyring view | render `keyring.png` | `ADD A NODE`, `Fingerprint (paste or type)`, `Alias`, `Trust`; rows `⇄ builder` with art, grouped fingerprint, `Rename…`, `Compare…`, `Remove…` |
+| The decision record | render `decision-record.png` | `refused  to join a room · qvpip3tkrhoo (not in keyring)` / `answering qvpip3tkrhoo: join proof-of-possession failed`; `trusted  to trust a member · ben`; filters `every node`, `every room`; `kept 14 days and never sent anywhere` |
+| A wrong passphrase is the daemon's sentence | the demo build's `vox`, scratch root: `vox node attach mac --passphrase-file BAD` | `vox node: that passphrase does not open node mac's identity` (exit 1); the app shows the sentence without `vox node: ` (`AppModel.sentence`) |
+| Quit lets go; a holder keeps it | checkers appG and appK on #437, release `vox`: a holding client, then SIGTERM | `default attached … (held)`, then `default detached` |
+| First run, Keep Running, Keychain, menu bar, notifications, keys, services view, accessibility | source at 6e909d10: `RootView.swift`, `AppModel.swift`, `Daemon.swift`, `MenuBar.swift`, `Notify.swift`, `Commands.swift`, `Services.swift`, `Keyring.swift`, `Theme.swift`; `crates/vox-tui/src/keychain.rs` | quoted strings as in the source; not run |
+
 ## v0.3.1 command check
 
 Run on 2026-10-05 for #425 with `vox 0.3.1` built at `bf6dfcdb` (`cargo build --release --bin
