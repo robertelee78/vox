@@ -455,8 +455,16 @@ impl Router {
         // hook waits (ADR-029 DR-5): never stored as claimed.
         let mut session = session;
         if let Some(claim) = session.tmux_claim.take() {
-            let proven =
-                tokio::task::spawn_blocking(move || crate::claude_injector::prove(&claim)).await;
+            let proven = {
+                let config = self.inner.account.config_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::claude_injector::prove(
+                        &claim,
+                        &crate::claude_injector::harnesses(&config),
+                    )
+                })
+                .await
+            };
             match proven {
                 Ok(Ok(pane)) => session.tmux = Some(pane),
                 Ok(Err(why)) => session.tmux_why = Some(why),
