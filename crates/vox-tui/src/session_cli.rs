@@ -24,6 +24,9 @@ pub struct Line {
     pub text: String,
     /// The full input and output, labelled, in order.
     pub details: Vec<(String, String)>,
+    /// The harness's id for the call or request it is about (`ref`): what `--approve`,
+    /// `--reject` and `--answer` name. Empty for an entry about none.
+    pub reference: String,
 }
 
 /// How the reader names a node: by its alias, or as itself.
@@ -302,6 +305,7 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
             kind: b.kind().to_owned(),
             text: format!("{prefix}{text}"),
             details,
+            reference: b.reference().to_owned(),
         });
     }
     out
@@ -473,7 +477,7 @@ pub async fn show(
                 out,
                 "{}",
                 serde_json::json!({
-                    "seq": l.seq, "kind": l.kind, "line": l.text,
+                    "seq": l.seq, "kind": l.kind, "line": l.text, "ref": l.reference,
                     "details": if details { Value::Object(d) } else { Value::Null },
                 })
             );
