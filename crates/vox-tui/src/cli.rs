@@ -1846,6 +1846,14 @@ enum Cmd {
     /// Close the live tunnels `vox status` lists.
     #[command(subcommand)]
     Tunnel(TunnelCmd),
+    /// Set up this machine: a node for each harness installed here, and one for you.
+    ///
+    /// Looks for Claude Code, Codex and OpenCode (their programs on `PATH`) and offers each
+    /// a node of its own, `<harness>-<host>`, with a passphrase you type, its hook installed
+    /// in the harness's settings and the agent skill beside it. On macOS it also offers a
+    /// node for you, which you may skip. It ends by printing every node it made: its
+    /// fingerprint, with its art, and its alias, harness, host, OS and Vox version.
+    Setup(AccountArgs),
     /// Put `vox` on PATH and install tab completion for your shell.
     ///
     /// `install.sh` and `vox update` run this for you. It writes the completion script into
@@ -2819,6 +2827,13 @@ pub fn run() -> ExitCode {
                 crate::lan_cli::up_held(&paths, &a, &steps).await
             })
         }
+        Cmd::Setup(account) => match crate::setup::run(&account.as_node_args()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("vox: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Cmd::ShellSetup { remove } => crate::shell::run(remove),
         Cmd::Update { check, rollback } => match crate::update::run(check, rollback) {
             Ok(()) => ExitCode::SUCCESS,
