@@ -746,6 +746,7 @@ const S3: &str = "33333333-cccc-4000-8000-000000000003";
 const S4: &str = "44444444-dddd-4000-8000-000000000004";
 const S5: &str = "55555555-eeee-4000-8000-000000000005";
 const S6: &str = "66666666-ffff-4000-8000-000000000006";
+const S8: &str = "88888888-1111-4000-8000-000000000008";
 
 /// ADR-029 DR-1, DR-5 — **input reaches exactly the session it is for, or is refused with why.**
 ///
@@ -874,22 +875,25 @@ fn a_driver_reaches_exactly_the_session_it_names_or_is_told_why() {
     );
 
     // ---- 5. a second server, whose pane is also %0 ----
+    // Server one's own %0 holds a session too, so the two %0s are each bound.
+    let first = t.run(&["display-message", "-p", "-t", ":0.0", "#{pane_id}"]);
+    let g = StandIn::start(&w, &t, &first, &room, "g", false);
+    g.hook(&prompt(&w, S8));
     let t2 = Tmux::new(&w, &room, "t2");
     let q0 = t2.run(&["display-message", "-p", "-t", ":0.0", "#{pane_id}"]);
     let d = StandIn::start(&w, &t2, &q0, &room, "d", false);
     d.hook(&prompt(&w, S4));
+    session_listed(&w, &room, S8);
     session_listed(&w, &room, S4);
-    let first = t.run(&["display-message", "-p", "-t", ":0.0", "#{pane_id}"]);
     println!("[proof] 5. server t1's first pane {first}, server t2's {q0}");
-    for (s, mine, text) in [(S4, &d, "to server two"), (S1, &a, "to server one")] {
+    for (s, mine, other, text) in [(S4, &d, &g, "to server two"), (S8, &g, &d, "to server one")] {
         let (ok, said) = drive(&w, &room, s, &["--say", text]);
+        println!("[proof] 5. --say {text:?} to {s}: {said}");
         assert!(
-            ok && mine.got(
-                &serde_json::json!({ "typed": text }),
-                Duration::from_secs(10)
-            ),
-            "PRODUCT: arm 5: with two servers, {text:?} must reach {s}'s own server; vox said \
-             {said:?}"
+            ok && mine.got(&serde_json::json!({ "typed": text }), Duration::from_secs(10))
+                && !other.got(&serde_json::json!({ "typed": text }), Duration::from_millis(300)),
+            "PRODUCT: arm 5: with two servers' %0 each bound, {text:?} must reach {s}'s own server \
+             alone; vox said {said:?}"
         );
     }
 
