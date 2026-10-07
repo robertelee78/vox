@@ -1219,7 +1219,15 @@ pub async fn run(
     }
 
     let drained = match daemon.register(&input, room_arg).await {
-        Ok(_answer) => drain(paths, room_arg, &input, &raw, format, None).await,
+        Ok(answer) => {
+            let note = crate::room_map::note(
+                answer.room.as_deref(),
+                answer.new,
+                answer.joining.as_deref(),
+                &daemon.account.data_root,
+            );
+            drain(paths, room_arg, &input, &raw, format, note).await
+        }
         Err(e) => Err(e),
     };
     if let Err(e) = drained {
@@ -1387,14 +1395,21 @@ fn session_room(
     input: &HookInput,
     room_arg: Option<&str>,
 ) -> (Option<String>, Option<(String, zeroize::Zeroizing<String>)>) {
-    // The room map (#550) looks up where the session started, exactly (RB-2).
-    let _ = (account, input.cwd.as_str());
     let named = room_arg.map(str::to_owned).or_else(|| {
         std::env::var("VOX_ROOM")
             .ok()
             .filter(|r| !r.trim().is_empty())
     });
-    (named.map(|r| r.trim().to_owned()), None)
+    if let Some(r) = named {
+        return (Some(r.trim().to_owned()), None);
+    }
+    // The room map gives the room of the directory the session started in, exactly (ADR-029
+    // RB-2), with what joining it takes (RB-3). A map that cannot be read gives none: the session
+    // is told why (`room_map::note`).
+    match crate::room_map::room_for(&account.data_root, std::path::Path::new(&input.cwd)) {
+        Ok(Some((room, link, passphrase))) => (Some(room), Some((link, passphrase))),
+        Ok(None) | Err(_) => (None, None),
+    }
 }
 
 /// An error's text on one line, for the one line the agent is told.

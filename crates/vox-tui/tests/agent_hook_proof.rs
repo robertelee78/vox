@@ -50,6 +50,15 @@
 //! `resume` leave it open; a real `SessionEnd` ends it, set apart under "ended", and what was said
 //! in the room stays readable. Mutant: end the Session on `Stop`.
 //!
+//! **The room a session works in comes from the room map** (ADR-029 RB-1–RB-5, #550,
+//! [`a_session_works_in_the_room_its_start_directory_is_mapped_to`]): an agent's node with no room
+//! and a `<data root>/rooms` naming a directory and Alice's room. A session started in that
+//! directory is told on its first turn that the room is being joined; its node joins Alice's room
+//! by itself and opens the session's Session there. A session started in a subfolder of it is
+//! told it works in no room, with `vox agent room <room>`, and gets no Session. The first session,
+//! later working in another mapped directory, stays where it is: its Session stays open and its
+//! node joins nothing else. Mutant: a start path matched as a prefix.
+//!
 //! Not proved here, and stated rather than implied: that a harness actually
 //! *shows* the model what it injects. The probe could not confirm it because this
 //! machine's API key returned 401, so no model ran. That is the rehearsal's job.
@@ -1971,5 +1980,150 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
         read.contains("SAID-WHILE-OPEN the codec is ported"),
         "PRODUCT: what was said in the room must stay readable after the Session ends; `vox room \
          read` printed:\n{read}"
+    );
+}
+
+#[test]
+#[ignore = "production Argon2id at setup + two real daemons and a join; CI runs it in release"]
+fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    // Alice holds two rooms; the agent's node holds none.
+    let alice = Daemon::start(&tmp.path().join("alice"));
+    let (ok, _, err) = hook(
+        &alice.data,
+        &alice.cfg,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "elsewhere",
+        ],
+        "other passphrase",
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's second `vox room create` failed: {err}"
+    );
+    let (_, listed, _) = hook(&alice.data, &alice.cfg, &["room", "list"], "");
+    let home: String = alice.room_key.chars().take(12).collect();
+    let other = listed
+        .lines()
+        .find(|l| l.contains("elsewhere"))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_else(|| panic!("PRODUCT (staging): alice lists no second room: {listed}"))
+        .to_owned();
+    let (link_home, link_other) = (alice.link(&home), alice.link(&other));
+    let agent = Daemon::start_bare(&tmp.path().join("agent"));
+    let (data, cfg) = (agent.data.clone(), agent.cfg.clone());
+
+    // The agent's data root maps two directories: the repository to Alice's first room, and
+    // another repository to her second.
+    let repo = tmp.path().join("repo");
+    let other_repo = tmp.path().join("other-repo");
+    for d in [repo.join("sub"), other_repo.clone()] {
+        std::fs::create_dir_all(&d).expect("APPARATUS: cannot make a repository directory");
+    }
+    let map = data.join("rooms");
+    std::fs::write(
+        &map,
+        format!(
+            "repo {}\n    room       {link_home}\n    passphrase channel passphrase\n\n\
+             repo {}\n    room       {link_other}\n    passphrase other passphrase\n",
+            repo.display(),
+            other_repo.display()
+        ),
+    )
+    .expect("APPARATUS: cannot write the room map");
+    std::fs::set_permissions(
+        &map,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .expect("APPARATUS: cannot make the room map private");
+
+    let person = [("CLAUDE_CODE_ENTRYPOINT", "cli")];
+    let turn = |session: &str, cwd: &Path| -> String {
+        let payload = format!(
+            r#"{{"session_id":"{session}","hook_event_name":"UserPromptSubmit","cwd":"{}","prompt":"hi","transcript_path":"/tmp/t.jsonl"}}"#,
+            cwd.display()
+        );
+        let (ok, out, err) = hook_env(
+            &data,
+            &cfg,
+            &["agent", "hook", "--node", "default"],
+            &payload,
+            &person,
+        );
+        assert!(ok, "PRODUCT: the hook must exit 0; it said {out}{err}");
+        out
+    };
+    let rooms = || hook(&data, &cfg, &["room", "list"], "").1;
+    let sessions = |room: &str| -> Vec<serde_json::Value> {
+        let (_, out, _) = hook(&data, &cfg, &["room", "sessions", room, "--json"], "");
+        out.lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    };
+    let open_in = |room: &str, id: &str| {
+        sessions(room)
+            .iter()
+            .any(|r| r["id"] == id && r["open"] == true)
+    };
+
+    // (1) A session started in the mapped directory: its node joins the room by itself.
+    let mapped = "11111111-aaaa-4bbb-8ccc-000000000001";
+    let first = turn(mapped, &repo);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut turns = 1;
+    while !(rooms().contains(&home) && open_in(&home, mapped)) {
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: a session started in {} (mapped to room {home}) never worked there within \
+             120 s: the node's rooms {:?}, the room's Sessions {:?}; its first turn was told \
+             {first:?}",
+            repo.display(),
+            rooms(),
+            sessions(&home)
+        );
+        std::thread::sleep(Duration::from_secs(2));
+        turn(mapped, &repo);
+        turns += 1;
+    }
+    eprintln!("[proof] (1) first turn told: {first:?}; working in {home} after {turns} turns");
+    assert!(
+        first.contains("joining room"),
+        "PRODUCT: a session whose room is being joined must be told so on its turn; it was told \
+         {first:?}"
+    );
+
+    // (2) A session started in a subfolder of the mapped directory: no room.
+    let below = "22222222-aaaa-4bbb-8ccc-000000000002";
+    let told = turn(below, &repo.join("sub"));
+    eprintln!("[proof] (2) a session started in repo/sub was told: {told:?}");
+    assert!(
+        told.contains("this session works in no room") && told.contains("vox agent room <room>"),
+        "PRODUCT: a session started in a subfolder of a mapped directory must be told it works in \
+         no room, with the command that sets one; it was told {told:?}"
+    );
+    assert!(
+        !sessions(&home).iter().any(|r| r["id"] == below),
+        "PRODUCT: a session started below a mapped directory must open no Session in its room: \
+         {:?}",
+        sessions(&home)
+    );
+
+    // (3) The first session, later working in another mapped repository, stays where it was.
+    let later = turn(mapped, &other_repo);
+    std::thread::sleep(Duration::from_secs(5));
+    let later2 = turn(mapped, &other_repo);
+    eprintln!("[proof] (3) its turns in other-repo were told: {later:?} / {later2:?}");
+    assert!(
+        open_in(&home, mapped) && !rooms().contains(&other) && !later.contains("no room"),
+        "PRODUCT: a session's room must not change because of where it works later: its Session \
+         in {home} {:?}, the node's rooms {:?}",
+        sessions(&home),
+        rooms()
     );
 }
