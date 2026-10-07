@@ -37,6 +37,8 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             "? unverified" on every row and "← in-only" for Carol, though nothing comes in from her);
             and no row of the members pane names a verified, TOFU or key-changed state, a consent
             or a block: one trust state, in the keyring or not (ADR-028 K-2, K-6, #473);
+  capability under each member's state line, what Bob's keyring grants it: Alice "read", Dave
+            "read + drive", Carol (not in his keyring) nothing (ADR-028 K-14, #525);
   look      in truecolour, Alice's row is "⇄ alice" (each trusts the other) and Dave's "→ dave" (only
             Bob trusts him), both in text.primary bold, and Carol's "· <her fingerprint>" in
             text.secondary, not bold (ADR-028 L-4); the accent is on the focused
@@ -321,9 +323,12 @@ try:
     # Carol trusts Bob, so what her label says is Bob's trust alone: a node reads only whom its
     # owner trusts (V210-118).
     # Bob trusts Dave, and Dave trusts nobody: the one way of the three (ADR-028 L-4's `→`).
+    # Bob trusts Dave with drive and Alice with read (ADR-028 K-14).
     for (w, other, name) in (("bob", "alice", "alice"), ("alice", "bob", "bob"), ("carol", "bob", "bob"),
                              ("bob", "dave", "dave"), ("bob", "erin", "erin")):
-        t = run(w, "trust", "add", fp[other], "--name", name, "--identity-passphrase-file", f"{S}/idpass")
+        drive = ["--drive"] if (w, other) == ("bob", "dave") else []
+        t = run(w, "trust", "add", fp[other], "--name", name, *drive,
+                "--identity-passphrase-file", f"{S}/idpass")
         if t.returncode != 0: product(f"{w}'s `vox trust add` failed: {t.stderr.strip()}")
     stage("alice shares an ssh stand-in")
     # It greets as sshd does, so Alice's node detects it as ssh (ADR-028 S-2).
@@ -637,6 +642,16 @@ try:
     claim("consent", bare(carol_label) == CAROL and bare(dave_label) == DAVE and not stated,
           f"alice: {label_of('alice')[0].strip()!r}; carol: {carol_label.strip()!r}; "
           f"dave: {(dave_label or '').strip()!r}; rows naming another trust state: {stated!r}")
+
+    stage("capability")
+    # What Bob's keyring entry grants each member, on the line under its state (ADR-028 K-14,
+    # #525): Alice read, Dave read + drive; Carol, not in his keyring, nothing.
+    def granted(who):
+        rows, (_, _, i) = members_pane(), label_of(who)
+        return bare(rows[i + 2]) if i is not None and i + 2 < len(rows) else None
+    claim("capability", granted("alice") == "read" and granted("dave") == "read + drive"
+          and granted("carol") not in ("read", "read + drive"),
+          f"alice: {granted('alice')!r}; dave: {granted('dave')!r}; under carol: {granted('carol')!r}")
 
     stage("look")
     # Alice's key reaches Bob once her node has released it: wait for her ⇄ before judging.

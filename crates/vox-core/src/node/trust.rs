@@ -72,9 +72,60 @@ pub const TRUST_META_KEY: &str = "trust";
 /// Only slot; the keyring is a single blob.
 pub const TRUST_SEGMENT_ID: u64 = 0;
 
-/// Encoding version of the keyring body, with each identity's history grant. The only version
-/// this build reads: version 1 (no grants) was an earlier release's (#423).
-const KEYRING_VERSION: u64 = 2;
+/// Encoding version of the keyring body, with each identity's history grant and capability
+/// (ADR-028 K-14). Version 2, without the capability, is still read, each entry as
+/// [`Capability::Read`]; version 1 (no grants) was an earlier release's (#423).
+const KEYRING_VERSION: u64 = 3;
+
+/// The version before the capability: read, never written.
+const KEYRING_VERSION_READ_ONLY: u64 = 2;
+
+/// What a keyring entry grants (ADR-028 K-14): **read**, what trust has meant since ADR-020 §3,
+/// or **read + drive**, which adds what ADR-029 §3 lets a member do with this node's Sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord)]
+pub enum Capability {
+    /// Read only. The default when trusting (K-16).
+    #[default]
+    Read,
+    /// Read, and drive this node's Sessions.
+    ReadDrive,
+}
+
+impl Capability {
+    /// How every client says it: `read` or `read + drive`.
+    #[must_use]
+    pub fn words(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::ReadDrive => "read + drive",
+        }
+    }
+
+    /// How `--json` says it: `read` or `read+drive`.
+    #[must_use]
+    pub fn json(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::ReadDrive => "read+drive",
+        }
+    }
+
+    /// The capability `--json` or a wire value names, if any.
+    #[must_use]
+    pub fn from_json(s: &str) -> Option<Self> {
+        match s {
+            "read" => Some(Self::Read),
+            "read+drive" => Some(Self::ReadDrive),
+            _ => None,
+        }
+    }
+
+    /// Whether it carries drive.
+    #[must_use]
+    pub fn drive(self) -> bool {
+        self == Self::ReadDrive
+    }
+}
 
 /// What a consent releases of **this node's own** messages to a trusted identity
 /// (PRD-001 R12, ADR-023 decision 5): chosen by the approver, per grant.
@@ -143,6 +194,8 @@ pub struct Keyring {
     entries: BTreeMap<Digest32, String>,
     /// The identities granted full history; everyone else gets [`HistoryGrant::Now`].
     full_history: BTreeSet<Digest32>,
+    /// The identities trusted with drive (ADR-028 K-14); everyone else has [`Capability::Read`].
+    drive: BTreeSet<Digest32>,
 }
 
 impl Keyring {
@@ -171,6 +224,19 @@ impl Keyring {
         petname: &str,
         history: HistoryGrant,
     ) -> Result<()> {
+        let capability = self.capability(&fingerprint).unwrap_or_default();
+        self.trust_as(fingerprint, petname, history, capability)
+    }
+
+    /// [`Keyring::trust_with`], choosing what the entry grants (ADR-028 K-14). Re-trusting
+    /// replaces the choice.
+    pub fn trust_as(
+        &mut self,
+        fingerprint: Digest32,
+        petname: &str,
+        history: HistoryGrant,
+        capability: Capability,
+    ) -> Result<()> {
         let name = petname.trim();
         if name.is_empty() || name.len() > MAX_PETNAME {
             return Err(Error::SizeLimitExceeded("petname length"));
@@ -186,7 +252,42 @@ impl Keyring {
             HistoryGrant::Full => self.full_history.insert(fingerprint),
             HistoryGrant::Now => self.full_history.remove(&fingerprint),
         };
+        match capability {
+            Capability::ReadDrive => self.drive.insert(fingerprint),
+            Capability::Read => self.drive.remove(&fingerprint),
+        };
         Ok(())
+    }
+
+    /// Change what a trusted entry grants. Returns whether `fingerprint` is trusted; an entry
+    /// that is not is left alone.
+    pub fn set_capability(&mut self, fingerprint: &Digest32, capability: Capability) -> bool {
+        if !self.entries.contains_key(fingerprint) {
+            return false;
+        }
+        match capability {
+            Capability::ReadDrive => self.drive.insert(*fingerprint),
+            Capability::Read => self.drive.remove(fingerprint),
+        };
+        true
+    }
+
+    /// What the entry for `fingerprint` grants; `None` when it is not in the keyring.
+    #[must_use]
+    pub fn capability(&self, fingerprint: &Digest32) -> Option<Capability> {
+        self.entries.contains_key(fingerprint).then(|| {
+            if self.drive.contains(fingerprint) {
+                Capability::ReadDrive
+            } else {
+                Capability::Read
+            }
+        })
+    }
+
+    /// Whether `fingerprint` is trusted with drive (ADR-028 K-14, ADR-029 §3).
+    #[must_use]
+    pub fn has_drive(&self, fingerprint: &Digest32) -> bool {
+        self.entries.contains_key(fingerprint) && self.drive.contains(fingerprint)
     }
 
     /// What a consent to `fingerprint` releases of this node's history.
@@ -214,6 +315,7 @@ impl Keyring {
     /// applies and nothing here can say otherwise.
     pub fn untrust(&mut self, fingerprint: &Digest32) -> bool {
         self.full_history.remove(fingerprint);
+        self.drive.remove(fingerprint);
         self.entries.remove(fingerprint).is_some()
     }
 
@@ -252,16 +354,17 @@ impl Keyring {
         self.entries.is_empty()
     }
 
-    /// Canonical CBOR body: `[version, [[fingerprint, petname, full_history], ..]]`.
+    /// Canonical CBOR body: `[version, [[fingerprint, petname, full_history, drive], ..]]`.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         e.array(2).uint(KEYRING_VERSION).array(self.entries.len());
         for (fp, name) in &self.entries {
-            e.array(3)
+            e.array(4)
                 .bytes(fp)
                 .text(name)
-                .uint(u64::from(self.full_history.contains(fp)));
+                .uint(u64::from(self.full_history.contains(fp)))
+                .uint(u64::from(self.drive.contains(fp)));
         }
         e.finish()
     }
@@ -276,10 +379,12 @@ impl Keyring {
         let version = d
             .uint()
             .map_err(|_| Error::MalformedAtRest("keyring version"))?;
-        if version != KEYRING_VERSION {
-            return Err(Error::MalformedAtRest("keyring version"));
-        }
-        let row_arity = 3;
+        // A version-2 keyring has no capability: each entry reads as read (ADR-028 K-14).
+        let row_arity = match version {
+            KEYRING_VERSION => 4,
+            KEYRING_VERSION_READ_ONLY => 3,
+            _ => return Err(Error::MalformedAtRest("keyring version")),
+        };
         let n = d
             .array()
             .map_err(|_| Error::MalformedAtRest("keyring len"))?;
@@ -288,6 +393,7 @@ impl Keyring {
         }
         let mut entries = BTreeMap::new();
         let mut full_history = BTreeSet::new();
+        let mut drive = BTreeSet::new();
         for _ in 0..n {
             let pair = d
                 .array()
@@ -307,16 +413,26 @@ impl Keyring {
             if name.is_empty() || name.len() > MAX_PETNAME {
                 return Err(Error::MalformedAtRest("keyring petname length"));
             }
-            if row_arity == 3 {
+            match d
+                .uint()
+                .map_err(|_| Error::MalformedAtRest("keyring history"))?
+            {
+                0 => {}
+                1 => {
+                    full_history.insert(fp);
+                }
+                _ => return Err(Error::MalformedAtRest("keyring history")),
+            }
+            if row_arity == 4 {
                 match d
                     .uint()
-                    .map_err(|_| Error::MalformedAtRest("keyring history"))?
+                    .map_err(|_| Error::MalformedAtRest("keyring capability"))?
                 {
                     0 => {}
                     1 => {
-                        full_history.insert(fp);
+                        drive.insert(fp);
                     }
-                    _ => return Err(Error::MalformedAtRest("keyring history")),
+                    _ => return Err(Error::MalformedAtRest("keyring capability")),
                 }
             }
             entries.insert(fp, name);
@@ -326,6 +442,7 @@ impl Keyring {
         Ok(Self {
             entries,
             full_history,
+            drive,
         })
     }
 
