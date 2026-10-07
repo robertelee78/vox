@@ -342,13 +342,16 @@ fn a_live_opencode_session_is_mirrored_and_driven() {
     for d in [oc_cfg.join("opencode"), project.join(".opencode/plugin")] {
         std::fs::create_dir_all(&d).unwrap_or_else(|e| panic!("APPARATUS: cannot make {d:?}: {e}"));
     }
-    let plugin = staged_as(
-        &data,
-        &cfg,
-        NODE,
-        &["agent", "plugin", "opencode", "--node", NODE],
-        None,
+    // The plugin as `vox agent plugin opencode` prints it on stdout (its advice goes to stderr).
+    let plugin = Command::new(VOX)
+        .args(["agent", "plugin", "opencode", "--node", NODE])
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot run vox agent plugin opencode: {e}"));
+    assert!(
+        plugin.status.success(),
+        "PRODUCT: `vox agent plugin opencode --node {NODE}` failed"
     );
+    let plugin = plugin.stdout;
     std::fs::write(project.join(".opencode/plugin/vox.js"), plugin)
         .unwrap_or_else(|e| panic!("APPARATUS: cannot install the plugin: {e}"));
     std::fs::write(
@@ -361,6 +364,34 @@ fn a_live_opencode_session_is_mirrored_and_driven() {
         .to_string(),
     )
     .unwrap_or_else(|e| panic!("APPARATUS: cannot write opencode.json: {e}"));
+    // What OpenCode and the plugin logged, kept outside the run's directory however it ends.
+    let plugin_log = sb.root.join("plugin.log");
+    struct KeepLogs(Vec<PathBuf>);
+    impl Drop for KeepLogs {
+        fn drop(&mut self) {
+            for (i, from) in self.0.iter().enumerate() {
+                let mut files = vec![from.clone()];
+                if from.is_dir() {
+                    files = std::fs::read_dir(from)
+                        .map(|d| d.filter_map(Result::ok).map(|e| e.path()).collect())
+                        .unwrap_or_default();
+                }
+                for (j, f) in files.iter().enumerate() {
+                    let to = PathBuf::from(format!(
+                        "/private/tmp/vc/kept-{}-log{i}-{j}.txt",
+                        std::process::id()
+                    ));
+                    if std::fs::copy(f, &to).is_ok() {
+                        println!("[proof] kept {} at {}", f.display(), to.display());
+                    }
+                }
+            }
+        }
+    }
+    let _logs = KeepLogs(vec![
+        plugin_log.clone(),
+        sb.home.join(".local/share/opencode/log"),
+    ]);
     let oc_tmp = sb.root.join("t");
     std::fs::create_dir_all(&oc_tmp)
         .unwrap_or_else(|e| panic!("APPARATUS: cannot make {oc_tmp:?}: {e}"));
@@ -385,6 +416,7 @@ fn a_live_opencode_session_is_mirrored_and_driven() {
         .env("VOX_CONFIG_DIR", &cfg)
         .env("VOX_ROOM", &room)
         .env("VOX_BIN", VOX)
+        .env("VOX_PLUGIN_LOG", &plugin_log)
         .current_dir(&project)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -423,6 +455,21 @@ fn a_live_opencode_session_is_mirrored_and_driven() {
         "wait 60 (?i)(opencode|ask anything|kimi)",
         Duration::from_secs(90),
     );
+    // The plugin is loaded before anything is typed: a turn before it would reach no Session.
+    let t0 = Instant::now();
+    while !std::fs::read_to_string(&plugin_log)
+        .unwrap_or_default()
+        .contains("plugin loaded")
+    {
+        assert!(
+            t0.elapsed() < Duration::from_secs(90),
+            "APPARATUS: OpenCode started but never loaded Vox's plugin from {:?} within 90 s; no \
+             prompt was typed",
+            project.join(".opencode/plugin/vox.js")
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    println!("[proof] (2) OpenCode loaded Vox's plugin");
     std::thread::sleep(Duration::from_secs(3));
     tui.type_line(PROMPT);
     println!("[proof] (3) the operator typed the first prompt at OpenCode's terminal");
@@ -559,7 +606,7 @@ fn a_live_opencode_session_is_mirrored_and_driven() {
         &id,
         Duration::from_secs(60),
         "the interrupted turn's end",
-        |p| p.matches("— turn ended —").count() >= 2,
+        interrupted_turn_ended,
     );
     println!(
         "[proof] (5) the interrupted turn ended {:.1}s after the interrupt (its command sleeps \
@@ -577,4 +624,12 @@ fn a_live_opencode_session_is_mirrored_and_driven() {
     ] {
         sb.check(&text, &format!("the live OpenCode session's {what}"));
     }
+}
+
+/// Whether the Session shows the turn's end after the interrupt that caused it: the interrupt's
+/// line, then "— turn ended —".
+fn interrupted_turn_ended(plain: &str) -> bool {
+    plain
+        .split_once("interrupt sent by")
+        .is_some_and(|(_, after)| after.contains("— turn ended —"))
 }

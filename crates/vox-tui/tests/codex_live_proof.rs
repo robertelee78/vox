@@ -1340,7 +1340,7 @@ fn a_live_codex_session_is_mirrored_and_driven() {
         &id,
         Duration::from_secs(60),
         "the interrupted turn's end, its command stopped",
-        |p, _| p.matches("— turn ended —").count() >= 2,
+        |p, _| interrupted_turn_ended(p),
     );
     println!(
         "[proof] (5) the interrupted turn ended {:.1}s after the interrupt (its command sleeps \
@@ -1378,4 +1378,12 @@ fn a_live_codex_session_is_mirrored_and_driven() {
         signin == "unchanged" || signin.ends_with("the operator's file was updated"),
         "APPARATUS: {signin}"
     );
+}
+
+/// Whether the Session shows the turn's end after the interrupt that caused it: the interrupt's
+/// line, then "— turn ended —".
+fn interrupted_turn_ended(plain: &str) -> bool {
+    plain
+        .split_once("interrupt sent by")
+        .is_some_and(|(_, after)| after.contains("— turn ended —"))
 }

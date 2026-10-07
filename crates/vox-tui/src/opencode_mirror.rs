@@ -99,6 +99,7 @@ impl OpenCodeMirror {
             finished: BTreeSet::new(),
             asks: BTreeMap::new(),
             model: None,
+            in_turn: false,
             next_id: 1,
             calls: BTreeMap::new(),
             answers: tx,
@@ -157,6 +158,9 @@ struct Follow {
     asks: BTreeMap<String, Ask>,
     /// The provider and model of the session's last assistant message, which /compact needs.
     model: Option<(String, String)>,
+    /// Whether a turn has shown anything since the last turn end: OpenCode reports a session idle
+    /// more than once around an abort, and one turn ends once.
+    in_turn: bool,
     next_id: u64,
     calls: BTreeMap<u64, (oneshot::Sender<Result<String, String>>, String)>,
     /// Where a member's first answer comes back to this loop.
@@ -459,13 +463,24 @@ impl Follow {
                     }
                 }
             }
-            "message.part.updated" => self.part(&sid, &p["part"]),
+            "message.part.updated" => {
+                self.in_turn = true;
+                self.part(&sid, &p["part"]);
+            }
             "session.idle" if sid == self.session => {
                 self.flush_replies();
-                self.post(split(self.envelope(&sid, "turn-end", None), ""));
+                if std::mem::take(&mut self.in_turn) {
+                    self.post(split(self.envelope(&sid, "turn-end", None), ""));
+                }
             }
-            "permission.asked" => self.permission(&sid, p),
-            "question.asked" => self.question(&sid, p),
+            "permission.asked" => {
+                self.in_turn = true;
+                self.permission(&sid, p);
+            }
+            "question.asked" => {
+                self.in_turn = true;
+                self.question(&sid, p);
+            }
             "permission.replied" => {
                 let Some(r) = p.get("requestID").and_then(Value::as_str) else {
                     return;
