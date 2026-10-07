@@ -329,9 +329,9 @@ fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
 /// The live tunnels, one per line with its number, member, service and how long it has been
 /// still, then those that ended for a reason, with that reason (V030-11).
 fn render_tunnels(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
-    let now = vox_core::transport::quic::unix_now();
-    let ago = |t: u64| {
-        let s = now.saturating_sub(t);
+    let now_ms = vox_core::transport::quic::unix_now_ms();
+    let ago = |t_ms: u64| {
+        let s = now_ms.saturating_sub(t_ms) / 1_000;
         if s < 120 {
             format!("{s}s")
         } else if s < 7200 {
@@ -391,7 +391,7 @@ fn render_tunnels(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
 /// What this node decided, newest first, one line each (ADR-028 D-3): when, what, about whom (this
 /// node's name for them, else their fingerprint's start), what was asked and why.
 fn render_decisions(frame: &mut Frame, area: Rect, vm: &ViewModel) {
-    let now_ms = vox_core::transport::quic::unix_now().saturating_mul(1_000);
+    let now_ms = vox_core::transport::quic::unix_now_ms();
     let ago = |at_ms: u64| {
         let s = now_ms.saturating_sub(at_ms) / 1_000;
         if s < 120 {

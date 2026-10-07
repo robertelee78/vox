@@ -1194,7 +1194,7 @@ impl ConnectionManager {
         // identity's holder can present a new process of it, and that holder can already speak as
         // it. **Two live processes of one identity** (a copied profile, an old binary) would each
         // supersede the other: that is bounded by the dialler's anchor backoff, which counts a
-        // connection lost soon after it was made as a failure (`ANCHOR_FLAP_SECS`), not a loop.
+        // connection lost soon after it was made as a failure (`ANCHOR_FLAP_MS`), not a loop.
         let process = conn.peer_process();
         if let Some(existing) = map.get(&peer).filter(|e| e.peer_process() != process) {
             let existing = Arc::clone(existing);

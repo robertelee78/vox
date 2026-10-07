@@ -130,16 +130,16 @@ struct Winding {
 
 /// How often automatic work (a rotation's rekeys, a trusted member's consent) may start a background
 /// dial to one member it cannot currently reach. See `reach_member`.
-const MEMBER_REDIAL_SECS: u64 = 30;
+const MEMBER_REDIAL_MS: u64 = 30_000;
 
 /// How often a node holding a room with a member it is not connected to says where it listens on
 /// this computer and the local network (`node::nearby`).
-const NEARBY_EVERY_SECS: u64 = 30;
+const NEARBY_EVERY_MS: u64 = 30_000;
 /// How soon after it holds a room it did not — what a node that just started does — a node says
 /// so, if a member of it is still not connected by then.
-const NEARBY_FIRST_SECS: u64 = 3;
+const NEARBY_FIRST_MS: u64 = 3_000;
 /// How soon a member heard on `node::nearby` may be dialled for it again.
-const NEARBY_REDIAL_SECS: u64 = 5;
+const NEARBY_REDIAL_MS: u64 = 5_000;
 
 /// How long relayed connections' closes get to leave through their circuits before the circuits'
 /// carrier connections are closed too (see `stop_network`). The frame only has to be handed to the
@@ -373,7 +373,7 @@ const PUBLISH_RETRY_CAP: Duration = Duration::from_secs(30);
 const KEY_DELIVERY_PATIENCE: Duration = Duration::from_secs(30);
 /// How often the node re-reads its retention file (ADR-023 decision 2: the sweep runs at
 /// least every minute; the file is read on the same cadence).
-const RETENTION_REREAD_SECS: u64 = 60;
+const RETENTION_REREAD_MS: u64 = 60_000;
 
 /// How often a peer reached over a relay is retried for a direct path.
 ///
@@ -763,17 +763,17 @@ impl NodeConfig {
 /// anchor closed its connection a moment after it connected — a restarted process of an
 /// identity, which the anchor still knew by its dead predecessor's connection — had no helper
 /// for up to 30 s (CI run 36418572653: a first relayed connection in 30065 ms, 55 attempts).
-const ANCHOR_REDIAL_SECS: u64 = 30;
+const ANCHOR_REDIAL_MS: u64 = 30_000;
 
 /// The longest an anchor whose **dial failed** waits before the next (V210-86, #278). Every
 /// second of it is a second a member stays away after its anchor is back: doubled to
-/// [`ANCHOR_REDIAL_SECS`], a member whose dials failed while its anchor restarted could come back
+/// [`ANCHOR_REDIAL_MS`], a member whose dials failed while its anchor restarted could come back
 /// up to 30 s after it. A dial that failed never became a connection, so what a shorter wait costs
 /// the anchor is bounded by its handshake cap and queue (`HANDSHAKES_IN_FLIGHT`,
 /// `HANDSHAKES_WAITING`). At the cap the wait is 1 or 2 s at random, so a room's members do not
-/// redial in step. A connection lost as soon as it is made (a flap, [`ANCHOR_FLAP_SECS`]) still
-/// backs off to [`ANCHOR_REDIAL_SECS`]: each of those was a whole handshake.
-const ANCHOR_UNREACHED_REDIAL_SECS: u64 = 2;
+/// redial in step. A connection lost as soon as it is made (a flap, [`ANCHOR_FLAP_MS`]) still
+/// backs off to [`ANCHOR_REDIAL_MS`]: each of those was a whole handshake.
+const ANCHOR_UNREACHED_REDIAL_MS: u64 = 2_000;
 
 /// The most addresses one dial of an anchor tries (V210-75): four rooms' worth of the
 /// [`MAX_ENDPOINTS`](crate::nat::multiaddr::MAX_ENDPOINTS) one room may name for it. An anchor
@@ -790,8 +790,8 @@ const ANCHOR_DIAL_CANDIDATES: usize = 4 * crate::nat::multiaddr::MAX_ENDPOINTS;
 /// backoff, not as a loss to redial at once (V210-57): two live processes of one identity (a
 /// copied profile, an old binary) supersede each other at the anchor, and redialling each loss at
 /// once would make that a loop at the tick's rate. Backed off, it settles to one try per
-/// [`ANCHOR_REDIAL_SECS`].
-const ANCHOR_FLAP_SECS: u64 = 10;
+/// [`ANCHOR_REDIAL_MS`].
+const ANCHOR_FLAP_MS: u64 = 10_000;
 
 /// How long an anchor connection may hear nothing before every tick probes it (V210-93).
 const ANCHOR_PROBE_AFTER: Duration = Duration::from_secs(3);
@@ -1319,7 +1319,7 @@ enum NetEvent {
         /// The passphrase, kept by the room's state.
         passphrase: Secret,
         /// When the join began.
-        now: u64,
+        now: crate::time::Ms,
         /// This node's fingerprint.
         me: Digest32,
         /// What the join came to. Boxed: a won join carries a whole session.
@@ -1337,7 +1337,7 @@ enum NetEvent {
         /// The genesis made before the seal.
         genesis: Box<crate::governance::genesis::Genesis>,
         /// When the room was begun.
-        now: u64,
+        now: crate::time::Ms,
         /// The room key and its sealed wrap, or why sealing failed.
         sealed: crate::error::Result<(crate::atrest::sek::Sek, crate::atrest::SekWrap)>,
         /// For `vox serve`: the one service the room is made for, as (tag, endpoint, the kind
@@ -2052,32 +2052,37 @@ fn spawn_inbound_pump(
     });
 }
 
-/// How long, in seconds, the identity passphrase stays good for a keyring change once it has been
-/// entered (V210-159, decider 2026-10-02). Posting and reading go on while the node runs; only a
-/// trust add or remove past this needs the passphrase again, whichever client asks.
-pub const KEYRING_WINDOW_SECS: u64 = 30 * 60;
+/// How long, in milliseconds, the identity passphrase stays good for a keyring change once it has
+/// been entered (V210-159, decider 2026-10-02). Posting and reading go on while the node runs; only
+/// a trust add or remove past this needs the passphrase again, whichever client asks.
+pub const KEYRING_WINDOW_MS: u64 = 30 * 60 * 1_000;
 
-/// [`KEYRING_WINDOW_SECS`], or `TEST_KEYRING_WINDOW_ENV`'s seconds in a `test-knobs` build.
-fn keyring_window() -> u64 {
+/// [`KEYRING_WINDOW_MS`], or `TEST_KEYRING_WINDOW_ENV`'s seconds in a `test-knobs` build.
+fn keyring_window_ms() -> u64 {
     #[cfg(feature = "test-knobs")]
     if let Some(secs) = std::env::var(TEST_KEYRING_WINDOW_ENV)
         .ok()
-        .and_then(|v| v.trim().parse().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
     {
-        return secs;
+        return secs.saturating_mul(1_000);
     }
-    KEYRING_WINDOW_SECS
+    KEYRING_WINDOW_MS
 }
 
-/// How many seconds a keyring change still goes without the passphrase, for a passphrase entered
-/// at `entered_at` (`0`: not since the node was attached) and the time `now`: `None` once a change
-/// would ask for it (ADR-028 K-9). A clock that went backwards counts as just entered, as
-/// a keyring change counts it.
+/// How many seconds a keyring change still goes without the passphrase, rounded up for a person,
+/// for a passphrase entered at `entered_ms` (`0`: not since the node was attached) and the time
+/// `now_ms`: `None` once a change would ask for it (ADR-028 K-9). A clock that went backwards
+/// counts as just entered, as a keyring change counts it.
 #[must_use]
-pub fn keyring_left(entered_at: u64, now: u64) -> Option<u64> {
-    let window = keyring_window();
-    let gone = now.saturating_sub(entered_at);
-    (entered_at != 0 && gone <= window).then(|| window - gone)
+pub fn keyring_left(entered_ms: u64, now_ms: u64) -> Option<u64> {
+    let window = keyring_window_ms();
+    let gone = now_ms.saturating_sub(entered_ms);
+    (entered_ms != 0 && gone <= window).then(|| (window - gone).div_ceil(1_000))
+}
+
+/// `ms` milliseconds as a person reads them in a note: whole seconds, rounded, as `"3s"`.
+fn seconds_said(ms: u64) -> String {
+    format!("{}s", ms.saturating_add(500) / 1_000)
 }
 
 /// **For proofs only.** The keyring window in seconds instead of 30 minutes, so a proof can see a
@@ -2506,12 +2511,12 @@ const MAX_JOIN_RESPONDERS: usize = 3;
 /// join measured here (12-21s end to end, two machines through a real anchor) and short
 /// enough that a node genuinely stranded off a board is named while somebody is still
 /// looking at the terminal.
-const PUBLISH_REFUSAL_GRACE: u64 = 60;
+const PUBLISH_REFUSAL_GRACE_MS: u64 = 60_000;
 
 /// How long this node's own record refused as stale goes unreported: long enough for the republish
 /// past the next second (`NetEvent::RepublishTo`) to land, short enough that a refusal it does not
 /// cure is named while somebody is still looking.
-const STALE_REFUSAL_GRACE: u64 = 5;
+const STALE_REFUSAL_GRACE_MS: u64 = 5_000;
 
 /// How many times in a row a node republishes one of its own records to a board that refused it as
 /// stale: enough to get past the second the refused one was signed in, with room for a clock that
@@ -3525,10 +3530,7 @@ impl NodeHandle {
     #[must_use]
     pub fn keyring_open_secs(&self) -> Option<u64> {
         let KeyringWindow { entered, clock } = &self.keyring;
-        keyring_left(
-            entered.load(std::sync::atomic::Ordering::Relaxed),
-            clock() / 1_000,
-        )
+        keyring_left(entered.load(std::sync::atomic::Ordering::Relaxed), clock())
     }
 
     /// The sync counters `vox status --json` reports (ADR-025 S0b).
@@ -3880,8 +3882,8 @@ pub struct Node {
     addresses_task: Option<tokio::task::AbortHandle>,
     /// The task telling this node each real change of the machine's network (ADR-012 N-51).
     changes_task: Option<tokio::task::AbortHandle>,
-    /// Per anchor that failed to connect: when it may be dialled again (unix seconds), and the
-    /// wait that set it, doubling to [`ANCHOR_REDIAL_SECS`] (V210-57). No entry: dial when
+    /// Per anchor that failed to connect: when it may be dialled again (unix milliseconds), and
+    /// the wait in milliseconds that set it, doubling to [`ANCHOR_REDIAL_MS`] (V210-57). No entry: dial when
     /// needed.
     anchor_backoff: BTreeMap<Digest32, (u64, u64)>,
     /// The anchors being dialled right now, so none is dialled twice at once (V210-57): a node
@@ -3892,20 +3894,21 @@ pub struct Node {
     /// addresses: where the next dial's window starts in their union (V210-75). Moved on by
     /// each failed dial, dropped when one connects.
     anchor_window: BTreeMap<Digest32, usize>,
-    /// When each anchor's current connection was made (unix seconds), with that connection's
-    /// serial, so one lost soon after is told from one lost after a while ([`ANCHOR_FLAP_SECS`]).
+    /// When each anchor's current connection was made (unix milliseconds), with that connection's
+    /// serial, so one lost soon after is told from one lost after a while ([`ANCHOR_FLAP_MS`]).
     anchor_connected_at: BTreeMap<Digest32, (u64, u64)>,
     /// The connection held to each anchor at the last look, so losing one is said when it
     /// happens, not only when it is next redialled (#229's diagnostics). The connection, not
     /// only the anchor: one lost and replaced between two looks is still a loss (V210-93).
     anchors_up: BTreeMap<Digest32, Arc<VoxConnection>>,
     /// Per anchor this node keeps and did not hold a connection to at the last look: since when
-    /// (unix seconds). What `vox status` and the notifier read (PRD-001 R37).
+    /// (unix milliseconds). What `vox status` and the notifier read (PRD-001 R37).
     anchor_unreached_since: BTreeMap<Digest32, u64>,
     /// Peers a room's sync is dialling right now (`reach_for_sync`), so one is not dialled twice.
     sync_dials: BTreeSet<Digest32>,
     /// When each open room's own records are next renewed on this node's board and its anchors
-    /// (V210-68, #258): half their lifetime after the last round that signed them.
+    /// (V210-68, #258): half their lifetime after the last round that signed them (unix
+    /// milliseconds).
     records_renew_at: BTreeMap<Digest32, u64>,
     /// ADR-025's sync ports, one per `(room, peer)`: see `node::ports`.
     ports: BTreeMap<(Digest32, Digest32), crate::node::ports::Port>,
@@ -3921,7 +3924,7 @@ pub struct Node {
     sched_all: bool,
     /// Peers this node has adopted a connection to; ports are discovered for them.
     connected: std::collections::BTreeSet<Digest32>,
-    /// When the periodic request (ADR-025 D7) is next raised on every port, unix seconds.
+    /// When the periodic request (ADR-025 D7) is next raised on every port, unix milliseconds.
     next_request_at: u64,
     /// The room instance each room's ports were last discovered for.
     discovered: BTreeMap<Digest32, crate::node::ports::RoomRef>,
@@ -3937,7 +3940,8 @@ pub struct Node {
     /// an operator scrolling past `rejected: policy` is how a `not a channel member` goes unread.
     /// Reported on change, like every other line a node says about itself.
     last_publish_refusal: BTreeMap<(Digest32, String), String>,
-    /// When we first saw a still-uncured refusal of one of **our own** records.
+    /// When we first saw a still-uncured refusal of one of **our own** records (unix
+    /// milliseconds).
     ///
     /// A newcomer's own bundle and address are refused `author is not a channel member`
     /// by every board until a member vouches for it — that is M15.2a working, it is the
@@ -3949,7 +3953,7 @@ pub struct Node {
     ///
     /// So it is not suppressed, it is **deferred by time**: the first sighting is
     /// remembered silently, and the refusal is reported only if the same board still
-    /// refuses the same record [`PUBLISH_REFUSAL_GRACE`] later. A join that cures itself
+    /// refuses the same record [`PUBLISH_REFUSAL_GRACE_MS`] later. A join that cures itself
     /// never prints; a node that is genuinely stuck out of a room still does, which is
     /// the whole reason this event exists.
     ///
@@ -3964,9 +3968,9 @@ pub struct Node {
     join_slots: Arc<std::sync::Mutex<crate::node::joinslots::JoinSlots>>,
     /// Slots for identity-passphrase checks; see [`VERIFIES_IN_FLIGHT`].
     verify_slots: Arc<tokio::sync::Semaphore>,
-    /// When the identity passphrase was last entered, in this node's clock's seconds: at
+    /// When the identity passphrase was last entered, in this node's clock's milliseconds: at
     /// creation, at unlock, or at a later check that passed. Zero while locked. A keyring change
-    /// is refused once [`keyring_window`] has passed since (V210-159). Shared, because a check
+    /// is refused once [`keyring_window_ms`] has passed since (V210-159). Shared, because a check
     /// passes on a blocking thread.
     passphrase_entered_at: Arc<std::sync::atomic::AtomicU64>,
     /// Set while a [`NodeCommand::Proved`] keyring change is applied: its passphrase was just
@@ -4069,7 +4073,8 @@ pub struct Node {
     /// with the address's serial: said when the anchor takes it, or when [`ADDRESS_PATIENCE`]
     /// passes without (`NetEvent::AnchorNoteDue`) (V210-96).
     anchor_owed: BTreeMap<(Digest32, Digest32), u64>,
-    /// When a background dial to each member was last started: see `reach_member`.
+    /// When a background dial to each member was last started (unix milliseconds): see
+    /// `reach_member`.
     member_dialed_at: BTreeMap<Digest32, u64>,
     /// Where this node says it listens on this computer and the local network, and hears others
     /// say so (V210-167; `node::nearby`). `None` for an anchor, or when the group cannot be
@@ -4077,11 +4082,12 @@ pub struct Node {
     nearby: Option<Arc<crate::node::nearby::Nearby>>,
     /// The task hearing `nearby`, aborted when the network stops.
     nearby_task: Option<tokio::task::AbortHandle>,
-    /// When this node next says where it listens, while a member is not connected.
+    /// When this node next says where it listens, while a member is not connected (unix
+    /// milliseconds).
     nearby_due: u64,
     /// How many rooms were held when it last said so: a room held since is said at once.
     nearby_rooms: usize,
-    /// When each member heard on `nearby` was last dialled for it.
+    /// When each member heard on `nearby` was last dialled for it (unix milliseconds).
     nearby_dialed: BTreeMap<Digest32, u64>,
     /// Each room's view summary and detail as this node's own latest write left them, taken under the room's lock
     /// by the write itself. `view_of` uses it when a session holds the room, so a person always sees
@@ -4102,7 +4108,7 @@ pub struct Node {
     withdrawn: BTreeMap<Digest32, Vec<u8>>,
     /// Per room, the members that had left as of the last tend (V030-08), to see one come back.
     departed_seen: BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
-    /// Per `(room, member)`: consecutive keys not taken, and the unix second before which the
+    /// Per `(room, member)`: consecutive keys not taken, and the unix millisecond before which the
     /// tick does not send it another. Without it, a pair that could not converge was sent a key
     /// once a tick for as long as both ran: 560 refusals in 3 minutes, measured.
     key_backoff: BTreeMap<(Digest32, Digest32), (u32, u64)>,
@@ -4192,9 +4198,9 @@ pub struct Node {
     /// them again with no anchor. Sealed under the identity: empty while locked.
     peer_book: crate::node::peer_book::PeerBook,
     /// This node's own retention (ADR-023 decision 2), re-read from the config directory
-    /// at most every [`RETENTION_REREAD_SECS`] so an edit takes effect without a restart.
+    /// at most every [`RETENTION_REREAD_MS`] so an edit takes effect without a restart.
     node_retention: crate::node::retention::RetentionConfig,
-    /// When `node_retention` was last read; `0` before the first read.
+    /// When `node_retention` was last read (unix milliseconds); `0` before the first read.
     retention_read_at: u64,
     /// Open rooms whose node retention must be re-applied because the file changed; applied by
     /// the sweep as each room is free. A room gets its value when it is opened, so this only
@@ -4206,7 +4212,7 @@ pub struct Node {
     /// Consents decided but not yet delivered, each with the key it releases, taken at the
     /// decision (V210-30). Kept beside the keyring, sealed the same way.
     consent_keys: crate::node::pending_consent::PendingConsents,
-    /// When each peer was last tried for a better path, so a relayed connection is retried
+    /// When each peer was last tried for a better path (unix milliseconds), so a relayed connection is retried
     /// on a schedule rather than only at the moment it was made.
     last_upgrade: std::collections::BTreeMap<Digest32, u64>,
     /// The live reacher set per channel (M17.11), written here and read by serving tasks.
@@ -4585,7 +4591,7 @@ impl Node {
             sync_book: crate::node::status::SyncBook::shared(),
         };
         let mut node = node;
-        node.status.started = (node.clock)() / 1_000;
+        node.status.started = (node.clock)();
         // The app layer asks the actor for connections through its own queue, forwarded
         // onto the network queue so they are served in order with everything else.
         {
@@ -5217,21 +5223,23 @@ impl Node {
     }
 
     /// The identity passphrase was just entered for a keyring change, and proved: further keyring
-    /// changes are allowed without it for [`keyring_window`] from now (V210-159). Only a keyring
+    /// changes are allowed without it for [`keyring_window_ms`] from now (V210-159). Only a keyring
     /// change opens the window; attaching never does (ADR-028 K-12).
     fn note_passphrase_entered(&self) {
-        self.passphrase_entered_at
-            .store(self.now().max(1), std::sync::atomic::Ordering::Relaxed);
+        self.passphrase_entered_at.store(
+            self.now_ms().get().max(1),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
-    /// Whether the identity passphrase was entered within [`keyring_window`]. Never, while
+    /// Whether the identity passphrase was entered within [`keyring_window_ms`]. Never, while
     /// locked. A clock that went backwards counts as recent: the passphrase was entered, and the
     /// window is kept by the next change of the clock forward, not by a wrong reading.
     fn passphrase_entered_recently(&self) -> bool {
         let at = self
             .passphrase_entered_at
             .load(std::sync::atomic::Ordering::Relaxed);
-        keyring_left(at, self.now()).is_some()
+        keyring_left(at, self.now_ms().get()).is_some()
     }
 
     fn create_identity(&mut self, passphrase: &Secret) -> Outcome {
@@ -5474,7 +5482,7 @@ impl Node {
                     loop {
                         match heard.recv().await {
                             // Dropped when the actor is behind: the next one is said within
-                            // `NEARBY_EVERY_SECS`.
+                            // `NEARBY_EVERY_MS`.
                             Ok((from, entries)) => {
                                 let _ = tx.try_send(NetEvent::Heard { from, entries });
                             }
@@ -5895,15 +5903,15 @@ impl Node {
                     // (`NetEvent::RepublishTo`); said only if it is still refused after that.
                     let stale = own_stale_refusal(kind, &Some(why.clone()));
                     let grace = if stale {
-                        STALE_REFUSAL_GRACE
+                        STALE_REFUSAL_GRACE_MS
                     } else {
-                        PUBLISH_REFUSAL_GRACE
+                        PUBLISH_REFUSAL_GRACE_MS
                     };
                     if stale {
                         self.stale_held.insert(key.clone());
                     }
                     if not_yet_vouched || stale {
-                        let now = self.now();
+                        let now = self.now_ms().get();
                         let seen_before = self.publish_refusal_first_seen.contains_key(&key);
                         let first = *self
                             .publish_refusal_first_seen
@@ -5918,8 +5926,10 @@ impl Node {
                                 let (channel_id, what, why) =
                                     (*channel_id, what.clone(), why.clone());
                                 tokio::spawn(async move {
-                                    tokio::time::sleep(Duration::from_secs(STALE_REFUSAL_GRACE))
-                                        .await;
+                                    tokio::time::sleep(Duration::from_millis(
+                                        STALE_REFUSAL_GRACE_MS,
+                                    ))
+                                    .await;
                                     let _ = tx
                                         .send(NetEvent::StaleGraceOver {
                                             channel_id,
@@ -6114,7 +6124,7 @@ impl Node {
     /// the tick: an anchor that restarted, or a link that dropped, is re-established on the
     /// next tick, and only one that keeps failing is backed off (V210-57).
     fn redial_anchors_if_due(&mut self) {
-        let now = self.now();
+        let now = self.now_ms().get();
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
@@ -6204,7 +6214,10 @@ impl Node {
             if self.dial_anchor(&net, id, candidates) && waited > 0 {
                 net.manager().note(
                     id,
-                    format!("dialling this anchor again, {waited}s after it last failed"),
+                    format!(
+                        "dialling this anchor again, {} after it last failed",
+                        seconds_said(waited)
+                    ),
                 );
             }
         }
@@ -6212,7 +6225,7 @@ impl Node {
 
     /// Say that the connection `conn` to the anchor `id` is gone, and when it is redialled: at
     /// once, or backed off like a failed dial if it was lost soon after it was made
-    /// ([`ANCHOR_FLAP_SECS`]). `silent` is how long it answered nothing, if that is why it went.
+    /// ([`ANCHOR_FLAP_MS`]). `silent` is how long it answered nothing, if that is why it went.
     fn say_anchor_lost(
         &mut self,
         net: &Arc<NodeNet>,
@@ -6220,7 +6233,7 @@ impl Node {
         conn: &VoxConnection,
         silent: Option<Duration>,
     ) {
-        let now = self.now();
+        let now = self.now_ms().get();
         let lasted = match self.anchor_connected_at.get(&id) {
             Some((serial, at)) if *serial == conn.serial() => {
                 let at = *at;
@@ -6246,20 +6259,21 @@ impl Node {
             (None, Some(e)) => anchor_close_reason(&e, conn.closed_here()),
             (None, None) => "it is no longer held".to_owned(),
         };
-        if lasted.is_some_and(|s| s < ANCHOR_FLAP_SECS) {
+        if lasted.is_some_and(|s| s < ANCHOR_FLAP_MS) {
             // Lost almost as soon as it was made: backed off like a failed dial.
             let wait = self
                 .anchor_backoff
                 .get(&id)
-                .map_or(1, |(_, w)| (w * 2).min(ANCHOR_REDIAL_SECS));
+                .map_or(1_000, |(_, w)| (w * 2).min(ANCHOR_REDIAL_MS));
             self.anchor_backoff.insert(id, (now + wait, wait));
             net.manager().note(
                 id,
                 format!(
-                    "the connection to this {} is gone {}s after it was made ({why}); it is \
-                     redialled in {wait}s",
+                    "the connection to this {} is gone {} after it was made ({why}); it is \
+                     redialled in {}",
                     self.board_word(&id),
-                    lasted.unwrap_or(0)
+                    seconds_said(lasted.unwrap_or(0)),
+                    seconds_said(wait)
                 ),
             );
         } else {
@@ -6797,7 +6811,7 @@ impl Node {
                         == crate::node::net::PathClass::Relayed
                     {
                         let tx = self.net_tx.clone();
-                        self.last_upgrade.insert(peer, self.now());
+                        self.last_upgrade.insert(peer, self.now_ms().get());
                         tokio::spawn(async move {
                             match net.upgrade(peer, &endpoints).await {
                                 Ok(better) => {
@@ -6852,14 +6866,8 @@ impl Node {
                             step: "making the room here and publishing this member on its boards"
                                 .to_owned(),
                         });
-                        self.finish_join_channel(
-                            *parsed,
-                            passphrase,
-                            crate::time::Ms(now.saturating_mul(1_000)),
-                            me,
-                            won,
-                        )
-                        .await
+                        self.finish_join_channel(*parsed, passphrase, now, me, won)
+                            .await
                     }
                     Err(lost) => {
                         let _ = self.event_tx.send(NodeEvent::JoinSteps {
@@ -6926,7 +6934,7 @@ impl Node {
                             *genesis,
                             sek,
                             &wrap,
-                            crate::time::Ms(now.saturating_mul(1_000)),
+                            now,
                         ) {
                             Ok(ch) => match service {
                                 None => self.finish_create_channel(ch).await,
@@ -7017,7 +7025,7 @@ impl Node {
             NetEvent::Stranded(peers) => self.dial_stranded(&peers).await,
             NetEvent::ReachFailed { peer, why } => {
                 // An anchor that failed to connect waits before its next dial, doubling to
-                // `ANCHOR_UNREACHED_REDIAL_SECS` (V210-57, V210-86), jittered once it is there, a
+                // `ANCHOR_UNREACHED_REDIAL_MS` (V210-57, V210-86), jittered once it is there, a
                 // room's own as well as a configured one (V210-75).
                 if self.is_kept_anchor(&peer) {
                     // A union too large for one dial tries its next window next time (V210-75).
@@ -7027,19 +7035,21 @@ impl Node {
                     let wait = self
                         .anchor_backoff
                         .get(&peer)
-                        .map_or(1, |(_, w)| (w * 2).min(ANCHOR_UNREACHED_REDIAL_SECS));
-                    let wait = if wait == ANCHOR_UNREACHED_REDIAL_SECS {
+                        .map_or(1_000, |(_, w)| (w * 2).min(ANCHOR_UNREACHED_REDIAL_MS));
+                    let wait = if wait == ANCHOR_UNREACHED_REDIAL_MS {
                         let coin = crate::identity::rng::random_array::<1>().map_or(0, |b| b[0]);
-                        wait - u64::from(coin & 1)
+                        wait - u64::from(coin & 1) * 1_000
                     } else {
                         wait
                     };
-                    self.anchor_backoff.insert(peer, (self.now() + wait, wait));
+                    self.anchor_backoff
+                        .insert(peer, (self.now_ms().get() + wait, wait));
                     if let Some(net) = self.net.as_ref() {
                         net.manager().note(
                             peer,
                             format!(
-                                "dialling this anchor failed ({why}); the next try is in {wait}s"
+                                "dialling this anchor failed ({why}); the next try is in {}",
+                                seconds_said(wait)
                             ),
                         );
                     }
@@ -7103,10 +7113,10 @@ impl Node {
                         }
                     }
                 }
-                // The backoff is kept until the connection has lasted (`ANCHOR_FLAP_SECS`): one
+                // The backoff is kept until the connection has lasted (`ANCHOR_FLAP_MS`): one
                 // superseded at once is a flap, not a success.
                 self.anchor_connected_at
-                    .insert(peer, (tracked.serial(), self.now()));
+                    .insert(peer, (tracked.serial(), self.now_ms().get()));
                 self.anchor_window.remove(&peer);
                 // Said, so a log shows a redial's outcome as well as its start (#243, a CI red
                 // whose forward said it dialled and then nothing).
@@ -7286,7 +7296,7 @@ impl Node {
                 // and adopting it resends at once (`accept_hello`). Should that offer be lost
                 // with its connection, the retry here is what brings the next one: it stays at
                 // the first step rather than doubling, so one lost offer costs 2 s, not 2 + 4 + 8.
-                let now = self.now();
+                let now = self.now_ms().get();
                 let hello_refused =
                     why == KeyRefusal::describe(KeyRefusal::HelloRefused.code().into_inner());
                 let entry = self.key_backoff.entry((channel_id, peer)).or_insert((0, 0));
@@ -7295,7 +7305,7 @@ impl Node {
                 } else {
                     entry.0.saturating_add(1)
                 };
-                entry.1 = now.saturating_add(1u64 << entry.0.min(6));
+                entry.1 = now.saturating_add(1_000u64 << entry.0.min(6));
                 let _ = self.event_tx.send(NodeEvent::KeyNotTaken {
                     channel_id,
                     peer,
@@ -7598,7 +7608,7 @@ impl Node {
                 if report.fail.is_none() {
                     // When this room, and this peer, last completed a sync, for `vox status`
                     // (PRD-001 R35).
-                    let now = self.now();
+                    let now = self.now_ms().get();
                     self.status.room_synced.insert(channel_id, now);
                     self.status.member_synced.insert(peer, now);
                 }
@@ -8246,7 +8256,7 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
-        let now = self.now();
+        let now = self.now_ms().get();
         let endpoint = Arc::clone(net.manager().endpoint());
         // Collected first: the borrow of `self.channels` cannot outlive the mutation of
         // `self.last_upgrade` below.
@@ -8266,7 +8276,7 @@ impl Node {
                     continue;
                 }
                 let last = self.last_upgrade.get(&peer).copied().unwrap_or(0);
-                if now.saturating_sub(last) < UPGRADE_RETRY.as_secs() {
+                if u128::from(now.saturating_sub(last)) < UPGRADE_RETRY.as_millis() {
                     continue;
                 }
                 due.push((peer, net.board_endpoints(cid, &peer)));
@@ -8314,7 +8324,7 @@ impl Node {
         {
             return;
         }
-        let now = self.now();
+        let now = self.now_ms().get();
         if !self
             .peer_book
             .note(conn.peer_id(), conn.quinn().remote_address(), now)
@@ -8791,7 +8801,8 @@ impl Node {
             let _ = reply.send(Outcome::Failed(Fault::Locked));
             return;
         };
-        let now = self.now();
+        let now_ms = self.now_ms();
+        let now = now_ms.secs();
         let me = net.local_id();
         // The boards to try, in the order `reach_a_board` tried them: the link's anchors, this
         // node's own, then any anchor it already holds a live connection to.
@@ -8880,7 +8891,7 @@ impl Node {
                     reply,
                     parsed: Box::new(parsed),
                     passphrase,
-                    now,
+                    now: now_ms,
                     me,
                     result: Box::new(result),
                 })
@@ -9827,7 +9838,7 @@ impl Node {
             .filter(|fp| self.trust.history(fp) == crate::node::trust::HistoryGrant::Full)
             .collect();
         let trusted: BTreeSet<Digest32> = self.trust.trusted().into_iter().collect();
-        let now_secs = self.now();
+        let now_ms = self.now_ms();
         for shared in self.channels.values() {
             // A room mid-session is skipped, not waited for; the next tick comes round.
             let Ok(mut channel) = shared.try_lock() else {
@@ -9842,7 +9853,7 @@ impl Node {
                 continue;
             }
             let keep_from = channel
-                .oldest_generation_needed(&trusted, crate::time::Ms(now_secs.saturating_mul(1_000)))
+                .oldest_generation_needed(&trusted, now_ms)
                 .unwrap_or(u64::MAX);
             pruned |= channel
                 .prune_superseded_origins(&store, keep_from)
@@ -10010,7 +10021,7 @@ impl Node {
             (owed, skdm, history)
         };
         let mut delivered = 0u64;
-        let now_secs = self.now();
+        let now_ms = self.now_ms().get();
         let targets: BTreeSet<Digest32> = owed.into_iter().chain(history.keys().copied()).collect();
         for target in targets {
             // A member whose last keys were not taken waits out its backoff, unless a person asked.
@@ -10018,7 +10029,7 @@ impl Node {
                 && self
                     .key_backoff
                     .get(&(*channel_id, target))
-                    .is_some_and(|(_, until)| now_secs < *until)
+                    .is_some_and(|(_, until)| now_ms < *until)
             {
                 continue;
             }
@@ -10206,7 +10217,7 @@ impl Node {
     /// a node that published everywhere for another reason is not asked again sooner: at most one
     /// renewal per room per half-lifetime. A round to one anchor does not arm it.
     async fn renew_records_if_due(&mut self) {
-        let now = self.now();
+        let now = self.now_ms().get();
         let due: Vec<Digest32> = self
             .records_renew_at
             .iter()
@@ -10228,9 +10239,11 @@ impl Node {
 
     /// Arm `room`'s next renewal at half its records' lifetime from now.
     fn arm_record_renewal(&mut self, room: &Digest32) {
-        let half = crate::nat::store::own_record_ttl_secs() / 2;
-        self.records_renew_at
-            .insert(*room, self.now().saturating_add(half.max(1)));
+        let half_ms = crate::nat::store::own_record_ttl_secs().saturating_mul(1_000) / 2;
+        self.records_renew_at.insert(
+            *room,
+            self.now_ms().get().saturating_add(half_ms.max(1_000)),
+        );
     }
 
     /// ADR-025: a local append bumped the room's generation (inside the room's own write), so the
@@ -10560,9 +10573,10 @@ impl Node {
                 self.sched_rooms.insert(key.0);
             }
         }
-        let now = self.now();
+        let now = self.now_ms().get();
         if now >= self.next_request_at {
-            self.next_request_at = now + crate::node::syncstream::SYNC_INTERVAL_SECS;
+            self.next_request_at =
+                now + crate::node::syncstream::SYNC_INTERVAL_SECS.saturating_mul(1_000);
             // Every port nothing has served lately: one whose own session ran clean within half
             // the interval, or is running now, is passed over (V210-97). Half, so an idle port,
             // served by the previous request, is still raised by every one.
@@ -12163,13 +12177,13 @@ impl Node {
         //
         // So the dial always runs in the background and reports `Dialed`/`ReachFailed`; `Dialed`
         // adopts the connection and delivers whatever that member is owed at once. Automatic work
-        // (the tick, a post) dials at most once per `MEMBER_REDIAL_SECS`; a command the person
+        // (the tick, a post) dials at most once per `MEMBER_REDIAL_MS`; a command the person
         // gave (`asked`, a member just trusted) dials now whatever the spacing.
-        let now = self.now();
+        let now = self.now_ms().get();
         let recent = self
             .member_dialed_at
             .get(&target)
-            .is_some_and(|t| now.saturating_sub(*t) < MEMBER_REDIAL_SECS);
+            .is_some_and(|t| now.saturating_sub(*t) < MEMBER_REDIAL_MS);
         if asked || !recent {
             self.member_dialed_at.insert(target, now);
             let tx = self.net_tx.clone();
@@ -12207,25 +12221,25 @@ impl Node {
     }
 
     /// Say where this node listens on this computer and the local network (`node::nearby`):
-    /// [`NEARBY_FIRST_SECS`] after it holds a room it did not, then every [`NEARBY_EVERY_SECS`],
+    /// [`NEARBY_FIRST_MS`] after it holds a room it did not, then every [`NEARBY_EVERY_MS`],
     /// each time only if a member of a room it holds is not connected.
     async fn say_where_if_due(&mut self) {
         let (Some(nearby), Some(net)) = (self.nearby.clone(), self.net.clone()) else {
             return;
         };
-        let now = self.now();
+        let now = self.now_ms().get();
         let rooms = self.channels.len();
         if rooms > self.nearby_rooms {
             // The dials a newly held room makes from what it knows get their moment first.
             self.nearby_rooms = rooms;
-            self.nearby_due = now + NEARBY_FIRST_SECS;
+            self.nearby_due = now + NEARBY_FIRST_MS;
             return;
         }
         self.nearby_rooms = rooms;
         if now < self.nearby_due {
             return;
         }
-        self.nearby_due = now + NEARBY_EVERY_SECS;
+        self.nearby_due = now + NEARBY_EVERY_MS;
         let me = net.local_id();
         let Ok(at) = net.manager().endpoint().local_addr() else {
             return;
@@ -12233,7 +12247,12 @@ impl Node {
         let mut entries = Vec::with_capacity(rooms);
         let mut missing = false;
         for (room, channel) in &self.channels {
-            entries.push(crate::node::nearby::entry(room, &me, at.port(), now));
+            entries.push(crate::node::nearby::entry(
+                room,
+                &me,
+                at.port(),
+                now / 1_000,
+            ));
             if !missing {
                 missing = channel
                     .lock()
@@ -12260,14 +12279,14 @@ impl Node {
             return;
         };
         let me = net.local_id();
-        let now = self.now();
+        let now = self.now_ms().get();
         let mut found: BTreeMap<Digest32, u16> = BTreeMap::new();
         for (room, channel) in &self.channels {
             for m in channel.lock().await.members() {
                 if m == me || found.contains_key(&m) || net.manager().existing(&m).is_some() {
                     continue;
                 }
-                if let Some(port) = crate::node::nearby::port_of(entries, room, &m, now) {
+                if let Some(port) = crate::node::nearby::port_of(entries, room, &m, now / 1_000) {
                     found.insert(m, port);
                 }
             }
@@ -12276,7 +12295,7 @@ impl Node {
             if self
                 .nearby_dialed
                 .get(&peer)
-                .is_some_and(|t| now.saturating_sub(*t) < NEARBY_REDIAL_SECS)
+                .is_some_and(|t| now.saturating_sub(*t) < NEARBY_REDIAL_MS)
             {
                 continue;
             }
@@ -12955,7 +12974,6 @@ impl Node {
             return;
         }
         let now_ms = self.now_ms();
-        let now = now_ms.secs();
         let Some(profile) = self.profile.as_ref() else {
             let _ = reply.send(Outcome::Failed(Fault::NoIdentity));
             return;
@@ -13015,7 +13033,7 @@ impl Node {
                     room_name,
                     passphrase,
                     genesis: Box::new(genesis),
-                    now,
+                    now: now_ms,
                     sealed,
                     service,
                 })
@@ -14334,7 +14352,7 @@ impl Node {
     /// last-seen column and its unreachable flag.
     fn note_peers_seen(&mut self) {
         let Some(net) = self.net.as_ref() else { return };
-        let now = self.now();
+        let now = self.now_ms().get();
         for peer in net.manager().peers() {
             self.status.last_seen.insert(peer, now);
         }
@@ -14350,7 +14368,7 @@ impl Node {
             add_stats, ForwardStatus, MemberStatus, PeerStatus, RoomStatus, StatusReport,
         };
         self.note_peers_seen();
-        let now = self.now();
+        let now = self.now_ms().get();
         let view = self.view_tx.borrow().clone();
         let me = view.identity.as_ref().map(|i| i.fingerprint);
         let trusted: std::collections::BTreeSet<Digest32> =
@@ -14588,7 +14606,6 @@ impl Node {
 
     async fn set_retention(&mut self, channel_id: &Digest32, ttl: u64) -> Outcome {
         let now_ms = self.now_ms();
-        let now = now_ms.secs();
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
@@ -14623,7 +14640,7 @@ impl Node {
                 return Outcome::Failed(Fault::RetentionFileUnwritable);
             }
             self.retention_read_at = 0;
-            self.refresh_node_retention(now);
+            self.refresh_node_retention(now_ms);
             self.sweep_retention().await;
             return Outcome::OwnRetention { own: ttl, room };
         }
@@ -14637,11 +14654,12 @@ impl Node {
     }
 
     /// Re-read the node's own retention file when it is due (first use, then every
-    /// [`RETENTION_REREAD_SECS`]). An unreadable file keeps the last policy read rather than
+    /// [`RETENTION_REREAD_MS`]). An unreadable file keeps the last policy read rather than
     /// dropping to "no node limit", which would keep more than the operator asked for.
-    fn refresh_node_retention(&mut self, now: u64) {
+    fn refresh_node_retention(&mut self, now_ms: crate::time::Ms) {
+        let now = now_ms.get();
         if self.retention_read_at == 0
-            || now.saturating_sub(self.retention_read_at) >= RETENTION_REREAD_SECS
+            || now.saturating_sub(self.retention_read_at) >= RETENTION_REREAD_MS
         {
             if let Ok(cfg) =
                 crate::node::retention::RetentionConfig::load(&self.paths.retention_file())
@@ -14665,8 +14683,8 @@ impl Node {
     /// the node's own minute: an expired message shown (measured: `node_retention=0` at render
     /// in the failing run, `=60` in the passing ones).
     fn node_retention_for(&mut self, channel_id: &Digest32) -> u64 {
-        let now = self.now();
-        self.refresh_node_retention(now);
+        let now_ms = self.now_ms();
+        self.refresh_node_retention(now_ms);
         self.node_retention.for_room(channel_id)
     }
 
@@ -14675,8 +14693,7 @@ impl Node {
     /// republished and `vox room read` stops showing it.
     async fn sweep_retention(&mut self) -> bool {
         let now_ms = self.now_ms();
-        let now = now_ms.secs();
-        self.refresh_node_retention(now);
+        self.refresh_node_retention(now_ms);
         let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
             return false;
         };
