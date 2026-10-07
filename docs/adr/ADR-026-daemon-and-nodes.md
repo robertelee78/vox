@@ -252,6 +252,7 @@ network presence from the start: there is no interim design with one socket per 
   | `NEXT_TUNNEL`, `NEXT_SERIAL`, `paths::NEXT` | process-wide unique counters |
   | `PINNED` (`atrest/lock.rs`) | process-wide mlock bookkeeping; every node shares `RLIMIT_MEMLOCK` |
   | `SAID` (`quic.rs`), cached strings (`api.rs`, `viewmodel.rs`) | process-wide |
+  | `SENDING` (`claude_injector.rs`) | process-wide: one tmux send at a time, whichever node's Session it types into (ctm's lock), so two drives never interleave their keys; it holds no node's state |
   | signals, metrics (labelled `node=`), runtime size | daemon-level |
 
 ### 9. Diagnostics

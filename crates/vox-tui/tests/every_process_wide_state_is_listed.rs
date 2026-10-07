@@ -41,6 +41,8 @@ mod row {
         "NEXT_TUNNEL, NEXT_SERIAL, paths::NEXT: process-wide unique counters";
     pub const PINNED: &str = "PINNED (atrest/lock.rs): process-wide mlock bookkeeping";
     pub const CACHED: &str = "SAID (quic.rs), cached strings (api.rs, viewmodel.rs): process-wide";
+    pub const SENDING: &str =
+        "SENDING (claude_injector.rs): process-wide, one tmux send at a time across nodes";
 }
 
 /// Every process-wide item: (file under `crates/`, name, how many the file has, its ADR row,
@@ -65,6 +67,7 @@ const LISTED: &[(&str, &str, usize, &str, Option<&str>)] = &[
     ("vox-core/src/atrest/lock.rs", "PINNED", 1, row::PINNED, None),
     ("vox-core/src/node/api.rs", "TEXT", 1, row::CACHED, None),
     ("vox-tui/src/viewmodel.rs", "TEXT", 1, row::CACHED, None),
+    ("vox-tui/src/claude_injector.rs", "SENDING", 1, row::SENDING, None),
     (
         "vox-tui/src/ident.rs",
         "NAMES",
