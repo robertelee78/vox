@@ -73,7 +73,9 @@ if interactive:
     tty.setraw(fd)
 done = 0
 try:
-    record({"started": os.getpid()})
+    # Its tmux variables, which every hook it runs inherits: quoted by the proof, so a report can
+    # say which server and pane its hooks named.
+    record({"started": os.getpid(), "TMUX": os.environ.get("TMUX", ""), "TMUX_PANE": os.environ.get("TMUX_PANE", "")})
     draw()
     while True:
         r, _, _ = select.select([fd] if interactive else [], [], [], 0.1)

@@ -640,7 +640,26 @@ impl StandIn {
             );
             std::thread::sleep(Duration::from_millis(100));
         }
+        s.log_tmux(name);
         s
+    }
+
+    /// Print the tmux variables the stand-in, and so every hook it runs, holds.
+    fn log_tmux(&self, name: &str) {
+        let started = self
+            .said()
+            .lines()
+            .find_map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).ok()?;
+                v.get("started")?;
+                Some(v)
+            })
+            .unwrap_or_default();
+        println!(
+            "[proof] stand-in {name}: its hooks hold TMUX={:?} TMUX_PANE={:?}",
+            started["TMUX"].as_str().unwrap_or_default(),
+            started["TMUX_PANE"].as_str().unwrap_or_default()
+        );
     }
 
     fn said(&self) -> String {
@@ -705,6 +724,7 @@ impl StandIn {
             );
             std::thread::sleep(Duration::from_millis(100));
         }
+        s.log_tmux(name);
         (s, child)
     }
 
