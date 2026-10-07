@@ -12256,12 +12256,7 @@ impl Node {
         let mut entries = Vec::with_capacity(rooms);
         let mut missing = false;
         for (room, channel) in &self.channels {
-            entries.push(crate::node::nearby::entry(
-                room,
-                &me,
-                at.port(),
-                now,
-            ));
+            entries.push(crate::node::nearby::entry(room, &me, at.port(), now));
             if !missing {
                 missing = channel
                     .lock()
