@@ -4363,7 +4363,7 @@ pub async fn retention(paths: &Paths, room: &str, duration: &str) -> Result<(), 
         Ok(Frame::Ok) => {
             println!(
                 "vox: {} keeps messages {}",
-                short(&channel_id),
+                which,
                 match ttl {
                     0 => "forever".to_owned(),
                     t => format!("for {}", vox_core::node::retention::describe(t)),
@@ -4389,13 +4389,13 @@ pub async fn retention(paths: &Paths, room: &str, duration: &str) -> Result<(), 
                 println!(
                     "vox: you follow the room's retention for {} again: this node keeps its \
                      messages {}",
-                    short(&channel_id),
+                    which,
                     say(own)
                 );
             } else {
                 println!(
                     "vox: set your own retention for {}: this node keeps its messages {}",
-                    short(&channel_id),
+                    which,
                     say(own)
                 );
             }
