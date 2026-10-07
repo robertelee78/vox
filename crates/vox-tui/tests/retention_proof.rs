@@ -475,14 +475,18 @@ fn shortening_a_rooms_retention_removes_older_messages_on_every_member() {
         );
         let rows = read_with_notices(&alice, &room);
         let at = |pick: &dyn Fn(&serde_json::Value) -> bool| {
-            rows.iter().enumerate().filter(|(_, r)| pick(r)).last().map(|(i, r)| {
-                (i, r["created_millis"].as_u64().unwrap_or(0))
-            })
+            rows.iter()
+                .enumerate()
+                .filter(|(_, r)| pick(r))
+                .last()
+                .map(|(i, r)| (i, r["created_millis"].as_u64().unwrap_or(0)))
         };
         let posted = at(&|r| r["text"].as_str() == Some(text.as_str()));
         let changed = at(&|r| {
             r["schema"] == "vox.room.notice/1"
-                && r["notice"].as_str().is_some_and(|n| n.contains("set the room's retention"))
+                && r["notice"]
+                    .as_str()
+                    .is_some_and(|n| n.contains("set the room's retention"))
         });
         let (Some(posted), Some(changed)) = (posted, changed) else {
             panic!(
