@@ -105,6 +105,44 @@ pub struct Session {
     /// `codex exec`) gets no Session.
     #[serde(default = "interactive_by_default")]
     pub interactive: bool,
+    /// The tmux pane the session runs in, when it runs in one (ADR-029 DR-1, DR-5): how a driver's
+    /// input reaches a Claude Code session, as ctm's injector does. `None` outside tmux.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux: Option<TmuxPane>,
+}
+
+/// Where a session's terminal is, in tmux: read from the harness's environment by its hook.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TmuxPane {
+    /// The tmux server's socket: the first field of `$TMUX`.
+    pub socket: String,
+    /// The pane: `$TMUX_PANE`, as `%<n>`.
+    pub pane: String,
+    /// The `tmux` the hook's `PATH` finds, so the daemon, whose environment is not the
+    /// harness's, runs the same one.
+    pub bin: String,
+}
+
+impl TmuxPane {
+    /// The pane this process runs in, if tmux says: `$TMUX` and `$TMUX_PANE` both set, and a
+    /// `tmux` on `PATH`. Never a guess: without `$TMUX_PANE` there is no pane (ctm's positional
+    /// fallback could name another session's pane).
+    #[must_use]
+    pub fn from_env() -> Option<Self> {
+        let socket = std::env::var("TMUX").ok()?;
+        let socket = socket.split(',').next()?.trim().to_owned();
+        let pane = std::env::var("TMUX_PANE").ok()?.trim().to_owned();
+        let bin = std::env::var_os("PATH").and_then(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join("tmux"))
+                .find(|t| t.is_file())
+        })?;
+        (!socket.is_empty() && !pane.is_empty()).then(|| Self {
+            socket,
+            pane,
+            bin: bin.display().to_string(),
+        })
+    }
 }
 
 /// A record written before Sessions said nothing of it: it was registered by a hook a person ran.
@@ -304,6 +342,17 @@ impl Session {
     /// the harness's).
     #[must_use]
     pub fn from_env(session: &str, codex: bool) -> Self {
+        let mut s = Self::from_env_untmuxed(session, codex);
+        s.tmux = TmuxPane::from_env();
+        // Claude Code sets `CLAUDE_CODE_ENTRYPOINT` for its hooks even when its messaging socket
+        // is off.
+        if s.harness == "unknown" && std::env::var_os("CLAUDE_CODE_ENTRYPOINT").is_some() {
+            s.harness = "claude".into();
+        }
+        s
+    }
+
+    fn from_env_untmuxed(session: &str, codex: bool) -> Self {
         if codex {
             Session {
                 session: session.to_owned(),
@@ -317,6 +366,7 @@ impl Session {
                 room: None,
                 name: None,
                 interactive: interactive_now(),
+                tmux: None,
             }
         } else if let (Ok(endpoint), Ok(token)) = (
             std::env::var("CLAUDE_CODE_MESSAGING_SOCKET"),
@@ -334,6 +384,7 @@ impl Session {
                 room: None,
                 name: None,
                 interactive: interactive_now(),
+                tmux: None,
             }
         } else if let (Ok(endpoint), Ok(token)) = (
             std::env::var("VOX_OPENCODE_WAKE_SOCKET"),
@@ -351,6 +402,7 @@ impl Session {
                 room: None,
                 name: None,
                 interactive: interactive_now(),
+                tmux: None,
             }
         } else {
             Session {
@@ -365,6 +417,7 @@ impl Session {
                 room: None,
                 name: None,
                 interactive: interactive_now(),
+                tmux: None,
             }
         }
     }

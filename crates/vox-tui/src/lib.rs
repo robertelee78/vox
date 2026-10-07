@@ -20,6 +20,7 @@
 pub mod agent_hook;
 pub mod app;
 pub mod app_cli;
+pub mod claude_injector;
 pub mod cli;
 pub mod client;
 pub mod codex_trust;
