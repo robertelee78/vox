@@ -195,7 +195,7 @@ impl Session {
         Ok(Message { header, ciphertext })
     }
 
-    /// Decrypt a wire [`Message`] at wall-clock time `now` (Unix seconds, used for
+    /// Decrypt a wire [`Message`] at wall-clock time `now` (milliseconds since the Unix epoch, used for
     /// skipped-key expiry). The first inbound message a side decrypts (responder
     /// only) is authenticated under the KEM-binding AD; all others under header
     /// AD. A consumed `(ratchet_pubkey, N)` is deleted so replay fails.

@@ -217,7 +217,7 @@ final class FirstRunProof: XCTestCase {
         try stager.write(Data("an earlier release's store".utf8), to: data + "/default/store.redb")
         try stager.write(Data("keep\n".utf8), to: config + "/app/login-item")
         let reason = "vox daemon will not start: STAGED-REASON is not a Vox data directory this version reads"
-        try stager.write(Data("1791262600 \(reason)\n".utf8),
+        try stager.write(Data("1791262600000 \(reason)\n".utf8),
                          to: home + "/Library/Logs/Vox/login-item.log")
 
         let ui = XCUIApplication(url: URL(fileURLWithPath: appPath))
