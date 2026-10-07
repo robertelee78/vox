@@ -175,7 +175,10 @@ impl Sink {
                         ended.push(r.to_owned());
                     }
                 }
-                Some("turn-end") => turn_end = true,
+                // A new prompt starts a new turn: one interrupted by Esc or Ctrl-C at the terminal
+                // fires no Stop (Claude Code 2.1.292, live spike 2026-10-06), so its requests are
+                // settled or expired here.
+                Some("turn-end" | "user") => turn_end = true,
                 _ => {}
             }
             kept.push(b);

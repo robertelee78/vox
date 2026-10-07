@@ -114,6 +114,26 @@ pub struct Session {
     /// what a driver is told.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux_why: Option<String>,
+    /// What the hook's environment says of its pane, for the daemon to prove
+    /// ([`crate::claude_injector::prove`]) before it stores the registration. Never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_claim: Option<TmuxClaim>,
+}
+
+/// What a hook's environment says of its tmux pane: claimed, not proven. The daemon proves it
+/// from the process table and tmux itself, since a hook may run where neither can be read (a
+/// sandbox refuses the setuid `ps`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TmuxClaim {
+    /// `$TMUX`'s first field.
+    pub socket: String,
+    /// `$TMUX_PANE`.
+    pub pane: String,
+    /// The `tmux` the hook's `PATH` finds.
+    pub bin: String,
+    /// The hook's own process, waiting for the daemon's answer while it proves: its ancestry is
+    /// the session's.
+    pub hook_pid: u32,
 }
 
 /// Where a session's terminal is, in tmux, and the process that ties the session to it: found by
@@ -342,8 +362,8 @@ impl Session {
     #[must_use]
     pub fn from_env(session: &str, codex: bool) -> Self {
         let mut s = Self::from_env_untmuxed(session, codex);
-        match crate::claude_injector::bind_here() {
-            Ok(pane) => s.tmux = pane,
+        match crate::claude_injector::claim_here() {
+            Ok(claim) => s.tmux_claim = claim,
             Err(why) => s.tmux_why = Some(why),
         }
         // Claude Code sets `CLAUDE_CODE_ENTRYPOINT` for its hooks even when its messaging socket
@@ -370,6 +390,7 @@ impl Session {
                 interactive: interactive_now(),
                 tmux: None,
                 tmux_why: None,
+                tmux_claim: None,
             }
         } else if let (Ok(endpoint), Ok(token)) = (
             std::env::var("CLAUDE_CODE_MESSAGING_SOCKET"),
@@ -389,6 +410,7 @@ impl Session {
                 interactive: interactive_now(),
                 tmux: None,
                 tmux_why: None,
+                tmux_claim: None,
             }
         } else if let (Ok(endpoint), Ok(token)) = (
             std::env::var("VOX_OPENCODE_WAKE_SOCKET"),
@@ -408,6 +430,7 @@ impl Session {
                 interactive: interactive_now(),
                 tmux: None,
                 tmux_why: None,
+                tmux_claim: None,
             }
         } else {
             Session {
@@ -424,6 +447,7 @@ impl Session {
                 interactive: interactive_now(),
                 tmux: None,
                 tmux_why: None,
+                tmux_claim: None,
             }
         }
     }

@@ -431,6 +431,18 @@ impl Router {
             .is_ok_and(|p| p.session_file(&session.session).is_file());
         let id = session.session.clone();
         let asked = session.room.clone();
+        // The tmux pane the hook claims is proven here, from tmux and the process table, while the
+        // hook waits (ADR-029 DR-5): never stored as claimed.
+        let mut session = session;
+        if let Some(claim) = session.tmux_claim.take() {
+            let proven =
+                tokio::task::spawn_blocking(move || crate::claude_injector::prove(&claim)).await;
+            match proven {
+                Ok(Ok(pane)) => session.tmux = Some(pane),
+                Ok(Err(why)) => session.tmux_why = Some(why),
+                Err(e) => session.tmux_why = Some(format!("the pane could not be proven: {e}")),
+            }
+        }
         let g = self
             .want(
                 node,

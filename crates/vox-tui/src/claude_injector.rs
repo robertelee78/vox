@@ -185,21 +185,25 @@ fn ancestry(table: &std::collections::HashMap<u32, Proc>, pid: u32) -> Vec<u32> 
     chain
 }
 
-/// The pane this process runs in, proven: `Ok(None)` outside tmux (no `$TMUX`), `Err` why when
-/// tmux is named but the pane cannot be proven. Called by the session's hook, so its ancestry is
-/// the session's.
+/// What this process's environment says of its tmux pane: `Ok(None)` outside tmux (no `$TMUX`),
+/// `Err` why when tmux is named but no pane can be. Called by the session's hook; the daemon
+/// proves it ([`prove`]).
 ///
 /// # Errors
-/// `$TMUX_PANE` unset, no `tmux` on `PATH`, tmux not answering for the pane, or this process not
-/// running under the pane's process (a `$TMUX`/`$TMUX_PANE` inherited by a process outside the
-/// pane: over ssh with the variables forwarded, or a process started elsewhere).
-pub fn bind_here() -> Result<Option<TmuxPane>, String> {
+/// `$TMUX` set without `$TMUX_PANE`, or no `tmux` on `PATH`.
+pub fn claim_here() -> Result<Option<crate::wake::TmuxClaim>, String> {
     let Ok(server) = std::env::var("TMUX") else {
         return Ok(None);
     };
-    let socket = server.split(',').next().unwrap_or_default().trim().to_owned();
-    // Case: `$TMUX` without `$TMUX_PANE` (tmux always sets both inside a pane): not a pane this
-    // process is in. ctm fell back to a positional target here, the active pane; never.
+    let socket = server
+        .split(',')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    // Case: `$TMUX` without `$TMUX_PANE`. tmux always sets both inside a pane, so this is not a
+    // pane this process is in. ctm fell back to a positional target here, which tmux resolves to
+    // the ACTIVE pane (ROUTING-002); never.
     let pane = std::env::var("TMUX_PANE")
         .map(|p| p.trim().to_owned())
         .ok()
@@ -214,10 +218,27 @@ pub fn bind_here() -> Result<Option<TmuxPane>, String> {
         .ok_or("no tmux on the session's PATH")?
         .display()
         .to_string();
-    let mut found = TmuxPane {
+    Ok(Some(crate::wake::TmuxClaim {
         socket,
         pane,
         bin,
+        hook_pid: std::process::id(),
+    }))
+}
+
+/// Prove `claim`, in the daemon, while the hook that made it waits: the pane exists on its server,
+/// and the hook runs under the pane's process. The session's process is the pane's own process
+/// when the session is the pane's command, else the pane's child on the hook's chain: Claude Code
+/// itself, or the wrapper that started it (a shell script, `npx`, a version shim), which lives as
+/// long as the session. Its start time comes from the process table.
+///
+/// # Errors
+/// The pane malformed or unknown to tmux, or the hook not under the pane's process.
+pub fn prove(claim: &crate::wake::TmuxClaim) -> Result<TmuxPane, String> {
+    let mut found = TmuxPane {
+        socket: claim.socket.clone(),
+        pane: claim.pane.clone(),
+        bin: claim.bin.clone(),
         pane_pid: 0,
         process: 0,
         process_start: String::new(),
@@ -233,13 +254,11 @@ pub fn bind_here() -> Result<Option<TmuxPane>, String> {
     .parse()
     .map_err(|_| format!("tmux gave no process for pane {}", found.pane))?;
     let table = processes()?;
-    let chain = ancestry(&table, std::process::id());
-    // The session's process: the pane's own process when the session is the pane's command, else
-    // the pane's child on this chain (Claude Code itself, or the wrapper that started it).
+    let chain = ancestry(&table, claim.hook_pid);
     let Some(at) = chain.iter().position(|&p| p == pane_pid) else {
         // Case: nested tmux is fine (the innermost server's variables are the hook's, and its
-        // chain reaches that pane); ssh, or variables inherited by a process outside the pane,
-        // is not: the chain never reaches the pane's process.
+        // chain reaches that pane). ssh, or variables inherited by a process outside the pane, is
+        // not: the chain never reaches the pane's process.
         return Err(format!(
             "this session does not run under tmux pane {}'s process, though $TMUX_PANE names it",
             found.pane
@@ -253,7 +272,7 @@ pub fn bind_here() -> Result<Option<TmuxPane>, String> {
     found.process = process;
     found.process_start.clone_from(&p.start);
     found.process_name.clone_from(&p.name);
-    Ok(Some(found))
+    Ok(found)
 }
 
 /// The recorded socket and pane are well-formed.
