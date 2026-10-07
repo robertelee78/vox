@@ -217,6 +217,8 @@ pub struct ChannelView {
     pub held_back: Vec<String>,
     /// The services shared in the room (V030-25, ADR-028 S-3).
     pub shared: Vec<SharedView>,
+    /// The room's Sessions, open and ended, newest opening first (ADR-029 CL-2).
+    pub sessions: Vec<SessionView>,
     /// This channel's reachability.
     pub reachability: Reachability,
 }
@@ -232,6 +234,29 @@ pub struct SharedView {
     pub copy: String,
     /// What it needs that does not hold, each in words; empty when nothing is missing.
     pub missing: Vec<String>,
+}
+
+/// One Session in a room, as the TUI lists it (ADR-029 SE-3, CL-2).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionView {
+    /// The node whose harness session it is.
+    pub node: Digest32,
+    /// The harness's own session id, as its node claims it (SE-2, MD-3).
+    pub id: String,
+    /// The session's current name, as its node claims it (MD-1); `None` when the harness gives
+    /// none.
+    pub name: Option<String>,
+    /// `codex@device-2 · gso-cap · 3f0c25bf`: this node's alias for the session's node, the
+    /// session's name, and its short id (SE-3).
+    pub label: String,
+    /// This node's alias for the session's node, as the label begins.
+    pub node_alias: String,
+    /// When it opened, seconds since the Unix epoch.
+    pub opened: u64,
+    /// When it ended, seconds since the Unix epoch; `None` while it is open (SE-5).
+    pub ended: Option<u64>,
+    /// Whether the session's node trusts this node with drive (SC-2, CL-3).
+    pub can_drive: bool,
 }
 
 /// Overall sync status surfaced in the status bar: what the node can say, which is how many

@@ -1574,6 +1574,8 @@ impl DaemonCore {
                             })
                             .collect()
                     },
+                    // The room's Sessions (ADR-029 CL-2): the snapshot is to carry them (#538).
+                    sessions: Vec::new(),
                     // **Every member held back, each on its own line** (V210-66).
                     held_back: d
                         .equivocations
