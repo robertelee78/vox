@@ -47,6 +47,9 @@ mod watchdog;
 #[path = "support/attach.rs"]
 mod attach;
 
+#[path = "support/typed.rs"]
+mod typed;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -188,11 +191,17 @@ fn vox_once(data: &std::path::Path, args: &[String]) -> (bool, String, String) {
 }
 
 fn vox_once_plain(data: &std::path::Path, args: &[String]) -> (bool, String, String) {
-    let out = Command::new(VOX)
-        .args(args)
+    let mut cmd = Command::new(VOX);
+    cmd.args(args)
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", data.join("cfg"))
-        .env("VOX_IDENTITY_PASSPHRASE", "identity passphrase")
+        .env("VOX_IDENTITY_PASSPHRASE", "identity passphrase");
+    // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
+    if typed::is_keyring_change(args) {
+        let (ok, shown) = typed::keyring(&cmd);
+        return (ok, shown.clone(), shown);
+    }
+    let out = cmd
         .stdin(Stdio::null())
         .output()
         .unwrap_or_else(|e| panic!("APPARATUS: cannot run vox {args:?}: {e}"));

@@ -224,12 +224,18 @@ fn shared_room(exe: &Path, host: &Path, guest: &Path, name: &str) -> String {
         "invite"
     };
     let link = ok(exe, host, &["room", link_verb, &room], None);
-    let join = [
-        &["room", "join"][..],
-        from_stdin,
-        &[link.trim(), "--name", name],
-    ]
-    .concat();
+    // A room keeps the name its creator gave it (ADR-028 R-1): this build's join names none; the
+    // previous release's took a local name.
+    let join = if exe == Path::new(VOX) {
+        [&["room", "join"][..], from_stdin, &[link.trim()]].concat()
+    } else {
+        [
+            &["room", "join"][..],
+            from_stdin,
+            &[link.trim(), "--name", name],
+        ]
+        .concat()
+    };
     ok(exe, guest, &join, Some("room pass"));
     room
 }
