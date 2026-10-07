@@ -62,18 +62,34 @@ struct Session {
     asks: BTreeMap<String, Ask>,
     /// Text drivers typed into the session lately, and when (see [`Sink::delivered_text`]).
     delivered: Vec<(String, std::time::Instant)>,
+    /// Requests settled lately, with what a late answer to each is told.
+    settled: std::collections::VecDeque<(String, String)>,
 }
 
 /// One approval or question waiting.
 struct Ask {
     /// `approval` or `question`.
     of: String,
-    /// The waiting hook, until it is handed an answer or released.
-    hook: Option<oneshot::Sender<Option<String>>>,
-    /// The member whose answer Vox handed the hook, and what it was.
+    /// Who waits for the first answer, until it is handed one or released.
+    waiter: Option<Waiter>,
+    /// The member whose answer Vox handed over, and what it was.
     given: Option<(String, Given)>,
-    transcript: PathBuf,
+    /// Where the harness records how the request was settled, for a harness that says so only
+    /// there (Claude Code). `None` when its adapter reports it ([`Sink::resolved`]).
+    transcript: Option<PathBuf>,
 }
+
+/// Who waits for a request's first answer.
+enum Waiter {
+    /// Claude Code's `PermissionRequest` hook: given the answer in no harness's shape
+    /// ([`decision`]), or nothing once the harness settled the request itself.
+    Hook(oneshot::Sender<Option<String>>),
+    /// An adapter that holds the request itself (Codex, OpenCode): given the answer.
+    Adapter(oneshot::Sender<Given>),
+}
+
+/// How many settled requests a session remembers, to tell a late answer why it was refused.
+const SETTLED_KEPT: usize = 256;
 
 /// An answer a member with drive gave in the Session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,9 +286,9 @@ impl Sink {
                         id.clone(),
                         Ask {
                             of: of.clone(),
-                            hook: Some(tx),
+                            waiter: Some(Waiter::Hook(tx)),
                             given: None,
-                            transcript: transcript.clone(),
+                            transcript: Some(transcript.clone()),
                         },
                     );
                     Ok(id)
@@ -325,23 +341,116 @@ impl Sink {
         let Some(path) = path else {
             return false;
         };
-        let Some(result) = tool_result(&path, id) else {
+        // An adapter's request is settled by the adapter's report, not here.
+        let Some(path) = path else {
             return true;
         };
+        let Some(r) = tool_result(&path, id) else {
+            return true;
+        };
+        // Only Vox's rejection carries its words; any other refusal was the terminal's.
+        let outcome = if r.is_error { "denied" } else { "" };
+        self.retire(node, session, id, outcome, r.answers, &r.text);
+        false
+    }
+
+    /// An adapter's harness settled `id` (Codex `serverRequest/resolved`, OpenCode
+    /// `permission.replied` / `question.replied`): `outcome` is `allowed`, `denied` or
+    /// `answered`, with the answers that took effect when the harness says them.
+    pub fn resolved(
+        &self,
+        node: &NodeName,
+        session: &str,
+        id: &str,
+        outcome: &str,
+        answers: Option<Value>,
+    ) {
+        self.retire(node, session, id, outcome, answers, "");
+    }
+
+    /// Retire `id`'s request as settled by its harness, post its `resolved` entry, release its
+    /// waiter, and remember what a late answer is told. `outcome` empty means "the harness took
+    /// it": allowed, or answered for a question. `said` is the harness's own text of a refusal.
+    fn retire(
+        &self,
+        node: &NodeName,
+        session: &str,
+        id: &str,
+        outcome: &str,
+        answers: Option<Value>,
+        said: &str,
+    ) {
         let ask = self.with(|all| {
             all.get_mut(&(node.clone(), session.to_owned()))
                 .and_then(|s| s.asks.remove(id))
         });
         let Some(mut ask) = ask else {
-            return false;
+            return;
         };
-        let entry = resolved(session, id, &ask, &result);
-        // The hook, if still waiting, has nothing to give: the harness has settled it.
-        if let Some(h) = ask.hook.take() {
+        let outcome = match outcome {
+            "" if ask.of == "question" => "answered",
+            "" => "allowed",
+            o => o,
+        };
+        let by = by_whom(&ask, outcome, answers.as_ref(), said);
+        let entry = resolved(session, id, &ask.of, outcome, answers, by.as_deref());
+        // The waiter, if still waiting, has nothing to give: the harness has settled it.
+        if let Some(Waiter::Hook(h)) = ask.waiter.take() {
             let _ = h.send(None);
         }
+        let late = if by.is_some() {
+            "already answered in Vox"
+        } else {
+            "already answered at the terminal"
+        };
+        self.remember(node, session, id, late);
         self.post_numbered(node, session, vec![entry]);
-        false
+    }
+
+    fn remember(&self, node: &NodeName, session: &str, id: &str, late: &str) {
+        self.with(|all| {
+            let s = all.entry((node.clone(), session.to_owned())).or_default();
+            s.settled.push_back((id.to_owned(), late.to_owned()));
+            while s.settled.len() > SETTLED_KEPT {
+                s.settled.pop_front();
+            }
+        });
+    }
+
+    /// An adapter holds a request from its harness (Codex, OpenCode): `entry` is its `approval`
+    /// or `question` entry, with its `ref` (the harness's request id). It is posted, and the
+    /// first answer a member with drive gives arrives on the receiver; once the harness settles
+    /// it, the adapter calls [`Sink::resolved`].
+    pub fn request(
+        &self,
+        node: &NodeName,
+        session: &str,
+        entry: String,
+    ) -> Option<oneshot::Receiver<Given>> {
+        let Ok(Value::Object(m)) = serde_json::from_str::<Value>(&entry) else {
+            return None;
+        };
+        let id = m.get("ref").and_then(Value::as_str)?.to_owned();
+        let of = m
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("approval")
+            .to_owned();
+        let (tx, rx) = oneshot::channel();
+        self.with(|all| {
+            let s = all.entry((node.clone(), session.to_owned())).or_default();
+            s.asks.insert(
+                id,
+                Ask {
+                    of,
+                    waiter: Some(Waiter::Adapter(tx)),
+                    given: None,
+                    transcript: None,
+                },
+            );
+        });
+        self.post_numbered(node, session, vec![entry]);
+        Some(rx)
     }
 
     /// Every request still waiting in `session` expires: the harness moved on without settling it
@@ -362,9 +471,10 @@ impl Sink {
                     .and_then(|s| s.asks.remove(&id))
             });
             if let Some(mut ask) = ask {
-                if let Some(h) = ask.hook.take() {
+                if let Some(Waiter::Hook(h)) = ask.waiter.take() {
                     let _ = h.send(None);
                 }
+                self.remember(node, session, &id, "the request expired before an answer");
                 let e = json!({
                     "v": crate::session_mirror::VERSION, "session": session, "kind": "resolved",
                     "ref": id, "of": ask.of, "outcome": "expired",
@@ -387,29 +497,38 @@ impl Sink {
         given: Given,
     ) -> Handed {
         self.with(|all| {
-            let Some(ask) = all
-                .get_mut(&(node.clone(), session.to_owned()))
-                .and_then(|s| s.asks.get_mut(id))
-            else {
-                return Handed::Refused(
-                    "this request is not waiting for an answer from Vox; answer it at the terminal"
-                        .into(),
-                );
+            let Some(s) = all.get_mut(&(node.clone(), session.to_owned())) else {
+                return Handed::Refused(NOT_WAITING.into());
             };
-            let Some(hook) = ask.hook.take() else {
+            let Some(ask) = s.asks.get_mut(id) else {
+                let late = s
+                    .settled
+                    .iter()
+                    .rev()
+                    .find(|(r, _)| r == id)
+                    .map_or(NOT_WAITING, |(_, why)| why.as_str());
+                return Handed::Refused(late.to_owned());
+            };
+            let Some(waiter) = ask.waiter.take() else {
                 return Handed::Refused("another answer was already given".into());
             };
-            let out = decision(&given, alias);
-            match hook.send(Some(out)) {
-                Ok(()) => {
-                    ask.given = Some((by.to_owned(), given));
-                    Handed::ToHarness
-                }
-                Err(_) => Handed::Refused("the session stopped waiting for an answer".into()),
+            let sent = match waiter {
+                Waiter::Hook(h) => h.send(Some(decision(&given, alias))).is_ok(),
+                Waiter::Adapter(a) => a.send(given.clone()).is_ok(),
+            };
+            if sent {
+                ask.given = Some((by.to_owned(), given));
+                Handed::ToHarness
+            } else {
+                Handed::Refused("the session stopped waiting for an answer".into())
             }
         })
     }
 }
+
+/// What an answer to a request Vox does not hold is told.
+const NOT_WAITING: &str =
+    "this request is not waiting for an answer from Vox; answer it at the terminal";
 
 /// The answer handed to the waiting hook, in no harness's shape: `{"allow": bool, "message"?}`
 /// for an approval, `{"answers": {question: answer}}` for a question. The hook writes it the way
@@ -479,43 +598,50 @@ fn tool_result(path: &Path, id: &str) -> Option<ToolResult> {
     None
 }
 
-/// The `resolved` entry for `ask`, from the harness's record of it.
-fn resolved(session: &str, id: &str, ask: &Ask, r: &ToolResult) -> String {
-    let given_by = ask.given.as_ref().map(|(by, _)| by.clone());
-    let (outcome, by) = if r.is_error {
-        // Only Vox's rejection carries its words; any other refusal was the terminal's.
-        let vox = r.text.contains(REJECTED_IN_VOX)
-            && matches!(ask.given, Some((_, Given::Approve { allow: false, .. })));
-        ("denied", if vox { given_by } else { None })
-    } else {
-        let outcome = if ask.of == "question" {
-            "answered"
-        } else {
-            "allowed"
-        };
-        // An allow from Vox and one from the terminal leave the same record; the member's counts
-        // when Vox handed it over before the result appeared (the stated limit above).
-        let vox = match &ask.given {
-            Some((_, Given::Approve { allow: true, .. })) => true,
-            Some((_, Given::Answer(given))) => r.answers.as_ref().is_some_and(|a| {
-                given
-                    .iter()
-                    .all(|(q, ans)| a.get(q).and_then(Value::as_str) == Some(ans.as_str()))
-            }),
-            _ => false,
-        };
-        (outcome, if vox { given_by } else { None })
+/// Who settled `ask`, by the harness's own record of it: the member whose answer Vox handed
+/// over, when that answer is the one that took effect, else `None`: the terminal.
+///
+/// A rejection from Vox carries [`REJECTED_IN_VOX`] in the text the harness records (`said`);
+/// an adapter's harness reports the outcome alone, so there a rejection matches the member's
+/// when the member rejected. An allow from Vox and one from the terminal leave the same record:
+/// the member's counts when Vox handed it over before the request was settled (the stated limit
+/// in this module's notes).
+fn by_whom(ask: &Ask, outcome: &str, answers: Option<&Value>, said: &str) -> Option<String> {
+    let (by, given) = ask.given.as_ref()?;
+    let took = match (outcome, given) {
+        ("denied", Given::Approve { allow: false, .. }) => {
+            ask.transcript.is_none() || said.contains(REJECTED_IN_VOX)
+        }
+        ("allowed", Given::Approve { allow: true, .. }) => true,
+        ("answered", Given::Answer(given)) => answers.is_some_and(|a| {
+            given
+                .iter()
+                .all(|(q, ans)| a.get(q).and_then(Value::as_str) == Some(ans.as_str()))
+        }),
+        _ => false,
     };
+    took.then(|| by.clone())
+}
+
+/// The `resolved` entry.
+fn resolved(
+    session: &str,
+    id: &str,
+    of: &str,
+    outcome: &str,
+    answers: Option<Value>,
+    by: Option<&str>,
+) -> String {
     let mut m = Map::new();
     m.insert("v".into(), json!(crate::session_mirror::VERSION));
     m.insert("session".into(), json!(session));
     m.insert("kind".into(), json!("resolved"));
     m.insert("ref".into(), json!(id));
-    m.insert("of".into(), json!(ask.of));
+    m.insert("of".into(), json!(of));
     m.insert("outcome".into(), json!(outcome));
-    if let Some(a) = &r.answers {
-        m.insert("answers".into(), a.clone());
+    if let Some(a) = answers {
+        m.insert("answers".into(), a);
     }
-    m.insert("by".into(), json!(by.unwrap_or_else(|| "terminal".into())));
+    m.insert("by".into(), json!(by.unwrap_or("terminal")));
     Value::Object(m).to_string()
 }
