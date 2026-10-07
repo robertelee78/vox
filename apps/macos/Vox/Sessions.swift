@@ -97,9 +97,11 @@ struct SessionsList: View {
 }
 
 /// One entry of a Session, to a member with drive (CL-1): its one line, word for word as `vox room
-/// session` prints it, and its Details (the full input and output) when asked; a request's state
-/// once it is resolved, or not answerable.
+/// session` prints it, and its Details (the full input and output) when asked; an open request's
+/// answers (SessionDrive.swift), or its state once it is resolved or not answerable.
 struct SessionEntryRow: View {
+    @ObservedObject var model: NodeModel
+    let session: FfiSession
     let entry: FfiSessionEntry
     @State private var details = false
 
@@ -107,9 +109,8 @@ struct SessionEntryRow: View {
         VStack(alignment: .leading, spacing: 4) {
             Text(entry.line).font(Theme.mono).textSelection(.enabled)
                 .accessibilityIdentifier("entry-line-\(entry.id)")
-            if let state = entry.request?.state {
-                Text(state).secondaryText()
-                    .accessibilityIdentifier("entry-state-\(entry.id)")
+            if let request = entry.request {
+                RequestView(model: model, session: session, request: request)
             }
             if !entry.details.isEmpty {
                 Button(details ? "Hide details" : "Details") { details.toggle() }
