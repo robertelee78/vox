@@ -87,7 +87,7 @@ pub enum ShareState {
 }
 
 /// One room this machine holds, as naming needs it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct NamedRoom {
     /// Its shared name (ADR-028 R-1), a DNS label; empty for a room no admin has named.
     label: String,
@@ -103,7 +103,7 @@ struct NamedRoom {
 ///
 /// A snapshot, taken from the node when a name is asked for: it never reaches back into
 /// live channel state while answering.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VoxResolver {
     /// Every room this machine holds, by id.
     rooms: BTreeMap<Digest32, NamedRoom>,
@@ -169,6 +169,10 @@ pub fn room_shown_here<'a>(
     }
 }
 
+/// How many characters of a node's fingerprint name it where this machine has no alias for it
+/// (ADR-028 S-1a): the short fingerprint every other view shows.
+pub const SHORT_FINGERPRINT: usize = 12;
+
 /// What a name that is not `<service>.<node>.<room>.vox` resolves to: nothing. The sentence is
 /// for this machine's operator and names no service.
 fn nothing(hostname: &str) -> String {
@@ -180,6 +184,23 @@ impl VoxResolver {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The names a client of the node can render with: the open rooms in `snap`, with their
+    /// members and shares, and the keyring's names. It resolves nothing the node would not.
+    #[must_use]
+    pub fn of_snapshot(snap: &crate::node::snapshot::NodeSnapshot) -> Self {
+        let mut names = Self::new();
+        for o in &snap.open {
+            names.add_room(o.channel_id, o.name.as_deref(), &o.members);
+            for s in &o.shares {
+                names.add_share(o.channel_id, s.host, &s.name, s.udp);
+            }
+        }
+        for (fp, petname) in &snap.trusted {
+            names.name(*fp, petname);
+        }
+        names
     }
 
     /// Add a room this machine holds, under its shared name (ADR-028 R-1; `None` for a room no
@@ -223,15 +244,7 @@ impl VoxResolver {
     /// the room id where it has not.
     #[must_use]
     pub fn address_of(&self, channel_id: &Digest32, host: &Digest32, name: &str) -> String {
-        let node = match self.names.get(host) {
-            Some(alias)
-                if !alias.is_empty()
-                    && self.names.values().filter(|n| *n == alias).count() == 1 =>
-            {
-                alias.clone()
-            }
-            _ => b32_encode(host),
-        };
+        let node = self.node_shown(channel_id, host);
         let room = match self.rooms.get(channel_id) {
             Some(r)
                 if !r.label.is_empty()
@@ -242,6 +255,102 @@ impl VoxResolver {
             _ => b32_encode(channel_id),
         };
         format!("{name}.{node}.{room}.vox")
+    }
+
+    /// The `<node>` part of a readable address (ADR-028 S-1a): this machine's alias for `host`
+    /// where it has one no other node has (K-4), its short fingerprint where it has none, and its
+    /// whole fingerprint where either would be ambiguous: an alias two nodes share, or a short
+    /// fingerprint another member of the room begins with too.
+    fn node_shown(&self, channel_id: &Digest32, host: &Digest32) -> String {
+        let fp = b32_encode(host);
+        match self.names.get(host) {
+            Some(alias) if !alias.is_empty() => {
+                if self.names.values().filter(|n| *n == alias).count() == 1 {
+                    alias.clone()
+                } else {
+                    fp
+                }
+            }
+            _ => {
+                let short = &fp[..SHORT_FINGERPRINT];
+                let members = self
+                    .rooms
+                    .get(channel_id)
+                    .map(|r| r.members.as_slice())
+                    .unwrap_or_default();
+                if members
+                    .iter()
+                    .any(|m| m != host && b32_encode(m).starts_with(short))
+                {
+                    fp
+                } else {
+                    short.to_owned()
+                }
+            }
+        }
+    }
+
+    /// `text` with each canonical address in it (ADR-028 S-1) written readable, as
+    /// [`Self::address_of`] writes it (S-1a: "a canonical address inside a message MUST be shown
+    /// readable"). An address of a room this machine does not hold is left as it is; so is the
+    /// service part of a service its log does not state, which only its fingerprint names.
+    #[must_use]
+    pub fn readable_in(&self, text: &str) -> String {
+        const ADDRESS: usize = 3 * (crate::node::link::B32_DIGEST_LEN + 1) + 3;
+        if !text.contains(".vox") {
+            return text.to_owned();
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(at) = rest.find(".vox") {
+            let end = at + ".vox".len();
+            // An address is ASCII, so a window that is not a whole slice of `text` holds none.
+            let start = end
+                .checked_sub(ADDRESS)
+                .filter(|&i| rest.is_char_boundary(i));
+            let readable = start.and_then(|start| {
+                let bounded = rest[..start]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '.')
+                    && rest[end..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !c.is_ascii_alphanumeric());
+                bounded
+                    .then(|| self.readable_of(&rest[start..end]))
+                    .flatten()
+                    .map(|r| (start, r))
+            });
+            match readable {
+                Some((start, readable)) => {
+                    out.push_str(&rest[..start]);
+                    out.push_str(&readable);
+                }
+                None => out.push_str(&rest[..end]),
+            }
+            rest = &rest[end..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// `address` written readable when it is a canonical address of a room this machine holds.
+    fn readable_of(&self, address: &str) -> Option<String> {
+        let labels = address.strip_suffix(".vox")?;
+        let [service, node, room] = labels.split('.').collect::<Vec<_>>()[..] else {
+            return None;
+        };
+        let channel_id = b32_decode(room, "vox room").ok()?;
+        let host = b32_decode(node, "vox node").ok()?;
+        let fp = b32_decode(service, "vox service").ok()?;
+        let r = self.rooms.get(&channel_id)?;
+        let name = r
+            .shares
+            .iter()
+            .find(|(h, n, _)| *h == host && service_fingerprint(&channel_id, h, n) == fp)
+            .map_or_else(|| service.to_owned(), |(_, n, _)| n.clone());
+        Some(self.address_of(&channel_id, &host, &name))
     }
 
     /// Resolve `<service>.<node>.<room>.vox`, or say why it leads nowhere.
@@ -356,6 +465,25 @@ impl VoxResolver {
             .map(|(fp, _)| *fp)
             .collect();
         if named.is_empty() {
+            // A short fingerprint, as a readable address shows a node with no alias here (S-1a),
+            // names the one member of this room it begins.
+            if label.len() >= SHORT_FINGERPRINT {
+                let begins: Vec<&Digest32> = members
+                    .iter()
+                    .filter(|m| b32_encode(m).starts_with(label))
+                    .collect();
+                match begins.as_slice() {
+                    [one] => return Ok(**one),
+                    [] => {}
+                    many => {
+                        return Err(format!(
+                            "`{label}` begins the fingerprints of {} members of `{room_label}`; \
+                             give more of it, or the whole fingerprint",
+                            many.len()
+                        ))
+                    }
+                }
+            }
             return Err(format!(
                 "no node you trust is called `{label}` — only trusted nodes have names here \
                  (`vox trust add <fingerprint> --name {label}`)"

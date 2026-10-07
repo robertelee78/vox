@@ -30,6 +30,8 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             q-mid, and the TUI shows it under "┆ alice: q-mid…", one level, not q-root, with q-mid
             itself off screen (ADR-028 R-9, #485);
   jump      Bob selects q-answer and presses Enter: the view moves to q-mid, selected;
+  address   a canonical address Alice posts reads as Bob's node writes it: "open
+            nas-web.alice.family.vox please" (ADR-028 S-1a, #488);
   consent   Carol, whom Bob never trusted, reads "not in keyring: trust to read each other";
             Dave, whom he trusts and who trusts nobody, "waiting for the other side"; Alice,
             whom he did and who trusts him, "trusted both ways" (ADR-028 R-5, #481;
@@ -482,7 +484,7 @@ try:
     stage("renamed")
     # The room's creator renames it; the room's one name reaches Bob's node, and his timeline says
     # who renamed it and to what, by his name for her (he trusts her as "alice").
-    r = run("alice", "room", "rename", room, "family", "--identity-passphrase-file", f"{S}/idpass")
+    r = run("alice", "room", "rename", room, "family")
     if r.returncode != 0: product(f"alice's `vox room rename` failed: {r.stderr.strip()}")
     said = "alice renamed the room to family"
     renamed = tui.until(lambda: said in timeline(), 60, 1)
@@ -558,6 +560,27 @@ try:
     tui.key("\x1b[F", 0)  # End
     tui.until(lambda: has(timeline(), f"f-{FILL:03d}"), 5, 0.2)
     focus("Timeline")  # where the stages below begin
+
+    stage("address")
+    # A canonical address inside a message reads as Bob's node writes it (ADR-028 S-1a, #488):
+    # Alice shares nas-web and posts the canonical address her `vox service list` gives, and his
+    # timeline shows `nas-web.alice.family.vox`, by his name for her and the room's name.
+    svc = __import__("socket").socket()
+    svc.bind(("127.0.0.1", 0))
+    svc.listen(4)
+    r = run("alice", "service", "add", room, "nas-web", f"127.0.0.1:{svc.getsockname()[1]}")
+    if r.returncode != 0: product(f"alice's `vox service add` failed: {r.stderr.strip()}")
+    listed = run("alice", "service", "list", room).stdout.splitlines()
+    canon = next((listed[i + 1].strip() for i, l in enumerate(listed[:-1])
+                  if l.strip().startswith("nas-web.")), "")
+    if len(canon) != 52 * 3 + 6: product(f"alice's `vox service list` gives no canonical address "
+                                         f"under nas-web: {listed!r}")
+    r = run("alice", "room", "post", room, f"open {canon} please")
+    if r.returncode != 0: product(f"alice's `vox room post` of the address failed: {r.stderr.strip()}")
+    want = "open nas-web.alice.family.vox please"
+    shown = tui.until(lambda: want in timeline(), 60, 1)
+    claim("address", shown, f"{want!r} in bob's timeline within 60 s: {shown}; its last rows: "
+          f"{[r.strip() for r in timeline().splitlines() if r.strip()][-3:]!r}")
 
     tui.key("\t", 1)   # timeline -> composer
     tui.key("\t", 1)   # composer -> members
@@ -784,7 +807,7 @@ try:
         text = "".join(bare(r) for r in pane(t.display(), "Timeline")).replace(" ", "")
         return want.replace(" ", "") in text
     before = (header(atui), header(tui))
-    r = run("alice", "room", "retention", room, "1w", "--identity-passphrase-file", f"{S}/idpass")
+    r = run("alice", "room", "retention", room, "1w")
     if r.returncode != 0: product(f"alice's `vox room retention {room} 1w` failed: {r.stderr.strip()}")
     LINE = "set the room's retention to 1 week: messages older than 1 week are removed from now on"
     both_until(lambda: says(atui, f"you {LINE}") and says(tui, f"alice {LINE}")

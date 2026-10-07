@@ -87,11 +87,25 @@ fn vox(dir: &std::path::Path, argv: &[&str], stdin: Option<&str>) -> (bool, Stri
 }
 
 fn vox_plain(dir: &Path, argv: &[&str], stdin: Option<&str>) -> (bool, String, String) {
-    let mut child = Command::new(VOX)
+    vox_as(dir, argv, stdin, Some(IDENTITY))
+}
+
+/// `vox argv` with `VOX_IDENTITY_PASSPHRASE` set to `identity`, or unset.
+fn vox_as(
+    dir: &Path,
+    argv: &[&str],
+    stdin: Option<&str>,
+    identity: Option<&str>,
+) -> (bool, String, String) {
+    let mut cmd = Command::new(VOX);
+    match identity {
+        Some(p) => cmd.env("VOX_IDENTITY_PASSPHRASE", p),
+        None => cmd.env_remove("VOX_IDENTITY_PASSPHRASE"),
+    };
+    let mut child = cmd
         .args(argv)
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
-        .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
         .env_remove("VOX_ROOM")
         .env_remove("VOX_ANCHORS")
         .env_remove("VOX_ROOM_PASSPHRASE")
@@ -653,10 +667,12 @@ fn a_local_name_reaches_the_node_it_names() {
     );
     // (7) **One shared name** (ADR-028 R-1). alice named neither room when she joined (a join
     // takes no name): she lists each under the name its creator gave it. She is no admin of
-    // family, so her rename is refused; bob's reaches her, and the address follows it.
+    // family, so her rename is refused; bob's reaches her, and the address follows it. **A rename
+    // asks for no passphrase** (ADR-028 K-11, #555): both run with no passphrase source set and no
+    // terminal.
     let (_, alice_rooms, _) = vox(&alice.dir, &["room", "list"], None);
-    let alice_renames = vox(&alice.dir, &["room", "rename", &family, "den"], None);
-    let bob_renames = vox(&bob.dir, &["room", "rename", &family, "home"], None);
+    let alice_renames = vox_as(&alice.dir, &["room", "rename", &family, "den"], None, None);
+    let bob_renames = vox_as(&bob.dir, &["room", "rename", &family, "home"], None, None);
     let started = Instant::now();
     let mut renamed = String::new();
     while started.elapsed() < SETUP {
@@ -697,7 +713,8 @@ fn a_local_name_reaches_the_node_it_names() {
     );
     assert!(
         bob_renames.0,
-        "PRODUCT: bob made family and must be able to rename it: {bob_renames:?}"
+        "PRODUCT: bob made family and must be able to rename it, with no passphrase source set \
+         and no terminal: a rename asks for no passphrase (ADR-028 K-11): {bob_renames:?}"
     );
     assert!(
         renamed

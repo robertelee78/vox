@@ -401,6 +401,15 @@ pub const LINE_BREAKS: &[char] = &[
 ];
 
 /// Whether `row` is a [`vox_agentcomms::envelope::PING`] or `PONG`, which no model is shown.
+/// Whether `row` is a Session's opening or end (ADR-029): a room's conversation (General) never
+/// shows one; `vox room sessions` and a client's All do.
+pub(crate) fn is_session_record(row: &vox_core::node::api::MessageRow) -> bool {
+    vox_agentcomms::envelope::Envelope::parse(&row.text).is_ok_and(|e| {
+        e.kind == vox_agentcomms::envelope::SESSION
+            || e.kind == vox_agentcomms::envelope::SESSION_END
+    })
+}
+
 fn is_plumbing(row: &vox_core::node::api::MessageRow) -> bool {
     vox_agentcomms::envelope::Envelope::parse(&row.text)
         .is_ok_and(|e| vox_agentcomms::envelope::is_plumbing(&e.kind))

@@ -1042,6 +1042,20 @@ fn row_value(
     })
 }
 
+/// This node's names for its rooms, their members and shares, and its keyring, as its snapshot
+/// gives them: what an address is written readable with (ADR-028 S-1a). None when the node does
+/// not say, so an address is left canonical.
+async fn names_in(client: &mut IpcClient) -> vox_core::node::resolver::VoxResolver {
+    let body = vox_core::node::snapshot::request_body();
+    let Ok(reply) = client.exchange(&body).await else {
+        return vox_core::node::resolver::VoxResolver::new();
+    };
+    match vox_core::node::snapshot::NodeSnapshot::from_bytes(&reply) {
+        Ok(Some(snap)) => vox_core::node::resolver::VoxResolver::of_snapshot(&snap),
+        _ => vox_core::node::resolver::VoxResolver::new(),
+    }
+}
+
 /// Who has read this node's own recent messages in `room`, and who has pulled its shares there
 /// whole (ADR-028 R-6, F-7), by entry, from one snapshot of the node. Empty when it does not say.
 async fn own_in(
@@ -1272,8 +1286,18 @@ pub async fn read(
             );
         }
         let take = if take == 0 { usize::MAX } else { take };
-        for r in rows.iter().filter(|r| r.late || !only_late).take(take) {
-            let _ = writeln!(out, "{}", plain_row(r));
+        // An address in a message, readable in this node's names (ADR-028 S-1a); `--json` keeps
+        // the canonical form a program copies (S-1). A Session's opening and end are not the
+        // room's conversation (ADR-029 CL-2): `vox room sessions` lists Sessions; `--json` keeps
+        // every row for programs.
+        let names = names_in(&mut client).await;
+        for r in rows
+            .iter()
+            .filter(|r| r.late || !only_late)
+            .filter(|r| !crate::agent_hook::is_session_record(r))
+            .take(take)
+        {
+            let _ = writeln!(out, "{}", names.readable_in(&plain_row(r)));
             // Under a share this node sent, who has pulled it whole (ADR-028 F-7).
             if let Some(line) = pulled_by.get(&r.entry_hash).and_then(|w| pulled_by_line(w)) {
                 let _ = writeln!(out, "  {line}");
@@ -4077,14 +4101,9 @@ pub async fn create(
 /// `vox room rename` — give a room a new name, for every member (ADR-028 R-1).
 ///
 /// # Errors
-/// A name that is not one DNS label, an unreachable node, an unknown room, a wrong identity
-/// passphrase, or a caller who is not the room's creator or an admin.
-pub async fn rename(
-    paths: &Paths,
-    room: &str,
-    name: &str,
-    identity_passphrase: &str,
-) -> Result<(), AppError> {
+/// A name that is not one DNS label, an unreachable node, an unknown room, or a caller who is
+/// not the room's creator or an admin. No passphrase is asked for (ADR-028 K-11).
+pub async fn rename(paths: &Paths, room: &str, name: &str) -> Result<(), AppError> {
     let name = vox_core::governance::name::room_name(name)
         .map_err(|why| AppError::Usage(format!("cannot rename the room: {why}")))?;
     let mut client = attach(paths).await?;
@@ -4093,7 +4112,6 @@ pub async fn rename(
         .request(&Request::RenameRoom {
             channel_id,
             name: name.clone(),
-            identity_passphrase: zeroize::Zeroizing::new(identity_passphrase.to_owned()),
         })
         .await
     {
@@ -4114,14 +4132,9 @@ pub async fn rename(
 /// `vox room retention` — set how long the room keeps messages (ADR-023 decision 2).
 ///
 /// # Errors
-/// An unparseable duration, an unreachable node, an unknown room, a wrong identity
-/// passphrase, or a caller who is not the room's admin.
-pub async fn retention(
-    paths: &Paths,
-    room: &str,
-    duration: &str,
-    identity_passphrase: &str,
-) -> Result<(), AppError> {
+/// An unparseable duration, an unreachable node, an unknown room, or a caller who is not the
+/// room's admin. No passphrase is asked for (ADR-028 K-11).
+pub async fn retention(paths: &Paths, room: &str, duration: &str) -> Result<(), AppError> {
     let ttl = vox_core::node::retention::parse_duration(duration).ok_or_else(|| {
         AppError::Usage(format!(
             "{duration:?} is not a retention: use 1h, 1w, 1m (a month), a number of seconds, \
@@ -4146,11 +4159,7 @@ pub async fn retention(
         );
     }
     match client
-        .request(&Request::SetRetention {
-            channel_id,
-            ttl,
-            identity_passphrase: zeroize::Zeroizing::new(identity_passphrase.to_owned()),
-        })
+        .request(&Request::SetRetention { channel_id, ttl })
         .await
     {
         Ok(Frame::Ok) => {

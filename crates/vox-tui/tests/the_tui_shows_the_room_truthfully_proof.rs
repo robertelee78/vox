@@ -4,7 +4,7 @@
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob, Carol and
 //! Dave (Alice and Bob trust each other, nobody trusts Carol, Bob trusts Dave and Dave nobody),
 //! Alice posts 70 lines, and Bob's real `vox tui` is read through the `pyte` terminal emulator at
-//! 160x50. It checks thirty-six claims, each
+//! 160x50. It checks thirty-four claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -44,20 +44,20 @@
 //!   Ctrl-R and sends q-answer. His post's `re` names q-mid, and the TUI shows it under "┆ alice:
 //!   q-mid…", one level, never q-root, while q-mid itself is off screen (ADR-028 R-9, #485);
 //! - `jump`: Bob selects q-answer and presses Enter, and q-mid is scrolled to and selected;
+//! - `address`: a canonical address Alice posts reads as Bob's node writes it, "open
+//!   nas-web.alice.family.vox please" (ADR-028 S-1a, #488);
 //! - `consent`: who reads whom, in words (ADR-028 R-5, #481): Carol, whom Bob never trusted, reads
 //!   "not in keyring: trust to read each other", Dave, whom he trusts and who trusts nobody,
 //!   "waiting for the other side", and Alice "trusted both ways" (the pane said "consented" for
 //!   everyone, then "? unverified" on every row and "← in-only" for Carol, though Bob's node
 //!   refuses her key; V210-155); and no row of the pane names a verified, TOFU or key-changed
 //!   state, a consent or a block: one trust state, in the keyring or not (ADR-028 K-2, K-6, #473);
-//! - `capability`: under each member's state line, what Bob's keyring grants it: Alice "read",
-//!   Dave "read + drive", Carol (not in his keyring) nothing (ADR-028 K-14, #525);
 //! - `look`: in truecolour, Alice's row reads "⇄ alice" (each trusts the other) and Dave's
 //!   "→ dave" (only Bob trusts him), both in text.primary bold, and Carol's "· <fingerprint>" in
 //!   text.secondary, not bold; the accent is on the focused members pane's border and nowhere
 //!   else (ADR-028 L-3, L-4; colours read from the token file);
-//! - `unknown`: `:show`, `:hide`, `:block`, `:unblock`, `:verify`, `:consent`, `:grant` and
-//!   `:revoke` each answer "unknown command",
+//! - `unknown`: `:show`, `:hide`, `:block`, `:unblock`, `:verify`, `:consent`, `:grant`, `:revoke`
+//!   and `:lanes` (#556) each answer "unknown command",
 //!   and the help line names none of them (they only said "not available yet"; V210-155);
 //! - `sync`: the status bar says how many peers the node is connected to, the anchor and at least
 //!   one member, so 2 or more (it said "idle" always);
@@ -81,16 +81,10 @@
 //!   minute, so it has closed): a wrong passphrase adds nothing and is never shown;
 //! - `onenode`: `:node spare` is refused, naming the one node the window acts as, and the window
 //!   still acts as default, by its status bar and sidebar (ADR-028 E-4, #470);
-//! - `lanes`: Alice's node claims work and posts `working`, `status` and an `ask` as an agent, and
-//!   Carol's claims work: in Bob's `:lanes`, Alice's lane is headed "alice · working" and shows her
-//!   ask, her coordination folded into one counted line and none of it shown; Carol's lane carries
-//!   one of the five state chips (ADR-028 W-3, #513);
 //! - `to`: `:to zz-nobody` is refused with a sentence and sets nothing; `:to alice` and `:urgent`
 //!   show on the composer as "To: alice · urgent", and the message Bob then sends, through the
 //!   one path `vox room post --to … --urgent` takes, reaches Alice with `to` naming her and
 //!   `urgent` (W-4, #513);
-//! - `seen`: Bob leaves his lanes and Alice posts again: looking again, only her new post is
-//!   marked new, her earlier ask not (W-3, #513);
 //! - `attach`: with `:to alice`, a note typed in the composer and `:share <file>`, Alice reads
 //!   one message, a `file` announcement carrying the note and `to` naming her, and no second
 //!   message for the note (ADR-028 F-1, #493);
@@ -122,7 +116,7 @@
 //!
 //! Each claim turns red against a product that restores its defect: the timeline drawn from the
 //! top, a scroll not clamped to the oldest line, the room's own lines (who named it) not drawn,
-//! every member shown `Trust::Trusted`, a stub command restored, the message pane's `reveal` removed, a member whose read records Bob cannot open named
+//! an address in a message left canonical, every member shown `Trust::Trusted`, a stub command restored, the message pane's `reveal` removed, a member whose read records Bob cannot open named
 //! as not having read, every message marked read whether drawn or not, a message called held by a
 //! node that has not said it holds it, a read record named by a read record, `SyncStatus`
 //! hard-coded (idle, or any one count), `Reachability` hard-coded either way, a notification that
@@ -131,14 +125,13 @@
 //! `consenting` list sent empty, so no member reads `⇄` (`look`, `depths`), a join line naming a
 //! trusted member that has not granted the newcomer (`newcomer`), a retention change with no line in
 //! the timeline or a focused pane titled twice (`retention`), the share flow's every-interface
-//! warning left out (`serve`), coordination posts shown in a lane, the
-//! composer's To: and urgent left off what it sends, every post marked new, an attach's note posted as a message of its own, a quote of the thread's root rather than `re`, Enter on a reply not
+//! warning left out (`serve`), the
+//! composer's To: and urgent left off what it sends, an attach's note posted as a message of its own, a quote of the thread's root rather than `re`, Enter on a reply not
 //! moving the selection, a trusted member shown as "verified" (`consent`), `:node <name>` acting as
 //! another node again, a copied command that is not the service's canonical address (`copies`), or
-//! a pasted fingerprint that is not the node's let through to the keyring (`trust`), an image
-//! drawn before this node's copy is verified (`inline`), or a member's keyring capability not
-//! drawn (`capability`). It passes only on the script's PASS with
-//! all 37 claims ok.
+//! a pasted fingerprint that is not the node's let through to the keyring (`trust`), or an image
+//! drawn before this node's copy is verified (`inline`). It passes only on the script's PASS with
+//! all 35 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -234,7 +227,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (37 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (35 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -248,8 +241,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (37, 37),
-                "APPARATUS: the driver said PASS without all 37 claims ok: {said}"
+                (35, 35),
+                "APPARATUS: the driver said PASS without all 35 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),
