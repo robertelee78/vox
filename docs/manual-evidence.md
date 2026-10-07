@@ -151,7 +151,7 @@ process stopped by PID.
 | Leave and join again: offered again | `vox room leave` and `vox room join` as `ben` | `ann`'s offers list `ben` again, `joined` |
 | Accept, and the offer back | `vox trust add --node ann FP --name ben`, the passphrase typed at a terminal; then `vox trust offers --node ben` | `vox: trusting xgfmgktt6c64dkgehy7nvxg3if as "ben": read`; `ann`'s offers empty; `ben`'s: `2o5a45ggy2i5ndadhow4xl776d (not in keyring) trusts you. No one you trust trusts it yet.` |
 | An agent's node is offered in its turn | `agent_hook_proof::an_offer_for_the_agents_node_is_shown_in_its_turn_and_only_the_operator_accepts_it`, release, `--ignored`, at `dfbbf9ae` | passed in 10.5 s; turn 1 carried `Vox offers your node nodes to trust (…)` and the `accept: … --node default` line quoted |
-| The TUI's offer rows, card and accept prompt | source at `dfbbf9ae` (`ui.rs`, `state.rs`); the room-truth proof's `offer`, `reoffer`, `offerback` and `accept` claims are still to be run (a first run had a `vox` without `test-knobs`: APPARATUS) | quoted from the source |
+| The TUI's offer rows, card and accept prompt | `the_tui_shows_the_room_truthfully_proof`, release, `--features vox-tui/test-knobs`, `--ignored`, at `dfbbf9ae` (a first run built without `test-knobs` stopped as APPARATUS, precondition unmet) | passed in 455.6 s; sidebar `needs you (2)`, `offer: kt3y l5vl… joined`, `offer: zvfn 6q7d… trusts you`; claims `offer`, `reoffer`, `offerback` and `accept` ok, the accept asking a name and read or read + drive and no fingerprint to compare |
 
 ## v0.3.1 command check
 
