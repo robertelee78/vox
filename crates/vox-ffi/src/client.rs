@@ -1938,7 +1938,7 @@ impl VoxClient {
         };
         let held = Arc::clone(&self.held);
         self.on_rt(async move {
-            let (at, node, trusted, action) = {
+            let (at, node, trusted, action, shown) = {
                 let mut slot = held.lock().await;
                 let h = slot.as_mut().ok_or_else(not_attached)?;
                 let names = names(&mut h.client).await?;
@@ -1951,6 +1951,12 @@ impl VoxClient {
                     .find(|s| s.id == session && s.open)
                     .ok_or_else(|| failed("no open Session in this room has that id"))?;
                 let trusted = names.contains_key(&row.node);
+                // The session's node as this node knows it: its alias, or its short fingerprint.
+                let shown = names
+                    .get(&row.node)
+                    .filter(|a| !a.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| b32_encode(&row.node).chars().take(12).collect());
                 let action = match file {
                     Some((path, note)) if trusted => {
                         match start_file_for(&mut h.client, channel_id, row.node, &path, note).await
@@ -1967,7 +1973,7 @@ impl VoxClient {
                     }
                     _ => action,
                 };
-                (h.at.clone(), row.node, trusted, action)
+                (h.at.clone(), row.node, trusted, action, shown)
             };
             // The app gate opens a stream only between nodes that trust each other; a member
             // with drive trusts the session's node already, since it reads the Session only
@@ -1976,8 +1982,7 @@ impl VoxClient {
                 return Ok(DriveAnswer {
                     ok: false,
                     said: format!(
-                        "you do not trust {}, so you cannot drive or read its Sessions",
-                        b32_encode(&node).chars().take(12).collect::<String>()
+                        "you do not trust {shown}, so you cannot drive or read its Sessions"
                     ),
                     delivery: DriveDelivery::Unreachable,
                 });
@@ -1995,7 +2000,7 @@ impl VoxClient {
                 match vox_core::node::drive_input::send(&at, channel_id, node, &request).await {
                     Ok(a) => DriveAnswer {
                         ok: a.ok,
-                        said: a.said,
+                        said: a.said_to(&shown),
                         delivery: DriveDelivery::Answered,
                     },
                     Err(vox_core::node::drive_input::Unsent::Unreachable(said)) => DriveAnswer {

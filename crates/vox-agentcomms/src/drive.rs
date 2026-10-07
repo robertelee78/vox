@@ -106,6 +106,31 @@ pub struct Answer {
     pub ok: bool,
     /// What happened, or why not.
     pub said: String,
+    /// Why not, when the driver words it itself: [`NO_DRIVE`]. The session's node knows itself
+    /// only by its own name, which the driver may not; the driver names it as it knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+/// The session's node does not trust the driver with drive (DR-2).
+pub const NO_DRIVE: &str = "no-drive";
+
+/// What a driver reads for [`NO_DRIVE`], `node` being its own name for the session's node: its
+/// alias for it, or its short fingerprint.
+#[must_use]
+pub fn no_drive(node: &str) -> String {
+    format!("{node} does not trust you with drive; it trusts you to read only, or not at all")
+}
+
+impl Answer {
+    /// What the driver reads, naming the session's node as `node`.
+    #[must_use]
+    pub fn said_to(&self, node: &str) -> String {
+        match self.code.as_deref() {
+            Some(NO_DRIVE) => no_drive(node),
+            _ => self.said.clone(),
+        }
+    }
 }
 
 /// A slash command as typed, `/rename new name`, split into its name and arguments.
