@@ -240,7 +240,11 @@ fn over_of(ch: &ChannelState) -> Option<String> {
 /// (V210-71), since most publishes are about something else, and is **extended** by the rows
 /// added since when it has (V210-120). A room's timeline only grows at its end, so the published
 /// one is a prefix of it: rebuilding it whole made every message cost the room's whole history.
-fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
+fn detail_of(
+    ch: &ChannelState,
+    prev: Option<&ChannelDetail>,
+    now: crate::time::Ms,
+) -> ChannelDetail {
     let (frozen, refused_below_checkpoint) = ch.fork_watch();
     // A room with a message not received yet (V030-10) is shown with it in place, rebuilt each
     // time: filling one in changes a row inside the timeline, so the published one is no longer
@@ -301,7 +305,7 @@ fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
         equivocations: ch.equivocations(),
         creator: ch.genesis().creator_pubkey().fingerprint(),
         consented: ch.consented().into_iter().collect(),
-        admins: ch.admins(),
+        admins: ch.admins(now),
         consenting: consenting.into_iter().collect(),
         trusted_by: trusted_by
             .into_iter()
@@ -13434,8 +13438,10 @@ impl Node {
                 )
             });
             if written.is_ok() {
-                self.fresh_details
-                    .insert(channel_id, (summary_of(&ch), detail_of(&ch, None)));
+                self.fresh_details.insert(
+                    channel_id,
+                    (summary_of(&ch), detail_of(&ch, None, self.now_ms())),
+                );
             }
             written
         };
@@ -13586,7 +13592,11 @@ impl Node {
             return None;
         }
         let stamp = ch.admin_change_clock()?;
-        let admins: Vec<Digest32> = ch.admins().into_iter().filter(|a| *a != me).collect();
+        let admins: Vec<Digest32> = ch
+            .admins(self.now_ms())
+            .into_iter()
+            .filter(|a| *a != me)
+            .collect();
         crate::nat::withdraw::AdminRoster::build(signer, channel_id, stamp, admins)
             .ok()
             .map(|r| r.to_wire())
@@ -13688,8 +13698,10 @@ impl Node {
                 }
                 return Outcome::Failed(fault_of(&e));
             }
-            self.fresh_details
-                .insert(*channel_id, (summary_of(&ch), detail_of(&ch, None)));
+            self.fresh_details.insert(
+                *channel_id,
+                (summary_of(&ch), detail_of(&ch, None, self.now_ms())),
+            );
         }
         self.note_local_append(channel_id);
         self.withdraw_from_boards(channel_id, crate::nat::withdraw::WithdrawScope::Room)
@@ -13723,8 +13735,10 @@ impl Node {
             if let Err(e) = done {
                 return Outcome::Failed(fault_of(&e));
             }
-            self.fresh_details
-                .insert(*channel_id, (summary_of(&ch), detail_of(&ch, None)));
+            self.fresh_details.insert(
+                *channel_id,
+                (summary_of(&ch), detail_of(&ch, None, self.now_ms())),
+            );
         }
         self.note_local_append(channel_id);
         // The boards learn who may take the room off them (V030-14).
@@ -13746,8 +13760,10 @@ impl Node {
             if let Err(e) = ch.choose_idle_end(profile, idle_secs, now_ms) {
                 return Outcome::Failed(fault_of(&e));
             }
-            self.fresh_details
-                .insert(*channel_id, (summary_of(&ch), detail_of(&ch, None)));
+            self.fresh_details.insert(
+                *channel_id,
+                (summary_of(&ch), detail_of(&ch, None, self.now_ms())),
+            );
         }
         self.note_local_append(channel_id);
         Outcome::Done
@@ -14662,7 +14678,10 @@ impl Node {
         };
         let (governs, room) = {
             let ch = shared.lock().await;
-            (ch.governs_retention(&me), ch.room_retention())
+            (
+                ch.governs_retention(&me, self.now_ms()),
+                ch.room_retention(),
+            )
         };
         if !governs {
             // Longer than the room keeps is refused; `0` is forever, the longest of all.
@@ -15026,6 +15045,7 @@ impl Node {
                     .open_channels
                     .iter()
                     .find(|d| d.channel_id == *channel_id),
+                self.now_ms(),
             )
         };
         self.fresh_details
@@ -15195,6 +15215,7 @@ impl Node {
             open_channels.push(detail_of(
                 &ch,
                 prev.open_channels.iter().find(|d| d.channel_id == *id),
+                self.now_ms(),
             ));
         }
         let mut channels = Vec::with_capacity(known.len());

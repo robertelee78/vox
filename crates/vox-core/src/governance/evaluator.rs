@@ -158,6 +158,11 @@ pub struct Evaluator {
     /// non-admins are absent). Computed with attenuation + expiry + revocation +
     /// tie-break already applied.
     authority: BTreeMap<Digest32, CapabilitySet>,
+    /// When an admin's authority lapses, milliseconds since the Unix epoch, for each admin whose
+    /// governing cert expires (#562): judged at every read ([`Evaluator::grants_at`],
+    /// [`Evaluator::admins_at`]), not only when the evaluator was built, so an admin whose cert
+    /// expired since holds nothing.
+    admin_expires_ms: BTreeMap<Digest32, u64>,
     /// For each identity that was named as a delegate but holds no effective
     /// authority, the classified reason (see [`DenyReason`]). Identities never
     /// named are simply absent (plain `NotAdmin`).
@@ -327,6 +332,7 @@ impl Evaluator {
         let mut resolver = Resolver::new(root_admin, &causality, now_ms);
         let head = resolver.head()?;
         let authority = head.authority;
+        let admin_expires_ms = head.expires_ms;
         let denied = head.denied;
         let current_epoch = head.epoch;
         let (policy, retention_changes) = resolver.resolve_policy(genesis)?;
@@ -338,6 +344,7 @@ impl Evaluator {
             channel_id,
             root_admin,
             authority,
+            admin_expires_ms,
             denied,
             policy,
             retention_changes,
@@ -492,6 +499,34 @@ impl Evaluator {
     pub fn admins(&self) -> BTreeSet<Digest32> {
         self.authority.keys().copied().collect()
     }
+
+    /// Whether `key`'s admin authority has lapsed by `now_ms`: its governing cert expired.
+    fn lapsed(&self, key: &Digest32, now_ms: u64) -> bool {
+        self.admin_expires_ms
+            .get(key)
+            .is_some_and(|expiry| *expiry <= now_ms)
+    }
+
+    /// [`Evaluator::admins`] as of `now_ms` (#562): an admin whose cert has expired since the
+    /// evaluator was built is not one.
+    #[must_use]
+    pub fn admins_at(&self, now_ms: u64) -> BTreeSet<Digest32> {
+        self.authority
+            .keys()
+            .filter(|k| !self.lapsed(k, now_ms))
+            .copied()
+            .collect()
+    }
+
+    /// [`Evaluator::grants`] as of `now_ms` (#562): an admin whose cert has expired since the
+    /// evaluator was built holds nothing, and is told so.
+    #[must_use]
+    pub fn grants_at(&self, key: &Digest32, cap: &Capability, now_ms: u64) -> Verdict {
+        if self.lapsed(key, now_ms) {
+            return Verdict::Denied(DenyReason::Expired);
+        }
+        self.grants(key, cap)
+    }
 }
 
 /// Resolved authority + established epoch over some causal scope, plus the
@@ -501,6 +536,8 @@ struct Resolved {
     authority: BTreeMap<Digest32, CapabilitySet>,
     denied: BTreeMap<Digest32, DenyReason>,
     epoch: u64,
+    /// When each delegate's governing cert expires, milliseconds; absent for one that never does.
+    expires_ms: BTreeMap<Digest32, u64>,
 }
 
 /// The well-founded stratified resolver (ADR-007 §"Conflict resolution").
@@ -682,6 +719,7 @@ impl<'a> Resolver<'a> {
 
         let mut authority: BTreeMap<Digest32, CapabilitySet> = BTreeMap::new();
         authority.insert(self.root_admin, CapabilitySet::admin());
+        let mut expires_ms: BTreeMap<Digest32, u64> = BTreeMap::new();
 
         let mut effective_for: BTreeMap<Digest32, Vec<&GovEntry>> = BTreeMap::new();
         for e in &self.causality.order {
@@ -724,6 +762,9 @@ impl<'a> Resolver<'a> {
             if let Some(governing) = maximal.last() {
                 if let GovBody::AdminCert(c) = &governing.body {
                     authority.insert(delegate, c.body.capability_set.clone());
+                    if c.body.expiry_ms != 0 {
+                        expires_ms.insert(delegate, c.body.expiry_ms);
+                    }
                 }
             }
         }
@@ -739,6 +780,7 @@ impl<'a> Resolver<'a> {
             authority,
             denied,
             epoch,
+            expires_ms,
         })
     }
 
