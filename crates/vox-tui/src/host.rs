@@ -2070,8 +2070,9 @@ async fn post_in_order(
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
                     "text": format!(
-                        "{dropped} entr{} of this session were dropped before its room opened",
-                        if dropped == 1 { "y" } else { "ies" }
+                        "{dropped} {} of this session {} dropped before its room opened",
+                        if dropped == 1 { "entry" } else { "entries" },
+                        if dropped == 1 { "was" } else { "were" }
                     ),
                 })
                 .to_string();
