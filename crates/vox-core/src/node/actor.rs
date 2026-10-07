@@ -308,6 +308,7 @@ fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
             .map(|(member, by)| (member, by.into_iter().collect()))
             .collect(),
         retention: ch.effective_retention(),
+        retention_above_room: ch.retention_above_room(),
         key_generations: ch.key_generations(),
         received_key_generations: ch.received_key_generations(),
         frozen,
@@ -14719,11 +14720,9 @@ impl Node {
             }
             // **A node may keep less than its room, never more** (V030-32). A file value above the
             // room's is ignored — the shorter wins — and the node says so, once.
-            let (node, room) = (self.node_retention.for_room(cid), ch.room_retention());
-            if node != 0
-                && room != 0
-                && node > room
-                && self.retention_warned.insert((*cid, node, room))
+            if let Some((node, room)) = ch
+                .retention_above_room()
+                .filter(|&(node, room)| self.retention_warned.insert((*cid, node, room)))
             {
                 let _ = self.event_tx.send(NodeEvent::RetentionAboveRoom {
                     channel_id: *cid,

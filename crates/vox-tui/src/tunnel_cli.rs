@@ -715,19 +715,23 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
             channel_id,
             node,
             room,
-        } => {
-            eprintln!(
-                "vox: warning: this node's retention file asks to keep room {} for {}, longer than \
-                 the room keeps it ({}); a member may keep less than the room, never more, so the \
-                 room's {} is in force",
-                short(channel_id),
-                vox_core::node::retention::describe(*node),
-                vox_core::node::retention::describe(*room),
-                vox_core::node::retention::describe(*room)
-            );
-        }
+        } => say_retention_above_room(channel_id, *node, *room),
         _ => {}
     }
+}
+
+/// Say that this node's own retention file asks to keep a room longer than the room does, and is
+/// ignored (V030-32).
+pub(crate) fn say_retention_above_room(channel_id: &Digest32, node: u64, room: u64) {
+    eprintln!(
+        "vox: warning: this node's retention file asks to keep room {} for {}, longer than the \
+         room keeps it ({}); a member may keep less than the room, never more, so the room's {} \
+         is in force",
+        short(channel_id),
+        vox_core::node::retention::describe(node),
+        vox_core::node::retention::describe(room),
+        vox_core::node::retention::describe(room)
+    );
 }
 
 /// [`join_advice`], told what the join said about itself: `said` is its reason and its steps.
