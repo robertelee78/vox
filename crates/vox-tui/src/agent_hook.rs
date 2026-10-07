@@ -63,6 +63,9 @@ struct HookInput {
     reason: String,
     /// The input is Claude Code's: it names its `hook_event_name`, which Codex's does not.
     claude: bool,
+    /// The harness's transcript of the session, as its payload names it: Claude Code keeps the
+    /// session's name there (ADR-029 MD-1).
+    transcript: String,
     /// The session's working directory: the payload's `cwd` (Claude Code's and Codex's carry it),
     /// else this process's (OpenCode's plugin runs the hook in OpenCode's own directory).
     cwd: String,
@@ -93,6 +96,11 @@ fn parse_input(raw: &str) -> HookInput {
             .unwrap_or_default()
             .to_owned(),
         claude: v.get("hook_event_name").is_some() && v.get("turn_id").is_none(),
+        transcript: v
+            .get("transcript_path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
         cwd: v
             .get("cwd")
             .and_then(serde_json::Value::as_str)
@@ -1276,6 +1284,7 @@ impl Daemon {
         if record.harness == "unknown" && input.claude && !input.codex {
             record.harness = "claude".into();
         }
+        record.name = session_name(input);
         let (room, join) = session_room(&self.account, input, room_arg);
         record.room = room;
         let record = serde_json::to_string(&record)
@@ -1374,6 +1383,41 @@ pub struct Registered {
     pub new: bool,
     /// `joining <room>…`, or why the join could not; `None` when none is under way.
     pub joining: Option<String>,
+}
+
+/// The session's current name, as its harness gives it (ADR-029 MD-1), read every turn so a rename
+/// shows on the next message; `None` when it gives none.
+///
+/// **Claude Code** writes it into the session's transcript (`transcript_path`): a `/rename` as a
+/// `{"type":"custom-title","customTitle":…}` line, and the title it makes itself as
+/// `{"type":"ai-title","aiTitle":…}` (measured from Claude Code 2.1.29x transcripts). The last
+/// custom title wins, else the last made one. Codex's and OpenCode's names are to be read by their
+/// own hooks (harness2).
+fn session_name(input: &HookInput) -> Option<String> {
+    use std::io::BufRead as _;
+    if !input.claude || input.transcript.is_empty() {
+        return None;
+    }
+    let file = std::fs::File::open(&input.transcript).ok()?;
+    let (mut custom, mut made) = (None, None);
+    for line in std::io::BufReader::new(file).lines() {
+        let Ok(line) = line else { break };
+        if !line.contains("-title\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        match v["type"].as_str() {
+            Some("custom-title") => custom = v["customTitle"].as_str().map(str::to_owned),
+            Some("ai-title") => made = v["aiTitle"].as_str().map(str::to_owned),
+            _ => {}
+        }
+    }
+    custom
+        .or(made)
+        .map(|n| n.trim().to_owned())
+        .filter(|n| !n.is_empty())
 }
 
 /// The room this session works in (ADR-029 §6), and, for a room the node is not a member of, the

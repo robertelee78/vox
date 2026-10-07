@@ -324,3 +324,29 @@ pub fn resolve<'a>(
         )),
     }
 }
+
+/// `text` with its session's current name in `at.session_name` (ADR-029 MD-1, MD-2): when it is an
+/// envelope from a session registered on this node (`from` names it) and carries no name yet, the
+/// name that session's harness last gave, from its registration. Anything else is `text` as it is.
+/// The name is the node's claim (MD-3); the model never supplies it.
+#[must_use]
+pub fn fill_name(paths: &crate::node::paths::Paths, text: &str) -> String {
+    let Ok(mut env) = Envelope::parse(text) else {
+        return text.to_owned();
+    };
+    if env.from.trim().is_empty() || env.at.session_name.is_some() {
+        return text.to_owned();
+    }
+    let name = std::fs::read(paths.session_file(env.from.trim()))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v["name"].as_str().map(str::to_owned))
+        .filter(|n| !n.trim().is_empty());
+    match name {
+        Some(n) => {
+            env.at.session_name = Some(n);
+            env.to_text()
+        }
+        None => text.to_owned(),
+    }
+}

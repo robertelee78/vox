@@ -274,6 +274,11 @@ pub fn store(paths: &Paths, reg: &Session) {
     {
         reg.room.clone_from(&b.room);
     }
+    // **A name, once given, stays until the harness gives another** (ADR-029 MD-1): a turn whose
+    // harness said nothing of it (a sub-agent's event, a transcript not yet written) keeps it.
+    if reg.name.is_none() {
+        reg.name = earlier.and_then(|b| b.name);
+    }
     reg.last_drained_ms = now;
     let dir = paths.session_dir();
     if std::fs::create_dir_all(&dir).is_err() {

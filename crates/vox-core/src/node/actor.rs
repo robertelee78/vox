@@ -3479,6 +3479,8 @@ pub struct NodeHandle {
     keyring: KeyringWindow,
     /// The files this node serves (ADR-028 F-2).
     shares: Arc<crate::node::shares::Shares>,
+    /// Where the node's files are: its sessions' registrations among them (ADR-029 MD-2).
+    paths: Paths,
 }
 
 /// When the identity passphrase was last entered, shared with the actor, and the actor's clock.
@@ -3495,6 +3497,12 @@ impl std::fmt::Debug for KeyringWindow {
 }
 
 impl NodeHandle {
+    /// Where the node's files are.
+    #[must_use]
+    pub fn paths(&self) -> &Paths {
+        &self.paths
+    }
+
     /// The files this node shares and serves (ADR-028 F-1, F-2).
     #[must_use]
     pub fn shares(&self) -> &Arc<crate::node::shares::Shares> {
@@ -4598,6 +4606,7 @@ impl Node {
             node.view_tx.subscribe(),
             handle_event_tx.clone(),
         );
+        let paths = node.paths.clone();
         let actor = tokio::spawn(node.run(cmd_rx, net_rx));
         let handle = NodeHandle {
             cmd_tx,
@@ -4610,6 +4619,7 @@ impl Node {
             sync_book,
             keyring,
             shares,
+            paths,
         };
         Ok((handle, actor))
     }
