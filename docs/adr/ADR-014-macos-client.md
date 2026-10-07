@@ -193,14 +193,17 @@ F-9–F-11; RR-1, RR-3, RR-4 (RR-2 is the daemon's); D-3; L-1–L-10; W-1–W-6;
   suite (`apps/macos/VoxAppProofs`) MUST launch the **signed release build** of `Vox.app` with
   `VOX_DATA_DIR` and `VOX_CONFIG_DIR` set to scratch directories, against a real daemon run from
   the same bundle, with a second node in another scratch data root as the peer, and assert what is
-  on screen through accessibility. Each proof MUST name a mutant that turns it red.
+  on screen through accessibility. The suite is quality-engineering work, not a gate (decider,
+  2026-10-07: "valuable … but absolutely not something to add to the CI"): it MUST NOT run in CI,
+  and it carries no mutant requirement; a broken step is fixed, not answered with more test work.
 - **M-31.** The suite MUST cover at least: first run to an attached node; create, room link, join
   and trust both ways with a message read each way and `read by` shown; a service shared and its
   canonical command copied and used; a file attached with a To: and pulled by the peer, `pulled
   by` shown; untrust cutting a live forward; quit detaching the node; the decision record showing a
   refused join.
-- **M-32.** These proofs are optional proofs (AGENTS.md: the `optional-proofs` mechanism, loud when
-  not run) because they need a macOS GUI session; they are to be run before a release is tagged.
+- **M-32.** The suite MUST run only on demand (to take the app through its pieces, or to
+  troubleshoot), and MUST be run once on the final release candidate before the tag. Not run, it
+  MUST say that it did not run.
 - **M-33.** What no automated proof can reach MUST be listed as manual checks in
   `docs/release/optional-proofs.md`, run by a person before tagging, and MUST NOT be claimed as
   proven otherwise: approving the login item and the LAN helper in System Settings; a notification
