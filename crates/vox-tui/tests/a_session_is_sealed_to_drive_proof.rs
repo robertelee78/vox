@@ -415,7 +415,9 @@ fn fetch_as(
     tag: &str,
 ) -> Result<String, String> {
     use std::io::{Read as _, Write as _};
-    let bound = match rt.block_on(m.socket(rt).request(&Request::Forward {
+    // The forward lives as long as the connection that asked for it: held until the fetch ends.
+    let mut client = m.socket(rt);
+    let bound = match rt.block_on(client.request(&Request::Forward {
         channel_id: room,
         host,
         service_tag: tag.to_owned(),
@@ -430,6 +432,7 @@ fn fetch_as(
         .map_err(|e| format!("send: {e}"))?;
     let mut got = Vec::new();
     let _ = s.read_to_end(&mut got);
+    drop(client);
     let head = String::from_utf8_lossy(&got);
     Ok(head.lines().next().unwrap_or_default().to_owned())
 }

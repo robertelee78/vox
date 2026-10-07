@@ -1129,6 +1129,9 @@ pub struct RoomSessionArgs {
     /// drive. Each input reaches that session alone, or is refused with the reason.
     #[command(flatten)]
     pub drive: SessionDriveArgs,
+    /// A note the session is told with the file `--file` sends it.
+    #[arg(long, value_name = "TEXT", requires = "file")]
+    pub note: Option<String>,
 }
 
 /// What `vox room session` sends to the session, when it drives it: at most one of these.
@@ -1157,6 +1160,10 @@ pub struct SessionDriveArgs {
     /// question (a question by its id or its text; several choices joined with ", ").
     #[arg(long, value_name = "REF", num_args = 2..)]
     pub answer: Option<Vec<String>>,
+    /// Send the session a file (ADR-029 DR-1.7): it lands on its node, and the session is told
+    /// where. Only its node is served it.
+    #[arg(long, value_name = "PATH")]
+    pub file: Option<std::path::PathBuf>,
 }
 
 impl SessionDriveArgs {
@@ -2304,6 +2311,16 @@ pub fn run() -> ExitCode {
                             crate::room_cli::tail(&paths, &a.room, a.since.as_deref(), a.json).await
                         }
                         RoomCmd::Roster(a) => crate::room_cli::roster(&paths, &a.room).await,
+                        RoomCmd::Session(a) if a.drive.file.is_some() => {
+                            crate::drive::run_file(
+                                &paths,
+                                &a.room,
+                                &a.session,
+                                a.drive.file.as_deref().unwrap_or(std::path::Path::new("")),
+                                a.note.as_deref(),
+                            )
+                            .await
+                        }
                         RoomCmd::Session(a) => match a.drive.action() {
                             Err(e) => Err(crate::app::AppError::Usage(e)),
                             Ok(Some(action)) => {
