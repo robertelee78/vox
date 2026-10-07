@@ -748,7 +748,9 @@ impl Shares {
             "ts": now_secs() * 1000,
         });
         if let Some(obj) = body.as_object_mut() {
-            for k in ["name", "size", "sha256", "tag", "http", "kind", "files", "image", "note"] {
+            for k in [
+                "name", "size", "sha256", "tag", "http", "kind", "files", "image", "note",
+            ] {
                 if let Some(v) = data.get(k) {
                     // The data's `kind` (file or folder) is the entry's `type`: its `kind` is the
                     // activity's.
@@ -1234,7 +1236,9 @@ async fn serve_one(
         // other member, though the tunnel let it in and it knows the tag, is refused.
         if !witness.allowed(member) {
             let _ = sock
-                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
                 .await;
             return Some(false);
         }

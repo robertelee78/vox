@@ -467,15 +467,20 @@ fn offer_in_session(body: &str) -> Option<(String, u64, String, String, bool, Op
     if v["kind"] != "file" || v["dir"] != "out" {
         return None;
     }
-    let s = |k: &str| v.get(k).and_then(serde_json::Value::as_str).map(str::to_owned);
+    let s = |k: &str| {
+        v.get(k)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
     let sha256 = s("sha256")?;
     if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let files = match v.get("files") {
         None => None,
-        Some(n) => Some(n.as_u64()?)
-            .filter(|n| (1..=crate::node::folder::MAX_FILES as u64).contains(n)),
+        Some(n) => {
+            Some(n.as_u64()?).filter(|n| (1..=crate::node::folder::MAX_FILES as u64).contains(n))
+        }
     };
     if v.get("files").is_some() && files.is_none() {
         return None;
@@ -485,7 +490,9 @@ fn offer_in_session(body: &str) -> Option<(String, u64, String, String, bool, Op
         v.get("size").and_then(serde_json::Value::as_u64)?,
         sha256.to_ascii_lowercase(),
         s("tag")?,
-        v.get("http").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        v.get("http")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
         files,
     ))
 }

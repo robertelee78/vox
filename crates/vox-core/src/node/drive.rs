@@ -97,7 +97,7 @@ pub fn is_file_out(row: &SessionRow) -> bool {
     // Most of a Session is not files: those are passed over without parsing them.
     row.body.contains(r#""file""#)
         && serde_json::from_str::<serde_json::Value>(&row.body)
-        .is_ok_and(|v| v["kind"] == "file" && v["dir"] == "out")
+            .is_ok_and(|v| v["kind"] == "file" && v["dir"] == "out")
 }
 
 impl DriveState {
