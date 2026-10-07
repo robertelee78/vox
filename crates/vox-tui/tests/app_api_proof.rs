@@ -829,10 +829,7 @@ fn an_untrusted_refusal_is_the_unknown_kind_refusal() {
             "127.0.0.1:0".parse().expect("APPARATUS: an address"),
         )
         .expect("CANNOT MEASURE: the attacker's endpoint binds");
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("APPARATUS: the clock")
-            .as_secs();
+        let now = vox_core::transport::quic::unix_now_ms();
         let conn = ep
             .connect(alice_addr, alice_id, now)
             .await
@@ -1256,10 +1253,7 @@ fn a_datagram_for_no_flow_or_an_unknown_context_is_dropped_and_counted() {
             "127.0.0.1:0".parse().expect("APPARATUS: an address"),
         )
         .expect("CANNOT MEASURE: the attacker's endpoint binds");
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("APPARATUS: the clock")
-            .as_secs();
+        let now = vox_core::transport::quic::unix_now_ms();
         let conn = ep
             .connect(alice_addr, alice_id, now)
             .await

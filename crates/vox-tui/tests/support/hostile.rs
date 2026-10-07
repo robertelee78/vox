@@ -21,12 +21,8 @@ use vox_core::transport::framing::{read_frame, write_frame};
 use vox_core::transport::quic::{VoxConnection, VoxEndpoint};
 use vox_core::transport::streams::{accept_typed, open_typed, StreamKind};
 
-/// The unix time now, in seconds: for the transport, whose session records are in seconds.
-pub fn now() -> u64 {
-    now_ms() / 1_000
-}
-
-/// The unix time now, in milliseconds: what board records and a genesis are stamped with.
+/// The unix time now, in milliseconds: what board records, a genesis and a session record are
+/// stamped with.
 pub fn now_ms() -> u64 {
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -105,7 +101,7 @@ pub async fn connect<S: vox_core::identity::composite::RootSigner + Send + Sync 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     let mut wait = std::time::Duration::from_millis(150);
     let conn = loop {
-        match endpoint.connect(addr, id, now()).await {
+        match endpoint.connect(addr, id, now_ms()).await {
             Ok(conn) => break conn,
             Err(vox_core::error::Error::HandshakeAuth(_))
                 if std::time::Instant::now() < deadline =>

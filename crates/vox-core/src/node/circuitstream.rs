@@ -568,7 +568,7 @@ pub async fn connect_through(
     relay: &Arc<VoxConnection>,
     peer: Digest32,
     endpoint: &Arc<VoxEndpoint>,
-    now_secs: u64,
+    now_ms: u64,
 ) -> Result<VoxConnection> {
     let (mut send, mut recv) = open_typed(relay, StreamKind::Circuit).await?;
     send_frame(&mut send, &CircuitFrame::Open { peer }).await?;
@@ -604,7 +604,7 @@ pub async fn connect_through(
     // circuit and closes the stream, which tells the relay and the far side to let go.
     let driver = DriverGuard::new(tokio::spawn(terminate(port, Arc::clone(relay), flow)));
     let mut conn =
-        crate::nat::reachability::connect_direct(Arc::clone(endpoint), &[target], peer, now_secs)
+        crate::nat::reachability::connect_direct(Arc::clone(endpoint), &[target], peer, now_ms)
             .await?;
     // **The circuit ends when the connection it carries does.** Nothing else ends it: the
     // relay forwards the inner connection's packets without reading them, so it cannot see

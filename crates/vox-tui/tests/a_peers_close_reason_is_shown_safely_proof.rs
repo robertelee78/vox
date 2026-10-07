@@ -124,7 +124,7 @@ fn a_peers_close_reason_never_reaches_the_terminal_raw() {
         rt.spawn(async move {
             let mut held = Vec::new();
             loop {
-                match ep.accept(hostile::now()).await {
+                match ep.accept(hostile::now_ms()).await {
                     Ok(Some(conn)) => {
                         conn.quinn()
                             .close(quinn::VarInt::from_u32(0x7e57), reason.as_bytes());

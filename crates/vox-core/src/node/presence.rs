@@ -31,7 +31,7 @@ use crate::nat::netwatch::{NetChange, NetShape, NetWatch};
 use crate::nat::portmap::PortMapping;
 use crate::node::circuitstream::CircuitLedger;
 use crate::node::nearby::{Entry, Nearby};
-use crate::transport::quic::{unix_now, unix_now_ms, SharedEndpoint, VoxConnection, VoxEndpoint};
+use crate::transport::quic::{unix_now_ms, SharedEndpoint, VoxConnection, VoxEndpoint};
 
 /// How many inbound handshakes — the TLS handshake and the identity exchange after it — may run
 /// at once (ADR-011 requirement 34): the cap pre-identity connections share.
@@ -949,7 +949,7 @@ fn spawn_handshake(
 ) {
     tokio::spawn(async move {
         let _permit = permit;
-        if let Ok(conn) = shared.finish_incoming(incoming, unix_now()).await {
+        if let Ok(conn) = shared.finish_incoming(incoming, unix_now_ms()).await {
             shared.route(conn);
         }
     });

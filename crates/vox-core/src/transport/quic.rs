@@ -988,7 +988,7 @@ impl SharedEndpoint {
     pub async fn finish_incoming(
         &self,
         incoming: quinn::Incoming,
-        now_secs: u64,
+        now_ms: u64,
     ) -> Result<VoxConnection> {
         let remote = incoming.remote_address();
         // Read before this end answers anything: see [`VoxConnection::via_circuit`].
@@ -1036,7 +1036,7 @@ impl SharedEndpoint {
         self.track(local.id(), &connection);
         let overflow = (!via_circuit).then(|| self.overflow.clone());
         let mut conn =
-            finish_connection(connection, local, &proven, now_secs, via_circuit, overflow)?;
+            finish_connection(connection, local, &proven, now_ms, via_circuit, overflow)?;
         conn.circuit_origin = circuit_origin.filter(|_| via_circuit);
         conn.carrier = carrier.filter(|_| via_circuit);
         Ok(conn)
@@ -1264,7 +1264,7 @@ impl VoxEndpoint {
         &self,
         addr: SocketAddr,
         expected_peer: Digest32,
-        now_secs: u64,
+        now_ms: u64,
     ) -> Result<VoxConnection> {
         // Read before the first packet leaves: see [`VoxConnection::via_circuit`].
         let via_circuit = self.shared.mux.is_circuit(addr);
@@ -1288,7 +1288,7 @@ impl VoxEndpoint {
             connection,
             Arc::clone(&self.local),
             &proven,
-            now_secs,
+            now_ms,
             via_circuit,
             (!via_circuit).then(|| self.shared.overflow.clone()),
         )?;
@@ -1302,8 +1302,8 @@ impl VoxEndpoint {
     ///
     /// # Errors
     /// A failed handshake or exchange.
-    pub async fn accept(&self, now_secs: u64) -> Result<Option<VoxConnection>> {
-        self.accept_with_admission(now_secs, Admission::AcceptAnyAuthenticated)
+    pub async fn accept(&self, now_ms: u64) -> Result<Option<VoxConnection>> {
+        self.accept_with_admission(now_ms, Admission::AcceptAnyAuthenticated)
             .await
     }
 
@@ -1315,13 +1315,13 @@ impl VoxEndpoint {
     /// As [`Self::finish_incoming`].
     pub async fn accept_with_admission(
         &self,
-        now_secs: u64,
+        now_ms: u64,
         admission: Admission,
     ) -> Result<Option<VoxConnection>> {
         let Some(incoming) = self.accept_incoming().await else {
             return Ok(None);
         };
-        self.finish_incoming(incoming, now_secs, admission)
+        self.finish_incoming(incoming, now_ms, admission)
             .await
             .map(Some)
     }
@@ -1343,10 +1343,10 @@ impl VoxEndpoint {
     pub async fn finish_incoming(
         &self,
         incoming: quinn::Incoming,
-        now_secs: u64,
+        now_ms: u64,
         mut admission: Admission,
     ) -> Result<VoxConnection> {
-        let conn = self.shared.finish_incoming(incoming, now_secs).await?;
+        let conn = self.shared.finish_incoming(incoming, now_ms).await?;
         if conn.local_id() != self.local_id {
             conn.close(WireError::ShuttingDown);
             return Err(Error::Handshake(
@@ -1483,7 +1483,7 @@ fn finish_connection(
     connection: Connection,
     local: Arc<LocalNode>,
     proven: &identity::Proven,
-    now_secs: u64,
+    now_ms: u64,
     via_circuit: bool,
     overflow: Option<tokio::sync::watch::Receiver<Option<(u32, u32)>>>,
 ) -> Result<VoxConnection> {
@@ -1491,7 +1491,7 @@ fn finish_connection(
     // Confirm the handshake ran under the Vox configuration and read the key-exchange group it
     // actually negotiated; a session under any group but the post-quantum hybrid is refused.
     let group = confirm_handshake(&connection)?;
-    let session = SessionEstablishment::observed(peer_id, group, now_secs)?;
+    let session = SessionEstablishment::observed(peer_id, group, now_ms)?;
     let peer_process = connection
         .peer_identity()
         .and_then(|any| {
@@ -1888,12 +1888,6 @@ static LIVE: Mutex<std::collections::BTreeMap<u64, Live>> =
 
 /// The next key in [`LIVE`].
 static NEXT_TUNNEL: AtomicU64 = AtomicU64::new(0);
-
-/// The time now in Unix seconds.
-#[must_use]
-pub fn unix_now() -> u64 {
-    unix_now_ms() / 1_000
-}
 
 /// The time now in Unix milliseconds, as [`LiveTunnel`] states times.
 #[must_use]

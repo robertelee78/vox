@@ -4,11 +4,9 @@
 //! The reconciliation engine is ADR-008's and is used unchanged; this module only
 //! opens/accepts the stream and states the policy:
 //!
-//! - **When.** A session per shared channel on every new connection
-//!   ([`SyncTrigger::Connected`]), every [`SYNC_INTERVAL_SECS`] while connected
-//!   ([`SyncTrigger::Periodic`]), and a push immediately after a local append
-//!   ([`SyncTrigger::LocalAppend`]). [`SyncSchedule`] is the pure clock-driven
-//!   decision, so the node's timer logic is testable without a network.
+//! - **When.** A session per shared channel on every new connection, every
+//!   [`SYNC_INTERVAL_SECS`] while connected, and a push immediately after a local append. The
+//!   node's actor keeps that clock, in milliseconds.
 //! - **Which mode.** Frontier mode until a channel exceeds
 //!   [`RANGE_MODE_AUTHOR_THRESHOLD`] authors, then range reconciliation
 //!   ([`should_use_range_mode`]) — the scale rule ADR-008 requires.
@@ -51,79 +49,6 @@ pub const RANGE_MODE_AUTHOR_THRESHOLD: usize = 100;
 #[must_use]
 pub fn should_use_range_mode(authors: usize) -> bool {
     authors > RANGE_MODE_AUTHOR_THRESHOLD
-}
-
-/// Why a sync session is being run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SyncTrigger {
-    /// A connection to this peer was just established.
-    Connected,
-    /// The periodic interval elapsed.
-    Periodic,
-    /// This node appended locally and is pushing it out.
-    LocalAppend,
-}
-
-/// The per-peer sync clock (ADR-016 §"Sync scheduling"), as a pure function of
-/// time and local appends so it can be tested without a network.
-#[derive(Debug, Clone, Copy)]
-pub struct SyncSchedule {
-    last_sync: u64,
-    pending_append: bool,
-}
-
-impl SyncSchedule {
-    /// A schedule for a peer that has just connected: the first session is due
-    /// immediately.
-    #[must_use]
-    pub fn connected() -> Self {
-        Self {
-            last_sync: 0,
-            pending_append: false,
-        }
-    }
-
-    /// Record a local append: the next check pushes it out without waiting for the
-    /// interval.
-    pub fn note_local_append(&mut self) {
-        self.pending_append = true;
-    }
-
-    /// When a session last ran, in seconds; 0 if none has since the peer connected.
-    /// Read-only, for `vox status`.
-    #[must_use]
-    pub fn last_sync(&self) -> u64 {
-        self.last_sync
-    }
-
-    /// Record that a session ran at `now_secs`.
-    pub fn note_synced(&mut self, now_secs: u64) {
-        self.last_sync = now_secs;
-        self.pending_append = false;
-    }
-
-    /// The trigger due at `now_secs`, if any. A local append wins over the
-    /// interval, and the first call after [`SyncSchedule::connected`] is
-    /// `Connected`.
-    #[must_use]
-    pub fn due(&self, now_secs: u64) -> Option<SyncTrigger> {
-        if self.last_sync == 0 {
-            return Some(SyncTrigger::Connected);
-        }
-        if self.pending_append {
-            return Some(SyncTrigger::LocalAppend);
-        }
-        if now_secs.saturating_sub(self.last_sync) >= SYNC_INTERVAL_SECS {
-            return Some(SyncTrigger::Periodic);
-        }
-        None
-    }
-}
-
-impl Default for SyncSchedule {
-    fn default() -> Self {
-        Self::connected()
-    }
 }
 
 /// The largest sync preamble either side will read (`[channel_id, epoch]`).

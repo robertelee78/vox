@@ -581,7 +581,8 @@ impl ConnectionManager {
         let conn = Arc::new(conn);
         let peer = conn.peer_id();
         if let Some(held) = lock(&self.conns).insert(peer, Arc::clone(&conn)) {
-            let retire_at = ((self.clock)() / 1_000).saturating_add(self.retire_grace_secs);
+            let retire_at =
+                (self.clock)().saturating_add(self.retire_grace_secs.saturating_mul(1_000));
             lock(&self.retiring).push((held, retire_at));
         }
         conn
@@ -908,13 +909,8 @@ impl ConnectionManager {
         }
         // Counted until the connection is filed, so a reach waiting on it never sees neither.
         let dial = self.direct_dial(peer);
-        let conn = connect_direct(
-            Arc::clone(&self.endpoint),
-            candidates,
-            peer,
-            (self.clock)() / 1_000,
-        )
-        .await?;
+        let conn =
+            connect_direct(Arc::clone(&self.endpoint), candidates, peer, (self.clock)()).await?;
         let filed = self.file(conn).await;
         drop(dial);
         Ok(filed)
@@ -941,13 +937,8 @@ impl ConnectionManager {
                 return Ok(conn);
             }
         }
-        let conn = connect_direct(
-            Arc::clone(&self.endpoint),
-            candidates,
-            peer,
-            (self.clock)() / 1_000,
-        )
-        .await?;
+        let conn =
+            connect_direct(Arc::clone(&self.endpoint), candidates, peer, (self.clock)()).await?;
         Ok(self.file(conn).await)
     }
 
@@ -961,7 +952,7 @@ impl ConnectionManager {
     pub async fn accept(&self, admission: Admission) -> Result<Option<Arc<VoxConnection>>> {
         let Some(conn) = self
             .endpoint
-            .accept_with_admission((self.clock)() / 1_000, admission)
+            .accept_with_admission((self.clock)(), admission)
             .await?
         else {
             return Ok(None);
@@ -1154,7 +1145,8 @@ impl ConnectionManager {
                 let held = map.get(&peer).is_some_and(|c| Arc::ptr_eq(c, &dead));
                 if held {
                     map.remove(&peer);
-                    let retire_at = ((self.clock)() / 1_000).saturating_add(self.retire_grace_secs);
+                    let retire_at =
+                        (self.clock)().saturating_add(self.retire_grace_secs.saturating_mul(1_000));
                     lock(&self.retiring).push((Arc::clone(&dead), retire_at));
                     self.note(
                         peer,
@@ -1265,7 +1257,8 @@ impl ConnectionManager {
                             also_serve: None,
                         };
                     }
-                    let retire_at = ((self.clock)() / 1_000).saturating_add(self.retire_grace_secs);
+                    let retire_at =
+                        (self.clock)().saturating_add(self.retire_grace_secs.saturating_mul(1_000));
                     let retired = Arc::new(conn);
                     lock(&self.retiring).push((Arc::clone(&retired), retire_at));
                     self.note(
@@ -1284,7 +1277,8 @@ impl ConnectionManager {
                         also_serve: Some(retired),
                     };
                 }
-                let retire_at = ((self.clock)() / 1_000).saturating_add(self.retire_grace_secs);
+                let retire_at =
+                    (self.clock)().saturating_add(self.retire_grace_secs.saturating_mul(1_000));
                 lock(&self.retiring).push((Arc::clone(&existing), retire_at));
                 self.note(
                     peer,
@@ -1316,7 +1310,7 @@ impl ConnectionManager {
     /// Close every retired connection whose grace has elapsed (or that the peer
     /// already closed). Returns how many were closed. The node's tick calls this.
     pub fn retire_expired(&self) -> usize {
-        let now = (self.clock)() / 1_000;
+        let now = (self.clock)();
         let mut retiring = lock(&self.retiring);
         let before = retiring.len();
         retiring.retain(|(conn, at)| {

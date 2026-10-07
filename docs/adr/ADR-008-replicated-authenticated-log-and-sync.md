@@ -143,7 +143,7 @@ consent grants (ADR-007), rendezvous records (ADR-012), the transport identity e
   | `0x000E` | admin-delegation-revocation | `vox/admin-delegation-revocation/v1` | ADR-007 |
   | `0x000F` | service-advertisement | `vox/service-advertisement/v1` | ADR-013 |
   | `0x0010` | esk-publication (removed) | `vox/esk-publication/v1` | ADR-009 |
-  | `0x0011` | session-establishment | `vox/session-establishment/v1` | ADR-011 |
+  | `0x0011` | session-establishment | `vox/session-establishment/v2` | ADR-011 |
   | `0x0012` | member-bundle-record | `vox/member-bundle-record/v2` | ADR-016 |
   | `0x0013` | service-grant-exclusion | `vox/service-grant-exclusion/v1` | ADR-007, ADR-017 |
   | `0x0014` | join-witness | `vox/join-witness/v2` | ADR-016 M17.6 |
