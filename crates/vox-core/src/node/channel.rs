@@ -203,6 +203,79 @@ const KNOWN_MEMBERS_VERSION: u64 = 1;
 /// release ledger ([`crate::node::drive::DriveState`]).
 const SEG_DRIVE: u64 = 16;
 
+/// What this node keeps of the room's board for good (#520), within [`SegmentKind::KeyMaterial`]:
+/// the admission notice of every author it admitted on a witness, and every member's own withdraw
+/// it has seen. A board forgets on a restart and a bundle record lapses; these are what let every
+/// member learn of a newcomer that is offline, and never of one that left.
+const SEG_BOARD_KEPT: u64 = 17;
+
+/// Encoding version of [`SEG_BOARD_KEPT`]: `[1, [notice wire..], [withdraw wire..]]`.
+const BOARD_KEPT_VERSION: u64 = 1;
+
+/// The notices and withdraws a room keeps (#520), as their signed wire bytes.
+#[derive(Debug, Clone, Default)]
+struct BoardKept {
+    /// `joiner` → `(witness time, notice)`, the newest witnessed.
+    notices: BTreeMap<Digest32, (u64, Vec<u8>)>,
+    /// `member` → `(withdraw time, withdraw)`, the newest.
+    withdraws: BTreeMap<Digest32, (u64, Vec<u8>)>,
+}
+
+fn board_kept_bytes(kept: &BoardKept) -> Vec<u8> {
+    let mut e = Encoder::new();
+    e.array(3)
+        .uint(BOARD_KEPT_VERSION)
+        .array(kept.notices.len());
+    for (_, wire) in kept.notices.values() {
+        e.bytes(wire);
+    }
+    e.array(kept.withdraws.len());
+    for (_, wire) in kept.withdraws.values() {
+        e.bytes(wire);
+    }
+    e.finish()
+}
+
+fn parse_board_kept(bytes: &[u8], channel_id: &Digest32) -> Result<BoardKept> {
+    let mut d = Decoder::new(bytes);
+    if d.array()? != 3 {
+        return Err(Error::MalformedAtRest("board kept arity"));
+    }
+    if d.uint()? != BOARD_KEPT_VERSION {
+        return Err(Error::MalformedAtRest("board kept version"));
+    }
+    let mut kept = BoardKept::default();
+    let n = d.array()?;
+    if n > AUTHORS_HARD_LIMIT {
+        return Err(Error::SizeLimitExceeded("kept notices"));
+    }
+    for _ in 0..n {
+        let wire = d.bytes()?.to_vec();
+        let notice = crate::nat::notice::AdmissionNotice::from_wire(&wire)
+            .map_err(|_| Error::MalformedAtRest("kept notice"))?;
+        if notice.channel_id() != *channel_id {
+            return Err(Error::MalformedAtRest("kept notice room"));
+        }
+        kept.notices
+            .insert(notice.joiner(), (notice.witness.timestamp_ms, wire));
+    }
+    let n = d.array()?;
+    if n > AUTHORS_HARD_LIMIT {
+        return Err(Error::SizeLimitExceeded("kept withdraws"));
+    }
+    for _ in 0..n {
+        let wire = d.bytes()?.to_vec();
+        let w = crate::nat::withdraw::BoardWithdraw::from_wire(&wire)
+            .map_err(|_| Error::MalformedAtRest("kept withdraw"))?;
+        if w.channel_id != *channel_id || w.scope != crate::nat::withdraw::WithdrawScope::Member {
+            return Err(Error::MalformedAtRest("kept withdraw scope"));
+        }
+        kept.withdraws.insert(w.author_id, (w.timestamp_ms, wire));
+    }
+    d.finish()?;
+    Ok(kept)
+}
+
 fn known_members_bytes(known: &BTreeSet<Digest32>) -> Vec<u8> {
     let mut e = Encoder::new();
     e.array(2).uint(KNOWN_MEMBERS_VERSION).array(known.len());
@@ -857,6 +930,9 @@ pub struct ChannelState {
     /// The drive key and the Session entries it opens (ADR-029 SC-2), persisted in `SEG_DRIVE`;
     /// the rows come from the plaintext cache.
     drive: DriveState,
+    /// The room's admission notices and members' withdraws this node keeps (#520), persisted in
+    /// `SEG_BOARD_KEPT`. See [`ChannelState::keep_notice`] and [`ChannelState::keep_withdraw`].
+    board_kept: BoardKept,
     /// The channel passphrase, retained **in memory only** for as long as the
     /// channel is open (M14.7c).
     ///
@@ -1685,6 +1761,7 @@ impl ChannelState {
             trust_marks: BTreeMap::new(),
             known_members: BTreeSet::new(),
             drive: DriveState::default(),
+            board_kept: BoardKept::default(),
             skipped: std::collections::VecDeque::new(),
             poisoned: false,
             settled: true,
@@ -2095,6 +2172,14 @@ impl ChannelState {
             None => DriveState::default(),
         };
         drive.sessions = sessions;
+        let board_kept =
+            match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_BOARD_KEPT)? {
+                Some(seg) => {
+                    let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_BOARD_KEPT, &seg)?;
+                    parse_board_kept(&bytes, channel_id)?
+                }
+                None => BoardKept::default(),
+            };
 
         Self::refresh_gov_preds(&dag, &mut gov_entries);
         let evaluator = Arc::new(Self::build_evaluator(
@@ -2158,6 +2243,7 @@ impl ChannelState {
             trust_marks,
             known_members,
             drive,
+            board_kept,
             skipped: std::collections::VecDeque::new(),
             poisoned: false,
             settled,
@@ -2400,6 +2486,7 @@ impl ChannelState {
             trust_marks: BTreeMap::new(),
             known_members: BTreeSet::new(),
             drive: DriveState::default(),
+            board_kept: BoardKept::default(),
             skipped: std::collections::VecDeque::new(),
             poisoned: false,
             settled: false,
@@ -2472,11 +2559,176 @@ impl ChannelState {
                             "join witness signed by an unadmitted key",
                         ))?;
                 w.verify(&witness_key, &self.channel_id, self.epoch, &fingerprint)?;
+                // **Never a member that left** (#520): its own withdraw, signed no earlier than
+                // the witness, refuses it, wherever the record came from. A member that joins again
+                // is witnessed again, later, and is taken.
+                if !self.authors.contains_key(&fingerprint)
+                    && self.withdrawn_since(&fingerprint, w.timestamp_ms)
+                {
+                    return Err(Error::MalformedGovernance(
+                        "admission withdrawn: the member left the room",
+                    ));
+                }
+                self.keep_notice(
+                    store,
+                    &crate::nat::notice::AdmissionNotice::new(key.clone(), (**w).clone())?,
+                )?;
             }
         }
         // Past the cap if it must be: another member admitted it, on its own view that there was
         // room. Refusing it here would split the room (V210-128).
         self.admit_within(store, key, now_ms / 1_000, AUTHORS_HARD_LIMIT)
+    }
+
+    /// Admit a newcomer **from its admission notice** (#520): the evidence its bundle record would
+    /// carry, the witness of a member this node already admits, without the bundle, so a newcomer
+    /// that is offline is still learned of. The same rules as [`ChannelState::admit_from_board`]:
+    /// the witness's signer must be an author here, the witness must bind this room, this epoch
+    /// and the key's fingerprint, a withdraw of the newcomer no older than the witness refuses it,
+    /// and the room's cap gives way only to what another member admitted. The notice is kept, to
+    /// pass on.
+    pub fn admit_from_notice(
+        &mut self,
+        store: &Store,
+        notice: &crate::nat::notice::AdmissionNotice,
+        now: crate::time::Ms,
+    ) -> Result<bool> {
+        if notice.channel_id() != self.channel_id {
+            return Err(Error::MalformedGovernance(
+                "admission notice of another room",
+            ));
+        }
+        let w = &notice.witness;
+        let witness_key =
+            self.authors
+                .get(&w.witness_id)
+                .cloned()
+                .ok_or(Error::MalformedGovernance(
+                    "join witness signed by an unadmitted key",
+                ))?;
+        notice.verify(&witness_key, &self.channel_id, self.epoch)?;
+        let fingerprint = notice.joiner();
+        if !self.authors.contains_key(&fingerprint)
+            && self.withdrawn_since(&fingerprint, w.timestamp_ms)
+        {
+            return Err(Error::MalformedGovernance(
+                "admission withdrawn: the member left the room",
+            ));
+        }
+        self.keep_notice(store, notice)?;
+        self.admit_within(store, &notice.key, now.get() / 1_000, AUTHORS_HARD_LIMIT)
+    }
+
+    /// Whether this node holds a withdraw of `member` signed at or after `since` (#520).
+    #[must_use]
+    pub fn withdrawn_since(&self, member: &Digest32, since: u64) -> bool {
+        self.board_kept
+            .withdraws
+            .get(member)
+            .is_some_and(|(at, _)| *at >= since)
+    }
+
+    /// Keep `notice`, the newest witnessed for its joiner (#520), persisted so this node passes it
+    /// on after a restart. A notice its joiner's kept withdraw refuses is not kept.
+    pub fn keep_notice(
+        &mut self,
+        store: &Store,
+        notice: &crate::nat::notice::AdmissionNotice,
+    ) -> Result<()> {
+        let (joiner, at) = (notice.joiner(), notice.witness.timestamp_ms);
+        if self.withdrawn_since(&joiner, at)
+            || self
+                .board_kept
+                .notices
+                .get(&joiner)
+                .is_some_and(|(held, _)| *held >= at)
+        {
+            return Ok(());
+        }
+        if !self.board_kept.notices.contains_key(&joiner)
+            && self.board_kept.notices.len() >= AUTHORS_HARD_LIMIT
+        {
+            return Ok(());
+        }
+        self.board_kept
+            .notices
+            .insert(joiner, (at, notice.to_wire()));
+        self.save_board_kept(store)
+    }
+
+    /// Keep a member's own withdraw (#520), checked by the caller against the member's key: the
+    /// newest one, persisted, so this node refuses every admission of that member it witnessed
+    /// before, and passes the withdraw on wherever it passes the member's notice.
+    pub fn keep_withdraw(
+        &mut self,
+        store: &Store,
+        withdraw: &crate::nat::withdraw::BoardWithdraw,
+    ) -> Result<bool> {
+        if withdraw.channel_id != self.channel_id
+            || withdraw.scope != crate::nat::withdraw::WithdrawScope::Member
+        {
+            return Ok(false);
+        }
+        let member = withdraw.author_id;
+        if self
+            .board_kept
+            .withdraws
+            .get(&member)
+            .is_some_and(|(at, _)| *at >= withdraw.timestamp_ms)
+        {
+            return Ok(false);
+        }
+        if !self.board_kept.withdraws.contains_key(&member)
+            && self.board_kept.withdraws.len() >= AUTHORS_HARD_LIMIT
+        {
+            return Ok(false);
+        }
+        self.board_kept
+            .withdraws
+            .insert(member, (withdraw.timestamp_ms, withdraw.to_wire()));
+        self.save_board_kept(store)?;
+        Ok(true)
+    }
+
+    /// The kept withdraws then the kept notices, as wire bytes (#520): what this node files on its
+    /// own board when it opens the room, and offers a peer's board that lacks them.
+    #[must_use]
+    pub fn board_kept(&self) -> Vec<Vec<u8>> {
+        self.board_kept
+            .withdraws
+            .values()
+            .chain(self.board_kept.notices.values())
+            .map(|(_, w)| w.clone())
+            .collect()
+    }
+
+    /// The key a kept notice gives `member` (#520): what checks a withdraw it signs where this
+    /// node never admitted it.
+    #[must_use]
+    pub fn notice_key(&self, member: &Digest32) -> Option<CompositePublicKey> {
+        let (_, wire) = self.board_kept.notices.get(member)?;
+        crate::nat::notice::AdmissionNotice::from_wire(wire)
+            .ok()
+            .map(|n| n.key)
+    }
+
+    fn save_board_kept(&mut self, store: &Store) -> Result<()> {
+        let seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_BOARD_KEPT,
+            &board_kept_bytes(&self.board_kept),
+        )?;
+        if let Err(e) = store.put_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_BOARD_KEPT,
+            &seg,
+        ) {
+            self.poisoned = true;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Admit `key` as a log author for this channel: its entries are accepted into

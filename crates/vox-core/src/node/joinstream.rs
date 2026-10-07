@@ -940,7 +940,10 @@ pub async fn run_responder<F, Fut>(
     admit_before_accepting: F,
 ) -> Result<JoinOutcome>
 where
-    F: FnOnce(crate::identity::composite::CompositePublicKey) -> Fut,
+    F: FnOnce(
+        crate::identity::composite::CompositePublicKey,
+        crate::nat::record::JoinWitness,
+    ) -> Fut,
     Fut: std::future::Future<Output = Result<Option<String>>>,
 {
     let exchange = responder_exchange(&mut send, &mut recv, peer_fp, cfg, store, ring);
@@ -961,7 +964,12 @@ where
             // is in only if it was: an admission that failed was dropped here, so a joiner the
             // room could not take (it was full) heard `Accepted`, exited 0, and was a member of
             // nothing.
-            let name = match admit_before_accepting(outcome.peer.identity.clone()).await {
+            let name = match admit_before_accepting(
+                outcome.peer.identity.clone(),
+                outcome.witness.clone(),
+            )
+            .await
+            {
                 Ok(name) => name,
                 Err(e) => {
                     let refusal = match e {

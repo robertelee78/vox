@@ -55,16 +55,20 @@
 //! - **Split** ([`a_split_room_keeps_both_newcomers_and_says_it_passed_its_cap`]): no anchor between
 //!   them; the host admits a newcomer while bob is down, and bob one while the host is down, each
 //!   checked from its own `vox status` to hold no connection to the other, and each at the cap less
-//!   one: an offline member blocks nothing. x is down while bob admits y (x would tell bob of
-//!   itself), and bob is checked not to know x. Up together again, both rosters list both
-//!   newcomers, one past the cap, and a member's log says so (the decider's ruling (a)).
+//!   one: an offline member blocks nothing. x goes down after its join and stays down to the end
+//!   (it would otherwise tell bob of itself), and bob is checked not to know x. The host and bob up
+//!   together again, both rosters list both newcomers, one past the cap, and a member's log says
+//!   so (the decider's ruling (a)): bob learns of x, offline, from the admission notice the host
+//!   keeps (#520).
 //!
 //! **Mutations that must turn it red:** the admission's result dropped again (in
 //! `NetEvent::JoinAdmit`, the ack answered `Ok(())` whatever `admit_author` returned): the
 //! newcomer is told it joined. A failed admission answered with `JoinReject::Refused` again (in
 //! `run_responder`): the second arm's joiner is told its passphrase is likely wrong. The seat round
 //! skipped, so the answering member admits on its own view (`seat_round` not run): the strict arm's
-//! three newcomers are all told they joined, `PRODUCT:`.
+//! three newcomers are all told they joined, `PRODUCT:`. The admitting member keeping no admission
+//! notice (#520, in `NetEvent::JoinAdmit` and `admit_from_board`): the split arm's bob never lists
+//! x, offline, `PRODUCT:`.
 #![cfg(unix)]
 
 #[path = "support/sync_pair.rs"]
@@ -502,8 +506,9 @@ fn a_member_online_that_does_not_answer_fails_the_join_and_is_named() {
 
 /// **The only way past the cap is a split, and it is said** (V030-30, #366; the decider's ruling
 /// (a)). With no anchor between them, the host admits a newcomer while bob is down, and bob one
-/// while the host and x are down, each at the cap less one: an offline member blocks nothing. Up
-/// together again, both keep both newcomers, one past the cap, and a member says so.
+/// while the host and x are down, each at the cap less one: an offline member blocks nothing. The
+/// host and bob up together again, x still down, both keep both newcomers, one past the cap, and a
+/// member says so: every member learns of a newcomer while it is offline (#520).
 #[test]
 #[ignore = "real binaries and production Argon2id: the release gate runs it"]
 fn a_split_room_keeps_both_newcomers_and_says_it_passed_its_cap() {
@@ -544,9 +549,9 @@ fn a_split_room_keeps_both_newcomers_and_says_it_passed_its_cap() {
     );
 
     // ---- the host down, bob up: bob admits y, knowing nothing of x -------------------------------
-    // x goes down with the host: x, a member now, dials bob once he is back and tells him of
-    // itself, and the two sides would not be split. A member learns a newcomer from the
-    // newcomer's own record, so x comes back with the host below.
+    // x goes down with the host and stays down: x, a member now, would dial bob once he is back and
+    // tell him of itself, and the two sides would not be split. Bob learns of x, offline, from the
+    // admission notice the host keeps (#520).
     drop(x_d);
     let host_said = host_d.transcript();
     drop(host_d);
@@ -571,9 +576,9 @@ fn a_split_room_keeps_both_newcomers_and_says_it_passed_its_cap() {
          not know x:\n{said}"
     );
 
-    // ---- all up: both keep both newcomers, and say the room passed its cap -----------------------
+    // ---- the host and bob up, x still down: both keep both newcomers, and say the room passed its
+    // cap ------------------------------------------------------------------------------------------
     let host_d = host.daemon_with(&knob);
-    let _x_d = x.daemon_with(&knob);
     let want: Vec<&str> = [&host, &bob, &x, &y]
         .iter()
         .map(|m| m.fp.as_str())
