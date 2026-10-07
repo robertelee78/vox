@@ -46,6 +46,9 @@
 //   IMAGE <w>x<h> JPEG <true|false> BLURHASH <hash>
 //                           the image the peer's file share announced: dimensions, whether the
 //                           thumbnail is a JPEG, its BlurHash
+//   PULLED_BY <names> SAME <true|false>
+//                           `pulledBy`: who pulled this node's file share whole (up to 90 s), and
+//                           whether it names the share's own announcement
 //   REFUSED <error>         `renameRoom` on the peer's room, which this node may not rename
 //   CREATED <room> <link>   `createRoom` named "mine", and its link
 //   (waits for a line on stdin: the peer has joined it)
@@ -187,6 +190,14 @@ do {
         .compactMap { $0.image }.first
     let jpeg = image.map { $0.thumb.starts(with: [0xFF, 0xD8]) } ?? false
     say("IMAGE \(image?.width ?? 0)x\(image?.height ?? 0) JPEG \(jpeg) BLURHASH \(image?.blurhash ?? "")")
+    var pulledBy: [PulledBy] = []
+    let pulledByUntil = Date().addingTimeInterval(90)
+    while pulledBy.isEmpty && Date() < pulledByUntil {
+        pulledBy = try await client.pulledBy(room: room)
+        if pulledBy.isEmpty { try await Task.sleep(nanoseconds: 250_000_000) }
+    }
+    let byNames = pulledBy.first?.names.joined(separator: ",") ?? ""
+    say("PULLED_BY \(byNames) SAME \(pulledBy.first?.id == fileShare.entry)")
     let operator_ = try Passphrase(bytes: Data(args[3].utf8))
     do {
         try await client.renameRoom(room: room, name: "taken", identityPassphrase: operator_)
