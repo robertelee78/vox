@@ -449,7 +449,9 @@ impl VoxNode {
                 tokio::select! {
                     item = events.next() => match item {
                         None => return,
-                        Some(EventStreamItem::Event(NodeEvent::NewEntry { .. })) => {}
+                        Some(EventStreamItem::Event(
+                            NodeEvent::NewEntry { .. } | NodeEvent::SessionEntry { .. },
+                        )) => {}
                         Some(EventStreamItem::Event(other)) => {
                             listener.on_notice(other.words());
                         }
