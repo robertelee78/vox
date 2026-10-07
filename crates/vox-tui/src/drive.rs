@@ -27,21 +27,51 @@
 
 pub use vox_agentcomms::drive::{slash, Action, Answer, Request, LABEL, MAX_REQUEST, PATIENCE};
 
-/// Drive `session` of the node `peer` in `room`, from the node at `paths` (the CLI's side).
+/// Why a drive did not reach its session, in the three ways every surface words alike (CL-1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotDelivered {
+    /// The session's node refused it: "not delivered to <label>: <why>".
+    Refused(String),
+    /// Nothing went out: the node could not be reached, or no single target was found (DR-5):
+    /// "not sent to <label>: <why>".
+    NotSent(String),
+    /// It went out and no answer came: "no answer from <label>: it may or may not have been
+    /// delivered".
+    NoAnswer(String),
+}
+
+impl NotDelivered {
+    /// The sentence a person reads, for the Session labelled `label`.
+    #[must_use]
+    pub fn sentence(&self, label: &str) -> String {
+        match self {
+            NotDelivered::Refused(why) => format!("not delivered to {label}: {why}"),
+            NotDelivered::NotSent(why) => format!("not sent to {label}: {why}"),
+            NotDelivered::NoAnswer(_) => {
+                format!("no answer from {label}: it may or may not have been delivered")
+            }
+        }
+    }
+}
+
+/// Drive `session` of the node `peer` in `room`, from the node at `paths` (the CLI's and the
+/// TUI's side). What happened, in words.
 ///
 /// # Errors
-/// Why it was not delivered: refused by the session's node, or that node could not be reached.
+/// [`NotDelivered`]: refused by the session's node, not sent, or not answered.
 pub async fn send(
     paths: &vox_core::node::paths::Paths,
     room: vox_core::hash::Digest32,
     peer: vox_core::hash::Digest32,
     request: &Request,
-) -> Result<String, String> {
-    let at = crate::client::one_shot(paths).map_err(|e| e.to_string())?;
+) -> Result<String, NotDelivered> {
+    use vox_core::node::drive_input::Unsent;
+    let at = crate::client::one_shot(paths).map_err(|e| NotDelivered::NotSent(e.to_string()))?;
     match vox_core::node::drive_input::send(&at, room, peer, request).await {
         Ok(Answer { ok: true, said }) => Ok(said),
-        Ok(Answer { ok: false, said }) => Err(said),
-        Err(unsent) => Err(unsent.to_string()),
+        Ok(Answer { ok: false, said }) => Err(NotDelivered::Refused(said)),
+        Err(Unsent::Unreachable(why)) => Err(NotDelivered::NotSent(why)),
+        Err(Unsent::NoAnswer(why)) => Err(NotDelivered::NoAnswer(why)),
     }
 }
 
@@ -110,6 +140,6 @@ pub async fn run(
             let _ = writeln!(std::io::stdout().lock(), "{label}: {said}");
             Ok(())
         }
-        Err(why) => Err(AppError::Usage(format!("not delivered to {label}: {why}"))),
+        Err(not) => Err(AppError::Usage(not.sentence(&label))),
     }
 }
