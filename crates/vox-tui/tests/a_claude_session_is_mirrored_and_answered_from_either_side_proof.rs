@@ -778,7 +778,9 @@ const S8: &str = "88888888-1111-4000-8000-000000000008";
 /// 7. the session exited, its pane back at the shell: refused, and the shell got nothing;
 /// 8. a new session in the same process and pane (`/clear`): the old one is refused;
 /// 9. the same session resumed in another pane: input goes to the new pane;
-/// 10. a session first seen by a tool hook (no prompt yet): bound; one never seen: refused.
+/// 10. a session first seen by a tool hook (no prompt yet): bound; one never seen: refused;
+/// 11. a file a driver sends into a session (`--file`, #546) lands, and the session's terminal
+///     is told its path ("person sent you a file: <path> — <note>"), the file there byte for byte.
 ///
 /// **Which side a red is on.** What `vox room session` printed, or what a stand-in got or did not
 /// get, is `PRODUCT:`. A tmux server, stand-in or event this proof could not stage is
@@ -789,7 +791,8 @@ const S8: &str = "88888888-1111-4000-8000-000000000008";
 /// pane is recorded by its position, not its id (arm 4); one session per pane ignores the server
 /// (arm 5); the hook's ancestry not required to reach the pane (arm 6); the session's process not
 /// checked at the send (arm 7); one session per pane not kept (arm 8); a later hook not rebinding
-/// (arm 9); a tool hook not registering (arm 10).
+/// (arm 9); a tool hook not registering (arm 10); the session not told where its file landed
+/// (arm 11).
 #[test]
 #[ignore = "real binary; run in release"]
 fn a_driver_reaches_exactly_the_session_it_names_or_is_told_why() {
@@ -1023,6 +1026,56 @@ fn a_driver_reaches_exactly_the_session_it_names_or_is_told_why() {
     assert!(
         ok && f.got(&serde_json::json!({ "typed": "after a tool hook" }), Duration::from_secs(10)),
         "PRODUCT: arm 10: a session first seen by a tool hook must be bound by it; vox said {said:?}"
+    );
+
+    // ---- 11. a file sent into the session: it lands, and the session is told where (#546) ----
+    let sent = w.root.join("for-s1.txt");
+    let bytes = "a file for session one\n".repeat(64);
+    std::fs::write(&sent, &bytes)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot write the file: {e}"));
+    let sent_s = sent.display().to_string();
+    let (ok, said) = drive(&w, &room, S1, &["--file", &sent_s, "--note", "for you"]);
+    println!("[proof] 11. --file to {S1}: {said}");
+    assert!(
+        ok,
+        "PRODUCT: arm 11: the file must be taken for {S1}; vox said {said:?}"
+    );
+    let t0 = Instant::now();
+    let told = loop {
+        let line = e.said().lines().find_map(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .ok()?
+                .get("typed")?
+                .as_str()
+                .filter(|t| t.starts_with("person sent you a file: ") && t.ends_with(" — for you"))
+                .map(str::to_owned)
+        });
+        if let Some(line) = line {
+            break Some(line);
+        }
+        if t0.elapsed() > Duration::from_secs(60) {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    println!("[proof] 11. {S1}'s pane was told: {told:?}");
+    let Some(told) = told else {
+        panic!(
+            "PRODUCT: arm 11: within 60 s, {S1}'s terminal must be told the file's path \
+             (\"person sent you a file: <path> — for you\"); its pane got:\n{}",
+            e.said()
+        )
+    };
+    let path = told
+        .trim_start_matches("person sent you a file: ")
+        .trim_end_matches(" — for you");
+    let landed = std::fs::read_to_string(path).unwrap_or_default();
+    assert!(
+        landed == bytes,
+        "PRODUCT: arm 11: the path {S1} was told ({path}) must hold the file sent, byte for byte; \
+         it holds {} bytes of {}",
+        landed.len(),
+        bytes.len()
     );
 }
 
