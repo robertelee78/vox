@@ -71,6 +71,9 @@ final class NodeModel: ObservableObject {
     private(set) var byID: [String: RoomMessage] = [:]
     /// Who has read each of this node's own messages in the room on screen, by message id (R-6).
     @Published private(set) var readBy: [String: [String]] = [:]
+    /// Who has pulled each of this node's own shares in the room on screen, verified, by the
+    /// share's message id (ADR-028 F-6, #498).
+    @Published private(set) var pulledBy: [String: [String]] = [:]
     /// Where this node's verified copy of each share it pulled in the room on screen is, by the
     /// share's message id (ADR-028 F-3, F-4): what its card opens with Quick Look.
     @Published private(set) var pulled: [String: String] = [:]
@@ -268,6 +271,7 @@ final class NodeModel: ObservableObject {
         guard case .room = selection else { return }
         messages = []
         readBy = [:]
+        pulledBy = [:]
         pulled = [:]
         members = []
         roomServices = []
@@ -704,6 +708,7 @@ final class NodeModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 guard let self, case .room(room) = self.selection else { return }
                 let reads = try? await self.client.readBy(room: room)
+                let pulls = try? await self.client.pulledBy(room: room)
                 let copies = try? await self.client.pulled(room: room)
                 let services = try? await self.client.services(room: room).shared
                 let rows = try? await self.memberRows(room)
@@ -711,6 +716,10 @@ final class NodeModel: ObservableObject {
                 if let reads {
                     let now = Dictionary(uniqueKeysWithValues: reads.map { ($0.id, $0.names) })
                     if now != self.readBy { self.readBy = now }
+                }
+                if let pulls {
+                    let now = Dictionary(pulls.map { ($0.id, $0.names) }) { $1 }
+                    if now != self.pulledBy { self.pulledBy = now }
                 }
                 if let copies {
                     let now = Dictionary(copies.map { ($0.entry, $0.path) }) { $1 }

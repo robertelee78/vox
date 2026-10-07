@@ -168,6 +168,7 @@ private struct RoomView: View {
                                     ForEach(model.messages, id: \.id) { message in
                                         MessageRow(message: message, me: model.me,
                                                    readBy: model.readBy[message.id] ?? [],
+                                                   pulledBy: model.pulledBy[message.id] ?? [],
                                                    pulled: model.pulled[message.id]) { looking = $0 }
                                             .frame(maxWidth: .infinity, alignment: .leading)
                                             .padding(4)
@@ -311,6 +312,8 @@ private struct MessageRow: View {
     let me: String
     /// Who has read it, when it is this node's own (R-6).
     let readBy: [String]
+    /// Who has pulled it, verified, when it is this node's own share (#498).
+    let pulledBy: [String]
     /// Where this node's verified copy of the file it shares is, once pulled.
     let pulled: String?
     /// Open a pulled copy with Quick Look.
@@ -337,6 +340,12 @@ private struct MessageRow: View {
             }
             if let card = message.card {
                 LinkCardView(card: card)
+            }
+            if !pulledBy.isEmpty {
+                Text("pulled by \(pulledBy.joined(separator: ", "))")
+                    .eyebrow().secondaryText()
+                    .accessibilityIdentifier("pulled-by-\(message.id)")
+                    .accessibilityLabel("pulled by \(pulledBy.joined(separator: ", "))")
             }
             if !readBy.isEmpty {
                 Text("read by \(readBy.joined(separator: ", "))")
