@@ -659,6 +659,7 @@ final class FirstRunProof: XCTestCase {
               until: { $0.contains("it may read what you write") })
         tap(ui, Key.id("keyring-trust"), "Trust")
         let carolRow = Key.id("keyring-row-carol")
+        keyringPassphraseIfAsked(ui) { self.locate(ui, carolRow) != nil }
         present(ui, carolRow, timeout: 30, "carol, once trusted, must be listed in the keyring view")
         let trustList = run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out
         XCTAssertTrue(trustList.contains(carolFp),
@@ -668,6 +669,7 @@ final class FirstRunProof: XCTestCase {
               "removing must say what untrusting does before it is done",
               until: { $0.contains("reads nothing you write from now on") })
         tap(ui, Key.id("keyring-untrust-confirm"), "Untrust")
+        keyringPassphraseIfAsked(ui) { self.locate(ui, carolRow) == nil }
         var after5 = ""
         let goneUntil = Date().addingTimeInterval(30)
         while Date() < goneUntil {
@@ -1008,6 +1010,7 @@ final class FirstRunProof: XCTestCase {
               "removing bob must say what untrusting does first",
               until: { $0.contains("reads nothing you write from now on") })
         tap(ui, Key.id("keyring-untrust-confirm"), "Untrust")
+        keyringPassphraseIfAsked(ui) { self.locate(ui, Key.id("keyring-row-bob")) == nil }
         XCTAssertTrue(live.cut(within: 30),
                       "PRODUCT: alice untrusted bob in the keyring view; bob's live connection into her service must be cut within 30 s, and it was not")
         print("[proof] untrust cut bob's live forward into alice's notes service")
@@ -1282,6 +1285,24 @@ final class FirstRunProof: XCTestCase {
     }
 
     /// Type `text` into `key`, only once it was clicked.
+    /// A keyring change made in the app after the keyring window closed, or before it ever
+    /// opened (attaching does not open it, ADR-028 K-12, #523): the app asks for the identity
+    /// passphrase, and alice types it, as a person would. Answered only if asked: the change may
+    /// land first, with the window open.
+    private func keyringPassphraseIfAsked(_ ui: XCUIApplication, landed: () -> Bool) {
+        let field = Key.id("keyring-passphrase")
+        let end = Date().addingTimeInterval(30)
+        while Date() < end && !landed() {
+            if locate(ui, field) != nil {
+                type(ui, field, "alice identity", "the keyring's passphrase field")
+                tap(ui, Key.id("keyring-passphrase-continue"), "Continue")
+                print("[proof] the keyring window was closed: the app asked for the passphrase, typed")
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+    }
+
     private func type(_ ui: XCUIApplication, _ key: Key, _ text: String, _ what: String,
                       file: StaticString = #filePath, line: UInt = #line) {
         if tap(ui, key, what, file: file, line: line) { el(ui, key).typeText(text) }

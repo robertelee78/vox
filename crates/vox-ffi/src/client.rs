@@ -1344,21 +1344,15 @@ impl VoxClient {
     }
 
     /// Keep `room`'s message bodies for `ttl_secs` seconds (0: forever), as
-    /// `vox room retention` does (ADR-023 decision 2); its creator or an admin only. Shortening
-    /// it deletes stored history, so the identity passphrase is always asked for.
+    /// `vox room retention` does (ADR-023 decision 2); its creator or an admin only. No
+    /// passphrase (ADR-028 K-11): the room's governance says who may.
     ///
     /// # Errors
-    /// A malformed id, a wrong passphrase, or the node's refusal (not the creator or an admin).
-    pub async fn set_retention(
-        &self,
-        room: String,
-        ttl_secs: u64,
-        identity_passphrase: Arc<Passphrase>,
-    ) -> Result<(), VoxError> {
+    /// A malformed id, or the node's refusal (not the creator or an admin).
+    pub async fn set_retention(&self, room: String, ttl_secs: u64) -> Result<(), VoxError> {
         let req = Request::SetRetention {
             channel_id: digest(&room, "room id")?,
             ttl: ttl_secs,
-            identity_passphrase: identity_passphrase.copy(),
         };
         on_held!(self, |c| done(c, &req).await)
     }

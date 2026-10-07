@@ -297,11 +297,10 @@ enum Retention {
     }
 }
 
-/// Retention, saying what it does before it is set (E-5); the identity passphrase always.
+/// Retention, saying what it does before it is set (E-5); no passphrase (ADR-028 K-11).
 private struct RetentionSheet: View {
     @ObservedObject var model: NodeModel
     @State private var seconds: UInt64 = 30 * 86_400
-    @State private var field = SecureFieldHolder()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -313,12 +312,15 @@ private struct RetentionSheet: View {
                 : "Every member deletes a message's text \(Retention.words(seconds)) after it was "
                     + "sent, and older ones at once. Deleted text cannot be read again.")
                 .secondaryText()
-            Text("Your identity passphrase:").secondaryText()
-            SecureInput(holder: field) { submit() }.frame(width: 320)
-            if let said = model.said { StateMark(kind: .danger, words: said).textSelection(.enabled) }
+                .accessibilityIdentifier("retention-effect")
+            if let said = model.said {
+                StateMark(kind: .danger, words: said).textSelection(.enabled)
+                    .accessibilityIdentifier("retention-said")
+            }
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 Button("Set") { submit() }.keyboardShortcut(.defaultAction)
+                    .accessibilityIdentifier("retention-submit")
             }
         }
         .padding(24)
@@ -326,9 +328,8 @@ private struct RetentionSheet: View {
     }
 
     private func submit() {
-        guard let secret = field.take() else { return }
         let s = seconds
-        Task { if await model.setRetention(s, passphrase: secret) { model.sheet = nil } }
+        Task { if await model.setRetention(s) { model.sheet = nil } }
     }
 }
 

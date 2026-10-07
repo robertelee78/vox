@@ -254,6 +254,7 @@ private struct KeyringPassphrase: View {
                 .frame(width: 320)
                 .accessibilityIdentifier("keyring-passphrase")
             Button("Continue") { submit() }
+                .accessibilityIdentifier("keyring-passphrase-continue")
         }
     }
 

@@ -488,14 +488,11 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// Set the room on screen's retention.
-    func setRetention(_ seconds: UInt64, passphrase secret: Secret) async -> Bool {
-        defer { secret.wipe() }
+    /// Set the room on screen's retention: no passphrase (ADR-028 K-11).
+    func setRetention(_ seconds: UInt64) async -> Bool {
         guard let id = roomOnScreen else { return false }
         do {
-            let passphrase = try secret.passphrase()
-            defer { passphrase.wipe() }
-            try await client.setRetention(room: id, ttlSecs: seconds, identityPassphrase: passphrase)
+            try await client.setRetention(room: id, ttlSecs: seconds)
             did = seconds == 0 ? "Messages here are kept for good."
                 : "Messages here are kept for \(Retention.words(seconds)), then deleted everywhere."
             return true
