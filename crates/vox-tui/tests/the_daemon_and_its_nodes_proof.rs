@@ -542,6 +542,72 @@ fn a_daemon_on_an_empty_root_starts_with_no_node() {
     );
 }
 
+/// ADR-026 D-1: **a daemon started while another stops takes over once it has.** Daemon A serves
+/// node `agent` and is stopped; its stop is held open (staged to take 6 s). `vox daemon --node
+/// agent` started meanwhile is told no "the daemon is stopping" and does not give up: it says it
+/// serves once A has stopped, and then it holds the account lock and serves the node. Mutant: give
+/// up on a stopping daemon, as before (red: B exits and nothing holds the lock).
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real binaries with production Argon2id; run in release"]
+fn a_daemon_started_while_another_stops_takes_over() {
+    const HOLD_MS: u64 = 6_000;
+    watchdog::arm();
+    let a = Account::new();
+    a.make_node("agent");
+    let mut first = a
+        .cmd(&["daemon", "--node", "agent"])
+        .env("VOX_TEST_STOP_HOLD_MS", HOLD_MS.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("APPARATUS: spawn the first vox daemon");
+    let up = wait_until(Duration::from_secs(60), || {
+        a.run(&["node", "list"], "").1.contains("agent") && a.lock_pid() == Some(first.id())
+    });
+    assert!(
+        up,
+        "PRODUCT (staging): the first daemon did not serve node agent within 60 s\nlog:\n{}",
+        a.log()
+    );
+    // A is asked to stop (SIGTERM, by its PID), and stays stopping for HOLD_MS.
+    let _ = Command::new("kill")
+        .args(["-TERM", &first.id().to_string()])
+        .status();
+    std::thread::sleep(Duration::from_millis(500));
+    let (still, said) = (alive(first.id()), a.run(&["node", "list"], ""));
+    assert!(
+        still,
+        "APPARATUS (staging not achieved): the first daemon was gone before the second started, so \
+         nothing was stopping: {said:?}"
+    );
+    let second_err = a._tmp.path().join("second.err");
+    let mut second = a
+        .cmd(&["daemon", "--node", "agent"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&second_err).unwrap()))
+        .spawn()
+        .expect("APPARATUS: spawn the second vox daemon");
+    let took_over = wait_until(Duration::from_secs(60), || {
+        a.lock_pid() == Some(second.id()) && a.run(&["node", "list"], "").1.contains("agent")
+    });
+    let _ = first.wait();
+    let gone = second.try_wait().ok().flatten();
+    let told = std::fs::read_to_string(&second_err).unwrap_or_default();
+    eprintln!(
+        "[proof] the second daemon took over: {took_over}; exited: {gone:?}; it said:\n{told}"
+    );
+    let _ = second.kill();
+    let _ = second.wait();
+    assert!(
+        took_over && gone.is_none() && told.contains("is stopping; this one serves once it has"),
+        "PRODUCT: a daemon started while another stopped must wait for it and then serve, saying \
+         so; it took over {took_over}, exited {gone:?}, and said:\n{told}"
+    );
+}
+
 /// ADR-026 L-3: a detach is done only when the node's keys are wiped and its directory let go.
 /// A room seal still working (staged to take 12 s) holds the node's stop; the last session's
 /// `SessionEnd`, which detaches the node, answers only after the seal ends, never at the daemon's
