@@ -121,6 +121,12 @@ pub struct DaemonCore {
     asked: Option<Instant>,
     /// The room on screen (drives `ViewModel::active` and unread resets).
     active: Option<Digest32>,
+    /// The Session the room's timeline shows: its room, node and session id (ADR-029 CL-2).
+    shown_session: Option<(Digest32, Digest32, String)>,
+    /// Its lines, as last read, for a member with drive (SC-1).
+    session_lines: Vec<crate::viewmodel::SessionLineView>,
+    /// When its entries were last read; `None` reads them on the next frame.
+    session_read: Option<Instant>,
     /// Unread per room off screen, at three levels (ADR-028 R-8, #484).
     unread: BTreeMap<Digest32, RoomUnread>,
     /// Rooms whose unread was counted, when the TUI first saw them open, from what the node
@@ -363,6 +369,9 @@ impl DaemonCore {
             active: None,
             unread: BTreeMap::new(),
             seeded: BTreeSet::new(),
+            shown_session: None,
+            session_lines: Vec::new(),
+            session_read: None,
             arrived: BTreeMap::new(),
             notified: BTreeSet::new(),
             notify_to,
@@ -1057,6 +1066,76 @@ impl DaemonCore {
 
     /// Read the room on screen: whole when it first comes on screen, or when a late row or an
     /// unknown cursor says the order changed above what is shown; else only what arrived since.
+    /// Read the shown Session's entries, at most once a second, and draw them as `vox room
+    /// session` does (ADR-029 SC-1, CL-1). Entries this node cannot open are not among them: a
+    /// member without drive reads none (SC-2).
+    fn read_session(&mut self) {
+        let Some((room, node, id)) = self.shown_session.clone() else {
+            return;
+        };
+        if Some(room) != self.active {
+            return;
+        }
+        if self
+            .session_read
+            .is_some_and(|at| at.elapsed() < SNAPSHOT_EVERY)
+        {
+            return;
+        }
+        self.session_read = Some(Instant::now());
+        let Ok(Frame::SessionEntries { rows }) =
+            self.request(&Request::SessionEntries { channel_id: room })
+        else {
+            return;
+        };
+        let kind = |r: &vox_core::node::drive::SessionRow| {
+            serde_json::from_str::<serde_json::Value>(&r.body)
+                .ok()
+                .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(str::to_owned))
+                .unwrap_or_default()
+        };
+        let seq = |r: &vox_core::node::drive::SessionRow| {
+            serde_json::from_str::<serde_json::Value>(&r.body)
+                .ok()
+                .and_then(|v| v.get("seq").and_then(serde_json::Value::as_u64))
+                .unwrap_or(0)
+        };
+        // The Session's own entries are its node's; a driver's entries name the session too.
+        let mut mine: Vec<_> = rows
+            .into_iter()
+            .filter(|r| r.session_id == id && (r.author == node || kind(r) == "drive"))
+            .collect();
+        mine.sort_by_key(|r| (r.created_millis, seq(r)));
+        let me = self.snapshot.me;
+        let names = SessionNames {
+            trusted: &self.snapshot.trusted,
+            me,
+        };
+        let label = self
+            .snapshot
+            .open
+            .iter()
+            .find(|o| o.channel_id == room)
+            .and_then(|o| o.sessions.iter().find(|x| x.node == node && x.id == id))
+            .map_or_else(
+                || vox_agentcomms::envelope::session_label(&names.alias_of(&node), None, &id),
+                |x| {
+                    vox_agentcomms::envelope::session_label(
+                        &names.alias_of(&node),
+                        x.name.as_deref(),
+                        &x.id,
+                    )
+                },
+            );
+        self.session_lines = crate::session_cli::lines(&mine, &label, &names)
+            .into_iter()
+            .map(|l| crate::viewmodel::SessionLineView {
+                text: l.text,
+                details: l.details,
+            })
+            .collect();
+    }
+
     fn read_timeline(&mut self) {
         let Some(cid) = self.active else {
             self.timeline = None;
@@ -1574,6 +1653,15 @@ impl DaemonCore {
                             })
                             .collect()
                     },
+                    session_lines: if self
+                        .shown_session
+                        .as_ref()
+                        .is_some_and(|(room, _, _)| *room == d.channel_id)
+                    {
+                        self.session_lines.clone()
+                    } else {
+                        Vec::new()
+                    },
                     // The room's Sessions (ADR-029 CL-2), newest opening first, each labelled as
                     // `vox room sessions` labels it (SE-3).
                     sessions: d
@@ -1937,6 +2025,7 @@ impl CoreHandle for DaemonCore {
             }
         }
         self.read_timeline();
+        self.read_session();
         self.count_unread();
         self.project()
     }
@@ -2116,6 +2205,15 @@ impl CoreHandle for DaemonCore {
                 ),
                 other => other,
             },
+            Command::ShowSession {
+                channel_id,
+                session,
+            } => {
+                self.shown_session = session.map(|(node, id)| (channel_id, node, id));
+                self.session_lines.clear();
+                self.session_read = None;
+                CommandStatus::Done
+            }
             Command::SelectChannel { channel_id } => {
                 // The room left counts from the newest row it showed: nothing seen is unread.
                 if let Some(t) = self
@@ -2283,5 +2381,33 @@ impl CoreHandle for DaemonCore {
 
     fn ended(&self) -> Option<String> {
         self.ended.clone()
+    }
+}
+
+/// How the TUI names a node in a Session's lines, as `vox room session` does: "you", this node's
+/// name for it, or its fingerprint marked not in the keyring (ADR-029 CL-1).
+struct SessionNames<'a> {
+    trusted: &'a [(Digest32, String)],
+    me: Option<Digest32>,
+}
+
+impl SessionNames<'_> {
+    fn alias_of(&self, fp: &Digest32) -> String {
+        crate::ident::author_for(self.trusted, self.me.as_ref(), fp)
+    }
+}
+
+impl crate::session_cli::Names for SessionNames<'_> {
+    fn alias(&self, fp: &Digest32) -> String {
+        self.alias_of(fp)
+    }
+    fn is_me(&self, by: &str) -> bool {
+        vox_core::node::link::b32_decode(by, "fingerprint").is_ok_and(|fp| self.me == Some(fp))
+    }
+    fn alias_b32(&self, by: &str) -> String {
+        match vox_core::node::link::b32_decode(by, "fingerprint") {
+            Ok(fp) => self.alias_of(&fp),
+            Err(_) => by.chars().take(12).collect(),
+        }
     }
 }

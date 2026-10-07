@@ -101,6 +101,10 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             among the room's messages; `:session <short id>`, without drive, shows only that it
             exists and "Only members alice trusts with drive see inside this Session.", with no
             composer, and `:send` there is refused, reaching nobody (ADR-029 CL-2, CL-3, #553);
+  drive     once Alice gives Bob drive (`vox trust drive`, at a terminal) and her open Session
+            runs a turn through Claude Code's hook, Bob's `:session` shows each line his `vox room
+            session` prints, not "Only members …"; `d` on the tool call's line shows its output
+            (ADR-029 SC-1, CL-1, #553);
   attach    with `:to alice`, the note typed in the composer and `:share <file>`, Alice reads one
             message: a `file` announcement carrying the note in it and `to` naming her, no second
             message for the note (ADR-028 F-1, #493);
@@ -1163,6 +1167,67 @@ try:
           f"{nodrive}, no composer {no_composer}; `:send` there said {refused!r}, reached the room: "
           f"{leaked}" + ("" if merged else f"; All showed: {all_rows!r}")
           + ("" if titled and nodrive else "; screen:\n" + "\n".join(screen)))
+
+    stage("drive")
+    # A Session read from inside (ADR-029 SC-1, CL-1, #553): Alice gives Bob drive, as a person
+    # does at a terminal, and her open Session runs one turn through Claude Code's hook: a tool
+    # call, its result in the transcript, the reply. Bob's `:session` then shows the turn, line for
+    # line as his `vox room session` prints it, and no "Only members …" sentence; the tool call's
+    # Details (`d` on its line) hold its whole output.
+    t = Tui([VOX, "trust", "drive", fp["bob"]], env("alice"))
+    t.until(lambda: t.closed or "passphrase" in t.text().lower(), 20, 0.5)
+    if not t.closed and "passphrase" in t.text().lower():
+        t.key("id pass\r", 0.5)
+    t.until(lambda: t.closed, 60, 0.5)
+    granted = t.text()
+    t.stop()
+    work = f"{S}/alice-work"
+    os.makedirs(work, exist_ok=True)
+    transcript = f"{work}/{OPEN_ID}.jsonl"
+    open(transcript, "w").close()
+    def turn(event, **extra):
+        hook("alice", {"session_id": OPEN_ID, "transcript_path": transcript, "cwd": work,
+                       "permission_mode": "default", "hook_event_name": event, **extra})
+    call = {"command": "echo DETAILS-OUTPUT-LINE", "description": "Say it"}
+    turn("PreToolUse", tool_name="Bash", tool_input=call, tool_use_id="toolu_D")
+    with open(transcript, "a") as f:
+        f.write(json.dumps({"type": "user", "sessionId": OPEN_ID, "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_D", "content": "DETAILS-OUTPUT-LINE\n",
+             "is_error": False}]}}) + "\n")
+    turn("PostToolUse", tool_name="Bash", tool_input=call, tool_use_id="toolu_D",
+         tool_response={"stdout": "DETAILS-OUTPUT-LINE\n", "stderr": "", "interrupted": False},
+         duration_ms=3)
+    turn("Stop", stop_hook_active=False, last_assistant_message="DRIVE-REPLY the codec is ported")
+    def cli_session():
+        r = run("bob", "room", "session", room, OPEN_ID)
+        return r.stdout if r.returncode == 0 else ""
+    if not until(lambda: "— turn ended —" in cli_session(), 120):
+        product(f"bob, given drive, never read alice's Session to its turn's end with `vox room "
+                f"session` within 120 s; alice's `vox trust drive` said {granted!r}; it said "
+                f"{run('bob', 'room', 'session', room, OPEN_ID).stdout!r}")
+    cli = [l for l in cli_session().splitlines()[1:] if l.strip()]
+    tui.key(f":session {OPEN_ID[:8]}\r", 2)
+    flat = lambda: " ".join(" ".join(bare(r).split()) for r in pane(tui.display(), "Timeline"))
+    tui.until(lambda: "— turn ended —" in flat(), 30, 1)
+    # Each line `vox room session` printed is a line of the TUI's (the pane wraps; read it whole).
+    same = all(" ".join(l.split()).replace(" ", "") in flat().replace(" ", "") for l in cli)
+    sealed_off = "Onlymembers" in flat().replace(" ", "")
+    hint = tui.display()[-1]
+    focus("Timeline")
+    for _ in range(len(cli) + 2):
+        tui.key("\x1b[A", 0.3)  # Up: an older line
+        if any(bare(r).startswith("▶ Bash:") for r in pane(tui.display(), "Timeline")):
+            break
+    tui.key("d", 1)
+    details = flat()
+    opened = "DETAILS-OUTPUT-LINE" in details.split("▶ Bash:", 1)[-1].split("reply:", 1)[0]
+    tui.key(":general\r", 2)
+    # The help line is reported, not judged: a node notice ("alice trusts you") holds that row
+    # until another replaces it.
+    claim("drive", same and not sealed_off and opened,
+          f"`vox room session` printed {cli!r}; the TUI showed each of them: {same}; said the "
+          f"Session is sealed off: {sealed_off}; `d` on the tool call showed its output: {opened}; "
+          f"help line: {hint.strip()!r}" + ("" if same and opened else f"; the pane: {details!r}"))
 
     stage("attach")
     # A file shared from the composer is one message, addressed like one (ADR-028 F-1, #493): its

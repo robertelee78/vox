@@ -4,7 +4,7 @@
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob, Carol and
 //! Dave (Alice and Bob trust each other, nobody trusts Carol, Bob trusts Dave and Dave nobody),
 //! Alice posts 70 lines, and Bob's real `vox tui` is read through the `pyte` terminal emulator at
-//! 160x50. It checks thirty-nine claims, each
+//! 160x50. It checks forty claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -93,6 +93,10 @@
 //!   the room's messages; `:session <short id>`, without drive, shows only that it exists and
 //!   "Only members alice trusts with drive see inside this Session.", with no composer, and
 //!   `:send` there is refused and reaches nobody (ADR-029 CL-2, CL-3, #553);
+//! - `drive`: once Alice gives Bob drive (`vox trust drive`, typed at a terminal) and her open
+//!   Session runs a turn through Claude Code's hook (a tool call, its result, the reply), Bob's
+//!   `:session` shows each line his `vox room session` prints, and not "Only members …"; `d` on the
+//!   tool call's line shows its output (ADR-029 SC-1, CL-1, #553);
 //! - `attach`: with `:to alice`, a note typed in the composer and `:share <file>`, Alice reads
 //!   one message, a `file` announcement carrying the note and `to` naming her, and no second
 //!   message for the note (ADR-028 F-1, #493);
@@ -144,9 +148,10 @@
 //! another node again, a copied command that is not the service's canonical address (`copies`), or
 //! a pasted fingerprint that is not the node's let through to the keyring (`trust`), an image
 //! drawn before this node's copy is verified (`inline`), a member's keyring capability not
-//! drawn (`capability`), a read of a hung-up terminal that never returns (`gone`), or a Session without drive
-//! offering a composer (`sessions`). It passes only on the script's PASS with
-//! all 39 claims ok.
+//! drawn (`capability`), a read of a hung-up terminal that never returns (`gone`), a Session without drive
+//! offering a composer (`sessions`), or a member with drive shown only that the Session exists
+//! (`drive`). It passes only on the script's PASS with
+//! all 40 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -242,7 +247,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (39 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (40 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -256,8 +261,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (39, 39),
-                "APPARATUS: the driver said PASS without all 39 claims ok: {said}"
+                (40, 40),
+                "APPARATUS: the driver said PASS without all 40 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),

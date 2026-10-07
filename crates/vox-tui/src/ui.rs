@@ -573,20 +573,41 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
             (&[][..], notices, shown)
         }
     };
-    (ui.timeline_scroll, ui.on_screen) = render_timeline(
-        frame,
-        body[0],
-        &channel.held_back,
-        timeline,
-        (&notices, &channel.retention, &shown),
-        Selection {
-            scroll: ui.timeline_scroll,
-            selected: ui.selected_message,
-            reveal: std::mem::take(&mut ui.reveal_selected),
-            focus: focused(ui, Focus::Timeline),
-        },
-        &mut ui.images.borrow_mut(),
-    );
+    // Inside a Session, for a member with drive: its activity, a line each (SC-1).
+    let inside = session.filter(|x| x.can_drive || !channel.session_lines.is_empty());
+    if let Some(x) = inside {
+        render_session(
+            frame,
+            body[0],
+            &channel.session_lines,
+            (ui.selected_session_line, ui.details_open),
+            &format!(
+                "Timeline — {}{}",
+                x.label,
+                if x.ended.is_some() {
+                    " · ended"
+                } else {
+                    " · open"
+                }
+            ),
+            focused(ui, Focus::Timeline),
+        );
+    } else {
+        (ui.timeline_scroll, ui.on_screen) = render_timeline(
+            frame,
+            body[0],
+            &channel.held_back,
+            timeline,
+            (&notices, &channel.retention, &shown),
+            Selection {
+                scroll: ui.timeline_scroll,
+                selected: ui.selected_message,
+                reveal: std::mem::take(&mut ui.reveal_selected),
+                focus: focused(ui, Focus::Timeline),
+            },
+            &mut ui.images.borrow_mut(),
+        );
+    }
     // Whom the next message is to, and whether it is urgent (ADR-028 W-4), by this node's names.
     let mut about = Vec::new();
     if !ui.to.is_empty() {
@@ -680,6 +701,61 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
             *area,
         );
     }
+}
+
+/// **A Session, read from inside** (ADR-029 SC-1): a line per activity, the newest at the bottom;
+/// the selected line marked `▶`, and under it, while open, its Details: each part labelled, its
+/// text indented. The window keeps the selected line in view.
+fn render_session(
+    frame: &mut Frame,
+    area: Rect,
+    lines: &[crate::viewmodel::SessionLineView],
+    (selected, details): (Option<usize>, bool),
+    title: &str,
+    focus: bool,
+) {
+    let width = usize::from(area.width.saturating_sub(2)).max(1);
+    let height = usize::from(area.height.saturating_sub(2));
+    let mut rows: Vec<Line> = Vec::new();
+    let mut at = None;
+    for (i, l) in lines.iter().enumerate() {
+        let chosen = selected == Some(i);
+        if chosen {
+            at = Some(rows.len());
+        }
+        let mark = if chosen { "▶ " } else { "  " };
+        rows.extend(wrap(Line::from(format!("{mark}{}", l.text)), width));
+        if chosen && details {
+            for (label, body) in &l.details {
+                rows.extend(wrap(
+                    Line::from(Span::styled(
+                        format!("    {label}:"),
+                        Style::default().add_modifier(Modifier::DIM),
+                    )),
+                    width,
+                ));
+                for part in body.lines() {
+                    rows.extend(wrap(Line::from(format!("      {part}")), width));
+                }
+            }
+        }
+    }
+    if lines.is_empty() {
+        rows.push(Line::from(Span::styled(
+            "· nothing from this Session yet",
+            Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
+        )));
+    }
+    // The newest at the bottom, unless that would hide the selected line.
+    let mut end = rows.len();
+    if let Some(top) = at {
+        if top + height < end {
+            end = (top + height).max(height.min(rows.len()));
+        }
+    }
+    let start = end.saturating_sub(height);
+    let shown: Vec<Line> = rows[start..end].to_vec();
+    frame.render_widget(Paragraph::new(shown).block(pane_block(title, focus)), area);
 }
 
 /// **The Sessions pane** (ADR-029 CL-2): General, All, each open Session by its label, and the
@@ -1235,7 +1311,11 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
         Screen::ChannelList => {
             " ↑/↓ select · Enter open · t tunnels · k keyring · d decisions · :new <name> · :join · :attach · Ctrl-C quit"
         }
-        // A Session's own help line (ADR-029 §8): its driving words join it as they are built.
+        // A Session's own help line (ADR-029 §8): its driving words join it as they are built,
+        // for a member with drive only (CL-3).
+        Screen::Channel if showing_session(ui, vm).is_some_and(|x| x.can_drive) => {
+            " Tab switch pane · ↑/↓ select a line · Enter or d: Details · :general · :all · :session <name> · : command · Esc back"
+        }
         Screen::Channel if matches!(ui.showing, Showing::Session(..)) => {
             " Tab switch pane · ↑/↓ select · Enter show · :general · :all · :session <name> · : command · Esc back"
         }

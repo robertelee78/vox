@@ -219,6 +219,9 @@ pub struct ChannelView {
     pub shared: Vec<SharedView>,
     /// The room's Sessions, open and ended, newest opening first (ADR-029 CL-2).
     pub sessions: Vec<SessionView>,
+    /// The lines of the Session on screen, for a member with drive (ADR-029 SC-1): one per
+    /// activity, in the words `vox room session` prints. Empty while none is shown.
+    pub session_lines: Vec<SessionLineView>,
     /// This channel's reachability.
     pub reachability: Reachability,
 }
@@ -257,6 +260,15 @@ pub struct SessionView {
     pub ended: Option<u64>,
     /// Whether the session's node trusts this node with drive (SC-2, CL-3).
     pub can_drive: bool,
+}
+
+/// One activity of a Session, as the reader sees it (ADR-029 SC-1).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionLineView {
+    /// The one line.
+    pub text: String,
+    /// Its full input and output, labelled, in order: Details.
+    pub details: Vec<(String, String)>,
 }
 
 /// Overall sync status surfaced in the status bar: what the node can say, which is how many
@@ -615,6 +627,14 @@ pub enum Command {
     SelectChannel {
         /// The channel now on screen, if any.
         channel_id: Option<Digest32>,
+    },
+    /// The Session the room's timeline now shows, by its node and session id; `None` for General
+    /// or All (ADR-029 CL-2).
+    ShowSession {
+        /// The room.
+        channel_id: Digest32,
+        /// The Session's node and the harness's session id.
+        session: Option<(Digest32, String)>,
     },
     /// Create a room under its shared name (ADR-028 R-1) with an out-of-band passphrase.
     CreateChannel {
