@@ -2090,7 +2090,7 @@ impl VoxClient {
                 .map(|p| PulledFile {
                     entry: b32_encode(&p.entry),
                     path: p.path.to_string_lossy().into_owned(),
-                    created: p.created,
+                    created: p.created_ms / 1_000,
                 })
                 .collect();
             pulled.sort_by_key(|p| p.created);

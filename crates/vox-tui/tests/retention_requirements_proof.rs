@@ -78,8 +78,24 @@ impl Drop for Daemon {
     }
 }
 
+/// Nothing of a real harness's terminal reaches a `vox` here (the lead, 2026-10-07): every
+/// `TMUX*`, `CLAUDE*`, `CODEX*` and `OPENCODE*` this process holds is taken out, by name.
+fn without_harness_env(cmd: &mut Command) -> &mut Command {
+    for (k, _) in std::env::vars_os() {
+        let name = k.to_string_lossy();
+        if ["TMUX", "CLAUDE", "CODEX", "OPENCODE"]
+            .iter()
+            .any(|p| name.starts_with(p))
+        {
+            cmd.env_remove(&k);
+        }
+    }
+    cmd
+}
+
 fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
     let mut cmd = Command::new(VOX);
+    without_harness_env(&mut cmd);
     cmd.args(args)
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
@@ -148,6 +164,7 @@ fn daemon(
     let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err")))
         .expect("APPARATUS: the daemon's output file");
     let mut cmd = Command::new(VOX);
+    without_harness_env(&mut cmd);
     cmd.args(["daemon", "--listen", listen])
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
@@ -1040,5 +1057,120 @@ fn r10_an_expired_entrys_skeleton_still_catches_a_fork() {
         !b.iter().any(|x| x == "after-2"),
         "PRODUCT: a conflicting entry at an expired position must be caught as a fork and its \
          author frozen: bob still accepts alice's posts"
+    );
+}
+
+/// The wall clock now, milliseconds since the Unix epoch.
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// `vox room read --json` on `dir`: each row's text and the millisecond its author claimed.
+fn read_ms(dir: &Path, room: &str) -> Vec<(String, u64)> {
+    let (ok, out, err) = vox(dir, &["room", "read", room, "--json"], None);
+    assert!(ok, "PRODUCT: vox room read --json: {err}");
+    out.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| {
+            Some((
+                v["text"].as_str()?.to_owned(),
+                v["created_millis"].as_u64()?,
+            ))
+        })
+        .collect()
+}
+
+/// **A message's retention runs from the millisecond it was posted** (the decider, 2026-10-07:
+/// every time Vox compares or expires is in milliseconds, rounded only when shown). A room kept
+/// for 2 s, a message posted late in its second: it still reads a quarter of a second before its
+/// 2 s are up, and is gone soon after. Reckoned in whole seconds, its age ran from the start of
+/// its second, and it was swept up to a second early.
+///
+/// The node sweeps once a second, at a phase this proof does not set, so one message posted late
+/// in its second would show an early sweep only most of the time: four are, each judged alone,
+/// and every one must still read 250 ms before its own 2 s.
+///
+/// Mutant: expiry compared in whole seconds again (`claimed_ms / 1_000 <= now_secs - ttl`) → red,
+/// the message gone before its 2 s.
+#[test]
+#[ignore = "real vox daemon and production Argon2id; CI runs it in release"]
+fn retention_runs_from_the_millisecond_a_message_was_posted() {
+    watchdog::arm();
+    const TTL_MS: u64 = 2_000;
+    let t = tempfile::tempdir().expect("APPARATUS: a temporary directory");
+    let (alice, _) = identity(t.path(), "alice");
+    let _a = daemon(
+        &alice,
+        "alice",
+        &format!("{IDENTITY}\n"),
+        "127.0.0.1:0",
+        &[],
+    );
+    let room = create(&alice);
+    let (ok, said) = set_retention(&alice, &room, "2");
+    assert!(
+        ok,
+        "PRODUCT (staging): `vox room retention {room} 2`: {said}"
+    );
+    until_retention(&alice, "PRODUCT (staging)", "alice", 2, 30);
+    let mut judged = 0;
+    let mut posted = 0;
+    while judged < 4 {
+        posted += 1;
+        assert!(
+            posted <= 40,
+            "APPARATUS: 40 posts, and fewer than four were claimed late enough in their second \
+             to judge"
+        );
+        // Late in a second: a post takes a few tens of milliseconds to be claimed.
+        while wall_ms() % 1_000 < 850 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let text = format!("ms-{posted}");
+        post(&alice, &room, &text);
+        let Some(claimed) = read_ms(&alice, &room)
+            .into_iter()
+            .find(|(t, _)| *t == text)
+            .map(|(_, c)| c)
+        else {
+            panic!("PRODUCT: alice's own post {text:?} does not read at once");
+        };
+        if claimed % 1_000 < 700 {
+            continue; // claimed too early in its second for a whole-second sweep to show
+        }
+        // 250 ms before its 2 s are up: it must still read.
+        let at = claimed + TTL_MS - 250;
+        while wall_ms() < at {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let still = read_ms(&alice, &room).iter().any(|(t, _)| *t == text);
+        println!(
+            "[proof] {text}: claimed at {} ms into its second; {} ms after its claim it reads: \
+             {still}",
+            claimed % 1_000,
+            wall_ms().saturating_sub(claimed)
+        );
+        assert!(
+            still,
+            "PRODUCT: a message claimed at {claimed} ({} ms into its second) in a room kept for \
+             2 s was gone {} ms after its claim, before its 2 s were up: its age was reckoned \
+             from the start of its second, not from the millisecond it was posted",
+            claimed % 1_000,
+            wall_ms().saturating_sub(claimed)
+        );
+        // And it does go, once its 2 s are up and the next sweep has run.
+        until(
+            &alice,
+            &room,
+            &format!("PRODUCT: {text}, kept for 2 s, is swept once they are up"),
+            5,
+            |texts| !texts.contains(&text),
+        );
+        judged += 1;
+    }
+    println!(
+        "[proof] four messages, each claimed late in its second, read until their 2 s were up"
     );
 }

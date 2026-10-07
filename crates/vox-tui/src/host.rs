@@ -938,9 +938,9 @@ impl Router {
                     room: driven.room,
                     entry: vox_core::hash::sha256(driven.tag.as_bytes()),
                     path: path.clone(),
-                    created: std::time::SystemTime::now()
+                    created_ms: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_secs()),
+                        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
                     folder: None,
                     files: Vec::new(),
                 },
