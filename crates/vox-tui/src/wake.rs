@@ -118,6 +118,13 @@ pub struct Session {
     /// ([`crate::claude_injector::prove`]) before it stores the registration. Never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux_claim: Option<TmuxClaim>,
+    /// A Codex session's `CODEX_HOME`, whose app-server the daemon reads it from (ADR-029 #541).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub codex_home: String,
+    /// The Vox OpenCode plugin's mirror socket, through which the daemon follows the session
+    /// (ADR-029 #542). Its token is [`Self::token`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mirror: String,
 }
 
 /// What a hook's environment says of its tmux pane: claimed, not proven. The daemon proves it
@@ -391,6 +398,8 @@ impl Session {
                 tmux: None,
                 tmux_why: None,
                 tmux_claim: None,
+                codex_home: crate::codex_mirror::codex_home_from_env(),
+                mirror: String::new(),
             }
         } else if let (Ok(endpoint), Ok(token)) = (
             std::env::var("CLAUDE_CODE_MESSAGING_SOCKET"),
@@ -411,6 +420,8 @@ impl Session {
                 tmux: None,
                 tmux_why: None,
                 tmux_claim: None,
+                codex_home: String::new(),
+                mirror: String::new(),
             }
         } else if let (Ok(endpoint), Ok(token)) = (
             std::env::var("VOX_OPENCODE_WAKE_SOCKET"),
@@ -431,6 +442,8 @@ impl Session {
                 tmux: None,
                 tmux_why: None,
                 tmux_claim: None,
+                codex_home: String::new(),
+                mirror: std::env::var("VOX_OPENCODE_MIRROR_SOCKET").unwrap_or_default(),
             }
         } else {
             Session {
@@ -448,6 +461,8 @@ impl Session {
                 tmux: None,
                 tmux_why: None,
                 tmux_claim: None,
+                codex_home: String::new(),
+                mirror: String::new(),
             }
         }
     }

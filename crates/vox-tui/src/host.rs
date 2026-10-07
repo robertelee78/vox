@@ -99,6 +99,18 @@ struct Inner {
     sink: Arc<crate::session_sink::Sink>,
     /// One queue per (node, session) into its Session, so its entries keep their order.
     posting: Mutex<BTreeMap<(NodeName, String), tokio::sync::mpsc::UnboundedSender<String>>>,
+    /// Codex sessions' activity, read from Codex's app-server as a peer client (ADR-029 #541).
+    codex: Arc<crate::codex_mirror::CodexMirror>,
+    /// OpenCode sessions' activity, read through Vox's OpenCode plugin (ADR-029 #542).
+    opencode: Arc<crate::opencode_mirror::OpenCodeMirror>,
+}
+
+/// A member's answer as the sink took it: handed to the harness, or why not.
+fn handed(h: crate::session_sink::Handed) -> Result<String, String> {
+    match h {
+        crate::session_sink::Handed::ToHarness => Ok("handed to the session; it decides".into()),
+        crate::session_sink::Handed::Refused(why) => Err(why),
+    }
 }
 
 /// One node's place in its life (L-1). A node with no slot is detached.
@@ -242,7 +254,11 @@ impl Router {
                         }
                     },
                 ));
+                let codex = crate::codex_mirror::CodexMirror::new(Arc::clone(&sink));
+                let opencode = crate::opencode_mirror::OpenCodeMirror::new(Arc::clone(&sink));
                 Inner {
+                    codex,
+                    opencode,
                     account,
                     rt,
                     defaults,
@@ -591,6 +607,292 @@ impl Router {
         })
     }
 
+    /// Listen for drive input to `node`'s sessions ([`crate::drive`]) until the node detaches.
+    fn serve_drive(
+        &self,
+        node: &NodeName,
+        handle: &NodeHandle,
+        mut detached: watch::Receiver<bool>,
+    ) {
+        let hub = Arc::clone(handle.app());
+        let mut listener = match hub.listen(None, crate::drive::LABEL) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("vox daemon: node {node} takes no drive input: {e}");
+                return;
+            }
+        };
+        let router = self.clone();
+        let node = node.clone();
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            loop {
+                let incoming = tokio::select! {
+                    i = listener.next() => i,
+                    _ = detached.wait_for(|d| *d) => None,
+                };
+                let Some(incoming) = incoming else { return };
+                let (router, node, handle, hub) = (
+                    router.clone(),
+                    node.clone(),
+                    handle.clone(),
+                    Arc::clone(&hub),
+                );
+                tokio::spawn(async move {
+                    let Ok(stream) = hub.accept(incoming.id).await else {
+                        return;
+                    };
+                    router.drive_stream(&node, &handle, stream).await;
+                });
+            }
+        });
+    }
+
+    /// One drive request on `stream`: read it, act on it, answer it, and say it in the Session.
+    async fn drive_stream(
+        &self,
+        node: &NodeName,
+        handle: &NodeHandle,
+        stream: vox_core::node::app::AppStream,
+    ) {
+        use crate::drive::{Answer, MAX_REQUEST, PATIENCE};
+        let info = stream.info().clone();
+        let mut buf = Vec::new();
+        let mut chunk = vec![0u8; 16 * 1024];
+        let read = tokio::time::timeout(PATIENCE, async {
+            while !buf.contains(&b'\n') && buf.len() <= MAX_REQUEST {
+                match stream.read(&mut chunk).await {
+                    Ok(Some(n)) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                    _ => break,
+                }
+            }
+        })
+        .await;
+        let line = buf.split(|b| *b == b'\n').next().unwrap_or_default();
+        let answer = match (read, serde_json::from_slice::<crate::drive::Request>(line)) {
+            (Err(_), _) => Answer {
+                ok: false,
+                said: "no drive request arrived in time".into(),
+            },
+            (_, Err(_)) if buf.len() > MAX_REQUEST => Answer {
+                ok: false,
+                said: "the drive request is too long".into(),
+            },
+            (_, Err(_)) => Answer {
+                ok: false,
+                said: "not a drive request this vox reads".into(),
+            },
+            (Ok(()), Ok(req)) => self.drive(node, handle, &info, req).await,
+        };
+        if let Ok(mut out) = serde_json::to_vec(&answer) {
+            out.push(b'\n');
+            let _ = stream.write_all(&out).await;
+        }
+        stream.finish().await;
+    }
+
+    /// Check a drive request and hand it to its session alone (ADR-029 DR-2, DR-5, DR-6, DR-7),
+    /// writing what was driven and, when it was not delivered, why into the Session.
+    async fn drive(
+        &self,
+        node: &NodeName,
+        handle: &NodeHandle,
+        info: &vox_core::node::app::AppInfo,
+        req: crate::drive::Request,
+    ) -> crate::drive::Answer {
+        use crate::drive::{Action, Answer};
+        let refuse = |said: String| Answer { ok: false, said };
+        if req.v != 1 {
+            return refuse(format!(
+                "drive protocol {} is not one this vox speaks",
+                req.v
+            ));
+        }
+        let view = handle.view();
+        // DR-2: only a member this node trusts with drive.
+        if !view.drive.contains(&info.peer) {
+            return refuse(format!(
+                "{} does not trust you with drive; it trusts you to read only, or not at all",
+                node
+            ));
+        }
+        let Ok(paths) = self.inner.account.node_paths(node) else {
+            return refuse("this node's files cannot be read".into());
+        };
+        // DR-5 and TA-5: exactly this session, open on this node, and none other.
+        let Some(reg) = crate::wake::registration(&paths, &req.session) else {
+            return refuse(
+                "that session is not open on its node: it ended, or never registered there;                  nothing was sent to any other session"
+                    .into(),
+            );
+        };
+        let room = vox_core::node::link::b32_encode(&info.channel_id);
+        if reg.room.as_deref() != Some(room.as_str()) {
+            return refuse("that session does not work in this room; nothing was sent".into());
+        }
+        let by = vox_core::node::link::b32_encode(&info.peer);
+        let alias = view
+            .trusted
+            .iter()
+            .find(|(fp, _)| *fp == info.peer)
+            .map_or_else(|| by.chars().take(8).collect(), |(_, n)| n.clone());
+        let sink = &self.inner.sink;
+        let outcome: Result<String, String> = match &req.action {
+            Action::Approve { r#ref } => handed(sink.answer(
+                node,
+                &req.session,
+                r#ref,
+                &by,
+                &alias,
+                crate::session_sink::Given::Approve {
+                    allow: true,
+                    why: None,
+                },
+            )),
+            Action::Reject { r#ref, why } => handed(sink.answer(
+                node,
+                &req.session,
+                r#ref,
+                &by,
+                &alias,
+                crate::session_sink::Given::Approve {
+                    allow: false,
+                    why: why.clone(),
+                },
+            )),
+            Action::Answer { r#ref, answers } => handed(sink.answer(
+                node,
+                &req.session,
+                r#ref,
+                &by,
+                &alias,
+                crate::session_sink::Given::Answer(answers.clone()),
+            )),
+            input => self.steer(node, &reg, input).await,
+        };
+        // What was driven, as this node's claim of who drove it (ADR-029 MD-3), and what came of
+        // it when it was not delivered (DR-6). An answer shows on its request's line.
+        let mut copy = serde_json::Map::new();
+        copy.insert(
+            "v".into(),
+            serde_json::json!(vox_agentcomms::activity::VERSION),
+        );
+        copy.insert("session".into(), serde_json::json!(req.session));
+        copy.insert("kind".into(), serde_json::json!("drive"));
+        copy.insert("by".into(), serde_json::json!(by));
+        copy.insert("action".into(), serde_json::json!(req.action.name()));
+        match &req.action {
+            Action::Text { text } => {
+                copy.insert("text".into(), serde_json::json!(text));
+            }
+            Action::Slash { text } => {
+                copy.insert("cmd".into(), serde_json::json!(crate::drive::slash(text).0));
+                copy.insert("text".into(), serde_json::json!(text));
+            }
+            Action::Approve { r#ref }
+            | Action::Reject { r#ref, .. }
+            | Action::Answer { r#ref, .. } => {
+                copy.insert("ref".into(), serde_json::json!(r#ref));
+            }
+            Action::Interrupt | Action::Stop => {}
+        }
+        let mut bodies =
+            vox_agentcomms::activity::split(copy, "text", vox_core::node::content::MAX_TEXT_LEN);
+        // Every drive's outcome, beside it (DR-6): what happened, or why it was not delivered.
+        let mut result = serde_json::json!({
+            "v": vox_agentcomms::activity::VERSION, "session": req.session,
+            "kind": "drive-result", "by": by, "action": req.action.name(),
+            "ok": outcome.is_ok(),
+        });
+        match &outcome {
+            Ok(said) => result["said"] = serde_json::json!(said),
+            Err(why) => result["why"] = serde_json::json!(why),
+        }
+        bodies.push(result.to_string());
+        sink.activity(node, &req.session, bodies, None);
+        match outcome {
+            Ok(said) => Answer { ok: true, said },
+            Err(said) => Answer { ok: false, said },
+        }
+    }
+
+    /// Typed text, an interrupt, a stop or a slash command, to `reg`'s harness alone.
+    async fn steer(
+        &self,
+        node: &NodeName,
+        reg: &crate::wake::Session,
+        action: &crate::drive::Action,
+    ) -> Result<String, String> {
+        use crate::codex_mirror::Steer;
+        use crate::drive::Action;
+        let steer = match action {
+            Action::Text { text } => Steer::Text(text.clone()),
+            Action::Interrupt => Steer::Interrupt,
+            Action::Stop => Steer::Stop,
+            Action::Slash { text } => {
+                let (cmd, args) = crate::drive::slash(text);
+                Steer::Slash { cmd, args }
+            }
+            _ => return Err("not an input for the session's terminal".into()),
+        };
+        let typed = match &steer {
+            Steer::Text(t) => Some(t.clone()),
+            _ => None,
+        };
+        let done = match reg.harness.as_str() {
+            "codex" if !reg.codex_home.is_empty() => {
+                self.inner
+                    .codex
+                    .steer(std::path::Path::new(&reg.codex_home), &reg.session, steer)
+                    .await
+            }
+            "opencode" => self.inner.opencode.steer(&reg.session, steer).await,
+            "claude" => {
+                use crate::claude_injector::Act;
+                let act = match steer {
+                    Steer::Text(t) => Act::Text(t),
+                    Steer::Interrupt => Act::Interrupt,
+                    Steer::Stop => Act::Stop,
+                    Steer::Slash { cmd, args } if args.is_empty() => Act::Slash(format!("/{cmd}")),
+                    Steer::Slash { cmd, args } => Act::Slash(format!("/{cmd} {args}")),
+                };
+                let reg = reg.clone();
+                tokio::task::spawn_blocking(move || crate::claude_injector::drive(&reg, &act))
+                    .await
+                    .unwrap_or_else(|_| Err("the delivery to the terminal failed".into()))
+                    .map(|()| "delivered to its terminal".to_owned())
+            }
+            "codex" => Err(
+                "this Codex session registered no CODEX_HOME, so Vox cannot reach its app-server"
+                    .into(),
+            ),
+            other => Err(format!("Vox cannot drive a {other} session")),
+        };
+        if let (Ok(_), Some(t)) = (&done, typed) {
+            self.inner.sink.delivered_text(node, &reg.session, &t);
+        }
+        done
+    }
+
+    /// Follow a registered session's activity where its harness offers it (ADR-029 SC-1): a
+    /// Codex session from its `CODEX_HOME`'s app-server, an OpenCode session through Vox's
+    /// plugin's socket. Claude Code's comes through its hooks.
+    fn watch_harness(&self, node: &NodeName, s: &crate::wake::Session) {
+        match s.harness.as_str() {
+            "codex" if !s.codex_home.is_empty() => {
+                self.inner
+                    .codex
+                    .watch(std::path::Path::new(&s.codex_home), node, &s.session);
+            }
+            "opencode" if !s.mirror.is_empty() => {
+                self.inner
+                    .opencode
+                    .watch(node, &s.session, &s.mirror, &s.token);
+            }
+            _ => {}
+        }
+    }
+
     /// Post `bodies`, numbered, to `session`'s Session: sealed to the members `node` trusts with
     /// drive (ADR-029 SC-2), in the room the session works in. One task per session posts them in
     /// order, so a split entry's parts stay together.
@@ -640,6 +942,8 @@ impl Router {
                 let _ = vox_core::node::sessions::end(&handle, room, session, reason).await;
             }
         }
+        self.inner.codex.end(session);
+        self.inner.opencode.end(session);
         let going = {
             let mut slots = lock(&self.inner.slots);
             match slots.get_mut(node) {
@@ -849,6 +1153,13 @@ impl Router {
                             // This request attached it: what that said goes back to its client.
                             granted.notes = a.notes.clone();
                             let fingerprint = a.fingerprint;
+                            // Codex sessions registered before this daemon started are read
+                            // again from their app-server at once, not at their next turn.
+                            for s in crate::wake::registered(&a.paths) {
+                                self.watch_harness(node, &s);
+                            }
+                            // Drive input from members with drive (ADR-029 §3), while attached.
+                            self.serve_drive(node, &a.handle, a.detached.subscribe());
                             slots.insert(node.clone(), Slot::Attached(a));
                             drop(slots);
                             self.inner
@@ -902,6 +1213,7 @@ impl Router {
             }
             Want::Session(s) => {
                 crate::wake::store(&a.paths, &s);
+                self.watch_harness(node, &s);
                 a.sessions.insert(s.session.clone());
                 None
             }
@@ -1460,6 +1772,20 @@ impl Dispatch for Router {
                 bodies,
                 call,
             } => {
+                // A Codex session read from its app-server: its hooks' copy of the same activity
+                // is not posted again. The prompt is the hook's alone (see codex_mirror).
+                let bodies = if self.inner.codex.subscribed(&session) {
+                    bodies
+                        .into_iter()
+                        .filter(|b| {
+                            serde_json::from_str::<serde_json::Value>(b).is_ok_and(|v| {
+                                v.get("kind").and_then(|k| k.as_str()) == Some("user")
+                            })
+                        })
+                        .collect()
+                } else {
+                    bodies
+                };
                 self.inner.sink.activity(&node, &session, bodies, call);
                 DaemonFrame::Ok
             }

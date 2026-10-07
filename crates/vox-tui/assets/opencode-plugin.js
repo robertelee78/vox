@@ -65,6 +65,18 @@
 // message, so this plugin's own drain runs on it, and that drain is what gives the model the
 // messages themselves, once, first in its block.
 //
+// ## How the session's Session is fed and driven (ADR-029 #542, #544)
+//
+// A second socket beside the wake socket, `mirror.sock`, with the same token, carries the
+// Session. After its `auth` frame, a connection that sends
+// `{"type":"subscribe","session":"ses_…"}` stays open: this plugin writes
+// it every event of OpenCode's bus that belongs to that session or to a sub-agent's session
+// under it (`{"type":"event","event":…}`), and runs the calls it sends back, each on that
+// session alone (`{"type":"call","id":n,"action":…}` → `{"type":"result","id":n,"ok":…}`).
+// What the events mean, and what reaches the Session, is decided in `vox daemon`, not here.
+// A call names no session: it acts on the subscribed one, so input reaches exactly the session
+// it is for (DR-5), and the actions are a whitelist, none of which starts a session (DR-7).
+//
 // Every failure path is silent and injects nothing. A hook that breaks the turn it
 // rides on is worse than one that does nothing.
 
@@ -160,6 +172,9 @@ function sweep(own) {
         if (e?.code !== "ECONNREFUSED" && e?.code !== "ENOENT") return
         try {
           unlinkSync(sock)
+          try {
+            unlinkSync(join(dir, "mirror.sock"))
+          } catch {}
           rmdirSync(dir)
           log("wake: swept " + dir + ", whose OpenCode is gone")
         } catch {}
@@ -176,7 +191,7 @@ function removeOnExit(dir) {
   try {
     const helper = spawn(
       "/bin/sh",
-      ["-c", 'read _; rm -f -- "$1/wake.sock"; rmdir -- "$1"', "vox-oc-cleanup", dir],
+      ["-c", 'read _; rm -f -- "$1/wake.sock" "$1/mirror.sock"; rmdir -- "$1"', "vox-oc-cleanup", dir],
       { detached: true, stdio: ["pipe", "ignore", "ignore"] },
     )
     helper.on("error", (e) => log("wake: no cleanup helper: " + e))
@@ -204,6 +219,97 @@ const MAX_RELAYED = 16
 const VOX_NODE = "@VOX_NODE@"
 
 /**
+ * The connections following a session's Session: session id → the set of `write` functions.
+ * A sub-agent's session is followed through its parent (`parents`: child id → parent id).
+ */
+const followers = new Map()
+const parents = new Map()
+/** Requests OpenCode asked (permission or question id → the Session it was shown in). */
+const asked = new Map()
+const MAX_ASKED = 1024
+
+/** The session an event belongs to, and the Session it is shown in (its parent's, for a sub-agent). */
+function ownerOf(event) {
+  const p = event?.properties ?? {}
+  const sid = p.sessionID ?? p.part?.sessionID ?? p.info?.sessionID ?? p.info?.id
+  if (typeof sid !== "string") return null
+  if ((event.type === "session.created" || event.type === "session.updated") && p.info?.parentID) {
+    parents.set(p.info.id, p.info.parentID)
+  }
+  return parents.get(sid) ?? sid
+}
+
+function fanout(event) {
+  const owner = ownerOf(event)
+  if (!owner) return
+  if (event.type === "permission.asked" || event.type === "question.asked") {
+    const id = event.properties?.id
+    if (typeof id === "string") {
+      asked.set(id, owner)
+      if (asked.size > MAX_ASKED) asked.delete(asked.keys().next().value)
+    }
+  }
+  const writers = followers.get(owner)
+  if (!writers?.size) return
+  const line = JSON.stringify({ type: "event", event }) + "\n"
+  for (const write of writers) write(line)
+}
+
+/**
+ * Run one call from `vox daemon` on `session`, through OpenCode's in-process client. The
+ * actions are a whitelist; each names the subscribed session or one of its own requests.
+ */
+async function runCall(client, session, call) {
+  const raw = client._client
+  const req = (method, url, body) => raw.request({ method, url, body })
+  switch (call.action) {
+    case "prompt":
+      if (typeof call.text !== "string") throw new Error("a prompt needs text")
+      return req("POST", `/session/${session}/prompt_async`, {
+        parts: [{ type: "text", text: call.text }],
+      })
+    case "abort":
+      return req("POST", `/session/${session}/abort`, {})
+    case "rename":
+      if (typeof call.title !== "string" || !call.title.trim()) throw new Error("a rename needs a title")
+      return req("PATCH", `/session/${session}`, { title: call.title })
+    case "summarize":
+      if (typeof call.providerID !== "string" || typeof call.modelID !== "string") {
+        throw new Error("a compaction needs the session's provider and model")
+      }
+      return req("POST", `/session/${session}/summarize`, {
+        providerID: call.providerID,
+        modelID: call.modelID,
+      })
+    case "command":
+      if (typeof call.command !== "string" || !/^[A-Za-z0-9_.:-]+$/.test(call.command)) {
+        throw new Error("not a command name")
+      }
+      return req("POST", `/session/${session}/command`, {
+        command: call.command,
+        arguments: typeof call.arguments === "string" ? call.arguments : "",
+      })
+    case "permission":
+      if (typeof call.request !== "string" || !["once", "reject"].includes(call.reply)) {
+        throw new Error("a permission reply needs its request and once or reject")
+      }
+      if (asked.get(call.request) !== session) throw new Error("not a request of this session")
+      return req("POST", `/permission/${call.request}/reply`, {
+        reply: call.reply,
+        ...(typeof call.message === "string" ? { message: call.message } : {}),
+      })
+    case "question":
+      if (typeof call.request !== "string" || !Array.isArray(call.answers)) {
+        throw new Error("a question reply needs its request and answers")
+      }
+      if (asked.get(call.request) !== session) throw new Error("not a request of this session")
+      return req("POST", `/question/${call.request}/reply`, { answers: call.answers })
+    default:
+      throw new Error("unknown action")
+  }
+}
+
+/**
  * `relayed` notes each wake notice relayed to a session (session id → its texts), before
  * OpenCode is handed it: OpenCode may run the prompt's `chat.message` before `promptAsync`
  * returns, and that turn must know the message is Vox's notice, not the operator's (V030-21).
@@ -214,9 +320,12 @@ function wakeChannel(client, relayed) {
     // the token keeps every other process of theirs out as well.
     const dir = mkdtempSync(join(tmpdir(), "vox-oc-"))
     const path = join(dir, "wake.sock")
+    const mirrorPath = join(dir, "mirror.sock")
     const token = randomBytes(32).toString("hex")
     const expected = Buffer.from(token)
-    const server = createServer((conn) => {
+    // Two sockets, one token: `wake.sock` takes one prompt per connection (ADR-020 6.13);
+    // `mirror.sock` takes one subscription per connection and stays open (ADR-029 #542).
+    const serve = (kind) => (conn) => {
       let buf = ""
       // One decoder for the connection: a character whose bytes span two reads is held back
       // until its last byte arrives, rather than each read decoding to U+FFFD at the seam.
@@ -238,38 +347,75 @@ function wakeChannel(client, relayed) {
       }, AUTH_IDLE_MS)
       deadline.unref?.()
       conn.on("close", () => clearTimeout(deadline))
-      conn.on("data", async (chunk) => {
-        if (done) return
-        buf += utf8.write(chunk)
-        if (buf.length > MAX_FRAMES_BYTES) {
-          done = true
-          return conn.destroy()
-        }
-        const lines = buf.split("\n")
-        if (lines.length < 3) return
-        done = true
+      let authed = false
+      let following = null // the session this connection follows, once subscribed
+      const write = (line) => {
         try {
-          const auth = JSON.parse(lines[0])
-          const given = Buffer.from(String(auth?.token ?? ""))
+          if (!conn.destroyed) conn.write(line)
+        } catch {}
+      }
+      conn.on("close", () => {
+        if (following) followers.get(following)?.delete(write)
+      })
+      const onLine = async (line) => {
+        let msg
+        try {
+          msg = JSON.parse(line)
+        } catch {
+          return following ? undefined : answer({ error: "not JSON" })
+        }
+        if (!authed) {
+          const given = Buffer.from(String(msg?.token ?? ""))
           if (
-            auth?.type !== "auth" ||
+            msg?.type !== "auth" ||
             given.length !== expected.length ||
             !timingSafeEqual(given, expected)
           ) {
             log("wake: refused a connection with the wrong token")
             return answer({ error: "wrong token" })
           }
-          const msg = JSON.parse(lines[1])
-          if (msg?.type !== "prompt" || !msg.session || typeof msg.text !== "string") {
-            return answer({ error: "expected a prompt frame" })
+          authed = true
+          return
+        }
+        if (following) {
+          // A call from `vox daemon` on the followed session.
+          if (msg?.type !== "call") return
+          let reply
+          try {
+            const res = await runCall(client, following, msg)
+            const status = res?.response?.status ?? 0
+            reply = status >= 200 && status < 300
+              ? { type: "result", id: msg.id, ok: true }
+              : { type: "result", id: msg.id, ok: false, error: "OpenCode answered " + status }
+          } catch (e) {
+            reply = { type: "result", id: msg.id, ok: false, error: String(e?.message ?? e) }
           }
-          const noted = [...(relayed.get(msg.session) ?? []), msg.text].slice(-MAX_RELAYED)
-          relayed.set(msg.session, noted)
-          const forget = () => {
-            const left = relayed.get(msg.session) ?? []
-            const i = left.lastIndexOf(msg.text)
-            if (i >= 0) left.splice(i, 1)
+          return write(JSON.stringify(reply) + "\n")
+        }
+        if (kind === "mirror") {
+          if (msg?.type !== "subscribe" || typeof msg.session !== "string" || !msg.session) {
+            return answer({ error: "expected a subscribe frame" })
           }
+          done = true // no longer a one-shot: the deadline no longer applies
+          clearTimeout(deadline)
+          following = msg.session
+          if (!followers.has(following)) followers.set(following, new Set())
+          followers.get(following).add(write)
+          log("mirror: following " + following)
+          return write(JSON.stringify({ type: "subscribed", session: following }) + "\n")
+        }
+        if (msg?.type !== "prompt" || !msg.session || typeof msg.text !== "string") {
+          return answer({ error: "expected a prompt frame" })
+        }
+        done = true
+        const noted = [...(relayed.get(msg.session) ?? []), msg.text].slice(-MAX_RELAYED)
+        relayed.set(msg.session, noted)
+        const forget = () => {
+          const left = relayed.get(msg.session) ?? []
+          const i = left.lastIndexOf(msg.text)
+          if (i >= 0) left.splice(i, 1)
+        }
+        try {
           let res
           try {
             res = await client.session.promptAsync({
@@ -289,17 +435,38 @@ function wakeChannel(client, relayed) {
           log("wake: threw: " + e)
           answer({ error: String(e) })
         }
+      }
+      // Lines are handled one at a time, in order.
+      let queue = Promise.resolve()
+      conn.on("data", (chunk) => {
+        if (done && !following) return
+        buf += utf8.write(chunk)
+        if (buf.length > MAX_FRAMES_BYTES) {
+          done = true
+          return conn.destroy()
+        }
+        let i
+        while ((i = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, i)
+          buf = buf.slice(i + 1)
+          queue = queue.then(() => onLine(line)).catch((e) => log("wake: threw: " + e))
+        }
       })
-    })
+    }
+    const server = createServer(serve("wake"))
     server.on("error", (e) => log("wake: socket error: " + e))
     server.listen(path)
     // Bun's `listen` on a Unix path binds before it returns; `unref` so the socket
     // never keeps OpenCode alive.
     server.unref?.()
+    const mirror = createServer(serve("mirror"))
+    mirror.on("error", (e) => log("mirror: socket error: " + e))
+    mirror.listen(mirrorPath)
+    mirror.unref?.()
     removeOnExit(dir)
     sweep(dir)
-    log("wake: listening at " + path)
-    return { path, token }
+    log("wake: listening at " + path + " and " + mirrorPath)
+    return { path, mirrorPath, token }
   } catch (e) {
     log("wake: could not open the wake socket: " + e)
     return null
@@ -311,6 +478,16 @@ export default async function vox({ $, client }) {
   const relayed = new Map()
   const wake = wakeChannel(client, relayed)
   return {
+    // Every event of OpenCode's bus, to the connections following its session (#542). The
+    // `event` hook is fed in-process with the full set (permission.asked, question.asked,
+    // message.*, session.*), and runs for every OpenCode, TUI or not.
+    event: async ({ event }) => {
+      try {
+        fanout(event)
+      } catch (e) {
+        log("event: threw: " + e)
+      }
+    },
     // **Name the session to every shell this session runs** (ADR-021 §4, §7).
     // Claude Code and Codex put their session id in every tool's environment
     // (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`); OpenCode does not. So without
@@ -359,6 +536,7 @@ export default async function vox({ $, client }) {
         if (wake) {
           env.VOX_OPENCODE_WAKE_SOCKET = wake.path
           env.VOX_OPENCODE_WAKE_TOKEN = wake.token
+          env.VOX_OPENCODE_MIRROR_SOCKET = wake.mirrorPath
         }
 
         const result =

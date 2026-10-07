@@ -1,5 +1,6 @@
 // The shipped OpenCode plugin, hosted the way OpenCode hosts it, with no model and no OpenCode
-// (V030-21). Used by `room_text_cannot_close_the_opencode_fence_proof.rs`.
+// (V030-21). Used by `room_text_cannot_close_the_opencode_fence_proof.rs` and
+// `a_codex_and_an_opencode_session_are_mirrored_and_driven_proof.rs`.
 //
 //   node opencode_plugin_host.mjs <plugin.mjs> <session id>
 //
@@ -13,6 +14,12 @@
 //   wake <secs>   wait for `vox daemon` to relay a wake through the plugin's socket; OpenCode
 //                 then runs `chat.message` on the relayed prompt, and so does this:
 //                 `{"kind":"wake","relayed":…,"text":…}`, or `{"kind":"no-wake"}` past <secs>
+//   event <json>  one event of OpenCode's bus, as OpenCode hands it to the plugin's `event` hook:
+//                 `{"kind":"event"}` once the hook returned
+//   calls <secs> <n>
+//                 wait until the plugin has made at least <n> calls to OpenCode's API through
+//                 its in-process client (`client._client.request`), and answer all of them:
+//                 `{"kind":"calls","calls":[{method,url,body}…]}`
 //
 // Anything the host itself cannot do is `{"kind":"apparatus","error":…}`.
 
@@ -65,7 +72,18 @@ function $(strings, ...values) {
 
 const prompts = []
 let waiting = null
+// The plugin's calls to OpenCode's HTTP API, made in process; each is answered 200, as OpenCode
+// answers a call it takes.
+const calls = []
+let callWaiting = null
 const client = {
+  _client: {
+    async request({ method, url, body }) {
+      calls.push({ method, url, body: body ?? null })
+      if (callWaiting) callWaiting()
+      return { response: { status: 200 }, data: null }
+    },
+  },
   session: {
     // OpenCode takes the prompt and answers 2xx; the turn it starts runs afterwards.
     async promptAsync({ path, body }) {
@@ -113,6 +131,23 @@ for await (const line of lines) {
       const p = prompts.shift()
       if (!p) say({ kind: "no-wake" })
       else say({ kind: "wake", relayed: p.text, text: await turn(hooks, p.text) })
+    } else if (cmd === "event") {
+      await hooks.event({ event: JSON.parse(arg) })
+      say({ kind: "event" })
+    } else if (cmd === "calls") {
+      const [secs, n] = arg.split(" ").map(Number)
+      const deadline = Date.now() + secs * 1000
+      while (calls.length < n && Date.now() < deadline) {
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, Math.max(0, deadline - Date.now()))
+          callWaiting = () => {
+            clearTimeout(timer)
+            resolve()
+          }
+        })
+        callWaiting = null
+      }
+      say({ kind: "calls", calls })
     } else {
       say({ kind: "apparatus", error: "unknown command " + JSON.stringify(cmd) })
     }
