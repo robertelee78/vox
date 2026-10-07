@@ -1675,7 +1675,11 @@ impl VoxClient {
                 session,
                 action,
             };
-            Ok(
+            let file_tag = match &request.action {
+                Action::File { tag, .. } => Some(tag.clone()),
+                _ => None,
+            };
+            let answer =
                 match vox_core::node::drive_input::send(&at, channel_id, node, &request).await {
                     Ok(a) => DriveAnswer {
                         ok: a.ok,
@@ -1692,8 +1696,21 @@ impl VoxClient {
                         said,
                         delivery: DriveDelivery::NoAnswer,
                     },
-                },
-            )
+                };
+            // A file not taken is served to no one, so not served at all.
+            if let (Some(tag), false) = (file_tag, answer.ok) {
+                if let Some(h) = held.lock().await.as_mut() {
+                    let _ = ask(
+                        &mut h.client,
+                        &Request::ShareStop {
+                            channel_id,
+                            selector: tag,
+                        },
+                    )
+                    .await;
+                }
+            }
+            Ok(answer)
         })
         .await
     }
