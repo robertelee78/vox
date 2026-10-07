@@ -52,7 +52,7 @@ vox room rename family home
 ```
 
 Only the room's creator, or an admin it named, may rename it; anyone else is refused, saying so.
-It asks for the identity passphrase, as `vox room retention` does. The new name reaches every
+It asks for the identity passphrase. The new name reaches every
 member as the room syncs, and each member's timeline in `vox tui` says who renamed it and to what:
 `bob renamed the room to home`. Service addresses follow the name: `ssh.nas.home.vox`, and the old
 `ssh.nas.family.vox` then leads nowhere. In `vox tui`, `:rename home` does the same.
@@ -138,7 +138,7 @@ vox room retention ROOM_ID 1w
 
 The duration is `1h`, `1w`, `1m` (a month), a number of seconds, or `forever`. It applies to
 **everything already in the room**, on every member as the change reaches them: shortening it
-deletes older messages. It always asks for your identity passphrase. Vox says plainly that a
+deletes older messages. It asks for no passphrase. Vox says plainly that a
 modified node can keep everything: retention is housekeeping, not a security property.
 
 A member who is not an admin can only keep less on its own node. The same command then reports

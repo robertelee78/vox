@@ -75,11 +75,24 @@ impl Drop for Daemon {
 }
 
 fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
+    vox_with(dir, args, stdin, Some(IDENTITY))
+}
+
+/// `vox args` with `VOX_IDENTITY_PASSPHRASE` set to `identity`, or unset, and no terminal.
+fn vox_with(
+    dir: &Path,
+    args: &[&str],
+    stdin: Option<&str>,
+    identity: Option<&str>,
+) -> (bool, String, String) {
     let mut cmd = Command::new(VOX);
+    match identity {
+        Some(p) => cmd.env("VOX_IDENTITY_PASSPHRASE", p),
+        None => cmd.env_remove("VOX_IDENTITY_PASSPHRASE"),
+    };
     cmd.args(args)
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
-        .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
         .env_remove("VOX_ROOM")
         .stdin(if stdin.is_some() {
             Stdio::piped()
@@ -405,8 +418,24 @@ fn shortening_a_rooms_retention_removes_older_messages_on_every_member() {
         listed > 0,
         "PRODUCT (staging): bob's `vox status --json` never listed the room while it synced"
     );
-    let (ok, out, err) = vox(&alice, &["room", "retention", &room, "30"], None);
-    assert!(ok, "PRODUCT: the admin's vox room retention 30: {err}");
+    // **A retention change asks for no passphrase** (ADR-028 K-11, #555): with no passphrase
+    // source set and no terminal, a member who is not an admin is told the room's is not theirs
+    // to change, and the creator's change is made.
+    let (ok, out, err) = vox_with(&bob, &["room", "retention", &room, "forever"], None, None);
+    println!("bob, no passphrase anywhere: {}", out.trim());
+    assert!(
+        ok && out.contains("only its creator or an admin changes that"),
+        "PRODUCT: bob, not an admin, asking with no passphrase source must be told only the \
+         creator or an admin changes the room's retention (ADR-028 K-11: no passphrase is \
+         asked for); succeeded {ok}, said:\n{out}{err}"
+    );
+    let (ok, out, err) = vox_with(&alice, &["room", "retention", &room, "30"], None, None);
+    assert!(
+        ok,
+        "PRODUCT: the creator's `vox room retention 30`, with no passphrase source and no \
+         terminal, must be made: a retention change asks for no passphrase (ADR-028 K-11): \
+         {out}{err}"
+    );
     println!("{}", out.trim());
     let set_at = Instant::now();
 
