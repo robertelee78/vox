@@ -8,7 +8,9 @@
 //! the facts a person needs to recognise it — alias, harness, host, OS and Vox version.
 //!
 //! Every question says what answering yes changes before anything is changed (ADR-028 E-5). A
-//! harness that is not installed is named as not found and offered nothing. A node that exists
+//! harness that is not installed is named as not found and offered nothing. Wiring Codex also
+//! keeps Codex's app-server running (the decider, 2026-10-06), so a plain `codex` session can be
+//! followed and driven from Vox; it runs no model. A node that exists
 //! already is left as it is. The harnesses' settings are merged, never replaced: only entries that
 //! run `vox agent hook` are taken out, and the new node's put in.
 
@@ -91,7 +93,7 @@ pub fn run(args: &NodeArgs) -> Result<(), AppError> {
         })
         .collect();
 
-    for (h, _) in &found {
+    for (h, program) in &found {
         let name = NodeName::parse(&format!("{}-{host}", h.key))?;
         if account.nodes_on_disk().contains(&name) {
             println!("vox setup: node {name} exists already; it is left as it is");
@@ -115,6 +117,13 @@ pub fn run(args: &NodeArgs) -> Result<(), AppError> {
             println!("  {line}");
         }
         if h.key == "codex" {
+            match crate::codex_app_server::ensure(program, &wiring.dir) {
+                Ok(_) => println!("  Codex's app-server is running"),
+                Err(why) => println!(
+                    "  Codex's app-server did not start ({why}): Codex sessions are followed \
+                     through their hooks only"
+                ),
+            }
             steps.push(
                 "run `vox agent trust codex`: Codex runs a hook only once it is trusted".into(),
             );
@@ -375,7 +384,9 @@ impl Wiring {
             ),
             "codex" => format!(
                 "its hook, `vox agent hook --node {node}`, is to go in {}; other Vox hook \
-                 entries there are replaced, nothing else",
+                 entries there are replaced, nothing else; and Codex's app-server is to be kept \
+                 running (`codex app-server daemon start`), so a plain `codex` session can be \
+                 followed and driven from Vox: it runs no model",
                 self.hook_file().display()
             ),
             _ => format!(

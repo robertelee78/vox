@@ -22,6 +22,7 @@ pub mod app;
 pub mod app_cli;
 pub mod cli;
 pub mod client;
+pub mod codex_app_server;
 pub mod codex_trust;
 pub mod coord;
 pub mod daemon;
