@@ -1981,13 +1981,15 @@ impl Dispatch for Router {
 /// Post one session's entries into its Session, in the order they were queued. Each goes to the
 /// room its session works in now; a session in no room, or headless (ADR-029 SE-1), has no
 /// Session, and its entries go nowhere. A failure is said in the daemon's log, naming the entry's
-/// kind: the session goes on.
+/// kind, once until it changes or entries reach the Session again (a room still joining refused
+/// every turn's entries, and said so 60 times): the session goes on.
 async fn post_in_order(
     weak: std::sync::Weak<Inner>,
     node: NodeName,
     session: String,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) {
+    let mut failing: Option<String> = None;
     while let Some(body) = rx.recv().await {
         let Some(inner) = weak.upgrade() else {
             return;
@@ -2016,17 +2018,22 @@ async fn post_in_order(
                 body: body.clone(),
             })
             .await;
-        if !matches!(
+        if matches!(
             outcome,
             vox_core::node::api::Outcome::Done | vox_core::node::api::Outcome::Appended(_)
         ) {
+            if failing.take().is_some() {
+                eprintln!("vox daemon: {node}: session {session}: entries reach its Session again");
+            }
+        } else if failing.as_deref() != Some(outcome.to_string().as_str()) {
+            failing = Some(outcome.to_string());
             let kind = serde_json::from_str::<serde_json::Value>(&body)
                 .ok()
                 .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(str::to_owned))
                 .unwrap_or_default();
             eprintln!(
                 "vox daemon: {node}: session {session}: a {kind} entry did not reach its Session: \
-                 {outcome}"
+                 {outcome} (said once; later entries refused the same way are not said)"
             );
         }
     }
