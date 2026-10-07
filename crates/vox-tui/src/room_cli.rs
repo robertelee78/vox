@@ -273,11 +273,22 @@ pub(crate) async fn post(
     room: &str,
     text: Option<&str>,
     card: bool,
+    session: Option<String>,
 ) -> Result<(), AppError> {
     let body = body_of(text)?;
     if body.trim().is_empty() {
         return Err(AppError::Usage("refusing to post an empty message".into()));
     }
+    // **A message from a harness session says which** (ADR-029 MD-1, MD-2): its `from` is the
+    // session's id, whatever the agent wrote, and the node fills in its name. A message that
+    // already names a session, and one no session sends (a person's), is posted as given.
+    let body = match (session, vox_agentcomms::envelope::Envelope::parse(&body)) {
+        (Some(s), Ok(mut env)) if env.from.trim().is_empty() => {
+            env.from = s;
+            env.to_text()
+        }
+        _ => body,
+    };
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
     match client
@@ -729,7 +740,14 @@ pub async fn post_cmd(
                 }
             }
         }
-        return post(paths, room, Some(&body), !opts.no_card).await;
+        return post(
+            paths,
+            room,
+            Some(&body),
+            !opts.no_card,
+            coord::session(opts.coord.session.as_deref()),
+        )
+        .await;
     }
 
     let PostReport {

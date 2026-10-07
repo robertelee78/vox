@@ -48,7 +48,10 @@
 //! harness's own session id; a headless run's (`sdk-cli`) opens none; a sub-agent's event, which
 //! carries its parent's session id, opens no other. `Stop` and a `SessionEnd` whose reason is
 //! `resume` leave it open; a real `SessionEnd` ends it, set apart under "ended", and what was said
-//! in the room stays readable. Mutant: end the Session on `Stop`.
+//! in the room stays readable. Every message from a session carries its id and the name its harness
+//! gives (Claude Code's last `/rename` in its transcript): a plain `vox room post` from it, and none
+//! from a session with no name, which is shown by its short id. A daemon restarted mid-session
+//! opens no second Session. Mutants: end the Session on `Stop`; omit the name on plain posts.
 //!
 //! Not proved here, and stated rather than implied: that a harness actually
 //! *shows* the model what it injects. The probe could not confirm it because this
@@ -1850,11 +1853,46 @@ fn hook_env(
     )
 }
 
-/// A Claude Code hook payload for `event` in `session`, with `extra` JSON fields.
+/// A Claude Code hook payload for `event` in `session`, with `extra` JSON fields; its transcript is
+/// `/tmp/t.jsonl`, which holds no title.
 fn claude_event(session: &str, event: &str, extra: &str) -> String {
+    claude_event_at(session, event, extra, Path::new("/tmp/t.jsonl"))
+}
+
+/// [`claude_event`] with the session's transcript at `transcript`.
+fn claude_event_at(session: &str, event: &str, extra: &str, transcript: &Path) -> String {
     format!(
-        r#"{{"session_id":"{session}","hook_event_name":"{event}","cwd":"/tmp","transcript_path":"/tmp/t.jsonl"{extra}}}"#
+        r#"{{"session_id":"{session}","hook_event_name":"{event}","cwd":"/tmp","transcript_path":{}{extra}}}"#,
+        serde_json::Value::from(transcript.display().to_string())
     )
+}
+
+/// Stop `d`'s daemon, as a crash does (by its PID), and start it again on the same profile.
+fn restart(d: &mut Daemon, root: &Path) {
+    let _ = d.child.kill();
+    let _ = d.child.wait();
+    let err_file = root.join("daemon-2.err");
+    d.child = vox(&d.data, &d.cfg)
+        .args(["daemon", "--listen", "127.0.0.1:0", "--passphrase-file"])
+        .arg(root.join("identity.pass"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(&err_file)
+                .expect("APPARATUS: cannot create the daemon's stderr file"),
+        ))
+        .spawn()
+        .expect("APPARATUS: cannot start vox daemon again");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !hook(&d.data, &d.cfg, &["room", "list"], "").0 {
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT (staging): the restarted daemon never answered `vox room list` in 60 s; it \
+             said:\n{}",
+            std::fs::read_to_string(&err_file).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 #[test]
@@ -1862,10 +1900,20 @@ fn claude_event(session: &str, event: &str, extra: &str) -> String {
 fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
-    let daemon = Daemon::start(tmp.path());
+    let mut daemon = Daemon::start(tmp.path());
     let (data, cfg) = (daemon.data.clone(), daemon.cfg.clone());
     let room: String = daemon.room_key.chars().take(12).collect();
     let person = [("CLAUDE_CODE_ENTRYPOINT", "cli")];
+    // The session's transcript, as Claude Code writes it: a title it made, then the person's
+    // `/rename` (ADR-029 MD-1).
+    let transcript = tmp.path().join("transcript.jsonl");
+    std::fs::write(
+        &transcript,
+        "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n\
+         {\"type\":\"ai-title\",\"aiTitle\":\"porting the codec\",\"sessionId\":\"x\"}\n\
+         {\"type\":\"custom-title\",\"customTitle\":\"gso-cap\",\"sessionId\":\"x\"}\n",
+    )
+    .expect("APPARATUS: cannot write the transcript");
     let headless = [("CLAUDE_CODE_ENTRYPOINT", "sdk-cli")];
     let hook_args = [
         "agent",
@@ -1891,9 +1939,9 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
         rows.iter().filter(|r| r["id"] == id).cloned().collect()
     };
 
-    // (1) A session a person is at: its first turn opens its Session.
+    // (1) A session a person is at: its first turn opens its Session, named as its harness names it.
     run(
-        claude_event(at, "UserPromptSubmit", r#","prompt":"hi""#),
+        claude_event_at(at, "UserPromptSubmit", r#","prompt":"hi""#, &transcript),
         &person,
     );
     // (2) A headless run in the same room: no Session.
@@ -1903,14 +1951,59 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
     );
     // (3) A sub-agent's event, under its parent's session id: no other Session.
     run(
-        claude_event(
+        claude_event_at(
             at,
             "SubagentStop",
             r#","agent_id":"agent-7","agent_type":"Explore""#,
+            &transcript,
         ),
         &person,
     );
     let after_open = sessions();
+    // (7) Every message from a session carries its id and name, whatever verb posts it
+    // (ADR-029 MD-1, MD-2): a plain `vox room post` from it, and one from a session with no name.
+    let post_as = |session: &str, text: &str| {
+        let (ok, out, err) = hook_env(
+            &data,
+            &cfg,
+            &["room", "post", &room, text],
+            "",
+            &[("VOX_SESSION", session)],
+        );
+        assert!(
+            ok,
+            "PRODUCT (staging): `vox room post` from {session}: {out}{err}"
+        );
+    };
+    run(
+        claude_event("0a1b2c3d-nameless", "UserPromptSubmit", r#","prompt":"hi""#),
+        &person,
+    );
+    post_as(at, "PLAIN-FROM-NAMED the codec is ported");
+    post_as("0a1b2c3d-nameless", "PLAIN-FROM-NAMELESS done here");
+    let envelope_of = |marker: &str| {
+        shown_rows(&daemon)
+            .into_iter()
+            .find(|(_, t)| t.contains(marker))
+            .and_then(|(_, t)| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .unwrap_or_default()
+    };
+    let named = envelope_of("PLAIN-FROM-NAMED");
+    let nameless = envelope_of("PLAIN-FROM-NAMELESS");
+    let (_, nameless_listed, _) = hook(&data, &cfg, &["room", "sessions", &room], "");
+    // (8) The daemon restarts mid-session; the session's next turn opens no second Session.
+    restart(&mut daemon, tmp.path());
+    run(
+        claude_event_at(at, "UserPromptSubmit", r#","prompt":"again""#, &transcript),
+        &person,
+    );
+    let after_restart = sessions();
+    // On the log itself: one opening, however many turns and restarts.
+    let openings = shown_rows(&daemon)
+        .into_iter()
+        .filter_map(|(_, t)| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .filter(|v| v["type"] == "session" && v["from"] == at)
+        .count();
     // (4) The turn ends: `Stop`. (5) A resume: `SessionEnd` whose reason is `resume`.
     run(claude_event(at, "Stop", ""), &person);
     run(
@@ -1929,6 +2022,11 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
     let (_, listed, _) = hook(&data, &cfg, &["room", "sessions", &room], "");
     let (_, read, _) = hook(&data, &cfg, &["room", "read", &room], "");
     eprintln!(
+        "[proof] a plain post from the named session: {named}\n[proof] from the nameless one: \
+         {nameless}\n[proof] after a restart: {after_restart:?}\n[proof] sessions listed: \
+         {nameless_listed}"
+    );
+    eprintln!(
         "[proof] after opening: {after_open:?}\n[proof] after Stop and a resume: \
          {after_resume:?}\n[proof] after the real end: {after_end:?}\n[proof] `vox room \
          sessions`:\n{listed}\n[proof] `vox room read`:\n{read}"
@@ -1943,6 +2041,31 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
     assert!(
         after_open.len() == 1,
         "PRODUCT: a headless run must open no Session; the room lists {after_open:?}"
+    );
+    assert!(
+        opened[0]["name"] == "gso-cap",
+        "PRODUCT: a Session must carry the name its harness gives (the last `/rename`); the room \
+         lists {after_open:?}"
+    );
+    assert!(
+        named["from"] == at && named["at"]["session_name"] == "gso-cap",
+        "PRODUCT: a plain `vox room post` from a renamed session must carry its id and its name; \
+         it carried {named}"
+    );
+    assert!(
+        nameless["from"] == "0a1b2c3d-nameless" && nameless["at"]["session_name"].is_null(),
+        "PRODUCT: a post from a session with no name must carry its id and no name; it carried \
+         {nameless}"
+    );
+    assert!(
+        nameless_listed.contains("0a1b2c3d") && !nameless_listed.contains("nameless ·"),
+        "PRODUCT: a Session with no name must be shown by its short id; `vox room sessions` \
+         printed:\n{nameless_listed}"
+    );
+    assert!(
+        of(&after_restart, at).len() == 1 && openings == 1,
+        "PRODUCT: a daemon restarted mid-session must not open the session's Session again; the \
+         room's log holds {openings} opening(s) for it, and lists {after_restart:?}"
     );
     assert!(
         of(&after_resume, at).len() == 1 && of(&after_resume, at)[0]["open"] == true,
