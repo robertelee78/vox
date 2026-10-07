@@ -4002,6 +4002,10 @@ pub struct Node {
     /// The last `refresh_network_view` gave up on a busy room, so the view is behind and the tick
     /// rebuilds it. Atomic only because the refresh takes `&self`.
     view_stale: std::sync::atomic::AtomicBool,
+    /// A member gained or lost drive in the last command (ADR-028 K-14): this node's drive keys
+    /// are released or changed before its answer (ADR-029 SC-2a, SC-2b). Atomic only because
+    /// `note_capability` takes `&self`.
+    drive_changed: std::sync::atomic::AtomicBool,
     /// Pairwise streams for a room still being joined, held until the join reports back: see
     /// `take_inbound_skdm`.
     held_pairwise: Vec<(Digest32, PairwiseIn)>,
@@ -4503,6 +4507,7 @@ impl Node {
             locking: 0,
             unlock_after_lock: Vec::new(),
             view_stale: std::sync::atomic::AtomicBool::new(false),
+            drive_changed: std::sync::atomic::AtomicBool::new(false),
             held_pairwise: Vec::new(),
             pairwise_out: BTreeMap::new(),
             board_authors: BTreeMap::new(),
@@ -4799,6 +4804,12 @@ impl Node {
                         continue;
                     }
                     let outcome = self.handle(command).await;
+                    if self
+                        .drive_changed
+                        .swap(false, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        self.tend_drive_keys().await;
+                    }
                     self.note_if_stalled(name, started);
                     self.publish().await;
                     if shutdown {
@@ -14788,7 +14799,12 @@ impl Node {
 
     /// Append one Session entry under this node's drive key (ADR-029 SC-1, SC-2), then release
     /// that key to whoever with drive is owed it, so a member owed it from the entry reads it.
-    async fn append_session(&mut self, channel_id: &Digest32, session_id: &str, body: &str) -> Outcome {
+    async fn append_session(
+        &mut self,
+        channel_id: &Digest32,
+        session_id: &str,
+        body: &str,
+    ) -> Outcome {
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
@@ -14838,7 +14854,10 @@ impl Node {
                 return;
             };
             let mut ch = shared.lock().await;
-            if ch.rotate_drive_if_lost(profile.store(), holders, now).is_err() {
+            if ch
+                .rotate_drive_if_lost(profile.store(), holders, now)
+                .is_err()
+            {
                 return;
             }
             let Ok(owed) = ch.owed_drive(profile.store(), holders) else {
@@ -15273,6 +15292,8 @@ impl Node {
     fn note_capability(&self, fingerprint: Digest32, had_drive: bool) {
         let drive = self.trust.has_drive(&fingerprint);
         if drive != had_drive {
+            self.drive_changed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = self
                 .event_tx
                 .send(NodeEvent::CapabilityChanged { fingerprint, drive });

@@ -154,7 +154,12 @@ impl Member {
             paths.account().socket(),
             vox_core::node::paths::NodeName::parse("default").expect("APPARATUS: a node name"),
         )))
-        .unwrap_or_else(|e| panic!("PRODUCT: {}'s node did not answer its socket: {e}", self.name))
+        .unwrap_or_else(|e| {
+            panic!(
+                "PRODUCT: {}'s node did not answer its socket: {e}",
+                self.name
+            )
+        })
     }
 }
 
@@ -245,7 +250,11 @@ fn posts_until_read(author: &Member, reader: &Member, room: &str, tag: &str) -> 
     while Instant::now() < deadline {
         n += 1;
         let (ok, _, e) = author.vox(&["room", "post", room, &format!("{tag} {n}")], None);
-        assert!(ok, "PRODUCT: `vox room post` failed for {}: {e}", author.name);
+        assert!(
+            ok,
+            "PRODUCT: `vox room post` failed for {}: {e}",
+            author.name
+        );
         std::thread::sleep(Duration::from_secs(1));
         if reader.reads(room, &format!("{tag} ")) {
             return true;
@@ -272,7 +281,12 @@ fn room_id(m: &Member, name: &str) -> String {
     list.lines()
         .find(|l| l.split_whitespace().any(|w| w == name))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| panic!("PRODUCT (staging): {name} is not in {}'s list: {list}", m.name))
+        .unwrap_or_else(|| {
+            panic!(
+                "PRODUCT (staging): {name} is not in {}'s list: {list}",
+                m.name
+            )
+        })
         .to_owned()
 }
 
@@ -290,14 +304,20 @@ fn channel_id(rt: &tokio::runtime::Runtime, m: &Member, short: &str) -> [u8; 32]
 
 /// The bodies of alice's Session entries `m`'s node opens in the room.
 fn opened(rt: &tokio::runtime::Runtime, m: &Member, room: [u8; 32], alice: &str) -> Vec<String> {
-    match rt.block_on(m.socket(rt).request(&Request::SessionEntries { channel_id: room })) {
+    match rt.block_on(
+        m.socket(rt)
+            .request(&Request::SessionEntries { channel_id: room }),
+    ) {
         Ok(Frame::SessionEntries { rows }) => rows
             .into_iter()
             .filter(|r| vox_core::node::link::b32_encode(&r.author) == alice)
             .filter(|r| r.session_id == SESSION)
             .map(|r| r.body)
             .collect(),
-        other => panic!("PRODUCT: {}'s node answered the Session read with {other:?}", m.name),
+        other => panic!(
+            "PRODUCT: {}'s node answered the Session read with {other:?}",
+            m.name
+        ),
     }
 }
 
@@ -356,7 +376,9 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     let id = channel_id(&rt, &alice, &room);
 
     // ---- claim 1: alice's Session writes entries; bob opens them, carol none ----
-    let before: Vec<String> = (1..=ENTRIES).map(|n| format!("BEFORE-DOWNGRADE {n}")).collect();
+    let before: Vec<String> = (1..=ENTRIES)
+        .map(|n| format!("BEFORE-DOWNGRADE {n}"))
+        .collect();
     let carol_held = entries(&carol, &room);
     for body in &before {
         match rt.block_on(alice.socket(&rt).request(&Request::AppendSession {
@@ -417,7 +439,9 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         None,
     );
     assert!(ok, "PRODUCT: `vox trust read` of bob failed: {o}{e}");
-    let after: Vec<String> = (1..=ENTRIES).map(|n| format!("AFTER-DOWNGRADE {n}")).collect();
+    let after: Vec<String> = (1..=ENTRIES)
+        .map(|n| format!("AFTER-DOWNGRADE {n}"))
+        .collect();
     for body in &after {
         match rt.block_on(alice.socket(&rt).request(&Request::AppendSession {
             channel_id: id,
@@ -433,7 +457,9 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     // Ten seconds more for anything still on its way.
     std::thread::sleep(Duration::from_secs(10));
     let bob_now = opened(&rt, &bob, id, &alice.fp);
-    eprintln!("[proof] claim 2: bob synced past the later entries: {bob_synced}; opened {bob_now:?}");
+    eprintln!(
+        "[proof] claim 2: bob synced past the later entries: {bob_synced}; opened {bob_now:?}"
+    );
     assert!(
         bob_synced,
         "PRODUCT (staging): bob never read alice's room message after the later Session entries, \

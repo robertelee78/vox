@@ -4495,7 +4495,9 @@ impl ChannelState {
         let gone: BTreeSet<Digest32> = due.iter().map(|(h, _)| *h).collect();
         self.timeline.retain(|r| !gone.contains(&r.entry_hash));
         // A Session entry follows the room's retention (SE-5).
-        self.drive.sessions.retain(|r| !gone.contains(&r.entry_hash));
+        self.drive
+            .sessions
+            .retain(|r| !gone.contains(&r.entry_hash));
         for h in &gone {
             self.forget_read_record(h);
         }
@@ -5274,8 +5276,10 @@ impl ChannelState {
             now_secs,
         )?;
         let members = self.drive_members();
-        self.drive
-            .begin(chain, holders.iter().filter(|m| members.contains(*m)).copied());
+        self.drive.begin(
+            chain,
+            holders.iter().filter(|m| members.contains(*m)).copied(),
+        );
         Ok(())
     }
 
@@ -5418,7 +5422,11 @@ impl ChannelState {
     /// The members owed this node's live drive key (SC-2a), each now marked owed from where the
     /// key stands, if it was not before; the marks are kept, so a release made later is made
     /// from them.
-    pub fn owed_drive(&mut self, store: &Store, holders: &BTreeSet<Digest32>) -> Result<Vec<Digest32>> {
+    pub fn owed_drive(
+        &mut self,
+        store: &Store,
+        holders: &BTreeSet<Digest32>,
+    ) -> Result<Vec<Digest32>> {
         let members = self.drive_members();
         let owed = self.drive.take_owed(&members, holders);
         if !owed.is_empty() {
@@ -5528,7 +5536,8 @@ impl ChannelState {
             SEG_DRIVE,
             &self.drive.to_state(),
         )?;
-        if let Err(e) = store.put_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_DRIVE, &seg)
+        if let Err(e) =
+            store.put_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_DRIVE, &seg)
         {
             self.poisoned = true;
             return Err(e);
