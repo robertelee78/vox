@@ -327,8 +327,13 @@ pub struct RendezvousStore {
 }
 
 impl RendezvousStore {
-    /// Take `author`'s records for `channel_id` off this board, every epoch, and refuse any
-    /// stamped at or before `timestamp` from now on (V030-14). Returns how many went.
+    /// Take `author`'s records for `channel_id` stamped at or before `timestamp` off this board,
+    /// every epoch, and refuse any such from now on (V030-14). Returns how many went.
+    ///
+    /// A record stamped later stays: the member signed it after the leave, so it joined again. A
+    /// withdraw comes back to a board again and again — every member keeps it and files it
+    /// (#520) — and one that took every record took a rejoined member's address off each board it
+    /// came back to, so no member could reach it, and no anchor would carry to it.
     pub fn withdraw_member(
         &mut self,
         channel_id: &Digest32,
@@ -337,12 +342,22 @@ impl RendezvousStore {
     ) -> usize {
         let mut gone = 0usize;
         for ((cid, _), bucket) in &mut self.members {
-            if cid == channel_id && bucket.remove(author).is_some() {
+            if cid == channel_id
+                && bucket
+                    .get(author)
+                    .is_some_and(|r| r.timestamp_ms <= timestamp)
+            {
+                bucket.remove(author);
                 gone += 1;
             }
         }
         for ((cid, _), bucket) in &mut self.bundles {
-            if cid == channel_id && bucket.remove(author).is_some() {
+            if cid == channel_id
+                && bucket
+                    .get(author)
+                    .is_some_and(|r| r.timestamp_ms <= timestamp)
+            {
+                bucket.remove(author);
                 gone += 1;
             }
         }
