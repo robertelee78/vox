@@ -381,8 +381,9 @@ app's text, buttons and controls, up to twice the usual size.
 
 The timeline works from the keyboard. **View > Focus Timeline** (⌃⌘T), Tab, or a click on a
 message puts the keyboard on it; ↑ and ↓ select a message, Space opens its pulled file in Quick
-Look, and Return opens the file, or else the link on its card. Escape or Space closes the preview,
-and the keyboard goes back to the timeline.
+Look, Return (or Enter) opens the file, or else the link on its card, and Tab or ⇧Tab moves on.
+Escape or Space closes a preview however it was opened; one the keyboard opened gives the keyboard
+back to the timeline.
 
 Every control has a VoiceOver label in words: a message reads as one sentence (who wrote, to whom,
 whether urgent, what it says, and who read or pulled it), a room says its group and unread, a
