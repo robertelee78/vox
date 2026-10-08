@@ -186,6 +186,18 @@ struct Apparatus: Error, CustomStringConvertible {
     var description: String { "APPARATUS: \(why)" }
 }
 
+/// What the daemon holds that an element is drawn from (a member, a keyring entry, a room), read
+/// when the element is not shown: held, the app failed to show it (PRODUCT); not held, the staging
+/// was not achieved (APPARATUS). Either way the red quotes what the daemon said.
+struct Premise {
+    let what: String
+    let read: () -> (holds: Bool, said: String)
+    init(_ what: String, _ read: @escaping () -> (holds: Bool, said: String)) {
+        self.what = what
+        self.read = read
+    }
+}
+
 final class FirstRunProof: XCTestCase {
     private var daemon: Started?
     /// Runs what the runner's sandbox forbids: every `vox`, the files, the echo services.
@@ -565,7 +577,7 @@ final class FirstRunProof: XCTestCase {
         let row = Key.id("room-mission")
         words(ui, row, timeout: 10, "the room's row must say it needs you",
               until: { $0.contains("needs you") })
-        tap(ui, row, "mission in the sidebar")
+        tap(ui, row, "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         let bob = Key.id("member-bob")
         let bobWords = words(ui, bob, timeout: 30, "the inspector must list bob in alice's keyring",
                              until: { $0.hasPrefix("bob, in keyring") }) ?? ""
@@ -670,7 +682,8 @@ final class FirstRunProof: XCTestCase {
         let trustList = run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out
         XCTAssertTrue(trustList.contains(carolFp),
                       "PRODUCT: `vox trust list` must list carol once the app trusted her; it said: \(trustList)")
-        tap(ui, Key.id("keyring-remove-carol"), "Remove… on carol")
+        tap(ui, Key.id("keyring-remove-carol"), "Remove… on carol",
+            premise: trusted(vox, voxEnv, carolFp, "carol"))
         words(ui, Key.id("keyring-remove-effect"), timeout: 10,
               "removing must say what untrusting does before it is done",
               until: { $0.contains("reads nothing you write from now on") })
@@ -695,7 +708,7 @@ final class FirstRunProof: XCTestCase {
         }
 
         // (6) Attach a file to the room, To: bob, with a note.
-        tap(ui, Key.id("room-mission"), "mission in the sidebar")
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         let file = scratch.appendingPathComponent("for-bob.bin")
         let bytes = Data((0..<150_000).map { UInt8(truncatingIfNeeded: $0 &* 31 % 253) })
         try stager.write(bytes, to: file.path)
@@ -717,8 +730,9 @@ final class FirstRunProof: XCTestCase {
             }
         }
         let toBob = Key.id("attach-to-bob")
-        present(ui, toBob, timeout: 10, "attaching a file must ask To:")
-        tap(ui, toBob, "To: bob")
+        present(ui, toBob, timeout: 10, "attaching a file must ask To: with bob in it",
+                premise: member(vox, voxEnv, room, bobFp, "bob"))
+        tap(ui, toBob, "To: bob", premise: member(vox, voxEnv, room, bobFp, "bob"))
         let noteField = Key.id("attach-note")
         type(ui, noteField, "FOR-BOB-NOTE", "the note field")
         tap(ui, Key.id("attach-send"), "Send")
@@ -796,10 +810,12 @@ final class FirstRunProof: XCTestCase {
             try staged(vox, ["room", "post", "--node", "alice", id, "HELLO-\(name)"], env: voxEnv)
         }
         let aaa = Key.id("room-aaa")
-        present(ui, aaa, timeout: 30, "room aaa must show in the sidebar")
+        present(ui, aaa, timeout: 30, "room aaa must show in the sidebar",
+                premise: inRoom(vox, voxEnv, "aaa"))
         present(ui, Key.id("room-bbb"), timeout: 30,
-                "room bbb must show in the sidebar")
-        tap(ui, aaa, "aaa in the sidebar")
+                "room bbb must show in the sidebar",
+                premise: inRoom(vox, voxEnv, "bbb"))
+        tap(ui, aaa, "aaa in the sidebar", premise: inRoom(vox, voxEnv, "aaa"))
         try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "NEEDS-YOU-9"],
                    env: bobSession)
         words(ui, Key.id("group-needs you"), timeout: 60,
@@ -822,12 +838,12 @@ final class FirstRunProof: XCTestCase {
         let to = Key.id("compose-to")
         present(ui, to, timeout: 10, "the composer must offer To:")
         tap(ui, to, "To:")
-        tap(ui, Key.id("to-bob"), "bob in To:")
+        tap(ui, Key.id("to-bob"), "bob in To:", premise: member(vox, voxEnv, room, bobFp, "bob"))
         ui.typeKey(.escape, modifierFlags: [])
         words(ui, to, timeout: 10, "ticking bob in To: must say so", until: { $0 == "To: bob" })
         // Seen in mission, then at once another room: the read record names mission, the room the
         // message is in.
-        tap(ui, aaa, "aaa in the sidebar")
+        tap(ui, aaa, "aaa in the sidebar", premise: inRoom(vox, voxEnv, "aaa"))
         words(ui, to, timeout: 10, "To: set in mission must not carry into aaa",
               until: { $0 == "To: the room" })
         var nine: [String] = []
@@ -865,8 +881,8 @@ final class FirstRunProof: XCTestCase {
         guard !canonical.isEmpty else {
             throw Apparatus("alice's `vox service list --json` never listed bob's web share")
         }
-        tap(ui, aaa, "aaa in the sidebar")
-        tap(ui, Key.id("room-mission"), "mission in the sidebar")
+        tap(ui, aaa, "aaa in the sidebar", premise: inRoom(vox, voxEnv, "aaa"))
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         let card = Key.id("service-\(cliAddress)")
         present(ui, card, timeout: 30, "the room must show a card for bob's service \(cliAddress)")
         tap(ui, card, "the service card")
@@ -941,7 +957,7 @@ final class FirstRunProof: XCTestCase {
         let shareRoom = Key.id("share-room")
         present(ui, shareRoom, timeout: 10, "picking a listening service must offer a room to share it in")
         tap(ui, shareRoom, "the room picker")
-        tap(ui, Key.menuItem("mission"), "mission in the room picker")
+        tap(ui, Key.menuItem("mission"), "mission in the room picker", premise: inRoom(vox, voxEnv, "mission"))
         words(ui, Key.id("share-can"), timeout: 10,
               "before sharing, the view must say bob, whom alice trusts, can reach it",
               until: { $0.contains("bob") })
@@ -1012,7 +1028,7 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("bob's forward at \(bobBound) carried nothing before the untrust")
         }
         tap(ui, Key.id("keyring"), "Keyring in the sidebar")
-        tap(ui, Key.id("keyring-remove-bob"), "Remove… on bob")
+        tap(ui, Key.id("keyring-remove-bob"), "Remove… on bob", premise: trusted(vox, voxEnv, bobFp, "bob"))
         words(ui, Key.id("keyring-remove-effect"), timeout: 10,
               "removing bob must say what untrusting does first",
               until: { $0.contains("reads nothing you write from now on") })
@@ -1069,7 +1085,7 @@ final class FirstRunProof: XCTestCase {
         try stager.write(Data("opened from the keyboard\n".utf8), to: keysFile.path)
         try staged(vox, ["share", "--node", "bob", room, keysFile.path, "--to", aliceFp,
                          "-m", "KEYS-FILE"], env: bobSession)
-        tap(ui, Key.id("room-mission"), "mission in the sidebar")
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         // Premise: alice's node pulled it (the row offers Quick Look only then).
         let lookButton = Key.id("quick-look-for-keys.txt")
         present(ui, lookButton, timeout: 120,
@@ -1240,6 +1256,7 @@ final class FirstRunProof: XCTestCase {
     /// (the Touch Bar), APPARATUS.
     @discardableResult
     private func present(_ ui: XCUIApplication, _ key: Key, timeout: TimeInterval, _ product: String,
+                         premise: Premise? = nil,
                          file: StaticString = #filePath, line: UInt = #line) -> Bool {
         guard windowReadable(ui, file: file, line: line) else { return false }
         let end = Date().addingTimeInterval(timeout)
@@ -1248,14 +1265,15 @@ final class FirstRunProof: XCTestCase {
             Thread.sleep(forTimeInterval: 0.25)
         } while Date() < end
         if locateEverywhere(ui, key) != nil { return true }
-        missing(ui, key, product, file: file, line: line)
+        missing(ui, key, product, premise: premise, file: file, line: line)
         return false
     }
 
     /// The red for `key` not shown: APPARATUS when the app has it only outside what it shows a
-    /// person, PRODUCT otherwise, quoting everything shown.
-    private func missing(_ ui: XCUIApplication, _ key: Key, _ product: String, file: StaticString,
-                         line: UInt) {
+    /// person, or when `premise` (what the daemon holds that it is drawn from) does not hold;
+    /// PRODUCT otherwise, quoting everything shown and what the daemon said.
+    private func missing(_ ui: XCUIApplication, _ key: Key, _ product: String, premise: Premise? = nil,
+                         file: StaticString, line: UInt) {
         keepTree(ui, "\(key) was not shown")
         // Premise: the same search finds a known sibling of the same kind; if not, the search is
         // what failed, not the app.
@@ -1268,10 +1286,20 @@ final class FirstRunProof: XCTestCase {
         if anywhere.exists {
             XCTFail("APPARATUS: \(key) is in the app only outside its windows, dialogs, sheets, popovers and menus (\(anywhere.elementType.rawValue)); the proof's search missed it",
                     file: file, line: line)
-        } else {
-            XCTFail("PRODUCT: \(product); \(key) is in none of the app's windows, dialogs, sheets, popovers or menus, which show: \(onScreen(ui))",
-                    file: file, line: line)
+            return
         }
+        var held = ""
+        if let premise {
+            let (holds, said) = premise.read()
+            guard holds else {
+                XCTFail("APPARATUS (staging not achieved): \(key) is not shown, and the daemon says \(premise.what) does not hold: \(said)",
+                        file: file, line: line)
+                return
+            }
+            held = "; \(premise.what), as the daemon says: \(said)"
+        }
+        XCTFail("PRODUCT: \(product)\(held); \(key) is in none of the app's windows, dialogs, sheets, popovers or menus, which show: \(onScreen(ui))",
+                file: file, line: line)
     }
 
     /// `key`'s words once `holds` is true of them, within `timeout`, the premise holding: PRODUCT
@@ -1333,10 +1361,13 @@ final class FirstRunProof: XCTestCase {
         return got
     }
 
-    /// Click `key`, once it is shown and hittable: APPARATUS when XCTest cannot click it, never an
-    /// exception that names no side.
+    /// Click `key`, once it is shown and hittable, never an exception that names no side. Shown
+    /// but never hittable: APPARATUS (XCTest cannot click it). Not shown: `missing`'s red, PRODUCT
+    /// when the search works and `premise` holds. A target drawn from what the daemon holds names
+    /// that as its premise; any other target is a control of the screen the proof has just
+    /// reached, which the app must show.
     @discardableResult
-    private func tap(_ ui: XCUIApplication, _ key: Key, _ what: String,
+    private func tap(_ ui: XCUIApplication, _ key: Key, _ what: String, premise: Premise? = nil,
                      file: StaticString = #filePath, line: UInt = #line) -> Bool {
         let end = Date().addingTimeInterval(10)
         repeat {
@@ -1350,8 +1381,12 @@ final class FirstRunProof: XCTestCase {
             }
             Thread.sleep(forTimeInterval: 0.25)
         } while Date() < end
+        guard locateEverywhere(ui, key) != nil else {
+            missing(ui, key, "the app must show \(what)", premise: premise, file: file, line: line)
+            return false
+        }
         keepTree(ui, "\(what) could not be clicked")
-        XCTFail("APPARATUS: XCTest cannot click \(what) (\(key)): \(locateEverywhere(ui, key) == nil ? "not shown" : "not hittable")",
+        XCTFail("APPARATUS: XCTest cannot click \(what) (\(key)): shown, never hittable",
                 file: file, line: line)
         return false
     }
@@ -1440,6 +1475,35 @@ final class FirstRunProof: XCTestCase {
     private func run(_ vox: String, _ args: [String], env: [String: String],
                      input: String? = nil) -> (status: Int32, out: String) {
         stager.run([vox] + args, env: env, input: input)
+    }
+
+    /// Premise: `fp` (alias `name`) is in alice's roster of `room`, as `vox room roster` says.
+    private func member(_ vox: String, _ env: [String: String], _ room: String, _ fp: String,
+                        _ name: String) -> Premise {
+        Premise("\(name) is a member of the room") {
+            let r = self.run(vox, ["room", "roster", "--node", "alice", room], env: env)
+            return (r.status == 0 && r.out.contains(fp),
+                    "`vox room roster` exited \(r.status) listing \(r.out.trimmingCharacters(in: .whitespacesAndNewlines).debugDescription), \(name) being \(fp)")
+        }
+    }
+
+    /// Premise: `fp` (alias `name`) is in alice's keyring, as `vox trust list` says.
+    private func trusted(_ vox: String, _ env: [String: String], _ fp: String,
+                         _ name: String) -> Premise {
+        Premise("\(name) is in alice's keyring") {
+            let r = self.run(vox, ["trust", "list", "--node", "alice"], env: env)
+            return (r.status == 0 && r.out.contains(fp),
+                    "`vox trust list` exited \(r.status): \(r.out.trimmingCharacters(in: .whitespacesAndNewlines).debugDescription), \(name) being \(fp)")
+        }
+    }
+
+    /// Premise: alice is in the room named `name`, as `vox room list` says.
+    private func inRoom(_ vox: String, _ env: [String: String], _ name: String) -> Premise {
+        Premise("alice is in room \(name)") {
+            let r = self.run(vox, ["room", "list", "--node", "alice"], env: env)
+            return (r.status == 0 && r.out.split(separator: "\n").contains { $0.contains(" \(name)") },
+                    "`vox room list` exited \(r.status): \(r.out.trimmingCharacters(in: .whitespacesAndNewlines).debugDescription)")
+        }
     }
 
     /// The line `start` waited for, as `vox` printed it.
