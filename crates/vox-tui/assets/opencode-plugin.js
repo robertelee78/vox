@@ -402,7 +402,22 @@ function wakeChannel(client, relayed) {
           if (!followers.has(following)) followers.set(following, new Set())
           followers.get(following).add(write)
           log("mirror: following " + following)
-          return write(JSON.stringify({ type: "subscribed", session: following }) + "\n")
+          write(JSON.stringify({ type: "subscribed", session: following }) + "\n")
+          // Its title as it is now, said as OpenCode's bus says a change of it: a title set before
+          // this follow began (OpenCode's own, or a /rename) is the Session's name from the start
+          // (ADR-029 MD-1), not only after the session is next updated.
+          const followed = following
+          client._client
+            .request({ method: "GET", url: `/session/${followed}` })
+            .then((res) => {
+              const info = res?.data
+              if (info?.id === followed && typeof info.title === "string") {
+                const event = { type: "session.updated", properties: { info } }
+                write(JSON.stringify({ type: "event", event }) + "\n")
+              }
+            })
+            .catch(() => {})
+          return
         }
         if (msg?.type !== "prompt" || !msg.session || typeof msg.text !== "string") {
           return answer({ error: "expected a prompt frame" })

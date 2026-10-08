@@ -16,6 +16,8 @@
 //                 `{"kind":"wake","relayed":…,"text":…}`, or `{"kind":"no-wake"}` past <secs>
 //   event <json>  one event of OpenCode's bus, as OpenCode hands it to the plugin's `event` hook:
 //                 `{"kind":"event"}` once the hook returned
+//   title <text>  the session's title as OpenCode holds it, from now on: what the plugin reads
+//                 with `GET /session/<id>` (a read, not counted among `calls`): `{"kind":"title"}`
 //   calls <secs> <n>
 //                 wait until the plugin has made at least <n> calls to OpenCode's API through
 //                 its in-process client (`client._client.request`), and answer all of them:
@@ -76,9 +78,16 @@ let waiting = null
 // answers a call it takes.
 const calls = []
 let callWaiting = null
+// The session's title as OpenCode holds it (`title`), or none.
+let title = null
 const client = {
   _client: {
     async request({ method, url, body }) {
+      // A read of the session: its info, as OpenCode answers it. Not a call the plugin made on
+      // the session's behalf, so not among `calls`.
+      if (method === "GET" && url === `/session/${session}`) {
+        return { response: { status: 200 }, data: { id: session, ...(title ? { title } : {}) } }
+      }
       calls.push({ method, url, body: body ?? null })
       if (callWaiting) callWaiting()
       return { response: { status: 200 }, data: null }
@@ -131,6 +140,9 @@ for await (const line of lines) {
       const p = prompts.shift()
       if (!p) say({ kind: "no-wake" })
       else say({ kind: "wake", relayed: p.text, text: await turn(hooks, p.text) })
+    } else if (cmd === "title") {
+      title = arg
+      say({ kind: "title" })
     } else if (cmd === "event") {
       await hooks.event({ event: JSON.parse(arg) })
       say({ kind: "event" })

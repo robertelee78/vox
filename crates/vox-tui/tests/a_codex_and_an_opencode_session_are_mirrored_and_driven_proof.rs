@@ -34,8 +34,9 @@
 //! 6. The app-server goes away: `--say` to S1 is refused and says why (DR-5, DR-6).
 //!
 //! Between 4 and 5, Codex renames S1's thread (`thread/name/updated`): Session S1 reads the new
-//! name with no message posted (ADR-029 MD-1). The OpenCode session is renamed too
-//! (`session.updated` with its title), and its Session reads that title.
+//! name with no message posted (ADR-029 MD-1). The OpenCode session is titled before Vox follows
+//! it, and its Session reads that title with no `session.updated` after the follow; then it is
+//! renamed (`session.updated` with its title), and its Session reads the new one.
 //!
 //! **OpenCode** (`an_opencode_session_is_mirrored_and_driven`): one session of `oc-a` through the
 //! hosted plugin: its prompt, a tool call, a question asked and answered by `person` with
@@ -51,7 +52,9 @@
 //! "miss events after a resume") → no second reply; the plugin's `question.asked` not forwarded
 //! (#542, "drop a question event") → no question line; drive input handed to the node's newest
 //! session instead of the named one (#544) → `turn/start` on S2's thread; a Session not renamed
-//! until its next message (the rename record dropped) → neither reads its new name.
+//! until its next message (the rename record dropped) → neither reads its new name; the plugin
+//! not reading the session's title when a follow begins → the OpenCode Session never reads the
+//! title it had before.
 
 #![cfg(unix)]
 
@@ -877,6 +880,10 @@ fn an_opencode_session_is_mirrored_and_driven() {
         lines,
     };
 
+    // The session already has a title when Vox starts following it: OpenCode's own, or a /rename
+    // before the follow. It sends no session.updated for it afterwards.
+    host.ask("title oc titled before", within);
+
     // ---- (2) the operator's prompt: the plugin's drain registers the session ----
     host.ask("turn Paint e1 the colour I pick.", within);
     // Its events, as OpenCode's bus gives them to the plugin's `event` hook. Vox follows the
@@ -899,6 +906,11 @@ fn an_opencode_session_is_mirrored_and_driven() {
         );
         std::thread::sleep(Duration::from_millis(500));
     }
+    let titled = w.read_until(OC, "· oc titled before ·", within);
+    println!(
+        "[proof] (2) Session {OC}, titled before Vox followed it: {}",
+        titled.lines().next().unwrap_or_default()
+    );
 
     // ---- (3) a tool call, a question answered by person, the reply, the turn's end ----
     host.event(json!({"type": "message.updated", "properties": {"info": {"id": "msg_a1", "sessionID": OC, "role": "assistant", "providerID": "opencode", "modelID": "kimi-k3"}}}));
