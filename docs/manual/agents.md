@@ -1,11 +1,55 @@
 # Agent communications
 
-Applies to: v0.3.1. Every agent acts only as its own node, named with `--node`; hooks refuse to
+Applies to: v0.4.0. Every agent acts only as its own node, named with `--node`; hooks refuse to
 run without it.
 
 Vox connects existing agent sessions through rooms. It does not start a new harness or model
 run merely because a message arrives. Give each agent its own node rather than sharing your
 person's node or keyring.
+
+## Set up a machine with `vox setup`
+
+```sh
+vox setup
+```
+
+`vox setup` looks for Claude Code, Codex and OpenCode on `PATH` and offers each a node of its own,
+`<harness>-<host>`, with a passphrase you type, its hook in the harness's settings and the agent
+skill beside it. It says what it is to do before each one:
+
+```text
+vox setup: looking for harnesses on this machine (their programs on PATH)
+  Claude Code  found: /usr/local/bin/claude
+  Codex        not found
+  OpenCode     found: /usr/local/bin/opencode
+
+Claude Code is to get a node of its own, claude-mac, with a passphrase you type.
+  its hook, `vox agent hook --node claude-mac`, is to go in ~/.claude/settings.json, with VOX_NODE=claude-mac for its sessions; other Vox hook entries there are replaced, nothing else
+  the agent skill is to be written to ~/.claude/skills/vox-agent-comms/SKILL.md
+Create claude-mac and wire Claude Code to it? [Y/n]
+```
+
+Your settings file keeps the rest of its content in its own order. For Codex, setup also keeps
+Codex's app-server running, which is how a Codex session is driven (see [Sessions](sessions.md)),
+and ends by saying `next, run vox agent trust codex: Codex runs a hook only once it is trusted`.
+On macOS it offers a node for you as well, which you may skip. It ends by printing every node it
+made, with its fingerprint in groups beside its art, and what a person needs to recognise it:
+
+```text
+  ◢◢◢◢◢◢◤◤◣◣  pats xrnp fyyr ahbv hrv2
+  ◣◣◥◥◣◣◥◥◣◣  vczt nijl oh7d rbba vptg
+  ◢◢◤◤◥◥◣◣◤◤  czv2 723j fm7a
+  ◣◣◤◤◥◥◢◢◥◥
+  ◣◣◢◢◢◢◥◥◥◥
+  alias claude-mac · harness Claude Code · host mac · macOS 27.2 · vox 0.4.0
+```
+
+Give that fingerprint to whoever is to trust the node. The nodes setup makes are not attached:
+attach each in a terminal, `vox node attach claude-mac`, as below. Then map the repositories the
+agent works in to their rooms, so each session it starts works in the right one (see
+[the room a session works in](sessions.md#the-room-a-session-works-in)).
+
+The rest of this chapter is what setup does for you, done by hand, and what to check after.
 
 ## Give the agent its own node and room
 
@@ -22,8 +66,8 @@ daemon if none runs, but it never attaches the node and never takes a passphrase
 not attached, it tells the agent so, with the command for you to run, `vox node attach
 claude-mbp`. `vox node attach claude-mbp --keep --passphrase-file PATH` also attaches it again
 whenever the daemon starts, reading the passphrase from that private file. A keyring change for
-the agent's node, such as `vox trust add <fingerprint> --node claude-mbp`, is typed by you in a
-terminal too.
+the agent's node, such as `vox trust add FULL_FINGERPRINT --node claude-mbp`, is typed by you in a
+terminal too ([an agent's node](keyring.md#an-agents-node)).
 
 Join the intended room as that node, substituting the full room link, then exchange the compared
 fingerprints and trust decisions with the other participants:
@@ -133,6 +177,26 @@ An urgent wake carries no message, only a notice that messages wait; the session
 through its hook. Urgent delivery is not a claim that the model has understood, accepted or
 finished the task. An absent/stopped session cannot be made live by an urgency flag. If it is
 silent, use [agent troubleshooting](troubleshooting.md#the-agent-does-not-respond).
+
+### Hand an agent a file
+
+Share the file to the agent's node as you would to a person, with a note saying what to do with
+it:
+
+```sh
+vox share ROOM_ID ./plan.txt --to claude-mbp -m "read this before the call"
+```
+
+The agent's node pulls it by itself (see [where a shared file lands](files.md#where-a-shared-file-lands)),
+and the agent's next turn gets the share with its note and the pulled copy's path:
+
+```text
+[hfnbgudh from robertGPT to you] file offered: plan.txt (9 bytes): read this before the call
+  ↳ pulled to DATA_ROOT/nodes/claude-mbp/files/ROOM_ID/plan.txt
+```
+
+If the copy is not verified yet, the line says it is not pulled yet, where it will land, and that
+a later turn says where. `--urgent` wakes the session as it does for an addressed post.
 
 ## Coordinate ownership, not a second progress tracker
 

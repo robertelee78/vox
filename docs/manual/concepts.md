@@ -1,7 +1,7 @@
 # How Vox fits together
 
 Applies to: the shared product model. Commands and lifecycle details differ by release; the
-task chapters describe v0.3.1.
+task chapters describe v0.4.0.
 
 ## A node is an identity
 
@@ -48,12 +48,15 @@ local label. Use the selector your version's command help accepts.
 
 A node can share a named local service with a room. Reach depends on shared room membership
 and the host's trust decision. Each member reaches it as `service.node.room.vox`, where the node
-and room parts are that member's own names for them, so two members may see different
-addresses for the same service. It is not a public web link and does not install global DNS.
-The local proxy (`vox up`) or a forward (`vox forward`) bridges your ordinary tool into Vox.
+and room parts are that member's own names for them, so two members may see different readable
+addresses for the same service. Its canonical address, made of fingerprints and IDs, is the same
+for everyone and is the one to copy and send. It is not a public web link and does not install global DNS.
+The daemon's local proxy (`vox up` says where it listens) or a forward (`vox forward`) bridges
+your ordinary tool into Vox.
 
-A file announcement is a message; its bytes are fetched from a live offer. Seeing the
-announcement does not prove that the sender is still serving the bytes.
+A shared file is a message; its bytes are pulled from the sharer's daemon, which serves them
+until the message expires or the sharer stops. Seeing the message does not prove that the bytes
+are still served.
 
 ## An anchor is a bridge
 

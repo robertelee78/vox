@@ -1,12 +1,20 @@
 # Install and update
 
-Applies to: v0.3.1. The installer may select a later published release; check the resulting
+Applies to: v0.4.0. The installer may select a later published release; check the resulting
 version and its release notes before using version-specific instructions.
 
 ## Install
 
-The supported release targets are Intel Linux, Apple Silicon macOS and Intel macOS. The macOS
-release requires macOS 11 or later. Run this as your own user:
+From v0.4.0 the release targets are:
+
+- **Linux** on x86_64 (`x86_64-unknown-linux-gnu`): the `vox` binary.
+- **macOS 13 or later on Apple Silicon** (`aarch64-apple-darwin`): `Vox.app` with `vox` inside it.
+
+Other Macs are refused: on an Intel Mac, or on macOS before 13, the installer stops before
+downloading anything and says `this Mac is not supported: Vox needs a Mac with Apple Silicon and
+macOS 13 or later`. (v0.3.1 and earlier also built for Intel Macs and macOS 11.)
+
+Run this as your own user:
 
 ```sh
 curl -fsSL https://voxlux.us/install.sh | sh
@@ -14,9 +22,13 @@ curl -fsSL https://voxlux.us/install.sh | sh
 
 The vanity address is the installation entry point. **GitHub Releases remains the source of
 the executable and its release record**; the domain is not a second binary distributor.
-The installer checks the downloaded executable's size and SHA-256 against the record and installs
-atomically into `~/.local/bin`. On macOS it also requires the expected Developer ID signature
-and Apple's notarization check. Do not bypass a failed integrity or signature check.
+The installer checks what it downloads, its size and SHA-256, against the record. On Linux it
+installs `vox` atomically into `~/.local/bin`. On macOS it installs `Vox.app` into
+`/Applications` (or `~/Applications` when it cannot write there), after checking that the app and
+the `vox` inside it carry the expected Developer ID signature and passed Apple's notarization, and
+makes `~/.local/bin/vox` a link to the `vox` inside the app, so the app, the daemon and the CLI
+are one binary of one version. It refuses to replace a `Vox.app` it did not install. Do not bypass
+a failed integrity or signature check. See [The Vox app on a Mac](app.md) for the app itself.
 
 This command executes the script it downloads. If you prefer to inspect it first, download it
 without running it, read it, then run that inspected file. An example with a new local filename:
@@ -56,15 +68,20 @@ vox --version
 ```
 
 The first command checks without replacing the binary. The second downloads and verifies the
-published replacement, saves the previous binary and updates shell integration. A source build
-is not overwritten; update its source and rebuild instead.
+published replacement, saves the previous binary and updates shell integration. On macOS it
+replaces the whole `Vox.app`, with the `vox` inside it, and keeps the previous app for
+`--rollback`. A source build is not overwritten; update its source and rebuild instead.
 
 On macOS, an update must carry the same Developer ID as the binary being replaced. On Linux,
 the transport and release digest do not provide an equivalent Apple signing identity; do not
 describe the two as the same assurance.
 
-After an update, running processes can still be the old version. Plan a restart of the affected
-Vox process when it is safe to interrupt its rooms and services. Agent coordination requires
+After an update, `vox update` restarts the vox daemon onto the new version, so update when it is
+safe to interrupt your rooms and services. Every node detaches as the daemon stops; the new daemon
+attaches again each node whose passphrase it keeps (`vox node attach --keep`, or the Keychain from
+the app), and the update names any other node with `vox node attach NAME` to attach it again. A
+daemon you started yourself in a terminal is left running the old version, and the update says so.
+An open `vox tui` or Vox app keeps running the old version until you restart it. Agent coordination requires
 participants to run the same Vox version; update the group deliberately, not one worker in
 the middle of a claim.
 

@@ -1,6 +1,6 @@
 # Troubleshooting by symptom
 
-Applies to: v0.3.1. Check `vox --version` first: the fixes here are for the version they name.
+Applies to: v0.4.0. Check `vox --version` first: the fixes here are for the version they name.
 
 ## Before changing anything
 
@@ -58,8 +58,10 @@ damaged node.
 
 **Check:** run `vox node list`: each node is `attached` or `detached`. Compare `--node`,
 `VOX_NODE`, the data/config roots and the OS user with the terminal or agent that should hold the
-node. A node attached because a session needed it, such as `vox forward` or an agent session,
-detaches again when the last of them ends.
+node. A node attached because a session needed it, such as `vox forward`, detaches again when
+the last of them ends. An agent's hook never attaches its node: the agent says `node NAME is not
+attached, and a hook never attaches it`, and you attach it, in a terminal outside the agent's
+session.
 
 **Fix:** `vox node attach robertgpt`. Do not create a second node to get past this message: a
 new node is a new identity, with no rooms and no trust. To keep a node attached across daemon
@@ -67,6 +69,31 @@ restarts, attach it with `--keep` (see [passphrase input](reference.md#passphras
 
 **Verify:** `vox room list` returns the rooms or `no rooms`, not the attach message. If the
 same message remains, report the selected roots and the exact message.
+
+## A keyring change asks for the passphrase, or is refused
+
+**Exact symptoms:**
+
+- `vox: changing who you trust needs your identity passphrase: it was not entered for a keyring
+  change in the last 30 minutes`, then `identity passphrase:` at a terminal;
+- the same line, then `it is typed at a terminal, and taken from nothing else (not
+  VOX_IDENTITY_PASSPHRASE, not a file). Run it in a terminal: vox trust add …`, and the command
+  exits 1;
+- `vox: --identity-passphrase-file is refused: a keyring change's passphrase is typed at a
+  terminal, never read from a file`.
+
+**Meaning:** a keyring change (`vox trust add`, `remove`, `rename`, `drive`, `read`) needs the
+identity passphrase unless one was typed for a keyring change in the last 30 minutes. Attaching
+the node does not count. The passphrase is typed at a terminal; a file, `VOX_IDENTITY_PASSPHRASE`
+and an agent's session are never asked for it. Nothing is changed when the command is refused.
+
+**Check:** `vox status` says `keyring asks for the passphrase` or `keyring open Nm` on its second
+line.
+
+**Fix:** run the command the message names in a terminal of your own, outside any agent's session,
+and type the passphrase at the prompt. For an agent's node, you, its operator, run it.
+
+**Verify:** `vox trust list` shows the change, and `vox status` says `keyring open 30m`.
 
 ## A daemon is already running
 
@@ -125,15 +152,27 @@ trust and readable messages. If refusal remains, report the exact explanation, n
 
 ### The room is full or has ended
 
-**Exact symptoms:** `the room is full, so you were not admitted`, or `that room has ended — a
-member or its board said so — so it takes nobody in`.
+**Exact symptoms:** after `vox: cannot join:`, one of
 
-**Meaning:** the first means your passphrase was accepted but the room takes no more members.
-The second means its creator or an admin ended it, or it ended itself after an idle time its
-creator chose; your passphrase was never checked.
+- `the room is full, so you were not admitted`
+- `another newcomer took the room's last place at the same moment, so you were not admitted`
+- `a member of the room did not agree to take you in, so you were not admitted`, with a `said:`
+  line naming the member, for example `member bob did not answer within 5s, and every member
+  online must agree before the room takes a newcomer`
+- `that room has ended — a member or its board said so — so it takes nobody in`
 
-**Fix:** ask the room's creator. An ended room is gone; they can make a new room and share its
-link.
+**Meaning:** in the first three your passphrase was accepted. A room takes at most 1,024
+members, and every member online must agree before it takes a newcomer (see
+[Create or join](rooms.md#create-or-join)). The first means the room is at its cap. The second
+means you and another newcomer asked for its last place together, and the other got it. The third
+means a member the room could reach did not answer in time or does not yet count the member that
+answered you as part of the room. The last means its creator or an admin ended the room, or it
+ended itself after an idle time its creator chose; your passphrase was never checked.
+
+**Fix:** for a full or ended room, ask the room's creator; an ended room is gone, and they can
+make a new room and share its link. After the second or third, run the join again: a place
+another newcomer did not take is free again, and a member that was busy or still syncing usually
+answers the next time. If the same member is named again, ask its owner whether it is running.
 
 ### No board or no member answered
 
@@ -213,11 +252,13 @@ service being reachable are separate facts.
 - the host trusts the guest fingerprint;
 - both use the intended room;
 - `vox service list ROOM_ID` names the intended offer and shows **your** address for it;
-- the guest's `vox up` or `vox forward` is still running;
+- the guest has a node attached, so its daemon's proxy runs (`vox up` says where, or why it
+  is not running), or its `vox forward` is still running;
 - the ordinary client uses that loopback proxy or forward.
 
-Copy the address your own `service list` prints, not one from someone else's screen: the node
-and room parts are each viewer's own names.
+A readable address from someone else's screen uses their names for the node and room, which may
+mean nothing on your machine. Use the readable address your own `service list` prints, or the
+canonical address under it, which is the same on every member's machine.
 
 **Fix:** restore the missing piece. A forward that says `tunnel refused or cut — the host
 refused "ssh" — it has not trusted this identity, or offers nothing there, or its service did not
@@ -267,17 +308,20 @@ sides an anchor they can reach. Do not delete the node or change trust to cure a
 
 ## The file is unavailable or fails verification
 
-**Meaning:** the room can retain an announcement after its live offer stops. An unreachable
-offer can also mean missing trust; a hash failure means the received bytes do not match the
-signed announcement, not that the check should be disabled.
+**Meaning:** a share's message can stay in the room after its sharer stops serving it. An
+unreachable share can also mean missing trust; a hash failure means the received bytes do not
+match the signed announcement, not that the check should be disabled.
 
-**Check:** identify the sender and exact offer; ask whether `room send` or `share` is still
-running (a `share` with `--count` or `--for` stops by itself). A fetch from an offer that has
-stopped says `the offer of FILE is gone: NAME no longer serves it`; one whose sender cannot be
-reached says `the offer of FILE cannot be collected now` and gives the reason. Inspect any reported size/hash or stall reason. If `--out` already exists, that
-is local destination protection, not a transfer failure.
+**Check:** identify the sharer and the exact share. Ask whether it is still shared: the sharer's
+`vox share list ROOM_ID` lists it, and a share given `--count` or `--for` stops by itself. A pull
+from a share that has stopped says `the offer of FILE is gone: NAME no longer serves it`; one
+whose sharer cannot be reached says `the offer of FILE cannot be collected now` and gives the
+reason. Inspect any reported size/hash or stall reason. If `--out` already exists, that is local
+destination protection, not a transfer failure. A share your node did not pull by itself is
+either addressed to someone else or from a node not in your keyring (see
+[where a shared file lands](files.md#where-a-shared-file-lands)).
 
-**Fix:** have the sender re-offer the intended unchanged file if needed, then fetch again.
+**Fix:** have the sharer share the intended unchanged file again if needed, then pull again.
 Use another output path for a collision. Do not salvage or open a failed `.part` as though
 verified; this workflow rejects incomplete/mismatched transfers and removes its partial file.
 

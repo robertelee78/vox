@@ -1,6 +1,6 @@
 # Commands and local state
 
-Applies to: v0.3.1. This is a map to the real command help, not a substitute for the parser
+Applies to: v0.4.0. This is a map to the real command help, not a substitute for the parser
 in your installed version.
 
 ## Find the right help
@@ -29,14 +29,14 @@ is not an alias for your parser.
 | Run an anchor | `vox node` with no subcommand | A headless node; reachable infrastructure |
 | Ask a node about rooms | `vox room list`, `read`, `roster` | The node attached |
 | Inspect runtime | `vox status`, `vox status --json` | The node attached |
-| Change peer trust | `vox trust add`, `rename`, `remove` | Compared fingerprint; passphrase after 30 minutes |
+| Change peer trust | `vox trust add`, `rename`, `remove` | Compared fingerprint; passphrase after 30 minutes (`vox status` shows the minutes left) |
 | List peer trust | `vox trust list` | The node attached |
 | Room lifecycle | `vox room retention`, `admin`, `leave`, `end` | Creator or admin for the room-wide ones |
 | Share a port in a new room | `vox serve NAME=PORT` | Existing local service |
 | Join a service room | `vox connect ROOM_LINK` | Room link and passphrase |
-| Reach services | `vox up`, `vox forward SERVICE.NODE.ROOM.vox` | Host's trust; proxy or forward running |
+| Reach services | the daemon's proxy (`vox up` says where), `vox forward SERVICE.NODE.ROOM.vox` | Host's trust; a node attached, or the forward running |
 | Close live tunnels | `vox tunnel close` | `vox status` lists them |
-| Exchange file bytes | `vox room send`, `vox share`, `vox room get` | Attached node and a live offer |
+| Share and pull files | `vox share`, `vox share list`, `vox share stop`, `vox room get` | Attached node; the sharer's daemon serving it |
 | A room's family LAN | `vox lan up` | `sudo vox lan helper` running |
 | Wire a harness | `vox agent plugin`, `skill`, `trust`, `doctor` | `--node` for plugin and hook |
 
@@ -51,6 +51,10 @@ Session-holding commands (`serve`, `connect`, `up`, `forward`, `lan up`) and `vo
 start the daemon in the background when none runs and attach their node. One-shot commands
 (`room`, `status`, `trust`, `share`, `service`) only ask an attached node, and say so when it is
 not: `vox node attach NAME` first.
+
+A `vox daemon` started while the daemon holding the data root is stopping says so, waits until it
+has stopped, and then serves its node itself. `vox tui` exits when its terminal goes away, and
+SIGHUP or SIGTERM stop it cleanly.
 
 Data/config selection follows explicit flags, then `VOX_DATA_DIR` / `VOX_CONFIG_DIR`, then
 XDG/platform defaults. Each data root has its own daemon and nodes, so two shells with different
@@ -67,10 +71,41 @@ corresponding XDG/platform config location; it is not necessarily the same root 
 Inside the data root:
 
 - `nodes/NAME/` holds one node: identity material such as `vault.cbor`, the room store
-  `store.redb`, and that node's own `config/`, cursors and agent sessions.
+  `store.redb`, and that node's own `config/`, cursors and agent sessions. `files/ROOM_ID/` holds
+  the shares it pulled (see [Send and receive files](files.md)), and `decisions/` its decision
+  record (below).
 - `.daemon/` holds the daemon's lock, its control socket `vox.sock`, the port it reuses, the list
   of nodes kept attached (`attach`), its `config`, and `log`, where a daemon started in the
   background writes its output.
+
+### The decision record
+
+`vox status` lists the most recent refusals near its top, newest first:
+
+```text
+recent refusals
+  4s ago  refused 34rtzgeq333h to join a room: answering 34rtzgeq333h: join proof-of-possession failed
+```
+
+In the TUI, `d` on the room list, or `:decisions`, shows the whole record, newest first, titled
+`Decisions (newest first · kept 14 days · Esc: back)`. (`vox status` also begins with this node's
+own fingerprint, in groups beside its art.)
+
+Each node writes down every refusal and every change of access it decides: a join or a tunnel it
+refused, a session it cut, a node added to or removed from its keyring, a share it stopped. Each
+decision says what was decided, what was asked, who it was about (your name for them, or the
+start of their fingerprint), when, and why, in the node's own words, for example `join
+proof-of-possession failed` for a wrong room passphrase. It never holds message text, a file's
+name or contents, a passphrase or a key. A refusal that can repeat many times a minute, such as a
+refused stream, is written the first time; its repeats in the next hour are counted and written
+as one.
+
+The record is sealed at rest under the node's identity, in
+`nodes/NAME/decisions/YYYY-MM-DD.sealed`, one file per UTC day, readable by your account only, and
+it is read only through the node: in the TUI with `d`, in the app's Decision record view, and its
+latest refusals in `vox status`. Files older than 14 days are deleted, and the record is never
+sent anywhere. A record an earlier build wrote in plain text (`.jsonl`) is sealed into its day's
+file, and the plain file removed, the next time the node is attached.
 
 These are not caches to remove when a join is refused. The source creates private
 directories/files on supported Unix systems; still protect the account and machine that can use
@@ -79,15 +114,17 @@ report.
 
 ## Passphrase input
 
-The identity passphrase protects a node's key material; an empty one is allowed. A room
-passphrase is a separate join factor. At a terminal, use the masked prompt. For an unattended
+The identity passphrase protects a node's key material. Every node has one: `node create` refuses
+an empty one and creates nothing. A room passphrase is a separate join factor, and it may be
+empty. At a terminal, use the masked prompt. For an unattended
 command, use its supported passphrase-file option and restrict the file to the intended OS user.
 
 `node create` and `node attach` read the identity passphrase from `--passphrase-file`; `room
 create` and `room join` read the room passphrase from `--passphrase-file`, where `-` selects
 stdin. Without a terminal or that explicit input, they fail rather than wait on an unattended
-prompt. A keyring change (`vox trust add`, `remove`, `rename`) takes the identity passphrase only
-typed at a terminal; a room's retention or name asks for none.
+prompt. A keyring change (`vox trust add`, `remove`, `rename`, `drive`, `read`) takes the identity
+passphrase only typed at a terminal, never from a file or the environment; a room's retention or
+name asks for none (see [when the passphrase is asked for](keyring.md#when-the-passphrase-is-asked-for)).
 
 To keep a node attached across daemon restarts:
 
@@ -119,8 +156,8 @@ and shell history expose secrets. `VOX_ROOM_PASSPHRASE` is also refused.
 environment can be read by same-user processes and inherited by children. A supported mechanism is not a promise that it is equally private.
 
 Do not write a real passphrase into a documentation example, paste it to a model, or capture
-it in a screenshot. Empty passphrases change at-rest/join protection; an example should not
-silently opt you into that choice.
+it in a screenshot. An empty room passphrase leaves the room's link as its only join factor; an
+example should not silently opt you into that choice.
 
 ## Output, cursors and status
 
