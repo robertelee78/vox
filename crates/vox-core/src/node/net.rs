@@ -390,6 +390,26 @@ fn heard_count(quic: &quinn::Connection) -> u64 {
     .fold(0u64, |sum, n| sum.wrapping_add(*n))
 }
 
+/// What this end has sent `quic`'s peer that its application asked for: stream and datagram frames,
+/// not the keep-alive's pings. A connection sending any of these is in use (see
+/// [`ConnectionManager::in_use`]).
+fn sent_count(quic: &quinn::Connection) -> u64 {
+    let f = quic.stats().frame_tx;
+    f.stream.wrapping_add(f.datagram)
+}
+
+/// How long a connection in use may hear nothing before every liveness sample probes it: an
+/// anchor's (V210-93), for every connection something is waiting on.
+pub const IN_USE_PROBE_AFTER: Duration = Duration::from_secs(3);
+
+/// How long a connection in use may go unanswered, probed on every sample, before it is taken for
+/// gone and closed: an anchor's (V210-93).
+pub const IN_USE_SILENCE_IS_LOSS: Duration = Duration::from_secs(8);
+
+/// How many probes must go unanswered before a connection in use is taken for gone: an
+/// anchor's (V210-93), so this node's own stall is never read as the peer's silence.
+pub const IN_USE_PROBES_BEFORE_LOSS: u32 = 5;
+
 /// The one byte a liveness probe carries. Too short to be a framed datagram (which starts with an
 /// 8-byte sequence number), so the far end drops it unread; what matters is that the frame is
 /// ack-eliciting.
@@ -458,10 +478,11 @@ pub struct ConnectionManager {
     /// keep serving what is already on them; nothing new is opened on them.
     retiring: Mutex<Vec<(Arc<VoxConnection>, u64)>>,
     /// Per connection (by [`VoxConnection::serial`]): its `heard_count` when
-    /// last sampled, and when that count last moved. The evidence [`SILENCE_IS_DEATH`] reads.
+    /// last sampled, when that count last moved, and what this end had sent then ([`sent_count`]).
+    /// The evidence [`SILENCE_IS_DEATH`] and [`Self::in_use`] read.
     /// Not keyed by quinn's stable id, which a new connection can reuse from a freed one and
     /// so inherit its silence.
-    heard: Mutex<HashMap<u64, (u64, Instant)>>,
+    heard: Mutex<HashMap<u64, (u64, Instant, u64)>>,
     /// Per connection (by serial) that [`Self::close_if_unanswering`] is probing: how many probes
     /// have gone unanswered, and when the last was counted.
     probing: Mutex<HashMap<u64, (u32, Instant)>>,
@@ -746,11 +767,23 @@ impl ConnectionManager {
         let received = heard_count(conn.quinn());
         let now = Instant::now();
         let mut heard = lock(&self.heard);
-        let entry = heard.entry(conn.serial()).or_insert((received, now));
+        let entry = heard
+            .entry(conn.serial())
+            .or_insert_with(|| (received, now, sent_count(conn.quinn())));
         if entry.0 != received {
-            *entry = (received, now);
+            *entry = (received, now, sent_count(conn.quinn()));
         }
         now.saturating_duration_since(entry.1)
+    }
+
+    /// Whether something is waiting on `conn`: this end has sent its peer stream or datagram
+    /// frames since the peer was last heard from. A quiet connection, whose only traffic is the
+    /// keep-alive, is not in use, and is never probed for it.
+    fn in_use(&self, conn: &VoxConnection) -> bool {
+        let _ = self.silent_for(conn);
+        lock(&self.heard)
+            .get(&conn.serial())
+            .is_some_and(|(_, _, sent)| sent_count(conn.quinn()) != *sent)
     }
 
     /// Whether `conn` has been silent past [`SILENCE_IS_DEATH`].
@@ -831,6 +864,38 @@ impl ConnectionManager {
             .iter()
             .map(|(p, c)| (*p, Arc::clone(c)))
             .collect();
+        // **A direct connection something is waiting on is probed as an anchor's is** (V210-93):
+        // silent [`IN_USE_PROBE_AFTER`], probed on every sample, closed once it has answered
+        // nothing for [`IN_USE_SILENCE_IS_LOSS`]. A member is never an anchor (V030-51), so a dead
+        // direct path to the room's host was otherwise noticed only at [`SILENCE_IS_DEATH`]: a
+        // forward whose path died stood dead for 30 s, where it had stood 8 s while the host was
+        // probed as an anchor. Only while in use, so a quiet room costs no more probes than it
+        // did. Silence counts only what authenticates ([`heard_count`]), so garbage under the
+        // connection's ID hides nothing.
+        for (peer, conn) in &peers {
+            if !is_live(conn)
+                || path_class(&self.endpoint, conn) != PathClass::Direct
+                || !self.in_use(conn)
+            {
+                continue;
+            }
+            if let Some(silent) = self.close_if_unanswering(
+                conn,
+                IN_USE_PROBE_AFTER,
+                IN_USE_SILENCE_IS_LOSS,
+                IN_USE_PROBES_BEFORE_LOSS,
+            ) {
+                self.note(
+                    *peer,
+                    format!(
+                        "the connection {} answered nothing for {}s while in use; closed, so \
+                         the next use reaches it again",
+                        conn_tag(conn),
+                        silent.as_secs()
+                    ),
+                );
+            }
+        }
         let retired: Vec<Arc<VoxConnection>> = lock(&self.retiring)
             .iter()
             .map(|(c, _)| Arc::clone(c))
