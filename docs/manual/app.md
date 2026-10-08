@@ -212,8 +212,8 @@ its To: and note in the room on screen (or the next room you open).
 
 Beside the timeline, **MEMBERS** lists the room's other members with their trust: ⇄ for a member
 in your keyring that trusts you back, → for one in your keyring that does not yet, and · with a
-dimmed name marked `not in keyring` for one you have not trusted. VoiceOver says the first two as
-`in keyring, trusts you` and `in keyring`. Under a member in your keyring, its entry's grant:
+dimmed name marked `not in keyring` for one you have not trusted. Under a member in your keyring,
+its entry's grant:
 `read` or `read + drive`. Under a member whose node has said which machine it runs on, that
 claim: `says it runs on macOS 26.2 (aarch64)`.
 
@@ -363,18 +363,20 @@ An urgent message addressed to you also plays a sound. Clicking a notification o
 macOS asks once whether Vox may notify; to change your answer, use System Settings,
 Notifications, Vox.
 
-## Accessibility
+## Contrast and display settings
 
-The app follows your Mac's settings:
+Text is drawn at a contrast of 4.5:1 or more against its background, and card outlines at 4.5:1
+or more. A selected sidebar row is filled with a darker blue than the system's, so its text reads
+at 4.89:1. A selected row or card also has a bar along its leading edge, so a selection never
+rests on colour alone.
 
-- **Reduce Motion** stops its animations.
+The app follows your Mac's display settings (System Settings, Accessibility, Display):
+
 - **Increase Contrast** switches to brighter colours: every text colour at 7:1 or more against
-  its background (an error on a selected row at 6:1), outlines at 3.9:1 or more, and the selection
-  marked with the focus colour.
+  its background (an error on a selected row at 6:1), outlines at 3.9:1 or more, the selected
+  sidebar row's text at 5.02:1, and the selection marked with the focus colour.
+- **Reduce Motion** stops its animations.
 - **Reduce Transparency**: content is drawn in opaque colours only.
-
-A selected row or card has a bar along its leading edge, so a selection never rests on colour
-alone, and card outlines are at 4.5:1 or more.
 
 **View > Bigger** (⌘+), **Smaller** (⌘-) and **Actual Size** (⌘0) change the size of all the
 app's text, buttons and controls, up to twice the usual size.
@@ -385,10 +387,7 @@ Look, Return (or Enter) opens the file, or else the link on its card, and Tab or
 Escape or Space closes a preview however it was opened; one the keyboard opened gives the keyboard
 back to the timeline.
 
-Every control has a VoiceOver label in words: a message reads as one sentence (who wrote, to whom,
-whether urgent, what it says, and who read or pulled it), a room says its group and unread, a
-member its trust, a service card its address, who shares it and its kind, and the status bar
-reads as one sentence. The app is dark only.
+The app is dark only.
 
 ## Sessions
 
