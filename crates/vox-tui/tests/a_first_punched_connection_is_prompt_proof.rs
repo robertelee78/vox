@@ -31,6 +31,11 @@
 //! - at least one unsolicited peer datagram was **dropped** by a NAT in that sample — the path was
 //!   punched through a filter that was really there, not an open one.
 //!
+//! **What the emulator does not cover:** what a node says nearby (`node::nearby`, the local
+//! multicast group) goes around the NATs. On a Linux host with a public address the guest was
+//! seen dialling the host at the machine's public address it heard there (io, 2026-10-08); that
+//! dial failed and decided nothing, but a nearby dial that landed would be a path no NAT made.
+//!
 //! **Control, same run:** both NATs made **symmetric** (a new mapping per destination, so the
 //! observed address is useless to the peer and no punch can work). The pair must stay relayed —
 //! answered, but not one payload byte peer to peer — or the emulator leaks and this proof reports
