@@ -18,7 +18,9 @@
 //! - **Rejoin.** Alice leaves, then joins again through bob with the room's address and passphrase,
 //!   as anyone joins. Within [`WITHIN`] bob's and carol's rosters name her again (carol learns it
 //!   only from her signed statement that she is back), what she posts reaches both and what bob
-//!   posts reaches her, and bob has not frozen her for signing two entries at one position.
+//!   posts reaches her, and bob has not frozen her for signing two entries at one position. Then
+//!   she leaves again, joins again and leaves a third time (#564): each leave drops her from bob's
+//!   and carol's rosters within [`WITHIN`], as the first did.
 //! - **End.** Bob, who did not create the room, is refused `vox room admin add`. Alice, its
 //!   creator, makes bob and carol admins and takes carol's back; every member's `vox room admin
 //!   list` says so. Carol is then refused `vox room end`, and bob, an admin, ends the room. Within
@@ -50,7 +52,8 @@
 //! member that left still synced with (leave); an end that leaves the members' copies (end, idle
 //! end, TUI), or their agent cursor files (end); a post taken after the end, an admin's end ignored, or a join to an ended room
 //! refused as a wrong passphrase (end); the TUI's `:leave` acting with no confirmation, or saying
-//! "done" in place of what it did (TUI); the CLI's before-sentence dropped (leave).
+//! "done" in place of what it did (TUI); the CLI's before-sentence dropped (leave); a readmission
+//! that outlives the departure it undid (rejoin: alice's second leave never leaves bob's roster).
 
 #![cfg(unix)]
 
@@ -369,6 +372,48 @@ fn a_member_that_left_joins_again_and_is_a_member_again() {
          her feed in the room when she joined again. Frozen: {frozen:?}"
     );
     eprintln!("[proof] rejoin: alice and bob read each other again, and bob froze nobody");
+
+    // **Leaving again is a leave** (#564): bob, who let alice in again, kept her readmission for
+    // good, so her second departure reached him and was never applied. Leave, join again, leave:
+    // each leave drops her from bob's and carol's rosters within the bound the first one had, and
+    // a second readmission does not stand for the third leave either.
+    let leaves = |n: u32| {
+        let o = alice.vox(None, &["room", "leave", id]);
+        assert!(o.ok, "PRODUCT: alice's leave {n} was refused: {o:?}");
+        for w in [bob, carol] {
+            let (gone, o) = poll(w, &["room", "roster", id], WITHIN, |o| {
+                o.ok && !o.stdout.contains(&alice.b32())
+            });
+            assert!(
+                gone,
+                "PRODUCT: {WITHIN:?} after alice's leave {n}, {}'s roster \
+                 still names her: {o:?}\n{}'s daemon said:\n{}",
+                w.name,
+                w.name,
+                std::fs::read_to_string(tmp.path().join(format!("{}.daemon.err", w.name)))
+                    .unwrap_or_default()
+            );
+        }
+    };
+    let joins = |n: u32| {
+        let o = alice.vox_in(
+            None,
+            &["room", "join", "--passphrase-file", "-", &link],
+            Some("channel passphrase"),
+        );
+        assert!(o.ok, "PRODUCT: alice's join {n} was refused: {o:?}");
+        let (back, o) = poll(bob, &["room", "roster", id], WITHIN, |o| {
+            o.ok && o.stdout.contains(&alice.b32())
+        });
+        assert!(
+            back,
+            "PRODUCT: {WITHIN:?} after alice's join {n}, bob's roster does not name her: {o:?}"
+        );
+    };
+    leaves(2);
+    joins(3);
+    leaves(3);
+    eprintln!("[proof] rejoin: alice's second and third leaves each dropped her from both rosters");
 }
 
 #[test]
