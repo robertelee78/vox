@@ -203,6 +203,12 @@ connection, bound to the TLS session by its exporter.
     **Timing.** The listener MUST send every outcome of an `ASK`, a `PROVE` or a refusal, no earlier
     than 50 ms after the `ASK` arrived plus a uniformly random 0–50 ms, so a refusal and a `PROVE` are
     not told apart by timing at the scale an ML-DSA signature takes.
+    **Starting.** A daemon MUST NOT accept a connection before its first node is attached: until
+    then it has nobody to answer for, and a refusal then turned a restarting anchor's own members
+    away (`every_member_is_back_after_an_anchor_restart_proof`). A dial in that gap waits to be
+    answered. A node attached later is refused in its own gap as not attached: a daemon MUST NOT
+    hold a dial for a node that is on disk but not attached, which would tell which nodes it holds
+    (ADR-026 G-1).
 33. **Nothing before the exchange.** QUIC's own limits MUST hold a connection to the exchange until
     flight 3 verifies: at most 2 client-opened bidirectional streams, 0 unidirectional streams and a
     64 KiB connection window. The listener MUST raise them to the normal values (requirement 24) only
