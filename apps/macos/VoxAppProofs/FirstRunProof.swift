@@ -1424,9 +1424,17 @@ final class FirstRunProof: XCTestCase {
                 ui.terminate()
                 throw Apparatus("Vox.app is on the account's real profile, not this run's scratch one: it shows \(shown(real)); stopped before any step")
             }
-            if scratchSigns.contains(where: { locate(ui, $0) != nil }) { return }
-            if throughDaemon.contains(where: { locate(ui, $0) != nil }), !voxBefore.isEmpty,
-               pids("vox").isSubset(of: voxBefore) { return }
+            if let sign = scratchSigns.first(where: { locate(ui, $0) != nil }) {
+                print("[guard] Vox.app (pid \(pid)) is on this run's scratch profile: it shows \(sign)")
+                return
+            }
+            if let screen = throughDaemon.first(where: { locate(ui, $0) != nil }), !voxBefore.isEmpty {
+                let voxNow = pids("vox")
+                if voxNow.isSubset(of: voxBefore) {
+                    print("[guard] Vox.app (pid \(pid)) reached this run's daemon: it shows \(screen), and no vox started since (vox pids \(voxNow.sorted()))")
+                    return
+                }
+            }
             Thread.sleep(forTimeInterval: 0.5)
         }
         keepTree(ui, "Vox.app could not be shown on the scratch profile")
