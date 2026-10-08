@@ -33,12 +33,22 @@ pub struct NetShape {
 impl NetShape {
     /// The machine's shape now.
     pub async fn now() -> Self {
+        // The routes are asked of the kernel by a blocking read: off the async workers, so a slow
+        // answer holds no worker (and with it the runtime's timers) while it comes.
+        let (route_v4, route_v6) = tokio::task::spawn_blocking(|| {
+            (
+                route_v4_now(),
+                crate::nat::portmap::gateway::default_gateway_v6()
+                    .ok()
+                    .map(|(ip, _)| ip),
+            )
+        })
+        .await
+        .unwrap_or((None, None));
         Self {
             addrs: crate::nat::reachability::local_route_ips().await,
-            route_v4: route_v4_now(),
-            route_v6: crate::nat::portmap::gateway::default_gateway_v6()
-                .ok()
-                .map(|(ip, _)| ip),
+            route_v4,
+            route_v6,
         }
     }
 }
