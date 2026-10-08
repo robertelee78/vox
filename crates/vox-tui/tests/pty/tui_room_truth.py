@@ -87,12 +87,23 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             joined. alice trusts it.", naming neither Erin, whom Bob trusts and who never granted
             Frank, nor anyone outside Bob's keyring (ADR-028 K-7, #476); Frank is in no keyring of
             Bob's after;
+  offer     Frank, who joined after Bob, waits under "needs you" as an offer; selected, his
+            fingerprint shows grouped with its art; `x` dismisses it, on Bob's node alone (nothing
+            reaches the room); with Bob's node detached and attached again, Frank stays dismissed
+            and Carol (who trusts Bob) is still offered (ADR-028 K-15, K-17, K-18, #526);
+  reoffer   Frank leaves and joins again, and is offered again; dismissed, he leaves and joins once
+            more, and is offered again (K-18: a dismissal is kept against the join);
   trust     the join's line offers ":trust <frank's first 8>" (ADR-028 K-5, #475); `t` on Frank
             in Bob's members pane opens the trust prompt, showing his fingerprint; Dave's pasted
             there adds nothing and shows both fingerprints; Frank's own, pasted through the hint's
             `:trust`, in groups and upper case, adds him once the identity passphrase is typed
             into the prompt (Bob's keyring window is a minute, and has closed): a wrong one adds
             nothing and is never shown;
+  offerback Bob having trusted Frank, Frank's `vox trust offers` lists Bob as one that trusts
+            him; Frank accepts with `vox trust add`, and each reads the other (K-17, #527);
+  accept    Carol's offer, accepted in Bob's TUI, asks her name (her fingerprint shown) and read or
+            read + drive, never a fingerprint to compare; she is then in his keyring and no longer
+            offered (K-16, #527); run after `depths`, since every claim before it reads Carol as out of the keyring;
   onenode   `:node spare` is refused, naming the one node this window acts as, and the window
             still acts as default: its status bar and sidebar say so (ADR-028 E-4, #470);
   to        `:to alice` and `:urgent` show on the composer as "To: alice · urgent", and the
@@ -182,7 +193,7 @@ VOX, TAG = sys.argv[1], sys.argv[2]
 # Sized for the debug build, whose joins grind their proof of work for minutes: three joins at
 # JOIN_SECS each (two at once, then Frank's), and the rest (about 150 s in debug, and 90 s more for
 # the depths' three TUIs). The Rust wrapper's bound sits above it.
-BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "1750"))
+BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "1950"))
 # A member waits 480 s for a joiner's proof of work (V210-87), plus its 5 s slack: a join that has
 # not returned by then is past what the product allows, and is a named RED.
 JOIN_SECS = 490
@@ -1044,9 +1055,14 @@ try:
     side = lambda: [r.strip().strip("│").strip() for r in pane(tui.display(), "Rooms")]
     def regions():
         s = side()
-        heads = [i for i, r in enumerate(s) if r == "needs you (1)"]
-        under = s[heads[0] + 1] if heads and heads[0] + 1 < len(s) else ""
-        return (bool(heads) and under.lstrip("▶ ").startswith("family ") and "to you 1" in under
+        # Trust offers wait under needs you too, first (ADR-028 K-15): the room is the row after
+        # them, and the count is the room and the offers.
+        heads = [i for i, r in enumerate(s) if r.startswith("needs you (")]
+        rows = s[heads[0] + 1:] if heads else []
+        offers = [r for r in rows if r.lstrip("▶ ").startswith("offer: ")]
+        under = next((r for r in rows if not r.lstrip("▶ ").startswith("offer: ")), "")
+        return (bool(heads) and s[heads[0]] == f"needs you ({1 + len(offers)})"
+                and under.lstrip("▶ ").startswith("family ") and "to you 1" in under
                 and "spare  detached" in s and "default  attached" in s
                 and bool(s) and s[0] == "node default · attached")
     tui.until(regions, 30, 1)
@@ -1074,6 +1090,93 @@ try:
           f"before alice trusted frank, bob's TUI said {before_grant!r} (wanted {alone!r}); after, "
           f"{after_grant!r} (wanted {trusted!r}); frank absent from bob's keyring: {unadded}")
 
+    stage("offer")
+    # ADR-028 K-15, K-18 (#526): Frank, who joined after Bob and is in no keyring of his, waits as
+    # an offer under "needs you", his fingerprint grouped with its art when selected. Dismissing
+    # it is Bob's alone: it goes, and nothing reaches the room. It stays dismissed after Bob's TUI
+    # is closed and opened again, while Carol's offer (she trusts Bob, K-17) is still there.
+    grouped = lambda f: " ".join(f[i:i + 4] for i in range(0, len(f), 4))
+    # The whole screen, one line: the offer stages' own, since later stages define `flat` for a pane.
+    whole = lambda: " ".join(r.strip() for r in tui.display())
+    offer_row = lambda who: f"offer: {grouped(fp[who])[:9]}…"
+    offered = lambda who: any(r.lstrip("▶ ").startswith(offer_row(who)) for r in side())
+    tui.key("\x1b", 1)  # the room list
+    listed_frank = tui.until(lambda: offered("frank"), 60, 1)
+    def select_offer(who):
+        """Up through the sidebar until `who`'s offer is the one shown: its card's first row, the
+        first five groups of its fingerprint, beside the art."""
+        for _ in range(30):
+            if "Trust offer" in whole() and grouped(fp[who])[:24] in re.sub(r"\s+", " ", whole()):
+                return True
+            tui.key("\x1b[A", 0.5)  # Up
+        return False
+    card = select_offer("frank")
+    art = any(c in whole() for c in "◢◣◤◥")
+    # Nothing reaches the room: what Alice holds of it is unchanged.
+    rows_before = len(run("alice", "room", "read", room, "--json", "--limit", "1000").stdout.splitlines())
+    tui.key("x", 2)
+    dismissed_said = f"dismissed the offer of {fp['frank'][:26]}" in re.sub(r"\s+", " ", whole())
+    frank_gone = tui.until(lambda: not offered("frank"), 10, 0.5)
+    tui.pump(3)
+    rows_after = len(run("alice", "room", "read", room, "--json", "--limit", "1000").stdout.splitlines())
+    # Bob's node detached and attached again, which is what reads the dismissals back from its
+    # store: what was dismissed stays dismissed; what was not stays offered.
+    if not tui.stop():
+        apparatus(f"bob's `vox tui` (pid {tui.pid}) could not be stopped to open it again")
+    dt = run("bob", "node", "detach", "default")
+    if dt.returncode != 0: product(f"bob's `vox node detach default` failed: {dt.stderr.strip()}")
+    default_detached = lambda: any(l.split()[:1] == ["default"] and "detached" in l
+                                   for l in run("bob", "node", "list").stdout.splitlines())
+    if not until(default_detached, 30, 1):
+        product("bob's node never read as detached within 30 s: " + run("bob", "node", "list").stdout)
+    # Attached again as it was, kept, so a `vox tui` naming no node later still finds it.
+    reattached = run("bob", "node", "attach", "default", "--keep", "--passphrase-file", f"{S}/idpass")
+    if reattached.returncode != 0:
+        product(f"bob's `vox node attach default --keep` failed: {reattached.stderr.strip()}")
+    tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0", "--anchor", spec, "--node", "default"],
+              tui_env(COLORTERM="truecolor", VOX_NOTIFY_COMMAND=f"{S}/note.sh",
+                      VOX_TEST_KEYRING_WINDOW_SECS="60"))
+    tui.pump(4)
+    unlock(tui)
+    tui.key("\x1b", 1)
+    carol_kept = tui.until(lambda: offered("carol"), 60, 1)
+    frank_kept_out = not offered("frank")
+    claim("offer", listed_frank and card and art and dismissed_said and frank_gone
+          and rows_after == rows_before > 0 and carol_kept and frank_kept_out,
+          f"frank offered under needs you: {listed_frank}; selected, his card with art: {card} "
+          f"{art}; x: said {dismissed_said}, gone {frank_gone}; the room's rows as alice holds them {rows_before} → "
+          f"{rows_after}; after bob's node was detached and attached again: carol still offered {carol_kept}, frank "
+          f"still dismissed {frank_kept_out}; sidebar {side()!r}")
+
+    stage("reoffer")
+    # A dismissal is kept against Frank's join: each time he leaves and joins again he is offered
+    # again, the second time as well as the first, dismissed in between.
+    def rejoin(n):
+        lv = run("frank", "room", "leave", room)
+        if lv.returncode != 0: product(f"frank's `vox room leave` ({n}) failed: {lv.stderr.strip()}")
+        j = run("frank", "room", "join", "--passphrase-file", "-", link, stdin="room pass")
+        if j.returncode != 0: product(f"frank's `vox room join` ({n}) failed: {j.stderr.strip()}")
+        return tui.until(lambda: offered("frank"), 120, 1)
+    again = rejoin("again")
+    again_side = side()
+    redismissed = select_offer("frank")
+    tui.key("x", 2)
+    redismissed = redismissed and tui.until(lambda: not offered("frank"), 10, 0.5)
+    twice = rejoin("a third time")
+    # The room selected and open again, as the later stages expect: Down past the offers, and
+    # Enter on it if the dismissed offer's card left no room open; Esc back to the room list.
+    for _ in range(10):
+        if any(r.startswith("▶ family") for r in side()):
+            break
+        tui.key("\x1b[B", 0.5)
+    if "No room open" in whole():
+        tui.key("\r", 2)
+        tui.key("\x1b", 1)
+    claim("reoffer", again and redismissed and twice,
+          f"after frank left and joined again, offered: {again} (sidebar {again_side!r}); dismissed "
+          f"again: {redismissed}; after he left and joined once more, offered: {twice} (sidebar "
+          f"{side()!r})")
+
     stage("trust")
     # ADR-028 K-5 (#475): the join's line offers the one trust action, ":trust <frank's first 8>";
     # `t` on Frank in the members pane opens the same prompt. A fingerprint pasted that is not
@@ -1081,6 +1184,7 @@ try:
     flat_ws = lambda: re.sub(r"\s+", " ", flat())
     hint = f":trust {fp['frank'][:8]}"
     hinted = hint in flat_ws()
+    hint_screen = [] if hinted else [r.rstrip() for r in tui.display() if r.strip()]
     grouped = lambda f: " ".join(f[i:i + 4] for i in range(0, len(f), 4))
     in_ring = lambda: fp["frank"] in run("bob", "trust", "list").stdout
     tui.key("\r", 2)   # into the room
@@ -1117,12 +1221,33 @@ try:
     tui.key("\x1b", 2)  # back to the room list
     claim("trust", hinted and prompt_seen and mismatch_said and not mismatch_added and closed
           and not wrong_pass_added and not shown_secret and matched and match_said,
-          f"the join offered {hint!r}: {hinted}; `t` on frank opened the prompt with his "
+          f"the join offered {hint!r}: {hinted}{'' if hinted else f' (the screen: {hint_screen!r})'}; `t` on frank opened the prompt with his "
           f"fingerprint: {prompt_seen}; dave's pasted: both shown and told not to trust: "
           f"{mismatch_said}, frank added anyway: {mismatch_added}; with the keyring closed "
           f"({closed}), a wrong passphrase added him: {wrong_pass_added}, was shown: {shown_secret}, "
           f"the TUI said {wrong_pass_said!r}; frank's own pasted through {hint!r} with the "
           f"passphrase: added {matched}, said so {match_said}")
+
+    stage("offerback")
+    # ADR-028 K-17 (#527): Bob trusted Frank, so Frank is offered Bob back, as one that trusts
+    # him; Frank accepting completes the pair, and each reads what the other writes.
+    def frank_offers():
+        r = run("frank", "trust", "offers")
+        return r.stdout if r.returncode == 0 else ""
+    back = until(lambda: fp["bob"] in frank_offers().replace(" ", "") or grouped(fp["bob"])[:24]
+                 in frank_offers(), 120, 2)
+    offers_text = frank_offers()
+    t = run("frank", "trust", "add", fp["bob"], "--name", "bob", "--identity-passphrase-file", f"{S}/idpass")
+    if t.returncode != 0: product(f"frank's `vox trust add` of bob failed: {t.stderr.strip()}")
+    p = run("frank", "room", "post", room, "FRANK-TO-ALL-527")
+    if p.returncode != 0: product(f"frank's `vox room post` failed: {p.stderr.strip()}")
+    p = run("bob", "room", "post", room, "BOB-TO-ALL-527")
+    if p.returncode != 0: product(f"bob's `vox room post` failed: {p.stderr.strip()}")
+    bob_reads = until(lambda: "FRANK-TO-ALL-527" in run("bob", "room", "read", room, "--limit", "500").stdout, 90, 2)
+    frank_reads = until(lambda: "BOB-TO-ALL-527" in run("frank", "room", "read", room, "--limit", "500").stdout, 90, 2)
+    claim("offerback", back and "trusts you" in offers_text and bob_reads and frank_reads,
+          f"frank offered bob back: {back} ({offers_text.strip()[-160:]!r}); once frank accepted, "
+          f"bob read frank: {bob_reads}, frank read bob: {frank_reads}")
 
     stage("onenode")
     # After `trust`: its refusal takes the status line, where the join's offer to trust is read.
@@ -1671,6 +1796,42 @@ try:
         if not tui.stop():
             apparatus(f"`vox tui` ({name}, pid {tui.pid}) could not be stopped")
     claim("depths", all(depths.values()), f"{depths!r}")
+
+    stage("accept")
+    # ADR-028 K-16 (#527): accepting an offer in the TUI asks a name, then read or read + drive,
+    # then the passphrase, and never a fingerprint to compare; Carol is then in Bob's keyring.
+    # After `depths`, every claim before it reading Carol as out of Bob's keyring; and before
+    # `inline`, whose TUI draws images a terminal emulator here cannot read.
+    tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0", "--node", "default"],
+              tui_env(COLORTERM="truecolor"))
+    tui.pump(4)
+    unlock(tui)
+    # Back to the room list from wherever the TUI opened: a room, or a Session in it.
+    for _ in range(3):
+        if "Rooms (Enter" in whole():
+            break
+        tui.key("\x1b", 1)
+    carol_card = select_offer("carol")
+    if not carol_card:
+        print(f"{TAG} accept: the screen while looking for carol's offer:\n{tui.text()}")
+    tui.key("\r", 2)
+    prompt = re.sub(r"\s+", " ", whole())
+    asked_name = "your name for them" in prompt and grouped(fp["carol"])[:24] in prompt
+    asked_compare = "as they gave it to you" in prompt
+    tui.key("carol\r", 1)
+    asked_cap = "read, or read + drive" in re.sub(r"\s+", " ", whole())
+    tui.key("\r", 1)   # read, the default
+    tui.key("id pass\r", 3)
+    in_ring_carol = until(lambda: fp["carol"] in run("bob", "trust", "list").stdout, 30, 1)
+    said_trust = "you now trust carol" in re.sub(r"\s+", " ", whole())
+    claim("accept", carol_card and asked_name and asked_cap and not asked_compare and in_ring_carol
+          and said_trust and not offered("carol"),
+          f"carol's offer selected: {carol_card}; the prompt asked her name with her fingerprint "
+          f"shown: {asked_name}, read or read + drive: {asked_cap}, a fingerprint to compare: "
+          f"{asked_compare}; carol in bob's keyring: {in_ring_carol}; said so: {said_trust}; "
+          f"still offered: {offered('carol')}")
+    if not tui.stop():
+        apparatus(f"bob's `vox tui` (pid {tui.pid}) could not be stopped after `accept`")
 
     stage("inline")
     # Images drawn inline, only once verified (ADR-028 F-11, #502). The anchor comes back on its

@@ -51,6 +51,7 @@ pub mod nameipc;
 pub mod nearby;
 pub mod net;
 pub mod network;
+pub mod offers;
 pub mod open_rooms;
 pub mod pairwise_stream;
 pub mod passphrase;

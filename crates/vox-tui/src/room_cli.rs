@@ -4949,6 +4949,79 @@ pub async fn trust_remove(paths: &Paths, target: Digest32) -> Result<(), AppErro
     }
 }
 
+/// The members offered to this node's keyring (ADR-028 K-15 – K-18), as the node has them.
+pub(crate) async fn offers_of(
+    client: &mut IpcClient,
+) -> Result<Vec<vox_core::node::api::Offer>, AppError> {
+    match client.request(&Request::Offers).await {
+        Ok(Frame::Offers { offers }) => Ok(offers),
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
+        Ok(other) => Err(crate::client::unexpected(&other)),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+/// `vox trust offers`: each node offered to the keyring, its fingerprint grouped with its art
+/// (K-1), why it is offered, which of the nodes in the keyring trust it (K-7), and how to accept
+/// or dismiss it. A read: no passphrase.
+pub async fn trust_offers(paths: &Paths) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let offers = offers_of(&mut client).await?;
+    if offers.is_empty() {
+        println!(
+            "no offers: every node you share a room with is in your keyring, or was dismissed"
+        );
+        return Ok(());
+    }
+    for (i, o) in offers.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        let fp = b32_encode(&o.member);
+        for row in vox_text::fingerprint::card(&fp) {
+            println!("{row}");
+        }
+        // Word for word what the TUI and the app say of it (ADR-028 CL-1).
+        let in_rooms: Vec<String> = o.rooms.iter().map(|r| format!("{:?}", r.name)).collect();
+        println!("  {}", o.said);
+        println!("  in {}", listed(&in_rooms, ""));
+        println!(
+            "  accept: vox trust add {fp} --name <name> [--drive]   dismiss: vox trust dismiss {}",
+            short(&o.member)
+        );
+    }
+    Ok(())
+}
+
+/// `vox trust dismiss`: dismiss an offer on this node alone (K-18). The node offered is not told.
+pub async fn trust_dismiss(paths: &Paths, fingerprint: &str) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let offers = offers_of(&mut client).await?;
+    let ids: Vec<Digest32> = offers.iter().map(|o| o.member).collect();
+    let member = resolve_prefix(fingerprint, &ids).map_err(|_| {
+        AppError::Usage(format!(
+            "no offer matches {fingerprint:?}; `vox trust offers` lists them"
+        ))
+    })?;
+    println!(
+        "vox: about to dismiss the offer of {}: on this node alone; it is not told, and stays out \
+         of your keyring",
+        crate::ident::author_id(&member)
+    );
+    match client.request(&Request::DismissOffer { member }).await {
+        Ok(Frame::Ok) => {
+            println!(
+                "vox: dismissed the offer of {}; if it leaves and joins again, it is offered again",
+                crate::ident::author_id(&member)
+            );
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
+        Ok(other) => Err(crate::client::unexpected(&other)),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
 /// `vox trust list`, asked of the running node: a read, so no passphrase (V210-165).
 pub async fn trust_list(paths: &Paths) -> Result<(), AppError> {
     let mut client = attach(paths).await?;

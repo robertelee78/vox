@@ -880,11 +880,7 @@ impl DaemonCore {
                     .collect()
             })
             .unwrap_or_default();
-        let who = match trusters.as_slice() {
-            [] => "No one you trust trusts it yet.".to_owned(),
-            [one] => format!("{one} trusts it."),
-            [rest @ .., last] => format!("{} and {last} trust it.", rest.join(", ")),
-        };
+        let who = vox_text::offer::trusted_by(&trusters);
         // Trust is offered where it matters (ADR-028 K-5), with the one action used everywhere.
         let offer = if self.snapshot.trusted.iter().any(|(t, _)| *t == peer) {
             String::new()
@@ -1912,6 +1908,7 @@ impl DaemonCore {
             tunnels: snap.tunnels,
             closed_tunnels: snap.closed_tunnels,
             keyring: snap.trusted.clone(),
+            offers: snap.offers.clone(),
             decisions: self.decisions(),
             listening: self
                 .listening
@@ -2325,6 +2322,33 @@ impl CoreHandle for DaemonCore {
             Command::RenameRoom { channel_id, name } => {
                 self.send(Request::RenameRoom { channel_id, name })
             }
+            Command::AcceptOffer {
+                target,
+                petname,
+                drive,
+                identity_passphrase,
+            } => match self.send(Request::Trust {
+                target,
+                petname: petname.clone(),
+                identity_passphrase: Zeroizing::new(secret(&identity_passphrase)),
+                full_history: false,
+                drive,
+            }) {
+                CommandStatus::Done => CommandStatus::Said(format!(
+                    "you now trust {petname} ({}): it may read what you write in every room you \
+                     share; it is offered you back",
+                    if drive { "read + drive" } else { "read" }
+                )),
+                other => other,
+            },
+            Command::DismissOffer { member } => match self.send(Request::DismissOffer { member }) {
+                CommandStatus::Done => CommandStatus::Said(format!(
+                    "dismissed the offer of {} on this node alone: it is not told, and stays \
+                         out of your keyring",
+                    crate::ident::author_id(&member)
+                )),
+                other => other,
+            },
             Command::Trust {
                 target,
                 petname,
