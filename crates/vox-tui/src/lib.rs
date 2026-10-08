@@ -44,6 +44,7 @@ pub mod node_tasks;
 pub mod notify;
 pub mod opencode_mirror;
 pub mod ping;
+pub mod platform;
 pub mod room_cli;
 pub mod room_map;
 pub mod session_cli;

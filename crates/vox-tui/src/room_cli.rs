@@ -886,6 +886,8 @@ struct Reach {
     /// The `data.wake` of each of its sessions' `hello`s still in force (no later `bye`): `""`
     /// for a hello that did not say. Empty when none announced itself.
     wakes: Vec<String>,
+    /// The machine each of those hellos says it runs on (ADR-020 §4.9b), its fields as they came.
+    platforms: Vec<serde_json::Value>,
     /// When it last posted as an agent (a structured post), ms since the epoch.
     last_posted: Option<u64>,
     /// Whether this identity consents to it reading, and it to this identity.
@@ -901,6 +903,7 @@ impl Reach {
             "name": self.name,
             "announced": !self.wakes.is_empty(),
             "wake": self.wakes,
+            "platforms": self.platforms,
             "last_posted_millis": self.last_posted,
             "you_trust": self.you_trust,
             "it_trusts": self.it_trusts,
@@ -934,15 +937,30 @@ fn reach_of(
     use vox_agentcomms::envelope::{BYE, HELLO};
     let theirs = || snap.posted.iter().filter(|p| p.author == *fp);
     // A session's hello is in force until a later `bye` from the same session.
-    let wakes: Vec<String> = theirs()
-        .filter(|h| h.envelope.kind == HELLO)
-        .filter(|h| {
+    let in_force = || {
+        theirs().filter(|h| h.envelope.kind == HELLO).filter(|h| {
             !theirs().any(|b| {
                 b.envelope.kind == BYE
                     && b.envelope.from == h.envelope.from
                     && b.created_millis >= h.created_millis
             })
         })
+    };
+    // Which machine each says it runs on (ADR-020 §4.9b): the node's own claim, said as one.
+    let mut platforms: Vec<serde_json::Value> = Vec::new();
+    let mut machines: Vec<String> = Vec::new();
+    for h in in_force() {
+        let fields = crate::platform::fields(&h.envelope.data);
+        if !platforms.contains(&fields) {
+            platforms.push(fields);
+        }
+        if let Some(said) = crate::platform::claim(&h.envelope.data) {
+            if !machines.contains(&said) {
+                machines.push(said);
+            }
+        }
+    }
+    let wakes: Vec<String> = in_force()
         .map(|h| {
             h.envelope
                 .data
@@ -971,6 +989,9 @@ fn reach_of(
             .to_owned(),
         );
     }
+    if !machines.is_empty() {
+        parts.push(format!("it says it runs on {}", machines.join(", ")));
+    }
     let (you_trust, it_trusts) = (outbound.contains(fp), inbound.contains(fp));
     parts.push(
         if you_trust {
@@ -994,6 +1015,7 @@ fn reach_of(
     Reach {
         name: crate::ident::name_of(fp),
         wakes,
+        platforms,
         last_posted,
         you_trust,
         it_trusts,
