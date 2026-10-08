@@ -61,7 +61,9 @@ check_real() {
 # **Preflight: everything this run needs, checked in seconds, before any build.**
 # The app this run proves: the one given, or the one it builds here.
 if [ -n "${VOX_PROOF_APP:-}" ]; then
-    APP="$(cd "$VOX_PROOF_APP" && pwd)"
+    # The physical path (/private/var, not /var): the one the running app reports, so the proof
+    # attaches to the copy the stager starts instead of launching one of its own.
+    APP="$(cd "$VOX_PROOF_APP" && pwd -P)"
 else
     APP="$DERIVED/Build/Products/Release/Vox.app"
 fi
@@ -113,7 +115,9 @@ xcodebuild -project apps/macos/Vox.xcodeproj -scheme Vox -configuration Release 
     build-for-testing
 
 if [ -n "${VOX_PROOF_APP:-}" ]; then
-    APP="$(cd "$VOX_PROOF_APP" && pwd)"
+    # The physical path (/private/var, not /var): the one the running app reports, so the proof
+    # attaches to the copy the stager starts instead of launching one of its own.
+    APP="$(cd "$VOX_PROOF_APP" && pwd -P)"
     [ -x "$APP/Contents/Helpers/vox" ] || {
         echo "app-proofs: APPARATUS: $APP holds no Contents/Helpers/vox" >&2
         exit 2

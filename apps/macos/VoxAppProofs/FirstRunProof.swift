@@ -1406,6 +1406,11 @@ final class FirstRunProof: XCTestCase {
         }
         if given {
             givenPid = pid
+            // Attached only: an XCUIApplication that does not see it running would launch a second
+            // copy itself, through NSWorkspace, with no environment. That is never done.
+            guard ui.state != .notRunning else {
+                throw Apparatus("XCTest does not see the Vox.app the stager started (pid \(pid), \(executable(pid))) as \(appPath): refusing to let it launch one itself, without this run's environment")
+            }
             ui.activate()
         }
         // The profile, positively, before any step. The account's own config has answered the
@@ -1420,9 +1425,10 @@ final class FirstRunProof: XCTestCase {
         let until = Date().addingTimeInterval(30)
         while Date() < until {
             if let real = locate(ui, realRoot) {
+                let said = shown(real)
                 keepTree(ui, "Vox.app showed the account's data root")
                 ui.terminate()
-                throw Apparatus("Vox.app is on the account's real profile, not this run's scratch one: it shows \(shown(real)); stopped before any step")
+                throw Apparatus("Vox.app is on the account's real profile, not this run's scratch one: it shows \(said); stopped before any step")
             }
             if let sign = scratchSigns.first(where: { locate(ui, $0) != nil }) {
                 print("[guard] Vox.app (pid \(pid)) is on this run's scratch profile: it shows \(sign)")
