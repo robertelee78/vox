@@ -60,6 +60,9 @@ cleanup() {
     stop "$ASKING"
     stop "$PAGE"
     stop "$DAEMON"
+    # The demo's build (its own vox and the renderer, about 1 GB) goes; its data root (small)
+    # stays to be read. Dozens of runs left behind filled the disk.
+    rm -rf "$BUILD"
     echo "app-screenshots: the demo data root was $DEMO (scratch; remove it when done)"
 }
 # However the script ends, its demo daemon and page server stop: a signal exits through the
