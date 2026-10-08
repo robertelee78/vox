@@ -263,6 +263,9 @@ struct Projected {
     names: vox_core::node::resolver::VoxResolver,
     len: usize,
     rows: std::sync::Arc<Vec<MessageView>>,
+    /// Where each row is, by entry hash: in `rows`, and in the rows held. What changes with
+    /// [`Own`] is projected again for its rows alone.
+    at: std::collections::HashMap<Digest32, (usize, usize)>,
 }
 
 impl std::fmt::Debug for DaemonCore {
@@ -1515,30 +1518,61 @@ impl DaemonCore {
                 if p.me == me
                     && p.verified == images.len()
                     && p.trusted.as_slice() == trusted
-                    && p.own == *own
                     && p.names == *names
                     && p.len <= held.len()
                     && !quoted_late(p) =>
             {
                 if p.len < held.len() {
                     // A Session's opening and end are not the room's conversation (ADR-029 CL-2).
-                    std::sync::Arc::make_mut(&mut p.rows).extend(
-                        held[p.len..]
-                            .iter()
-                            .filter(|r| !crate::agent_hook::is_session_record(r))
-                            .map(view_of),
-                    );
+                    let rows = std::sync::Arc::make_mut(&mut p.rows);
+                    for (i, r) in held.iter().enumerate().skip(p.len) {
+                        if !crate::agent_hook::is_session_record(r) {
+                            p.at.insert(r.entry_hash, (rows.len(), i));
+                            rows.push(view_of(r));
+                        }
+                    }
                     p.len = held.len();
+                }
+                // **Who read, holds or pulled this node's messages changes with each one it
+                // sends**, and only those messages say it (ADR-028 R-6, F-7): they are projected
+                // again, not the room. Projecting the whole room again for it made each frame
+                // after a send cost the room's history.
+                if p.own != *own {
+                    let mine = |o: &Own| -> Vec<Digest32> {
+                        o.read_by
+                            .iter()
+                            .map(|(e, _)| *e)
+                            .chain(o.held.iter().map(|(e, _)| *e))
+                            .chain(o.pulled_by.iter().map(|(e, _)| *e))
+                            .collect()
+                    };
+                    let mut again = mine(&p.own);
+                    again.extend(mine(own));
+                    again.sort_unstable();
+                    again.dedup();
+                    let rows = std::sync::Arc::make_mut(&mut p.rows);
+                    for e in again {
+                        if let Some(&(v, h)) = p.at.get(&e) {
+                            let r = &held[h];
+                            rows[v].read_by = readers(r);
+                            rows[v].pulled_by = pullers(r);
+                            rows[v].whereabouts = whereabouts(r);
+                        }
+                    }
+                    p.own = own.clone();
                 }
                 std::sync::Arc::clone(&p.rows)
             }
             _ => {
-                let rows = std::sync::Arc::new(
-                    held.iter()
-                        .filter(|r| !crate::agent_hook::is_session_record(r))
-                        .map(view_of)
-                        .collect::<Vec<_>>(),
-                );
+                let mut at = std::collections::HashMap::new();
+                let mut rows = Vec::new();
+                for (i, r) in held.iter().enumerate() {
+                    if !crate::agent_hook::is_session_record(r) {
+                        at.insert(r.entry_hash, (rows.len(), i));
+                        rows.push(view_of(r));
+                    }
+                }
+                let rows = std::sync::Arc::new(rows);
                 *projected = Some(Projected {
                     verified: images.len(),
                     me,
@@ -1547,6 +1581,7 @@ impl DaemonCore {
                     names: names.clone(),
                     len: held.len(),
                     rows: std::sync::Arc::clone(&rows),
+                    at,
                 });
                 rows
             }
