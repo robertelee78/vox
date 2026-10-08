@@ -1276,10 +1276,23 @@ impl VoxEndpoint {
             .endpoint
             .connect_with(self.shared.client.clone(), addr, "vox.invalid")
             .map_err(|_| Error::MalformedBundle("quic connect"))?;
-        let signer = lock(&self.signer)
-            .clone()
-            .ok_or_else(|| Error::Handshake("this node is detached".to_owned()))?;
+        if lock(&self.signer).is_none() {
+            return Err(Error::Handshake("this node is detached".to_owned()));
+        }
         let connection = connecting.await.map_err(handshake_failed)?;
+        // **The node must still be attached when the handshake ends**, not only when the dial
+        // began. A handshake can take as long as the path takes to open (a punch, a forward that
+        // lets packets through later): one begun by an attach that has since detached completed
+        // after a new attach of the same node had connected, and named the old attach's instance,
+        // so the peer took it for a newer process of this identity and closed the new attach's
+        // connections, a live session among them (V210-57; `a_displaced_relay_is_let_go`). The
+        // signer goes with its attach ([`Self::unregister`]), so it is the attach's own word.
+        let Some(signer) = lock(&self.signer).clone() else {
+            identity::refuse(&connection);
+            return Err(Error::Handshake(
+                "this node detached while the dial was under way".to_owned(),
+            ));
+        };
         let proven = identity::dial(&connection, &*signer, self.local.instance(), expected_peer)
             .await
             .map_err(|f| f.into_error(addr, &expected_peer))?;
