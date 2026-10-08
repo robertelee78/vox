@@ -23,7 +23,9 @@
 //!
 //! **Asserted after the restart:** the restarted anchor reports all [`MEMBERS`] peers connected
 //! within [`BACK_WITHIN`] of SIGCONT — its own `N peer(s) connected` line, read as it is printed;
-//! and **no member was turned away**: none says its dial to the anchor failed after the restart.
+//! and **no member was turned away**: none says its dial to the anchor failed after the restart,
+//! save a dial begun before the hold, which may time out across it within the exchange's bound
+//! and must then say it did not answer in time, not "answers as" (ADR-011 38a).
 //!
 //! **A stop must be said to every member** for that bound to hold: a member that misses its
 //! anchor's close learns it is gone only from its silence (30 s).
@@ -280,7 +282,12 @@ fn every_member_is_back_after_an_anchor_restart() {
     );
 
     // ---- nobody was turned away ------------------------------------------------------------------
-    // What the members saw: a member the anchor turned away says its dial failed.
+    // What the members saw: a member the anchor turned away says its dial failed. One exception,
+    // the staging's own: a dial whose exchange began before SIGSTOP and was not answered by then
+    // times out across the hold, within EXCHANGE_TIMEOUT of SIGCONT, and must say it timed out —
+    // never "answers as" or "did not prove", which read as a refusal or an impostor (ADR-011 38a).
+    let exchange = vox_core::transport::identity::EXCHANGE_TIMEOUT;
+    let mut across_hold = Vec::new();
     let turned_away: Vec<String> = daemons
         .iter()
         .flat_map(|d| {
@@ -289,10 +296,24 @@ fn every_member_is_back_after_an_anchor_restart() {
                 .unwrap_or_else(|e| e.into_inner())
                 .iter()
                 .filter(|(t, l)| *t >= back && l.contains("dialling this anchor failed"))
+                .filter(|(t, l)| {
+                    let held = *t < back + exchange
+                        && l.contains(&format!("did not answer within {} s", exchange.as_secs()))
+                        && !l.contains("answers as")
+                        && !l.contains("did not prove");
+                    if held {
+                        across_hold.push(format!("{}: {l}", d.name));
+                    }
+                    !held
+                })
                 .map(|(_, l)| format!("{}: {l}", d.name))
                 .collect::<Vec<_>>()
         })
         .collect();
+    eprintln!(
+        "[proof] {} dial(s) begun before the hold timed out across it, as they said: {across_hold:#?}",
+        across_hold.len()
+    );
     eprintln!(
         "[proof] {} dial(s) to the restarted anchor failed, as the members said",
         turned_away.len()

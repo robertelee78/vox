@@ -240,9 +240,13 @@ connection, bound to the TLS session by its exporter.
     (`perf_r40_chat_latency_proof`, `perf_r40_relayed_chat_proof`,
     `a_first_direct_connection_is_prompt_proof`, `a_first_punched_connection_is_prompt_proof`,
     `a_first_relayed_connection_is_under_two_seconds_proof`).
-38a. **Diagnostics.** A dialler whose expected node does not answer MUST say "nothing at `<address>`
-    answers as `<expected node>`", and MUST NOT name anyone else (ADR-026 G-1)
-    (`a_dial_that_reaches_another_node_names_no_one_proof`).
+38a. **Diagnostics.** A dialler whose expected node does not answer MUST say which of three things
+    happened, and MUST NOT name anyone else (ADR-026 G-1): a refusal, "nothing at `<address>`
+    answers as `<expected node>`" (`a_dial_that_reaches_another_node_names_no_one_proof`); a
+    `PROVE` that does not verify, "what answered at `<address>` did not prove it is `<expected
+    node>`"; no `PROVE` within the exchange's bound, "`<address>` did not answer within `<bound>` s
+    as `<expected node>`" (`every_member_is_back_after_an_anchor_restart_proof`). A silence MUST NOT
+    be said as a refusal or an impostor.
 39. **Accepted cost (ADR-026).** A party that knows a node's fingerprint can test, by naming it,
     whether that node is attached at an address. The generic refusal (requirement 32)
     keeps it from learning anything more.
