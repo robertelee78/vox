@@ -236,17 +236,6 @@ def one_daemon(app):
             print("[launch-proof] nothing of this proof is left running")
 
 
-def node_state(vox, env, node):
-    """`vox node list`'s word for `node`: attached, detached, or what it said instead."""
-    done = subprocess.run([vox, "node", "list"], env=env, capture_output=True, text=True,
-                          stdin=subprocess.DEVNULL, timeout=60)
-    for line in done.stdout.splitlines():
-        words = line.split()
-        if words and words[0] == node and len(words) > 1:
-            return words[1]
-    return f"not listed ({done.stdout.strip()!r}{done.stderr.strip()!r})"
-
-
 def main():
     if len(sys.argv) != 2:
         fail("APPARATUS", "usage: app-launch-proof.py <Vox.app>")
