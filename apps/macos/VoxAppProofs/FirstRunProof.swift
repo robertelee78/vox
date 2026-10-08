@@ -341,7 +341,7 @@ final class FirstRunProof: XCTestCase {
         try stager.write(Data("1791262600000 \(reason)\n".utf8),
                          to: home + "/Library/Logs/Vox/login-item.log")
 
-        let ui = XCUIApplication(url: URL(fileURLWithPath: appPath))
+        let ui = voxApp(appPath)
         ui.launchEnvironment = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "HOME": home,
                                 "VOX_PROXY": "127.0.0.1:0"]
         try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
@@ -422,7 +422,7 @@ final class FirstRunProof: XCTestCase {
         }
         guard readable else { throw Apparatus("alice never read a post of bob's in 120 s") }
 
-        let ui = XCUIApplication(url: app)
+        let ui = voxApp(appPath)
         ui.launchEnvironment = voxEnv
         try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
         defer {
@@ -553,7 +553,7 @@ final class FirstRunProof: XCTestCase {
             print("[proof] started at step \(from): steps 1–5 NOT RUN; what they leave was staged by vox")
         }
 
-        let ui = XCUIApplication(url: app)
+        let ui = voxApp(appPath)
         ui.launchEnvironment = voxEnv
         try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
 
@@ -1367,6 +1367,15 @@ final class FirstRunProof: XCTestCase {
 
     private func resolved(_ path: String) -> String {
         URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+    }
+
+    /// The app the proof drives: the built app by its path; a given app (VOX_PROOF_APP), which the
+    /// stager starts, by its bundle id, to attach to that copy (by its path XCTest does not see a
+    /// copy it did not launch). Only one Vox ever runs while a case does (see launchVox).
+    private func voxApp(_ appPath: String) -> XCUIApplication {
+        ProcessInfo.processInfo.environment["VOX_PROOF_GIVEN"] == "1"
+            ? XCUIApplication(bundleIdentifier: "us.vox.app")
+            : XCUIApplication(url: URL(fileURLWithPath: appPath))
     }
 
     /// Start Vox.app on this run's scratch profile and show, before any step, that it is on it;
