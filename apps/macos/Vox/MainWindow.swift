@@ -116,7 +116,6 @@ private struct RoomRow: View {
     }
 }
 
-/// The room on screen: its timeline and a field to post, with its members beside it.
 /// The timeline draws its own focus ring on the row the keyboard is on; the system's ring around
 /// the whole timeline is left out where SwiftUI can leave it out (macOS 14).
 private struct OwnFocusRing: ViewModifier {
@@ -129,6 +128,7 @@ private struct OwnFocusRing: ViewModifier {
     }
 }
 
+/// The room on screen: its timeline and a field to post, with its members beside it.
 private struct RoomView: View {
     @ObservedObject var model: NodeModel
     let room: String
@@ -384,7 +384,6 @@ private struct RoomView: View {
         Task { await model.post(text, to: recipients, urgent: now, re: re) }
     }
 
-    /// The rows in view are read, only while the window is in front of the person (R-6).
     /// ↑/↓ on the timeline: the selection moves to the message before or after it, scrolled into
     /// view; with none selected, ↑ takes the newest and ↓ the oldest.
     private func move(_ direction: MoveCommandDirection, _ scroller: ScrollViewProxy) {
@@ -428,6 +427,7 @@ private struct RoomView: View {
         return true
     }
 
+    /// The rows in view are read, only while the window is in front of the person (R-6).
     private func markSeen() {
         readLog.debug("seen check in \(room, privacy: .public): window seen \(window.seen), \(inView.count) rows in view")
         guard window.seen else { return }
