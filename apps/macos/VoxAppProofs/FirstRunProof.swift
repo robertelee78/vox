@@ -719,7 +719,22 @@ final class FirstRunProof: XCTestCase {
         // file's path, then the panel's own Attach (OKButton), once the Go To sheet has closed and
         // it is enabled.
         if present(ui, Key.id("open-panel"), timeout: 10, "Attach must open the file panel") {
-            ui.typeKey("g", modifierFlags: [.command, .shift])
+            // The path is typed only into the Go To sheet once it shows: typed into a panel still
+            // opening, it went nowhere. ⌘⇧G again if the panel was not yet taking keys.
+            let panel = el(ui, Key.id("open-panel"))
+            func goTo() -> Bool { panel.sheets.firstMatch.exists || ui.sheets.firstMatch.exists }
+            var asked = 0
+            while asked < 3 && !goTo() {
+                asked += 1
+                ui.typeKey("g", modifierFlags: [.command, .shift])
+                let until = Date().addingTimeInterval(5)
+                while Date() < until && !goTo() { Thread.sleep(forTimeInterval: 0.25) }
+            }
+            guard goTo() else {
+                keepTree(ui, "the file panel's Go To sheet never showed")
+                XCTFail("APPARATUS: ⌘⇧G, typed \(asked) times, never showed the file panel's Go To sheet")
+                return
+            }
             ui.typeText(file.path + "\r")
             let choose = el(ui, Key.id("open-panel")).buttons["OKButton"]
             let enabled = NSPredicate(format: "exists == true AND isEnabled == true AND isHittable == true")
