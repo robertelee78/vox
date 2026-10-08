@@ -33,6 +33,10 @@
 //!    the agent's node as the watcher knows it, never by the node's own name.
 //! 6. The app-server goes away: `--say` to S1 is refused and says why (DR-5, DR-6).
 //!
+//! Between 4 and 5, Codex renames S1's thread (`thread/name/updated`): Session S1 reads the new
+//! name with no message posted (ADR-029 MD-1). The OpenCode session is renamed too
+//! (`session.updated` with its title), and its Session reads that title.
+//!
 //! **OpenCode** (`an_opencode_session_is_mirrored_and_driven`): one session of `oc-a` through the
 //! hosted plugin: its prompt, a tool call, a question asked and answered by `person` with
 //! `--answer` (the plugin replies to that question on OpenCode's API), the reply and the turn's
@@ -46,7 +50,8 @@
 //! **Mutations that must turn it red**, one per claim: a closed thread not subscribed again (#541,
 //! "miss events after a resume") → no second reply; the plugin's `question.asked` not forwarded
 //! (#542, "drop a question event") → no question line; drive input handed to the node's newest
-//! session instead of the named one (#544) → `turn/start` on S2's thread.
+//! session instead of the named one (#544) → `turn/start` on S2's thread; a Session not renamed
+//! until its next message (the rename record dropped) → neither reads its new name.
 
 #![cfg(unix)]
 
@@ -701,6 +706,17 @@ fn a_codex_session_is_mirrored_and_driven() {
     let turn2 = w.read_until(S1, "reply: second reply, after the resume", within);
     println!("[proof] (4) Session S1 after the resume:\n{turn2}");
 
+    // ---- (4b) S1 is renamed in Codex: its Session takes the name with no message posted ----
+    app.tell_all(
+        "thread/name/updated",
+        json!({"threadId": S1, "threadName": "codex renamed"}),
+    );
+    let named = w.read_until(S1, "· codex renamed ·", within);
+    println!(
+        "[proof] (4b) Session S1 after Codex renamed its thread: {}",
+        named.lines().next().unwrap_or_default()
+    );
+
     // ---- (5) person types into S1: S1's thread alone gets the turn; /clear and watcher refused --
     let (ok, said) = w.drive(PERSON, S1, &["--say", "carry on with e2"]);
     println!("[proof] (5) person --say to S1: {said}");
@@ -918,7 +934,14 @@ fn an_opencode_session_is_mirrored_and_driven() {
     host.event(json!({"type": "question.replied", "properties": {"sessionID": OC, "requestID": qid, "answers": [["blue"]]}}));
     host.event(json!({"type": "message.part.updated", "properties": {"part": {"id": "prt_r1", "messageID": "msg_a1", "sessionID": OC, "type": "text", "text": "e1 is blue now."}}}));
     host.event(json!({"type": "session.idle", "properties": {"sessionID": OC}}));
+    // Renamed in OpenCode: its Session takes the title with no message posted (ADR-029 MD-1).
+    host.event(json!({"type": "session.updated", "properties": {"info": {"id": OC, "title": "oc renamed"}}}));
     let done = w.read_until(OC, "— turn ended —", within);
+    let named = w.read_until(OC, "· oc renamed ·", within);
+    println!(
+        "[proof] (3) Session {OC} after OpenCode renamed it: {}",
+        named.lines().next().unwrap_or_default()
+    );
     println!("[proof] (3) Session {OC} after the turn:\n{done}");
     let lines: Vec<&str> = done.lines().collect();
     let at = |needle: &str| lines.iter().position(|l| l.contains(needle));

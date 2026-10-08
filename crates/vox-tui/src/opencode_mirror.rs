@@ -100,6 +100,7 @@ impl OpenCodeMirror {
             asks: BTreeMap::new(),
             model: None,
             ended: false,
+            title: None,
             next_id: 1,
             calls: BTreeMap::new(),
             answers: tx,
@@ -161,6 +162,9 @@ struct Follow {
     /// Whether the last thing posted was a turn's end: OpenCode reports a session idle more than
     /// once around an abort, and one turn ends once.
     ended: bool,
+    /// The session's title as last said: OpenCode sends `session.updated` for much besides a
+    /// rename, and only a new title renames the Session.
+    title: Option<String>,
     next_id: u64,
     calls: BTreeMap<u64, (oneshot::Sender<Result<String, String>>, String)>,
     /// Where a member's first answer comes back to this loop.
@@ -466,6 +470,19 @@ impl Follow {
             }
             "message.part.updated" => {
                 self.part(&sid, &p["part"]);
+            }
+            // **A rename is the Session's name at once** (ADR-029 MD-1): OpenCode's title, set by
+            // `/rename`, by Vox's own rename, or made by OpenCode itself, arrives only here.
+            "session.updated" => {
+                let info = &p["info"];
+                if info.get("id").and_then(Value::as_str) == Some(self.session.as_str()) {
+                    if let Some(title) = info.get("title").and_then(Value::as_str) {
+                        if self.title.as_deref() != Some(title) {
+                            self.title = Some(title.to_owned());
+                            self.sink.renamed(&self.node, &self.session, title);
+                        }
+                    }
+                }
             }
             "session.idle" if sid == self.session => {
                 self.flush_replies();

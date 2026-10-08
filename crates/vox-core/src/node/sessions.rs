@@ -185,8 +185,9 @@ pub struct Opening {
 }
 
 /// Open `session`'s Session in `room` if it has none open there (ADR-029 SE-1): idempotent, so a
-/// node that restarts or a session that resumes never opens a second. Call it once the node is a
-/// member of `room`.
+/// node that restarts or a session that resumes never opens a second. One already open under
+/// another name is renamed: its record is posted again with the name its harness now gives
+/// (MD-1). Call it once the node is a member of `room`.
 ///
 /// # Errors
 /// Why the opening could not be posted.
@@ -201,10 +202,14 @@ pub async fn open_when_member(
         .as_ref()
         .map(|i| i.fingerprint)
         .ok_or_else(|| "the node is locked".to_owned())?;
-    let open = of_room(handle, &room)
+    let rows = of_room(handle, &room);
+    let open = rows
         .iter()
-        .any(|s| s.node == me && s.id == session.id && s.open);
-    if open {
+        .find(|s| s.node == me && s.id == session.id && s.open);
+    // **A rename is said at once** (ADR-029 MD-1): the harness renamed its session, and a Session
+    // that posts nothing would otherwise keep its old name until its next message. A Session record
+    // for one already open names it again (`fold` reads it as the name from then on).
+    if open.is_some_and(|row| session.name.is_none() || row.name == session.name) {
         return Ok(());
     }
     let mut env = Envelope::new(SESSION, "");
