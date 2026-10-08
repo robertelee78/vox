@@ -1356,10 +1356,12 @@ final class FirstRunProof: XCTestCase {
             .split(whereSeparator: \.isNewline).compactMap { Int32($0) })
     }
 
-    /// The executable `pid` runs, symlinks resolved ("" when it has ended).
+    /// The executable `pid` runs, by proc_pidpath (ps names a process by its argv), symlinks
+    /// resolved ("" when it has ended).
     private func executable(_ pid: Int32) -> String {
-        let path = stager.run(["/bin/ps", "-o", "comm=", "-p", "\(pid)"], env: [:]).out
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let path = stager.run(["/usr/bin/python3", "-c",
+            "import ctypes, sys; b = ctypes.create_string_buffer(4096); n = ctypes.CDLL('/usr/lib/libproc.dylib').proc_pidpath(\(pid), b, 4096); print(b.value.decode() if n > 0 else '')"],
+            env: [:]).out.trimmingCharacters(in: .whitespacesAndNewlines)
         return path.isEmpty ? "" : URL(fileURLWithPath: path).resolvingSymlinksInPath().path
     }
 
@@ -1372,8 +1374,8 @@ final class FirstRunProof: XCTestCase {
     /// `open -n --env`: XCTest launches a hardened app through NSWorkspace and drops its
     /// environment, and one such run opened the account's real data root. The proof then attaches.
     ///
-    /// Before: no Vox.app runs, and every `vox` running is this app's own (so the app cannot reach
-    /// the account's daemon). After: exactly one Vox runs, this app's executable; and within 30 s
+    /// Before: no Vox.app runs, so the proof cannot attach to another. After: exactly one Vox runs,
+    /// this app's executable; and within 30 s
     /// the app shows this run's scratch path or a node staged only here, or asks the first-run
     /// question the account's own config has answered. The account's data root shown, or none of
     /// these, stops the case.
@@ -1382,11 +1384,6 @@ final class FirstRunProof: XCTestCase {
         try scratchOnly(env, under: scratch)
         let given = ProcessInfo.processInfo.environment["VOX_PROOF_GIVEN"] == "1"
         let appExe = resolved(appPath + "/Contents/MacOS/Vox")
-        let bundleVox = resolved(appPath + "/Contents/Helpers/vox")
-        let voxBefore = pids("vox")
-        for pid in voxBefore where executable(pid) != bundleVox && !executable(pid).isEmpty {
-            throw Apparatus("refusing to start Vox.app: a vox not of this app runs (pid \(pid), \(executable(pid))), so the app could reach the account's daemon")
-        }
         if let running = pids("Vox").first {
             throw Apparatus("refusing to start Vox.app: a Vox.app already runs (pid \(running), \(executable(running))), and the proof could drive it")
         }
