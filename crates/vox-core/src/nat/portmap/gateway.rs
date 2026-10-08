@@ -413,7 +413,16 @@ pub mod macos {
         let msg = request(v6, seq, pid);
         rustix::io::write(&fd, &msg).map_err(|_| fail("gateway: no default route found"))?;
         let mut buf = vec![0u8; 2048];
+        // **The whole wait is bounded, not each read** (the anchor-restart proof's red): a routing
+        // socket gets every process's routing messages, so on a busy machine a read never waited
+        // out its timeout, and an answer of our own that the kernel dropped (a full socket buffer)
+        // left this reading other processes' messages for ever, a tokio worker with it: the node
+        // stopped redialling its anchor, and never came back.
+        let began = std::time::Instant::now();
         loop {
+            if began.elapsed() > ANSWER_WITHIN {
+                return Err(fail("gateway: the routing table did not answer"));
+            }
             let n = rustix::io::read(&fd, &mut buf[..])
                 .map_err(|_| fail("gateway: the routing table did not answer"))?;
             let m = &buf[..n];
