@@ -644,19 +644,32 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
             )
             .expect("APPARATUS (harness error): a pre-join")
         };
-    let (r1_rec, r2_rec, sent_at) = loop {
+    // Both pre-joins are built and signed **before** their second starts (a prekey ring takes tens
+    // of ms to make, more on a slow machine), stamped for a second two seconds ahead; then they
+    // are sent in that second's first 100 ms. Building them inside the window spun forever on a
+    // Linux host where two rings take longer than the window: a watchdog abort, not a verdict.
+    let mut tries = 0;
+    let (r1_rec, r2_rec, second, sent_at) = loop {
+        tries += 1;
+        assert!(
+            tries <= 10,
+            "APPARATUS (staging not achieved): in 10 tries the two pre-joins were never sent within \
+             the first 100 ms of the second they were stamped for"
+        );
+        let second = (hostile::now_ms() / 1_000 + 2) * 1_000;
+        let built = (
+            prejoin(&r1, 0x43, second + 900 - lifetime),
+            prejoin(&r2, 0x44, second - 300 - lifetime),
+        );
         let now = hostile::now_ms();
-        if now % 1_000 < 50 {
-            let built = (
-                prejoin(&r1, 0x43, now + 900 - lifetime),
-                prejoin(&r2, 0x44, now - 300 - lifetime),
-            );
-            // Still inside the first 100 ms once both are signed, or wait for the next second.
-            if hostile::now_ms() % 1_000 < 100 {
-                break (built.0, built.1, now);
-            }
+        if now >= second {
+            continue;
         }
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(second - now));
+        let now = hostile::now_ms();
+        if now - second < 100 {
+            break (built.0, built.1, second, now);
+        }
     };
     let (inside, inside_read) = rt.block_on(async {
         let put = put(&r1_v, &r1_rec.to_wire()).await;
@@ -677,15 +690,15 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     println!(
         "[proof] step: a pre-join with 900 ms of its lifetime left, sent {} ms into a second \
          → {inside:?}, read back {} ms later: {}; one 300 ms past its lifetime → {past:?}",
-        sent_at % 1_000,
+        sent_at - second,
         read_at - sent_at,
         if r1_served { "served" } else { "not served" }
     );
     assert!(
-        read_at - sent_at < 900,
-        "APPARATUS (staging not achieved): the put and the read took {} ms, past the record's \
-         900 ms; nothing below would measure the lifetime",
-        read_at - sent_at
+        read_at - second < 900,
+        "APPARATUS (staging not achieved): the put and the read ended {} ms into the second, past \
+         the record's 900 ms; nothing below would measure the lifetime",
+        read_at - second
     );
     assert!(
         inside.is_ok() && r1_served,
