@@ -983,6 +983,24 @@ async fn notices_on(conn: &VoxConnection, room: &Digest32) -> Vec<Vec<u8>> {
     set.notices.iter().map(|n| n.to_wire()).collect()
 }
 
+/// Whether `conn`'s node's board serves `who`'s address in `room`: its member record and its
+/// bundle record, as the attacker reads them. What every other member reaches it by, and what an
+/// anchor carries to it by.
+async fn serves_member(conn: &VoxConnection, room: &Digest32, who: &Digest32) -> (bool, bool) {
+    let mut client = RendezvousClient::open(conn)
+        .await
+        .expect("CANNOT MEASURE: the node's board stream did not open");
+    let set = client
+        .get(room, 0, RecordKinds::ALL)
+        .await
+        .expect("CANNOT MEASURE: the node's board did not answer a read");
+    client.finish();
+    (
+        set.members.iter().any(|r| r.author_id == *who),
+        set.bundles.iter().any(|b| b.author_id == *who),
+    )
+}
+
 /// #520 — **every member learns of an admitted newcomer while it is offline, and an admission
 /// replayed after a member left admits it nowhere.** The decider (2026-10-06): when a member lets a
 /// newcomer in, every member learns of it, so every member's list matches; who reads whom does not
@@ -1003,11 +1021,18 @@ async fn notices_on(conn: &VoxConnection, room: &Digest32) -> Vec<Vec<u8>> {
 ///    was away and offline since (the offline newcomer, from its notice), and **never lists x**;
 ///    and the attacker's replay of x's notice to carol's board is **refused, `withdrawn`**: the
 ///    withdraw reached her with the notice, first.
+/// 4. *A rejoin outlives its old leave*: x joins again through the host, and the host's and
+///    carol's boards serve x's member and bundle records within 60 s and still serve them 40 s of
+///    syncs later. x's withdraw goes from board to board with the room's notices; it takes off
+///    only what x signed before it left. Taking more left a rejoined member with no address on any
+///    board: no member could reach it, no anchor would carry to it, and a member that trusted it
+///    could release it no key.
 ///
 /// **Mutations**, one each: (1) the admitting member keeps no notice — red PRODUCT (no notice on
 /// the host's board). (2) `nat::store::accept_notice` ignores withdraws — red PRODUCT (2: the
 /// replay is taken). (3) `ChannelState::admit_from_notice` ignores withdraws and the board passes
-/// withdraws on after notices — red PRODUCT (3: carol lists x).
+/// withdraws on after notices — red PRODUCT (3: carol lists x). (4) `RendezvousStore::withdraw_member`
+/// takes every record of the member, whenever signed — red PRODUCT (4: x's records gone).
 #[test]
 #[ignore = "real vox processes with production Argon2id and three real joins; run in release"]
 fn an_admission_reaches_every_member_and_never_outlives_a_leave() {
@@ -1149,5 +1174,46 @@ fn an_admission_reaches_every_member_and_never_outlives_a_leave() {
         matches!(&at_carol, Err(why) if why.contains("withdrawn")),
         "PRODUCT: x left, and its admission notice replayed to carol's board must be refused as \
          withdrawn: the withdraw reaches her with the notice; her board answered {at_carol:?}"
+    );
+
+    // ---- 4. x joins again: every board serves it, and keeps serving it --------------------
+    // Its withdraw stays with every member and goes from board to board (#520); it must take
+    // off only what x signed before it left, never the address x signs after joining again.
+    let _x = join("x", &x_dir);
+    let boards = [
+        ("the host", host_addr, host_id),
+        ("carol", carol_addr, carol_id),
+    ];
+    let read_boards = || -> Vec<(&str, (bool, bool))> {
+        boards
+            .iter()
+            .map(|(name, addr, id)| {
+                let (_s, conn) = rt.block_on(connect(&spy, *addr, *id));
+                (*name, rt.block_on(serves_member(&conn, &room, &x_id)))
+            })
+            .collect()
+    };
+    let all_serve = |seen: &[(&str, (bool, bool))]| seen.iter().all(|(_, (m, b))| *m && *b);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut seen = read_boards();
+    while !all_serve(&seen) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_secs(1));
+        seen = read_boards();
+    }
+    assert!(
+        all_serve(&seen),
+        "PRODUCT: x joined again, and within 60 s the host's and carol's boards must serve its \
+         member and bundle records, which every member reaches it by; (member, bundle) served: \
+         {seen:?}"
+    );
+    // Long enough for every member's next sync, each of which exchanges boards and passes the
+    // room's withdraws on (SYNC_INTERVAL_SECS is 30).
+    std::thread::sleep(Duration::from_secs(40));
+    let kept = read_boards();
+    eprintln!("[proof] rejoin: (member, bundle) served after 40 s of syncs: {kept:?}");
+    assert!(
+        all_serve(&kept),
+        "PRODUCT: x joined again; 40 s of syncs later the host's and carol's boards must still \
+         serve its member and bundle records; (member, bundle) served: {kept:?}"
     );
 }
