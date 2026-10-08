@@ -1106,14 +1106,20 @@ final class FirstRunProof: XCTestCase {
             keepTree(ui, "Space opened nothing")
             XCTFail("PRODUCT: View > Focus Timeline, then Space, must open the selected row's pulled file, for-keys.txt, in Quick Look; no window opened")
         } else if !lookClosed() {
-            throw Apparatus("Quick Look opened by Space did not close on Escape")
+            // The mouse's preview closed on Escape above, so this one is the product's.
+            keepTree(ui, "Quick Look opened by Space stayed open")
+            XCTFail("PRODUCT: Escape must close the Quick Look that Space opened from the timeline; it stayed open, so the keyboard is trapped")
+            return
         }
         ui.typeKey(.return, modifierFlags: [])
         if !lookOpened() {
             keepTree(ui, "Return opened nothing")
             XCTFail("PRODUCT: Return on the selected row, whose file alice pulled, must open its first action, Quick Look; no window opened")
         } else if !lookClosed() {
-            throw Apparatus("Quick Look opened by Return did not close on Escape")
+            // The mouse's preview closed on Escape above, so this one is the product's.
+            keepTree(ui, "Quick Look opened by Return stayed open")
+            XCTFail("PRODUCT: Escape must close the Quick Look that Return opened from the timeline; it stayed open, so the keyboard is trapped")
+            return
         }
         // ↑ to KEYS-B, ↑ to KEYS-A, ↓ back to KEYS-B: each said by Reply to Selected Message.
         for (key, want) in [(XCUIKeyboardKey.upArrow, "KEYS-B"), (.upArrow, "KEYS-A"),

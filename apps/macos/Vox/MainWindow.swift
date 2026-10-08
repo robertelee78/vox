@@ -202,6 +202,7 @@ private struct TimelineKeys: NSViewRepresentable {
             case 125: key = .down
             case 36, 76: key = .open // Return, Enter
             case 49: key = .look // Space
+            case 53: key = .close // Escape
             default: key = nil
             }
             // Only the bare key: ⌘↑ and the like are the menus' and the system's.
@@ -214,7 +215,7 @@ private struct TimelineKeys: NSViewRepresentable {
 
 /// A key the timeline acts on.
 private enum TimelineKey {
-    case up, down, open, look
+    case up, down, open, look, close
 }
 
 /// The room on screen: its timeline and a field to post, with its members beside it.
@@ -329,7 +330,8 @@ private struct RoomView: View {
                                 case .up: return move(.up, scroller)
                                 case .down: return move(.down, scroller)
                                 case .open: return openSelected()
-                                case .look: return lookSelected()
+                                case .look: return toggleLook()
+                                case .close: return closeLook()
                                 }
                             })
                             .onReceive(NotificationCenter.default.publisher(for: .voxFocusTimeline)) { _ in
@@ -506,6 +508,20 @@ private struct RoomView: View {
     private func lookSelected() -> Bool {
         guard let id = model.selectedMessage, let path = model.pulled[id] else { return false }
         looking = URL(fileURLWithPath: path)
+        return true
+    }
+
+    /// Space: Quick Look on the selected row's pulled file, or, while it shows, off again (as in
+    /// the Finder). Whether it did either.
+    private func toggleLook() -> Bool {
+        closeLook() || lookSelected()
+    }
+
+    /// Escape: Quick Look closed, if it shows. A preview the keyboard opened leaves the keyboard
+    /// here, not on the preview, so its keys must close it too (WCAG 2.1.2). Whether it showed.
+    private func closeLook() -> Bool {
+        guard looking != nil else { return false }
+        looking = nil
         return true
     }
 
