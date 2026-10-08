@@ -130,7 +130,18 @@ else
     codesign --force --sign - --options runtime --preserve-metadata=entitlements "$APP"
 fi
 
-trap_unregister() { "$LSREGISTER" -u "$APP" >/dev/null 2>&1 || true; }
+trap_unregister() {
+    # A given app (VOX_PROOF_APP) is started by the stager with `open -n`, outside the runner: any
+    # of its processes still running are stopped by pid, and its share extension is unregistered
+    # with it, so no later LaunchServices lookup or share sheet opens this copy.
+    if [ -n "${VOX_PROOF_APP:-}" ]; then
+        for pid in $(pgrep -f "$APP/Contents/MacOS/Vox" || true); do kill "$pid" 2>/dev/null || true; done
+        for ext in "$APP"/Contents/PlugIns/*.appex; do
+            [ -e "$ext" ] && pluginkit -r "$ext" >/dev/null 2>&1 || true
+        done
+    fi
+    "$LSREGISTER" -u "$APP" >/dev/null 2>&1 || true
+}
 
 # The launch proof (#438) drives no UI, so it needs no automation approval: it runs first, alone
 # when asked for by name.
@@ -195,6 +206,7 @@ TEST_RUNNER_VOX_PROOF_APP="$APP" TEST_RUNNER_VOX_PROOF_SCRATCH="$SCRATCH" \
     TEST_RUNNER_VOX_PROOF_STAGER_PORT="$(cat "$SCRATCH/stager.port")" \
     TEST_RUNNER_VOX_PROOF_STAGER_TOKEN="$TOKEN" \
     TEST_RUNNER_VOX_PROOF_FROM="${VOX_PROOF_FROM:-}" \
+    TEST_RUNNER_VOX_PROOF_GIVEN="${VOX_PROOF_APP:+1}" \
     xcodebuild -project apps/macos/Vox.xcodeproj -scheme Vox -configuration Release \
     -derivedDataPath "$DERIVED" ${only[@]+"${only[@]}"} test-without-building \
     2>&1 | tee "$SCRATCH/xcodebuild.log" || status=$?

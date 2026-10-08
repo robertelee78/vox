@@ -210,6 +210,9 @@ final class FirstRunProof: XCTestCase {
     /// Set while the proof itself has hidden or quit Vox (⌘H, ⌘Q), until Vox is active again:
     /// what takes the foreground meanwhile was handed it by the proof, not taken.
     private var handedOff = false
+    /// The given app's process (VOX_PROOF_APP), started by the stager: stopped by its pid when the
+    /// case ends.
+    private var givenPid: Int32?
 
     override func setUpWithError() throws {
         // A case stops at its first red: one red, with its side, and no cascade behind it.
@@ -249,6 +252,7 @@ final class FirstRunProof: XCTestCase {
     override func tearDown() {
         if let watchingForeground { NSWorkspace.shared.notificationCenter.removeObserver(watchingForeground) }
         if let watchingVox { NSWorkspace.shared.notificationCenter.removeObserver(watchingVox) }
+        if let givenPid, stager != nil { _ = stager.run(["/bin/kill", "\(givenPid)"], env: [:]) }
         daemon?.terminate()
         super.tearDown()
     }
@@ -340,8 +344,7 @@ final class FirstRunProof: XCTestCase {
         let ui = XCUIApplication(url: URL(fileURLWithPath: appPath))
         ui.launchEnvironment = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "HOME": home,
                                 "VOX_PROXY": "127.0.0.1:0"]
-        try scratchOnly(ui.launchEnvironment, under: scratchPath)
-        ui.launch()
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
         defer { ui.terminate() }
         let said = Key.id("login-item-said")
         let quoted = words(ui, said, timeout: 30,
@@ -421,8 +424,7 @@ final class FirstRunProof: XCTestCase {
 
         let ui = XCUIApplication(url: app)
         ui.launchEnvironment = voxEnv
-        try scratchOnly(ui.launchEnvironment, under: scratchPath)
-        ui.launch()
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
         defer {
             ui.terminate()
             _ = run(vox, ["node", "detach", "alice"], env: voxEnv)
@@ -553,8 +555,7 @@ final class FirstRunProof: XCTestCase {
 
         let ui = XCUIApplication(url: app)
         ui.launchEnvironment = voxEnv
-        try scratchOnly(ui.launchEnvironment, under: scratchPath)
-        ui.launch()
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
 
         if from > 5 {
             // The app attaches alice itself, her passphrase typed, as in step 2.
@@ -1184,8 +1185,7 @@ final class FirstRunProof: XCTestCase {
         guard held.contains("WHILE-APP-CLOSED") else {
             throw Apparatus("alice's node never held bob's WHILE-APP-CLOSED in 60 s: \(held)")
         }
-        try scratchOnly(ui.launchEnvironment, under: scratchPath)
-        ui.launch()
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
         let reopened = words(ui, Key.id("group-needs you"), timeout: 30,
                              "bob's message to alice came while the app was closed; opened again, the app must count it from what her node recorded as read, mission under \"needs you (1)\"",
                              until: { $0.lowercased() == "needs you (1)" }) ?? ""
@@ -1348,6 +1348,90 @@ final class FirstRunProof: XCTestCase {
             if let found = find(key, in: container) { return found }
         }
         return nil
+    }
+
+    /// The pids of the processes named `name`, by the stager (outside the runner's sandbox).
+    private func pids(_ name: String) -> Set<Int32> {
+        Set(stager.run(["/usr/bin/pgrep", "-x", name], env: [:]).out
+            .split(whereSeparator: \.isNewline).compactMap { Int32($0) })
+    }
+
+    /// The executable `pid` runs, symlinks resolved ("" when it has ended).
+    private func executable(_ pid: Int32) -> String {
+        let path = stager.run(["/bin/ps", "-o", "comm=", "-p", "\(pid)"], env: [:]).out
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return path.isEmpty ? "" : URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+    }
+
+    private func resolved(_ path: String) -> String {
+        URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+    }
+
+    /// Start Vox.app on this run's scratch profile and show, before any step, that it is on it;
+    /// else stop (fail closed). A given, signed app (VOX_PROOF_APP) is started by the stager with
+    /// `open -n --env`: XCTest launches a hardened app through NSWorkspace and drops its
+    /// environment, and one such run opened the account's real data root. The proof then attaches.
+    ///
+    /// Before: no Vox.app runs, and every `vox` running is this app's own (so the app cannot reach
+    /// the account's daemon). After: exactly one Vox runs, this app's executable; and within 30 s
+    /// the app shows this run's scratch path or a node staged only here, or (a screen reached
+    /// through a daemon) no `vox` started since: the app reached this run's daemon, the only one.
+    /// The account's data root shown, or none of these, stops the case.
+    private func launchVox(_ ui: XCUIApplication, _ appPath: String, env: [String: String],
+                           scratch: String) throws {
+        try scratchOnly(env, under: scratch)
+        let given = ProcessInfo.processInfo.environment["VOX_PROOF_GIVEN"] == "1"
+        let appExe = resolved(appPath + "/Contents/MacOS/Vox")
+        let bundleVox = resolved(appPath + "/Contents/Helpers/vox")
+        let voxBefore = pids("vox")
+        for pid in voxBefore where executable(pid) != bundleVox && !executable(pid).isEmpty {
+            throw Apparatus("refusing to start Vox.app: a vox not of this app runs (pid \(pid), \(executable(pid))), so the app could reach the account's daemon")
+        }
+        if let running = pids("Vox").first {
+            throw Apparatus("refusing to start Vox.app: a Vox.app already runs (pid \(running), \(executable(running))), and the proof could drive it")
+        }
+        if given {
+            var argv = ["/usr/bin/open", "-n"]
+            for (key, value) in env.sorted(by: { $0.key < $1.key }) { argv += ["--env", "\(key)=\(value)"] }
+            argv.append(appPath)
+            let opened = stager.run(argv, env: [:])
+            guard opened.status == 0 else {
+                throw Apparatus("`open -n` did not start \(appPath): \(opened.out)")
+            }
+            let until = Date().addingTimeInterval(15)
+            while Date() < until && pids("Vox").isEmpty { Thread.sleep(forTimeInterval: 0.25) }
+        } else {
+            ui.launch()
+        }
+        let running = pids("Vox")
+        guard running.count == 1, let pid = running.first, executable(pid) == appExe else {
+            throw Apparatus("after starting Vox.app, the Vox processes are \(running.map { "\($0) \(executable($0))" }), not one of \(appExe)")
+        }
+        if given {
+            givenPid = pid
+            ui.activate()
+        }
+        // The profile, positively, before any step.
+        let realRoot = Key.showing("Library/Application Support/vox")
+        let scratchSigns: [Key] = [Key.showing(resolved(scratch)), Key.showing(scratch), Key.id("node-alice"),
+                            Key.showing("node alice")]
+        let throughDaemon: [Key] = [Key.id("login-item-why"), Key.id("menu-bar-offer"),
+                                    Key.id("passphrase"), Key.id("attached")]
+        let until = Date().addingTimeInterval(30)
+        while Date() < until {
+            if let real = locate(ui, realRoot) {
+                keepTree(ui, "Vox.app showed the account's data root")
+                ui.terminate()
+                throw Apparatus("Vox.app is on the account's real profile, not this run's scratch one: it shows \(shown(real)); stopped before any step")
+            }
+            if scratchSigns.contains(where: { locate(ui, $0) != nil }) { return }
+            if throughDaemon.contains(where: { locate(ui, $0) != nil }), !voxBefore.isEmpty,
+               pids("vox").isSubset(of: voxBefore) { return }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        keepTree(ui, "Vox.app could not be shown on the scratch profile")
+        ui.terminate()
+        throw Apparatus("Vox.app could not be shown to be on this run's scratch profile within 30 s (no scratch path, no node staged here, nor a screen reached through this run's daemon alone); stopped before any step")
     }
 
     /// The proof hides (⌘H) or quits (⌘Q) Vox itself: what takes the foreground next is handed
