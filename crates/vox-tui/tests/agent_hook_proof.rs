@@ -2420,7 +2420,9 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
 #[test]
 #[ignore = "production Argon2id at setup + two real daemons and a join; CI runs it in release"]
 fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
-    watchdog::arm();
+    // The join in (1) is bounded by the product's own patience (below), and the rest of the arm
+    // takes a few minutes more.
+    watchdog::arm_for(Duration::from_secs(1200));
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     // Alice holds two rooms; the agent's node holds none.
     let alice = Daemon::start(&tmp.path().join("alice"));
@@ -2512,23 +2514,62 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     // Its first prompt is typed before its node is a member of the room: the Session still
     // carries it, once the room opens (SC-1).
     let first = turn_saying(mapped, &repo, "SAID-BEFORE-THE-JOIN");
-    let deadline = Instant::now() + Duration::from_secs(120);
+    // **The proof waits as long as the product does.** A member waits 480 s for a joiner's proof
+    // of work (V210-87), which a debug build grinds slowly: under load the join took 31–269 s,
+    // and a 120 s bound read a join still under way as one that never worked. A join still
+    // running past the product's own patience is the product's.
+    let deadline = Instant::now() + Duration::from_secs(540);
     let mut turns = 1;
+    let mut last = first.clone();
     while !(rooms().contains(&home) && open_in(&home, mapped)) {
+        // What a red quotes: the first line each turn was told (the join's status), and both
+        // daemons' own words.
+        let said = |out: &str| -> String {
+            let v: serde_json::Value = serde_json::from_str(out).unwrap_or_default();
+            v["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap_or(out)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_owned()
+        };
+        let tail = |root: &str| -> String {
+            let log = std::fs::read_to_string(tmp.path().join(root).join("daemon.err"))
+                .unwrap_or_default();
+            let lines: Vec<&str> = log
+                .lines()
+                .filter(|l| {
+                    !l.contains("did not reach its Session") && !l.contains("open it with its")
+                })
+                .collect();
+            lines[lines.len().saturating_sub(40)..].join("\n")
+        };
         assert!(
             Instant::now() < deadline,
             "PRODUCT: a session started in {} (mapped to room {home}) never worked there within \
-             120 s: the node's rooms {:?}, the room's Sessions {:?}; its first turn was told \
-             {first:?}",
+             540 s: the node's rooms {:?}, the room's Sessions {:?}; its first turn was told \
+             {:?}, its last ({turns} turns) {:?}; the map's link {link_home}; the agent's daemon said:\n{}\nAlice's daemon \
+             said:\n{}",
             repo.display(),
             rooms(),
-            sessions(&home)
+            sessions(&home),
+            said(&first),
+            said(&last),
+            tail("agent"),
+            tail("alice")
         );
         std::thread::sleep(Duration::from_secs(2));
-        turn(mapped, &repo);
+        last = turn(mapped, &repo);
         turns += 1;
     }
     eprintln!("[proof] (1) first turn told: {first:?}; working in {home} after {turns} turns");
+    // Where the join's time went, as the agent's daemon said it.
+    let agent_log =
+        std::fs::read_to_string(tmp.path().join("agent").join("daemon.err")).unwrap_or_default();
+    for line in agent_log.lines().filter(|l| l.contains("vox: join ")) {
+        eprintln!("[proof] (1) the agent's daemon: {line}");
+    }
     assert!(
         first.contains("joining room"),
         "PRODUCT: a session whose room is being joined must be told so on its turn; it was told \

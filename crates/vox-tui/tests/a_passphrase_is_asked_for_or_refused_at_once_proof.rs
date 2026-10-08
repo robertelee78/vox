@@ -45,6 +45,12 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// A room address that parses (a room id, and one anchor with its address) and names nowhere a
+/// node runs (UDP port 9 on this machine): what these verbs read only after the prompt this proof
+/// is about. An address that will not parse is refused before any prompt.
+const UNREACHABLE_ROOM: &str =
+    "vox://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?a=ccccccccccccccccccccccccccccccccccccccccccccccccccca&b=/ip4/127.0.0.1/udp/9";
+
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDPASS: &str = "an identity pass phrase";
 
@@ -493,7 +499,7 @@ fn no_command_waits_for_input_it_cannot_get() {
     );
     check(
         "vox room join (running node)",
-        &mut vox_cmd(&alice, &["room", "join", "vox://not-read"]),
+        &mut vox_cmd(&alice, &["room", "join", UNREACHABLE_ROOM]),
         false,
         &["no terminal to ask at", "--passphrase-file"],
     );
@@ -536,7 +542,7 @@ fn no_command_waits_for_input_it_cannot_get() {
     // `vox connect` asks for the room's passphrase first.
     check(
         "vox connect",
-        &mut vox_cmd(&bob, &["connect", "vox://not-read"]),
+        &mut vox_cmd(&bob, &["connect", UNREACHABLE_ROOM]),
         false,
         &["no terminal to ask at", "--passphrase-file"],
     );

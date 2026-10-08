@@ -1,6 +1,17 @@
-//! The node's **decision record** (ADR-028 §7): what this node decided, one JSON line per
-//! decision, in `nodes/<name>/decisions/<YYYY-MM-DD>.jsonl` (mode `0600`, the directory `0700`),
+//! The node's **decision record** (ADR-028 §7): what this node decided, one sealed event per
+//! decision, in `nodes/<name>/decisions/<YYYY-MM-DD>.sealed` (mode `0600`, the directory `0700`),
 //! kept 14 days and never sent anywhere (D-1, D-2).
+//!
+//! **Sealed at rest** (#563; the decider: "Encrypting the diary is the right option"). A record of
+//! every trust added or removed, with fingerprints and names, is the keyring itself in another
+//! form, and the keyring is sealed (ADR-010 AR-22). Each event is AES-256-GCM under
+//! `HKDF(self_seed, "vox/decisions-sek/v1")`, so only the unlocked identity reads or writes it; a
+//! headless `vox node`, whose identity is a plaintext file by design, seals under its identity
+//! factor, as its peer book is. Each file is a run of `[length (4 bytes, big-endian)][nonce]
+//! [ciphertext]` records, the day bound into each record's AAD. Clients read the record through
+//! the node ([`crate::node::ipc::Request::Decisions`]), never from the files. A decision taken
+//! while the identity is locked is held in memory and written when it unlocks. A plaintext
+//! `.jsonl` day an earlier build wrote is sealed into its day's file at unlock and removed.
 //!
 //! Every refusal and every change of access is a decision: a refused join or tunnel, a trust added
 //! or removed, a session cut. An event holds when, what was asked, by whom (fingerprint and this
@@ -11,8 +22,49 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::atrest::sek::{Sek, NONCE_LEN};
+use crate::atrest::store::{open_segment, seal_segment, SealedSegment, SegmentKind};
 use crate::hash::Digest32;
+use crate::identity::composite::RootSigner;
+
+/// HKDF label for the record's sealing key, taken over `self_seed` (ADR-010 AR-22).
+pub const DECISIONS_SEK_INFO: &[u8] = b"vox/decisions-sek/v1";
+
+/// The context a headless node's identity factor is taken over, for the same key.
+const DECISIONS_CONTEXT_LABEL: &[u8] = b"vox/decisions-context/v1";
+
+/// The segment kind each sealed event's AAD names. The record's own key keeps it apart from the
+/// keyring, which uses the same kind under another key.
+const SEALED_KIND: SegmentKind = SegmentKind::Trust;
+
+/// The most decisions held in memory while the identity is locked; older ones are dropped first.
+const PENDING_MAX: usize = 4_096;
+
+/// The key the record is sealed under, for `signer`: from its vault's `self_seed`, or, for a
+/// headless node that holds no vault, from its identity factor.
+fn sealing_key(signer: &dyn RootSigner) -> crate::error::Result<Sek> {
+    if signer.at_rest_seed().is_some() {
+        return crate::atrest::seal::sek(signer, DECISIONS_SEK_INFO);
+    }
+    use crate::atrest::idfactor::{IdentityFactor, SignatureIdentityFactor};
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+    let factor = SignatureIdentityFactor::new(signer);
+    let factor_id = factor.factor_id(&crate::hash::sha256(DECISIONS_CONTEXT_LABEL))?;
+    let hk = Hkdf::<Sha256>::new(None, factor_id.as_ref());
+    let mut key = zeroize::Zeroizing::new([0u8; crate::atrest::sek::SEK_LEN]);
+    hk.expand(DECISIONS_SEK_INFO, key.as_mut())
+        .map_err(|_| crate::error::Error::AtRestUnlockFailed)?;
+    Ok(Sek::from_bytes(key))
+}
+
+/// The segment id a day's records are sealed with: the day, so a record cannot be moved to
+/// another day's file.
+fn day_id(day: i64) -> u64 {
+    u64::try_from(day).unwrap_or(0)
+}
 
 /// The directory under a node's own directory that holds its decision record.
 pub const DECISIONS_DIR: &str = "decisions";
@@ -90,6 +142,8 @@ pub struct Event {
     pub decided: String,
     /// Why.
     pub why: String,
+    /// The room it concerns, by its ID as `vox` prints one, when it is about one.
+    pub room: Option<String>,
 }
 
 impl Event {
@@ -102,15 +156,20 @@ impl Event {
             alias: v["alias"].as_str().map(str::to_owned),
             decided: v["decided"].as_str()?.to_owned(),
             why: v["why"].as_str()?.to_owned(),
+            room: v["room"].as_str().map(str::to_owned),
         })
     }
 }
 
 /// A node's decision record: where it is, and which day it was last pruned on. Cheap to clone;
 /// every clone appends to the same files.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DecisionLog {
     dir: PathBuf,
+    /// The sealing key while the identity is unlocked; `None` while it is locked.
+    key: Arc<std::sync::Mutex<Option<Arc<Sek>>>>,
+    /// Decisions taken while locked, `(day, event)`, written when the key returns.
+    pending: Arc<std::sync::Mutex<Vec<(i64, String)>>>,
     pruned: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
     /// This node's names for the members it trusts, as last published: what an event names
     /// someone as when the decision was taken where the keyring is not at hand.
@@ -130,15 +189,99 @@ struct Folded {
     decision: Decision,
 }
 
+impl std::fmt::Debug for DecisionLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecisionLog")
+            .field("dir", &self.dir)
+            .finish_non_exhaustive()
+    }
+}
+
 impl DecisionLog {
     /// The record under `node_dir` (`nodes/<name>/`).
     #[must_use]
     pub fn new(node_dir: &Path) -> Self {
         Self {
             dir: node_dir.join(DECISIONS_DIR),
+            key: Arc::default(),
+            pending: Arc::default(),
             pruned: std::sync::Arc::new(std::sync::Mutex::new(None)),
             aliases: std::sync::Arc::default(),
             folded: std::sync::Arc::default(),
+        }
+    }
+
+    /// The identity `signer` is unlocked: take the record's key from it, seal any plaintext day an
+    /// earlier build left and remove it, and write what was decided while locked.
+    ///
+    /// # Errors
+    /// The key cannot be taken from `signer`.
+    pub fn unlock(&self, signer: &dyn RootSigner) -> crate::error::Result<()> {
+        let key = Arc::new(sealing_key(signer)?);
+        *self
+            .key
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&key));
+        self.seal_plaintext_days(&key);
+        let held = std::mem::take(
+            &mut *self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for (day, line) in held {
+            if let Err(e) = self.append(&key, day, &line) {
+                eprintln!(
+                    "vox: could not write the decision record in {}: {e}",
+                    self.dir.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The identity is locked: drop the key. Decisions until the next unlock are held in memory.
+    pub fn lock(&self) {
+        *self
+            .key
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    fn key(&self) -> Option<Arc<Sek>> {
+        self.key
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Seal each `<day>.jsonl` an earlier build wrote in the clear into that day's sealed file,
+    /// then remove it (#563: never left readable). A day whose events cannot all be written is
+    /// left for the next unlock.
+    fn seal_plaintext_days(&self, key: &Sek) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            let Some(day) = e
+                .file_name()
+                .to_str()
+                .and_then(|n| n.strip_suffix(".jsonl"))
+                .and_then(day_of)
+            else {
+                continue;
+            };
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let sealed = text
+                .lines()
+                .filter(|l| Event::of(l).is_some())
+                .try_for_each(|l| self.append(key, day, l));
+            if sealed.is_ok() {
+                let _ = std::fs::remove_file(&path);
+            }
         }
     }
 
@@ -241,11 +384,25 @@ impl DecisionLog {
             fields.insert("room".into(), crate::node::link::b32_encode(&room).into());
         }
         let line = event.to_string();
-        if let Err(e) = self.append(day, &line) {
-            eprintln!(
-                "vox: could not write the decision record in {}: {e}",
-                self.dir.display()
-            );
+        match self.key() {
+            Some(key) => {
+                if let Err(e) = self.append(&key, day, &line) {
+                    eprintln!(
+                        "vox: could not write the decision record in {}: {e}",
+                        self.dir.display()
+                    );
+                }
+            }
+            None => {
+                let mut held = self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if held.len() >= PENDING_MAX {
+                    held.remove(0);
+                }
+                held.push((day, line));
+            }
         }
         let mut pruned = self
             .pruned
@@ -257,9 +414,17 @@ impl DecisionLog {
         }
     }
 
-    fn append(&self, day: i64, line: &str) -> std::io::Result<()> {
+    fn append(&self, key: &Sek, day: i64, line: &str) -> std::io::Result<()> {
         crate::node::paths::create_private_dir(&self.dir)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let sealed = seal_segment(key, SEALED_KIND, day_id(day), line.as_bytes())
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let len = u32::try_from(NONCE_LEN + sealed.ciphertext.len())
+            .map_err(|_| std::io::Error::other("a decision too long to record"))?;
+        let mut record = Vec::with_capacity(4 + len as usize);
+        record.extend_from_slice(&len.to_be_bytes());
+        record.extend_from_slice(&sealed.nonce);
+        record.extend_from_slice(&sealed.ciphertext);
         let mut open = std::fs::OpenOptions::new();
         open.create(true).append(true);
         #[cfg(unix)]
@@ -267,16 +432,66 @@ impl DecisionLog {
             use std::os::unix::fs::OpenOptionsExt as _;
             open.mode(0o600);
         }
-        let mut f = open.open(self.dir.join(format!("{}.jsonl", date_of(day))))?;
-        f.write_all(format!("{line}\n").as_bytes())
+        let mut f = open.open(self.dir.join(format!("{}.sealed", date_of(day))))?;
+        // One write per record, so a crash leaves at most a torn last record, which a read passes
+        // over.
+        f.write_all(&record)?;
+        f.sync_data()
+    }
+
+    /// The events of one sealed day's file, in the order written. A record that does not open or
+    /// read as an event is passed over.
+    fn read_day(key: &Sek, day: i64, bytes: &[u8]) -> Vec<Event> {
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        while at + 4 <= bytes.len() {
+            let len = u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+                as usize;
+            at += 4;
+            let Some(body) = bytes.get(at..at + len) else {
+                break;
+            };
+            at += len;
+            if body.len() < NONCE_LEN {
+                continue;
+            }
+            let mut nonce = [0u8; NONCE_LEN];
+            nonce.copy_from_slice(&body[..NONCE_LEN]);
+            let sealed = SealedSegment {
+                nonce,
+                ciphertext: body[NONCE_LEN..].to_vec(),
+            };
+            if let Ok(plain) = open_segment(key, SEALED_KIND, day_id(day), &sealed) {
+                if let Some(e) = std::str::from_utf8(&plain).ok().and_then(Event::of) {
+                    out.push(e);
+                }
+            }
+        }
+        out
     }
 
     /// The newest `limit` events of the record, newest first, those `decided` when it is given
-    /// (D-3). A line that does not read as an event is passed over.
+    /// (D-3): what is written, which only the unlocked identity opens, and what is held while
+    /// locked. A record that does not read as an event is passed over.
     #[must_use]
     pub fn recent(&self, limit: usize, decided: Option<Decided>) -> Vec<Event> {
+        let wanted = |e: &Event| decided.is_none_or(|d| e.decided == d.as_str());
+        let mut held: Vec<Event> = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(|(_, l)| Event::of(l))
+            .filter(|e| wanted(e))
+            .collect();
+        held.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
+        let Some(key) = self.key() else {
+            held.truncate(limit);
+            return held;
+        };
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return Vec::new();
+            held.truncate(limit);
+            return held;
         };
         let mut days: Vec<(i64, PathBuf)> = entries
             .flatten()
@@ -284,21 +499,20 @@ impl DecisionLog {
                 let day = e
                     .file_name()
                     .to_str()
-                    .and_then(|n| n.strip_suffix(".jsonl"))
+                    .and_then(|n| n.strip_suffix(".sealed"))
                     .and_then(day_of)?;
                 Some((day, e.path()))
             })
             .collect();
         days.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-        let mut out = Vec::new();
-        for (_, path) in days {
-            let Ok(text) = std::fs::read_to_string(&path) else {
+        let mut out = held;
+        for (day_n, path) in days {
+            let Ok(bytes) = std::fs::read(&path) else {
                 continue;
             };
-            let mut day: Vec<Event> = text
-                .lines()
-                .filter_map(Event::of)
-                .filter(|e| decided.is_none_or(|d| e.decided == d.as_str()))
+            let mut day: Vec<Event> = Self::read_day(&key, day_n, &bytes)
+                .into_iter()
+                .filter(|e| wanted(e))
                 .collect();
             day.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
             out.extend(day);
@@ -306,6 +520,7 @@ impl DecisionLog {
                 break;
             }
         }
+        out.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
         out.truncate(limit);
         out
     }
@@ -320,7 +535,10 @@ impl DecisionLog {
             let name = e.file_name();
             let Some(day) = name
                 .to_str()
-                .and_then(|n| n.strip_suffix(".jsonl"))
+                .and_then(|n| {
+                    n.strip_suffix(".sealed")
+                        .or_else(|| n.strip_suffix(".jsonl"))
+                })
                 .and_then(day_of)
             else {
                 continue;

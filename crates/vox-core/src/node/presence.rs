@@ -31,7 +31,7 @@ use crate::nat::netwatch::{NetChange, NetShape, NetWatch};
 use crate::nat::portmap::PortMapping;
 use crate::node::circuitstream::CircuitLedger;
 use crate::node::nearby::{Entry, Nearby};
-use crate::transport::quic::{unix_now, unix_now_ms, SharedEndpoint, VoxConnection, VoxEndpoint};
+use crate::transport::quic::{unix_now_ms, SharedEndpoint, VoxConnection, VoxEndpoint};
 
 /// How many inbound handshakes — the TLS handshake and the identity exchange after it — may run
 /// at once (ADR-011 requirement 34): the cap pre-identity connections share.
@@ -842,7 +842,7 @@ fn spawn_watcher(
             let Some(change) = NetChange::between(&before, &after, unix_now_ms()) else {
                 continue;
             };
-            before = after;
+            before = after.knowing(&before);
             let Some(p) = presence.upgrade() else { return };
             p.changed(change).await;
         }
@@ -927,6 +927,15 @@ fn spawn_accept_loop(
                 }
             });
         }
+        // **An endpoint that ends while the node runs is said** (`MuxSocket::read_failed`): quinn
+        // ends it on an I/O error it reports only on its `tracing` output, and the node then went
+        // on running unreachable without a word.
+        if !*shared.closed().borrow() {
+            eprintln!(
+                "vox: this node stopped taking connections: its endpoint ended though nothing \
+                 closed it, so nobody can reach it until its daemon restarts"
+            );
+        }
     })
     .abort_handle()
 }
@@ -940,7 +949,7 @@ fn spawn_handshake(
 ) {
     tokio::spawn(async move {
         let _permit = permit;
-        if let Ok(conn) = shared.finish_incoming(incoming, unix_now()).await {
+        if let Ok(conn) = shared.finish_incoming(incoming, unix_now_ms()).await {
             shared.route(conn);
         }
     });

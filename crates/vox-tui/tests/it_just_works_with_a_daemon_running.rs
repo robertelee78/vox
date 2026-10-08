@@ -238,27 +238,13 @@ fn the_verbs_a_person_cannot_skip_work_while_a_daemon_holds_the_profile() {
          removes — a closed room cannot show its name, so there was nothing to type"
     );
 
-    // ---- claim 1: trust add, while the daemon holds the profile ----
-    let (ok, out, err) = vox(
-        &data,
-        &cfg,
-        &["trust", "add", &stranger, "--name", "agent-two"],
-    );
-    assert!(
-        ok,
-        "PRODUCT: `vox trust add` must work while a daemon holds the profile — it is how a person \
-         decides who may read them, and there is no way to avoid running it. stdout={out:?} \
-         stderr={err:?}"
-    );
-    assert!(
-        out.contains("agent-two"),
-        "PRODUCT: and it must say what it granted: {out:?}"
-    );
-
     // ---- claim 3: a wrong passphrase is refused ----
     // This is the load-bearing one. ADR-020 §7 keeps keyring edits off this socket
     // because an agent session can reach it; the passphrase is what replaces that
     // exclusion. If it were not checked, claim 1 would be measuring a hole.
+    // **Before claim 1**: the right passphrase entered for a keyring change opens the keyring
+    // window (ADR-020 3.1, ADR-028 K-12), inside which no passphrase is asked, so a wrong one
+    // would never be read. Attaching opened none, so this change is asked for its passphrase.
     let (ok, out, err) = vox_as(
         &data,
         &cfg,
@@ -274,6 +260,23 @@ fn the_verbs_a_person_cannot_skip_work_while_a_daemon_holds_the_profile() {
     assert!(
         err.contains("passphrase"),
         "PRODUCT: and the refusal must say why: stdout={out:?} stderr={err:?}"
+    );
+
+    // ---- claim 1: trust add, while the daemon holds the profile ----
+    let (ok, out, err) = vox(
+        &data,
+        &cfg,
+        &["trust", "add", &stranger, "--name", "agent-two"],
+    );
+    assert!(
+        ok,
+        "PRODUCT: `vox trust add` must work while a daemon holds the profile — it is how a person \
+         decides who may read them, and there is no way to avoid running it. stdout={out:?} \
+         stderr={err:?}"
+    );
+    assert!(
+        out.contains("agent-two"),
+        "PRODUCT: and it must say what it granted: {out:?}"
     );
 
     // ---- claim 2: trust list, over the socket ----

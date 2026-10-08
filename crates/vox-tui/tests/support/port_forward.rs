@@ -364,6 +364,12 @@ impl ForwardedWorld {
     /// `VOX_TEST_ADVERTISE`: without it the host advertises its real address, the forward is never
     /// used, and the world is not the one its proofs measure (V210-105).
     pub fn new(forward_open: bool) -> Self {
+        Self::new_with_host_env(forward_open, &[])
+    }
+
+    /// [`ForwardedWorld::new`], its host started with `host_env` too: a test-only knob a proof
+    /// stages its moment with (each named in a `test_knobs::require` of the proof's own).
+    pub fn new_with_host_env(forward_open: bool, host_env: &[(&str, &str)]) -> Self {
         use crate::world::{
             after_label, args, echo_service, fingerprint, mkdir, vox_once, vox_once_attached,
             VoxProc,
@@ -396,6 +402,11 @@ impl ForwardedWorld {
         let forward = PortForward::start(host_addr, forward_open);
         let advertise = forward.public.to_string();
         let service_port = echo_service();
+        // A knob reaches the host's node only through the daemon its `vox serve` starts: one left by
+        // an earlier verb would run without it.
+        if !host_env.is_empty() {
+            crate::world::reap_daemon(&host_dir);
+        }
         let mut host = VoxProc::spawn_env(
             "host",
             &host_dir,
@@ -407,7 +418,7 @@ impl ForwardedWorld {
                 "--listen",
                 &host_addr.to_string(),
             ]),
-            &[("VOX_TEST_ADVERTISE", advertise.as_str())],
+            &[&[("VOX_TEST_ADVERTISE", advertise.as_str())], host_env].concat(),
         );
         let room = after_label(
             &host.expect_line("room", |l| l.starts_with("room ")),

@@ -620,7 +620,7 @@ pub async fn execute_punch(
     endpoint: Arc<VoxEndpoint>,
     plan: PunchPlan,
     expected_peer: Digest32,
-    now_secs: u64,
+    now_ms: u64,
 ) -> Result<VoxConnection> {
     if !plan.fire_delay.is_zero() {
         tokio::time::sleep(plan.fire_delay).await;
@@ -629,7 +629,7 @@ pub async fn execute_punch(
         endpoint,
         &plan.targets,
         expected_peer,
-        now_secs,
+        now_ms,
         PUNCH_ATTEMPT_TIMEOUT,
     )
     .await

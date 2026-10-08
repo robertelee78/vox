@@ -153,6 +153,36 @@ pub struct MuxSocket {
     ipv6: bool,
     /// See [`Self::received`].
     received: std::sync::atomic::AtomicU64,
+    /// The real socket's failed reads since it last read a datagram (see
+    /// [`MuxSocket::read_failed`]).
+    failing: Mutex<Option<Failing>>,
+}
+
+/// A run of failed reads on the real socket: how many, since when.
+struct Failing {
+    reads: u64,
+    since: std::time::Instant,
+}
+
+/// How long a socket whose read failed waits before reading again.
+const RECV_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// **Test-only: one injected read failure** (`VOX_TEST_RECV_FAIL_FILE`, in a build with the
+/// `test-knobs` feature; no shipped build reads it, V210-105). While the named file exists, the next
+/// read of the real socket fails, the network down, instead of reading, and removes the file: a proof
+/// sees it gone once the failure has happened.
+#[cfg(feature = "test-knobs")]
+pub const TEST_RECV_FAIL_FILE_ENV: &str = "VOX_TEST_RECV_FAIL_FILE";
+
+#[cfg(feature = "test-knobs")]
+fn injected_read_failure() -> Option<io::Error> {
+    static FILE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let file = FILE
+        .get_or_init(|| std::env::var_os(TEST_RECV_FAIL_FILE_ENV).map(Into::into))
+        .as_ref()?;
+    std::fs::remove_file(file)
+        .ok()
+        .map(|()| io::Error::new(io::ErrorKind::NetworkDown, "network is down (injected)"))
 }
 
 #[derive(Default)]
@@ -245,7 +275,60 @@ impl MuxSocket {
             carriers: Mutex::new(HashMap::new()),
             inbox: Mutex::new(Inbox::default()),
             received: std::sync::atomic::AtomicU64::new(0),
+            failing: Mutex::new(None),
         })
+    }
+
+    /// **A failed read of the real socket is said, and read again; it never ends the endpoint.**
+    /// quinn ends its endpoint for good on any read error but `ECONNRESET`, and says so only on
+    /// its `tracing` output, which nothing reads: the node went on running and could be reached by
+    /// nobody, in silence, for the rest of its life — seen once after a real change of the
+    /// machine's network, a joiner on loopback refused "no board could be read" on every try. So
+    /// the failure is said once per run of them, the read is tried again after [`RECV_RETRY`], and
+    /// the first read that works after says how long the socket could not read.
+    fn read_failed(&self, e: &io::Error, cx: &Context) {
+        {
+            let mut failing = self.failing.lock().unwrap_or_else(PoisonError::into_inner);
+            match failing.as_mut() {
+                Some(f) => f.reads += 1,
+                None => {
+                    eprintln!(
+                        "vox: this node's socket could not read ({e}); it keeps listening and \
+                         reads again"
+                    );
+                    *failing = Some(Failing {
+                        reads: 1,
+                        since: std::time::Instant::now(),
+                    });
+                }
+            }
+        }
+        let waker = cx.waker().clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(async move {
+                    tokio::time::sleep(RECV_RETRY).await;
+                    waker.wake();
+                });
+            }
+            Err(_) => waker.wake(),
+        }
+    }
+
+    /// A read worked: if a run of failed ones came before it, say it is over.
+    fn read_works(&self) {
+        let ended = self
+            .failing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(f) = ended {
+            eprintln!(
+                "vox: this node's socket reads again, after {} failed read(s) over {} ms",
+                f.reads,
+                f.since.elapsed().as_millis()
+            );
+        }
     }
 
     /// How many receive batches the real socket underneath has handed up so far (circuits' are not
@@ -529,12 +612,28 @@ impl AsyncUdpSocket for MuxSocket {
             }
             inbox.waker = Some(cx.waker().clone());
         }
-        let got = self.inner.poll_recv(cx, bufs, meta);
-        if let Poll::Ready(Ok(n)) = &got {
-            self.received
-                .fetch_add(*n as u64, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "test-knobs")]
+        if let Some(e) = injected_read_failure() {
+            self.read_failed(&e, cx);
+            return Poll::Pending;
         }
-        got
+        match self.inner.poll_recv(cx, bufs, meta) {
+            Poll::Ready(Ok(n)) => {
+                self.received
+                    .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                self.read_works();
+                Poll::Ready(Ok(n))
+            }
+            // quinn passes over a reset itself: an ICMP report a peer could forge, not the socket's.
+            Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset => {
+                Poll::Ready(Err(e))
+            }
+            Poll::Ready(Err(e)) => {
+                self.read_failed(&e, cx);
+                Poll::Pending
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {

@@ -277,11 +277,12 @@ fn vox_serve_names_who_can_reach_it_and_who_cannot() {
          who can reach it (the guest and mallory); it said:\n{said}"
     );
     // Said as a sentence: the program and where it listens, without the list's column padding.
+    // Every address it listens on is named, so 0.0.0.0 may come with others (a program bound to
+    // 0.0.0.0 and 127.0.0.1 too reads "on 0.0.0.0:5432, 127.0.0.1:5432, tcp").
     let everywhere = at(&|l: &str| {
         l.starts_with("warning: `db` (")
-            && l.contains(&format!(
-                " on 0.0.0.0:{db_port}, tcp) listens on every interface"
-            ))
+            && l.contains(&format!(" on 0.0.0.0:{db_port}"))
+            && l.contains(", tcp) listens on every interface")
             && !l.contains("  ")
     });
     let database =

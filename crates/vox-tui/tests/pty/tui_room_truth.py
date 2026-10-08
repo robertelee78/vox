@@ -101,7 +101,8 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             Sessions and ends one: Bob's Sessions pane lists the open one by `vox room sessions`'s
             label and the ended one apart under "Ended (1)"; `:all` shows each opening and end
             among the room's messages; `:session <short id>`, without drive, shows only that it
-            exists and "Only members alice trusts with drive see inside this Session.", with no
+            exists, "<label> — name and id as alice says" (MD-3) and "Only members alice trusts
+            with drive see inside this Session.", with no
             composer, and `:send` there is refused, reaching nobody (ADR-029 CL-2, CL-3, #553);
   session-order  Alice posts, then her hook opens a new Session, within one second: in Bob's All the
             post reads first and "<label> opened" under it (#562: times in milliseconds);
@@ -1208,6 +1209,8 @@ try:
     screen = tui.display()
     inside = " ".join(" ".join(r.split()) for r in pane(screen, "Timeline"))
     titled = any(f"Timeline — {open_label} · open" in r for r in screen)
+    # The Session's name and id are alice's node's claim, and the TUI says so (ADR-029 MD-3).
+    claimed = any(f"{open_label} — name and id as alice says" in r for r in screen)
     # The pane wraps its lines: read it as one text without the spaces a wrap took.
     nodrive = ("Only members alice trusts with drive see inside this Session.".replace(" ", "")
                in inside.replace(" ", ""))
@@ -1223,10 +1226,11 @@ try:
     share_told = "you cannot drive this Session: alice has not given you drive" in share_refused
     tui.key(":general\r", 2)
     leaked = "DRIVE-WITHOUT-DRIVE" in run("alice", "room", "read", room).stdout
-    claim("sessions", listed and apart and merged and titled and nodrive and no_composer and told
+    claim("sessions", listed and apart and merged and titled and claimed and nodrive and no_composer and told
           and not leaked and share_told,
           f"Sessions pane: {listed_rows!r} (open listed: {listed}, ended apart: {apart}); All merged the "
-          f"openings and end among the messages: {merged}; `:session` titled {titled}, said no drive "
+          f"openings and end among the messages: {merged}; `:session` titled {titled}, said whose claim its "
+          f"name and id are {claimed}, said no drive "
           f"{nodrive}, no composer {no_composer}; `:send` there said {refused!r}, reached the room: "
           f"{leaked}; `:share` there said {share_refused!r}" + ("" if merged else f"; All showed: {all_rows!r}")
           + ("" if titled and nodrive else "; screen:\n" + "\n".join(screen)))

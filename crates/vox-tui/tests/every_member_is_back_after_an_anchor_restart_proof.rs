@@ -23,7 +23,9 @@
 //!
 //! **Asserted after the restart:** the restarted anchor reports all [`MEMBERS`] peers connected
 //! within [`BACK_WITHIN`] of SIGCONT — its own `N peer(s) connected` line, read as it is printed;
-//! and **no member was turned away**: none says its dial to the anchor failed after the restart.
+//! and **no member was turned away**: none says its dial to the anchor failed after the restart,
+//! save a dial begun before the hold, which may time out across it within the exchange's bound
+//! and must then say it did not answer in time, not "answers as" (ADR-011 38a).
 //!
 //! **A stop must be said to every member** for that bound to hold: a member that misses its
 //! anchor's close learns it is gone only from its silence (30 s).
@@ -280,7 +282,12 @@ fn every_member_is_back_after_an_anchor_restart() {
     );
 
     // ---- nobody was turned away ------------------------------------------------------------------
-    // What the members saw: a member the anchor turned away says its dial failed.
+    // What the members saw: a member the anchor turned away says its dial failed. One exception,
+    // the staging's own: a dial whose exchange began before SIGSTOP and was not answered by then
+    // times out across the hold, within EXCHANGE_TIMEOUT of SIGCONT, and must say it timed out —
+    // never "answers as" or "did not prove", which read as a refusal or an impostor (ADR-011 38a).
+    let exchange = vox_core::transport::identity::EXCHANGE_TIMEOUT;
+    let mut across_hold = Vec::new();
     let turned_away: Vec<String> = daemons
         .iter()
         .flat_map(|d| {
@@ -289,10 +296,24 @@ fn every_member_is_back_after_an_anchor_restart() {
                 .unwrap_or_else(|e| e.into_inner())
                 .iter()
                 .filter(|(t, l)| *t >= back && l.contains("dialling this anchor failed"))
+                .filter(|(t, l)| {
+                    let held = *t < back + exchange
+                        && l.contains(&format!("did not answer within {} s", exchange.as_secs()))
+                        && !l.contains("answers as")
+                        && !l.contains("did not prove");
+                    if held {
+                        across_hold.push(format!("{}: {l}", d.name));
+                    }
+                    !held
+                })
                 .map(|(_, l)| format!("{}: {l}", d.name))
                 .collect::<Vec<_>>()
         })
         .collect();
+    eprintln!(
+        "[proof] {} dial(s) begun before the hold timed out across it, as they said: {across_hold:#?}",
+        across_hold.len()
+    );
     eprintln!(
         "[proof] {} dial(s) to the restarted anchor failed, as the members said",
         turned_away.len()
@@ -408,10 +429,55 @@ fn every_member_is_back_after_an_anchor_restart() {
             eprintln!("[proof]     +{:?} {l}", t.duration_since(away));
         }
     }
+    // **A member that never came back is the product's red, whatever its dials did** (the full
+    // pass of 75c22d4f: 27 of 32 back after a minute, and the staging line, read first, called it
+    // a staging miss). Each one is named, with what it said since the anchor went away.
+    let missing: Vec<String> = daemons
+        .iter()
+        .filter(|d| {
+            !d.timed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|(t, l)| *t >= back && l.contains("connected to this anchor"))
+        })
+        .map(|d| {
+            let lines = d.timed.lock().unwrap_or_else(|e| e.into_inner());
+            let said: Vec<String> = lines
+                .iter()
+                .filter(|(t, _)| *t >= away)
+                .map(|(t, l)| format!("    +{:?} {l}", t.duration_since(away)))
+                .collect();
+            format!("  {}:\n{}", d.name, said.join("\n"))
+        })
+        .collect();
+    assert!(
+        most >= MEMBERS,
+        "PRODUCT: only {most}/{MEMBERS} members were connected to the anchor again within {:?} of it \
+         listening after the outage; those that did not say they were:\n{}",
+        BACK_WITHIN + Duration::from_secs(50),
+        missing.join("\n")
+    );
+    // Which members, and what they said while it was away: a staging miss names its cause.
+    let short: Vec<String> = daemons
+        .iter()
+        .zip(&failed)
+        .filter(|(_, n)| **n < 2)
+        .map(|(d, n)| {
+            let lines = d.timed.lock().unwrap_or_else(|e| e.into_inner());
+            let said: Vec<String> = lines
+                .iter()
+                .filter(|(t, _)| *t >= away)
+                .map(|(t, l)| format!("    +{:?} {l}", t.duration_since(away)))
+                .collect();
+            format!("  {} ({n} failed dial(s)):\n{}", d.name, said.join("\n"))
+        })
+        .collect();
     assert!(
         fewest >= 2,
         "PRODUCT (staging): a member's dials failed only {fewest} time(s) while its anchor was away, \
-         so its backoff never grew"
+         so its backoff never grew; {most}/{MEMBERS} were back. The members short of two:\n{}",
+        short.join("\n")
     );
     assert!(
         most >= MEMBERS && at <= BACK_WITHIN,

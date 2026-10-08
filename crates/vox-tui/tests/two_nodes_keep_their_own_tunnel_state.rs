@@ -39,7 +39,7 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::net::{TcpListener, TcpStream};
 
 use vox_core::identity::composite::SoftwareRootSigner;
-use vox_core::transport::quic::{unix_now, VoxConnection, VoxEndpoint};
+use vox_core::transport::quic::{unix_now_ms, VoxConnection, VoxEndpoint};
 use vox_core::tunnel::session;
 
 fn loopback() -> SocketAddr {
@@ -59,7 +59,7 @@ async fn connect(
     let addr = peer.local_addr().expect("APPARATUS: peer address");
     let mine = tokio::time::timeout(
         Duration::from_secs(10),
-        local.connect(addr, peer.local_id(), unix_now()),
+        local.connect(addr, peer.local_id(), unix_now_ms()),
     )
     .await
     .expect("APPARATUS: the dial did not finish in 10 s")
@@ -123,7 +123,7 @@ fn a_nodes_stop_does_not_wait_for_another_nodes_finishing_tunnel() {
         let (acc_tx, mut accepted) = tokio::sync::mpsc::unbounded_channel();
         let y_accept = Arc::clone(&y);
         y_rt.spawn(async move {
-            while let Ok(Some(conn)) = y_accept.accept(unix_now()).await {
+            while let Ok(Some(conn)) = y_accept.accept(unix_now_ms()).await {
                 let _ = acc_tx.send(conn);
             }
         });

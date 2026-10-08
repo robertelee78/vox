@@ -28,18 +28,94 @@ pub struct NetShape {
     pub route_v4: Option<Ipv4Addr>,
     /// The IPv6 default route's next hop, where the platform says it.
     pub route_v6: Option<Ipv6Addr>,
+    /// Whether the kernel answered for each route, IPv4 then IPv6. A lookup that got no answer
+    /// is unknown, not "no route": compared as "none", it was a route that went away, and the
+    /// node redialled everything for a network change that never happened.
+    pub routes_known: (bool, bool),
 }
 
 impl NetShape {
     /// The machine's shape now.
     pub async fn now() -> Self {
+        // The routes are asked of the kernel by a blocking read: off the async workers, so a slow
+        // answer holds no worker (and with it the runtime's timers) while it comes.
+        let (route_v4, route_v6) = tokio::task::spawn_blocking(|| {
+            (
+                route_v4_now(),
+                known(crate::nat::portmap::gateway::default_gateway_v6())
+                    .map(|r| r.map(|(ip, _)| ip)),
+            )
+        })
+        .await
+        .unwrap_or((None, None));
         Self {
             addrs: crate::nat::reachability::local_route_ips().await,
-            route_v4: crate::nat::portmap::gateway::default_gateway_v4().ok(),
-            route_v6: crate::nat::portmap::gateway::default_gateway_v6()
-                .ok()
-                .map(|(ip, _)| ip),
+            route_v4: route_v4.flatten(),
+            route_v6: route_v6.flatten(),
+            routes_known: (route_v4.is_some(), route_v6.is_some()),
         }
+    }
+
+    /// This shape, with a route it does not know taken from `earlier`: what the watcher compares
+    /// the next shape with, so an unanswered lookup does not hide a later change of that route.
+    #[must_use]
+    pub fn knowing(mut self, earlier: &NetShape) -> Self {
+        if !self.routes_known.0 {
+            self.route_v4 = earlier.route_v4;
+            self.routes_known.0 = earlier.routes_known.0;
+        }
+        if !self.routes_known.1 {
+            self.route_v6 = earlier.route_v6;
+            self.routes_known.1 = earlier.routes_known.1;
+        }
+        self
+    }
+}
+
+/// A route lookup's answer: `Some(Some(hop))`, `Some(None)` when the kernel said there is no
+/// default route, and `None` when it said nothing (no answer, or a socket that would not open).
+fn known<T>(r: crate::error::Result<T>) -> Option<Option<T>> {
+    use crate::nat::portmap::gateway::{NO_NEXT_HOP, NO_ROUTE, NO_ROUTE_V6};
+    match r {
+        Ok(v) => Some(Some(v)),
+        Err(crate::error::Error::PortMappingFailed(why))
+            if why == NO_ROUTE || why == NO_ROUTE_V6 || why == NO_NEXT_HOP =>
+        {
+            Some(None)
+        }
+        Err(_) => None,
+    }
+}
+
+/// The IPv4 default route's next hop now (see [`known`]), or the one a proof staged
+/// ([`TEST_ROUTE_V4_FILE_ENV`]).
+fn route_v4_now() -> Option<Option<Ipv4Addr>> {
+    #[cfg(feature = "test-knobs")]
+    if let Some(staged) = test_route_v4() {
+        return staged;
+    }
+    known(crate::nat::portmap::gateway::default_gateway_v4())
+}
+
+/// **Test-only: the IPv4 default route's next hop, read from a file** (`VOX_TEST_ROUTE_V4_FILE`, in a
+/// build with the `test-knobs` feature; no shipped build reads it, V210-105). The file holds an
+/// address or `none`; writing it stages a move of the machine's default route through the node's
+/// own change path ([`NetWatch::settled`] wakes on it as on the operating system's event), with no
+/// privilege and no real interface touched. `unanswered` stages a lookup the kernel did not
+/// answer.
+#[cfg(feature = "test-knobs")]
+pub const TEST_ROUTE_V4_FILE_ENV: &str = "VOX_TEST_ROUTE_V4_FILE";
+
+/// The lookup the [`TEST_ROUTE_V4_FILE_ENV`] file stages, as [`known`] gives it: `None` when the
+/// knob is not set (the real route is read), `Some(None)` for `unanswered`, `Some(Some(None))` for
+/// `none`.
+#[cfg(feature = "test-knobs")]
+fn test_route_v4() -> Option<Option<Option<Ipv4Addr>>> {
+    let text = std::fs::read_to_string(std::env::var_os(TEST_ROUTE_V4_FILE_ENV)?).ok()?;
+    match text.trim() {
+        "unanswered" => Some(None),
+        "none" => Some(Some(None)),
+        ip => ip.parse().ok().map(|ip| Some(Some(ip))),
     }
 }
 
@@ -70,14 +146,15 @@ impl NetChange {
         let went: Vec<IpAddr> = old.difference(&new).copied().collect();
         let mut routes = Vec::new();
         let said = |ip: Option<String>| ip.unwrap_or_else(|| "none".to_owned());
-        if before.route_v4 != after.route_v4 {
+        // A route compared only where both looks got an answer (see `NetShape::routes_known`).
+        if before.routes_known.0 && after.routes_known.0 && before.route_v4 != after.route_v4 {
             routes.push(format!(
                 "IPv4 default route {} → {}",
                 said(before.route_v4.map(|i| i.to_string())),
                 said(after.route_v4.map(|i| i.to_string()))
             ));
         }
-        if before.route_v6 != after.route_v6 {
+        if before.routes_known.1 && after.routes_known.1 && before.route_v6 != after.route_v6 {
             routes.push(format!(
                 "IPv6 default route {} → {}",
                 said(before.route_v6.map(|i| i.to_string())),
@@ -157,6 +234,24 @@ impl NetWatch {
     /// the machine went quiet for [`NETWORK_SETTLE`], which it may not do for as long as that
     /// connection lasts: a move to another network was never noticed, and nothing was redialled.
     pub async fn settled(&mut self) -> std::io::Result<()> {
+        #[cfg(feature = "test-knobs")]
+        if std::env::var_os(TEST_ROUTE_V4_FILE_ENV).is_some() {
+            let seen = test_route_v4();
+            let staged = async {
+                while test_route_v4() == seen {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            };
+            return tokio::select! {
+                r = self.settled_os() => r,
+                () = staged => Ok(()),
+            };
+        }
+        self.settled_os().await
+    }
+
+    /// [`NetWatch::settled`] on the operating system's events alone.
+    async fn settled_os(&mut self) -> std::io::Result<()> {
         while !self.read_relevant().await? {}
         let mut quiet_from = tokio::time::Instant::now() + NETWORK_SETTLE;
         loop {

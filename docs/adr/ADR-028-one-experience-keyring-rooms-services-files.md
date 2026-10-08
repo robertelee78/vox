@@ -275,9 +275,14 @@ keep code in sync through GitHub.
   alias), what was decided, and why, and, for a decision about a room (a join, a share stopped),
   that room's ID.
 - **D-2.** The record MUST hold no message text, file name or content, passphrase, key or token,
-  and of a room only its ID, never its name. It MUST be stored under the node's directory
-  (`nodes/<name>/decisions/<YYYY-MM-DD>.jsonl`, mode `0600`), kept 14 days, and never sent
-  anywhere.
+  and of a room only its ID, never its name. It MUST be sealed at rest under a key derived from
+  the identity, as the trust keyring is (ADR-010 AR-22): each event AES-256-GCM under
+  `HKDF(self_seed, "vox/decisions-sek/v1")`, or, for a headless `vox node`, under its identity
+  factor. It MUST be stored under the node's directory (`nodes/<name>/decisions/<YYYY-MM-DD>.sealed`,
+  mode `0600`), kept 14 days, never sent anywhere, and read by clients only through the node
+  while it is attached. A plaintext day an earlier build wrote MUST be sealed or removed at the
+  next unlock, never left readable. (The decider, 2026-10-07: "Encrypting the diary is the right
+  option"; #563.)
 - **D-3.** `vox status` MUST name the most recent refusals; the TUI and the app MUST show the record
   as a timeline.
 

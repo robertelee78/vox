@@ -644,19 +644,32 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
             )
             .expect("APPARATUS (harness error): a pre-join")
         };
-    let (r1_rec, r2_rec, sent_at) = loop {
+    // Both pre-joins are built and signed **before** their second starts (a prekey ring takes tens
+    // of ms to make, more on a slow machine), stamped for a second two seconds ahead; then they
+    // are sent in that second's first 100 ms. Building them inside the window spun forever on a
+    // Linux host where two rings take longer than the window: a watchdog abort, not a verdict.
+    let mut tries = 0;
+    let (r1_rec, r2_rec, second, sent_at) = loop {
+        tries += 1;
+        assert!(
+            tries <= 10,
+            "APPARATUS (staging not achieved): in 10 tries the two pre-joins were never sent within \
+             the first 100 ms of the second they were stamped for"
+        );
+        let second = (hostile::now_ms() / 1_000 + 2) * 1_000;
+        let built = (
+            prejoin(&r1, 0x43, second + 900 - lifetime),
+            prejoin(&r2, 0x44, second - 300 - lifetime),
+        );
         let now = hostile::now_ms();
-        if now % 1_000 < 50 {
-            let built = (
-                prejoin(&r1, 0x43, now + 900 - lifetime),
-                prejoin(&r2, 0x44, now - 300 - lifetime),
-            );
-            // Still inside the first 100 ms once both are signed, or wait for the next second.
-            if hostile::now_ms() % 1_000 < 100 {
-                break (built.0, built.1, now);
-            }
+        if now >= second {
+            continue;
         }
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(second - now));
+        let now = hostile::now_ms();
+        if now - second < 100 {
+            break (built.0, built.1, second, now);
+        }
     };
     let (inside, inside_read) = rt.block_on(async {
         let put = put(&r1_v, &r1_rec.to_wire()).await;
@@ -677,15 +690,15 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     println!(
         "[proof] step: a pre-join with 900 ms of its lifetime left, sent {} ms into a second \
          → {inside:?}, read back {} ms later: {}; one 300 ms past its lifetime → {past:?}",
-        sent_at % 1_000,
+        sent_at - second,
         read_at - sent_at,
         if r1_served { "served" } else { "not served" }
     );
     assert!(
-        read_at - sent_at < 900,
-        "APPARATUS (staging not achieved): the put and the read took {} ms, past the record's \
-         900 ms; nothing below would measure the lifetime",
-        read_at - sent_at
+        read_at - second < 900,
+        "APPARATUS (staging not achieved): the put and the read ended {} ms into the second, past \
+         the record's 900 ms; nothing below would measure the lifetime",
+        read_at - second
     );
     assert!(
         inside.is_ok() && r1_served,
@@ -948,5 +961,193 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
          its roster lists F1, who falsely claims to be the creator ({f1_listed}), or F2, whose \
          witness a stranger signed in bravo's name ({f2_listed}); its `vox room read` shows F1's \
          post ({rendered}), its key {said}:\n{roster}\n{read}"
+    );
+}
+
+/// A member's roster of `team`, as `vox room roster` prints it.
+fn roster(dir: &std::path::Path) -> String {
+    let (ok, out, err) = vox_in(dir, &["room", "roster", "team"], "");
+    format!("{}{out}{err}", if ok { "" } else { "(roster failed) " })
+}
+
+/// The admission notices `conn`'s node holds on its board for `room`, as the attacker reads them.
+async fn notices_on(conn: &VoxConnection, room: &Digest32) -> Vec<Vec<u8>> {
+    let mut client = RendezvousClient::open(conn)
+        .await
+        .expect("CANNOT MEASURE: the node's board stream did not open");
+    let set = client
+        .get(room, 0, RecordKinds::NOTICES)
+        .await
+        .expect("CANNOT MEASURE: the node's board did not answer a read");
+    client.finish();
+    set.notices.iter().map(|n| n.to_wire()).collect()
+}
+
+/// #520 — **every member learns of an admitted newcomer while it is offline, and an admission
+/// replayed after a member left admits it nowhere.** The decider (2026-10-06): when a member lets a
+/// newcomer in, every member learns of it, so every member's list matches; who reads whom does not
+/// change. The lead's condition: a replayable admission must never make a departed node an author.
+///
+/// **Staging.** The host (`vox daemon`) creates `team`; carol, then spy, join it through the host
+/// and stop, so neither is online for what follows; then x joins and **leaves** (`vox room leave`),
+/// and stops. Before x leaves, the proof, holding spy's real key as an attacker would, reads x's
+/// admission notice off the host's board. Everything asserted is what the shipped binary does.
+///
+/// **Asserted.**
+/// 1. The host keeps x's admission notice on its board after x joined (#520): without it nobody
+///    could learn of x while x is offline. Missing is `PRODUCT`.
+/// 2. *Replay where the leave is known* (b): the attacker puts x's notice back on the host's board
+///    after x left: **refused, `withdrawn`**.
+/// 3. *Replay where it is not* (the withdraw notice): carol, who saw neither x's join nor its leave
+///    nor any withdraw, starts again and syncs with the host. She learns spy, admitted while she
+///    was away and offline since (the offline newcomer, from its notice), and **never lists x**;
+///    and the attacker's replay of x's notice to carol's board is **refused, `withdrawn`**: the
+///    withdraw reached her with the notice, first.
+///
+/// **Mutations**, one each: (1) the admitting member keeps no notice — red PRODUCT (no notice on
+/// the host's board). (2) `nat::store::accept_notice` ignores withdraws — red PRODUCT (2: the
+/// replay is taken). (3) `ChannelState::admit_from_notice` ignores withdraws and the board passes
+/// withdraws on after notices — red PRODUCT (3: carol lists x).
+#[test]
+#[ignore = "real vox processes with production Argon2id and three real joins; run in release"]
+fn an_admission_reaches_every_member_and_never_outlives_a_leave() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS (harness error): a temp dir");
+    let (anchor_dir, host_dir, carol_dir, spy_dir, x_dir) = (
+        profile_dir(tmp.path(), "anchor"),
+        profile_dir(tmp.path(), "host"),
+        profile_dir(tmp.path(), "carol"),
+        profile_dir(tmp.path(), "spy"),
+        profile_dir(tmp.path(), "x"),
+    );
+    let pass_file = tmp.path().join("identity.pass");
+    std::fs::write(&pass_file, format!("{IDENTITY}\n"))
+        .expect("APPARATUS (harness error): the identity passphrase file");
+    let (_anchor, spec) = hostile::anchor(&anchor_dir, "127.0.0.1:0");
+    // Every identity made before any daemon starts: `fingerprint` makes it.
+    let host_id = fingerprint(&host_dir);
+    let carol_id = fingerprint(&carol_dir);
+    let (spy_id, x_id) = (fingerprint(&spy_dir), fingerprint(&x_dir));
+    let host = std::cell::RefCell::new(daemon("host", &host_dir, 0, &spec, &pass_file));
+    let host_port = hostile::listening_port(&host_dir);
+    let host_addr = format!("127.0.0.1:{host_port}")
+        .parse()
+        .expect("APPARATUS (harness error): the host's address");
+    let (room, link) = create_room(&host_dir, "team", ROOM_PASS);
+    let join = |name: &str, dir: &std::path::Path| {
+        let mut d = daemon(name, dir, 0, &spec, &pass_file);
+        let (ok, out, err) = vox_in(
+            dir,
+            &["room", "join", "--passphrase-file", "-", &link],
+            ROOM_PASS,
+        );
+        assert!(
+            ok,
+            "PRODUCT (staging): {name} could not join: {out}{err}\n---- {name}'s daemon ----\n{}\n---- the host's daemon ----\n{}",
+            d.transcript(),
+            host.borrow_mut().transcript()
+        );
+        // Let the host file the new member before it goes.
+        std::thread::sleep(Duration::from_secs(3));
+        d
+    };
+    drop(join("carol", &carol_dir));
+    drop(join("spy", &spy_dir));
+    let x = join("x", &x_dir);
+
+    // ---- 1. the host keeps x's notice ------------------------------------------------------
+    let spy = member_signer(&spy_dir);
+    let rt = Rt::new();
+    let (_s1, spy_host) = rt.block_on(connect(&spy, host_addr, host_id));
+    let x_hex = b32_encode(&x_id);
+    let captured = rt
+        .block_on(notices_on(&spy_host, &room))
+        .into_iter()
+        .find(|w| {
+            vox_core::nat::notice::AdmissionNotice::from_wire(w).is_ok_and(|n| n.joiner() == x_id)
+        });
+    let Some(captured) = captured else {
+        panic!("PRODUCT: x joined through the host, and the host's board holds no admission notice of x (#520)");
+    };
+
+    // x leaves, as a person does, and stops.
+    let (ok, out, err) = vox_in(&x_dir, &["room", "leave", "team"], "");
+    assert!(ok, "PRODUCT (staging): x could not leave: {out}{err}");
+    std::thread::sleep(Duration::from_secs(3));
+    drop(x);
+
+    // ---- 2. a replay where the leave is known ---------------------------------------------
+    let at_host = rt.block_on(put(&spy_host, &captured));
+    assert!(
+        matches!(&at_host, Err(why) if why.contains("withdrawn")),
+        "PRODUCT: x left, and its admission notice put back on the host's board must be refused \
+         as withdrawn; the board answered {at_host:?}"
+    );
+
+    // ---- 3. a replay where nothing of the leave was seen ----------------------------------
+    // Started here rather than through `daemon`, so a daemon that does not come up says why.
+    let mut carol_d = world::VoxProc::spawn(
+        "carol",
+        &carol_dir,
+        &world::args(&[
+            "daemon",
+            "--listen",
+            "127.0.0.1:0",
+            "--anchor",
+            &spec,
+            "--passphrase-file",
+            pass_file
+                .to_str()
+                .expect("APPARATUS (harness error): a UTF-8 path"),
+        ]),
+    );
+    let up_by = Instant::now() + Duration::from_secs(90);
+    let mut answered = vox_in(&carol_dir, &["room", "list"], "");
+    while !answered.0 && Instant::now() < up_by {
+        std::thread::sleep(Duration::from_millis(500));
+        answered = vox_in(&carol_dir, &["room", "list"], "");
+    }
+    assert!(
+        answered.0,
+        "PRODUCT (staging): carol's daemon, started again, never answered `vox room list` within \
+         90 s; it said:\n{}{}\nits daemon said:\n{}",
+        answered.1,
+        answered.2,
+        carol_d.transcript()
+    );
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let spy_hex = b32_encode(&spy_id);
+    let mut seen = roster(&carol_dir);
+    while !seen.contains(&spy_hex) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(500));
+        seen = roster(&carol_dir);
+    }
+    assert!(
+        seen.contains(&spy_hex),
+        "PRODUCT: spy was admitted while carol was away and has been offline since; back, carol \
+         must list spy within 90 s (#520: every member learns of a newcomer, offline or not). \
+         Her roster:\n{seen}"
+    );
+    let carol_port = hostile::listening_port(&carol_dir);
+    let carol_addr = format!("127.0.0.1:{carol_port}")
+        .parse()
+        .expect("APPARATUS (harness error): carol's address");
+    let (_s2, spy_carol) = rt.block_on(connect(&spy, carol_addr, carol_id));
+    let at_carol = rt.block_on(put(&spy_carol, &captured));
+    // Time for anything the replay could set off: a board that grew asks the node to admit.
+    std::thread::sleep(Duration::from_secs(5));
+    let after = roster(&carol_dir);
+    eprintln!(
+        "[proof] replay at the host: {at_host:?}; at carol: {at_carol:?}; carol's roster:\n{after}"
+    );
+    assert!(
+        !after.contains(&x_hex) && !seen.contains(&x_hex),
+        "PRODUCT: x left before carol came back, and carol must never list x, though its \
+         admission was offered by the host and replayed to her; her roster:\n{after}"
+    );
+    assert!(
+        matches!(&at_carol, Err(why) if why.contains("withdrawn")),
+        "PRODUCT: x left, and its admission notice replayed to carol's board must be refused as \
+         withdrawn: the withdraw reaches her with the notice; her board answered {at_carol:?}"
     );
 }

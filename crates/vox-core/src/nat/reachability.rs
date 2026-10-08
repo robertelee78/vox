@@ -789,19 +789,19 @@ where
 /// [`Error::Unreachable`] if `candidates` is empty or every candidate fails.
 ///
 /// `endpoint` is shared (`Arc`) so each raced attempt can run concurrently on the
-/// same local QUIC endpoint. `now_secs` is the caller-supplied wall clock recorded
+/// same local QUIC endpoint. `now_ms` is the caller-supplied wall clock recorded
 /// in the session-establishment entry (ADR-011).
 pub async fn connect_direct(
     endpoint: Arc<VoxEndpoint>,
     candidates: &[SocketAddr],
     expected_peer: Digest32,
-    now_secs: u64,
+    now_ms: u64,
 ) -> Result<VoxConnection> {
     connect_direct_within(
         endpoint,
         candidates,
         expected_peer,
-        now_secs,
+        now_ms,
         PER_ATTEMPT_TIMEOUT,
     )
     .await
@@ -814,14 +814,14 @@ pub async fn connect_direct_within(
     endpoint: Arc<VoxEndpoint>,
     candidates: &[SocketAddr],
     expected_peer: Digest32,
-    now_secs: u64,
+    now_ms: u64,
     per_attempt: Duration,
 ) -> Result<VoxConnection> {
     let candidates = dialable_candidates(&endpoint, candidates);
     if candidates.is_empty() {
         return Err(Error::Unreachable("no direct candidates"));
     }
-    connect_dialable(endpoint, candidates, expected_peer, now_secs, per_attempt).await
+    connect_dialable(endpoint, candidates, expected_peer, now_ms, per_attempt).await
 }
 
 /// The candidates `endpoint`'s socket can send to, an IPv4-mapped address written as IPv4 on an
@@ -878,7 +878,7 @@ async fn connect_dialable(
     endpoint: Arc<VoxEndpoint>,
     candidates: Vec<SocketAddr>,
     expected_peer: Digest32,
-    now_secs: u64,
+    now_ms: u64,
     per_attempt: Duration,
 ) -> Result<VoxConnection> {
     // Each attempt carries the address it was for, so a failure can name it. Flattening
@@ -903,7 +903,7 @@ async fn connect_dialable(
                 &endpoint,
                 candidates[next],
                 expected_peer,
-                now_secs,
+                now_ms,
                 per_attempt,
             );
             next += 1;
@@ -914,7 +914,7 @@ async fn connect_dialable(
             // any in-flight attempt (RFC 8305 staggered start).
             tokio::select! {
                 () = tokio::time::sleep(CONNECTION_ATTEMPT_DELAY) => {
-                    spawn_attempt(&mut set, &endpoint, candidates[next], expected_peer, now_secs, per_attempt);
+                    spawn_attempt(&mut set, &endpoint, candidates[next], expected_peer, now_ms, per_attempt);
                     next += 1;
                 }
                 joined = set.join_next() => {
@@ -978,14 +978,14 @@ fn spawn_attempt(
     endpoint: &Arc<VoxEndpoint>,
     addr: SocketAddr,
     expected_peer: Digest32,
-    now_secs: u64,
+    now_ms: u64,
     per_attempt: Duration,
 ) {
     let ep = Arc::clone(endpoint);
     set.spawn(async move {
         let outcome = match tokio::time::timeout(
             per_attempt,
-            ep.connect(addr, expected_peer, now_secs),
+            ep.connect(addr, expected_peer, now_ms),
         )
         .await
         {

@@ -741,8 +741,9 @@ async fn flight_or_end(
 // The dialler.
 // ---------------------------------------------------------------------------
 
-/// Why a dial's exchange failed, for this end. Only [`DialFailed::NotAnswered`] and
-/// [`DialFailed::BadProve`] are about the other end, and neither names anyone (ADR-011 38a).
+/// Why a dial's exchange failed, for this end. [`DialFailed::NotAnswered`],
+/// [`DialFailed::BadProve`] and [`DialFailed::TimedOut`] are about the other end, and none names
+/// anyone (ADR-011 38a).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DialFailed {
     /// The listener refused: the node is not attached there (or will not say more).
@@ -761,14 +762,27 @@ pub enum DialFailed {
 }
 
 impl DialFailed {
-    /// What the dial reports (ADR-011 38a): a refusal, a `PROVE` that does not verify and a
-    /// silence all say "nothing at `<address>` answers as `<expected>`", and name no one else.
+    /// What the dial reports (ADR-011 38a), each naming no one but `expected`: a refusal says
+    /// "nothing at `<address>` answers as `<expected>`"; a `PROVE` that does not verify, "what
+    /// answered at `<address>` did not prove it is `<expected>`"; a silence, that `<address>` did
+    /// not answer within [`EXCHANGE_TIMEOUT`]. A silence is not an impostor: one said as "nothing
+    /// answers as" sent a person looking for one when the anchor was only slow (a dial across
+    /// its pause, the anchor-restart proof's red).
     #[must_use]
     pub fn into_error(self, addr: SocketAddr, expected: &Digest32) -> Error {
         match self {
-            Self::NotAnswered | Self::BadProve(_) | Self::TimedOut => {
+            Self::NotAnswered => {
                 Error::HandshakeAuth(format!("nothing at {addr} answers as {}", short(expected)))
             }
+            Self::BadProve(_) => Error::HandshakeAuth(format!(
+                "what answered at {addr} did not prove it is {}",
+                short(expected)
+            )),
+            Self::TimedOut => Error::Handshake(format!(
+                "{addr} did not answer within {} s as {}",
+                EXCHANGE_TIMEOUT.as_secs(),
+                short(expected)
+            )),
             Self::Exporter => {
                 Error::Handshake("the TLS session could not export its identity binding".into())
             }
@@ -827,6 +841,12 @@ pub(crate) async fn dial_with(
             Ok(Some(f)) => f,
             Ok(None) => return Err(closed(conn)),
             Err(Error::SizeLimitExceeded(_)) => return Err(bad_prove(conn, "an oversize PROVE")),
+            // No PROVE by the deadline is a silence, not a broken stream: the read's own patience
+            // ends at the deadline, before the timeout below does.
+            Err(_) if Instant::now() >= deadline && conn.close_reason().is_none() => {
+                conn.close(close_code(BAD_PROVE), b"");
+                return Err(DialFailed::TimedOut);
+            }
             Err(_) => return Err(closed(conn)),
         };
         let Ok(prove) = Prove::decode(&prove) else {

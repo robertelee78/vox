@@ -470,8 +470,9 @@ async fn a_prove_that_does_not_verify_gets_no_claim() {
             .into_error(c.remote_address(), &target.id())
             .to_string();
         assert!(
-            err.contains("nothing at") && err.contains("answers as"),
-            "PRODUCT: the dial said {err:?}, not \"nothing at <address> answers as <node>\""
+            err.contains("what answered at") && err.contains("did not prove it is"),
+            "PRODUCT: the dial said {err:?}, not \"what answered at <address> did not prove it \
+             is <node>\""
         );
     }
 }

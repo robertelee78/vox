@@ -988,7 +988,7 @@ impl SharedEndpoint {
     pub async fn finish_incoming(
         &self,
         incoming: quinn::Incoming,
-        now_secs: u64,
+        now_ms: u64,
     ) -> Result<VoxConnection> {
         let remote = incoming.remote_address();
         // Read before this end answers anything: see [`VoxConnection::via_circuit`].
@@ -1036,7 +1036,7 @@ impl SharedEndpoint {
         self.track(local.id(), &connection);
         let overflow = (!via_circuit).then(|| self.overflow.clone());
         let mut conn =
-            finish_connection(connection, local, &proven, now_secs, via_circuit, overflow)?;
+            finish_connection(connection, local, &proven, now_ms, via_circuit, overflow)?;
         conn.circuit_origin = circuit_origin.filter(|_| via_circuit);
         conn.carrier = carrier.filter(|_| via_circuit);
         Ok(conn)
@@ -1066,11 +1066,13 @@ impl SharedEndpoint {
     pub fn close(&self) {
         // A stopping node's last word to every connection it still has (V210-93): "stopped",
         // the same as `ConnectionManager::close_all` says, never a code that reads as a fault.
+        // Marked closed first: the accept loop that ends on it reads this to know the end was
+        // asked for.
+        self.closed.send_replace(true);
         self.endpoint.close(
             close_code(WireError::ShuttingDown),
             WireError::ShuttingDown.to_string().as_bytes(),
         );
-        self.closed.send_replace(true);
     }
 
     /// Whether the endpoint is closed, as a watch: `true` once [`Self::close`] has run.
@@ -1253,8 +1255,8 @@ impl VoxEndpoint {
     /// The neutral TLS handshake (post-quantum group, no classical fallback), then the identity
     /// exchange as the dialler ([`identity::dial`]): this node shows who it is only once the
     /// other end has proved, on this TLS session, to be `expected_peer`. Anything else — a
-    /// refusal, a `PROVE` that does not verify, silence — says "nothing at `addr` answers as
-    /// `expected_peer`" and names nobody (ADR-011 38a).
+    /// refusal, a `PROVE` that does not verify, silence — is said as what it was, naming nobody
+    /// but `expected_peer` ([`identity::DialFailed::into_error`], ADR-011 38a).
     ///
     /// # Errors
     /// As above, or a handshake failure by its own cause.
@@ -1262,7 +1264,7 @@ impl VoxEndpoint {
         &self,
         addr: SocketAddr,
         expected_peer: Digest32,
-        now_secs: u64,
+        now_ms: u64,
     ) -> Result<VoxConnection> {
         // Read before the first packet leaves: see [`VoxConnection::via_circuit`].
         let via_circuit = self.shared.mux.is_circuit(addr);
@@ -1286,7 +1288,7 @@ impl VoxEndpoint {
             connection,
             Arc::clone(&self.local),
             &proven,
-            now_secs,
+            now_ms,
             via_circuit,
             (!via_circuit).then(|| self.shared.overflow.clone()),
         )?;
@@ -1300,8 +1302,8 @@ impl VoxEndpoint {
     ///
     /// # Errors
     /// A failed handshake or exchange.
-    pub async fn accept(&self, now_secs: u64) -> Result<Option<VoxConnection>> {
-        self.accept_with_admission(now_secs, Admission::AcceptAnyAuthenticated)
+    pub async fn accept(&self, now_ms: u64) -> Result<Option<VoxConnection>> {
+        self.accept_with_admission(now_ms, Admission::AcceptAnyAuthenticated)
             .await
     }
 
@@ -1313,13 +1315,13 @@ impl VoxEndpoint {
     /// As [`Self::finish_incoming`].
     pub async fn accept_with_admission(
         &self,
-        now_secs: u64,
+        now_ms: u64,
         admission: Admission,
     ) -> Result<Option<VoxConnection>> {
         let Some(incoming) = self.accept_incoming().await else {
             return Ok(None);
         };
-        self.finish_incoming(incoming, now_secs, admission)
+        self.finish_incoming(incoming, now_ms, admission)
             .await
             .map(Some)
     }
@@ -1341,10 +1343,10 @@ impl VoxEndpoint {
     pub async fn finish_incoming(
         &self,
         incoming: quinn::Incoming,
-        now_secs: u64,
+        now_ms: u64,
         mut admission: Admission,
     ) -> Result<VoxConnection> {
-        let conn = self.shared.finish_incoming(incoming, now_secs).await?;
+        let conn = self.shared.finish_incoming(incoming, now_ms).await?;
         if conn.local_id() != self.local_id {
             conn.close(WireError::ShuttingDown);
             return Err(Error::Handshake(
@@ -1481,7 +1483,7 @@ fn finish_connection(
     connection: Connection,
     local: Arc<LocalNode>,
     proven: &identity::Proven,
-    now_secs: u64,
+    now_ms: u64,
     via_circuit: bool,
     overflow: Option<tokio::sync::watch::Receiver<Option<(u32, u32)>>>,
 ) -> Result<VoxConnection> {
@@ -1489,7 +1491,7 @@ fn finish_connection(
     // Confirm the handshake ran under the Vox configuration and read the key-exchange group it
     // actually negotiated; a session under any group but the post-quantum hybrid is refused.
     let group = confirm_handshake(&connection)?;
-    let session = SessionEstablishment::observed(peer_id, group, now_secs)?;
+    let session = SessionEstablishment::observed(peer_id, group, now_ms)?;
     let peer_process = connection
         .peer_identity()
         .and_then(|any| {
@@ -1886,12 +1888,6 @@ static LIVE: Mutex<std::collections::BTreeMap<u64, Live>> =
 
 /// The next key in [`LIVE`].
 static NEXT_TUNNEL: AtomicU64 = AtomicU64::new(0);
-
-/// The time now in Unix seconds.
-#[must_use]
-pub fn unix_now() -> u64 {
-    unix_now_ms() / 1_000
-}
 
 /// The time now in Unix milliseconds, as [`LiveTunnel`] states times.
 #[must_use]

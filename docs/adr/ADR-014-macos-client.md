@@ -217,6 +217,12 @@ F-9–F-11; RR-1, RR-3, RR-4 (RR-2 is the daemon's); D-3; L-1–L-10; W-1–W-6;
 The iOS app (v0.4.1), with showing and scanning fingerprint QR codes (ADR-028 K-1, K-5), and calls
 (v0.5.0).
 
+Dictation of its own (decider, 2026-10-07). The composer is a standard text field, so the
+system's built-in Dictation types into it as into any text field, on the Mac and in the iOS app;
+Vox adds no dictation of its own. Because the system decides whether Dictation runs on the device
+or on Apple's servers, and no setting or API lets an app require on-device, the manual MUST say so
+in one line and name swictation for dictation that stays on the Mac.
+
 ## Superseded and amended lines
 
 | ADR line | Was | Now |

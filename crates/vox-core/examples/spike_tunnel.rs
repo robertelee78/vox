@@ -30,7 +30,7 @@ const ADMIN_SEED_B: [u8; 32] = [4u8; 32];
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
 }
 

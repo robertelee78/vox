@@ -94,6 +94,15 @@ pub const TEST_ADVERTISE_ENV: &str = "VOX_TEST_ADVERTISE";
 #[cfg(feature = "test-knobs")]
 pub const TEST_HOLD_BOARD_READ_ENV: &str = "VOX_TEST_HOLD_BOARD_READ_MS";
 
+/// Test-only: hold every reach this node starts this many milliseconds before it does anything,
+/// saying so in the peer's notes — so a proof can make one side slower to reach the other than the
+/// other is to reach it: a host that has not yet learnt its guest came online, or a guest with
+/// nothing of its own to send the host (`a_first_direct_connection_is_prompt_proof`).
+/// **For proofs; nothing in a real deployment sets it.** Unset, empty or unparsable is no hold.
+/// Not compiled in without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_HOLD_REACH_ENV: &str = "VOX_TEST_HOLD_REACH_MS";
+
 /// How long a reach gives its direct dial before it asks any peer to carry a circuit (V210-122).
 ///
 /// **500 ms, not 250** (#321, attempt 3). A direct dial's first answer cannot come before the peer
@@ -631,12 +640,6 @@ impl NodeNet {
         &self.presence
     }
 
-    /// The clock in whole seconds, for the transport's session records, which are specified in
-    /// seconds.
-    fn now_secs(&self) -> u64 {
-        (self.clock)() / 1_000
-    }
-
     /// The clock in milliseconds: what the board's records are stamped with and judged by.
     fn now_ms(&self) -> u64 {
         (self.clock)()
@@ -1078,6 +1081,20 @@ impl NodeNet {
         peer: Digest32,
         endpoints: &EndpointList,
     ) -> Result<Arc<VoxConnection>> {
+        #[cfg(feature = "test-knobs")]
+        if let Some(ms) = std::env::var(TEST_HOLD_REACH_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+        {
+            if self.manager.existing(&peer).is_none() {
+                self.manager.note(
+                    peer,
+                    format!("held {ms} ms before reaching it, for a proof ({TEST_HOLD_REACH_ENV})"),
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            }
+        }
         loop {
             if let Some(conn) = self.manager.existing(&peer) {
                 return Ok(conn);
@@ -1194,7 +1211,7 @@ impl NodeNet {
         let (direct_failed, failed) = tokio::sync::watch::channel(candidates_none);
         if has_direct {
             let endpoint = Arc::clone(self.manager.endpoint());
-            let now = self.now_secs();
+            let now = self.now_ms();
             // The addresses go into the label: "all direct candidates failed" is not a
             // diagnosis on its own, and which addresses this node believed in is exactly
             // what distinguishes a stale board record from a blocked path.
@@ -1245,7 +1262,7 @@ impl NodeNet {
             let me = self.local_id();
             let coordinator = Arc::clone(coordinator);
             let endpoint = Arc::clone(self.manager.endpoint());
-            let now = self.now_secs();
+            let now = self.now_ms();
             let label = format!("dial-back via {}", short_id(coordinator.peer_id()));
             let mut failed = failed.clone();
             let manager = Arc::clone(&self.manager);
@@ -1370,13 +1387,19 @@ impl NodeNet {
                 (label, result)
             });
         }
+        // Whether each circuit has spoken for itself: asked its relay, or said it gave way. One that
+        // has not when another rung wins is said to have given way by the ladder, before it is
+        // aborted (see below).
+        let mut waiting: Vec<(Digest32, Arc<std::sync::atomic::AtomicBool>)> = Vec::new();
         for relay in helpers {
             let endpoint = Arc::clone(self.manager.endpoint());
-            let now = self.now_secs();
+            let now = self.now_ms();
             let label = format!("circuit via {}", short_id(relay.peer_id()));
             let mut failed = failed.clone();
             let manager = Arc::clone(&self.manager);
             let untold = Arc::clone(&self.untold);
+            let spoke = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            waiting.push((relay.peer_id(), Arc::clone(&spoke)));
             set.spawn(async move {
                 let deadline = started + DIRECT_HEAD_START;
                 let mut elsewhere = false;
@@ -1390,7 +1413,9 @@ impl NodeNet {
                     // win (`has_changed` errs on a dropped sender whatever it last sent).
                     let rung_won = failed.has_changed().is_err() && !*failed.borrow();
                     let held = manager.existing(&peer);
-                    if rung_won || held.is_some() {
+                    if (rung_won || held.is_some())
+                        && !spoke.swap(true, std::sync::atomic::Ordering::SeqCst)
+                    {
                         // Said, so a pair that never bridges shows what it waited for (V210-122):
                         // how long, and whether the connection that answered is direct.
                         let what = match held
@@ -1433,6 +1458,15 @@ impl NodeNet {
                 }
                 // Said, so a pair that bridges shows why (V210-122): how long the reach
                 // waited, and whether its direct dial had failed or was still under way.
+                if spoke.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    // The ladder said it gave way: another rung won as this one woke.
+                    return (
+                        label,
+                        Err(Error::Unreachable(
+                            "not asked for: a direct connection answered first",
+                        )),
+                    );
+                }
                 manager.note(
                     peer,
                     format!(
@@ -1513,6 +1547,26 @@ impl NodeNet {
                     if let Some(ms) = test_ladder_settle_ms() {
                         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                     }
+                    // **Every circuit still held back says it gave way** (V210-122), here, before
+                    // it is aborted: polling every 10 ms, it was aborted before it could say so as
+                    // often as not, and a direct path that beat a waiting circuit left no word.
+                    let what = match crate::node::net::path_class(self.manager.endpoint(), &conn) {
+                        crate::node::net::PathClass::Direct => "a direct connection",
+                        _ => "a relayed connection",
+                    };
+                    for (relay, spoke) in &waiting {
+                        if !spoke.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                            self.manager.note(
+                                peer,
+                                format!(
+                                    "not asking {} for a circuit: {what} answered first, {} ms \
+                                     into the reach",
+                                    short_id(*relay),
+                                    started.elapsed().as_millis()
+                                ),
+                            );
+                        }
+                    }
                     let won = self.manager.adopt(conn).await;
                     // **Every connection a rung made is filed, not only the first** (#335). Two
                     // circuits through two helpers connect within milliseconds of each other, and
@@ -1581,7 +1635,7 @@ impl NodeNet {
         let candidates = direct_candidates(endpoints);
         if !candidates.is_empty() {
             let endpoint = Arc::clone(self.manager.endpoint());
-            let now = self.now_secs();
+            let now = self.now_ms();
             set.spawn(async move {
                 crate::nat::reachability::connect_direct_within(
                     endpoint,
@@ -1602,7 +1656,7 @@ impl NodeNet {
             };
             let local = coordstream::punch_endpoints(observed, &local_eps);
             let endpoint = Arc::clone(self.manager.endpoint());
-            let now = self.now_secs();
+            let now = self.now_ms();
             set.spawn(async move {
                 let (mut send, mut recv) =
                     coordstream::open_punch_session(&coordinator, peer).await?;
@@ -1686,7 +1740,7 @@ impl NodeNet {
             Arc::clone(self.manager.endpoint()),
             plan,
             peer,
-            self.now_secs(),
+            self.now_ms(),
         )
         .await?;
         Ok(self.manager.adopt(conn).await)
@@ -1701,7 +1755,7 @@ impl NodeNet {
         peer: Digest32,
     ) -> Result<Arc<VoxConnection>> {
         let conn =
-            circuitstream::connect_through(relay, peer, self.manager.endpoint(), self.now_secs())
+            circuitstream::connect_through(relay, peer, self.manager.endpoint(), self.now_ms())
                 .await?;
         Ok(self.manager.adopt(conn).await)
     }
@@ -1726,7 +1780,7 @@ impl NodeNet {
             Arc::clone(self.manager.endpoint()),
             plan,
             peer,
-            self.now_secs(),
+            self.now_ms(),
         )
         .await;
         // **Said, either way** (V030-22): this is the dial a peer that cannot reach this node asked
@@ -1965,6 +2019,30 @@ impl NodeNet {
     /// records. Local, so cheap: it is what lets the sync gate learn a member that
     /// joined through somebody else before refusing it (`run_sync_session`).
     #[must_use]
+    pub fn board_notices(&self, channel_id: &Digest32) -> Vec<crate::nat::notice::AdmissionNotice> {
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.notices(channel_id).into_iter().cloned().collect()
+    }
+
+    /// The members' own withdraws this node's board holds for `channel_id`, each checked against
+    /// the member's key when it was taken (#520).
+    #[must_use]
+    pub fn board_member_withdraws(
+        &self,
+        channel_id: &Digest32,
+    ) -> Vec<crate::nat::withdraw::BoardWithdraw> {
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        guard
+            .member_withdraws(channel_id)
+            .into_iter()
+            .filter_map(|w| crate::nat::withdraw::BoardWithdraw::from_wire(w).ok())
+            .collect()
+    }
+
+    /// The live member bundle records this node's board holds for `(channel, epoch)`.
+    #[must_use]
     pub fn board_bundles(&self, channel_id: &Digest32, epoch: u64) -> Vec<MemberBundleRecord> {
         let now = self.now_ms();
         let store = self.service.store();
@@ -2075,6 +2153,37 @@ impl NodeNet {
                 .into_iter()
                 .filter(|r| !has_address.contains(&r.author_id))
                 .map(RendezvousRecord::to_wire),
+        );
+        // And the room's admission notices and members' withdraws the peer lacks (#520): the
+        // withdraws first, so the peer refuses a notice of a member that left before it could
+        // take it.
+        let has_withdraw: std::collections::BTreeSet<(Digest32, u64)> = peer
+            .withdraws
+            .iter()
+            .map(|w| (w.author_id, w.timestamp_ms))
+            .collect();
+        let has_notice: std::collections::BTreeSet<(Digest32, u64)> = peer
+            .notices
+            .iter()
+            .map(|n| (n.joiner(), n.witness.timestamp_ms))
+            .collect();
+        out.extend(
+            guard
+                .member_withdraws(channel_id)
+                .into_iter()
+                .filter_map(|w| {
+                    let parsed = crate::nat::withdraw::BoardWithdraw::from_wire(w).ok()?;
+                    (!has_withdraw.contains(&(parsed.author_id, parsed.timestamp_ms)))
+                        .then(|| w.to_vec())
+                }),
+        );
+        let mut notices = guard.notices(channel_id);
+        notices.sort_by_key(|n| n.witness.timestamp_ms);
+        out.extend(
+            notices
+                .into_iter()
+                .filter(|n| !has_notice.contains(&(n.joiner(), n.witness.timestamp_ms)))
+                .map(crate::nat::notice::AdmissionNotice::to_wire),
         );
         out
     }
@@ -2250,7 +2359,10 @@ impl NodeNet {
         admit_before_accepting: F,
     ) -> Result<JoinOutcome>
     where
-        F: FnOnce(crate::identity::composite::CompositePublicKey) -> Fut,
+        F: FnOnce(
+            crate::identity::composite::CompositePublicKey,
+            crate::nat::record::JoinWitness,
+        ) -> Fut,
         Fut: std::future::Future<Output = Result<Option<String>>>,
     {
         let cfg = ResponderConfig {

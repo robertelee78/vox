@@ -248,10 +248,12 @@ network presence from the start: there is no interim design with one socket per 
   | origin-tag `KEY` (`circuitstream.rs`) | per relaying node |
   | `ident::NAMES`, `ident::ME` (`vox-tui`) | removed; names passed explicitly |
   | test-knob maps by room (`actor.rs`), the `LEFT` counter | keyed (node, room) |
-  | test-knob environment `OnceLock`s (`prekeys.rs`, `channel.rs`, `log/sync.rs`, `nat/store.rs`, `ipc.rs`) | process-wide, test builds only |
+  | test-knob environment `OnceLock`s (`prekeys.rs`, `channel.rs`, `log/sync.rs`, `nat/store.rs`, `ipc.rs`, `transport/mux.rs`) | process-wide, test builds only |
   | `NEXT_TUNNEL`, `NEXT_SERIAL`, `paths::NEXT` | process-wide unique counters |
   | `PINNED` (`atrest/lock.rs`) | process-wide mlock bookkeeping; every node shares `RLIMIT_MEMLOCK` |
   | `SAID` (`quic.rs`), cached strings (`api.rs`, `viewmodel.rs`) | process-wide |
+  | `SENDING` (`claude_injector.rs`) | process-wide: one tmux send at a time, whichever node's Session it types into (ctm's lock), so two drives never interleave their keys; it holds no node's state |
+  | `ASCII`, `DEPTH` (`theme.rs`, `vox-tui`) | process-wide: what this process's terminal can show, read once from its environment; a TUI runs in one terminal |
   | signals, metrics (labelled `node=`), runtime size | daemon-level |
 
 ### 9. Diagnostics
