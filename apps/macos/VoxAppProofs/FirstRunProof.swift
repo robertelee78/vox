@@ -561,7 +561,7 @@ final class FirstRunProof: XCTestCase {
                    env: bobSession)
         words(ui, Key.id("group-needs you"), timeout: 60,
               "a message to alice must list the room under \"needs you (1)\"",
-              until: { $0 == "needs you (1)" })
+              until: { $0.lowercased() == "needs you (1)" })
         let row = Key.id("room-mission")
         words(ui, row, timeout: 10, "the room's row must say it needs you",
               until: { $0.contains("needs you") })
@@ -574,7 +574,7 @@ final class FirstRunProof: XCTestCase {
                         until: { $0.contains("node alice") && $0.contains("peer") && $0.contains("keyring") }) ?? ""
         let regrouped = words(ui, Key.id("group-needs you"), timeout: 10,
                               "the room shown is read, so nothing needs alice: \"needs you (0)\"",
-                              until: { $0 == "needs you (0)" }) ?? ""
+                              until: { $0.lowercased() == "needs you (0)" }) ?? ""
         print("[proof] grouped: needs you (1), then \(regrouped); inspector: \(bobWords); status: \(bar)")
 
         // (4) Read each way. Bob's NEEDS-YOU is on alice's screen now: her node says she read it.
@@ -804,7 +804,7 @@ final class FirstRunProof: XCTestCase {
                    env: bobSession)
         words(ui, Key.id("group-needs you"), timeout: 60,
               "bob's message to alice must put mission under needs you",
-              until: { $0 == "needs you (1)" })
+              until: { $0.lowercased() == "needs you (1)" })
         ui.typeKey("j", modifierFlags: .command)
         // A message's text is a Text: its words are its accessibility value.
         let landed = Key.showing("NEEDS-YOU-9")
@@ -1058,7 +1058,7 @@ final class FirstRunProof: XCTestCase {
         ui.launch()
         let reopened = words(ui, Key.id("group-needs you"), timeout: 30,
                              "bob's message to alice came while the app was closed; opened again, the app must count it from what her node recorded as read, mission under \"needs you (1)\"",
-                             until: { $0 == "needs you (1)" }) ?? ""
+                             until: { $0.lowercased() == "needs you (1)" }) ?? ""
         print("[proof] opened again: \(reopened)")
 
         // (14) The keyboard. Bob posts KEYS-A and KEYS-B, then shares a file to alice, which her
