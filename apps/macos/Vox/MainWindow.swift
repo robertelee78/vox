@@ -199,13 +199,17 @@ private struct TimelineKeys: NSViewRepresentable {
             asked = NotificationCenter.default.addObserver(
                 forName: .voxFocusTimeline, object: nil, queue: .main
             ) { [weak self] _ in
-                guard let self, let window = self.window, window.firstResponder !== self else { return }
+                guard let self, let window = self.window else { return }
                 // Not while a sheet or popover is up: it has the keyboard, and keeps it.
                 guard window.attachedSheet == nil,
                       !(window.childWindows ?? []).contains(where: \.isVisible) else { return }
-                self.taking = true
-                window.makeFirstResponder(self)
-                self.taking = false
+                if window.firstResponder !== self {
+                    self.taking = true
+                    window.makeFirstResponder(self)
+                    self.taking = false
+                }
+                // Back from a Quick Look the keyboard opened, which had taken the keys.
+                if !window.isKeyWindow { window.makeKey() }
             }
             setAccessibilityElement(false)
         }
@@ -263,6 +267,11 @@ private struct RoomView: View {
     @State private var attaching: Attaching?
     /// The pulled copy Quick Look shows.
     @State private var looking: URL?
+    /// Whether the keyboard opened it, so the keyboard goes back to the timeline when it closes.
+    @State private var lookFromKeys = false
+    /// Escape and Space while Quick Look shows, wherever the keys go: the preview's own window
+    /// takes them, and would keep them (WCAG 2.1.2).
+    @State private var previewKeys: Any?
 
 /// What the composer posts is addressed to, and whether it is urgent (M-15).
     @State private var to: Set<String> = []
@@ -417,6 +426,34 @@ private struct RoomView: View {
                     }
                     .accessibilityIdentifier("timeline")
                     .quickLookPreview($looking)
+                    .onChange(of: looking) { url in
+                        if let previewKeys { NSEvent.removeMonitor(previewKeys) }
+                        previewKeys = nil
+                        if url != nil {
+                            let shown = $looking
+                            previewKeys = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                                let bare = event.modifierFlags
+                                    .intersection([.command, .option, .control, .shift]).isEmpty
+                                guard bare, event.keyCode == 53 || event.keyCode == 49 else { return event }
+                                // Space is a space wherever text is being typed.
+                                if event.keyCode == 49,
+                                   (event.window?.firstResponder as? NSTextView)?.isEditable == true {
+                                    return event
+                                }
+                                shown.wrappedValue = nil
+                                return nil
+                            }
+                        } else if lookFromKeys {
+                            lookFromKeys = false
+                            DispatchQueue.main.async {
+                                NotificationCenter.default.post(name: .voxFocusTimeline, object: nil)
+                            }
+                        }
+                    }
+                    .onDisappear {
+                        if let previewKeys { NSEvent.removeMonitor(previewKeys) }
+                        previewKeys = nil
+                    }
                 }
                 // A Session has no room composer (CL-1): the room's composer never speaks into
                 // a Session. An open one's own composer is for a member with drive only (CL-3).
@@ -543,6 +580,7 @@ private struct RoomView: View {
     private func lookSelected() -> Bool {
         guard let id = model.selectedMessage, let path = model.pulled[id] else { return false }
         looking = URL(fileURLWithPath: path)
+        lookFromKeys = true
         return true
     }
 
@@ -552,8 +590,8 @@ private struct RoomView: View {
         closeLook() || lookSelected()
     }
 
-    /// Escape: Quick Look closed, if it shows. A preview the keyboard opened leaves the keyboard
-    /// here, not on the preview, so its keys must close it too (WCAG 2.1.2). Whether it showed.
+    /// Escape: Quick Look closed, if it shows, while the keys are still the timeline's (the preview
+    /// taking them is `previewKeys`'s). Whether it showed.
     private func closeLook() -> Bool {
         guard looking != nil else { return false }
         looking = nil
