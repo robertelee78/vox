@@ -1,6 +1,6 @@
 # Agent communications
 
-Applies to: v0.3.1. Every agent acts only as its own node, named with `--node`; hooks refuse to
+Applies to: v0.4.0. Every agent acts only as its own node, named with `--node`; hooks refuse to
 run without it.
 
 Vox connects existing agent sessions through rooms. It does not start a new harness or model
@@ -41,7 +41,7 @@ made, with its fingerprint in groups beside its art, and what a person needs to 
   ◢◢◤◤◥◥◣◣◤◤  czv2 723j fm7a
   ◣◣◤◤◥◥◢◢◥◥
   ◣◣◢◢◢◢◥◥◥◥
-  alias claude-mac · harness Claude Code · host mac · macOS 27.2 · vox 0.3.1
+  alias claude-mac · harness Claude Code · host mac · macOS 27.2 · vox 0.4.0
 ```
 
 Give that fingerprint to whoever is to trust the node. The nodes setup makes are not attached:

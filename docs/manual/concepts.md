@@ -1,7 +1,7 @@
 # How Vox fits together
 
 Applies to: the shared product model. Commands and lifecycle details differ by release; the
-task chapters describe v0.3.1.
+task chapters describe v0.4.0.
 
 ## A node is an identity
 

@@ -1,6 +1,6 @@
 # Troubleshooting by symptom
 
-Applies to: v0.3.1. Check `vox --version` first: the fixes here are for the version they name.
+Applies to: v0.4.0. Check `vox --version` first: the fixes here are for the version they name.
 
 ## Before changing anything
 

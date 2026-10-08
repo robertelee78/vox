@@ -7,6 +7,7 @@ not a chapter in the public navigation manifest. Source inspection is not an exe
 
 | Label | Exact source revision | Use |
 |---|---|---|
+| v0.4.0 | `5c564791` (`v040/version-bump`, on integrate `a0787063`) | Task chapters from v0.4.0 (#516), the v0.4.0 command check; each row names the integrate commit it was checked at |
 | v0.3.1 | `bf6dfcdbee65e82a4683400baa94dd62fc8532d6` (built on macOS and on Linux) | Task chapters from v0.3.1 (#425), the v0.3.1 command check |
 | v0.3.0 | `82523cebc870a29e0947b0cb7c20b4563d233966` (built); manual merged at `c24a260dee708a340df5544f80a4518823e261a8`; review fixes at `c142ddd3293bfd1273cfd5737a673bcceb93dfc9` and `vox room link` at `d01c2c767c9ae295d1ed9aabdf66b73838c8f266` (each built, rechecked) | Task chapters, troubleshooting, the v0.3.0 command check |
 | Released v0.2.10 | `8d95a381f14d6bbb45f714d75f64e57d2f5dbf96` | History only: the earlier edition and the profile-to-node move check; the manual no longer describes it |
@@ -49,7 +50,7 @@ later parser or implementation may invalidate both an example and its troublesho
 | install: containers, root refusal, receive buffer (v0.3.1) | `crates/vox-core/src/error.rs` (`Root`); `crates/vox-core/src/transport/quic.rs` (`UDP_SOCKET_BUFFER`, `mtu_ceiling_for`, the buffer line) |
 | reference: paths, data root layout, passphrase input, daemon passphrase-file lines | `crates/vox-core/src/node/paths.rs`; ADR-026 F-1; `crates/vox-tui/src/app.rs:870-1020` |
 
-## v0.4.0 command check (integrate, in progress)
+## v0.4.0 command check
 
 For #516 the chapters are being written as v0.4.0 stories merge. They were checked on 2026-10-05
 against `integrate/v0.4.0` as it stood, in three steps: `0e27808d` (the keyring window, service
@@ -60,8 +61,9 @@ knob (a room cap lowered to 3, a member that never answers) or a terminal (the T
 merged proofs. Those were run in release with `--features test-knobs`, at the commit each row
 names. A row's quote is replaced where a later step changed the output.
 Every process had scratch `VOX_DATA_DIR` and `VOX_CONFIG_DIR`, and every process was stopped by its
-recorded PID or `vox node detach`. No `sudo` was used. All of it is to be checked again against
-the v0.4.0 candidate, which is to replace this commit in the Baselines table.
+recorded PID or `vox node detach`. No `sudo` was used. The rows were not all run again at the
+version bump: each row names the commit it was checked at, and the later passes below say what
+changed since. The bump (`5c564791`) changes only the version in `Cargo.toml` and `Cargo.lock`.
 
 | Manual claim | Where and how | Observed |
 |---|---|---|

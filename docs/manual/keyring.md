@@ -1,6 +1,6 @@
 # Identity and keyring
 
-Applies to: v0.3.1. Examples act as the node `robertgpt`. With one node attached, commands act
+Applies to: v0.4.0. Examples act as the node `robertgpt`. With one node attached, commands act
 as it; with several, add `--node robertgpt`.
 
 ## Your nodes

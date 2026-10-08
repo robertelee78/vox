@@ -8,8 +8,9 @@ changed, and recover when it does not.
 
 ## Start with your version
 
-Run `vox --version`. The task chapters here describe **v0.3.1**, in which one daemon hosts
-your nodes and every command names the node it acts as.
+Run `vox --version`. The task chapters here describe **v0.4.0**, in which one daemon hosts
+your nodes and every command names the node it acts as. On a Mac, v0.4.0 also brings
+[the Vox app](app.md).
 
 The manual follows the source repository. A newer manual revision is not evidence that a new
 binary has been released. The website skins these same files; there is no separately edited
@@ -24,9 +25,9 @@ website edition.
 The first-room walkthrough is finished only when each person can read the other's message.
 A successful local post or join is not enough.
 
-The [command check](https://github.com/robertelee78/vox/blob/main/docs/manual-evidence.md#v031-command-check)
-records the commands in these chapters run against the v0.3.1 binary in isolated, same-host
-data roots. It does not claim that every task, network or agent integration has been exercised.
+The [command check](https://github.com/robertelee78/vox/blob/main/docs/manual-evidence.md#v040-command-check)
+records the commands in these chapters run against v0.4.0 builds in isolated, same-host data
+roots, each at the commit it names. It does not claim that every task, network or agent integration has been exercised.
 
 ## Find a task
 

@@ -1,6 +1,6 @@
 # Rooms and messages
 
-Applies to: v0.3.1. The `vox room` commands ask an attached node through the daemon; they do not
+Applies to: v0.4.0. The `vox room` commands ask an attached node through the daemon; they do not
 attach one. Examples act as the only attached node; with several, add `--node robertgpt`.
 `ROOM_ID` is copied from `vox room list`.
 
