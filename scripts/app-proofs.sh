@@ -134,14 +134,6 @@ else
     codesign --force --sign - --options runtime --preserve-metadata=entitlements "$APP"
 fi
 
-# A given app signed by a team (Developer ID): XCTest would launch it through NSWorkspace and drop
-# its environment, so the proofs start it with `open -n --env` and attach (GIVEN=1), and refuse
-# when they cannot. An ad hoc signed app (a local build, or the release re-signed ad hoc) is
-# launched by XCTest with its environment, as every local run is.
-GIVEN=""
-if [ -n "${VOX_PROOF_APP:-}" ] && codesign -dv "$APP" 2>&1 | grep -q "^TeamIdentifier=[A-Z0-9]\{10\}$"; then
-    GIVEN=1
-fi
 trap_unregister() {
     # A given app (VOX_PROOF_APP) is started by the stager with `open -n`, outside the runner: any
     # of its processes still running are stopped by pid, and its share extension is unregistered
@@ -218,7 +210,7 @@ TEST_RUNNER_VOX_PROOF_APP="$APP" TEST_RUNNER_VOX_PROOF_SCRATCH="$SCRATCH" \
     TEST_RUNNER_VOX_PROOF_STAGER_PORT="$(cat "$SCRATCH/stager.port")" \
     TEST_RUNNER_VOX_PROOF_STAGER_TOKEN="$TOKEN" \
     TEST_RUNNER_VOX_PROOF_FROM="${VOX_PROOF_FROM:-}" \
-    TEST_RUNNER_VOX_PROOF_GIVEN="$GIVEN" \
+    TEST_RUNNER_VOX_PROOF_GIVEN="${VOX_PROOF_APP:+1}" \
     xcodebuild -project apps/macos/Vox.xcodeproj -scheme Vox -configuration Release \
     -derivedDataPath "$DERIVED" ${only[@]+"${only[@]}"} test-without-building \
     2>&1 | tee "$SCRATCH/xcodebuild.log" || status=$?
