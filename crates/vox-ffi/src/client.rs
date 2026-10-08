@@ -1135,10 +1135,13 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str
     }
 }
 
-/// The most of each platform field shown: a node's claim, so its length is the node's choice too.
-const PLATFORM_CHARS: usize = 64;
+/// The most of each platform field shown, in bytes, as the CLI and the TUI show it: a node's claim,
+/// so its length is the node's choice too.
+const PLATFORM_FIELD: usize = 48;
 
-/// The platform a `hello` says its node runs on (ADR-020 §4.9b), when it names at least the OS.
+/// The platform a `hello` says its node runs on (ADR-020 §4.9b), when it names at least the OS:
+/// `os` (`macOS`, `Linux`, …), `os_version` (`26.2`, `Ubuntu 24.04.1 LTS`) and `arch`, filled by
+/// that node's Vox. An older node's `hello` has none.
 fn platform_of(env: &vox_agentcomms::envelope::Envelope) -> Option<NodePlatform> {
     if env.kind != vox_agentcomms::envelope::HELLO {
         return None;
@@ -1147,8 +1150,7 @@ fn platform_of(env: &vox_agentcomms::envelope::Envelope) -> Option<NodePlatform>
         env.data
             .get(k)
             .and_then(|v| v.as_str())
-            .map(|v| v.chars().take(PLATFORM_CHARS).collect::<String>())
-            .map(|v| shown_name(&v))
+            .map(|v| vox_text::shown(v.trim(), PLATFORM_FIELD))
             .unwrap_or_default()
     };
     let os = text("os");
