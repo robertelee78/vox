@@ -1163,11 +1163,15 @@ try:
     tui.key("x", 2)
     redismissed = redismissed and tui.until(lambda: not offered("frank"), 10, 0.5)
     twice = rejoin("a third time")
-    # The room selected again, as the later stages expect: Down past the offers.
+    # The room selected and open again, as the later stages expect: Down past the offers, and
+    # Enter on it if the dismissed offer's card left no room open; Esc back to the room list.
     for _ in range(10):
         if any(r.startswith("▶ family") for r in side()):
             break
         tui.key("\x1b[B", 0.5)
+    if "No room open" in whole():
+        tui.key("\r", 2)
+        tui.key("\x1b", 1)
     claim("reoffer", again and redismissed and twice,
           f"after frank left and joined again, offered: {again} (sidebar {again_side!r}); dismissed "
           f"again: {redismissed}; after he left and joined once more, offered: {twice} (sidebar "
@@ -1180,6 +1184,7 @@ try:
     flat_ws = lambda: re.sub(r"\s+", " ", flat())
     hint = f":trust {fp['frank'][:8]}"
     hinted = hint in flat_ws()
+    hint_screen = [] if hinted else [r.rstrip() for r in tui.display() if r.strip()]
     grouped = lambda f: " ".join(f[i:i + 4] for i in range(0, len(f), 4))
     in_ring = lambda: fp["frank"] in run("bob", "trust", "list").stdout
     tui.key("\r", 2)   # into the room
@@ -1216,7 +1221,7 @@ try:
     tui.key("\x1b", 2)  # back to the room list
     claim("trust", hinted and prompt_seen and mismatch_said and not mismatch_added and closed
           and not wrong_pass_added and not shown_secret and matched and match_said,
-          f"the join offered {hint!r}: {hinted}; `t` on frank opened the prompt with his "
+          f"the join offered {hint!r}: {hinted}{'' if hinted else f' (the screen: {hint_screen!r})'}; `t` on frank opened the prompt with his "
           f"fingerprint: {prompt_seen}; dave's pasted: both shown and told not to trust: "
           f"{mismatch_said}, frank added anyway: {mismatch_added}; with the keyring closed "
           f"({closed}), a wrong passphrase added him: {wrong_pass_added}, was shown: {shown_secret}, "
