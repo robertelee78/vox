@@ -408,5 +408,5 @@ fi
 say ""
 say "next:"
 say "  vox                 the interactive client"
-say "  vox serve 22        offer this machine's ssh to a new room, and print the invite"
+say "  vox serve ssh=22    offer this machine's ssh to a new room, and print the room link"
 say "  vox update          install the next release"
