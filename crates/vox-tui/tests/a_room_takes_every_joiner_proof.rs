@@ -30,6 +30,12 @@
 //! (`ConnectionManager::file_inner`): joins fail `closed by the peer` again, at the 1–2% the defect
 //! ran at, so one run of 301 joins is expected to show several.
 //!
+//! **Accepted, not a defect to fix now** (the decider, 2026-10-07, #342): under load, a room of 300
+//! refuses a few joins when one online member is slow to agree within 5 s, under the strict
+//! room-wide cap ("member … did not answer within 5s, and every member online must agree"); the
+//! refusal names the silent member, and the next join gets in. Rooms this big are not expected
+//! yet. No product change.
+//!
 //! **A rate claim, so more than one run.** At the measured rate (2, 5, 3, 5 and 8 failures in five
 //! runs of 300), 301 joins with no failure happen by chance about 1% of the time, and three such
 //! runs in a row about once in a million.
