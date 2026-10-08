@@ -27,7 +27,8 @@ one, and the first eight characters of its id: `alice · 3f0c25bf`, or `codex-ma
 3f0c25bf`. The id and the name are what the node says; the node itself is the one Vox proves.
 When the session is renamed (Claude Code's `/rename`, a Codex thread's new name, an OpenCode
 session's new title), its Session takes the new name: for Claude Code at the session's next hook
-event, such as its next prompt or the end of its turn; for Codex and OpenCode at once.
+event, such as its next prompt or the end of its turn; for Codex and OpenCode at once. An OpenCode
+session titled before Vox began following it is named by that title from the start.
 
 ## The room a session works in
 
