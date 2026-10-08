@@ -3,6 +3,7 @@
 // its members and their trust; and a status bar with the node, its peers and the keyring window.
 // The keyring is a view of this window, not a window of its own.
 
+import AppKit
 import SwiftUI
 
 struct MainWindow: View {
@@ -61,6 +62,7 @@ private struct Sidebar: View {
                 StateMark(kind: .live, words: "node \(model.node), attached")
                     .font(Theme.text)
                     .accessibilityIdentifier("attached")
+                    .background(SidebarHighlightOff())
             }
             ForEach([RoomGroup.needsYou, .active, .quiet], id: \.self) { need in
                 let rooms = model.group(need)
@@ -70,9 +72,11 @@ private struct Sidebar: View {
                 Section {
                     ForEach(rooms) { room in
                         RoomRow(room: room).tag(NodeModel.Selection.room(room.id))
+                            .sidebarRow(model.selection == .room(room.id))
                     }
                     ForEach(offers, id: \.fingerprint) { offer in
                         OfferRow(offer: offer).tag(NodeModel.Selection.offer(offer.fingerprint))
+                            .sidebarRow(model.selection == .offer(offer.fingerprint))
                     }
                 } header: {
                     Text("\(need.words) (\(count))")
@@ -83,10 +87,13 @@ private struct Sidebar: View {
             }
             Section {
                 Text("Keyring").font(Theme.text).tag(NodeModel.Selection.keyring)
+                    .sidebarRow(model.selection == .keyring)
                     .accessibilityIdentifier("keyring")
                 Text("Decision record").font(Theme.text).tag(NodeModel.Selection.decisions)
+                    .sidebarRow(model.selection == .decisions)
                     .accessibilityIdentifier("decisions")
                 Text("Services").font(Theme.text).tag(NodeModel.Selection.services)
+                    .sidebarRow(model.selection == .services)
                     .accessibilityIdentifier("services")
             }
             Section {
@@ -101,12 +108,43 @@ private struct Sidebar: View {
             }
         }
         .listStyle(.sidebar)
-        // A selected row is filled with the selection token, not the system accent: text.primary
-        // on the system blue was 3.1:1 (WCAG 2.1 1.4.3); on this it is 4.89:1 (#450).
-        .tint(VoxTokens.Colors.selection)
         // The sidebar's rows in the app's face and size: a sidebar list sets its own otherwise.
         .font(Theme.text)
         .environment(\.defaultMinListRowHeight, Theme.scaled(24))
+    }
+}
+
+extension View {
+    /// A sidebar row's fill while it is the one selected: the selection token, on which
+    /// text.primary is 4.89:1 (WCAG 2.1 1.4.3, #450). The system's own highlight, which ignores
+    /// `.tint` and drew text.primary at 3.1:1, is off (`SidebarHighlightOff`); the row is still the
+    /// list's selection, so arrow keys move it and VoiceOver says it is selected.
+    fileprivate func sidebarRow(_ selected: Bool) -> some View {
+        listRowBackground(
+            RoundedRectangle(cornerRadius: 5)
+                .fill(selected ? VoxTokens.Colors.selection : Color.clear)
+                .padding(.horizontal, 10))
+    }
+}
+
+/// Turns off the sidebar table's own selection highlight, from inside one of its rows: the
+/// selected row is drawn by `sidebarRow` instead. Selection, keyboard and accessibility are the
+/// table's as before; only the drawing of the highlight changes.
+private struct SidebarHighlightOff: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView { Finder() }
+    func updateNSView(_ view: NSView, context: Context) { (view as? Finder)?.apply() }
+
+    final class Finder: NSView {
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            apply()
+        }
+
+        func apply() {
+            var up = superview
+            while let v = up, !(v is NSTableView) { up = v.superview }
+            (up as? NSTableView)?.selectionHighlightStyle = .none
+        }
     }
 }
 
