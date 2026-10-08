@@ -138,6 +138,21 @@ pub struct RoomMessage {
     pub image: Option<ImagePreview>,
     /// The link card its sender's node fetched for its first link (ADR-028 F-10), or none.
     pub card: Option<LinkCard>,
+    /// The platform its author's node says it runs on, when it is a `hello` that says so (ADR-020
+    /// §4.9b): that node's claim, not checked.
+    pub platform: Option<NodePlatform>,
+}
+
+/// The OS, OS version and CPU architecture a node says it runs on, from its `hello` (ADR-020
+/// §4.9b). Its own claim: shown as what the node says, never as fact.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct NodePlatform {
+    /// The OS's name, as the node gave it.
+    pub os: String,
+    /// The OS's version, as the node gave it; empty when it gave none.
+    pub os_version: String,
+    /// The CPU architecture, as the node gave it; empty when it gave none.
+    pub arch: String,
 }
 
 /// What a file share's announcement carries of an image (ADR-028 F-9), so it can be shown while
@@ -1071,7 +1086,7 @@ fn shown_name(s: &str) -> String {
 fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str>) -> RoomMessage {
     use vox_agentcomms::attention::{unread_level, UnreadLevel as L};
     let reveal = |s: &str| vox_agentcomms::envelope::reveal_keeping(s, |c| c == '\n' || c == '\t');
-    let (kind, text, to, re, urgent, file, image, card) =
+    let (kind, text, to, re, urgent, file, image, card, platform) =
         match vox_agentcomms::envelope::Envelope::parse(&row.text) {
             Ok(env) => (
                 shown_name(&env.kind),
@@ -1082,6 +1097,7 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str
                 file_offer(&env),
                 image_of(&env),
                 card_of(&env),
+                platform_of(&env),
             ),
             Err(_) => (
                 vox_agentcomms::envelope::SAY.to_owned(),
@@ -1089,6 +1105,7 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str
                 Vec::new(),
                 String::new(),
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -1114,7 +1131,32 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str
         file,
         image,
         card,
+        platform,
     }
+}
+
+/// The most of each platform field shown: a node's claim, so its length is the node's choice too.
+const PLATFORM_CHARS: usize = 64;
+
+/// The platform a `hello` says its node runs on (ADR-020 §4.9b), when it names at least the OS.
+fn platform_of(env: &vox_agentcomms::envelope::Envelope) -> Option<NodePlatform> {
+    if env.kind != vox_agentcomms::envelope::HELLO {
+        return None;
+    }
+    let text = |k: &str| {
+        env.data
+            .get(k)
+            .and_then(|v| v.as_str())
+            .map(|v| v.chars().take(PLATFORM_CHARS).collect::<String>())
+            .map(|v| shown_name(&v))
+            .unwrap_or_default()
+    };
+    let os = text("os");
+    (!os.is_empty()).then(|| NodePlatform {
+        os,
+        os_version: text("os_version"),
+        arch: text("arch"),
+    })
 }
 
 /// The file a `file` envelope offers, from the fields its sharer's daemon filled in.

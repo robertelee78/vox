@@ -654,6 +654,15 @@ private struct Inspector: View {
                         .padding(.leading, 18)
                         .accessibilityIdentifier("member-capability-\(member.name)")
                 }
+                // The platform its node says it runs on (ADR-020 §4.9b): its claim, said as one.
+                if let platform = model.platforms[member.id] {
+                    Text("says it runs \(Platform.words(platform))")
+                        .font(Theme.mono).secondaryText()
+                        .padding(.leading, 18)
+                        .textSelection(.enabled)
+                        .accessibilityLabel("\(member.name) says it runs \(Platform.words(platform))")
+                        .accessibilityIdentifier("member-platform-\(member.name)")
+                }
             }
             Divider().padding(.vertical, 8)
             FamilyLan(model: model, room: room)
@@ -664,6 +673,14 @@ private struct Inspector: View {
         // A container, so each row keeps its own identifier (member-<name>) under this one.
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("inspector")
+    }
+}
+
+/// A node's claimed platform in words: "macOS 26.1, arm64", leaving out what it did not say.
+enum Platform {
+    static func words(_ p: NodePlatform) -> String {
+        let os = [p.os, p.osVersion].filter { !$0.isEmpty }.joined(separator: " ")
+        return [os, p.arch].filter { !$0.isEmpty }.joined(separator: ", ")
     }
 }
 
