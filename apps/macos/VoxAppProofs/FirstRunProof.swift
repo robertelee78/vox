@@ -577,6 +577,36 @@ final class FirstRunProof: XCTestCase {
                               until: { $0.lowercased() == "needs you (0)" }) ?? ""
         print("[proof] grouped: needs you (1), then \(regrouped); inspector: \(bobWords); status: \(bar)")
 
+        // (3b) The platform bob's node says it runs on (ADR-020 §4.9b): a claim of a resource has
+        // bob's session announce itself, and Vox fills its hello's os, os_version and arch from
+        // the machine. What the inspector must say is what that hello says, read through `vox`.
+        // Whether the claim is won does not matter here: its hello is posted first, either way.
+        _ = run(vox, ["room", "claim", "--node", "bob", room, "platform-proof"], env: bobSession)
+        var claimed: (os: String, version: String, arch: String)?
+        let helloUntil = Date().addingTimeInterval(30)
+        while Date() < helloUntil && claimed == nil {
+            for line in run(vox, ["room", "read", "--node", "bob", "--json", room], env: voxEnv).out
+                .split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      let env = row["envelope"] as? [String: Any], env["type"] as? String == "hello",
+                      let data = env["data"] as? [String: Any],
+                      let os = data["os"] as? String, !os.isEmpty else { continue }
+                claimed = (os, data["os_version"] as? String ?? "", data["arch"] as? String ?? "")
+            }
+            if claimed == nil { Thread.sleep(forTimeInterval: 1) }
+        }
+        guard let claimed else {
+            throw Apparatus("bob's claim was to post his session's hello with os, os_version and arch, and `vox room read --node bob --json` shows none in 30 s, so the inspector's claim cannot be checked")
+        }
+        let platform = [[claimed.os, claimed.version].filter { !$0.isEmpty }.joined(separator: " "),
+                        claimed.arch.isEmpty ? "" : "(\(claimed.arch))"]
+            .filter { !$0.isEmpty }.joined(separator: " ")
+        let says = "bob says it runs on \(platform)"
+        words(ui, Key.id("member-platform-bob"), timeout: 30,
+              "alice's inspector must say, under bob, the platform his node's hello claims: \"\(says)\"",
+              until: { $0 == says })
+        print("[proof] inspector: \(says)")
+
         // (4) Read each way. Bob's NEEDS-YOU is on alice's screen now: her node says she read it.
         var readByAlice: [String] = []
         let readUntil = Date().addingTimeInterval(60)

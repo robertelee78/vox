@@ -659,7 +659,8 @@ private struct Inspector: View {
                     Text("says it runs on \(Platform.words(platform))")
                         .font(Theme.mono).secondaryText()
                         .padding(.leading, 18)
-                        .textSelection(.enabled)
+                        // Not selectable: a selectable Text with its own label sent SwiftUI's
+                        // accessibility into endless recursion, and the app crashed when read.
                         .accessibilityLabel("\(member.name) says it runs on \(Platform.words(platform))")
                         .accessibilityIdentifier("member-platform-\(member.name)")
                 }
