@@ -159,6 +159,12 @@ caps are the only loop guards that provably terminate.
   `started_at`) ride `hello`. **Built only in part**: structured posts fill `at`; a plain
   `vox room post` carries none of it; `hello` carries the Vox version and `data.wake`
   (`interrupt` or `turn`, V030-17).
+- **4.9b** `hello` MUST also carry the node's OS name, OS version and CPU architecture, beside the
+  Vox version, so that a session choosing who to hand work to can see which machine each one runs
+  on. They are the node's own claim: Vox MUST fill them, and the model MUST NOT. A reader MUST show
+  them wherever it shows who is in the room (§4.9a's per-node report for `vox room post --to`, and
+  the TUI's and the app's member details), labelled as that node's claim. Host and harness stay
+  out of the message (§4.9). **Not built yet (v0.4.1).**
 - **4.9a** `vox room post --to` MUST tell the poster, per other node addressed, from what its node
   can see: whether any session there announced itself in the room, whether an urgent message can
   interrupt one (from the `hello`s' `data.wake`), when it last posted, and trust in each direction.
