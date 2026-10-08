@@ -3,6 +3,7 @@
 // its members and their trust; and a status bar with the node, its peers and the keyring window.
 // The keyring is a view of this window, not a window of its own.
 
+import AppKit
 import SwiftUI
 
 struct MainWindow: View {
@@ -124,16 +125,136 @@ private struct RoomRow: View {
     }
 }
 
-/// The timeline draws its own focus ring on the row the keyboard is on; the system's ring around
-/// the whole timeline is left out where SwiftUI can leave it out (macOS 14).
-private struct OwnFocusRing: ViewModifier {
-    func body(content: Content) -> some View {
-        if #available(macOS 14.0, *) {
-            content.focusEffectDisabled()
-        } else {
-            content
+/// **The timeline's keyboard** (WCAG 2.1.1, 2.4.7): an AppKit view behind the timeline that
+/// takes first responder and its keys. SwiftUI's own focus would not do: a `.focusable()` scroll
+/// view on macOS 13 and 14 did not take focus set from a menu while the sidebar's list held it,
+/// so the keys went to the sidebar. This view takes it from Tab (with keyboard navigation on),
+/// from View > Focus Timeline, and from a click on a row; it says when it has it, so the row the
+/// keyboard is on is outlined, and draws no ring of its own.
+///
+/// It takes the keyboard only when asked (Tab, Focus Timeline, a row clicked), never on its own:
+/// a view that took first responder whenever AppKit or SwiftUI offered it held it while a sheet
+/// or popover was being presented, and the sheet or popover never showed (#450).
+private struct TimelineKeys: NSViewRepresentable {
+    /// Whether the keyboard is on the timeline, as this view says.
+    @Binding var focused: Bool
+    /// A key, answered with whether it did anything (a key that does nothing goes on up).
+    let key: (TimelineKey) -> Bool
+
+    func makeNSView(context: Context) -> KeyView {
+        let view = KeyView()
+        view.onFocus = report
+        view.onKey = key
+        return view
+    }
+
+    func updateNSView(_ view: KeyView, context: Context) {
+        view.onKey = key
+        view.onFocus = report
+    }
+
+    /// Whether the view has the keyboard, written only when it changes, so a render does not
+    /// follow every responder call.
+    private func report(_ has: Bool) {
+        DispatchQueue.main.async { if focused != has { focused = has } }
+    }
+
+    final class KeyView: NSView {
+        var onFocus: ((Bool) -> Void)?
+        var onKey: ((TimelineKey) -> Bool)?
+        private var asked: NSObjectProtocol?
+        /// Set while Focus Timeline or a row's click hands it the keyboard.
+        private var taking = false
+        /// Whether it has the keyboard, as last said.
+        private var has = false
+
+        /// Asked for, or Tab (or ⇧Tab) reaching it: never offered by AppKit or SwiftUI on their
+        /// own, as when a sheet or popover is presented or closes.
+        override var acceptsFirstResponder: Bool {
+            if taking { return true }
+            guard let event = NSApp.currentEvent else { return false }
+            return event.type == .keyDown && event.keyCode == 48
+        }
+        override var canBecomeKeyView: Bool { acceptsFirstResponder }
+        override var focusRingType: NSFocusRingType {
+            get { .none }
+            set {}
+        }
+
+        /// Clicks go to the rows in front of it, never to it.
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        private func say(_ now: Bool) {
+            guard now != has else { return }
+            has = now
+            onFocus?(now)
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let asked { NotificationCenter.default.removeObserver(asked) }
+            asked = nil
+            guard window != nil else { return }
+            // View > Focus Timeline, or a click on a row: the keyboard comes here.
+            asked = NotificationCenter.default.addObserver(
+                forName: .voxFocusTimeline, object: nil, queue: .main
+            ) { [weak self] _ in
+                guard let self, let window = self.window else { return }
+                // Not while a sheet or popover is up: it has the keyboard, and keeps it.
+                guard window.attachedSheet == nil,
+                      !(window.childWindows ?? []).contains(where: \.isVisible) else { return }
+                if window.firstResponder !== self {
+                    self.taking = true
+                    window.makeFirstResponder(self)
+                    self.taking = false
+                }
+                // Back from a Quick Look the keyboard opened, which had taken the keys.
+                if !window.isKeyWindow { window.makeKey() }
+            }
+            setAccessibilityElement(false)
+        }
+
+        override func becomeFirstResponder() -> Bool {
+            guard acceptsFirstResponder else { return false }
+            say(true)
+            return true
+        }
+
+        override func resignFirstResponder() -> Bool {
+            say(false)
+            return true
+        }
+
+        override func keyDown(with event: NSEvent) {
+            // Tab and ⇧Tab move on, as from any control (with keyboard navigation on).
+            if event.keyCode == 48 {
+                if event.modifierFlags.contains(.shift) {
+                    window?.selectPreviousKeyView(self)
+                } else {
+                    window?.selectNextKeyView(self)
+                }
+                return
+            }
+            let key: TimelineKey?
+            switch event.keyCode {
+            case 126: key = .up
+            case 125: key = .down
+            case 36, 76: key = .open // Return, Enter
+            case 49: key = .look // Space
+            case 53: key = .close // Escape
+            default: key = nil
+            }
+            // Only the bare key: ⌘↑ and the like are the menus' and the system's.
+            let bare = event.modifierFlags.intersection([.command, .option, .control]).isEmpty
+            if let key, bare, onKey?(key) == true { return }
+            super.keyDown(with: event)
         }
     }
+}
+
+/// A key the timeline acts on.
+private enum TimelineKey {
+    case up, down, open, look, close
 }
 
 /// The room on screen: its timeline and a field to post, with its members beside it.
@@ -146,6 +267,11 @@ private struct RoomView: View {
     @State private var attaching: Attaching?
     /// The pulled copy Quick Look shows.
     @State private var looking: URL?
+    /// Whether the keyboard opened it, so the keyboard goes back to the timeline when it closes.
+    @State private var lookFromKeys = false
+    /// Escape and Space while Quick Look shows, wherever the keys go: the preview's own window
+    /// takes them, and would keep them (WCAG 2.1.2).
+    @State private var previewKeys: Any?
 
 /// What the composer posts is addressed to, and whether it is urgent (M-15).
     @State private var to: Set<String> = []
@@ -157,7 +283,7 @@ private struct RoomView: View {
     @State private var newest: String?
     /// Whether the keyboard is on the timeline (WCAG 2.1.1): ↑/↓ move the selection, Return
     /// opens the selected message's first action, Space Quick Looks its pulled file.
-    @FocusState private var timelineFocused: Bool
+    @State private var timelineFocused = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -218,6 +344,9 @@ private struct RoomView: View {
                                                             focused: timelineFocused
                                                                 && model.selectedMessage == message.id) {
                                                     model.selectedMessage = message.id
+                                                    // Clicked: the keyboard follows, as in a list.
+                                                    NotificationCenter.default.post(
+                                                        name: .voxFocusTimeline, object: nil)
                                                 }
                                                 .reportsFrame(of: message.id)
                                                 .id(message.id)
@@ -238,29 +367,19 @@ private struct RoomView: View {
                                 .padding(12)
                             }
                             .coordinateSpace(name: "timeline")
-                            // **Operable from the keyboard** (WCAG 2.1.1, 2.4.7): the timeline
-                            // takes focus (Tab with keyboard navigation on, or View > Focus
-                            // Timeline); the focused row is outlined by `selectable`, so the
-                            // system's own ring around the whole timeline is not drawn as well.
-                            .focusable()
-                            .focused($timelineFocused)
-                            .modifier(OwnFocusRing())
-                            .onMoveCommand { direction in move(direction, scroller) }
-                            // Return and Space while the timeline holds the keyboard, as buttons
-                            // with keys (onKeyPress is macOS 14 only); off when it does not, so
-                            // the composer still types a space.
-                            .background {
-                                Button("") { _ = openSelected() }
-                                    .keyboardShortcut(.return, modifiers: [])
-                                    .disabled(!timelineFocused)
-                                    .hidden()
-                                Button("") { _ = lookSelected() }
-                                    .keyboardShortcut(.space, modifiers: [])
-                                    .disabled(!timelineFocused)
-                                    .hidden()
-                            }
+                            // **Operable from the keyboard** (WCAG 2.1.1, 2.4.7): see
+                            // `TimelineKeys`. The focused row is outlined by `selectable`.
+                            .background(TimelineKeys(focused: $timelineFocused) { key in
+                                switch key {
+                                case .up: return move(.up, scroller)
+                                case .down: return move(.down, scroller)
+                                case .open: return openSelected()
+                                case .look: return toggleLook()
+                                case .close: return closeLook()
+                                }
+                            })
                             .onReceive(NotificationCenter.default.publisher(for: .voxFocusTimeline)) { _ in
-                                timelineFocused = true
+                                // Taken: the newest row, when none was selected.
                                 if model.selectedMessage == nil, let last = model.messages.last {
                                     model.selectedMessage = last.id
                                     scroller.scrollTo(last.id)
@@ -307,6 +426,34 @@ private struct RoomView: View {
                     }
                     .accessibilityIdentifier("timeline")
                     .quickLookPreview($looking)
+                    .onChange(of: looking) { url in
+                        if let previewKeys { NSEvent.removeMonitor(previewKeys) }
+                        previewKeys = nil
+                        if url != nil {
+                            let shown = $looking
+                            previewKeys = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                                let bare = event.modifierFlags
+                                    .intersection([.command, .option, .control, .shift]).isEmpty
+                                guard bare, event.keyCode == 53 || event.keyCode == 49 else { return event }
+                                // Space is a space wherever text is being typed.
+                                if event.keyCode == 49,
+                                   (event.window?.firstResponder as? NSTextView)?.isEditable == true {
+                                    return event
+                                }
+                                shown.wrappedValue = nil
+                                return nil
+                            }
+                        } else if lookFromKeys {
+                            lookFromKeys = false
+                            DispatchQueue.main.async {
+                                NotificationCenter.default.post(name: .voxFocusTimeline, object: nil)
+                            }
+                        }
+                    }
+                    .onDisappear {
+                        if let previewKeys { NSEvent.removeMonitor(previewKeys) }
+                        previewKeys = nil
+                    }
                 }
                 // A Session has no room composer (CL-1): the room's composer never speaks into
                 // a Session. An open one's own composer is for a member with drive only (CL-3).
@@ -394,20 +541,21 @@ private struct RoomView: View {
 
     /// ↑/↓ on the timeline: the selection moves to the message before or after it, scrolled into
     /// view; with none selected, ↑ takes the newest and ↓ the oldest.
-    private func move(_ direction: MoveCommandDirection, _ scroller: ScrollViewProxy) {
+    private func move(_ direction: MoveCommandDirection, _ scroller: ScrollViewProxy) -> Bool {
         let ids = model.timelineItems.compactMap { $0.message?.id }
-        guard !ids.isEmpty else { return }
+        guard !ids.isEmpty else { return false }
         let at = model.selectedMessage.flatMap { ids.firstIndex(of: $0) }
         let next: Int
         switch direction {
         case .up: next = at.map { max($0 - 1, 0) } ?? ids.count - 1
         case .down: next = at.map { min($0 + 1, ids.count - 1) } ?? 0
-        default: return
+        default: return false
         }
         model.selectedMessage = ids[next]
         withAnimation(Theme.motion(reduced: reduceMotion)) {
             scroller.scrollTo(ids[next])
         }
+        return true
     }
 
     /// The selected message, as the timeline shows it.
@@ -432,6 +580,21 @@ private struct RoomView: View {
     private func lookSelected() -> Bool {
         guard let id = model.selectedMessage, let path = model.pulled[id] else { return false }
         looking = URL(fileURLWithPath: path)
+        lookFromKeys = true
+        return true
+    }
+
+    /// Space: Quick Look on the selected row's pulled file, or, while it shows, off again (as in
+    /// the Finder). Whether it did either.
+    private func toggleLook() -> Bool {
+        closeLook() || lookSelected()
+    }
+
+    /// Escape: Quick Look closed, if it shows, while the keys are still the timeline's (the preview
+    /// taking them is `previewKeys`'s). Whether it showed.
+    private func closeLook() -> Bool {
+        guard looking != nil else { return false }
+        looking = nil
         return true
     }
 

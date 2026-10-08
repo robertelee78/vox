@@ -6,6 +6,20 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXAggregateTarget section */
+		70000000000000000000A004 /* Theme */ = {
+			isa = PBXAggregateTarget;
+			buildConfigurationList = 80000000000000000000A005 /* Build configuration list for PBXAggregateTarget "Theme" */;
+			buildPhases = (
+				E0000000000000000000A007 /* Generate Theme */,
+			);
+			dependencies = (
+			);
+			name = Theme;
+			productName = Theme;
+		};
+/* End PBXAggregateTarget section */
+
 /* Begin PBXBuildFile section */
 		B0000000000000000000A001 /* vox_ffi.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A001 /* vox_ffi.swift */; };
 		B0000000000000000000A002 /* VoxFFI.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A002 /* VoxFFI.xcframework */; };
@@ -15,6 +29,8 @@
 		B0000000000000000000A006 /* VoxTokens.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A008 /* VoxTokens.xcassets */; };
 		B0000000000000000000A007 /* vox_ffi.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A001 /* vox_ffi.swift */; };
 		B0000000000000000000A008 /* VoxFFI.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A002 /* VoxFFI.xcframework */; };
+		B0000000000000000000A010 /* VoxTokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A007 /* VoxTokens.swift */; };
+		B0000000000000000000A011 /* VoxTokens.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A008 /* VoxTokens.xcassets */; };
 		B0000000000000000000A009 /* ShareExtension.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A009 /* ShareExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
@@ -32,6 +48,20 @@
 			proxyType = 1;
 			remoteGlobalIDString = 70000000000000000000A003;
 			remoteInfo = ShareExtension;
+		};
+		C0000000000000000000A005 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 90000000000000000000A001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 70000000000000000000A004;
+			remoteInfo = Theme;
+		};
+		C0000000000000000000A006 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 90000000000000000000A001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 70000000000000000000A004;
+			remoteInfo = Theme;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -227,7 +257,6 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 80000000000000000000A002 /* Build configuration list for PBXNativeTarget "Vox" */;
 			buildPhases = (
-				E0000000000000000000A007 /* Generate Theme */,
 				E0000000000000000000A001 /* Sources */,
 				E0000000000000000000A002 /* Frameworks */,
 				E0000000000000000000A003 /* Resources */,
@@ -238,6 +267,7 @@
 			buildRules = (
 			);
 			dependencies = (
+				C0000000000000000000A007 /* PBXTargetDependency */,
 				C0000000000000000000A004 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
@@ -280,6 +310,7 @@
 			buildRules = (
 			);
 			dependencies = (
+				C0000000000000000000A008 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				D0000000000000000000A004 /* ShareExtension */,
@@ -309,6 +340,9 @@
 					70000000000000000000A003 = {
 						CreatedOnToolsVersion = 27.0;
 					};
+					70000000000000000000A004 = {
+						CreatedOnToolsVersion = 27.0;
+					};
 				};
 			};
 			buildConfigurationList = 80000000000000000000A001 /* Build configuration list for PBXProject "Vox" */;
@@ -328,6 +362,7 @@
 				70000000000000000000A001 /* Vox */,
 				70000000000000000000A002 /* VoxAppProofs */,
 				70000000000000000000A003 /* ShareExtension */,
+				70000000000000000000A004 /* Theme */,
 			);
 		};
 /* End PBXProject section */
@@ -352,6 +387,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B0000000000000000000A011 /* VoxTokens.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -405,6 +441,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				B0000000000000000000A007 /* vox_ffi.swift in Sources */,
+				B0000000000000000000A010 /* VoxTokens.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -420,6 +457,16 @@
 			isa = PBXTargetDependency;
 			target = 70000000000000000000A003 /* ShareExtension */;
 			targetProxy = C0000000000000000000A003 /* PBXContainerItemProxy */;
+		};
+		C0000000000000000000A007 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 70000000000000000000A004 /* Theme */;
+			targetProxy = C0000000000000000000A005 /* PBXContainerItemProxy */;
+		};
+		C0000000000000000000A008 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 70000000000000000000A004 /* Theme */;
+			targetProxy = C0000000000000000000A006 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -603,6 +650,22 @@
 			};
 			name = Release;
 		};
+		85000000000000000000A001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Debug;
+		};
+		85000000000000000000A002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -638,6 +701,15 @@
 			buildConfigurations = (
 				84000000000000000000A001 /* Debug */,
 				84000000000000000000A002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		80000000000000000000A005 /* Build configuration list for PBXAggregateTarget "Theme" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				85000000000000000000A001 /* Debug */,
+				85000000000000000000A002 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
