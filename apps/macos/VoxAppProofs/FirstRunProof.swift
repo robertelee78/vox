@@ -242,7 +242,7 @@ final class FirstRunProof: XCTestCase {
         ui.launchEnvironment = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "HOME": home,
                                 "VOX_PROXY": "127.0.0.1:0"]
         try scratchOnly(ui.launchEnvironment, under: scratchPath)
-        ui.launch()
+        launch(ui)
         defer { ui.terminate() }
         let said = Key.id("login-item-said")
         let quoted = words(ui, said, timeout: 30,
@@ -323,7 +323,7 @@ final class FirstRunProof: XCTestCase {
         let ui = XCUIApplication(url: app)
         ui.launchEnvironment = voxEnv
         try scratchOnly(ui.launchEnvironment, under: scratchPath)
-        ui.launch()
+        launch(ui)
         defer {
             ui.terminate()
             _ = run(vox, ["node", "detach", "alice"], env: voxEnv)
@@ -455,7 +455,7 @@ final class FirstRunProof: XCTestCase {
         let ui = XCUIApplication(url: app)
         ui.launchEnvironment = voxEnv
         try scratchOnly(ui.launchEnvironment, under: scratchPath)
-        ui.launch()
+        launch(ui)
 
         if from > 5 {
             // The app attaches alice itself, her passphrase typed, as in step 2.
@@ -1071,7 +1071,7 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("alice's node never held bob's WHILE-APP-CLOSED in 60 s: \(held)")
         }
         try scratchOnly(ui.launchEnvironment, under: scratchPath)
-        ui.launch()
+        launch(ui)
         let reopened = words(ui, Key.id("group-needs you"), timeout: 30,
                              "bob's message to alice came while the app was closed; opened again, the app must count it from what her node recorded as read, mission under \"needs you (1)\"",
                              until: { $0.lowercased() == "needs you (1)" }) ?? ""
@@ -1236,6 +1236,27 @@ final class FirstRunProof: XCTestCase {
         return nil
     }
 
+    /// Launch the app with its main window inside the screen's visible frame, 40 points clear of
+    /// its top and bottom edges, whatever frame the account's `us.vox.app` defaults keep: a window
+    /// left reaching the bottom edge put the services room picker where the pointer reveals an
+    /// auto-hidden Dock, and its click opened nothing. The argument holds for this launch only.
+    private func launch(_ ui: XCUIApplication) {
+        if let screen = NSScreen.main?.visibleFrame {
+            let f = screen.insetBy(dx: 8, dy: 40)
+            let frame = [f.minX, f.minY, f.width, f.height,
+                         screen.minX, screen.minY, screen.width, screen.height]
+                .map { String(Int($0)) }.joined(separator: " ")
+            ui.launchArguments = ["-NSWindow Frame main", frame + " "]
+        }
+        ui.launch()
+    }
+
+    /// Whether a menu other than the menu bar's is open: the menu bar's own menus have no size
+    /// until opened.
+    private func menuOpen(_ ui: XCUIApplication) -> Bool {
+        ui.menus.allElementsBoundByIndex.contains { $0.frame.width > 0 && $0.frame.height > 0 }
+    }
+
     /// The app's whole accessibility tree, attached to the result, so a red carries its own
     /// evidence.
     private func keepTree(_ ui: XCUIApplication, _ why: String) {
@@ -1285,6 +1306,13 @@ final class FirstRunProof: XCTestCase {
         let anywhere = key.query(in: ui.descendants(matching: .any)).firstMatch
         if anywhere.exists {
             XCTFail("APPARATUS: \(key) is in the app only outside its windows, dialogs, sheets, popovers and menus (\(anywhere.elementType.rawValue)); the proof's search missed it",
+                    file: file, line: line)
+            return
+        }
+        // A menu item is shown only in an open menu: none open, the click that was to open it
+        // reached nothing (the menu never opened), which the app's words cannot settle.
+        if case .menuItem = key, !menuOpen(ui) {
+            XCTFail("APPARATUS: \(key) is not shown because no menu is open: the click that was to open its menu opened nothing",
                     file: file, line: line)
             return
         }
