@@ -69,8 +69,8 @@ fn the_tui_names_a_trusted_member_by_name_and_anyone_else_by_fingerprint_marked(
         }
         Some(1) if said.contains("cargo RED") => panic!(
             "PRODUCT: the TUI must name alice \"alice\" and carol by 26 characters with \"not in \
-             keyring\" under them, and draw each node's own card in the members pane and the keyring view: \
-             {said}"
+             keyring\" under them, draw each node's own card in the members pane and the keyring view, \
+             and say on alice's card which machine her hello says she runs on (ADR-020 §4.9b): {said}"
         ),
         _ => panic!(
             "CANNOT MEASURE: APPARATUS: the TUI driver ended after {:?} at stage {:?} with exit \

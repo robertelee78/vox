@@ -223,6 +223,35 @@ struct Timeline {
     stale: bool,
     /// The projection, and what it was projected with.
     projected: Option<Projected>,
+    /// The machine each member's newest `hello` here says it runs on (ADR-020 §4.9b), and when
+    /// that hello was posted: folded as rows arrive, so a frame never reads the room for it.
+    machines: std::collections::HashMap<Digest32, (u64, String)>,
+}
+
+/// Fold `row` into `machines` if it is a `hello` that says which machine it runs on, newer than
+/// the one held for its author.
+fn note_machine(
+    machines: &mut std::collections::HashMap<Digest32, (u64, String)>,
+    row: &MessageRow,
+) {
+    if !row.text.starts_with('{') || !row.text.contains(vox_agentcomms::envelope::HELLO) {
+        return;
+    }
+    let Ok(e) = vox_agentcomms::envelope::Envelope::parse(&row.text) else {
+        return;
+    };
+    if e.kind != vox_agentcomms::envelope::HELLO {
+        return;
+    }
+    let Some(said) = crate::platform::claim(&e.data) else {
+        return;
+    };
+    if machines
+        .get(&row.author)
+        .is_none_or(|(at, _)| *at <= row.created_millis)
+    {
+        machines.insert(row.author, (row.created_millis, said));
+    }
 }
 
 /// How many of the node's decisions, newest first, the TUI's decision screen holds.
@@ -1336,6 +1365,7 @@ impl DaemonCore {
                     t.cursor = Some(c);
                 }
                 for row in rows {
+                    note_machine(&mut t.machines, &row);
                     // An owed row whose body has arrived takes its own place.
                     match t.rows.iter_mut().find(|r| r.entry_hash == row.entry_hash) {
                         Some(held) => {
@@ -1348,12 +1378,17 @@ impl DaemonCore {
                 t.stale = false;
             }
             _ => {
+                let mut machines = std::collections::HashMap::new();
+                for row in &rows {
+                    note_machine(&mut machines, row);
+                }
                 self.timeline = Some(Timeline {
                     channel_id: cid,
                     cursor: newest(&rows),
                     rows,
                     stale: false,
                     projected: None,
+                    machines,
                 });
             }
         }
@@ -1734,6 +1769,12 @@ impl DaemonCore {
                             let is_me = me == Some(*m);
                             MemberView {
                                 id: *m,
+                                machine: self
+                                    .timeline
+                                    .as_ref()
+                                    .filter(|t| t.channel_id == d.channel_id)
+                                    .and_then(|t| t.machines.get(m))
+                                    .map(|(_, said)| said.clone()),
                                 capability: (!is_me && snap.trusted.iter().any(|(fp, _)| fp == m))
                                     .then(|| {
                                         if snap.drive.contains(m) {
