@@ -180,9 +180,9 @@ struct ShareView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Share to a Vox room").font(.headline)
+            Text("Share to a Vox room").font(Faces.text).fontWeight(.semibold)
             if let file = model.file {
-                Text(file.lastPathComponent).font(.body.monospaced()).lineLimit(1)
+                Text(file.lastPathComponent).font(Faces.mono).lineLimit(1)
             }
             switch model.phase {
             case .loading:
@@ -211,6 +211,9 @@ struct ShareView: View {
         }
         .padding(16)
         .frame(width: 440, height: 380)
+        // The app's surface and text colours, from the token file (ADR-028 L-1, L-6).
+        .background(VoxTokens.Colors.bgBase)
+        .foregroundStyle(VoxTokens.Colors.textPrimary)
     }
 
     private var form: some View {
@@ -220,7 +223,9 @@ struct ShareView: View {
                     Text(room.name.isEmpty ? String(room.id.prefix(12)) : room.name).tag(room.id)
                 }
             }
-            Text("To (none: the whole room)").font(.caption)
+            Text("To (none: the whole room)").font(Faces.eyebrow)
+                .tracking(VoxTokens.Fonts.appEyebrow.tracking * (VoxTokens.Fonts.appEyebrow.size ?? 11))
+                .textCase(VoxTokens.Fonts.appEyebrow.uppercase ? .uppercase : nil)
             List(model.members, id: \.fingerprint) { member in
                 Toggle(isOn: Binding(
                     get: { model.to.contains(member.fingerprint) },
@@ -234,8 +239,38 @@ struct ShareView: View {
             .frame(minHeight: 90)
             TextField("Note", text: $model.note)
             if !model.failure.isEmpty {
-                Text(model.failure).foregroundColor(.red).fixedSize(horizontal: false, vertical: true)
+                // Danger in its token, with its glyph: never by colour alone (ADR-028 L-2, E-6).
+                Text("✕ \(model.failure)").foregroundStyle(VoxTokens.Colors.danger)
+                    .fixedSize(horizontal: false, vertical: true)
             }
+        }
+    }
+}
+
+/// The sheet's faces, from the token file (ADR-028 L-1, L-7), as the app's `Theme` makes them: a
+/// face that names a text style is that style, one with a size keeps it. The extension cannot
+/// follow the app's own text size (View > Bigger): that is the app's setting, not shared with it.
+private enum Faces {
+    static var text: Font { font(VoxTokens.Fonts.appText) }
+    static var mono: Font { font(VoxTokens.Fonts.appMono) }
+    static var eyebrow: Font { font(VoxTokens.Fonts.appEyebrow) }
+
+    private static func font(_ face: VoxTokens.Face) -> Font {
+        let design: Font.Design = face.system == "monospaced" ? .monospaced : .default
+        let weight = weightOf(face.weight)
+        if let size = face.size {
+            return .system(size: size, weight: weight, design: design)
+        }
+        return .system(.body, design: design).weight(weight)
+    }
+
+    private static func weightOf(_ value: Int) -> Font.Weight {
+        switch value {
+        case ..<350: return .light
+        case ..<450: return .regular
+        case ..<550: return .medium
+        case ..<650: return .semibold
+        default: return .bold
         }
     }
 }
