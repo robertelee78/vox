@@ -44,12 +44,15 @@ and its release record. No package manager, account or token is required:
 curl -fsSL https://voxlux.us/install.sh | sh
 ```
 
-Targets: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin` (macOS 11+).
+Targets: `x86_64-unknown-linux-gnu`, and `aarch64-apple-darwin` on macOS 13 or later. An Intel
+Mac, or macOS before 13, is not supported: the installer says so and downloads nothing.
 
 The installer downloads from the *exact release* its record names (not a moving `latest`),
 verifies size and SHA-256, and on macOS also requires the Developer ID signature (team
-`3T2D2YNTVW`, `us.vox.cli`, hardened runtime) and confirms the notarization ticket with Apple. It
-installs atomically into `~/.local/bin` and runs `vox shell-setup`. Nothing needs `sudo`.
+`3T2D2YNTVW`, `us.vox.cli`, hardened runtime) and confirms the notarization ticket with Apple. On
+Linux it installs `vox` atomically into `~/.local/bin`; on macOS it installs `Vox.app` (in
+`/Applications` when that is writable, else `~/Applications`) and makes `~/.local/bin/vox` a link
+to the `vox` inside it. It then runs `vox shell-setup`. Nothing needs `sudo`.
 
 ```
 VOX_INSTALL_DIR=/opt/bin   # install somewhere else
@@ -348,16 +351,19 @@ Heavy, timing-bound or live-model checks need `--features optional-proofs`; see
 
 ## Status
 
-**v0.3.1** (October 2026). Linux and macOS, as a terminal client, CLI and daemon. Working today:
+**v0.4.0** (October 2026). Linux and macOS, as a terminal client, CLI and daemon, and on the Mac
+also as **Vox.app**, a native app for Apple Silicon and macOS 13 or later
+([ADR-014](docs/adr/ADR-014-macos-client.md)) that is a client of the same daemon. Working today:
 one daemon per data root with any number of nodes; rooms over the real network through the full NAT
 ladder, with port mappings renewed and released and a change of network noticed and acted on at
-once; trust-gated reading; replication and sync; room-bound TCP and UDP services reached as
-`<service>.<node>.<room>.vox`, and `ssh` over Vox; `vox share`; the family LAN (macOS); leaving and
-ending rooms, admins and retention; key rotation and per-member revocation; agent comms for Claude
-Code, Codex and OpenCode, each agent its own node.
+once; trust per keyring entry, as read or read + drive; replication and sync; room-bound TCP and UDP
+services reached as `<service>.<node>.<room>.vox`, and `ssh` over Vox; shares as addressed messages,
+pulled automatically; the family LAN (macOS); leaving and ending rooms, admins and retention; key
+rotation and per-member revocation; Claude Code, Codex and OpenCode sessions, each agent its own
+node, with a Session per interactive session that members trusted with drive can read and drive
+from the CLI, the TUI or the app.
 
-Next: the native macOS client ([ADR-014](docs/adr/ADR-014-macos-client.md)). iOS is a separate,
-later capability.
+iOS is a separate, later capability.
 
 ## Contributing
 
