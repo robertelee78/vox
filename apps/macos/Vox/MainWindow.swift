@@ -131,6 +131,10 @@ private struct RoomRow: View {
 /// so the keys went to the sidebar. This view takes it from Tab (with keyboard navigation on),
 /// from View > Focus Timeline, and from a click on a row; it says when it has it, so the row the
 /// keyboard is on is outlined, and draws no ring of its own.
+///
+/// It takes the keyboard only when asked (Tab, Focus Timeline, a row clicked), never on its own:
+/// a view that took first responder whenever AppKit or SwiftUI offered it held it while a sheet
+/// or popover was being presented, and the sheet or popover never showed (#450).
 private struct TimelineKeys: NSViewRepresentable {
     /// Whether the keyboard is on the timeline, as this view says.
     @Binding var focused: Bool
@@ -139,26 +143,51 @@ private struct TimelineKeys: NSViewRepresentable {
 
     func makeNSView(context: Context) -> KeyView {
         let view = KeyView()
-        view.onFocus = { has in DispatchQueue.main.async { focused = has } }
+        view.onFocus = report
         view.onKey = key
         return view
     }
 
     func updateNSView(_ view: KeyView, context: Context) {
         view.onKey = key
-        view.onFocus = { has in DispatchQueue.main.async { focused = has } }
+        view.onFocus = report
+    }
+
+    /// Whether the view has the keyboard, written only when it changes, so a render does not
+    /// follow every responder call.
+    private func report(_ has: Bool) {
+        DispatchQueue.main.async { if focused != has { focused = has } }
     }
 
     final class KeyView: NSView {
         var onFocus: ((Bool) -> Void)?
         var onKey: ((TimelineKey) -> Bool)?
         private var asked: NSObjectProtocol?
+        /// Set while Focus Timeline or a row's click hands it the keyboard.
+        private var taking = false
+        /// Whether it has the keyboard, as last said.
+        private var has = false
 
-        override var acceptsFirstResponder: Bool { true }
-        override var canBecomeKeyView: Bool { true }
+        /// Asked for, or Tab (or ⇧Tab) reaching it: never offered by AppKit or SwiftUI on their
+        /// own, as when a sheet or popover is presented or closes.
+        override var acceptsFirstResponder: Bool {
+            if taking { return true }
+            guard let event = NSApp.currentEvent else { return false }
+            return event.type == .keyDown && event.keyCode == 48
+        }
+        override var canBecomeKeyView: Bool { acceptsFirstResponder }
         override var focusRingType: NSFocusRingType {
             get { .none }
             set {}
+        }
+
+        /// Clicks go to the rows in front of it, never to it.
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        private func say(_ now: Bool) {
+            guard now != has else { return }
+            has = now
+            onFocus?(now)
         }
 
         override func viewDidMoveToWindow() {
@@ -170,19 +199,25 @@ private struct TimelineKeys: NSViewRepresentable {
             asked = NotificationCenter.default.addObserver(
                 forName: .voxFocusTimeline, object: nil, queue: .main
             ) { [weak self] _ in
-                guard let self, let window = self.window else { return }
+                guard let self, let window = self.window, window.firstResponder !== self else { return }
+                // Not while a sheet or popover is up: it has the keyboard, and keeps it.
+                guard window.attachedSheet == nil,
+                      !(window.childWindows ?? []).contains(where: \.isVisible) else { return }
+                self.taking = true
                 window.makeFirstResponder(self)
+                self.taking = false
             }
             setAccessibilityElement(false)
         }
 
         override func becomeFirstResponder() -> Bool {
-            onFocus?(true)
+            guard acceptsFirstResponder else { return false }
+            say(true)
             return true
         }
 
         override func resignFirstResponder() -> Bool {
-            onFocus?(false)
+            say(false)
             return true
         }
 
