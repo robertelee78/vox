@@ -110,6 +110,10 @@ impl Ansi16 {
 pub struct Color {
     pub name: String,
     pub rgb: [u8; 3],
+    /// Its value under Increase Contrast, where the token file gives one (`hex_hc`, ADR-028 #450):
+    /// the app's colour set carries it as the high-contrast appearance. The TUI draws in the
+    /// terminal's colours and does not use it.
+    pub rgb_hc: Option<[u8; 3]>,
     pub xterm256: u8,
     pub ansi16: Ansi16,
 }
@@ -195,9 +199,17 @@ pub fn parse(text: &str) -> Result<Tokens, String> {
         let ansi = v.get("ansi16").and_then(Value::as_str).unwrap_or("");
         let ansi16 = Ansi16::parse(ansi)
             .ok_or_else(|| format!("color {name:?}: ansi16 {ansi:?} is not a 16-colour slot"))?;
+        let rgb_hc = match v.get("hex_hc") {
+            None => None,
+            Some(h) => Some(hex(
+                h.as_str().unwrap_or(""),
+                &format!("color {name:?} hex_hc"),
+            )?),
+        };
         colors.push(Color {
             name: name.clone(),
             rgb,
+            rgb_hc,
             xterm256: u8::try_from(xterm256).map_err(|e| e.to_string())?,
             ansi16,
         });
@@ -338,11 +350,24 @@ pub fn write_swift(t: &Tokens, out: &Path) -> std::io::Result<()> {
     for c in &t.colors {
         let set = catalog.join(format!("{}.colorset", camel(&c.name, false)));
         std::fs::create_dir_all(&set)?;
-        let [r, g, b] = c.rgb;
+        // The colour, and under Increase Contrast its `hex_hc`, which macOS picks by itself.
+        let entry = |[r, g, b]: [u8; 3], appearance: &str| {
+            format!(
+                "{{ \"idiom\" : \"universal\",{appearance} \"color\" : {{ \"color-space\" : \"srgb\", \"components\" : {{ \"red\" : \"0x{r:02X}\", \"green\" : \"0x{g:02X}\", \"blue\" : \"0x{b:02X}\", \"alpha\" : \"1.000\" }} }} }}"
+            )
+        };
+        let mut entries = vec![entry(c.rgb, "")];
+        if let Some(hc) = c.rgb_hc {
+            entries.push(entry(
+                hc,
+                " \"appearances\" : [ { \"appearance\" : \"contrast\", \"value\" : \"high\" } ],",
+            ));
+        }
         std::fs::write(
             set.join("Contents.json"),
             format!(
-                "{{\n  \"colors\" : [ {{ \"idiom\" : \"universal\", \"color\" : {{ \"color-space\" : \"srgb\", \"components\" : {{ \"red\" : \"0x{r:02X}\", \"green\" : \"0x{g:02X}\", \"blue\" : \"0x{b:02X}\", \"alpha\" : \"1.000\" }} }} }} ],\n  \"info\" : {{ \"author\" : \"vox-theme\", \"version\" : 1 }}\n}}\n"
+                "{{\n  \"colors\" : [ {} ],\n  \"info\" : {{ \"author\" : \"vox-theme\", \"version\" : 1 }}\n}}\n",
+                entries.join(", ")
             ),
         )?;
         let _ = writeln!(

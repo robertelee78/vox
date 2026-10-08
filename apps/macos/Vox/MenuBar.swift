@@ -86,7 +86,7 @@ struct MenuBarContent: View {
             Button("Hide This Menu Bar Item") { app.showMenuBar(false) }
         }
         .padding(12)
-        .frame(width: 320)
+        .frame(width: Theme.scaled(320))
         .background(WindowReader(seen: window))
         .font(Theme.text)
     }
@@ -145,7 +145,7 @@ private struct NodeFacts: View {
 
     @ViewBuilder
     private func section(_ title: String, @ViewBuilder _ rows: () -> some View) -> some View {
-        Text(title).eyebrow().secondaryText()
+        Text(title).eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
         rows()
     }
 }

@@ -40,20 +40,17 @@ struct TimelineItem: Identifiable {
 }
 
 extension NodeModel {
-    /// The timeline's title (CL-2): what is shown, and the room's retention (ADR-028 R-7).
+    /// The timeline's title (CL-2): what is shown, and for the room's own lines (General, All) its
+    /// retention (ADR-028 R-7).
     var timelineTitle: String {
-        let shown: String
         switch showing {
-        case .general: shown = ""
-        case .all: shown = " — All"
+        case .general: return "Timeline · ⏱ \(retention)"
+        case .all: return "Timeline — All · ⏱ \(retention)"
+        // A Session's title has no retention: it is the room's (as the TUI says it).
         case .session:
-            if let s = shownSession {
-                shown = " — \(s.label)\(s.open ? " · open" : " · ended")"
-            } else {
-                shown = " — a Session this room no longer lists"
-            }
+            guard let s = shownSession else { return "Timeline — a Session this room no longer lists" }
+            return "Timeline — \(s.label)\(s.open ? " · open" : " · ended")"
         }
-        return "Timeline\(shown) · ⏱ \(retention)"
     }
 
     /// The room's messages and what was done to it, in the room's order: each notice right after

@@ -76,7 +76,7 @@ struct KeyringView: View {
     /// done (E-5).
     private var addForm: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("ADD A NODE").eyebrow().secondaryText()
+            Text("ADD A NODE").eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
             TextField("Fingerprint (paste or type)", text: $fingerprint)
                 .font(Theme.mono)
                 .focused($adding)
@@ -277,7 +277,7 @@ private struct RemoveSheet: View {
             }
         }
         .padding(24)
-        .frame(width: 440)
+        .frame(width: Theme.scaled(440))
     }
 }
 
@@ -291,7 +291,7 @@ private struct KeyringPassphrase: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Changing who you trust needs your identity passphrase again.").secondaryText()
             SecureInput(holder: field) { submit() }
-                .frame(width: 320)
+                .frame(width: Theme.scaled(320))
                 .accessibilityIdentifier("keyring-passphrase")
             Button("Continue") { submit() }
                 .accessibilityIdentifier("keyring-passphrase-continue")

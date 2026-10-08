@@ -52,7 +52,7 @@ struct ServicesView: View {
                     StateMark(kind: .plain, words: did).textSelection(.enabled)
                         .accessibilityIdentifier("services-did")
                 }
-                Text("SHARED WITH YOU").eyebrow().secondaryText()
+                Text("SHARED WITH YOU").eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
                 let theirs = rows.flatMap { r in r.shared.filter { $0.by != "you" }.map { (r, $0) } }
                 if theirs.isEmpty {
                     Text("Nothing is shared with this node in its open rooms.").secondaryText()
@@ -61,7 +61,7 @@ struct ServicesView: View {
                     SharedServiceBox(model: model, room: room.name, service: service)
                 }
                 Divider()
-                Text("YOUR SHARES").eyebrow().secondaryText()
+                Text("YOUR SHARES").eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
                 let mine = rows.flatMap { r in r.offered.map { (r, $0) } }
                 if mine.isEmpty { Text("This node shares nothing.").secondaryText() }
                 ForEach(mine, id: \.1.tag) { room, offered in
@@ -117,7 +117,7 @@ private struct SharedServiceBox: View {
             Text("by \(service.by) in \(room)  ·  \(service.kind)").caption().secondaryText()
             ForEach(Array(service.commands.enumerated()), id: \.offset) { _, command in
                 HStack(alignment: .firstTextBaseline) {
-                    Text(command.what).eyebrow().secondaryText().frame(width: 56, alignment: .leading)
+                    Text(command.what).eyebrow().secondaryText().frame(width: Theme.scaled(56), alignment: .leading)
                     Text(command.command.replacingOccurrences(of: service.canonical, with: service.address))
                         .font(Theme.mono).lineLimit(1).truncationMode(.middle)
                     Spacer()
@@ -155,7 +155,7 @@ private struct ShareForm: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("SHARE A SERVICE").eyebrow().secondaryText()
+            Text("SHARE A SERVICE").eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
             if let listening {
                 ForEach(listening.services, id: \.line) { service in
                     Button {

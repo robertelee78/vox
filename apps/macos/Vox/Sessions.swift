@@ -37,10 +37,11 @@ extension NodeModel {
         return sessions.first { $0.nodeFingerprint == node && $0.sessionId == id }
     }
 
-    /// A Session's header, to a member with drive (CL-1): its name and id are its node's claim
-    /// (MD-3). None for this node's own Sessions (their node's alias is empty): the claim is its own.
+    /// Another node's Session's header, with drive or without (ADR-029 MD-3, as the TUI says it):
+    /// its name and id are that node's claim. None for this node's own Sessions (their node's
+    /// alias is empty): the claim is this node's own.
     var sessionHeader: String? {
-        guard let s = shownSession, s.canDrive, !s.nodeAlias.isEmpty else { return nil }
+        guard let s = shownSession, !s.nodeAlias.isEmpty else { return nil }
         return "\(s.label) — name and id as \(s.nodeAlias) says"
     }
 }
@@ -54,6 +55,7 @@ struct SessionsList: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("SESSIONS").eyebrow().secondaryText()
+                .accessibilityAddTraits(.isHeader)
             row("General", .general, id: "session-general")
             row("All", .all, id: "session-all")
             ForEach(model.openSessions, id: \.self) { s in
@@ -67,6 +69,7 @@ struct SessionsList: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("sessions-ended")
+                .accessibilityValue(endedOpen ? "expanded" : "collapsed")
                 if endedOpen {
                     ForEach(ended, id: \.self) { s in
                         row("\(s.label) · ended", .session(node: s.nodeFingerprint, id: s.sessionId),
@@ -113,7 +116,7 @@ struct SessionEntryRow: View {
             Text(entry.line).font(Theme.mono).textSelection(.enabled)
                 .accessibilityIdentifier("entry-line-\(entry.id)")
             if let request = entry.request {
-                RequestView(model: model, session: session, request: request)
+                RequestView(model: model, session: session, request: request, about: entry.line)
             }
             // A file the session sent, once this node has a verified copy (ADR-029 DR-1, F-11).
             if let file = entry.file, let pulled = file.pulledPath {

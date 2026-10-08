@@ -4,6 +4,11 @@
 import AppKit
 import SwiftUI
 
+extension Notification.Name {
+    /// Put the keyboard on the room's timeline (View > Focus Timeline).
+    static let voxFocusTimeline = Notification.Name("us.vox.focusTimeline")
+}
+
 /// A sheet a menu, key or palette action opens.
 enum NodeSheet: String, Identifiable {
     case palette, newRoom, joinRoom, fingerprint, rename, retention, admins, leave, end
@@ -69,6 +74,10 @@ extension VoxAction {
                 node?.replyTo = node?.messages.first { $0.id == node?.selectedMessage }
             },
             VoxAction("Room", "Send Urgent", .return, enabled: inRoom) { node?.urgentAsked += 1 },
+            // The keyboard's way into the messages (WCAG 2.1.1): ↑/↓ then move through them.
+            VoxAction("View", "Focus Timeline", "t", [.command, .shift], enabled: inRoom) {
+                NotificationCenter.default.post(name: .voxFocusTimeline, object: nil)
+            },
             VoxAction("Room", "Copy Selected Service's Address", "c", [.command, .shift],
                       enabled: node?.selectedService != nil) { node?.copyServiceCommand() },
             VoxAction("Room", "Next Room That Needs You", "j", enabled: live) {
@@ -91,6 +100,10 @@ extension VoxAction {
             VoxAction("View", "Decision Record", "d", [.command, .shift], enabled: live) {
                 Task { await node?.show(.decisions) }
             },
+            // The app's own text size (WCAG 1.4.4): macOS has none for the whole system.
+            VoxAction("View", "Bigger", "+") { AppModel.shared.stepTextSize(1) },
+            VoxAction("View", "Smaller", "-") { AppModel.shared.stepTextSize(-1) },
+            VoxAction("View", "Actual Size", "0") { AppModel.shared.stepTextSize(0) },
         ] + digits
     }
 }
@@ -182,7 +195,7 @@ struct Palette: View {
             .frame(height: 280)
         }
         .padding(16)
-        .frame(width: 420)
+        .frame(width: Theme.scaled(420))
     }
 
     private func done(_ action: VoxAction) {
@@ -231,7 +244,7 @@ private struct RoomForm: View {
             }
             Text(joining ? "The room's passphrase, sent to you another way than its link."
                 : "A passphrase for the room: send it another way than its link.").secondaryText()
-            SecureInput(holder: field) { submit() }.frame(width: 320)
+            SecureInput(holder: field) { submit() }.frame(width: Theme.scaled(320))
                 .accessibilityIdentifier("room-form-passphrase")
             if let said = model.said { StateMark(kind: .danger, words: said).textSelection(.enabled) }
             HStack {
@@ -242,7 +255,7 @@ private struct RoomForm: View {
             }
         }
         .padding(24)
-        .frame(width: 440)
+        .frame(width: Theme.scaled(440))
     }
 
     private func submit() {
@@ -324,7 +337,7 @@ private struct RetentionSheet: View {
             }
         }
         .padding(24)
-        .frame(width: 440)
+        .frame(width: Theme.scaled(440))
     }
 
     private func submit() {
@@ -360,7 +373,7 @@ private struct RenameSheet: View {
             }
         }
         .padding(24)
-        .frame(width: 440)
+        .frame(width: Theme.scaled(440))
     }
 
     private func submit() {
@@ -396,7 +409,7 @@ private struct AdminsSheet: View {
             Button("Done") { model.sheet = nil }.keyboardShortcut(.defaultAction)
         }
         .padding(24)
-        .frame(width: 440)
+        .frame(width: Theme.scaled(440))
         .task { admins = await model.admins() }
     }
 }
@@ -426,6 +439,6 @@ private struct LeaveSheet: View {
             }
         }
         .padding(24)
-        .frame(width: 440)
+        .frame(width: Theme.scaled(440))
     }
 }

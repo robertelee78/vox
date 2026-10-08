@@ -158,7 +158,7 @@ private struct PassphraseForm: View {
         Text("Attach node \(node)").heading()
         Text("Type node \(node)'s identity passphrase.").secondaryText()
         SecureInput(holder: field) { submit() }
-            .frame(width: 320)
+            .frame(width: Theme.scaled(320))
             .accessibilityIdentifier("passphrase")
             .accessibilityLabel("Identity passphrase for node \(node)")
         if model.keepRunning {

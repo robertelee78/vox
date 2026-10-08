@@ -12,7 +12,7 @@ struct MainWindow: View {
         VStack(spacing: 0) {
             NavigationSplitView {
                 Sidebar(model: model)
-                    .navigationSplitViewColumnWidth(min: 220, ideal: 260)
+                    .navigationSplitViewColumnWidth(min: Theme.scaled(220), ideal: Theme.scaled(260))
             } detail: {
                 switch model.selection {
                 case let .room(id):
@@ -57,6 +57,7 @@ private struct Sidebar: View {
                                 })) {
             Section {
                 StateMark(kind: .live, words: "node \(model.node), attached")
+                    .font(Theme.text)
                     .accessibilityIdentifier("attached")
             }
             ForEach([RoomGroup.needsYou, .active, .quiet], id: \.self) { need in
@@ -73,24 +74,28 @@ private struct Sidebar: View {
                 }
             }
             Section {
-                Text("Keyring").tag(NodeModel.Selection.keyring)
+                Text("Keyring").font(Theme.text).tag(NodeModel.Selection.keyring)
                     .accessibilityIdentifier("keyring")
-                Text("Decision record").tag(NodeModel.Selection.decisions)
+                Text("Decision record").font(Theme.text).tag(NodeModel.Selection.decisions)
                     .accessibilityIdentifier("decisions")
-                Text("Services").tag(NodeModel.Selection.services)
+                Text("Services").font(Theme.text).tag(NodeModel.Selection.services)
                     .accessibilityIdentifier("services")
             }
             Section {
                 ForEach(model.nodes, id: \.name) { node in
                     StateMark(kind: node.state == "attached" ? .live : .plain,
                               words: "\(node.name) \(node.state)")
+                        .font(Theme.text)
                         .accessibilityIdentifier("node-\(node.name)")
                 }
             } header: {
-                Text("nodes on this Mac").eyebrow()
+                Text("nodes on this Mac").eyebrow().accessibilityAddTraits(.isHeader)
             }
         }
         .listStyle(.sidebar)
+        // The sidebar's rows in the app's face and size: a sidebar list sets its own otherwise.
+        .font(Theme.text)
+        .environment(\.defaultMinListRowHeight, Theme.scaled(24))
     }
 }
 
@@ -100,7 +105,7 @@ private struct RoomRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(room.name).fontWeight(room.need == .quiet ? .regular : .bold)
+            Text(room.name).font(Theme.text).fontWeight(room.need == .quiet ? .regular : .bold)
             if room.need != .quiet {
                 Text(room.words).eyebrow().secondaryText()
             }
@@ -108,6 +113,18 @@ private struct RoomRow: View {
         .accessibilityElement(children: .ignore)
         .accessibilityIdentifier("room-\(room.name)")
         .accessibilityLabel("\(room.name), \(room.need.words), \(room.words)")
+    }
+}
+
+/// The timeline draws its own focus ring on the row the keyboard is on; the system's ring around
+/// the whole timeline is left out where SwiftUI can leave it out (macOS 14).
+private struct OwnFocusRing: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 14.0, *) {
+            content.focusEffectDisabled()
+        } else {
+            content
+        }
     }
 }
 
@@ -130,6 +147,10 @@ private struct RoomView: View {
     /// The newest message when the messages last changed: if it was in view, the timeline follows
     /// the next one; scrolled up to read, it stays (as the TUI does, V210-82).
     @State private var newest: String?
+    /// Whether the keyboard is on the timeline (WCAG 2.1.1): ↑/↓ move the selection, Return
+    /// opens the selected message's first action, Space Quick Looks its pulled file.
+    @FocusState private var timelineFocused: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         HStack(spacing: 0) {
@@ -185,7 +206,9 @@ private struct RoomView: View {
                                                        pulled: model.pulled[message.id]) { looking = $0 }
                                                 .frame(maxWidth: .infinity, alignment: .leading)
                                                 .padding(4)
-                                                .selectable(model.selectedMessage == message.id) {
+                                                .selectable(model.selectedMessage == message.id,
+                                                            focused: timelineFocused
+                                                                && model.selectedMessage == message.id) {
                                                     model.selectedMessage = message.id
                                                 }
                                                 .reportsFrame(of: message.id)
@@ -207,6 +230,34 @@ private struct RoomView: View {
                                 .padding(12)
                             }
                             .coordinateSpace(name: "timeline")
+                            // **Operable from the keyboard** (WCAG 2.1.1, 2.4.7): the timeline
+                            // takes focus (Tab with keyboard navigation on, or View > Focus
+                            // Timeline); the focused row is outlined by `selectable`, so the
+                            // system's own ring around the whole timeline is not drawn as well.
+                            .focusable()
+                            .focused($timelineFocused)
+                            .modifier(OwnFocusRing())
+                            .onMoveCommand { direction in move(direction, scroller) }
+                            // Return and Space while the timeline holds the keyboard, as buttons
+                            // with keys (onKeyPress is macOS 14 only); off when it does not, so
+                            // the composer still types a space.
+                            .background {
+                                Button("") { _ = openSelected() }
+                                    .keyboardShortcut(.return, modifiers: [])
+                                    .disabled(!timelineFocused)
+                                    .hidden()
+                                Button("") { _ = lookSelected() }
+                                    .keyboardShortcut(.space, modifiers: [])
+                                    .disabled(!timelineFocused)
+                                    .hidden()
+                            }
+                            .onReceive(NotificationCenter.default.publisher(for: .voxFocusTimeline)) { _ in
+                                timelineFocused = true
+                                if model.selectedMessage == nil, let last = model.messages.last {
+                                    model.selectedMessage = last.id
+                                    scroller.scrollTo(last.id)
+                                }
+                            }
                             .onPreferenceChange(RowFrames.self) { frames in
                                 // Seen: at least half of the row inside the timeline's bounds.
                                 let bounds = CGRect(origin: .zero, size: viewport.size)
@@ -260,7 +311,7 @@ private struct RoomView: View {
             }
             Divider()
             Inspector(model: model, room: room)
-                .frame(width: 240)
+                .frame(width: Theme.scaled(240))
         }
         // On the room, not its timeline: ⌘O, ⌘↩ and a file from the Finder Services item work
         // wherever the room's focus is.
@@ -314,7 +365,7 @@ private struct RoomView: View {
             .accessibilityIdentifier("attach")
             TextField("Say something to the room", text: $draft)
                 .textFieldStyle(.plain)
-                .frame(minWidth: 160, maxWidth: .infinity)
+                .frame(minWidth: Theme.scaled(160), maxWidth: .infinity)
                 .layoutPriority(1)
                 .onSubmit { send(urgent: urgent) }
                 .accessibilityIdentifier("compose")
@@ -331,6 +382,49 @@ private struct RoomView: View {
         urgent = false
         model.replyTo = nil
         Task { await model.post(text, to: recipients, urgent: now, re: re) }
+    }
+
+    /// ↑/↓ on the timeline: the selection moves to the message before or after it, scrolled into
+    /// view; with none selected, ↑ takes the newest and ↓ the oldest.
+    private func move(_ direction: MoveCommandDirection, _ scroller: ScrollViewProxy) {
+        let ids = model.timelineItems.compactMap { $0.message?.id }
+        guard !ids.isEmpty else { return }
+        let at = model.selectedMessage.flatMap { ids.firstIndex(of: $0) }
+        let next: Int
+        switch direction {
+        case .up: next = at.map { max($0 - 1, 0) } ?? ids.count - 1
+        case .down: next = at.map { min($0 + 1, ids.count - 1) } ?? 0
+        default: return
+        }
+        model.selectedMessage = ids[next]
+        withAnimation(Theme.motion(reduced: reduceMotion)) {
+            scroller.scrollTo(ids[next])
+        }
+    }
+
+    /// The selected message, as the timeline shows it.
+    private var selected: RoomMessage? {
+        model.messages.first { $0.id == model.selectedMessage }
+    }
+
+    /// Return: the selected message's first action — its pulled file in Quick Look, else its link
+    /// card's link (http and https only, as the card itself opens). Whether there was one.
+    private func openSelected() -> Bool {
+        guard let message = selected else { return false }
+        if lookSelected() { return true }
+        if let card = message.card, let url = URL(string: card.url),
+           ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
+            NSWorkspace.shared.open(url)
+            return true
+        }
+        return false
+    }
+
+    /// Space: the selected message's pulled file in Quick Look. Whether there was one.
+    private func lookSelected() -> Bool {
+        guard let id = model.selectedMessage, let path = model.pulled[id] else { return false }
+        looking = URL(fileURLWithPath: path)
+        return true
     }
 
     /// The rows in view are read, only while the window is in front of the person (R-6).
@@ -391,6 +485,29 @@ private struct MessageRow: View {
                     .accessibilityLabel("read by \(readBy.joined(separator: ", "))")
             }
         }
+        // VoiceOver reads the row first as one sentence, in the order it is drawn; its parts
+        // (the file's buttons, the link) stay reachable inside it (WCAG 1.3.1, 4.1.2).
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(spoken)
+    }
+
+    /// The row as one sentence: who, to whom, how, what, and what became of it.
+    private var spoken: String {
+        var parts = [author]
+        if message.to.contains(me) { parts.append("to you") }
+        if message.urgent { parts.append("urgent") }
+        if message.late { parts.append("arrived late") }
+        var said = parts.joined(separator: ", ") + ": "
+        if let file = message.file {
+            said += "\(file.folder ? "folder" : "file") \(file.name)"
+            if !file.note.isEmpty { said += ", \(file.note)" }
+        } else {
+            said += message.owed ? "not received yet" : message.text
+        }
+        if let card = message.card, !card.title.isEmpty { said += ", link: \(card.title)" }
+        if !pulledBy.isEmpty { said += ", pulled by \(pulledBy.joined(separator: ", "))" }
+        if !readBy.isEmpty { said += ", read by \(readBy.joined(separator: ", "))" }
+        return said
     }
 
     /// A share's text is its note.
@@ -473,8 +590,11 @@ private struct LinkCardView: View {
                 // other scheme (file:, an app's own) is drawn as text, never opened.
                 if let url = URL(string: card.url),
                    ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
+                    // A link, drawn as one: not in the app's button style.
                     Link(card.url, destination: url).caption().lineLimit(1)
                         .truncationMode(.middle)
+                        .buttonStyle(.plain)
+                        .foregroundStyle(VoxTokens.Colors.accent)
                 } else {
                     Text(card.url).caption().lineLimit(1).truncationMode(.middle)
                         .textSelection(.enabled)
@@ -516,6 +636,7 @@ private struct Inspector: View {
             SessionsList(model: model)
             Divider().padding(.vertical, 8)
             Text("MEMBERS").eyebrow().secondaryText()
+                .accessibilityAddTraits(.isHeader)
             ForEach(model.members) { member in
                 TrustMark(name: member.name, trust: member.trust)
                     .accessibilityIdentifier("member-\(member.name)")
@@ -546,6 +667,7 @@ private struct FamilyLan: View {
 
     var body: some View {
         Text("FAMILY LAN").eyebrow().secondaryText()
+            .accessibilityAddTraits(.isHeader)
         if model.lanHelperReady {
             Toggle("On this room's LAN", isOn: Binding(
                 get: { model.lanOn.contains(room) },
