@@ -50,6 +50,11 @@
 // 13. What came while the app was closed (ADR-028 R-8): alice's node, attached by hand, takes
 //     bob's message to her while no app runs; opened again, the app lists mission under "needs
 //     you (1)" at once, from what her node recorded as read.
+// 14. The keyboard (WCAG 2.1.1, 2.4.7; #450), run with Full Keyboard Access on (set around the
+//     pass, never by the proof): View > Focus Timeline (⇧⌘T) puts the keyboard on mission's
+//     timeline with its newest message selected; ↑ and ↓ move the selection, as Reply to Selected
+//     Message (⌘R) then says; Space and Return on a row whose file alice pulled open it in Quick
+//     Look; Tab from the timeline reaches the composer.
 //
 // Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
 // place of the app's hold), and quitting leaves it attached: (12) goes red. A room with a message
@@ -65,7 +70,8 @@
 // A notification that carries the message's text: (8) goes red. ⌘J bound to the next room in
 // the sidebar's order: (9) goes red. The decision record oldest first: (10) goes red.
 // Untrust that leaves a member's live sessions running: (11) goes red. An app that counts
-// nothing from before it opened (no seeding from VoxClient.unread): (13) goes red.
+// nothing from before it opened (no seeding from VoxClient.unread): (13) goes red. ↑/↓ that do not
+// move the selection, or Space and Return that open nothing: (14) goes red.
 
 // Every check on the window proves its own query first (ADR-018: a red names its side): Vox is in
 // front and XCTest reads words in what it shows, else the red is APPARATUS; then a red is PRODUCT
@@ -1054,6 +1060,87 @@ final class FirstRunProof: XCTestCase {
                              "bob's message to alice came while the app was closed; opened again, the app must count it from what her node recorded as read, mission under \"needs you (1)\"",
                              until: { $0 == "needs you (1)" }) ?? ""
         print("[proof] opened again: \(reopened)")
+
+        // (14) The keyboard. Bob posts KEYS-A and KEYS-B, then shares a file to alice, which her
+        // node pulls: the newest row of mission is the file's.
+        try staged(vox, ["room", "post", "--node", "bob", room, "KEYS-A"], env: bobSession)
+        try staged(vox, ["room", "post", "--node", "bob", room, "KEYS-B"], env: bobSession)
+        let keysFile = scratch.appendingPathComponent("for-keys.txt")
+        try stager.write(Data("opened from the keyboard\n".utf8), to: keysFile.path)
+        try staged(vox, ["share", "--node", "bob", room, keysFile.path, "--to", aliceFp,
+                         "-m", "KEYS-FILE"], env: bobSession)
+        tap(ui, Key.id("room-mission"), "mission in the sidebar")
+        // Premise: alice's node pulled it (the row offers Quick Look only then).
+        let lookButton = Key.id("quick-look-for-keys.txt")
+        present(ui, lookButton, timeout: 120,
+                "the file bob shared to alice must be pulled and offer Quick Look in her timeline")
+        // Premise: Quick Look, opened with the mouse, shows as one more window, and Escape closes
+        // it; else the proof cannot tell it from the keyboard.
+        let windowsBefore = ui.windows.count
+        tap(ui, lookButton, "Quick Look on for-keys.txt")
+        func lookOpened() -> Bool {
+            let end = Date().addingTimeInterval(10)
+            while Date() < end {
+                if ui.windows.count > windowsBefore { return true }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            return false
+        }
+        func lookClosed() -> Bool {
+            ui.typeKey(.escape, modifierFlags: [])
+            let end = Date().addingTimeInterval(10)
+            while Date() < end {
+                if ui.windows.count == windowsBefore { return true }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            return false
+        }
+        guard lookOpened(), lookClosed() else {
+            keepTree(ui, "Quick Look by mouse was not seen to open and close")
+            throw Apparatus("Quick Look, opened with the mouse on for-keys.txt, did not show as one more window that Escape closes (\(windowsBefore) windows before, \(ui.windows.count) now), so the keyboard's cannot be told")
+        }
+        // ⇧⌘T: the keyboard on the timeline, the newest row (the file's) selected.
+        ui.typeKey("t", modifierFlags: [.command, .shift])
+        ui.typeKey(" ", modifierFlags: [])
+        if !lookOpened() {
+            keepTree(ui, "Space opened nothing")
+            XCTFail("PRODUCT: View > Focus Timeline, then Space, must open the selected row's pulled file, for-keys.txt, in Quick Look; no window opened")
+        } else if !lookClosed() {
+            throw Apparatus("Quick Look opened by Space did not close on Escape")
+        }
+        ui.typeKey(.return, modifierFlags: [])
+        if !lookOpened() {
+            keepTree(ui, "Return opened nothing")
+            XCTFail("PRODUCT: Return on the selected row, whose file alice pulled, must open its first action, Quick Look; no window opened")
+        } else if !lookClosed() {
+            throw Apparatus("Quick Look opened by Return did not close on Escape")
+        }
+        // ↑ to KEYS-B, ↑ to KEYS-A, ↓ back to KEYS-B: each said by Reply to Selected Message.
+        for (key, want) in [(XCUIKeyboardKey.upArrow, "KEYS-B"), (.upArrow, "KEYS-A"),
+                            (.downArrow, "KEYS-B")] {
+            ui.typeKey(key, modifierFlags: [])
+            ui.typeKey("r", modifierFlags: .command)
+            present(ui, Key.showing("Replying to bob: \(want)"), timeout: 10,
+                    "\(key == .upArrow ? "↑" : "↓") on the timeline must select \(want), which ⌘R then replies to")
+            // Back to the timeline for the next key: ⌘R leaves the keyboard where it was.
+            ui.typeKey("t", modifierFlags: [.command, .shift])
+        }
+        // Tab from the timeline reaches the composer. Premise: XCTest reads the composer's
+        // keyboard focus (clicked, it has it).
+        let compose = Key.id("compose")
+        tap(ui, compose, "the composer")
+        guard el(ui, compose).value(forKey: "hasKeyboardFocus") as? Bool == true else {
+            throw Apparatus("XCTest reads no keyboard focus on the composer after clicking it")
+        }
+        ui.typeKey("t", modifierFlags: [.command, .shift])
+        var tabs = 0
+        while tabs < 25 && el(ui, compose).value(forKey: "hasKeyboardFocus") as? Bool != true {
+            ui.typeKey(.tab, modifierFlags: [])
+            tabs += 1
+        }
+        XCTAssertTrue(el(ui, compose).value(forKey: "hasKeyboardFocus") as? Bool == true,
+                      "PRODUCT: Tab from the timeline must reach the composer; after \(tabs) Tabs it has no keyboard focus")
+        print("[proof] keyboard: Space and Return opened Quick Look; ↑ ↑ ↓ selected KEYS-B, KEYS-A, KEYS-B; Tab reached the composer in \(tabs)")
         ui.typeKey("q", modifierFlags: .command)
         _ = ui.wait(for: .notRunning, timeout: 30)
         _ = run(vox, ["node", "detach", "alice"], env: voxEnv)

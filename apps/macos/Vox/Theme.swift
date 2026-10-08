@@ -204,6 +204,8 @@ private struct CardOutline: ViewModifier {
 /// Increase Contrast (L-3, L-5); and said to be selected.
 private struct SelectionMark: ViewModifier {
     let selected: Bool
+    /// The row the keyboard is on (WCAG 2.4.7): outlined in the focus accent, as well as marked.
+    var focused = false
     @Environment(\.colorSchemeContrast) private var contrast
 
     func body(content: Content) -> some View {
@@ -215,7 +217,9 @@ private struct SelectionMark: ViewModifier {
                 }
             }
             .overlay {
-                if selected && contrast == .increased {
+                if focused {
+                    RoundedRectangle(cornerRadius: 4).stroke(VoxTokens.Colors.accent, lineWidth: 2)
+                } else if selected && contrast == .increased {
                     RoundedRectangle(cornerRadius: 4).stroke(VoxTokens.Colors.accent)
                 }
             }
@@ -259,9 +263,10 @@ extension View {
 
     /// A row or card selected by clicking it: marked when `selected`, and to assistive
     /// technologies one element that is a button and says whether it is selected.
-    func selectable(_ selected: Bool, select: @escaping () -> Void) -> some View {
+    func selectable(_ selected: Bool, focused: Bool = false,
+                    select: @escaping () -> Void) -> some View {
         accessibilityElement(children: .contain)
-            .selectionMark(selected)
+            .modifier(SelectionMark(selected: selected, focused: focused))
             .contentShape(Rectangle())
             .onTapGesture(perform: select)
             .accessibilityAddTraits(.isButton)

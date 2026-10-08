@@ -117,6 +117,18 @@ private struct RoomRow: View {
 }
 
 /// The room on screen: its timeline and a field to post, with its members beside it.
+/// The timeline draws its own focus ring on the row the keyboard is on; the system's ring around
+/// the whole timeline is left out where SwiftUI can leave it out (macOS 14).
+private struct OwnFocusRing: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 14.0, *) {
+            content.focusEffectDisabled()
+        } else {
+            content
+        }
+    }
+}
+
 private struct RoomView: View {
     @ObservedObject var model: NodeModel
     let room: String
@@ -135,6 +147,10 @@ private struct RoomView: View {
     /// The newest message when the messages last changed: if it was in view, the timeline follows
     /// the next one; scrolled up to read, it stays (as the TUI does, V210-82).
     @State private var newest: String?
+    /// Whether the keyboard is on the timeline (WCAG 2.1.1): ↑/↓ move the selection, Return
+    /// opens the selected message's first action, Space Quick Looks its pulled file.
+    @FocusState private var timelineFocused: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         HStack(spacing: 0) {
@@ -190,7 +206,9 @@ private struct RoomView: View {
                                                        pulled: model.pulled[message.id]) { looking = $0 }
                                                 .frame(maxWidth: .infinity, alignment: .leading)
                                                 .padding(4)
-                                                .selectable(model.selectedMessage == message.id) {
+                                                .selectable(model.selectedMessage == message.id,
+                                                            focused: timelineFocused
+                                                                && model.selectedMessage == message.id) {
                                                     model.selectedMessage = message.id
                                                 }
                                                 .reportsFrame(of: message.id)
@@ -212,6 +230,34 @@ private struct RoomView: View {
                                 .padding(12)
                             }
                             .coordinateSpace(name: "timeline")
+                            // **Operable from the keyboard** (WCAG 2.1.1, 2.4.7): the timeline
+                            // takes focus (Tab with keyboard navigation on, or View > Focus
+                            // Timeline); the focused row is outlined by `selectable`, so the
+                            // system's own ring around the whole timeline is not drawn as well.
+                            .focusable()
+                            .focused($timelineFocused)
+                            .modifier(OwnFocusRing())
+                            .onMoveCommand { direction in move(direction, scroller) }
+                            // Return and Space while the timeline holds the keyboard, as buttons
+                            // with keys (onKeyPress is macOS 14 only); off when it does not, so
+                            // the composer still types a space.
+                            .background {
+                                Button("") { _ = openSelected() }
+                                    .keyboardShortcut(.return, modifiers: [])
+                                    .disabled(!timelineFocused)
+                                    .hidden()
+                                Button("") { _ = lookSelected() }
+                                    .keyboardShortcut(.space, modifiers: [])
+                                    .disabled(!timelineFocused)
+                                    .hidden()
+                            }
+                            .onReceive(NotificationCenter.default.publisher(for: .voxFocusTimeline)) { _ in
+                                timelineFocused = true
+                                if model.selectedMessage == nil, let last = model.messages.last {
+                                    model.selectedMessage = last.id
+                                    scroller.scrollTo(last.id)
+                                }
+                            }
                             .onPreferenceChange(RowFrames.self) { frames in
                                 // Seen: at least half of the row inside the timeline's bounds.
                                 let bounds = CGRect(origin: .zero, size: viewport.size)
@@ -339,6 +385,49 @@ private struct RoomView: View {
     }
 
     /// The rows in view are read, only while the window is in front of the person (R-6).
+    /// ↑/↓ on the timeline: the selection moves to the message before or after it, scrolled into
+    /// view; with none selected, ↑ takes the newest and ↓ the oldest.
+    private func move(_ direction: MoveCommandDirection, _ scroller: ScrollViewProxy) {
+        let ids = model.timelineItems.compactMap { $0.message?.id }
+        guard !ids.isEmpty else { return }
+        let at = model.selectedMessage.flatMap { ids.firstIndex(of: $0) }
+        let next: Int
+        switch direction {
+        case .up: next = at.map { max($0 - 1, 0) } ?? ids.count - 1
+        case .down: next = at.map { min($0 + 1, ids.count - 1) } ?? 0
+        default: return
+        }
+        model.selectedMessage = ids[next]
+        withAnimation(Theme.motion(reduced: reduceMotion)) {
+            scroller.scrollTo(ids[next])
+        }
+    }
+
+    /// The selected message, as the timeline shows it.
+    private var selected: RoomMessage? {
+        model.messages.first { $0.id == model.selectedMessage }
+    }
+
+    /// Return: the selected message's first action — its pulled file in Quick Look, else its link
+    /// card's link (http and https only, as the card itself opens). Whether there was one.
+    private func openSelected() -> Bool {
+        guard let message = selected else { return false }
+        if lookSelected() { return true }
+        if let card = message.card, let url = URL(string: card.url),
+           ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
+            NSWorkspace.shared.open(url)
+            return true
+        }
+        return false
+    }
+
+    /// Space: the selected message's pulled file in Quick Look. Whether there was one.
+    private func lookSelected() -> Bool {
+        guard let id = model.selectedMessage, let path = model.pulled[id] else { return false }
+        looking = URL(fileURLWithPath: path)
+        return true
+    }
+
     private func markSeen() {
         readLog.debug("seen check in \(room, privacy: .public): window seen \(window.seen), \(inView.count) rows in view")
         guard window.seen else { return }
