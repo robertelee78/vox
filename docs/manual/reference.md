@@ -92,25 +92,20 @@ In the TUI, `d` on the room list, or `:decisions`, shows the whole record, newes
 own fingerprint, in groups beside its art.)
 
 Each node writes down every refusal and every change of access it decides: a join or a tunnel it
-refused, a session it cut, a node added to or removed from its keyring, a share it stopped. One
-JSON line per decision goes to `nodes/NAME/decisions/YYYY-MM-DD.jsonl`, one file per UTC day,
-readable by your account only. Files older than 14 days are deleted, and the record is never sent
-anywhere. A line looks like this:
+refused, a session it cut, a node added to or removed from its keyring, a share it stopped. Each
+decision says what was decided, what was asked, who it was about (your name for them, or the
+start of their fingerprint), when, and why, in the node's own words, for example `join
+proof-of-possession failed` for a wrong room passphrase. It never holds message text, a file's
+name or contents, a passphrase or a key. A refusal that can repeat many times a minute, such as a
+refused stream, is written the first time; its repeats in the next hour are counted and written
+as one.
 
-```json
-{"alias":"ann","asked":"to stop trusting a member","at_ms":1791266648587,"by":"kdbctelrwq73b3cclgfyt33oeofci4euoxemuzbw6w5w7niozx4q","decided":"untrusted","why":"this node's person removed them from the keyring: they read nothing new from it and reach none of its services"}
-```
-
-`by` is the fingerprint of the node the decision was about, `alias` your name for it if you gave
-one, and `why` the node's own words, for example `join proof-of-possession failed` for a wrong
-room passphrase. A line never holds message text, a file's name or contents, a passphrase or a
-key. A refusal that can repeat many times a minute, such as a refused stream, is written the
-first time; its repeats in the next hour are counted and written as one line when the hour is
-over. To see who was refused today:
-
-```sh
-grep '"decided":"refused"' "DATA_ROOT/nodes/NAME/decisions/$(date -u +%F).jsonl"
-```
+The record is sealed at rest under the node's identity, in
+`nodes/NAME/decisions/YYYY-MM-DD.sealed`, one file per UTC day, readable by your account only, and
+it is read only through the node: in the TUI with `d`, in the app's Decision record view, and its
+latest refusals in `vox status`. Files older than 14 days are deleted, and the record is never
+sent anywhere. A record an earlier build wrote in plain text (`.jsonl`) is sealed into its day's
+file, and the plain file removed, the next time the node is attached.
 
 These are not caches to remove when a join is refused. The source creates private
 directories/files on supported Unix systems; still protect the account and machine that can use

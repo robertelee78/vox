@@ -205,15 +205,18 @@ Ended (1)
 - Inside a Session you have drive for, its composer types into the session; a line starting with
   `/` is a slash command. `:interrupt` and `:stop` interrupt and stop it. On a waiting line, `a`
   approves, `r` rejects and a number picks a question's option; `:approve`, `:reject` and
-  `:answer` act on the oldest request waiting. Enter or `d` on a line shows its Details.
+  `:answer` act on the oldest request waiting; `:answer` takes one answer for each part of the
+  question, separated by `;`. Enter or `d` on a line shows its Details.
   `:share PATH` sends the session a file.
 - A Session waiting on you is marked `! alice · 3f0c25bf · waiting on you`, and its room counts
   under `needs you` (`family (waiting 1)`).
+- Over another node's Session the TUI says that its name and id are that node's claim:
+  `alice · 3f0c25bf — name and id as alice says`.
 - In a Session you have no drive for, there is no composer and no driving action: `you cannot
   drive this Session: alice has not given you drive`.
 
-Source: [Sessions in the CLI](https://github.com/robertelee78/vox/blob/21b851ad31eab34d7cbf5432f8ce4c205f2ed11c/crates/vox-tui/src/session_cli.rs),
-[the room map](https://github.com/robertelee78/vox/blob/21b851ad31eab34d7cbf5432f8ce4c205f2ed11c/crates/vox-tui/src/room_map.rs),
-[setting a session's room](https://github.com/robertelee78/vox/blob/21b851ad31eab34d7cbf5432f8ce4c205f2ed11c/crates/vox-tui/src/agent_room.rs),
-[driving Claude Code](https://github.com/robertelee78/vox/blob/21b851ad31eab34d7cbf5432f8ce4c205f2ed11c/crates/vox-tui/src/claude_injector.rs)
-and [Sessions](https://github.com/robertelee78/vox/blob/21b851ad31eab34d7cbf5432f8ce4c205f2ed11c/docs/adr/ADR-029-sessions-and-the-repo-room.md).
+Source: [Sessions in the CLI](https://github.com/robertelee78/vox/blob/a51335ff1b47836bbb9ecefd6c705f58c0225f4a/crates/vox-tui/src/session_cli.rs),
+[the room map](https://github.com/robertelee78/vox/blob/a51335ff1b47836bbb9ecefd6c705f58c0225f4a/crates/vox-tui/src/room_map.rs),
+[setting a session's room](https://github.com/robertelee78/vox/blob/a51335ff1b47836bbb9ecefd6c705f58c0225f4a/crates/vox-tui/src/agent_room.rs),
+[driving Claude Code](https://github.com/robertelee78/vox/blob/a51335ff1b47836bbb9ecefd6c705f58c0225f4a/crates/vox-tui/src/claude_injector.rs)
+and [Sessions](https://github.com/robertelee78/vox/blob/a51335ff1b47836bbb9ecefd6c705f58c0225f4a/docs/adr/ADR-029-sessions-and-the-repo-room.md).
