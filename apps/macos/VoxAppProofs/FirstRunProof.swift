@@ -1374,9 +1374,9 @@ final class FirstRunProof: XCTestCase {
     ///
     /// Before: no Vox.app runs, and every `vox` running is this app's own (so the app cannot reach
     /// the account's daemon). After: exactly one Vox runs, this app's executable; and within 30 s
-    /// the app shows this run's scratch path or a node staged only here, or (a screen reached
-    /// through a daemon) no `vox` started since: the app reached this run's daemon, the only one.
-    /// The account's data root shown, or none of these, stops the case.
+    /// the app shows this run's scratch path or a node staged only here, or asks the first-run
+    /// question the account's own config has answered. The account's data root shown, or none of
+    /// these, stops the case.
     private func launchVox(_ ui: XCUIApplication, _ appPath: String, env: [String: String],
                            scratch: String) throws {
         try scratchOnly(env, under: scratch)
@@ -1411,12 +1411,15 @@ final class FirstRunProof: XCTestCase {
             givenPid = pid
             ui.activate()
         }
-        // The profile, positively, before any step.
+        // The profile, positively, before any step. The account's own config has answered the
+        // first-run question (checked here, by the stager), so an app asking it is not reading
+        // the account's config: the launch environment, which comes whole or not at all, reached it.
+        let accountAnswered = stager.run(["/usr/bin/python3", "-c",
+            "import os, pwd, sys; sys.exit(0 if os.path.isfile(os.path.join(pwd.getpwuid(os.getuid()).pw_dir, 'Library/Application Support/vox/app/login-item')) else 1)"],
+            env: [:]).status == 0
         let realRoot = Key.showing("Library/Application Support/vox")
-        let scratchSigns: [Key] = [Key.showing(resolved(scratch)), Key.showing(scratch), Key.id("node-alice"),
-                            Key.showing("node alice")]
-        let throughDaemon: [Key] = [Key.id("login-item-why"), Key.id("menu-bar-offer"),
-                                    Key.id("passphrase"), Key.id("attached")]
+        let scratchSigns: [Key] = [Key.showing(resolved(scratch)), Key.showing(scratch),
+                                   Key.id("node-alice"), Key.showing("node alice"), Key.showing("alice")]
         let until = Date().addingTimeInterval(30)
         while Date() < until {
             if let real = locate(ui, realRoot) {
@@ -1428,18 +1431,15 @@ final class FirstRunProof: XCTestCase {
                 print("[guard] Vox.app (pid \(pid)) is on this run's scratch profile: it shows \(sign)")
                 return
             }
-            if let screen = throughDaemon.first(where: { locate(ui, $0) != nil }), !voxBefore.isEmpty {
-                let voxNow = pids("vox")
-                if voxNow.isSubset(of: voxBefore) {
-                    print("[guard] Vox.app (pid \(pid)) reached this run's daemon: it shows \(screen), and no vox started since (vox pids \(voxNow.sorted()))")
-                    return
-                }
+            if accountAnswered, locate(ui, Key.id("login-item-why")) != nil {
+                print("[guard] Vox.app (pid \(pid)) asks the first-run question, which the account's own config has answered: it reads this run's config")
+                return
             }
             Thread.sleep(forTimeInterval: 0.5)
         }
         keepTree(ui, "Vox.app could not be shown on the scratch profile")
         ui.terminate()
-        throw Apparatus("Vox.app could not be shown to be on this run's scratch profile within 30 s (no scratch path, no node staged here, nor a screen reached through this run's daemon alone); stopped before any step")
+        throw Apparatus("Vox.app could not be shown to be on this run's scratch profile within 30 s (no scratch path, no node staged here, nor a first-run question the account has answered); stopped before any step")
     }
 
     /// The proof hides (⌘H) or quits (⌘Q) Vox itself: what takes the foreground next is handed
