@@ -131,7 +131,7 @@ and your node says so once for that member and room, on its own terminal (the da
 `.daemon/log` in the data root, or the terminal of a `vox daemon` you started):
 
 ```text
-vox node: connection to obs52x2rogrwwzsqt2dmpmsta6 — your key for it in room qilvehgxilrf waits: this node's board holds no prekey bundle of it yet; it is sent once one arrives
+vox: connection to obs52x2rogrwwzsqt2dmpmsta6 — your key for it in room qilvehgxilrf waits: this node's board holds no prekey bundle of it yet; it is sent once one arrives
 ```
 
 Nothing needs doing: the key is sent as soon as the bundle arrives. If the bundle is there but no
