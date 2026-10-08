@@ -206,16 +206,27 @@ final class FirstRunProof: XCTestCase {
     /// person at the Mac, never the walkthrough (it quits Vox, and Vox's own panels are its own).
     private var lostForeground: [(at: Date, to: String)] = []
     private var watchingForeground: NSObjectProtocol?
+    private var watchingVox: NSObjectProtocol?
+    /// Set while the proof itself has hidden or quit Vox (⌘H, ⌘Q), until Vox is active again:
+    /// what takes the foreground meanwhile was handed it by the proof, not taken.
+    private var handedOff = false
 
     override func setUpWithError() throws {
         // A case stops at its first red: one red, with its side, and no cascade behind it.
         continueAfterFailure = false
         stager = try Stager.fromEnvironment()
         let workspace = NSWorkspace.shared
+        watchingVox = workspace.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            if (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?
+                .bundleIdentifier == "us.vox.app" { self?.handedOff = false }
+        }
         watchingForeground = workspace.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { [weak self] note in
-            guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+            guard self?.handedOff == false,
+                  let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
                   app.bundleIdentifier != "us.vox.app",
                   app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
                   // Vox's own file panel and previews run in system services of its own.
@@ -227,7 +238,7 @@ final class FirstRunProof: XCTestCase {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
                 let voxRunning = NSRunningApplication.runningApplications(withBundleIdentifier: "us.vox.app")
                     .contains { !$0.isTerminated }
-                if voxRunning {
+                if voxRunning, self?.handedOff == false {
                     self?.lostForeground.append((at, to))
                     print("[foreground] Vox lost the foreground to \(to) (\(app.bundleIdentifier ?? "?"))")
                 }
@@ -237,6 +248,7 @@ final class FirstRunProof: XCTestCase {
 
     override func tearDown() {
         if let watchingForeground { NSWorkspace.shared.notificationCenter.removeObserver(watchingForeground) }
+        if let watchingVox { NSWorkspace.shared.notificationCenter.removeObserver(watchingVox) }
         daemon?.terminate()
         super.tearDown()
     }
@@ -692,7 +704,7 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(readByAlice.contains("alice"),
                       "PRODUCT: bob's message drawn in alice's timeline must be read: bob's `vox room read --json` must say alice read it; it says read_by \(readByAlice)")
         // Hidden (⌘H), alice's app shows nobody bob's next message: it is not read.
-        ui.typeKey("h", modifierFlags: .command)
+        handOff(ui, "h")
         XCTAssertTrue(ui.wait(for: .runningBackground, timeout: 10),
                       "APPARATUS: ⌘H did not hide the app")
         try staged(vox, ["room", "post", "--node", "bob", room, "WHILE-HIDDEN"], env: voxEnv)
@@ -1141,7 +1153,7 @@ final class FirstRunProof: XCTestCase {
         print("[proof] untrust cut bob's live forward into alice's notes service")
 
         // (12) Quitting detaches it.
-        ui.typeKey("q", modifierFlags: .command)
+        handOff(ui, "q")
         XCTAssertTrue(ui.wait(for: .notRunning, timeout: 30), "PRODUCT: ⌘Q did not quit the app")
         var after = ""
         let until = Date().addingTimeInterval(30)
@@ -1259,7 +1271,7 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(el(ui, compose).value(forKey: "hasKeyboardFocus") as? Bool == true,
                       "PRODUCT: Tab from the timeline must reach the composer; after \(tabs) Tabs it has no keyboard focus")
         print("[proof] keyboard: Space and Return opened Quick Look; ↑ ↑ ↓ selected KEYS-B, KEYS-A, KEYS-B; Tab reached the composer in \(tabs)")
-        ui.typeKey("q", modifierFlags: .command)
+        handOff(ui, "q")
         _ = ui.wait(for: .notRunning, timeout: 30)
         _ = run(vox, ["node", "detach", "alice"], env: voxEnv)
     }
@@ -1336,6 +1348,13 @@ final class FirstRunProof: XCTestCase {
             if let found = find(key, in: container) { return found }
         }
         return nil
+    }
+
+    /// The proof hides (⌘H) or quits (⌘Q) Vox itself: what takes the foreground next is handed
+    /// it, so it is not counted as lost, until Vox is active again.
+    private func handOff(_ ui: XCUIApplication, _ key: String) {
+        handedOff = true
+        ui.typeKey(key, modifierFlags: .command)
     }
 
     /// Whether a menu other than the menu bar's is open: the menu bar's own menus have no size
