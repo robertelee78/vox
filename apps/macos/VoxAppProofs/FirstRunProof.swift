@@ -289,7 +289,10 @@ final class FirstRunProof: XCTestCase {
         let area = bounds(mine.element)
         for w in windows.prefix(mine.offset) {
             let owner = w[kCGWindowOwnerName as String] as? String ?? "?"
-            guard pid(w) != vox.processIdentifier, owner != "Window Server", layer(w) >= 0 else { continue }
+            // The menu bar, and the overlay macOS shows while XCTest drives the Mac, which takes
+            // no clicks, are always in front.
+            guard pid(w) != vox.processIdentifier, owner != "Window Server", owner != "AutomationModeUI",
+                  layer(w) >= 0, (w[kCGWindowAlpha as String] as? Double ?? 1) > 0 else { continue }
             let over = bounds(w).intersection(area)
             if !over.isNull, over.width * over.height > area.width * area.height / 4 {
                 return "\(owner) (layer \(layer(w)), \(Int(over.width))×\(Int(over.height)) of Vox's \(Int(area.width))×\(Int(area.height)))"
