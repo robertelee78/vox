@@ -2532,56 +2532,34 @@ impl VoxClient {
         })
     }
 
-    /// This node's decision record, newest first (ADR-028 §7, D-1, D-2): every day's file it
-    /// keeps (14 days), read from `nodes/<node>/decisions/`, as the TUI's Decisions screen reads
-    /// it. A line that does not parse is left out.
+    /// This node's decision record, newest first (ADR-028 §7, D-1, D-2): every event it keeps
+    /// (14 days), as the TUI's Decisions screen shows it. Read by the node, which alone opens
+    /// the record: it is sealed at rest under the identity (#563).
     ///
     /// # Errors
-    /// No node attached, or the data root cannot be found.
+    /// No node attached, or the node did not answer.
     pub async fn decisions(&self) -> Result<Vec<DecisionEvent>, VoxError> {
         let held = Arc::clone(&self.held);
-        let (data_root, config_dir) = (self.data_root.clone(), self.config_dir.clone());
         self.on_rt(async move {
-            let node = held
-                .lock()
-                .await
-                .as_ref()
-                .map(|h| h.node.clone())
-                .ok_or_else(not_attached)?;
-            let account = Account::of(Some(&data_root), Some(&config_dir))
-                .map_err(|e| failed(format!("data root: {e}")))?;
-            let dir = account
-                .node_dir(&node)
-                .join(vox_core::node::decisions::DECISIONS_DIR);
-            let Ok(days) = std::fs::read_dir(&dir) else {
-                return Ok(Vec::new());
+            // Read by the node, which alone opens the sealed record (#563).
+            let found = {
+                let mut slot = held.lock().await;
+                let h = slot.as_mut().ok_or_else(not_attached)?;
+                match ask(&mut h.client, &Request::Decisions { limit: u64::MAX }).await? {
+                    Frame::Decisions { events } => events,
+                    other => return Err(unexpected(&other)),
+                }
             };
-            let text = |v: &serde_json::Value, k: &str| {
-                v.get(k)
-                    .and_then(serde_json::Value::as_str)
-                    .map(shown_name)
-                    .unwrap_or_default()
-            };
-            let mut events: Vec<DecisionEvent> = days
-                .filter_map(Result::ok)
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-                .filter_map(|p| std::fs::read_to_string(p).ok())
-                .flat_map(|day| {
-                    day.lines()
-                        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-                        .collect::<Vec<_>>()
-                })
-                .filter_map(|v| {
-                    Some(DecisionEvent {
-                        at_millis: v.get("at_ms")?.as_u64()?,
-                        asked: text(&v, "asked"),
-                        by: text(&v, "by"),
-                        alias: text(&v, "alias"),
-                        decided: text(&v, "decided"),
-                        why: text(&v, "why"),
-                        room: text(&v, "room"),
-                    })
+            let mut events: Vec<DecisionEvent> = found
+                .into_iter()
+                .map(|e| DecisionEvent {
+                    at_millis: e.at_ms,
+                    asked: shown_name(&e.asked),
+                    by: shown_name(&e.by),
+                    alias: e.alias.as_deref().map(shown_name).unwrap_or_default(),
+                    decided: shown_name(&e.decided),
+                    why: shown_name(&e.why),
+                    room: e.room.as_deref().map(shown_name).unwrap_or_default(),
                 })
                 .collect();
             events.sort_by(|a, b| b.at_millis.cmp(&a.at_millis));

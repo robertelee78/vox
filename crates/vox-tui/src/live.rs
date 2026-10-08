@@ -2030,9 +2030,14 @@ impl DaemonCore {
             .0
             .is_none_or(|at| at.elapsed() >= SNAPSHOT_EVERY)
         {
-            let log =
-                vox_core::node::decisions::DecisionLog::new(&self.account.node_dir(&self.node));
-            self.decisions = (Some(Instant::now()), log.recent(DECISIONS_SHOWN, None));
+            // Read by the node, which alone opens the sealed record (#563).
+            let events = match self.request(&Request::Decisions {
+                limit: DECISIONS_SHOWN as u64,
+            }) {
+                Ok(Frame::Decisions { events }) => events,
+                _ => self.decisions.1.clone(),
+            };
+            self.decisions = (Some(Instant::now()), events);
         }
         self.decisions.1.clone()
     }
