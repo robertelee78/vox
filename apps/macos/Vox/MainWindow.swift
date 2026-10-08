@@ -101,6 +101,9 @@ private struct Sidebar: View {
             }
         }
         .listStyle(.sidebar)
+        // A selected row is filled with the selection token, not the system accent: text.primary
+        // on the system blue was 3.1:1 (WCAG 2.1 1.4.3); on this it is 4.89:1 (#450).
+        .tint(VoxTokens.Colors.selection)
         // The sidebar's rows in the app's face and size: a sidebar list sets its own otherwise.
         .font(Theme.text)
         .environment(\.defaultMinListRowHeight, Theme.scaled(24))

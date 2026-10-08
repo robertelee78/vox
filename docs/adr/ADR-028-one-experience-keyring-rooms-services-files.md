@@ -299,6 +299,7 @@ keep code in sync through GitHub.
   | bg.raised | `#131417` | 233 | default bg |
   | bg.panel | `#16171a` | 234 | default bg |
   | bg.overlay | `#1c1d21` | 234 | black |
+  | selection | `#1767b5` (Increase Contrast `#1b70c6`) | 25 | blue |
   | line.hair | `#26272b` | 235 | bright black |
   | text.primary | `#f0ece4` | 255 | default fg |
   | text.secondary | `#a8a299` | 247 | default fg |
