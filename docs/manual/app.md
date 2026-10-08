@@ -214,7 +214,8 @@ Beside the timeline, **MEMBERS** lists the room's other members with their trust
 in your keyring that trusts you back, → for one in your keyring that does not yet, and · with a
 dimmed name marked `not in keyring` for one you have not trusted. VoiceOver says the first two as
 `in keyring, trusts you` and `in keyring`. Under a member in your keyring, its entry's grant:
-`read` or `read + drive`.
+`read` or `read + drive`. Under a member whose node has said which machine it runs on, that
+claim: `says it runs on macOS 26.2 (aarch64)`.
 
 Under the members, **FAMILY LAN** offers the room's family LAN. Before Vox's LAN helper is
 approved, it says what approving grants: one root process that creates network interfaces for
@@ -336,7 +337,7 @@ Every action is in the menus, and the palette lists the same actions.
 | ⌘⇧S | Services |
 | ⌘⇧D | Decision Record |
 | ⌘1 to ⌘9 | The first to ninth room, in the sidebar's order |
-| ⇧⌘T | Focus Timeline |
+| ⌃⌘T | Focus Timeline |
 | ⌘+, ⌘-, ⌘0 | Bigger, Smaller, Actual Size |
 
 ## The menu bar item
@@ -378,9 +379,10 @@ alone, and card outlines are at 4.5:1 or more.
 **View > Bigger** (⌘+), **Smaller** (⌘-) and **Actual Size** (⌘0) change the size of all the
 app's text, buttons and controls, up to twice the usual size.
 
-The timeline works from the keyboard. **View > Focus Timeline** (⇧⌘T) puts the keyboard on it;
-↑ and ↓ select a message, Space opens its pulled file in Quick Look, and Return opens the file,
-or else the link on its card.
+The timeline works from the keyboard. **View > Focus Timeline** (⌃⌘T), Tab, or a click on a
+message puts the keyboard on it; ↑ and ↓ select a message, Space opens its pulled file in Quick
+Look, and Return opens the file, or else the link on its card. Escape or Space closes the preview,
+and the keyboard goes back to the timeline.
 
 Every control has a VoiceOver label in words: a message reads as one sentence (who wrote, to whom,
 whether urgent, what it says, and who read or pulled it), a room says its group and unread, a

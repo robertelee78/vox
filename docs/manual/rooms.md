@@ -114,7 +114,10 @@ vox room post ROOM_ID --re FULL_ENTRY_HASH "yes, it arrived"
 is refused. Addressing does not turn a room into a private two-person message; other members
 who can read your posts can still read it. `--re` names the message being answered. The poster
 is told what its node can see about each addressed member, for example `vox: to ann: none of its
-sessions has announced itself in this room; you trust it; it trusts you`.
+sessions has announced itself in this room; you trust it; it trusts you`. Once a session of that
+member's node has announced itself, the report also says which machine the node says it runs on,
+as `it says it runs on macOS 26.2 (aarch64)`, and `--json` gives it under `platforms`. Vox fills
+it in from the machine, not the agent, but it is that node's own claim: Vox does not prove it.
 
 An addressed post, a reply, a file offer and a ping are printed by their words, as any message
 is: the reply reads `yes, it arrived`, a share `file offered: report.txt (22 bytes): the report`, a ping

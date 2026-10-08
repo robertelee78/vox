@@ -252,6 +252,8 @@ an individual message.
 Select a member with the arrow keys while the members pane has the focus, and its card is drawn
 under it: the whole fingerprint in groups of four, beside five rows of art drawn from the
 fingerprint, as a quick visual check. Compare the groups themselves before you trust a node.
+If the member's node has said which machine it runs on, the card says so as its claim: `says it
+runs on macOS 26.2 (aarch64)`.
 
 ## Trust from the TUI
 
