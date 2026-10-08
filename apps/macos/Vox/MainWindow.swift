@@ -120,10 +120,31 @@ extension View {
     /// `.tint` and drew text.primary at 3.1:1, is off (`SidebarHighlightOff`); the row is still the
     /// list's selection, so arrow keys move it and VoiceOver says it is selected.
     fileprivate func sidebarRow(_ selected: Bool) -> some View {
-        listRowBackground(
-            RoundedRectangle(cornerRadius: 5)
-                .fill(selected ? VoxTokens.Colors.selection : Color.clear)
-                .padding(.horizontal, 10))
+        listRowBackground(SelectionFill(selected: selected).padding(.horizontal, 10))
+    }
+}
+
+/// The selected row's fill, drawn by an AppKit view that takes no vibrancy: a SwiftUI shape there
+/// was blended with the sidebar's material, and #1767b5 read #3e7bbd (text.primary about 4.0:1).
+/// Its colour is the token's, resolved for the view's appearance, so Increase Contrast gives
+/// `hex_hc`.
+private struct SelectionFill: NSViewRepresentable {
+    let selected: Bool
+
+    func makeNSView(context: Context) -> Fill { Fill() }
+    func updateNSView(_ view: Fill, context: Context) {
+        view.selected = selected
+        view.needsDisplay = true
+    }
+
+    final class Fill: NSView {
+        var selected = false
+        override var allowsVibrancy: Bool { false }
+        override func draw(_ dirty: NSRect) {
+            guard selected, let color = NSColor(named: "Selection") else { return }
+            color.setFill()
+            NSBezierPath(roundedRect: bounds, xRadius: 5, yRadius: 5).fill()
+        }
     }
 }
 
