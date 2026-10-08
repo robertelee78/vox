@@ -51,6 +51,9 @@ pub struct MemberView {
     /// What your keyring entry for it grants, read or read + drive (ADR-028 K-14); `None` for
     /// you and for a member not in your keyring.
     pub capability: Option<vox_core::node::trust::Capability>,
+    /// The machine its newest `hello` in the room says it runs on (ADR-020 §4.9b), its own claim:
+    /// `macOS 26.2 (aarch64)`. `None` when none of its sessions has said.
+    pub machine: Option<String>,
 }
 
 /// One line the timeline tells about the room, not a message (ADR-028 E-5).

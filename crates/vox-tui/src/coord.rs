@@ -808,6 +808,9 @@ pub async fn participate(
             crate::wake::WAKE_KEY.into(),
             crate::wake::reachability(paths, session).into(),
         );
+        // **And which machine it runs on** (ADR-020 §4.9b): filled here, from the machine, never
+        // by the model.
+        crate::platform::insert(&mut data);
         let hello = Draft {
             kind: HELLO.into(),
             body: format!("session {session} runs vox {VERSION}"),
