@@ -615,6 +615,13 @@ impl Conn {
                 match p {
                     Pending::Resume(thread) => {
                         if err.is_none() {
+                            // The thread's name as Codex has it now, set before Vox watched it.
+                            if let (Some(t), Some(name)) = (
+                                self.threads.get(&thread),
+                                v.pointer("/result/thread/name").and_then(Value::as_str),
+                            ) {
+                                self.sink.renamed(&t.node, &thread, name);
+                            }
                             if let Some(t) = self.threads.get_mut(&thread) {
                                 t.subscribed = true;
                                 self.subscribed
@@ -666,6 +673,18 @@ impl Conn {
         };
         let node = t.node.clone();
         match method {
+            // **A rename is the Session's name at once** (ADR-029 MD-1): `/rename` in Codex, or
+            // Vox's own `thread/name/set`, is said here, and nothing else carries it.
+            "thread/name/updated" => {
+                if let Some(name) = p.get("threadName").and_then(Value::as_str) {
+                    self.sink.renamed(&node, &thread, name);
+                }
+            }
+            "thread/started" => {
+                if let Some(name) = p.pointer("/thread/name").and_then(Value::as_str) {
+                    self.sink.renamed(&node, &thread, name);
+                }
+            }
             "thread/status/changed" => {
                 t.refused = 0;
                 t.status = p

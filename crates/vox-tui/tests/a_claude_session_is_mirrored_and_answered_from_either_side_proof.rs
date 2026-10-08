@@ -1278,6 +1278,9 @@ fn waiting_ref(plain: &str, line: &str, flag: &str) -> Option<String> {
 ///    (apparatus), writes the own-node drive request (`OwnDrive`) for `claude-a`'s Session on
 ///    `person`'s own connection to the daemon. It is refused, and the hook is still waiting
 ///    3 s later: that path drives only the attached node's own Sessions.
+/// 8. renamed mid-session (`/rename`, which Claude Code writes into the transcript as a
+///    `custom-title` line): at the session's next hook event, which posts no message to the room,
+///    its Session reads the new name in `vox room sessions` (ADR-029 MD-1).
 ///
 /// **Mutations that must turn it red** (#545's own): the request closed when the Session's answer
 /// is sent → arm 4 reads "approved here". A node's own drive refused as an untrusted node's (DR-2
@@ -1285,6 +1288,8 @@ fn waiting_ref(plain: &str, line: &str, flag: &str) -> Option<String> {
 /// node → arm 6 reads "did not arrive whole". The sink not posting its `resolved` entry → arm 5's
 /// request still waits. The own-node request served as whichever attached node
 /// holds the Session (not the one the connection is attached as) → arm 7's request is delivered.
+/// A renamed session's Session not renamed until its next message (the rename record dropped) →
+/// arm 8 reads the old name.
 #[test]
 #[ignore = "real binary; run in release"]
 fn an_approval_is_answered_from_either_side_and_the_first_answer_wins() {
@@ -1652,5 +1657,51 @@ fn an_approval_is_answered_from_either_side_and_the_first_answer_wins() {
         ok && d["behavior"] == "deny",
         "PRODUCT: arm 7: the Session's own node must still answer the request; vox said \
          {out}{err}, the hook gave {d}"
+    );
+
+    // ---- 8. renamed mid-session: the Session takes the name before any message ----
+    let renamed = "renamed mid-session";
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript.0)
+        .and_then(|mut f| {
+            writeln!(
+                f,
+                "{}",
+                serde_json::json!({ "type": "custom-title", "customTitle": renamed, "sessionId": SESSION })
+            )
+        })
+        .unwrap_or_else(|e| panic!("APPARATUS: the transcript: {e}"));
+    w.hook_done(
+        &room,
+        &ev(
+            "Stop",
+            serde_json::json!({ "stop_hook_active": false, "last_assistant_message": "" }),
+        ),
+    );
+    let t0 = Instant::now();
+    let listed = loop {
+        let (_, out, _) = w.vox(PERSON, &["room", "sessions", &room, "--json"], None);
+        // One JSON object per line, one line per Session.
+        let named = out
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|s| s["id"] == SESSION)
+            .and_then(|s| s["name"].as_str().map(str::to_owned));
+        if named.as_deref() == Some(renamed) || t0.elapsed() > Duration::from_secs(30) {
+            break (named, out);
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    println!(
+        "[proof] 8. after a rename and a hook event, the Session is named {:?}",
+        listed.0
+    );
+    assert!(
+        listed.0.as_deref() == Some(renamed),
+        "PRODUCT: arm 8: a session renamed mid-session must show its new name ({renamed:?}) in \
+         `vox room sessions` without posting a message; it lists {:?}:\n{}",
+        listed.0,
+        listed.1
     );
 }

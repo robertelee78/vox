@@ -258,14 +258,19 @@ impl Router {
             .map(|bind| Arc::new(crate::daemon_proxy::DaemonProxy::new(bind)));
         let router = Self {
             inner: Arc::new_cyclic(|weak: &std::sync::Weak<Inner>| {
-                let weak = weak.clone();
-                let sink = crate::session_sink::Sink::new(Arc::new(
-                    move |node: &NodeName, session: &str, bodies: Vec<String>| {
+                let (weak, weak_rename) = (weak.clone(), weak.clone());
+                let sink = crate::session_sink::Sink::new(
+                    Arc::new(move |node: &NodeName, session: &str, bodies: Vec<String>| {
                         if let Some(inner) = weak.upgrade() {
                             Router { inner }.post_session(node, session, bodies);
                         }
-                    },
-                ));
+                    }),
+                    Arc::new(move |node: &NodeName, session: &str, name: &str| {
+                        if let Some(inner) = weak_rename.upgrade() {
+                            Router { inner }.rename_session(node, session, name);
+                        }
+                    }),
+                );
                 let codex = crate::codex_mirror::CodexMirror::new(Arc::clone(&sink));
                 let opencode = crate::opencode_mirror::OpenCodeMirror::new(Arc::clone(&sink));
                 Inner {
@@ -1212,6 +1217,26 @@ impl Router {
             }
             _ => {}
         }
+    }
+
+    /// `session` of `node` is called `name` now, as its harness says (ADR-029 MD-1): its
+    /// registration keeps the name, and its open Session is renamed at once, not at its next
+    /// message.
+    fn rename_session(&self, node: &NodeName, session: &str, name: &str) {
+        let Ok(paths) = self.inner.account.node_paths(node) else {
+            return;
+        };
+        let Some(reg) = crate::wake::store_name(&paths, session, name) else {
+            return;
+        };
+        let Some(handle) = self.handle_of(node) else {
+            return;
+        };
+        let (router, node) = (self.clone(), node.clone());
+        self.inner.rt.spawn(async move {
+            // A Session not open yet is opened under the new name when it is.
+            let _ = router.open_session(&node, &handle, &reg, None).await;
+        });
     }
 
     /// Post `bodies`, numbered, to `session`'s Session: sealed to the members `node` trusts with

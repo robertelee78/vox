@@ -359,6 +359,19 @@ pub fn store(paths: &Paths, reg: &Session) {
     }
 }
 
+/// Name `session`'s registration `name`, as its harness now calls it (ADR-029 MD-1): what an
+/// adapter that hears a rename (Codex's thread name, OpenCode's session title) records. `None`
+/// when the session is not registered; else the registration as it now is.
+pub fn store_name(paths: &Paths, session: &str, name: &str) -> Option<Session> {
+    let mut reg = load(paths, session)?;
+    reg.name = Some(name.to_owned());
+    if let Ok(body) = serde_json::to_vec(&reg) {
+        let _ =
+            vox_core::node::paths::write_private_file_unique(&paths.session_file(session), &body);
+    }
+    Some(reg)
+}
+
 /// Move `session`'s registration to `room` (ADR-029 RB-5, `vox agent room`): the one way a
 /// session's room changes. `None` when the session is not registered; else the room it worked in
 /// before, if any.

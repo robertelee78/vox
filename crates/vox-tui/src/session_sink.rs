@@ -46,10 +46,14 @@ pub const REJECTED_IN_VOX: &str = "rejected in Vox by";
 /// Where entries go once numbered: the node's Session append (reads2's `AppendSession`).
 pub type Poster = Arc<dyn Fn(&NodeName, &str, Vec<String>) + Send + Sync>;
 
+/// Where a session's new name goes (ADR-029 MD-1): its registration, and its Session's record.
+pub type Renamer = Arc<dyn Fn(&NodeName, &str, &str) + Send + Sync>;
+
 /// The sink. One per daemon.
 pub struct Sink {
     state: Mutex<BTreeMap<(NodeName, String), Session>>,
     post: Poster,
+    rename: Renamer,
 }
 
 /// What the sink holds for one session.
@@ -110,13 +114,23 @@ pub enum Handed {
 }
 
 impl Sink {
-    /// A sink posting through `post`.
+    /// A sink posting through `post`, and naming a session anew through `rename`.
     #[must_use]
-    pub fn new(post: Poster) -> Arc<Self> {
+    pub fn new(post: Poster, rename: Renamer) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(BTreeMap::new()),
             post,
+            rename,
         })
+    }
+
+    /// The harness renamed `session` (Codex's thread name, OpenCode's session title): its
+    /// Session takes the name now, without waiting for its next message (ADR-029 MD-1).
+    pub fn renamed(&self, node: &NodeName, session: &str, name: &str) {
+        let name = name.trim();
+        if !name.is_empty() {
+            (self.rename)(node, session, name);
+        }
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut BTreeMap<(NodeName, String), Session>) -> R) -> R {
