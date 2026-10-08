@@ -202,16 +202,62 @@ final class FirstRunProof: XCTestCase {
     private var daemon: Started?
     /// Runs what the runner's sandbox forbids: every `vox`, the files, the echo services.
     private var stager: Stager!
+    /// When another app took the foreground from a running Vox, and which: a display change or a
+    /// person at the Mac, never the walkthrough (it quits Vox, and Vox's own panels are its own).
+    private var lostForeground: [(at: Date, to: String)] = []
+    private var watchingForeground: NSObjectProtocol?
 
     override func setUpWithError() throws {
         // A case stops at its first red: one red, with its side, and no cascade behind it.
         continueAfterFailure = false
         stager = try Stager.fromEnvironment()
+        let workspace = NSWorkspace.shared
+        watchingForeground = workspace.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  app.bundleIdentifier != "us.vox.app",
+                  app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+                  // Vox's own file panel and previews run in system services of its own.
+                  !(app.bundleIdentifier ?? "").hasPrefix("com.apple.appkit.xpc."),
+                  !(app.bundleIdentifier ?? "").hasPrefix("com.apple.quicklook.") else { return }
+            let at = Date()
+            let to = app.localizedName ?? app.bundleIdentifier ?? "pid \(app.processIdentifier)"
+            // Taken from a Vox that is still running a second later: not Vox quitting.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                let voxRunning = NSRunningApplication.runningApplications(withBundleIdentifier: "us.vox.app")
+                    .contains { !$0.isTerminated }
+                if voxRunning {
+                    self?.lostForeground.append((at, to))
+                    print("[foreground] Vox lost the foreground to \(to) (\(app.bundleIdentifier ?? "?"))")
+                }
+            }
+        }
     }
 
     override func tearDown() {
+        if let watchingForeground { NSWorkspace.shared.notificationCenter.removeObserver(watchingForeground) }
         daemon?.terminate()
         super.tearDown()
+    }
+
+    /// A PRODUCT red within 30 s of another app taking the foreground from a running Vox is the
+    /// environment's, not the product's: a popover or a sheet closes when Vox loses the
+    /// foreground, and a click or key in that time went elsewhere. It is recorded as APPARATUS,
+    /// naming when and to what, with the read it would have been.
+    override func record(_ issue: XCTIssue) {
+        let words = issue.compactDescription
+        let product = words.range(of: "PRODUCT")
+        let apparatus = words.range(of: "APPARATUS")
+        guard let product, apparatus.map({ product.lowerBound < $0.lowerBound }) ?? true,
+              let lost = lostForeground.last(where: { Date().timeIntervalSince($0.at) < 30 }) else {
+            super.record(issue)
+            return
+        }
+        var moved = issue
+        let ago = String(format: "%.1f", Date().timeIntervalSince(lost.at))
+        moved.compactDescription = "APPARATUS: Vox lost the foreground to \(lost.to) \(ago) s before this red, so what it read cannot be the product's; it read: \(words)"
+        super.record(moved)
     }
 
     /// The login item's daemon ended on a refusal no retry changes (`vox daemon --login-item`
