@@ -1417,6 +1417,9 @@ final class FirstRunProof: XCTestCase {
             givenPid = pid
             // Attached only: an XCUIApplication that does not see it running would launch a second
             // copy itself, through NSWorkspace, with no environment. That is never done.
+            // XCTest sees a copy it did not launch only once it is up: waited for, never launched.
+            let seenUntil = Date().addingTimeInterval(15)
+            while ui.state == .notRunning && Date() < seenUntil { Thread.sleep(forTimeInterval: 0.5) }
             guard ui.state != .notRunning else {
                 throw Apparatus("XCTest does not see the Vox.app the stager started (pid \(pid), \(executable(pid))) as \(appPath): refusing to let it launch one itself, without this run's environment")
             }
