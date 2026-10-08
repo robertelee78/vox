@@ -7,7 +7,11 @@
 //! their first connections are not the burst being measured, and the anchor must report all of
 //! them connected. Then the anchor is **stopped** (SIGINT, as a person stops it: it closes every
 //! connection, so every member learns at once and redials together), kept down for [`DOWN`], and
-//! brought back **on the same port** from the same profile. Once it is listening it is held for
+//! brought back **on the same port** from the same profile, held for [`STARTING`] between
+//! binding the port and attaching its node (a start slowed by its unlock), so every member's
+//! redial reaches it in that gap. **Asserted:** none of them is refused ("nothing … answers as" the
+//! anchor): an anchor that answered before its node was attached refused its own members. Once it
+//! is listening it is held for
 //! [`HELD`] (SIGSTOP, then SIGCONT, by its PID), as an anchor busy starting up is: the members'
 //! redials queue in its socket and it meets them all at once. The bound runs from SIGCONT.
 //!
@@ -56,6 +60,11 @@
 //! - a member's redial after a failed anchor dial stretched (the first wait 30 s instead of 1) →
 //!   red on the bound after the outage. Doubling the cap alone (`ANCHOR_UNREACHED_REDIAL_SECS` =
 //!   30) does not go red with 32 members: their waits never grow past a few seconds in 40 s.
+//! - the presence's accept loop started when its port is bound, not with the first attach
+//!   (`NetPresence::start` spawning it) → red on the refusals while the anchor started.
+//!
+//! **Needs a `test-knobs` build** (`VOX_TEST_DAEMON_SERVE_DELAY_MS`); run it with
+//! `--features test-knobs,optional-proofs`.
 
 #![cfg(unix)]
 // Without the feature only the stand-in below runs; the proof's code still compiles, unused.
@@ -70,6 +79,9 @@ mod watchdog;
 
 #[path = "support/world.rs"]
 mod world;
+
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -87,6 +99,9 @@ const MEMBERS: usize = 2 * MEMBERS_PER_SOURCE;
 const DOWN: Duration = Duration::from_secs(3);
 /// How long the restarted anchor is held (SIGSTOP) once it is listening, so the redials meet it at once.
 const HELD: Duration = Duration::from_secs(3);
+/// How long the restarted anchor is held between binding its port and attaching its node
+/// (`VOX_TEST_DAEMON_SERVE_DELAY_MS`, test-knobs builds): every member redials at least once in it.
+const STARTING: Duration = Duration::from_secs(2);
 /// How long the anchor is away in the second outage, its port answered by another node meanwhile.
 const OUTAGE: Duration = Duration::from_secs(40);
 /// How soon after the anchor is back every member must be connected to it again.
@@ -99,6 +114,7 @@ const SETTLE: Duration = Duration::from_secs(300);
 #[ignore = "real binaries, 32 daemons and production Argon2id; run by hand, never in CI"]
 fn every_member_is_back_after_an_anchor_restart() {
     watchdog::arm();
+    test_knobs::require(&["VOX_TEST_DAEMON_SERVE_DELAY_MS"]);
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let anchor_dir = tmp.path().join("anchor");
     std::fs::create_dir_all(anchor_dir.join("cfg"))
@@ -204,10 +220,17 @@ fn every_member_is_back_after_an_anchor_restart() {
     }
     drop(anchor);
     std::thread::sleep(DOWN);
-    let mut anchor = VoxProc::spawn(
+    // Held between binding its port and attaching its node for STARTING, as a start slowed by its
+    // unlock is: the members' redials reach it in that gap.
+    let restarted = Instant::now();
+    let mut anchor = VoxProc::spawn_env(
         "anchor (restarted)",
         &anchor_dir,
         &args(&["node", "--listen", &listen]),
+        &[(
+            "VOX_TEST_DAEMON_SERVE_DELAY_MS",
+            &STARTING.as_millis().to_string(),
+        )],
     );
     anchor.expect_line("the restarted anchor's --anchor spec", |l| {
         l.contains("@/ip4/127.0.0.1/udp/")
@@ -279,6 +302,34 @@ fn every_member_is_back_after_an_anchor_restart() {
         "PRODUCT: every member was back only {at:?} after the anchor's return, over \
          {BACK_WITHIN:?}\n---- the anchor ----\n{}",
         anchor.transcript()
+    );
+
+    // ---- nobody was turned away while the anchor started ------------------------------------------
+    // Bound and not yet attached, the anchor has nobody to answer for: a dial then must wait to be
+    // answered, not be refused as if the anchor were not there.
+    let while_starting: Vec<String> = daemons
+        .iter()
+        .flat_map(|d| {
+            d.timed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|(t, l)| {
+                    *t >= restarted
+                        && *t < back
+                        && l.contains("dialling this anchor failed")
+                        && l.contains("answers as")
+                })
+                .map(|(_, l)| format!("{}: {l}", d.name))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        while_starting.is_empty(),
+        "PRODUCT: the restarted anchor refused its own members while it started; {} refusal(s), \
+         the first: {:#?}",
+        while_starting.len(),
+        &while_starting[..while_starting.len().min(3)]
     );
 
     // ---- nobody was turned away ------------------------------------------------------------------

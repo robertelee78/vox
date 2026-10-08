@@ -126,7 +126,10 @@ fn lock_burst(b: &Mutex<Burst>) -> std::sync::MutexGuard<'_, Burst> {
 pub struct NetPresence {
     shared: Arc<SharedEndpoint>,
     bursts: broadcast::Sender<HandshakeBurst>,
-    accept: tokio::task::AbortHandle,
+    /// The accept loop, started by the first [`NetPresence::attach`]: before a node is attached
+    /// there is nobody to answer for, and an exchange answered then refused the node about to
+    /// attach (a restarting anchor turned its own members away with "nothing … answers as" it).
+    accept: Mutex<Option<tokio::task::AbortHandle>>,
     /// What every node on this presence advertises (ADR-012 N-46: one ip:port for all), composed
     /// once per presence. `None` until the first discovery has run.
     advertised: watch::Sender<Option<EndpointList>>,
@@ -359,15 +362,15 @@ pub struct NodeLink {
 }
 
 impl NetPresence {
-    /// Run the presence on `shared`: its accept loop starts now.
+    /// Run the presence on `shared`. Its accept loop starts with the first node attached
+    /// ([`Self::attach`]): until then a dial waits to be answered rather than being refused.
     #[must_use]
     pub fn start(shared: Arc<SharedEndpoint>) -> Arc<Self> {
         let (bursts, _) = broadcast::channel(16);
-        let accept = spawn_accept_loop(Arc::clone(&shared), bursts.clone());
         let presence = Arc::new(Self {
             shared,
             bursts,
-            accept,
+            accept: Mutex::new(None),
             advertised: watch::channel(None).0,
             mapping: Mutex::new(Mapping::default()),
             asks: Mutex::new(crate::nat::reachability::GatewayAsks::default()),
@@ -616,13 +619,21 @@ impl NetPresence {
     }
 
     /// **Attach a node**: register it on the endpoint with a fresh instance, and give it its view
-    /// and its inbound connections.
+    /// and its inbound connections. The first attach starts the accept loop, once the node is
+    /// registered, so a dial that arrived while the daemon was starting is answered by it.
+    ///
+    /// **Only the first node.** A node attached later is refused in its own gap, as one not
+    /// attached: waiting for a node that is on disk but not attached would tell a dialler which
+    /// nodes this daemon holds (ADR-011 requirement 32, ADR-026 G-1).
     ///
     /// # Errors
     /// As [`SharedEndpoint::register`]: the node is attached here already.
     pub fn attach(&self, signer: Arc<dyn RootSigner + Send + Sync>) -> Result<NodeLink> {
         let (tx, inbound) = mpsc::channel(INBOUND_QUEUE);
         let endpoint = self.shared.register(signer, Some(tx))?;
+        lock(&self.accept).get_or_insert_with(|| {
+            spawn_accept_loop(Arc::clone(&self.shared), self.bursts.clone())
+        });
         Ok(NodeLink {
             endpoint: Arc::new(endpoint),
             inbound,
@@ -646,7 +657,9 @@ impl NetPresence {
     /// daemon's log, what became of each port mapping it held: deleted (the gateway answered the
     /// deletion with success), refused, or not answered within `UNMAP_PATIENCE` (N-56).
     pub async fn close(&self) -> Vec<String> {
-        self.accept.abort();
+        if let Some(accept) = lock(&self.accept).take() {
+            accept.abort();
+        }
         if let Some(mapper) = lock(&self.mapper).take() {
             mapper.abort();
         }
@@ -715,7 +728,9 @@ impl NetPresence {
 
 impl Drop for NetPresence {
     fn drop(&mut self) {
-        self.accept.abort();
+        if let Some(accept) = lock(&self.accept).take() {
+            accept.abort();
+        }
         if let Some(mapper) = lock(&self.mapper).take() {
             mapper.abort();
         }
