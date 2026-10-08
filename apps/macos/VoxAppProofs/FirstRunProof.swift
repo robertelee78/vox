@@ -186,20 +186,131 @@ struct Apparatus: Error, CustomStringConvertible {
     var description: String { "APPARATUS: \(why)" }
 }
 
+/// What the daemon holds that an element is drawn from (a member, a keyring entry, a room), read
+/// when the element is not shown: held, the app failed to show it (PRODUCT); not held, the staging
+/// was not achieved (APPARATUS). Either way the red quotes what the daemon said.
+struct Premise {
+    let what: String
+    let read: () -> (holds: Bool, said: String)
+    init(_ what: String, _ read: @escaping () -> (holds: Bool, said: String)) {
+        self.what = what
+        self.read = read
+    }
+}
+
 final class FirstRunProof: XCTestCase {
     private var daemon: Started?
     /// Runs what the runner's sandbox forbids: every `vox`, the files, the echo services.
     private var stager: Stager!
+    /// When another app took the foreground from a running Vox, and which: a display change or a
+    /// person at the Mac, never the walkthrough (it quits Vox, and Vox's own panels are its own).
+    private var lostForeground: [(at: Date, to: String)] = []
+    private var watchingForeground: NSObjectProtocol?
+    private var watchingVox: NSObjectProtocol?
+    /// Set while the proof itself has hidden or quit Vox (⌘H, ⌘Q), until Vox is active again:
+    /// what takes the foreground meanwhile was handed it by the proof, not taken.
+    private var handedOff = false
 
     override func setUpWithError() throws {
         // A case stops at its first red: one red, with its side, and no cascade behind it.
         continueAfterFailure = false
         stager = try Stager.fromEnvironment()
+        let workspace = NSWorkspace.shared
+        watchingVox = workspace.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            if (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?
+                .bundleIdentifier == "us.vox.app" { self?.handedOff = false }
+        }
+        watchingForeground = workspace.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard self?.handedOff == false,
+                  let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  app.bundleIdentifier != "us.vox.app",
+                  app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+                  // Vox's own file panel and previews run in system services of its own.
+                  !(app.bundleIdentifier ?? "").hasPrefix("com.apple.appkit.xpc."),
+                  !(app.bundleIdentifier ?? "").hasPrefix("com.apple.quicklook.") else { return }
+            let at = Date()
+            let to = app.localizedName ?? app.bundleIdentifier ?? "pid \(app.processIdentifier)"
+            // Taken from a Vox that is still running a second later: not Vox quitting.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                let voxRunning = NSRunningApplication.runningApplications(withBundleIdentifier: "us.vox.app")
+                    .contains { !$0.isTerminated }
+                if voxRunning, self?.handedOff == false {
+                    self?.lostForeground.append((at, to))
+                    print("[foreground] Vox lost the foreground to \(to) (\(app.bundleIdentifier ?? "?"))")
+                }
+            }
+        }
     }
 
     override func tearDown() {
+        if let watchingForeground { NSWorkspace.shared.notificationCenter.removeObserver(watchingForeground) }
+        if let watchingVox { NSWorkspace.shared.notificationCenter.removeObserver(watchingVox) }
         daemon?.terminate()
         super.tearDown()
+    }
+
+    /// A PRODUCT red within 30 s of another app taking the foreground from a running Vox is the
+    /// environment's, not the product's: a popover or a sheet closes when Vox loses the
+    /// foreground, and a click or key in that time went elsewhere. It is recorded as APPARATUS,
+    /// naming when and to what, with the read it would have been.
+    override func record(_ issue: XCTIssue) {
+        let words = issue.compactDescription
+        let product = words.range(of: "PRODUCT")
+        let apparatus = words.range(of: "APPARATUS")
+        guard let product, apparatus.map({ product.lowerBound < $0.lowerBound }) ?? true else {
+            super.record(issue)
+            return
+        }
+        var moved = issue
+        if let cover = coveredBy() {
+            moved.compactDescription = "APPARATUS: Vox's window is covered by \(cover), so a click or a read on it cannot be the product's; it read: \(words)"
+        } else if let lost = lostForeground.last(where: { Date().timeIntervalSince($0.at) < 30 }) {
+            let ago = String(format: "%.1f", Date().timeIntervalSince(lost.at))
+            moved.compactDescription = "APPARATUS: Vox lost the foreground to \(lost.to) \(ago) s before this red, so what it read cannot be the product's; it read: \(words)"
+        } else {
+            super.record(issue)
+            return
+        }
+        super.record(moved)
+    }
+
+    /// Another app's window in front of Vox's main window and over a quarter of it (a person's
+    /// window, a system overlay such as the screenshot tool's), by the window list's owner, layer
+    /// and bounds only: never an image. Nil when nothing covers it, or Vox has no window.
+    private func coveredBy() -> String? {
+        guard let vox = NSRunningApplication.runningApplications(withBundleIdentifier: "us.vox.app")
+            .first(where: { !$0.isTerminated && ($0.bundleURL?.path.contains("/target/xcode/") ?? false) })
+        else { return nil }
+        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                                 kCGNullWindowID) as? [[String: Any]] ?? []
+        func bounds(_ w: [String: Any]) -> CGRect {
+            guard let b = w[kCGWindowBounds as String] as? NSDictionary else { return .null }
+            return CGRect(dictionaryRepresentation: b as CFDictionary) ?? .null
+        }
+        func pid(_ w: [String: Any]) -> pid_t { (w[kCGWindowOwnerPID as String] as? Int).map(pid_t.init) ?? 0 }
+        func layer(_ w: [String: Any]) -> Int { w[kCGWindowLayer as String] as? Int ?? 0 }
+        // Front to back: Vox's largest normal window, and what is listed before it.
+        guard let mine = windows.enumerated()
+            .filter({ pid($0.element) == vox.processIdentifier && layer($0.element) == 0 })
+            .max(by: { bounds($0.element).width * bounds($0.element).height
+                       < bounds($1.element).width * bounds($1.element).height }) else { return nil }
+        let area = bounds(mine.element)
+        for w in windows.prefix(mine.offset) {
+            let owner = w[kCGWindowOwnerName as String] as? String ?? "?"
+            // The menu bar, and the overlay macOS shows while XCTest drives the Mac, which takes
+            // no clicks, are always in front.
+            guard pid(w) != vox.processIdentifier, owner != "Window Server", owner != "AutomationModeUI",
+                  layer(w) >= 0, (w[kCGWindowAlpha as String] as? Double ?? 1) > 0 else { continue }
+            let over = bounds(w).intersection(area)
+            if !over.isNull, over.width * over.height > area.width * area.height / 4 {
+                return "\(owner) (layer \(layer(w)), \(Int(over.width))×\(Int(over.height)) of Vox's \(Int(area.width))×\(Int(area.height)))"
+            }
+        }
+        return nil
     }
 
     /// The login item's daemon ended on a refusal no retry changes (`vox daemon --login-item`
@@ -565,7 +676,7 @@ final class FirstRunProof: XCTestCase {
         let row = Key.id("room-mission")
         words(ui, row, timeout: 10, "the room's row must say it needs you",
               until: { $0.contains("needs you") })
-        tap(ui, row, "mission in the sidebar")
+        tap(ui, row, "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         let bob = Key.id("member-bob")
         let bobWords = words(ui, bob, timeout: 30, "the inspector must list bob in alice's keyring",
                              until: { $0.hasPrefix("bob, in keyring") }) ?? ""
@@ -623,7 +734,7 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(readByAlice.contains("alice"),
                       "PRODUCT: bob's message drawn in alice's timeline must be read: bob's `vox room read --json` must say alice read it; it says read_by \(readByAlice)")
         // Hidden (⌘H), alice's app shows nobody bob's next message: it is not read.
-        ui.typeKey("h", modifierFlags: .command)
+        handOff(ui, "h")
         XCTAssertTrue(ui.wait(for: .runningBackground, timeout: 10),
                       "APPARATUS: ⌘H did not hide the app")
         try staged(vox, ["room", "post", "--node", "bob", room, "WHILE-HIDDEN"], env: voxEnv)
@@ -700,7 +811,8 @@ final class FirstRunProof: XCTestCase {
         let trustList = run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out
         XCTAssertTrue(trustList.contains(carolFp),
                       "PRODUCT: `vox trust list` must list carol once the app trusted her; it said: \(trustList)")
-        tap(ui, Key.id("keyring-remove-carol"), "Remove… on carol")
+        tap(ui, Key.id("keyring-remove-carol"), "Remove… on carol",
+            premise: trusted(vox, voxEnv, carolFp, "carol"))
         words(ui, Key.id("keyring-remove-effect"), timeout: 10,
               "removing must say what untrusting does before it is done",
               until: { $0.contains("reads nothing you write from now on") })
@@ -725,7 +837,7 @@ final class FirstRunProof: XCTestCase {
         }
 
         // (6) Attach a file to the room, To: bob, with a note.
-        tap(ui, Key.id("room-mission"), "mission in the sidebar")
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         let file = scratch.appendingPathComponent("for-bob.bin")
         let bytes = Data((0..<150_000).map { UInt8(truncatingIfNeeded: $0 &* 31 % 253) })
         try stager.write(bytes, to: file.path)
@@ -736,7 +848,22 @@ final class FirstRunProof: XCTestCase {
         // file's path, then the panel's own Attach (OKButton), once the Go To sheet has closed and
         // it is enabled.
         if present(ui, Key.id("open-panel"), timeout: 10, "Attach must open the file panel") {
-            ui.typeKey("g", modifierFlags: [.command, .shift])
+            // The path is typed only into the Go To sheet once it shows: typed into a panel still
+            // opening, it went nowhere. ⌘⇧G again if the panel was not yet taking keys.
+            let panel = el(ui, Key.id("open-panel"))
+            func goTo() -> Bool { panel.sheets.firstMatch.exists || ui.sheets.firstMatch.exists }
+            var asked = 0
+            while asked < 3 && !goTo() {
+                asked += 1
+                ui.typeKey("g", modifierFlags: [.command, .shift])
+                let until = Date().addingTimeInterval(5)
+                while Date() < until && !goTo() { Thread.sleep(forTimeInterval: 0.25) }
+            }
+            guard goTo() else {
+                keepTree(ui, "the file panel's Go To sheet never showed")
+                XCTFail("APPARATUS: ⌘⇧G, typed \(asked) times, never showed the file panel's Go To sheet")
+                return
+            }
             ui.typeText(file.path + "\r")
             let choose = el(ui, Key.id("open-panel")).buttons["OKButton"]
             let enabled = NSPredicate(format: "exists == true AND isEnabled == true AND isHittable == true")
@@ -747,8 +874,9 @@ final class FirstRunProof: XCTestCase {
             }
         }
         let toBob = Key.id("attach-to-bob")
-        present(ui, toBob, timeout: 10, "attaching a file must ask To:")
-        tap(ui, toBob, "To: bob")
+        present(ui, toBob, timeout: 10, "attaching a file must ask To: with bob in it",
+                premise: member(vox, voxEnv, room, bobFp, "bob"))
+        tap(ui, toBob, "To: bob", premise: member(vox, voxEnv, room, bobFp, "bob"))
         let noteField = Key.id("attach-note")
         type(ui, noteField, "FOR-BOB-NOTE", "the note field")
         tap(ui, Key.id("attach-send"), "Send")
@@ -826,10 +954,12 @@ final class FirstRunProof: XCTestCase {
             try staged(vox, ["room", "post", "--node", "alice", id, "HELLO-\(name)"], env: voxEnv)
         }
         let aaa = Key.id("room-aaa")
-        present(ui, aaa, timeout: 30, "room aaa must show in the sidebar")
+        present(ui, aaa, timeout: 30, "room aaa must show in the sidebar",
+                premise: inRoom(vox, voxEnv, "aaa"))
         present(ui, Key.id("room-bbb"), timeout: 30,
-                "room bbb must show in the sidebar")
-        tap(ui, aaa, "aaa in the sidebar")
+                "room bbb must show in the sidebar",
+                premise: inRoom(vox, voxEnv, "bbb"))
+        tap(ui, aaa, "aaa in the sidebar", premise: inRoom(vox, voxEnv, "aaa"))
         try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "NEEDS-YOU-9"],
                    env: bobSession)
         words(ui, Key.id("group-needs you"), timeout: 60,
@@ -852,12 +982,12 @@ final class FirstRunProof: XCTestCase {
         let to = Key.id("compose-to")
         present(ui, to, timeout: 10, "the composer must offer To:")
         tap(ui, to, "To:")
-        tap(ui, Key.id("to-bob"), "bob in To:")
+        tap(ui, Key.id("to-bob"), "bob in To:", premise: member(vox, voxEnv, room, bobFp, "bob"))
         ui.typeKey(.escape, modifierFlags: [])
         words(ui, to, timeout: 10, "ticking bob in To: must say so", until: { $0 == "To: bob" })
         // Seen in mission, then at once another room: the read record names mission, the room the
         // message is in.
-        tap(ui, aaa, "aaa in the sidebar")
+        tap(ui, aaa, "aaa in the sidebar", premise: inRoom(vox, voxEnv, "aaa"))
         words(ui, to, timeout: 10, "To: set in mission must not carry into aaa",
               until: { $0 == "To: the room" })
         var nine: [String] = []
@@ -895,8 +1025,8 @@ final class FirstRunProof: XCTestCase {
         guard !canonical.isEmpty else {
             throw Apparatus("alice's `vox service list --json` never listed bob's web share")
         }
-        tap(ui, aaa, "aaa in the sidebar")
-        tap(ui, Key.id("room-mission"), "mission in the sidebar")
+        tap(ui, aaa, "aaa in the sidebar", premise: inRoom(vox, voxEnv, "aaa"))
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         let card = Key.id("service-\(cliAddress)")
         present(ui, card, timeout: 30, "the room must show a card for bob's service \(cliAddress)")
         tap(ui, card, "the service card")
@@ -971,7 +1101,7 @@ final class FirstRunProof: XCTestCase {
         let shareRoom = Key.id("share-room")
         present(ui, shareRoom, timeout: 10, "picking a listening service must offer a room to share it in")
         tap(ui, shareRoom, "the room picker")
-        tap(ui, Key.menuItem("mission"), "mission in the room picker")
+        tap(ui, Key.menuItem("mission"), "mission in the room picker", premise: inRoom(vox, voxEnv, "mission"))
         words(ui, Key.id("share-can"), timeout: 10,
               "before sharing, the view must say bob, whom alice trusts, can reach it",
               until: { $0.contains("bob") })
@@ -1042,7 +1172,7 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("bob's forward at \(bobBound) carried nothing before the untrust")
         }
         tap(ui, Key.id("keyring"), "Keyring in the sidebar")
-        tap(ui, Key.id("keyring-remove-bob"), "Remove… on bob")
+        tap(ui, Key.id("keyring-remove-bob"), "Remove… on bob", premise: trusted(vox, voxEnv, bobFp, "bob"))
         words(ui, Key.id("keyring-remove-effect"), timeout: 10,
               "removing bob must say what untrusting does first",
               until: { $0.contains("reads nothing you write from now on") })
@@ -1053,7 +1183,7 @@ final class FirstRunProof: XCTestCase {
         print("[proof] untrust cut bob's live forward into alice's notes service")
 
         // (12) Quitting detaches it.
-        ui.typeKey("q", modifierFlags: .command)
+        handOff(ui, "q")
         XCTAssertTrue(ui.wait(for: .notRunning, timeout: 30), "PRODUCT: ⌘Q did not quit the app")
         var after = ""
         let until = Date().addingTimeInterval(30)
@@ -1099,7 +1229,7 @@ final class FirstRunProof: XCTestCase {
         try stager.write(Data("opened from the keyboard\n".utf8), to: keysFile.path)
         try staged(vox, ["share", "--node", "bob", room, keysFile.path, "--to", aliceFp,
                          "-m", "KEYS-FILE"], env: bobSession)
-        tap(ui, Key.id("room-mission"), "mission in the sidebar")
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         // Premise: alice's node pulled it (the row offers Quick Look only then).
         let lookButton = Key.id("quick-look-for-keys.txt")
         present(ui, lookButton, timeout: 120,
@@ -1177,7 +1307,7 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(el(ui, compose).value(forKey: "hasKeyboardFocus") as? Bool == true,
                       "PRODUCT: Tab from the timeline must reach the composer; after \(tabs) Tabs it has no keyboard focus")
         print("[proof] keyboard: Space and Return opened Quick Look; ↑ ↑ ↓ selected KEYS-B, KEYS-A, KEYS-B; Tab reached the composer in \(tabs)")
-        ui.typeKey("q", modifierFlags: .command)
+        handOff(ui, "q")
         _ = ui.wait(for: .notRunning, timeout: 30)
         _ = run(vox, ["node", "detach", "alice"], env: voxEnv)
     }
@@ -1256,6 +1386,19 @@ final class FirstRunProof: XCTestCase {
         return nil
     }
 
+    /// The proof hides (⌘H) or quits (⌘Q) Vox itself: what takes the foreground next is handed
+    /// it, so it is not counted as lost, until Vox is active again.
+    private func handOff(_ ui: XCUIApplication, _ key: String) {
+        handedOff = true
+        ui.typeKey(key, modifierFlags: .command)
+    }
+
+    /// Whether a menu other than the menu bar's is open: the menu bar's own menus have no size
+    /// until opened.
+    private func menuOpen(_ ui: XCUIApplication) -> Bool {
+        ui.menus.allElementsBoundByIndex.contains { $0.frame.width > 0 && $0.frame.height > 0 }
+    }
+
     /// The app's whole accessibility tree, attached to the result, so a red carries its own
     /// evidence.
     private func keepTree(_ ui: XCUIApplication, _ why: String) {
@@ -1276,6 +1419,7 @@ final class FirstRunProof: XCTestCase {
     /// (the Touch Bar), APPARATUS.
     @discardableResult
     private func present(_ ui: XCUIApplication, _ key: Key, timeout: TimeInterval, _ product: String,
+                         premise: Premise? = nil,
                          file: StaticString = #filePath, line: UInt = #line) -> Bool {
         guard windowReadable(ui, file: file, line: line) else { return false }
         let end = Date().addingTimeInterval(timeout)
@@ -1284,14 +1428,15 @@ final class FirstRunProof: XCTestCase {
             Thread.sleep(forTimeInterval: 0.25)
         } while Date() < end
         if locateEverywhere(ui, key) != nil { return true }
-        missing(ui, key, product, file: file, line: line)
+        missing(ui, key, product, premise: premise, file: file, line: line)
         return false
     }
 
     /// The red for `key` not shown: APPARATUS when the app has it only outside what it shows a
-    /// person, PRODUCT otherwise, quoting everything shown.
-    private func missing(_ ui: XCUIApplication, _ key: Key, _ product: String, file: StaticString,
-                         line: UInt) {
+    /// person, or when `premise` (what the daemon holds that it is drawn from) does not hold;
+    /// PRODUCT otherwise, quoting everything shown and what the daemon said.
+    private func missing(_ ui: XCUIApplication, _ key: Key, _ product: String, premise: Premise? = nil,
+                         file: StaticString, line: UInt) {
         keepTree(ui, "\(key) was not shown")
         // Premise: the same search finds a known sibling of the same kind; if not, the search is
         // what failed, not the app.
@@ -1304,10 +1449,27 @@ final class FirstRunProof: XCTestCase {
         if anywhere.exists {
             XCTFail("APPARATUS: \(key) is in the app only outside its windows, dialogs, sheets, popovers and menus (\(anywhere.elementType.rawValue)); the proof's search missed it",
                     file: file, line: line)
-        } else {
-            XCTFail("PRODUCT: \(product); \(key) is in none of the app's windows, dialogs, sheets, popovers or menus, which show: \(onScreen(ui))",
-                    file: file, line: line)
+            return
         }
+        // A menu item is shown only in an open menu: none open, the click that was to open it
+        // reached nothing (the menu never opened), which the app's words cannot settle.
+        if case .menuItem = key, !menuOpen(ui) {
+            XCTFail("APPARATUS: \(key) is not shown because no menu is open: the click that was to open its menu opened nothing",
+                    file: file, line: line)
+            return
+        }
+        var held = ""
+        if let premise {
+            let (holds, said) = premise.read()
+            guard holds else {
+                XCTFail("APPARATUS (staging not achieved): \(key) is not shown, and the daemon says \(premise.what) does not hold: \(said)",
+                        file: file, line: line)
+                return
+            }
+            held = "; \(premise.what), as the daemon says: \(said)"
+        }
+        XCTFail("PRODUCT: \(product)\(held); \(key) is in none of the app's windows, dialogs, sheets, popovers or menus, which show: \(onScreen(ui))",
+                file: file, line: line)
     }
 
     /// `key`'s words once `holds` is true of them, within `timeout`, the premise holding: PRODUCT
@@ -1369,39 +1531,69 @@ final class FirstRunProof: XCTestCase {
         return got
     }
 
-    /// Click `key`, once it is shown and hittable: APPARATUS when XCTest cannot click it, never an
-    /// exception that names no side.
+    /// Click `key`, once it is shown and hittable, never an exception that names no side. Shown
+    /// but never hittable: APPARATUS (XCTest cannot click it). Not shown: `missing`'s red, PRODUCT
+    /// when the search works and `premise` holds. A target drawn from what the daemon holds names
+    /// that as its premise; any other target is a control of the screen the proof has just
+    /// reached, which the app must show.
     @discardableResult
-    private func tap(_ ui: XCUIApplication, _ key: Key, _ what: String,
+    private func tap(_ ui: XCUIApplication, _ key: Key, _ what: String, premise: Premise? = nil,
                      file: StaticString = #filePath, line: UInt = #line) -> Bool {
         let end = Date().addingTimeInterval(10)
         repeat {
             if let e = locate(ui, key) {
-                // Shown but off screen in a scroll view: scrolled to, as a person does.
-                if !e.isHittable { scrollTo(ui, e) }
-                if e.isHittable {
+                // Shown but out of view (off screen, or clipped by its scroll view): scrolled to,
+                // as a person does, so the click lands on it.
+                // A menu item is in its open menu, not in a scroll view: hittable is enough.
+                let reached: () -> Bool
+                if case .menuItem = key { reached = { e.isHittable } } else { reached = { self.inView(ui, e) } }
+                if !reached() { scrollTo(ui, e) }
+                if reached() {
                     e.click()
                     return true
                 }
             }
             Thread.sleep(forTimeInterval: 0.25)
         } while Date() < end
+        guard locateEverywhere(ui, key) != nil else {
+            missing(ui, key, "the app must show \(what)", premise: premise, file: file, line: line)
+            return false
+        }
         keepTree(ui, "\(what) could not be clicked")
-        XCTFail("APPARATUS: XCTest cannot click \(what) (\(key)): \(locateEverywhere(ui, key) == nil ? "not shown" : "not hittable")",
+        XCTFail("APPARATUS: XCTest cannot click \(what) (\(key)): shown, never in view to click",
                 file: file, line: line)
         return false
     }
 
     /// Scroll the window's scroll view that holds `e` until `e` is on screen (or it moves no more).
+    /// Whether a click on `e` reaches it: hittable, and wholly inside the scroll view that holds it
+    /// (XCTest calls a row clipped below its scroll view hittable, and a click there lands on
+    /// whatever is drawn over it).
+    private func inView(_ ui: XCUIApplication, _ e: XCUIElement) -> Bool {
+        guard e.isHittable else { return false }
+        let f = e.frame
+        // The scroll view that holds it: one it is a descendant of, found by its identifier,
+        // under it on screen (XCTest also found it among the sidebar's descendants); a target
+        // with no identifier, or in no scroll view, is clicked where it is.
+        let id = e.identifier
+        guard !id.isEmpty, let view = ui.windows.firstMatch.scrollViews.allElementsBoundByIndex.first(where: {
+            $0.frame.minX <= f.midX && f.midX <= $0.frame.maxX
+                && $0.descendants(matching: .any).matching(identifier: id).firstMatch.exists
+        })?.frame else { return true }
+        return view.minY <= f.minY && f.maxY <= view.maxY
+    }
+
     private func scrollTo(_ ui: XCUIApplication, _ e: XCUIElement) {
         let target = e.frame
+        let id = e.identifier
         guard let view = ui.windows.firstMatch.scrollViews.allElementsBoundByIndex.first(where: {
             $0.frame.minX <= target.midX && target.midX <= $0.frame.maxX
+                && (id.isEmpty || $0.descendants(matching: .any).matching(identifier: id).firstMatch.exists)
         }) else { return }
-        for _ in 0..<20 where !e.isHittable {
+        for _ in 0..<20 where !inView(ui, e) {
             let now = e.frame
-            let down = now.midY > view.frame.maxY
-            let up = now.midY < view.frame.minY
+            let down = now.maxY > view.frame.maxY
+            let up = now.minY < view.frame.minY
             guard down || up else { return }
             view.scroll(byDeltaX: 0, deltaY: down ? -200 : 200)
             if e.frame == now { return }
@@ -1476,6 +1668,35 @@ final class FirstRunProof: XCTestCase {
     private func run(_ vox: String, _ args: [String], env: [String: String],
                      input: String? = nil) -> (status: Int32, out: String) {
         stager.run([vox] + args, env: env, input: input)
+    }
+
+    /// Premise: `fp` (alias `name`) is in alice's roster of `room`, as `vox room roster` says.
+    private func member(_ vox: String, _ env: [String: String], _ room: String, _ fp: String,
+                        _ name: String) -> Premise {
+        Premise("\(name) is a member of the room") {
+            let r = self.run(vox, ["room", "roster", "--node", "alice", room], env: env)
+            return (r.status == 0 && r.out.contains(fp),
+                    "`vox room roster` exited \(r.status) listing \(r.out.trimmingCharacters(in: .whitespacesAndNewlines).debugDescription), \(name) being \(fp)")
+        }
+    }
+
+    /// Premise: `fp` (alias `name`) is in alice's keyring, as `vox trust list` says.
+    private func trusted(_ vox: String, _ env: [String: String], _ fp: String,
+                         _ name: String) -> Premise {
+        Premise("\(name) is in alice's keyring") {
+            let r = self.run(vox, ["trust", "list", "--node", "alice"], env: env)
+            return (r.status == 0 && r.out.contains(fp),
+                    "`vox trust list` exited \(r.status): \(r.out.trimmingCharacters(in: .whitespacesAndNewlines).debugDescription), \(name) being \(fp)")
+        }
+    }
+
+    /// Premise: alice is in the room named `name`, as `vox room list` says.
+    private func inRoom(_ vox: String, _ env: [String: String], _ name: String) -> Premise {
+        Premise("alice is in room \(name)") {
+            let r = self.run(vox, ["room", "list", "--node", "alice"], env: env)
+            return (r.status == 0 && r.out.split(separator: "\n").contains { $0.contains(" \(name)") },
+                    "`vox room list` exited \(r.status): \(r.out.trimmingCharacters(in: .whitespacesAndNewlines).debugDescription)")
+        }
     }
 
     /// The line `start` waited for, as `vox` printed it.
