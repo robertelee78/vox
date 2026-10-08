@@ -1028,20 +1028,25 @@ fn an_admission_reaches_every_member_and_never_outlives_a_leave() {
     let host_id = fingerprint(&host_dir);
     let carol_id = fingerprint(&carol_dir);
     let (spy_id, x_id) = (fingerprint(&spy_dir), fingerprint(&x_dir));
-    let _host = daemon("host", &host_dir, 0, &spec, &pass_file);
+    let host = std::cell::RefCell::new(daemon("host", &host_dir, 0, &spec, &pass_file));
     let host_port = hostile::listening_port(&host_dir);
     let host_addr = format!("127.0.0.1:{host_port}")
         .parse()
         .expect("APPARATUS (harness error): the host's address");
     let (room, link) = create_room(&host_dir, "team", ROOM_PASS);
     let join = |name: &str, dir: &std::path::Path| {
-        let d = daemon(name, dir, 0, &spec, &pass_file);
+        let mut d = daemon(name, dir, 0, &spec, &pass_file);
         let (ok, out, err) = vox_in(
             dir,
             &["room", "join", "--passphrase-file", "-", &link],
             ROOM_PASS,
         );
-        assert!(ok, "PRODUCT (staging): {name} could not join: {out}{err}");
+        assert!(
+            ok,
+            "PRODUCT (staging): {name} could not join: {out}{err}\n---- {name}'s daemon ----\n{}\n---- the host's daemon ----\n{}",
+            d.transcript(),
+            host.borrow_mut().transcript()
+        );
         // Let the host file the new member before it goes.
         std::thread::sleep(Duration::from_secs(3));
         d
