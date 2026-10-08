@@ -27,8 +27,10 @@
 //!   through Vox sees.
 //!
 //! Asserted: in every round of the `vox room get` arm the collector ends within [`BOUND`] with
-//! a reset, or with Vox's own words for one ([`WITHDRAWN_SAID`]: `vox room get` follows its node's
-//! events, and says why a transfer failed instead of the socket's error, #406), never by
+//! a reset, or with Vox's own words for one ([`WITHDRAWN_SAID`] when the host says it withdrew
+//! access, [`STOPPED_SAID`] when it only refused the transfer after part of it came: `vox room
+//! get` follows its node's events, and says why a transfer failed instead of the socket's error,
+//! #406), never by
 //! stalling and never with a clean end; in every round of the raw arm the socket is reset
 //! (`ECONNRESET`), never closed cleanly and never left hanging.
 //!
@@ -60,8 +62,12 @@ use sync_pair::{Member, ID_PASS, VOX};
 const ROUNDS: usize = if cfg!(debug_assertions) { 3 } else { 30 };
 /// Rounds of the raw-collector arm.
 const RAW_ROUNDS: usize = if cfg!(debug_assertions) { 2 } else { 10 };
-/// What `vox room get` says of a transfer its sharer withdrew mid-way (#406).
+/// What `vox room get` says of a transfer its sharer withdrew mid-way, when the host says it
+/// withdrew access (#406).
 const WITHDRAWN_SAID: &str = "was withdrawn while it was being collected";
+/// What it says when the host only refused it after part of it came: all that is known is that
+/// it stopped partway, and the host's own reason (#496).
+const STOPPED_SAID: &str = "stopped partway";
 const FILE_BYTES: usize = 64 << 20;
 /// A collector that is reset ends at once; one that hangs is given up on by `vox room get` after
 /// 30 s of silence.
@@ -240,7 +246,7 @@ fn a_cut_session_is_reset_not_hung() {
                     End::Stalled
                 } else if text.contains("reset") || text.contains("reading the transfer") {
                     End::Reset
-                } else if text.contains(WITHDRAWN_SAID) {
+                } else if text.contains(WITHDRAWN_SAID) || text.contains(STOPPED_SAID) {
                     End::Explained
                 } else {
                     eprintln!("[proof] round {round}: collector said: {}", text.trim());
@@ -362,8 +368,8 @@ fn a_cut_session_is_reset_not_hung() {
         count(End::Other),
     );
     eprintln!(
-        "[proof] vox room get: {ROUNDS} cut transfers: {reset} reset, {explained} explained as \
-         withdrawn, {stalled} stalled, {other} other"
+        "[proof] vox room get: {ROUNDS} cut transfers: {reset} reset, {explained} explained \
+         (withdrawn, or stopped partway), {stalled} stalled, {other} other"
     );
     if reset + explained != ROUNDS {
         red.push(format!(
