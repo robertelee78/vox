@@ -75,7 +75,8 @@ extension VoxAction {
             },
             VoxAction("Room", "Send Urgent", .return, enabled: inRoom) { node?.urgentAsked += 1 },
             // The keyboard's way into the messages (WCAG 2.1.1): ↑/↓ then move through them.
-            VoxAction("View", "Focus Timeline", "t", [.command, .shift], enabled: inRoom) {
+            // ⌃⌘T: ⇧⌘T is the system's View > Show Tab Bar, and ⌥⌘T its Show Toolbar.
+            VoxAction("View", "Focus Timeline", "t", [.command, .control], enabled: inRoom) {
                 NotificationCenter.default.post(name: .voxFocusTimeline, object: nil)
             },
             VoxAction("Room", "Copy Selected Service's Address", "c", [.command, .shift],

@@ -3,6 +3,7 @@
 // its members and their trust; and a status bar with the node, its peers and the keyring window.
 // The keyring is a view of this window, not a window of its own.
 
+import AppKit
 import SwiftUI
 
 struct MainWindow: View {
@@ -124,16 +125,96 @@ private struct RoomRow: View {
     }
 }
 
-/// The timeline draws its own focus ring on the row the keyboard is on; the system's ring around
-/// the whole timeline is left out where SwiftUI can leave it out (macOS 14).
-private struct OwnFocusRing: ViewModifier {
-    func body(content: Content) -> some View {
-        if #available(macOS 14.0, *) {
-            content.focusEffectDisabled()
-        } else {
-            content
+/// **The timeline's keyboard** (WCAG 2.1.1, 2.4.7): an AppKit view behind the timeline that
+/// takes first responder and its keys. SwiftUI's own focus would not do: a `.focusable()` scroll
+/// view on macOS 13 and 14 did not take focus set from a menu while the sidebar's list held it,
+/// so the keys went to the sidebar. This view takes it from Tab (with keyboard navigation on),
+/// from View > Focus Timeline, and from a click on a row; it says when it has it, so the row the
+/// keyboard is on is outlined, and draws no ring of its own.
+private struct TimelineKeys: NSViewRepresentable {
+    /// Whether the keyboard is on the timeline, as this view says.
+    @Binding var focused: Bool
+    /// A key, answered with whether it did anything (a key that does nothing goes on up).
+    let key: (TimelineKey) -> Bool
+
+    func makeNSView(context: Context) -> KeyView {
+        let view = KeyView()
+        view.onFocus = { has in DispatchQueue.main.async { focused = has } }
+        view.onKey = key
+        return view
+    }
+
+    func updateNSView(_ view: KeyView, context: Context) {
+        view.onKey = key
+        view.onFocus = { has in DispatchQueue.main.async { focused = has } }
+    }
+
+    final class KeyView: NSView {
+        var onFocus: ((Bool) -> Void)?
+        var onKey: ((TimelineKey) -> Bool)?
+        private var asked: NSObjectProtocol?
+
+        override var acceptsFirstResponder: Bool { true }
+        override var canBecomeKeyView: Bool { true }
+        override var focusRingType: NSFocusRingType {
+            get { .none }
+            set {}
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let asked { NotificationCenter.default.removeObserver(asked) }
+            asked = nil
+            guard window != nil else { return }
+            // View > Focus Timeline, or a click on a row: the keyboard comes here.
+            asked = NotificationCenter.default.addObserver(
+                forName: .voxFocusTimeline, object: nil, queue: .main
+            ) { [weak self] _ in
+                guard let self, let window = self.window else { return }
+                window.makeFirstResponder(self)
+            }
+            setAccessibilityElement(false)
+        }
+
+        override func becomeFirstResponder() -> Bool {
+            onFocus?(true)
+            return true
+        }
+
+        override func resignFirstResponder() -> Bool {
+            onFocus?(false)
+            return true
+        }
+
+        override func keyDown(with event: NSEvent) {
+            // Tab and ⇧Tab move on, as from any control (with keyboard navigation on).
+            if event.keyCode == 48 {
+                if event.modifierFlags.contains(.shift) {
+                    window?.selectPreviousKeyView(self)
+                } else {
+                    window?.selectNextKeyView(self)
+                }
+                return
+            }
+            let key: TimelineKey?
+            switch event.keyCode {
+            case 126: key = .up
+            case 125: key = .down
+            case 36, 76: key = .open // Return, Enter
+            case 49: key = .look // Space
+            default: key = nil
+            }
+            // Only the bare key: ⌘↑ and the like are the menus' and the system's.
+            let bare = event.modifierFlags.intersection([.command, .option, .control]).isEmpty
+            if let key, bare, onKey?(key) == true { return }
+            super.keyDown(with: event)
         }
     }
+}
+
+/// A key the timeline acts on.
+private enum TimelineKey {
+    case up, down, open, look
 }
 
 /// The room on screen: its timeline and a field to post, with its members beside it.
@@ -157,7 +238,7 @@ private struct RoomView: View {
     @State private var newest: String?
     /// Whether the keyboard is on the timeline (WCAG 2.1.1): ↑/↓ move the selection, Return
     /// opens the selected message's first action, Space Quick Looks its pulled file.
-    @FocusState private var timelineFocused: Bool
+    @State private var timelineFocused = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -218,6 +299,9 @@ private struct RoomView: View {
                                                             focused: timelineFocused
                                                                 && model.selectedMessage == message.id) {
                                                     model.selectedMessage = message.id
+                                                    // Clicked: the keyboard follows, as in a list.
+                                                    NotificationCenter.default.post(
+                                                        name: .voxFocusTimeline, object: nil)
                                                 }
                                                 .reportsFrame(of: message.id)
                                                 .id(message.id)
@@ -238,29 +322,18 @@ private struct RoomView: View {
                                 .padding(12)
                             }
                             .coordinateSpace(name: "timeline")
-                            // **Operable from the keyboard** (WCAG 2.1.1, 2.4.7): the timeline
-                            // takes focus (Tab with keyboard navigation on, or View > Focus
-                            // Timeline); the focused row is outlined by `selectable`, so the
-                            // system's own ring around the whole timeline is not drawn as well.
-                            .focusable()
-                            .focused($timelineFocused)
-                            .modifier(OwnFocusRing())
-                            .onMoveCommand { direction in move(direction, scroller) }
-                            // Return and Space while the timeline holds the keyboard, as buttons
-                            // with keys (onKeyPress is macOS 14 only); off when it does not, so
-                            // the composer still types a space.
-                            .background {
-                                Button("") { _ = openSelected() }
-                                    .keyboardShortcut(.return, modifiers: [])
-                                    .disabled(!timelineFocused)
-                                    .hidden()
-                                Button("") { _ = lookSelected() }
-                                    .keyboardShortcut(.space, modifiers: [])
-                                    .disabled(!timelineFocused)
-                                    .hidden()
-                            }
+                            // **Operable from the keyboard** (WCAG 2.1.1, 2.4.7): see
+                            // `TimelineKeys`. The focused row is outlined by `selectable`.
+                            .background(TimelineKeys(focused: $timelineFocused) { key in
+                                switch key {
+                                case .up: return move(.up, scroller)
+                                case .down: return move(.down, scroller)
+                                case .open: return openSelected()
+                                case .look: return lookSelected()
+                                }
+                            })
                             .onReceive(NotificationCenter.default.publisher(for: .voxFocusTimeline)) { _ in
-                                timelineFocused = true
+                                // Taken: the newest row, when none was selected.
                                 if model.selectedMessage == nil, let last = model.messages.last {
                                     model.selectedMessage = last.id
                                     scroller.scrollTo(last.id)
@@ -394,20 +467,21 @@ private struct RoomView: View {
 
     /// ↑/↓ on the timeline: the selection moves to the message before or after it, scrolled into
     /// view; with none selected, ↑ takes the newest and ↓ the oldest.
-    private func move(_ direction: MoveCommandDirection, _ scroller: ScrollViewProxy) {
+    private func move(_ direction: MoveCommandDirection, _ scroller: ScrollViewProxy) -> Bool {
         let ids = model.timelineItems.compactMap { $0.message?.id }
-        guard !ids.isEmpty else { return }
+        guard !ids.isEmpty else { return false }
         let at = model.selectedMessage.flatMap { ids.firstIndex(of: $0) }
         let next: Int
         switch direction {
         case .up: next = at.map { max($0 - 1, 0) } ?? ids.count - 1
         case .down: next = at.map { min($0 + 1, ids.count - 1) } ?? 0
-        default: return
+        default: return false
         }
         model.selectedMessage = ids[next]
         withAnimation(Theme.motion(reduced: reduceMotion)) {
             scroller.scrollTo(ids[next])
         }
+        return true
     }
 
     /// The selected message, as the timeline shows it.

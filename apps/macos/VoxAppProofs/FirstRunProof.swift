@@ -51,7 +51,7 @@
 //     bob's message to her while no app runs; opened again, the app lists mission under "needs
 //     you (1)" at once, from what her node recorded as read.
 // 14. The keyboard (WCAG 2.1.1, 2.4.7; #450), run with Full Keyboard Access on (set around the
-//     pass, never by the proof): View > Focus Timeline (⇧⌘T) puts the keyboard on mission's
+//     pass, never by the proof): View > Focus Timeline (⌃⌘T) puts the keyboard on mission's
 //     timeline with its newest message selected; ↑ and ↓ move the selection, as Reply to Selected
 //     Message (⌘R) then says; Space and Return on a row whose file alice pulled open it in Quick
 //     Look; Tab from the timeline reaches the composer.
@@ -1099,8 +1099,8 @@ final class FirstRunProof: XCTestCase {
             keepTree(ui, "Quick Look by mouse was not seen to open and close")
             throw Apparatus("Quick Look, opened with the mouse on for-keys.txt, did not show as one more window that Escape closes (\(windowsBefore) windows before, \(ui.windows.count) now), so the keyboard's cannot be told")
         }
-        // ⇧⌘T: the keyboard on the timeline, the newest row (the file's) selected.
-        ui.typeKey("t", modifierFlags: [.command, .shift])
+        // ⌃⌘T: the keyboard on the timeline, the newest row (the file's) selected.
+        ui.typeKey("t", modifierFlags: [.command, .control])
         ui.typeKey(" ", modifierFlags: [])
         if !lookOpened() {
             keepTree(ui, "Space opened nothing")
@@ -1123,7 +1123,7 @@ final class FirstRunProof: XCTestCase {
             present(ui, Key.showing("Replying to bob: \(want)"), timeout: 10,
                     "\(key == .upArrow ? "↑" : "↓") on the timeline must select \(want), which ⌘R then replies to")
             // Back to the timeline for the next key: ⌘R leaves the keyboard where it was.
-            ui.typeKey("t", modifierFlags: [.command, .shift])
+            ui.typeKey("t", modifierFlags: [.command, .control])
         }
         // Tab from the timeline reaches the composer. Premise: XCTest reads the composer's
         // keyboard focus (clicked, it has it).
@@ -1132,7 +1132,7 @@ final class FirstRunProof: XCTestCase {
         guard el(ui, compose).value(forKey: "hasKeyboardFocus") as? Bool == true else {
             throw Apparatus("XCTest reads no keyboard focus on the composer after clicking it")
         }
-        ui.typeKey("t", modifierFlags: [.command, .shift])
+        ui.typeKey("t", modifierFlags: [.command, .control])
         var tabs = 0
         while tabs < 25 && el(ui, compose).value(forKey: "hasKeyboardFocus") as? Bool != true {
             ui.typeKey(.tab, modifierFlags: [])
