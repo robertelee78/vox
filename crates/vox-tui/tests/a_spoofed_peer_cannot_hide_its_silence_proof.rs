@@ -6,13 +6,15 @@
 //! on the path, who has seen the host's packets, keeps sending the guest garbage that carries the
 //! host's connection ID, from the host's address. The guest must still notice the connection is
 //! dead within the normal bound and carry its next request over the anchor's circuit. The room's
-//! host is one of the room's anchors (its link names it), so the bound is an anchor's: probed after
-//! 3 s of silence, taken for gone after 8 s of unanswered probes (V210-93). Before the fix the
-//! liveness count was of datagrams routed to the connection, taken before authentication, so the
-//! garbage kept the dead connection "heard" and the guest waited for QUIC's 60 s idle timeout.
+//! host is a member, never an anchor (V030-51); a direct connection that something is waiting on
+//! is probed as an anchor's is: probed after 3 s of silence, taken for gone after 8 s of unanswered
+//! probes (V210-93). Before the fix the liveness count was of datagrams routed to the connection,
+//! taken before authentication, so the garbage kept the dead connection "heard" and the guest
+//! waited for QUIC's 60 s idle timeout.
 //!
-//! Measured: 9.5 s from the cut with the fix, the guest saying "the connection to this anchor is
-//! gone … (it answered nothing for 8s)".
+//! Measured: 9.5 s from the cut with the fix, when the host was still probed as an anchor. With the
+//! host a member only (V030-51) and nothing probing a member's connection in use, 30.4–30.7 s: the
+//! dead connection was caught only by `SILENCE_IS_DEATH`.
 //!
 //! **The staging — real processes only** (`support/port_forward.rs`'s `ForwardedWorld`). A `vox
 //! node` anchor, a `vox serve` host on `127.0.0.1` behind a port forward the proof owns, and the
@@ -25,10 +27,11 @@
 //! forward); the spoofer sent the guest garbage throughout; and from the cut, a request is answered
 //! again within [`FAILOVER_WITHIN`].
 //!
-//! **The mutation that must turn it red:** count datagrams before authentication again
+//! **The mutations that must turn it red:** count datagrams before authentication again
 //! (`heard_count` in `node/net.rs` returning `quic.stats().udp_rx.datagrams`). The garbage then
 //! keeps the dead connection heard, and the first request answered after the cut comes after the
-//! idle timeout: red, as PRODUCT.
+//! idle timeout: red, as PRODUCT. And no probe of a connection in use
+//! (`ConnectionManager::tend_liveness`): the first answer comes at `SILENCE_IS_DEATH`, 30 s.
 
 // Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
 // `--features optional-proofs` a stand-in takes its place and says it was not run
@@ -194,8 +197,13 @@ fn a_spoofed_peer_cannot_hide_a_dead_connection() {
         failover <= FAILOVER_WITHIN,
         "PRODUCT: the direct path died and a spoofer sent the guest garbage under the host's \
          connection ID; the guest's first request was answered again only {failover:?} after the \
-         cut, over {FAILOVER_WITHIN:?}: the garbage kept the dead connection looking alive.\nup \
-         said from the cut:\n{}",
+         cut, over {FAILOVER_WITHIN:?}: {}.\nup said from the cut:\n{}",
+        if failover >= Duration::from_secs(55) {
+            "the garbage kept the dead connection looking alive until QUIC's idle timeout"
+        } else {
+            "the dead connection in use was not probed and closed within its 8 s, and waited out \
+             the 30 s silence bound"
+        },
         said.join("\n")
     );
     if !interrupt(&mut up, Duration::from_secs(15)) {
