@@ -125,6 +125,19 @@ It is not just permission for the currently open room or one
 file. The other node makes its own independent decision to trust you. For a conversation,
 confirm a message can be read in each direction.
 
+Trusting a node sends it your key for each room you share, sealed to the key bundle that node
+publishes on the room's board. If your node's board does not hold that bundle yet, the key waits,
+and your node says so once for that member and room, on its own terminal (the daemon's log,
+`.daemon/log` in the data root, or the terminal of a `vox daemon` you started):
+
+```text
+vox node: connection to obs52x2rogrwwzsqt2dmpmsta6 — your key for it in room qilvehgxilrf waits: this node's board holds no prekey bundle of it yet; it is sent once one arrives
+```
+
+Nothing needs doing: the key is sent as soon as the bundle arrives. If the bundle is there but no
+session could be opened from it, the line says `no pairwise session with it could be opened from
+its prekey bundle; it is tried again`.
+
 `--history` chooses what of **your own** earlier messages the trusted node can read: `now`, the
 default, releases what you write from this approval onward; `full` also releases everything you
 still hold a key for. It never releases anyone else's messages.
