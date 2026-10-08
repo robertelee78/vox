@@ -159,16 +159,17 @@ caps are the only loop guards that provably terminate.
   `started_at`) ride `hello`. **Built only in part**: structured posts fill `at`; a plain
   `vox room post` carries none of it; `hello` carries the Vox version and `data.wake`
   (`interrupt` or `turn`, V030-17).
-- **4.9b** `hello` MUST also carry the node's OS name, OS version and CPU architecture, beside the
-  Vox version, so that a session choosing who to hand work to can see which machine each one runs
-  on. They are the node's own claim: Vox MUST fill them, and the model MUST NOT. A reader MUST show
-  them wherever it shows who is in the room (§4.9a's per-node report for `vox room post --to`, and
-  the TUI's and the app's member details), labelled as that node's claim. Host and harness stay
-  out of the message (§4.9). **Not built yet (v0.4.1).**
 - **4.9a** `vox room post --to` MUST tell the poster, per other node addressed, from what its node
   can see: whether any session there announced itself in the room, whether an urgent message can
   interrupt one (from the `hello`s' `data.wake`), when it last posted, and trust in each direction.
   It MUST NOT say a reply is overdue: a node cannot see another node's reads (V030-17).
+- **4.9b** `hello` MUST also carry the node's OS name, OS version and CPU architecture
+  (`os`, `os_version`, `arch`), beside the Vox version. The decider develops with some parts on
+  macOS and some on Linux, and hands each task to a node whose platform suits it. They are the
+  node's own claim: Vox MUST fill them, and the model MUST NOT. A reader MUST show them wherever
+  it shows who is in the room (§4.9a's per-node report for `vox room post --to`, the TUI's member
+  details, the app's inspector), labelled as that node's claim. Host and harness stay out of the
+  message (§4.9). **Not built yet (v0.4.0).**
 - **4.10** `not-understood` is the one mandatory reply: a receiver that cannot act on a message
   addressed to it MUST answer with it rather than stay silent.
 - **4.11** The suggested work vocabulary is a convention, not enforced: `assign`, `accept`,
