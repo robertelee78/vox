@@ -1,5 +1,7 @@
-//! A node's decision record (ADR-028 §7), read as its person would read it: the day files under
-//! `<data root>/nodes/<node>/decisions/`, one JSON object per line.
+//! A node's decision record (ADR-028 §7), read as its person's clients read it: through the
+//! daemon, which alone opens it (#563), as the TUI's Decisions screen and the app ask for it. The
+//! day files under `<data root>/nodes/<node>/decisions/` are sealed; [`files`] gives their bytes
+//! for a proof to search for what must not be in them.
 
 #![allow(dead_code)]
 
@@ -10,21 +12,51 @@ pub fn dir(data: &Path, node: &str) -> PathBuf {
     data.join("nodes").join(node).join("decisions")
 }
 
-/// Every event in the record, oldest file first, as written. A line that is not JSON is a red of
-/// its own: `PRODUCT:` quoting it.
+/// Every event in the record, oldest first, as node `node`'s daemon at the data root `data` answers
+/// for it ([`vox_core::node::ipc::Request::Decisions`]), each as the JSON object an event is:
+/// `at_ms`, `asked`, `by`, `alias`, `decided`, `why`, and `room` when it has one. A node the daemon
+/// does not hold has no record to read: an empty one.
 pub fn events(data: &Path, node: &str) -> Vec<serde_json::Value> {
-    let mut out = Vec::new();
-    for (_, text) in files(data, node) {
-        for line in text.lines().filter(|l| !l.trim().is_empty()) {
-            out.push(serde_json::from_str(line).unwrap_or_else(|e| {
-                panic!("PRODUCT: a line of the decision record is not JSON ({e}): {line:?}")
-            }));
-        }
-    }
+    use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request};
+    let socket = vox_core::node::paths::Account::of(Some(data), Some(&data.join("cfg")))
+        .expect("APPARATUS: the data root's account")
+        .socket();
+    let name = vox_core::node::paths::NodeName::parse(node).expect("APPARATUS: a node name");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("APPARATUS: a runtime");
+    let asked = rt.block_on(async {
+        let mut client = IpcClient::open_at(&NodeSocket::one_shot(socket, name))
+            .await
+            .ok()?;
+        client
+            .request(&Request::Decisions { limit: u64::MAX })
+            .await
+            .ok()
+    });
+    let Some(Frame::Decisions { events }) = asked else {
+        return Vec::new();
+    };
+    let mut out: Vec<serde_json::Value> = events
+        .into_iter()
+        .map(|e| {
+            let mut v = serde_json::json!({
+                "at_ms": e.at_ms, "asked": e.asked, "by": e.by, "alias": e.alias,
+                "decided": e.decided, "why": e.why,
+            });
+            if let Some(room) = e.room {
+                v["room"] = room.into();
+            }
+            v
+        })
+        .collect();
+    out.reverse();
     out
 }
 
-/// Every day file of the record, by name, with what it holds; none when there is no record.
+/// Every day file of the record, by name, with its bytes as text (lossy); none when there is no
+/// record.
 pub fn files(data: &Path, node: &str) -> Vec<(String, String)> {
     let Ok(entries) = std::fs::read_dir(dir(data, node)) else {
         return Vec::new();
@@ -34,7 +66,7 @@ pub fn files(data: &Path, node: &str) -> Vec<(String, String)> {
         .map(|e| {
             (
                 e.file_name().to_string_lossy().into_owned(),
-                std::fs::read_to_string(e.path()).unwrap_or_default(),
+                String::from_utf8_lossy(&std::fs::read(e.path()).unwrap_or_default()).into_owned(),
             )
         })
         .collect();

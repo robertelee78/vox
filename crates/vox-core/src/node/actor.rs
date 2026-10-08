@@ -3544,6 +3544,8 @@ pub struct NodeHandle {
     shares: Arc<crate::node::shares::Shares>,
     /// Where the node's files are: its sessions' registrations among them (ADR-029 MD-2).
     paths: Paths,
+    /// The node's decision record (ADR-028 §7), which only the node opens (#563).
+    decisions: crate::node::decisions::DecisionLog,
 }
 
 /// When the identity passphrase was last entered, shared with the actor, and the actor's clock.
@@ -3564,6 +3566,12 @@ impl NodeHandle {
     #[must_use]
     pub fn paths(&self) -> &Paths {
         &self.paths
+    }
+
+    /// This node's decision record (ADR-028 §7), which only the node reads (#563).
+    #[must_use]
+    pub fn decisions(&self) -> &crate::node::decisions::DecisionLog {
+        &self.decisions
     }
 
     /// The files this node shares and serves (ADR-028 F-1, F-2).
@@ -4676,7 +4684,11 @@ impl Node {
         };
         // A headless node has nothing to unlock: it is on the network from the start.
         let mut node = node;
-        if node.headless.is_some() {
+        if let Some(signer) = node.headless.clone() {
+            // A headless node's identity is unlocked for its whole life: so is its record.
+            if let Err(e) = node.decisions.unlock(&*signer) {
+                eprintln!("vox: this node's decision record cannot be sealed: {e}");
+            }
             node.start_network()?;
         }
         node.publish_initial();
@@ -4693,6 +4705,7 @@ impl Node {
             handle_event_tx.clone(),
         );
         let paths = node.paths.clone();
+        let decisions = node.decisions.clone();
         let actor = tokio::spawn(node.run(cmd_rx, net_rx));
         let handle = NodeHandle {
             cmd_tx,
@@ -4706,6 +4719,7 @@ impl Node {
             keyring,
             shares,
             paths,
+            decisions,
         };
         Ok((handle, actor))
     }
@@ -12799,6 +12813,9 @@ impl Node {
             crate::node::peer_book::PeerBook::load(profile.store(), signer).unwrap_or_default();
         self.consent_keys =
             crate::node::pending_consent::PendingConsents::load(profile.store(), signer)?;
+        // The decision record is sealed under this identity too (#563): from now it is written,
+        // what was decided while locked with it.
+        self.decisions.unlock(signer)?;
         Ok(())
     }
 
@@ -12848,6 +12865,10 @@ impl Node {
     async fn lock_all(&mut self) -> oneshot::Receiver<()> {
         self.passphrase_entered_at
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        // The record's key goes with the identity's; a headless node's identity never locks.
+        if self.headless.is_none() {
+            self.decisions.lock();
+        }
         for (_, shared) in std::mem::take(&mut self.channels) {
             shared.lock().await.lock_now();
         }
