@@ -1608,14 +1608,16 @@ fn two_sessions_answering_each_other_stop_being_told_at_the_hop_budget() {
 /// an urgent `ask` with `vox room post --to bob --to carol`. Asserted, from what the shipped
 /// binaries print:
 ///
-/// 1. the `hello` alice reads says `data.wake` is `turn`;
+/// 1. the `hello` alice reads says `data.wake` is `turn`, and which machine bob's node runs on:
+///    `data.os`, `data.os_version` and `data.arch`, this machine's, filled by Vox (ADR-020 §4.9b);
 /// 2. alice is told, for bob, "urgent will not interrupt it", that each side trusts the other,
-///    and when it last posted;
+///    when it last posted, and the machine it says it runs on;
 /// 3. for carol, "none of its sessions has announced itself in this room";
 /// 4. nothing she is told says "overdue": her node cannot see another node's reads.
 ///
 /// **Mutation.** Drop `data.wake` from the `hello` (`coord::participate`), and (1) and (2) go red:
-/// alice is told the hello does not say whether it can be interrupted.
+/// alice is told the hello does not say whether it can be interrupted. Drop the machine fields
+/// (`platform::insert` there), and (1) goes red.
 #[test]
 #[ignore = "an anchor and three vox daemons with production Argon2id; CI runs it in release"]
 fn a_sender_is_told_how_each_addressee_can_be_reached() {
@@ -1675,6 +1677,26 @@ fn a_sender_is_told_how_each_addressee_can_be_reached() {
          turn (data.wake = turn); alice reads: {}",
         hello["envelope"]
     );
+    // Which machine: the same one this proof runs on, since every node here does.
+    let os = if cfg!(target_os = "macos") {
+        "macOS"
+    } else {
+        "Linux"
+    };
+    let data = &hello["envelope"]["data"];
+    assert!(
+        data["os"].as_str() == Some(os)
+            && data["arch"].as_str() == Some(std::env::consts::ARCH)
+            && data["os_version"].as_str().is_some_and(|v| !v.is_empty()),
+        "PRODUCT: a hello must say which machine its node runs on, filled by Vox: os {os:?}, \
+         arch {:?} and its OS version (ADR-020 §4.9b); alice reads: {data}",
+        std::env::consts::ARCH
+    );
+    let machine = format!(
+        "{os} {} ({})",
+        data["os_version"].as_str().unwrap_or_default(),
+        std::env::consts::ARCH
+    );
 
     // ---- (2)-(4) alice addresses bob's node, and carol's, where no session announced itself ----
     let o = alice.vox_in(
@@ -1716,6 +1738,11 @@ fn a_sender_is_told_how_each_addressee_can_be_reached() {
     assert!(
         to_bob.contains("last posted "),
         "PRODUCT: bob's session posted, and alice must be told when: {to_bob}"
+    );
+    assert!(
+        to_bob.contains(&format!("it says it runs on {machine}")),
+        "PRODUCT: alice must be told which machine bob's node says it runs on ({machine}), as its \
+         claim (ADR-020 §4.9b): {to_bob}"
     );
     assert!(
         to_carol.contains("none of its sessions has announced itself in this room"),

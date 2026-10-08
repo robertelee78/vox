@@ -1288,6 +1288,13 @@ fn render_members(
             // The selected member's card (ADR-028 K-1, L-9): its fingerprint whole and grouped,
             // with its art beside it, never the art alone.
             if selected == Some(m.id) && focus {
+                // Which machine it says it runs on (ADR-020 §4.9b), as its claim.
+                if let Some(machine) = &m.machine {
+                    lines.push(Line::from(Span::styled(
+                        format!("    says it runs on {machine}"),
+                        theme::fg(theme::TEXT_SECONDARY),
+                    )));
+                }
                 for row in vox_text::fingerprint::card(&vox_core::node::link::b32_encode(&m.id)) {
                     lines.push(Line::from(format!("    {row}")));
                 }

@@ -75,10 +75,16 @@ final class NodeModel: ObservableObject {
     @Published private(set) var messages: [RoomMessage] = [] {
         didSet {
             byID = Dictionary(messages.map { ($0.id, $0) }) { $1 }
+            var said: [String: NodePlatform] = [:]
+            for message in messages { if let p = message.platform { said[message.author] = p } }
+            if said != platforms { platforms = said }
         }
     }
     /// The room on screen's messages by id, for what is in view.
     private(set) var byID: [String: RoomMessage] = [:]
+    /// The platform each member's node says it runs on, from its latest `hello` that says so in
+    /// the room on screen (ADR-020 §4.9b), by fingerprint: its claim, never checked.
+    @Published private(set) var platforms: [String: NodePlatform] = [:]
     /// Who has read each of this node's own messages in the room on screen, by message id (R-6).
     @Published private(set) var readBy: [String: [String]] = [:]
     /// Who has pulled each of this node's own shares in the room on screen, verified, by the

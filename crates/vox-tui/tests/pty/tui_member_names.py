@@ -13,6 +13,11 @@ opens the keyring view, which shows each node Bob trusts, Alice and Erin (a node
 room), by name with its grouped fingerprint and its art; Alice's art there is her card's, and
 Erin's is another. Mutation: the art drawn from the alias instead of the fingerprint turns it red.
 
+ADR-020 §4.9b (#568): a session of Alice's takes part in work coordination, so its `hello` is
+posted, carrying the machine Vox says it runs on (data.os, os_version, arch). Alice trusts Bob, so
+he reads it; her card in his members pane must say "says it runs on <os> <os_version> (<arch>)",
+exactly what that Vox-written hello says. Mutation: the line dropped from the card turns it red.
+
 Exit 0 = pass, 1 = red
 (the product's), 2 = apparatus (CANNOT MEASURE). A `vox` step on the way that fails (an identity,
 a daemon, create, invite, join, trust, the roster) is the product's red: it prints `PRODUCT:` with
@@ -135,6 +140,36 @@ try:
     for (who, name) in (("alice", "alice"), ("erin", "erin")):
         t = run("bob", "trust", "add", fp[who], "--name", name, "--identity-passphrase-file", f"{S}/idpass")
         if t.returncode != 0: product(f"bob's `vox trust add` of {name} failed: {t.stderr.strip()}")
+    stage("alice's session says hello")
+    # Alice trusts Bob, so he reads her; a session of hers takes part in work coordination, so its
+    # hello is posted, with the machine Vox fills in (ADR-020 §4.9b).
+    t = run("alice", "trust", "add", fp["bob"], "--name", "bob", "--identity-passphrase-file", f"{S}/idpass")
+    if t.returncode != 0: product(f"alice's `vox trust add` of bob failed: {t.stderr.strip()}")
+    e = env("alice"); e.update(VOX_SESSION="alice-session-1")
+    p = subprocess.run([VOX, "room", "post", room, "--type", "status", "--work", "test:568", "-"],
+                       env=e, input="checking the machine claim", capture_output=True, text=True, timeout=120)
+    if p.returncode != 0: product(f"alice's session's `vox room post --work` failed: {p.stderr.strip()}")
+    import json
+    hello = {}
+    def bob_reads_hello():
+        global hello
+        r = run("bob", "room", "read", room, "--json")
+        for line in r.stdout.splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            env_ = row.get("envelope") or {}
+            if env_.get("type") == "hello" and env_.get("from") == "alice-session-1":
+                hello = env_.get("data") or {}
+                return True
+        return False
+    if not until(bob_reads_hello, 90, 1):
+        product("bob never read alice's session's hello within 90 s")
+    if not (hello.get("os") and hello.get("arch")):
+        product(f"alice's hello carries no machine (ADR-020 §4.9b): its data is {hello!r}")
+    machine = " ".join(x for x in (hello["os"], hello.get("os_version", "")) if x) + f" ({hello['arch']})"
+    print(f"{TAG} bob reads alice's hello: {hello!r}")
     stage("bob's roster")
     # Bob's node must know both members before its TUI is opened.
     def roster():
@@ -189,12 +224,16 @@ try:
         tui.key("\x1b[B", 1)  # Down: the next member
     rows = [r.rstrip() for r in members()]
     at = next((i for i, r in enumerate(rows) if picked(r)), None)
-    under = rows[at + 1:at + 8] if at is not None else []
+    under = rows[at + 1:at + 10] if at is not None else []
     card_art = art(under)
     first_groups = grouped(fp["alice"])[:24]
     card_ok = len(card_art) == 5 and any(first_groups in r for r in under)
     print(f"{TAG} alice selected: {at is not None}; her card: art {card_art!r}, "
           f"'{first_groups}' beside it: {any(first_groups in r for r in under)}")
+    machine_ok = any(f"says it runs on {machine}" in r for r in under)
+    print(f"{TAG} her card says she runs on {machine!r}: {machine_ok}")
+    for r in under:
+        print(f"  |{r}")
 
     stage("the keyring view")
     tui.key("\x1b", 2)  # Esc: back to the room list
@@ -218,7 +257,7 @@ try:
     print(f"{TAG} the keyring shows alice and erin with their grouped fingerprints and art: "
           f"{keyring_ok}; alice's art is her card's: {same_as_card}; erin's is another: {differs}")
     code = 0 if (alice_ok and not alice_fp_shown and carol_ok and card_ok and keyring_ok
-                 and same_as_card and differs) else 1
+                 and same_as_card and differs and machine_ok) else 1
     print(f"{TAG} {'PASS' if code == 0 else 'RED'}")
 except Hung as h:
     # A verb past the product's bound for it is the RED below, raised before this; so here every
