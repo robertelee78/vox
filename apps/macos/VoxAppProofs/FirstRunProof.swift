@@ -242,7 +242,7 @@ final class FirstRunProof: XCTestCase {
         ui.launchEnvironment = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "HOME": home,
                                 "VOX_PROXY": "127.0.0.1:0"]
         try scratchOnly(ui.launchEnvironment, under: scratchPath)
-        launch(ui)
+        ui.launch()
         defer { ui.terminate() }
         let said = Key.id("login-item-said")
         let quoted = words(ui, said, timeout: 30,
@@ -323,7 +323,7 @@ final class FirstRunProof: XCTestCase {
         let ui = XCUIApplication(url: app)
         ui.launchEnvironment = voxEnv
         try scratchOnly(ui.launchEnvironment, under: scratchPath)
-        launch(ui)
+        ui.launch()
         defer {
             ui.terminate()
             _ = run(vox, ["node", "detach", "alice"], env: voxEnv)
@@ -455,7 +455,7 @@ final class FirstRunProof: XCTestCase {
         let ui = XCUIApplication(url: app)
         ui.launchEnvironment = voxEnv
         try scratchOnly(ui.launchEnvironment, under: scratchPath)
-        launch(ui)
+        ui.launch()
 
         if from > 5 {
             // The app attaches alice itself, her passphrase typed, as in step 2.
@@ -1071,7 +1071,7 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("alice's node never held bob's WHILE-APP-CLOSED in 60 s: \(held)")
         }
         try scratchOnly(ui.launchEnvironment, under: scratchPath)
-        launch(ui)
+        ui.launch()
         let reopened = words(ui, Key.id("group-needs you"), timeout: 30,
                              "bob's message to alice came while the app was closed; opened again, the app must count it from what her node recorded as read, mission under \"needs you (1)\"",
                              until: { $0.lowercased() == "needs you (1)" }) ?? ""
@@ -1236,21 +1236,6 @@ final class FirstRunProof: XCTestCase {
         return nil
     }
 
-    /// Launch the app with its main window inside the screen's visible frame, 40 points clear of
-    /// its top and bottom edges, whatever frame the account's `us.vox.app` defaults keep: a window
-    /// left reaching the bottom edge put the services room picker where the pointer reveals an
-    /// auto-hidden Dock, and its click opened nothing. The argument holds for this launch only.
-    private func launch(_ ui: XCUIApplication) {
-        if let screen = NSScreen.main?.visibleFrame {
-            let f = screen.insetBy(dx: 8, dy: 40)
-            let frame = [f.minX, f.minY, f.width, f.height,
-                         screen.minX, screen.minY, screen.width, screen.height]
-                .map { String(Int($0)) }.joined(separator: " ")
-            ui.launchArguments = ["-NSWindow Frame main", frame + " "]
-        }
-        ui.launch()
-    }
-
     /// Whether a menu other than the menu bar's is open: the menu bar's own menus have no size
     /// until opened.
     private func menuOpen(_ ui: XCUIApplication) -> Bool {
@@ -1400,9 +1385,13 @@ final class FirstRunProof: XCTestCase {
         let end = Date().addingTimeInterval(10)
         repeat {
             if let e = locate(ui, key) {
-                // Shown but off screen in a scroll view: scrolled to, as a person does.
-                if !e.isHittable { scrollTo(ui, e) }
-                if e.isHittable {
+                // Shown but out of view (off screen, or clipped by its scroll view): scrolled to,
+                // as a person does, so the click lands on it.
+                // A menu item is in its open menu, not in a scroll view: hittable is enough.
+                let reached: () -> Bool
+                if case .menuItem = key { reached = { e.isHittable } } else { reached = { self.inView(ui, e) } }
+                if !reached() { scrollTo(ui, e) }
+                if reached() {
                     e.click()
                     return true
                 }
@@ -1414,21 +1403,40 @@ final class FirstRunProof: XCTestCase {
             return false
         }
         keepTree(ui, "\(what) could not be clicked")
-        XCTFail("APPARATUS: XCTest cannot click \(what) (\(key)): shown, never hittable",
+        XCTFail("APPARATUS: XCTest cannot click \(what) (\(key)): shown, never in view to click",
                 file: file, line: line)
         return false
     }
 
     /// Scroll the window's scroll view that holds `e` until `e` is on screen (or it moves no more).
+    /// Whether a click on `e` reaches it: hittable, and wholly inside the scroll view that holds it
+    /// (XCTest calls a row clipped below its scroll view hittable, and a click there lands on
+    /// whatever is drawn over it).
+    private func inView(_ ui: XCUIApplication, _ e: XCUIElement) -> Bool {
+        guard e.isHittable else { return false }
+        let f = e.frame
+        // The scroll view that holds it: one it is a descendant of, found by its identifier,
+        // under it on screen (XCTest also found it among the sidebar's descendants); a target
+        // with no identifier, or in no scroll view, is clicked where it is.
+        let id = e.identifier
+        guard !id.isEmpty, let view = ui.windows.firstMatch.scrollViews.allElementsBoundByIndex.first(where: {
+            $0.frame.minX <= f.midX && f.midX <= $0.frame.maxX
+                && $0.descendants(matching: .any).matching(identifier: id).firstMatch.exists
+        })?.frame else { return true }
+        return view.minY <= f.minY && f.maxY <= view.maxY
+    }
+
     private func scrollTo(_ ui: XCUIApplication, _ e: XCUIElement) {
         let target = e.frame
+        let id = e.identifier
         guard let view = ui.windows.firstMatch.scrollViews.allElementsBoundByIndex.first(where: {
             $0.frame.minX <= target.midX && target.midX <= $0.frame.maxX
+                && (id.isEmpty || $0.descendants(matching: .any).matching(identifier: id).firstMatch.exists)
         }) else { return }
-        for _ in 0..<20 where !e.isHittable {
+        for _ in 0..<20 where !inView(ui, e) {
             let now = e.frame
-            let down = now.midY > view.frame.maxY
-            let up = now.midY < view.frame.minY
+            let down = now.maxY > view.frame.maxY
+            let up = now.minY < view.frame.minY
             guard down || up else { return }
             view.scroll(byDeltaX: 0, deltaY: down ? -200 : 200)
             if e.frame == now { return }
