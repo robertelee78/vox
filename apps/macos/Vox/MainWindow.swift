@@ -24,6 +24,8 @@ struct MainWindow: View {
                     DecisionsView(model: model)
                 case .services:
                     ServicesView(model: model)
+                case let .offer(fingerprint):
+                    OfferView(model: model, fingerprint: fingerprint).id(fingerprint)
                 case nil:
                     Text("Pick a room.")
                         .secondaryText()
@@ -62,15 +64,21 @@ private struct Sidebar: View {
             }
             ForEach([RoomGroup.needsYou, .active, .quiet], id: \.self) { need in
                 let rooms = model.group(need)
+                // A trust offer waiting needs the person too (ADR-028 K-15, W-2).
+                let offers = need == .needsYou ? model.offers : []
+                let count = rooms.count + offers.count
                 Section {
                     ForEach(rooms) { room in
                         RoomRow(room: room).tag(NodeModel.Selection.room(room.id))
                     }
+                    ForEach(offers, id: \.fingerprint) { offer in
+                        OfferRow(offer: offer).tag(NodeModel.Selection.offer(offer.fingerprint))
+                    }
                 } header: {
-                    Text("\(need.words) (\(rooms.count))")
+                    Text("\(need.words) (\(count))")
                         .eyebrow()
                         .accessibilityIdentifier("group-\(need.words)")
-                        .accessibilityLabel("\(need.words) (\(rooms.count))")
+                        .accessibilityLabel("\(need.words) (\(count))")
                 }
             }
             Section {
