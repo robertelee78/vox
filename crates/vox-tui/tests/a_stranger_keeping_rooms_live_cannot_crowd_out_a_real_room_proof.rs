@@ -230,7 +230,7 @@ async fn connect_from(
     let endpoint = VoxEndpoint::bind(Arc::clone(signer) as Arc<_>, local)
         .expect("APPARATUS: bind the stand-in peer's endpoint");
     let conn = endpoint
-        .connect(addr, id, hostile::now())
+        .connect(addr, id, hostile::now_ms())
         .await
         .unwrap_or_else(|e| panic!("PRODUCT (staging): connect {local} -> {addr}: {e:?}"));
     (endpoint, Arc::new(conn))

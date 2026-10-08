@@ -642,12 +642,34 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
             (&[][..], notices, shown)
         }
     };
+    // **A Session's name and id are its node's claim** (ADR-029 MD-3): over another node's
+    // Session, a line says so beside the node, as this node knows it. This node's own needs none.
+    let claim = session
+        .filter(|x| x.node_alias != crate::ident::YOU)
+        .map(|x| format!("{} — name and id as {} says", x.label, x.node_alias));
+    let area = match &claim {
+        Some(line) => {
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(body[0]);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    line.clone(),
+                    Style::default().add_modifier(Modifier::DIM),
+                ))),
+                split[0],
+            );
+            split[1]
+        }
+        None => body[0],
+    };
     // Inside a Session, for a member with drive: its activity, a line each (SC-1).
     let inside = session.filter(|x| x.can_drive || !channel.session_lines.is_empty());
     if let Some(x) = inside {
         render_session(
             frame,
-            body[0],
+            area,
             &channel.session_lines,
             (ui.selected_session_line, ui.details_open),
             &format!(
@@ -664,7 +686,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
     } else {
         (ui.timeline_scroll, ui.on_screen) = render_timeline(
             frame,
-            body[0],
+            area,
             &channel.held_back,
             timeline,
             (&notices, &channel.retention, &shown),

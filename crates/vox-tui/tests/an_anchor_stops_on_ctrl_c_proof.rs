@@ -613,6 +613,10 @@ fn every_long_running_verb_stops_cleanly_on_every_stop_signal() {
             &args(&[
                 "serve",
                 &format!("{0}={0}", w.service_port),
+                // A room of its own name for each serve: a node holds one room of a name, so a
+                // second `vox serve` under the default name is refused, and rightly.
+                "--name",
+                &format!("stop-{}", sig.0.to_lowercase()),
                 "--anchor",
                 &w.host_anchor,
                 "--listen",

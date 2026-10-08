@@ -1269,7 +1269,9 @@ fn waiting_ref(plain: &str, line: &str, flag: &str) -> Option<String> {
 ///    refused, saying it was answered at the terminal.
 /// 5. approved from the Session's own node: `claude-a`, the node the session runs on, approves
 ///    with `vox room session` as its operator (ADR-029 SC-2), trusting nobody but `person`. The
-///    hook gives the approval; `person`'s Session reads "answered in Vox by claude-a: approved".
+///    hook gives the approval; once the harness records it, `claude-a` (what the app reads) reads
+///    "approved here" and `person` "answered in Vox by claude-a: approved", with no request waiting
+///    on either.
 /// 6. a file sent in from the Session's own node: it lands whole on that node, where the Session
 ///    says (no tunnel runs from a node to itself, so it is copied from the share).
 /// 7. another node on the same daemon, through the own-node path: the test, as an attacker
@@ -1280,7 +1282,8 @@ fn waiting_ref(plain: &str, line: &str, flag: &str) -> Option<String> {
 /// **Mutations that must turn it red** (#545's own): the request closed when the Session's answer
 /// is sent → arm 4 reads "approved here". A node's own drive refused as an untrusted node's (DR-2
 /// without the node itself) → arm 5 is refused. A file from the node itself pulled as from another
-/// node → arm 6 reads "did not arrive whole". The own-node request served as whichever attached node
+/// node → arm 6 reads "did not arrive whole". The sink not posting its `resolved` entry → arm 5's
+/// request still waits. The own-node request served as whichever attached node
 /// holds the Session (not the one the connection is attached as) → arm 7's request is delivered.
 #[test]
 #[ignore = "real binary; run in release"]
@@ -1480,6 +1483,38 @@ fn an_approval_is_answered_from_either_side_and_the_first_answer_wins() {
          {said:?}, the hook gave {d}"
     );
     transcript.tool_result("toolu_5", "", false);
+    // Once the harness records it, nothing waits any more: on the Session's own node, which
+    // answered and reads it as answered here (what the app reads, CL-1), and on the other
+    // member's, which reads who answered. `waiting` is what `pending` counts.
+    for (reader, reads) in [
+        (AGENT, "approved here".to_owned()),
+        (PERSON, format!("answered in Vox by {AGENT}: approved")),
+    ] {
+        let t0 = Instant::now();
+        let (still, request) = loop {
+            let (_, out, _) = w.vox(reader, &["room", "session", &room, SESSION, "--json"], None);
+            let lines: Vec<serde_json::Value> = out
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect();
+            let still = lines.iter().filter(|l| l["waiting"] == true).count();
+            let request = lines
+                .iter()
+                .find(|l| l["ref"] == "toolu_5" && l["kind"] == "approval")
+                .map(|l| l["line"].as_str().unwrap_or_default().to_owned());
+            let settled = request.as_deref().is_some_and(|r| r.ends_with(&reads));
+            if (still == 0 && settled) || t0.elapsed() > Duration::from_secs(60) {
+                break (still, request);
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        };
+        println!("[proof] 5. {reader} reads: {request:?}, {still} request(s) waiting");
+        assert!(
+            still == 0 && request.as_deref().is_some_and(|r| r.ends_with(&reads)),
+            "PRODUCT: arm 5: once the harness records the approval, {reader} must read the request \
+             as {reads:?} and none waiting (pending 0); it read {request:?} with {still} waiting"
+        );
+    }
     session_says(&format!(
         "Bash: touch e5 — answered in Vox by {AGENT}: approved"
     ));

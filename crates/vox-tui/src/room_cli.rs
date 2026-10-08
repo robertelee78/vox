@@ -3509,27 +3509,34 @@ async fn collect_offer(
     }
 
     let (bound, mut events) = open_forward(client, paths, channel_id, offer).await?;
-    let result = collect(&bound, &dest, offer).await.and_then(|placed| {
-        // **A copy in the node's files directory ends with its message** (ADR-028 F-5): it is
-        // recorded so the daemon deletes it then. One the person put elsewhere is theirs.
-        if managed {
-            vox_core::node::pulls::record(
-                paths,
-                &vox_core::node::pulls::Pulled {
-                    room: channel_id,
-                    entry: offer.entry,
-                    path: placed,
-                    created_ms: offer.created_ms,
-                    folder: None,
-                    files: Vec::new(),
-                },
-            )
-            .map_err(|e| {
-                AppError::Usage(format!("the file landed, but cannot be recorded: {e}"))
-            })?;
-        }
-        Ok(())
-    });
+    let mut started = false;
+    let result = collect(&bound, &dest, offer)
+        .await
+        .map_err(|(e, got)| {
+            started = got > 0;
+            e
+        })
+        .and_then(|placed| {
+            // **A copy in the node's files directory ends with its message** (ADR-028 F-5): it is
+            // recorded so the daemon deletes it then. One the person put elsewhere is theirs.
+            if managed {
+                vox_core::node::pulls::record(
+                    paths,
+                    &vox_core::node::pulls::Pulled {
+                        room: channel_id,
+                        entry: offer.entry,
+                        path: placed,
+                        created_ms: offer.created_ms,
+                        folder: None,
+                        files: Vec::new(),
+                    },
+                )
+                .map_err(|e| {
+                    AppError::Usage(format!("the file landed, but cannot be recorded: {e}"))
+                })?;
+            }
+            Ok(())
+        });
     let _ = client
         .request(&Request::StopForward {
             local: bound.clone(),
@@ -3541,7 +3548,7 @@ async fn collect_offer(
         // the sharer refused says that, not the socket's error ("Connection reset by peer"). One
         // that sent the wrong bytes says that, whatever the node said.
         Err(e) if !e.to_string().contains("announced") => match events.as_mut() {
-            Some(ev) => Err(why_not_collected(ev, offer).await.unwrap_or(e)),
+            Some(ev) => Err(why_not_collected(ev, offer, started).await.unwrap_or(e)),
             None => Err(e),
         },
         other => other,
@@ -3701,7 +3708,9 @@ async fn collect_folder(
                 e
             } else {
                 match events.as_mut() {
-                    Some(ev) => why_not_collected(ev, offer).await.unwrap_or(e),
+                    Some(ev) => why_not_collected(ev, offer, !done.fetched.is_empty())
+                        .await
+                        .unwrap_or(e),
                     None => e,
                 }
             });
@@ -3730,9 +3739,25 @@ async fn collect_folder(
 /// sharer withdrew it mid-transfer (the transfer's stream was reset; this says why), refused it
 /// (it no longer serves the offer: this node reads the announcement, so the sharer trusted it),
 /// or could not be reached. `None` if it said none of these.
-async fn why_not_collected(events: &mut IpcClient, offer: &Offer) -> Option<AppError> {
+///
+/// **The words follow the cause, not the first refusal heard.** A transfer cut mid-way is
+/// retried, and the host refuses the retry once the offer is gone: that refusal can arrive before
+/// the one saying the host withdrew access, and the person was told the offer "is gone" rather
+/// than "withdrawn while it was being collected" (2 of 30 transfers). So every refusal for the
+/// offer within the moment is read, and the withdrawal, which explains the others, wins. And the
+/// host does not always say it withdrew access: a cut that lands early ends the transfer some
+/// other way, and the one refusal heard is the retry's. A refusal of a transfer that had `started`
+/// (some of the offer came) is said as what is known, never as a withdrawal: it stopped partway,
+/// served to this node no more, for the host's own reason, which may be the sharer stopping it, its count or time
+/// running out, its trust in this node ending, or a restart without it.
+async fn why_not_collected(
+    events: &mut IpcClient,
+    offer: &Offer,
+    started: bool,
+) -> Option<AppError> {
     use vox_core::node::api::NodeEvent;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let (mut withdrew, mut refused, mut other) = (None, None, None);
     while let Ok(Ok(Some(frame))) = tokio::time::timeout_at(deadline, events.next()).await {
         let Frame::Event(NodeEvent::ProxyRefused { reason }) = frame else {
             continue;
@@ -3740,31 +3765,46 @@ async fn why_not_collected(events: &mut IpcClient, offer: &Offer) -> Option<AppE
         if !reason.contains(&offer.tag) {
             continue;
         }
-        let who = crate::ident::name_of(&offer.author);
-        return Some(AppError::Usage(if reason.contains("withdrew access") {
-            // Reached, and serving it a moment ago: the sharer stopped sharing mid-transfer.
-            format!(
-                "the offer of {} was withdrawn while it was being collected: {who} stopped \
-                 sharing it ({reason}). The file is served only while {who} shares it; ask them \
-                 to share it again",
-                offer.name
-            )
+        if reason.contains("withdrew access") {
+            withdrew = Some(reason);
+            break;
         } else if reason.contains("the host refused") {
-            format!(
-                "the offer of {} is gone: {who} no longer serves it. The announcement stays in \
-                 the room, but the file is served only while {who} shares it; ask them to share \
-                 it again",
-                offer.name
-            )
+            refused.get_or_insert(reason);
         } else {
-            format!(
-                "the offer of {} cannot be collected now: {who} could not be reached ({reason}). \
-                 The file is served only while {who} is online and sharing it",
-                offer.name
-            )
-        }));
+            other.get_or_insert(reason);
+        }
     }
-    None
+    let who = crate::ident::name_of(&offer.author);
+    Some(AppError::Usage(if let Some(reason) = withdrew {
+        // Reached, and serving it a moment ago: the sharer stopped sharing mid-transfer.
+        format!(
+            "the offer of {} was withdrawn while it was being collected: {who} stopped sharing it \
+             ({reason}). The file is served only while {who} shares it; ask them to share it again",
+            offer.name
+        )
+    } else if let Some(reason) = refused.as_ref().filter(|_| started) {
+        // Served a moment ago, refused now: all that is known is that it stopped being served to
+        // this node partway. The sharer may have stopped sharing it, or its count or time may
+        // have run out, or it may no longer trust this node, or it restarted without it: the
+        // host's own reason says which.
+        format!(
+            "the offer of {} stopped partway: {who} stopped serving it to this node ({reason}). \
+             The file is served only while {who} shares it with you; ask them to share it again",
+            offer.name
+        )
+    } else if refused.is_some() {
+        format!(
+            "the offer of {} is gone: {who} no longer serves it. The announcement stays in the \
+             room, but the file is served only while {who} shares it; ask them to share it again",
+            offer.name
+        )
+    } else {
+        format!(
+            "the offer of {} cannot be collected now: {who} could not be reached ({}). The file \
+             is served only while {who} is online and sharing it",
+            offer.name, other?
+        )
+    }))
 }
 
 /// Where a collected file is to land.
@@ -3813,7 +3853,7 @@ async fn collect(
     bound: &str,
     dest: &Destination,
     offer: &Offer,
-) -> Result<std::path::PathBuf, AppError> {
+) -> Result<std::path::PathBuf, (AppError, u64)> {
     let dir = dest.dir();
     // `create_new`, so the temporary file is never somebody else's either.
     let (part, file) = (0..1000)
@@ -3827,24 +3867,30 @@ async fn collect(
                 .map(|f| (p, f))
         })
         .ok_or_else(|| {
-            AppError::Usage(format!(
-                "cannot create a temporary file in {}",
-                dir.display()
-            ))
+            (
+                AppError::Usage(format!(
+                    "cannot create a temporary file in {}",
+                    dir.display()
+                )),
+                0,
+            )
         })?;
     let result = receive(bound, file, &dir, offer).await;
     let total = match result {
         Ok(total) => total,
         Err(e) => {
+            // How much of it came before it stopped: a transfer the host refuses after serving
+            // some of it was withdrawn while it was being collected.
+            let got = std::fs::metadata(&part).map_or(0, |m| m.len());
             // **Only the `.part` is removed.** It is the one file this collector created;
             // whatever was in the directory before is not its to delete.
             let _ = std::fs::remove_file(&part);
-            return Err(e);
+            return Err((e, got));
         }
     };
     let placed = place(&part, dest);
     let _ = std::fs::remove_file(&part);
-    let placed = placed?;
+    let placed = placed.map_err(|e| (e, 0))?;
     println!(
         "vox: {} ({total} bytes) matches its announced SHA-256",
         placed.display()

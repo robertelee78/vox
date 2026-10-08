@@ -95,8 +95,9 @@ pub struct SharedEndpoint {
     /// Set once [`SharedEndpoint::close`] has run.
     closed: tokio::sync::watch::Sender<bool>,
     /// Each node's connections, by node, so a node gone without detaching can still have its own
-    /// closed ([`SharedEndpoint::evict`]). Closed ones are dropped as new ones are added.
-    by_node: Mutex<std::collections::HashMap<Digest32, Vec<Connection>>>,
+    /// closed ([`SharedEndpoint::evict`]). Closed ones are dropped as new ones are added, and each
+    /// is taken out when its [`VoxConnection`] is dropped (see [`Tracked`]).
+    by_node: Arc<ByNode>,
     /// The socket's own drop count, `(epoch, drops)`, as the overflow sampler last read it
     /// (ADR-024 RO-1); `None` until it has, and for a socket with no such count. Each direct
     /// connection reports it to its peer ([`crate::transport::overflow`]).
@@ -863,7 +864,7 @@ impl SharedEndpoint {
             registry: Mutex::new(std::collections::HashMap::new()),
             limiter: identity::AskLimiter::standard(),
             closed: tokio::sync::watch::channel(false).0,
-            by_node: Mutex::new(std::collections::HashMap::new()),
+            by_node: Arc::new(Mutex::new(std::collections::HashMap::new())),
             overflow,
         }))
     }
@@ -926,11 +927,16 @@ impl SharedEndpoint {
     }
 
     /// File `conn` under the node `local`, for [`Self::evict`].
-    fn track(&self, local: Digest32, conn: &Connection) {
+    fn track(&self, local: Digest32, conn: &Connection) -> Tracked {
         let mut by = lock(&self.by_node);
         let list = by.entry(local).or_default();
         list.retain(|c| c.close_reason().is_none());
         list.push(conn.clone());
+        Tracked {
+            by_node: Arc::downgrade(&self.by_node),
+            local,
+            id: conn.stable_id(),
+        }
     }
 
     /// **Evict a node** that went without detaching — its actor panicked (ADR-026 L-6): take it
@@ -988,7 +994,7 @@ impl SharedEndpoint {
     pub async fn finish_incoming(
         &self,
         incoming: quinn::Incoming,
-        now_secs: u64,
+        now_ms: u64,
     ) -> Result<VoxConnection> {
         let remote = incoming.remote_address();
         // Read before this end answers anything: see [`VoxConnection::via_circuit`].
@@ -1033,10 +1039,11 @@ impl SharedEndpoint {
                 "the node asked for went away during the identity exchange".to_owned(),
             ));
         };
-        self.track(local.id(), &connection);
+        let local_id = local.id();
         let overflow = (!via_circuit).then(|| self.overflow.clone());
         let mut conn =
-            finish_connection(connection, local, &proven, now_secs, via_circuit, overflow)?;
+            finish_connection(connection, local, &proven, now_ms, via_circuit, overflow)?;
+        conn.tracked = Some(self.track(local_id, &conn.connection));
         conn.circuit_origin = circuit_origin.filter(|_| via_circuit);
         conn.carrier = carrier.filter(|_| via_circuit);
         Ok(conn)
@@ -1066,11 +1073,13 @@ impl SharedEndpoint {
     pub fn close(&self) {
         // A stopping node's last word to every connection it still has (V210-93): "stopped",
         // the same as `ConnectionManager::close_all` says, never a code that reads as a fault.
+        // Marked closed first: the accept loop that ends on it reads this to know the end was
+        // asked for.
+        self.closed.send_replace(true);
         self.endpoint.close(
             close_code(WireError::ShuttingDown),
             WireError::ShuttingDown.to_string().as_bytes(),
         );
-        self.closed.send_replace(true);
     }
 
     /// Whether the endpoint is closed, as a watch: `true` once [`Self::close`] has run.
@@ -1253,8 +1262,8 @@ impl VoxEndpoint {
     /// The neutral TLS handshake (post-quantum group, no classical fallback), then the identity
     /// exchange as the dialler ([`identity::dial`]): this node shows who it is only once the
     /// other end has proved, on this TLS session, to be `expected_peer`. Anything else — a
-    /// refusal, a `PROVE` that does not verify, silence — says "nothing at `addr` answers as
-    /// `expected_peer`" and names nobody (ADR-011 38a).
+    /// refusal, a `PROVE` that does not verify, silence — is said as what it was, naming nobody
+    /// but `expected_peer` ([`identity::DialFailed::into_error`], ADR-011 38a).
     ///
     /// # Errors
     /// As above, or a handshake failure by its own cause.
@@ -1262,7 +1271,7 @@ impl VoxEndpoint {
         &self,
         addr: SocketAddr,
         expected_peer: Digest32,
-        now_secs: u64,
+        now_ms: u64,
     ) -> Result<VoxConnection> {
         // Read before the first packet leaves: see [`VoxConnection::via_circuit`].
         let via_circuit = self.shared.mux.is_circuit(addr);
@@ -1281,15 +1290,15 @@ impl VoxEndpoint {
         let proven = identity::dial(&connection, &*signer, self.local.instance(), expected_peer)
             .await
             .map_err(|f| f.into_error(addr, &expected_peer))?;
-        self.shared.track(self.local_id, &connection);
         let mut conn = finish_connection(
             connection,
             Arc::clone(&self.local),
             &proven,
-            now_secs,
+            now_ms,
             via_circuit,
             (!via_circuit).then(|| self.shared.overflow.clone()),
         )?;
+        conn.tracked = Some(self.shared.track(self.local_id, &conn.connection));
         conn.carrier = carrier.filter(|_| via_circuit);
         Ok(conn)
     }
@@ -1300,8 +1309,8 @@ impl VoxEndpoint {
     ///
     /// # Errors
     /// A failed handshake or exchange.
-    pub async fn accept(&self, now_secs: u64) -> Result<Option<VoxConnection>> {
-        self.accept_with_admission(now_secs, Admission::AcceptAnyAuthenticated)
+    pub async fn accept(&self, now_ms: u64) -> Result<Option<VoxConnection>> {
+        self.accept_with_admission(now_ms, Admission::AcceptAnyAuthenticated)
             .await
     }
 
@@ -1313,13 +1322,13 @@ impl VoxEndpoint {
     /// As [`Self::finish_incoming`].
     pub async fn accept_with_admission(
         &self,
-        now_secs: u64,
+        now_ms: u64,
         admission: Admission,
     ) -> Result<Option<VoxConnection>> {
         let Some(incoming) = self.accept_incoming().await else {
             return Ok(None);
         };
-        self.finish_incoming(incoming, now_secs, admission)
+        self.finish_incoming(incoming, now_ms, admission)
             .await
             .map(Some)
     }
@@ -1341,10 +1350,10 @@ impl VoxEndpoint {
     pub async fn finish_incoming(
         &self,
         incoming: quinn::Incoming,
-        now_secs: u64,
+        now_ms: u64,
         mut admission: Admission,
     ) -> Result<VoxConnection> {
-        let conn = self.shared.finish_incoming(incoming, now_secs).await?;
+        let conn = self.shared.finish_incoming(incoming, now_ms).await?;
         if conn.local_id() != self.local_id {
             conn.close(WireError::ShuttingDown);
             return Err(Error::Handshake(
@@ -1481,7 +1490,7 @@ fn finish_connection(
     connection: Connection,
     local: Arc<LocalNode>,
     proven: &identity::Proven,
-    now_secs: u64,
+    now_ms: u64,
     via_circuit: bool,
     overflow: Option<tokio::sync::watch::Receiver<Option<(u32, u32)>>>,
 ) -> Result<VoxConnection> {
@@ -1489,7 +1498,7 @@ fn finish_connection(
     // Confirm the handshake ran under the Vox configuration and read the key-exchange group it
     // actually negotiated; a session under any group but the post-quantum hybrid is refused.
     let group = confirm_handshake(&connection)?;
-    let session = SessionEstablishment::observed(peer_id, group, now_secs)?;
+    let session = SessionEstablishment::observed(peer_id, group, now_ms)?;
     let peer_process = connection
         .peer_identity()
         .and_then(|any| {
@@ -1517,6 +1526,7 @@ fn finish_connection(
         carrier: None,
         tunnels: Arc::new(Mutex::new(0)),
         dropped: None,
+        tracked: None,
     })
 }
 
@@ -1584,6 +1594,8 @@ pub struct VoxConnection {
     tunnels: Arc<Mutex<u32>>,
     /// Told when this is dropped (see [`Self::tell_when_dropped`]).
     dropped: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Its entry in the endpoint's per-node list, taken out when this is dropped.
+    tracked: Option<Tracked>,
 }
 
 impl Drop for VoxConnection {
@@ -1592,6 +1604,41 @@ impl Drop for VoxConnection {
         // an otherwise-unused connection open for ever. Flows still bound keep it
         // reading until they end.
         self.router.release_owner();
+        // So does the endpoint's per-node list. **A connection nobody holds any more must close**,
+        // as quinn closes one when its last handle goes: kept alive by the list, a connection one
+        // end dropped unfiled (a dial that lost a race) stayed open at the other end, which filed
+        // it and opened streams nobody here would ever serve — the two ends then held different
+        // connections to each other (`a_displaced_relay_is_let_go`).
+        if let Some(t) = self.tracked.take() {
+            t.release();
+        }
+    }
+}
+
+/// The endpoint's per-node connection list ([`SharedEndpoint::evict`]'s).
+type ByNode = Mutex<std::collections::HashMap<Digest32, Vec<Connection>>>;
+
+/// A connection's place in [`ByNode`]: dropped with the connection, so the list never keeps a
+/// connection open that nothing else holds.
+#[derive(Debug)]
+struct Tracked {
+    by_node: std::sync::Weak<ByNode>,
+    local: Digest32,
+    id: usize,
+}
+
+impl Tracked {
+    fn release(self) {
+        let Some(by_node) = self.by_node.upgrade() else {
+            return;
+        };
+        let mut by = lock(&by_node);
+        if let Some(list) = by.get_mut(&self.local) {
+            list.retain(|c| c.stable_id() != self.id);
+            if list.is_empty() {
+                by.remove(&self.local);
+            }
+        }
     }
 }
 
@@ -1886,12 +1933,6 @@ static LIVE: Mutex<std::collections::BTreeMap<u64, Live>> =
 
 /// The next key in [`LIVE`].
 static NEXT_TUNNEL: AtomicU64 = AtomicU64::new(0);
-
-/// The time now in Unix seconds.
-#[must_use]
-pub fn unix_now() -> u64 {
-    unix_now_ms() / 1_000
-}
 
 /// The time now in Unix milliseconds, as [`LiveTunnel`] states times.
 #[must_use]

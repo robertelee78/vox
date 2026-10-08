@@ -363,6 +363,10 @@ const T_SESSION_ENTRIES: u64 = 5431;
 const T_SESSION_ROWS: u64 = 5432;
 const T_SESSIONS_REQ: u64 = 4940;
 const T_SESSIONS: u64 = 4941;
+/// `[5450, limit]` — [`Request::Decisions`] (#563).
+const T_DECISIONS_REQ: u64 = 5450;
+/// [`Frame::Decisions`].
+const T_DECISIONS: u64 = 5451;
 /// [`Frame::Appended`].
 const T_APPENDED: u64 = 5433;
 /// `[5434, channel_id, path, envelope, to]` — [`Request::SessionShare`]; `to` is `[0, session
@@ -533,6 +537,12 @@ pub enum Request {
     Sessions {
         /// The room.
         channel_id: Digest32,
+    },
+    /// This node's decision record, newest first (ADR-028 D-3), answered with
+    /// [`Frame::Decisions`]: read by the node, which alone opens it (#563).
+    Decisions {
+        /// The most events to answer with.
+        limit: u64,
     },
     /// The members offered to this node's keyring (ADR-028 K-15 – K-18), answered with
     /// [`Frame::Offers`].
@@ -907,6 +917,9 @@ impl Request {
             }
             Request::Sessions { channel_id } => {
                 e.array(2).uint(T_SESSIONS_REQ).bytes(channel_id);
+            }
+            Request::Decisions { limit } => {
+                e.array(2).uint(T_DECISIONS_REQ).uint(*limit);
             }
             Request::Offers => {
                 e.array(1).uint(T_OFFERS_REQ);
@@ -1464,6 +1477,14 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Sessions { channel_id })
             }
+            (T_DECISIONS_REQ, 2) => {
+                let limit = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc decisions limit"))?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Decisions { limit })
+            }
             (T_OFFERS_REQ, 1) => {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
@@ -1767,6 +1788,11 @@ pub enum Frame {
         /// Each Session.
         sessions: Vec<crate::node::sessions::SessionRow>,
     },
+    /// The decision record's newest events, as a [`Request::Decisions`] asked for.
+    Decisions {
+        /// Each event, newest first.
+        events: Vec<crate::node::decisions::Event>,
+    },
     /// The members offered to the keyring, as a [`Request::Offers`] asked for.
     Offers {
         /// Each offer, in fingerprint order.
@@ -1935,6 +1961,29 @@ impl Frame {
             Frame::Sessions { sessions } => {
                 e.array(2).uint(T_SESSIONS);
                 crate::node::sessions::put_rows(&mut e, sessions);
+            }
+            Frame::Decisions { events } => {
+                e.array(2).uint(T_DECISIONS).array(events.len());
+                for ev in events {
+                    e.array(7).uint(ev.at_ms).text(&ev.asked).text(&ev.by);
+                    match &ev.alias {
+                        Some(a) => {
+                            e.array(1).text(a);
+                        }
+                        None => {
+                            e.array(0);
+                        }
+                    }
+                    e.text(&ev.decided).text(&ev.why);
+                    match &ev.room {
+                        Some(r) => {
+                            e.array(1).text(r);
+                        }
+                        None => {
+                            e.array(0);
+                        }
+                    }
+                }
             }
             Frame::Offers { offers } => {
                 e.array(2).uint(T_OFFERS);
@@ -2565,6 +2614,41 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
         (T_SESSIONS, 2) => {
             let sessions = crate::node::sessions::read_rows(d)?;
             return Ok(Frame::Sessions { sessions });
+        }
+        (T_DECISIONS, 2) => {
+            let bad = || Error::MalformedIpc("ipc decisions");
+            let n = d.array().map_err(|_| bad())?;
+            let mut events = Vec::with_capacity(n.min(1_024));
+            for _ in 0..n {
+                if d.array().map_err(|_| bad())? != 7 {
+                    return Err(bad());
+                }
+                let at_ms = d.uint().map_err(|_| bad())?;
+                let asked = text(d, "ipc decision asked")?;
+                let by = text(d, "ipc decision by")?;
+                let alias = match d.array().map_err(|_| bad())? {
+                    0 => None,
+                    1 => Some(text(d, "ipc decision alias")?),
+                    _ => return Err(bad()),
+                };
+                let decided = text(d, "ipc decision decided")?;
+                let why = text(d, "ipc decision why")?;
+                let room = match d.array().map_err(|_| bad())? {
+                    0 => None,
+                    1 => Some(text(d, "ipc decision room")?),
+                    _ => return Err(bad()),
+                };
+                events.push(crate::node::decisions::Event {
+                    at_ms,
+                    asked,
+                    by,
+                    alias,
+                    decided,
+                    why,
+                    room,
+                });
+            }
+            return Ok(Frame::Decisions { events });
         }
         (T_OFFERS, 2) => {
             let offers = crate::node::offers::read_offers(d)?;
@@ -4367,6 +4451,11 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             None => Frame::Error {
                 reason: "room not open".into(),
             },
+        },
+        Request::Decisions { limit } => Frame::Decisions {
+            events: handle
+                .decisions()
+                .recent(usize::try_from(limit).unwrap_or(usize::MAX), None),
         },
         Request::Offers => Frame::Offers {
             offers: handle.view().offers.clone(),

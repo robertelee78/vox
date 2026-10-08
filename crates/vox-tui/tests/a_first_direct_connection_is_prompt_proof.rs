@@ -119,6 +119,19 @@ const PAYLOAD: usize = 16 * 1024;
 /// head start and the new one. Whether a forward staged it is read from the guest's own ladder,
 /// never from a wall clock.
 const SLOW_DIRECT_DELAYS: [u64; 6] = [180, 150, 120, 90, 60, 30];
+/// How long the host's reaches wait in [`a_side_that_can_reach_directly_asks_for_no_circuit`]
+/// (`VOX_TEST_HOLD_REACH_MS`): longer than a guest's whole reach, head start and board read
+/// included, so the guest's own reach is the one that finds the host.
+const HOST_REACH_HOLD: Duration = Duration::from_millis(2500);
+/// How long the guest's forward holds its reaches in
+/// [`a_side_that_can_reach_directly_asks_for_no_circuit`]: a fresh node's first reach of the host
+/// set out beside its anchor dial, before any relay was connected, so it had no circuit to hold back
+/// and the claim was never put to the test. Held this long, the reach starts with its anchor held,
+/// as a node that has been up a while reaches.
+const GUEST_REACH_HOLD: Duration = Duration::from_millis(400);
+/// How long carol's reaches wait in [`the_host_asks_a_guest_to_dial_back`]: long enough that the
+/// host, posting to her, reaches her first.
+const CAROL_REACH_HOLD: Duration = Duration::from_millis(5000);
 /// The old head start and the circuit's 10 ms poll, written as a number: a direct connection that
 /// answered a waiting circuit this far into the reach, or later, would have lost the race to it.
 const OLD_HEAD_START_MS: u128 = 260;
@@ -143,6 +156,17 @@ fn gave_way(note: &str) -> Option<(&str, u128)> {
 /// "reached … in 271 ms", 1 circuit asked). The head start is now 500 ms, so the direct dial wins
 /// and no circuit is asked for.
 ///
+/// **Which real case it stands for.** A guest reaching a host it can dial, while the host has not
+/// reached it first: the host has not yet learnt the guest came online (it learns it from the
+/// anchor's board or the guest's own sync), or has nothing to send it. Here the host, which cannot
+/// dial the guest at all, bridged to it through the anchor the moment the guest came online — a
+/// legitimate circuit (the decider, 2026-10-02) — so the guest's reach always found that relayed
+/// connection held, and no forward ever staged (CANNOT MEASURE on every run of integrate
+/// c95e2399). The host's reaches are therefore held [`HOST_REACH_HOLD`] (`VOX_TEST_HOLD_REACH_MS`,
+/// compiled in only with `test-knobs`): the case where the guest is the faster to reach. And the
+/// guest's own reach waits [`GUEST_REACH_HOLD`] for its anchor connection, as a node that has
+/// been up a while has one when it reaches.
+///
 /// **What staged it is the guest's own ladder** (#321's attempt-3 verdict: a wall-clock premise
 /// passed with the delay off the critical path — the host's own circuit to the guest answered the
 /// forward's reach). Each circuit that gives way says so: `not asking <relay> for a circuit: a
@@ -164,9 +188,14 @@ fn gave_way(note: &str) -> Option<(&str, u128)> {
 #[test]
 #[ignore = "production Argon2id + a real PoW; run in release"]
 fn a_side_that_can_reach_directly_asks_for_no_circuit() {
-    test_knobs::require(&["VOX_TEST_ADVERTISE"]);
+    test_knobs::require(&["VOX_TEST_ADVERTISE", "VOX_TEST_HOLD_REACH_MS"]);
     watchdog::arm();
-    let mut w = ForwardedWorld::new(true);
+    // The host is the slower to reach: its reaches wait [`HOST_REACH_HOLD`] (see the doc above).
+    let hold = HOST_REACH_HOLD.as_millis().to_string();
+    let mut w = ForwardedWorld::new_with_host_env(true, &[("VOX_TEST_HOLD_REACH_MS", &hold)]);
+    // The guest's node runs in the daemon its `vox connect` left: stopped, so the first forward
+    // starts the daemon its reaches are held in ([`GUEST_REACH_HOLD`]), as every forward's are.
+    world::reap_daemon(&w.guest_dir);
     let mut staged = Vec::new();
     let mut unstaged = Vec::new();
     let mut overshot = 0usize;
@@ -248,7 +277,7 @@ fn a_side_that_can_reach_directly_asks_for_no_circuit() {
 #[test]
 #[ignore = "production Argon2id + a real PoW, a third member staged; run in release"]
 fn the_host_asks_a_guest_to_dial_back() {
-    test_knobs::require(&["VOX_TEST_ADVERTISE"]);
+    test_knobs::require(&["VOX_TEST_ADVERTISE", "VOX_TEST_HOLD_REACH_MS"]);
     watchdog::arm();
     let mut w = ForwardedWorld::new(true);
     dial_back_is_asked_for(&mut w);
@@ -264,6 +293,15 @@ fn the_host_asks_a_guest_to_dial_back() {
 /// those stalled attempts were answered by the host ahead of the dial-back, one post-quantum
 /// handshake at a time, and the dial-back's own connection came 1–3 s late — the staging, not the
 /// product (measured: every send `Ok`, the host's handshakes 150–575 ms each at load 45–97).
+///
+/// **Which real case it stands for.** A guest online that is slower to reach the host than the host
+/// is to reach her: her read of the anchor's board is slow or fails, or she has nothing of her own
+/// to send and her last connection to the host has gone, while the host has news for her. Her node
+/// now reads the host's address off the board and dials it at once (V210-96), so unheld she reached
+/// the host herself in every staging and the host never needed her (5 of 5 unstaged on integrate
+/// c95e2399). Her reaches are therefore held [`CAROL_REACH_HOLD`] (`VOX_TEST_HOLD_REACH_MS`,
+/// compiled in only with `test-knobs`); her answer to the host's dial-back is not a reach of hers,
+/// and is not held.
 ///
 /// **Re-staged, up to [`STAGINGS`] times, when it did not stage.** Carol may reach the host herself
 /// first — her node reads the host's address off the anchor's board and dials it directly, which is
@@ -315,6 +353,9 @@ enum Staging {
 fn stage_dial_back(w: &mut ForwardedWorld, n: usize) -> Staging {
     use world::{args, room_pass_file, vox_once, VoxProc};
     let (carol, carol_fp) = anchor_only_guest(w, &format!("carol-{n}"));
+    // Her node runs in the daemon her `vox connect` left: stopped, so her `vox up` starts the
+    // daemon her reaches are held in ([`CAROL_REACH_HOLD`]).
+    world::reap_daemon(&carol);
     // Counted from before carol comes online: the host reaches for her as soon as she does.
     let before = (
         reach_count(&w.host_dir, &carol_fp, "the host", "circuits"),
@@ -326,7 +367,8 @@ fn stage_dial_back(w: &mut ForwardedWorld, n: usize) -> Staging {
     // hundred milliseconds, so the host's reach for her starts while she is not yet connected to
     // it — the case. Her dial back crosses the same path.
     w.forward.set_delay(STAGING_DELAY);
-    let mut up = VoxProc::spawn(
+    let carol_hold = CAROL_REACH_HOLD.as_millis().to_string();
+    let mut up = VoxProc::spawn_env(
         &format!("carol-{n}-up"),
         &carol,
         &args(&[
@@ -340,8 +382,14 @@ fn stage_dial_back(w: &mut ForwardedWorld, n: usize) -> Staging {
             "--listen",
             "[::1]:0",
         ]),
+        &[("VOX_TEST_HOLD_REACH_MS", &carol_hold)],
     );
     up.expect_line("carol's proxy is up", |l| l.starts_with("vox up on "));
+    // The host posts only once she is connected to the anchor: before, its circuit to her went to
+    // her exited `vox connect`, and the anchor refused it — not the case under test.
+    up.expect_staging("carol connected to the anchor", |l| {
+        l.contains("connected to this anchor")
+    });
     let (ok, out, err) = vox_once(
         &w.host_dir,
         &args(&["room", "post", &w.room, "for carol, by a dial-back"]),
@@ -661,7 +709,10 @@ fn without_entry_of(address: &str, who: &str) -> String {
 /// read how many circuits it asked for to the host while it still runs, and stop it (by its PID).
 fn forward_once(w: &ForwardedWorld) -> (String, u64, Vec<String>) {
     use world::{args, VoxProc};
-    let mut fwd = VoxProc::spawn(
+    // The forward's node reaches the host only once its anchor connection is held (see
+    // [`GUEST_REACH_HOLD`]), as a node that has been up a while does.
+    let hold = GUEST_REACH_HOLD.as_millis().to_string();
+    let mut fwd = VoxProc::spawn_env(
         "forward",
         &w.guest_dir,
         &args(&[
@@ -673,6 +724,7 @@ fn forward_once(w: &ForwardedWorld) -> (String, u64, Vec<String>) {
             "--listen",
             "[::1]:0",
         ]),
+        &[("VOX_TEST_HOLD_REACH_MS", &hold)],
     );
     let line = fwd.expect_line("`vox forward` saying it reached the host", |l| {
         l.contains("vox: reached ") && l.contains(" ms (")

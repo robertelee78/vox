@@ -21,12 +21,8 @@ use vox_core::transport::framing::{read_frame, write_frame};
 use vox_core::transport::quic::{VoxConnection, VoxEndpoint};
 use vox_core::transport::streams::{accept_typed, open_typed, StreamKind};
 
-/// The unix time now, in seconds: for the transport, whose session records are in seconds.
-pub fn now() -> u64 {
-    now_ms() / 1_000
-}
-
-/// The unix time now, in milliseconds: what board records and a genesis are stamped with.
+/// The unix time now, in milliseconds: what board records, a genesis and a session record are
+/// stamped with.
 pub fn now_ms() -> u64 {
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -105,7 +101,7 @@ pub async fn connect<S: vox_core::identity::composite::RootSigner + Send + Sync 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     let mut wait = std::time::Duration::from_millis(150);
     let conn = loop {
-        match endpoint.connect(addr, id, now()).await {
+        match endpoint.connect(addr, id, now_ms()).await {
             Ok(conn) => break conn,
             Err(vox_core::error::Error::HandshakeAuth(_))
                 if std::time::Instant::now() < deadline =>
@@ -204,7 +200,7 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use crate::ports;
-use crate::world::{args, vox_once, VoxProc, IDENTITY, VOX};
+use crate::world::{args, vox_once, vox_once_plain, VoxProc, IDENTITY, VOX};
 
 /// How long any one piece of setup may take before the proof says it cannot measure.
 pub const SETUP: Duration = Duration::from_secs(120);
@@ -307,7 +303,13 @@ pub fn daemon_on(name: &str, data: &Path, listen: &str, spec: &str, pass_file: &
     let mut p = p;
     let deadline = Instant::now() + SETUP;
     while Instant::now() < deadline {
-        if vox_once(data, &args(&["room", "list"])).0 {
+        // **Asked plainly, attaching nothing.** `vox_once` attaches a node no daemon holds yet, runs
+        // the verb, and detaches it after; while this daemon was still taking its lock (a slow
+        // start, over `DAEMON_GRACE`), that attach landed in this very daemon and the detach that
+        // followed left its node detached: the next `vox room join` said "node default is not
+        // attached" (a staging red, once in 20 throttled runs). The daemon started here attaches
+        // its own node; wait for that.
+        if vox_once_plain(data, &args(&["room", "list"])).0 {
             return p;
         }
         if matches!(p.child.try_wait(), Ok(Some(_))) && ports::bind_refused(&p.transcript()) {

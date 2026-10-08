@@ -21,11 +21,14 @@
 //! Every red names its side: `PRODUCT:` what the host said or did not; `PRODUCT (staging):` a `vox`
 //! step of the staging (a join that was not refused); `APPARATUS:` the driver's own machinery.
 //!
-//! - **decision record** (ADR-028 §7, #506): alice's node records the foreground arm's refusal as
-//!   one event naming bob, why, and the room by its ID (never its name), in `nodes/default/decisions/<today>.jsonl` (0600, its directory
-//!   0700); neither the passphrase bob offered nor a message alice posted is in it; and of two
-//!   earlier days planted before her daemon starts, the one 14 days old is removed and the one 13
-//!   days old kept. `vox status` names that refusal under "recent refusals", and first in
+//! - **decision record** (ADR-028 §7, #506, #563): alice's node records the foreground arm's
+//!   refusal as one event naming bob, why, and the room by its ID (never its name), read through
+//!   her daemon as her clients read it; the record is sealed at rest in
+//!   `nodes/default/decisions/<today>.sealed` (0600, its directory 0700), so neither bob's
+//!   fingerprint, the passphrase bob offered, nor a message alice posted is readable in any of its
+//!   files. Two earlier days are planted before her daemon starts as an earlier build wrote them,
+//!   in the clear (`<day>.jsonl`): the one 14 days old is removed, and the one 13 days old is
+//!   sealed into its day's file, its plain file removed, and its event still read back. `vox status` names that refusal under "recent refusals", and first in
 //!   `--json`'s `refusals`; alice's TUI, on `d`, shows both refusals of bob's join (the
 //!   foreground arm's and the TUI arm's), newest first (D-3, #507).
 //!
@@ -33,6 +36,7 @@
 //! `JoinFailed` (`tunnel_cli::say_if_it_explains_a_failure`) — the foreground and auto-started arms
 //! red; the TUI ignoring `JoinFailed` (`DaemonCore::on_node_event`) — the TUI arm red; a node
 //! that records a message's text in its decision record when it posts one — the record arm red;
+//! the record written in the clear again — the record arm red (#563);
 //! a join refusal recorded with no room — the record arm red; a status report with no refusals in
 //! it — the `vox status` claims red; the TUI's decision record read oldest first — the TUI's
 //! decision claim red.
@@ -58,6 +62,8 @@ const WRONG: &str = "QXJZ-a-wrong-room-passphrase-KVWY";
 /// How long the host has to say it, once bob has been told no.
 const SAYS_WITHIN: Duration = Duration::from_secs(10);
 const SAID: &str = "a join did not complete — answering ";
+/// Whom the planted earlier days' events name: a fingerprint as `vox` prints one.
+const PLANTED_BY: &str = "plantedplantedplantedplantedplantedplantedplantedpla";
 /// A message alice posts in her room: found in her decision record, it is the leak (ADR-028 D-2).
 const MESSAGE: &str = "QXJZ-a-message-nobody-records-KVWY";
 
@@ -292,8 +298,18 @@ fn a_refused_join_is_seen_by_the_host() {
         format!("{}.jsonl", decision_record::date_of(today - 14)),
         format!("{}.jsonl", decision_record::date_of(today - 13)),
     );
-    for name in [&old, &kept] {
-        std::fs::write(record.join(name), "{\"planted\":true}\n")
+    // As an earlier build wrote a day: one event per line, in the clear.
+    let planted = |days_ago: i64| {
+        let at_ms = u64::try_from((today - days_ago) * 86_400_000 + 3_600_000).unwrap_or(0);
+        format!(
+            "{}\n",
+            serde_json::json!({ "at_ms": at_ms, "asked": "a tunnel to a service",
+                "by": PLANTED_BY, "alias": null, "decided": "refused",
+                "why": format!("planted {days_ago} days ago") })
+        )
+    };
+    for (name, days_ago) in [(&old, 14), (&kept, 13)] {
+        std::fs::write(record.join(name), planted(days_ago))
             .expect("APPARATUS: could not plant an earlier day's record");
     }
     let err = tmp.path().join("alice.daemon.err");
@@ -345,19 +361,34 @@ fn a_refused_join_is_seen_by_the_host() {
     }
     let files = decision_record::files(&alice.dir, "default");
     let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
-    let today_file = format!("{}.jsonl", decision_record::date_of(today));
+    let sealed = |n: &str| n.replace(".jsonl", ".sealed");
+    let today_file = format!("{}.sealed", decision_record::date_of(today));
+    let kept_read = events
+        .iter()
+        .any(|e| e["why"] == "planted 13 days ago" && e["by"] == PLANTED_BY);
+    let old_read = events.iter().any(|e| e["why"] == "planted 14 days ago");
+    println!("[proof] alice's decision record files: {names:?}");
     if names.contains(&old.as_str())
-        || !names.contains(&kept.as_str())
+        || names.contains(&sealed(&old).as_str())
+        || old_read
+        || names.contains(&kept.as_str())
+        || !names.contains(&sealed(&kept).as_str())
+        || !kept_read
         || !names.contains(&today_file.as_str())
     {
         red.push(format!(
-            "PRODUCT: alice's decision record must keep 14 days: {kept} and {today_file} kept, \
-             {old} removed; it holds {names:?}"
+            "PRODUCT: alice's decision record must keep 14 days, sealed: {kept}'s event sealed into \
+             {} and still read back (read: {kept_read}), its plain file gone; {today_file} \
+             written; {old} removed (read: {old_read}); it holds {names:?}",
+            sealed(&kept)
         ));
     }
     for (text, what) in [
         (WRONG, "the passphrase bob offered"),
         (MESSAGE, "the text of a message"),
+        (bob.fp.as_str(), "bob's fingerprint, in the clear"),
+        (PLANTED_BY, "an earlier build's event, in the clear"),
+        ("to join a room", "an event's words, in the clear"),
     ] {
         if files.iter().any(|(_, t)| t.contains(text)) {
             red.push(format!(

@@ -203,6 +203,12 @@ connection, bound to the TLS session by its exporter.
     **Timing.** The listener MUST send every outcome of an `ASK`, a `PROVE` or a refusal, no earlier
     than 50 ms after the `ASK` arrived plus a uniformly random 0–50 ms, so a refusal and a `PROVE` are
     not told apart by timing at the scale an ML-DSA signature takes.
+    **Starting.** A daemon MUST NOT accept a connection before its first node is attached: until
+    then it has nobody to answer for, and a refusal then turned a restarting anchor's own members
+    away (`every_member_is_back_after_an_anchor_restart_proof`). A dial in that gap waits to be
+    answered. A node attached later is refused in its own gap as not attached: a daemon MUST NOT
+    hold a dial for a node that is on disk but not attached, which would tell which nodes it holds
+    (ADR-026 G-1).
 33. **Nothing before the exchange.** QUIC's own limits MUST hold a connection to the exchange until
     flight 3 verifies: at most 2 client-opened bidirectional streams, 0 unidirectional streams and a
     64 KiB connection window. The listener MUST raise them to the normal values (requirement 24) only
@@ -240,9 +246,13 @@ connection, bound to the TLS session by its exporter.
     (`perf_r40_chat_latency_proof`, `perf_r40_relayed_chat_proof`,
     `a_first_direct_connection_is_prompt_proof`, `a_first_punched_connection_is_prompt_proof`,
     `a_first_relayed_connection_is_under_two_seconds_proof`).
-38a. **Diagnostics.** A dialler whose expected node does not answer MUST say "nothing at `<address>`
-    answers as `<expected node>`", and MUST NOT name anyone else (ADR-026 G-1)
-    (`a_dial_that_reaches_another_node_names_no_one_proof`).
+38a. **Diagnostics.** A dialler whose expected node does not answer MUST say which of three things
+    happened, and MUST NOT name anyone else (ADR-026 G-1): a refusal, "nothing at `<address>`
+    answers as `<expected node>`" (`a_dial_that_reaches_another_node_names_no_one_proof`); a
+    `PROVE` that does not verify, "what answered at `<address>` did not prove it is `<expected
+    node>`"; no `PROVE` within the exchange's bound, "`<address>` did not answer within `<bound>` s
+    as `<expected node>`" (`every_member_is_back_after_an_anchor_restart_proof`). A silence MUST NOT
+    be said as a refusal or an impostor.
 39. **Accepted cost (ADR-026).** A party that knows a node's fingerprint can test, by naming it,
     whether that node is attached at an address. The generic refusal (requirement 32)
     keeps it from learning anything more.

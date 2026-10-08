@@ -47,6 +47,11 @@
 //! so the anchor sees a single source for all of them, and no packet is lost or delayed. A room
 //! of 500 members on 500 networks is not what this stages.
 //!
+//! **Accepted, not a defect to fix now** (the decider, 2026-10-07, #342): under load, a room this
+//! size refuses a few joins when one online member is slow to agree within 5 s, under the strict
+//! room-wide cap; the refusal names the silent member, and the next join gets in. Rooms this big
+//! are not expected yet. No product change.
+//!
 //! **Every red says which it is**: `PRODUCT:` quotes what `vox` said or did; `CANNOT MEASURE:`
 //! names staging that was not achieved or a harness too slow to look; `APPARATUS:` names a fault
 //! of the proof's own; the watchdog says it is the watchdog.

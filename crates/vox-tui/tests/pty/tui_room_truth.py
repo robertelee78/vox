@@ -91,8 +91,8 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             fingerprint shows grouped with its art; `x` dismisses it, on Bob's node alone (nothing
             reaches the room); with Bob's node detached and attached again, Frank stays dismissed
             and Carol (who trusts Bob) is still offered (ADR-028 K-15, K-17, K-18, #526);
-  reoffer   Frank leaves and joins again, and is offered again (K-18: a dismissal is kept against
-            the join);
+  reoffer   Frank leaves and joins again, and is offered again; dismissed, he leaves and joins once
+            more, and is offered again (K-18: a dismissal is kept against the join);
   trust     the join's line offers ":trust <frank's first 8>" (ADR-028 K-5, #475); `t` on Frank
             in Bob's members pane opens the trust prompt, showing his fingerprint; Dave's pasted
             there adds nothing and shows both fingerprints; Frank's own, pasted through the hint's
@@ -112,7 +112,8 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             Sessions and ends one: Bob's Sessions pane lists the open one by `vox room sessions`'s
             label and the ended one apart under "Ended (1)"; `:all` shows each opening and end
             among the room's messages; `:session <short id>`, without drive, shows only that it
-            exists and "Only members alice trusts with drive see inside this Session.", with no
+            exists, "<label> — name and id as alice says" (MD-3) and "Only members alice trusts
+            with drive see inside this Session.", with no
             composer, and `:send` there is refused, reaching nobody (ADR-029 CL-2, CL-3, #553);
   session-order  Alice posts, then her hook opens a new Session, within one second: in Bob's All the
             post reads first and "<label> opened" under it (#562: times in milliseconds);
@@ -1148,13 +1149,33 @@ try:
           f"still dismissed {frank_kept_out}; sidebar {side()!r}")
 
     stage("reoffer")
-    # A dismissal is kept against Frank's join: he leaves and joins again, and is offered again.
-    lv = run("frank", "room", "leave", room)
-    if lv.returncode != 0: product(f"frank's `vox room leave` failed: {lv.stderr.strip()}")
-    j = run("frank", "room", "join", "--passphrase-file", "-", link, stdin="room pass")
-    if j.returncode != 0: product(f"frank's second `vox room join` failed: {j.stderr.strip()}")
-    again = tui.until(lambda: offered("frank"), 120, 1)
-    claim("reoffer", again, f"after frank left and joined again, bob's sidebar: {side()!r}")
+    # A dismissal is kept against Frank's join: each time he leaves and joins again he is offered
+    # again, the second time as well as the first, dismissed in between.
+    def rejoin(n):
+        lv = run("frank", "room", "leave", room)
+        if lv.returncode != 0: product(f"frank's `vox room leave` ({n}) failed: {lv.stderr.strip()}")
+        j = run("frank", "room", "join", "--passphrase-file", "-", link, stdin="room pass")
+        if j.returncode != 0: product(f"frank's `vox room join` ({n}) failed: {j.stderr.strip()}")
+        return tui.until(lambda: offered("frank"), 120, 1)
+    again = rejoin("again")
+    again_side = side()
+    redismissed = select_offer("frank")
+    tui.key("x", 2)
+    redismissed = redismissed and tui.until(lambda: not offered("frank"), 10, 0.5)
+    twice = rejoin("a third time")
+    # The room selected and open again, as the later stages expect: Down past the offers, and
+    # Enter on it if the dismissed offer's card left no room open; Esc back to the room list.
+    for _ in range(10):
+        if any(r.startswith("▶ family") for r in side()):
+            break
+        tui.key("\x1b[B", 0.5)
+    if "No room open" in whole():
+        tui.key("\r", 2)
+        tui.key("\x1b", 1)
+    claim("reoffer", again and redismissed and twice,
+          f"after frank left and joined again, offered: {again} (sidebar {again_side!r}); dismissed "
+          f"again: {redismissed}; after he left and joined once more, offered: {twice} (sidebar "
+          f"{side()!r})")
 
     stage("trust")
     # ADR-028 K-5 (#475): the join's line offers the one trust action, ":trust <frank's first 8>";
@@ -1163,6 +1184,7 @@ try:
     flat_ws = lambda: re.sub(r"\s+", " ", flat())
     hint = f":trust {fp['frank'][:8]}"
     hinted = hint in flat_ws()
+    hint_screen = [] if hinted else [r.rstrip() for r in tui.display() if r.strip()]
     grouped = lambda f: " ".join(f[i:i + 4] for i in range(0, len(f), 4))
     in_ring = lambda: fp["frank"] in run("bob", "trust", "list").stdout
     tui.key("\r", 2)   # into the room
@@ -1199,7 +1221,7 @@ try:
     tui.key("\x1b", 2)  # back to the room list
     claim("trust", hinted and prompt_seen and mismatch_said and not mismatch_added and closed
           and not wrong_pass_added and not shown_secret and matched and match_said,
-          f"the join offered {hint!r}: {hinted}; `t` on frank opened the prompt with his "
+          f"the join offered {hint!r}: {hinted}{'' if hinted else f' (the screen: {hint_screen!r})'}; `t` on frank opened the prompt with his "
           f"fingerprint: {prompt_seen}; dave's pasted: both shown and told not to trust: "
           f"{mismatch_said}, frank added anyway: {mismatch_added}; with the keyring closed "
           f"({closed}), a wrong passphrase added him: {wrong_pass_added}, was shown: {shown_secret}, "
@@ -1312,6 +1334,8 @@ try:
     screen = tui.display()
     inside = " ".join(" ".join(r.split()) for r in pane(screen, "Timeline"))
     titled = any(f"Timeline — {open_label} · open" in r for r in screen)
+    # The Session's name and id are alice's node's claim, and the TUI says so (ADR-029 MD-3).
+    claimed = any(f"{open_label} — name and id as alice says" in r for r in screen)
     # The pane wraps its lines: read it as one text without the spaces a wrap took.
     nodrive = ("Only members alice trusts with drive see inside this Session.".replace(" ", "")
                in inside.replace(" ", ""))
@@ -1327,10 +1351,11 @@ try:
     share_told = "you cannot drive this Session: alice has not given you drive" in share_refused
     tui.key(":general\r", 2)
     leaked = "DRIVE-WITHOUT-DRIVE" in run("alice", "room", "read", room).stdout
-    claim("sessions", listed and apart and merged and titled and nodrive and no_composer and told
+    claim("sessions", listed and apart and merged and titled and claimed and nodrive and no_composer and told
           and not leaked and share_told,
           f"Sessions pane: {listed_rows!r} (open listed: {listed}, ended apart: {apart}); All merged the "
-          f"openings and end among the messages: {merged}; `:session` titled {titled}, said no drive "
+          f"openings and end among the messages: {merged}; `:session` titled {titled}, said whose claim its "
+          f"name and id are {claimed}, said no drive "
           f"{nodrive}, no composer {no_composer}; `:send` there said {refused!r}, reached the room: "
           f"{leaked}; `:share` there said {share_refused!r}" + ("" if merged else f"; All showed: {all_rows!r}")
           + ("" if titled and nodrive else "; screen:\n" + "\n".join(screen)))

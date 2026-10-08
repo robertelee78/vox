@@ -19,13 +19,14 @@
 //! those being widened.
 //!
 //! Body field order (fixed, canonical-CBOR array): `[peer_id, suite_id,
-//! negotiated_group, ts]`:
+//! negotiated_group, ts_ms]`:
 //! - `peer_id` — the authenticated peer's 32-byte composite-identity fingerprint;
 //! - `suite_id` — the ADR-003 ciphersuite id in force (`vox-suite-1` = `0x0001`);
 //! - `negotiated_group` — the TLS named-group code point (X25519MLKEM768 =
 //!   `0x11EC`), as observed in the handshake; a record whose group is anything else is
 //!   refused when built and rejected on parse;
-//! - `ts` — unix seconds the session was established.
+//! - `ts_ms` — unix milliseconds the session was established (format 2; format 1 held seconds, and
+//!   is refused rather than read in the wrong unit).
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
@@ -44,8 +45,8 @@ pub struct SessionEstablishment {
     /// The TLS key-exchange group the handshake negotiated (always X25519MLKEM768: any
     /// other is refused by [`Self::observed`]).
     pub negotiated_group: u16,
-    /// Unix seconds at which the session was established.
-    pub ts: u64,
+    /// Unix milliseconds at which the session was established.
+    pub ts_ms: u64,
 }
 
 impl SessionEstablishment {
@@ -55,7 +56,7 @@ impl SessionEstablishment {
     /// # Errors
     /// [`Error::SuiteBelowFloor`] when `group` is not X25519MLKEM768: a session under a classical
     /// group is refused, never recorded.
-    pub fn observed(peer_id: Digest32, group: u16, ts: u64) -> Result<Self> {
+    pub fn observed(peer_id: Digest32, group: u16, ts_ms: u64) -> Result<Self> {
         if group != X25519MLKEM768_CODE_POINT {
             return Err(Error::SuiteBelowFloor {
                 observed: group,
@@ -66,7 +67,7 @@ impl SessionEstablishment {
             peer_id,
             suite_id: VOX_SUITE_1.id,
             negotiated_group: group,
-            ts,
+            ts_ms,
         })
     }
 
@@ -79,7 +80,7 @@ impl SessionEstablishment {
             .bytes(&self.peer_id)
             .uint(u64::from(self.suite_id))
             .uint(u64::from(self.negotiated_group))
-            .uint(self.ts);
+            .uint(self.ts_ms);
         wire::frame(StructTag::SessionEstablishment, &e.finish())
     }
 
@@ -105,7 +106,7 @@ impl SessionEstablishment {
             .map_err(|_| Error::MalformedBundle("session-establishment suite_id range"))?;
         let negotiated_group = u16::try_from(d.uint()?)
             .map_err(|_| Error::MalformedBundle("session-establishment group range"))?;
-        let ts = d.uint()?;
+        let ts_ms = d.uint()?;
         d.finish()?;
 
         // The suite must be in the ADR-003 registry.
@@ -121,7 +122,7 @@ impl SessionEstablishment {
             peer_id,
             suite_id,
             negotiated_group,
-            ts,
+            ts_ms,
         })
     }
 }

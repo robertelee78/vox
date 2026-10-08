@@ -72,6 +72,15 @@ pub fn server_candidates_v6() -> Vec<(Ipv6Addr, u32)> {
     out
 }
 
+/// What a route lookup says when the kernel answered that there is **no** IPv4 default route: a
+/// fact, unlike a lookup that got no answer, which is unknown (the network watcher compares only
+/// what it knows, so an unanswered lookup is never a route that went away).
+pub const NO_ROUTE: &str = "gateway: no default route found";
+/// [`NO_ROUTE`], for IPv6.
+pub const NO_ROUTE_V6: &str = "gateway: no IPv6 default route found";
+/// The kernel's default route leaves by an interface with no next hop: no route to a gateway.
+pub const NO_NEXT_HOP: &str = "gateway: the default route has no next hop";
+
 /// True for `fe80::/10`, the link-local unicast prefix.
 ///
 /// `Ipv6Addr::is_unicast_link_local` is still unstable, and this is one mask.
@@ -97,9 +106,8 @@ fn is_link_local(ip: Ipv6Addr) -> bool {
 pub fn default_gateway_v6() -> Result<(Ipv6Addr, u32)> {
     let table = std::fs::read_to_string("/proc/net/ipv6_route")
         .map_err(|_| Error::PortMappingFailed("gateway: cannot read /proc/net/ipv6_route"))?;
-    let (gw, iface) = parse_proc_net_ipv6_route(&table).ok_or(Error::PortMappingFailed(
-        "gateway: no IPv6 default route found",
-    ))?;
+    let (gw, iface) =
+        parse_proc_net_ipv6_route(&table).ok_or(Error::PortMappingFailed(NO_ROUTE_V6))?;
     let scope = if is_link_local(gw) {
         interface_index(&iface).ok_or(Error::PortMappingFailed(
             "gateway: link-local next hop with no interface index",
@@ -120,9 +128,7 @@ pub fn default_gateway_v6() -> Result<(Ipv6Addr, u32)> {
             index,
             ..
         } => Ok((a, if is_link_local_any(a) { index } else { 0 })),
-        _ => Err(Error::PortMappingFailed(
-            "gateway: no IPv6 default route found",
-        )),
+        _ => Err(Error::PortMappingFailed(NO_ROUTE_V6)),
     }
 }
 
@@ -211,7 +217,7 @@ fn interface_index(iface: &str) -> Option<u32> {
 pub fn default_gateway_v4() -> Result<Ipv4Addr> {
     let table = std::fs::read_to_string("/proc/net/route")
         .map_err(|_| Error::PortMappingFailed("gateway: cannot read /proc/net/route"))?;
-    parse_proc_net_route(&table).ok_or(Error::PortMappingFailed("gateway: no default route found"))
+    parse_proc_net_route(&table).ok_or(Error::PortMappingFailed(NO_ROUTE))
 }
 
 /// The IPv4 default route's next hop on macOS, by `RTM_GET` ([`macos::default_route`], N-53).
@@ -219,7 +225,7 @@ pub fn default_gateway_v4() -> Result<Ipv4Addr> {
 pub fn default_gateway_v4() -> Result<Ipv4Addr> {
     match macos::default_route(false)?.addr {
         std::net::IpAddr::V4(a) => Ok(a),
-        std::net::IpAddr::V6(_) => Err(Error::PortMappingFailed("gateway: no default route found")),
+        std::net::IpAddr::V6(_) => Err(Error::PortMappingFailed(NO_ROUTE)),
     }
 }
 
@@ -411,9 +417,26 @@ pub mod macos {
         let seq = i32::from_ne_bytes(crate::identity::rng::random_array().unwrap_or([1, 0, 0, 0]))
             & 0x7fff_ffff;
         let msg = request(v6, seq, pid);
-        rustix::io::write(&fd, &msg).map_err(|_| fail("gateway: no default route found"))?;
+        // The kernel refuses the request with ESRCH when there is no such route: that is known.
+        // Any other failure says nothing about the route.
+        rustix::io::write(&fd, &msg).map_err(|e| {
+            if e == rustix::io::Errno::SRCH {
+                fail(super::NO_ROUTE)
+            } else {
+                fail("gateway: the routing table did not answer")
+            }
+        })?;
         let mut buf = vec![0u8; 2048];
+        // **The whole wait is bounded, not each read** (the anchor-restart proof's red): a routing
+        // socket gets every process's routing messages, so on a busy machine a read never waited
+        // out its timeout, and an answer of our own that the kernel dropped (a full socket buffer)
+        // left this reading other processes' messages for ever, a tokio worker with it: the node
+        // stopped redialling its anchor, and never came back.
+        let began = std::time::Instant::now();
         loop {
+            if began.elapsed() > ANSWER_WITHIN {
+                return Err(fail("gateway: the routing table did not answer"));
+            }
             let n = rustix::io::read(&fd, &mut buf[..])
                 .map_err(|_| fail("gateway: the routing table did not answer"))?;
             let m = &buf[..n];
@@ -425,7 +448,7 @@ pub mod macos {
                 continue; // another process's answer, read on this socket too
             }
             if field(24) != 0 {
-                return Err(fail("gateway: no default route found"));
+                return Err(fail(super::NO_ROUTE));
             }
             return parse_answer(m);
         }
@@ -471,7 +494,7 @@ pub mod macos {
             }
             at += padded(len);
         }
-        let addr = gateway.ok_or(fail("gateway: the default route has no next hop"))?;
+        let addr = gateway.ok_or(fail(super::NO_NEXT_HOP))?;
         Ok(Hop {
             addr,
             interface,

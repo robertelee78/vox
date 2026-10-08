@@ -60,7 +60,7 @@ pub const MAX_RENDEZVOUS_FRAME: usize = MAX_PREKEY_BUNDLE_BYTES + 16 * 1024;
 
 /// The most `RECORD` frames a client accepts for one `GET`: the store can hold at
 /// most this many live records for one `(channelID, epoch)`, plus the genesis.
-pub const MAX_GET_RECORDS: usize = 2 * MAX_AUTHORS_PER_BUCKET + MAX_PREJOIN_PER_CHANNEL + 1;
+pub const MAX_GET_RECORDS: usize = 4 * MAX_AUTHORS_PER_BUCKET + MAX_PREJOIN_PER_CHANNEL + 1;
 
 /// Which record kinds a `GET` asks for (a bit set).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,8 +76,12 @@ impl RecordKinds {
     /// The channel genesis (`0x000D`) — what a cold joiner needs before it can
     /// build channel state at all (ADR-007).
     pub const GENESIS: Self = Self(0b1000);
+    /// Admission notices (`0x0020`) and the members' own withdraws (`0x001A`, scope member), the
+    /// withdraws first (#520): what lets a member learn of an admitted newcomer while it is
+    /// offline, and never of one that left.
+    pub const NOTICES: Self = Self(0b1_0000);
     /// Every kind.
-    pub const ALL: Self = Self(0b1111);
+    pub const ALL: Self = Self(0b1_1111);
 
     /// Combine two sets.
     #[must_use]
@@ -146,6 +150,10 @@ pub enum RejectReason {
     /// from us than we do, which is real. Folded into `Policy` the two could not be told apart, and
     /// every stale mirror was reported to the person as a refusal.
     Stale = 6,
+    /// The record's author left the room: a withdraw it signed is no older than the record
+    /// (V030-14, #520). Its own code, so a refused replay of a departed member's admission says
+    /// why.
+    Withdrawn = 7,
 }
 
 impl RejectReason {
@@ -157,6 +165,7 @@ impl RejectReason {
             4 => Some(Self::Capacity),
             5 => Some(Self::UnknownKind),
             6 => Some(Self::Stale),
+            7 => Some(Self::Withdrawn),
             _ => None,
         }
     }
@@ -172,6 +181,7 @@ impl RejectReason {
             Self::Capacity => "rejected: capacity",
             Self::UnknownKind => "rejected: unknown record kind",
             Self::Stale => "rejected: the board holds a newer record from that author",
+            Self::Withdrawn => "rejected: withdrawn, its author left the room",
         }
     }
 
@@ -181,6 +191,7 @@ impl RejectReason {
             Error::RendezvousRejected("author is not a room member") => Self::NotMember,
             Error::RendezvousRejected(s) if s.ends_with("at capacity") => Self::Capacity,
             Error::RendezvousRejected(s) if s.starts_with("non-increasing") => Self::Stale,
+            Error::RendezvousRejected("withdrawn") => Self::Withdrawn,
             Error::RendezvousRejected(_) => Self::Policy,
             _ => Self::Malformed,
         }
@@ -338,6 +349,10 @@ pub struct RecordSet {
     /// board's word: it checked the withdraw against the room's creator or admin roster, which a
     /// joiner does not hold.
     pub ended_by: Option<Digest32>,
+    /// The members' own withdraws (#520), unverified: each is checked against the leaver's key.
+    pub withdraws: Vec<crate::nat::withdraw::BoardWithdraw>,
+    /// Admission notices (#520), unverified: each is checked against its witness's key.
+    pub notices: Vec<crate::nat::notice::AdmissionNotice>,
 }
 
 /// Which rooms a board keeps for a peer that brings their genesis — the rooms it will
@@ -545,6 +560,22 @@ impl RendezvousService {
                             .map(|r| RendezvousResponse::Record(r.to_wire())),
                     );
                 }
+                if kinds.contains(RecordKinds::NOTICES) {
+                    // The withdraws first, so a reader refuses a notice of a member that left
+                    // before it could admit it (#520).
+                    out.extend(
+                        store
+                            .member_withdraws(channel_id)
+                            .into_iter()
+                            .map(|w| RendezvousResponse::Record(w.to_vec())),
+                    );
+                    out.extend(
+                        store
+                            .notices(channel_id)
+                            .into_iter()
+                            .map(|n| RendezvousResponse::Record(n.to_wire())),
+                    );
+                }
                 if kinds.contains(RecordKinds::GENESIS) {
                     if let Some(g) = store.genesis(channel_id) {
                         out.push(RendezvousResponse::Record(g.to_wire()));
@@ -586,6 +617,8 @@ impl RendezvousService {
         store
             .bundle(channel, epoch, author, now)
             .and_then(|b| CompositePublicKey::from_bytes(&b.prekey_bundle.root_pub).ok())
+            // A member this board learned of from its admission notice (#520).
+            .or_else(|| store.notice_key(channel, author).cloned())
     }
 
     /// The key a bundle record for an author this board does not know yet may be admitted
@@ -738,12 +771,30 @@ impl RendezvousService {
                     }
                 };
                 let Some(key) = key else {
+                    // A member's own withdraw for a member this board knows no key for yet is
+                    // held, unchecked, until a notice brings the key (#520): sent first so a
+                    // notice of a member that left is refused, it must not be lost for coming
+                    // first.
+                    if w.scope == WithdrawScope::Member {
+                        store.hold_pending_withdraw(w);
+                        return Ok(());
+                    }
                     return Err(RejectReason::NotMember);
                 };
                 w.verify(&key).map_err(|e| RejectReason::for_error(&e))?;
                 match w.scope {
                     WithdrawScope::Member => {
                         store.withdraw_member(&w.channel_id, &w.author_id, w.timestamp_ms);
+                        // Kept to pass on with the room's notices (#520).
+                        if store.keep_member_withdraw(
+                            &w.channel_id,
+                            &w.author_id,
+                            w.timestamp_ms,
+                            record.to_vec(),
+                        ) && publisher.is_some()
+                        {
+                            grew = Some(w.channel_id);
+                        }
                     }
                     WithdrawScope::Room => {
                         store.withdraw_room(&w.channel_id, Some(record.to_vec()));
@@ -751,6 +802,28 @@ impl RendezvousService {
                 }
                 withdrew = Some(w.channel_id);
                 Ok(())
+            }
+            // A newcomer's admission, as its admitting member witnessed it (#520): taken only on a
+            // witness this board can check, as a bundle is (V210-70), and never for a member
+            // whose withdraw is no older than the witness.
+            StructTag::AdmissionNotice => {
+                let notice = crate::nat::notice::AdmissionNotice::from_wire(record)
+                    .map_err(|e| RejectReason::for_error(&e))?;
+                let (cid, epoch) = (notice.channel_id(), notice.witness.epoch);
+                let mut store = lock(&self.store);
+                let Some(key) =
+                    self.known_key(&store, &cid, epoch, &notice.witness.witness_id, now)
+                else {
+                    return Err(RejectReason::NotMember);
+                };
+                notice
+                    .verify(&key, &cid, epoch)
+                    .map_err(|e| RejectReason::for_error(&e))?;
+                store.accept_notice(notice).map(|learned| {
+                    if learned && publisher.is_some() {
+                        grew = Some(cid);
+                    }
+                })
             }
             // A room's admins, from its creator (V030-14).
             StructTag::AdminRoster => {
@@ -921,15 +994,36 @@ impl RendezvousClient {
                             }
                             set.genesis = Some(g);
                         }
-                        StructTag::BoardWithdraw if kinds.contains(RecordKinds::GENESIS) => {
+                        StructTag::BoardWithdraw => {
                             use crate::nat::withdraw::{BoardWithdraw, WithdrawScope};
                             let w = BoardWithdraw::from_wire(&wire)?;
-                            if w.channel_id != *channel_id || w.scope != WithdrawScope::Room {
+                            if w.channel_id != *channel_id {
                                 return Err(Error::MalformedRendezvous(
-                                    "rendezvous get: withdraw is not this room's end",
+                                    "rendezvous get: withdraw is not this room's",
                                 ));
                             }
-                            set.ended_by = Some(w.author_id);
+                            match w.scope {
+                                WithdrawScope::Room if kinds.contains(RecordKinds::GENESIS) => {
+                                    set.ended_by = Some(w.author_id);
+                                }
+                                WithdrawScope::Member if kinds.contains(RecordKinds::NOTICES) => {
+                                    set.withdraws.push(w);
+                                }
+                                _ => {
+                                    return Err(Error::MalformedRendezvous(
+                                        "rendezvous get: record of an unrequested kind",
+                                    ))
+                                }
+                            }
+                        }
+                        StructTag::AdmissionNotice if kinds.contains(RecordKinds::NOTICES) => {
+                            let n = crate::nat::notice::AdmissionNotice::from_wire(&wire)?;
+                            if n.channel_id() != *channel_id {
+                                return Err(Error::MalformedRendezvous(
+                                    "rendezvous get: notice is not this room's",
+                                ));
+                            }
+                            set.notices.push(n);
                         }
                         _ => {
                             return Err(Error::MalformedRendezvous(

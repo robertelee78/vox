@@ -751,6 +751,11 @@ pub(crate) fn say_retention_above_room(channel_id: &Digest32, node: u64, room: u
 pub(crate) fn join_advice_after(fault: Option<Fault>, said: &str) -> &'static str {
     let reached = said.contains(": exchange: ") || said.contains(": exchange (incl. solve) ");
     match fault {
+        Some(Fault::Unreachable)
+            if reached && said.contains(vox_core::node::actor::MEMBER_CLOSED) =>
+        {
+            "a member was reached, then closed the connection during the join exchange\n       your passphrase was never checked — this is not a verdict on it\n       run the join again; `said:` below names why the member closed it"
+        }
         Some(Fault::Unreachable) if reached => {
             "a member was reached, but did not answer the join exchange in time\n       your passphrase was never checked — this is not a verdict on it\n       the member may have gone offline part-way, or be too busy to answer; try again while it is online"
         }

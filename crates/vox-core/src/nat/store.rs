@@ -36,13 +36,15 @@
 //! All time is caller-supplied `now` (milliseconds since the Unix epoch): the store is deterministic
 //! and has no ambient clock, which keeps it unit-testable and side-effect-free.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::error::{Error, Result};
 use crate::governance::genesis::Genesis;
 use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
+use crate::nat::notice::AdmissionNotice;
 use crate::nat::record::{MemberBundleRecord, PreJoinRecord, RendezvousRecord};
+use crate::nat::withdraw::BoardWithdraw;
 
 /// Minimum milliseconds between successive accepted records for one
 /// `(author, channel, epoch)` — the ADR-012 refresh cap (≥ 60 s).
@@ -295,6 +297,16 @@ pub struct RendezvousStore {
     /// `(channelID, author)` → the time of the member's withdraw (V030-14): its records stamped
     /// no later are refused, so a peer still mirroring them cannot put them back.
     withdrawn_members: HashMap<(Digest32, Digest32), u64>,
+    /// `(channelID, author)` → the member's own signed withdraw, the newest held (#520): passed on
+    /// with the room's admission notices, so a notice never travels further than the leave.
+    member_withdraws: HashMap<(Digest32, Digest32), (u64, Vec<u8>)>,
+    /// `channelID` → (`joiner` → its admission notice, the newest witnessed held) (#520). Kept
+    /// after a withdraw, so the leaver's key still checks its withdraw; refused as admission by it.
+    notices: HashMap<Digest32, BTreeMap<Digest32, AdmissionNotice>>,
+    /// `(channelID, author)` → a member withdraw that came before any key to check it by (#520):
+    /// held, unchecked, until a notice brings the member's key. It can refuse only a notice whose
+    /// key it verifies under, so nobody but the member can make it count.
+    pending_withdraws: HashMap<(Digest32, Digest32), BoardWithdraw>,
     /// Rooms withdrawn whole (V030-14): nothing of them is taken again. With the signed room
     /// withdraw that took it off when the room was ended, which a joiner is shown so it can be
     /// told the room ended rather than that nobody published it; `None` for a node's own forget.
@@ -366,6 +378,11 @@ impl RendezvousStore {
         }
         self.withdrawn_members
             .retain(|(cid, _), _| cid != channel_id);
+        self.member_withdraws
+            .retain(|(cid, _), _| cid != channel_id);
+        self.pending_withdraws
+            .retain(|(cid, _), _| cid != channel_id);
+        self.notices.remove(channel_id);
         // The genesis's bookkeeping goes with it, so a board's count of rooms stays its rooms.
         self.pinned.remove(channel_id);
         self.genesis_arrived.remove(channel_id);
@@ -411,6 +428,116 @@ impl RendezvousStore {
         self.rosters
             .get(channel_id)
             .is_some_and(|(_, admins)| admins.contains(who))
+    }
+
+    /// Keep `notice` (#520), checked by the caller against a key this board already knows for its
+    /// witness. Refused when a withdraw of the joiner is no older than its witness, or when the
+    /// room holds [`MAX_AUTHORS_PER_BUCKET`] notices of others. Returns whether the board learned
+    /// something: a joiner it held no notice for, or a later witness of one.
+    pub fn accept_notice(&mut self, notice: AdmissionNotice) -> Result<bool> {
+        let cid = notice.channel_id();
+        let joiner = notice.joiner();
+        // A withdraw that came first is checked now the notice brings the member's key.
+        if let Some(w) = self.pending_withdraws.remove(&(cid, joiner)) {
+            if w.verify(&notice.key).is_ok() {
+                self.withdraw_member(&cid, &joiner, w.timestamp_ms);
+                self.keep_member_withdraw(&cid, &joiner, w.timestamp_ms, w.to_wire());
+            }
+        }
+        if self.withdrawn(&cid, &joiner, notice.witness.timestamp_ms) {
+            return Err(Error::RendezvousRejected("withdrawn"));
+        }
+        let room = self.notices.entry(cid).or_default();
+        match room.get(&joiner) {
+            Some(held) if held.witness.timestamp_ms >= notice.witness.timestamp_ms => {
+                return Ok(false)
+            }
+            None if room.len() >= MAX_AUTHORS_PER_BUCKET => {
+                return Err(Error::RendezvousRejected("notice bucket at capacity"));
+            }
+            _ => {}
+        }
+        room.insert(joiner, notice);
+        Ok(true)
+    }
+
+    /// The admission notices this board holds for `channel_id`, each joiner's newest (#520).
+    #[must_use]
+    pub fn notices(&self, channel_id: &Digest32) -> Vec<&AdmissionNotice> {
+        self.notices
+            .get(channel_id)
+            .map(|r| r.values().collect())
+            .unwrap_or_default()
+    }
+
+    /// The key a notice held here gives `author` in `channel_id` (#520): what checks a withdraw
+    /// it signs, and a witness it signs for a later joiner.
+    #[must_use]
+    pub fn notice_key(
+        &self,
+        channel_id: &Digest32,
+        author: &Digest32,
+    ) -> Option<&CompositePublicKey> {
+        self.notices
+            .get(channel_id)
+            .and_then(|r| r.get(author))
+            .map(|n| &n.key)
+    }
+
+    /// Keep a member's own signed withdraw (#520), the newest one, to pass on with the room's
+    /// notices. The caller has verified it and applied it ([`RendezvousStore::withdraw_member`]).
+    pub fn keep_member_withdraw(
+        &mut self,
+        channel_id: &Digest32,
+        author: &Digest32,
+        timestamp: u64,
+        wire: Vec<u8>,
+    ) -> bool {
+        let held = self
+            .member_withdraws
+            .entry((*channel_id, *author))
+            .or_default();
+        if held.0 >= timestamp && !held.1.is_empty() {
+            return false;
+        }
+        *held = (timestamp, wire);
+        true
+    }
+
+    /// Hold a member withdraw no key here can check yet (#520), the newest per member, at most
+    /// [`MAX_AUTHORS_PER_BUCKET`] per room.
+    pub fn hold_pending_withdraw(&mut self, w: BoardWithdraw) {
+        let key = (w.channel_id, w.author_id);
+        if let Some(held) = self.pending_withdraws.get(&key) {
+            if held.timestamp_ms >= w.timestamp_ms {
+                return;
+            }
+        } else if self
+            .pending_withdraws
+            .keys()
+            .filter(|(cid, _)| *cid == w.channel_id)
+            .count()
+            >= MAX_AUTHORS_PER_BUCKET
+        {
+            return;
+        }
+        self.pending_withdraws.insert(key, w);
+    }
+
+    /// The members' own signed withdraws this board holds for `channel_id` (#520).
+    #[must_use]
+    pub fn member_withdraws(&self, channel_id: &Digest32) -> Vec<&[u8]> {
+        self.member_withdraws
+            .iter()
+            .filter(|((cid, _), _)| cid == channel_id)
+            .map(|(_, (_, w))| w.as_slice())
+            .collect()
+    }
+
+    /// When `author`'s newest withdraw from `channel_id` held here was signed, if one is.
+    #[must_use]
+    pub fn member_withdrawn_at(&self, channel_id: &Digest32, author: &Digest32) -> Option<u64> {
+        self.withdrawn_members.get(&(*channel_id, *author)).copied()
     }
 
     /// Whether a withdraw refuses a record of `author` in `channel_id` stamped `timestamp`.

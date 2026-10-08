@@ -331,7 +331,16 @@ fn a_crash_inside_a_join_never_costs_the_member_the_room() {
             .collect();
         let (ok, _, err) = vox(
             &host,
-            &["room", "create", "--passphrase-file", "-", "--name", "h"],
+            // A name of its own per kill point: alice holds every room she joined, and a node
+            // holds one room of a name, so a second "h" is refused, and rightly.
+            &[
+                "room",
+                "create",
+                "--passphrase-file",
+                "-",
+                "--name",
+                &format!("h{k}"),
+            ],
             Some(&format!("{ROOMPASS}\n")),
         );
         assert!(ok, "PRODUCT (staging): host{k}'s room create: {err}");

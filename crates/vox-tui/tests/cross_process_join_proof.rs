@@ -100,6 +100,11 @@ fn vox_plain(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
+    if world::typed::is_keyring_change(args) {
+        let (ok, shown) = world::typed::keyring(&cmd);
+        return (ok, shown.clone(), shown);
+    }
     let mut child = cmd.spawn().expect("APPARATUS: spawn vox");
     if let Some(text) = stdin {
         child
@@ -281,9 +286,8 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
             "join".into(),
             "--passphrase-file".into(),
             "-".into(),
+            // The room keeps the name its creator gave it (ADR-028 R-1): a join names none.
             link.clone(),
-            "--name".into(),
-            "mission".into(),
         ],
         Some(&format!("{roompass}\n")),
     );
