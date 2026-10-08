@@ -135,6 +135,8 @@ status bar along the bottom.
 
   A room that is not quiet shows its unread in words under its name. **Next Room That Needs
   You** (⌘J, or Control-N as in the TUI) opens the first room in **needs you**.
+- Trust offers, first under **needs you**: `offer: xgfm gktt… joined`, or `… trusts you` (see
+  [Trust offers](#trust-offers)).
 - **Keyring**, **Decision record** and **Services**: views of this window, described below.
 - **nodes on this Mac**, each with whether it is attached.
 
@@ -177,7 +179,8 @@ and `https` links can be opened from a card; any other link is shown as text.
 
 Type in **Say something to the room** and press Return. Beside the field:
 
-- **To:** ticks the members the message is addressed to. With none ticked it goes to the room.
+- **To:** opens the room's members to tick the ones the message is addressed to. With none
+  ticked it goes to the room.
 - **Urgent** marks it urgent. ⌘Return sends it urgent at once.
 
 You can dictate into the composer as into any text field, with the 🎤 key or **Edit > Start
@@ -210,7 +213,8 @@ its To: and note in the room on screen (or the next room you open).
 Beside the timeline, **MEMBERS** lists the room's other members with their trust: ⇄ for a member
 in your keyring that trusts you back, → for one in your keyring that does not yet, and · with a
 dimmed name marked `not in keyring` for one you have not trusted. VoiceOver says the first two as
-`in keyring, trusts you` and `in keyring`.
+`in keyring, trusts you` and `in keyring`. Under a member in your keyring, its entry's grant:
+`read` or `read + drive`.
 
 Under the members, **FAMILY LAN** offers the room's family LAN. Before Vox's LAN helper is
 approved, it says what approving grants: one root process that creates network interfaces for
@@ -245,13 +249,18 @@ that failed, in the daemon's words. If macOS does not let Vox notify, it says
 
 **Keyring** in the sidebar, or **View > Keyring** (⌘⇧K), lists the nodes yours trusts: each by
 your alias for it, with its fingerprint art and its fingerprint in groups, and an arrow saying
-whether it trusts you back (⇄) or not yet (→). See [Identity and keyring](keyring.md) for what
-trust grants.
+whether it trusts you back (⇄) or not yet (→), and what its entry grants: `read` or `read +
+drive`. See [Identity and keyring](keyring.md) for what trust grants.
 
-- **Add a node**: paste or type its fingerprint and give it an alias. Before you choose
-  **Trust**, the view says what trusting does: it may read what you write in every room you
-  share, now and later; you read what it writes once it trusts you too; and it reaches every
-  service you bind to a room you are both in.
+- **Add a node**: paste or type its fingerprint, give it an alias, and choose what it
+  **Grants**: `read` or `read + drive`. Before you choose **Trust**, the view says what trusting
+  does: it may read what you write in every room you share, now and later; you read what it
+  writes once it trusts you too; and it reaches every service you bind to a room you are both in.
+- **Change…**: switch between read and read + drive, saying first what that does: "With drive,
+  NAME also sees inside your Sessions and may type into them, interrupt or stop them, answer their
+  approvals and questions, and send and receive their files." or "With read only, NAME sees each
+  of your Sessions' name and whether it is open, and nothing inside it." Then **Give drive** or
+  **Read only**.
 - **Compare…**: paste or type the fingerprint the person gave you another way. Case, spaces and
   dashes do not count. A match says `Matches NAME's fingerprint.`; a mismatch says
   `Does not match. This is not the node you trusted as NAME: do not trust it.` and offers to
@@ -269,6 +278,17 @@ Changing who you trust needs your identity passphrase once the keyring window ha
 view then asks for it, and makes the change you were making when you choose **Continue**.
 
 **Node > Show Fingerprint** (⌘I) shows your own fingerprint with its art, and **Copy**.
+
+### Trust offers
+
+A node that joined a room after yours, or that trusts you, and is not in your keyring, waits as
+an offer under **needs you** in the sidebar (see [Offers](keyring.md#offers-nodes-waiting-for-your-trust)).
+Select it to see a **Trust offer**: its fingerprint with its art, the same sentence `vox trust
+offers` prints (`ben joined. ann trusts it.`), the rooms you share (`In: family`), and what
+trusting and dismissing do. Give it an alias, choose **Grants** (`read` or `read + drive`), and
+**Trust**; the view says what that grant does first, and asks for your identity passphrase if the
+keyring window has closed. You are not asked to compare fingerprints. **Dismiss** removes the offer
+on your node alone: it is not told, and stays out of your keyring.
 
 ## The services view
 
@@ -316,6 +336,8 @@ Every action is in the menus, and the palette lists the same actions.
 | ⌘⇧S | Services |
 | ⌘⇧D | Decision Record |
 | ⌘1 to ⌘9 | The first to ninth room, in the sidebar's order |
+| ⇧⌘T | Focus Timeline |
+| ⌘+, ⌘-, ⌘0 | Bigger, Smaller, Actual Size |
 
 ## The menu bar item
 
@@ -345,14 +367,25 @@ Notifications, Vox.
 The app follows your Mac's settings:
 
 - **Reduce Motion** stops its animations.
-- **Increase Contrast** lifts secondary text to the primary colour, strengthens outlines, and
-  marks the selection with the focus colour.
+- **Increase Contrast** switches to brighter colours: every text colour at 7:1 or more against
+  its background (an error on a selected row at 6:1), outlines at 3.9:1 or more, and the selection
+  marked with the focus colour.
 - **Reduce Transparency**: content is drawn in opaque colours only.
-- Running text follows the system text size.
 
-Every control has a VoiceOver label in words: a room says its group and unread, a member its
-trust, a service card its address, who shares it and its kind, and the status bar reads as one
-sentence. The app is dark only.
+A selected row or card has a bar along its leading edge, so a selection never rests on colour
+alone, and card outlines are at 4.5:1 or more.
+
+**View > Bigger** (⌘+), **Smaller** (⌘-) and **Actual Size** (⌘0) change the size of all the
+app's text, buttons and controls, up to twice the usual size.
+
+The timeline works from the keyboard. **View > Focus Timeline** (⇧⌘T) puts the keyboard on it;
+↑ and ↓ select a message, Space opens its pulled file in Quick Look, and Return opens the file,
+or else the link on its card.
+
+Every control has a VoiceOver label in words: a message reads as one sentence (who wrote, to whom,
+whether urgent, what it says, and who read or pulled it), a room says its group and unread, a
+member its trust, a service card its address, who shares it and its kind, and the status bar
+reads as one sentence. The app is dark only.
 
 ## Sessions
 
@@ -362,8 +395,7 @@ opening and end among it), each open Session (`● LABEL`, or `! LABEL · waitin
 waiting for you), and **Ended (N)**, folded until you open it. See [Sessions](sessions.md) for what
 a Session is.
 
-Choose a Session to show it in the timeline. Its title says which: `Timeline — LABEL · open ·
-⏱ 1 week`. To a member its node trusts with **read + drive**, a Session shows each entry as one
+Choose a Session to show it in the timeline. Its title says which: `Timeline — LABEL · open`. To a member its node trusts with **read + drive**, a Session shows each entry as one
 line, word for word as `vox room session` prints it, with **Details** for its full input and
 output, and a file the session sent offers **Quick Look** and **Show in Finder** once your node
 has a checked copy. The header says that the Session's name and id are its node's claim:
