@@ -210,9 +210,6 @@ final class FirstRunProof: XCTestCase {
     /// Set while the proof itself has hidden or quit Vox (⌘H, ⌘Q), until Vox is active again:
     /// what takes the foreground meanwhile was handed it by the proof, not taken.
     private var handedOff = false
-    /// The given app's process (VOX_PROOF_APP), started by the stager: stopped by its pid when the
-    /// case ends.
-    private var givenPid: Int32?
 
     override func setUpWithError() throws {
         // A case stops at its first red: one red, with its side, and no cascade behind it.
@@ -252,7 +249,6 @@ final class FirstRunProof: XCTestCase {
     override func tearDown() {
         if let watchingForeground { NSWorkspace.shared.notificationCenter.removeObserver(watchingForeground) }
         if let watchingVox { NSWorkspace.shared.notificationCenter.removeObserver(watchingVox) }
-        if let givenPid, stager != nil { _ = stager.run(["/bin/kill", "\(givenPid)"], env: [:]) }
         daemon?.terminate()
         super.tearDown()
     }
@@ -1369,61 +1365,32 @@ final class FirstRunProof: XCTestCase {
         URL(fileURLWithPath: path).resolvingSymlinksInPath().path
     }
 
-    /// The app the proof drives: the built app by its path; a given app (VOX_PROOF_APP), which the
-    /// stager starts, by its bundle id, to attach to that copy (by its path XCTest does not see a
-    /// copy it did not launch). Only one Vox ever runs while a case does (see launchVox).
+    /// The app the proof drives: this build's own Vox.app, by its path (app-proofs.sh refuses any
+    /// other: XCTest launches another bundle without the environment).
     private func voxApp(_ appPath: String) -> XCUIApplication {
-        ProcessInfo.processInfo.environment["VOX_PROOF_GIVEN"] == "1"
-            ? XCUIApplication(bundleIdentifier: "us.vox.app")
-            : XCUIApplication(url: URL(fileURLWithPath: appPath))
+        XCUIApplication(url: URL(fileURLWithPath: appPath))
     }
 
     /// Start Vox.app on this run's scratch profile and show, before any step, that it is on it;
-    /// else stop (fail closed). A given, signed app (VOX_PROOF_APP) is started by the stager with
-    /// `open -n --env`: XCTest launches a hardened app through NSWorkspace and drops its
-    /// environment, and one such run opened the account's real data root. The proof then attaches.
+    /// else stop (fail closed). XCTest once launched a bundle other than this build's without its
+    /// environment, and the app opened the account's real data root (read-only); app-proofs.sh now
+    /// refuses such a bundle, and this guard stops any launch that still lands there.
     ///
-    /// Before: no Vox.app runs, so the proof cannot attach to another. After: exactly one Vox runs,
-    /// this app's executable; and within 30 s
-    /// the app shows this run's scratch path or a node staged only here, or asks the first-run
-    /// question the account's own config has answered. The account's data root shown, or none of
-    /// these, stops the case.
+    /// Before: no Vox.app runs, so the proof cannot drive another. After: exactly one Vox runs,
+    /// this app's executable; and within 30 s the app shows this run's scratch path or a node
+    /// staged only here, or asks the first-run question the account's own config has answered.
+    /// The account's data root shown, or none of these, stops the case.
     private func launchVox(_ ui: XCUIApplication, _ appPath: String, env: [String: String],
                            scratch: String) throws {
         try scratchOnly(env, under: scratch)
-        let given = ProcessInfo.processInfo.environment["VOX_PROOF_GIVEN"] == "1"
         let appExe = resolved(appPath + "/Contents/MacOS/Vox")
         if let running = pids("Vox").first {
             throw Apparatus("refusing to start Vox.app: a Vox.app already runs (pid \(running), \(executable(running))), and the proof could drive it")
         }
-        if given {
-            var argv = ["/usr/bin/open", "-n"]
-            for (key, value) in env.sorted(by: { $0.key < $1.key }) { argv += ["--env", "\(key)=\(value)"] }
-            argv.append(appPath)
-            let opened = stager.run(argv, env: [:])
-            guard opened.status == 0 else {
-                throw Apparatus("`open -n` did not start \(appPath): \(opened.out)")
-            }
-            let until = Date().addingTimeInterval(15)
-            while Date() < until && pids("Vox").isEmpty { Thread.sleep(forTimeInterval: 0.25) }
-        } else {
-            ui.launch()
-        }
+        ui.launch()
         let running = pids("Vox")
         guard running.count == 1, let pid = running.first, executable(pid) == appExe else {
             throw Apparatus("after starting Vox.app, the Vox processes are \(running.map { "\($0) \(executable($0))" }), not one of \(appExe)")
-        }
-        if given {
-            givenPid = pid
-            // Attached only: an XCUIApplication that does not see it running would launch a second
-            // copy itself, through NSWorkspace, with no environment. That is never done.
-            // XCTest sees a copy it did not launch only once it is up: waited for, never launched.
-            let seenUntil = Date().addingTimeInterval(15)
-            while ui.state == .notRunning && Date() < seenUntil { Thread.sleep(forTimeInterval: 0.5) }
-            guard ui.state != .notRunning else {
-                throw Apparatus("XCTest does not see the Vox.app the stager started (pid \(pid), \(executable(pid))) as \(appPath): refusing to let it launch one itself, without this run's environment")
-            }
-            ui.activate()
         }
         // The profile, positively, before any step. The account's own config has answered the
         // first-run question (checked here, by the stager), so an app asking it is not reading
