@@ -62,6 +62,7 @@ private struct Sidebar: View {
                 StateMark(kind: .live, words: "node \(model.node), attached")
                     .font(Theme.text)
                     .accessibilityIdentifier("attached")
+                    .background(SidebarHighlightOff())
             }
             ForEach([RoomGroup.needsYou, .active, .quiet], id: \.self) { need in
                 let rooms = model.group(need)
@@ -71,9 +72,11 @@ private struct Sidebar: View {
                 Section {
                     ForEach(rooms) { room in
                         RoomRow(room: room).tag(NodeModel.Selection.room(room.id))
+                            .sidebarRow(model.selection == .room(room.id))
                     }
                     ForEach(offers, id: \.fingerprint) { offer in
                         OfferRow(offer: offer).tag(NodeModel.Selection.offer(offer.fingerprint))
+                            .sidebarRow(model.selection == .offer(offer.fingerprint))
                     }
                 } header: {
                     Text("\(need.words) (\(count))")
@@ -84,10 +87,13 @@ private struct Sidebar: View {
             }
             Section {
                 Text("Keyring").font(Theme.text).tag(NodeModel.Selection.keyring)
+                    .sidebarRow(model.selection == .keyring)
                     .accessibilityIdentifier("keyring")
                 Text("Decision record").font(Theme.text).tag(NodeModel.Selection.decisions)
+                    .sidebarRow(model.selection == .decisions)
                     .accessibilityIdentifier("decisions")
                 Text("Services").font(Theme.text).tag(NodeModel.Selection.services)
+                    .sidebarRow(model.selection == .services)
                     .accessibilityIdentifier("services")
             }
             Section {
@@ -105,6 +111,61 @@ private struct Sidebar: View {
         // The sidebar's rows in the app's face and size: a sidebar list sets its own otherwise.
         .font(Theme.text)
         .environment(\.defaultMinListRowHeight, Theme.scaled(24))
+    }
+}
+
+extension View {
+    /// A sidebar row's fill while it is the one selected: the selection token, on which
+    /// text.primary is 4.89:1 (WCAG 2.1 1.4.3, #450). The system's own highlight, which ignores
+    /// `.tint` and drew text.primary at 3.1:1, is off (`SidebarHighlightOff`); the row is still the
+    /// list's selection, so arrow keys move it and VoiceOver says it is selected.
+    fileprivate func sidebarRow(_ selected: Bool) -> some View {
+        listRowBackground(SelectionFill(selected: selected).padding(.horizontal, 10))
+    }
+}
+
+/// The selected row's fill, drawn by an AppKit view that takes no vibrancy: a SwiftUI shape there
+/// was blended with the sidebar's material, and #1767b5 read #3e7bbd (text.primary about 4.0:1).
+/// Its colour is the token's, resolved for the view's appearance, so Increase Contrast gives
+/// `hex_hc`.
+private struct SelectionFill: NSViewRepresentable {
+    let selected: Bool
+
+    func makeNSView(context: Context) -> Fill { Fill() }
+    func updateNSView(_ view: Fill, context: Context) {
+        view.selected = selected
+        view.needsDisplay = true
+    }
+
+    final class Fill: NSView {
+        var selected = false
+        override var allowsVibrancy: Bool { false }
+        override func draw(_ dirty: NSRect) {
+            guard selected, let color = NSColor(named: "Selection") else { return }
+            color.setFill()
+            NSBezierPath(roundedRect: bounds, xRadius: 5, yRadius: 5).fill()
+        }
+    }
+}
+
+/// Turns off the sidebar table's own selection highlight, from inside one of its rows: the
+/// selected row is drawn by `sidebarRow` instead. Selection, keyboard and accessibility are the
+/// table's as before; only the drawing of the highlight changes.
+private struct SidebarHighlightOff: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView { Finder() }
+    func updateNSView(_ view: NSView, context: Context) { (view as? Finder)?.apply() }
+
+    final class Finder: NSView {
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            apply()
+        }
+
+        func apply() {
+            var up = superview
+            while let v = up, !(v is NSTableView) { up = v.superview }
+            (up as? NSTableView)?.selectionHighlightStyle = .none
+        }
     }
 }
 
@@ -425,6 +486,7 @@ private struct RoomView: View {
                         _ = firstFile(in: providers) { attaching = Attaching(url: $0) }
                     }
                     .accessibilityIdentifier("timeline")
+                    .accessibilityLabel("Timeline")
                     .quickLookPreview($looking)
                     .onChange(of: looking) { url in
                         if let previewKeys { NSEvent.removeMonitor(previewKeys) }
@@ -519,6 +581,7 @@ private struct RoomView: View {
             .accessibilityLabel("Attach a file or folder")
             .accessibilityIdentifier("attach")
             TextField("Say something to the room", text: $draft)
+                .accessibilityLabel("Message to the room")
                 .textFieldStyle(.plain)
                 .frame(minWidth: Theme.scaled(160), maxWidth: .infinity)
                 .layoutPriority(1)

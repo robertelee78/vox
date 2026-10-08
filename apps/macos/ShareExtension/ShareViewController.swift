@@ -238,6 +238,7 @@ struct ShareView: View {
             }
             .frame(minHeight: 90)
             TextField("Note", text: $model.note)
+                .accessibilityLabel("Note")
             if !model.failure.isEmpty {
                 // Danger in its token, with its glyph: never by colour alone (ADR-028 L-2, E-6).
                 Text("✕ \(model.failure)").foregroundStyle(VoxTokens.Colors.danger)

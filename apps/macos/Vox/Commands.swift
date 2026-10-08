@@ -176,6 +176,7 @@ struct Palette: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             TextField("Type a command", text: $query)
+                .accessibilityLabel("Command")
                 .onSubmit { if let first = found.first { done(first) } }
                 .accessibilityIdentifier("palette-query")
             ScrollView {
@@ -239,13 +240,16 @@ private struct RoomForm: View {
             Text(joining ? "Join a room" : "New room").heading()
             if joining {
                 TextField("Room link (vox://…)", text: $link).font(Theme.mono)
+                    .accessibilityLabel("Room link")
             } else {
                 TextField("Its name, as every member sees it", text: $name)
+                    .accessibilityLabel("Room name")
                     .accessibilityIdentifier("room-form-name")
             }
             Text(joining ? "The room's passphrase, sent to you another way than its link."
                 : "A passphrase for the room: send it another way than its link.").secondaryText()
             SecureInput(holder: field) { submit() }.frame(width: Theme.scaled(320))
+                .accessibilityLabel(joining ? "Room passphrase" : "Passphrase for the new room")
                 .accessibilityIdentifier("room-form-passphrase")
             if let said = model.said { StateMark(kind: .danger, words: said).textSelection(.enabled) }
             HStack {
@@ -357,6 +361,7 @@ private struct RenameSheet: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Rename the room").heading()
             TextField("Its new name", text: $name).onSubmit { submit() }
+                .accessibilityLabel("New room name")
                 .accessibilityIdentifier("rename-name")
             Text("Every member sees the new name, in their sidebar and in every address of the "
                 + "room's services. Only the room's creator or an admin may rename it.")

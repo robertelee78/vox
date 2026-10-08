@@ -42,6 +42,7 @@ struct AttachSheet: View {
             Text(to.isEmpty ? "For the whole room." : "For the members ticked; the room sees it too.")
                 .secondaryText()
             TextField("Note (optional)", text: $note)
+                .accessibilityLabel("Note")
                 .accessibilityIdentifier("attach-note")
             HStack {
                 Button("Cancel", action: done).keyboardShortcut(.cancelAction)
