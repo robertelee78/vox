@@ -28,7 +28,10 @@
 //!
 //! A second test, `a_peer_on_loopback_is_not_cut_off_when_the_default_route_moves`, runs on every
 //! platform without privilege: it stages a move of the default route through the daemon's own
-//! change path (`VOX_TEST_ROUTE_V4_FILE`) and proves a join over loopback survives it.
+//! change path (`VOX_TEST_ROUTE_V4_FILE`) and proves a join over loopback survives it. First it
+//! stages a route lookup the kernel did not answer, and proves the daemon says no move for it.
+//! Mutation: an unanswered lookup compared as "no route" (`NetShape::now` marking every route
+//! known) → red, alice saying "192.168.1.1 → none".
 //!
 //! A `vox` step that fails before the move is `PRODUCT (staging):`, after it `PRODUCT:`, each
 //! quoting what vox said; the driver's own failures (no `unshare`, a `sudo` step, a crash) are
@@ -328,6 +331,17 @@ fn a_peer_on_loopback_is_not_cut_off_when_the_default_route_moves() {
         }
     });
     std::thread::sleep(Duration::from_millis(1500));
+
+    // ---- a route lookup the kernel does not answer is not a route that went away -------------
+    // Unknown is not "none": said as "192.168.1.1 → none", it redialled every peer for a change
+    // that never happened (uxresearch round 3's "→ none").
+    std::fs::write(&route, "unanswered").expect("APPARATUS: stage an unanswered lookup");
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        !alice.said().contains("192.168.1.1 →"),
+        "PRODUCT: a route lookup that got no answer was said as a move of the default route: {}",
+        alice.said()
+    );
 
     // The move, while the agent's node is busy.
     agent.signal("-STOP");

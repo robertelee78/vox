@@ -842,7 +842,7 @@ fn spawn_watcher(
             let Some(change) = NetChange::between(&before, &after, unix_now_ms()) else {
                 continue;
             };
-            before = after;
+            before = after.knowing(&before);
             let Some(p) = presence.upgrade() else { return };
             p.changed(change).await;
         }
