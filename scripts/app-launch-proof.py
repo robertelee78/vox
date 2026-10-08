@@ -18,13 +18,15 @@ person can check it with `ps` and the daemon's log (`<data root>/.daemon/log`):
 3. Quit and launched again while that daemon runs (a node attached by hand, `vox node attach`,
    keeps it running), the app uses it: the same daemon, by PID, and still one start in its log.
 
-4. Keep Running kept: with "keep" answered, the app acting as carol (a node with no passphrase,
-   so nothing goes in the Keychain) leaves her attached after it quits (SIGTERM, which the app
-   takes as ⌘Q); with "no" answered, quitting detaches her (ADR-014 M-6, ADR-028 A-4).
+4. Keep Running kept: NOT RUN here, and said so. It was proved with carol, a node with no
+   passphrase, which the app attaches at launch with no one at the keyboard. Since #522 every node
+   has a passphrase: the app asks for it, or reads it from the login Keychain once Keep Running put
+   it there, and this headless proof neither types nor touches the person's Keychain. Keep Running
+   is checked in the attended QE pass instead (ADR-014 M-6, ADR-028 A-4).
 
 Mutant: the app starts a daemon of its own at every launch (`vox daemon --as-detached`, its output
-in the log) as well as reaching the one running: (2) goes red on the second launch. Mutant: the
-app detaches its node on quit whatever was chosen: (4) goes red.
+in the log) as well as reaching the one running: (2) goes red on the second launch. (4) is not run
+(above).
 
 Every red names its side: PRODUCT (what the app or the daemon did) or APPARATUS (the proof's own
 staging).
@@ -245,66 +247,6 @@ def node_state(vox, env, node):
     return f"not listed ({done.stdout.strip()!r}{done.stderr.strip()!r})"
 
 
-def after_quit(app, answer):
-    """(4) and its control: the app acting as carol, a node with no passphrase, with the first-run
-    answer `answer`; quit; what `vox node list` says of carol 10 s later."""
-    scratch = tempfile.mkdtemp(prefix="vox-keep-")
-    data, config = os.path.join(scratch, "data"), os.path.join(scratch, "config")
-    os.makedirs(os.path.join(config, "app"), mode=0o700)
-    for name, text in (("login-item", answer), ("node", "carol")):
-        with open(os.path.join(config, "app", name), "w", encoding="utf-8") as f:
-            f.write(text + "\n")
-    env = clean_env()
-    env.update({"VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config})
-    vox = os.path.join(app, "Contents", "Helpers", "vox")
-    empty = os.path.join(scratch, "empty.pass")
-    open(empty, "w", encoding="utf-8").close()
-    made = subprocess.run([vox, "node", "create", "carol", "--passphrase-file", empty], env=env,
-                          capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120)
-    if made.returncode != 0:
-        fail("APPARATUS", f"`vox node create carol` exited {made.returncode}: {made.stdout}{made.stderr}")
-    out = os.path.join(scratch, "app.out")
-    app_p = launch(app, env, out)
-    try:
-        until = time.monotonic() + 60
-        state = ""
-        while time.monotonic() < until:
-            if app_p.poll() is not None:
-                exited(app_p, out, "before it attached carol")
-            state = node_state(vox, env, "carol")
-            if state == "attached":
-                break
-            time.sleep(0.25)
-        if state != "attached":
-            fail("PRODUCT", f"answered {answer!r}, the app never attached carol (a node with no "
-                            f"passphrase) in 60 s; `vox node list` says {state}; the daemon's log: "
-                            f"{log_text(data)!r}")
-        # Quit as a person does: the app takes SIGTERM as ⌘Q.
-        app_p.send_signal(signal.SIGTERM)
-        try:
-            app_p.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            fail("PRODUCT", "the app did not quit within 30 s of SIGTERM")
-        time.sleep(10)
-        return node_state(vox, env, "carol")
-    finally:
-        if app_p.poll() is None:
-            app_p.kill()
-            app_p.wait()
-        for pid in daemons(data):
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        until = time.monotonic() + 15
-        while daemons(data) and time.monotonic() < until:
-            time.sleep(0.1)
-        for pid in daemons(data):
-            os.kill(pid, signal.SIGKILL)
-            print(f"[launch-proof] APPARATUS: daemon {pid} outlived the keep phase and was killed",
-                  file=sys.stderr)
-
-
 def main():
     if len(sys.argv) != 2:
         fail("APPARATUS", "usage: app-launch-proof.py <Vox.app>")
@@ -312,19 +254,12 @@ def main():
     if not os.access(os.path.join(app, "Contents", "Helpers", "vox"), os.X_OK):
         fail("APPARATUS", f"{app} holds no Contents/Helpers/vox; build it with scripts/app-proofs.sh")
     one_daemon(app)
-    # (4) Keep Running chosen: carol stays attached after the app quits. The control: Not Now,
-    # and quitting detaches her (ADR-028 A-4).
-    kept = after_quit(app, "keep")
-    print(f"[launch-proof] Keep Running: 10 s after the app quit, `vox node list` says carol is {kept}")
-    if kept != "attached":
-        fail("PRODUCT", f"with Keep Running chosen, carol (no passphrase) must stay attached after "
-                        f"the app quits; `vox node list` says {kept}")
-    declined = after_quit(app, "no")
-    print(f"[launch-proof] Not Now: 10 s after the app quit, `vox node list` says carol is {declined}")
-    if declined != "detached":
-        fail("PRODUCT", f"with Not Now chosen, quitting must detach carol; `vox node list` says "
-                        f"{declined}")
-    print("[launch-proof] ok: kept after quit only with Keep Running")
+    # (4) is not run: since #522 every node has a passphrase, and this headless proof neither
+    # types it nor touches the person's Keychain. Said loudly, never read as a pass.
+    print("[launch-proof] OPTIONAL PROOF NOT RUN: (4) Keep Running — every node has a passphrase "
+          "(#522), which this headless proof neither types nor reads from the person's Keychain; "
+          "it is checked in the attended QE pass")
+    print("[launch-proof] ok: (1)-(3) one daemon, never two, reused")
 
 
 if __name__ == "__main__":
