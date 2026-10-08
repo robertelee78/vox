@@ -233,6 +233,7 @@ struct ShareView: View {
             }
             .frame(minHeight: 90)
             TextField("Note", text: $model.note)
+                .accessibilityLabel("Note")
             if !model.failure.isEmpty {
                 Text(model.failure).foregroundColor(.red).fixedSize(horizontal: false, vertical: true)
             }

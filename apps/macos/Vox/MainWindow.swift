@@ -306,6 +306,7 @@ private struct RoomView: View {
                         _ = firstFile(in: providers) { attaching = Attaching(url: $0) }
                     }
                     .accessibilityIdentifier("timeline")
+                    .accessibilityLabel("Timeline")
                     .quickLookPreview($looking)
                 }
                 // A Session has no room composer (CL-1): the room's composer never speaks into
@@ -372,6 +373,7 @@ private struct RoomView: View {
             .accessibilityLabel("Attach a file or folder")
             .accessibilityIdentifier("attach")
             TextField("Say something to the room", text: $draft)
+                .accessibilityLabel("Message to the room")
                 .textFieldStyle(.plain)
                 .frame(minWidth: Theme.scaled(160), maxWidth: .infinity)
                 .layoutPriority(1)

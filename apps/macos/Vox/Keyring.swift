@@ -78,10 +78,12 @@ struct KeyringView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("ADD A NODE").eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
             TextField("Fingerprint (paste or type)", text: $fingerprint)
+                .accessibilityLabel("Fingerprint")
                 .font(Theme.mono)
                 .focused($adding)
                 .accessibilityIdentifier("keyring-add-fingerprint")
             TextField("Alias", text: $alias)
+                .accessibilityLabel("Alias")
                 .accessibilityIdentifier("keyring-add-alias")
             Picker("Grants", selection: $drive) {
                 Text(Capability.words(false)).tag(false)
@@ -197,6 +199,7 @@ private struct KeyringRow: View {
             if renaming {
                 HStack {
                     TextField("New alias", text: $newAlias)
+                        .accessibilityLabel("New alias for \(node.name)")
                     Button("Rename") {
                         let name = newAlias
                         Task { if await model.rename(node.fingerprint, to: name) { renaming = false } }
@@ -209,6 +212,7 @@ private struct KeyringRow: View {
             }
             if comparing {
                 TextField("Their fingerprint, pasted or typed", text: $other).font(Theme.mono)
+                    .accessibilityLabel("Their fingerprint, to compare with \(node.name)'s")
                     .accessibilityIdentifier("keyring-compare-\(node.name)")
                 if !other.isEmpty {
                     if Compare.same(other, node.fingerprint) {
@@ -291,6 +295,7 @@ struct KeyringPassphrase: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Changing who you trust needs your identity passphrase again.").secondaryText()
             SecureInput(holder: field) { submit() }
+                .accessibilityLabel("Identity passphrase")
                 .frame(width: Theme.scaled(320))
                 .accessibilityIdentifier("keyring-passphrase")
             Button("Continue") { submit() }

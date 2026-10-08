@@ -174,6 +174,7 @@ private struct ShareForm: View {
             }
             if let picked, let preview {
                 TextField("Name", text: $name).accessibilityIdentifier("share-name")
+                    .accessibilityLabel("Service name")
                 Picker("Room", selection: $room) {
                     ForEach(model.rooms.filter(\.open)) { Text($0.name).tag($0.id) }
                 }

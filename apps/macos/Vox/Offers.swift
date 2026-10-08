@@ -77,6 +77,7 @@ struct OfferView: View {
             .secondaryText()
         Divider()
         TextField("Alias", text: $alias)
+            .accessibilityLabel("Alias")
             .frame(width: 320)
             .accessibilityIdentifier("offer-alias")
         Picker("Grants", selection: $drive) {
