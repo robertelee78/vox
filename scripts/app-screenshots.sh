@@ -27,6 +27,9 @@ export VOX_DATA_DIR="$DEMO/data" VOX_CONFIG_DIR="$DEMO/config"
 unset CODEX_HOME CLAUDE_CONFIG_DIR OPENCODE_CONFIG_DIR VOX_SESSION CLAUDE_CODE_SESSION_ID \
     CODEX_THREAD_ID CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_MESSAGING_TOKEN VOX_HARNESS \
     VOX_OPENCODE_WAKE_SOCKET VOX_OPENCODE_WAKE_TOKEN
+# The runner's own terminal is not the demo's: a hook that finds TMUX_PANE names that pane as its
+# session's, and a drive would then aim at the runner's terminal.
+unset TMUX TMUX_PANE
 export VOX_PROXY=127.0.0.1:0
 # Never the real data root: both are under the scratch directory made just now.
 case "$VOX_DATA_DIR$VOX_CONFIG_DIR" in
