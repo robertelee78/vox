@@ -167,6 +167,10 @@ quit with the release `vox`. Sessions in the app (#554) and the Finder Share men
 
 ### Trust offers (`v040/trust-offers` c429f9be, `v040/agent-offers` dfbbf9ae, not merged)
 
+The branches now stand at `acc4032e` and `024e2705`. Their user words differ from `dfbbf9ae` only in
+the agent's turn, which now reads `Vox offers your node these nodes to trust`; the manual quotes that
+(from the source at `024e2705`, not run).
+
 Written on 2026-10-07 against `dfbbf9ae`, which holds both, before either merged; to be checked
 again when they do. `cargo build --release --bin vox` with no features; one daemon in a scratch
 data root with nodes `ann` and `ben` (both with an identity passphrase), room `family`, every
@@ -179,7 +183,7 @@ process stopped by PID.
 | Dismiss | `vox trust dismiss --node ann xgfmgk`; a prefix matching no offer | `vox: about to dismiss the offer of xgfmgktt6c64dkgehy7nvxg3if: on this node alone; …`, `vox: dismissed the offer of …; if it leaves and joins again, it is offered again`; `vox: no offer matches "zzzzzz"; vox trust offers lists them` (exit 1) |
 | Leave and join again: offered again | `vox room leave` and `vox room join` as `ben` | `ann`'s offers list `ben` again, `joined` |
 | Accept, and the offer back | `vox trust add --node ann FP --name ben`, the passphrase typed at a terminal; then `vox trust offers --node ben` | `vox: trusting xgfmgktt6c64dkgehy7nvxg3if as "ben": read`; `ann`'s offers empty; `ben`'s: `2o5a45ggy2i5ndadhow4xl776d (not in keyring) trusts you. No one you trust trusts it yet.` |
-| An agent's node is offered in its turn | `agent_hook_proof::an_offer_for_the_agents_node_is_shown_in_its_turn_and_only_the_operator_accepts_it`, release, `--ignored`, at `dfbbf9ae` | passed in 10.5 s; turn 1 carried `Vox offers your node nodes to trust (…)` and the `accept: … --node default` line quoted |
+| An agent's node is offered in its turn | `agent_hook_proof::an_offer_for_the_agents_node_is_shown_in_its_turn_and_only_the_operator_accepts_it`, release, `--ignored`, at `dfbbf9ae` | passed in 10.5 s; turn 1 carried `Vox offers your node these nodes to trust (…)` and the `accept: … --node default` line quoted |
 | The TUI's offer rows, card and accept prompt | `the_tui_shows_the_room_truthfully_proof`, release, `--features vox-tui/test-knobs`, `--ignored`, at `dfbbf9ae` (a first run built without `test-knobs` stopped as APPARATUS, precondition unmet) | passed in 455.6 s; sidebar `needs you (2)`, `offer: kt3y l5vl… joined`, `offer: zvfn 6q7d… trusts you`; claims `offer`, `reoffer`, `offerback` and `accept` ok, the accept asking a name and read or read + drive and no fingerprint to compare |
 
 ## v0.3.1 command check
