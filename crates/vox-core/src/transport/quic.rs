@@ -1255,8 +1255,8 @@ impl VoxEndpoint {
     /// The neutral TLS handshake (post-quantum group, no classical fallback), then the identity
     /// exchange as the dialler ([`identity::dial`]): this node shows who it is only once the
     /// other end has proved, on this TLS session, to be `expected_peer`. Anything else — a
-    /// refusal, a `PROVE` that does not verify, silence — says "nothing at `addr` answers as
-    /// `expected_peer`" and names nobody (ADR-011 38a).
+    /// refusal, a `PROVE` that does not verify, silence — is said as what it was, naming nobody
+    /// but `expected_peer` ([`identity::DialFailed::into_error`], ADR-011 38a).
     ///
     /// # Errors
     /// As above, or a handshake failure by its own cause.
