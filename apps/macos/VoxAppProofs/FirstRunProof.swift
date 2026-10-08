@@ -249,15 +249,54 @@ final class FirstRunProof: XCTestCase {
         let words = issue.compactDescription
         let product = words.range(of: "PRODUCT")
         let apparatus = words.range(of: "APPARATUS")
-        guard let product, apparatus.map({ product.lowerBound < $0.lowerBound }) ?? true,
-              let lost = lostForeground.last(where: { Date().timeIntervalSince($0.at) < 30 }) else {
+        guard let product, apparatus.map({ product.lowerBound < $0.lowerBound }) ?? true else {
             super.record(issue)
             return
         }
         var moved = issue
-        let ago = String(format: "%.1f", Date().timeIntervalSince(lost.at))
-        moved.compactDescription = "APPARATUS: Vox lost the foreground to \(lost.to) \(ago) s before this red, so what it read cannot be the product's; it read: \(words)"
+        if let cover = coveredBy() {
+            moved.compactDescription = "APPARATUS: Vox's window is covered by \(cover), so a click or a read on it cannot be the product's; it read: \(words)"
+        } else if let lost = lostForeground.last(where: { Date().timeIntervalSince($0.at) < 30 }) {
+            let ago = String(format: "%.1f", Date().timeIntervalSince(lost.at))
+            moved.compactDescription = "APPARATUS: Vox lost the foreground to \(lost.to) \(ago) s before this red, so what it read cannot be the product's; it read: \(words)"
+        } else {
+            super.record(issue)
+            return
+        }
         super.record(moved)
+    }
+
+    /// Another app's window in front of Vox's main window and over a quarter of it (a person's
+    /// window, a system overlay such as the screenshot tool's), by the window list's owner, layer
+    /// and bounds only: never an image. Nil when nothing covers it, or Vox has no window.
+    private func coveredBy() -> String? {
+        guard let vox = NSRunningApplication.runningApplications(withBundleIdentifier: "us.vox.app")
+            .first(where: { !$0.isTerminated && ($0.bundleURL?.path.contains("/target/xcode/") ?? false) })
+        else { return nil }
+        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                                 kCGNullWindowID) as? [[String: Any]] ?? []
+        func bounds(_ w: [String: Any]) -> CGRect {
+            guard let b = w[kCGWindowBounds as String] as? NSDictionary else { return .null }
+            return CGRect(dictionaryRepresentation: b as CFDictionary) ?? .null
+        }
+        func pid(_ w: [String: Any]) -> pid_t { (w[kCGWindowOwnerPID as String] as? Int).map(pid_t.init) ?? 0 }
+        func layer(_ w: [String: Any]) -> Int { w[kCGWindowLayer as String] as? Int ?? 0 }
+        // Front to back: Vox's largest normal window, and what is listed before it.
+        guard let mine = windows.enumerated()
+            .filter({ pid($0.element) == vox.processIdentifier && layer($0.element) == 0 })
+            .max(by: { bounds($0.element).width * bounds($0.element).height
+                       < bounds($1.element).width * bounds($1.element).height }) else { return nil }
+        let area = bounds(mine.element)
+        for w in windows.prefix(mine.offset) {
+            let owner = w[kCGWindowOwnerName as String] as? String ?? "?"
+            guard pid(w) != vox.processIdentifier, pid(w) != ProcessInfo.processInfo.processIdentifier,
+                  owner != "Window Server", layer(w) >= 0 else { continue }
+            let over = bounds(w).intersection(area)
+            if !over.isNull, over.width * over.height > area.width * area.height / 4 {
+                return "\(owner) (layer \(layer(w)), \(Int(over.width))×\(Int(over.height)) of Vox's \(Int(area.width))×\(Int(area.height)))"
+            }
+        }
+        return nil
     }
 
     /// The login item's daemon ended on a refusal no retry changes (`vox daemon --login-item`
