@@ -4371,9 +4371,13 @@ impl ChannelState {
     /// Whether `member` sets this room's retention: its creator, or an admin it named — a holder
     /// of the `policy` capability (V030-32). Anyone else sets only their own node's.
     #[must_use]
-    pub fn governs_retention(&self, member: &Digest32) -> bool {
+    pub fn governs_retention(&self, member: &Digest32, now: crate::time::Ms) -> bool {
         self.evaluator
-            .grants(member, &crate::governance::capability::Capability::Policy)
+            .grants_at(
+                member,
+                &crate::governance::capability::Capability::Policy,
+                now.get(),
+            )
             .is_granted()
     }
 
@@ -4557,7 +4561,11 @@ impl ChannelState {
         let me = signer.fingerprint();
         if !self
             .evaluator
-            .grants(&me, &crate::governance::capability::Capability::Policy)
+            .grants_at(
+                &me,
+                &crate::governance::capability::Capability::Policy,
+                now_ms,
+            )
             .is_granted()
         {
             return Err(Error::MalformedGovernance(
@@ -7187,9 +7195,13 @@ impl ChannelState {
 
     /// Whether `who` may name the room: its creator or an admin (ADR-028 R-1).
     #[must_use]
-    pub fn may_rename(&self, who: &Digest32) -> bool {
+    pub fn may_rename(&self, who: &Digest32, now: crate::time::Ms) -> bool {
         self.evaluator
-            .grants(who, &crate::governance::capability::Capability::Policy)
+            .grants_at(
+                who,
+                &crate::governance::capability::Capability::Policy,
+                now.get(),
+            )
             .is_granted()
     }
 
@@ -7203,7 +7215,7 @@ impl ChannelState {
     pub fn set_name(&mut self, profile: &Profile, name: &str, now: crate::time::Ms) -> Result<()> {
         let now_ms = now.get();
         let signer = profile.signer()?;
-        if !self.may_rename(&signer.fingerprint()) {
+        if !self.may_rename(&signer.fingerprint(), now) {
             return Err(Error::MalformedGovernance(
                 "only the room's creator or an admin may rename it",
             ));
@@ -7385,7 +7397,7 @@ impl ChannelState {
         let now_ms = now.get();
         let signer = profile.signer()?;
         let me = signer.fingerprint();
-        if me != self.evaluator.root_admin() && !self.evaluator.admins().contains(&me) {
+        if me != self.evaluator.root_admin() && !self.evaluator.admins_at(now_ms).contains(&me) {
             return Err(Error::Profile(
                 "only the room's creator or an admin may end it",
             ));
@@ -7521,10 +7533,15 @@ impl ChannelState {
 
     /// The room's admins, the creator first (V030-08).
     #[must_use]
-    pub fn admins(&self) -> Vec<Digest32> {
+    pub fn admins(&self, now: crate::time::Ms) -> Vec<Digest32> {
         let root = self.evaluator.root_admin();
         std::iter::once(root)
-            .chain(self.evaluator.admins().into_iter().filter(|a| *a != root))
+            .chain(
+                self.evaluator
+                    .admins_at(now.get())
+                    .into_iter()
+                    .filter(|a| *a != root),
+            )
             .collect()
     }
 
