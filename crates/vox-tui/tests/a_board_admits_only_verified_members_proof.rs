@@ -1027,12 +1027,18 @@ async fn serves_member(conn: &VoxConnection, room: &Digest32, who: &Digest32) ->
 ///    only what x signed before it left. Taking more left a rejoined member with no address on any
 ///    board: no member could reach it, no anchor would carry to it, and a member that trusted it
 ///    could release it no key.
+/// 5. *A key that cannot go says why, once*: spy's own withdraw, stamped now, takes its bundle off
+///    carol's board; spy, connected, stays a member. carol's operator trusts spy at a terminal, and
+///    over the next 30 s carol's node says exactly once that her key to spy waits for a bundle. It
+///    failed on every tick's retry and said nothing.
 ///
 /// **Mutations**, one each: (1) the admitting member keeps no notice — red PRODUCT (no notice on
 /// the host's board). (2) `nat::store::accept_notice` ignores withdraws — red PRODUCT (2: the
 /// replay is taken). (3) `ChannelState::admit_from_notice` ignores withdraws and the board passes
 /// withdraws on after notices — red PRODUCT (3: carol lists x). (4) `RendezvousStore::withdraw_member`
-/// takes every record of the member, whenever signed — red PRODUCT (4: x's records gone).
+/// takes every record of the member, whenever signed — red PRODUCT (4: x's records gone). (5)
+/// `release_key_to` says nothing when it has no session — red PRODUCT (5: said 0 times); (5b) it
+/// says it on every retry — red PRODUCT (5: said many times).
 #[test]
 #[ignore = "real vox processes with production Argon2id and three real joins; run in release"]
 fn an_admission_reaches_every_member_and_never_outlives_a_leave() {
@@ -1215,5 +1221,59 @@ fn an_admission_reaches_every_member_and_never_outlives_a_leave() {
         all_serve(&kept),
         "PRODUCT: x joined again; 40 s of syncs later the host's and carol's boards must still \
          serve its member and bundle records; (member, bundle) served: {kept:?}"
+    );
+
+    // ---- 5. a key that cannot go says why, once --------------------------------------------
+    // Staged as spy itself may: its own withdraw, stamped now, on carol's board takes its bundle
+    // off, and spy stays a member of the room. spy is connected to carol (the attacker's
+    // connection), so carol's key to it fails for want of a bundle to open a session from.
+    let (_s3, spy_carol) = rt.block_on(connect(&spy, carol_addr, carol_id));
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("APPARATUS (harness error): the clock")
+        .as_millis() as u64;
+    let withdraw = vox_core::nat::withdraw::BoardWithdraw::build(
+        spy.as_ref(),
+        &room,
+        0,
+        vox_core::nat::withdraw::WithdrawScope::Member,
+        now_ms,
+    )
+    .expect("APPARATUS (harness error): spy's withdraw");
+    let taken = rt.block_on(put(&spy_carol, &withdraw.to_wire()));
+    let (_, bundle_left) = rt.block_on(serves_member(&spy_carol, &room, &spy_id));
+    assert!(
+        taken.is_ok() && !bundle_left,
+        "PRODUCT (staging): spy's own withdraw on carol's board must take its bundle off: put \
+         {taken:?}, bundle still served: {bundle_left}"
+    );
+    let before = carol_d.transcript().len();
+    let mut trust = std::process::Command::new(world::VOX);
+    trust
+        .args(["trust", "add", &spy_hex, "--name", "spy"])
+        .env("VOX_DATA_DIR", &carol_dir)
+        .env("VOX_CONFIG_DIR", carol_dir.join("cfg"))
+        .env("VOX_IDENTITY_PASSPHRASE", IDENTITY);
+    let (trusted, screen) = world::typed::keyring(&trust);
+    assert!(
+        trusted,
+        "PRODUCT (staging): carol's `vox trust add` of spy, typed at a terminal, failed: {screen}"
+    );
+    // Thirty ticks of retries: said once over all of them, not on each.
+    std::thread::sleep(Duration::from_secs(30));
+    let transcript = carol_d.transcript();
+    let said: Vec<&str> = transcript[before..]
+        .lines()
+        .filter(|l| {
+            l.contains(&spy_hex[..20])
+                && l.contains("waits: this node's board holds no prekey bundle of it yet")
+        })
+        .collect();
+    eprintln!("[proof] carol's key to spy, its bundle off her board: {said:#?}");
+    assert!(
+        said.len() == 1,
+        "PRODUCT: carol trusted spy, whose bundle her board does not hold; over 30 s her node must \
+         say once that her key waits for one, and said {} time(s): {said:#?}",
+        said.len()
     );
 }

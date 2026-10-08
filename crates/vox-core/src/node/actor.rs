@@ -4132,6 +4132,9 @@ pub struct Node {
     /// When a background dial to each member was last started (unix milliseconds): see
     /// `reach_member`.
     member_dialed_at: BTreeMap<Digest32, u64>,
+    /// `(room, member)` whose key waits for a prekey bundle of it this node's board does not
+    /// hold: said once, not on every tick's retry, until the key goes (see `release_key_to`).
+    key_waits_said: BTreeSet<(Digest32, Digest32)>,
     /// Where this node says it listens on this computer and the local network, and hears others
     /// say so (V210-167; `node::nearby`). `None` for an anchor, or when the group cannot be
     /// joined.
@@ -4604,6 +4607,7 @@ impl Node {
             leave_serial: 0,
             anchor_owed: BTreeMap::new(),
             member_dialed_at: BTreeMap::new(),
+            key_waits_said: BTreeSet::new(),
             nearby: None,
             nearby_task: None,
             nearby_due: 0,
@@ -9431,6 +9435,36 @@ impl Node {
         let Some(conn) = self.reach_member(channel_id, target, asked).await else {
             return Outcome::Failed(Fault::Unreachable);
         };
+        // **No session, because no bundle: said** (#520). A key is sealed to the member's prekey
+        // bundle, read from this node's board; with none there the consent fails on every tick's
+        // retry and wrote nothing, so a person who trusted a member that just joined again saw no
+        // key go and no reason. Said once per member and room, until the key goes.
+        if !self.sessions.contains_key(&(*channel_id, target)) {
+            if self.key_waits_said.insert((*channel_id, target)) {
+                let epoch = match self.channels.get(channel_id).map(Arc::clone) {
+                    Some(shared) => shared.lock().await.join_context().ok().map(|c| c.epoch),
+                    None => None,
+                };
+                if let (Some(net), Some(epoch)) = (self.net.as_ref(), epoch) {
+                    let why = if net.board_bundle(channel_id, epoch, &target).is_none() {
+                        "this node's board holds no prekey bundle of it yet; it is sent once one \
+                         arrives"
+                    } else {
+                        "no pairwise session with it could be opened from its prekey bundle; it is \
+                         tried again"
+                    };
+                    net.manager().note(
+                        target,
+                        format!(
+                            "your key for it in room {} waits: {why}",
+                            crate::node::network::short_id(*channel_id)
+                        ),
+                    );
+                }
+            }
+            return Outcome::Failed(Fault::Unreachable);
+        }
+        self.key_waits_said.remove(&(*channel_id, target));
         let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
             return Outcome::Failed(Fault::Unreachable);
         };
