@@ -68,7 +68,16 @@ Task { @MainActor in
         await model.show(.room(room.id))
         await wait(3)
         try render(MainWindow(model: model), "main-window")
-        // A Session of ann's own, staged by the script, waiting on her (ADR-029 §8).
+        // A trust offer waiting on ann: cam joined and trusts her (ADR-028 K-15).
+        if let offer = model.offers.first {
+            await model.show(.offer(offer.fingerprint))
+            await wait(1)
+            try render(MainWindow(model: model), "offer")
+        }
+        // A Session of ann's own, staged by the script, waiting on her (ADR-029 §8): in the room,
+        // which the offer above left.
+        await model.show(.room(room.id))
+        await wait(2)
         if let s = model.openSessions.first {
             model.showing = .session(node: s.nodeFingerprint, id: s.sessionId)
             await wait(3)

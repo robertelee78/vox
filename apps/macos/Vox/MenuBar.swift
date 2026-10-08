@@ -101,11 +101,20 @@ private struct NodeFacts: View {
         Text(model.keyring).font(Theme.mono).secondaryText()
         section("NEEDS YOU") {
             let rooms = model.group(.needsYou)
-            if rooms.isEmpty { Text("nothing addressed to you").secondaryText() }
+            if rooms.isEmpty && model.offers.isEmpty {
+                Text("nothing addressed to you").secondaryText()
+            }
             ForEach(rooms) { room in
                 Button("\(room.name): \(room.words)") {
                     NSApp.activate(ignoringOtherApps: true)
                     Task { await model.show(.room(room.id)) }
+                }
+            }
+            // A trust offer waiting (ADR-028 K-15).
+            ForEach(model.offers, id: \.fingerprint) { offer in
+                Button("offer: \(offer.short)… \(offer.whyWords)") {
+                    NSApp.activate(ignoringOtherApps: true)
+                    Task { await model.show(.offer(offer.fingerprint)) }
                 }
             }
         }
