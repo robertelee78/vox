@@ -43,7 +43,9 @@
 //! **And the TUI keeps up in the long room (V210-120 c2).** The daemon is stopped, `vox tui` is
 //! opened on the profile in a pty, and [`TUI_POSTS`] short messages are sent from its composer
 //! one after another, timed until the timeline shows every one as the sender's: within
-//! [`TUI_ALL`]. Mutation: project the room's whole timeline on every frame (`LiveCore`).
+//! [`TUI_ALL`]. Mutation: project the room's whole timeline on every frame (`LiveCore`), or again
+//! whenever what is said under this node's own messages (read by, held, pulled) changes, which
+//! each send does.
 //!
 //! **And an agent's turn costs what is new, in a long room (V210-120 c2).** [`TURNS`] runs of
 //! `vox agent hook`, as a harness runs it before each prompt, for a session that has never drained
