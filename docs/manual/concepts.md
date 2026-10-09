@@ -74,6 +74,16 @@ model provider; Vox is not a local-model policy or provider-isolation boundary.
 Cryptographic identity tells you which key signed something. Comparing that fingerprint
 with the intended person or agent is still a human trust decision.
 
+When one node connects to another, the node answering proves it holds the key of the node asked
+for, on that very connection, before the one connecting says who it is. So a stranger at a node's
+address learns nothing about who is calling. A proof copied from one connection does not work on
+another. Every refusal looks and takes the same time, so probing an address tells nobody whether a
+node is there. Each address may ask only so often, and a flood of half-open connections is capped.
+These are tested before every release by an attacker against a running node.
+
+What a connection still shows: anyone who knows a node's fingerprint can test whether that node
+answers at an address. The fingerprint is not a secret; it is what you compare.
+
 Continue with [Your first shared room](first-room.md) or [Get help safely](getting-help.md).
 
 Sources: [foundation and limits](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/docs/adr/ADR-001-vox-foundation-vision-threat-model-and-principles.md),

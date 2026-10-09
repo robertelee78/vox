@@ -212,6 +212,11 @@ vox room read ROOM_ID --json
 vox room read ROOM_ID --since FULL_ENTRY_HASH --json
 ```
 
+`tail` shows the room's conversation as `room read` does: a Session's records (its opening, a
+rename, its end) are not part of it, so a renamed Session never reads as opened twice. `vox room
+sessions` lists the Sessions, and `tail --json` keeps every row, Session records included, for a
+program that follows the room.
+
 Stop `tail` with Ctrl-C. For a resumed reader, retain the full entry hash from a previous
 successful output. It is a cursor, not a room/member prefix: a shortened one is refused with
 `--since takes a full 52-character entry hash, as vox room read prints it in the first column`.
