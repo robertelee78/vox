@@ -6,13 +6,12 @@
 #   scripts/app-proofs.sh                     # every proof
 #   scripts/app-proofs.sh FirstRunProof       # one class (xcodebuild's -only-testing)
 #   scripts/app-proofs.sh LaunchProof         # scripts/app-launch-proof.py alone: no UI automation
-#   VOX_PROOF_APP=/path/to/Vox.app scripts/app-proofs.sh
-#                                             # against that app: the signed release candidate
+#   VOX_PROOF_APP=<any other Vox.app>         # refused before anything runs (see below)
 #
 # It builds the macOS slice of VoxFFI.xcframework, the release `vox`, and the app; puts `vox` in
 # the bundle at Contents/Helpers/vox and signs the bundle ad hoc, inside out; then runs the suite.
-# With VOX_PROOF_APP it still builds the proofs, but proves that app, unchanged (ADR-014 M-30: the
-# signed release build).
+# It proves only the app it builds: XCTest launches any other bundle without the proofs'
+# environment, on the account's real data root, so VOX_PROOF_APP naming one is refused.
 # Optional: it blocks nothing. Preconditions, the person's to arrange, never the suite's:
 #   - UI automation allowed on this Mac (developer mode, and the approval macOS asks for once);
 #   - Vox allowed to notify (System Settings, Notifications), and no Focus on, for the
@@ -59,11 +58,22 @@ check_real() {
 }
 
 # **Preflight: everything this run needs, checked in seconds, before any build.**
-# The app this run proves: the one given, or the one it builds here.
+# The app this run proves: the one it builds here, only. XCTest launches any other bundle (a
+# release, signed or re-signed ad hoc, at any other path) through NSWorkspace and drops its
+# environment, so that app opens the account's real data root: refused before anything is built
+# or launched (APPARATUS), fail closed. VOX_PROOF_APP naming this build's own product is the same
+# as not setting it.
+APP="$DERIVED/Build/Products/Release/Vox.app"
 if [ -n "${VOX_PROOF_APP:-}" ]; then
-    APP="$(cd "$VOX_PROOF_APP" && pwd)"
-else
-    APP="$DERIVED/Build/Products/Release/Vox.app"
+    given="$(cd "$VOX_PROOF_APP" 2>/dev/null && pwd -P || true)"
+    product="$(mkdir -p "$DERIVED/Build/Products/Release" && cd "$DERIVED/Build/Products/Release" && pwd -P)/Vox.app"
+    if [ "$given" != "$product" ]; then
+        echo "app-proofs: APPARATUS (precondition unmet): VOX_PROOF_APP=$VOX_PROOF_APP is not this" \
+            "build's own Vox.app ($product); XCTest would launch it without this run's environment," \
+            "on the account's real data root, so nothing was built or launched" >&2
+        exit 2
+    fi
+    unset VOX_PROOF_APP
 fi
 # **No other Vox.app is registered** (APPARATUS before anything runs): LaunchServices opens a
 # registered us.vox.app for a notification click, Spotlight, Launchpad or a login item's lookup,
@@ -112,25 +122,21 @@ xcodebuild -project apps/macos/Vox.xcodeproj -scheme Vox -configuration Release 
     -derivedDataPath "$DERIVED" ARCHS=arm64 CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual \
     build-for-testing
 
-if [ -n "${VOX_PROOF_APP:-}" ]; then
-    APP="$(cd "$VOX_PROOF_APP" && pwd)"
-    [ -x "$APP/Contents/Helpers/vox" ] || {
-        echo "app-proofs: APPARATUS: $APP holds no Contents/Helpers/vox" >&2
-        exit 2
-    }
-    codesign --verify --strict "$APP" || {
-        echo "app-proofs: APPARATUS: $APP's signature does not check out" >&2
-        exit 2
-    }
-else
-    APP="$DERIVED/Build/Products/Release/Vox.app"
-    mkdir -p "$APP/Contents/Helpers"
-    cp target/release/vox "$APP/Contents/Helpers/vox"
-    codesign --force --sign - --options runtime --identifier us.vox.cli "$APP/Contents/Helpers/vox"
-    codesign --force --sign - --options runtime --preserve-metadata=entitlements "$APP"
-fi
+APP="$DERIVED/Build/Products/Release/Vox.app"
+mkdir -p "$APP/Contents/Helpers"
+cp target/release/vox "$APP/Contents/Helpers/vox"
+codesign --force --sign - --options runtime --identifier us.vox.cli "$APP/Contents/Helpers/vox"
+codesign --force --sign - --options runtime --preserve-metadata=entitlements "$APP"
 
-trap_unregister() { "$LSREGISTER" -u "$APP" >/dev/null 2>&1 || true; }
+trap_unregister() {
+    # Any of the app's processes still running are stopped by pid, and its share extension is
+    # unregistered with it, so no later LaunchServices lookup or share sheet opens this build.
+    for pid in $(pgrep -f "$APP/Contents/MacOS/Vox" || true); do kill "$pid" 2>/dev/null || true; done
+    for ext in "$APP"/Contents/PlugIns/*.appex; do
+        [ -e "$ext" ] && pluginkit -r "$ext" >/dev/null 2>&1 || true
+    done
+    "$LSREGISTER" -u "$APP" >/dev/null 2>&1 || true
+}
 
 # The launch proof (#438) drives no UI, so it needs no automation approval: it runs first, alone
 # when asked for by name.
