@@ -230,7 +230,9 @@ network presence from the start: there is no interim design with one socket per 
     `vault.cbor`, `node-identity.key` or `store.redb` is not a node: such a release left it there.
     A data root holding one MUST be refused by every verb, and by the daemon before it takes its
     lock, saying "`<root>` is not a Vox data directory this version reads: `<root>/<name>` is not a
-    node", and MUST be left byte for byte unchanged.
+    node", and MUST be left byte for byte unchanged. At the person's request (Move It Aside and
+    Start Fresh), the app MAY rename a refused earlier-release node folder, whole and unread, into
+    `<root>/moved-aside/`; it MUST NOT read, convert or delete it.
   - **v0.3.x: not upgraded.** A v0.3.x data root has v0.4.0's layout and no `.daemon/format`, so
     it cannot be told from one v0.4.0 wrote. It is read as format 1, and Vox MUST carry no code
     that converts it to v0.4.0's formats.

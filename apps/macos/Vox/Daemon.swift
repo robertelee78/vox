@@ -118,7 +118,8 @@ enum Daemon {
                 try await Task.sleep(nanoseconds: 250_000_000)
             }
         }
-        throw last ?? VoxError.Failed(reason: "the vox daemon did not answer")
+        throw StartFailure(kind: .notAnswering,
+                           said: last.map(sentence) ?? "the vox daemon did not answer")
     }
 
     /// The bundle's `vox`, at Contents/Helpers/vox.
@@ -144,7 +145,7 @@ enum Daemon {
         }.value
         guard status == 0 else {
             let text = said.trimmingCharacters(in: .whitespacesAndNewlines)
-            throw VoxError.Failed(reason: text.isEmpty
+            throw StartFailure(kind: .exited, said: text.isEmpty
                 ? "the vox daemon did not start (vox exited \(status))"
                 : text.replacingOccurrences(of: "vox: ", with: ""))
         }
