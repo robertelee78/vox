@@ -929,8 +929,8 @@ private struct RoomView: View {
             .accessibilityLabel("Attach a file or folder")
             .accessibilityIdentifier("attach")
             // Who posts (E-4): the node this window acts as, before the field.
+            // No label of its own (a selectable Text with one recurses); the field says "as ann".
             Text("\(model.node) ▸").font(Theme.mono).secondaryText()
-                .accessibilityLabel("posting as \(model.node)")
                 .accessibilityIdentifier("compose-as")
             // Up to 12 lines, so a long message is read before it goes; Return sends, ⇧↩ (or ⌥↩)
             // adds a line (P19).
@@ -1185,12 +1185,12 @@ private struct MessageRow: View {
                         .nodeCard(model, message.author, name: author)
                         .accessibilityIdentifier("author-\(message.id)")
                 }
-                // Its time of day; the whole date and time on hover and to VoiceOver.
+                // Its time of day; the whole date and time on hover, and in the row's spoken label.
+                // No label of its own: a selectable Text with one sends SwiftUI's accessibility into
+                // endless recursion (the detail pane is selectable).
                 Text(TimelineTime.short(message.createdMillis))
                     .font(Theme.mono).secondaryText()
                     .help(TimelineTime.full(message.createdMillis))
-                    .accessibilityLabel(TimelineTime.full(message.createdMillis))
-                    .accessibilityValue(TimelineTime.short(message.createdMillis))
                     .accessibilityIdentifier("time-\(message.id)")
                 if message.urgent { StateMark(kind: .attention, words: "urgent") }
                 if message.to.contains(me) { Text("to you").eyebrow() }

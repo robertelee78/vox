@@ -94,7 +94,7 @@ struct SessionComposer: View {
                 // Who types, into which Session (E-4, CL-1): never read as the room's composer.
                 Text("\(model.node) ▸ \(session.label)").font(Theme.mono).secondaryText()
                     .lineLimit(1).truncationMode(.middle)
-                    .accessibilityLabel("typing as \(model.node) into \(session.label)")
+                    // No label of its own (a selectable Text with one recurses); the field's says it.
                     .accessibilityIdentifier("session-compose-as")
                 // Up to 12 lines, so a pasted stack trace or a long prompt is read before it goes;
                 // Return sends, ⇧↩ (or ⌥↩) adds a line (P19).
