@@ -137,9 +137,11 @@ private struct Sidebar: View {
         .listStyle(.sidebar)
         // The nodes on this Mac, at the sidebar's foot (G5), whatever the rooms above scroll to.
         .safeAreaInset(edge: .bottom, spacing: 0) { OnThisMachine(nodes: model.nodes) }
-        // On bg.panel, not the system's sidebar material (L-6).
+        // On bg.panel, not the system's sidebar material (L-6), drawn where the sidebar's
+        // vibrancy cannot tint it (PanelFill).
         .scrollContentBackground(.hidden)
-        .panelSurface()
+        .background(PanelFill())
+        .foregroundStyle(VoxTokens.Colors.textPrimary)
         // The sidebar's rows keep macOS's sidebar size (System Settings, Appearance, Sidebar icon
         // size), never the conversation's text size (the decider, v0.4.1).
         .font(nil)
@@ -161,6 +163,22 @@ extension View {
 /// was blended with the sidebar's material, and #1767b5 read #3e7bbd (text.primary about 4.0:1).
 /// Its colour is the token's, resolved for the view's appearance, so Increase Contrast gives
 /// `hex_hc`.
+/// The sidebar's surface, bg.panel exactly as the token file has it (L-6). Drawn by SwiftUI, a
+/// colour in the sidebar is blended by its material: the look case read #16171a as #1d1e21. An
+/// AppKit view that refuses vibrancy draws the token itself, as SelectionFill does.
+private struct PanelFill: NSViewRepresentable {
+    func makeNSView(context: Context) -> Fill { Fill() }
+    func updateNSView(_ view: Fill, context: Context) { view.needsDisplay = true }
+
+    final class Fill: NSView {
+        override var allowsVibrancy: Bool { false }
+        override func draw(_ dirty: NSRect) {
+            NSColor(named: "BgPanel")?.setFill()
+            bounds.fill()
+        }
+    }
+}
+
 private struct SelectionFill: NSViewRepresentable {
     let selected: Bool
 
@@ -242,7 +260,8 @@ private struct OnThisMachine: View {
         }
         .padding(.horizontal, Space.s16)
         .padding(.bottom, Space.s12)
-        .panelSurface()
+        .background(PanelFill())
+        .foregroundStyle(VoxTokens.Colors.textPrimary)
     }
 }
 
