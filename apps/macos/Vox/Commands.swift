@@ -393,6 +393,9 @@ private struct RenameSheet: View {
 private struct AdminsSheet: View {
     @ObservedObject var model: NodeModel
     @State private var admins: [String] = []
+    /// The member about to be made an admin, asked first: an admin can end the room for everyone
+    /// (E-5). Taking adminship away goes through at once.
+    @State private var asking: NodeModel.MemberRow?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -400,19 +403,48 @@ private struct AdminsSheet: View {
             Text("An admin may end the room and set its retention.").secondaryText()
             ForEach(model.members) { member in
                 Toggle(isOn: Binding(get: { admins.contains(member.id) }, set: { on in
+                    if on {
+                        asking = member
+                        return
+                    }
                     Task {
-                        await model.setAdmin(member.id, on)
+                        await model.setAdmin(member.id, false)
                         admins = await model.admins()
                     }
                 })) {
                     TrustMark(name: member.name, trust: member.trust)
                 }
-                .disabled(admins.first == member.id)
+                .disabled(admins.first == member.id || asking != nil)
+                .accessibilityIdentifier("admin-\(member.name)")
                 .accessibilityLabel(admins.contains(member.id) ? "\(member.name), admin"
                                                                : "\(member.name), not an admin")
             }
+            if let member = asking {
+                VStack(alignment: .leading, spacing: 8) {
+                    StateMark(kind: .attention,
+                              words: "Make \(member.name) an admin? An admin can end this room for "
+                                  + "everyone and change its retention.")
+                        .accessibilityIdentifier("admin-confirm")
+                    HStack {
+                        Spacer()
+                        Button("Cancel") { asking = nil }
+                            .keyboardShortcut(.cancelAction)
+                            .accessibilityIdentifier("admin-confirm-cancel")
+                        Button("Make Admin") {
+                            asking = nil
+                            Task {
+                                await model.setAdmin(member.id, true)
+                                admins = await model.admins()
+                            }
+                        }
+                        .accessibilityIdentifier("admin-confirm-make")
+                    }
+                }
+            }
             if let said = model.said { StateMark(kind: .danger, words: said).textSelection(.enabled) }
-            Button("Done") { model.sheet = nil }.keyboardShortcut(.defaultAction)
+            if asking == nil {
+                Button("Done") { model.sheet = nil }.keyboardShortcut(.defaultAction)
+            }
         }
         .padding(24)
         .frame(width: Theme.scaled(440))
