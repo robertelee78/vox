@@ -251,6 +251,8 @@ struct Premise {
 
 final class FirstRunProof: XCTestCase {
     private var daemon: Started?
+    /// Dora's daemon, a peer whose clock is behind (step 3d): apparatus, stopped with the case.
+    private var peer: Started?
     /// Runs what the runner's sandbox forbids: every `vox`, the files, the echo services.
     private var stager: Stager!
     /// When another app took the foreground from a running Vox, and which: a display change or a
@@ -313,6 +315,7 @@ final class FirstRunProof: XCTestCase {
         launched = []
         if let watchingForeground { NSWorkspace.shared.notificationCenter.removeObserver(watchingForeground) }
         if let watchingVox { NSWorkspace.shared.notificationCenter.removeObserver(watchingVox) }
+        peer?.terminate()
         daemon?.terminate()
         // The person's clipboard back, exactly as it was.
         let board = NSPasteboard.general
@@ -2298,6 +2301,254 @@ final class FirstRunProof: XCTestCase {
 
         }
 
+        // (5d) Finding your way (v0.4.1). Each part is what a person sees, and stages what it needs
+        // itself, so it runs from step 6 too (VOX_PROOF_FROM=6).
+        //
+        // The room's header: its name and its retention, always (R-7); the window takes its name.
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
+        words(ui, Key.id("room-header-name"), timeout: 10, "the room's header must name it: \"mission\"",
+              until: { $0 == "mission" })
+        words(ui, Key.id("room-header-meta"), timeout: 10,
+              "the room's header must say what is shown and the room's retention: \"… · General · ⏱ …\"",
+              until: { $0.contains("General") && $0.contains("⏱") })
+        let titled = Date().addingTimeInterval(10)
+        while Date() < titled && !ui.windows.firstMatch.title.hasPrefix("mission") {
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        XCTAssertTrue(ui.windows.firstMatch.title.hasPrefix("mission"),
+                      "PRODUCT: the window must take the room's name as its title; it is \"\(ui.windows.firstMatch.title)\"")
+
+        // Who you can't read yet, and why: erin joins, and neither she nor alice has trusted the
+        // other; then erin trusts alice, and the line says so and offers her offer.
+        let erinPass = scratch.appendingPathComponent("erin.pass").path
+        try stager.write(Data("erin identity\n".utf8), to: erinPass)
+        try staged(vox, ["node", "create", "erin"],
+                   env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "erin identity"]) { $1 })
+        try staged(vox, ["node", "attach", "erin", "--passphrase-file", erinPass], env: voxEnv)
+        let erinFp = try line(staged(vox, ["id", "--node", "erin"], env: voxEnv)) { $0.count == 52 }
+        let erinLink = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        try staged(vox, ["room", "join", "--node", "erin", "--passphrase-file", roomPass, erinLink],
+                   env: voxEnv)
+        let erinShort = String(erinFp.prefix(12))
+        let banner = Key.id("trust-banner")
+        words(ui, banner, timeout: 60,
+              "erin joined and nobody trusted anybody: the room must say \"You and \(erinShort) can't read each other yet\"",
+              until: { $0.contains(erinShort) && $0.contains("can't read each other") })
+        try staged(vox, ["trust", "add", "--node", "erin", aliceFp, "--name", "alice",
+                         "--identity-passphrase-file", erinPass], env: voxEnv)
+        words(ui, banner, timeout: 60,
+              "erin trusts alice now: the room must say \"\(erinShort) trusts you. Trust \(erinShort) too\"",
+              until: { $0.contains("\(erinShort) trusts you") })
+        present(ui, Key.id("trust-banner-offer"), timeout: 10,
+                "the line must offer erin's trust offer, \"Trust \(erinShort)…\"")
+
+        // The Dock badge: the same count as the sidebar's NEEDS YOU, read from what macOS shows.
+        func badge() -> String {
+            let id = Bundle(path: appPath)?.bundleIdentifier ?? ""
+            let out = run("/usr/bin/lsappinfo", ["info", "-only", "StatusLabel", "-app", id], env: [:]).out
+            guard let r = out.range(of: "\"label\"=\"") else { return "" }
+            return String(out[r.upperBound...].prefix { $0 != "\"" })
+        }
+        let needs = words(ui, Key.id("group-needs you"), timeout: 10,
+                          "the sidebar must count what needs alice", until: { $0.lowercased().hasPrefix("needs you (") }) ?? ""
+        let counted = needs.filter(\.isNumber)
+        var badged = ""
+        let badgeUntil = Date().addingTimeInterval(10)
+        while Date() < badgeUntil {
+            badged = badge()
+            if badged == (counted == "0" ? "" : counted) { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        XCTAssertEqual(badged, counted == "0" ? "" : counted,
+                       "PRODUCT: the Dock badge must say what the sidebar's NEEDS YOU counts, \"\(needs)\"; macOS shows \"\(badged)\"")
+
+        // Making an admin asks first; Cancel makes nobody an admin; Make Admin does.
+        ui.typeKey("k", modifierFlags: .command)
+        type(ui, Key.id("palette-query"), "Admins", "the command palette")
+        ui.typeKey(.return, modifierFlags: [])
+        let bobAdmin = Key.id("admin-bob")
+        if present(ui, bobAdmin, timeout: 10, "the Admins sheet must list bob") {
+            tap(ui, bobAdmin, "bob's admin switch")
+            words(ui, Key.id("admin-confirm"), timeout: 10,
+                  "turning bob into an admin must ask first, saying what an admin can do",
+                  until: { $0.contains("Make bob an admin?") && $0.contains("end this room for everyone") })
+            tap(ui, Key.id("admin-confirm-cancel"), "Cancel")
+            let listed = run(vox, ["room", "admin", "list", "--node", "alice", room], env: voxEnv).out
+            XCTAssertFalse(listed.contains(bobFp) || listed.contains("bob"),
+                           "PRODUCT: Cancel must make nobody an admin; `vox room admin list` says: \(listed)")
+            tap(ui, bobAdmin, "bob's admin switch")
+            tap(ui, Key.id("admin-confirm-make"), "Make Admin")
+            var made = ""
+            let madeUntil = Date().addingTimeInterval(15)
+            while Date() < madeUntil && !(made.contains(bobFp) || made.contains("bob")) {
+                made = run(vox, ["room", "admin", "list", "--node", "alice", room], env: voxEnv).out
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+            XCTAssertTrue(made.contains(bobFp) || made.contains("bob"),
+                          "PRODUCT: Make Admin must make bob an admin; `vox room admin list` says: \(made)")
+            ui.typeKey(.return, modifierFlags: [])  // Done
+        }
+
+        // A vox:// link opened by the system fills in the Join sheet; nothing is joined by it.
+        try staged(vox, ["room", "create", "--node", "bob", "--passphrase-file", roomPass, "--name", "orient"],
+                   env: voxEnv)
+        let orient = try line(staged(vox, ["room", "list", "--node", "bob"], env: voxEnv)) {
+            $0.contains(" orient")
+        }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        let orientLink = try line(staged(vox, ["room", "link", "--node", "bob", orient], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        _ = run("/usr/bin/open", ["-a", appPath, orientLink], env: [:])
+        let linkField = Key.id("room-form-link")
+        if present(ui, linkField, timeout: 15, "opening a vox:// link must open the Join sheet") {
+            XCTAssertEqual(el(ui, linkField).value as? String, orientLink,
+                           "PRODUCT: the Join sheet must hold the link Vox was opened with")
+            ui.typeKey(.escape, modifierFlags: [])
+        }
+        Thread.sleep(forTimeInterval: 2)
+        let aliceRooms = run(vox, ["room", "list", "--node", "alice"], env: voxEnv).out
+        XCTAssertFalse(aliceRooms.contains(" orient"),
+                       "PRODUCT: opening a room link must never join by itself; alice's `vox room list` says: \(aliceRooms)")
+
+        // The composer says who posts (E-4): alice, before a field that names the room.
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
+        if present(ui, Key.id("compose-as"), timeout: 10, "the composer must say who posts: \"alice ▸\"") {
+            let shownAs = el(ui, Key.id("compose-as"))
+            XCTAssertTrue((shownAs.value as? String) == "alice ▸" || shownAs.label == "posting as alice",
+                          "PRODUCT: the composer must say who posts, \"alice ▸\"; it shows \(String(describing: shownAs.value)) (\(shownAs.label))")
+        }
+        if present(ui, Key.id("compose"), timeout: 10, "the room must have its composer") {
+            XCTAssertEqual(el(ui, Key.id("compose")).placeholderValue, "Message mission…",
+                           "PRODUCT: the composer's field must name the room it posts to")
+        }
+
+        // A stopped node shows as detached, keeps what was typed, and attaches again.
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
+        type(ui, Key.id("compose"), "DRAFT-KEPT-P12", "the composer")
+        try staged(vox, ["node", "detach", "alice"], env: voxEnv)
+        words(ui, Key.id("node-stopped"), timeout: 30,
+              "node alice was detached from outside: the window must say so",
+              until: { $0.contains("detached") })
+        present(ui, Key.id("detached"), timeout: 10, "the sidebar must say node alice is detached")
+        XCTAssertEqual(el(ui, Key.id("compose")).value as? String, "DRAFT-KEPT-P12",
+                       "PRODUCT: what was typed must stay while the node is detached")
+        type(ui, Key.id("node-stopped-passphrase"), "alice identity", "the passphrase field")
+        tap(ui, Key.id("node-stopped-attach"), "Attach Again")
+        present(ui, Key.id("attached"), timeout: 60, "Attach Again must attach node alice again")
+        XCTAssertEqual(el(ui, Key.id("compose")).value as? String, "DRAFT-KEPT-P12",
+                       "PRODUCT: what was typed must still be there once the node is attached again")
+        // The draft goes, so later steps start from an empty composer.
+        tap(ui, Key.id("compose"), "the composer")
+        ui.typeKey("a", modifierFlags: .command)
+        ui.typeKey(.delete, modifierFlags: [])
+        print("[proof] finding your way: header, who can't read whom, Dock badge \(badged.isEmpty ? "none" : badged), admin asked first, a link fills Join, a stopped node attaches again with its draft")
+        // (5b) When each message was posted, and where what alice had not read starts. Bob posts
+        // UNREAD-579 while alice is in the keyring, so the room opens with it unread. Its row says
+        // its time of day, and the whole date and time to VoiceOver; the unread line sits above it,
+        // and today's divider above that. Times are the ones the node keeps, in milliseconds. It
+        // stages what it unread579 itself, so it runs from step 6 too (VOX_PROOF_FROM=6).
+        tap(ui, Key.id("keyring"), "Keyring in the sidebar")
+        try staged(vox, ["room", "post", "--node", "bob", room, "UNREAD-579"], env: voxEnv)
+        var unread579: (id: String, millis: UInt64)?
+        let unread579Until = Date().addingTimeInterval(30)
+        while unread579 == nil && Date() < unread579Until {
+            unread579 = posted(vox, voxEnv, room, "UNREAD-579")
+            if unread579 == nil { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        guard let unread579 else {
+            throw Apparatus("alice's `vox room read --json` never showed bob's UNREAD-579 in 30 s, so its time cannot be checked")
+        }
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
+        let needsAt = Date(timeIntervalSince1970: TimeInterval(unread579.millis) / 1_000)
+        let needsTime = Key.id("time-\(unread579.id)")
+        if present(ui, needsTime, timeout: 30, "bob's UNREAD-579 must show the time it was posted") {
+            let e = el(ui, needsTime)
+            let short = needsAt.formatted(.dateTime.hour().minute())
+            let full = needsAt.formatted(date: .complete, time: .standard)
+            XCTAssertEqual(e.value as? String, short,
+                           "PRODUCT: UNREAD-579, posted at \(full) (\(unread579.millis) ms), must show its time of day \"\(short)\"; it shows \(String(describing: e.value))")
+            XCTAssertEqual(e.label, full,
+                           "PRODUCT: UNREAD-579's time must say the whole date and time to VoiceOver, \"\(full)\"; it says \"\(e.label)\"")
+        }
+        let unreadLine = Key.id("unread-divider")
+        words(ui, unreadLine, timeout: 10,
+              "the room opened with UNREAD-579 unread: an unread line must say how many, \"N unread\"",
+              until: { $0.hasSuffix(" unread") })
+        XCTAssertLessThanOrEqual(el(ui, unreadLine).frame.maxY, el(ui, needsTime).frame.minY,
+                                 "PRODUCT: the unread line must sit above UNREAD-579, which alice had not read; the line is at \(el(ui, unreadLine).frame), UNREAD-579's time at \(el(ui, needsTime).frame)")
+        let today = Key.id("day-\(Self.dayKey(Date()))")
+        words(ui, today, timeout: 10, "today's messages must sit under a \"Today\" divider",
+              until: { $0 == "Today" })
+        print("[proof] times: UNREAD-579 at \(needsAt.formatted(.dateTime.hour().minute())), under the unread line and \"Today\"")
+
+        // (5c) A message from another day sits under that day's divider. Dora is a node of a
+        // daemon of her own whose clock is two days behind: apparatus, a `vox` built with
+        // test-knobs (VOX_TEST_CLOCK_SKEW_MS), never the app's. She joins, she and alice trust each
+        // other, and she posts until alice reads one; it claims a time two days ago.
+        guard let knobs = env["VOX_PROOF_KNOBS_VOX"], !knobs.isEmpty else {
+            throw Apparatus("VOX_PROOF_KNOBS_VOX (a vox built with test-knobs, for dora's clock) is set by scripts/app-proofs.sh")
+        }
+        let doraEnv = ["VOX_DATA_DIR": scratch.appendingPathComponent("dora-data").path,
+                       "VOX_CONFIG_DIR": scratch.appendingPathComponent("dora-config").path,
+                       "VOX_PROXY": "127.0.0.1:0",
+                       "VOX_TEST_CLOCK_SKEW_MS": String(-2 * 86_400_000)]
+        let doraPass = scratch.appendingPathComponent("dora.pass").path
+        try stager.write(Data("dora identity\n".utf8), to: doraPass)
+        peer = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: doraEnv,
+                         until: "vox daemon: control socket")
+        try staged(knobs, ["node", "create", "dora"],
+                   env: doraEnv.merging(["VOX_IDENTITY_PASSPHRASE": "dora identity"]) { $1 })
+        try staged(knobs, ["node", "attach", "dora", "--passphrase-file", doraPass], env: doraEnv)
+        let doraFp = try line(staged(knobs, ["id", "--node", "dora"], env: doraEnv)) { $0.count == 52 }
+        let doraLink = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        try staged(knobs, ["room", "join", "--node", "dora", "--passphrase-file", roomPass, doraLink],
+                   env: doraEnv)
+        try staged(vox, ["trust", "add", "--node", "alice", doraFp, "--name", "dora",
+                         "--identity-passphrase-file", alicePass], env: voxEnv)
+        try staged(knobs, ["trust", "add", "--node", "dora", aliceFp, "--name", "alice",
+                           "--identity-passphrase-file", doraPass], env: doraEnv)
+        var old: (id: String, millis: UInt64)?
+        let oldUntil = Date().addingTimeInterval(120)
+        var d = 0
+        while old == nil && Date() < oldUntil {
+            d += 1
+            try staged(knobs, ["room", "post", "--node", "dora", room, "FROM-ANOTHER-DAY-\(d)"], env: doraEnv)
+            Thread.sleep(forTimeInterval: 1)
+            old = posted(vox, voxEnv, room, "FROM-ANOTHER-DAY-")
+        }
+        guard let old else {
+            throw Apparatus("alice never read a post of dora's in 120 s, so no message from another day was staged")
+        }
+        let oldAt = Date(timeIntervalSince1970: TimeInterval(old.millis) / 1_000)
+        guard !Calendar.current.isDateInToday(oldAt) else {
+            throw Apparatus("dora's post claims \(oldAt.formatted()) (\(old.millis) ms), today: VOX_TEST_CLOCK_SKEW_MS did not move her clock")
+        }
+        let oldTime = Key.id("time-\(old.id)")
+        let oldDay = Key.id("day-\(Self.dayKey(oldAt))")
+        let oldWords = Self.dayWords(oldAt)
+        if present(ui, oldTime, timeout: 60, "dora's post, from \(oldAt.formatted()), must be in alice's timeline with its time",
+                   premise: trusted(vox, voxEnv, doraFp, "dora")) {
+            scrollTo(ui, el(ui, oldTime))
+            words(ui, oldDay, timeout: 10,
+                  "dora's post claims \(oldAt.formatted()): a divider must say its day, \"\(oldWords)\"",
+                  until: { $0 == oldWords })
+            // The divider nearest above it is its own day's.
+            let at = el(ui, oldTime).frame.minY
+            let above = ui.windows.firstMatch.descendants(matching: .any)
+                .matching(NSPredicate(format: "identifier BEGINSWITH %@", "day-"))
+                .allElementsBoundByIndex.filter { $0.frame.maxY <= at }
+                .max { $0.frame.minY < $1.frame.minY }
+            XCTAssertEqual(above?.identifier, "day-\(Self.dayKey(oldAt))",
+                           "PRODUCT: dora's post from \(oldAt.formatted()) must sit under its own day's divider, \"\(oldWords)\"; the divider nearest above it is \(above.map { "\"\($0.label)\" (\($0.identifier))" } ?? "none")")
+        }
+        print("[proof] another day: dora's post at \(oldAt.formatted()), under \"\(oldWords)\"")
+        peer?.terminate()
+        peer = nil
+
         // (16) Outcomes (#608, #611, #615): run here, with the room and bob's trust in place, so
         // that VOX_PROOF_FROM=16 runs it alone, on what steps 1 to 5 leave (staged by `vox`), and
         // stops after it.
@@ -3640,6 +3891,38 @@ final class FirstRunProof: XCTestCase {
             return (r.status == 0 && r.out.split(separator: "\n").contains { $0.contains(" \(name)") },
                     "`vox room list` exited \(r.status): \(r.out.trimmingCharacters(in: .whitespacesAndNewlines).debugDescription)")
         }
+    }
+
+    /// A message of `room` as alice's node reads it, by the start of its text: its id and the
+    /// time it claims, in milliseconds.
+    private func posted(_ vox: String, _ env: [String: String], _ room: String,
+                        _ text: String) -> (id: String, millis: UInt64)? {
+        let rows = run(vox, ["room", "read", "--node", "alice", "--json", room], env: env).out
+        for line in rows.split(separator: "\n") {
+            guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  (row["text"] as? String)?.contains(text) == true,
+                  let id = row["entry_hash"] as? String,
+                  let millis = (row["created_millis"] as? NSNumber)?.uint64Value else { continue }
+            return (id, millis)
+        }
+        return nil
+    }
+
+    /// The local day of `date`, as the timeline's day dividers name it: "2026-10-04".
+    private static func dayKey(_ date: Date) -> String {
+        let c = Calendar.current.dateComponents([.year, .month, .day], from: date)
+        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
+    }
+
+    /// What a day divider says for a day other than today and yesterday: "Sunday, October 4", the
+    /// year when it is not this one.
+    private static func dayWords(_ date: Date) -> String {
+        let cal = Calendar.current
+        if cal.isDateInYesterday(date) { return "Yesterday" }
+        if cal.component(.year, from: date) == cal.component(.year, from: Date()) {
+            return date.formatted(.dateTime.weekday(.wide).month(.wide).day())
+        }
+        return date.formatted(.dateTime.weekday(.wide).month(.wide).day().year())
     }
 
     /// The line `start` waited for, as `vox` printed it.

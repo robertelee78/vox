@@ -11,6 +11,10 @@ struct MainWindow: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if model.ended != nil {
+                NodeStopped(model: model)
+                Divider()
+            }
             NavigationSplitView {
                 Sidebar(model: model)
                     .navigationSplitViewColumnWidth(min: Theme.scaled(220), ideal: Theme.scaled(260))
@@ -63,6 +67,12 @@ struct MainWindow: View {
                 .textSelection(.enabled)
         }
         .contentSurface()
+        // The Dock says how many things need the person, the same count as the sidebar's NEEDS
+        // YOU: rooms (a message to them, or a Session waiting on them) and trust offers. Gone
+        // while nothing does, and when the window is.
+        .onAppear { DockBadge.show(model.needsYouCount) }
+        .onChange(of: model.needsYouCount) { DockBadge.show($0) }
+        .onDisappear { DockBadge.show(0) }
         .sheet(item: $model.sheet) { NodeSheets(model: model, sheet: $0).textSelection(.enabled) }
         .sheet(item: $model.card) { node in
             NodeCard(model: model, node: node) { model.card = nil }.textSelection(.enabled)
@@ -88,9 +98,10 @@ private struct Sidebar: View {
                                     Task { await model.show(s) }
                                 })) {
             Section {
-                StateMark(kind: .live, words: "node \(model.node), attached")
+                StateMark(kind: model.ended == nil ? .live : .danger,
+                          words: "node \(model.node), \(model.ended == nil ? "attached" : "detached")")
                     .copyMenu([("Copy Name", model.node)])
-                    .accessibilityIdentifier("attached")
+                    .accessibilityIdentifier(model.ended == nil ? "attached" : "detached")
                     .background(SidebarHighlightOff())
             }
             ForEach([RoomGroup.needsYou, .active, .quiet], id: \.self) { need in
@@ -426,6 +437,8 @@ private struct RoomView: View {
     var body: some View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
+                RoomHeader(model: model, room: room)
+                Divider()
                 if !model.roomServices.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 8) {
@@ -475,8 +488,18 @@ private struct RoomView: View {
                             // do not measure in this coordinate space, so what is in view could not be
                             // told.
                             ScrollView {
+                                let items = model.timelineItems
+                                let days = TimelineTime.dividers(items)
                                 LazyVStack(alignment: .leading, spacing: 10) {
-                                    ForEach(model.timelineItems) { item in
+                                    ForEach(items) { item in
+                                        // A new day starts above the first line that falls on it.
+                                        if let day = days[item.id] {
+                                            DayDivider(key: day, words: TimelineTime.dayWords(item.millis))
+                                        }
+                                        // What was unread as the room came on screen starts here.
+                                        if let id = item.message?.id, id == model.unreadFrom {
+                                            UnreadDivider(count: model.unreadCount)
+                                        }
                                         if let message = item.message {
                                             MessageRow(model: model, message: message, me: model.me,
                                                        quote: model.quote(of: message),
@@ -685,6 +708,9 @@ private struct RoomView: View {
                 // A Session has no room composer (CL-1): the room's composer never speaks into
                 // a Session. An open one's own composer is for a member with drive only (CL-3).
                 if !model.showingSession {
+                    // Who here cannot read this node, or be read by it, and why: reading needs
+                    // trust both ways (ADR-028 R-5), which a newcomer is not told anywhere else.
+                    TrustBanner(model: model)
                     composer
                 } else if let s = model.shownSession, s.canDrive, s.open, let room = model.roomOnScreen {
                     Divider()
@@ -782,11 +808,15 @@ private struct RoomView: View {
             .help("Attach a file or folder")
             .accessibilityLabel("Attach a file or folder")
             .accessibilityIdentifier("attach")
+            // Who posts (E-4): the node this window acts as, before the field.
+            Text("\(model.node) ▸").font(Theme.mono).secondaryText()
+                .accessibilityLabel("posting as \(model.node)")
+                .accessibilityIdentifier("compose-as")
             // Up to 12 lines, so a long message is read before it goes; Return sends, ⌥↩ adds a
             // line (P19).
-            TextField("Say something to the room", text: $draft, axis: .vertical)
+            TextField("Message \(model.roomName(room))…", text: $draft, axis: .vertical)
                 .lineLimit(1...12)
-                .accessibilityLabel("Message to the room")
+                .accessibilityLabel("Message \(model.roomName(room)), as \(model.node)")
                 .textFieldStyle(.plain)
                 .frame(minWidth: Theme.scaled(160), maxWidth: .infinity)
                 .layoutPriority(1)
@@ -807,6 +837,8 @@ private struct RoomView: View {
         }
         let (text, recipients, re) = (draft, Array(to.union(named)), model.replyTo?.id ?? "")
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        // A detached node posts nothing: the draft stays until it is attached again.
+        guard model.ended == nil else { return }
         draft = ""
         urgent = false
         model.replyTo = nil
@@ -1029,6 +1061,13 @@ private struct MessageRow: View {
                         .nodeCard(model, message.author, name: author)
                         .accessibilityIdentifier("author-\(message.id)")
                 }
+                // Its time of day; the whole date and time on hover and to VoiceOver.
+                Text(TimelineTime.short(message.createdMillis))
+                    .font(Theme.mono).secondaryText()
+                    .help(TimelineTime.full(message.createdMillis))
+                    .accessibilityLabel(TimelineTime.full(message.createdMillis))
+                    .accessibilityValue(TimelineTime.short(message.createdMillis))
+                    .accessibilityIdentifier("time-\(message.id)")
                 if message.urgent { StateMark(kind: .attention, words: "urgent") }
                 if message.to.contains(me) { Text("to you").eyebrow() }
                 if message.late {
@@ -1088,6 +1127,7 @@ private struct MessageRow: View {
         if message.to.contains(me) { parts.append("to you") }
         if message.urgent { parts.append("urgent") }
         if message.late { parts.append("arrived late") }
+        parts.append("at \(TimelineTime.full(message.createdMillis))")
         var said = parts.joined(separator: ", ") + ": "
         if let file = message.file {
             said += "\(file.folder ? "folder" : "file") \(file.name)"
@@ -1109,6 +1149,156 @@ private struct MessageRow: View {
     private var shownText: String { message.file?.note ?? message.text }
 
     private var author: String { NodeModel.author(message, me: me) }
+}
+
+/// The node stopped under the window (detached elsewhere, or the daemon stopped): said at the top,
+/// with the way back. The window and everything typed in it stay; attaching the same node again
+/// picks up where it was. Start Over goes back to reaching the daemon, as at launch.
+private struct NodeStopped: View {
+    @ObservedObject var model: NodeModel
+    @State private var field = SecureFieldHolder()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            StateMark(kind: .danger, words: "Node \(model.node) is detached: \(model.ended ?? "")")
+                .textSelection(.enabled)
+                .accessibilityIdentifier("node-stopped")
+            Text("Nothing you typed is lost. Type node \(model.node)'s identity passphrase to attach "
+                + "it again; leave it empty if it needs none.")
+                .secondaryText()
+            HStack {
+                SecureInput(holder: field) { again() }
+                    .frame(width: Theme.scaled(260))
+                    .accessibilityIdentifier("node-stopped-passphrase")
+                    .accessibilityLabel("Identity passphrase for node \(model.node)")
+                Button("Attach Again") { again() }
+                    .accessibilityIdentifier("node-stopped-attach")
+                Button("Start Over") { Task { await AppModel.shared.start() } }
+                    .accessibilityIdentifier("node-stopped-start-over")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+    }
+
+    private func again() {
+        let secret = field.take()
+        Task { await model.attachAgain(secret) }
+    }
+}
+
+/// A line above the composer while any member and this node cannot read each other, saying which
+/// way trust is missing and what to do. Members are named as the room names them: this node's
+/// alias, else the start of the fingerprint.
+private struct TrustBanner: View {
+    @ObservedObject var model: NodeModel
+
+    var body: some View {
+        let cut = model.members.filter { $0.trust != .mutual }
+        if !cut.isEmpty {
+            HStack(spacing: 8) {
+                StateMark(kind: .attention, words: words(cut))
+                    .accessibilityIdentifier("trust-banner")
+                Spacer()
+                if cut.count == 1, let member = cut.first, member.trust == .none,
+                   model.offers.contains(where: { $0.fingerprint == member.id }) {
+                    Button("Trust \(member.name)…") { Task { await model.show(.offer(member.id)) } }
+                        .accessibilityIdentifier("trust-banner-offer")
+                } else if cut.contains(where: { $0.trust == .none }) {
+                    Button("Show Keyring") { Task { await model.show(.keyring) } }
+                        .accessibilityIdentifier("trust-banner-keyring")
+                }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 6)
+        }
+    }
+
+    private func words(_ cut: [NodeModel.MemberRow]) -> String {
+        guard cut.count == 1, let m = cut.first else {
+            return "\(cut.count) members here and you can't read each other yet: reading needs both "
+                + "sides to trust each other."
+        }
+        switch (m.trust, m.trustsYou) {
+        case (.oneWay, _):
+            return "You trust \(m.name). Waiting for \(m.name) to trust you back before you can read each other."
+        case (.none, true):
+            return "\(m.name) trusts you. Trust \(m.name) too, and you can read each other."
+        default:
+            return "You and \(m.name) can't read each other yet: each of you has to trust the other."
+        }
+    }
+}
+
+/// The Dock icon's badge.
+enum DockBadge {
+    static func show(_ count: Int) {
+        NSApp.dockTile.badgeLabel = count > 0 ? "\(count)" : nil
+    }
+}
+
+/// The room's own header, pinned above its timeline: its name, how many members it has, what the
+/// timeline shows (General, All, or a Session), and its retention, which is always said (R-7).
+/// The window takes the room's name as its title, so the Window menu and ⌘` say which room it is.
+private struct RoomHeader: View {
+    @ObservedObject var model: NodeModel
+    let room: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("ROOM").eyebrow().secondaryText()
+            Text(model.roomName(room)).fontWeight(.semibold)
+                .lineLimit(1).truncationMode(.middle)
+                .textSelection(.enabled)
+                .accessibilityIdentifier("room-header-name")
+                .accessibilityAddTraits(.isHeader)
+            Text(model.roomHeaderMeta)
+                .secondaryText()
+                .lineLimit(1).truncationMode(.middle)
+                .accessibilityIdentifier("room-header-meta")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .navigationTitle(model.roomName(room))
+        .navigationSubtitle(model.roomHeaderMeta)
+    }
+}
+
+/// Where a new day starts in the timeline: its words between two hairlines.
+private struct DayDivider: View {
+    /// The day, "2026-10-04", as the divider's identifier says it.
+    let key: String
+    let words: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            VStack { Divider() }
+            Text(words).caption().secondaryText()
+            VStack { Divider() }
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .ignore)
+        .accessibilityAddTraits(.isHeader)
+        .accessibilityLabel(words)
+        .accessibilityIdentifier("day-\(key)")
+    }
+}
+
+/// Where what was unread when the room came on screen starts.
+private struct UnreadDivider: View {
+    let count: Int
+
+    var body: some View {
+        let words = count == 1 ? "1 unread" : "\(count) unread"
+        HStack(spacing: 8) {
+            VStack { Divider() }
+            Text(words).caption()
+            VStack { Divider() }
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(words)
+        .accessibilityIdentifier("unread-divider")
+    }
 }
 
 /// A file or folder offered in the room (ADR-028 F-1): its name, size and SHA-256, as the share's

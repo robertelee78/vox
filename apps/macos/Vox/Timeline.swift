@@ -191,3 +191,61 @@ extension NodeModel {
         return "\(who) \(n.what)"
     }
 }
+
+/// When a message or a line happened, as the timeline says it. Every time is kept in milliseconds
+/// and rounded only here, for display.
+enum TimelineTime {
+    static func date(_ millis: UInt64) -> Date {
+        Date(timeIntervalSince1970: TimeInterval(millis) / 1_000)
+    }
+
+    /// The time of day, local, in the person's own form: "9:41 AM", or "09:41".
+    static func short(_ millis: UInt64) -> String {
+        date(millis).formatted(.dateTime.hour().minute())
+    }
+
+    /// The whole date and time, for the tooltip and VoiceOver: "Sunday, October 4, 2026 at
+    /// 9:41:07 AM".
+    static func full(_ millis: UInt64) -> String {
+        date(millis).formatted(date: .complete, time: .standard)
+    }
+
+    /// Whether `millis` is a time to place a day by: a line kept at the end (`.max`) or without a
+    /// time (0) has none.
+    static func placed(_ millis: UInt64) -> Bool { millis != 0 && millis != .max }
+
+    /// The local day `millis` falls on, as a key: "2026-10-04".
+    static func day(_ millis: UInt64) -> String {
+        let c = Calendar.current.dateComponents([.year, .month, .day], from: date(millis))
+        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
+    }
+
+    /// The day as a divider says it: "Today", "Yesterday", "Sunday, October 4", and the year when
+    /// it is not this one.
+    static func dayWords(_ millis: UInt64, now: Date = Date()) -> String {
+        let when = date(millis)
+        let calendar = Calendar.current
+        if calendar.isDate(when, inSameDayAs: now) { return "Today" }
+        if let yesterday = calendar.date(byAdding: .day, value: -1, to: now),
+           calendar.isDate(when, inSameDayAs: yesterday) {
+            return "Yesterday"
+        }
+        if calendar.component(.year, from: when) == calendar.component(.year, from: now) {
+            return when.formatted(.dateTime.weekday(.wide).month(.wide).day())
+        }
+        return when.formatted(.dateTime.weekday(.wide).month(.wide).day().year())
+    }
+
+    /// The items a day divider goes above, each with its day's key: the first item, and each one
+    /// whose local day is not the day of the item above it that has a time.
+    static func dividers(_ items: [TimelineItem]) -> [String: String] {
+        var above: String?
+        var out: [String: String] = [:]
+        for item in items where placed(item.millis) {
+            let day = day(item.millis)
+            if day != above { out[item.id] = day }
+            above = day
+        }
+        return out
+    }
+}

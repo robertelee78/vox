@@ -79,6 +79,9 @@ final class NodeModel: ObservableObject {
         let trust: Trust
         /// Whether this node's keyring entry for it grants drive as well as read (K-14).
         let drive: Bool
+        /// Whether it trusts this node: it has granted this node consent (ADR-007 G-9), whether
+        /// or not this node trusts it back.
+        var trustsYou = false
     }
 
     let node: String
@@ -87,6 +90,11 @@ final class NodeModel: ObservableObject {
 
     @Published private(set) var rooms: [Room] = []
     @Published var selection: Selection?
+    /// The first message that was unread when the room came on screen, and how many were: where
+    /// the timeline draws its unread line. It stays while the room is on screen; what arrives
+    /// meanwhile is read as it is shown.
+    @Published private(set) var unreadFrom: String?
+    @Published private(set) var unreadCount = 0
     @Published private(set) var messages: [RoomMessage] = [] {
         didSet {
             byID = Dictionary(messages.map { ($0.id, $0) }) { $1 }
@@ -249,6 +257,15 @@ final class NodeModel: ObservableObject {
     /// Why the last operation was not done, or may not have been, in the daemon's words (M-7):
     /// `outcome`, when not done.
     var said: String? { outcome.flatMap { $0.kind == .done ? nil : $0.words } }
+    /// A room link to fill the Join sheet with, taken by the sheet when it opens.
+    @Published var joinLink: String?
+
+    /// Open the Join sheet with `link` filled in (a vox:// link the system opened the app with).
+    func offerJoin(_ link: String) {
+        joinLink = link
+        sheet = .joinRoom
+    }
+
     /// The node ended: detached, or the daemon stopped.
     @Published private(set) var ended: String?
 
@@ -426,6 +443,8 @@ final class NodeModel: ObservableObject {
         }
         guard case .room = selection else { return }
         messages = []
+        unreadFrom = nil
+        unreadCount = 0
         readBy = [:]
         whereabouts = [:]
         joins = []
@@ -467,8 +486,14 @@ final class NodeModel: ObservableObject {
         do {
             // Each read lands only if the room is still the one on screen: a quick switch must not
             // draw one room's messages under another.
+            // What was unread as the room came on screen, before showing it marks it read: the
+            // timeline's unread line goes above the first of it (ADR-028 R-8).
+            let unread = ((try? await client.unread(room: id)) ?? []).filter { $0.author != me }
             let read = try await client.read(room: id, after: "", limit: 0)
             guard case .room(id) = self.selection else { return }
+            let unreadIDs = Set(unread.map(\.id))
+            unreadFrom = read.first { unreadIDs.contains($0.id) }?.id
+            unreadCount = unread.count
             messages = read
             let services = (try? await client.services(room: id).shared) ?? []
             let rows = try await memberRows(id)
@@ -1096,7 +1121,8 @@ final class NodeModel: ObservableObject {
                                  trustsYou: back.contains(m.fingerprint))
             return MemberRow(id: m.fingerprint,
                              name: m.name.isEmpty ? String(m.fingerprint.prefix(12)) : m.name,
-                             trust: trust, drive: keyring[m.fingerprint] ?? false)
+                             trust: trust, drive: keyring[m.fingerprint] ?? false,
+                             trustsYou: back.contains(m.fingerprint))
         }
     }
 
@@ -1213,6 +1239,21 @@ final class NodeModel: ObservableObject {
 
     fileprivate func stopped(_ text: String) {
         ended = text
+    }
+
+    /// Attach this node again after it stopped, with `secret` if it needs its passphrase, and
+    /// follow it as before: the window and its drafts stay.
+    func attachAgain(_ secret: Secret?) async {
+        begin("attach")
+        do {
+            let passphrase = try secret?.passphrase()
+            defer { passphrase?.wipe() }
+            _ = try await client.attach(node: node, passphrase: passphrase)
+            ended = nil
+            await start()
+        } catch {
+            report(error)
+        }
     }
 
     private func name(of room: RoomSummary) -> String {

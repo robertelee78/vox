@@ -190,6 +190,10 @@ echo "app-proofs: preflight: whether Vox may notify is checked first by the noti
 
 XCFRAMEWORK_SLICES=macos scripts/build-xcframework.sh
 cargo build --release --bin vox
+# Apparatus, never the app's: a `vox` built with test-knobs, for a peer whose clock is set behind
+# (FirstRunProof step 3d, VOX_TEST_CLOCK_SKEW_MS), in a target directory of its own so the app's
+# `vox` is never one with knobs.
+cargo build --release --bin vox --features vox-tui/test-knobs --target-dir target/proof-knobs
 
 # **The app under proof registers no background item** (#571): built with
 # VOX_PROOF_STUB_SERVICES, its login item and its LAN helper are stand-ins that record what was
@@ -301,6 +305,7 @@ TEST_RUNNER_VOX_PROOF_APP="$APP" TEST_RUNNER_VOX_PROOF_SCRATCH="$SCRATCH" \
     TEST_RUNNER_VOX_PROOF_STAGER_PORT="$(cat "$SCRATCH/stager.port")" \
     TEST_RUNNER_VOX_PROOF_STAGER_TOKEN="$TOKEN" \
     TEST_RUNNER_VOX_PROOF_FROM="${VOX_PROOF_FROM:-}" \
+    TEST_RUNNER_VOX_PROOF_KNOBS_VOX="$ROOT/target/proof-knobs/release/vox" \
     TEST_RUNNER_VOX_PROOF_CONTINUE="${VOX_PROOF_CONTINUE:-}" \
     xcodebuild -project apps/macos/Vox.xcodeproj -scheme Vox -configuration Release \
     -derivedDataPath "$DERIVED" ${only[@]+"${only[@]}"} test-without-building \

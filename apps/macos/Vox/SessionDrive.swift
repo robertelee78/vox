@@ -88,11 +88,16 @@ struct SessionComposer: View {
                 .accessibilityLabel("Send the session a file")
                 .accessibilityIdentifier("session-attach")
                 .disabled(sending)
+                // Who types, into which Session (E-4, CL-1): never read as the room's composer.
+                Text("\(model.node) ▸ \(session.label)").font(Theme.mono).secondaryText()
+                    .lineLimit(1).truncationMode(.middle)
+                    .accessibilityLabel("typing as \(model.node) into \(session.label)")
+                    .accessibilityIdentifier("session-compose-as")
                 // Up to 12 lines, so a pasted stack trace or a long prompt is read before it goes;
                 // Return sends, ⌥↩ adds a line (P19).
                 TextField("Composer — to \(session.label)", text: $draft, axis: .vertical)
                     .lineLimit(1...12)
-                    .accessibilityLabel("Message to \(session.label)")
+                    .accessibilityLabel("Message to \(session.label), as \(model.node)")
                     .textFieldStyle(.plain)
                     .frame(minWidth: Theme.scaled(160), maxWidth: .infinity)
                     .layoutPriority(1)

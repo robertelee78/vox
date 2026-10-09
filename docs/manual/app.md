@@ -221,7 +221,7 @@ and `https` links can be opened from a card; any other link is shown as text.
 
 ### Posting
 
-Type in **Say something to the room** and press Return. Beside the field:
+Type in **Message ROOM…**, after your node’s name (`ann ▸`, who posts), and press Return. Beside the field:
 
 - **To:** opens the room's members to tick the ones the message is addressed to. With none
   ticked it goes to the room.
@@ -452,7 +452,7 @@ has a checked copy. The header says that the Session's name and id are its node'
 `LABEL — name and id as NODE says`. To anyone else it shows only that it opened (and ended), and
 `Only members NODE trusts with drive see inside this Session.`
 
-With drive, an open Session has its own composer, `Composer — to LABEL`, in place of the room's:
+With drive, an open Session has its own composer, `Composer — to LABEL` after `ann ▸ LABEL` (who types, into which Session), in place of the room's:
 
 - What you type goes to the session as its operator's input; a line starting with `/` is sent as
   a slash command.

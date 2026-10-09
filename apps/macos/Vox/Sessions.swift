@@ -26,6 +26,26 @@ extension NodeModel {
     }
 
     /// Whether one Session is on screen, rather than the room's conversation or All.
+    /// What needs the person, as the sidebar's NEEDS YOU counts it: its rooms and trust offers.
+    var needsYouCount: Int { group(.needsYou).count + offers.count }
+
+    /// A room's name as the sidebar says it, else its id's start.
+    func roomName(_ room: String) -> String {
+        rooms.first { $0.id == room }?.name ?? String(room.prefix(12))
+    }
+
+    /// The room header's facts: members, what is shown, and the retention, always (R-7).
+    var roomHeaderMeta: String {
+        let people = members.count + 1
+        let shown: String
+        switch showing {
+        case .general: shown = "General"
+        case .all: shown = "All"
+        case .session: shown = shownSession?.label ?? "a Session"
+        }
+        return "\(people == 1 ? "1 member" : "\(people) members") · \(shown) · ⏱ \(retention)"
+    }
+
     var showingSession: Bool {
         if case .session = showing { return true }
         return false
