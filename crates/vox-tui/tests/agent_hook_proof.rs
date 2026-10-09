@@ -2429,19 +2429,26 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
                 .join(", "))
             .unwrap_or_else(|_| "no files directory".into())
     );
-    // (8) The daemon restarts mid-session; the session's next turn opens no second Session.
+    // (8) The daemon restarts mid-session; the session's next turn opens no second Session. The
+    // Session's records on the log are counted on each side of the restart: a rename posts the
+    // record again (it names it, c6b218c3a), so a count of every record is not a count of openings;
+    // the restart must add none.
+    let records_of = |d: &Daemon| {
+        shown_rows(d)
+            .into_iter()
+            .filter_map(|(_, t)| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .filter(|v| v["type"] == "session" && v["from"] == at)
+            .count()
+    };
+    let before_restart = records_of(&daemon);
     restart(&mut daemon, tmp.path());
     run(
         claude_event_at(at, "UserPromptSubmit", r#","prompt":"again""#, &transcript),
         &person,
     );
     let after_restart = sessions();
-    // On the log itself: one opening, however many turns and restarts.
-    let openings = shown_rows(&daemon)
-        .into_iter()
-        .filter_map(|(_, t)| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .filter(|v| v["type"] == "session" && v["from"] == at)
-        .count();
+    // On the log itself: no record of it more than before the restart.
+    let openings = records_of(&daemon) - before_restart.min(records_of(&daemon));
     // (4) The turn ends: `Stop`. (5) A resume: `SessionEnd` whose reason is `resume`.
     run(claude_event(at, "Stop", ""), &person);
     run(
@@ -2540,9 +2547,10 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
          sessions` labelled it {bob_renamed:?} after the post"
     );
     assert!(
-        of(&after_restart, at).len() == 1 && openings == 1,
+        of(&after_restart, at).len() == 1 && openings == 0,
         "PRODUCT: a daemon restarted mid-session must not open the session's Session again; the \
-         room's log holds {openings} opening(s) for it, and lists {after_restart:?}"
+         room's log holds {openings} record(s) of it more than before the restart ({before_restart} \
+         before), and lists {after_restart:?}"
     );
     assert!(
         of(&after_resume, at).len() == 1 && of(&after_resume, at)[0]["open"] == true,
