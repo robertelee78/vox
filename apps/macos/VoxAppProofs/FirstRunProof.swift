@@ -751,8 +751,14 @@ final class FirstRunProof: XCTestCase {
               "a wrong passphrase must show the daemon's own sentence where it was typed",
               until: { $0.contains("that passphrase does not open node alice's identity") })
 
-        // (2) The right one attaches it.
-        type(ui, field, "alice identity", "the passphrase field")
+        // (2) The right one attaches it, pasted with ⌘V, as from a password manager (v0.4.1).
+        if let held = paste(ui, field, "alice identity", "the passphrase field") {
+            if held.count != "alice identity".count {
+                XCTFail("PRODUCT: ⌘V into the passphrase field must paste the passphrase on the pasteboard (\("alice identity".count) characters); the field holds \(held.count)")
+            }
+        } else if locate(ui, field) != nil {
+            XCTFail("APPARATUS: XCTest reads no value from the passphrase field after ⌘V")
+        }
         tap(ui, Key.id("attach"), "Attach")
         present(ui, Key.id("attached"), timeout: 60,
                 "the right passphrase must attach node alice")
@@ -889,6 +895,18 @@ final class FirstRunProof: XCTestCase {
         }
         XCTAssertTrue(readByAlice.contains("alice"),
                       "PRODUCT: bob's message drawn in alice's timeline must be read: bob's `vox room read --json` must say alice read it; it says read_by \(readByAlice)")
+        // Bob's message, selected by dragging across it and copied, as a person copies what a
+        // member wrote (v0.4.1).
+        if windowReadable(ui) {
+            if let body = textSaying(ui, "NEEDS-YOU") {
+                let copied = selectAndCopy(ui, body, "bob's message NEEDS-YOU")
+                XCTAssertEqual(copied, "NEEDS-YOU",
+                               "PRODUCT: bob's message, selected by dragging across it and copied with ⌘C, must put NEEDS-YOU on the pasteboard; it holds \(copied.debugDescription)")
+            } else {
+                keepTree(ui, "no Text says exactly NEEDS-YOU")
+                XCTFail("APPARATUS: XCTest finds no element whose words are exactly NEEDS-YOU, though bob's message was read on alice's screen")
+            }
+        }
         // Hidden (⌘H), alice's app shows nobody bob's next message: it is not read.
         handOff(ui, "h")
         XCTAssertTrue(ui.wait(for: .runningBackground, timeout: 10),
@@ -927,7 +945,12 @@ final class FirstRunProof: XCTestCase {
         // Alice posts; bob's agent reads it in a drain, as a harness does before every prompt.
         let compose = Key.id("compose")
         present(ui, compose, timeout: 10, "the room must have a field to post")
-        type(ui, compose, "FROM-ALICE\r", "the composer")
+        // Pasted (⌘V), then sent with Return (v0.4.1).
+        let composed = paste(ui, compose, "FROM-ALICE", "the composer")
+        if composed != "FROM-ALICE" {
+            XCTFail("PRODUCT: ⌘V into the composer must paste FROM-ALICE; it holds \(composed.debugDescription)")
+        }
+        el(ui, compose).typeText("\r")
         var drained = ""
         let drainUntil = Date().addingTimeInterval(60)
         while Date() < drainUntil && !drained.contains("FROM-ALICE") {
@@ -953,7 +976,11 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("keyring"), "Keyring in the sidebar")
         let addFp = Key.id("keyring-add-fingerprint")
         present(ui, addFp, timeout: 10, "the keyring view must offer to add a node")
-        type(ui, addFp, carolFp, "the fingerprint field")
+        // Pasted from Edit › Paste, as the field invites ("paste or type", v0.4.1).
+        let pastedFp = paste(ui, addFp, carolFp, "the fingerprint field", fromMenu: true)
+        if pastedFp != carolFp {
+            XCTFail("PRODUCT: Edit › Paste into the fingerprint field must paste carol's fingerprint \(carolFp); it holds \(pastedFp.debugDescription)")
+        }
         let addAlias = Key.id("keyring-add-alias")
         type(ui, addAlias, "carol", "the alias field")
         // The effect sentences are Texts: their words are their accessibility value.
@@ -964,6 +991,11 @@ final class FirstRunProof: XCTestCase {
         let carolRow = Key.id("keyring-row-carol")
         keyringPassphraseIfAsked(ui) { self.locate(ui, carolRow) != nil }
         present(ui, carolRow, timeout: 30, "carol, once trusted, must be listed in the keyring view")
+        // Her grouped fingerprint, selected and copied, as a person copies it to compare (v0.4.1).
+        let copiedFp = selectAndCopy(ui, Key.id("keyring-fingerprint-carol"), "carol's grouped fingerprint")
+        if copiedFp.filter({ !$0.isWhitespace }) != carolFp {
+            XCTFail("PRODUCT: carol's grouped fingerprint, selected by dragging across it and copied with ⌘C, must put her fingerprint \(carolFp) on the pasteboard; it holds \(copiedFp.debugDescription)")
+        }
         let trustList = run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out
         XCTAssertTrue(trustList.contains(carolFp),
                       "PRODUCT: `vox trust list` must list carol once the app trusted her; it said: \(trustList)")
@@ -1838,6 +1870,77 @@ final class FirstRunProof: XCTestCase {
             view.scroll(byDeltaX: 0, deltaY: down ? -200 : 200)
             if e.frame == now { return }
         }
+    }
+
+    /// Paste `text` into `key` as a person does (the decider, v0.4.1: "All input fields, I
+    /// should be able to paste into"): put on the pasteboard, the field clicked, then ⌘V, or Edit ›
+    /// Paste from the menu bar. What the field then holds (a secure field's value is one bullet per
+    /// character), or nil when the field was not reached. The pasteboard is cleared after.
+    /// Premise: the runner reads back what it puts on the pasteboard, else APPARATUS.
+    @discardableResult
+    private func paste(_ ui: XCUIApplication, _ key: Key, _ text: String, _ what: String,
+                       fromMenu: Bool = false,
+                       file: StaticString = #filePath, line: UInt = #line) -> String? {
+        let board = NSPasteboard.general
+        defer { board.clearContents() }
+        board.clearContents()
+        board.setString(text, forType: .string)
+        guard board.string(forType: .string) == text else {
+            XCTFail("APPARATUS: the proof cannot put what it pastes into \(what) on the pasteboard",
+                    file: file, line: line)
+            return nil
+        }
+        guard tap(ui, key, what, file: file, line: line) else { return nil }
+        if fromMenu {
+            let edit = ui.menuBars.menuBarItems["Edit"]
+            guard edit.waitForExistence(timeout: 10) else {
+                keepTree(ui, "no Edit menu")
+                XCTFail("PRODUCT: the app must have an Edit menu to paste into \(what) from; the menu bar has none",
+                        file: file, line: line)
+                return nil
+            }
+            edit.click()
+            guard tap(ui, Key.menuItem("Paste"), "Edit › Paste, into \(what)", file: file, line: line) else {
+                return nil
+            }
+        } else {
+            el(ui, key).typeKey("v", modifierFlags: .command)
+        }
+        Thread.sleep(forTimeInterval: 0.5)
+        return el(ui, key).value as? String
+    }
+
+    /// Select what `key` shows by dragging across it, as a person does, and copy it with ⌘C: what
+    /// the pasteboard then holds (the decider, v0.4.1: "All text in the app, I should be able to
+    /// select it for copy purposes").
+    private func selectAndCopy(_ ui: XCUIApplication, _ key: Key, _ what: String,
+                               file: StaticString = #filePath, line: UInt = #line) -> String {
+        guard let e = locate(ui, key) else {
+            missing(ui, key, "the app must show \(what)", file: file, line: line)
+            return ""
+        }
+        return selectAndCopy(ui, e, what, file: file, line: line)
+    }
+
+    /// The element whose own words are exactly `words` (a Text's value, or its label), in the
+    /// window: one Text, not a row that says it among other things.
+    private func textSaying(_ ui: XCUIApplication, _ words: String) -> XCUIElement? {
+        let e = ui.windows.firstMatch.descendants(matching: .any)
+            .matching(NSPredicate(format: "value == %@ OR label == %@", words, words)).firstMatch
+        return e.exists ? e : nil
+    }
+
+    private func selectAndCopy(_ ui: XCUIApplication, _ e: XCUIElement, _ what: String,
+                               file: StaticString = #filePath, line: UInt = #line) -> String {
+        if !inView(ui, e) { scrollTo(ui, e) }
+        return copiedBy(ui, {
+            // From just inside its first character to just inside its last, on its first line and
+            // its last if it wraps: the whole of it.
+            let from = e.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.25)).withOffset(CGVector(dx: 1, dy: 0))
+            let to = e.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.75)).withOffset(CGVector(dx: -1, dy: 0))
+            from.click(forDuration: 0.3, thenDragTo: to)
+            ui.typeKey("c", modifierFlags: .command)
+        }, file: file, line: line)
     }
 
     /// Type `text` into `key`, only once it was clicked.
