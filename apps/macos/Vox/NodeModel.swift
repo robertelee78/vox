@@ -1216,7 +1216,13 @@ extension NodeModel {
         guard let a = selectedApproval else { return }
         let action: DriveAction = approve ? .approve(reference: a.reference)
             : .reject(reference: a.reference, why: nil)
-        did = await drive(a.session, in: a.room, action)
+        // What came of it is this operation's outcome (P6): done, refused, or not known.
+        begin(approve ? "approve-request" : "reject-request")
+        switch await driveResult(a.session, in: a.room, action) {
+        case let .taken(words): report(done: asSentence(words))
+        case let .refused(words): outcome = Outcome(operation: operation, kind: .refused, words: asSentence(words))
+        case let .unknown(words): outcome = Outcome(operation: operation, kind: .unknown, words: asSentence(words))
+        }
         await readSession()
     }
 
