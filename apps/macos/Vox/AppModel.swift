@@ -170,7 +170,9 @@ final class AppModel: ObservableObject {
         switch nodes.count {
         case 0: phase = .welcome(said: nil)
         case 1: await use(nodes[0])
-        default: phase = .choosing(nodes.map(\.name))
+        default:
+            nodeList = nodes
+            phase = .choosing(nodes.map(\.name))
         }
     }
 
@@ -267,8 +269,49 @@ final class AppModel: ObservableObject {
             self.node = nil
             phase = .detached(node: node)
         } catch {
-            phase = .unreachable(sentence(error))
+            phase = .unreachable(StartFailure(error))
         }
+    }
+
+    /// Whether Node › Sign Out… asks the person to confirm.
+    @Published var signingOut = false
+    /// The nodes on this Mac, with their fingerprints, as the sign-in choice lists them (P8).
+    @Published private(set) var nodeList: [NodeSummary] = []
+
+    /// The node signed in as now, attached or detached: what Sign Out acts on.
+    var signedInAs: String? {
+        switch phase {
+        case let .attached(node, _), let .detached(node): return node
+        default: return nil
+        }
+    }
+
+    /// Sign out of the node (ADR-028 E-4, the decider 2026-10-08): detach it, and forget all that
+    /// would bring it back without the person: its keep and the passphrase kept for it in the
+    /// Keychain (the daemon's unkeep), and this app's remembered node. The node, its rooms and its
+    /// messages stay on this Mac. Then the sign-in: choose a node, or make one.
+    func signOut() async {
+        guard let client, let name = signedInAs else { return }
+        signingOut = false
+        do {
+            try await client.unkeep(node: name)
+            await client.release()
+            self.node = nil
+            // Not attached is as good: it is detached either way.
+            try? await client.detach(node: name)
+            forget(name, client)
+            let nodes = try await client.nodes()
+            nodeList = nodes
+            phase = .choosing(nodes.map(\.name))
+        } catch {
+            phase = .unreachable(StartFailure(error))
+        }
+    }
+
+    /// The sign-in's New Node…: make one here, as at first run.
+    func newNode() {
+        guard case .choosing = phase else { return }
+        phase = .welcome(said: nil)
     }
 
     /// Attach again the node this window was opened with, after Detach (E-4): at once if it needs
@@ -277,7 +320,7 @@ final class AppModel: ObservableObject {
         guard let client, case let .detached(name) = phase else { return }
         do {
             guard let node = try await client.nodes().first(where: { $0.name == name }) else {
-                phase = .unreachable("node \(name) is no longer on this Mac")
+                phase = .unreachable(StartFailure(kind: .other, said: "node \(name) is no longer on this Mac"))
                 return
             }
             await use(node)
@@ -456,6 +499,13 @@ final class AppModel: ObservableObject {
         }
         let name = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return name.isEmpty ? nil : name
+    }
+
+    /// Forget the remembered node, if it is `node`.
+    private func forget(_ node: String, _ client: VoxClient) {
+        if chosenNode(client) == node {
+            try? FileManager.default.removeItem(at: choiceFile(client))
+        }
     }
 
     private func remember(_ node: String, _ client: VoxClient) {

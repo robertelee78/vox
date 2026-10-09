@@ -127,6 +127,10 @@ struct VoxCommands: Commands {
                 .disabled(app.node != nil)
             Button("Detach") { Task { await app.detachNode() } }
                 .disabled(app.node == nil)
+            Divider()
+            // E-4: the one way to act as another node: sign out, then sign in.
+            Button("Sign Out…") { app.signingOut = true }
+                .disabled(app.signedInAs == nil)
             items("Node")
         }
         CommandMenu("Keyring") { items("Keyring") }
