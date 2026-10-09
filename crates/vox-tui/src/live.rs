@@ -96,6 +96,10 @@ impl Drop for Conn {
     }
 }
 
+/// How often the TUI asks whether the daemon's `.vox` proxy runs: it changes only when the
+/// daemon starts or its port is taken, so not with every snapshot.
+const PROXY_EVERY: Duration = Duration::from_secs(5);
+
 /// The TUI's binding to the daemon.
 pub struct DaemonCore {
     rt: tokio::runtime::Handle,
@@ -119,6 +123,11 @@ pub struct DaemonCore {
     snapshot: NodeSnapshot,
     /// When the snapshot was last asked for; `None` asks now.
     asked: Option<Instant>,
+    /// Whether the daemon's `.vox` proxy runs, and where, as last asked: the Shared pane's
+    /// `proxy configured` fact (ADR-028 S-3). `None` until asked.
+    proxy: Option<Result<std::net::SocketAddr, String>>,
+    /// When the proxy was last asked about.
+    proxy_asked: Option<Instant>,
     /// The room on screen (drives `ViewModel::active` and unread resets).
     active: Option<Digest32>,
     /// The Session the room's timeline shows: its room, node and session id (ADR-029 CL-2).
@@ -409,6 +418,8 @@ impl DaemonCore {
             daemon_events,
             snapshot: NodeSnapshot::default(),
             asked: None,
+            proxy: None,
+            proxy_asked: None,
             active: None,
             unread: BTreeMap::new(),
             seeded: BTreeSet::new(),
@@ -936,6 +947,7 @@ impl DaemonCore {
             return;
         }
         self.asked = Some(Instant::now());
+        self.ask_proxy();
         self.on_disk = self
             .account
             .nodes_on_disk()
@@ -967,6 +979,35 @@ impl DaemonCore {
                 self.ended
                     .get_or_insert(format!("the vox daemon stopped answering: {e}"));
             }
+        }
+    }
+
+    /// Ask the daemon whether its `.vox` proxy runs, every [`PROXY_EVERY`], on a connection of
+    /// its own that attaches nothing: the Shared pane's `proxy configured` fact.
+    fn ask_proxy(&mut self) {
+        if self
+            .proxy_asked
+            .is_some_and(|at| at.elapsed() < PROXY_EVERY)
+        {
+            return;
+        }
+        self.proxy_asked = Some(Instant::now());
+        let at = vox_core::node::ipc::NodeSocket {
+            path: self.account.socket(),
+            using: UseNode {
+                node: self.node.clone(),
+                attach: AttachMode::No,
+                passphrase: None,
+                anchors: Vec::new(),
+            },
+            waiting: None,
+        };
+        let asked = until_stopped(&self.rt, &self.stop, vox_core::node::nameipc::proxy(&at));
+        if let Some(asked) = asked {
+            self.proxy = Some(asked.map_err(|e| match e {
+                vox_core::error::Error::AppRefused(reason) => reason,
+                other => other.to_string(),
+            }));
         }
     }
 
@@ -1867,13 +1908,15 @@ impl DaemonCore {
                                         .next()
                                         .map(|(_, c)| c)
                                         .unwrap_or_default(),
-                                    missing: crate::tunnel_cli::service_needs(&svc, None)
-                                        .into_iter()
-                                        .filter(|(_, holds, _)| !holds)
-                                        .map(|(need, _, otherwise)| {
-                                            format!("{need}: no — {otherwise}")
-                                        })
-                                        .collect(),
+                                    ready: crate::tunnel_cli::service_needs(
+                                        &svc,
+                                        self.proxy.as_ref(),
+                                    )
+                                    .into_iter()
+                                    .map(|(need, holds, otherwise)| {
+                                        crate::tunnel_cli::service_tick(&need, holds, &otherwise)
+                                    })
+                                    .collect(),
                                 }
                             })
                             .collect()

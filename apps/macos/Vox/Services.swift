@@ -105,7 +105,7 @@ struct ServicesView: View {
 
 /// One service shared with this node: its readable address, who shares it and its kind; each
 /// command shown with the readable address and copied with the canonical one (S-1, S-3); and what
-/// reaching it needs, each saying whether it holds.
+/// reaching it needs, as readiness ticks: ✓ when it holds, the missing one in amber with its fix.
 private struct SharedServiceBox: View {
     @ObservedObject var model: NodeModel
     let room: String
@@ -126,10 +126,16 @@ private struct SharedServiceBox: View {
                         .accessibilityIdentifier("copy-\(command.what)-\(service.address)")
                 }
             }
+            // What reaching it needs, as ticks (the App Study's readiness, in vox-core's words, the
+            // same as `vox service list` and the TUI): ✓ when it holds, and the missing one in
+            // amber with its fix, never only "connection failed".
             ForEach(Array(service.needs.enumerated()), id: \.offset) { _, need in
-                StateMark(kind: need.holds ? .plain : .attention,
-                          words: need.holds ? "needs \(need.need): yes"
-                              : "needs \(need.need): no — \(need.otherwise)")
+                if need.holds {
+                    Text("✓ \(need.need)").font(Theme.text).secondaryText()
+                        .accessibilityLabel("\(need.need): yes")
+                } else {
+                    StateMark(kind: .attention, words: "missing: \(need.need) — \(need.otherwise)")
+                }
             }
         }
         .padding(10)
