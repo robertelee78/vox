@@ -177,10 +177,10 @@ fn now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-/// Text the operator typed, without the room block the drain put in front of it. `None` for a
-/// wake notice Vox relayed: it is Vox's, not the operator's.
+/// Text the operator typed, without the blocks the drain put in front of it (Vox's notice, the
+/// room's fence). `None` for a wake notice Vox relayed: it is Vox's, not the operator's.
 fn typed(text: &str) -> Option<&str> {
-    if !text.starts_with("<vox-room-") {
+    if !text.starts_with("<vox-room-") && !text.starts_with("<vox-notice-") {
         return Some(text);
     }
     for (label, mine) in [
