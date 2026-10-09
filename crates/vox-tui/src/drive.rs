@@ -30,13 +30,13 @@ pub use vox_agentcomms::drive::{slash, Action, Answer, Request, LABEL, MAX_REQUE
 /// Why a drive did not reach its session, in the three ways every surface words alike (CL-1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotDelivered {
-    /// The session's node refused it: "not delivered to <label>: <why>".
+    /// The session's node refused it: `"not delivered to <label>: <why>"`.
     Refused(String),
     /// Nothing went out: the node could not be reached, or no single target was found (DR-5):
-    /// "not sent to <label>: <why>".
+    /// `"not sent to <label>: <why>"`.
     NotSent(String),
-    /// It went out and no answer came: "no answer from <label>: it may or may not have been
-    /// delivered".
+    /// It went out and no answer came: `"no answer from <label>: it may or may not have been
+    /// delivered"`.
     NoAnswer(String),
 }
 

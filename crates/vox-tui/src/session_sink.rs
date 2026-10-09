@@ -219,7 +219,7 @@ impl Sink {
     /// A driver's text was delivered to `session` as its input (#544): its `drive` entry already
     /// shows it as typed in Vox by that driver, so the harness's own prompt event for the same
     /// text, if it fires one, is not shown again as typed at the terminal. A limit, stated: the
-    /// same text typed at the terminal within [`DELIVERED_FOR`] is shown once, as typed in Vox.
+    /// same text typed at the terminal within 30 s (`DELIVERED_FOR`) is shown once, as typed in Vox.
     pub fn delivered_text(&self, node: &NodeName, session: &str, text: &str) {
         self.with(|all| {
             let s = all.entry((node.clone(), session.to_owned())).or_default();

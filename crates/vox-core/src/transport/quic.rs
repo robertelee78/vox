@@ -513,11 +513,11 @@ fn base_transport(mtu_ceiling: u16) -> quinn::TransportConfig {
 
 /// The transport parameters of a connection **before its identity exchange** (ADR-011
 /// requirement 33): the normal parameters with QUIC's own limits holding the connection to the
-/// exchange — at most [`identity::PRE_IDENTITY_BIDI`](crate::transport::identity::PRE_IDENTITY_BIDI)
+/// exchange — at most [`identity::PRE_IDENTITY_BIDI`]
 /// client-opened bidirectional streams, no unidirectional stream, and a
-/// [`identity::PRE_IDENTITY_WINDOW`](crate::transport::identity::PRE_IDENTITY_WINDOW) connection
+/// [`identity::PRE_IDENTITY_WINDOW`] connection
 /// window. A third stream is QUIC's STREAM_LIMIT_ERROR, not something Vox has to police.
-/// [`identity::open_post_identity`](crate::transport::identity::open_post_identity) raises them
+/// [`identity::open_post_identity`] raises them
 /// once the exchange is done.
 #[must_use]
 pub fn pre_identity_transport_config(mtu_ceiling: u16) -> Arc<quinn::TransportConfig> {
@@ -773,7 +773,7 @@ enum Missed {
 }
 
 impl SharedEndpoint {
-    /// Bind the endpoint to `addr`: one UDP socket (dual-stack self-tested, [`bind_udp`]), the
+    /// Bind the endpoint to `addr`: one UDP socket (dual-stack self-tested, `bind_udp`), the
     /// multiplexer over it, and a neutral leaf made once for this endpoint's whole life.
     ///
     /// # Errors

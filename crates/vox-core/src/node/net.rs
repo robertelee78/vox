@@ -1011,9 +1011,10 @@ impl ConnectionManager {
     /// authenticated peer identity. `Ok(None)` when the endpoint is closed.
     ///
     /// **Performs the handshake inline**, so this is for a caller that wants exactly one
-    /// connection. An accept *loop* must use [`Self::accept_incoming`] and
-    /// [`Self::finish_incoming`] instead, or it serialises on handshakes and one stalled
-    /// unauthenticated peer blocks every other inbound connection.
+    /// connection. A node's inbound connections come from its presence's accept loop
+    /// ([`NetPresence`](crate::node::presence::NetPresence)), which hands each one over
+    /// handshaken for [`Self::take_inbound`]: a loop over this one would serialise on handshakes,
+    /// and one stalled unauthenticated peer would block every other inbound connection.
     pub async fn accept(&self, admission: Admission) -> Result<Option<Arc<VoxConnection>>> {
         let Some(conn) = self
             .endpoint
@@ -1026,8 +1027,7 @@ impl ConnectionManager {
     }
 
     /// File a connection the presence accepted for this node (after its identity exchange),
-    /// handing back a duplicate it retired so the caller keeps serving it (see
-    /// [`Self::file_reporting`]).
+    /// handing back a duplicate it retired so the caller keeps serving it (`file_reporting`).
     pub async fn take_inbound(&self, conn: VoxConnection) -> Filed {
         self.file_reporting(conn).await
     }

@@ -25,7 +25,7 @@
 //! ## Inbound visibility opt-out is *not here*
 //! The inbound "do I want to see them?" control is purely receiver-side: it
 //! creates **no** governance entry, performs no rotation, and affects no one else
-//! (ADR-007). It is modeled in [`crate::governance::visibility`], deliberately
+//! (ADR-007). It is the node's trust keyring ([`crate::node::trust`]), deliberately
 //! outside this signed-struct module, because it is not a log fact at all.
 
 use crate::cbor::{Decoder, Encoder};
