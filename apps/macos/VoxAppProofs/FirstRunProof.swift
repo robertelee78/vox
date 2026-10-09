@@ -688,101 +688,6 @@ final class FirstRunProof: XCTestCase {
                               until: { $0.lowercased() == "needs you (0)" }) ?? ""
         print("[proof] grouped: needs you (1), then \(regrouped); inspector: \(bobWords); status: \(bar)")
 
-        // (3c) When each message was posted, and where what alice had not read starts: NEEDS-YOU
-        // came while she was in the keyring, so the room opened with it unread. Its row says its
-        // time of day, and the whole date and time to VoiceOver; the unread line sits above it, and
-        // today's divider above that. Times are the ones the node keeps, in milliseconds.
-        guard let needs = posted(vox, voxEnv, room, "NEEDS-YOU") else {
-            throw Apparatus("alice's `vox room read --json` shows no NEEDS-YOU, so its time cannot be checked")
-        }
-        let needsAt = Date(timeIntervalSince1970: TimeInterval(needs.millis) / 1_000)
-        let needsTime = Key.id("time-\(needs.id)")
-        if present(ui, needsTime, timeout: 30, "bob's NEEDS-YOU must show the time it was posted") {
-            let e = el(ui, needsTime)
-            let short = needsAt.formatted(.dateTime.hour().minute())
-            let full = needsAt.formatted(date: .complete, time: .standard)
-            XCTAssertEqual(e.value as? String, short,
-                           "PRODUCT: NEEDS-YOU, posted at \(full) (\(needs.millis) ms), must show its time of day \"\(short)\"; it shows \(String(describing: e.value))")
-            XCTAssertEqual(e.label, full,
-                           "PRODUCT: NEEDS-YOU's time must say the whole date and time to VoiceOver, \"\(full)\"; it says \"\(e.label)\"")
-        }
-        let unreadLine = Key.id("unread-divider")
-        words(ui, unreadLine, timeout: 10,
-              "the room opened with NEEDS-YOU unread: its unread line must say \"1 unread\"",
-              until: { $0 == "1 unread" })
-        XCTAssertLessThanOrEqual(el(ui, unreadLine).frame.maxY, el(ui, needsTime).frame.minY,
-                                 "PRODUCT: the unread line must sit above NEEDS-YOU, the first message alice had not read; the line is at \(el(ui, unreadLine).frame), NEEDS-YOU's time at \(el(ui, needsTime).frame)")
-        let today = Key.id("day-\(Self.dayKey(Date()))")
-        words(ui, today, timeout: 10, "today's messages must sit under a \"Today\" divider",
-              until: { $0 == "Today" })
-        print("[proof] times: NEEDS-YOU at \(needsAt.formatted(.dateTime.hour().minute())), under \"1 unread\" and \"Today\"")
-
-        // (3d) A message from another day sits under that day's divider. Dora is a node of a
-        // daemon of her own whose clock is two days behind: apparatus, a `vox` built with
-        // test-knobs (VOX_TEST_CLOCK_SKEW_MS), never the app's. She joins, she and alice trust each
-        // other, and she posts until alice reads one; it claims a time two days ago.
-        guard let knobs = env["VOX_PROOF_KNOBS_VOX"], !knobs.isEmpty else {
-            throw Apparatus("VOX_PROOF_KNOBS_VOX (a vox built with test-knobs, for dora's clock) is set by scripts/app-proofs.sh")
-        }
-        let doraEnv = ["VOX_DATA_DIR": scratch.appendingPathComponent("dora-data").path,
-                       "VOX_CONFIG_DIR": scratch.appendingPathComponent("dora-config").path,
-                       "VOX_PROXY": "127.0.0.1:0",
-                       "VOX_TEST_CLOCK_SKEW_MS": String(-2 * 86_400_000)]
-        let doraPass = scratch.appendingPathComponent("dora.pass").path
-        try stager.write(Data("dora identity\n".utf8), to: doraPass)
-        peer = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: doraEnv,
-                         until: "vox daemon: control socket")
-        try staged(knobs, ["node", "create", "dora"],
-                   env: doraEnv.merging(["VOX_IDENTITY_PASSPHRASE": "dora identity"]) { $1 })
-        try staged(knobs, ["node", "attach", "dora", "--passphrase-file", doraPass], env: doraEnv)
-        let doraFp = try line(staged(knobs, ["id", "--node", "dora"], env: doraEnv)) { $0.count == 52 }
-        let doraLink = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
-            $0.hasPrefix("vox://")
-        }
-        try staged(knobs, ["room", "join", "--node", "dora", "--passphrase-file", roomPass, doraLink],
-                   env: doraEnv)
-        try staged(vox, ["trust", "add", "--node", "alice", doraFp, "--name", "dora",
-                         "--identity-passphrase-file", alicePass], env: voxEnv)
-        try staged(knobs, ["trust", "add", "--node", "dora", aliceFp, "--name", "alice",
-                           "--identity-passphrase-file", doraPass], env: doraEnv)
-        var old: (id: String, millis: UInt64)?
-        let oldUntil = Date().addingTimeInterval(120)
-        var d = 0
-        while old == nil && Date() < oldUntil {
-            d += 1
-            try staged(knobs, ["room", "post", "--node", "dora", room, "FROM-ANOTHER-DAY-\(d)"], env: doraEnv)
-            Thread.sleep(forTimeInterval: 1)
-            old = posted(vox, voxEnv, room, "FROM-ANOTHER-DAY-")
-        }
-        guard let old else {
-            throw Apparatus("alice never read a post of dora's in 120 s, so no message from another day was staged")
-        }
-        let oldAt = Date(timeIntervalSince1970: TimeInterval(old.millis) / 1_000)
-        guard !Calendar.current.isDateInToday(oldAt) else {
-            throw Apparatus("dora's post claims \(oldAt.formatted()) (\(old.millis) ms), today: VOX_TEST_CLOCK_SKEW_MS did not move her clock")
-        }
-        let oldTime = Key.id("time-\(old.id)")
-        let oldDay = Key.id("day-\(Self.dayKey(oldAt))")
-        let oldWords = Self.dayWords(oldAt)
-        if present(ui, oldTime, timeout: 60, "dora's post, from \(oldAt.formatted()), must be in alice's timeline with its time",
-                   premise: trusted(vox, voxEnv, doraFp, "dora")) {
-            scrollTo(ui, el(ui, oldTime))
-            words(ui, oldDay, timeout: 10,
-                  "dora's post claims \(oldAt.formatted()): a divider must say its day, \"\(oldWords)\"",
-                  until: { $0 == oldWords })
-            // The divider nearest above it is its own day's.
-            let at = el(ui, oldTime).frame.minY
-            let above = ui.windows.firstMatch.descendants(matching: .any)
-                .matching(NSPredicate(format: "identifier BEGINSWITH %@", "day-"))
-                .allElementsBoundByIndex.filter { $0.frame.maxY <= at }
-                .max { $0.frame.minY < $1.frame.minY }
-            XCTAssertEqual(above?.identifier, "day-\(Self.dayKey(oldAt))",
-                           "PRODUCT: dora's post from \(oldAt.formatted()) must sit under its own day's divider, \"\(oldWords)\"; the divider nearest above it is \(above.map { "\"\($0.label)\" (\($0.identifier))" } ?? "none")")
-        }
-        print("[proof] another day: dora's post at \(oldAt.formatted()), under \"\(oldWords)\"")
-        peer?.terminate()
-        peer = nil
-
         // (3b) The platform bob's node says it runs on (ADR-020 §4.9b): a claim of a resource has
         // bob's session announce itself, and Vox fills its hello's os, os_version and arch from
         // the machine. What the inspector must say is what that hello says, read through `vox`.
@@ -930,6 +835,111 @@ final class FirstRunProof: XCTestCase {
         print("[proof] keyring: added and listed carol, then removed her after saying what untrusting does")
 
         }
+
+        // (5b) When each message was posted, and where what alice had not read starts. Bob posts
+        // UNREAD-579 while alice is in the keyring, so the room opens with it unread. Its row says
+        // its time of day, and the whole date and time to VoiceOver; the unread line sits above it,
+        // and today's divider above that. Times are the ones the node keeps, in milliseconds. It
+        // stages what it needs itself, so it runs from step 6 too (VOX_PROOF_FROM=6).
+        tap(ui, Key.id("keyring"), "Keyring in the sidebar")
+        try staged(vox, ["room", "post", "--node", "bob", room, "UNREAD-579"], env: voxEnv)
+        var needs: (id: String, millis: UInt64)?
+        let heldUntil = Date().addingTimeInterval(30)
+        while needs == nil && Date() < heldUntil {
+            needs = posted(vox, voxEnv, room, "UNREAD-579")
+            if needs == nil { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        guard let needs else {
+            throw Apparatus("alice's `vox room read --json` never showed bob's UNREAD-579 in 30 s, so its time cannot be checked")
+        }
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
+        let needsAt = Date(timeIntervalSince1970: TimeInterval(needs.millis) / 1_000)
+        let needsTime = Key.id("time-\(needs.id)")
+        if present(ui, needsTime, timeout: 30, "bob's UNREAD-579 must show the time it was posted") {
+            let e = el(ui, needsTime)
+            let short = needsAt.formatted(.dateTime.hour().minute())
+            let full = needsAt.formatted(date: .complete, time: .standard)
+            XCTAssertEqual(e.value as? String, short,
+                           "PRODUCT: UNREAD-579, posted at \(full) (\(needs.millis) ms), must show its time of day \"\(short)\"; it shows \(String(describing: e.value))")
+            XCTAssertEqual(e.label, full,
+                           "PRODUCT: UNREAD-579's time must say the whole date and time to VoiceOver, \"\(full)\"; it says \"\(e.label)\"")
+        }
+        let unreadLine = Key.id("unread-divider")
+        words(ui, unreadLine, timeout: 10,
+              "the room opened with UNREAD-579 unread: an unread line must say how many, \"N unread\"",
+              until: { $0.hasSuffix(" unread") })
+        XCTAssertLessThanOrEqual(el(ui, unreadLine).frame.maxY, el(ui, needsTime).frame.minY,
+                                 "PRODUCT: the unread line must sit above UNREAD-579, which alice had not read; the line is at \(el(ui, unreadLine).frame), UNREAD-579's time at \(el(ui, needsTime).frame)")
+        let today = Key.id("day-\(Self.dayKey(Date()))")
+        words(ui, today, timeout: 10, "today's messages must sit under a \"Today\" divider",
+              until: { $0 == "Today" })
+        print("[proof] times: UNREAD-579 at \(needsAt.formatted(.dateTime.hour().minute())), under the unread line and \"Today\"")
+
+        // (5c) A message from another day sits under that day's divider. Dora is a node of a
+        // daemon of her own whose clock is two days behind: apparatus, a `vox` built with
+        // test-knobs (VOX_TEST_CLOCK_SKEW_MS), never the app's. She joins, she and alice trust each
+        // other, and she posts until alice reads one; it claims a time two days ago.
+        guard let knobs = env["VOX_PROOF_KNOBS_VOX"], !knobs.isEmpty else {
+            throw Apparatus("VOX_PROOF_KNOBS_VOX (a vox built with test-knobs, for dora's clock) is set by scripts/app-proofs.sh")
+        }
+        let doraEnv = ["VOX_DATA_DIR": scratch.appendingPathComponent("dora-data").path,
+                       "VOX_CONFIG_DIR": scratch.appendingPathComponent("dora-config").path,
+                       "VOX_PROXY": "127.0.0.1:0",
+                       "VOX_TEST_CLOCK_SKEW_MS": String(-2 * 86_400_000)]
+        let doraPass = scratch.appendingPathComponent("dora.pass").path
+        try stager.write(Data("dora identity\n".utf8), to: doraPass)
+        peer = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: doraEnv,
+                         until: "vox daemon: control socket")
+        try staged(knobs, ["node", "create", "dora"],
+                   env: doraEnv.merging(["VOX_IDENTITY_PASSPHRASE": "dora identity"]) { $1 })
+        try staged(knobs, ["node", "attach", "dora", "--passphrase-file", doraPass], env: doraEnv)
+        let doraFp = try line(staged(knobs, ["id", "--node", "dora"], env: doraEnv)) { $0.count == 52 }
+        let doraLink = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        try staged(knobs, ["room", "join", "--node", "dora", "--passphrase-file", roomPass, doraLink],
+                   env: doraEnv)
+        try staged(vox, ["trust", "add", "--node", "alice", doraFp, "--name", "dora",
+                         "--identity-passphrase-file", alicePass], env: voxEnv)
+        try staged(knobs, ["trust", "add", "--node", "dora", aliceFp, "--name", "alice",
+                           "--identity-passphrase-file", doraPass], env: doraEnv)
+        var old: (id: String, millis: UInt64)?
+        let oldUntil = Date().addingTimeInterval(120)
+        var d = 0
+        while old == nil && Date() < oldUntil {
+            d += 1
+            try staged(knobs, ["room", "post", "--node", "dora", room, "FROM-ANOTHER-DAY-\(d)"], env: doraEnv)
+            Thread.sleep(forTimeInterval: 1)
+            old = posted(vox, voxEnv, room, "FROM-ANOTHER-DAY-")
+        }
+        guard let old else {
+            throw Apparatus("alice never read a post of dora's in 120 s, so no message from another day was staged")
+        }
+        let oldAt = Date(timeIntervalSince1970: TimeInterval(old.millis) / 1_000)
+        guard !Calendar.current.isDateInToday(oldAt) else {
+            throw Apparatus("dora's post claims \(oldAt.formatted()) (\(old.millis) ms), today: VOX_TEST_CLOCK_SKEW_MS did not move her clock")
+        }
+        let oldTime = Key.id("time-\(old.id)")
+        let oldDay = Key.id("day-\(Self.dayKey(oldAt))")
+        let oldWords = Self.dayWords(oldAt)
+        if present(ui, oldTime, timeout: 60, "dora's post, from \(oldAt.formatted()), must be in alice's timeline with its time",
+                   premise: trusted(vox, voxEnv, doraFp, "dora")) {
+            scrollTo(ui, el(ui, oldTime))
+            words(ui, oldDay, timeout: 10,
+                  "dora's post claims \(oldAt.formatted()): a divider must say its day, \"\(oldWords)\"",
+                  until: { $0 == oldWords })
+            // The divider nearest above it is its own day's.
+            let at = el(ui, oldTime).frame.minY
+            let above = ui.windows.firstMatch.descendants(matching: .any)
+                .matching(NSPredicate(format: "identifier BEGINSWITH %@", "day-"))
+                .allElementsBoundByIndex.filter { $0.frame.maxY <= at }
+                .max { $0.frame.minY < $1.frame.minY }
+            XCTAssertEqual(above?.identifier, "day-\(Self.dayKey(oldAt))",
+                           "PRODUCT: dora's post from \(oldAt.formatted()) must sit under its own day's divider, \"\(oldWords)\"; the divider nearest above it is \(above.map { "\"\($0.label)\" (\($0.identifier))" } ?? "none")")
+        }
+        print("[proof] another day: dora's post at \(oldAt.formatted()), under \"\(oldWords)\"")
+        peer?.terminate()
+        peer = nil
 
         // (6) Attach a file to the room, To: bob, with a note.
         tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
