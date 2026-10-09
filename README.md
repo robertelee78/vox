@@ -78,17 +78,30 @@ On macOS an update must carry the **same Developer ID** as the `vox` it replaces
 rests on TLS to GitHub and the release record's digest; [ADR-015](docs/adr/ADR-015-rust-tui-client.md)
 says so plainly. A build from source is never overwritten.
 
-`vox shell-setup` adds one marked block to the end of your shell rc (PATH and completion for zsh,
-bash, fish). To undo:
+**An update never breaks your nodes.** From v0.4.0 on, each release opens what the release before it
+wrote, with nothing lost: your identity, your keyring, your rooms, and every message in order with its
+time. Every release is checked against the previous published one before it ships
+([ADR-026](docs/adr/ADR-026-daemon-and-nodes.md) F-3).
+
+To remove Vox:
 
 ```
-vox shell-setup --remove
-rm -rf ~/.local/bin/vox ~/.local/bin/.vox-*
+vox uninstall --dry-run   # list what it would remove, and change nothing
+vox uninstall             # remove it
 ```
 
-Your nodes and their rooms live in `~/.local/share/vox/nodes/<name>/` (macOS:
-`~/Library/Application Support/vox/nodes/<name>/`). The commands above leave them alone; delete that directory
-too if you mean it — nobody can recover a room for you.
+`vox uninstall` stops the daemon (and Vox.app), and removes what installing and setting up Vox put
+on the machine:
+- the login item and the LAN helper, on a Mac;
+- the Keychain items for kept nodes;
+- the agent wiring and skill pack it installed;
+- the shell completions and startup block;
+- Vox.app or the `vox` binary.
+
+It keeps anything you edited, and says so. Your nodes and their rooms are kept too, in
+`~/.local/share/vox/nodes/<name>/` (macOS: `~/Library/Application Support/vox/nodes/<name>/`), and
+it says where: nobody can recover a node or a room for you. `vox uninstall --purge` removes them as
+well, only at a terminal and only after you type each node's name.
 
 ## Getting started
 
@@ -351,7 +364,7 @@ Heavy, timing-bound or live-model checks need `--features optional-proofs`; see
 
 ## Status
 
-**v0.4.0** (October 2026). Linux and macOS, as a terminal client, CLI and daemon, and on the Mac
+**v0.4.1** (October 2026). Linux and macOS, as a terminal client, CLI and daemon, and on the Mac
 also as **Vox.app**, a native app for Apple Silicon and macOS 13 or later
 ([ADR-014](docs/adr/ADR-014-macos-client.md)) that is a client of the same daemon. Working today:
 one daemon per data root with any number of nodes; rooms over the real network through the full NAT
@@ -361,7 +374,8 @@ services reached as `<service>.<node>.<room>.vox`, and `ssh` over Vox; shares as
 pulled automatically; the family LAN (macOS); leaving and ending rooms, admins and retention; key
 rotation and per-member revocation; Claude Code, Codex and OpenCode sessions, each agent its own
 node, with a Session per interactive session that members trusted with drive can read and drive
-from the CLI, the TUI or the app.
+from the CLI, the TUI or the app; the agent skill pack kept current for every harness, and a repo
+bound to its room once; an upgrade that keeps your data, and `vox uninstall`.
 
 iOS is a separate, later capability.
 

@@ -249,4 +249,5 @@ Sources: [integration generators](https://github.com/robertelee78/vox/blob/bf6df
 [client-specific wakes](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/wake.rs),
 [doctor](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/doctor.rs),
 [ping](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/ping.rs)
-and [shipped participation skill](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/assets/agent-skill.md).
+and the [agent skill pack](https://github.com/robertelee78/vox/blob/v0.4.1/crates/vox-tui/assets/skill/SKILL.md)
+it installs.

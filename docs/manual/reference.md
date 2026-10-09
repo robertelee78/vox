@@ -76,7 +76,14 @@ Inside the data root:
   record (below).
 - `.daemon/` holds the daemon's lock, its control socket `vox.sock`, the port it reuses, the list
   of nodes kept attached (`attach`), its `config`, and `log`, where a daemon started in the
-  background writes its output.
+  background writes its output. `format` says the data root's format and the version of vox that
+  last served it, two lines such as `format 1` and `written-by vox 0.4.1`, so a later release knows
+  what to upgrade (see [Install and update](install.md#update-deliberately)).
+
+A data root an earlier release left with a node's files directly in it, outside `nodes/` (any
+release before v0.3.0), is refused by every command, and nothing in it is changed: `… is not a Vox
+data directory this version reads: …/default is not a node (a node lives under …/nodes)`. Move it
+aside, or use another data root (`--data-dir` or `VOX_DATA_DIR`).
 
 ### The decision record
 
