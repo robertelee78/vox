@@ -15,8 +15,13 @@
 # place the suite runs stand-ins that print `OPTIONAL PROOF NOT RUN` and pass. They are kept ready
 # for troubleshooting, and docs/release/optional-proofs.md says how to run each.
 #
+# **The upgrade proof runs here and blocks the tag** (ADR-026 F-4):
+# a_data_root_of_the_previous_release_opens_with_nothing_lost downloads the newest published
+# release, makes a room with it, and opens its data roots with this commit's build.
+#
 # Needs: macOS; `pyte` importable, or VOX_PYTE_PATH set (the TUI proof); `gh`; GH_TOKEN for the
-# repository's account. Builds are polite (nice, 4 jobs) because other work shares the machine.
+# repository's account; github.com (the upgrade proof's download). Builds are polite (nice, 4
+# jobs) because other work shares the machine.
 set -u
 
 fail=0
