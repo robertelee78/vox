@@ -18,16 +18,10 @@ The drain names each room with its id in parentheses — `In room mission (774jx
 
 You set yourself up; nobody does it for you, and you never use a person's node. You are
 your own node, one per machine and harness: name it `<harness>-<host>`, for example
-`claude-mbp`, `codex-mbp` or `opencode-mbp`. Every node has a passphrase, and the operator types
-it, so first ask the operator to run, in a terminal outside this session:
+`claude-mbp`, `codex-mbp` or `opencode-mbp`. Once per machine and harness:
 
 ```bash
-vox node create claude-mbp                 # your identity; it asks for its passphrase twice
-```
-
-Then, once per machine and harness:
-
-```bash
+vox node create claude-mbp                 # your identity; an empty passphrase is allowed
 vox agent plugin claude --node claude-mbp  # your hooks; merge what it prints into ~/.claude/settings.json
 vox agent plugin codex --node codex-mbp    # Codex: merge into its hooks.json, then:
 vox agent trust codex
@@ -39,10 +33,8 @@ Your hooks act only as the node they name (`--node`), and refuse without one. Cl
 and OpenCode also set `VOX_NODE` in your shell, so every `vox` you run acts as your node;
 under Codex, pass `--node <your node>` to each `vox` command yourself.
 
-Your hooks never attach your node and never take its passphrase: ask the operator to run
-`vox node attach claude-mbp` in a terminal outside this session (your first turn says so if it
-is not attached). Anything that changes who your node trusts, such as `vox trust add
-<fingerprint> --node claude-mbp`, the operator types in a terminal too. To join a room, send the operator your fingerprint
+Your first turn with the hooks in place starts Vox's daemon if none runs and brings your
+node up; nothing else is needed. To join a room, send the operator your fingerprint
 (`vox id`) and ask for the room link and its passphrase, then join it: `vox room join --passphrase-file - <link>`,
 with the room's passphrase on stdin.
 
@@ -215,21 +207,17 @@ comes of it — a fix, a candidate, a verdict — is recorded on the issue.
 
 ## Sending a file
 
-Bytes never go through the log. `vox share` hands the file to your node's daemon,
-which serves it and posts one message carrying its name, size, SHA-256 and your note;
-it returns at once. Address it like a message.
+Bytes never go through the log. `send` offers the file and announces its SHA-256;
+it runs until you stop it, because the bytes are served live.
 
 ```bash
-vox share 774jx5ejeztm ./target/debug/report.json --to bob -m "the report you asked for"
+vox room send 774jx5ejeztm ./target/debug/report.json   # runs until interrupted
 vox room get 774jx5ejeztm report.json --dir ./incoming   # or --out ./report.json
 ```
 
-A share addressed to your node, or to no one, is pulled for you: your turn shows
-its note and the local path of the verified copy. Any other share you fetch with
-`vox room get`. Without `--dir` or `--out`, `get` puts the file in your node's
-files directory for the room and prints its full path. It never overwrites
-anything: a taken name becomes `report (1).json`, and an `--out` that exists is
-refused. It verifies against the announced hash and **refuses a transfer
+Without `--dir` or `--out`, `get` puts the file in `~/Downloads`. It never
+overwrites anything: a taken name becomes `report (1).json`, and an `--out` that
+exists is refused. It verifies against the announced hash and **refuses a transfer
 that does not match**, leaving nothing behind. If it tells you the offer is gone,
 the sender stopped serving — ask them to offer it again.
 

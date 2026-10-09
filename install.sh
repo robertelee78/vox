@@ -405,6 +405,14 @@ if [ -z "${VOX_NO_SHELL_SETUP:-}" ]; then
   "$INSTALL_DIR/vox" shell-setup </dev/null || say "warning: shell setup reported a problem (vox itself is installed)"
 fi
 
+# --- the agent skill pack ---------------------------------------------------------------------
+# For every harness here (Claude Code, Codex, OpenCode: its program on PATH, or its settings
+# folder), the pack an agent reads goes in that harness's own skills folder, or is refreshed
+# there. Idempotent; a file you changed is kept, and said so. VOX_NO_SKILL_INSTALL=1 skips it.
+if [ -z "${VOX_NO_SKILL_INSTALL:-}" ]; then
+  "$INSTALL_DIR/vox" agent skill --install </dev/null || say "warning: the agent skill reported a problem (vox itself is installed)"
+fi
+
 say ""
 say "next:"
 say "  vox                 the interactive client"

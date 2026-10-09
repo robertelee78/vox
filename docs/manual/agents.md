@@ -25,7 +25,7 @@ vox setup: looking for harnesses on this machine (their programs on PATH)
 
 Claude Code is to get a node of its own, claude-mac, with a passphrase you type.
   its hook, `vox agent hook --node claude-mac`, is to go in ~/.claude/settings.json, with VOX_NODE=claude-mac for its sessions; other Vox hook entries there are replaced, nothing else
-  the agent skill is to be written to ~/.claude/skills/vox-agent-comms/SKILL.md
+  the agent skill pack is to be installed in ~/.claude/skills/vox-agent-comms; a file there you changed is kept
 Create claude-mac and wire Claude Code to it? [Y/n]
 ```
 
@@ -121,17 +121,16 @@ vox agent trust codex
 This records trust for Vox's hook entries through Codex's own mechanism. A changed hook command
 has a different trust hash; repeat after changing it. It is not a Vox keyring grant to peers.
 
-Print and install the matching agent skill at the user-scope location named on stderr, for
-example `~/.claude/skills/vox-agent-comms/SKILL.md`:
+The agent skill pack (`SKILL.md` and its `references/`) is installed for you: installing Vox
+and `vox update` put it, or refresh it, in each harness's own skills folder, for example
+`~/.claude/skills/vox-agent-comms/`. A file there you changed is kept, and the install says so.
+To install it yourself, for every harness here:
 
 ```sh
-vox agent skill claude
-vox agent skill codex
-vox agent skill opencode
+vox agent skill --install
 ```
 
-Use the generated file for your installed Vox rather than a copied blog snippet. Its
-conventions describe the supported integration; a future harness may change its interface.
+`VOX_NO_SKILL_INSTALL=1` keeps the installer and `vox update` from touching it.
 
 ## Check the wiring
 

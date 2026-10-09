@@ -915,31 +915,17 @@ enum AgentCmd {
     ///
     /// The plugin is a shim over `vox agent hook`, not a second implementation.
     Plugin(AgentPluginArgs),
-    /// Print the agent-facing skill: what the room is for, its vocabulary and its
-    /// manners.
+    /// Install the agent skill pack for every harness here, or print its entry.
     ///
-    /// A skill is on-demand only, so it cannot be what guarantees an agent reads
-    /// its room — that is `vox agent hook`'s job. This carries what a hook cannot.
+    /// The pack is what an agent reads to work in a room: rooms, Sessions, trust, files and
+    /// setup, as `SKILL.md` and the reference files it points to. Claude Code, Codex and OpenCode
+    /// each load it from their own skills folder, at user scope, beside the drain.
     ///
-    /// Claude Code, Codex and OpenCode all load the same file, a `SKILL.md` in a folder
-    /// named after the skill. Install it at **user scope**, beside the drain, so a
-    /// session opened in any repository has both:
+    /// Installing Vox, and `vox update`, run `vox agent skill --install` for you: it installs or
+    /// refreshes the pack for every harness present here, and leaves alone any file you changed,
+    /// saying so. Run it yourself after changing a harness's settings folder.
     ///
-    /// For example:
-    ///
-    /// mkdir -p ~/.claude/skills/vox-agent-comms
-    ///
-    /// vox agent skill claude > ~/.claude/skills/vox-agent-comms/SKILL.md
-    ///
-    /// mkdir -p ~/.codex/skills/vox-agent-comms           # $CODEX_HOME/skills when set
-    ///
-    /// vox agent skill codex > ~/.codex/skills/vox-agent-comms/SKILL.md
-    ///
-    /// mkdir -p ~/.config/opencode/skills/vox-agent-comms # $XDG_CONFIG_HOME/opencode/skills when set
-    ///
-    /// vox agent skill opencode > ~/.config/opencode/skills/vox-agent-comms/SKILL.md
-    ///
-    /// The skill goes to stdout; where it goes, to stderr, so it does not land in the file.
+    /// Without `--install` it prints the pack's entry, `SKILL.md`; where the pack goes, to stderr.
     Skill(AgentSkillArgs),
     /// Trust Vox's drain hook in a harness that gates hooks on trust. Only Codex
     /// does: it runs a `hooks.json` entry only once its hash is recorded as trusted.
@@ -1019,6 +1005,10 @@ pub struct AgentSkillArgs {
     /// The harness to say where the skill goes for: `claude`, `codex` or `opencode`.
     /// Without one, all three are listed. The skill itself is the same for each.
     pub harness: Option<String>,
+    /// Install or refresh the pack for every harness present here (its program on `PATH`, or
+    /// its settings folder), keeping any file you changed.
+    #[arg(long, conflicts_with = "harness")]
+    pub install: bool,
 }
 
 /// Where `harness` loads a user-scope skill named `vox-agent-comms` from, as a shell path, or
@@ -1039,8 +1029,8 @@ fn skill_dir(harness: &str) -> Option<&'static str> {
 }
 
 /// The one line that says how to install the skill for `harness`, runnable as it stands.
-fn skill_install(harness: &str, dir: &str) -> String {
-    format!("mkdir -p {dir} && vox agent skill {harness} > {dir}/SKILL.md")
+fn skill_install(_harness: &str, dir: &str) -> String {
+    format!("vox agent skill --install   # the pack goes in {dir}")
 }
 
 /// `vox agent trust`
@@ -2854,6 +2844,13 @@ pub fn run() -> ExitCode {
                 }
             }
         }
+        Cmd::Agent(AgentCmd::Skill(args)) if args.install => {
+            if crate::skill_pack::install_all() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
         Cmd::Agent(AgentCmd::Skill(args)) => {
             // Where it goes, on stderr so it does not land in the file (V210-121, V210-166):
             // user scope, beside the drain, so every repository gets both.
@@ -2871,7 +2868,7 @@ pub fn run() -> ExitCode {
                 let dir = skill_dir(h).unwrap_or_default();
                 eprintln!("vox: install at user scope: {}", skill_install(h, dir));
             } else {
-                eprintln!("vox: each harness loads this same file from its own skills folder:");
+                eprintln!("vox: each harness loads this same pack from its own skills folder:");
                 for h in named {
                     let dir = skill_dir(h).unwrap_or_default();
                     eprintln!("     {h:<8} {}", skill_install(h, dir));

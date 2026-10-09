@@ -367,11 +367,8 @@ impl Wiring {
         }
     }
 
-    fn skill_file(&self) -> PathBuf {
-        self.dir
-            .join("skills")
-            .join("vox-agent-comms")
-            .join("SKILL.md")
+    fn skill_dir(&self) -> PathBuf {
+        self.dir.join("skills").join(crate::skill_pack::DIR_NAME)
     }
 
     /// What installing changes, said before it is done (ADR-028 E-5).
@@ -397,8 +394,8 @@ impl Wiring {
         vec![
             hook,
             format!(
-                "the agent skill is to be written to {}",
-                self.skill_file().display()
+                "the agent skill pack is to be installed in {}; a file there you changed is kept",
+                self.skill_dir().display()
             ),
         ]
     }
@@ -411,12 +408,13 @@ impl Wiring {
             "codex" => merge_hooks(&hook, &crate::agent_hook::codex_hooks(node))?,
             _ => write(&hook, &crate::agent_hook::opencode_plugin(node))?,
         }
-        let skill = self.skill_file();
-        write(&skill, crate::agent_hook::AGENT_SKILL)?;
-        Ok(vec![
-            format!("installed the hook in {}", hook.display()),
-            format!("installed the skill in {}", skill.display()),
-        ])
+        let mut said = vec![format!("installed the hook in {}", hook.display())];
+        said.extend(
+            crate::skill_pack::install_into(&self.skill_dir())?
+                .iter()
+                .map(crate::skill_pack::Done::said),
+        );
+        Ok(said)
     }
 }
 

@@ -2392,4 +2392,4 @@ pub const OPENCODE_PLUGIN: &str = include_str!("../assets/opencode-plugin.js");
 /// is why the drain is a hook and not an instruction. What it carries instead is
 /// the part a hook cannot: the conventions, the vocabulary, and the manners a room
 /// full of agents needs to stay readable by the person in it.
-pub const AGENT_SKILL: &str = include_str!("../assets/agent-skill.md");
+pub const AGENT_SKILL: &str = crate::skill_pack::FILES[0].1;

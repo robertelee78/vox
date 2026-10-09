@@ -131,6 +131,7 @@ pub(super) fn update(
     ask_to_restart(current.to_string().as_str(), &vox.version_text);
     super::restart::restart_daemon(&active.join(HELPER), &vox.version_text);
     shell_setup_from(apps, exe);
+    super::run_skill_install(exe);
     Ok(())
 }
 
@@ -162,6 +163,7 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
     ask_to_restart(&was, &now);
     super::restart::restart_daemon(&active.join(HELPER), &now);
     shell_setup_from(apps, exe);
+    super::run_skill_install(exe);
     Ok(())
 }
 
