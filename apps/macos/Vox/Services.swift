@@ -47,7 +47,7 @@ struct ServicesView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Space.s16) {
-                Text("Services").heading()
+                Text("Services").title()
                 if let did = model.did {
                     StateMark(kind: .plain, words: did).textSelection(.enabled)
                         .accessibilityIdentifier("services-did")

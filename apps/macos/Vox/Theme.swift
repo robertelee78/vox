@@ -25,7 +25,10 @@ enum Theme {
     static var mono: Font { font(VoxTokens.Fonts.appMono) }
     /// Uppercase eyebrow labels: SF Mono, tracked (L-7).
     static var eyebrow: Font { font(VoxTokens.Fonts.appEyebrow) }
-    /// Large headings: Inter Display ExtraBold, which the app carries (L-7).
+    /// Pane, sheet and dialog titles: SF Pro semibold (L-7), at a steady size.
+    static var title: Font { font(VoxTokens.Fonts.appTitle) }
+    /// Large headings, on the first-run screens only: Inter Display ExtraBold, which the app
+    /// carries (L-7).
     static var heading: Font { font(VoxTokens.Fonts.appHeading, defaultSize: headingSize,
                                     relativeTo: .largeTitle) }
     /// A file's or folder's symbol in its card: the title style, so it follows the text size.
@@ -306,7 +309,14 @@ extension View {
                                keepCase: true))
     }
 
-    /// A large heading, in the token file's face and tracking (L-7).
+    /// A pane's, sheet's or dialog's title: SF Pro semibold, never scaled, and a header to
+    /// assistive technologies (L-7).
+    func title() -> some View {
+        font(Theme.title).accessibilityAddTraits(.isHeader)
+    }
+
+    /// A large heading, in the token file's face and tracking (L-7): the first-run screens only
+    /// (RootView's setup), never a pane, sheet or dialog.
     func heading() -> some View {
         modifier(ScaledTypeset(face: VoxTokens.Fonts.appHeading, defaultSize: Theme.headingSize,
                                relativeTo: .largeTitle))

@@ -132,7 +132,7 @@ private struct KeepNodeOffer: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s12) {
-            Text("Keep node \(node) attached?").heading()
+            Text("Keep node \(node) attached?").title()
             Text("Keep Running is on. To keep node \(node) attached when Vox is closed and after a "
                 + "restart, Vox stores its passphrase in the Keychain. Anyone who can unlock this "
                 + "Mac's login keychain can then attach node \(node). Without it, node \(node) stays "

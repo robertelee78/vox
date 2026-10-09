@@ -246,7 +246,7 @@ private struct RoomForm: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s12) {
-            Text(joining ? "Join a room" : "New room").heading()
+            Text(joining ? "Join a room" : "New room").title()
             if joining {
                 TextField("Room link (vox://…)", text: $link).font(Theme.mono)
                     .accessibilityLabel("Room link")
@@ -291,7 +291,7 @@ private struct FingerprintSheet: View {
     var body: some View {
         let card = fingerprintCard(fingerprint: model.me)
         VStack(alignment: .leading, spacing: Space.s12) {
-            Text("Node \(model.node)").heading()
+            Text("Node \(model.node)").title()
             VStack(spacing: 0) {
                 ForEach(Array(card.art.enumerated()), id: \.offset) { Text($0.element) }
             }
@@ -331,7 +331,7 @@ private struct RetentionSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s12) {
-            Text("Retention").heading()
+            Text("Retention").title()
             Picker("Keep messages", selection: $seconds) {
                 ForEach(Retention.choices, id: \.1) { Text($0.0).tag($0.1) }
             }
@@ -368,7 +368,7 @@ private struct RenameSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s12) {
-            Text("Rename the room").heading()
+            Text("Rename the room").title()
             TextField("Its new name", text: $name).onSubmit { submit() }
                 .accessibilityLabel("New room name")
                 .accessibilityIdentifier("rename-name")
@@ -405,7 +405,7 @@ private struct AdminsSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s12) {
-            Text("Admins").heading()
+            Text("Admins").title()
             Text("An admin may end the room and set its retention.").secondaryText()
             ForEach(model.members) { member in
                 Toggle(isOn: Binding(get: { admins.contains(member.id) }, set: { on in
@@ -436,7 +436,7 @@ private struct LeaveSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s12) {
-            Text(ending ? "End this room for everyone?" : "Leave this room?").heading()
+            Text(ending ? "End this room for everyone?" : "Leave this room?").title()
             Text(ending
                 ? "Every member's copy of the room is deleted, and no one can post in it again. "
                     + "Only its creator or an admin can do this."

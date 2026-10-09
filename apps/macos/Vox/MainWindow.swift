@@ -31,7 +31,7 @@ struct MainWindow: View {
                     // A node in no room yet (its first run, most often): the two ways in, here,
                     // not only in the File menu.
                     VStack(spacing: Space.s12) {
-                        Text("You are in no room yet.").heading()
+                        Text("You are in no room yet.").title()
                         Text("Make a room and share its link, or join one with the link and "
                             + "passphrase someone sent you.")
                             .secondaryText()

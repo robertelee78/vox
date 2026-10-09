@@ -39,7 +39,7 @@ struct OfferView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Space.s12) {
-                Text("Trust offer").heading()
+                Text("Trust offer").title()
                 if let offer = model.offers.first(where: { $0.fingerprint == fingerprint }) {
                     card(offer)
                 } else {

@@ -31,7 +31,7 @@ struct DecisionsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s12) {
-            Text("Decision record").heading()
+            Text("Decision record").title()
             // Two filters that share the room's width: they fit the window's narrowest.
             HStack {
                 Picker("About", selection: $about) {

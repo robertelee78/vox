@@ -23,6 +23,7 @@
     "app.mono":    { "family": "SF Mono",       "system": "monospaced", "weight": 400 },
     "app.eyebrow": { "family": "SF Mono",       "system": "monospaced", "weight": 600, "tracking": 0.12, "uppercase": true, "size": 11 },
     "app.heading": { "family": "Inter Display", "bundled": "InterDisplay-ExtraBold.otf", "weight": 800, "tracking": -0.02 },
+    "app.title":   { "family": "SF Pro",        "system": "title",      "weight": 600, "size": 20 },
     "app.glyph":   { "family": "SF Pro",        "system": "title",      "weight": 400 }
   },
   "space": [4, 8, 12, 16, 20, 24, 32],

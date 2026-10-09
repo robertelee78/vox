@@ -27,7 +27,7 @@ struct KeyringView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Space.s16) {
-                Text("Keyring").heading()
+                Text("Keyring").title()
                 Text(model.keyring).font(Theme.mono).secondaryText()
                 if let did = model.keyringDid {
                     StateMark(kind: .plain, words: did)
@@ -267,7 +267,7 @@ private struct RemoveSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s16) {
-            Text("Untrust \(node.name)?").heading()
+            Text("Untrust \(node.name)?").title()
             Text(Effects.untrusting(node.name))
                 .accessibilityIdentifier("keyring-remove-effect")
             HStack {

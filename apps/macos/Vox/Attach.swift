@@ -24,7 +24,7 @@ struct AttachSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s12) {
-            Text("Share \(file.url.lastPathComponent)").heading()
+            Text("Share \(file.url.lastPathComponent)").title()
             Text("TO").eyebrow().secondaryText()
             if model.members.isEmpty {
                 Text("No one else is in this room yet.").secondaryText()
