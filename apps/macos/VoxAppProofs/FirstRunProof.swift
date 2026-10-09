@@ -55,6 +55,10 @@
 //     timeline with its newest message selected; ↑ and ↓ move the selection, as Reply to Selected
 //     Message (⌘R) then says; Space and Return on a row whose file alice pulled open it in Quick
 //     Look; Tab from the timeline reaches the composer.
+// 16. What an operation comes to (#608, #611, #615), run after step 5, or alone with
+//     VOX_PROOF_FROM=16: New Room with an empty passphrase says what that means and makes the
+//     room; a refused End for Everyone keeps its sheet open with the reason; that refusal is the
+//     status bar's, never another sheet's, and dismissed it goes.
 //
 // Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
 // place of the app's hold), and quitting leaves it attached: (12) goes red. A room with a message
@@ -833,13 +837,13 @@ final class FirstRunProof: XCTestCase {
 
         }
 
-        // (15) Outcomes (#608, #611, #615): run here, with the room and bob's trust in place, so
-        // that VOX_PROOF_FROM=15 runs it alone, on what steps 1 to 5 leave (staged by `vox`), and
+        // (16) Outcomes (#608, #611, #615): run here, with the room and bob's trust in place, so
+        // that VOX_PROOF_FROM=16 runs it alone, on what steps 1 to 5 leave (staged by `vox`), and
         // stops after it.
-        if from <= 5 || from == 15 {
+        if from <= 5 || from == 16 {
             try outcomes(ui, vox: vox, voxEnv: voxEnv, roomPass: roomPass)
-            if from == 15 {
-                print("[proof] VOX_PROOF_FROM=15: step 15 run alone; steps 6 to 14 NOT RUN")
+            if from == 16 {
+                print("[proof] VOX_PROOF_FROM=16: step 16 run alone; steps 6 to 15 NOT RUN")
                 return
             }
         }
@@ -1319,7 +1323,7 @@ final class FirstRunProof: XCTestCase {
         _ = run(vox, ["node", "detach", "alice"], env: voxEnv)
     }
 
-    /// (15) What an operation comes to, as a person meets it.
+    /// (16) What an operation comes to, as a person meets it.
     /// - #608 (D16): New Room with its passphrase field left empty says "No passphrase: anyone
     ///   with the link can join." and makes the room, as `vox room list` lists it.
     /// - #611 (D19): End for Everyone in a room alice did not create is refused by her node; the
