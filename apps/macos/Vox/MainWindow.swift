@@ -524,7 +524,9 @@ private struct RoomView: View {
                     composer
                 } else if let s = model.shownSession, s.canDrive, s.open, let room = model.roomOnScreen {
                     Divider()
+                    // One composer per Session: a draft for one never shows in another (D12).
                     SessionComposer(model: model, room: room, session: s)
+                        .id("\(room)/\(s.nodeFingerprint)/\(s.sessionId)")
                 }
             }
             Divider()
@@ -547,6 +549,17 @@ private struct RoomView: View {
         // Only while the room's own composer is on screen: never a General draft sent while a
         // Session is shown (D2).
         .onChange(of: model.urgentAsked) { _ in if !model.showingSession { send(urgent: true) } }
+        // The room's draft, To: and Urgent are kept while the app runs, as the room was left
+        // (D12); in memory only.
+        .onAppear {
+            let kept = model.roomDrafts[room] ?? RoomDraft()
+            draft = kept.text
+            to = kept.to
+            urgent = kept.urgent
+        }
+        .onChange(of: draft) { model.roomDrafts[room, default: RoomDraft()].text = $0 }
+        .onChange(of: to) { model.roomDrafts[room, default: RoomDraft()].to = $0 }
+        .onChange(of: urgent) { model.roomDrafts[room, default: RoomDraft()].urgent = $0 }
         .onChange(of: model.incoming) { url in
             if let url {
                 attaching = Attaching(url: url)

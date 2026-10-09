@@ -87,6 +87,9 @@ struct SessionComposer: View {
             }
         }
         .padding(12)
+        // Its draft, kept per Session while the app runs, in memory only (D12).
+        .onAppear { draft = model.sessionDrafts[key] ?? "" }
+        .onChange(of: draft) { model.sessionDrafts[key] = $0 }
         // ⌘O while this Session is shown: a file sent to it, not the room (D2).
         .onChange(of: model.sessionAttachAsked) { _ in
             DispatchQueue.main.async {
@@ -94,6 +97,9 @@ struct SessionComposer: View {
             }
         }
     }
+
+    /// The Session's destination, which its draft is kept under.
+    private var key: String { "\(room)/\(session.nodeFingerprint)/\(session.sessionId)" }
 
     /// Type the draft, or send it as a slash command when it starts with "/".
     private func send() {

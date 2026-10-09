@@ -11,6 +11,14 @@ import ServiceManagement
 /// 'subsystem == "us.vox.app"'`): ids and counts only, never message text.
 let readLog = Logger(subsystem: "us.vox.app", category: "read")
 
+/// A room's composer as it was left: its text, To:, Urgent and the reply being written (D12).
+struct RoomDraft {
+    var text = ""
+    var to: Set<String> = []
+    var urgent = false
+    var reply: RoomMessage?
+}
+
 @MainActor
 final class NodeModel: ObservableObject {
     /// What the window shows in its middle.
@@ -106,6 +114,14 @@ final class NodeModel: ObservableObject {
     }
     /// The Session on screen is being read: its timeline says "Loading…" (D3).
     @Published private(set) var sessionLoading = false
+
+    /// What is typed, kept per destination while the app runs, in memory only: nothing goes on
+    /// disk or the wire (D12). A room's draft, To:, Urgent and reply, by room id.
+    var roomDrafts: [String: RoomDraft] = [:]
+    /// A Session's draft, by its destination (`room/node/session`).
+    var sessionDrafts: [String: String] = [:]
+    /// What each room last showed (General, All, or a Session), restored when it opens again.
+    var lastShowing: [String: Showing] = [:]
     /// The room on screen's Sessions, open and ended (ADR-029 CL-2).
     @Published private(set) var sessions: [FfiSession] = []
     /// The Session on screen's entries, oldest first, to a member with drive (SC-1).
@@ -327,6 +343,11 @@ final class NodeModel: ObservableObject {
     /// its own is read (show reads it).
     func select(_ selection: Selection?) {
         guard selection != self.selection else { return }
+        // The room left keeps what it showed and the reply being written (D12).
+        if case let .room(left) = self.selection {
+            lastShowing[left] = showing
+            roomDrafts[left, default: RoomDraft()].reply = replyTo
+        }
         self.selection = selection
         // An offer's view says what its own Trust did, never an earlier keyring change.
         if case .offer = selection {
@@ -340,7 +361,6 @@ final class NodeModel: ObservableObject {
         pulled = [:]
         retention = ""
         notices = []
-        showing = .general
         sessions = []
         sessionEntries = []
         sessionNote = nil
@@ -348,7 +368,14 @@ final class NodeModel: ObservableObject {
         roomServices = []
         selectedMessage = nil
         selectedService = nil
-        replyTo = nil
+        // What this room last showed, and its reply, come back (D12): General the first time.
+        if case let .room(opened) = selection {
+            showing = lastShowing[opened] ?? .general
+            replyTo = roomDrafts[opened]?.reply
+        } else {
+            showing = .general
+            replyTo = nil
+        }
     }
 
     /// Show `selection`; a room shown is read, so its unread counts end.
@@ -381,6 +408,8 @@ final class NodeModel: ObservableObject {
             retention = kept
             notices = done
             sessions = listed
+            // A Session restored as this room's last view is read once the room lists it (D12).
+            if showingSession { await readSession() }
             watchReads(id)
         } catch {
             said = sentence(error)
