@@ -141,12 +141,19 @@ struct SessionEntryRow: View {
     var body: some View {
         let reference = entry.request?.reference
         VStack(alignment: .leading, spacing: Space.s4 * scale) {
-            Text(entry.line).voxFont(VoxTokens.Fonts.appMono).textSelection(.enabled)
-                .accessibilityIdentifier("entry-line-\(entry.id)")
-            if let request = entry.request {
-                RequestView(model: model, room: room, session: session, request: request,
-                            about: entry.line)
+            // The line and its request's answers are the request's own element, inside the row:
+            // the row is selected like a message (P14), the request as the one ⌥⌘Y and ⌥⌘N act
+            // on (P1), and neither takes the other's place.
+            VStack(alignment: .leading, spacing: Space.s4 * scale) {
+                Text(entry.line).voxFont(VoxTokens.Fonts.appMono).textSelection(.enabled)
+                    .accessibilityIdentifier("entry-line-\(entry.id)")
+                if let request = entry.request {
+                    RequestView(model: model, room: room, session: session, request: request,
+                                about: entry.line)
+                }
             }
+            // A request is selected by clicking it: what ⌥⌘Y and ⌥⌘N act on (P1).
+            .modifier(RequestSelection(model: model, reference: reference))
             // A file the session sent, once this node has a verified copy (ADR-029 DR-1, F-11).
             if let file = entry.file, let pulled = file.pulledPath {
                 HStack {
@@ -168,8 +175,6 @@ struct SessionEntryRow: View {
             }
         }
         .voxPadding(.horizontal, Space.s4)
-        // A request is selected by clicking it: what ⌥⌘Y and ⌥⌘N act on (P1).
-        .modifier(RequestSelection(model: model, reference: reference))
     }
 }
 
