@@ -4,27 +4,47 @@
 
 import SwiftUI
 
+/// What came of driving a Session: taken, refused (not delivered or not sent), or not known
+/// (no answer: it may or may not have arrived), with what to say of it (D13).
+enum DriveResult {
+    case taken(String)
+    case refused(String)
+    case unknown(String)
+
+    var said: String {
+        switch self {
+        case let .taken(s), let .refused(s), let .unknown(s): return s
+        }
+    }
+}
+
 extension NodeModel {
     /// Send `action` to the Session `s` of `room`, the destination its control was drawn for (D3),
     /// and say what came of it (DR-6), as `vox room session` and the TUI say it.
     func drive(_ s: FfiSession, in room: String, _ action: DriveAction) async -> String {
+        await driveResult(s, in: room, action).said
+    }
+
+    /// `drive`, telling a send that was taken from one refused or not known (D13).
+    func driveResult(_ s: FfiSession, in room: String, _ action: DriveAction) async -> DriveResult {
         guard s.canDrive else {
-            return "you cannot drive this Session: \(s.nodeAlias) has not given you drive"
+            return .refused("you cannot drive this Session: \(s.nodeAlias) has not given you drive")
         }
         do {
             let answer = try await drive(room: room, session: s.sessionId, action: action)
             switch answer.delivery {
             case .answered:
-                return answer.ok ? "\(s.label): \(answer.said)" : "not delivered to \(s.label): \(answer.said)"
+                return answer.ok ? .taken("\(s.label): \(answer.said)")
+                    : .refused("not delivered to \(s.label): \(answer.said)")
             case .unreachable:
                 // A file the node could not serve says "not sent: …" already.
                 let why = answer.said.hasPrefix("not sent: ") ? String(answer.said.dropFirst(10)) : answer.said
-                return "not sent to \(s.label): \(why)"
+                return .refused("not sent to \(s.label): \(why)")
             case .noAnswer:
-                return "no answer from \(s.label): it may or may not have been delivered"
+                return .unknown("no answer from \(s.label): it may or may not have been delivered")
             }
         } catch {
-            return sentence(error)
+            return .refused(sentence(error))
         }
     }
 }
@@ -39,7 +59,13 @@ struct SessionComposer: View {
     let session: FfiSession
     @State private var draft = ""
     @State private var said = ""
-    @State private var busy = false
+    /// A send (or a file) waiting for its answer: only sending and the paperclip wait on it; Interrupt
+    /// and Stop stay live (D13).
+    @State private var sending = false
+    @State private var interrupting = false
+    @State private var stopping = false
+    /// Asked before Stop (⌃C): it ends the session.
+    @State private var confirmStop = false
 
     init(model: NodeModel, room: String, session: FfiSession) {
         self.model = model
@@ -61,23 +87,34 @@ struct SessionComposer: View {
                 .help("Send the session a file")
                 .accessibilityLabel("Send the session a file")
                 .accessibilityIdentifier("session-attach")
+                .disabled(sending)
                 TextField("Composer — to \(session.label)", text: $draft)
                     .accessibilityLabel("Message to \(session.label)")
                     .textFieldStyle(.plain)
                     .frame(minWidth: Theme.scaled(160), maxWidth: .infinity)
                     .layoutPriority(1)
                     .onSubmit(send)
+                    // Esc interrupts the turn it is running, as the tooltip says (D13).
+                    .onExitCommand { interrupt() }
+                    .disabled(sending)
                     .accessibilityIdentifier("session-compose")
-                Button("Interrupt") { act(.interrupt) }
+                Button("Interrupt") { interrupt() }
                     .fixedSize()
                     .help("Interrupt the turn it is running (Esc)")
+                    .disabled(interrupting)
                     .accessibilityIdentifier("session-interrupt")
-                Button("Stop") { act(.stop) }
+                Button("Stop") { confirmStop = true }
                     .fixedSize()
                     .help("Stop it (Ctrl-C)")
+                    .keyboardShortcut("c", modifiers: .control)
+                    .disabled(stopping)
                     .accessibilityIdentifier("session-stop")
             }
-            .disabled(busy)
+            .confirmationDialog("Stop \(session.label)? It ends the session.", isPresented: $confirmStop) {
+                Button("Stop the Session", role: .destructive) { stop() }
+                    .accessibilityIdentifier("session-stop-confirm")
+                Button("Cancel", role: .cancel) {}
+            }
             if !said.isEmpty {
                 Text(said)
                     .secondaryText()
@@ -101,19 +138,55 @@ struct SessionComposer: View {
     /// The Session's destination, which its draft is kept under.
     private var key: String { "\(room)/\(session.nodeFingerprint)/\(session.sessionId)" }
 
-    /// Type the draft, or send it as a slash command when it starts with "/".
+    /// Type the draft, or send it as a slash command when it starts with "/". The text stays
+    /// until the session's node has taken it (D13): refused, it is back as typed; with no answer,
+    /// it is back marked "delivery unknown", and never sent again by itself.
     private func send() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-        draft = ""
-        act(text.hasPrefix("/") ? .slash(command: text) : .text(text: text))
+        guard !text.isEmpty, !sending else { return }
+        sending = true
+        let action: DriveAction = text.hasPrefix("/") ? .slash(command: text) : .text(text: text)
+        Task {
+            let result = await model.driveResult(session, in: room, action)
+            switch result {
+            case .taken:
+                if draft.trimmingCharacters(in: .whitespacesAndNewlines) == text { draft = "" }
+                said = result.said
+            case .refused:
+                said = result.said
+            case .unknown:
+                said = result.said + " (delivery unknown: your text is kept; send it again if it did not arrive)"
+            }
+            sending = false
+        }
     }
 
+    /// Interrupt the turn it is running (Esc or the button), live while a send waits (D13).
+    private func interrupt() {
+        guard !interrupting else { return }
+        interrupting = true
+        Task {
+            said = await model.drive(session, in: room, .interrupt)
+            interrupting = false
+        }
+    }
+
+    /// Stop the session, once asked (⌃C or the button).
+    private func stop() {
+        guard !stopping else { return }
+        stopping = true
+        Task {
+            said = await model.drive(session, in: room, .stop)
+            stopping = false
+        }
+    }
+
+    /// A file sent in: it waits as a send does.
     private func act(_ action: DriveAction) {
-        busy = true
+        sending = true
         Task {
             said = await model.drive(session, in: room, action)
-            busy = false
+            sending = false
         }
     }
 }
