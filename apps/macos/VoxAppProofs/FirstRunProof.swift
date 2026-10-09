@@ -1590,6 +1590,59 @@ final class FirstRunProof: XCTestCase {
               until: { $0 == says })
         print("[proof] inspector: \(says)")
 
+        // (3c) The family LAN asks for its helper only when turned on (the app review's proposal 4): a sheet
+        // that names where to allow it, waits, and, once macOS says it is allowed and the person is
+        // back in Vox, closes by itself and asks the daemon to bring the LAN up. The helper is the
+        // proof build's stand-in (VOX_PROOF_STUB_SERVICES): it registers nothing, and here makes
+        // register wait for an approval the proof gives by writing its file, as the person's switch
+        // in System Settings would.
+        let helperFile = config + "/app/proof-lan-helper"
+        try stager.write(Data("ask\n".utf8), to: helperFile + ".approval")
+        tap(ui, Key.id("family-lan"), "the family LAN's toggle in mission's inspector")
+        let steps = words(ui, Key.id("lan-helper-steps"), timeout: 15,
+                          "turning the family LAN on, with no LAN helper allowed, must ask for it and say where: \"System Settings › General › Login Items & Extensions\", then \"Allow in the Background\"",
+                          until: { $0.contains("System Settings › General › Login Items & Extensions")
+                              && $0.contains("Allow in the Background") }) ?? ""
+        present(ui, Key.id("lan-helper-waiting"), timeout: 5,
+                "the LAN helper's sheet must say it is waiting for the person to allow it")
+        let asked = stager.run(["/bin/cat", helperFile], env: [:]).out
+        guard asked.hasPrefix("awaiting-approval") else {
+            throw Apparatus("the stand-in LAN helper was to wait for approval once registered; its file says \"\(asked)\", so the wait for the person cannot be staged")
+        }
+        // The person goes to System Settings, turns Vox on there, and comes back. The proof hands
+        // the foreground away itself, so it is not counted as lost.
+        handedOff = true
+        XCUIApplication(bundleIdentifier: "com.apple.finder").activate()
+        try stager.write(Data("registered vox-proof-service-stand-in\n".utf8), to: helperFile)
+        ui.activate()
+        var sheetGone = false
+        let allowedUntil = Date().addingTimeInterval(15)
+        while Date() < allowedUntil && !sheetGone {
+            sheetGone = locate(ui, Key.id("lan-helper-sheet")) == nil
+                && locate(ui, Key.id("lan-helper-waiting")) == nil
+            if !sheetGone { Thread.sleep(forTimeInterval: 0.25) }
+        }
+        if !sheetGone {
+            keepTree(ui, "the LAN helper's sheet stayed after approval")
+            XCTFail("PRODUCT: once the LAN helper is allowed and Vox is in front again, its sheet must close by itself and the LAN go on; after 15 s it still says \"\(shown(el(ui, Key.id("lan-helper-waiting"))))\"")
+        } else {
+            // The LAN asked of the daemon: its line, or why it could not (no real helper runs here).
+            var answer = ""
+            let answerUntil = Date().addingTimeInterval(15)
+            while Date() < answerUntil && answer.isEmpty {
+                for key in [Key.id("family-lan-said"), Key.id("family-lan-failed")] {
+                    if let e = locate(ui, key) { answer = shown(e) }
+                }
+                if answer.isEmpty { Thread.sleep(forTimeInterval: 0.25) }
+            }
+            if answer.isEmpty {
+                keepTree(ui, "the family LAN was not asked for after approval")
+                XCTFail("PRODUCT: with the LAN helper allowed, Vox must go on to turn mission's family LAN on and say the daemon's answer; the inspector shows neither family-lan-said nor family-lan-failed")
+            }
+            print("[proof] family LAN: asked (\(steps)); allowed; the daemon said \(answer)")
+        }
+        try stager.write(Data("unregistered vox-proof-service-stand-in\n".utf8), to: helperFile)
+
         // (4) Read each way. Bob's NEEDS-YOU is on alice's screen now: her node says she read it.
         var readByAlice: [String] = []
         let readUntil = Date().addingTimeInterval(60)

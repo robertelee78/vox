@@ -983,8 +983,9 @@ enum Platform {
     }
 }
 
-/// The room's family LAN (ADR-013): offered only once the LAN helper is approved, and before
-/// that, what approving it grants (ADR-014 M-12).
+/// The room's family LAN (ADR-013): a toggle. The LAN helper it needs is asked for only when the
+/// LAN is turned on, in a sheet that says where to allow it and goes on by itself once it is
+/// (ADR-014 M-12).
 private struct FamilyLan: View {
     @ObservedObject var model: NodeModel
     let room: String
@@ -992,29 +993,82 @@ private struct FamilyLan: View {
     var body: some View {
         Text("FAMILY LAN").eyebrow().secondaryText()
             .accessibilityAddTraits(.isHeader)
-        if model.lanHelperReady {
-            Toggle("On this room's LAN", isOn: Binding(
-                get: { model.lanOn.contains(room) },
-                set: { on in Task { await model.setLan(room, on: on) } }))
-                .accessibilityIdentifier("family-lan")
-            if let said = model.lanSaid[room] {
-                Text(said).font(Theme.mono).secondaryText().textSelection(.enabled)
-                    .accessibilityIdentifier("family-lan-said")
+        Toggle("On this room's LAN", isOn: Binding(
+            get: { model.lanOn.contains(room) },
+            set: { on in
+                Task { if on { await model.turnLanOn(room) } else { await model.setLan(room, on: false) } }
+            }))
+            .accessibilityIdentifier("family-lan")
+            .sheet(isPresented: Binding(get: { model.lanAsking == room },
+                                        set: { if !$0 { model.cancelLanAsk() } })) {
+                LanHelperSheet(model: model, room: room)
             }
-            Button("Remove the LAN Helper") { Task { await model.removeLanHelper() } }
-                .accessibilityIdentifier("family-lan-remove")
-        } else {
-            Text("The family LAN needs Vox's LAN helper: one root process that creates network "
-                + "interfaces for Vox and nothing else. Approve it once in System Settings.")
-                .secondaryText()
-                .accessibilityIdentifier("family-lan-why")
-            Button("Allow the LAN Helper") { Task { await model.allowLanHelper() } }
-                .accessibilityIdentifier("family-lan-allow")
+        if let said = model.lanSaid[room] {
+            Text(said).font(Theme.mono).secondaryText().textSelection(.enabled)
+                .accessibilityIdentifier("family-lan-said")
         }
         if let failed = model.lanFailed[room] {
             StateMark(kind: .danger, words: failed).textSelection(.enabled)
+                .accessibilityIdentifier("family-lan-failed")
+        }
+        if model.lanHelperReady {
+            Button("Remove the LAN Helper") { Task { await model.removeLanHelper() } }
+                .accessibilityIdentifier("family-lan-remove")
         }
     }
+}
+
+/// Asking for the LAN helper, once someone turns a family LAN on: what it is, the exact place to
+/// allow it, and a wait that ends by itself when macOS says it is allowed, noticed on every
+/// refresh and as soon as Vox is back in front.
+private struct LanHelperSheet: View {
+    @ObservedObject var model: NodeModel
+    let room: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            // A room's name is its content: never uppercased.
+            Text("Family LAN for \u{201C}\(name)\u{201D}").caption().secondaryText()
+            Text("Allow Vox's LAN helper").heading()
+                .accessibilityAddTraits(.isHeader)
+            Text("The family LAN needs one helper that runs as root and creates network interfaces "
+                + "for Vox, and nothing else.")
+                .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("1. Open System Settings › General › Login Items & Extensions.")
+                Text("2. Under \u{201C}Allow in the Background\u{201D}, turn on Vox.")
+                Text("3. Come back here; Vox notices and turns the LAN on.")
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("lan-helper-steps")
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Waiting for you to allow it…").secondaryText()
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("lan-helper-waiting")
+            HStack {
+                Spacer()
+                Button("Cancel") { model.cancelLanAsk() }
+                    .keyboardShortcut(.cancelAction)
+                    .accessibilityIdentifier("lan-helper-cancel")
+                Button("Open Login Items") { Daemon.openLoginItems() }
+                    .accessibilityIdentifier("lan-helper-open")
+            }
+        }
+        .padding(20)
+        .frame(width: 460)
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await model.recheckLanHelper() }
+        }
+        // A container, so its steps and its wait keep their own identifiers: given to the whole
+        // sheet without it, the identifier replaced every one of theirs.
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("lan-helper-sheet")
+    }
+
+    private var name: String { model.rooms.first { $0.id == room }?.name ?? String(room.prefix(12)) }
 }
 
 /// The node, its peers and the keyring window (W-1, K-9); and the last thing that failed, in the
