@@ -1,4 +1,4 @@
-//! Vox Lux — Rust TUI client library (ADR-015).
+//! Vox Lucis — Rust TUI client library (ADR-015).
 //!
 //! The terminal-native client over `vox-core`, linked directly as a Rust crate
 //! (no FFI). This library crate holds the presentation-agnostic pieces — the typed

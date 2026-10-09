@@ -44,7 +44,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 
 ## Tiers
 
-User documentation: [ADR-027 — One user manual, automatically skinned by voxlux.us](ADR-027-user-manual-and-website-skin.md)
+User documentation: [ADR-027 — One user manual, automatically skinned by voxlucis.us](ADR-027-user-manual-and-website-skin.md)
 is accepted for implementation. ADR-026 is reserved on `rearch/v030`; this documentation decision
 does not import that branch's unreleased command surface into the released manual.
 

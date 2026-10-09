@@ -1,5 +1,5 @@
 #!/bin/sh
-# Vox Lux installer — ADR-015 §"Install and update".
+# Vox Lucis installer — ADR-015 §"Install and update".
 #
 #   curl -fsSL https://raw.githubusercontent.com/robertelee78/vox/main/install.sh | sh
 #

@@ -208,10 +208,21 @@ pub fn helper_answers(socket: &Path) -> Result<(), String> {
     }
 }
 
-/// What `vox lan up` says when there is no helper to ask: how to start one.
+/// What `vox lan up` says when there is no helper to ask: how to start one. A `vox` inside Vox.app
+/// points at the app's helper, which replaces `sudo vox lan helper` on a Mac (ADR-014 M-10).
 #[must_use]
 pub fn no_helper(socket: &Path) -> String {
     let flag = if socket == Path::new(DEFAULT_HELPER_SOCKET) {
+        if let Some(app) = vox_app() {
+            return format!(
+                "no LAN helper is answering on {}. On this Mac the helper is Vox.app's: open Vox \
+                 ({}), choose a room, and click Allow the LAN Helper, then approve it once in \
+                 System Settings, under Login Items & Extensions, Allow in the Background. Then run \
+                 `vox lan up` again (as yourself, not with sudo).",
+                socket.display(),
+                app.display()
+            );
+        }
         String::new()
     } else {
         format!(" --socket {}", socket.display())
@@ -222,6 +233,23 @@ pub fn no_helper(socket: &Path) -> String {
          then run `vox lan up` again (as yourself, not with sudo).",
         socket.display()
     )
+}
+
+/// The Vox.app this `vox` is, when it runs as the bundle's own `Contents/Helpers/vox`.
+fn vox_app() -> Option<std::path::PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let exe = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .ok()?;
+    let helpers = exe.parent()?;
+    let contents = helpers.parent()?;
+    let app = contents.parent()?;
+    (helpers.file_name()? == "Helpers"
+        && contents.file_name()? == "Contents"
+        && app.extension()? == "app")
+        .then(|| app.to_path_buf())
 }
 
 #[cfg(target_os = "macos")]

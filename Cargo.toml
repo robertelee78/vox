@@ -1,4 +1,4 @@
-# Vox Lux — Cargo workspace.
+# Vox Lucis — Cargo workspace.
 #
 # Per ADR-001 principle 10 (Rust-maximal): one shared `vox-core` library and
 # Rust clients over it. Crates are added to `members` as milestones land.

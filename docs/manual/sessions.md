@@ -1,4 +1,4 @@
-# Sessions: follow and drive an agent's work
+# Sessions
 
 Applies to: v0.4.0. You need an agent's node set up with its harness (see
 [Agent communications](agents.md)), in a room you are a member of, and its node's trust with

@@ -17,7 +17,7 @@ macOS 13 or later`. (v0.3.1 and earlier also built for Intel Macs and macOS 11.)
 Run this as your own user:
 
 ```sh
-curl -fsSL https://voxlux.us/install.sh | sh
+curl -fsSL https://voxlucis.us/install.sh | sh
 ```
 
 The vanity address is the installation entry point. **GitHub Releases remains the source of
@@ -34,7 +34,7 @@ This command executes the script it downloads. If you prefer to inspect it first
 without running it, read it, then run that inspected file. An example with a new local filename:
 
 ```sh
-curl -fL https://voxlux.us/install.sh -o vox-install-review.sh
+curl -fL https://voxlucis.us/install.sh -o vox-install-review.sh
 less vox-install-review.sh
 sh vox-install-review.sh
 ```
