@@ -741,22 +741,38 @@ fn a_chosen_idle_end_ends_a_quiet_room_and_only_that_room() {
 /// Run `:verb` in `w`'s `vox tui` (its daemon stopped), keeping it open `hold` after; a red for a
 /// refusal (`PRODUCT`) or a driver that could not get there (`APPARATUS`).
 fn tui_verb(w: &Worker, verb: &str, hold: Duration) {
+    drive_verb(w, verb, hold, false);
+}
+
+/// Run `:verb` in `w`'s `vox tui` (its daemon stopped), a verb the TUI must refuse: the status line
+/// the refusal is stated in, as the person reads it.
+fn tui_refusal(w: &Worker, verb: &str) -> String {
+    let stdout = drive_verb(w, verb, Duration::ZERO, true);
+    stdout
+        .lines()
+        .find_map(|l| l.split_once("REFUSED: ").map(|(_, said)| said.to_owned()))
+        .unwrap_or_default()
+}
+
+/// [`tui_verb`] and [`tui_refusal`]: the driver's stdout once it passed.
+fn drive_verb(w: &Worker, verb: &str, hold: Duration, refusal: bool) -> String {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_room_verb.py");
     let tag = format!("[{} :{verb}]", w.name);
     let hold = hold.as_secs().to_string();
-    let driven = pty_driver::run(
-        script,
-        &[
-            support::VOX,
-            w.data.to_str().unwrap(),
-            w.cfg.to_str().unwrap(),
-            "identity passphrase",
-            "channel passphrase",
-            &tag,
-            verb,
-            &hold,
-        ],
-    );
+    let mut argv = vec![
+        support::VOX,
+        w.data.to_str().unwrap(),
+        w.cfg.to_str().unwrap(),
+        "identity passphrase",
+        "channel passphrase",
+        &tag,
+        verb,
+        &hold,
+    ];
+    if refusal {
+        argv.push("refusal");
+    }
+    let driven = pty_driver::run(script, &argv);
     eprintln!(
         "[proof] tui: {} -> {:?} in {:.1}s: {}",
         tag,
@@ -786,6 +802,7 @@ fn tui_verb(w: &Worker, verb: &str, hold: Duration) {
             w.name, driven.code, driven.stage, driven.stdout
         ),
     }
+    driven.stdout
 }
 
 #[test]
@@ -797,6 +814,29 @@ fn the_tui_leaves_and_ends() {
     let mut room = room_of(&rt, tmp.path(), &["alice", "bob", "carol"]);
     let id = room.id.clone();
     let cid = room.cid;
+
+    // **A refusal is one sentence from vox-core, the same in the CLI and the TUI** (ADR-028 E-7,
+    // #629): bob, who neither created the room nor was made an admin, asks to end it, first with
+    // `vox room end`, then with `:end` in his TUI. Both say what failed and what to do, in the
+    // words vox-core writes for the fault; the TUI words nothing of its own.
+    let cli = room.workers[1].vox(None, &["room", "end", &id]);
+    let cause = "only the room's creator, or an admin it delegated, may do that";
+    let next = "ask the room's creator to do it, or to make you an admin";
+    assert!(
+        !cli.ok && cli.stderr.contains(cause) && cli.stderr.contains(next),
+        "PRODUCT: bob's `vox room end` must be refused in vox-core's sentence, saying what failed \
+         ({cause:?}) and what to do ({next:?}): {cli:?}"
+    );
+    let bob_err = tmp.path().join("bob.after-tui.err");
+    room.workers[1].stop_daemon();
+    let tui = tui_refusal(&room.workers[1], "end");
+    room.workers[1].restart_daemon(&bob_err);
+    assert!(
+        tui.contains(cause) && tui.contains(next),
+        "PRODUCT: bob's `:end` in the TUI must be refused in the sentence the CLI gave, from \
+         vox-core ({cause:?}, then {next:?}); the TUI said: {tui:?}"
+    );
+    eprintln!("[proof] tui: a non-creator's :end is refused as the CLI refuses it: {tui}");
 
     room.workers[2].stop_daemon();
     tui_verb(&room.workers[2], "leave", Duration::from_secs(15));

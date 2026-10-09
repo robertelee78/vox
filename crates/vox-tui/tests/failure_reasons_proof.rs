@@ -20,7 +20,8 @@
 //! 4. (moved: the proxy's port in use is the daemon's to report, `vox_up_binds_loopback_only_proof`);
 //! 5. `vox forward` onto a local port something else holds → that address, in use — promptly,
 //!    not after the path-waiting loop;
-//! 6. `vox trust remove` of someone never trusted → there is nothing to remove;
+//! 6. `vox trust remove` of someone never trusted → that identity is not in your keyring, and
+//!    `vox trust list` shows who is;
 //! 7. a forward into a host that has not trusted you → the guest is told the host refused and
 //!    why that usually is, and the **host** logs whom it refused and why;
 //! 8. a room that is not there → "nothing here matches";
@@ -447,7 +448,12 @@ fn every_common_failure_names_its_cause() {
         "PRODUCT: trust remove, never trusted: removing a trust that does not exist succeeded; it \
          said:\n{said}"
     );
-    assert_says("trust remove, never trusted", &said, &["never trusted"]);
+    // vox-core's one sentence for it (ADR-028 E-7, #629): what failed, and what to do.
+    assert_says(
+        "trust remove, never trusted",
+        &said,
+        &["is not in your keyring", "`vox trust list` shows who is"],
+    );
 
     // ---- (9) trust past the keyring's limit (capped at SMALL_CAP by the test-only knob) ----
     // SMALL_TRIES distinct identities, one after another: more than the capped keyring holds,

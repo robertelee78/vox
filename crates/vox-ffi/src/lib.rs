@@ -67,17 +67,20 @@ fn failed(reason: impl Into<String>) -> VoxError {
     }
 }
 
-fn outcome(what: &str, out: Outcome) -> Result<(), VoxError> {
+/// `_what` names the call for a reader of the code; a person reads only the fault's sentence.
+fn outcome(_what: &str, out: Outcome) -> Result<(), VoxError> {
     match out {
         Outcome::Done | Outcome::Bound(_) | Outcome::OwnRetention { .. } | Outcome::Appended(_) => {
             Ok(())
         }
-        Outcome::Failed(f) => Err(failed(format!("{what}: {f:?}"))),
+        // The one sentence vox-core writes for the fault (ADR-028 E-7), never its variant's name
+        // and never prefixed with the call's.
+        Outcome::Failed(f) => Err(failed(f.explain())),
     }
 }
 
 fn digest(text: &str, what: &'static str) -> Result<Digest32, VoxError> {
-    b32_decode(text.trim(), what).map_err(|e| failed(format!("{what}: {e}")))
+    b32_decode(text.trim(), what).map_err(|e| failed(e.to_string()))
 }
 
 /// A node's fingerprint as a person reads it (ADR-028 K-1, L-9): what the app draws wherever it

@@ -1206,16 +1206,20 @@ impl Fault {
             Fault::NoIdentity => {
                 "this node has no identity yet\n       create one with `vox id` (or start `vox tui`)"
             }
-            Fault::IdentityExists => "this node already has an identity",
+            Fault::IdentityExists => {
+                "this node already has an identity\n       use it: `vox node attach` unlocks it; for another node, `vox node create <name>`"
+            }
             Fault::Locked => {
                 "the identity is locked\n       unlock it: pipe the identity passphrase to `vox daemon`, or run `vox tui`"
             }
-            Fault::WrongPassphrase => "the passphrase is wrong",
+            Fault::WrongPassphrase => {
+                "the passphrase is wrong\n       check it and type it again"
+            }
             Fault::PassphraseNeeded => {
                 "changing who you trust needs your identity passphrase: it was not entered for a keyring change in the last 30 minutes\n       type it, and the change is made: `vox trust` asks for it at a terminal"
             }
             Fault::PassphraseEmpty => {
-                "every node has an identity passphrase, and an empty one is refused; nothing was created"
+                "every node has an identity passphrase, and an empty one is refused; nothing was created\n       choose one, and run it again"
             }
             Fault::UnknownChannel => {
                 "no such room on this node\n       `vox room list` shows the rooms it holds"
@@ -1223,7 +1227,9 @@ impl Fault {
             Fault::ChannelNotOpen => {
                 "that room is not open on this node\n       open it with its passphrase: a line `<room> <passphrase>` to `vox daemon`, or in `vox tui`"
             }
-            Fault::TooLong => "that is longer than this field allows",
+            Fault::TooLong => {
+                "that is longer than this field allows\n       shorten it, and try again"
+            }
             // The cap in force, read once (#85): a test build's lowered cap is never called 1,024.
             Fault::KeyringFull => {
                 static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -1252,9 +1258,11 @@ impl Fault {
                  trust grants or prekey ring will not open under it\n       the store was altered, \
                  or copied from another node's data directory"
             }
-            Fault::ShuttingDown => "the node is shutting down",
+            Fault::ShuttingDown => {
+                "the node is shutting down\n       attach it again (`vox node attach`), then try again"
+            }
             Fault::NotNetworked => {
-                "this node is not on the network (it is locked, or was started without a listen address)"
+                "this node is not on the network: it is locked, or was started without a listen address\n       attach it with `vox node attach`, which unlocks it and puts it on the network"
             }
             Fault::BadLink => {
                 "that address will not parse, or names a room this node cannot use\n       check you copied the whole vox:// address"
@@ -1286,12 +1294,14 @@ impl Fault {
             Fault::NotAdmittedAfterJoin => {
                 "a member accepted your passphrase, then could not admit you, so you were not admitted\n       the member may have been locking or closing; run the join again while it is running"
             }
-            Fault::Refused => "the other side refused",
+            Fault::Refused => {
+                "the other side refused, and said no more\n       ask the person who runs it; this node's log names the side that refused"
+            }
             Fault::NotAdmitted => {
                 "that member is not admitted to the room on this node yet\n       it is, once this node syncs their records; then try again"
             }
             Fault::NotConsented => {
-                "there is nothing to withdraw: that identity was never trusted, or already is not"
+                "that identity is not in your keyring\n       `vox trust list` shows who is; `vox trust add <fingerprint>` adds one"
             }
             Fault::NotTrusted => {
                 "that identity is not in your trust keyring, so it is given no key to read you\n       run `vox trust add <fingerprint>` if you mean it to read you"
@@ -1305,7 +1315,9 @@ impl Fault {
             Fault::AddressNotHere => {
                 "a local address it was asked to use is not an address of this machine\n       use one this machine has (`ifconfig` lists them), or 127.0.0.1"
             }
-            Fault::BindFailed => "a local address it was asked to use could not be listened on",
+            Fault::BindFailed => {
+                "a local address it was asked to use could not be listened on\n       another program may hold it: choose another port, or stop that program"
+            }
             Fault::AlreadyMember => {
                 "this node already holds that room — there is nothing to join\n       `vox room list` shows it; open it with its passphrase if it is closed"
             }
@@ -1337,10 +1349,10 @@ impl Fault {
                 "this room has ended — its creator or an admin ended it, or nothing was said in it for the idle end its creator chose — so it takes no new message\n       this node deletes it once it has passed the end on"
             }
             Fault::RoomLeft => {
-                "you left this room, so nothing more of yours is written to it"
+                "you left this room, so nothing more of yours is written to it\n       join it again with its link to write to it"
             }
             Fault::NotCreator => {
-                "only the room's creator, or an admin it delegated, may do that — and this identity is neither"
+                "only the room's creator, or an admin it delegated, may do that — and this identity is neither\n       ask the room's creator to do it, or to make you an admin"
             }
             Fault::JoinedRoomEnded => {
                 "that room has ended — a member or its board said so — so it takes nobody in\n       your passphrase was never checked; the room is over, not your access to it"
@@ -1349,7 +1361,7 @@ impl Fault {
                 "the member that answered has left that room, so it lets nobody in\n       your passphrase was never checked; ask a member still in the room for an address"
             }
             Fault::NotRoomCreator => {
-                "only the room's creator adds or removes an admin, and this identity did not create the room"
+                "only the room's creator adds or removes an admin, and this identity did not create the room\n       ask the room's creator to do it"
             }
             Fault::NotAnAdmin => {
                 "that member is not an admin of the room\n       `vox room admin list` shows who is"
@@ -1360,7 +1372,9 @@ impl Fault {
             Fault::NameTaken => {
                 "you already share a service under that name in this room\n       choose another name, or `vox service remove` the one you share first"
             }
-            Fault::NoSuchForward => "no forward is listening at that local address",
+            Fault::NoSuchForward => {
+                "no forward is listening at that local address\n       `vox status` lists the forwards that are open"
+            }
             Fault::TunnelLimit => {
                 "16 tunnels are already open to this member\n       to free one: `vox tunnel close` it (`vox status` lists every tunnel, its number, and when it last moved), or close the program using it, or the `vox forward` carrying it; on the host, `vox service remove` the service, or `vox trust remove` the member"
             }
