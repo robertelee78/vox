@@ -1209,6 +1209,12 @@ final class FirstRunProof: XCTestCase {
 
         // (4e) @alias (ADR-028 K-4, D8): typing "@b" in the composer offers @bob; picked, it is
         // written in full and bob is addressed, as ticking him in To: does.
+        // From an empty To:: bob's d7 Session, ticked in 4d, stays ticked in the room after its post.
+        tap(ui, Key.id("compose-to"), "To:")
+        tap(ui, Key.id("to-bob-\(d7Session.prefix(8))"), "bob's Session \(d7Session), ticked in 4d, to untick it")
+        ui.typeKey(.escape, modifierFlags: [])
+        words(ui, Key.id("compose-to"), timeout: 10, "To: with bob's Session unticked must say the room",
+              until: { $0 == "To: the room" })
         let composeBox = Key.id("compose")
         type(ui, composeBox, "MENTION @b", "the composer")
         tap(ui, Key.id("mention-bob"), "@bob offered for \"@b\"",
