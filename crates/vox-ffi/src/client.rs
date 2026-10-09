@@ -2992,6 +2992,18 @@ impl VoxClient {
         }
     }
 
+    /// How long `room` keeps messages here, in seconds; 0 for forever (ADR-028 R-7, F-5): what a
+    /// retention change starts from, so it never opens at a value the room does not keep.
+    ///
+    /// # Errors
+    /// A malformed id, the room not open, or the daemon's refusal.
+    pub async fn retention_secs(&self, room: String) -> Result<u64, VoxError> {
+        match self.open_snap(&room).await?.0 {
+            Some(open) => Ok(open.retention),
+            None => Err(failed("the room is not open on this node")),
+        }
+    }
+
     /// Who has pulled this node's own shares in `room` whole and verified them (ADR-028 F-7), from
     /// the daemon's record of completed fetches, as `vox room read` says "pulled by": a fetch cut
     /// short is in none.

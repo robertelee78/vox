@@ -92,6 +92,9 @@ final class NodeModel: ObservableObject {
     @Published private(set) var pulledBy: [String: [String]] = [:]
     /// The room on screen's retention, as a person reads it (ADR-028 R-7).
     @Published private(set) var retention = ""
+    /// The room on screen's retention in seconds, 0 for forever; `nil` until read. What the
+    /// Retention sheet opens at (D14).
+    @Published private(set) var retentionSecs: UInt64?
     /// What the room on screen's timeline shows (ADR-029 CL-2): General each time a room opens.
     @Published var showing: Showing = .general {
         didSet { if showing != oldValue { Task { await readSession() } } }
@@ -324,6 +327,7 @@ final class NodeModel: ObservableObject {
         pulledBy = [:]
         pulled = [:]
         retention = ""
+        retentionSecs = nil
         notices = []
         showing = .general
         sessions = []
@@ -358,12 +362,14 @@ final class NodeModel: ObservableObject {
             let services = (try? await client.services(room: id).shared) ?? []
             let rows = try await memberRows(id)
             let kept = (try? await client.retention(room: id)) ?? ""
+            let keptSecs = try? await client.retentionSecs(room: id)
             let done = (try? await client.notices(room: id)) ?? []
             let listed = (try? await client.sessions(room: id)) ?? []
             guard case .room(id) = self.selection else { return }
             roomServices = services
             members = rows
             retention = kept
+            retentionSecs = keptSecs
             notices = done
             sessions = listed
             watchReads(id)
@@ -827,9 +833,11 @@ final class NodeModel: ObservableObject {
                 let services = try? await self.client.services(room: room).shared
                 let rows = try? await self.memberRows(room)
                 let kept = try? await self.client.retention(room: room)
+                let keptSecs = try? await self.client.retentionSecs(room: room)
                 let done = try? await self.client.notices(room: room)
                 guard case .room(room) = self.selection else { return }
                 if let kept, kept != self.retention { self.retention = kept }
+                if let keptSecs, keptSecs != self.retentionSecs { self.retentionSecs = keptSecs }
                 if let done, done != self.notices { self.notices = done }
                 let listed = try? await self.client.sessions(room: room)
                 guard case .room(room) = self.selection else { return }

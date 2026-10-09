@@ -53,6 +53,7 @@
 //   CREATED <room> <link>   `createRoom` named "mine", and its link
 //   (waits for a line on stdin: the peer has joined it)
 //   RENAMED                 `renameRoom` gave it the name "renamed"
+//   RETENTION_SECS <n>      `retentionSecs` of that room after `setRetention` of 7 days
 //   (waits for a line on stdin: the id of a session of this node's, staged through its hook)
 //   SESSION <label> PENDING <n> DRIVE <bool>
 //                           `sessions`: that Session, once one request in it waits (up to 90 s)
@@ -246,6 +247,9 @@ do {
     _ = readLine()
     try await client.renameRoom(room: made, name: "renamed")
     say("RENAMED")
+    // What a retention change opens at (D14): the room's own value.
+    try await client.setRetention(room: made, ttlSecs: 7 * 86_400)
+    say("RETENTION_SECS \(try await client.retentionSecs(room: made))")
 
     // A Session of this node's own (ADR-029, #554), staged by the proof through `vox agent hook`.
     let sid = (readLine() ?? "").trimmingCharacters(in: .whitespaces)

@@ -58,6 +58,9 @@
 //!    the request open with its reference; and the listener heard of the entries and of the
 //!    room's Sessions changing.
 //!
+//! 10. **What a retention change starts from** (D14): `retentionSecs` gives the room's own value,
+//!     7 days once the app sets it so, never a default.
+//!
 //! Mutant for (3): `services` drops the address (`SharedService.address` empty): red PRODUCT.
 //! Mutant for (3): the FFI's commands carry the readable address: red PRODUCT.
 //! Mutant for (6): `servicePreview` says no warning: red PRODUCT.
@@ -65,6 +68,7 @@
 //! `RoomMessage.image` always nil; `renameRoom` answers without asking the node; `pulledBy`
 //! always empty.
 //! Mutant for (8): `sessionRead` gives each entry's kind for its line: red PRODUCT.
+//! Mutant for (10): `retentionSecs` gives 30 days whatever the room keeps: red PRODUCT.
 //!
 //! **The iOS app's embedded node** (`VoxNode`, ADR-026 S-4's exception): the Swift program runs
 //! the node in its own process, against a real `vox daemon`. What must hold:
@@ -905,6 +909,13 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
     );
     writeln!(to_app).unwrap();
     let renamed = expect(&from_app, &seen, "RENAMED");
+    // (10) What a retention change starts from (D14).
+    let retention_secs = expect(&from_app, &seen, "RETENTION_SECS ");
+    assert_eq!(
+        retention_secs,
+        format!("RETENTION_SECS {}", 7 * 86_400),
+        "PRODUCT: `retentionSecs` must give the room's own retention"
+    );
     // `vox room list` shows a room by its short id, then its name.
     let shows_renamed = |l: &str, id: &str| {
         let mut w = l.split_whitespace();

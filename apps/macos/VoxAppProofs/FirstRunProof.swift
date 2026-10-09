@@ -28,6 +28,9 @@
 // 6. Attaching a file (ADR-014 M-24, ADR-028 F-1, #449): chosen with Attach…, addressed To: bob
 //    with a note, it is one share: bob's node pulls it by itself, byte for byte, and the note is
 //    in the share's announcement, never a message of its own.
+//    6c. (D14) Retention opens at the room's own value (1 year, set by `vox`), Set is disabled
+//        until another is chosen, Return never sets it, and the effect names the files and
+//        previews that go with the messages.
 // 7. (The lanes view: removed, ADR-029.)
 // 8. Notifications, a case of its own (testNotificationSaysWhoWroteNeverWhat), the one step that
 //    needs a person at the Mac (ADR-014 M-23, ADR-028 R-10, #448): with the keyring on screen, bob's message
@@ -931,6 +934,37 @@ final class FirstRunProof: XCTestCase {
         }
         let pulledBytes: Data? = got == want ? bytes : nil
         print("[proof] attached for-bob.bin To: bob; bob pulled \(pulledBytes?.count ?? 0) bytes; rows with the note: \(bobRows.count)")
+        // (6c) Retention opens at what the room keeps; Return never sets it (D14).
+        try staged(vox, ["room", "retention", "--node", "alice", room, String(365 * 86_400)], env: voxEnv)
+        ui.menuBars.menuBarItems["Room"].click()
+        ui.menuBars.menuItems["Retention…"].click()
+        let choice = Key.id("retention-choice")
+        let submit = Key.id("retention-submit")
+        present(ui, choice, timeout: 15, "Room > Retention… must open the Retention sheet")
+        var openedAt = ""
+        let openUntil = Date().addingTimeInterval(15)
+        while Date() < openUntil && openedAt != "1 year" {
+            openedAt = (el(ui, choice).value as? String) ?? ""
+            if openedAt != "1 year" { Thread.sleep(forTimeInterval: 0.25) }
+        }
+        XCTAssertEqual(openedAt, "1 year",
+                       "PRODUCT: the Retention sheet must open at the room's own retention, 1 year (D14)")
+        XCTAssertFalse(el(ui, submit).isEnabled,
+                       "PRODUCT: Set must be disabled while the choice is what the room keeps (D14)")
+        el(ui, choice).click()
+        ui.menuItems["30 days"].click()
+        let effect = words(ui, Key.id("retention-effect"), timeout: 10,
+                           "a shorter retention must say the files and previews go too (D14)",
+                           until: { $0.contains("the files it shared and their previews") }) ?? ""
+        XCTAssertTrue(el(ui, submit).isEnabled,
+                      "PRODUCT: Set must be enabled once another retention is chosen (D14)")
+        ui.typeKey(.return, modifierFlags: [])
+        Thread.sleep(forTimeInterval: 2)
+        XCTAssertTrue(el(ui, submit).exists,
+                      "PRODUCT: Return must not set a retention: the sheet closed as if Set were pressed (D14)")
+        ui.typeKey(.escape, modifierFlags: [])
+        print("[proof] retention sheet opened at \(openedAt); effect: \(effect)")
+
 
         // (7) The lanes view was removed (ADR-029 Sessions replace it; ADR-028 W-3 withdrawn).
 
