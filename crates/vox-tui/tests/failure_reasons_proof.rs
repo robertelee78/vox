@@ -21,7 +21,7 @@
 //! 5. `vox forward` onto a local port something else holds → that address, in use — promptly,
 //!    not after the path-waiting loop;
 //! 6. `vox trust remove` of someone never trusted → that identity is not in your keyring, and
-//!    `vox trust list` shows who is;
+//!    `vox trust list` shows who is; refused first, with no "about to remove" said before it;
 //! 7. a forward into a host that has not trusted you → the guest is told the host refused and
 //!    why that usually is, and the **host** logs whom it refused and why;
 //! 8. a room that is not there → "nothing here matches";
@@ -453,6 +453,12 @@ fn every_common_failure_names_its_cause() {
         "trust remove, never trusted",
         &said,
         &["is not in your keyring", "`vox trust list` shows who is"],
+    );
+    // Refused first: nothing is said of what it was to lose, when there is nothing to remove.
+    assert!(
+        !said.contains("about to remove") && !said.contains("it is to read nothing"),
+        "PRODUCT: trust remove, never trusted: it must be refused before anything is said of \
+         removing it; it said:\n{said}"
     );
 
     // ---- (9) trust past the keyring's limit (capped at SMALL_CAP by the test-only knob) ----

@@ -4949,6 +4949,21 @@ pub async fn trust_capability(
 /// `vox trust remove`, asked of the running node.
 pub async fn trust_remove(paths: &Paths, target: Digest32) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
+    // **Not in the keyring: refused first**, in vox-core's sentence (ADR-028 E-7), with nothing said
+    // of what it was to lose: there is nothing to remove. A read, so no passphrase (V210-165).
+    let entries = match client.trusted("").await {
+        Ok(Frame::Trusted { entries }) => entries,
+        Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
+        Err(e) => return Err(AppError::Usage(e.to_string())),
+    };
+    if !entries.iter().any(|(id, _, _)| *id == target) {
+        return Err(AppError::Usage(
+            vox_core::node::api::Fault::NotConsented
+                .explain()
+                .to_owned(),
+        ));
+    }
     // What it is to stop, said before it is done (ADR-028 E-5).
     let rooms = rooms_with(&mut client, &target).await;
     let room_names: Vec<String> = rooms.iter().map(|(id, n)| room_said(id, n)).collect();
