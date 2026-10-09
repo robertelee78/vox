@@ -502,6 +502,31 @@ impl Router {
         Ok((g.info, g.notes))
     }
 
+    /// Stop keeping `node` (ADR-014 M-6, #571): Vox.app's Keep Running turned off. Its line leaves
+    /// the attach file, and with it any Keychain item it names, so the daemon does not attach it
+    /// again at its next start. Attached and held by a client, it becomes a held node, detached
+    /// when its last holder goes; it is not detached now, so the app that turned Keep Running off
+    /// goes on acting as it.
+    ///
+    /// # Errors
+    /// [`Refusal::NoSuchNode`] for a node that is not on disk.
+    pub async fn unkeep(&self, node: &NodeName) -> Result<(), Refusal> {
+        if !self.inner.account.nodes_on_disk().contains(node) {
+            return Err(Refusal::NoSuchNode { node: node.clone() });
+        }
+        let _file = self.inner.keep_file.lock().await;
+        {
+            let mut slots = lock(&self.inner.slots);
+            if let Some(Slot::Attached(a)) = slots.get_mut(node) {
+                if a.keep.take().is_some() && a.holders > 0 {
+                    a.implicit = true;
+                }
+            }
+        }
+        self.write_attach_file_held(Some(node)).await;
+        Ok(())
+    }
+
     /// The Keychain account a kept node's passphrase is stored under: its directory.
     fn keychain_account(&self, node: &NodeName) -> String {
         self.inner
@@ -2131,6 +2156,10 @@ impl Dispatch for Router {
                     Err(r) => refused(r),
                 }
             }
+            DaemonRequest::Unkeep { node } => match self.unkeep(&node).await {
+                Ok(()) => DaemonFrame::Ok,
+                Err(r) => refused(r),
+            },
             DaemonRequest::SessionRegister {
                 node,
                 session,

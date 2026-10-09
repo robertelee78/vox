@@ -7,6 +7,7 @@
 //! rest of the line reads. Every printer of such text passes it through [`shown`].
 
 pub mod fingerprint;
+pub mod node;
 pub mod offer;
 pub mod read;
 

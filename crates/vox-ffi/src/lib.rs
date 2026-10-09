@@ -59,6 +59,20 @@ pub enum VoxError {
         /// What happened, for a person.
         reason: String,
     },
+    /// The passphrase given does not open the node's identity: asked for again where it was
+    /// typed (P4).
+    #[error("{reason}")]
+    WrongPassphrase {
+        /// The daemon's sentence, for a person.
+        reason: String,
+    },
+    /// Another process holds the node (an older `vox` still running as it): no passphrase fixes
+    /// it (P4).
+    #[error("{reason}")]
+    Busy {
+        /// The daemon's sentence, for a person.
+        reason: String,
+    },
 }
 
 fn failed(reason: impl Into<String>) -> VoxError {

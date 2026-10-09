@@ -230,7 +230,9 @@ network presence from the start: there is no interim design with one socket per 
     `vault.cbor`, `node-identity.key` or `store.redb` is not a node: such a release left it there.
     A data root holding one MUST be refused by every verb, and by the daemon before it takes its
     lock, saying "`<root>` is not a Vox data directory this version reads: `<root>/<name>` is not a
-    node", and MUST be left byte for byte unchanged.
+    node", and MUST be left byte for byte unchanged. At the person's request (Move It Aside and
+    Start Fresh), the app MAY rename a refused earlier-release node folder, whole and unread, into
+    `<root>/moved-aside/`; it MUST NOT read, convert or delete it.
   - **v0.3.x: not upgraded.** A v0.3.x data root has v0.4.0's layout and no `.daemon/format`, so
     it cannot be told from one v0.4.0 wrote. It is read as format 1, and Vox MUST carry no code
     that converts it to v0.4.0's formats.
@@ -298,9 +300,7 @@ Each claim MUST be proved by real use of the shipped binary (ADR-018), with one 
 3. detaching one node keeps the other's live tunnel and sync (mutant: endpoint closed on detach)
    (`the_nodes_of_one_daemon_proof`);
 4. tunnels, counters, status and metrics are per node; node A cannot list or close B's tunnel
-   (`two_nodes_are_clients_of_one_daemon_proof`). The metrics exposition's shape, with each
-   family's `HELP` and `TYPE` once across nodes and `node` first among a sample's labels, has no
-   proof: its in-process test was deleted in v0.4.1 (AGENTS.md: no unit tests);
+   (`two_nodes_are_clients_of_one_daemon_proof`);
 5. a panic in one node's actor leaves the daemon and the other nodes serving
    (`the_daemon_and_its_nodes_proof`);
 6. two clients attaching one node at once both succeed with one attach; a detach with a request in
