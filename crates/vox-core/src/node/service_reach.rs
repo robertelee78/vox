@@ -32,9 +32,16 @@ pub fn commands(s: &SharedService) -> Vec<(&'static str, String)> {
     }
 }
 
-/// What one shared service needs to be reached from here, and whether each holds (ADR-028 S-3):
-/// `(the condition, holds, what to do when it does not)`. `proxy` is whether the `.vox` proxy
-/// runs, or `None` where that is not known here (its need is then not said).
+/// **What one shared service needs to be reached from here, and whether each holds** (ADR-028
+/// S-3, the App Study's readiness ticks): `(the fact, holds, what to do when it does not)`, in the
+/// order a person checks them, and in the words every client shows: `proxy configured`, `node
+/// attached`, `<host> trusts you`, `<host> online`. `proxy` is whether the `.vox` proxy runs, or
+/// `None` where that is not known here (its fact is then not said).
+///
+/// Each fact is this node's own knowledge; nothing is asked of anyone for it. `<host> trusts you`
+/// is the host's own consent to this node, as the host wrote it into the room's log, never a
+/// reading of anybody's keyring. `<host> online` is whether this node holds a live connection to
+/// the host now.
 #[must_use]
 pub fn needs(
     s: &SharedService,
@@ -44,42 +51,47 @@ pub fn needs(
     let theirs = s.by != "you";
     let who = s.by.as_str();
     let mut needs = Vec::new();
+    // A forward carries without the proxy; ssh by address and a URL go through it.
+    if let Some(proxy) = proxy.filter(|_| matches!(s.kind.as_str(), "ssh" | "http" | "https")) {
+        needs.push(match proxy {
+            Ok(_) => ("proxy configured".to_owned(), true, String::new()),
+            Err(why) => (
+                "proxy configured".to_owned(),
+                false,
+                format!("the .vox proxy is not running: {why}; a `vox forward` works without it"),
+            ),
+        });
+    }
+    needs.push((
+        "node attached".to_owned(),
+        true,
+        "`vox node attach`".to_owned(),
+    ));
     if theirs {
         needs.push((
-            format!("{who} trusts this node (as the room's log says)"),
+            format!("{who} trusts you"),
             s.trusts_you,
             format!(
                 "{who} must trust this node: there, `vox trust add` the fingerprint `vox id` \
                  prints here"
             ),
         ));
-    }
-    needs.push((
-        "this node is attached".to_owned(),
-        true,
-        "`vox node attach`".to_owned(),
-    ));
-    // A forward carries without the proxy; ssh by address and a URL go through it.
-    if let Some(proxy) = proxy.filter(|_| matches!(s.kind.as_str(), "ssh" | "http" | "https")) {
-        needs.push(match proxy {
-            Ok(at) => (
-                format!("the .vox proxy is running on {at}"),
-                true,
-                String::new(),
-            ),
-            Err(why) => (
-                "the .vox proxy is running".to_owned(),
-                false,
-                format!("not running: {why}"),
-            ),
-        });
-    }
-    if theirs {
         needs.push((
-            format!("{who} is online"),
+            format!("{who} online"),
             s.online,
             format!("{who} is not reachable now; it is reached when it comes back"),
         ));
     }
     needs
+}
+
+/// One fact of [`needs`] as a line, as `vox service list` and the TUI show it: `✓ <fact>` when it
+/// holds, `missing: <fact> — <what to do>` when it does not.
+#[must_use]
+pub fn tick(need: &str, holds: bool, otherwise: &str) -> String {
+    if holds {
+        format!("✓ {need}")
+    } else {
+        format!("missing: {need} — {otherwise}")
+    }
 }

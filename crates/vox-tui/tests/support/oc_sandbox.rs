@@ -120,6 +120,24 @@ pub fn sandbox_profile(rw: &[&Path], r: &[&Path]) -> String {
     s
 }
 
+/// **The profile for a harness run against a stand-in model**: [`sandbox_profile`]'s file rules,
+/// and no network at all but the stand-in's one port on `localhost` and Unix sockets under `rw`
+/// (the run's own daemon). No name lookup, no provider, no update check: nothing leaves the
+/// machine. Later rules win, so these close what the base profile left open.
+pub fn offline_profile(rw: &[&Path], r: &[&Path], port: u16) -> String {
+    let q = |p: &Path| format!("{:?}", real(p).display().to_string());
+    let mut s = sandbox_profile(rw, r);
+    s += "(deny network-outbound)\n";
+    for p in rw {
+        s += &format!(
+            "(allow network-outbound (remote unix-socket (subpath {})))\n",
+            q(p)
+        );
+    }
+    s += &format!("(allow network-outbound (remote ip \"localhost:{port}\"))\n");
+    s
+}
+
 /// `p` with every symlink resolved: the sandbox matches real paths (`/tmp` is
 /// `/private/tmp`).
 pub fn real(p: &Path) -> std::path::PathBuf {

@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Args;
-use vox_core::error::{Error, IpcHandshake};
+use vox_core::error::Error;
 use vox_core::hash::Digest32;
 use vox_core::nat::bootstrap::BootstrapSet;
 use vox_core::node::daemonipc::{
@@ -306,24 +306,11 @@ pub async fn open(at: &NodeSocket) -> Result<IpcClient, AppError> {
 
 /// A failure to reach the node `at` names, for a person.
 pub fn said(at: &NodeSocket, e: Error) -> AppError {
-    let node = &at.using.node;
-    let path = at.path.display();
-    AppError::Usage(match e {
-        // The cause stays named (#191): the OS's reason the connect failed, beside the socket.
-        Error::Ipc(IpcHandshake::Unreachable { reason }) => format!(
-            "no vox daemon is running for this data root, so node {node} is not attached.\n\
-             \x20      Start one:  vox daemon      (or `vox node attach {node}`)\n\
-             \x20      Socket: {path} ({reason})"
-        ),
-        Error::Ipc(IpcHandshake::Refused { reason }) => reason,
-        Error::Ipc(h @ IpcHandshake::ClosedBeforeHello) => {
-            format!(
-                "the daemon's socket at {path} accepted, but {h}: it may be stopping. Try again."
-            )
-        }
-        Error::Ipc(h) => format!("{h}. Socket: {path}"),
-        other => format!("the daemon at {path} did not answer ({other})"),
-    })
+    AppError::Usage(vox_core::node::daemonipc::unreached(
+        &at.path,
+        Some(at.using.node.as_str()),
+        e,
+    ))
 }
 
 /// Make sure the account's daemon is running, starting it with `listen` and
@@ -565,26 +552,17 @@ pub fn create_identity(paths: &Paths, passphrase: &str) -> Result<Digest32, AppE
     // The node's own clock, a test step included (V210-64): an identity made here is stamped as
     // the node making it would have stamped it.
     let now_ms = (vox_core::time::clock_with_test_skew())();
-    let now = now_ms / 1_000;
     // **A wait is said, once, after a second** (V210-100): another vox making this node's identity
     // holds its directory, and one stopped (Ctrl-Z) holds it until resumed; this one waiting with
     // nothing on the screen looked hung.
-    match vox_core::node::profile::Profile::create_noting(
+    // **Its prekey ring is made with it** (V210-77), as the app's first run makes it too.
+    match vox_core::node::profile::Profile::create_node(
         paths.clone(),
         passphrase.as_bytes(),
-        now,
-        vox_core::atrest::sek::Argon2Profile::default(),
+        now_ms,
         &crate::tunnel_cli::say_waiting,
     ) {
-        // **Its prekey ring is made with it**, as the node making an identity makes it, so the
-        // ring's age is the identity's (V210-77): what a node attaching later keeps up, not
-        // something it makes afresh.
-        Ok(p) => {
-            let signer = p.signer()?;
-            let dh_secret = *signer.x25519_identity_secret();
-            vox_core::node::prekeys::load_or_create(p.store(), signer, &dh_secret, now_ms)?;
-            Ok(p.fingerprint())
-        }
+        Ok(fp) => Ok(fp),
         // Waited the whole patience and the holder is still not done: say what holds it and how to
         // find it, never to stop a node — the holder may only be slow, or stopped.
         Err(Error::ProfileBusy) => Err(AppError::Usage(format!(

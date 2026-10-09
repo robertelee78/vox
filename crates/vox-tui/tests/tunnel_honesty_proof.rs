@@ -1914,9 +1914,31 @@ fn withdrawing_trust_cuts_a_live_session_and_refuses_the_next_request() {
     });
     // And that the guest is to reach none of the host's services: the one it offers is named as
     // lost, never as one the guest is to reach.
+    // Remove is the one word for it, before and after (ADR-028 E-2, K-6; #628).
+    let about = lines
+        .iter()
+        .position(|l| l.starts_with("vox: about to remove ") && l.ends_with(" from your keyring"));
     let acted = lines
         .iter()
-        .position(|l| l.starts_with("vox: no longer trusting"));
+        .position(|l| l.starts_with("vox: removed ") && l.ends_with(" from your keyring"));
+    let lower = out.to_lowercase();
+    assert!(
+        matches!((about, acted), (Some(b), Some(a)) if b < a)
+            && !lower.contains("untrust")
+            && !lower.contains("stop trusting")
+            && !lower.contains("no longer trusting"),
+        "PRODUCT: `vox trust remove` must say it is about to remove the guest from your keyring, \
+         then that it removed it, and never call it untrusting (ADR-028 E-2, #628):\n{out}"
+    );
+    for help in [&["trust", "--help"][..], &["trust", "remove", "--help"][..]] {
+        let (ok, said, err) = vox_once(&w.host_dir, &args(help));
+        let low = said.to_lowercase();
+        assert!(
+            ok && said.contains("Remove") && !low.contains("untrust") && !low.contains("stop trusting"),
+            "PRODUCT: `vox {}` must call it Remove, never untrust or stop trusting (#628):\n{said}{err}",
+            help.join(" ")
+        );
+    }
     let loses = lines.iter().position(|l| {
         l.starts_with("     and to reach none of your services from now on: it loses ")
             && l.contains(&format!("{port} in \"service\""))
@@ -1996,7 +2018,7 @@ fn withdrawing_trust_cuts_a_live_session_and_refuses_the_next_request() {
     // Step 5: the host's decision record (ADR-028 §7, #506) holds each decision once, naming the
     // guest and why: the untrust, the session it cut, and the CONNECT refused after it.
     let want = [
-        ("to stop trusting a member", "untrusted"),
+        ("to remove a member from the keyring", "removed"),
         ("a tunnel to a service", "cut"),
         ("a tunnel to a service", "refused"),
     ];

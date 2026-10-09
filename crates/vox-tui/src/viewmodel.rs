@@ -247,8 +247,9 @@ pub struct SharedView {
     /// The command a copy gives, carrying the canonical address (S-1) so it works pasted on any
     /// member's machine: the first of its kind's commands.
     pub copy: String,
-    /// What it needs that does not hold, each in words; empty when nothing is missing.
-    pub missing: Vec<String>,
+    /// What reaching it needs, each fact `✓ <fact>` or `missing: <fact> — <fix>` (ADR-028 S-3,
+    /// the readiness ticks `vox service list` and the app show).
+    pub ready: Vec<String>,
 }
 
 /// One Session in a room, as the TUI lists it (ADR-029 SE-3, CL-2).
@@ -400,181 +401,34 @@ pub struct ServePreview {
     pub lines: Vec<String>,
 }
 
-/// The bounded set of user-facing errors the UI surfaces (ADR-015 §"Error & offline
-/// UX"). Each renders to a fixed human string — there is no free-form text path, so
-/// an error can never carry plaintext, a key, or a passphrase into the UI/logs.
+/// The TUI's own failures: states of this client that no node fault names (ADR-015 §"Error &
+/// offline UX"). Each renders to a fixed human string, so an error can never carry plaintext, a
+/// key, or a passphrase into the UI or logs. A node's fault is never mapped here: it is shown in
+/// the one sentence vox-core writes for it (`Fault::explain`, ADR-028 E-7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiError {
-    /// Wrong room passphrase on join.
-    WrongPassphrase,
-    /// An identity was to be made with an empty passphrase (ADR-028 K-11).
-    PassphraseEmpty,
-    /// The identity opened, but what it sealed in the store would not (V210-40).
-    SealedUnreadable,
-    /// Join proof-of-work is still being computed (Equihash delay).
-    JoinPowDelay,
-    /// This device took longer to solve a join's proof of work than the member waits (V210-87).
-    JoinPowTooSlow,
-    /// Every member that answered a join was busy answering others (V210-92).
-    JoinMembersBusy,
-    /// The room is at its cap, so the join was refused (V210-128).
-    JoinRoomFull,
-    /// A member accepted the passphrase and then could not admit this identity (V210-128).
-    JoinNotAdmitted,
-    /// Join proof-of-possession / identity mismatch.
-    JoinProofMismatch,
-    /// No reachable peer / your node — "both must be online" for a 2-member channel.
-    Unreachable,
-    /// The channel epoch advanced (passphrase rotation); re-sync needed.
-    EpochMismatch,
-    /// You have no consent from a member yet ("you'll see them once they consent").
-    MissingConsent,
-    /// A received entry/structure was malformed (maps ADR-008 wire codes).
-    Malformed,
-    /// A transport/connection error.
-    Transport,
-    /// The profile has no identity yet (create one with `:init`).
-    NoIdentity,
-    /// The profile already has an identity.
-    IdentityExists,
     /// The profile had no identity when this TUI started, and another vox created one since:
     /// nothing was created here (V210-100, the CLI's V210-91 refusal).
     IdentityMadeElsewhere,
-    /// Another vox holds this node open for writing.
-    ProfileBusy,
     /// The node this TUI acts as is not attached: give its passphrase (`:attach`).
     NotAttached,
-    /// The channel is not open (select it and enter its passphrase).
-    ChannelNotOpen,
-    /// An input exceeded its bound (name or message length).
-    TooLong,
-    /// The trust keyring holds its maximum number of identities.
-    KeyringFull,
-    /// A write to this node's files failed for a reason the TUI has no fault for. A fault that
-    /// names its file is shown in its own words instead (`live::failed`).
-    Storage,
     /// The tunnel to close is no longer open (V030-11).
     NoSuchTunnel,
-    /// The other side refused: the channel passphrase is wrong, or it is not
-    /// accepting joins for that channel. Deliberately coarse — the responder does not
-    /// say which, so neither does this (ADR-005).
-    Refused,
-    /// There is no consent to withdraw from that member.
-    NotConsented,
-    /// A consent named a member this node has not admitted to the room yet.
-    NotAdmitted,
-    /// The node is not networked, so it cannot reach anyone.
-    NotNetworked,
-    /// A local address the node needs (its listen port) is held by another program.
-    AddressInUse,
-    /// A local address the node was asked to listen on is not an address of this machine.
-    AddressNotHere,
-    /// A local address the node was asked to listen on could not be bound for another reason.
-    BindFailed,
-    /// A join named a room this profile already holds.
-    AlreadyMember,
-    /// The room has ended: it takes no new message (V030-08).
-    RoomEnded,
-    /// No other member could be told of the leave within 30 s; the node leaves once one can
-    /// (V210-164).
-    LeaveNotHeard,
-    /// Something was written in the room after the leave, so this node is in it again (V210-164).
-    LeaveUndone,
-    /// Only the room's creator, or an admin it delegated, may do that (V030-08).
-    NotCreator,
-    /// The room was joined a moment ago and is still being read (V030-08).
-    StillJoining,
     /// An unexpected internal error (never carries detail).
     Internal,
 }
 
 impl UiError {
-    /// Map an ADR-008 wire error code (`0x01`–`0x08`) to a UI error. Unknown codes
-    /// fall to [`UiError::Malformed`] (never an uninterpreted passthrough).
-    #[must_use]
-    pub fn from_wire_code(code: u8) -> Self {
-        match code {
-            0x05 => UiError::JoinProofMismatch,
-            0x07 => UiError::EpochMismatch,
-            _ => UiError::Malformed,
-        }
-    }
-
     /// The fixed, redaction-safe human string for this error.
     #[must_use]
     pub fn message(self) -> &'static str {
         match self {
-            UiError::WrongPassphrase => "wrong passphrase",
-            UiError::PassphraseEmpty => {
-                "every node has an identity passphrase; an empty one is refused"
-            }
-            UiError::SealedUnreadable => {
-                "passphrase right, but this node's keyring or prekeys will not open — altered, or another identity's"
-            }
-            UiError::JoinPowDelay => "join proof-of-work in progress…",
-            UiError::JoinPowTooSlow => {
-                "this device solved the join's proof of work too slowly for the member — try when it is less busy"
-            }
-            UiError::JoinMembersBusy => {
-                "a member is busy answering other joins — try again shortly"
-            }
-            UiError::JoinRoomFull => {
-                "the room is full — nobody else can join (your passphrase was accepted)"
-            }
-            UiError::JoinNotAdmitted => {
-                "a member accepted your passphrase but could not admit you (it was locking or closing) — try again"
-            }
-            UiError::JoinProofMismatch => "join identity proof failed",
-            UiError::Unreachable => "no reachable peer — the host or a member must be online",
-            UiError::EpochMismatch => "the room's passphrase was changed — re-syncing",
-            UiError::MissingConsent => "you'll see this member once they trust you",
-            UiError::Malformed => "received a malformed entry (ignored)",
-            UiError::Transport => "connection error",
-            UiError::NoIdentity => "no identity yet — :init to create one",
-            UiError::IdentityExists => "an identity already exists on this node",
             UiError::IdentityMadeElsewhere => {
                 "another vox created this node's identity at the same time; nothing was created here — :attach with its passphrase"
             }
-            UiError::ProfileBusy => {
-                "another vox is still running as this node — stop it, then try again"
-            }
             UiError::NotAttached => "this node is not attached — :attach and give its passphrase",
-            UiError::ChannelNotOpen => "this room is not open — select it and enter its passphrase",
-            UiError::TooLong => "too long",
-            // The cap in force (#85), as `Fault::KeyringFull` names it.
-            UiError::KeyringFull => {
-                static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-                TEXT.get_or_init(|| {
-                    format!(
-                        "your trust keyring is full ({}) — remove one first",
-                        vox_core::node::trust::trust_cap_words()
-                    )
-                })
-            }
-            UiError::Storage => "could not write this node's files — check free disk space, and that the data directory is writable",
-            UiError::NotConsented => "nothing to withdraw — you never trusted this member",
-            UiError::NotAdmitted => "that member is not admitted here yet — try again once synced",
-            UiError::NoSuchTunnel => "that tunnel is no longer open",
-            UiError::Refused => "refused — check the room passphrase",
-            UiError::NotNetworked => "this node is not on the network",
-            UiError::AddressInUse => {
-                "a local port it needs is held by another program — pick another --listen"
-            }
-            UiError::AddressNotHere => {
-                "the --listen address is not an address of this machine — use one it has"
-            }
-            UiError::BindFailed => "the --listen address could not be listened on",
-            UiError::AlreadyMember => "you already hold that room — it is in your list",
-            UiError::RoomEnded => {
-                "this room has ended — it takes no new message, and this node deletes it soon"
-            }
-            UiError::LeaveNotHeard => {
-                "no other member could be told within 30s — the room goes once one can be"
-            }
-            UiError::LeaveUndone => "something was written here after :leave — you are in the room again",
-            UiError::NotCreator => "only the room's creator, or an admin it delegated, may end it",
-            UiError::StillJoining => "joined a moment ago and still reading the room — try again",
-            UiError::Internal => "internal error",
+            UiError::NoSuchTunnel => "that tunnel is no longer open — the tunnels pane lists those that are",
+            UiError::Internal => "internal error — the node's log says what failed",
         }
     }
 }

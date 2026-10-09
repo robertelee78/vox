@@ -18,7 +18,7 @@ These are the operator's, and only the operator's:
 vox trust add <fingerprint> --name <name>   # trust a node (read)
 vox trust drive <fingerprint>               # let it drive this node's Sessions too
 vox trust read <fingerprint>                # take drive back: read only
-vox trust remove <fingerprint>              # stop trusting it
+vox trust remove <fingerprint>              # remove it from the keyring
 vox trust dismiss <fingerprint>             # dismiss an offer
 ```
 
