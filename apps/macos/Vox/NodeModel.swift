@@ -11,6 +11,14 @@ import ServiceManagement
 /// 'subsystem == "us.vox.app"'`): ids and counts only, never message text.
 let readLog = Logger(subsystem: "us.vox.app", category: "read")
 
+/// A room's composer as it was left: its text, To:, Urgent and the reply being written (D12).
+struct RoomDraft {
+    var text = ""
+    var to: Set<String> = []
+    var urgent = false
+    var reply: RoomMessage?
+}
+
 @MainActor
 final class NodeModel: ObservableObject {
     /// What the window shows in its middle.
@@ -94,8 +102,35 @@ final class NodeModel: ObservableObject {
     @Published private(set) var retention = ""
     /// What the room on screen's timeline shows (ADR-029 CL-2): General each time a room opens.
     @Published var showing: Showing = .general {
-        didSet { if showing != oldValue { Task { await readSession() } } }
+        didSet {
+            guard showing != oldValue else { return }
+            // Another Session's entries are never drawn, nor acted on, under this one's header
+            // while it loads (D3): cleared, and said to be loading.
+            sessionEntries = []
+            sessionNote = nil
+            sessionLoading = showingSession
+            Task { await readSession() }
+        }
     }
+    /// The Session on screen is being read: its timeline says "Loading…" (D3).
+    @Published private(set) var sessionLoading = false
+
+    /// What is typed, kept per destination while the app runs, in memory only: nothing goes on
+    /// disk or the wire (D12). A room's draft, To:, Urgent and reply, by room id.
+    var roomDrafts: [String: RoomDraft] = [:]
+    /// A Session's draft, by its destination (`room/node/session`).
+    var sessionDrafts: [String: String] = [:]
+    /// What each room last showed (General, All, or a Session), restored when it opens again.
+    var lastShowing: [String: Showing] = [:]
+
+    /// The request selected in the Session on screen, by its reference: what Approve (⌥⌘Y) and
+    /// Reject (⌥⌘N) act on, and where ⌘J and a notification land (P1).
+    @Published var selectedRequest: String?
+    /// The requests waiting on this node already known, by `room/node/session/reference`: one
+    /// that is new notifies, once per Session (P1). Taken in silence the first time, so opening
+    /// Vox notifies nothing.
+    private var knownWaiting: Set<String> = []
+    private var waitingSeen = false
     /// The room on screen's Sessions, open and ended (ADR-029 CL-2).
     @Published private(set) var sessions: [FfiSession] = []
     /// The Session on screen's entries, oldest first, to a member with drive (SC-1).
@@ -116,6 +151,8 @@ final class NodeModel: ObservableObject {
     @Published var sheet: NodeSheet?
     /// Asks the room on screen to choose a file to attach (⌘O); each ask counts one up.
     @Published var attachAsked = 0
+    /// ⌘O while a Session is shown, to a member with drive: a file sent to that Session (D2).
+    @Published var sessionAttachAsked = 0
     /// Asks the room on screen to send its draft urgent (⌘↩).
     @Published var urgentAsked = 0
     /// The message selected in the timeline, and the one the composer replies to (⌘R).
@@ -136,9 +173,12 @@ final class NodeModel: ObservableObject {
     /// What the last keyring change did, or why it failed, in the daemon's words (E-5, M-7).
     @Published private(set) var keyringDid: String?
     @Published private(set) var keyringFailed: String?
-    /// The keyring window has closed: the change waiting is made once the passphrase is given.
-    @Published private(set) var keyringNeedsPassphrase = false
-    private var keyringWaiting: ((Passphrase?) async throws -> String)?
+    /// The keyring change waiting for the identity passphrase (the keyring window has closed,
+    /// ADR-026 N-2), bound to what it changes (D1): made only with it, cleared by Cancel and by
+    /// any keyring change that succeeds, and replaced only when the person says so.
+    @Published private(set) var keyringPending: KeyringPending?
+    /// A second gated change while one waits: asked about first, never put in silently (D1).
+    @Published private(set) var keyringReplacing: KeyringPending?
 
     /// Follows who has read what while a room is on screen.
     private var watching: Task<Void, Never>?
@@ -197,6 +237,9 @@ final class NodeModel: ObservableObject {
         notifies = notify
         guard notify else { return }
         notifier.open = { [weak self] room in Task { await self?.show(.room(room)) } }
+        notifier.openRequest = { [weak self] room, node, session, reference in
+            Task { await self?.openRequest(room: room, node: node, session: session, reference: reference) }
+        }
         notifier.allowed = { [weak self] granted in self?.notifying = granted }
         notifier.ask()
     }
@@ -318,6 +361,11 @@ final class NodeModel: ObservableObject {
     /// its own is read (show reads it).
     func select(_ selection: Selection?) {
         guard selection != self.selection else { return }
+        // The room left keeps what it showed and the reply being written (D12).
+        if case let .room(left) = self.selection {
+            lastShowing[left] = showing
+            roomDrafts[left, default: RoomDraft()].reply = replyTo
+        }
         self.selection = selection
         // An offer's view says what its own Trust did, never an earlier keyring change.
         if case .offer = selection {
@@ -331,7 +379,6 @@ final class NodeModel: ObservableObject {
         pulled = [:]
         retention = ""
         notices = []
-        showing = .general
         sessions = []
         sessionEntries = []
         sessionNote = nil
@@ -339,7 +386,14 @@ final class NodeModel: ObservableObject {
         roomServices = []
         selectedMessage = nil
         selectedService = nil
-        replyTo = nil
+        // What this room last showed, and its reply, come back (D12): General the first time.
+        if case let .room(opened) = selection {
+            showing = lastShowing[opened] ?? .general
+            replyTo = roomDrafts[opened]?.reply
+        } else {
+            showing = .general
+            replyTo = nil
+        }
     }
 
     /// Show `selection`; a room shown is read, so its unread counts end.
@@ -372,6 +426,8 @@ final class NodeModel: ObservableObject {
             retention = kept
             notices = done
             sessions = listed
+            // A Session restored as this room's last view is read once the room lists it (D12).
+            if showingSession { await readSession() }
             watchReads(id)
         } catch {
             reportBackground(error)
@@ -384,7 +440,9 @@ final class NodeModel: ObservableObject {
     /// K-16). Whether it was done.
     func trust(_ fingerprint: String, as alias: String, drive: Bool) async -> Bool {
         let fp = fingerprint.filter { !$0.isWhitespace && $0 != "-" && $0 != "·" }.lowercased()
-        return await keyringChange { [client] pass in
+        return await keyringChange(fingerprint: fp, alias: alias,
+                                   words: "trust \(alias), \(Capability.words(drive))",
+                                   action: "Trust") { [client] pass in
             try await client.trustAdd(fingerprint: fp, name: alias, drive: drive,
                                       identityPassphrase: pass)
             return "Trusting \(fp.prefix(12)) as \(alias), \(Capability.words(drive))."
@@ -393,7 +451,9 @@ final class NodeModel: ObservableObject {
 
     /// Give `node` drive as well as read, or (`drive` false) read only (K-14).
     func setCapability(_ node: TrustedNode, drive: Bool) async -> Bool {
-        await keyringChange { [client] pass in
+        await keyringChange(fingerprint: node.fingerprint, alias: node.name,
+                            words: "give \(node.name) \(Capability.words(drive))",
+                            action: drive ? "Give Drive" : "Read Only") { [client] pass in
             try await client.setCapability(fingerprint: node.fingerprint, drive: drive,
                                            identityPassphrase: pass)
             return "\(node.name) now has \(Capability.words(drive))."
@@ -402,7 +462,9 @@ final class NodeModel: ObservableObject {
 
     /// Show `fingerprint` as `alias` from now on.
     func rename(_ fingerprint: String, to alias: String) async -> Bool {
-        await keyringChange { [client] pass in
+        let was = trusted.first { $0.fingerprint == fingerprint }?.name ?? String(fingerprint.prefix(12))
+        return await keyringChange(fingerprint: fingerprint, alias: alias,
+                                   words: "rename \(was) to \(alias)", action: "Rename") { [client] pass in
             try await client.trustRename(fingerprint: fingerprint, name: alias,
                                          identityPassphrase: pass)
             return "\(fingerprint.prefix(12)) is now \(alias)."
@@ -413,28 +475,42 @@ final class NodeModel: ObservableObject {
     /// Whether it was done; when not, why is `keyringFailed`, or the passphrase is asked for.
     @discardableResult
     func untrust(_ node: TrustedNode) async -> Bool {
-        await keyringChange { [client] pass in
+        await keyringChange(fingerprint: node.fingerprint, alias: node.name,
+                            words: "remove \(node.name) from your keyring", action: "Remove") { [client] pass in
             try await client.trustRemove(fingerprint: node.fingerprint, identityPassphrase: pass)
             return "Removed \(node.name) from your keyring. Your sender key is rotated, and everyone you "
                 + "still trust is re-keyed."
         }
     }
 
-    /// The change waiting for the passphrase, made with it; its bytes are wiped at once.
-    func retryKeyring(with secret: Secret) async {
+    /// The change `pending` names, made with the passphrase typed for it; its bytes are wiped at
+    /// once. Nothing is made unless `pending` is still the change waiting (D1): a prompt drawn for
+    /// one change never makes another.
+    func retryKeyring(_ pending: KeyringPending, with secret: Secret) async {
         defer { secret.wipe() }
-        guard let waiting = keyringWaiting else { return }
+        guard keyringPending?.id == pending.id else { return }
         do {
             let passphrase = try secret.passphrase()
             defer { passphrase.wipe() }
-            keyringDid = try await waiting(passphrase)
+            keyringDid = try await pending.run(passphrase)
             keyringFailed = nil
-            keyringNeedsPassphrase = false
-            keyringWaiting = nil
+            if keyringPending?.id == pending.id { keyringPending = nil }
             await refresh()
         } catch {
             keyringFailed = sentence(error)
         }
+    }
+
+    /// Cancel the change waiting for the passphrase: it is not made (D1).
+    func cancelKeyring() {
+        keyringPending = nil
+        keyringReplacing = nil
+    }
+
+    /// The person's answer to "Replace the waiting change?" (D1).
+    func replaceKeyring(_ yes: Bool) {
+        if yes, let next = keyringReplacing { keyringPending = next }
+        keyringReplacing = nil
     }
 
     // ---- trust offers (ADR-028 K-15 to K-18) ------------------------------------------------
@@ -461,23 +537,31 @@ final class NodeModel: ObservableObject {
     }
 
     /// Make a keyring change, asking for the passphrase when the node says the keyring window has
-    /// closed (ADR-026 N-2), and say what it did.
-    private func keyringChange(_ change: @escaping (Passphrase?) async throws -> String) async -> Bool {
+    /// closed (ADR-026 N-2, a typed refusal), and say what it did. The change waiting is named
+    /// (D1): what, on whom, and the action that makes it.
+    private func keyringChange(fingerprint: String, alias: String, words: String, action: String,
+                               _ change: @escaping (Passphrase?) async throws -> String) async -> Bool {
         keyringDid = nil
         keyringFailed = nil
         do {
             keyringDid = try await change(nil)
-            keyringNeedsPassphrase = false
+            // Any change that succeeds clears the one waiting: it was made in another way, or
+            // the person has moved on (D1).
+            keyringPending = nil
+            keyringReplacing = nil
             await refresh()
             return true
-        } catch {
-            let why = sentence(error)
-            if why.contains("needs your identity passphrase") {
-                keyringWaiting = change
-                keyringNeedsPassphrase = true
+        } catch VoxError.PassphraseNeeded {
+            let next = KeyringPending(fingerprint: fingerprint, alias: alias, words: words,
+                                      action: action, run: change)
+            if let waiting = keyringPending, waiting.words != next.words {
+                keyringReplacing = next
             } else {
-                keyringFailed = why
+                keyringPending = next
             }
+            return false
+        } catch {
+            keyringFailed = sentence(error)
             return false
         }
     }
@@ -758,7 +842,13 @@ final class NodeModel: ObservableObject {
     /// The next room that needs the person, if any (W-2).
     func nextNeedingYou() async {
         if let room = group(.needsYou).first {
-            await show(.room(room.id))
+            // A request waiting in one of its Sessions: that Session, that request (P1).
+            if let waiting = await firstWaiting(in: room.id) {
+                await openRequest(room: room.id, node: waiting.node, session: waiting.session,
+                                  reference: waiting.reference)
+            } else {
+                await show(.room(room.id))
+            }
         } else if let offer = offers.first {
             await show(.offer(offer.fingerprint))
         }
@@ -1019,16 +1109,22 @@ extension NodeModel {
         guard let room = roomOnScreen, let s = shownSession, s.canDrive else {
             if !sessionEntries.isEmpty { sessionEntries = [] }
             if sessionNote != nil { sessionNote = nil }
+            sessionLoading = false
             return
         }
         do {
             let read = try await client.sessionRead(room: room, node: s.nodeFingerprint,
                                                     sessionId: s.sessionId)
-            guard shownSession?.sessionId == s.sessionId else { return }
+            // Drawn only for the destination it was read for, still on screen and still driven
+            // (D3): the room, the Session's node and its id, and drive held.
+            guard roomOnScreen == room, let now = shownSession, now.nodeFingerprint == s.nodeFingerprint,
+                  now.sessionId == s.sessionId, now.canDrive else { return }
             if read.entries != sessionEntries { sessionEntries = read.entries }
             if read.note != sessionNote { sessionNote = read.note }
+            sessionLoading = false
         } catch {
             reportBackground(error)
+            sessionLoading = false
         }
     }
 
@@ -1042,6 +1138,92 @@ extension NodeModel {
                 rooms[i].waiting = n
             }
         }
+        await noteWaiting()
+    }
+
+    /// The requests open in `room`'s Sessions this node drives, waiting on it, in each Session's
+    /// order: `(node, session, reference, label)`.
+    private func waiting(in room: String) async -> [(node: String, session: String, reference: String, label: String)] {
+        guard let listed = try? await client.sessions(room: room) else { return [] }
+        var found: [(node: String, session: String, reference: String, label: String)] = []
+        for s in listed where s.pending > 0 && s.canDrive && s.open {
+            guard let read = try? await client.sessionRead(room: room, node: s.nodeFingerprint,
+                                                           sessionId: s.sessionId) else { continue }
+            for e in read.entries {
+                if let r = e.request, r.state == nil {
+                    found.append((s.nodeFingerprint, s.sessionId, r.reference, s.label))
+                }
+            }
+        }
+        return found
+    }
+
+    /// The first request waiting in `room`, for ⌘J.
+    private func firstWaiting(in room: String) async -> (node: String, session: String, reference: String)? {
+        guard let w = await waiting(in: room).first else { return nil }
+        return (w.node, w.session, w.reference)
+    }
+
+    /// A request that is new since the last look notifies, once per Session, replacing that
+    /// Session's earlier one; a Session no longer waiting has its notification withdrawn (P1).
+    /// Never the request's text (R-10).
+    private func noteWaiting() async {
+        var now: Set<String> = []
+        var bySession: [String: (room: String, node: String, session: String, reference: String, label: String)] = [:]
+        for room in rooms where room.open {
+            for w in await waiting(in: room.id) {
+                let key = "\(room.id)/\(w.node)/\(w.session)/\(w.reference)"
+                now.insert(key)
+                if !knownWaiting.contains(key) && waitingSeen {
+                    bySession["\(room.id)/\(w.node)/\(w.session)"] = (room.id, w.node, w.session, w.reference, w.label)
+                }
+            }
+        }
+        for (_, w) in bySession {
+            let name = rooms.first { $0.id == w.room }?.name ?? "a room"
+            notifier.postWaiting(room: w.room, roomName: name, node: w.node, session: w.session,
+                                 reference: w.reference, label: w.label)
+        }
+        let stillWaiting = Set(now.map { $0.split(separator: "/").prefix(3).joined(separator: "/") })
+        for gone in Set(knownWaiting.map { $0.split(separator: "/").prefix(3).joined(separator: "/") })
+            .subtracting(stillWaiting) {
+            notifier.withdrawWaiting(sessionKey: gone)
+        }
+        knownWaiting = now
+        waitingSeen = true
+    }
+
+    /// Open `room`, its Session `session` of `node`, and select its request `reference`, centred
+    /// (P1): where a notification and ⌘J land.
+    func openRequest(room: String, node: String, session: String, reference: String) async {
+        await show(.room(room))
+        showing = .session(node: node, id: session)
+        selectedRequest = reference
+    }
+
+    /// The approval selected in the Session on screen, open and this node's to answer: what
+    /// ⌥⌘Y and ⌥⌘N act on (P1). Questions are answered by their options, not these keys.
+    var selectedApproval: (session: FfiSession, room: String, reference: String)? {
+        guard let reference = selectedRequest, let s = shownSession, s.canDrive, s.open,
+              let room = roomOnScreen,
+              let r = sessionEntries.compactMap(\.request).first(where: { $0.reference == reference }),
+              r.state == nil, !r.isQuestion else { return nil }
+        return (s, room, reference)
+    }
+
+    /// Approve (⌥⌘Y) or Reject (⌥⌘N) the selected approval, and say what came of it (P1).
+    func answerSelected(approve: Bool) async {
+        guard let a = selectedApproval else { return }
+        let action: DriveAction = approve ? .approve(reference: a.reference)
+            : .reject(reference: a.reference, why: nil)
+        // What came of it is this operation's outcome (P6): done, refused, or not known.
+        begin(approve ? "approve-request" : "reject-request")
+        switch await driveResult(a.session, in: a.room, action) {
+        case let .taken(words): report(done: asSentence(words))
+        case let .refused(words): outcome = Outcome(operation: operation, kind: .refused, words: asSentence(words))
+        case let .unknown(words): outcome = Outcome(operation: operation, kind: .unknown, words: asSentence(words))
+        }
+        await readSession()
     }
 
     /// A Session in `room` opened, ended or was renamed, or what waits on this node changed.
@@ -1051,6 +1233,7 @@ extension NodeModel {
             let n = listed.reduce(0) { $0 + Int($1.pending) }
             if rooms[i].waiting != n { rooms[i].waiting = n }
         }
+        await noteWaiting()
         guard roomOnScreen == room, let listed = try? await client.sessions(room: room),
               roomOnScreen == room else { return }
         if listed != sessions { sessions = listed }

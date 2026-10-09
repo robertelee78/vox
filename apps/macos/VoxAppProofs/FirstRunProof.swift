@@ -5,6 +5,8 @@
 // (through xcodebuild's TEST_RUNNER_ prefix):
 //   VOX_PROOF_APP      the Vox.app under proof; its Contents/Helpers/vox runs the daemon
 //   VOX_PROOF_SCRATCH  a scratch directory: the data root and config directory go there
+//   VOX_PROOF_CONTINUE 1 for a combined mutant build: a case goes on past a red (its
+//                      closing [proof] line then holds nothing)
 //
 // What must hold, as a person sees it:
 // 1. At first run the app asks once whether to keep the daemon running while logged in, saying
@@ -108,6 +110,12 @@ func shown(_ element: XCUIElement) -> String {
     if let value = element.value as? String, !value.isEmpty { return value }
     // A menu button's words are its title.
     return element.title
+}
+
+/// What is typed in a text field: its value, never its label (a composer's label names it, as
+/// "Message to the room", whatever is typed). Empty when nothing is.
+func typed(_ field: XCUIElement) -> String {
+    (field.value as? String) ?? ""
 }
 
 /// Refuse (APPARATUS) to launch the app with a data root or config directory outside this run's
@@ -224,8 +232,11 @@ final class FirstRunProof: XCTestCase {
     private var handedOff = false
 
     override func setUpWithError() throws {
-        // A case stops at its first red: one red, with its side, and no cascade behind it.
-        continueAfterFailure = false
+        // A case stops at its first red: one red, with its side, and no cascade behind it. A
+        // combined mutant build (VOX_PROOF_CONTINUE=1) goes on, so each mutated claim says its own
+        // red; whoever runs it keeps out any mutant whose red could follow from another's. A
+        // case's closing `[proof]` line still prints there, and holds only in a run with no red.
+        continueAfterFailure = ProcessInfo.processInfo.environment["VOX_PROOF_CONTINUE"] == "1"
         stager = try Stager.fromEnvironment()
         let workspace = NSWorkspace.shared
         watchingVox = workspace.notificationCenter.addObserver(
@@ -259,6 +270,10 @@ final class FirstRunProof: XCTestCase {
     }
 
     override func tearDown() {
+        // A red stops a case without running its `defer`s (continueAfterFailure is false), so the
+        // Vox it started would still run into the next case: quit here each Vox this case started.
+        for ui in launched where ui.state != .notRunning { ui.terminate() }
+        launched = []
         if let watchingForeground { NSWorkspace.shared.notificationCenter.removeObserver(watchingForeground) }
         if let watchingVox { NSWorkspace.shared.notificationCenter.removeObserver(watchingVox) }
         daemon?.terminate()
@@ -1033,6 +1048,300 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(gone && kept == vault,
                       "PRODUCT: Move It Aside must move the old node directory, whole: it must be kept under moved-aside/ with its vault as it was, and gone from where it was; gone from there: \(gone), the kept vault reads \(kept.debugDescription); the app said \(note.debugDescription)")
         print("[proof] earlier release: default moved aside whole (\(note)); the welcome followed; no screen named Terminal or a vox command")
+    }
+
+    /// Driving Sessions in the app goes where it is shown (D2, D12, D13, P1). Alice and the
+    /// agent node claude-a share rooms work and other; claude-a's two Sessions S1 and S2 are opened
+    /// by `vox agent hook` as Claude Code runs it, and S1 asks an approval. Claims, each with its
+    /// mutant:
+    /// - D12: work's draft survives going to other and back (mutant: the draft not restored);
+    ///   S1's draft never shows in S2, and comes back in S1 (mutant: the composer not keyed by
+    ///   its Session).
+    /// - D2: with S1 shown, ⌘↩ sends nothing to the room, and Send Urgent is disabled (mutant:
+    ///   Send Urgent enabled in a Session).
+    /// - D13: a prompt the Session does not take stays in its composer (mutant: cleared before
+    ///   delivery), and ⌃C asks before stopping.
+    /// - P1: ⌘J opens S1 with its waiting request selected, and ⌥⌘Y approves it: the hook gets
+    ///   "allow" (mutant: ⌘J opening the room only).
+    func testSessionsAreDrivenWhereTheyAreShown() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
+            throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are set by scripts/app-proofs.sh")
+        }
+        let vox = URL(fileURLWithPath: appPath).appendingPathComponent("Contents/Helpers/vox").path
+        let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("sessions")
+        let data = root.appendingPathComponent("data").path
+        let config = root.appendingPathComponent("config").path
+        let work = root.appendingPathComponent("work").path
+        let home = root.appendingPathComponent("home").path
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        let pass = { (name: String) in root.appendingPathComponent("\(name).pass").path }
+        try stager.write(Data("alice identity\n".utf8), to: pass("alice"))
+        try stager.write(Data("agent identity\n".utf8), to: pass("claude-a"))
+        try stager.write(Data("work room\n".utf8), to: pass("room"))
+        try stager.write(Data("keep\n".utf8), to: work + "/.keep")
+        try stager.write(Data("keep\n".utf8), to: home + "/.keep")
+        // The first run answered (Not Now) and the node chosen: the app opens as alice.
+        try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
+        try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+                           until: "vox daemon: control socket")
+        for (name, words) in [("alice", "alice identity"), ("claude-a", "agent identity")] {
+            try staged(vox, ["node", "create", name],
+                       env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": words]) { $1 })
+            try staged(vox, ["node", "attach", name, "--passphrase-file", pass(name)], env: voxEnv)
+        }
+        let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
+        let agentFp = try line(staged(vox, ["id", "--node", "claude-a"], env: voxEnv)) { $0.count == 52 }
+        var rooms: [String: String] = [:]
+        for name in ["work", "other"] {
+            try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", pass("room"),
+                             "--name", name], env: voxEnv)
+            let id = try line(staged(vox, ["room", "list", "--node", "alice"], env: voxEnv)) {
+                $0.contains(" \(name)")
+            }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+            let link = try line(staged(vox, ["room", "link", "--node", "alice", id], env: voxEnv)) {
+                $0.hasPrefix("vox://")
+            }
+            try staged(vox, ["room", "join", "--node", "claude-a", "--passphrase-file", pass("room"), link],
+                       env: voxEnv)
+            rooms[name] = id
+        }
+        let room = rooms["work"] ?? ""
+        try staged(vox, ["trust", "add", "--node", "alice", agentFp, "--name", "claude-a",
+                         "--identity-passphrase-file", pass("alice")], env: voxEnv)
+        try staged(vox, ["trust", "add", "--node", "claude-a", aliceFp, "--name", "alice", "--drive",
+                         "--identity-passphrase-file", pass("claude-a")], env: voxEnv)
+        // Claude Code's two sessions, opened by its hook as it runs it.
+        let hookEnv = voxEnv.merging(["HOME": home, "VOX_NODE": "claude-a",
+                                      "VOX_IDENTITY_PASSPHRASE": "agent identity",
+                                      "CLAUDE_CODE_ENTRYPOINT": "cli", "PATH": "/usr/bin:/bin"]) { $1 }
+        let s1 = "51aaaaaa-4c0e-4f00-9a1b-0c0ffee54001", s2 = "52bbbbbb-4c0e-4f00-9a1b-0c0ffee54002"
+        func event(_ session: String, _ name: String, _ extra: [String: Any] = [:]) -> String {
+            var e: [String: Any] = ["session_id": session, "transcript_path": work + "/\(session).jsonl",
+                                    "cwd": work, "permission_mode": "default", "hook_event_name": name]
+            for (k, v) in extra { e[k] = v }
+            let bytes = (try? JSONSerialization.data(withJSONObject: e)) ?? Data()
+            return String(decoding: bytes, as: UTF8.self)
+        }
+        func hook(_ json: String) throws {
+            let r = stager.run(["/bin/sh", "-c", "cd \"$1\" && exec \"$2\" agent hook --node claude-a --room \"$3\"",
+                                "hook", work, vox, room], env: hookEnv, input: json)
+            guard r.status == 0 else { throw Apparatus("`vox agent hook` exited \(r.status): \(r.out)") }
+        }
+        for (session, words) in [(s1, "S1-WORDS"), (s2, "S2-WORDS")] {
+            try stager.write(Data(), to: work + "/\(session).jsonl")
+            try hook(event(session, "UserPromptSubmit", ["prompt": words]))
+        }
+        // S1 asks an approval: its hook waits for the answer, in the background, its pid kept.
+        // Only the hook itself goes to the background, with its own output in a file, so nothing
+        // left running holds the stager's pipe open; `&&` would background a subshell holding it.
+        let touch: [String: Any] = ["command": "touch p1", "description": "Make p1"]
+        try hook(event(s1, "PreToolUse", ["tool_name": "Bash", "tool_input": touch, "tool_use_id": "toolu_P1"]))
+        let asked = root.appendingPathComponent("asked")
+        try stager.write(Data(event(s1, "PermissionRequest", ["tool_name": "Bash", "tool_input": touch,
+                                                               "permission_suggestions": []]).utf8),
+                         to: asked.path + ".json")
+        let started = stager.run(["/bin/sh", "-c",
+                                  "cd \"$1\" || exit 1; \"$2\" agent hook --node claude-a --room \"$3\" < \"$4.json\" > \"$4.out\" 2>&1 & echo $!",
+                                  "hook", work, vox, room, asked.path], env: hookEnv)
+        let hookPid = started.out.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard started.status == 0, Int32(hookPid) != nil else {
+            throw Apparatus("the waiting PermissionRequest hook did not start: \(started.out)")
+        }
+        defer { _ = stager.run(["/bin/kill", hookPid], env: [:]) }
+        let waitingUntil = Date().addingTimeInterval(20)
+        var sessionsNow = ""
+        while Date() < waitingUntil && !sessionsNow.contains("waiting") {
+            sessionsNow = run(vox, ["room", "sessions", "--node", "alice", room], env: voxEnv).out
+            if !sessionsNow.contains("waiting") { Thread.sleep(forTimeInterval: 0.5) }
+        }
+
+        let ui = voxApp(appPath)
+        ui.launchEnvironment = voxEnv
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        defer { ui.terminate() }
+        present(ui, Key.id("attached"), timeout: 60, "the app must open attached as alice")
+
+        // P1: ⌘J lands on S1, its waiting request selected.
+        ui.typeKey("j", modifierFlags: .command)
+        let requestRow = Key.idPrefix("request-row-")
+        present(ui, requestRow, timeout: 30,
+                "⌘J must open S1, the Session waiting on alice, with its request",
+                premise: Premise("S1 has a request waiting on alice") {
+                    (sessionsNow.contains("waiting"), "`vox room sessions` said \(sessionsNow.debugDescription)")
+                })
+        if let row = locate(ui, requestRow), !row.isSelected {
+            keepTree(ui, "the request ⌘J landed on was not selected")
+            XCTFail("PRODUCT: ⌘J must select the waiting request in S1; its row is not selected")
+        }
+        // ⌥⌘Y approves the selected request: the hook gets allow.
+        ui.typeKey("y", modifierFlags: [.command, .option])
+        let answerUntil = Date().addingTimeInterval(20)
+        var answered = ""
+        while Date() < answerUntil && !answered.contains("behavior") {
+            answered = stager.run(["/bin/cat", asked.path + ".out"], env: [:]).out
+            if !answered.contains("behavior") { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        XCTAssertTrue(answered.contains("\"allow\""),
+                      "PRODUCT: ⌥⌘Y must approve the selected request: S1's hook must get allow; it printed \(answered.debugDescription)")
+
+        // D12: work's draft survives going to other and back.
+        tap(ui, Key.id("session-general"), "General in work's Sessions")
+        let compose = Key.id("compose")
+        type(ui, compose, "KEEP-ROOM-DRAFT", "work's composer")
+        tap(ui, Key.id("room-other"), "other in the sidebar", premise: inRoom(vox, voxEnv, "other"))
+        tap(ui, Key.id("room-work"), "work in the sidebar", premise: inRoom(vox, voxEnv, "work"))
+        tap(ui, Key.id("session-general"), "General in work's Sessions")
+        words(ui, compose, timeout: 10, "work's draft must be kept when another room is opened and work again",
+              until: { $0.contains("KEEP-ROOM-DRAFT") }, field: true)
+
+        // D2: with S1 shown, ⌘↩ sends nothing to the room, and Send Urgent is disabled.
+        let s1Row = Key.id("session-\(s1.prefix(8))"), s2Row = Key.id("session-\(s2.prefix(8))")
+        tap(ui, s1Row, "S1 in work's Sessions")
+        ui.typeKey(.return, modifierFlags: .command)
+        Thread.sleep(forTimeInterval: 3)
+        let roomRead = run(vox, ["room", "read", "--node", "alice", room], env: voxEnv).out
+        XCTAssertFalse(roomRead.contains("KEEP-ROOM-DRAFT"),
+                       "PRODUCT: ⌘↩ while S1 is shown must not send work's General draft to the room; the room reads it")
+        let urgent = ui.menuBars.menuItems["Send Urgent"]
+        if urgent.exists && urgent.isEnabled {
+            XCTFail("PRODUCT: Send Urgent must be disabled while a Session is shown; it is enabled")
+        }
+
+        // D12: S1's draft never shows in S2, and comes back in S1.
+        let sessionCompose = Key.id("session-compose")
+        type(ui, sessionCompose, "S1-DRAFT", "S1's composer")
+        tap(ui, s2Row, "S2 in work's Sessions")
+        Thread.sleep(forTimeInterval: 1)
+        if let e = locate(ui, sessionCompose), typed(e).contains("S1-DRAFT") {
+            keepTree(ui, "S1's draft showed in S2")
+            XCTFail("PRODUCT: S1's draft must not show in S2's composer; it shows \"\(typed(e))\"")
+        }
+        tap(ui, s1Row, "S1 in work's Sessions")
+        words(ui, sessionCompose, timeout: 10, "S1's draft must come back in S1",
+              until: { $0.contains("S1-DRAFT") }, field: true)
+
+        // D13: a prompt S2 does not take stays. claude-a is detached first, so nothing can take
+        // it: refused or unanswered, the text must stay.
+        try staged(vox, ["node", "detach", "claude-a"], env: voxEnv)
+        tap(ui, s2Row, "S2 in work's Sessions")
+        type(ui, sessionCompose, "S2-PROMPT\r", "S2's composer")
+        let said = words(ui, Key.id("session-said"), timeout: 30, "S2 must say what came of the prompt",
+                         until: { !$0.isEmpty }) ?? ""
+        words(ui, sessionCompose, timeout: 5,
+              "a prompt S2 did not take must stay in its composer (S2 said \"\(said)\")",
+              until: { $0.contains("S2-PROMPT") }, field: true)
+        ui.typeKey("c", modifierFlags: .control)
+        present(ui, Key.showing("It ends the session."), timeout: 10,
+                "⌃C must ask before stopping the Session")
+        ui.typeKey(.escape, modifierFlags: [])
+        print("[proof] sessions: ⌘J landed on S1's request and ⌥⌘Y approved it; work's draft kept; ⌘↩ in S1 sent nothing; S1's draft stayed in S1; S2 said \(said.debugDescription) and kept the prompt; ⌃C asked")
+    }
+
+    /// A keyring change waiting for the passphrase is bound to what it changes (D1). Alice is
+    /// attached with her keyring window closed, so a change asks for the passphrase. She adds
+    /// bob; the prompt names it ("trust bob"). Carol, a newcomer to her room, is offered: carol's
+    /// offer shows no prompt, only that a change is waiting; trusting carol there asks first
+    /// whether to replace it, and kept, the passphrase typed makes bob's change, not carol's.
+    /// Mutant: the prompt shown wherever a change waits → red at "carol's offer must not show
+    /// the prompt".
+    func testAKeyringChangeWaitsWhereItWasMade() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
+            throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are set by scripts/app-proofs.sh")
+        }
+        let vox = URL(fileURLWithPath: appPath).appendingPathComponent("Contents/Helpers/vox").path
+        let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("keyring-pending")
+        let data = root.appendingPathComponent("data").path
+        let config = root.appendingPathComponent("config").path
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        let pass = { (name: String) in root.appendingPathComponent("\(name).pass").path }
+        for name in ["alice", "bob", "carol"] {
+            try stager.write(Data("\(name) identity\n".utf8), to: pass(name))
+        }
+        try stager.write(Data("pending room\n".utf8), to: pass("room"))
+        try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
+        try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+                           until: "vox daemon: control socket")
+        for name in ["alice", "bob", "carol"] {
+            try staged(vox, ["node", "create", name],
+                       env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "\(name) identity"]) { $1 })
+            try staged(vox, ["node", "attach", name, "--passphrase-file", pass(name)], env: voxEnv)
+        }
+        let bobFp = try line(staged(vox, ["id", "--node", "bob"], env: voxEnv)) { $0.count == 52 }
+        let carolFp = try line(staged(vox, ["id", "--node", "carol"], env: voxEnv)) { $0.count == 52 }
+        try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", pass("room"),
+                         "--name", "pending"], env: voxEnv)
+        let room = try line(staged(vox, ["room", "list", "--node", "alice"], env: voxEnv)) {
+            $0.contains(" pending")
+        }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        let link = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        // Carol joins: alice is offered carol (K-15).
+        try staged(vox, ["room", "join", "--node", "carol", "--passphrase-file", pass("room"), link],
+                   env: voxEnv)
+        let offerUntil = Date().addingTimeInterval(30)
+        var offers = ""
+        while Date() < offerUntil && !offers.contains(String(carolFp.prefix(12))) {
+            offers = run(vox, ["trust", "offers", "--node", "alice"], env: voxEnv).out
+            if !offers.contains(String(carolFp.prefix(12))) { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        guard offers.contains(String(carolFp.prefix(12))) else {
+            throw Apparatus("staging not achieved: alice was never offered carol: `vox trust offers` said \(offers)")
+        }
+
+        let ui = voxApp(appPath)
+        ui.launchEnvironment = voxEnv
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        defer { ui.terminate() }
+        present(ui, Key.id("attached"), timeout: 60, "the app must open attached as alice")
+
+        // Bob's change, waiting for the passphrase, named.
+        tap(ui, Key.id("keyring"), "Keyring in the sidebar")
+        type(ui, Key.id("keyring-add-fingerprint"), bobFp, "the fingerprint field")
+        type(ui, Key.id("keyring-add-alias"), "bob", "the alias field")
+        tap(ui, Key.id("keyring-trust"), "Trust")
+        words(ui, Key.id("keyring-passphrase-why"), timeout: 15,
+              "a change waiting for the passphrase must name itself",
+              until: { $0.contains("trust bob") })
+
+        // Carol's offer: no prompt there, only that bob's change waits.
+        let offer = Key.id("offer-\(carolFp.prefix(12))")
+        tap(ui, offer, "carol's offer in the sidebar",
+            premise: Premise("carol is offered to alice") {
+                (offers.contains(String(carolFp.prefix(12))), "`vox trust offers` said \(offers.debugDescription)")
+            })
+        present(ui, Key.id("offer-alias"), timeout: 10, "carol's offer must open")
+        if locate(ui, Key.id("keyring-passphrase")) != nil {
+            keepTree(ui, "carol's offer showed the passphrase prompt")
+            XCTFail("PRODUCT: carol's offer must not show the passphrase prompt for bob's change")
+        }
+        words(ui, Key.id("keyring-waiting"), timeout: 10,
+              "carol's offer must say a keyring change is waiting, and which",
+              until: { $0.contains("trust bob") })
+        // Trusting carol while bob's waits: asked first; kept.
+        type(ui, Key.id("offer-alias"), "carol", "carol's alias field")
+        tap(ui, Key.id("offer-accept"), "Trust on carol's offer")
+        present(ui, Key.id("keyring-replace-ask"), timeout: 15,
+                "a second change waiting for the passphrase must ask before replacing the first")
+        tap(ui, Key.id("keyring-replace-no"), "Keep Waiting Change")
+
+        // The passphrase, typed where bob's change waits, makes bob's change only.
+        tap(ui, Key.id("keyring"), "Keyring in the sidebar")
+        type(ui, Key.id("keyring-passphrase"), "alice identity", "the keyring's passphrase field")
+        tap(ui, Key.id("keyring-passphrase-continue"), "Trust (with the passphrase)")
+        let listUntil = Date().addingTimeInterval(30)
+        var list = ""
+        while Date() < listUntil && !list.contains(bobFp) {
+            list = run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out
+            if !list.contains(bobFp) { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        XCTAssertTrue(list.contains(bobFp) && !list.contains(carolFp),
+                      "PRODUCT: the passphrase typed for bob's change must trust bob, and not carol; `vox trust list` says \(list)")
+        print("[proof] keyring: bob's change named and waiting; carol's offer showed only the waiting line; a second change asked first; the passphrase trusted bob only")
     }
 
     func testFirstRunAttachesTheNodeAndQuitDetachesIt() throws {
@@ -2117,6 +2426,9 @@ final class FirstRunProof: XCTestCase {
         URL(fileURLWithPath: path).resolvingSymlinksInPath().path
     }
 
+    /// Each Vox.app this case started, quit at its end however it ends.
+    private var launched: [XCUIApplication] = []
+
     /// The app the proof drives: this build's own Vox.app, by its path (app-proofs.sh refuses any
     /// other: XCTest launches another bundle without the environment).
     private func voxApp(_ appPath: String) -> XCUIApplication {
@@ -2140,6 +2452,7 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("refusing to start Vox Proof: one already runs (pid \(running), \(executable(running))), and the proof could drive it")
         }
         ui.launch()
+        launched.append(ui)
         let running = proofApps()
         guard running.count == 1, let pid = running.first, executable(pid) == appExe else {
             throw Apparatus("after starting Vox Proof, the \(proofAppID) processes are \(running.map { "\($0) \(executable($0))" }), not one of \(appExe)")
@@ -2264,11 +2577,13 @@ final class FirstRunProof: XCTestCase {
 
     /// `key`'s words once `holds` is true of them, within `timeout`, the premise holding: PRODUCT
     /// quoting them when it never is; `missing` when it never shows; APPARATUS when it shows and
-    /// XCTest reads neither its label nor its value.
+    /// XCTest reads neither its label nor its value. A `field` is read by what is typed in it
+    /// (`typed`), and an empty one is read as empty.
     @discardableResult
     private func words(_ ui: XCUIApplication, _ key: Key, timeout: TimeInterval, _ product: String,
-                       until holds: (String) -> Bool = { _ in true },
+                       until holds: (String) -> Bool = { _ in true }, field: Bool = false,
                        file: StaticString = #filePath, line: UInt = #line) -> String? {
+        let read = field ? typed : shown
         guard windowReadable(ui, file: file, line: line) else { return nil }
         let end = Date().addingTimeInterval(timeout)
         var last = ""
@@ -2276,19 +2591,19 @@ final class FirstRunProof: XCTestCase {
         repeat {
             if let e = locate(ui, key) {
                 seen = true
-                last = shown(e)
-                if !last.isEmpty && holds(last) { return last }
+                last = read(e)
+                if (field || !last.isEmpty) && holds(last) { return last }
             }
             Thread.sleep(forTimeInterval: 0.25)
         } while Date() < end
         if !seen, let e = locateEverywhere(ui, key) {
             seen = true
-            last = shown(e)
-            if !last.isEmpty && holds(last) { return last }
+            last = read(e)
+            if (field || !last.isEmpty) && holds(last) { return last }
         }
         if !seen {
             missing(ui, key, product, file: file, line: line)
-        } else if last.isEmpty {
+        } else if last.isEmpty && !field {
             keepTree(ui, "\(key) could not be read")
             XCTFail("APPARATUS: \(key) is shown and XCTest reads neither its label nor its value",
                     file: file, line: line)

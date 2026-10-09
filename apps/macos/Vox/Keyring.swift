@@ -39,8 +39,12 @@ struct KeyringView: View {
                         .textSelection(.enabled)
                         .accessibilityIdentifier("keyring-said")
                 }
-                if model.keyringNeedsPassphrase {
-                    KeyringPassphrase(model: model)
+                KeyringReplaceAsk(model: model)
+                // A change for a node not in the keyring yet (an add) is asked for here; one for
+                // a node in it, beside its row (D1).
+                if let pending = model.keyringPending,
+                   !model.trusted.contains(where: { $0.fingerprint == pending.fingerprint }) {
+                    KeyringPassphrase(model: model, pending: pending)
                 }
                 addForm
                 Divider()
@@ -186,6 +190,9 @@ private struct KeyringRow: View {
                 Button("Remove…", role: .destructive, action: remove)
                     .accessibilityIdentifier("keyring-remove-\(node.name)")
             }
+            if let pending = model.keyringPending, pending.fingerprint == node.fingerprint {
+                KeyringPassphrase(model: model, pending: pending)
+            }
             if changing {
                 // The other grant, said before it is made (E-5).
                 Text(Effects.granting(node.name, drive: !node.drive)).secondaryText()
@@ -283,7 +290,10 @@ private struct RemoveSheet: View {
                         // Closed only once it is done; a failure stays, with its reason.
                         if await model.untrust(node) {
                             done()
-                        } else if model.keyringNeedsPassphrase {
+                        } else if model.keyringPending?.fingerprint == node.fingerprint
+                                    || model.keyringReplacing?.fingerprint == node.fingerprint {
+                            // This removal waits for the passphrase, or asks first whether to
+                            // replace another change waiting (D1).
                             asking = true
                         } else {
                             failed = model.keyringFailed
@@ -295,7 +305,10 @@ private struct RemoveSheet: View {
                 .accessibilityIdentifier("keyring-remove-confirm")
             }
             if asking {
-                KeyringPassphrase(model: model)
+                KeyringReplaceAsk(model: model)
+                if let pending = model.keyringPending, pending.fingerprint == node.fingerprint {
+                    KeyringPassphrase(model: model, pending: pending)
+                }
             }
             if let failed {
                 StateMark(kind: .danger, words: failed).textSelection(.enabled)
@@ -304,11 +317,18 @@ private struct RemoveSheet: View {
         }
         .padding(24)
         .frame(width: Theme.scaled(440))
-        // The passphrase given: done once the change is made, else why not, here.
-        .onChange(of: model.keyringNeedsPassphrase) { needs in
-            guard asking, !needs else { return }
+        // The passphrase given: done once the change is made, else why not, here. Cancelled, or
+        // the other change kept, nothing was removed and the sheet stays.
+        .onChange(of: model.keyringPending?.id) { _ in
+            guard asking, model.keyringPending?.fingerprint != node.fingerprint,
+                  model.keyringReplacing?.fingerprint != node.fingerprint else { return }
             asking = false
-            if model.keyringFailed == nil { done() }
+            if model.keyringFailed == nil, model.keyringDid != nil { done() }
+        }
+        .onChange(of: model.keyringReplacing?.id) { _ in
+            guard asking, model.keyringReplacing == nil,
+                  model.keyringPending?.fingerprint != node.fingerprint else { return }
+            asking = false
         }
         .onChange(of: model.keyringFailed) { why in
             if asking, let why { failed = why }
@@ -316,26 +336,90 @@ private struct RemoveSheet: View {
     }
 }
 
-/// The identity passphrase, asked for when the keyring window has closed (ADR-026 N-2): the
-/// change waiting for it is made with it.
+/// A keyring change waiting for the identity passphrase (ADR-026 N-2), bound to what it changes
+/// (D1): the node, the alias, the change in words, and the action that makes it. It holds no
+/// passphrase; `run` makes the change with the one typed for it.
+struct KeyringPending: Identifiable {
+    let id = UUID()
+    let fingerprint: String
+    let alias: String
+    /// The change, said in the prompt: "give bo read + drive".
+    let words: String
+    /// What its button says: "Give Drive".
+    let action: String
+    let run: (Passphrase?) async throws -> String
+}
+
+/// The identity passphrase for the change `pending` names, asked for beside what it changes (D1):
+/// made only for that change; Cancel drops it.
 struct KeyringPassphrase: View {
     @ObservedObject var model: NodeModel
+    let pending: KeyringPending
     @State private var field = SecureFieldHolder()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Changing who you trust needs your identity passphrase again.").secondaryText()
+            Text("Type your identity passphrase to \(pending.words).").secondaryText()
+                .accessibilityIdentifier("keyring-passphrase-why")
             SecureInput(holder: field) { submit() }
-                .accessibilityLabel("Identity passphrase")
+                .accessibilityLabel("Identity passphrase, to \(pending.words)")
                 .frame(width: Theme.scaled(320))
                 .accessibilityIdentifier("keyring-passphrase")
-            Button("Continue") { submit() }
-                .accessibilityIdentifier("keyring-passphrase-continue")
+            HStack {
+                Button(pending.action) { submit() }
+                    .keyboardShortcut(.defaultAction)
+                    .accessibilityIdentifier("keyring-passphrase-continue")
+                Button("Cancel") { model.cancelKeyring() }
+                    .keyboardShortcut(.cancelAction)
+                    .accessibilityIdentifier("keyring-passphrase-cancel")
+            }
         }
     }
 
     private func submit() {
         guard let secret = field.take() else { return }
-        Task { await model.retryKeyring(with: secret) }
+        let change = pending
+        Task { await model.retryKeyring(change, with: secret) }
+    }
+}
+
+/// A keyring change waiting somewhere else: one line, with Show and Cancel (D1).
+struct KeyringWaitingLine: View {
+    @ObservedObject var model: NodeModel
+    let pending: KeyringPending
+
+    var body: some View {
+        HStack {
+            Text("A keyring change is waiting for your passphrase: \(pending.words).").secondaryText()
+                .accessibilityIdentifier("keyring-waiting")
+            Button("Show") { model.select(.keyring) }
+                .accessibilityIdentifier("keyring-waiting-show")
+            Button("Cancel") { model.cancelKeyring() }
+                .accessibilityIdentifier("keyring-waiting-cancel")
+        }
+    }
+}
+
+/// A second change needing the passphrase while one waits: replaced only if the person says so
+/// (D1).
+struct KeyringReplaceAsk: View {
+    @ObservedObject var model: NodeModel
+
+    var body: some View {
+        if let next = model.keyringReplacing, let waiting = model.keyringPending {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Replace the waiting change? \(waiting.words.prefix(1).uppercased() + waiting.words.dropFirst()) "
+                    + "is waiting for your passphrase; \(next.words) would take its place.")
+                    .secondaryText()
+                    .accessibilityIdentifier("keyring-replace-ask")
+                HStack {
+                    Button("Replace") { model.replaceKeyring(true) }
+                        .accessibilityIdentifier("keyring-replace-yes")
+                    Button("Keep Waiting Change") { model.replaceKeyring(false) }
+                        .keyboardShortcut(.cancelAction)
+                        .accessibilityIdentifier("keyring-replace-no")
+                }
+            }
+        }
     }
 }
