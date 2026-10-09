@@ -378,6 +378,8 @@ private struct RoomView: View {
     /// The newest message when the messages last changed: if it was in view, the timeline follows
     /// the next one; scrolled up to read, it stays (as the TUI does, V210-82).
     @State private var newest: String?
+    /// What is shown just changed, and has not been scrolled to its newest line yet.
+    @State private var opened = false
     /// Whether the keyboard is on the timeline (WCAG 2.1.1): ↑/↓ move the selection, Return
     /// opens the selected message's first action, Space Quick Looks its pulled file.
     @State private var timelineFocused = false
@@ -453,11 +455,13 @@ private struct RoomView: View {
                                             Text(notice).secondaryText().italic()
                                                 .padding(.horizontal, 4)
                                                 .accessibilityIdentifier(item.id)
+                                                .reportsFrame(of: item.id)
                                                 .id(item.id)
                                         } else if let entry = item.entry, let session = model.shownSession,
                                                   let room = model.roomOnScreen {
                                             SessionEntryRow(model: model, room: room, session: session,
                                                             entry: entry) { looking = $0 }
+                                                .reportsFrame(of: item.id)
                                                 .id(item.id)
                                         }
                                     }
@@ -496,10 +500,10 @@ private struct RoomView: View {
                             // appeared, its count never changed and it stayed at the top, so the
                             // newest rows were never in view, and never read.
                             .onAppear {
-                                if let last = model.messages.last {
-                                    scroller.scrollTo(last.id, anchor: .bottom)
+                                if let last = model.followItem {
+                                    scroller.scrollTo(last, anchor: .bottom)
                                 }
-                                newest = model.messages.last?.id
+                                newest = model.followItem
                             }
                             // A request ⌘J or a notification landed on, centred once its
                             // Session's entries are drawn (P1).
@@ -507,17 +511,44 @@ private struct RoomView: View {
                             .onChange(of: model.sessionEntries.count) { _ in
                                 centre(model.selectedRequest, scroller)
                             }
-                            .onChange(of: model.messages.count) { _ in
-                                let following = newest == nil || inView.contains(newest ?? "")
-                                if following, let last = model.messages.last {
-                                    scroller.scrollTo(last.id, anchor: .bottom)
+                            // What is shown changed (General, All, a Session): it opens at its
+                            // newest line, or, a Session with a request waiting, at that request,
+                            // centred, so going to an approval shows it (P7).
+                            .onChange(of: model.showing) { _ in
+                                openAtNewest(scroller)
+                                // A Session's lines are read after it is chosen: it is opened
+                                // again at its newest once they land.
+                                opened = model.showsSessionToRead
+                                newest = model.followItem
+                            }
+                            // Each new line followed while the newest was in view: by the last
+                            // real line's identity and the count (a Session's note, kept at the
+                            // end, is not a line to follow), so a Session follows its output
+                            // as General follows its messages.
+                            .onChange(of: model.followSignature) { _ in
+                                // A request gone to (⌘J, a notification) stays where it was
+                                // centred: new output does not scroll it away (P1, P7).
+                                if model.selectedRequest != nil, !opened {
+                                    newest = model.followItem
+                                    return
                                 }
-                                newest = model.messages.last?.id
+                                if opened, !model.showsSessionToRead {
+                                    opened = false
+                                    openAtNewest(scroller)
+                                } else {
+                                    let following = newest == nil || inView.contains(newest ?? "")
+                                    if following, let last = model.followItem {
+                                        scroller.scrollTo(last, anchor: .bottom)
+                                    }
+                                }
+                                newest = model.followItem
                             }
                         }
                     }
                     .background(WindowReader(seen: window))
                     .onChange(of: window.seen) { _ in markSeen() }
+                    .onChange(of: model.showing) { _ in updateLooking() }
+                    .onDisappear { if model.lookingAt == room { model.lookingAt = nil } }
                     // A row whose body has just arrived is read now, even if its frame is
                     // unchanged (no new measure to trigger it).
                     .onChange(of: model.messages) { _ in markSeen() }
@@ -732,9 +763,32 @@ private struct RoomView: View {
         return true
     }
 
+    /// What is shown, at its newest line; or a Session's request waiting for an answer, centred.
+    private func openAtNewest(_ scroller: ScrollViewProxy) {
+        if model.selectedRequest != nil {
+            centre(model.selectedRequest, scroller)
+        } else if let waiting = model.waitingEntry {
+            scroller.scrollTo(waiting, anchor: .center)
+        } else if let last = model.followItem {
+            scroller.scrollTo(last, anchor: .bottom)
+        }
+    }
+
+    /// Tell the model whether this room's own timeline is being looked at as it grows: in a window
+    /// in front of the person, General or All shown (not a Session), and its newest message in
+    /// view, so the next one is drawn in view as it lands (D18).
+    private func updateLooking() {
+        var ownTimeline = true
+        if case .session = model.showing { ownTimeline = false }
+        let following = newest == nil || inView.contains(newest ?? "")
+        let now = window.seen && ownTimeline && following ? room : nil
+        if model.lookingAt != now { model.lookingAt = now }
+    }
+
     /// The rows in view are read, only while the window is in front of the person (R-6).
     private func markSeen() {
         readLog.debug("seen check in \(room, privacy: .public): window seen \(window.seen), \(inView.count) rows in view")
+        updateLooking()
         guard window.seen else { return }
         for id in inView {
             if let message = model.byID[id] { model.drawn(message, in: room) }

@@ -106,6 +106,30 @@ extension NodeModel {
         }
     }
 
+    /// The newest line of what is shown, to follow: the last one with a time of its own (a
+    /// Session's closing note, kept at the end, is not one).
+    var followItem: String? {
+        timelineItems.last { $0.millis != .max }?.id
+    }
+
+    /// A Session shown whose lines this member may read and has not read yet.
+    var showsSessionToRead: Bool {
+        guard let s = shownSession else { return false }
+        return s.canDrive && (sessionLoading || (sessionEntries.isEmpty && sessionNote == nil))
+    }
+
+    /// What following watches: the newest line and how many there are.
+    var followSignature: String {
+        "\(followItem ?? "")#\(timelineItems.count)"
+    }
+
+    /// The shown Session's request still waiting for an answer, if one is: the line to go to.
+    var waitingEntry: String? {
+        guard case .session = showing else { return nil }
+        return sessionEntries.last { $0.request != nil && $0.request?.state == nil }
+            .map { "entry-\($0.id)" }
+    }
+
     /// "<who> <what>", who named as the TUI names them: you, the alias, or the fingerprint's first
     /// 26 characters marked "(not in keyring)".
     func noticeWords(_ n: RoomNoticeRow) -> String {
