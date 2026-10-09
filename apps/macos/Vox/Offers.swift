@@ -38,7 +38,7 @@ struct OfferView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: Space.s12) {
                 Text("Trust offer").heading()
                 if let offer = model.offers.first(where: { $0.fingerprint == fingerprint }) {
                     card(offer)
@@ -51,14 +51,14 @@ struct OfferView: View {
                     }
                 }
             }
-            .padding(24)
+            .padding(Space.s24)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
     @ViewBuilder private func card(_ offer: OfferInfo) -> some View {
         let card = fingerprintCard(fingerprint: offer.fingerprint)
-        HStack(alignment: .top, spacing: 16) {
+        HStack(alignment: .top, spacing: Space.s16) {
             VStack(spacing: 0) {
                 ForEach(Array(card.art.enumerated()), id: \.offset) { Text($0.element) }
             }

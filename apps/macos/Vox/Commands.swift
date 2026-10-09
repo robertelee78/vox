@@ -180,13 +180,13 @@ struct Palette: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: Space.s8) {
             TextField("Type a command", text: $query)
                 .accessibilityLabel("Command")
                 .onSubmit { if let first = found.first { done(first) } }
                 .accessibilityIdentifier("palette-query")
             ScrollView {
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: Space.s4) {
                     ForEach(found) { action in
                         Button { done(action) } label: {
                             HStack {
@@ -202,7 +202,7 @@ struct Palette: View {
             }
             .frame(height: 280)
         }
-        .padding(16)
+        .padding(Space.s16)
         .frame(width: Theme.scaled(420))
     }
 
@@ -242,7 +242,7 @@ private struct RoomForm: View {
     @State private var field = SecureFieldHolder()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: Space.s12) {
             Text(joining ? "Join a room" : "New room").heading()
             if joining {
                 TextField("Room link (vox://…)", text: $link).font(Theme.mono)
@@ -265,7 +265,7 @@ private struct RoomForm: View {
                     .accessibilityIdentifier("room-form-submit")
             }
         }
-        .padding(24)
+        .padding(Space.s24)
         .frame(width: Theme.scaled(440))
     }
 
@@ -287,7 +287,7 @@ private struct FingerprintSheet: View {
 
     var body: some View {
         let card = fingerprintCard(fingerprint: model.me)
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: Space.s12) {
             Text("Node \(model.node)").heading()
             VStack(spacing: 0) {
                 ForEach(Array(card.art.enumerated()), id: \.offset) { Text($0.element) }
@@ -305,7 +305,7 @@ private struct FingerprintSheet: View {
                 Button("Done") { model.sheet = nil }.keyboardShortcut(.defaultAction)
             }
         }
-        .padding(24)
+        .padding(Space.s24)
     }
 }
 
@@ -327,7 +327,7 @@ private struct RetentionSheet: View {
     @State private var seconds: UInt64 = 30 * 86_400
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: Space.s12) {
             Text("Retention").heading()
             Picker("Keep messages", selection: $seconds) {
                 ForEach(Retention.choices, id: \.1) { Text($0.0).tag($0.1) }
@@ -347,7 +347,7 @@ private struct RetentionSheet: View {
                     .accessibilityIdentifier("retention-submit")
             }
         }
-        .padding(24)
+        .padding(Space.s24)
         .frame(width: Theme.scaled(440))
     }
 
@@ -364,7 +364,7 @@ private struct RenameSheet: View {
     @State private var name = ""
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: Space.s12) {
             Text("Rename the room").heading()
             TextField("Its new name", text: $name).onSubmit { submit() }
                 .accessibilityLabel("New room name")
@@ -384,7 +384,7 @@ private struct RenameSheet: View {
                     .accessibilityIdentifier("rename-submit")
             }
         }
-        .padding(24)
+        .padding(Space.s24)
         .frame(width: Theme.scaled(440))
     }
 
@@ -401,7 +401,7 @@ private struct AdminsSheet: View {
     @State private var admins: [String] = []
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: Space.s12) {
             Text("Admins").heading()
             Text("An admin may end the room and set its retention.").secondaryText()
             ForEach(model.members) { member in
@@ -420,7 +420,7 @@ private struct AdminsSheet: View {
             if let said = model.said { StateMark(kind: .danger, words: said).textSelection(.enabled) }
             Button("Done") { model.sheet = nil }.keyboardShortcut(.defaultAction)
         }
-        .padding(24)
+        .padding(Space.s24)
         .frame(width: Theme.scaled(440))
         .task { admins = await model.admins() }
     }
@@ -432,7 +432,7 @@ private struct LeaveSheet: View {
     let ending: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: Space.s12) {
             Text(ending ? "End this room for everyone?" : "Leave this room?").heading()
             Text(ending
                 ? "Every member's copy of the room is deleted, and no one can post in it again. "
@@ -450,7 +450,7 @@ private struct LeaveSheet: View {
                 }
             }
         }
-        .padding(24)
+        .padding(Space.s24)
         .frame(width: Theme.scaled(440))
     }
 }

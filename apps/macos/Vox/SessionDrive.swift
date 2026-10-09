@@ -34,6 +34,7 @@ extension NodeModel {
 /// operator's input, a line starting with "/" as a slash command; Interrupt (Esc), Stop (Ctrl-C),
 /// and a file sent in. What came of the last of them is said under it.
 struct SessionComposer: View {
+    @Environment(\.voxTextScale) private var scale
     @ObservedObject var model: NodeModel
     let session: FfiSession
     @State private var draft = ""
@@ -46,8 +47,8 @@ struct SessionComposer: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: Space.s8 * scale) {
+            HStack(spacing: Space.s8 * scale) {
                 Button {
                     if let url = chooseFile() {
                         act(.file(path: url.path, note: nil))
@@ -84,7 +85,7 @@ struct SessionComposer: View {
                     .accessibilityIdentifier("session-said")
             }
         }
-        .padding(12)
+        .voxPadding(Space.s12)
     }
 
     /// Type the draft, or send it as a slash command when it starts with "/".
@@ -107,6 +108,7 @@ struct SessionComposer: View {
 /// An approval or a question a Session asked (DR-4), in its entry's row: Approve and Reject, or
 /// each part's options, while it waits on the reader; once it is settled, what became of it.
 struct RequestView: View {
+    @Environment(\.voxTextScale) private var scale
     @ObservedObject var model: NodeModel
     let session: FfiSession
     let request: FfiRequest
@@ -126,7 +128,7 @@ struct RequestView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: Space.s8 * scale) {
             if let state = request.state {
                 Text(state).secondaryText()
                     .accessibilityIdentifier("request-state-\(request.reference)")
@@ -142,7 +144,7 @@ struct RequestView: View {
     }
 
     private var approval: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: Space.s8 * scale) {
             Button("Approve") { act(.approve(reference: request.reference)) }
                 .accessibilityIdentifier("request-approve-\(request.reference)")
                 .accessibilityLabel(about.isEmpty ? "Approve" : "Approve: \(about)")
@@ -166,11 +168,11 @@ struct RequestView: View {
         let parts = request.questions
         // Numbered across the parts, so each option's id is one of a kind in the request.
         let offsets = parts.indices.map { i in parts[..<i].reduce(0) { $0 + $1.options.count } }
-        return VStack(alignment: .leading, spacing: 6) {
+        return VStack(alignment: .leading, spacing: Space.s8 * scale) {
             ForEach(parts.indices, id: \.self) { i in
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: Space.s4 * scale) {
                     Text(parts[i].text)
-                    HStack(spacing: 6) {
+                    HStack(spacing: Space.s8 * scale) {
                         ForEach(parts[i].options.indices, id: \.self) { n in
                             let option = parts[i].options[n]
                             Button(option) { pick(part: i, option) }

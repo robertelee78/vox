@@ -30,7 +30,7 @@ struct DecisionsView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: Space.s12) {
             Text("Decision record").heading()
             // Two filters that share the room's width: they fit the window's narrowest.
             HStack {
@@ -53,7 +53,7 @@ struct DecisionsView: View {
                 Text("Nothing decided yet.").secondaryText()
             }
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 10) {
+                LazyVStack(alignment: .leading, spacing: Space.s12) {
                     ForEach(Array(shown.enumerated()), id: \.offset) { index, event in
                         DecisionRow(event: event, who: name(event))
                             .accessibilityIdentifier("decision-\(index)")
@@ -61,7 +61,7 @@ struct DecisionsView: View {
                 }
             }
         }
-        .padding(24)
+        .padding(Space.s24)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .task {
             // Read again every few seconds while on screen: the node appends as it decides.
@@ -87,8 +87,8 @@ private struct DecisionRow: View {
     let who: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: Space.s4) {
+            HStack(spacing: Space.s8) {
                 StateMark(kind: kind, words: event.decided)
                 Text(event.asked)
                 Text("·").secondaryText()

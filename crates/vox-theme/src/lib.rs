@@ -1,7 +1,7 @@
 //! The look's one token file (ADR-028 L-1, L-2): read, checked, and written out for each client.
 //!
-//! `assets/theme/vox-tokens.json` is the only place a colour, a typeface or a motion value is
-//! defined. The TUI's build script turns it into Rust constants ([`rust_source`]); `vox-theme
+//! `assets/theme/vox-tokens.json` is the only place a colour, a typeface, a spacing, a corner
+//! radius or a motion value is defined. The TUI's build script turns it into Rust constants ([`rust_source`]); `vox-theme
 //! swift` turns it into the macOS app's asset catalogue and a Swift file ([`write_swift`]). A file
 //! that is not exactly what this reader expects is refused with the reason, never half-read.
 
@@ -142,7 +142,14 @@ pub struct Tokens {
     pub fonts: Vec<Font>,
     /// Motion values, by name: frame counts, milliseconds, damping.
     pub motion: Vec<(String, f64)>,
+    /// The app's spacing scale, in points, smallest first (L-1a).
+    pub space: Vec<f64>,
+    /// The app's corner radii, in points: `control` and `window`, the two [`RADII`] (L-1a).
+    pub radius: Vec<(String, f64)>,
 }
+
+/// The corner radii ADR-028 L-1a names: controls, cards and tiles; windows and frames.
+pub const RADII: &[&str] = &["control", "window"];
 
 impl Tokens {
     /// The colour of this name, which [`parse`] has made sure exists for every name in [`COLORS`].
@@ -261,10 +268,49 @@ pub fn parse(text: &str) -> Result<Tokens, String> {
             .ok_or_else(|| format!("motion {name:?} must be a number of at least 0"))?;
         motion.push((name.clone(), n));
     }
+
+    let mut space = Vec::new();
+    let steps = root
+        .get("space")
+        .and_then(Value::as_array)
+        .ok_or("space is not a list of points")?;
+    for v in steps {
+        let n = v
+            .as_f64()
+            .filter(|n| n.is_finite() && *n > 0.0 && n.fract() == 0.0)
+            .ok_or_else(|| format!("space {v} must be a whole number of points above 0"))?;
+        if space.last().is_some_and(|last| n <= *last) {
+            return Err(format!("space {n} must be larger than the step before it"));
+        }
+        space.push(n);
+    }
+    if space.is_empty() {
+        return Err("space has no steps".into());
+    }
+
+    let mut radius = Vec::new();
+    let table = object(root.get("radius").unwrap_or(&Value::Null), "radius")?;
+    for (name, v) in table {
+        if !RADII.contains(&name.as_str()) {
+            return Err(format!("radius {name:?} is not one ADR-028 L-1a names"));
+        }
+        let n = v
+            .as_f64()
+            .filter(|n| n.is_finite() && *n >= 0.0)
+            .ok_or_else(|| format!("radius {name:?} must be a number of at least 0"))?;
+        radius.push((name.clone(), n));
+    }
+    for name in RADII {
+        if !table.contains_key(*name) {
+            return Err(format!("radius {name:?} is missing"));
+        }
+    }
     Ok(Tokens {
         colors,
         fonts,
         motion,
+        space,
+        radius,
     })
 }
 
@@ -400,6 +446,19 @@ pub fn write_swift(t: &Tokens, out: &Path) -> std::io::Result<()> {
         let _ = writeln!(
             swift,
             "        public static let {}: Double = {n:?}",
+            camel(name, true)
+        );
+    }
+    // A step is named by its points (`s12`), which is what the scale is.
+    swift.push_str("    }\n\n    public enum Space {\n");
+    for n in &t.space {
+        let _ = writeln!(swift, "        public static let s{n}: CGFloat = {n:?}");
+    }
+    swift.push_str("    }\n\n    public enum Radius {\n");
+    for (name, n) in &t.radius {
+        let _ = writeln!(
+            swift,
+            "        public static let {}: CGFloat = {n:?}",
             camel(name, true)
         );
     }

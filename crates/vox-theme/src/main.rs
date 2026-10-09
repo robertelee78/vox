@@ -25,10 +25,12 @@ fn main() -> ExitCode {
     match vox_theme::write_swift(&tokens, Path::new(out)) {
         Ok(()) => {
             println!(
-                "vox-theme: wrote {} colours, {} faces and {} motion values to {}",
+                "vox-theme: wrote {} colours, {} faces, {} motion values, {} spacing steps and {} radii to {}",
                 tokens.colors.len(),
                 tokens.fonts.len(),
                 tokens.motion.len(),
+                tokens.space.len(),
+                tokens.radius.len(),
                 out
             );
             ExitCode::SUCCESS

@@ -13,6 +13,11 @@
 import AppKit
 import SwiftUI
 
+/// The spacing scale and the two corner radii, from the token file (L-1a). Inside the
+/// conversation they are taken at its text size (`voxPadding`, `voxTextScale`); elsewhere as they are.
+typealias Space = VoxTokens.Space
+typealias Radius = VoxTokens.Radius
+
 enum Theme {
     /// The face for running text: SF Pro (L-7).
     static var text: Font { font(VoxTokens.Fonts.appText) }
@@ -214,17 +219,19 @@ private struct Typeset: ViewModifier {
 /// off. A button styled plain or borderless keeps its own.
 struct VoxButtonStyle: ButtonStyle {
     @Environment(\.isEnabled) private var enabled
+    @Environment(\.voxTextScale) private var scale
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(Theme.text)
+            .font(Theme.font(VoxTokens.Fonts.appText, scale: scale))
             .foregroundStyle(configuration.role == .destructive ? VoxTokens.Colors.danger
                                                                 : VoxTokens.Colors.textPrimary)
-            .padding(.horizontal, Theme.scaled(10))
-            .padding(.vertical, Theme.scaled(4))
-            .background(RoundedRectangle(cornerRadius: 5)
+            .padding(.horizontal, Space.s12 * scale)
+            .padding(.vertical, Space.s4 * scale)
+            .background(RoundedRectangle(cornerRadius: Radius.control * scale)
                 .fill(configuration.isPressed ? VoxTokens.Colors.bgPanel : VoxTokens.Colors.bgOverlay))
-            .overlay(RoundedRectangle(cornerRadius: 5).stroke(VoxTokens.Colors.textMuted))
+            .overlay(RoundedRectangle(cornerRadius: Radius.control * scale)
+                .stroke(VoxTokens.Colors.textMuted))
             .opacity(enabled ? 1 : 0.45)
             .contentShape(Rectangle())
     }
@@ -234,9 +241,21 @@ struct VoxButtonStyle: ButtonStyle {
 /// marks a card's edge (WCAG 2.1 1.4.11); under Increase Contrast its token's hex_hc, which the
 /// colour set carries (L-5, #450).
 private struct CardOutline: ViewModifier {
+    @Environment(\.voxTextScale) private var scale
+
     func body(content: Content) -> some View {
-        content.overlay(RoundedRectangle(cornerRadius: 6).stroke(VoxTokens.Colors.textMuted))
+        content.overlay(RoundedRectangle(cornerRadius: Radius.control * scale)
+            .stroke(VoxTokens.Colors.textMuted))
     }
+}
+
+/// Padding of a spacing step at the text size of where it is drawn (L-1a).
+private struct ScaledPadding: ViewModifier {
+    @Environment(\.voxTextScale) private var scale
+    let edges: Edge.Set
+    let points: CGFloat
+
+    func body(content: Content) -> some View { content.padding(edges, points * scale) }
 }
 
 /// A selected row or card: drawn on bg.overlay with a bar in the accent at its leading edge, so
@@ -247,6 +266,7 @@ private struct SelectionMark: ViewModifier {
     /// The row the keyboard is on (WCAG 2.4.7): outlined in the focus accent, as well as marked.
     var focused = false
     @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.voxTextScale) private var scale
 
     func body(content: Content) -> some View {
         content
@@ -258,9 +278,11 @@ private struct SelectionMark: ViewModifier {
             }
             .overlay {
                 if focused {
-                    RoundedRectangle(cornerRadius: 4).stroke(VoxTokens.Colors.accent, lineWidth: 2)
+                    RoundedRectangle(cornerRadius: Radius.control * scale)
+                        .stroke(VoxTokens.Colors.accent, lineWidth: 2)
                 } else if selected && contrast == .increased {
-                    RoundedRectangle(cornerRadius: 4).stroke(VoxTokens.Colors.accent)
+                    RoundedRectangle(cornerRadius: Radius.control * scale)
+                        .stroke(VoxTokens.Colors.accent)
                 }
             }
             .accessibilityAddTraits(selected ? .isSelected : [])
@@ -300,6 +322,17 @@ extension View {
 
     /// `face`, at the text size of where it is drawn: the conversation's inside it, steady outside.
     func voxFont(_ face: VoxTokens.Face) -> some View { modifier(ScaledFont(face: face)) }
+
+    /// Padding of a spacing step (`Space`): at the conversation's text size inside it, as it is
+    /// elsewhere (L-1a).
+    func voxPadding(_ edges: Edge.Set, _ points: CGFloat) -> some View {
+        modifier(ScaledPadding(edges: edges, points: points))
+    }
+
+    /// `voxPadding` on every edge.
+    func voxPadding(_ points: CGFloat) -> some View {
+        modifier(ScaledPadding(edges: .all, points: points))
+    }
 
     /// Outline a card (L-5).
     func cardOutline() -> some View { modifier(CardOutline()) }
@@ -361,7 +394,7 @@ struct TrustMark: View {
     let trust: Trust
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: Space.s8) {
             Text(trust.glyph).font(Theme.mono)
             Text(name).fontWeight(trust == .none ? .regular : .bold)
             if trust == .none {
@@ -395,7 +428,7 @@ struct StateMark: View {
     let words: String
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: Space.s8) {
             Text(glyph).font(Theme.mono)
             // Its own face: a sidebar list sets its rows' font over the one inherited.
             Text(words).font(Theme.text)

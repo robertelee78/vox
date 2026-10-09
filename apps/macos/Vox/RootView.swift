@@ -23,7 +23,7 @@ struct RootView: View {
                                     set: { if !$0, let n = model.keepNodeAsk { model.declineToKeepNode(n) } })) {
             if let node = model.keepNodeAsk {
                 KeepNodeOffer(node: node, model: model)
-                    .padding(24)
+                    .padding(Space.s24)
                     .font(Theme.text)
             }
         }
@@ -37,7 +37,7 @@ struct RootView: View {
     }
 
     private var setup: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: Space.s16) {
             switch model.phase {
             case .askingLoginItem:
                 LoginItemQuestion(model: model)
@@ -77,7 +77,7 @@ struct RootView: View {
                 ProgressView("Opening the node…")
             }
         }
-        .padding(24)
+        .padding(Space.s24)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .font(Theme.text)
         .contentSurface()
@@ -130,7 +130,7 @@ private struct KeepNodeOffer: View {
     @State private var field = SecureFieldHolder()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: Space.s12) {
             Text("Keep node \(node) attached?").heading()
             Text("Keep Running is on. To keep node \(node) attached when Vox is closed and after a "
                 + "restart, Vox stores its passphrase in the Keychain. Anyone who can unlock this "

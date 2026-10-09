@@ -66,7 +66,7 @@ struct MenuBarContent: View {
     @StateObject private var window = WindowSeen()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: Space.s12) {
             if let model = app.node {
                 NodeFacts(model: model, facts: facts)
                     .task { facts = await model.menuBarFacts() }
@@ -85,7 +85,7 @@ struct MenuBarContent: View {
             }
             Button("Hide This Menu Bar Item") { app.showMenuBar(false) }
         }
-        .padding(12)
+        .padding(Space.s12)
         .frame(width: Theme.scaled(320))
         .background(WindowReader(seen: window))
         .font(Theme.text)

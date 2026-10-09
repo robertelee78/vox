@@ -46,7 +46,7 @@ struct ServicesView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: Space.s16) {
                 Text("Services").heading()
                 if let did = model.did {
                     StateMark(kind: .plain, words: did).textSelection(.enabled)
@@ -85,7 +85,7 @@ struct ServicesView: View {
                     rows = await model.readServices()
                 }
             }
-            .padding(24)
+            .padding(Space.s24)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .accessibilityIdentifier("services-view")
@@ -112,7 +112,7 @@ private struct SharedServiceBox: View {
     let service: SharedService
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: Space.s8) {
             Text(service.address).font(Theme.mono).fontWeight(.bold).textSelection(.enabled)
             Text("by \(service.by) in \(room)  ·  \(service.kind)").caption().secondaryText()
             ForEach(Array(service.commands.enumerated()), id: \.offset) { _, command in
@@ -132,7 +132,7 @@ private struct SharedServiceBox: View {
                               : "needs \(need.need): no — \(need.otherwise)")
             }
         }
-        .padding(10)
+        .padding(Space.s12)
         .cardOutline()
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("service-box-\(service.address)")
@@ -154,7 +154,7 @@ private struct ShareForm: View {
     @State private var failed: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: Space.s8) {
             Text("SHARE A SERVICE").eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
             if let listening {
                 ForEach(listening.services, id: \.line) { service in
@@ -164,7 +164,7 @@ private struct ShareForm: View {
                         Text(service.line).font(Theme.mono).frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .buttonStyle(.plain)
-                    .padding(4)
+                    .padding(Space.s4)
                     .selectionMark(picked?.line == service.line)
                     .accessibilityIdentifier("listening-\(service.port)")
                 }

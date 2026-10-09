@@ -23,7 +23,7 @@ struct AttachSheet: View {
     @State private var sending = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: Space.s12) {
             Text("Share \(file.url.lastPathComponent)").heading()
             Text("TO").eyebrow().secondaryText()
             if model.members.isEmpty {
@@ -62,7 +62,7 @@ struct AttachSheet: View {
                 StateMark(kind: .danger, words: said).textSelection(.enabled)
             }
         }
-        .padding(24)
+        .padding(Space.s24)
         .frame(width: Theme.scaled(440))
     }
 }

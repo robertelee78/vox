@@ -26,7 +26,7 @@ struct KeyringView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: Space.s16) {
                 Text("Keyring").heading()
                 Text(model.keyring).font(Theme.mono).secondaryText()
                 if let did = model.keyringDid {
@@ -55,7 +55,7 @@ struct KeyringView: View {
                         }
                 }
             }
-            .padding(24)
+            .padding(Space.s24)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .sheet(item: Binding(get: { removing.map(Removal.init) }, set: { removing = $0?.node })) {
@@ -75,7 +75,7 @@ struct KeyringView: View {
     /// Add: the fingerprint pasted or typed, an alias (K-3), and what trusting does, before it is
     /// done (E-5).
     private var addForm: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: Space.s8) {
             Text("ADD A NODE").eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
             TextField("Fingerprint (paste or type)", text: $fingerprint)
                 .accessibilityLabel("Fingerprint")
@@ -161,14 +161,14 @@ private struct KeyringRow: View {
 
     var body: some View {
         let card = fingerprintCard(fingerprint: node.fingerprint)
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .top, spacing: 16) {
+        VStack(alignment: .leading, spacing: Space.s8) {
+            HStack(alignment: .top, spacing: Space.s16) {
                 VStack(spacing: 0) {
                     ForEach(Array(card.art.enumerated()), id: \.offset) { Text($0.element) }
                 }
                 .font(Theme.mono)
                 .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: Space.s4) {
                     // ⇄ once it trusts this node back, → until then (L-4).
                     TrustMark(name: node.name,
                               trust: model.trustsBack.contains(node.fingerprint) ? .mutual : .oneWay)
@@ -227,7 +227,7 @@ private struct KeyringRow: View {
                 }
             }
         }
-        .padding(.vertical, 8)
+        .padding(.vertical, Space.s8)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("keyring-row-\(node.name)")
         .onChange(of: model.keyringAsk) { ask in
@@ -265,7 +265,7 @@ private struct RemoveSheet: View {
     let done: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: Space.s16) {
             Text("Untrust \(node.name)?").heading()
             Text(Effects.untrusting(node.name))
                 .accessibilityIdentifier("keyring-remove-effect")
@@ -280,7 +280,7 @@ private struct RemoveSheet: View {
                 .accessibilityIdentifier("keyring-untrust-confirm")
             }
         }
-        .padding(24)
+        .padding(Space.s24)
         .frame(width: Theme.scaled(440))
     }
 }
@@ -292,7 +292,7 @@ struct KeyringPassphrase: View {
     @State private var field = SecureFieldHolder()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: Space.s8) {
             Text("Changing who you trust needs your identity passphrase again.").secondaryText()
             SecureInput(holder: field) { submit() }
                 .accessibilityLabel("Identity passphrase")

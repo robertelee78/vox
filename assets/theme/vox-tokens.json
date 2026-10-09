@@ -25,6 +25,8 @@
     "app.heading": { "family": "Inter Display", "bundled": "InterDisplay-ExtraBold.otf", "weight": 800, "tracking": -0.02 },
     "app.glyph":   { "family": "SF Pro",        "system": "title",      "weight": 400 }
   },
+  "space": [4, 8, 12, 16, 20, 24, 32],
+  "radius": { "control": 5, "window": 10 },
   "motion": {
     "tui.max_frames": 3,
     "tui.frame_ms": 16,

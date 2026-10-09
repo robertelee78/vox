@@ -6,13 +6,14 @@ import SwiftUI
 /// To: and urgent for what the composer posts (M-15): the members ticked are written into `to` as
 /// whole fingerprints; urgent may interrupt their agents mid-turn.
 struct ComposerAddress: View {
+    @Environment(\.voxTextScale) private var scale
     @ObservedObject var model: NodeModel
     @Binding var to: Set<String>
     @Binding var urgent: Bool
     @State private var choosing = false
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: Space.s8 * scale) {
             // A button that opens the members to tick, not a menu: macOS draws a menu's label in
             // its own fixed size, and To: must follow the app's text size (WCAG 1.4.4).
             Button { choosing.toggle() } label: {
@@ -24,7 +25,7 @@ struct ComposerAddress: View {
             .accessibilityLabel(addressedInFull)
             .accessibilityIdentifier("compose-to")
             .popover(isPresented: $choosing, arrowEdge: .top) {
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: Space.s8 * scale) {
                     Text("To").eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
                     if model.members.isEmpty { Text("No other members yet").secondaryText() }
                     ForEach(model.members) { member in
@@ -37,7 +38,7 @@ struct ComposerAddress: View {
                 }
                 // Part of the composer, so at the conversation's text size (L-1b).
                 .conversationScale(Theme.scale)
-                .padding(12)
+                .voxPadding(Space.s12)
             }
             Toggle(isOn: $urgent) { Text("Urgent") }
                 .fixedSize()

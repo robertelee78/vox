@@ -53,7 +53,7 @@ struct SessionsList: View {
     @State private var endedOpen = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: Space.s4) {
             Text("SESSIONS").eyebrow().secondaryText()
                 .accessibilityAddTraits(.isHeader)
             row("General", .general, id: "session-general")
@@ -104,6 +104,7 @@ struct SessionsList: View {
 /// session` prints it, and its Details (the full input and output) when asked; an open request's
 /// answers (SessionDrive.swift), or its state once it is resolved or not answerable.
 struct SessionEntryRow: View {
+    @Environment(\.voxTextScale) private var scale
     @ObservedObject var model: NodeModel
     let session: FfiSession
     let entry: FfiSessionEntry
@@ -112,7 +113,7 @@ struct SessionEntryRow: View {
     @State private var details = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: Space.s4 * scale) {
             Text(entry.line).voxFont(VoxTokens.Fonts.appMono).textSelection(.enabled)
                 .accessibilityIdentifier("entry-line-\(entry.id)")
             if let request = entry.request {
@@ -138,6 +139,6 @@ struct SessionEntryRow: View {
                 }
             }
         }
-        .padding(.horizontal, 4)
+        .voxPadding(.horizontal, Space.s4)
     }
 }

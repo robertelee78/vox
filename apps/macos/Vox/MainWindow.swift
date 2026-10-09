@@ -30,7 +30,7 @@ struct MainWindow: View {
                 case nil where model.rooms.isEmpty:
                     // A node in no room yet (its first run, most often): the two ways in, here,
                     // not only in the File menu.
-                    VStack(spacing: 12) {
+                    VStack(spacing: Space.s12) {
                         Text("You are in no room yet.").heading()
                         Text("Make a room and share its link, or join one with the link and "
                             + "passphrase someone sent you.")
@@ -140,7 +140,7 @@ extension View {
     /// `.tint` and drew text.primary at 3.1:1, is off (`SidebarHighlightOff`); the row is still the
     /// list's selection, so arrow keys move it and VoiceOver says it is selected.
     fileprivate func sidebarRow(_ selected: Bool) -> some View {
-        listRowBackground(SelectionFill(selected: selected).padding(.horizontal, 10))
+        listRowBackground(SelectionFill(selected: selected).padding(.horizontal, Space.s8))
     }
 }
 
@@ -206,7 +206,7 @@ private struct RoomRow: View {
     var selected = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: Space.s4) {
             Text(room.name).fontWeight(room.need == .quiet ? .regular : .bold)
             if room.need != .quiet {
                 if selected {
@@ -356,6 +356,9 @@ private enum TimelineKey {
 
 /// The room on screen: its timeline and a field to post, with its members beside it.
 private struct RoomView: View {
+    /// The conversation's text size, for its spacing (L-1a): this view sets it on the timeline and
+    /// the composer, so it reads it from Theme rather than from its own environment.
+    private var scale: Double { Theme.scale }
     @ObservedObject var model: NodeModel
     let room: String
     @State private var draft = ""
@@ -388,7 +391,7 @@ private struct RoomView: View {
             VStack(spacing: 0) {
                 if !model.roomServices.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 8) {
+                        HStack(spacing: Space.s8 * scale) {
                             ForEach(model.roomServices, id: \.address) { service in
                                 let selected = model.selectedService?.address == service.address
                                 // A button, so a click anywhere on the card selects it, as AppKit
@@ -405,7 +408,7 @@ private struct RoomView: View {
                                 .accessibilityAddTraits(selected ? .isSelected : [])
                             }
                         }
-                        .padding(8)
+                        .voxPadding(Space.s8)
                     }
                     Divider()
                 }
@@ -413,12 +416,12 @@ private struct RoomView: View {
                     .secondaryText()
                     .lineLimit(1).truncationMode(.middle)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 12).padding(.top, 8)
+                    .voxPadding(.horizontal, Space.s12).voxPadding(.top, Space.s8)
                     .accessibilityIdentifier("timeline-title")
                 if let header = model.sessionHeader {
                     Text(header)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 12).padding(.top, 4)
+                        .voxPadding(.horizontal, Space.s12).voxPadding(.top, Space.s4)
                         .accessibilityIdentifier("session-header")
                 }
                 Group {
@@ -428,7 +431,7 @@ private struct RoomView: View {
                             // do not measure in this coordinate space, so what is in view could not be
                             // told.
                             ScrollView {
-                                LazyVStack(alignment: .leading, spacing: 10) {
+                                LazyVStack(alignment: .leading, spacing: Space.s12 * scale) {
                                     ForEach(model.timelineItems) { item in
                                         if let message = item.message {
                                             MessageRow(message: message, me: model.me,
@@ -436,7 +439,7 @@ private struct RoomView: View {
                                                        pulledBy: model.pulledBy[message.id] ?? [],
                                                        pulled: model.pulled[message.id]) { looking = $0 }
                                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                                .padding(4)
+                                                .voxPadding(Space.s4)
                                                 .selectable(model.selectedMessage == message.id,
                                                             focused: timelineFocused
                                                                 && model.selectedMessage == message.id) {
@@ -451,7 +454,7 @@ private struct RoomView: View {
                                             // What was done to the room: a line among the
                                             // messages, not one of them (ADR-028 R-1, R-7).
                                             Text(notice).secondaryText().italic()
-                                                .padding(.horizontal, 4)
+                                                .voxPadding(.horizontal, Space.s4)
                                                 .accessibilityIdentifier(item.id)
                                                 .id(item.id)
                                         } else if let entry = item.entry, let session = model.shownSession {
@@ -461,7 +464,7 @@ private struct RoomView: View {
                                         }
                                     }
                                 }
-                                .padding(12)
+                                .voxPadding(Space.s12)
                             }
                             .coordinateSpace(name: "timeline")
                             // **Operable from the keyboard** (WCAG 2.1.1, 2.4.7): see
@@ -606,10 +609,10 @@ private struct RoomView: View {
                 Spacer()
                 Button("Cancel") { model.replyTo = nil }.buttonStyle(.borderless)
             }
-            .padding(.horizontal, 12).padding(.top, 8)
+            .voxPadding(.horizontal, Space.s12).voxPadding(.top, Space.s8)
             .accessibilityIdentifier("replying-to")
         }
-        HStack(spacing: 8) {
+        HStack(spacing: Space.s8 * scale) {
             Button {
                 if let url = chooseFile() { attaching = Attaching(url: url) }
             } label: {
@@ -628,7 +631,7 @@ private struct RoomView: View {
                 .accessibilityIdentifier("compose")
             ComposerAddress(model: model, to: $to, urgent: $urgent)
         }
-        .padding(12)
+        .voxPadding(Space.s12)
     }
 
     /// Post the draft, To: and replying as set; urgent when asked (⌘↩ or the switch).
@@ -712,6 +715,7 @@ private struct RoomView: View {
 
 /// One message in the timeline.
 private struct MessageRow: View {
+    @Environment(\.voxTextScale) private var scale
     let message: RoomMessage
     let me: String
     /// Who has read it, when it is this node's own (R-6).
@@ -724,8 +728,8 @@ private struct MessageRow: View {
     let look: (URL) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: Space.s4 * scale) {
+            HStack(spacing: Space.s8 * scale) {
                 Text(author).fontWeight(.bold)
                 if message.urgent { StateMark(kind: .attention, words: "urgent") }
                 if message.to.contains(me) { Text("to you").eyebrow() }
@@ -795,6 +799,7 @@ private struct MessageRow: View {
 /// A file or folder offered in the room (ADR-028 F-1): its name, size and SHA-256, as the share's
 /// signed announcement states them.
 private struct FileCard: View {
+    @Environment(\.voxTextScale) private var scale
     let file: FileOffer
     /// The image's preview its share announced (ADR-028 F-9): shown while the sharer is offline.
     let image: ImagePreview?
@@ -803,13 +808,13 @@ private struct FileCard: View {
     let look: (URL) -> Void
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
+        HStack(alignment: .top, spacing: Space.s12 * scale) {
             if let image, let thumb = NSImage(data: image.thumb) {
                 Image(nsImage: thumb)
                     .resizable()
                     .aspectRatio(CGFloat(image.width) / CGFloat(max(image.height, 1)), contentMode: .fit)
                     .frame(maxWidth: 160, maxHeight: 120)
-                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                    .clipShape(RoundedRectangle(cornerRadius: Radius.control * scale))
                     .accessibilityLabel("image \(image.width) by \(image.height)")
                     .accessibilityIdentifier("thumb-\(file.name)")
             } else {
@@ -817,7 +822,7 @@ private struct FileCard: View {
                     .voxFont(VoxTokens.Fonts.appGlyph)
                     .accessibilityHidden(true)
             }
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: Space.s4 * scale) {
                 Text(file.name).fontWeight(.bold)
                 Text("\(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file))"
                     + "  ·  sha256 \(file.sha256.prefix(16))…")
@@ -835,7 +840,7 @@ private struct FileCard: View {
                 }
             }
         }
-        .padding(8)
+        .voxPadding(Space.s8)
         .cardOutline()
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("file-\(file.name)")
@@ -846,17 +851,18 @@ private struct FileCard: View {
 /// A link's card (ADR-028 F-10): what the sender's node found at the message's first link, carried
 /// in the message, so drawing it fetches nothing. Opening the link is the person's own choice.
 private struct LinkCardView: View {
+    @Environment(\.voxTextScale) private var scale
     let card: LinkCard
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
+        HStack(alignment: .top, spacing: Space.s12 * scale) {
             if let data = card.image, let picture = NSImage(data: data) {
                 Image(nsImage: picture).resizable().aspectRatio(contentMode: .fit)
                     .frame(maxWidth: 72, maxHeight: 72)
-                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                    .clipShape(RoundedRectangle(cornerRadius: Radius.control * scale))
                     .accessibilityHidden(true)
             }
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: Space.s4 * scale) {
                 if !card.title.isEmpty { Text(card.title).fontWeight(.bold) }
                 if !card.description.isEmpty { Text(card.description).secondaryText().lineLimit(3) }
                 // Clickable only for http and https (a whitelist): the link is the peer's, and any
@@ -874,7 +880,7 @@ private struct LinkCardView: View {
                 }
             }
         }
-        .padding(8)
+        .voxPadding(Space.s8)
         .cardOutline()
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier("card-\(card.url)")
@@ -883,18 +889,19 @@ private struct LinkCardView: View {
 
 /// A service a member shares in the room: its address, who shares it, and what it is (ADR-028 S-2).
 private struct ServiceCard: View {
+    @Environment(\.voxTextScale) private var scale
     let service: SharedService
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: Space.s8 * scale) {
             Image(systemName: "point.3.connected.trianglepath.dotted").accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: Space.s4 * scale) {
                 Text(service.address).voxFont(VoxTokens.Fonts.appMono).textSelection(.enabled)
                 Text("by \(service.by)  ·  \(service.kind)\(service.udp && service.kind != "udp" ? "/udp" : "")")
                     .caption().secondaryText()
             }
         }
-        .padding(8)
+        .voxPadding(Space.s8)
         .cardOutline()
     }
 }
@@ -905,9 +912,9 @@ private struct Inspector: View {
     let room: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: Space.s8) {
             SessionsList(model: model)
-            Divider().padding(.vertical, 8)
+            Divider().padding(.vertical, Space.s8)
             Text("MEMBERS").eyebrow().secondaryText()
                 .accessibilityAddTraits(.isHeader)
             ForEach(model.members) { member in
@@ -916,25 +923,25 @@ private struct Inspector: View {
                 // What this node's keyring grants it (K-14), once it is in the keyring.
                 if member.trust != .none {
                     Text(Capability.words(member.drive)).eyebrow().secondaryText()
-                        .padding(.leading, 18)
+                        .padding(.leading, Space.s20)
                         .accessibilityIdentifier("member-capability-\(member.name)")
                 }
                 // The platform its node says it runs on (ADR-020 §4.9b): its claim, said as one.
                 if let platform = model.platforms[member.id] {
                     Text("says it runs on \(Platform.words(platform))")
                         .font(Theme.mono).secondaryText()
-                        .padding(.leading, 18)
+                        .padding(.leading, Space.s20)
                         // Not selectable: a selectable Text with its own label sent SwiftUI's
                         // accessibility into endless recursion, and the app crashed when read.
                         .accessibilityLabel("\(member.name) says it runs on \(Platform.words(platform))")
                         .accessibilityIdentifier("member-platform-\(member.name)")
                 }
             }
-            Divider().padding(.vertical, 8)
+            Divider().padding(.vertical, Space.s8)
             FamilyLan(model: model, room: room)
             Spacer()
         }
-        .padding(12)
+        .padding(Space.s12)
         .frame(maxHeight: .infinity, alignment: .topLeading)
         // A container, so each row keeps its own identifier (member-<name>) under this one.
         .accessibilityElement(children: .contain)
@@ -991,7 +998,7 @@ private struct StatusBar: View {
     @ObservedObject var model: NodeModel
 
     var body: some View {
-        HStack(spacing: 16) {
+        HStack(spacing: Space.s16) {
             Text("node \(model.node)")
             Text(model.peers == 1 ? "1 peer" : "\(model.peers) peers")
             Text(model.keyring)
@@ -1011,8 +1018,8 @@ private struct StatusBar: View {
             }
         }
         .font(Theme.mono)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+        .padding(.horizontal, Space.s12)
+        .padding(.vertical, Space.s8)
         // A container, so "notifications-off" keeps its identifier; its label says the whole bar.
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("status")
