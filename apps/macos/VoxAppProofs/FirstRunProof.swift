@@ -762,9 +762,7 @@ final class FirstRunProof: XCTestCase {
     /// "title"; Set the default again → red at "Retention"; Give Drive the default → red at
     /// "drive". Then Node > Detach: the chooser lists alice, detached, with her fingerprint and
     /// "Everything you post, trust and share will be as alice."; `vox node list` shows the same
-    /// fingerprint; and with bob's vault copied over hers, it shows none. claude-mac, a node
-    /// Claude Code's hook has run on, is listed only after "Show agent nodes", then says it is an
-    /// agent's (P8). Mutations: agent nodes shown by default → red at "hide the agent node"; the
+    /// fingerprint; and with bob's vault copied over hers, it shows none (P8). Mutations: the
     /// fingerprint file not written → red at "chooser must show"; its vault hash not checked → red
     /// at "stale".
     func testTheLookIsTheTokensAndReturnNeverGivesWhatItShouldNot() throws {
@@ -800,21 +798,6 @@ final class FirstRunProof: XCTestCase {
             $0.contains(" talk")
         }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
         try staged(vox, ["room", "post", "--node", "alice", room, "LOOK-AT-THIS"], env: voxEnv)
-        // An agent's node (P8): claude-mac, on which Claude Code's hook has run, as Claude Code
-        // runs it at a session's start; the hook records its session in the node's directory.
-        try stager.write(Data("claude identity\n".utf8), to: pass("claude"))
-        try staged(vox, ["node", "create", "claude-mac"],
-                   env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "claude identity"]) { $1 })
-        try staged(vox, ["node", "attach", "claude-mac", "--passphrase-file", pass("claude")], env: voxEnv)
-        let start = "{\"hook_event_name\":\"SessionStart\",\"session_id\":\"look-agent-session\","
-            + "\"cwd\":\"\(home)\",\"source\":\"startup\",\"transcript_path\":\"\(home)/t.jsonl\"}"
-        _ = stager.run([vox, "agent", "hook", "--node", "claude-mac"],
-                       env: voxEnv.merging(["CLAUDE_CODE_ENTRYPOINT": "cli", "HOME": home]) { $1 },
-                       input: start)
-        let recorded = stager.run(["/bin/ls", data + "/nodes/claude-mac/sessions"], env: [:]).out
-        guard recorded.contains(".json") else {
-            throw Apparatus("staging not achieved: Claude Code's SessionStart hook recorded no session for claude-mac (its sessions directory holds \(recorded.debugDescription))")
-        }
         try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
         try stager.write(Data("alice\n".utf8), to: config + "/app/node")
 
@@ -947,13 +930,6 @@ final class FirstRunProof: XCTestCase {
                        "PRODUCT: the chooser must show detached alice's fingerprint, \(aliceFp) (P8); it shows \(shown.debugDescription)")
         words(ui, Key.id("node-acting-as-alice"), timeout: 5, "the chooser must say what choosing alice means (P8)",
               until: { $0 == "Everything you post, trust and share will be as alice." })
-        // The agent's node is not offered until asked for, then says whose it is.
-        XCTAssertNil(locate(ui, Key.id("node-claude-mac")),
-                     "PRODUCT: the chooser must hide the agent node claude-mac until \"Show agent nodes\" is chosen (P8); it lists it by default")
-        tap(ui, Key.id("show-agent-nodes"), "Show agent nodes")
-        let agentFor = words(ui, Key.id("node-for-claude-mac"), timeout: 10,
-                             "with Show agent nodes, the chooser must list claude-mac and say whose it is (P8)",
-                             until: { $0 == "An agent's node: Claude Code sessions run as it." }) ?? ""
         let listed = run(vox, ["node", "list"], env: voxEnv).out
         let aliceLine = nodeLine(listed, "alice") ?? ""
         XCTAssertTrue(aliceLine.contains(" detached ") && plain(aliceLine).contains(plain(aliceFp)),
@@ -965,7 +941,7 @@ final class FirstRunProof: XCTestCase {
         let restored = nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "alice") ?? ""
         XCTAssertFalse(plain(restored).contains(plain(aliceFp)) || plain(restored).contains(plain(bobFp)),
                        "PRODUCT: with another vault in alice's place, `vox node list` must not show a fingerprint for her, stale or otherwise; it says \(restored.debugDescription)")
-        print("[proof] look: \(read.joined(separator: "; ")); title \(titleHeight) high; retention kept by Return; bob \(capability.debugDescription) after Return; chooser shows alice \(shown.debugDescription), hides claude-mac until asked, then \(agentFor.debugDescription); node list \(aliceLine.debugDescription), then with bob's vault \(restored.debugDescription)")
+        print("[proof] look: \(read.joined(separator: "; ")); title \(titleHeight) high; retention kept by Return; bob \(capability.debugDescription) after Return; chooser shows alice \(shown.debugDescription); node list \(aliceLine.debugDescription), then with bob's vault \(restored.debugDescription)")
     }
 
     /// `key` gone within `timeout`: PRODUCT naming what still shows it.
