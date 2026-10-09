@@ -261,7 +261,7 @@ private struct RoomForm: View {
                 Text("No passphrase: anyone with the link can join.")
                     .accessibilityIdentifier("room-form-no-passphrase")
             }
-            if let said = model.said { StateMark(kind: .danger, words: said).textSelection(.enabled) }
+            OutcomeMark(outcome: model.failure(of: operation))
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 Button(joining ? "Join" : "Create") { submit() }.keyboardShortcut(.defaultAction)
@@ -271,7 +271,10 @@ private struct RoomForm: View {
         }
         .padding(24)
         .frame(width: Theme.scaled(440))
+        .onAppear { model.clearOutcome(of: operation) }
     }
+
+    private var operation: String { joining ? "join-room" : "create-room" }
 
     private func submit() {
         // Return and the button may both ask: the second finds one under way. An empty field is
@@ -346,10 +349,7 @@ private struct RetentionSheet: View {
                     + "sent, and older ones at once. Deleted text cannot be read again.")
                 .secondaryText()
                 .accessibilityIdentifier("retention-effect")
-            if let said = model.said {
-                StateMark(kind: .danger, words: said).textSelection(.enabled)
-                    .accessibilityIdentifier("retention-said")
-            }
+            OutcomeMark(outcome: model.failure(of: "retention"), id: "retention-said")
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 Button("Set") { submit() }.keyboardShortcut(.defaultAction)
@@ -358,6 +358,7 @@ private struct RetentionSheet: View {
         }
         .padding(24)
         .frame(width: Theme.scaled(440))
+        .onAppear { model.clearOutcome(of: "retention") }
     }
 
     private func submit() {
@@ -382,10 +383,7 @@ private struct RenameSheet: View {
                 + "room's services. Only the room's creator or an admin may rename it.")
                 .secondaryText()
                 .accessibilityIdentifier("rename-effect")
-            if let said = model.said {
-                StateMark(kind: .danger, words: said).textSelection(.enabled)
-                    .accessibilityIdentifier("rename-said")
-            }
+            OutcomeMark(outcome: model.failure(of: "rename"), id: "rename-said")
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 Button("Rename") { submit() }.keyboardShortcut(.defaultAction)
@@ -395,6 +393,7 @@ private struct RenameSheet: View {
         }
         .padding(24)
         .frame(width: Theme.scaled(440))
+        .onAppear { model.clearOutcome(of: "rename") }
     }
 
     private func submit() {
@@ -426,11 +425,12 @@ private struct AdminsSheet: View {
                 .accessibilityLabel(admins.contains(member.id) ? "\(member.name), admin"
                                                                : "\(member.name), not an admin")
             }
-            if let said = model.said { StateMark(kind: .danger, words: said).textSelection(.enabled) }
+            OutcomeMark(outcome: model.failure(of: "admins"))
             Button("Done") { model.sheet = nil }.keyboardShortcut(.defaultAction)
         }
         .padding(24)
         .frame(width: Theme.scaled(440))
+        .onAppear { model.clearOutcome(of: "admins") }
         .task { admins = await model.admins() }
     }
 }

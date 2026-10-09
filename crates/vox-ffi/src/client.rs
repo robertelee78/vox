@@ -1211,14 +1211,14 @@ async fn room_ids(
     }
 }
 
-/// Send `req` and read its answer, as a refusal or a detach where it is one.
+/// Send `req` and read its answer, as a refusal or a detach where it is one. A daemon that stops
+/// answering once it was asked leaves it not known whether it was done.
 async fn ask(client: &mut IpcClient, req: &Request) -> Result<Frame, VoxError> {
-    answered(
-        client
-            .request(req)
-            .await
-            .map_err(|e| failed(format!("the vox daemon stopped answering: {e}")))?,
-    )
+    answered(client.request(req).await.map_err(|e| VoxError::Unknown {
+        reason: format!(
+            "the vox daemon stopped answering before it said whether this was done: {e}"
+        ),
+    })?)
 }
 
 async fn done(client: &mut IpcClient, req: &Request) -> Result<(), VoxError> {

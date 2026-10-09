@@ -956,9 +956,6 @@ private struct StatusBar: View {
             Text("node \(model.node)")
             Text(model.peers == 1 ? "1 peer" : "\(model.peers) peers")
             Text(model.keyring)
-            if let did = model.did {
-                Text(did)
-            }
             if model.notifying == false {
                 // M-23: said where the person works, so a missing notification is explained.
                 Text("notifications off (System Settings, Notifications, Vox)")
@@ -967,8 +964,18 @@ private struct StatusBar: View {
             Spacer()
             if let ended = model.ended {
                 StateMark(kind: .danger, words: ended)
-            } else if let said = model.said {
-                StateMark(kind: .danger, words: said).textSelection(.enabled)
+            } else if let outcome = model.outcome {
+                // What the last operation came to, kept until the next starts or it is dismissed
+                // (P6): done, refused and not known each said as itself.
+                OutcomeMark(outcome: outcome, id: "status-outcome-\(outcome.kindName)")
+                Button {
+                    model.clearOutcome()
+                } label: {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss")
+                .accessibilityIdentifier("status-dismiss")
             }
         }
         .font(Theme.mono)
@@ -984,12 +991,13 @@ private struct StatusBar: View {
     private var words: String {
         var parts = ["node \(model.node)", model.peers == 1 ? "1 peer" : "\(model.peers) peers",
                      model.keyring]
-        if let did = model.did { parts.append(did) }
         if model.notifying == false {
             parts.append("notifications off (System Settings, Notifications, Vox)")
         }
-        if let ended = model.ended { parts.append(ended) } else if let said = model.said {
-            parts.append(said)
+        if let ended = model.ended {
+            parts.append(ended)
+        } else if let outcome = model.outcome {
+            parts.append(outcome.said)
         }
         return parts.filter { !$0.isEmpty }.joined(separator: ", ")
     }
@@ -998,4 +1006,42 @@ private struct StatusBar: View {
 extension RoomGroup {
     /// The group, as the sidebar heads it (the TUI's words).
     var words: String { roomGroupWords(group: self) }
+}
+
+/// What one operation came to, as a person reads it (P6): done plainly, refused as a danger, and
+/// not known whether it was done as an attention, each with its own words; nothing when there is
+/// none.
+struct OutcomeMark: View {
+    let outcome: Outcome?
+    /// Where it is shown, as its identifier says it; else its kind (`outcome-refused`).
+    var id: String? = nil
+
+    var body: some View {
+        if let outcome {
+            StateMark(kind: outcome.kind == .done ? .plain
+                          : outcome.kind == .refused ? .danger : .attention,
+                      words: outcome.said)
+                .textSelection(.enabled)
+                .accessibilityIdentifier(id ?? "outcome-\(outcome.kindName)")
+        }
+    }
+}
+
+extension Outcome {
+    /// Its words, with what it was where that is not plain from them.
+    var said: String {
+        switch kind {
+        case .done, .refused: return words
+        case .unknown: return "Not known whether it was done. \(words)"
+        }
+    }
+
+    /// Its kind, as an identifier says it.
+    var kindName: String {
+        switch kind {
+        case .done: return "done"
+        case .refused: return "refused"
+        case .unknown: return "unknown"
+        }
+    }
 }

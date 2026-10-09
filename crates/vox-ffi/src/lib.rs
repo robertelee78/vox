@@ -59,6 +59,13 @@ pub enum VoxError {
         /// What happened, for a person.
         reason: String,
     },
+    /// The request was sent and the daemon stopped answering before it said: whether it was done
+    /// is not known (a client says so, never "failed").
+    #[error("{reason}")]
+    Unknown {
+        /// What happened, for a person.
+        reason: String,
+    },
 }
 
 fn failed(reason: impl Into<String>) -> VoxError {

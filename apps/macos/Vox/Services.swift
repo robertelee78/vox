@@ -48,7 +48,10 @@ struct ServicesView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 Text("Services").heading()
-                if let did = model.did {
+                // What this view's last share, stop or copy did: its own, never another's (P6).
+                if let did = model.outcome.flatMap({
+                    $0.kind == .done && ["share", "stop-share", "copy"].contains($0.operation) ? $0.words : nil
+                }) {
                     StateMark(kind: .plain, words: did).textSelection(.enabled)
                         .accessibilityIdentifier("services-did")
                 }
