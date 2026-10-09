@@ -939,23 +939,50 @@ final class FirstRunProof: XCTestCase {
         guard let cg = shot.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             throw Apparatus("XCTest's screenshot of the window has no bitmap")
         }
-        let bitmap = NSBitmapImageRep(cgImage: cg)
-        let perPoint = CGFloat(cg.width) / frame.width
-        func rgb(_ p: CGPoint) -> (Int, Int, Int)? {
-            let x = Int((p.x - frame.minX) * perPoint), y = Int((p.y - frame.minY) * perPoint)
-            guard x >= 0, y >= 0, x < cg.width, y < cg.height,
-                  let c = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { return nil }
-            return (Int((c.redComponent * 255).rounded()), Int((c.greenComponent * 255).rounded()),
-                    Int((c.blueComponent * 255).rounded()))
+        // The screenshot's own bytes, in its own colour space (Display P3 on this Mac), each token
+        // converted into that space to compare. NSBitmapImageRep.colorAt reports a screenshot's
+        // pixel as "Generic RGB", and converting that to sRGB brightened every dark grey: bg.panel
+        // #16171a read as #1d1e21 for a day while the sidebar was right (2026-10-09).
+        guard let space = cg.colorSpace else {
+            throw Apparatus("XCTest's screenshot has no colour space to read its pixels in")
         }
+        let perPoint = CGFloat(cg.width) / frame.width
+        /// `image`'s pixel at a point of the window, as its bytes say in its own colour space.
+        func reader(_ image: CGImage) -> (CGPoint) -> (Int, Int, Int)? {
+            guard let context = CGContext(data: nil, width: image.width, height: image.height,
+                                          bitsPerComponent: 8, bytesPerRow: image.width * 4,
+                                          space: image.colorSpace ?? space,
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+                return { _ in nil }
+            }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+            guard let data = context.data else { return { _ in nil } }
+            let bytes = data.assumingMemoryBound(to: UInt8.self)
+            return { p in
+                let x = Int((p.x - frame.minX) * perPoint), y = Int((p.y - frame.minY) * perPoint)
+                guard x >= 0, y >= 0, x < image.width, y < image.height else { return nil }
+                // A bitmap context's first row is the image's top row, as the window's points run.
+                let i = (y * image.width + x) * 4
+                return (Int(bytes[i]), Int(bytes[i + 1]), Int(bytes[i + 2]))
+            }
+        }
+        let rgb = reader(cg)
         func hex(_ c: (Int, Int, Int)?) -> String {
             guard let c else { return "nothing (off the window)" }
             return String(format: "#%02x%02x%02x", c.0, c.1, c.2)
         }
+        /// The token `want` (sRGB, as the token file has it) in the screenshot's colour space.
+        func inSpace(_ want: String) -> (Int, Int, Int)? {
+            guard let v = Int(want.dropFirst(), radix: 16),
+                  let c = CGColor(srgbRed: CGFloat(v >> 16 & 0xff) / 255, green: CGFloat(v >> 8 & 0xff) / 255,
+                                  blue: CGFloat(v & 0xff) / 255, alpha: 1)
+                    .converted(to: space, intent: .defaultIntent, options: nil),
+                  let k = c.components, k.count >= 3 else { return nil }
+            return (Int((k[0] * 255).rounded()), Int((k[1] * 255).rounded()), Int((k[2] * 255).rounded()))
+        }
         func near(_ c: (Int, Int, Int)?, _ want: String) -> Bool {
-            guard let c, let v = Int(want.dropFirst(), radix: 16) else { return false }
-            return abs(c.0 - (v >> 16 & 0xff)) <= 4 && abs(c.1 - (v >> 8 & 0xff)) <= 4
-                && abs(c.2 - (v & 0xff)) <= 4
+            guard let c, let w = inSpace(want) else { return false }
+            return abs(c.0 - w.0) <= 4 && abs(c.1 - w.1) <= 4 && abs(c.2 - w.2) <= 4
         }
         let above = status.frame.minY - 24
         let points: [(String, CGPoint, String)] = [
@@ -963,7 +990,8 @@ final class FirstRunProof: XCTestCase {
             ("the sidebar", CGPoint(x: frame.minX + 6, y: above), "#16171a"),
             ("the timeline", CGPoint(x: message.frame.minX + 40, y: message.frame.maxY + 40), "#0c0d0f"),
             ("the inspector", CGPoint(x: frame.maxX - 16, y: above), "#131417"),
-            ("the status bar", CGPoint(x: status.frame.minX + 3, y: status.frame.midY), "#131417"),
+            // In the bar's leading padding: its words start 12 points in.
+            ("the status bar", CGPoint(x: frame.minX + 4, y: status.frame.midY), "#131417"),
         ]
         var read: [String] = []
         for (place, point, want) in points {
@@ -997,12 +1025,8 @@ final class FirstRunProof: XCTestCase {
            let t = locate(ui, title) {
             let shotSheet = window.screenshot().image
             if let cgs = shotSheet.cgImage(forProposedRect: nil, context: nil, hints: nil) {
-                let b = NSBitmapImageRep(cgImage: cgs)
                 let p = CGPoint(x: t.frame.minX - 12, y: t.frame.minY - 12)
-                let px = Int((p.x - frame.minX) * perPoint), py = Int((p.y - frame.minY) * perPoint)
-                let c = b.colorAt(x: px, y: py)?.usingColorSpace(.sRGB)
-                let got = c.map { (Int(($0.redComponent * 255).rounded()), Int(($0.greenComponent * 255).rounded()),
-                                   Int(($0.blueComponent * 255).rounded())) }
+                let got = reader(cgs)(p)
                 read.append("sheet \(hex(got))")
                 XCTAssertTrue(near(got, "#16171a"),
                               "PRODUCT: a sheet must be drawn in bg.panel #16171a (L-6); inside Rename's, at \(p), it is \(hex(got)) (sheet at \(sheet.frame))")
