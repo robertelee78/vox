@@ -204,11 +204,11 @@ network presence from the start: there is no interim design with one socket per 
   the same exchange as any other pair. The first piece of work MUST be a real-binary proof that this
   works, including connection loss and redial, before anything else depends on it.
 
-### 7. Files, and no migration
+### 7. Files, migration and upgrades
 
 - **F-1. Layout.**
   ```
-  <data root>/.daemon/        lock, vox.sock, port, log, attach,
+  <data root>/.daemon/        lock, vox.sock, port, log, attach, format,
                               config (listen, metrics, relay limits)
   <data root>/nodes/<name>/   vault.cbor | node-identity.key, store.redb,
                               config/   (today's file names: anchors, config,
@@ -220,14 +220,39 @@ network presence from the start: there is no interim design with one socket per 
   from the same file in the account's config directory. The daemon's own settings (listen, metrics,
   relay limits) MUST be read from `.daemon/config`; the relay limits are `relay-circuits` and
   `relay-circuits-per-asker` (ADR-012 N-45).
-- **F-3. No migration.** Vox MUST carry no code that reads, converts or migrates data written by a
-  release before v0.3.0: nobody has run one (decider, 2026-10-04, #423).
-  - A directory of the data root outside `nodes/` holding `vault.cbor`, `node-identity.key` or
-    `store.redb` is not a node. A data root holding one MUST be refused by every verb, and by the
-    daemon before it takes its lock, saying "`<root>` is not a Vox data directory this version
-    reads: `<root>/<name>` is not a node", and MUST be left byte for byte unchanged.
-  - Only this version's formats are read: a vault, keyring, store blob, cache row or log entry of
-    another version is malformed, never converted.
+- **F-3. Data from an earlier release** (amended 2026-10-08). Data written before v0.4.0 is not
+  upgraded: nobody ran a release before v0.3.0 (decider, 2026-10-04, #423), and the one person
+  with older data started fresh. Data written by v0.4.0 or later MUST be upgraded by every later
+  release (decider, 2026-10-08: "From this point forward … we need a way to upgrade folks so we
+  don't break their old profiles when we make changes").
+  - **Before v0.3.0: refused.** Vox MUST carry no code that reads, converts or migrates data
+    written by a release before v0.3.0. A directory of the data root outside `nodes/` holding
+    `vault.cbor`, `node-identity.key` or `store.redb` is not a node: such a release left it there.
+    A data root holding one MUST be refused by every verb, and by the daemon before it takes its
+    lock, saying "`<root>` is not a Vox data directory this version reads: `<root>/<name>` is not a
+    node", and MUST be left byte for byte unchanged.
+  - **v0.3.x: not upgraded.** A v0.3.x data root has v0.4.0's layout and no `.daemon/format`, so
+    it cannot be told from one v0.4.0 wrote. It is read as format 1, and Vox MUST carry no code
+    that converts it to v0.4.0's formats.
+  - **From v0.4.0 on: upgraded.** `.daemon/format` MUST name the data root's format and the
+    version of vox that last served it, as two lines: `format <n>` and `written-by vox
+    <version>`. The daemon (and `vox node`) MUST write it once it holds the account lock, and MUST
+    rewrite it only when what it says changes. A data root without the file is format 1, as
+    v0.4.0 left it.
+  - The format covers the data root's layout and every format of the files under it: the vault,
+    the anchor's key, every store table and encoding, and the node and daemon config files. A
+    release that changes any of them MUST raise the format number, and MUST upgrade, automatically
+    and before anything else is written, a data root of every earlier format a release since
+    v0.4.0 wrote. Nothing a person had may be lost: the node's identity, its keyring, its rooms,
+    and every row with its time. A data root an upgrade cannot read MUST be refused unchanged, with
+    the reason.
+  - Upgrade code MUST NOT be deleted while a supported release could have written data in the
+    format it reads.
+  - Each release MUST prove it on a data root the newest published release wrote
+    (`a_data_root_of_the_previous_release_opens_with_nothing_lost`), before it is tagged; the proof
+    MUST NOT be optional.
+  - Only this version's formats, and those it upgrades, are read: a vault, keyring, store blob,
+    cache row or log entry of any other version is malformed, never converted.
   - One node is one identity: a node holding a vault runs its anchor (`vox node`) as node
     `<name>-anchor`.
 
@@ -289,7 +314,13 @@ Each claim MUST be proved by real use of the shipped binary (ADR-018), with one 
    (`an_agents_wiring_acts_only_as_its_node_proof`); a one-shot verb refuses an unattached node
    (`the_nodes_of_one_daemon_proof`); node names follow N-1a (`the_nodes_of_one_daemon_proof`);
 10. a fresh data root works end to end, and one holding a node's files outside `nodes/` is refused
-    with the reason and left unchanged (`a_data_root_of_an_earlier_release_is_refused_proof`);
+    with the reason and left unchanged (`a_data_root_of_an_earlier_release_is_refused_proof`); a
+    data root the previous published release wrote (downloaded and digest-checked: an anchor and two
+    members, a room, trust both ways, posts each way and a share) opens in this build with the same
+    fingerprint, keyring, room and rows in the same order with the same times, its share still
+    listed, a new post delivered, and `.daemon/format` written (F-3) (mutant: the vault's AEAD label
+    changed → red) (`a_data_root_of_the_previous_release_opens_with_nothing_lost`, in the same
+    file);
 11. a node keeps running in full past the keyring window, and only a keyring change asks for the
     passphrase again (`a_keyring_change_needs_a_recent_passphrase_proof`);
 12. R40 and R42 are re-measured (`perf_r40_chat_latency_proof`, `perf_r40_relayed_chat_proof`,

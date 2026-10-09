@@ -86,6 +86,13 @@ unreachable when it was reached. When an anchor is missing, say truthfully what 
 - **Every known defect is fixed in the current release.** Never defer one to "next release". Why: the
   decider ruled it; the one exception, shipping a known break so a feature can be tested, is the
   decider's call alone. (The decider, 2026-09-26; the v0.2.10 release plan)
+- **An upgrade never breaks a person's data.** "we need a way to upgrade folks so we don't break
+  their old profiles when we make changes." A change to any on-disk format (the data root's layout,
+  the vault, a store encoding, a config file) ships an automatic upgrade from every release since
+  v0.4.0, proven on a data root the previous published release wrote
+  (`a_data_root_of_the_previous_release_opens_with_nothing_lost`), and raises the data root's format
+  (`.daemon/format`). Upgrade code is never deleted while a supported release could have written
+  the data. Data from before v0.4.0 is out of scope. (The decider, 2026-10-08; ADR-026 F-3)
 
 ## Safety
 
