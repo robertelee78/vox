@@ -34,11 +34,25 @@
 //!    stream closes the connection with the refusal. Mutant: no check for a second flight.
 //! 8. **A silent dialler** (requirement 33): a connection that never asks is closed with the
 //!    refusal 5000 ms after its handshake. Mutant: no bound on the wait for the `ASK`.
+//! 9. **No second exchange after the first** (requirement 33): a member's stream of the identity
+//!    kind after its exchange closes the connection with the refusal's code. Mutant: the host
+//!    leaves the connection open.
+//! 10. **The answer's random delay** (requirement 32): of 16 `PROVE`s, some leave in the first
+//!     half of the 50–100 ms window and some in the second. Mutant: no random delay.
+//! 11. **A node that comes back is a new process** (requirement 40, ADR-026 I-3): the host's
+//!     instance is the same while it stays attached and new after a detach and attach; and the
+//!     host closes an identity's connection as superseded when that identity connects with a new
+//!     instance, four rounds running. Mutants: the instance fixed; the instance left out of the
+//!     process identity.
+//! 12. **A flood of pre-identity connections is capped** (requirements 33–34): 64 that never ask
+//!     hold every handshake slot, so the next waits about 5000 ms for one; and with every slot
+//!     held, 1124 attempts at once have 100 refused at once (1024 wait). Mutants: no cap of 64; no
+//!     cap of 1024.
 //!
 //! **Not measurable from outside, so not claimed here:** that a rate-limited `ASK` is refused
 //! *before* its target is looked up (requirement 34's order: the lookup leaves no trace on the
-//! wire); a circuit's `ASK` for another node, and a listener whose exporter fails (internal
-//! failures no attacker can cause); the answer jitter's distribution.
+//! wire); a circuit's `ASK` for another node; and a listener whose exporter fails (an internal
+//! failure no attacker can cause).
 //!
 //! **Which side a red is on.** The daemon doing what an attack wanted (answering, accepting,
 //! leaking a reason, a code, a flight or a time) is `PRODUCT:`; a daemon that would not start, an
@@ -118,6 +132,7 @@ fn daemon(root: &Path, name: &str, spec: &str) -> Daemon {
 struct World {
     _tmp: tempfile::TempDir,
     _anchor: VoxProc,
+    spec: String,
     host: Daemon,
 }
 
@@ -129,6 +144,7 @@ fn world() -> World {
     World {
         _tmp: tmp,
         _anchor: anchor,
+        spec,
         host,
     }
 }
@@ -843,5 +859,355 @@ fn a_silent_dialler_is_closed_at_five_seconds() {
             ms(took),
             ms(EXCHANGE_TIMEOUT)
         );
+    });
+}
+
+/// Claim 9 (requirement 33's last rule). Once the exchange is done, a stream that opens with the
+/// identity kind is a second exchange, and closes the connection with the refusal. Played by a
+/// member of the host's room, whose key the attacker holds (its own daemon stopped): the host
+/// dispatches a member's streams, so the rule is reached.
+#[test]
+#[ignore = "real daemons and a test-side attacker; run in release"]
+fn an_identity_stream_after_the_exchange_closes_the_connection() {
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    watchdog::arm();
+    let w = world();
+    let (_room, link) = hostile::create_room(&w.host.data, "team", "room pass");
+    let member = {
+        let m = daemon(w._tmp.path(), "member", &w.spec);
+        let (ok, out, err) = hostile::vox_in(
+            &m.data,
+            &["room", "join", "--passphrase-file", "-", &link],
+            "room pass",
+        );
+        assert!(
+            ok,
+            "APPARATUS: staging: the member could not join: {out}{err}"
+        );
+        // Let the host file the new member before its daemon goes.
+        std::thread::sleep(Duration::from_secs(3));
+        m.data.clone()
+    };
+    let signer = hostile::member_signer(&member);
+    let rt = runtime();
+    rt.block_on(async {
+        let e = endpoint(false);
+        let instance = new_instance().expect("APPARATUS: an instance");
+        let c = connect(&e, w.host.addr).await;
+        dial(&c, &*signer, instance, w.host.fp)
+            .await
+            .unwrap_or_else(|f| panic!("PRODUCT: the member's dial was refused: {f:?}"));
+        let (mut send, _recv) = c
+            .open_bi()
+            .await
+            .expect("PRODUCT: a stream after the exchange did not open");
+        write_frame(&mut send, &StreamKind::Identity.frame())
+            .await
+            .expect("APPARATUS: write the stream's kind");
+        write_frame(&mut send, &Ask { target: w.host.fp }.encode())
+            .await
+            .expect("APPARATUS: write the ASK");
+        // After the exchange the peer is known, so the close may say why; what must hold is that
+        // the connection ends, with the refusal's code.
+        let Some(seen) = closed(&c, Duration::from_millis(2000)).await else {
+            panic!(
+                "PRODUCT: an identity stream after the exchange left the connection open 2000 ms \
+                 later"
+            )
+        };
+        assert_eq!(
+            seen.code,
+            refusal(),
+            "PRODUCT: an identity stream after the exchange closed the connection with code {}, \
+             not the refusal's ({})",
+            seen.code,
+            refusal()
+        );
+        println!("[proof] an identity stream after the exchange: the connection closed");
+    });
+}
+
+/// Claim 10 (requirement 32's timing). Each `PROVE` leaves no earlier than the 50 ms floor after
+/// its `ASK`, plus a random delay up to 50 ms, so a prober cannot learn a refusal's timing from a
+/// constant: of 16 answers, some come in the window's first half and some in its second.
+#[test]
+#[ignore = "real daemons and a test-side attacker; run in release"]
+fn every_answer_waits_the_floor_and_a_random_delay() {
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    watchdog::arm();
+    let w = world();
+    let rt = runtime();
+    let fp = w.host.fp;
+    let delays = rt.block_on(async {
+        let e = endpoint(false);
+        let mut conns = Vec::new();
+        for _ in 0..ASK_BURST {
+            conns.push(connect(&e, w.host.addr).await);
+        }
+        let tasks: Vec<_> = conns
+            .into_iter()
+            .map(|c| {
+                tokio::spawn(async move {
+                    let (_send, mut recv, asked) = raw_ask(&c, fp).await;
+                    let _ = read_prove(&mut recv).await;
+                    let took = asked.elapsed();
+                    drop(c);
+                    took
+                })
+            })
+            .collect();
+        let mut delays = Vec::new();
+        for t in tasks {
+            delays.push(t.await.expect("APPARATUS: an ASK task"));
+        }
+        delays
+    });
+    let mid = ANSWER_FLOOR + ANSWER_JITTER / 2;
+    let top = ANSWER_FLOOR + ANSWER_JITTER + Duration::from_millis(150);
+    let mut ms_list: Vec<u128> = delays.iter().map(|d| ms(*d)).collect();
+    ms_list.sort_unstable();
+    let early = delays.iter().filter(|d| **d < mid).count();
+    let late = delays.len() - early;
+    println!(
+        "[proof] {} PROVEs after their ASKs, ms: {ms_list:?}; {early} before {} ms, {late} at or \
+         after",
+        delays.len(),
+        ms(mid)
+    );
+    for d in &delays {
+        assert!(
+            *d >= ANSWER_FLOOR - Duration::from_millis(2) && *d <= top,
+            "PRODUCT: a PROVE left {} ms after its ASK, outside {}..={} ms",
+            ms(*d),
+            ms(ANSWER_FLOOR),
+            ms(top)
+        );
+    }
+    assert!(
+        early >= 3 && late >= 3,
+        "PRODUCT: of {} PROVEs, {early} left in the first half of the window and {late} in the \
+         second: the delay is not spread over the window ({ms_list:?} ms)",
+        delays.len()
+    );
+}
+
+/// Claim 11 (requirement 40, ADR-026 I-3). **A node that comes back is a new process to its
+/// peers.** Its instance is drawn fresh at every attach: two `ASK`s while the host's node stays
+/// attached get one instance in their `PROVE`s, and one after `vox node detach` and `vox node
+/// attach` gets another. And a peer takes a connection of a new instance for a new process of
+/// that identity: an identity that connects again with a new instance has its connection before
+/// closed by the host (`Unresponsive`, ADR-011 V210-57), while the new one stays, every time.
+#[test]
+#[ignore = "real daemons and a test-side attacker; run in release"]
+fn a_node_that_comes_back_is_a_new_process() {
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    watchdog::arm();
+    let w = world();
+    let rt = runtime();
+    let fp = w.host.fp;
+    let instance_of = |rt: &hostile::Rt| {
+        rt.block_on(async {
+            let e = endpoint(false);
+            let c = connect(&e, w.host.addr).await;
+            let (_send, mut recv, _) = raw_ask(&c, fp).await;
+            let prove = read_prove(&mut recv).await;
+            Prove::decode(&prove)
+                .expect("PRODUCT: the daemon's PROVE does not parse")
+                .instance
+        })
+    };
+    let (first, again) = (instance_of(&rt), instance_of(&rt));
+    let pass = w._tmp.path().join("host.pass");
+    let pass = pass.to_str().expect("APPARATUS: a UTF-8 path");
+    for argv in [
+        vec!["node", "detach", "default"],
+        vec![
+            "node",
+            "attach",
+            "default",
+            "--keep",
+            "--passphrase-file",
+            pass,
+        ],
+    ] {
+        let (ok, out, err) = vox_once_plain(&w.host.data, &args(&argv));
+        assert!(
+            ok,
+            "APPARATUS: staging `vox {}`: {out}{err}",
+            argv.join(" ")
+        );
+    }
+    let back = instance_of(&rt);
+    println!(
+        "[proof] the host's instance: {} twice while attached ({}), {} after detach and attach",
+        b32_encode_16(&first),
+        first == again,
+        b32_encode_16(&back)
+    );
+    assert_eq!(
+        first, again,
+        "PRODUCT: the host's instance changed while its node stayed attached"
+    );
+    assert_ne!(
+        first, back,
+        "PRODUCT: the host's node came back with the instance it had: its peers would take it for \
+         the process before"
+    );
+
+    // The peer's side: one identity, a new instance each round.
+    let me = stranger();
+    rt.block_on(async {
+        let e = endpoint(false);
+        let held = connect(&e, w.host.addr).await;
+        dial(
+            &held,
+            &me,
+            new_instance().expect("APPARATUS: an instance"),
+            fp,
+        )
+        .await
+        .unwrap_or_else(|f| panic!("PRODUCT: an honest dial was refused: {f:?}"));
+        let mut held = held;
+        let unresponsive = u64::from(vox_core::wire::WireError::Unresponsive.code());
+        for round in 1..=4 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let next = connect(&e, w.host.addr).await;
+            dial(
+                &next,
+                &me,
+                new_instance().expect("APPARATUS: an instance"),
+                fp,
+            )
+            .await
+            .unwrap_or_else(|f| {
+                panic!("PRODUCT: round {round}: an honest dial was refused: {f:?}")
+            });
+            let Some(old) = closed(&held, Duration::from_millis(1000)).await else {
+                panic!(
+                    "PRODUCT: round {round}: the connection of the process before was still open \
+                     1000 ms after a new process of its identity connected"
+                )
+            };
+            assert_eq!(
+                old.code, unresponsive,
+                "PRODUCT: round {round}: the connection of the process before was closed with \
+                 code {}, not as superseded by a new process ({unresponsive})",
+                old.code
+            );
+            assert!(
+                closed(&next, Duration::from_millis(1000)).await.is_none(),
+                "PRODUCT: round {round}: the new process's connection was closed"
+            );
+            held = next;
+        }
+        println!("[proof] 4 rounds: each new instance's connection closed the one before");
+    });
+}
+
+/// A 16-byte instance, shown in base32.
+fn b32_encode_16(i: &[u8; 16]) -> String {
+    let mut d = [0u8; 32];
+    d[..16].copy_from_slice(i);
+    b32_encode(&d)[..26].to_owned()
+}
+
+/// Claim 12 (requirements 33, 34; ADR-026). **A flood of pre-identity connections is capped.**
+/// 64 connections that finish their handshake and never ask hold every handshake slot until the
+/// 5000 ms exchange bound closes them; the next attempt waits for a slot, so its handshake
+/// finishes only once one frees. With every slot held, at most 1024 more attempts wait: a burst of
+/// 1124 has its last 100 refused at once.
+#[test]
+#[ignore = "real daemons and a test-side attacker; run in release"]
+fn a_flood_of_pre_identity_connections_is_capped() {
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    watchdog::arm();
+    let w = world();
+    let rt = runtime();
+    let addr = w.host.addr;
+    rt.block_on(async {
+        let e = endpoint(false);
+        // Every slot held, by connections that never ask.
+        let started = Instant::now();
+        let mut silent = Vec::new();
+        for _ in 0..64 {
+            silent.push(connect(&e, addr).await);
+        }
+        let held_by = started.elapsed();
+        // The next attempt waits for a slot.
+        let asked = Instant::now();
+        let next = tokio::time::timeout(Duration::from_secs(15), async {
+            e.connect(addr, "vox.invalid")
+                .expect("APPARATUS: start a connection")
+                .await
+        })
+        .await
+        .expect("PRODUCT: the 65th attempt neither finished nor was refused in 15000 ms");
+        let waited = asked.elapsed();
+        println!(
+            "[proof] 64 silent connections took the slots in {} ms; the 65th attempt's handshake \
+             finished {} ms after it began ({})",
+            ms(held_by),
+            ms(waited),
+            if next.is_ok() { "admitted" } else { "refused" }
+        );
+        assert!(
+            waited >= Duration::from_millis(3000),
+            "PRODUCT: with every handshake slot held, the 65th attempt finished its handshake {} ms \
+             after it began: the cap of 64 did not hold it",
+            ms(waited)
+        );
+        drop(next);
+        drop(silent);
+        // Wait for the slots to come back before the next part.
+        tokio::time::sleep(Duration::from_millis(6000)).await;
+
+        // Every slot held again; then 1124 attempts at once.
+        let mut silent = Vec::new();
+        for _ in 0..64 {
+            silent.push(connect(&e, addr).await);
+        }
+        let fired = Instant::now();
+        let attempts: Vec<_> = (0..1124)
+            .map(|_| {
+                let connecting = e
+                    .connect(addr, "vox.invalid")
+                    .expect("APPARATUS: start a connection");
+                tokio::spawn(async move {
+                    let r = tokio::time::timeout(Duration::from_secs(15), connecting).await;
+                    (r, Instant::now())
+                })
+            })
+            .collect();
+        let mut refused_at_once = 0usize;
+        let mut other = 0usize;
+        for a in attempts {
+            let (r, at) = a.await.expect("APPARATUS: an attempt task");
+            match r {
+                Ok(Err(quinn::ConnectionError::ConnectionClosed(_)))
+                    if at.duration_since(fired) < Duration::from_millis(2000) =>
+                {
+                    refused_at_once += 1;
+                }
+                _ => other += 1,
+            }
+        }
+        println!(
+            "[proof] with every slot held, 1124 attempts at once: {refused_at_once} refused within \
+             2000 ms, {other} waited (admitted or refused later)"
+        );
+        assert!(
+            refused_at_once >= 100,
+            "PRODUCT: with every slot held, {refused_at_once} of 1124 attempts were refused at \
+             once: the 1024 waiting places did not bound the queue"
+        );
+        drop(silent);
     });
 }
