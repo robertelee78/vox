@@ -1150,11 +1150,17 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("the waiting PermissionRequest hook did not start: \(started.out)")
         }
         defer { _ = stager.run(["/bin/kill", hookPid], env: [:]) }
+        // The request is waiting on alice once S1's read marks it so (`"waiting":true`); the
+        // room's Sessions list never says "waiting", so it cannot tell.
+        let s1Read = { self.run(vox, ["room", "session", "--node", "alice", "--json", room, s1], env: voxEnv).out }
         let waitingUntil = Date().addingTimeInterval(20)
-        var sessionsNow = ""
-        while Date() < waitingUntil && !sessionsNow.contains("waiting") {
-            sessionsNow = run(vox, ["room", "sessions", "--node", "alice", room], env: voxEnv).out
-            if !sessionsNow.contains("waiting") { Thread.sleep(forTimeInterval: 0.5) }
+        var s1Now = ""
+        while Date() < waitingUntil && !s1Now.contains("\"waiting\":true") {
+            s1Now = s1Read()
+            if !s1Now.contains("\"waiting\":true") { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        guard s1Now.contains("\"waiting\":true") else {
+            throw Apparatus("staging not achieved: S1's request is not waiting on alice within 20 s; `vox room session --json` said \(s1Now.debugDescription)")
         }
 
         let ui = voxApp(appPath)
@@ -1169,7 +1175,8 @@ final class FirstRunProof: XCTestCase {
         present(ui, requestRow, timeout: 30,
                 "⌘J must open S1, the Session waiting on alice, with its request",
                 premise: Premise("S1 has a request waiting on alice") {
-                    (sessionsNow.contains("waiting"), "`vox room sessions` said \(sessionsNow.debugDescription)")
+                    let now = s1Read()
+                    return (now.contains("\"waiting\":true"), "`vox room session --json` said \(now.debugDescription)")
                 })
         if let row = locate(ui, requestRow), !row.isSelected {
             keepTree(ui, "the request ⌘J landed on was not selected")
