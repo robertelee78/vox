@@ -24,6 +24,8 @@
 //    agent drain (`vox agent hook`), shows "read by bob" under it in her timeline.
 //    A reply quotes what it answers (ADR-028 R-9, D6): bob's reply to FROM-ALICE shows "re you:
 //    FROM-ALICE" above it, and its quote, clicked, or ⌘↑ with the reply selected, selects FROM-ALICE.
+//    To: offers bob's open Session under him (MADR W-4, ADR-029 TA-1, D7): ticked, alice's post is
+//    addressed to that Session alone, <bob>/<session>, as bob's node holds it.
 // 5. The keyring view (ADR-014 M-16, ADR-028 K-3, E-5, #443): a pasted fingerprint with an alias
 //    says what trusting does before it is done, and is listed, as `vox trust list` lists it;
 //    removing it says what untrusting does first, and only then removes it.
@@ -75,6 +77,8 @@
 // nothing from before it opened (no seeding from VoxClient.unread): (13) goes red. ↑/↓ that do not
 // move the selection, or Space and Return that open nothing: (14) goes red.
 // A quote that goes nowhere (MessageRow's quote button not calling `jump`): (4) goes red.
+// To: that ticks the member for one of its Sessions (the Session's tick inserting the member's
+// fingerprint alone): (4) goes red.
 
 // Every check on the window proves its own query first (ADR-018: a red names its side): Vox is in
 // front and XCTest reads words in what it shows, else the red is APPARATUS; then a red is PRODUCT
@@ -839,6 +843,51 @@ final class FirstRunProof: XCTestCase {
         reaches("clicking the reply's quote") { tap(ui, quote, "the reply's quote") }
         reaches("⌘↑ with the reply selected") { ui.typeKey(.upArrow, modifierFlags: .command) }
         print("[proof] bob's reply quotes \"re you: FROM-ALICE\", and its quote and ⌘↑ go to it")
+
+        // (4d) To: offers bob's open Session under him, and a message to it alone is addressed to
+        // that Session (MADR W-4, ADR-029 TA-1, D7): bob's Claude Code session opens a Session in
+        // mission by its hook, as a person's does; alice ticks it in To: and posts; bob's node holds
+        // the post addressed to <bob>/<session>, as `vox room post --to bob/<session>` sends it.
+        let d7Session = "d7-proof-session"
+        let opened = run(vox, ["agent", "hook", "--node", "bob", "--room", room, "--format", "text"],
+                         env: voxEnv.merging(["CLAUDE_CODE_ENTRYPOINT": "cli"]) { $1 },
+                         input: "{\"session_id\":\"\(d7Session)\",\"hook_event_name\":\"UserPromptSubmit\",\"cwd\":\"/tmp\",\"transcript_path\":\"/tmp/t.jsonl\",\"prompt\":\"go\"}")
+        guard opened.status == 0 else {
+            throw Apparatus("bob's Claude Code hook, to open a Session in mission, exited \(opened.status): \(opened.out)")
+        }
+        let sessionsUntil = Date().addingTimeInterval(30)
+        var listed = ""
+        while Date() < sessionsUntil && !listed.contains(d7Session.prefix(8)) {
+            listed = run(vox, ["room", "sessions", "--node", "alice", room], env: voxEnv).out
+            if !listed.contains(d7Session.prefix(8)) { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        guard listed.contains(d7Session.prefix(8)) else {
+            throw Apparatus("alice's `vox room sessions` never listed bob's Session \(d7Session) in 30 s: \(listed)")
+        }
+        let toBox = Key.id("compose-to")
+        tap(ui, toBox, "To:")
+        tap(ui, Key.idPrefix("to-bob-"), "bob's open Session under bob in To:",
+            premise: Premise("alice's `vox room sessions` lists bob's open Session \(d7Session)") {
+                let now = self.run(vox, ["room", "sessions", "--node", "alice", room], env: voxEnv).out
+                return (now.contains(d7Session.prefix(8)), now)
+            })
+        ui.typeKey(.escape, modifierFlags: [])
+        type(ui, Key.id("compose"), "TO-BOB-SESSION\r", "the composer")
+        var addressedTo: [String] = []
+        let postedUntil = Date().addingTimeInterval(30)
+        while Date() < postedUntil && addressedTo.isEmpty {
+            let rows = run(vox, ["room", "read", "--node", "bob", "--json", room], env: voxEnv).out
+            for line in rows.split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      (row["text"] as? String)?.contains("TO-BOB-SESSION") == true else { continue }
+                addressedTo = (row["envelope"] as? [String: Any])?["to"] as? [String] ?? ["(not addressed)"]
+            }
+            if addressedTo.isEmpty { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        XCTAssertTrue(addressedTo.count == 1 && addressedTo[0].hasSuffix("/\(d7Session)")
+                      && addressedTo[0].lowercased().hasPrefix(bobFp.lowercased()),
+                      "PRODUCT: alice's post with bob's Session ticked in To: must be addressed to that Session alone, <bob>/\(d7Session); bob's node holds it addressed to \(addressedTo)")
+        print("[proof] To: bob's Session: the post is addressed to \(addressedTo)")
 
         // (5) The keyring: carol, a node made here, added by her pasted fingerprint, then removed.
         try staged(vox, ["node", "create", "carol"],
