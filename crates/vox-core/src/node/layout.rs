@@ -7,7 +7,7 @@
 //! ([`refuse_old_layout`]), and left exactly as it is. Vox carries no code that reads, converts or
 //! moves such a directory.
 //!
-//! **What wrote a data root is written in it** (ADR-026 F-4): `.daemon/format` names the data
+//! **What wrote a data root is written in it** (ADR-026 F-3): `.daemon/format` names the data
 //! root's format and the version of vox that last served it ([`stamp_format`]). A release that
 //! changes an on-disk format upgrades every data root a supported release wrote, and this is how
 //! it tells which one it holds. A root without the file was last served by v0.4.0, which wrote
@@ -70,7 +70,7 @@ pub fn refuse_old_layout(account: &Account) -> Result<()> {
     }
 }
 
-/// The data root's format (ADR-026 F-4): the layout of `.daemon/` and `nodes/`, and every format
+/// The data root's format (ADR-026 F-3): the layout of `.daemon/` and `nodes/`, and every format
 /// the files under them are in. A release that changes any of them raises it, and upgrades a root
 /// of every earlier value a supported release (v0.4.0 on) wrote.
 pub const DATA_ROOT_FORMAT: u32 = 1;

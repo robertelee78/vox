@@ -20,7 +20,7 @@
 //! identical. The config directory and `HOME` are outside it, so nothing legitimate writes inside
 //! it.
 //!
-//! **Arm 3, a data root of the previous published release** (ADR-026 F-4, decider 2026-10-08):
+//! **Arm 3, a data root of the previous published release** (ADR-026 F-3, decider 2026-10-08):
 //! made by that release, downloaded and digest-checked, and opened by this build with nothing lost
 //! ([`a_data_root_of_the_previous_release_opens_with_nothing_lost`]). It runs before every
 //! release.
@@ -443,7 +443,7 @@ fn seen(w: &room::Worker, room: &str, others: &[String], side: &str) -> Seen {
     }
 }
 
-/// ADR-026 F-4 — **a data root the previous published release wrote opens in this build with
+/// ADR-026 F-3 — **a data root the previous published release wrote opens in this build with
 /// nothing lost.** The previous release (downloaded, digest-checked) makes an anchor and two
 /// members, alice and bob: a room, trust both ways, posts each way and a share. Each member's
 /// view is read with that release. Then every process is stopped as a person stops it and started

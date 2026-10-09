@@ -80,7 +80,7 @@ pub const DAEMON_LOG_FILE: &str = "log";
 /// The nodes the daemon attaches when it starts, in `.daemon/` (ADR-026 L-4).
 pub const DAEMON_ATTACH_FILE: &str = "attach";
 /// `<data root>/.daemon/format`: the data root's format and the vox that last served it (ADR-026
-/// F-4).
+/// F-3).
 pub const FORMAT_FILE: &str = "format";
 /// The longest node name, in bytes (ADR-026 N-1a).
 pub const NODE_NAME_MAX: usize = 64;
