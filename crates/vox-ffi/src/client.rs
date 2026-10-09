@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::runtime::{Handle, Runtime};
-use vox_core::error::{Error, IpcHandshake};
+use vox_core::error::Error;
 use vox_core::hash::Digest32;
 use vox_core::node::api::{MessageRow, NodeEvent};
 use vox_core::node::daemonipc::{
@@ -1051,19 +1051,9 @@ pub struct VoxClient {
 }
 
 /// A failure to reach the daemon, said for a person.
+/// The sentence vox-core writes for it, which the CLI shows too (ADR-028 E-7).
 fn said(socket: &std::path::Path, e: Error) -> VoxError {
-    let path = socket.display();
-    failed(match e {
-        Error::Ipc(IpcHandshake::Unreachable { reason }) => {
-            format!("no vox daemon is running for this data root ({path}: {reason})")
-        }
-        Error::Ipc(IpcHandshake::Refused { reason }) => reason,
-        Error::Ipc(h @ IpcHandshake::ClosedBeforeHello) => {
-            format!("the vox daemon accepted, but {h}: it may be stopping. Try again.")
-        }
-        Error::Ipc(h) => format!("{h} ({path})"),
-        other => format!("the vox daemon at {path} did not answer ({other})"),
-    })
+    failed(vox_core::node::daemonipc::unreached(socket, None, e))
 }
 
 /// An attach's failure, typed where a client acts on it (P4): a wrong passphrase is asked for
@@ -1292,14 +1282,14 @@ async fn room_ids(
     }
 }
 
-/// Send `req` and read its answer, as a refusal or a detach where it is one.
+/// Send `req` and read its answer, as a refusal or a detach where it is one. A daemon that stops
+/// answering once it was asked leaves it not known whether it was done.
 async fn ask(client: &mut IpcClient, req: &Request) -> Result<Frame, VoxError> {
-    answered(
-        client
-            .request(req)
-            .await
-            .map_err(|e| failed(format!("the vox daemon stopped answering: {e}")))?,
-    )
+    answered(client.request(req).await.map_err(|e| VoxError::Unknown {
+        reason: format!(
+            "the vox daemon stopped answering before it said whether this was done: {e}"
+        ),
+    })?)
 }
 
 async fn done(client: &mut IpcClient, req: &Request) -> Result<(), VoxError> {
@@ -2394,7 +2384,7 @@ impl VoxClient {
             let resolve = || async {
                 vox_core::node::nameipc::resolve(&at, &address)
                     .await
-                    .map_err(|e| failed(format!("{address}: {e}")))
+                    .map_err(|e| failed(e.to_string()))
             };
             let mut room = resolve().await?;
             let deadline = tokio::time::Instant::now() + vox_core::node::up::HOST_PATIENCE;

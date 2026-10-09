@@ -478,7 +478,7 @@ impl Evaluator {
         &self.lifecycle
     }
     /// Whether `reader` currently has consent to read `author` (outbound axis
-    /// only; compose with [`crate::governance::visibility`] for the inbound axis).
+    /// only; the inbound axis is the reader's trust keyring, [`crate::node::trust`]).
     /// Forward-guarantee semantics: this is the *current* authorization.
     #[must_use]
     pub fn can_read(&self, reader: &Digest32, author: &Digest32) -> bool {

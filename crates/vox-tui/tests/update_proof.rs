@@ -592,11 +592,19 @@ fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
 #[cfg(target_os = "macos")]
 const NEWER: &str = "99.0.0";
 
-/// An executable that answers `--version` as a vox of `version` would: distinguishable from
-/// this build where a copy of it would not be, and runnable where tampered bytes would not be.
+/// An executable that answers `--version` as a vox of `version` would, and is this build for
+/// everything else: distinguishable from this build where a copy of it would not be, runnable
+/// where tampered bytes would not be, and the new release's own `vox agent skill --install` when
+/// the update runs it.
 #[cfg(target_os = "macos")]
 fn version_stub(path: &Path, version: &str) {
-    previous_stub(path, version);
+    write(
+        path,
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo \"vox {version}\"; exit 0; fi\nexec \"{VOX}\" \"$@\"\n"
+        ),
+    );
+    make_executable(path);
 }
 
 /// A Vox.app at `dir/Vox.app` saying `version`, carrying `helper` at `Contents/Helpers/vox`,
@@ -768,6 +776,7 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
         Err(why) => {
             for id in [
                 "bundle.update_replaces_the_whole_bundle",
+                "bundle.update_installs_the_agent_skill_pack",
                 "bundle.update_refuses_a_vox_that_is_not_the_records",
                 "bundle.apple_gate_refuses_an_unsigned_app",
             ] {
@@ -799,6 +808,9 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
         let tmp = tmpdir();
         let home = tmp.path();
         let link = bundle_install(home, Some("stable"));
+        // Claude Code is here (its settings folder): the update gives it the agent skill pack.
+        std::fs::create_dir_all(home.join(".claude"))
+            .unwrap_or_else(|e| panic!("APPARATUS: a harness folder: {e}"));
         let apps = home.join("Apps");
         let out = vox(&link, home, &["update"], &base);
         let text = said(&out);
@@ -818,6 +830,20 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
                 "after `vox update` (exit_ok={}): vox reports {cli:?}, Vox.app says {app:?}; \
                  .Vox.app.previous holds vox {prev_cli:?} and app {prev_app:?}; it said {text:?}",
                 out.status.success()
+            ),
+        ));
+        // **The agent skill pack, refreshed with the CLI** (v0.4.1): the new release installs it
+        // where Claude Code reads it.
+        let pack = home.join(".claude/skills/vox-agent-comms");
+        let entry =
+            pack.join("SKILL.md").is_file() && pack.join("references/sessions.md").is_file();
+        claims.push(claim(
+            "bundle.update_installs_the_agent_skill_pack",
+            out.status.success() && entry && text.contains("Claude Code: installed"),
+            format!(
+                "after `vox update`, {} holds SKILL.md and references/sessions.md: {entry}; it \
+                 said {text:?}",
+                pack.display()
             ),
         ));
         receipts.insert("bundle.update".into(), text);

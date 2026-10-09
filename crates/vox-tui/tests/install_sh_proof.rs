@@ -330,6 +330,8 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
     {
         let tmp = tempfile::tempdir().staged();
         let home = tmp.path();
+        // Claude Code is here (its settings folder): the installer gives it the agent skill pack.
+        std::fs::create_dir_all(home.join(".claude")).staged();
         let (ok, text) = run_installer(&server, home, "stable");
         let version = Command::new(home.join("bin/vox"))
             .arg("--version")
@@ -354,7 +356,251 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
             rc.contains(">>> vox >>>") && rc.contains("VOX_PROOF_USER_LINE=kept"),
             format!("the rc is {rc:?}"),
         ));
+        // **The agent skill pack, installed with Vox** (v0.4.1): where Claude Code reads it, and
+        // none for a harness that is not here.
+        let pack = home.join(".claude/skills/vox-agent-comms");
+        let entry =
+            pack.join("SKILL.md").is_file() && pack.join("references/sessions.md").is_file();
+        claims.push(claim(
+            "install.installs_the_agent_skill_pack",
+            ok && entry && !home.join(".codex").exists(),
+            format!(
+                "{} holds SKILL.md and references/sessions.md: {entry}; .codex made: {}",
+                pack.display(),
+                home.join(".codex").exists()
+            ),
+        ));
         receipts.insert("install.happy_path".into(), text);
+    }
+
+    // ---- `vox uninstall`: what install.sh, shell-setup and setup put here goes; nodes stay ----
+    // A person's whole journey, in a scratch home: install with the real install.sh, make a node
+    // and attach it (a daemon runs), wire Claude Code as `vox setup` does (its hook entries merged
+    // beside one of the person's own, the agent skill), keep an OpenCode plugin the person edited,
+    // then `vox uninstall --dry-run` (nothing changes) and `vox uninstall` with the installed vox.
+    // Mutant: uninstall without removing the install (`bundle_files`/`standalone_files` skipped):
+    // red at uninstall.removes_the_install.
+    {
+        let tmp = tempfile::tempdir().staged();
+        let home = tmp.path();
+        let (installed_ok, install_text) = run_installer(&server, home, "stable");
+        let vox = home.join("bin/vox");
+        let env = uninstall_env(home);
+        let pass = home.join("alice.pass");
+        std::fs::write(&pass, "alice identity\n").staged();
+        let made = run_vox(
+            &vox,
+            &env,
+            &[
+                "node",
+                "create",
+                "alice",
+                "--passphrase-file",
+                pass.to_str().staged(),
+            ],
+        );
+        let attached = run_vox(
+            &vox,
+            &env,
+            &[
+                "node",
+                "attach",
+                "alice",
+                "--passphrase-file",
+                pass.to_str().staged(),
+            ],
+        );
+        // Claude Code wired as `vox setup` wires it: Vox's entries and VOX_NODE merged into the
+        // person's own settings, which keep their own hook; and the skill.
+        let claude = home.join(".claude");
+        let plugin = run_vox(
+            &vox,
+            &env,
+            &["agent", "plugin", "claude", "--node", "alice"],
+        );
+        let mut settings: serde_json::Value = serde_json::from_str(&plugin.1).unwrap_or_default();
+        if let Some(stop) = settings["hooks"]["Stop"].as_array_mut() {
+            stop.push(serde_json::json!({"hooks": [{"type": "command", "command": "echo the-persons-own-hook"}]}));
+        }
+        settings["model"] = serde_json::json!("the-persons-setting");
+        std::fs::create_dir_all(claude.join("skills/vox-agent-comms")).staged();
+        std::fs::write(
+            claude.join("settings.json"),
+            serde_json::to_string_pretty(&settings).staged(),
+        )
+        .staged();
+        let skill = run_vox(&vox, &env, &["agent", "skill", "claude"]);
+        std::fs::write(claude.join("skills/vox-agent-comms/SKILL.md"), &skill.1).staged();
+        // OpenCode's plugin, as Vox writes it, then edited by the person: kept, and named.
+        let oc = home.join(".config/opencode/plugin");
+        std::fs::create_dir_all(&oc).staged();
+        let oc_text = run_vox(
+            &vox,
+            &env,
+            &["agent", "plugin", "opencode", "--node", "alice"],
+        );
+        std::fs::write(
+            oc.join("vox.js"),
+            format!("{}// the person's own line\n", oc_text.1),
+        )
+        .staged();
+        let daemon_before = data_holders(&home.join("data"));
+        let staged_ok = installed_ok
+            && made.0
+            && attached.0
+            && plugin.0
+            && skill.0
+            && oc_text.0
+            && !daemon_before.is_empty();
+
+        let before = home_files(home);
+        let dry = run_vox(&vox, &env, &["uninstall", "--dry-run"]);
+        let after_dry = home_files(home);
+        let out = run_vox(&vox, &env, &["uninstall"]);
+        let text = out.1.clone() + &out.2;
+        let rc = std::fs::read_to_string(home.join(".zshrc")).unwrap_or_default();
+        let settings_after =
+            std::fs::read_to_string(claude.join("settings.json")).unwrap_or_default();
+        let daemon_after = data_holders(&home.join("data"));
+        if !staged_ok {
+            claims.push(blocked(
+                "uninstall.removes_the_install",
+                format!("APPARATUS (staging not achieved): install ok={installed_ok} ({install_text:?}); node create {made:?}; attach {attached:?}; plugin ok={}; skill ok={}; a daemon on the scratch data root: {daemon_before:?}", plugin.0, skill.0),
+            ));
+        } else {
+            claims.push(claim(
+                "uninstall.dry_run_changes_nothing",
+                dry.0 && before == after_dry && dry.1.contains("would") && dry.1.contains(".zshrc"),
+                format!(
+                    "--dry-run (exit_ok={}) said {:?}; the home tree changed: {}",
+                    dry.0,
+                    dry.1,
+                    before != after_dry
+                ),
+            ));
+            let install_gone = !vox.exists()
+                && std::fs::symlink_metadata(&vox).is_err()
+                && !marker_path(home).exists()
+                && (!cfg!(target_os = "macos") || !system_apps(home).join("Vox.app").exists());
+            claims.push(claim(
+                "uninstall.removes_the_install",
+                out.0 && install_gone,
+                format!("`vox uninstall` (exit_ok={}) said {text:?}; vox left={}, marker left={}, Vox.app left={}",
+                    out.0, std::fs::symlink_metadata(&vox).is_ok(), marker_path(home).exists(),
+                    system_apps(home).join("Vox.app").exists()),
+            ));
+            claims.push(claim(
+                "uninstall.removes_shell_setup_and_keeps_the_persons_lines",
+                !rc.contains(">>> vox >>>")
+                    && rc.contains("VOX_PROOF_USER_LINE=kept")
+                    && !home.join(".local/share/zsh/site-functions/_vox").exists(),
+                format!("the rc is now {rc:?}"),
+            ));
+            claims.push(claim(
+                "uninstall.removes_vox_wiring_and_keeps_the_persons_own",
+                !settings_after.contains("vox agent hook") && !settings_after.contains("VOX_NODE")
+                    && settings_after.contains("the-persons-own-hook")
+                    && settings_after.contains("the-persons-setting")
+                    && !claude.join("skills/vox-agent-comms").exists()
+                    && oc.join("vox.js").exists() && text.contains("vox.js is kept"),
+                format!("Claude's settings are now {settings_after:?}; skill left={}; the edited OpenCode plugin left={}",
+                    claude.join("skills/vox-agent-comms").exists(), oc.join("vox.js").exists()),
+            ));
+            claims.push(claim(
+                "uninstall.stops_the_daemon_and_keeps_the_nodes",
+                daemon_after.is_empty()
+                    && home.join("data/nodes/alice").is_dir()
+                    && text.contains("no backup"),
+                format!(
+                    "processes holding the data root after: {daemon_after:?}; nodes/alice kept={}",
+                    home.join("data/nodes/alice").is_dir()
+                ),
+            ));
+            // **Each kept directory is said once, as what it holds** (#632's check): the data
+            // root with the nodes, their keys and rooms and the no-backup sentence, a full stop
+            // before the `--purge` sentence; the config directory as settings, never as nodes.
+            // Mutant: the old line (`<dir> is kept: it holds your nodes, …`) for both.
+            let data_dir = home.join("data");
+            let config_dir = home.join("config");
+            let line_for = |dir: &Path| -> Vec<&str> {
+                text.lines()
+                    .filter(|l| l.starts_with(&format!("vox uninstall: kept {}", dir.display())))
+                    .collect()
+            };
+            let (data_lines, config_lines) = (line_for(&data_dir), line_for(&config_dir));
+            let data_ok = data_lines.len() == 1
+                && data_lines[0].starts_with(&format!(
+                    "vox uninstall: kept {}: your nodes, their keys and their rooms (alice); there \
+                     is no backup of a node",
+                    data_dir.display()
+                ))
+                && data_lines[0].ends_with(". `vox uninstall --purge` removes it.")
+                && !data_lines[0].contains(" is kept");
+            let config_ok = if config_dir.exists() {
+                config_lines
+                    == [format!(
+                        "vox uninstall: kept {}: the settings Vox reads for your nodes. `vox \
+                         uninstall --purge` removes it.",
+                        config_dir.display()
+                    )
+                    .as_str()]
+            } else {
+                config_lines.is_empty()
+            };
+            claims.push(claim(
+                "uninstall.says_once_what_each_kept_directory_holds",
+                data_ok && config_ok,
+                format!(
+                    "the data root's kept lines: {data_lines:?}; the config directory's (it exists: \
+                     {}): {config_lines:?}",
+                    config_dir.exists()
+                ),
+            ));
+            // macOS keeps a background item by bundle id, so every Vox shares it: this install
+            // registered none, so uninstalling it must touch none, whatever another Vox on this
+            // Mac (the person's own, say) has registered.
+            claims.push(claim(
+                "uninstall.leaves_another_vox_background_items_alone",
+                !dry.1.contains("unregister Vox's") && !text.contains("unregistered Vox's"),
+                format!(
+                    "this install registered no background item; --dry-run said {:?}; uninstall said {text:?}",
+                    dry.1
+                ),
+            ));
+        }
+        for pid in data_holders(&home.join("data")) {
+            let _ = Command::new("/bin/kill").arg(pid).status();
+        }
+        receipts.insert("uninstall".into(), text);
+
+        // --purge: install again (the nodes are still there), then the installed vox refuses
+        // with no terminal, and at a terminal, once the node's name is typed, removes them too.
+        let (again, again_text) = run_installer(&server, home, "stable");
+        let refused = run_vox(&vox, &env, &["uninstall", "--purge"]);
+        let kept_after_refusal = home.join("data/nodes/alice").is_dir();
+        let purged = at_a_terminal(
+            &vox.to_string_lossy(),
+            &env,
+            &["uninstall", "--purge"],
+            "alice\n",
+        );
+        if again {
+            claims.push(claim(
+                "uninstall.purge_asks_at_a_terminal_and_removes_the_nodes",
+                !refused.0 && refused.2.contains("no terminal") && kept_after_refusal
+                    && !home.join("data").exists() && !vox.exists(),
+                format!("with no terminal it said {:?} (data kept={kept_after_refusal}); at a terminal, typing alice, it said {purged:?}; data left={}, vox left={}",
+                    refused.2, home.join("data").exists(), vox.exists()),
+            ));
+        } else {
+            claims.push(blocked(
+                "uninstall.purge_asks_at_a_terminal_and_removes_the_nodes",
+                format!("APPARATUS (staging not achieved): installing again said {again_text:?}"),
+            ));
+        }
+        for pid in data_holders(&home.join("data")) {
+            let _ = Command::new("/bin/kill").arg(pid).status();
+        }
     }
 
     // ---- a record whose digest does not describe the asset ---------------------------
@@ -855,6 +1101,136 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
     }
 
     report(&claims, &receipts, &allowed);
+}
+
+/// The environment `vox uninstall` runs in: the scratch home, and a data root and config directory
+/// in it, never the person's.
+fn uninstall_env(home: &Path) -> Vec<(String, String)> {
+    let h = home.to_string_lossy().into_owned();
+    vec![
+        ("HOME".into(), h.clone()),
+        ("PATH".into(), SYSTEM_PATH.into()),
+        ("SHELL".into(), "/bin/zsh".into()),
+        ("TERM".into(), "dumb".into()),
+        ("VOX_DATA_DIR".into(), format!("{h}/data")),
+        ("VOX_CONFIG_DIR".into(), format!("{h}/config")),
+        ("VOX_INSTALL_DIR".into(), format!("{h}/bin")),
+        ("VOX_LISTEN".into(), "127.0.0.1:0".into()),
+        ("VOX_PROXY".into(), "127.0.0.1:0".into()),
+    ]
+}
+
+/// Run `vox` with only `env`: whether it exited 0, its stdout and its stderr.
+fn run_vox(vox: &Path, env: &[(String, String)], args: &[&str]) -> (bool, String, String) {
+    let out = Command::new(vox)
+        .args(args)
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .staged();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Run `vox` at a pseudo-terminal (`script`), typing `input`: everything it said.
+fn at_a_terminal(vox: &str, env: &[(String, String)], args: &[&str], input: &str) -> String {
+    let mut cmd = Command::new("/usr/bin/script");
+    if cfg!(target_os = "macos") {
+        cmd.args(["-q", "/dev/null", vox]).args(args);
+    } else {
+        let line = std::iter::once(vox)
+            .chain(args.iter().copied())
+            .collect::<Vec<_>>()
+            .join(" ");
+        cmd.args(["-qec", &line, "/dev/null"]);
+    }
+    let mut child = cmd
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .staged();
+    // `script` turns the end of its input into ^D at the terminal: the input stays open until the
+    // command has ended (or 60 s), so the typed line is read, not an end of file.
+    let stdin = child.stdin.take();
+    if let Some(mut s) = stdin.as_ref() {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let _ = s.write_all(input.as_bytes());
+        let _ = s.flush();
+    }
+    let t0 = std::time::Instant::now();
+    while child.try_wait().ok().flatten().is_none()
+        && t0.elapsed() < std::time::Duration::from_secs(60)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    drop(stdin);
+    let out = child.wait_with_output().staged();
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// Every file and link under `root`, with its size: what a dry run must leave as it was.
+fn home_files(root: &Path) -> BTreeMap<PathBuf, u64> {
+    let mut seen = BTreeMap::new();
+    let mut todo = vec![root.to_path_buf()];
+    while let Some(dir) = todo.pop() {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let Ok(m) = std::fs::symlink_metadata(e.path()) else {
+                continue;
+            };
+            if m.is_dir() {
+                todo.push(e.path());
+            } else if !e.path().to_string_lossy().contains("/data/.daemon/") {
+                // The daemon's own log and socket change as it runs; everything else must not.
+                seen.insert(e.path(), m.len());
+            }
+        }
+    }
+    seen
+}
+
+/// The processes holding a file under `dir` open: the daemon a proof started for that data root.
+fn data_holders(dir: &Path) -> Vec<String> {
+    if cfg!(target_os = "linux") {
+        let mut pids = Vec::new();
+        for proc in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+            let pid = proc.file_name().to_string_lossy().into_owned();
+            if !pid.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            let holds = std::fs::read_dir(proc.path().join("fd"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|t| t.starts_with(dir)));
+            if holds {
+                pids.push(pid);
+            }
+        }
+        return pids;
+    }
+    Command::new("/usr/sbin/lsof")
+        .arg("-t")
+        .arg("+D")
+        .arg(dir)
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn report(claims: &[Claim], receipts: &BTreeMap<String, String>, allowed: &[String]) {

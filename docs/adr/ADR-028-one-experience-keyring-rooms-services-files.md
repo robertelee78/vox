@@ -3,7 +3,8 @@
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
 **Status**: Accepted for v0.4.0 (the decider, 2026-10-05); §2a added, and the lanes view (W-3)
-removed, from the decider's answers of 2026-10-06. Nothing in this ADR is built unless a requirement says so.
+removed, from the decider's answers of 2026-10-06; E-2, E-5, E-7, K-6, K-8, L-1, L-1a, L-1b, L-2, L-6 and L-7 amended
+for v0.4.1 (the decider, 2026-10-08). Nothing in this ADR is built unless a requirement says so.
 **Date**: 2026-10-05
 **Deciders**: Robert E. Lee
 **Tags**: ux, tui, macos, keyring, rooms, services, files, look, install
@@ -29,8 +30,10 @@ decider named: read records, the room's shared name, the decision record and the
   (where its members talk and share), and services and files (what is reachable through a room).
   A task MUST take the same steps and the same words in both clients.
 - **E-2.** The words MUST be: node, fingerprint, keyring, alias, room, room link, passphrase,
-  Session, service, address, file, trust, untrust. "Contact", "channel", "invite", "consent", "safety code",
-  "verified" and "block" MUST NOT appear in what either client or the CLI says.
+  Session, service, address, file, trust, remove, attach, detach. Taking a node out of the keyring
+  MUST be called Remove in both clients, the CLI's help and output, and the manual. "Contact",
+  "channel", "invite", "consent", "safety code", "verified", "block" and "untrust" MUST NOT appear in
+  what either client or the CLI says.
 - **E-3.** There MUST be no contacts list, no directory and no separate 1:1 path (ADR-001): a
   direct message is a two-member room.
 - **E-4.** Each client MUST act as exactly one node, the one it was opened with. The TUI and the
@@ -38,10 +41,15 @@ decider named: read records, the room's shared name, the decision record and the
   machine. Other nodes on the machine appear only as members of rooms this node shares with them.
 - **E-5.** Every action that changes access MUST state its effect in words before it acts and
   report what it did after: trusting (which rooms and services it covers, now and later),
-  untrusting (what stops, what was already read, which live sessions were cut), leaving, ending,
+  removing a node (what stops, what was already read, which live sessions were cut), leaving, ending,
   retention, sharing and stopping a share.
 - **E-6.** Every state MUST be shown by a glyph and a word, never by colour alone (ADR-015 14.1
   as amended in §9).
+- **E-7.** A failure MUST be told in one sentence, written once in vox-core and shown by every
+  client and the CLI. The sentence MUST say what failed and what the person can do next. A client
+  MAY capitalise its first letter, end it with a full stop, and show its technical detail in a
+  disclosure with Copy; it MUST NOT reword it. A sentence that fails this rule MUST be fixed in
+  vox-core, not in a client.
 
 ### 2. Identity and keyring
 
@@ -63,13 +71,13 @@ decider named: read records, the room's shared name, the decision record and the
   service or file the node cannot reach because the sharer does not trust it. Comparing a
   fingerprint MUST offer paste or typing, and grouped text; a mismatch MUST be its own action that
   says not to trust the node. Scanning a fingerprint is v0.4.1, with the iOS app.
-- **K-6.** Removing a node from the keyring ("untrust") MUST be the only way to stop reading and
+- **K-6.** Removing a node from the keyring (Remove, E-2) MUST be the only way to stop reading and
   being read by it (ADR-007 G-21). There MUST be no separate block.
 - **K-7.** When a node joins a room, each member's client MUST say which of this node's trusted
   members trust the newcomer, from the consent grants on the log (ADR-007 G-9), for example
   `K2M9·Q7RT joined. ann trusts it.` This MUST NOT add it to anyone's keyring.
 - **K-8.** There MUST be no identity backup. Onboarding MUST say plainly that a lost machine means
-  a new node, which the people who trust the old one untrust.
+  a new node, and that the people who trust the old one remove it from their keyrings.
 - **K-9.** The keyring window (ADR-026 N-2, 30 minutes) MUST be visible where the person works:
   the TUI status bar and the app's menu bar extra MUST show whether a keyring change will ask for
   the passphrase, for example `keyring open 23m`.
@@ -193,9 +201,14 @@ by any of them (ADR-001: there is no typed agent or human).
   commands are: for `ssh`,
   `ssh USER@ADDRESS`, a `vox forward ADDRESS 127.0.0.1:PORT` pair and an `~/.ssh/config` block; for
   `http`/`https`, a browser URL through the proxy and a forward; for `tcp`/`udp`, a forward. Each
-  MUST show what it needs and whether it holds: the sharer trusts this node, this node is
-  attached, the proxy is running, the sharer is online. Copy MUST use the system clipboard in the
-  app and OSC 52 in the TUI, and the command MUST also be printed.
+  MUST show what it needs as readiness ticks, in this order and these words in every client and
+  `vox service list`: `proxy configured` (for what goes through the proxy), `node attached`,
+  `<sharer> trusts you`, `<sharer> online`, each `✓` when it holds and, when it does not,
+  `missing:` with what to do (decider, 2026-10-08, G4). `<sharer> trusts you` MUST come only from
+  the sharer's own consent to this node in the room's log, never from reading anyone's keyring;
+  `<sharer> online` is whether this node holds a live connection to the sharer; nothing is sent to
+  learn any of them. Copy MUST use the system clipboard in the app and OSC 52 in the TUI, and the
+  command MUST also be printed.
 - **S-4.** Sharing MUST be one step in both clients: the client MUST list the services listening
   on this machine with their process names, suggest a name, and before sharing show the address
   members will use and name who in the room can and cannot reach it (ADR-017 4.2). A share of an
@@ -288,9 +301,16 @@ keep code in sync through GitHub.
 
 ### 8. Look
 
-- **L-1.** One token file MUST define every colour, type and motion value. The TUI MUST read it at
-  build time and the app's Swift asset catalogue MUST be generated from it; neither MUST hard-code
-  a value the file defines.
+- **L-1.** One token file MUST define every colour, type, spacing, corner radius and motion value.
+  The TUI MUST read it at build time and the app's Swift asset catalogue MUST be generated from it;
+  neither MAY hard-code a value the file defines.
+- **L-1a.** The app's spacing MUST come from a 4-point scale (4, 8, 12, 16, 20, 24, 32) and its
+  corner radii from two values: 5 for controls, cards and tiles, and 10 for windows and frames.
+  Spacing and radii inside the timeline and the composer MUST scale with the conversation text size
+  (L-1b); everywhere else they MUST stay fixed.
+- **L-1b.** ⌘+, ⌘− and the text size in Settings MUST scale the conversation only: the timeline
+  and the composer. They MUST NOT scale the sidebar, the inspector, the toolbar, the status bar or
+  sheets.
 - **L-2.** The default and only theme for v0.4.0 MUST be dark, with these values:
 
   | Token | Hex | 256 | 16 |
@@ -299,8 +319,9 @@ keep code in sync through GitHub.
   | bg.raised | `#131417` | 233 | default bg |
   | bg.panel | `#16171a` | 234 | default bg |
   | bg.overlay | `#1c1d21` | 234 | black |
-  | selection | `#1767b5` (Increase Contrast `#1b70c6`) | 25 | blue |
-  | line.hair | `#26272b` | 235 | bright black |
+  | selection | `#45474f` (Increase Contrast `#55575f`), with an accent bar at its leading edge: text.primary on it 7.86:1 (hc 7.20), the bar against bg.panel 9.54:1 (hc 11.73) | 239 | bright black |
+  | selection.secondary | `#dcd7cf` (Increase Contrast `#e2ddd5`): a selected row's second line, 6.47:1 on selection (hc 5.33) | 252 | default fg |
+  | line.hair | `#303137` (Increase Contrast `#8c8780`) | 236 | bright black |
   | text.primary | `#f0ece4` | 255 | default fg |
   | text.secondary | `#a8a299` | 247 | default fg |
   | text.muted | `#8a857f` | 244 | bright black |
@@ -316,11 +337,14 @@ keep code in sync through GitHub.
 - **L-5.** The TUI MUST detect truecolour, then 256, then 16 colours, and honour `NO_COLOR`.
   Motion MUST be at most 3 frames in the TUI, off over SSH and slow links, and in the app MUST
   respect Reduce Motion, Reduce Transparency and Increase Contrast.
-- **L-6.** The app MUST draw content on bg.base, not the system background, and MAY use the system
-  glass material only on the navigation layer (sidebar, toolbar, menu bar extra).
+- **L-6.** The app MUST draw every surface from the tokens, never the system background: the
+  timeline and content panes on bg.base, the sidebar and sheets on bg.panel, and the inspector and
+  status bar on bg.raised. Surfaces MUST be separated by line.hair, not the system divider. The app
+  MAY use the system glass material only on the toolbar and the menu bar extra.
 - **L-7.** App type MUST be SF Pro for text, SF Mono (`monospacedSystemFont`) for fingerprints,
   addresses, commands and uppercase eyebrow labels, and Inter Display (SIL OFL 1.1, bundled) at
-  800–900 weight for large headings.
+  800–900 weight for large headings, which are on the first-run screens only. Pane, sheet and
+  dialog titles MUST be SF Pro semibold.
 - **L-8.** Security state MUST be stated in words. Decorative locks, code rain, green-on-black,
   "access granted" and any glitch effect MUST NOT be used.
 - **L-8a.** The standard is mastery, not costume (the decider: "dead sexy hacker style — something
@@ -404,7 +428,7 @@ Each line below is amended as stated. Where code already matches, the ADR text i
 | ADR-014 3.2–3.5 | Invite QR; consent wording; per-channel local name; nickname bound to a verified key | Room link (R-4); trust wording (E-2); shared room name (R-1); alias (K-3) |
 | ADR-014 3.6 | Nicknames and verification synced across shared-root devices | Removed: one identity per device (ADR-001) |
 | ADR-014 §4 (4.1–4.5) | Safety code; verified / TOFU / key-changed states | Fingerprint and one trust state (K-1, K-2, K-5) |
-| ADR-014 §5 (5.1–5.6) | Per-sender consent prompts, three states, Block | Keyring trust and untrust (K-2, K-6) |
+| ADR-014 §5 (5.1–5.6) | Per-sender consent prompts, three states, Block | Keyring trust and removal (K-2, K-6) |
 | ADR-014 9.1 | Background LaunchAgent | Daemon as a login item (A-5) |
 | ADR-015 3.1 | Room "MAY have a local name"; member pane shows "nickname, verification, consent" | Shared name (R-1); alias and trust (K-3, L-4) |
 | ADR-015 4.1–4.4 | Safety-code QR and digits; verification states; prompts | Fingerprint compare (K-1, K-5); one state (K-2) |

@@ -532,6 +532,11 @@ pub struct JoinRoomArgs {
     /// asked for at the terminal, and with no terminal the command fails at once.
     #[arg(long)]
     pub passphrase_file: Option<PathBuf>,
+    /// Also bind this directory to the room, in the room map: every agent session started in it,
+    /// from any harness, then works in this room, its node joining with the passphrase given
+    /// here. What an agent asks you to run when its repo is tied to no room.
+    #[arg(long, value_name = "DIR")]
+    pub bind: Option<PathBuf>,
 }
 
 /// `vox room create`
@@ -662,7 +667,7 @@ pub enum TunnelCmd {
     /// service. `vox status` lists them, with their numbers.
     ///
     /// On the host, this closes a member's sessions to your services; on a guest, a session your
-    /// `vox up` or `vox forward` carries. Nobody is untrusted and no service is removed: the
+    /// `vox up` or `vox forward` carries. Nobody leaves a keyring and no service is removed: the
     /// member can open a new tunnel at once. The far end is told the tunnel was closed.
     Close(TunnelCloseArgs),
 }
@@ -915,31 +920,17 @@ enum AgentCmd {
     ///
     /// The plugin is a shim over `vox agent hook`, not a second implementation.
     Plugin(AgentPluginArgs),
-    /// Print the agent-facing skill: what the room is for, its vocabulary and its
-    /// manners.
+    /// Install the agent skill pack for every harness here, or print its entry.
     ///
-    /// A skill is on-demand only, so it cannot be what guarantees an agent reads
-    /// its room — that is `vox agent hook`'s job. This carries what a hook cannot.
+    /// The pack is what an agent reads to work in a room: rooms, Sessions, trust, files and
+    /// setup, as `SKILL.md` and the reference files it points to. Claude Code, Codex and OpenCode
+    /// each load it from their own skills folder, at user scope, beside the drain.
     ///
-    /// Claude Code, Codex and OpenCode all load the same file, a `SKILL.md` in a folder
-    /// named after the skill. Install it at **user scope**, beside the drain, so a
-    /// session opened in any repository has both:
+    /// Installing Vox, and `vox update`, run `vox agent skill --install` for you: it installs or
+    /// refreshes the pack for every harness present here, and leaves alone any file you changed,
+    /// saying so. Run it yourself after changing a harness's settings folder.
     ///
-    /// For example:
-    ///
-    /// mkdir -p ~/.claude/skills/vox-agent-comms
-    ///
-    /// vox agent skill claude > ~/.claude/skills/vox-agent-comms/SKILL.md
-    ///
-    /// mkdir -p ~/.codex/skills/vox-agent-comms           # $CODEX_HOME/skills when set
-    ///
-    /// vox agent skill codex > ~/.codex/skills/vox-agent-comms/SKILL.md
-    ///
-    /// mkdir -p ~/.config/opencode/skills/vox-agent-comms # $XDG_CONFIG_HOME/opencode/skills when set
-    ///
-    /// vox agent skill opencode > ~/.config/opencode/skills/vox-agent-comms/SKILL.md
-    ///
-    /// The skill goes to stdout; where it goes, to stderr, so it does not land in the file.
+    /// Without `--install` it prints the pack's entry, `SKILL.md`; where the pack goes, to stderr.
     Skill(AgentSkillArgs),
     /// Trust Vox's drain hook in a harness that gates hooks on trust. Only Codex
     /// does: it runs a `hooks.json` entry only once its hash is recorded as trusted.
@@ -1019,6 +1010,10 @@ pub struct AgentSkillArgs {
     /// The harness to say where the skill goes for: `claude`, `codex` or `opencode`.
     /// Without one, all three are listed. The skill itself is the same for each.
     pub harness: Option<String>,
+    /// Install or refresh the pack for every harness present here (its program on `PATH`, or
+    /// its settings folder), keeping any file you changed.
+    #[arg(long, conflicts_with = "harness")]
+    pub install: bool,
 }
 
 /// Where `harness` loads a user-scope skill named `vox-agent-comms` from, as a shell path, or
@@ -1039,8 +1034,8 @@ fn skill_dir(harness: &str) -> Option<&'static str> {
 }
 
 /// The one line that says how to install the skill for `harness`, runnable as it stands.
-fn skill_install(harness: &str, dir: &str) -> String {
-    format!("mkdir -p {dir} && vox agent skill {harness} > {dir}/SKILL.md")
+fn skill_install(_harness: &str, dir: &str) -> String {
+    format!("vox agent skill --install   # the pack goes in {dir}")
 }
 
 /// `vox agent trust`
@@ -1090,7 +1085,12 @@ pub struct AgentRoomArgs {
     #[command(flatten)]
     pub profile: AccountArgs,
     /// The room: its id, a unique start of it, or its name.
-    pub room: String,
+    #[arg(required_unless_present = "none")]
+    pub room: Option<String>,
+    /// The operator said no to binding this session's repo to a room: record it in the room map,
+    /// so no session started in that directory is asked again.
+    #[arg(long, conflicts_with = "room")]
+    pub none: bool,
     /// The agent's own node, as its hook names it; `VOX_NODE` in the session's environment.
     #[arg(long, env = "VOX_NODE", required = true)]
     pub node: String,
@@ -1707,9 +1707,9 @@ enum TrustCmd {
     Add(TrustAddArgs),
     /// List the identities this node trusts, and what it calls them.
     List(IdentityArgs),
-    /// Stop trusting an identity, and change the lock.
+    /// Remove an identity from your keyring, and change the lock.
     ///
-    /// Removes the ring entry, then rotates this identity's sender key and re-keys
+    /// Removes its keyring entry, then rotates this identity's sender key and re-keys
     /// everyone still trusted, in every room shared with the removed key — so it stops
     /// reading what comes next, everywhere. It keeps what it already
     /// read; that cannot be taken back.
@@ -1815,7 +1815,7 @@ pub struct TrustAddArgs {
 pub struct TrustRemoveArgs {
     #[command(flatten)]
     pub profile: NodeArgs,
-    /// The identity to stop trusting.
+    /// The identity to remove from your keyring.
     pub fingerprint: String,
     /// **Refused.** A command line is world-readable while the process runs — `ps`, or
     /// `/proc/<pid>/cmdline` — so a passphrase here is disclosed to every process on the
@@ -2129,6 +2129,23 @@ enum Cmd {
         /// Remove everything `vox shell-setup` installed.
         #[arg(long)]
         remove: bool,
+    },
+    /// Remove vox from this machine: what install.sh, `vox shell-setup` and `vox setup` put here.
+    ///
+    /// It stops the daemon and Vox.app, unregisters Vox's login item and LAN helper (on a Mac),
+    /// removes the Keychain items it stored for kept nodes, the `vox agent hook` entries, plugin
+    /// and skill it installed for Claude Code, Codex and OpenCode (only what is still as it wrote
+    /// it; anything edited is named and left), the shell completions and startup-file block, and
+    /// Vox.app or the `vox` binary with its link. Your nodes, their keys and rooms are kept, and
+    /// it says where; a node has no backup. `--purge` removes them too.
+    Uninstall {
+        /// List everything it would do, and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also remove the data root and config directory: every node, its keys and its rooms.
+        /// Asks you to type each node's name first, at a terminal only.
+        #[arg(long)]
+        purge: bool,
     },
     /// Replace this `vox` with the latest GitHub release.
     ///
@@ -2470,8 +2487,13 @@ pub fn run() -> ExitCode {
                                 .await
                         }
                         RoomCmd::Join(a) => {
-                            crate::room_cli::join(&paths, &a.link, a.passphrase_file.as_deref())
-                                .await
+                            crate::room_cli::join(
+                                &paths,
+                                &a.link,
+                                a.passphrase_file.as_deref(),
+                                a.bind.as_deref(),
+                            )
+                            .await
                         }
                         RoomCmd::Create(a) => {
                             crate::room_cli::create(
@@ -2742,8 +2764,20 @@ pub fn run() -> ExitCode {
                     )?;
                     vox_core::node::layout::refuse_old_layout(&account)?;
                     block_on_client(async move {
-                        crate::agent_room::run(&account, &node, args.session.as_deref(), &args.room)
-                            .await
+                        match args.room.as_deref() {
+                            Some(room) => {
+                                crate::agent_room::run(
+                                    &account,
+                                    &node,
+                                    args.session.as_deref(),
+                                    room,
+                                )
+                                .await
+                            }
+                            None => {
+                                crate::agent_room::decline(&account, &node, args.session.as_deref())
+                            }
+                        }
                     })
                 });
             match outcome {
@@ -2854,6 +2888,13 @@ pub fn run() -> ExitCode {
                 }
             }
         }
+        Cmd::Agent(AgentCmd::Skill(args)) if args.install => {
+            if crate::skill_pack::install_all() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
         Cmd::Agent(AgentCmd::Skill(args)) => {
             // Where it goes, on stderr so it does not land in the file (V210-121, V210-166):
             // user scope, beside the drain, so every repository gets both.
@@ -2871,7 +2912,7 @@ pub fn run() -> ExitCode {
                 let dir = skill_dir(h).unwrap_or_default();
                 eprintln!("vox: install at user scope: {}", skill_install(h, dir));
             } else {
-                eprintln!("vox: each harness loads this same file from its own skills folder:");
+                eprintln!("vox: each harness loads this same pack from its own skills folder:");
                 for h in named {
                     let dir = skill_dir(h).unwrap_or_default();
                     eprintln!("     {h:<8} {}", skill_install(h, dir));
@@ -3175,6 +3216,13 @@ pub fn run() -> ExitCode {
             }
         },
         Cmd::ShellSetup { remove } => crate::shell::run(remove),
+        Cmd::Uninstall { dry_run, purge } => match crate::uninstall::run(dry_run, purge) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("vox: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Cmd::Update { check, rollback } => match crate::update::run(check, rollback) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {

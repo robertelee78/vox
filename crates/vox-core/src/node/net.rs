@@ -1011,9 +1011,10 @@ impl ConnectionManager {
     /// authenticated peer identity. `Ok(None)` when the endpoint is closed.
     ///
     /// **Performs the handshake inline**, so this is for a caller that wants exactly one
-    /// connection. An accept *loop* must use [`Self::accept_incoming`] and
-    /// [`Self::finish_incoming`] instead, or it serialises on handshakes and one stalled
-    /// unauthenticated peer blocks every other inbound connection.
+    /// connection. A node's inbound connections come from its presence's accept loop
+    /// ([`NetPresence`](crate::node::presence::NetPresence)), which hands each one over
+    /// handshaken for [`Self::take_inbound`]: a loop over this one would serialise on handshakes,
+    /// and one stalled unauthenticated peer would block every other inbound connection.
     pub async fn accept(&self, admission: Admission) -> Result<Option<Arc<VoxConnection>>> {
         let Some(conn) = self
             .endpoint
@@ -1026,8 +1027,7 @@ impl ConnectionManager {
     }
 
     /// File a connection the presence accepted for this node (after its identity exchange),
-    /// handing back a duplicate it retired so the caller keeps serving it (see
-    /// [`Self::file_reporting`]).
+    /// handing back a duplicate it retired so the caller keeps serving it (`file_reporting`).
     pub async fn take_inbound(&self, conn: VoxConnection) -> Filed {
         self.file_reporting(conn).await
     }
@@ -1622,12 +1622,34 @@ pub async fn accept_authorized(
     policy: &PeerPolicy,
 ) -> Result<(StreamKind, SendStream, RecvStream)> {
     let (kind, mut send, mut recv) = accept_typed(conn).await?;
+    refuse_second_exchange(conn.quinn(), kind)?;
     let class = policy.classify(&conn.peer_id());
     if !PeerPolicy::allows(class, kind) {
         refuse_disallowed(class, kind, &mut send, &mut recv);
         return Err(Error::StreamRefused("peer may not open this stream kind"));
     }
     Ok((kind, send, recv))
+}
+
+/// **One exchange per connection, whoever asks** (ADR-011 requirement 33): every stream is
+/// accepted after the identity exchange, so one of the identity kind is a second exchange, and the
+/// connection is closed with the refusal's code before the peer's class is looked at, member or
+/// stranger alike. A stranger's was refused as a stream, like any kind it may not open, and its
+/// connection stayed.
+///
+/// # Errors
+/// [`Error::StreamRefused`] for an identity stream, once the connection is closed.
+pub fn refuse_second_exchange(conn: &quinn::Connection, kind: StreamKind) -> Result<()> {
+    if kind == StreamKind::Identity {
+        conn.close(
+            crate::transport::quic::close_code(WireError::NotAvailable),
+            WireError::NotAvailable.to_string().as_bytes(),
+        );
+        return Err(Error::StreamRefused(
+            "an identity stream after the identity exchange",
+        ));
+    }
+    Ok(())
 }
 
 /// Refuse a stream `class` may not open as `kind`: uninformatively, except that a **pending joiner

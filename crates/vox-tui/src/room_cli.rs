@@ -1886,6 +1886,12 @@ fn emit_row(
     json: bool,
     status: Option<&str>,
 ) {
+    // A Session's opening and end are not the room's conversation (ADR-029 CL-2), as in `vox
+    // room read`: a rename re-posts the record, which printed here read as a second "opened".
+    // `--json` keeps every row for programs.
+    if !json && crate::agent_hook::is_session_record(r) {
+        return;
+    }
     let line = if json {
         row_json(room_key, r, ops, status)
     } else {
@@ -4113,9 +4119,26 @@ pub async fn join(
     paths: &Paths,
     link: &str,
     passphrase_file: Option<&std::path::Path>,
+    bind: Option<&std::path::Path>,
 ) -> Result<(), AppError> {
     // An address that will not parse is refused before anything is asked, with what is wrong.
     crate::tunnel_cli::readable(link)?;
+    // `--bind DIR` (ADR-029 RB-6): a directory that exists, and a room map that can be read,
+    // checked before anything is asked. What the map held for it is replaced, and said.
+    let data_root = paths.account().data_root;
+    let bind = match bind {
+        Some(dir) => {
+            let dir = std::fs::canonicalize(dir).map_err(|e| {
+                AppError::Usage(format!(
+                    "--bind {}: not a directory here: {e}",
+                    dir.display()
+                ))
+            })?;
+            crate::room_map::read(&data_root)?;
+            Some(dir)
+        }
+        None => None,
+    };
     let mut client = attach(paths).await?;
     // A room this node holds open, and has not left, is not joined again: its address is taken
     // as where the room's host is now, and the host is dialled there (V210-167). No passphrase is read for it: none
@@ -4136,6 +4159,13 @@ pub async fn join(
             }),
         Err(_) => None,
     };
+    if let (Some(name), Some(dir)) = (held.as_ref(), bind.as_ref()) {
+        return Err(AppError::Usage(format!(
+            "this node already holds {name}, so nothing was joined and no passphrase checked; to \
+             bind {} to it, run `vox agent room {name}` from a session started there, at a terminal",
+            dir.display()
+        )));
+    }
     if let Some(name) = held {
         return match client
             .request(&Request::Join {
@@ -4167,6 +4197,12 @@ pub async fn join(
         };
     }
     let passphrase = room_passphrase(passphrase_file, "the room's passphrase", false)?;
+    // Kept for the room map when binding, wiped either way.
+    let passphrase_kept = zeroize::Zeroizing::new(if bind.is_some() {
+        passphrase.clone()
+    } else {
+        String::new()
+    });
     match client
         .request(&Request::Join {
             link: link.to_owned(),
@@ -4187,6 +4223,24 @@ pub async fn join(
                 Err(_) => None,
             };
             println!("vox: joined {}", joined.as_deref().unwrap_or("the room"));
+            if let Some(dir) = bind.as_ref() {
+                // Said before it is written (ADR-028 E-5): who can read what is saved.
+                println!(
+                    "vox: binding {} to this room in the room map {}: every agent session started \
+                     there, from any harness, is to work in it, its node joining with this \
+                     passphrase; every node of this data root can read the map, the passphrase \
+                     included",
+                    dir.display(),
+                    crate::room_map::path(&data_root).display()
+                );
+                match crate::room_map::bind(&data_root, dir, link, &passphrase_kept)? {
+                    Some(was) => println!(
+                        "vox: bound {}, replacing what the room map held for it: {was}",
+                        dir.display()
+                    ),
+                    None => println!("vox: bound {}", dir.display()),
+                }
+            }
             println!("     you read a member once you trust it and it trusts you: `vox trust add`");
             if let Ok(parsed) = vox_core::node::link::InviteLink::parse(link) {
                 who_reads_whom(&mut client, parsed.channel_id).await;
@@ -4901,6 +4955,21 @@ pub async fn trust_capability(
 /// `vox trust remove`, asked of the running node.
 pub async fn trust_remove(paths: &Paths, target: Digest32) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
+    // **Not in the keyring: refused first**, in vox-core's sentence (ADR-028 E-7), with nothing said
+    // of what it was to lose: there is nothing to remove. A read, so no passphrase (V210-165).
+    let entries = match client.trusted("").await {
+        Ok(Frame::Trusted { entries }) => entries,
+        Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
+        Err(e) => return Err(AppError::Usage(e.to_string())),
+    };
+    if !entries.iter().any(|(id, _, _)| *id == target) {
+        return Err(AppError::Usage(
+            vox_core::node::api::Fault::NotConsented
+                .explain()
+                .to_owned(),
+        ));
+    }
     // What it is to stop, said before it is done (ADR-028 E-5).
     let rooms = rooms_with(&mut client, &target).await;
     let room_names: Vec<String> = rooms.iter().map(|(id, n)| room_said(id, n)).collect();
@@ -4914,14 +4983,14 @@ pub async fn trust_remove(paths: &Paths, target: Digest32) -> Result<(), AppErro
         .map(|(_, t)| t)
         .collect();
     println!(
-        "vox: about to stop trusting {}",
+        "vox: about to remove {} from your keyring",
         crate::ident::author_id(&target)
     );
     println!(
         "     it is to read nothing you write from now on in {}; what it already read stays read",
         listed(&room_names, "any room")
     );
-    // What it is to lose, never what it is to keep: once untrusted it reaches none of them.
+    // What it is to lose, never what it is to keep: once removed it reaches none of them.
     if services.is_empty() {
         println!("     and to reach none of your services (you offer none in a room you share)");
     } else {
@@ -4943,7 +5012,7 @@ pub async fn trust_remove(paths: &Paths, target: Digest32) -> Result<(), AppErro
     {
         Ok(Frame::Ok) => {
             println!(
-                "vox: no longer trusting {}",
+                "vox: removed {} from your keyring",
                 crate::ident::author_id(&target)
             );
             println!("     your sender key is rotated and everyone still trusted is re-keyed");

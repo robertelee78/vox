@@ -625,7 +625,7 @@ pub enum Request {
         channel_id: Digest32,
     },
     /// Add an identity to the trust keyring. Needs the identity passphrase once more than
-    /// [`KEYRING_WINDOW_SECS`](crate::node::actor::KEYRING_WINDOW_SECS) have passed since it was
+    /// [`KEYRING_WINDOW_MS`](crate::node::actor::KEYRING_WINDOW_MS) have passed since it was
     /// last entered (V210-159).
     Trust {
         /// Who to trust, as a full fingerprint.
@@ -3037,7 +3037,7 @@ impl Drop for IpcServer {
     fn drop(&mut self) {
         self.task.abort();
         // Best effort: leaving the file behind only costs the next bind an
-        // unlink, which `bind_at` does anyway.
+        // unlink, which `place_socket` does anyway.
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -3142,58 +3142,17 @@ async fn still_answering(path: &Path, node: Option<&crate::node::paths::NodeName
     }
 }
 
-/// Bind the control socket at `path` and serve `handle`'s event stream to every
-/// client that connects.
-///
-/// The directory is made private to this user first ([`prepare_socket_dir`]), and one that
-/// is not is refused: whoever owns the directory can replace the socket in it.
-///
-/// The stale socket file of a process that died is **unlinked first**: `bind`
-/// fails with `AddrInUse` otherwise (measured), and inheriting that error would
-/// report a dead predecessor as a live conflict. The socket is bound under a staging
-/// name and chmod'd to `0600` there — `bind` itself yields `0755` from the umask (also
-/// measured), so this is load-bearing, not decoration — and only then renamed to `path`,
-/// so `path` is never a socket at any other mode (V210-72).
-///
-/// [`prepare_socket_dir`]: crate::node::paths::prepare_socket_dir
-pub fn bind_at(handle: NodeHandle, path: PathBuf) -> Result<IpcServer> {
-    let listener = place_socket(&path)?;
-    let me = crate::node::paths::my_uid();
-    let task = tokio::spawn(async move {
-        loop {
-            let stream = match listener.accept().await {
-                Ok((stream, _)) => stream,
-                // **An accept error is not the end of the socket** (V210-72). They are
-                // transient — the process or the system out of descriptors (EMFILE,
-                // ENFILE), a connection aborted before it was taken (ECONNABORTED), no
-                // buffer space — and returning here ended the control socket for good
-                // while the daemon ran on, and every client after was told nothing was
-                // listening. The pause keeps an exhausted descriptor table from being
-                // spun on; the connection waits in the backlog meanwhile.
-                Err(_) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    continue;
-                }
-            };
-            // Only this user: the directory and the mode already say so, and the kernel's
-            // word for who connected is checked as well, so neither is the only guard.
-            if !stream.peer_cred().is_ok_and(|c| c.uid() == me) {
-                continue;
-            }
-            // Each client gets its own task and its own subscription, so one
-            // client's pace — or death — reaches no other and never the actor.
-            let stream_handle = handle.clone();
-            tokio::spawn(async move {
-                serve_client(stream, stream_handle).await;
-            });
-        }
-    });
-
-    Ok(IpcServer { path, task })
-}
-
 /// Place a listening socket at `path`, `0600`, by binding a staging name and renaming it into
 /// place, so no client ever finds the socket with a wider mode.
+///
+/// The directory is made private to this user first ([`prepare_socket_dir`]), and one that is
+/// not is refused: whoever owns the directory can replace the socket in it. The stale socket file
+/// of a process that died is **unlinked first**: `bind` fails with `AddrInUse` otherwise
+/// (measured), and inheriting that error would report a dead predecessor as a live conflict. The
+/// staging name is chmod'd to `0600` before the rename because `bind` itself yields `0755` from
+/// the umask (also measured), so `path` is never a socket at any other mode (V210-72).
+///
+/// [`prepare_socket_dir`]: crate::node::paths::prepare_socket_dir
 fn place_socket(path: &Path) -> Result<UnixListener> {
     crate::node::paths::prepare_socket_dir(path)?;
     // Never longer than `path`, so it fits wherever `path` does.
@@ -3229,11 +3188,6 @@ fn place_socket(path: &Path) -> Result<UnixListener> {
         return Err(e);
     }
     Ok(listener)
-}
-
-/// Bind the control socket at this profile's conventional path.
-pub fn bind(handle: NodeHandle, paths: &crate::node::paths::Paths) -> Result<IpcServer> {
-    bind_at(handle, paths.socket_file())
 }
 
 /// What a client opened over its connection and has not closed: a file offer's service,
@@ -3310,24 +3264,6 @@ enum Intent {
     Forward,
     StopForward(String),
     Nothing,
-}
-
-/// One client, until it goes, and then whatever it left open is withdrawn.
-async fn serve_client(mut stream: UnixStream, handle: NodeHandle) {
-    let mut held = Held::default();
-    let greeted = write_frame(
-        &mut stream,
-        &Frame::Hello {
-            protocol: PROTOCOL_VERSION,
-            me: handle.view().identity.map(|i| i.fingerprint),
-        }
-        .to_bytes(),
-    )
-    .await;
-    if greeted.is_ok() {
-        let _ = serve_requests(stream, &handle, &mut held, None, None).await;
-    }
-    held.release(&handle).await;
 }
 
 /// Wait until `detached` says the node detached (ADR-026 L-3); for ever when there is none to
@@ -3608,7 +3544,12 @@ pub fn bind_account<D: Dispatch>(dispatch: std::sync::Arc<D>, path: PathBuf) -> 
     let task = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
-                // Transient, as in [`bind_at`].
+                // **An accept error is not the end of the socket** (V210-72). They are
+                // transient — the process or the system out of descriptors (EMFILE, ENFILE), a
+                // connection aborted before it was taken (ECONNABORTED), no buffer space — and
+                // returning here would end the control socket for good while the daemon ran on.
+                // The pause keeps an exhausted descriptor table from being spun on; the
+                // connection waits in the backlog meanwhile.
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             };
@@ -5477,21 +5418,5 @@ impl IpcClient {
             Some(body) => Ok(Some(Frame::from_bytes(&body)?)),
             None => Ok(None),
         }
-    }
-}
-
-#[cfg(test)]
-mod account_socket_tests {
-    /// The account socket admits its own user only, and never root, even a daemon run as root
-    /// (ADR-026 C-1, S-5).
-    #[test]
-    fn only_the_same_user_and_never_root() {
-        assert!(super::admitted(Some(501), 501));
-        assert!(!super::admitted(Some(502), 501));
-        assert!(!super::admitted(None, 501));
-        assert!(
-            !super::admitted(Some(0), 0),
-            "PRODUCT: the account socket admitted uid 0"
-        );
     }
 }

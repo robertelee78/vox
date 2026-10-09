@@ -78,7 +78,7 @@ version too, until you quit it and open it again.
    lost, so is the node. Two passphrases that differ are refused, and nothing is created:
 
    ```text
-   the two passphrases differ; nothing was created
+   The two passphrases differ; nothing was created.
    ```
 
    The app then attaches the new node with that passphrase and opens its window.
@@ -89,7 +89,7 @@ version too, until you quit it and open it again.
    own words, under the field:
 
    ```text
-   that passphrase does not open node NAME's identity
+   That passphrase does not open node NAME's identity.
    ```
 
 The app remembers the node you chose, and attaches it each time it opens. The answers are kept
@@ -309,13 +309,13 @@ drive`. See [Identity and keyring](keyring.md) for what trust grants.
 - **Compare…**: paste or type the fingerprint the person gave you another way. Case, spaces and
   dashes do not count. A match says `Matches NAME's fingerprint.`; a mismatch says
   `Does not match. This is not the node you trusted as NAME: do not trust it.` and offers to
-  untrust it.
+  remove it.
 - **Rename…**: the new alias, and that the node's services are then reachable as
   `<service>.NEWALIAS.<room>.vox`.
-- **Remove…**: the sheet says what untrusting does before you confirm: it reads nothing you
-  write from now on, and you read nothing it writes; what it already read stays read; its live
-  sessions into your services are cut; your sender key is rotated, and everyone you still trust is
-  re-keyed.
+- **Remove…**: the sheet asks `Remove NAME from your keyring?` and says what removing does before
+  you confirm: it reads nothing you write from now on, and you read nothing it writes; what it
+  already read stays read; its live sessions into your services are cut; your sender key is
+  rotated, and everyone you still trust is re-keyed.
 
 The **Keyring** menu does the same for the row selected in this view.
 
@@ -410,20 +410,24 @@ Notifications, Vox.
 ## Contrast and display settings
 
 Text is drawn at a contrast of 4.5:1 or more against its background, and card outlines at 4.5:1
-or more. A selected sidebar row is filled with a darker blue than the system's, so its text reads
-at 4.89:1. A selected row or card also has a bar along its leading edge, so a selection never
-rests on colour alone.
+or more. A selected sidebar row is a grey fill with a blue bar along its leading edge; its text
+reads at 7.86:1 and its second line at 6.47:1. A selected row or card always has that bar, so a
+selection never rests on colour alone.
 
 The app follows your Mac's display settings (System Settings, Accessibility, Display):
 
 - **Increase Contrast** switches to brighter colours: every text colour at 7:1 or more against
   its background (an error on a selected row at 6:1), outlines at 3.9:1 or more, the selected
-  sidebar row's text at 5.02:1, and the selection marked with the focus colour.
+  sidebar row's text at 7.20:1 and its second line at 5.33:1, and the selection marked with the
+  focus colour.
 - **Reduce Motion** stops its animations.
 - **Reduce Transparency**: content is drawn in opaque colours only.
 
-**View > Bigger** (⌘+), **Smaller** (⌘-) and **Actual Size** (⌘0) change the size of all the
-app's text, buttons and controls, up to twice the usual size.
+**View > Bigger** (⌘+), **Smaller** (⌘-) and **Actual Size** (⌘0) change the size of the
+conversation, the messages and the composer, up to twice the usual size, as in Messages. The
+sidebar keeps macOS's sidebar size (System Settings, Appearance) and the inspector a steady size.
+**Vox > Settings…** (⌘,) sets the same size, and also turns Keep Running and the menu bar item on
+or off.
 
 The timeline works from the keyboard. **View > Focus Timeline** (⌃⌘T), Tab, or a click on a
 message puts the keyboard on it; ↑ and ↓ select a message, Space opens its pulled file in Quick

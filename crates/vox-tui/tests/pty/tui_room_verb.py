@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tui_room_verb.py <vox> <data_dir> <config_dir> <identity_pass> <room_pass> <tag> <verb> <hold_secs>
+"""tui_room_verb.py <vox> <data_dir> <config_dir> <identity_pass> <room_pass> <tag> <verb> <hold_secs> [refusal]
 
 Runs one room verb (`:leave` or `:end`, V030-08) on a profile's only room through the
 shipped `vox tui`, as a person would: unlock, open the room, `:<verb>`. Then it keeps the TUI
@@ -14,6 +14,12 @@ Each verb changes access, so the TUI says what it is to do before it acts and wh
 (ADR-028 E-5): `:<verb>` opens a confirmation whose title states the effect (CONFIRM below), the
 driver types the verb's word there, and the TUI then says what it did (SAID below) instead of a
 bare "done".
+
+With a last argument `refusal` the verb is one the TUI must refuse (a member who did not create the
+room typing `:end`): exit 0 prints `REFUSED: <the status line>` once the TUI states a refusal, and
+`RED: the TUI did :<verb>, which it must refuse` if it says what it did instead. The status line is
+printed whole, as the person reads it, so the caller can compare it with what the CLI says (ADR-028
+E-7: one sentence, from vox-core, in every client).
 
 Shaped as `tui_close_room.py` (V210-107, #302): **a TUI that does not do what the person typed is
 the product, not the apparatus.**
@@ -37,6 +43,7 @@ from vox_pty import STAGE, Hung, Tui, arm, disarm, pyte, stage, is_attached  # n
 
 VOX, DATA, CFG, IDPASS, ROOMPASS, TAG, VERB, HOLD = sys.argv[1:9]
 HOLD = int(HOLD)
+EXPECT_REFUSAL = sys.argv[9:10] == ["refusal"]
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "240")) + HOLD
 if pyte is None:
     print(f"{TAG} APPARATUS: pyte is not importable (install it, or set VOX_PYTE_PATH)")
@@ -57,14 +64,14 @@ SAYS = {
     "end": ("ended the room for everyone", "takes no new message in it", "deletes it"),
 }
 
-# What the TUI's status line says when it refused a room verb (`UiError::message`): its words, so
+# What the TUI's status line says when it refused a room verb (vox-core's `Fault::explain`): its words, so
 # an echo of the command box or any other repaint is never read as a refusal.
 REFUSALS = (
     "only the room's creator",
     "this room has ended",
     "you left this room",
-    "joined a moment ago",
-    "this room is not open",
+    "has not yet synced with another member",
+    "room is not open on this node",
     "internal error",
     "could not write this node's files",
     "could not be written",
@@ -155,6 +162,14 @@ try:
     answered = tui.until(lambda: tui.closed or "done" in status() or said_all() or refusal(), 30)
     gone_check()
     said = refusal()
+    if EXPECT_REFUSAL:
+        if said:
+            # The line is read once it is drawn whole: a repaint lands in more than one read.
+            tui.pump(1)
+            line = " ".join(status().split())
+            give(0, f"REFUSED: {line}")
+        if said_all():
+            give(1, f"RED: the TUI did :{VERB}, which it must refuse:\n{tui.text()}")
     if said:
         give(1, f"RED: the TUI refused :{VERB}: {said}:\n{tui.text()}")
     if not answered:

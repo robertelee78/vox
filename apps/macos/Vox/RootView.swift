@@ -417,6 +417,17 @@ final class SecureFieldHolder {
         guard !text.isEmpty else { return nil }
         return Secret(Data(text.utf8))
     }
+
+    /// The typed bytes, the field emptied: empty when nothing was typed. Only for a room's
+    /// passphrase, which a room may go without (ADR-005 J-2 as amended); an identity's never.
+    func takeAllowingEmpty() -> Secret {
+        let text = field.stringValue
+        field.stringValue = ""
+        return Secret(Data(text.utf8))
+    }
+
+    /// Whether nothing is typed now.
+    var isEmpty: Bool { field.stringValue.isEmpty }
 }
 
 /// An `NSSecureTextField`, read only by `SecureFieldHolder.take`. What M-5 leaves: AppKit holds
@@ -425,23 +436,35 @@ final class SecureFieldHolder {
 /// wiped in place once used.
 struct SecureInput: NSViewRepresentable {
     let holder: SecureFieldHolder
+    /// Told whether the field is empty as it changes (never what it holds).
+    var onEmpty: ((Bool) -> Void)? = nil
     let onSubmit: () -> Void
 
     func makeNSView(context: Context) -> NSSecureTextField {
         holder.field.target = context.coordinator
         holder.field.action = #selector(Coordinator.submit)
+        holder.field.delegate = context.coordinator
         return holder.field
     }
 
     func updateNSView(_ view: NSSecureTextField, context: Context) {
         context.coordinator.onSubmit = onSubmit
+        context.coordinator.onEmpty = onEmpty
     }
 
-    func makeCoordinator() -> Coordinator { Coordinator(onSubmit: onSubmit) }
+    func makeCoordinator() -> Coordinator { Coordinator(onSubmit: onSubmit, onEmpty: onEmpty) }
 
-    final class Coordinator: NSObject {
+    final class Coordinator: NSObject, NSTextFieldDelegate {
         var onSubmit: () -> Void
-        init(onSubmit: @escaping () -> Void) { self.onSubmit = onSubmit }
+        var onEmpty: ((Bool) -> Void)?
+        init(onSubmit: @escaping () -> Void, onEmpty: ((Bool) -> Void)?) {
+            self.onSubmit = onSubmit
+            self.onEmpty = onEmpty
+        }
         @objc func submit() { onSubmit() }
+        func controlTextDidChange(_ note: Notification) {
+            guard let field = note.object as? NSTextField else { return }
+            onEmpty?(field.stringValue.isEmpty)
+        }
     }
 }

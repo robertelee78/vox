@@ -8,8 +8,8 @@ every node, an agent's hooks act only as their `--node`, and the control socket 
 `.daemon/vox.sock` (6.11, 7.4, 7.6–7.8, 11.5 and §12 say how; 2.1, 6.10 and 8.5 are built); until it is built,
 each profile runs its own daemon and socket. The code is `crates/vox-agentcomms` (envelope, claims, operation ids, version
 gate), `crates/vox-tui/src/{agent_hook,wake,room_cli,coord,app,codex_trust}.rs` (the drain hook,
-the wake, the `vox room` and `vox agent` verbs, `vox daemon`), `crates/vox-tui/assets/agent-skill.md`
-(the skill) and `crates/vox-core/src/node/{ipc,trust,status}.rs` (the control socket, the trust
+the wake, the `vox room` and `vox agent` verbs, `vox daemon`), `crates/vox-tui/assets/skill/`
+(the skill pack) and `crates/vox-core/src/node/{ipc,trust,status}.rs` (the control socket, the trust
 keyring, the status report). Milestones M19.1a–M19.12 are built; M19.7 is proved on one host,
 not across two machines. Not built: the in-room approval
 entry point (3.7), per-message read metadata (3.10), volatile context on plain posts and

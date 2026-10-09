@@ -123,8 +123,13 @@ final class NodeModel: ObservableObject {
     @Published var replyTo: RoomMessage?
     /// The service card selected above the timeline, whose command ⌘⇧C copies.
     @Published var selectedService: SharedService?
-    /// What a menu action last did, said where the person is (E-5).
-    @Published var did: String?
+    /// What the last operation came to (P6): done, refused, or not known whether it was done,
+    /// with the operation that made it. A sheet shows only its own; a new operation clears it.
+    @Published private(set) var outcome: Outcome?
+    /// The operation under way, which an outcome is filed under.
+    private var operation = ""
+    /// What the last operation did, said where the person is (E-5): `outcome`, when done.
+    var did: String? { outcome.flatMap { $0.kind == .done ? $0.words : nil } }
 
     /// The services members share in the room on screen, as cards above its timeline.
     @Published private(set) var roomServices: [SharedService] = []
@@ -170,8 +175,9 @@ final class NodeModel: ObservableObject {
     private nonisolated static func lanHelperStatus() async -> SMAppService.Status {
         await Task.detached { Daemon.lanHelper.status }.value
     }
-    /// The last thing that failed, in the daemon's words (M-7), or the node's last notice.
-    @Published private(set) var said: String?
+    /// Why the last operation was not done, or may not have been, in the daemon's words (M-7):
+    /// `outcome`, when not done.
+    var said: String? { outcome.flatMap { $0.kind == .done ? nil : $0.words } }
     /// The node ended: detached, or the daemon stopped.
     @Published private(set) var ended: String?
 
@@ -210,7 +216,7 @@ final class NodeModel: ObservableObject {
         do {
             try await client.subscribe(listener: Listener(model: self))
         } catch {
-            said = sentence(error)
+            reportBackground(error)
         }
         follow()
     }
@@ -304,7 +310,7 @@ final class NodeModel: ObservableObject {
             let back = await readTrustsBack()
             if back != trustsBack { trustsBack = back }
         } catch {
-            said = sentence(error)
+            reportBackground(error)
         }
     }
 
@@ -368,7 +374,7 @@ final class NodeModel: ObservableObject {
             sessions = listed
             watchReads(id)
         } catch {
-            said = sentence(error)
+            reportBackground(error)
         }
     }
 
@@ -403,11 +409,13 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// Untrust `node`.
-    func untrust(_ node: TrustedNode) async {
-        _ = await keyringChange { [client] pass in
+    /// Remove `node` from the keyring.
+    /// Whether it was done; when not, why is `keyringFailed`, or the passphrase is asked for.
+    @discardableResult
+    func untrust(_ node: TrustedNode) async -> Bool {
+        await keyringChange { [client] pass in
             try await client.trustRemove(fingerprint: node.fingerprint, identityPassphrase: pass)
-            return "No longer trusting \(node.name). Your sender key is rotated, and everyone you "
+            return "Removed \(node.name) from your keyring. Your sender key is rotated, and everyone you "
                 + "still trust is re-keyed."
         }
     }
@@ -442,12 +450,13 @@ final class NodeModel: ObservableObject {
     /// Dismiss `offer`: here only, and silently (K-18); the node stays not in keyring, and trust
     /// stays reachable from the member pane.
     func dismiss(_ offer: OfferInfo) async {
+        begin("dismiss-offer")
         do {
             try await client.dismissOffer(fingerprint: offer.fingerprint)
             if let waiting = try? await client.pendingOffers() { offers = waiting }
             if selection == .offer(offer.fingerprint) { selection = nil }
         } catch {
-            said = sentence(error)
+            report(error)
         }
     }
 
@@ -483,13 +492,14 @@ final class NodeModel: ObservableObject {
     /// the helper is already enabled, it is unregistered before it is registered, so the item is
     /// made for this copy.
     func allowLanHelper() async {
+        begin("lan-helper")
         if await Self.lanHelperStatus() != .enabled {
             try? await lanHelper.unregister()
         }
         do {
             try lanHelper.register()
         } catch {
-            said = error.localizedDescription
+            report(error)
         }
         let status = await Self.lanHelperStatus()
         if status == .requiresApproval {
@@ -501,10 +511,11 @@ final class NodeModel: ObservableObject {
     /// Remove the LAN helper: launchd stops it and it is no longer registered, so nothing of Vox
     /// runs as root. The family LAN is offered again only after the next approval (M-12).
     func removeLanHelper() async {
+        begin("lan-helper")
         do {
             try await lanHelper.unregister()
         } catch {
-            said = error.localizedDescription
+            report(error)
         }
         lanHelperReady = await Self.lanHelperStatus() == .enabled
     }
@@ -554,12 +565,14 @@ final class NodeModel: ObservableObject {
 
     /// Create a room named `name` under `passphrase`, and show it.
     func createRoom(_ name: String, passphrase secret: Secret) async -> Bool {
-        await withPassphrase(secret) { [client] p in try await client.createRoom(name: name, passphrase: p) }
+        begin("create-room")
+        return await withPassphrase(secret) { [client] p in try await client.createRoom(name: name, passphrase: p) }
     }
 
     /// Join a room by its link and passphrase, and show it. It keeps the name its members gave it.
     func joinRoom(_ link: String, passphrase secret: Secret) async -> Bool {
-        await withPassphrase(secret) { [client] p in
+        begin("join-room")
+        return await withPassphrase(secret) { [client] p in
             try await client.joinRoom(link: link, passphrase: p)
         }
     }
@@ -574,47 +587,53 @@ final class NodeModel: ObservableObject {
             await show(.room(room))
             return true
         } catch {
-            said = sentence(error)
+            report(error)
             return false
         }
     }
 
     /// Copy the room on screen's link (⌘L), saying what it carries.
     func copyRoomLink() async {
+        begin("copy-link")
         guard let id = roomOnScreen else { return }
         do {
             let link = try await client.link(room: id)
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(link.url, forType: .string)
-            did = link.note.isEmpty ? "Room link copied." : "Room link copied. \(link.note)"
+            report(done: link.note.isEmpty ? "Room link copied." : "Room link copied. \(link.note)")
         } catch {
-            said = sentence(error)
+            report(error)
         }
     }
 
-    /// Leave the room on screen, or end it for everyone.
-    func leaveRoom(endingIt: Bool) async {
-        guard let id = roomOnScreen else { return }
+    /// Leave the room on screen, or end it for everyone: nil once done, else why not (D19), for
+    /// the sheet that asked to say where it was asked.
+    func leaveRoom(endingIt: Bool) async -> String? {
+        begin("leave")
+        guard let id = roomOnScreen else { return "No room is on screen to leave." }
         do {
             if endingIt { try await client.end(room: id) } else { try await client.leave(room: id) }
-            did = endingIt ? "The room is ended for everyone." : "You left the room."
+            report(done: endingIt ? "The room is ended for everyone." : "You left the room.")
             selection = nil
             await refresh()
+            return nil
         } catch {
-            said = sentence(error)
+            report(error)
+            return sentence(error)
         }
     }
 
     /// Set the room on screen's retention: no passphrase (ADR-028 K-11).
     func setRetention(_ seconds: UInt64) async -> Bool {
+        begin("retention")
         guard let id = roomOnScreen else { return false }
         do {
             try await client.setRetention(room: id, ttlSecs: seconds)
-            did = seconds == 0 ? "Messages here are kept for good."
-                : "Messages here are kept for \(Retention.words(seconds)), then deleted everywhere."
+            report(done: seconds == 0 ? "Messages here are kept for good."
+                : "Messages here are kept for \(Retention.words(seconds)), then deleted everywhere.")
             return true
         } catch {
-            said = sentence(error)
+            report(error)
             return false
         }
     }
@@ -622,14 +641,15 @@ final class NodeModel: ObservableObject {
     /// Rename the room on screen: its one name, as every member sees it (ADR-028 R-1). Only its
     /// creator or an admin may; the node's refusal is said as it comes. No passphrase (K-11).
     func renameRoom(to name: String) async -> Bool {
+        begin("rename")
         guard let id = roomOnScreen else { return false }
         do {
             try await client.renameRoom(room: id, name: name)
-            did = "The room is now \(name) for every member."
+            report(done: "The room is now \(name) for every member.")
             await refresh()
             return true
         } catch {
-            said = sentence(error)
+            report(error)
             return false
         }
     }
@@ -642,7 +662,7 @@ final class NodeModel: ObservableObject {
         do {
             return try await client.decisions()
         } catch {
-            said = sentence(error)
+            reportBackground(error)
             return []
         }
     }
@@ -655,28 +675,40 @@ final class NodeModel: ObservableObject {
 
     /// Make a member an admin of the room on screen, or take it back.
     func setAdmin(_ member: String, _ admin: Bool) async {
+        begin("admins")
         guard let id = roomOnScreen else { return }
         do {
             try await client.setAdmin(room: id, member: member, admin: admin)
         } catch {
-            said = sentence(error)
+            report(error)
         }
     }
 
     /// Copy the selected service's address (⌘⇧C): its canonical form, which works pasted on any
     /// member's machine (ADR-028 S-1, S-3), said by its readable one.
     func copyServiceCommand() {
+        begin("copy")
         guard let service = selectedService else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(service.canonical, forType: .string)
-        did = "Copied the address of \(service.address)."
+        report(done: "Copied the address of \(service.address).")
+    }
+
+    /// Copy a service's whole address: its canonical form, which works pasted on any member's
+    /// machine (S-1, S-3), said by its readable one (G3).
+    func copyAddress(of service: SharedService) {
+        begin("copy")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(service.canonical, forType: .string)
+        report(done: "Copied the address of \(service.address).")
     }
 
     /// Copy a service's command, as given: with the canonical address (S-3).
     func copyCommand(_ command: String) {
+        begin("copy")
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(command, forType: .string)
-        did = "Copied: \(command)"
+        report(done: "Copied: \(command)")
     }
 
     /// A room's services, as the daemon lists them.
@@ -701,22 +733,25 @@ final class NodeModel: ObservableObject {
 
     /// Share `local` in `room` as `tag`; nil when shared, else the daemon's sentence.
     func shareService(room: String, tag: String, local: String) async -> String? {
+        begin("share")
         do {
             try await client.serviceAdd(room: room, tag: tag, local: local)
-            did = "Shared \(tag) (\(local))."
+            report(done: "Shared \(tag) (\(local)).")
             return nil
         } catch {
+            report(error)
             return sentence(error)
         }
     }
 
     /// Stop sharing `tag` in `room`.
     func stopService(room: String, tag: String) async {
+        begin("stop-share")
         do {
             try await client.serviceRemove(room: room, tag: tag)
-            did = "Stopped sharing \(tag)."
+            report(done: "Stopped sharing \(tag).")
         } catch {
-            said = sentence(error)
+            report(error)
         }
     }
 
@@ -732,25 +767,65 @@ final class NodeModel: ObservableObject {
     /// Share the file or folder at `url` in the room on screen, addressed to `to` (members'
     /// fingerprints; none: the room) with `note`, in one message (ADR-028 F-1). Whether it was.
     func attach(_ url: URL, to: [String], note: String) async -> Bool {
+        begin("attach")
         guard case let .room(id) = selection else { return false }
         do {
             _ = try await client.share(room: id, path: url.path, to: to, note: note, re: "",
                                        urgent: false, count: 0, forSecs: 0)
             return true
         } catch {
-            said = sentence(error)
+            report(error)
             return false
         }
     }
 
     /// Post `text` to the room on screen.
     func post(_ text: String, to: [String] = [], urgent: Bool = false, re: String = "") async {
+        begin("post")
         guard case let .room(id) = selection else { return }
         do {
             try await client.post(room: id, text: text, to: to, re: re, urgent: urgent)
         } catch {
-            said = sentence(error)
+            report(error)
         }
+    }
+
+    // ---- what an operation came to (P6) ------------------------------------------------------
+
+    /// Start an operation: what the last one came to is cleared, so a result is never left over
+    /// from another (P6).
+    func begin(_ operation: String) {
+        self.operation = operation
+        outcome = nil
+    }
+
+    /// Why `operation` was not done, or may not have been: what its own sheet shows, and nothing
+    /// another operation left (P6).
+    func failure(of operation: String) -> Outcome? {
+        outcome.flatMap { $0.operation == operation && $0.kind != .done ? $0 : nil }
+    }
+
+    /// Take the outcome down: the status bar's dismiss, and a sheet that opens afresh.
+    func clearOutcome(of operation: String? = nil) {
+        if operation == nil || outcome?.operation == operation { outcome = nil }
+    }
+
+    /// The operation under way was done.
+    private func report(done words: String) {
+        outcome = Outcome(operation: operation, kind: .done, words: words)
+    }
+
+    /// The operation under way was refused, or whether it was done is not known: the daemon's
+    /// sentence, never a type's name (M-7).
+    private func report(_ error: Error) {
+        outcome = Outcome(operation: operation, kind: Outcome.kind(of: error), words: sentence(error))
+    }
+
+    /// Something the app does on its own failed (a refresh, a read): said in the status bar, but
+    /// never over what a person's own operation came to.
+    private func reportBackground(_ error: Error) {
+        guard outcome == nil || outcome?.operation == "" else { return }
+        outcome = Outcome(operation: "", kind: Outcome.kind(of: error), words: sentence(error))
     }
 
     // ---- what the node says -------------------------------------------------------------------
@@ -786,7 +861,7 @@ final class NodeModel: ObservableObject {
                     readLog.debug("mark read failed in \(room, privacy: .public): \(sentence(error), privacy: .public)")
                     // Not recorded: drawn again, it is told again.
                     ids.forEach { self.marked.remove($0) }
-                    self.said = sentence(error)
+                    self.reportBackground(error)
                 }
             }
         }
@@ -953,7 +1028,7 @@ extension NodeModel {
             if read.entries != sessionEntries { sessionEntries = read.entries }
             if read.note != sessionNote { sessionNote = read.note }
         } catch {
-            said = sentence(error)
+            reportBackground(error)
         }
     }
 
@@ -1027,10 +1102,27 @@ extension NodeModel {
 
     /// Stop one of this node's shares.
     func stopShare(_ share: MenuBarFacts.Share) async {
+        begin("stop-share")
         do {
             _ = try await client.shareStop(room: share.room, selector: share.tag)
         } catch {
-            said = sentence(error)
+            report(error)
         }
+    }
+}
+
+/// What one operation came to (P6), kept apart: done, refused, or not known whether it was done
+/// (the daemon stopped answering after it was asked).
+struct Outcome: Equatable {
+    enum Kind: Equatable { case done, refused, unknown }
+    /// The operation that made it: a sheet shows only its own.
+    let operation: String
+    let kind: Kind
+    /// What to say: what it did, or the daemon's sentence for why not.
+    let words: String
+
+    static func kind(of error: Error) -> Kind {
+        if case VoxError.Unknown(_) = error { return .unknown }
+        return .refused
     }
 }

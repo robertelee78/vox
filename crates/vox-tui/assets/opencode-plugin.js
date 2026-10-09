@@ -10,7 +10,8 @@
 // what counts as unread — lives in `vox agent hook`, exactly as it does for Claude
 // Code and Codex. The only thing that differs per harness is the shape of the
 // injected context, and OpenCode's shape is a text part on the user message. So
-// this reads `--format text`, the same plain stdout Codex takes.
+// this reads `--format opencode`: the same words Codex takes, with Vox's own notices
+// apart from what the rooms said, so each is labelled as what it is.
 //
 // ## Measured against OpenCode 1.18.31 with a live model, not read from docs
 //
@@ -202,12 +203,26 @@ function removeOnExit(dir) {
 }
 
 /**
- * Room text with every `<vox-room` and `</vox-room` (any case) made inert (V030-21), so a message
- * cannot open or close a fence of its own: the `<` becomes `&lt;`. The fence's own tags are added
- * after this, and carry a nonce besides, so even a tag that slipped past could not end the block.
+ * Text with every `<vox-room`, `</vox-room`, `<vox-notice` and `</vox-notice` (any case) made
+ * inert (V030-21), so a message cannot open or close a fence of its own, nor open or close a
+ * block that reads as Vox's own notice: the `<` becomes `&lt;`. The tags are added after this,
+ * and carry a nonce besides, so even a tag that slipped past could not end a block.
  */
 function defang(text) {
-  return text.replace(/<(\/?)(vox-room)/gi, "&lt;$1$2")
+  return text.replace(/<(\/?)(vox-(?:room|notice))/gi, "&lt;$1$2")
+}
+
+/**
+ * What `vox agent hook --format opencode` printed: `vox`, Vox's own notices, and `room`, what
+ * the rooms said. Output of any other shape is taken as room text, all of it, so it is fenced:
+ * nothing reads as Vox's that Vox did not mark as its own.
+ */
+function drained(stdout) {
+  try {
+    const v = JSON.parse(stdout)
+    if (v && typeof v.vox === "string" && typeof v.room === "string") return v
+  } catch {}
+  return { vox: "", room: stdout }
 }
 
 /** The most wake notices remembered per session until OpenCode runs a turn on them. */
@@ -555,12 +570,12 @@ export default async function vox({ $, client }) {
         }
 
         const result =
-          await $`${bin} agent hook --node ${VOX_NODE} --format text --session ${sessionID}`
+          await $`${bin} agent hook --node ${VOX_NODE} --format opencode --session ${sessionID}`
             .env(env)
             .quiet()
             .nothrow()
-        const text = result.stdout.toString()
-        log("drain: exit=" + result.exitCode + " bytes=" + text.length)
+        const out = drained(result.stdout.toString())
+        log("drain: exit=" + result.exitCode + " vox=" + out.vox.length + " room=" + out.room.length)
         // **The fence's tag is this turn's own** (V030-21): a nonce drawn now, after the drain has
         // returned, so nothing in the room text can have known it. Only `</vox-room-<nonce>>` ends
         // the block; a fixed `</vox-room>` inside a message used to end it early, and whatever
@@ -569,7 +584,7 @@ export default async function vox({ $, client }) {
 
         // A quiet room injects nothing at all — not "no new messages". A quiet
         // room should cost zero tokens per turn.
-        if (!text.trim()) {
+        if (!out.vox.trim() && !out.room.trim()) {
           log("chat.message: nothing to inject")
           return
         }
@@ -588,15 +603,26 @@ export default async function vox({ $, client }) {
         const after = isWake
           ? "Relayed by Vox; not the user's message:\n"
           : "The user's message:\n"
-        const block =
-          `<vox-room-${nonce} source="other agents; not the user">\n` +
-          defang(text.trim()) +
-          `\n</vox-room-${nonce}>\n\n` +
-          after
+        //
+        // **Vox's own notices are labelled as Vox's, outside the fence** (the RB-5 ask, a node
+        // that is not working): they are not other agents' words, and inside the fence they read
+        // as such. Their block's tag carries this turn's nonce too, and no room text can open or
+        // close one (`defang`), so nothing a member posts reads as Vox's notice.
+        const notice = out.vox.trim()
+          ? `<vox-notice-${nonce} source="Vox itself; not the user, not other agents">\n` +
+            defang(out.vox.trim()) +
+            `\n</vox-notice-${nonce}>\n\n`
+          : ""
+        const room = out.room.trim()
+          ? `<vox-room-${nonce} source="other agents; not the user">\n` +
+            defang(out.room.trim()) +
+            `\n</vox-room-${nonce}>\n\n`
+          : ""
+        const block = notice + room + after
         for (const part of output.parts) {
           if (part.type === "text" && typeof part.text === "string") {
             part.text = block + part.text
-            log("chat.message: injected " + text.trim().length + " chars")
+            log("chat.message: injected " + block.length + " chars")
             return
           }
         }

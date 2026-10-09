@@ -17,7 +17,8 @@
 //! "planning, assignment and decisions".
 //!
 //! And V210-166 (#391): `vox agent skill <harness>` names where each of Claude Code, Codex
-//! and OpenCode loads it from.
+//! and OpenCode loads it from. The skill is read as an agent gets it: the whole pack, as
+//! `vox agent skill --install` (run by the installer and `vox update`) puts it, every file.
 
 #![cfg(unix)]
 
@@ -29,6 +30,40 @@ mod watchdog;
 use std::process::Command;
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
+
+/// The skill pack as an agent reads it: `vox agent skill --install` into a scratch `HOME` where
+/// Claude Code is present, every file of the pack it put there, joined. (Ok, the pack, what it said.)
+fn pack() -> (bool, String, String) {
+    let home = tempfile::tempdir().expect("APPARATUS: a tempdir");
+    std::fs::create_dir_all(home.path().join(".claude")).expect("APPARATUS: a harness folder");
+    let out = Command::new(VOX)
+        .args(["agent", "skill", "--install"])
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("VOX_DATA_DIR", home.path().join("data"))
+        .env("VOX_CONFIG_DIR", home.path().join("cfg"))
+        .output()
+        .expect("APPARATUS: run vox");
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    let dir = home.path().join(".claude/skills/vox-agent-comms");
+    let mut files: Vec<std::path::PathBuf> = std::iter::once(dir.join("SKILL.md"))
+        .chain(
+            std::fs::read_dir(dir.join("references"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path()),
+        )
+        .collect();
+    files[1..].sort();
+    let text = files
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(f).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (out.status.success() && !text.is_empty(), text, said)
+}
 
 /// `vox agent skill [harness]`, with no profile of any kind: it reads nothing.
 fn skill(harness: Option<&str>) -> (bool, String, String) {
@@ -62,9 +97,12 @@ fn missing_split(text: &str, says: &[(&str, &str)]) -> Vec<String> {
 fn the_skill_and_the_drain_say_the_room_settles_who_and_the_issue_records_progress() {
     watchdog::arm();
 
-    // ---- the skill, as `vox agent skill` prints it ----
-    let (ok, text, _) = skill(None);
-    assert!(ok, "PRODUCT: `vox agent skill` failed: {text}");
+    // ---- the skill, as the pack an agent reads ----
+    let (ok, text, said) = pack();
+    assert!(
+        ok,
+        "PRODUCT: `vox agent skill --install` gave no pack: {said}"
+    );
     let missing = missing_split(
         &text,
         &[
@@ -119,6 +157,7 @@ fn the_skill_and_the_drain_say_the_room_settles_who_and_the_issue_records_progre
     eprintln!("[proof] the skill carries the split, and none of the old text");
 
     // ---- where each harness loads it (V210-166) ----
+    let (_, entry, _) = skill(None);
     for (h, dir) in [
         ("claude", "~/.claude/skills/vox-agent-comms"),
         ("codex", "${CODEX_HOME:-~/.codex}/skills/vox-agent-comms"),
@@ -129,12 +168,12 @@ fn the_skill_and_the_drain_say_the_room_settles_who_and_the_issue_records_progre
     ] {
         let (ok, same, said) = skill(Some(h));
         assert!(
-            ok && same == text,
-            "PRODUCT: `vox agent skill {h}` must print the same skill"
+            ok && same == entry && text.starts_with(entry.trim_end()),
+            "PRODUCT: `vox agent skill {h}` must print the pack's entry, the same for each"
         );
         assert!(
-            said.contains(&format!("{dir}/SKILL.md")),
-            "PRODUCT: `vox agent skill {h}` must say it goes in {dir}: {said:?}"
+            said.contains(dir),
+            "PRODUCT: `vox agent skill {h}` must say the pack goes in {dir}: {said:?}"
         );
         eprintln!("[proof] {h}: {}", said.trim());
     }
@@ -221,8 +260,11 @@ fn the_skill_and_the_drain_say_the_room_settles_who_and_the_issue_records_progre
 #[ignore = "on demand: drives the shipped binary"]
 fn the_skill_says_when_a_silent_holder_may_be_taken_over() {
     watchdog::arm();
-    let (ok, text, said) = skill(None);
-    assert!(ok, "PRODUCT: `vox agent skill` failed: {said}");
+    let (ok, text, said) = pack();
+    assert!(
+        ok,
+        "PRODUCT: `vox agent skill --install` gave no pack: {said}"
+    );
     let missing = missing_split(
         &text,
         &[

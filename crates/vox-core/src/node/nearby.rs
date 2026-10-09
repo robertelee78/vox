@@ -15,7 +15,7 @@
 //! and nothing more.
 //!
 //! **What a listener learns.** Each member is named by an [`Entry`]: a tag, `H(room, member,
-//! window)`, and its port masked by more of the same hash. The window is [`WINDOW_SECS`] of
+//! window)`, and its port masked by more of the same hash. The window is [`WINDOW_MS`] of
 //! wall-clock time, so the tag changes with it, and the port — which a node keeps across restarts
 //! and networks — is never sent in the clear. Without the room's id, a listener cannot tell
 //! which rooms or members a datagram names, nor link one window's datagrams to the next by their
