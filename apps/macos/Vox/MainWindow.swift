@@ -1339,8 +1339,11 @@ private struct TrustBanner: View {
 
     private func words(_ cut: [NodeModel.MemberRow]) -> String {
         guard cut.count == 1, let m = cut.first else {
-            return "\(cut.count) members here and you can't read each other yet: reading needs both "
-                + "sides to trust each other."
+            // Every one named (D4), as the room names them: the alias, else the fingerprint's start.
+            let names = cut.map(\.name)
+            let listed = names.dropLast().joined(separator: ", ") + " and " + (names.last ?? "")
+            return "\(listed) aren't reading each other with you yet: reading needs both sides to "
+                + "trust each other."
         }
         switch (m.trust, m.trustsYou) {
         case (.oneWay, _):
