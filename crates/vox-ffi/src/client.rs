@@ -1541,6 +1541,22 @@ impl VoxClient {
         }
     }
 
+    /// Stop keeping `node` (ADR-014 M-6): it is no longer attached again when the daemon starts,
+    /// and its Keychain item goes. Held by this client, it stays attached until released, then
+    /// detaches as a node never kept does.
+    ///
+    /// # Errors
+    /// The daemon's refusal.
+    pub async fn unkeep(&self, node: String) -> Result<(), VoxError> {
+        let name = NodeName::parse(&node).map_err(|e| failed(e.to_string()))?;
+        match self.daemon(DaemonRequest::Unkeep { node: name }).await? {
+            DaemonFrame::Ok => Ok(()),
+            other => Err(failed(format!(
+                "the vox daemon did not say node {node} is no longer kept ({other:?})"
+            ))),
+        }
+    }
+
     /// Stop holding the node: the daemon detaches it unless it is kept or held by another client.
     pub async fn release(&self) {
         let held = Arc::clone(&self.held);

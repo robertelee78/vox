@@ -4,9 +4,97 @@
 import Foundation
 import ServiceManagement
 
+/// What the app asks of a background item it registers with macOS (the login item, the LAN
+/// helper): registered, unregistered, and its status.
+protocol BackgroundItem {
+    var status: SMAppService.Status { get }
+    func register() throws
+    func unregister() async throws
+}
+
+extension SMAppService: BackgroundItem {}
+
+#if VOX_PROOF_STUB_SERVICES
+/// **Proof builds only** (`scripts/app-proofs.sh` compiles it in; a release never has it, and
+/// scripts/assemble-macos-app.sh refuses a bundle that does): a background item that registers
+/// nothing. A real login item runs the bundle's `vox daemon` under launchd with none of a proof's
+/// scratch directories, on the person's real profile (#571, and the v0.4.0 #439 check); a real LAN
+/// helper is a root daemon. This one keeps what the app asked for in `<config dir>/app/<file>`,
+/// where the proof reads it.
+struct ProofBackgroundItem: BackgroundItem {
+    /// The marker app-proofs.sh and assemble look for in the executable.
+    static let marker = "vox-proof-service-stand-in"
+    /// `proof-login-item` or `proof-lan-helper`.
+    let name: String
+
+    private var file: URL? {
+        guard let dir = try? configDir(dataRoot: "") else { return nil }
+        return URL(fileURLWithPath: dir).appendingPathComponent("app/\(name)")
+    }
+
+    var status: SMAppService.Status {
+        guard let file, let text = try? String(contentsOf: file, encoding: .utf8) else {
+            return .notRegistered
+        }
+        if text.hasPrefix("registered") { return .enabled }
+        if text.hasPrefix("awaiting-approval") { return .requiresApproval }
+        return .notRegistered
+    }
+
+    /// Registered at once, as macOS does for an item it has approved; or, when
+    /// `<config dir>/app/<name>.approval` says `ask`, left awaiting the person's approval, which
+    /// the proof gives by writing `registered` itself, standing in for the switch in System
+    /// Settings.
+    func register() throws {
+        let asks = file.flatMap { try? String(contentsOf: $0.appendingPathExtension("approval"),
+                                              encoding: .utf8) }?
+            .trimmingCharacters(in: .whitespacesAndNewlines) == "ask"
+        write(asks ? "awaiting-approval" : "registered")
+    }
+    func unregister() async throws { write("unregistered") }
+
+    private func write(_ state: String) {
+        guard let file else { return }
+        Self.write("\(state) \(Self.marker)\n", to: file)
+    }
+
+    static func write(_ text: String, to file: URL) {
+        try? FileManager.default.createDirectory(
+            at: file.deletingLastPathComponent(), withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        try? Data(text.utf8).write(to: file, options: .atomic)
+    }
+
+    /// Opening System Settings' Login Items, recorded in `<config dir>/app/proof-opened-login-items`
+    /// instead: no proof drives a System Settings pane.
+    static func openLoginItems() {
+        guard let dir = try? configDir(dataRoot: "") else { return }
+        write("opened \(Date().timeIntervalSince1970) \(marker)\n",
+              to: URL(fileURLWithPath: dir).appendingPathComponent("app/proof-opened-login-items"))
+    }
+}
+#endif
+
 enum Daemon {
-    /// The login item: the bundle's launch agent, running the bundle's own `vox daemon` (M-8).
-    static var loginItem: SMAppService { .agent(plistName: "us.vox.daemon.plist") }
+    /// The login item: the bundle's launch agent, running the bundle's own `vox daemon` (M-8). In
+    /// a proof build, a stand-in that registers nothing ([`ProofBackgroundItem`]).
+    static var loginItem: any BackgroundItem {
+        #if VOX_PROOF_STUB_SERVICES
+        ProofBackgroundItem(name: "proof-login-item")
+        #else
+        SMAppService.agent(plistName: "us.vox.daemon.plist")
+        #endif
+    }
+
+    /// The family LAN's root helper: the bundle's launch daemon (ADR-014 M-10). In a proof build,
+    /// a stand-in that registers nothing: no proof can register a root daemon.
+    static var lanHelper: any BackgroundItem {
+        #if VOX_PROOF_STUB_SERVICES
+        ProofBackgroundItem(name: "proof-lan-helper")
+        #else
+        SMAppService.daemon(plistName: "us.vox.lanhelper.plist")
+        #endif
+    }
 
     /// How long the login item's daemon, or one started here, is waited for (ADR-026 S-2).
     static let patience: TimeInterval = 15
@@ -76,11 +164,37 @@ enum Daemon {
         return "\(parts[1]) (\(when))"
     }
 
+    // ---- Keep Running: the one implementation the first run, the Vox menu and Settings use ----
+
+    /// Keep Running on: the answer kept as Keep Running and the login item registered. Returns
+    /// the login item's status after: `.enabled`, or `.requiresApproval` when macOS asks the person
+    /// first (M-8). A refusal leaves the answer as Not Now and is thrown.
+    static func startKeeping() throws -> SMAppService.Status {
+        remember(kept: true)
+        do {
+            try loginItem.register()
+        } catch {
+            remember(kept: false)
+            throw error
+        }
+        return loginItem.status
+    }
+
+    /// System Settings' Login Items, where the person approves the login item or the LAN helper;
+    /// in a proof build, only recorded ([`ProofBackgroundItem.openLoginItems`]).
+    static func openLoginItems() {
+        #if VOX_PROOF_STUB_SERVICES
+        ProofBackgroundItem.openLoginItems()
+        #else
+        SMAppService.openSystemSettingsLoginItems()
+        #endif
+    }
+
     /// Keep Running off: the login item unregistered (when it is registered), and the answer
     /// kept as Not Now.
-    static func stopKeeping() throws {
+    static func stopKeeping() async throws {
         if loginItem.status != .notRegistered {
-            try loginItem.unregister()
+            try await loginItem.unregister()
         }
         remember(kept: false)
     }

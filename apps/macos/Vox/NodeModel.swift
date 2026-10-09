@@ -161,14 +161,14 @@ final class NodeModel: ObservableObject {
     @Published private(set) var lanFailed: [String: String] = [:]
 
     /// The family LAN's root helper: the bundle's launchd daemon (ADR-014 M-10).
-    private var lanHelper: SMAppService { .daemon(plistName: "us.vox.lanhelper.plist") }
+    private var lanHelper: any BackgroundItem { Daemon.lanHelper }
 
     /// The LAN helper's status, asked off the main thread. Asking is a call to launchd's smd that
     /// waits about 20 ms; made every few seconds on the main thread, it held up the answer to
     /// macOS's "may this notification show as a banner while Vox is in front?", macOS filed the
     /// notification in Notification Center first, and no banner showed (#450 walkthrough).
     private nonisolated static func lanHelperStatus() async -> SMAppService.Status {
-        await Task.detached { SMAppService.daemon(plistName: "us.vox.lanhelper.plist").status }.value
+        await Task.detached { Daemon.lanHelper.status }.value
     }
     /// The last thing that failed, in the daemon's words (M-7), or the node's last notice.
     @Published private(set) var said: String?
@@ -483,7 +483,7 @@ final class NodeModel: ObservableObject {
         }
         let status = await Self.lanHelperStatus()
         if status == .requiresApproval {
-            SMAppService.openSystemSettingsLoginItems()
+            Daemon.openLoginItems()
         }
         lanHelperReady = status == .enabled
     }

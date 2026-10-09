@@ -1,6 +1,7 @@
 // What the app is doing, and the one node it acts as (ADR-014 M-6, ADR-028 E-4).
 
 import Foundation
+import ServiceManagement
 @MainActor
 final class AppModel: ObservableObject {
     /// The one model: the app observes it, and its delegate starts it and quits it.
@@ -67,7 +68,7 @@ final class AppModel: ObservableObject {
     /// app quits, once its passphrase is in the Keychain or it needs none (ADR-014 M-6, M-8).
     /// Read once, then kept as the person answers: views read it as they draw, and the answer is
     /// a file.
-    private(set) var keepRunning = Daemon.kept() == true
+    @Published private(set) var keepRunning = Daemon.kept() == true
 
     /// Whether the app holds a node the daemon is to let go of when it quits.
     var holdsNode: Bool {
@@ -87,19 +88,22 @@ final class AppModel: ObservableObject {
 
     /// The person's answer at first run: keep the daemon running while logged in, or not now.
     func answerLoginItem(keep: Bool) async {
-        Daemon.remember(kept: keep)
-        keepRunning = keep
         guard keep else {
+            Daemon.remember(kept: false)
+            keepRunning = false
             await reach()
             return
         }
+        let status: SMAppService.Status
         do {
-            try Daemon.loginItem.register()
+            status = try Daemon.startKeeping()
         } catch {
+            keepRunning = false
             phase = .loginItemApproval(said: error.localizedDescription)
             return
         }
-        if Daemon.loginItem.status == .requiresApproval {
+        keepRunning = true
+        if status == .requiresApproval {
             phase = .loginItemApproval(said: nil)
             return
         }
@@ -188,14 +192,106 @@ final class AppModel: ObservableObject {
     /// daemon reached as `vox` starts it.
     func stopKeepingRunning() async {
         do {
-            try Daemon.stopKeeping()
+            try await Daemon.stopKeeping()
         } catch {
             phase = .unreachable(sentence(error))
             return
         }
         keepRunning = false
         await reach()
+        await stopKeepingNode()
     }
+
+    /// Not Now also for the node (M-6): the daemon stops keeping the node chosen at first run, so
+    /// it is not attached again at the daemon's next start and detaches when the app lets go of
+    /// it. Before this, Turn Keep Running Off left the node kept (#571).
+    private func stopKeepingNode() async {
+        guard let client, let name = chosenNode(client) else { return }
+        do {
+            try await client.unkeep(node: name)
+        } catch {
+            keepRunningSaid = sentence(error)
+        }
+    }
+
+    /// Keep Running, turned on or off while Vox runs (Vox > Keep Running While Logged In, #571),
+    /// not only at first run or from the unreachable screen.
+    ///
+    /// On: the answer is kept, and the login item is registered; macOS's approval is asked for in
+    /// System Settings, as at first run (M-8). Off: the login item is unregistered, the answer
+    /// kept as Not Now, and the node no longer kept (M-6). If the daemon this app talks to was the
+    /// login item's and stopped with it, the daemon is reached again as `vox` starts it.
+    func setKeepRunning(_ on: Bool) async {
+        guard on != keepRunning else { return }
+        if on {
+            do {
+                let status = try Daemon.startKeeping()
+                keepRunning = true
+                if status == .requiresApproval { Daemon.openLoginItems() }
+            } catch {
+                keepRunning = false
+                keepRunningSaid = sentence(error)
+                return
+            }
+            await offerToKeepNode()
+            return
+        }
+        do {
+            try await Daemon.stopKeeping()
+        } catch {
+            keepRunningSaid = sentence(error)
+            return
+        }
+        keepRunning = false
+        var answers = false
+        if let client { answers = (try? await client.nodes()) != nil }
+        if !answers { await reach() }
+        await stopKeepingNode()
+    }
+
+    /// Keep Running turned on while a node is attached: the node is kept at once, as the person
+    /// expects ("Vox stays on with me while I'm logged in"). Every node has a passphrase
+    /// (ADR-028 K-11), and the daemon keeps a node only with its passphrase in the Keychain
+    /// (M-6), which the app never holds (M-5): so the app asks for it once, to store it, checked
+    /// against the node's vault by the daemon; or, declined, says plainly what that leaves.
+    private func offerToKeepNode() async {
+        guard let client, case let .attached(name, _) = phase else { return }
+        let kept = (try? await client.nodes())?.first { $0.name == name }?.keep ?? false
+        if !kept { keepNodeAsk = name }
+    }
+
+    /// The node Keep Running offers to keep, asking for its passphrase to store it; nil when no
+    /// offer is open.
+    @Published var keepNodeAsk: String?
+    /// Why storing it failed, in the daemon's words, shown in the offer.
+    @Published private(set) var keepNodeSaid: String?
+
+    /// Keep `node` with its passphrase in the Keychain (M-6, ADR-028 K-10): the daemon checks it
+    /// against the node's vault and stores it, so the node stays attached after quit and is
+    /// attached again when the daemon starts.
+    func keepNode(_ node: String, passphrase secret: Secret) async {
+        guard let client else { return }
+        do {
+            let passphrase = try secret.passphrase()
+            defer { passphrase.wipe() }
+            try await client.keep(node: node, passphrase: passphrase)
+            keepNodeAsk = nil
+            keepNodeSaid = nil
+        } catch {
+            keepNodeSaid = sentence(error)
+        }
+    }
+
+    /// The offer declined: the node is not kept, and the app says what that leaves.
+    func declineToKeepNode(_ node: String) {
+        keepNodeAsk = nil
+        keepNodeSaid = nil
+        keepRunningSaid = "Keep Running is on, but node \(node) is not kept: it stays attached "
+            + "while Vox is open, and after a restart Vox asks for its passphrase again."
+    }
+
+    /// Why turning Keep Running on or off failed, in macOS's or the daemon's words; nil once read.
+    @Published var keepRunningSaid: String?
 
     /// Let go of the node and end the client (A-4).
     func quit() async {

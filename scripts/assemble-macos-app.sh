@@ -14,7 +14,8 @@
 #   - the launch agent and LAN helper plists of M-8 and M-10, and the share extension;
 #   - every Mach-O in the bundle is thin arm64 and declares minos MIN_MACOS: the Intel target is
 #     not built at all (M-26a), so a fat or x86_64 slice anywhere is a refusal, not a strip;
-#   - no Mach-O asks to be debugged (get-task-allow), which notarization refuses.
+#   - no Mach-O asks to be debugged (get-task-allow), which notarization refuses;
+#   - no Mach-O carries the proofs' stand-in login item and LAN helper (VOX_PROOF_STUB_SERVICES).
 # Needs no credentials; it runs the same on a developer's Mac as in release.yml.
 set -euo pipefail
 
@@ -55,6 +56,9 @@ contents="$output_app/Contents"
 info="$contents/Info.plist"
 [[ -f "$info" ]] || fail "Contents/Info.plist is missing"
 
+# A proof build (us.vox.app.proof, "Vox Proof"; scripts/app-proofs.sh) is never a release.
+[[ $(plist "$info" CFBundleIdentifier) != us.vox.app.proof ]] || \
+  fail "bundle identifier is us.vox.app.proof: this is a proof build (scripts/app-proofs.sh), never a release"
 [[ $(plist "$info" CFBundleIdentifier) == us.vox.app ]] || \
   fail "bundle identifier is '$(plist "$info" CFBundleIdentifier)', want us.vox.app"
 [[ $(plist "$info" CFBundleShortVersionString) == "$version" ]] || \
@@ -76,6 +80,8 @@ shopt -u nullglob
 # macOS loads an app extension only if it is sandboxed; the signer keeps the entitlements the app
 # build gave it, so they are checked here.
 for appex in "${extensions[@]}"; do
+  [[ $(plist "$appex/Contents/Info.plist" CFBundleIdentifier) == us.vox.app.share ]] || \
+    fail "${appex#"$output_app/"} is '$(plist "$appex/Contents/Info.plist" CFBundleIdentifier)', want us.vox.app.share"
   /usr/bin/codesign -d --entitlements - --xml "$appex" 2>/dev/null |
     grep -q '<key>com.apple.security.app-sandbox</key><true/>' ||
     fail "${appex#"$output_app/"} is not sandboxed; macOS loads no extension that is not"
@@ -104,6 +110,12 @@ while IFS= read -r -d '' f; do
     grep -q '<key>com.apple.security.get-task-allow</key>'; then
     fail "${f#"$output_app/"} carries com.apple.security.get-task-allow, which notarization refuses \
 (set CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO for Release)"
+  fi
+  # A proof build's stand-in login item and LAN helper register nothing (scripts/app-proofs.sh,
+  # #571): a release carrying them would never keep the daemon running nor run the LAN helper.
+  if /usr/bin/grep -q vox-proof-service-stand-in "$f"; then
+    fail "${f#"$output_app/"} carries the proofs' stand-in background items (VOX_PROOF_STUB_SERVICES); \
+build the release without it"
   fi
 done < <(find "$contents" -type f -print0)
 [[ $machos -ge 3 ]] || fail "found $machos Mach-O files; the app, its extension and vox make three"
