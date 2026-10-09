@@ -840,27 +840,27 @@ final class FirstRunProof: XCTestCase {
         // UNREAD-579 while alice is in the keyring, so the room opens with it unread. Its row says
         // its time of day, and the whole date and time to VoiceOver; the unread line sits above it,
         // and today's divider above that. Times are the ones the node keeps, in milliseconds. It
-        // stages what it needs itself, so it runs from step 6 too (VOX_PROOF_FROM=6).
+        // stages what it unread579 itself, so it runs from step 6 too (VOX_PROOF_FROM=6).
         tap(ui, Key.id("keyring"), "Keyring in the sidebar")
         try staged(vox, ["room", "post", "--node", "bob", room, "UNREAD-579"], env: voxEnv)
-        var needs: (id: String, millis: UInt64)?
-        let heldUntil = Date().addingTimeInterval(30)
-        while needs == nil && Date() < heldUntil {
-            needs = posted(vox, voxEnv, room, "UNREAD-579")
-            if needs == nil { Thread.sleep(forTimeInterval: 0.5) }
+        var unread579: (id: String, millis: UInt64)?
+        let unread579Until = Date().addingTimeInterval(30)
+        while unread579 == nil && Date() < unread579Until {
+            unread579 = posted(vox, voxEnv, room, "UNREAD-579")
+            if unread579 == nil { Thread.sleep(forTimeInterval: 0.5) }
         }
-        guard let needs else {
+        guard let unread579 else {
             throw Apparatus("alice's `vox room read --json` never showed bob's UNREAD-579 in 30 s, so its time cannot be checked")
         }
         tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
-        let needsAt = Date(timeIntervalSince1970: TimeInterval(needs.millis) / 1_000)
-        let needsTime = Key.id("time-\(needs.id)")
+        let needsAt = Date(timeIntervalSince1970: TimeInterval(unread579.millis) / 1_000)
+        let needsTime = Key.id("time-\(unread579.id)")
         if present(ui, needsTime, timeout: 30, "bob's UNREAD-579 must show the time it was posted") {
             let e = el(ui, needsTime)
             let short = needsAt.formatted(.dateTime.hour().minute())
             let full = needsAt.formatted(date: .complete, time: .standard)
             XCTAssertEqual(e.value as? String, short,
-                           "PRODUCT: UNREAD-579, posted at \(full) (\(needs.millis) ms), must show its time of day \"\(short)\"; it shows \(String(describing: e.value))")
+                           "PRODUCT: UNREAD-579, posted at \(full) (\(unread579.millis) ms), must show its time of day \"\(short)\"; it shows \(String(describing: e.value))")
             XCTAssertEqual(e.label, full,
                            "PRODUCT: UNREAD-579's time must say the whole date and time to VoiceOver, \"\(full)\"; it says \"\(e.label)\"")
         }
