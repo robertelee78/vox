@@ -352,10 +352,34 @@ extension View {
             .accessibilityAction(.default, select)
     }
 
-    /// The content surface: bg.base, text.primary (L-6).
+    /// The content surface, the timeline and the content panes: bg.base, text.primary (L-6).
     func contentSurface() -> some View {
         background(VoxTokens.Colors.bgBase)
             .foregroundStyle(VoxTokens.Colors.textPrimary)
+    }
+
+    /// The sidebar's and a sheet's surface: bg.panel, never the system's material (L-6).
+    func panelSurface() -> some View {
+        background(VoxTokens.Colors.bgPanel)
+            .foregroundStyle(VoxTokens.Colors.textPrimary)
+    }
+
+    /// The inspector's and the status bar's surface: bg.raised (L-6).
+    func raisedSurface() -> some View {
+        background(VoxTokens.Colors.bgRaised)
+            .foregroundStyle(VoxTokens.Colors.textPrimary)
+    }
+}
+
+/// The line between two surfaces, or two parts of one: line.hair, one point wide, never the
+/// system's divider (L-6).
+struct Hairline: View {
+    var vertical = false
+
+    var body: some View {
+        Rectangle().fill(VoxTokens.Colors.lineHair)
+            .frame(width: vertical ? 1 : nil, height: vertical ? nil : 1)
+            .accessibilityHidden(true)
     }
 }
 

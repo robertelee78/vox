@@ -218,17 +218,20 @@ struct NodeSheets: View {
     let sheet: NodeSheet
 
     var body: some View {
-        switch sheet {
-        case .palette: Palette(model: model)
-        case .newRoom: RoomForm(model: model, joining: false)
-        case .joinRoom: RoomForm(model: model, joining: true)
-        case .fingerprint: FingerprintSheet(model: model)
-        case .rename: RenameSheet(model: model)
-        case .retention: RetentionSheet(model: model)
-        case .admins: AdminsSheet(model: model)
-        case .leave: LeaveSheet(model: model, ending: false)
-        case .end: LeaveSheet(model: model, ending: true)
+        Group {
+            switch sheet {
+            case .palette: Palette(model: model)
+            case .newRoom: RoomForm(model: model, joining: false)
+            case .joinRoom: RoomForm(model: model, joining: true)
+            case .fingerprint: FingerprintSheet(model: model)
+            case .rename: RenameSheet(model: model)
+            case .retention: RetentionSheet(model: model)
+            case .admins: AdminsSheet(model: model)
+            case .leave: LeaveSheet(model: model, ending: false)
+            case .end: LeaveSheet(model: model, ending: true)
+            }
         }
+        .panelSurface()
     }
 }
 

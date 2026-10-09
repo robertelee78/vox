@@ -25,6 +25,7 @@ struct RootView: View {
                 KeepNodeOffer(node: node, model: model)
                     .padding(Space.s24)
                     .font(Theme.text)
+                    .panelSurface()
             }
         }
         // Turning Keep Running on or off from the Vox menu, refused: macOS's or the daemon's words.

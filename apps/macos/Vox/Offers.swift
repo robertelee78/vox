@@ -75,7 +75,7 @@ struct OfferView: View {
             .secondaryText()
         Text("Dismissing it is yours alone: it is not told, and stays out of your keyring.")
             .secondaryText()
-        Divider()
+        Hairline()
         TextField("Alias", text: $alias)
             .accessibilityLabel("Alias")
             .frame(width: 320)

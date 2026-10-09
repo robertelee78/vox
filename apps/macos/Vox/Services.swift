@@ -60,7 +60,7 @@ struct ServicesView: View {
                 ForEach(theirs, id: \.1.canonical) { room, service in
                     SharedServiceBox(model: model, room: room.name, service: service)
                 }
-                Divider()
+                Hairline()
                 Text("YOUR SHARES").eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
                 let mine = rows.flatMap { r in r.offered.map { (r, $0) } }
                 if mine.isEmpty { Text("This node shares nothing.").secondaryText() }
@@ -80,7 +80,7 @@ struct ServicesView: View {
                     .accessibilityElement(children: .contain)
                     .accessibilityIdentifier("service-mine-\(offered.tag)")
                 }
-                Divider()
+                Hairline()
                 ShareForm(model: model, listening: listening) {
                     rows = await model.readServices()
                 }

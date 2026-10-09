@@ -43,7 +43,7 @@ struct KeyringView: View {
                     KeyringPassphrase(model: model)
                 }
                 addForm
-                Divider()
+                Hairline()
                 if model.trusted.isEmpty {
                     Text("This node trusts no one yet: nobody can read what you write until you "
                         + "trust them.").secondaryText()
@@ -60,6 +60,7 @@ struct KeyringView: View {
         }
         .sheet(item: Binding(get: { removing.map(Removal.init) }, set: { removing = $0?.node })) {
             RemoveSheet(model: model, node: $0.node) { removing = nil }
+                .panelSurface()
         }
         .onChange(of: model.keyringAsk) { ask in
             guard let ask else { return }

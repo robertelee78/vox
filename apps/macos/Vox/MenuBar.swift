@@ -77,7 +77,7 @@ struct MenuBarContent: View {
             } else {
                 Text("Vox is not acting as a node yet.").secondaryText()
             }
-            Divider()
+            Hairline()
             Button("Open Vox") {
                 NSApp.activate(ignoringOtherApps: true)
                 NSApp.windows.first { $0.identifier?.rawValue.contains("main") ?? false }?

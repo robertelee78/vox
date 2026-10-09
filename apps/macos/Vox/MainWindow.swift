@@ -53,8 +53,9 @@ struct MainWindow: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
-            Divider()
+            Hairline()
             StatusBar(model: model)
+                .raisedSurface()
         }
         .contentSurface()
         .sheet(item: $model.sheet) { NodeSheets(model: model, sheet: $0) }
@@ -127,6 +128,9 @@ private struct Sidebar: View {
             }
         }
         .listStyle(.sidebar)
+        // On bg.panel, not the system's sidebar material (L-6).
+        .scrollContentBackground(.hidden)
+        .panelSurface()
         // The sidebar's rows keep macOS's sidebar size (System Settings, Appearance, Sidebar icon
         // size), never the conversation's text size (the decider, v0.4.1).
         .font(nil)
@@ -410,7 +414,7 @@ private struct RoomView: View {
                         }
                         .voxPadding(Space.s8)
                     }
-                    Divider()
+                    Hairline()
                 }
                 Text(model.timelineTitle)
                     .secondaryText()
@@ -561,21 +565,23 @@ private struct RoomView: View {
                 if !model.showingSession {
                     composer
                 } else if let s = model.shownSession, s.canDrive, s.open {
-                    Divider()
+                    Hairline()
                     SessionComposer(model: model, session: s)
                 }
             }
             // The conversation, the timeline and the composer, at the text size View > Bigger and
             // Smaller set (the decider, v0.4.1); the inspector beside it keeps a steady size.
             .conversationScale(Theme.scale)
-            Divider()
+            Hairline(vertical: true)
             Inspector(model: model, room: room)
+                .raisedSurface()
                 .frame(width: Theme.scaled(240))
         }
         // On the room, not its timeline: ⌘O, ⌘↩ and a file from the Finder Services item work
         // wherever the room's focus is.
         .sheet(item: $attaching) { file in
             AttachSheet(model: model, file: file) { attaching = nil }
+                .panelSurface()
         }
         .onChange(of: model.attachAsked) { _ in
             // After the update, not inside it: a modal panel run from within a view update did
@@ -601,7 +607,7 @@ private struct RoomView: View {
 
     /// The room's composer, To: and urgent, under its own conversation and All.
     @ViewBuilder private var composer: some View {
-        Divider()
+        Hairline()
         if let reply = model.replyTo {
             HStack {
                 Text("Replying to \(reply.authorName.isEmpty ? String(reply.author.prefix(12)) : reply.authorName): \(reply.text.prefix(60))")
@@ -914,7 +920,7 @@ private struct Inspector: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s8) {
             SessionsList(model: model)
-            Divider().padding(.vertical, Space.s8)
+            Hairline().padding(.vertical, Space.s8)
             Text("MEMBERS").eyebrow().secondaryText()
                 .accessibilityAddTraits(.isHeader)
             ForEach(model.members) { member in
@@ -937,7 +943,7 @@ private struct Inspector: View {
                         .accessibilityIdentifier("member-platform-\(member.name)")
                 }
             }
-            Divider().padding(.vertical, Space.s8)
+            Hairline().padding(.vertical, Space.s8)
             FamilyLan(model: model, room: room)
             Spacer()
         }
