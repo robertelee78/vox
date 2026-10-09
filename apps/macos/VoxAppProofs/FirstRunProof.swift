@@ -89,6 +89,11 @@
 
 import XCTest
 
+/// The app under proof's bundle identifier: app-proofs.sh builds it as "Vox Proof", never as
+/// us.vox.app, so the person's own Vox, which may be installed and running, is never the one the
+/// proof launches, watches or drives (#571).
+let proofAppID = "us.vox.app.proof"
+
 /// A red that is the product's, thrown where an assertion cannot be: what `vox` did, quoted.
 struct Product: Error, CustomStringConvertible {
     let why: String
@@ -227,14 +232,14 @@ final class FirstRunProof: XCTestCase {
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { [weak self] note in
             if (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?
-                .bundleIdentifier == "us.vox.app" { self?.handedOff = false }
+                .bundleIdentifier == proofAppID { self?.handedOff = false }
         }
         watchingForeground = workspace.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { [weak self] note in
             guard self?.handedOff == false,
                   let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-                  app.bundleIdentifier != "us.vox.app",
+                  app.bundleIdentifier != proofAppID,
                   app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
                   // Vox's own file panel and previews run in system services of its own.
                   !(app.bundleIdentifier ?? "").hasPrefix("com.apple.appkit.xpc."),
@@ -243,7 +248,7 @@ final class FirstRunProof: XCTestCase {
             let to = app.localizedName ?? app.bundleIdentifier ?? "pid \(app.processIdentifier)"
             // Taken from a Vox that is still running a second later: not Vox quitting.
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-                let voxRunning = NSRunningApplication.runningApplications(withBundleIdentifier: "us.vox.app")
+                let voxRunning = NSRunningApplication.runningApplications(withBundleIdentifier: proofAppID)
                     .contains { !$0.isTerminated }
                 if voxRunning, self?.handedOff == false {
                     self?.lostForeground.append((at, to))
@@ -288,8 +293,27 @@ final class FirstRunProof: XCTestCase {
     /// Another app's window in front of Vox's main window and over a quarter of it (a person's
     /// window, a system overlay such as the screenshot tool's), by the window list's owner, layer
     /// and bounds only: never an image. Nil when nothing covers it, or Vox has no window.
+    /// A window of the system's over the screen point `at` that takes clicks there and is no part
+    /// of Vox: a Notification Center banner or panel, or the screenshot overlay (screencaptureui,
+    /// "Screenshot"), which may be the person's own. By the window list's owner, layer and bounds
+    /// only, never an image. Its owner, layer and bounds, else nil. Never stopped: waited out.
+    private func systemOverlayOver(_ at: CGPoint) -> String? {
+        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                                 kCGNullWindowID) as? [[String: Any]] ?? []
+        for w in windows {
+            guard let owner = w[kCGWindowOwnerName as String] as? String,
+                  owner == "Notification Center" || owner == "Screenshot",
+                  (w[kCGWindowLayer as String] as? Int ?? -1) >= 0,
+                  (w[kCGWindowAlpha as String] as? Double ?? 1) > 0,
+                  let b = w[kCGWindowBounds as String] as? NSDictionary,
+                  let r = CGRect(dictionaryRepresentation: b as CFDictionary), r.contains(at) else { continue }
+            return "\(owner), layer \(w[kCGWindowLayer as String] ?? "?"), \(Int(r.width))×\(Int(r.height)) at \(Int(r.minX)),\(Int(r.minY))"
+        }
+        return nil
+    }
+
     private func coveredBy() -> String? {
-        guard let vox = NSRunningApplication.runningApplications(withBundleIdentifier: "us.vox.app")
+        guard let vox = NSRunningApplication.runningApplications(withBundleIdentifier: proofAppID)
             .first(where: { !$0.isTerminated && ($0.bundleURL?.path.contains("/target/xcode/") ?? false) })
         else { return nil }
         let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
@@ -310,7 +334,11 @@ final class FirstRunProof: XCTestCase {
             let owner = w[kCGWindowOwnerName as String] as? String ?? "?"
             // The menu bar, and the overlay macOS shows while XCTest drives the Mac, which takes
             // no clicks, are always in front.
+            // Notification Center is left to tap(), which waits out a banner over what it clicks:
+            // its host window spans the screen's side whenever any app's banner shows (the
+            // person's own Vox's too), so its being there says nothing about this red.
             guard pid(w) != vox.processIdentifier, owner != "Window Server", owner != "AutomationModeUI",
+                  owner != "Notification Center",
                   layer(w) >= 0, (w[kCGWindowAlpha as String] as? Double ?? 1) > 0 else { continue }
             let over = bounds(w).intersection(area)
             if !over.isNull, over.width * over.height > area.width * area.height / 4 {
@@ -361,6 +389,174 @@ final class FirstRunProof: XCTestCase {
         XCTAssertEqual(answer.trimmingCharacters(in: .whitespacesAndNewlines), "no",
                        "PRODUCT: Turn Keep Running Off must keep the answer as Not Now; the answer file says \(answer.debugDescription)")
         print("[proof] login item: quoted \"\(quoted)\"; after Turn Keep Running Off the answer is \(answer.debugDescription)")
+    }
+
+    /// The first-run question (proposal 2): it says what Keep Running does and where to turn it
+    /// off, and Return answers nothing, so only choosing Keep Running adds a login item.
+    /// Keep Running is reachable while Vox runs (#571), not only on the screen shown when the
+    /// daemon is unreachable: with Keep Running chosen at first run and the node attached (and
+    /// kept, M-6), the Vox menu offers Turn Keep Running Off; chosen, the answer is kept as Not
+    /// Now, the login item is unregistered, and the node is no longer kept, still attached while
+    /// the app acts as it; the menu then offers Keep Running While Logged In, which turns it on.
+    ///
+    /// **No login item is ever registered here.** A real one runs the bundle's `vox daemon` under
+    /// launchd without this run's scratch directories, on the person's real profile. The app under
+    /// proof is built by app-proofs.sh with its login item replaced by a stand-in that registers
+    /// nothing and records what was asked (`ProofBackgroundItem`, `<config>/app/proof-login-item`); the
+    /// case refuses to start unless the executable carries that stand-in, and checks no login item
+    /// is loaded at the end. Approving a real login item stays the manual check manual.login_item.
+    /// Its own case: the other cases answer Not Now, and the unreachable case never reaches a
+    /// running app. Mutations: Keep Running the first run's default button again → red at "Return at
+    /// the first-run question must answer nothing"; the Vox menu without the item → red at "Turn
+    /// Keep Running Off"; Off without unkeeping the node → red at "must stop keeping node alice";
+    /// On without offering to keep the attached node → red at "must offer to keep her".
+    /// On, with the node attached and not kept, offers to keep it at once (its passphrase stored
+    /// in the Keychain, M-6); declined here, and the app must say what that leaves.
+    func testKeepRunningCanBeTurnedOffAndOnWhileVoxRuns() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
+            throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are set by scripts/app-proofs.sh")
+        }
+        let exe = appPath + "/Contents/MacOS/Vox"
+        guard stager.run(["/usr/bin/grep", "-q", "vox-proof-service-stand-in", exe], env: [:]).status == 0 else {
+            throw Apparatus("\(exe) carries no stand-in background items (VOX_PROOF_STUB_SERVICES): it would register a real login item, which runs on the real profile; build it with scripts/app-proofs.sh")
+        }
+        let vox = URL(fileURLWithPath: appPath).appendingPathComponent("Contents/Helpers/vox").path
+        let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("keep-running")
+        let data = root.appendingPathComponent("data").path
+        let config = root.appendingPathComponent("config").path
+        let home = root.appendingPathComponent("home").path
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        // The account's daemon, from the bundle, stopped by this case; node alice kept as Keep
+        // Running keeps a node (`--keep`, its passphrase from a scratch file: the Keychain is the
+        // person's, never a proof's), and chosen; the first-run question not answered yet.
+        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+                           until: "vox daemon: control socket")
+        let pass = root.appendingPathComponent("alice.pass").path
+        try stager.write(Data("alice identity\n".utf8), to: pass)
+        try staged(vox, ["node", "create", "alice", "--passphrase-file", pass], env: voxEnv)
+        try staged(vox, ["node", "attach", "alice", "--keep", "--passphrase-file", pass], env: voxEnv)
+        try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+        // A file's words, or "" when there is none (its absence is what Return must leave).
+        func read(_ name: String) -> String {
+            stager.run(["/bin/sh", "-c", "cat \"$0\" 2>/dev/null", config + "/app/" + name], env: [:]).out
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        func settle(_ name: String, _ want: (String) -> Bool) -> String {
+            var got = read(name)
+            let until = Date().addingTimeInterval(10)
+            while !want(got) && Date() < until {
+                Thread.sleep(forTimeInterval: 0.25)
+                got = read(name)
+            }
+            return got
+        }
+
+        let ui = voxApp(appPath)
+        ui.launchEnvironment = voxEnv.merging(["HOME": home]) { $1 }
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        defer { ui.terminate() }
+        // First run (proposal 2): the question says what Keep Running does and where to turn it
+        // off, and Return answers nothing: neither button is the default, so a login item is
+        // added only by choosing Keep Running.
+        let why = Key.id("login-item-why")
+        words(ui, why, timeout: 30,
+              "at first run the app must say what Keep Running does and where to turn it off",
+              until: { $0.contains("keeps Vox running in the background while you're logged in, even with the app closed")
+                  && $0.contains("You can turn this off in Settings or the Vox menu") })
+        ui.typeKey(.return, modifierFlags: [])
+        Thread.sleep(forTimeInterval: 3)
+        let afterReturn = (read("login-item"), read("proof-login-item"))
+        XCTAssertTrue(afterReturn.0.isEmpty && afterReturn.1.isEmpty && el(ui, why).exists,
+                      "PRODUCT: Return at the first-run question must answer nothing (no default button): the answer file says \(afterReturn.0.debugDescription), the login item was left \(afterReturn.1.debugDescription), and the question is \(el(ui, why).exists ? "still shown" : "gone")")
+        tap(ui, Key.id("login-item-keep"), "Keep Running at first run")
+        let answerFirst = settle("login-item") { $0 == "keep" }
+        let itemFirst = settle("proof-login-item") { $0.hasPrefix("registered") }
+        XCTAssertTrue(answerFirst == "keep" && itemFirst.hasPrefix("registered"),
+                      "PRODUCT: Keep Running at first run must keep the answer and register the login item; the answer is \(answerFirst.debugDescription), the login item was left \(itemFirst.debugDescription)")
+        present(ui, Key.id("attached"), timeout: 60,
+                "with Keep Running chosen and alice kept and attached, the app must open acting as alice")
+
+        // The node as `vox node list` shows it: " (kept)" when the daemon keeps it (M-6).
+        func aliceLine() -> String {
+            run(vox, ["node", "list"], env: voxEnv).out.split(separator: "\n")
+                .map(String.init).first { $0.hasPrefix("alice") } ?? ""
+        }
+        let keptBefore = aliceLine()
+        guard keptBefore.hasSuffix("(kept)") else {
+            throw Apparatus("staging not achieved: node alice is not kept before the case; `vox node list` says \(keptBefore.debugDescription)")
+        }
+
+        let voxMenu = ui.menuBars.menuBarItems["Vox"]
+        guard voxMenu.waitForExistence(timeout: 10) else {
+            throw Apparatus("XCTest finds no Vox menu in the menu bar")
+        }
+        // Off: the answer, the login item and the node (M-6: Not Now keeps no node).
+        voxMenu.click()
+        tap(ui, Key.menuItem("Turn Keep Running Off"), "Vox > Turn Keep Running Off while Vox runs")
+        let answerOff = settle("login-item") { $0 == "no" }
+        let itemOff = settle("proof-login-item") { $0.hasPrefix("unregistered") }
+        var nodeOff = aliceLine()
+        let until = Date().addingTimeInterval(10)
+        while nodeOff.hasSuffix("(kept)") && Date() < until {
+            Thread.sleep(forTimeInterval: 0.25)
+            nodeOff = aliceLine()
+        }
+        let keepFile = stager.run(["/bin/cat", data + "/.daemon/attach"], env: [:]).out
+        XCTAssertTrue(answerOff == "no" && itemOff.hasPrefix("unregistered"),
+                      "PRODUCT: Vox > Turn Keep Running Off must keep the answer as Not Now and unregister the login item; the answer is \(answerOff.debugDescription), the login item was left \(itemOff.debugDescription)")
+        XCTAssertTrue(nodeOff.contains("attached") && !nodeOff.hasSuffix("(kept)")
+                        && !keepFile.split(separator: "\n").contains { $0.hasPrefix("alice\t") },
+                      "PRODUCT: Vox > Turn Keep Running Off must stop keeping node alice, as Not Now does (M-6), while the app still acts as her: `vox node list` says \(nodeOff.debugDescription), and the daemon's attach file says \(keepFile.debugDescription)")
+        // On again.
+        voxMenu.click()
+        tap(ui, Key.menuItem("Keep Running While Logged In"),
+            "after Turn Keep Running Off, Vox > Keep Running While Logged In")
+        let answerOn = settle("login-item") { $0 == "keep" }
+        let itemOn = settle("proof-login-item") { $0.hasPrefix("registered") }
+        XCTAssertTrue(answerOn == "keep" && itemOn.hasPrefix("registered"),
+                      "PRODUCT: Vox > Keep Running While Logged In must keep the answer as Keep Running and register the login item; the answer is \(answerOn.debugDescription), the login item was left \(itemOn.debugDescription)")
+        // On with alice attached and not kept: the app offers to keep her at once, with her
+        // passphrase in the Keychain, saying what declining leaves. Declined here: the Keychain is
+        // the person's, never a proof's (storing is manual.keep_running).
+        let offer = Key.id("keep-node-why")
+        words(ui, offer, timeout: 10,
+              "turning Keep Running on with node alice attached and not kept must offer to keep her, saying what that takes and what declining leaves",
+              until: { $0.contains("node alice") && $0.contains("Keychain")
+                  && $0.contains("after a restart it needs its passphrase") })
+        tap(ui, Key.id("keep-node-not-now"), "Not Now in the offer to keep node alice")
+        words(ui, Key.showing("node alice is not kept"), timeout: 10,
+              "declining must say plainly that node alice is not kept and needs her passphrase after a restart",
+              until: { $0.contains("after a restart Vox asks for its passphrase again") })
+        // The alert's own OK, in its sheet or dialog: `ui.buttons["OK"]` also finds the Touch Bar's
+        // copy of it, which XCTest cannot click (rooms2's run, APPARATUS).
+        let okUntil = Date().addingTimeInterval(5)
+        var ok: XCUIElement?
+        repeat {
+            ok = [ui.sheets, ui.dialogs, ui.windows].lazy
+                .map { $0.buttons["OK"].firstMatch }
+                .first { $0.exists && $0.isHittable }
+            if ok == nil { Thread.sleep(forTimeInterval: 0.25) }
+        } while ok == nil && Date() < okUntil
+        if let ok { ok.click() } else {
+            XCTFail("APPARATUS: XCTest finds no clickable OK in the alert's sheet or dialog (only, perhaps, the Touch Bar's)")
+        }
+        let notKept = aliceLine()
+        XCTAssertTrue(notKept.contains("attached") && !notKept.hasSuffix("(kept)"),
+                      "PRODUCT: declining the offer must leave node alice attached and not kept; `vox node list` says \(notKept.debugDescription)")
+        voxMenu.click()
+        present(ui, Key.menuItem("Turn Keep Running Off"), timeout: 10,
+                "with Keep Running on again, the Vox menu must offer Turn Keep Running Off")
+        ui.typeKey(.escape, modifierFlags: [])
+        // Nothing here registered a real login item: none is loaded for this user.
+        let uid = stager.run(["/usr/bin/id", "-u"], env: [:]).out.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Only the proof build's own: the person's own Vox (us.vox.app) may have its login item
+        // loaded, and launchd names whose it is.
+        let loaded = stager.run(["/bin/launchctl", "print", "gui/\(uid)/us.vox.daemon"], env: [:])
+        let proofs = loaded.status == 0 && loaded.out.contains("parent bundle identifier = \(proofAppID)\n")
+        XCTAssertFalse(proofs,
+                       "PRODUCT: Vox Proof's login item is loaded after this case: the app registered a real one past its stand-in (app-proofs.sh refused to start with one loaded): \(loaded.out.prefix(200))")
+        print("[proof] keep running: off kept \(answerOff.debugDescription) and left the login item \(itemOff.debugDescription); on kept \(answerOn.debugDescription) and left it \(itemOn.debugDescription)")
     }
 
     /// (8) Notifications (ADR-014 M-23, ADR-028 R-10, #448), alone: the one step that needs a
@@ -574,7 +770,7 @@ final class FirstRunProof: XCTestCase {
         // daemon's sentence.
         words(ui, Key.id("login-item-why"), timeout: 30,
               "at first run the app must ask whether to keep the daemon running, saying what that does",
-              until: { $0.contains("keeps your rooms reachable while you are logged in, even with the app closed") })
+              until: { $0.contains("keeps Vox running in the background while you're logged in, even with the app closed") })
         // The menu bar extra, offered here, off until turned on (M-22): the toggle shows it is on
         // once clicked. Whether the item then shows in the menu bar XCTest cannot see on this
         // Mac (it reads no menu bar items); a person looks, in testNotificationSaysWhoWroteNeverWhat.
@@ -1538,6 +1734,13 @@ final class FirstRunProof: XCTestCase {
             .split(whereSeparator: \.isNewline).compactMap { Int32($0) })
     }
 
+    /// The running Vox Proof apps (bundle id us.vox.app.proof), by pid: the person's own Vox
+    /// (us.vox.app), also named Vox, is never counted.
+    private func proofApps() -> Set<Int32> {
+        Set(NSRunningApplication.runningApplications(withBundleIdentifier: proofAppID)
+            .filter { !$0.isTerminated }.map(\.processIdentifier))
+    }
+
     /// The executable `pid` runs, by proc_pidpath (ps names a process by its argv), symlinks
     /// resolved ("" when it has ended).
     private func executable(_ pid: Int32) -> String {
@@ -1570,13 +1773,13 @@ final class FirstRunProof: XCTestCase {
                            scratch: String) throws {
         try scratchOnly(env, under: scratch)
         let appExe = resolved(appPath + "/Contents/MacOS/Vox")
-        if let running = pids("Vox").first {
-            throw Apparatus("refusing to start Vox.app: a Vox.app already runs (pid \(running), \(executable(running))), and the proof could drive it")
+        if let running = proofApps().first {
+            throw Apparatus("refusing to start Vox Proof: one already runs (pid \(running), \(executable(running))), and the proof could drive it")
         }
         ui.launch()
-        let running = pids("Vox")
+        let running = proofApps()
         guard running.count == 1, let pid = running.first, executable(pid) == appExe else {
-            throw Apparatus("after starting Vox.app, the Vox processes are \(running.map { "\($0) \(executable($0))" }), not one of \(appExe)")
+            throw Apparatus("after starting Vox Proof, the \(proofAppID) processes are \(running.map { "\($0) \(executable($0))" }), not one of \(appExe)")
         }
         // The profile, positively, before any step. The account's own config has answered the
         // first-run question (checked here, by the stager), so an app asking it is not reading
@@ -1773,6 +1976,20 @@ final class FirstRunProof: XCTestCase {
                 if case .menuItem = key { reached = { e.isHittable } } else { reached = { self.inView(ui, e) } }
                 if !reached() { scrollTo(ui, e) }
                 if reached() {
+                    // A notification banner, or the screenshot overlay (the person may be taking
+                    // a screenshot), over the click's point would take the click: waited out, as
+                    // a person waits, and never stopped: it may be theirs.
+                    let at = CGPoint(x: e.frame.midX, y: e.frame.midY)
+                    let clearBy = Date().addingTimeInterval(20)
+                    while systemOverlayOver(at) != nil, Date() < clearBy {
+                        Thread.sleep(forTimeInterval: 0.5)
+                    }
+                    if let held = systemOverlayOver(at) {
+                        keepTree(ui, "a system window covered \(what)")
+                        XCTFail("APPARATUS: \(held) covered \(what) (\(key)) for 20 s; not Vox's, and left alone",
+                                file: file, line: line)
+                        return false
+                    }
                     e.click()
                     return true
                 }

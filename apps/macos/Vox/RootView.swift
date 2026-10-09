@@ -10,11 +10,29 @@ struct RootView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        if case .attached = model.phase, let node = model.node {
-            MainWindow(model: node)
-                .font(Theme.text)
-        } else {
-            setup
+        Group {
+            if case .attached = model.phase, let node = model.node {
+                MainWindow(model: node)
+                    .font(Theme.text)
+            } else {
+                setup
+            }
+        }
+        // Keep Running turned on with a node attached: keep it now, with its passphrase.
+        .sheet(isPresented: Binding(get: { model.keepNodeAsk != nil },
+                                    set: { if !$0, let n = model.keepNodeAsk { model.declineToKeepNode(n) } })) {
+            if let node = model.keepNodeAsk {
+                KeepNodeOffer(node: node, model: model)
+                    .padding(24)
+                    .font(Theme.text)
+            }
+        }
+        // Turning Keep Running on or off from the Vox menu, refused: macOS's or the daemon's words.
+        .alert("Keep Running", isPresented: Binding(get: { model.keepRunningSaid != nil },
+                                                    set: { if !$0 { model.keepRunningSaid = nil } })) {
+            Button("OK") {}
+        } message: {
+            Text(model.keepRunningSaid ?? "")
         }
     }
 
@@ -79,20 +97,60 @@ private struct LoginItemQuestion: View {
 
     var body: some View {
         Text("Keep Vox running while you're logged in?").heading()
-        Text("Vox keeps your rooms reachable while you are logged in, even with the app closed.")
+        Text("Keep Running keeps Vox running in the background while you're logged in, even with "
+            + "the app closed, so your rooms stay reachable. It adds Vox to Login Items, and macOS "
+            + "may ask you to allow it. You can turn this off in Settings or the Vox menu.")
             .secondaryText()
             .accessibilityIdentifier("login-item-why")
         // M-22: offered here, at first run, and off unless the person turns it on.
         Toggle("Show Vox in the menu bar", isOn: Binding(get: { model.menuBar },
                                                          set: { model.showMenuBar($0) }))
             .accessibilityIdentifier("menu-bar-offer")
+        // Neither is the default: Return must not add a login item (#571, proposal 2).
         HStack {
             Button("Keep Running") { Task { await model.answerLoginItem(keep: true) } }
-                .keyboardShortcut(.defaultAction)
                 .accessibilityIdentifier("login-item-keep")
             Button("Not Now") { Task { await model.answerLoginItem(keep: false) } }
                 .accessibilityIdentifier("login-item-not-now")
         }
+    }
+}
+
+/// Keep Running turned on while node `node` is attached: keep it now, its passphrase stored in the
+/// Keychain (M-6, ADR-028 K-10), or not, said plainly.
+private struct KeepNodeOffer: View {
+    let node: String
+    @ObservedObject var model: AppModel
+    @State private var field = SecureFieldHolder()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Keep node \(node) attached?").heading()
+            Text("Keep Running is on. To keep node \(node) attached when Vox is closed and after a "
+                + "restart, Vox stores its passphrase in the Keychain. Anyone who can unlock this "
+                + "Mac's login keychain can then attach node \(node). Without it, node \(node) stays "
+                + "attached only while Vox is open, and after a restart it needs its passphrase.")
+                .secondaryText()
+                .accessibilityIdentifier("keep-node-why")
+            SecureInput(holder: field) { store() }
+                .frame(width: Theme.scaled(320))
+                .accessibilityIdentifier("keep-node-passphrase")
+                .accessibilityLabel("Identity passphrase for node \(node)")
+            if let said = model.keepNodeSaid {
+                Said(text: said)
+            }
+            HStack {
+                Button("Store in Keychain") { store() }
+                    .accessibilityIdentifier("keep-node-store")
+                Button("Not Now") { model.declineToKeepNode(node) }
+                    .accessibilityIdentifier("keep-node-not-now")
+            }
+        }
+    }
+
+    private func store() {
+        guard let secret = field.take() else { return }
+        Task { await model.keepNode(node, passphrase: secret) }
     }
 }
 
@@ -110,7 +168,7 @@ private struct LoginItemApproval: View {
             Said(text: said)
         }
         HStack {
-            Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
+            Button("Open Login Items") { Daemon.openLoginItems() }
                 .accessibilityIdentifier("login-item-settings")
             Button("Continue") { Task { await model.reach() } }
                 .keyboardShortcut(.defaultAction)
