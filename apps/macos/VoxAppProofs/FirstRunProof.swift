@@ -765,6 +765,59 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(!room.isEmpty && read.contains("HELLO-FIRST-RUN"),
                       "PRODUCT: the room made in the app must hold alice's post, as `vox room read` reads it; `vox room list` says \(rooms), and the room reads \(read)")
         print("[proof] new person: node alice made and attached in the app, room \(room) made from the empty window, HELLO-FIRST-RUN posted; no screen named Terminal or a vox command")
+
+        // **Sign Out, then sign in as a new node (ADR-028 E-4, the decider 2026-10-08).** Alice is
+        // kept as Keep Running keeps a node (`--keep`, from a scratch file: the Keychain is the
+        // person's, never a proof's). Node › Sign Out… says what it does; confirmed, alice is
+        // detached, no longer kept, and the app's choice of her forgotten, her room still on disk;
+        // the sign-in lists her with her fingerprint and offers New Node…, which makes and attaches
+        // bob, and the app acts as bob.
+        let alicePass = root.appendingPathComponent("alice.pass").path
+        try stager.write(Data("alice identity\n".utf8), to: alicePass)
+        try staged(vox, ["node", "attach", "alice", "--keep", "--passphrase-file", alicePass], env: voxEnv)
+        let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
+        func aliceLine() -> String { nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "alice") ?? "" }
+        guard aliceLine().hasSuffix("(kept)") else {
+            throw Apparatus("staging not achieved: node alice is not kept before Sign Out; `vox node list` says \(aliceLine().debugDescription)")
+        }
+        let nodeMenu = ui.menuBars.menuBarItems["Node"]
+        guard nodeMenu.waitForExistence(timeout: 10) else { throw Apparatus("XCTest finds no Node menu") }
+        nodeMenu.click()
+        tap(ui, Key.menuItem("Sign Out…"), "Node › Sign Out…")
+        words(ui, Key.id("sign-out-effect"), timeout: 10,
+              "Sign Out… must say what it does before it does it",
+              until: { $0.contains("stay on this Mac") && $0.contains("Keychain") })
+        tap(ui, Key.id("sign-out-confirm"), "Sign Out")
+        let signIn = Key.id("node-alice")
+        let listedAlice = words(ui, signIn, timeout: 30,
+                                "signed out, the app must offer the sign-in, listing node alice with her fingerprint",
+                                until: { $0.contains("Act as node alice") && $0.contains(String(aliceFp.prefix(4))) }) ?? ""
+        let out = aliceLine()
+        let keepFile = stager.run(["/bin/sh", "-c", "cat \"$0\" 2>/dev/null", data + "/.daemon/attach"], env: [:]).out
+        let choice = stager.run(["/bin/sh", "-c", "cat \"$0\" 2>/dev/null", config + "/app/node"], env: [:]).out
+        XCTAssertTrue(!out.contains(" attached") && !out.hasSuffix("(kept)")
+                        && !keepFile.split(separator: "\n").contains { $0.hasPrefix("alice\t") },
+                      "PRODUCT: signed out, node alice must be detached and no longer kept: `vox node list` says \(out.debugDescription), the attach file \(keepFile.debugDescription)")
+        XCTAssertTrue(choice.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      "PRODUCT: signed out, the app must forget it opens node alice; its choice file says \(choice.debugDescription)")
+        let aliceDir = stager.run(["/bin/ls", data + "/nodes/alice"], env: [:])
+        XCTAssertEqual(aliceDir.status, 0, "PRODUCT: signed out, node alice must stay on disk: \(aliceDir.out)")
+        tap(ui, Key.id("new-node"), "New Node… in the sign-in")
+        if tap(ui, name, "the node's name field") {
+            ui.typeKey("a", modifierFlags: .command)
+            el(ui, name).typeText("bob")
+        }
+        type(ui, Key.id("new-node-passphrase"), "bob identity", "the passphrase field")
+        type(ui, Key.id("new-node-passphrase-again"), "bob identity", "the passphrase again field")
+        tap(ui, Key.id("new-node-make"), "Make Node")
+        present(ui, Key.id("attached"), timeout: 90, "made at the sign-in, node bob must be attached in the window")
+        let nodes = run(vox, ["node", "list"], env: voxEnv).out
+        let chosen = stager.run(["/bin/sh", "-c", "cat \"$0\" 2>/dev/null", config + "/app/node"], env: [:]).out
+        XCTAssertTrue((nodeLine(nodes, "bob")?.contains(" attached ") ?? false)
+                        && chosen.trimmingCharacters(in: .whitespacesAndNewlines) == "bob",
+                      "PRODUCT: signed in as the new node bob, the app must act as bob: `vox node list` says \(nodes), its choice \(chosen.debugDescription)")
+        _ = run(vox, ["node", "detach", "bob"], env: voxEnv)
+        print("[proof] sign out: \(out.debugDescription) after; sign-in listed \(listedAlice.debugDescription); signed in as new node bob")
     }
 
     /// Red when what the app shows sends a person to Terminal or names a `vox` command: every
