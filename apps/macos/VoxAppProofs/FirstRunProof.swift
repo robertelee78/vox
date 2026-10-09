@@ -2770,6 +2770,19 @@ final class FirstRunProof: XCTestCase {
               until: { $0.contains("\(erinShort) trusts you") })
         present(ui, Key.id("trust-banner-offer"), timeout: 10,
                 "the line must offer erin's trust offer, \"Trust \(erinShort)…\"")
+        // With two members alice can't read, the line names both (D4): fay joins too.
+        let fayPass = scratch.appendingPathComponent("fay.pass").path
+        try stager.write(Data("fay identity\n".utf8), to: fayPass)
+        try staged(vox, ["node", "create", "fay"],
+                   env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "fay identity"]) { $1 })
+        try staged(vox, ["node", "attach", "fay", "--passphrase-file", fayPass], env: voxEnv)
+        let fayFp = try line(staged(vox, ["id", "--node", "fay"], env: voxEnv)) { $0.count == 52 }
+        try staged(vox, ["room", "join", "--node", "fay", "--passphrase-file", roomPass, erinLink],
+                   env: voxEnv)
+        let fayShort = String(fayFp.prefix(12))
+        words(ui, banner, timeout: 60,
+              "erin and fay can't read alice: the line must name them both, \"… \(erinShort) … \(fayShort) aren't reading each other with you yet\"",
+              until: { $0.contains(erinShort) && $0.contains(fayShort) && $0.contains("aren't reading each other with you yet") })
 
         // The Dock badge: the same count as the sidebar's NEEDS YOU, read from what macOS shows.
         func badge() -> String {
