@@ -4,6 +4,7 @@
 // The keyring is a view of this window, not a window of its own.
 
 import AppKit
+import Quartz
 import SwiftUI
 
 struct MainWindow: View {
@@ -780,6 +781,15 @@ private struct RoomView: View {
                                     let following = newest == nil || inView.contains(newest ?? "")
                                     if following, let last = model.followItem {
                                         scroller.scrollTo(last, anchor: .bottom)
+                                        // Again once the new rows are laid out: a room opened
+                                        // with ⌘J gets its messages after it appears, and a
+                                        // scroll asked for in the pass that brings them can
+                                        // do nothing (as on a change of what is shown).
+                                        DispatchQueue.main.async {
+                                            if model.followItem == last {
+                                                scroller.scrollTo(last, anchor: .bottom)
+                                            }
+                                        }
                                     }
                                 }
                                 newest = model.followItem
@@ -820,7 +830,17 @@ private struct RoomView: View {
                                 shown.wrappedValue = nil
                                 return nil
                             }
-                        } else if lookFromKeys {
+                        } else {
+                            // Closed for certain: a preview closed while it is still opening (Escape
+                            // a moment after Return or Space) can stay on screen with nothing left
+                            // to close it, and the keys trapped behind it; so again once its
+                            // opening is over.
+                            closePreviewPanel()
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                                if looking == nil { closePreviewPanel() }
+                            }
+                        }
+                        if url == nil, lookFromKeys {
                             lookFromKeys = false
                             DispatchQueue.main.async {
                                 NotificationCenter.default.post(name: .voxFocusTimeline, object: nil)
@@ -1132,6 +1152,13 @@ private struct RoomView: View {
     /// the Finder). Whether it did either.
     private func toggleLook() -> Bool {
         closeLook() || lookSelected()
+    }
+
+    /// The Quick Look panel off the screen, if it shows.
+    private func closePreviewPanel() {
+        guard QLPreviewPanel.sharedPreviewPanelExists(), let panel = QLPreviewPanel.shared(),
+              panel.isVisible else { return }
+        panel.close()
     }
 
     /// Escape: Quick Look closed, if it shows, while the keys are still the timeline's (the preview
