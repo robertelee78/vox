@@ -75,6 +75,9 @@ struct MainWindow: View {
                 .textSelection(.enabled)
         }
         .contentSurface()
+        // The window's own background, which shows around the floating sidebar's rounded pane,
+        // from the tokens too (L-6: never the system background).
+        .background(WindowBackground())
         // The Dock says how many things need the person, the same count as the sidebar's NEEDS
         // YOU: rooms (a message to them, or a Session waiting on them) and trust offers. Gone
         // while nothing does, and when the window is.
@@ -197,6 +200,26 @@ private struct PanelFill: NSViewRepresentable {
         override func draw(_ dirty: NSRect) {
             NSColor(named: "BgPanel")?.setFill()
             bounds.fill()
+        }
+    }
+}
+
+/// Paints the window's background bg.panel (L-6). macOS draws the sidebar as a pane floating in
+/// the window, with rounded corners and a margin, and what shows there is the window's own
+/// background, not any view of ours (the look case read #1d1e21 there, against bg.panel #16171a).
+private struct WindowBackground: NSViewRepresentable {
+    func makeNSView(context: Context) -> Watcher { Watcher() }
+    func updateNSView(_ view: Watcher, context: Context) { view.paint() }
+
+    final class Watcher: NSView {
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            paint()
+        }
+
+        func paint() {
+            guard let window, let panel = NSColor(named: "BgPanel") else { return }
+            if window.backgroundColor != panel { window.backgroundColor = panel }
         }
     }
 }
