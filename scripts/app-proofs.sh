@@ -43,9 +43,15 @@ if ! kept="$( (umask 077; osascript -l JavaScript "$ROOT/scripts/pasteboard-keep
     exit 2
 fi
 chmod 600 "$SCRATCH/pasteboard.plist"
-trap 'osascript -l JavaScript "$ROOT/scripts/pasteboard-keep.js" restore "$SCRATCH/pasteboard.plist" >/dev/null \
-          || echo "app-proofs: the clipboard could not be put back: $SCRATCH/pasteboard.plist is lost with the scratch" >&2
-      rm -rf "$SCRATCH"' EXIT
+# Put the clipboard back and delete the kept copy: called first by every EXIT trap below, green or
+# red (a red keeps the scratch for reading, never the clipboard). Safe to call twice.
+restore_clipboard() {
+    [ -e "$SCRATCH/pasteboard.plist" ] || return 0
+    osascript -l JavaScript "$ROOT/scripts/pasteboard-keep.js" restore "$SCRATCH/pasteboard.plist" >/dev/null 2>&1 \
+        || echo "app-proofs: the clipboard could not be put back as it was" >&2
+    rm -f "$SCRATCH/pasteboard.plist"
+}
+trap 'restore_clipboard; rm -rf "$SCRATCH"' EXIT
 
 # **Never the person's own Vox, and never its profile** (APPARATUS). The person's own Vox.app
 # (us.vox.app), its login item and its daemon may be installed and running on the real profile:
@@ -224,7 +230,7 @@ trap_unregister() {
 launch_status=0
 watch_real &
 WATCH_REAL=$!
-trap 'kill "$WATCH_REAL" 2>/dev/null; rm -rf "$SCRATCH"' EXIT
+trap 'restore_clipboard; kill "$WATCH_REAL" 2>/dev/null; rm -rf "$SCRATCH"' EXIT
 if [ "$#" -eq 0 ] || [ "$*" = "LaunchProof" ]; then
     python3 scripts/app-launch-proof.py "$APP" || launch_status=$?
     if [ "$*" = "LaunchProof" ]; then
@@ -251,6 +257,7 @@ STAGER=$!
 # reading the red; a green run removes it.
 finish() {
     local status=$?
+    restore_clipboard
     kill "$WATCH_REAL" 2>/dev/null
     kill "$STAGER" 2>/dev/null; wait "$STAGER" 2>/dev/null
     trap_unregister
