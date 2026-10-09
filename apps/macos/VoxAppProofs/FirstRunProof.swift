@@ -2731,6 +2731,8 @@ final class FirstRunProof: XCTestCase {
         //
         // The room's header: its name and its retention, always (R-7); the window takes its name.
         tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
+        // A room opens at what it last showed (D12), here bob's Session from 4f: General first.
+        tap(ui, Key.id("session-general"), "General in mission's Sessions")
         words(ui, Key.id("room-header-name"), timeout: 10, "the room's header must name it: \"mission\"",
               until: { $0 == "mission" })
         words(ui, Key.id("room-header-meta"), timeout: 10,
