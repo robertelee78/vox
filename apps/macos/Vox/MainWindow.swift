@@ -70,7 +70,8 @@ private struct Sidebar: View {
                 let count = rooms.count + offers.count
                 Section {
                     ForEach(rooms) { room in
-                        RoomRow(room: room).tag(NodeModel.Selection.room(room.id))
+                        RoomRow(room: room, selected: model.selection == .room(room.id))
+                            .tag(NodeModel.Selection.room(room.id))
                             .sidebarRow(model.selection == .room(room.id))
                     }
                     ForEach(offers, id: \.fingerprint) { offer in
@@ -115,7 +116,7 @@ private struct Sidebar: View {
 
 extension View {
     /// A sidebar row's fill while it is the one selected: the selection token, on which
-    /// text.primary is 4.89:1 (WCAG 2.1 1.4.3, #450). The system's own highlight, which ignores
+    /// text.primary is 7.86:1 (WCAG 2.1 1.4.3, #450). The system's own highlight, which ignores
     /// `.tint` and drew text.primary at 3.1:1, is off (`SidebarHighlightOff`); the row is still the
     /// list's selection, so arrow keys move it and VoiceOver says it is selected.
     fileprivate func sidebarRow(_ selected: Bool) -> some View {
@@ -143,6 +144,15 @@ private struct SelectionFill: NSViewRepresentable {
             guard selected, let color = NSColor(named: "Selection") else { return }
             color.setFill()
             NSBezierPath(roundedRect: bounds, xRadius: 5, yRadius: 5).fill()
+            // The accent bar at the leading edge: the selection's mark, 9.54:1 against the panel
+            // (the fill alone is 1.94:1), so the selection never rests on its fill (the decider,
+            // v0.4.1: grey, with ice for focus and live state).
+            if let accent = NSColor(named: "Accent") {
+                accent.setFill()
+                NSBezierPath(roundedRect: NSRect(x: bounds.minX + 2, y: bounds.minY + 5, width: 3,
+                                                 height: Swift.max(bounds.height - 10, 0)),
+                             xRadius: 1.5, yRadius: 1.5).fill()
+            }
         }
     }
 }
@@ -171,12 +181,19 @@ private struct SidebarHighlightOff: NSViewRepresentable {
 /// A room in the sidebar: its name, and its unread in words.
 private struct RoomRow: View {
     let room: NodeModel.Room
+    /// Whether it is the row selected: its second line then takes selection.secondary, which
+    /// reads on the selection's fill (text.secondary would not: 3.66:1).
+    var selected = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(room.name).fontWeight(room.need == .quiet ? .regular : .bold)
             if room.need != .quiet {
-                Text(room.words).eyebrow().secondaryText()
+                if selected {
+                    Text(room.words).eyebrow().foregroundStyle(VoxTokens.Colors.selectionSecondary)
+                } else {
+                    Text(room.words).eyebrow().secondaryText()
+                }
             }
         }
         .accessibilityElement(children: .ignore)
