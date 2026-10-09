@@ -1,6 +1,6 @@
 [package]
 name = "vox-core"
-description = "Vox Lux shared core: identity, crypto, log/sync, transport, governance, tunneling."
+description = "Vox Lucis shared core: identity, crypto, log/sync, transport, governance, tunneling."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,6 +1,6 @@
 //! # vox-core
 //!
-//! The single shared Rust core for Vox Lux (ADR-001 principle 10). Every Vox
+//! The single shared Rust core for Vox Lucis (ADR-001 principle 10). Every Vox
 //! client — the Rust TUI (ADR-015), the macOS app (ADR-014) — is a peer over
 //! *this* library, never a fork of it.
 //!

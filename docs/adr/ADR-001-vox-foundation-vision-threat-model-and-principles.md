@@ -9,7 +9,7 @@ macOS client of principle 10 (ADR-014) is planned, not built.
 
 ## Context
 
-Vox Lux ("Vox") is a serverless, end-to-end-encrypted peer-to-peer overlay for private communication
+Vox Lucis ("Vox") is a serverless, end-to-end-encrypted peer-to-peer overlay for private communication
 and arbitrary TCP/IP tunneling, built in Rust. Existing secure messengers depend on central servers
 (for prekeys, identity and routing), tie identity to phone numbers or accounts, and treat admission as
 a room-level property, so one wrong add exposes all new traffic from everyone (Albrecht, Celi, Dowling
