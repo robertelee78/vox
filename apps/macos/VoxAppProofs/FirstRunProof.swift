@@ -122,6 +122,9 @@
 // fingerprint alone): (4) goes red.
 // An @alias picked that is only written, not addressed: (4) goes red. The FFI's names() without
 // the clash suffix: (5) goes red.
+// The room's composer without ⇧↩ (`shiftReturnAddsLine` dropped): (4e2) goes red on the body,
+// sent at ⇧↩ as "LINE ONE". Without `axis: .vertical`: (4e2) goes red on the growth, the field
+// one line tall.
 
 // Every check on the window proves its own query first (ADR-018: a red names its side): Vox is in
 // front and XCTest reads words in what it shows, else the red is APPARATUS; then a red is PRODUCT
@@ -2615,8 +2618,20 @@ final class FirstRunProof: XCTestCase {
         words(ui, Key.id("compose-to"), timeout: 10, "To: with bob unticked must say the room",
               until: { $0 == "To: the room" })
         type(ui, Key.id("compose"), "LINE ONE", "the composer")
+        let oneLine = el(ui, Key.id("compose")).frame.height
         el(ui, Key.id("compose")).typeKey(.return, modifierFlags: .shift)
-        el(ui, Key.id("compose")).typeText("LINE TWO\r")
+        el(ui, Key.id("compose")).typeText("LINE TWO")
+        // It grows to show the line it was given, before it is sent (up to 12): a field that
+        // stays one line tall hides what is about to go.
+        let grownUntil = Date().addingTimeInterval(3)
+        var twoLineHeight = el(ui, Key.id("compose")).frame.height
+        while Date() < grownUntil && twoLineHeight <= oneLine {
+            Thread.sleep(forTimeInterval: 0.2)
+            twoLineHeight = el(ui, Key.id("compose")).frame.height
+        }
+        XCTAssertGreaterThan(twoLineHeight, oneLine,
+                             "PRODUCT: given a second line by ⇧↩, the composer must grow to show it; it stayed \(oneLine) pt tall")
+        el(ui, Key.id("compose")).typeText("\r")
         var twoLines: String?
         let linesUntil = Date().addingTimeInterval(30)
         while Date() < linesUntil && twoLines == nil {
