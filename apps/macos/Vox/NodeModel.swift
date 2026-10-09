@@ -532,14 +532,6 @@ final class NodeModel: ObservableObject {
                  trustsYou: trustsMe.contains(fingerprint) || trustsBack.contains(fingerprint))
     }
 
-    /// The members of the room on screen this node does not yet read each other with, each by its
-    /// alias (else its short fingerprint) and where it stands (R-5, D4); nil when there are none.
-    var notMutual: String? {
-        let waiting = members.filter { $0.trust != .mutual }
-        guard !waiting.isEmpty else { return nil }
-        let named = waiting.map { "\($0.name) (\($0.trust.words))" }.joined(separator: ", ")
-        return "Not reading each other yet: \(named). A member's card says who still has to trust whom."
-    }
 
     /// The rooms this node holds that `fingerprint` is a member of, by name (G2).
     func sharedRooms(with fingerprint: String) async -> [String] {

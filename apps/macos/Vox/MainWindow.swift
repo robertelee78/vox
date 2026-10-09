@@ -589,13 +589,6 @@ private struct RoomView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .voxPadding(.horizontal, Space.s12).voxPadding(.top, Space.s8)
                     .accessibilityIdentifier("timeline-title")
-                // Who this node and a member do not yet read each other with (R-5, D4).
-                if let banner = model.notMutual {
-                    StateMark(kind: .attention, words: banner)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .voxPadding(.horizontal, Space.s12).voxPadding(.top, Space.s4)
-                        .accessibilityIdentifier("trust-banner")
-                }
                 if let header = model.sessionHeader {
                     Text(header)
                         .frame(maxWidth: .infinity, alignment: .leading)
