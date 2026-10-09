@@ -411,6 +411,18 @@ final class NodeModel: ObservableObject {
         return "Not reading each other yet: \(named). A member's card says who still has to trust whom."
     }
 
+    /// The rooms this node holds that `fingerprint` is a member of, by name (G2).
+    func sharedRooms(with fingerprint: String) async -> [String] {
+        var names: [String] = []
+        for room in rooms {
+            if let roster = try? await client.roster(room: room.id),
+               roster.contains(where: { $0.fingerprint == fingerprint }) {
+                names.append(room.name)
+            }
+        }
+        return names
+    }
+
     /// Open `fingerprint`'s card (D4), named `name` as the room names it.
     func openCard(_ fingerprint: String, name: String, act: NodeCardFor.Act? = nil) {
         keyringDid = nil
@@ -447,12 +459,12 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// Untrust `node`.
+    /// Remove `node` from the keyring.
     func untrust(_ node: TrustedNode) async {
         _ = await keyringChange { [client] pass in
             try await client.trustRemove(fingerprint: node.fingerprint, identityPassphrase: pass)
-            return "No longer trusting \(node.name). Your sender key is rotated, and everyone you "
-                + "still trust is re-keyed."
+            return "Removed \(node.name) from your keyring. Your sender key is rotated, and "
+                + "everyone you still trust is re-keyed."
         }
     }
 
