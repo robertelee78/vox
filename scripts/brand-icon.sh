@@ -85,9 +85,10 @@ cat >"$SET/Contents.json" <<EOF
 EOF
 
 # The menu bar image: a template (black with alpha; macOS colours it for the bar), kept as a vector
-# PDF so it is sharp at every scale. rsvg-convert keeps the glint's mask as vector in the PDF.
+# PDF so it is sharp at every scale. At 72 dpi its 18 px are 18 pt; at rsvg-convert's own 90 they
+# were 13.5.
 mkdir -p "$BAR"
-rsvg-convert -f pdf "$MENUBAR" -o "$BAR/MenuBarIcon.pdf"
+rsvg-convert -f pdf -d 72 -p 72 "$MENUBAR" -o "$BAR/MenuBarIcon.pdf"
 cat >"$BAR/Contents.json" <<EOF
 {
   "images" : [
