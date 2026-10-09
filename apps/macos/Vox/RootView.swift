@@ -51,6 +51,19 @@ struct RootView: View {
                 ProgressView("Attaching node \(node)…")
             case .attached:
                 ProgressView("Opening the node…")
+            case let .detached(node):
+                // E-4: this window is node <node>'s, attached or not. Attach it again, or quit.
+                Text("Node \(node) is detached.").heading()
+                Text("This window acts only as node \(node). Attach it again to go on, or quit Vox.")
+                    .secondaryText()
+                    .accessibilityIdentifier("detached-why")
+                HStack {
+                    Button("Attach \(node) Again") { Task { await model.attachAgain() } }
+                        .keyboardShortcut(.defaultAction)
+                        .accessibilityIdentifier("attach-again")
+                    Button("Quit Vox") { NSApp.terminate(nil) }
+                        .accessibilityIdentifier("detached-quit")
+                }
             }
         }
         .padding(24)

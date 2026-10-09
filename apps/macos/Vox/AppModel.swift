@@ -26,6 +26,9 @@ final class AppModel: ObservableObject {
         case attaching(node: String)
         /// Acting as `node`, whose fingerprint is `fingerprint`.
         case attached(node: String, fingerprint: String)
+        /// `node` was detached from this window (Node > Detach): it may be attached again, and
+        /// nothing else (E-4). Acting as another node is a fresh first run, not a menu action.
+        case detached(node: String)
     }
 
     @Published private(set) var phase: Phase = .starting {
@@ -124,9 +127,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// The person picked `name` at first run.
+    /// The person picked `name` at first run. Only then: a window already opened as a node never
+    /// becomes another (E-4).
     func choose(_ name: String) async {
-        guard let client else { return }
+        guard let client, case .choosing = phase else { return }
         do {
             let nodes = try await client.nodes()
             guard let node = nodes.first(where: { $0.name == name }) else {
@@ -167,13 +171,29 @@ final class AppModel: ObservableObject {
     }
 
     /// Detach the node from the daemon now (Node > Detach): its connections close and its keys
-    /// are wiped; the app then asks which node to act as.
+    /// are wiped. The window stays this node's (ADR-028 E-4): it offers to attach it again, and
+    /// Quit; never a choice of another node on this Mac.
     func detachNode() async {
         guard let client, case let .attached(node, _) = phase else { return }
         do {
             try await client.detach(node: node)
             self.node = nil
-            phase = .choosing(try await client.nodes().map(\.name))
+            phase = .detached(node: node)
+        } catch {
+            phase = .unreachable(sentence(error))
+        }
+    }
+
+    /// Attach again the node this window was opened with, after Detach (E-4): at once if it needs
+    /// no passphrase, else its passphrase is asked for.
+    func attachAgain() async {
+        guard let client, case let .detached(name) = phase else { return }
+        do {
+            guard let node = try await client.nodes().first(where: { $0.name == name }) else {
+                phase = .unreachable("node \(name) is no longer on this Mac")
+                return
+            }
+            await use(node)
         } catch {
             phase = .unreachable(sentence(error))
         }
