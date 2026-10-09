@@ -38,6 +38,9 @@ struct MainWindow: View {
         }
         .contentSurface()
         .sheet(item: $model.sheet) { NodeSheets(model: model, sheet: $0) }
+        .sheet(item: $model.card) { node in
+            NodeCard(model: model, node: node) { model.card = nil }
+        }
         .toolbar {
             // W-2: a key moves to the next room that needs the person; Control-N, as in the TUI.
             Button("Next Room That Needs You") { Task { await model.nextNeedingYou() } }
@@ -379,6 +382,13 @@ private struct RoomView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 12).padding(.top, 8)
                     .accessibilityIdentifier("timeline-title")
+                // Who this node and a member do not yet read each other with (R-5, D4).
+                if let banner = model.notMutual {
+                    StateMark(kind: .attention, words: banner)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 12).padding(.top, 4)
+                        .accessibilityIdentifier("trust-banner")
+                }
                 if let header = model.sessionHeader {
                     Text(header)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -395,7 +405,7 @@ private struct RoomView: View {
                                 LazyVStack(alignment: .leading, spacing: 10) {
                                     ForEach(model.timelineItems) { item in
                                         if let message = item.message {
-                                            MessageRow(message: message, me: model.me,
+                                            MessageRow(model: model, message: message, me: model.me,
                                                        readBy: model.readBy[message.id] ?? [],
                                                        pulledBy: model.pulledBy[message.id] ?? [],
                                                        pulled: model.pulled[message.id]) { looking = $0 }
@@ -673,6 +683,8 @@ private struct RoomView: View {
 
 /// One message in the timeline.
 private struct MessageRow: View {
+    /// What opens its author's card (D4); not observed, so a row redraws only with its own data.
+    let model: NodeModel
     let message: RoomMessage
     let me: String
     /// Who has read it, when it is this node's own (R-6).
@@ -687,7 +699,14 @@ private struct MessageRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
-                Text(author).fontWeight(.bold)
+                if message.author == me {
+                    Text(author).fontWeight(.bold)
+                } else {
+                    // Its card: who it is, who trusts whom, and Trust…, Compare…, Remove… (K-5).
+                    Text(author).fontWeight(.bold)
+                        .nodeCard(model, message.author, name: author)
+                        .accessibilityIdentifier("author-\(message.id)")
+                }
                 if message.urgent { StateMark(kind: .attention, words: "urgent") }
                 if message.to.contains(me) { Text("to you").eyebrow() }
                 if message.late {
@@ -873,9 +892,10 @@ private struct Inspector: View {
                 .accessibilityAddTraits(.isHeader)
             ForEach(model.members) { member in
                 TrustMark(name: member.name, trust: member.trust)
+                    .nodeCard(model, member.id, name: member.name)
                     .accessibilityIdentifier("member-\(member.name)")
                 // What this node's keyring grants it (K-14), once it is in the keyring.
-                if member.trust != .none {
+                if member.trust.inKeyring {
                     Text(Capability.words(member.drive)).eyebrow().secondaryText()
                         .padding(.leading, 18)
                         .accessibilityIdentifier("member-capability-\(member.name)")

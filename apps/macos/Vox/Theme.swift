@@ -280,36 +280,70 @@ extension View {
     }
 }
 
-/// Whether a node is in this node's keyring, shown by glyph, weight and words, never by colour
-/// alone (ADR-028 L-4, E-6).
+/// Who trusts whom between this node and another, each direction (ADR-028 L-4, R-5), shown by
+/// glyph, weight and words, never by colour alone (E-6). Words for every state, the TUI's (CL-1).
 enum Trust: Equatable {
-    /// In the keyring, and it trusts this node back.
+    /// In the keyring, and it trusts this node back: they read each other.
     case mutual
-    /// In the keyring; it does not trust this node.
+    /// In the keyring; its trust in this node has not reached it: waiting for the other side.
     case oneWay
-    /// Not in the keyring.
+    /// Not in the keyring, and it trusts this node.
+    case theyOnly
+    /// Not in the keyring, and no trust of it in this node has reached it.
     case none
+
+    /// The state from its two directions.
+    static func of(inKeyring: Bool, trustsYou: Bool) -> Trust {
+        switch (inKeyring, trustsYou) {
+        case (true, true): return .mutual
+        case (true, false): return .oneWay
+        case (false, true): return .theyOnly
+        case (false, false): return .none
+        }
+    }
+
+    /// Whether this node's keyring holds it.
+    var inKeyring: Bool { self == .mutual || self == .oneWay }
 
     var glyph: String {
         switch self {
         case .mutual: return "⇄"
         case .oneWay: return "→"
-        case .none: return "·"
+        case .theyOnly, .none: return "·"
         }
     }
 
     /// What the state is, in words.
     var words: String {
         switch self {
-        case .mutual: return "in keyring, trusts you"
-        case .oneWay: return "in keyring"
+        case .mutual: return "trusted both ways"
+        case .oneWay: return "waiting for the other side"
+        case .theyOnly: return "not in keyring, trusts you"
         case .none: return "not in keyring"
+        }
+    }
+
+    /// Both directions in a sentence, naming the node as `name` (D4): who trusts whom, and so
+    /// whether they read each other.
+    func sentence(_ name: String) -> String {
+        switch self {
+        case .mutual:
+            return "You trust \(name), and \(name) trusts you: you read each other."
+        case .oneWay:
+            return "You trust \(name); \(name)'s trust in you has not reached this node yet, so "
+                + "you can't read each other. Waiting for the other side."
+        case .theyOnly:
+            return "\(name) trusts you; you haven't trusted \(name), so you can't read each other "
+                + "until you do."
+        case .none:
+            return "You haven't trusted \(name), and no trust of \(name)'s in you has reached "
+                + "this node: you can't read each other."
         }
     }
 }
 
-/// A member's name with its trust: in the keyring in text.primary bold with ⇄ or →; not in it
-/// in text.secondary with · and the words "not in keyring" (L-4).
+/// A member's name with its trust in words, whatever the state: in the keyring in text.primary
+/// bold with ⇄ or →; not in it in text.secondary with · (L-4).
 struct TrustMark: View {
     let name: String
     let trust: Trust
@@ -317,10 +351,8 @@ struct TrustMark: View {
     var body: some View {
         HStack(spacing: 6) {
             Text(trust.glyph).font(Theme.mono)
-            Text(name).fontWeight(trust == .none ? .regular : .bold)
-            if trust == .none {
-                Text(trust.words).font(Theme.eyebrow)
-            }
+            Text(name).fontWeight(trust.inKeyring ? .bold : .regular)
+            Text(trust.words).font(Theme.eyebrow)
         }
         .modifier(TrustStyle(trust: trust))
         .accessibilityElement(children: .ignore)
@@ -333,7 +365,7 @@ private struct TrustStyle: ViewModifier {
     @Environment(\.colorSchemeContrast) private var contrast
 
     func body(content: Content) -> some View {
-        content.foregroundStyle(trust == .none && contrast != .increased
+        content.foregroundStyle(!trust.inKeyring && contrast != .increased
                                 ? VoxTokens.Colors.textSecondary : VoxTokens.Colors.textPrimary)
     }
 }

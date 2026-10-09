@@ -145,6 +145,11 @@ final class NodeModel: ObservableObject {
     @Published private(set) var offers: [OfferInfo] = []
     /// The trusted nodes that trust this node back, as the rooms shared with them record it (L-4).
     @Published private(set) var trustsBack: Set<String> = []
+    /// The members of the room on screen whose trust in this node has reached it, in the keyring
+    /// or not (ADR-028 R-5, D4).
+    @Published private(set) var trustsMe: Set<String> = []
+    /// The node whose card is open (D4): from a member row, a message's author or a decision row.
+    @Published var card: NodeCardFor?
     /// The keyring row selected, by fingerprint: what Keyring > Compare, Rename and Remove act on.
     @Published var keyringSelected: String?
     /// What a Keyring menu action asks the keyring view to open; each ask counts one up.
@@ -373,6 +378,29 @@ final class NodeModel: ObservableObject {
     }
 
     // ---- the keyring (M-16) ----------------------------------------------------------------
+
+    /// Where `fingerprint` stands with this node, each direction, as far as this node knows: its
+    /// keyring, and the consent grants of the room on screen and of every trusted node (D4).
+    func trust(of fingerprint: String) -> Trust {
+        Trust.of(inKeyring: trusted.contains { $0.fingerprint == fingerprint },
+                 trustsYou: trustsMe.contains(fingerprint) || trustsBack.contains(fingerprint))
+    }
+
+    /// The members of the room on screen this node does not yet read each other with, each by its
+    /// alias (else its short fingerprint) and where it stands (R-5, D4); nil when there are none.
+    var notMutual: String? {
+        let waiting = members.filter { $0.trust != .mutual }
+        guard !waiting.isEmpty else { return nil }
+        let named = waiting.map { "\($0.name) (\($0.trust.words))" }.joined(separator: ", ")
+        return "Not reading each other yet: \(named). A member's card says who still has to trust whom."
+    }
+
+    /// Open `fingerprint`'s card (D4), named `name` as the room names it.
+    func openCard(_ fingerprint: String, name: String, act: NodeCardFor.Act? = nil) {
+        keyringDid = nil
+        keyringFailed = nil
+        card = NodeCardFor(fingerprint: fingerprint, name: name, act: act)
+    }
 
     /// Trust `fingerprint` as `alias`, granting read, and drive as well when `drive` (K-14,
     /// K-16). Whether it was done.
@@ -802,9 +830,11 @@ final class NodeModel: ObservableObject {
         let consents = try await client.consents(room: room)
         let keyring = Dictionary(trusted.map { ($0.fingerprint, $0.drive) }) { $1 }
         let back = Set(consents.inbound)
+        // Their trust in this node, whether or not this node trusts them (D4): both directions.
+        if back != trustsMe { trustsMe = back }
         return roster.filter { $0.fingerprint != me }.map { m in
-            let trust: Trust = keyring[m.fingerprint] != nil
-                ? (back.contains(m.fingerprint) ? .mutual : .oneWay) : .none
+            let trust = Trust.of(inKeyring: keyring[m.fingerprint] != nil,
+                                 trustsYou: back.contains(m.fingerprint))
             return MemberRow(id: m.fingerprint,
                              name: m.name.isEmpty ? String(m.fingerprint.prefix(12)) : m.name,
                              trust: trust, drive: keyring[m.fingerprint] ?? false)
