@@ -1886,6 +1886,12 @@ fn emit_row(
     json: bool,
     status: Option<&str>,
 ) {
+    // A Session's opening and end are not the room's conversation (ADR-029 CL-2), as in `vox
+    // room read`: a rename re-posts the record, which printed here read as a second "opened".
+    // `--json` keeps every row for programs.
+    if !json && crate::agent_hook::is_session_record(r) {
+        return;
+    }
     let line = if json {
         row_json(room_key, r, ops, status)
     } else {

@@ -6,6 +6,12 @@
 //! shaped like a row would, printed raw, add a row attributed to someone else. This posts
 //! exactly that — plus a terminal escape sequence — and requires `read` and `tail` to
 //! print one row per entry, with the forgery visibly indented as a continuation.
+//!
+//! **A Session's records are not the room's conversation in `tail` either** (ADR-029 CL-2): before
+//! the post, one of alice's agent sessions takes two turns with a `/rename` between them, so its
+//! Session's record is posted twice (the second carries the new name). bob's plain `tail` prints
+//! neither record, so a rename never reads as a second "opened"; a `tail --json` beside it still
+//! gets both, for programs. Mutant: tail's plain output printing Session records → red.
 
 #![cfg(unix)]
 
@@ -57,6 +63,28 @@ fn a_message_cannot_forge_a_row_in_read_or_tail() {
         .stderr(Stdio::piped());
     support::strip_harness_env(&mut cmd);
     let mut tail = cmd.spawn().expect("APPARATUS: spawn `vox room tail`");
+    // And a program's `tail --json` beside it.
+    let mut cmd = Command::new(VOX);
+    cmd.args(["room", "tail", r, "--json"])
+        .env("VOX_DATA_DIR", &bob.data)
+        .env("VOX_CONFIG_DIR", &bob.cfg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    support::strip_harness_env(&mut cmd);
+    let mut tail_json = cmd
+        .spawn()
+        .expect("APPARATUS: spawn `vox room tail --json`");
+    let (jtx, jrx) = std::sync::mpsc::channel();
+    let so = tail_json
+        .stdout
+        .take()
+        .expect("APPARATUS: tail --json's stdout");
+    std::thread::spawn(move || {
+        for l in std::io::BufReader::new(so).lines().map_while(Result::ok) {
+            let _ = jtx.send(l);
+        }
+    });
     let (tx, rx) = std::sync::mpsc::channel();
     let so = tail.stdout.take().expect("APPARATUS: tail's stdout");
     std::thread::spawn(move || {
@@ -72,6 +100,53 @@ fn a_message_cannot_forge_a_row_in_read_or_tail() {
         s
     });
     std::thread::sleep(Duration::from_secs(1));
+
+    // ---- one of alice's sessions takes a turn, is renamed, and takes another ----
+    let session = "5e55105e-aaaa-4bbb-8ccc-dddddddddddd";
+    let transcript = tmp.path().join("transcript.jsonl");
+    let title = |name: &str| {
+        let mut t = std::fs::read_to_string(&transcript).unwrap_or_default();
+        t.push_str(&format!(
+            "{{\"type\":\"custom-title\",\"customTitle\":\"{name}\",\"sessionId\":\"x\"}}\n"
+        ));
+        std::fs::write(&transcript, t).expect("APPARATUS: the session's transcript");
+    };
+    let turn = |prompt: &str| {
+        let payload = serde_json::json!({
+            "session_id": session,
+            "hook_event_name": "UserPromptSubmit",
+            "cwd": tmp.path(),
+            "prompt": prompt,
+            "transcript_path": transcript,
+        })
+        .to_string();
+        let o = alice.vox_env(
+            None,
+            &[("CLAUDE_CODE_ENTRYPOINT", "cli")],
+            &["agent", "hook", "--node", "default", "--room", r],
+            Some(&payload),
+        );
+        assert!(
+            o.ok,
+            "PRODUCT (staging): alice's session hook failed: {o:?}"
+        );
+    };
+    title("tail-before");
+    turn("hi");
+    title("tail-after");
+    turn("go on");
+    let records = alice
+        .vox(None, &["room", "read", r, "--json"])
+        .ndjson()
+        .iter()
+        .filter_map(|v| serde_json::from_str::<serde_json::Value>(v["text"].as_str()?).ok())
+        .filter(|e| e["type"] == "session" && e["from"] == session)
+        .count();
+    assert_eq!(
+        records, 2,
+        "APPARATUS: staging not achieved: the rename did not re-post the Session's record (alice's \
+         room holds {records} for it)"
+    );
 
     let forged_hash = "a".repeat(52);
     let payload = format!(
@@ -92,7 +167,19 @@ fn a_message_cannot_forge_a_row_in_read_or_tail() {
         &["room", "read", r],
         |o: &Out| o.stdout.contains("an honest line"),
     );
-    let entries = bob.vox(None, &["room", "read", r, "--json"]).ndjson().len();
+    // Every entry but a Session's records, which `read` leaves out of the conversation (CL-2).
+    let entries = bob
+        .vox(None, &["room", "read", r, "--json"])
+        .ndjson()
+        .iter()
+        .filter(|v| {
+            let e = v["text"]
+                .as_str()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+                .unwrap_or_default();
+            e["type"] != "session" && e["type"] != "session-end"
+        })
+        .count();
     assert_eq!(
         row_starts(&read.stdout),
         entries,
@@ -136,6 +223,15 @@ fn a_message_cannot_forge_a_row_in_read_or_tail() {
             None => "was still running".to_owned(),
         }
     );
+    // Its own claim first: a Session record printed is a row of its own, which the forged-row
+    // count below would also catch, under the wrong name.
+    let short = &session[..8];
+    assert!(
+        !got.lines()
+            .any(|l| l.contains(short) || l.ends_with(" opened")),
+        "PRODUCT: `vox room tail` printed a Session's record as part of the room's conversation \
+         (ADR-029 CL-2), so a rename reads as a second \"opened\":\n{got}"
+    );
     assert_eq!(
         row_starts(&got),
         1,
@@ -144,5 +240,36 @@ fn a_message_cannot_forge_a_row_in_read_or_tail() {
     assert!(
         !got.contains('\x1b'),
         "PRODUCT: a raw escape sequence reached the terminal via tail:\n{got:?}"
+    );
+
+    // ---- the Session's records: not in the plain tail, both in the JSON one ----
+    let mut sessions_json = 0;
+    let mut forged_json = false;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && !(forged_json && sessions_json == 2) {
+        if let Ok(l) = jrx.recv_timeout(Duration::from_millis(500)) {
+            let row: serde_json::Value = serde_json::from_str(&l).unwrap_or_default();
+            forged_json |= row["text"]
+                .as_str()
+                .is_some_and(|t| t.contains(&forged_hash));
+            let e = row["text"]
+                .as_str()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+                .unwrap_or_default();
+            if e["type"] == "session" && e["from"] == session {
+                sessions_json += 1;
+            }
+        }
+    }
+    let _ = tail_json.kill();
+    let _ = tail_json.wait();
+    assert!(
+        forged_json && sessions_json == 2,
+        "PRODUCT: `vox room tail --json` must keep every row for programs: it gave {sessions_json} \
+         of the Session's 2 records{} in 30 s",
+        if forged_json { "" } else { ", and not the message after them" }
+    );
+    println!(
+        "[proof] the renamed Session's 2 records: none in the plain tail, both in tail --json"
     );
 }
