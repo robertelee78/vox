@@ -510,11 +510,50 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
                 "uninstall.stops_the_daemon_and_keeps_the_nodes",
                 daemon_after.is_empty()
                     && home.join("data/nodes/alice").is_dir()
-                    && text.contains("is kept")
                     && text.contains("no backup"),
                 format!(
                     "processes holding the data root after: {daemon_after:?}; nodes/alice kept={}",
                     home.join("data/nodes/alice").is_dir()
+                ),
+            ));
+            // **Each kept directory is said once, as what it holds** (#632's check): the data
+            // root with the nodes, their keys and rooms and the no-backup sentence, a full stop
+            // before the `--purge` sentence; the config directory as settings, never as nodes.
+            // Mutant: the old line (`<dir> is kept: it holds your nodes, …`) for both.
+            let data_dir = home.join("data");
+            let config_dir = home.join("config");
+            let line_for = |dir: &Path| -> Vec<&str> {
+                text.lines()
+                    .filter(|l| l.starts_with(&format!("vox uninstall: kept {}", dir.display())))
+                    .collect()
+            };
+            let (data_lines, config_lines) = (line_for(&data_dir), line_for(&config_dir));
+            let data_ok = data_lines.len() == 1
+                && data_lines[0].starts_with(&format!(
+                    "vox uninstall: kept {}: your nodes, their keys and their rooms (alice); there \
+                     is no backup of a node",
+                    data_dir.display()
+                ))
+                && data_lines[0].ends_with(". `vox uninstall --purge` removes it.")
+                && !data_lines[0].contains(" is kept");
+            let config_ok = if config_dir.exists() {
+                config_lines
+                    == [format!(
+                        "vox uninstall: kept {}: the settings Vox reads for your nodes. `vox \
+                         uninstall --purge` removes it.",
+                        config_dir.display()
+                    )
+                    .as_str()]
+            } else {
+                config_lines.is_empty()
+            };
+            claims.push(claim(
+                "uninstall.says_once_what_each_kept_directory_holds",
+                data_ok && config_ok,
+                format!(
+                    "the data root's kept lines: {data_lines:?}; the config directory's (it exists: \
+                     {}): {config_lines:?}",
+                    config_dir.exists()
                 ),
             ));
             // macOS keeps a background item by bundle id, so every Vox shares it: this install
