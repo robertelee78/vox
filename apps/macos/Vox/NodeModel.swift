@@ -94,8 +94,18 @@ final class NodeModel: ObservableObject {
     @Published private(set) var retention = ""
     /// What the room on screen's timeline shows (ADR-029 CL-2): General each time a room opens.
     @Published var showing: Showing = .general {
-        didSet { if showing != oldValue { Task { await readSession() } } }
+        didSet {
+            guard showing != oldValue else { return }
+            // Another Session's entries are never drawn, nor acted on, under this one's header
+            // while it loads (D3): cleared, and said to be loading.
+            sessionEntries = []
+            sessionNote = nil
+            sessionLoading = showingSession
+            Task { await readSession() }
+        }
     }
+    /// The Session on screen is being read: its timeline says "Loading…" (D3).
+    @Published private(set) var sessionLoading = false
     /// The room on screen's Sessions, open and ended (ADR-029 CL-2).
     @Published private(set) var sessions: [FfiSession] = []
     /// The Session on screen's entries, oldest first, to a member with drive (SC-1).
@@ -977,16 +987,22 @@ extension NodeModel {
         guard let room = roomOnScreen, let s = shownSession, s.canDrive else {
             if !sessionEntries.isEmpty { sessionEntries = [] }
             if sessionNote != nil { sessionNote = nil }
+            sessionLoading = false
             return
         }
         do {
             let read = try await client.sessionRead(room: room, node: s.nodeFingerprint,
                                                     sessionId: s.sessionId)
-            guard shownSession?.sessionId == s.sessionId else { return }
+            // Drawn only for the destination it was read for, still on screen and still driven
+            // (D3): the room, the Session's node and its id, and drive held.
+            guard roomOnScreen == room, let now = shownSession, now.nodeFingerprint == s.nodeFingerprint,
+                  now.sessionId == s.sessionId, now.canDrive else { return }
             if read.entries != sessionEntries { sessionEntries = read.entries }
             if read.note != sessionNote { sessionNote = read.note }
+            sessionLoading = false
         } catch {
             said = sentence(error)
+            sessionLoading = false
         }
     }
 

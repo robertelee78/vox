@@ -5,13 +5,12 @@
 import SwiftUI
 
 extension NodeModel {
-    /// Send `action` to the Session `s` of the room on screen, and say what came of it (DR-6), as
-    /// `vox room session` and the TUI say it.
-    func drive(_ s: FfiSession, _ action: DriveAction) async -> String {
+    /// Send `action` to the Session `s` of `room`, the destination its control was drawn for (D3),
+    /// and say what came of it (DR-6), as `vox room session` and the TUI say it.
+    func drive(_ s: FfiSession, in room: String, _ action: DriveAction) async -> String {
         guard s.canDrive else {
             return "you cannot drive this Session: \(s.nodeAlias) has not given you drive"
         }
-        guard let room = roomOnScreen else { return "not sent to \(s.label): no room is on screen" }
         do {
             let answer = try await drive(room: room, session: s.sessionId, action: action)
             switch answer.delivery {
@@ -35,13 +34,16 @@ extension NodeModel {
 /// and a file sent in. What came of the last of them is said under it.
 struct SessionComposer: View {
     @ObservedObject var model: NodeModel
+    /// The room it was drawn in: what it sends goes there and to `session` only (D3).
+    let room: String
     let session: FfiSession
     @State private var draft = ""
     @State private var said = ""
     @State private var busy = false
 
-    init(model: NodeModel, session: FfiSession) {
+    init(model: NodeModel, room: String, session: FfiSession) {
         self.model = model
+        self.room = room
         self.session = session
     }
 
@@ -104,7 +106,7 @@ struct SessionComposer: View {
     private func act(_ action: DriveAction) {
         busy = true
         Task {
-            said = await model.drive(session, action)
+            said = await model.drive(session, in: room, action)
             busy = false
         }
     }
@@ -114,6 +116,8 @@ struct SessionComposer: View {
 /// each part's options, while it waits on the reader; once it is settled, what became of it.
 struct RequestView: View {
     @ObservedObject var model: NodeModel
+    /// The room it was drawn in: Approve, Reject and an answer go there and to `session` (D3).
+    let room: String
     let session: FfiSession
     let request: FfiRequest
     /// What the request asks, as its entry's line says it: its buttons name it to VoiceOver.
@@ -124,8 +128,9 @@ struct RequestView: View {
     @State private var said = ""
     @State private var busy = false
 
-    init(model: NodeModel, session: FfiSession, request: FfiRequest, about: String = "") {
+    init(model: NodeModel, room: String, session: FfiSession, request: FfiRequest, about: String = "") {
         self.model = model
+        self.room = room
         self.session = session
         self.request = request
         self.about = about
@@ -214,7 +219,7 @@ struct RequestView: View {
     private func act(_ action: DriveAction) {
         busy = true
         Task {
-            said = await model.drive(session, action)
+            said = await model.drive(session, in: room, action)
             busy = false
         }
     }

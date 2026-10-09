@@ -105,6 +105,8 @@ struct SessionsList: View {
 /// answers (SessionDrive.swift), or its state once it is resolved or not answerable.
 struct SessionEntryRow: View {
     @ObservedObject var model: NodeModel
+    /// The room it was drawn in: its actions go there and to `session` only (D3).
+    let room: String
     let session: FfiSession
     let entry: FfiSessionEntry
     /// Open a pulled copy with Quick Look.
@@ -116,7 +118,8 @@ struct SessionEntryRow: View {
             Text(entry.line).font(Theme.mono).textSelection(.enabled)
                 .accessibilityIdentifier("entry-line-\(entry.id)")
             if let request = entry.request {
-                RequestView(model: model, session: session, request: request, about: entry.line)
+                RequestView(model: model, room: room, session: session, request: request,
+                            about: entry.line)
             }
             // A file the session sent, once this node has a verified copy (ADR-029 DR-1, F-11).
             if let file = entry.file, let pulled = file.pulledPath {

@@ -418,8 +418,9 @@ private struct RoomView: View {
                                                 .padding(.horizontal, 4)
                                                 .accessibilityIdentifier(item.id)
                                                 .id(item.id)
-                                        } else if let entry = item.entry, let session = model.shownSession {
-                                            SessionEntryRow(model: model, session: session,
+                                        } else if let entry = item.entry, let session = model.shownSession,
+                                                  let room = model.roomOnScreen {
+                                            SessionEntryRow(model: model, room: room, session: session,
                                                             entry: entry) { looking = $0 }
                                                 .id(item.id)
                                         }
@@ -521,9 +522,9 @@ private struct RoomView: View {
                 // a Session. An open one's own composer is for a member with drive only (CL-3).
                 if !model.showingSession {
                     composer
-                } else if let s = model.shownSession, s.canDrive, s.open {
+                } else if let s = model.shownSession, s.canDrive, s.open, let room = model.roomOnScreen {
                     Divider()
-                    SessionComposer(model: model, session: s)
+                    SessionComposer(model: model, room: room, session: s)
                 }
             }
             Divider()
