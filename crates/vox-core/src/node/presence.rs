@@ -969,7 +969,3 @@ fn spawn_handshake(
         }
     });
 }
-
-#[cfg(test)]
-#[path = "presence_tests.rs"]
-mod tests;

@@ -288,11 +288,12 @@ relay circuit.
 ### The daemon's one presence (ADR-026)
 
 Built. Proofs: `two_nodes_answer_at_one_address_proof` and `two_nodes_are_clients_of_one_daemon_proof`
-(N-41, N-42, N-46), `node::presence` tests (N-43, N-44, N-45, in process),
-`the_daemon_reads_its_relay_limits_from_its_config` (N-45),
+(N-41, N-42, N-46), `the_daemon_reads_its_relay_limits_from_its_config` (N-45),
 `a_dial_that_reaches_another_node_names_no_one_proof` (N-47),
 `a_first_punched_connection_is_prompt_proof` (N-48). N-43's unmapping at the daemon's stop:
-`a_stopped_daemon_deletes_its_port_mappings_proof` (N-56), against a PCP stand-in.
+`a_stopped_daemon_deletes_its_port_mappings_proof` (N-56), against a PCP stand-in. N-43's one
+discovery per presence and N-44's one nearby group per presence have no proof: their in-process
+tests were deleted in v0.4.1 (AGENTS.md: no unit tests).
 
 - **N-41.** The daemon, not a node, MUST bind the one UDP socket and QUIC endpoint of the machine's
   account, and run the dual-stack self-test once per bind.
