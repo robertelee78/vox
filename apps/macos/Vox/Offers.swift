@@ -27,14 +27,14 @@ struct OfferRow: View {
 }
 
 /// The offer selected: the node's fingerprint grouped with its art, what is said of it, its rooms,
-/// and the two things to do with it. Trusting asks an alias and read or read + drive (read the
-/// default), says what it does first, and asks no fingerprint comparison (K-16); it passes the
+/// and the two things to do with it. Trusting asks an alias and gives read, the only grant here
+/// (K-16; drive is its own step in the keyring, P5), says what it does first, and asks no
+/// fingerprint comparison (K-16); it passes the
 /// passphrase gate as every keyring change does. Dismissing is this node's alone (K-18).
 struct OfferView: View {
     @ObservedObject var model: NodeModel
     let fingerprint: String
     @State private var alias = ""
-    @State private var drive = false
 
     var body: some View {
         ScrollView {
@@ -71,7 +71,8 @@ struct OfferView: View {
         Text("In: \(offer.rooms.map(\.name).joined(separator: ", "))")
             .accessibilityIdentifier("offer-rooms")
         Text("It is not in your keyring. Trusting it lets it read what you write in every room "
-            + "you share, now and later; you are asked for a name, and for read or read + drive.")
+            + "you share, now and later. You are asked for a name, and it is given read; drive is "
+            + "a separate step in the keyring.")
             .secondaryText()
         Text("Dismissing it is yours alone: it is not told, and stays out of your keyring.")
             .secondaryText()
@@ -80,15 +81,8 @@ struct OfferView: View {
             .accessibilityLabel("Alias")
             .frame(width: 320)
             .accessibilityIdentifier("offer-alias")
-        Picker("Grants", selection: $drive) {
-            Text(Capability.words(false)).tag(false)
-            Text(Capability.words(true)).tag(true)
-        }
-        .pickerStyle(.segmented)
-        .fixedSize()
-        .accessibilityIdentifier("offer-capability")
         if !alias.isEmpty {
-            Text(Effects.trusting(alias) + " " + Effects.granting(alias, drive: drive))
+            Text(Effects.trusting(alias) + " " + Effects.granting(alias, drive: false))
                 .secondaryText()
                 .accessibilityIdentifier("offer-effect")
         }
@@ -101,8 +95,8 @@ struct OfferView: View {
         }
         HStack {
             Button("Trust") {
-                let (name, grant) = (alias, drive)
-                Task { _ = await model.accept(offer, as: name, drive: grant) }
+                let name = alias
+                Task { _ = await model.accept(offer, as: name, drive: false) }
             }
             .disabled(alias.isEmpty)
             .accessibilityIdentifier("offer-accept")

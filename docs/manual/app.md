@@ -253,15 +253,17 @@ your alias for it, with its fingerprint art and its fingerprint in groups, and a
 whether it trusts you back (⇄) or not yet (→), and what its entry grants: `read` or `read +
 drive`. See [Identity and keyring](keyring.md) for what trust grants.
 
-- **Add a node**: paste or type its fingerprint, give it an alias, and choose what it
-  **Grants**: `read` or `read + drive`. Before you choose **Trust**, the view says what trusting
-  does: it may read what you write in every room you share, now and later; you read what it
+- **Add a node**: paste or type its fingerprint and give it an alias. It is given `read`; drive
+  is a separate step on its row. Before you choose **Trust**, the view says what trusting does: it may read what you write in every room you share, now and later; you read what it
   writes once it trusts you too; and it reaches every service you bind to a room you are both in.
-- **Change…**: switch between read and read + drive, saying first what that does: "With drive,
-  NAME also sees inside your Sessions and may type into them, interrupt or stop them, answer their
-  approvals and questions, and send and receive their files." or "With read only, NAME sees each
-  of your Sessions' name and whether it is open, and nothing inside it." Then **Give drive** or
-  **Read only**.
+- **Also let NAME drive my Sessions…**: opens a sheet that says first what drive does: NAME can
+  then answer approvals and type into this node's Sessions, now and later, with their permissions;
+  "With drive, NAME also sees inside your Sessions and may type into them, interrupt or stop them,
+  answer their approvals and questions, and send and receive their files." Return chooses
+  **Cancel**. Only **Give Drive** gives it, and it asks for your identity passphrase if the keyring
+  window has closed.
+- **Make Read Only…** (a node with drive): says "With read only, NAME sees each of your Sessions'
+  name and whether it is open, and nothing inside it." Then **Make Read Only**.
 - **Compare…**: paste or type the fingerprint the person gave you another way. Case, spaces and
   dashes do not count. A match says `Matches NAME's fingerprint.`; a mismatch says
   `Does not match. This is not the node you trusted as NAME: do not trust it.` and offers to
@@ -286,8 +288,8 @@ A node that joined a room after yours, or that trusts you, and is not in your ke
 an offer under **needs you** in the sidebar (see [Offers](keyring.md#offers-nodes-waiting-for-your-trust)).
 Select it to see a **Trust offer**: its fingerprint with its art, the same sentence `vox trust
 offers` prints (`ben joined. ann trusts it.`), the rooms you share (`In: family`), and what
-trusting and dismissing do. Give it an alias, choose **Grants** (`read` or `read + drive`), and
-**Trust**; the view says what that grant does first, and asks for your identity passphrase if the
+trusting and dismissing do. Give it an alias and choose **Trust**: it is given `read` (drive is a
+separate step in the keyring); the view says what that grant does first, and asks for your identity passphrase if the
 keyring window has closed. You are not asked to compare fingerprints. **Dismiss** removes the offer
 on your node alone: it is not told, and stays out of your keyring.
 
