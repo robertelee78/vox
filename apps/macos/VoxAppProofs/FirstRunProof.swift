@@ -2856,8 +2856,8 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         if present(ui, Key.id("compose-as"), timeout: 10, "the composer must say who posts: \"alice ▸\"") {
             let shownAs = el(ui, Key.id("compose-as"))
-            XCTAssertTrue((shownAs.value as? String) == "alice ▸" || shownAs.label == "posting as alice",
-                          "PRODUCT: the composer must say who posts, \"alice ▸\"; it shows \(String(describing: shownAs.value)) (\(shownAs.label))")
+            XCTAssertEqual(shown(shownAs), "alice ▸",
+                           "PRODUCT: the composer must say who posts, \"alice ▸\"; it shows \"\(shown(shownAs))\"")
         }
         if present(ui, Key.id("compose"), timeout: 10, "the room must have its composer") {
             XCTAssertEqual(el(ui, Key.id("compose")).placeholderValue, "Message mission…",
@@ -2907,10 +2907,11 @@ final class FirstRunProof: XCTestCase {
             let e = el(ui, needsTime)
             let short = needsAt.formatted(.dateTime.hour().minute())
             let full = needsAt.formatted(date: .complete, time: .standard)
-            XCTAssertEqual(e.value as? String, short,
-                           "PRODUCT: UNREAD-579, posted at \(full) (\(unread579.millis) ms), must show its time of day \"\(short)\"; it shows \(String(describing: e.value))")
-            XCTAssertEqual(e.label, full,
-                           "PRODUCT: UNREAD-579's time must say the whole date and time to VoiceOver, \"\(full)\"; it says \"\(e.label)\"")
+            XCTAssertEqual(shown(e), short,
+                           "PRODUCT: UNREAD-579, posted at \(full) (\(unread579.millis) ms), must show its time of day \"\(short)\"; it shows \"\(shown(e))\"")
+            // The whole date and time is in the message row's spoken label, for VoiceOver.
+            present(ui, Key.showing("at \(full)"), timeout: 10,
+                    "UNREAD-579's row must say the whole date and time to VoiceOver, \"at \(full)\"")
         }
         let unreadLine = Key.id("unread-divider")
         words(ui, unreadLine, timeout: 10,
