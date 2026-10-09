@@ -45,7 +45,7 @@ SERVICE_ID.NODE_FINGERPRINT.ROOM_ID.vox please` reads `open web.robertgpt.family
 your machine. `--json` and anything you copy keep the canonical form.
 
 On a member's machine, `vox service list` also gives the commands for each service's kind, ready
-to copy, with its canonical address in them, and what each needs, with whether it holds now:
+to copy, with its canonical address in them, and what reaching it needs, each `✓` or `missing`:
 
 ```text
   ssh.robertgpt.family.vox  by robertgpt  ssh
@@ -53,17 +53,21 @@ to copy, with its canonical address in them, and what each needs, with whether i
       ssh     ssh $USER@SERVICE_ID.NODE_FINGERPRINT.ROOM_ID.vox
       forward vox forward SERVICE_ID.NODE_FINGERPRINT.ROOM_ID.vox 127.0.0.1:2222
       then    ssh -p 2222 $USER@127.0.0.1
-      needs   robertgpt trusts this node (as the room's log says): yes
-      needs   this node is attached: yes
-      needs   the .vox proxy is running on 127.0.0.1:1080: yes
-      needs   robertgpt is online: yes
+      ✓ proxy configured
+      ✓ node attached
+      ✓ robertgpt trusts you
+      ✓ robertgpt online
   for ssh by address, add this to ~/.ssh/config once:
     Host *.vox
         ProxyCommand nc -X 5 -x 127.0.0.1:1080 %h %p
 ```
 
-A `needs` line that says `no` names what to fix first. In the TUI, the same commands are in the
-room's Shared pane, and `y` copies the selected one to your clipboard.
+Each line is one thing reaching the service needs, `✓` when it holds. One that does not says
+`missing:` and what to do, for example `missing: robertgpt online — robertgpt is not reachable
+now; it is reached when it comes back`. `robertgpt trusts you` is robertgpt's own word, as it
+wrote it into the room; your node asks nobody for it. In the TUI, the same commands and the same
+lines are in the room's Shared pane, under the selected service, and `y` copies its command to your
+clipboard. Vox.app shows them under each service in the Services view.
 
 ## A port shared into a new room
 

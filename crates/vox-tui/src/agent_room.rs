@@ -103,6 +103,43 @@ pub async fn run(
     }
 }
 
+/// `vox agent room --none`: the operator said no to binding this session's repo to a room
+/// (ADR-029 RB-7). Its start directory is recorded in the room map with no room, so no session
+/// started there is asked again; no passphrase or link is involved.
+///
+/// # Errors
+/// No session named, a session not registered, or the map cannot be written.
+pub fn decline(
+    account: &Account,
+    node: &NodeName,
+    session_flag: Option<&str>,
+) -> Result<(), AppError> {
+    let session = crate::coord::require_session(session_flag)?;
+    let paths = account.node_paths(node)?;
+    let start = crate::wake::registration(&paths, &session)
+        .and_then(|r| r.start)
+        .ok_or_else(|| {
+            AppError::Usage(format!(
+                "session {session} of node {node} is not registered, or started nowhere Vox knows"
+            ))
+        })?;
+    let start = std::path::PathBuf::from(start);
+    if crate::room_map::decline(&account.data_root, &start)? {
+        println!(
+            "vox: {} is to stay tied to no room: no session started there is asked again; \
+             remove its block from {} to be asked",
+            start.display(),
+            crate::room_map::path(&account.data_root).display()
+        );
+    } else {
+        println!(
+            "vox: the room map names {} already; nothing was changed",
+            start.display()
+        );
+    }
+    Ok(())
+}
+
 /// Offer to save the session's start directory → `channel_id` in the room map, when the map does
 /// not name that directory yet.
 async fn offer_save(

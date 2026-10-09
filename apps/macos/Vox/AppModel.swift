@@ -1,6 +1,7 @@
 // What the app is doing, and the one node it acts as (ADR-014 M-6, ADR-028 E-4).
 
 import Foundation
+import ServiceManagement
 @MainActor
 final class AppModel: ObservableObject {
     /// The one model: the app observes it, and its delegate starts it and quits it.
@@ -15,9 +16,18 @@ final class AppModel: ObservableObject {
         case loginItemApproval(said: String?)
         /// Reaching the daemon.
         case starting
-        /// The daemon did not answer; its sentence.
-        case unreachable(String)
-        /// First run: no node chosen yet. The nodes on this Mac.
+        /// The daemon could not be reached, or the node not attached for a reason no passphrase
+        /// fixes: what kind of failure, and the sentence said (P4).
+        case unreachable(StartFailure)
+        /// The data root holds an earlier release's node directories, which this version does not
+        /// read (the daemon refuses it): offered to be moved aside (#576). Their paths; the
+        /// sentence after a failed move.
+        case oldLayout(dirs: [String], said: String?)
+        /// First run on a Mac with no node yet: make one here; the sentence after a failed try.
+        case welcome(said: String?)
+        /// Making node `node`, then attaching it.
+        case creating(node: String)
+        /// First run: several nodes on this Mac, none chosen yet. Their names.
         case choosing([String])
         /// The node needs its identity passphrase to attach; the daemon's sentence after a
         /// failed try.
@@ -51,6 +61,13 @@ final class AppModel: ObservableObject {
         textScale = next
     }
 
+    /// Set the app's text size to one of `Theme.scales` (Settings), as Bigger and Smaller step it.
+    func setTextSize(_ scale: Double) {
+        guard Theme.scales.contains(scale), scale != textScale else { return }
+        UserDefaults.standard.set(scale, forKey: Theme.scaleKey)
+        textScale = scale
+    }
+
     /// Show or hide the menu bar extra, and keep the choice. Setting the value it already has does
     /// nothing: SwiftUI sets a MenuBarExtra's `isInserted` on its updates, and a change notice for
     /// each of those started another update, so the main thread never went idle.
@@ -67,7 +84,7 @@ final class AppModel: ObservableObject {
     /// app quits, once its passphrase is in the Keychain or it needs none (ADR-014 M-6, M-8).
     /// Read once, then kept as the person answers: views read it as they draw, and the answer is
     /// a file.
-    private(set) var keepRunning = Daemon.kept() == true
+    @Published private(set) var keepRunning = Daemon.kept() == true
 
     /// Whether the app holds a node the daemon is to let go of when it quits.
     var holdsNode: Bool {
@@ -87,19 +104,22 @@ final class AppModel: ObservableObject {
 
     /// The person's answer at first run: keep the daemon running while logged in, or not now.
     func answerLoginItem(keep: Bool) async {
-        Daemon.remember(kept: keep)
-        keepRunning = keep
         guard keep else {
+            Daemon.remember(kept: false)
+            keepRunning = false
             await reach()
             return
         }
+        let status: SMAppService.Status
         do {
-            try Daemon.loginItem.register()
+            status = try Daemon.startKeeping()
         } catch {
+            keepRunning = false
             phase = .loginItemApproval(said: error.localizedDescription)
             return
         }
-        if Daemon.loginItem.status == .requiresApproval {
+        keepRunning = true
+        if status == .requiresApproval {
             phase = .loginItemApproval(said: nil)
             return
         }
@@ -117,10 +137,81 @@ final class AppModel: ObservableObject {
             if let chosen = chosenNode(client), let node = nodes.first(where: { $0.name == chosen }) {
                 await use(node)
             } else {
-                phase = .choosing(nodes.map(\.name))
+                await offerNodes(nodes)
             }
         } catch {
-            phase = .unreachable(sentence(error))
+            // Refused for an earlier release's node directories: said plainly, with a way on.
+            if let dirs = try? oldLayout(dataRoot: ""), !dirs.isEmpty {
+                phase = .oldLayout(dirs: dirs, said: nil)
+            } else {
+                phase = .unreachable(StartFailure(error))
+            }
+        }
+    }
+
+    /// What was moved aside, from and to, said on the welcome that follows.
+    @Published private(set) var movedAside: [MovedAside] = []
+
+    /// Move the earlier release's node directories aside, whole and unread (#576), then start as on
+    /// a Mac with no node: the welcome.
+    func moveAside() async {
+        let day = DateFormatter()
+        day.locale = Locale(identifier: "en_US_POSIX")
+        day.dateFormat = "yyyy-MM-dd"
+        do {
+            movedAside = try moveOldLayoutAside(dataRoot: "", date: day.string(from: Date()))
+        } catch {
+            let dirs = (try? oldLayout(dataRoot: "")) ?? []
+            phase = .oldLayout(dirs: dirs, said: sentence(error))
+            return
+        }
+        await reach()
+    }
+
+    /// No node chosen yet: none on this Mac, so make one here; one, so act as it without asking
+    /// which; several, so ask which.
+    private func offerNodes(_ nodes: [NodeSummary]) async {
+        switch nodes.count {
+        case 0: phase = .welcome(said: nil)
+        case 1: await use(nodes[0])
+        default: phase = .choosing(nodes.map(\.name))
+        }
+    }
+
+    /// First run with no node: make node `name` here, as `vox node create` does, under the
+    /// identity passphrase typed twice, then attach it with that passphrase. The bytes go into a
+    /// `Passphrase` at once and are wiped (M-5).
+    func createNode(_ name: String, passphrase secret: Secret, again: Secret) async {
+        guard let client else { return }
+        let same = secret.matches(again)
+        again.wipe()
+        guard same else {
+            secret.wipe()
+            phase = .welcome(said: asSentence("the two passphrases differ; nothing was created"))
+            return
+        }
+        phase = .creating(node: name)
+        let passphrase: Passphrase
+        do {
+            passphrase = try secret.passphrase()
+        } catch {
+            phase = .welcome(said: sentence(error))
+            return
+        }
+        defer { passphrase.wipe() }
+        do {
+            _ = try await client.createNode(node: name, passphrase: passphrase)
+        } catch {
+            phase = .welcome(said: sentence(error))
+            return
+        }
+        do {
+            let fingerprint = try await client.attach(node: name, passphrase: passphrase)
+            remember(name, client)
+            enter(name, fingerprint, client)
+        } catch {
+            // Made, but not attached: it is asked for as any node is.
+            phase = .passphrase(node: name, said: sentence(error))
         }
     }
 
@@ -130,12 +221,12 @@ final class AppModel: ObservableObject {
         do {
             let nodes = try await client.nodes()
             guard let node = nodes.first(where: { $0.name == name }) else {
-                phase = .choosing(nodes.map(\.name))
+                await offerNodes(nodes)
                 return
             }
             await use(node)
         } catch {
-            phase = .unreachable(sentence(error))
+            phase = .unreachable(StartFailure(error))
         }
     }
 
@@ -161,8 +252,11 @@ final class AppModel: ObservableObject {
             let fingerprint = try await client.attach(node: node, passphrase: passphrase)
             remember(node, client)
             enter(node, fingerprint, client)
+        } catch VoxError.WrongPassphrase(let reason) {
+            phase = .passphrase(node: node, said: reason)
         } catch {
-            phase = .passphrase(node: node, said: sentence(error))
+            // No passphrase fixes it (busy, gone, not answering): said as what it is (P4).
+            phase = .unreachable(StartFailure(error))
         }
     }
 
@@ -175,7 +269,7 @@ final class AppModel: ObservableObject {
             self.node = nil
             phase = .choosing(try await client.nodes().map(\.name))
         } catch {
-            phase = .unreachable(sentence(error))
+            phase = .unreachable(StartFailure(error))
         }
     }
 
@@ -188,13 +282,14 @@ final class AppModel: ObservableObject {
     /// daemon reached as `vox` starts it.
     func stopKeepingRunning() async {
         do {
-            try Daemon.stopKeeping()
+            try await Daemon.stopKeeping()
         } catch {
-            phase = .unreachable(sentence(error))
+            phase = .unreachable(StartFailure(error))
             return
         }
         keepRunning = false
         await reach()
+        await stopKeepingNode()
     }
 
     /// A vox:// room link the system opened the app with, held until a node is attached: it fills
@@ -211,6 +306,97 @@ final class AppModel: ObservableObject {
             pendingLink = link
         }
     }
+
+    /// Not Now also for the node (M-6): the daemon stops keeping the node chosen at first run, so
+    /// it is not attached again at the daemon's next start and detaches when the app lets go of
+    /// it. Before this, Turn Keep Running Off left the node kept (#571).
+    private func stopKeepingNode() async {
+        guard let client, let name = chosenNode(client) else { return }
+        do {
+            try await client.unkeep(node: name)
+        } catch {
+            keepRunningSaid = sentence(error)
+        }
+    }
+
+    /// Keep Running, turned on or off while Vox runs (Vox > Keep Running While Logged In, #571),
+    /// not only at first run or from the unreachable screen.
+    ///
+    /// On: the answer is kept, and the login item is registered; macOS's approval is asked for in
+    /// System Settings, as at first run (M-8). Off: the login item is unregistered, the answer
+    /// kept as Not Now, and the node no longer kept (M-6). If the daemon this app talks to was the
+    /// login item's and stopped with it, the daemon is reached again as `vox` starts it.
+    func setKeepRunning(_ on: Bool) async {
+        guard on != keepRunning else { return }
+        if on {
+            do {
+                let status = try Daemon.startKeeping()
+                keepRunning = true
+                if status == .requiresApproval { Daemon.openLoginItems() }
+            } catch {
+                keepRunning = false
+                keepRunningSaid = sentence(error)
+                return
+            }
+            await offerToKeepNode()
+            return
+        }
+        do {
+            try await Daemon.stopKeeping()
+        } catch {
+            keepRunningSaid = sentence(error)
+            return
+        }
+        keepRunning = false
+        var answers = false
+        if let client { answers = (try? await client.nodes()) != nil }
+        if !answers { await reach() }
+        await stopKeepingNode()
+    }
+
+    /// Keep Running turned on while a node is attached: the node is kept at once, as the person
+    /// expects ("Vox stays on with me while I'm logged in"). Every node has a passphrase
+    /// (ADR-028 K-11), and the daemon keeps a node only with its passphrase in the Keychain
+    /// (M-6), which the app never holds (M-5): so the app asks for it once, to store it, checked
+    /// against the node's vault by the daemon; or, declined, says plainly what that leaves.
+    private func offerToKeepNode() async {
+        guard let client, case let .attached(name, _) = phase else { return }
+        let kept = (try? await client.nodes())?.first { $0.name == name }?.keep ?? false
+        if !kept { keepNodeAsk = name }
+    }
+
+    /// The node Keep Running offers to keep, asking for its passphrase to store it; nil when no
+    /// offer is open.
+    @Published var keepNodeAsk: String?
+    /// Why storing it failed, in the daemon's words, shown in the offer.
+    @Published private(set) var keepNodeSaid: String?
+
+    /// Keep `node` with its passphrase in the Keychain (M-6, ADR-028 K-10): the daemon checks it
+    /// against the node's vault and stores it, so the node stays attached after quit and is
+    /// attached again when the daemon starts.
+    func keepNode(_ node: String, passphrase secret: Secret) async {
+        guard let client else { return }
+        do {
+            let passphrase = try secret.passphrase()
+            defer { passphrase.wipe() }
+            try await client.keep(node: node, passphrase: passphrase)
+            keepNodeAsk = nil
+            keepNodeSaid = nil
+        } catch {
+            keepNodeSaid = sentence(error)
+        }
+    }
+
+    /// The offer declined: the node is not kept, and the app says what that leaves.
+    func declineToKeepNode(_ node: String) {
+        keepNodeAsk = nil
+        keepNodeSaid = nil
+        keepRunningSaid = "Keep Running is on, but node \(node) is not kept: it stays attached "
+            + "while Vox is open, and after a restart Vox asks for its passphrase again."
+    }
+
+    /// Why turning Keep Running on or off failed, in macOS's or the daemon's words; nil once read.
+    @Published var keepRunningSaid: String?
 
     /// Let go of the node and end the client (A-4).
     func quit() async {
@@ -231,7 +417,7 @@ final class AppModel: ObservableObject {
                     _ = try await client.nodes()
                     phase = .passphrase(node: node.name, said: nil)
                 } catch {
-                    phase = .unreachable(sentence(error))
+                    phase = .unreachable(StartFailure(error))
                 }
                 return
             }
@@ -241,6 +427,9 @@ final class AppModel: ObservableObject {
             let fingerprint = try await client.attach(node: node.name, passphrase: nil)
             remember(node.name, client)
             enter(node.name, fingerprint, client)
+        } catch VoxError.Busy(let reason) {
+            // Another process holds the node: no passphrase fixes that (P4).
+            phase = .unreachable(StartFailure(kind: .busy, said: reason))
         } catch {
             // A node not attached that wants its passphrase: asked for, with nothing said yet.
             phase = .passphrase(node: node.name,
@@ -284,11 +473,76 @@ final class AppModel: ObservableObject {
     }
 }
 
-/// A failure as the daemon said it (M-7): the sentence alone, never a type's name.
+/// A failure as the daemon said it (M-7): the sentence alone, never a type's name, begun with a
+/// capital and ended with a full stop (P6).
 func sentence(_ error: Error) -> String {
     switch error {
-    case let VoxError.Failed(reason): return reason
-    case let VoxError.Detached(reason): return reason
-    default: return error.localizedDescription
+    case let VoxError.Failed(reason): return asSentence(reason)
+    case let VoxError.Detached(reason): return asSentence(reason)
+    case let VoxError.Unknown(reason): return asSentence(reason)
+    case let VoxError.WrongPassphrase(reason): return asSentence(reason)
+    case let VoxError.Busy(reason): return asSentence(reason)
+    default: return asSentence(error.localizedDescription)
+    }
+}
+
+/// `text` begun with a capital and ended with a full stop, its words otherwise as they came.
+func asSentence(_ text: String) -> String {
+    var said = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let first = said.first else { return said }
+    said = first.uppercased() + said.dropFirst()
+    if let last = said.last, !".!?".contains(last) { said += "." }
+    return said
+}
+
+/// Why Vox could not start acting as a node, by kind, with the sentence said (P4): the card says
+/// what happened and what can help, and keeps the sentence under Details.
+struct StartFailure: Error, Equatable {
+    enum Kind: Equatable {
+        /// The daemon Vox started stopped as it started (`vox daemon` exited).
+        case exited
+        /// No daemon answered within Vox's patience.
+        case notAnswering
+        /// Another process holds the node (an older `vox` still running as it).
+        case busy
+        /// Anything else.
+        case other
+    }
+
+    let kind: Kind
+    let said: String
+
+    init(kind: Kind, said: String) {
+        self.kind = kind
+        self.said = said
+    }
+
+    /// `error`, by kind: one Vox threw itself as such, the daemon's typed refusals, else other.
+    init(_ error: Error) {
+        switch error {
+        case let failure as StartFailure: self = failure
+        case let VoxError.Busy(reason): self.init(kind: .busy, said: reason)
+        default: self.init(kind: .other, said: sentence(error))
+        }
+    }
+
+    /// The card's headline.
+    var headline: String {
+        switch kind {
+        case .exited: return "Vox can't start its background service"
+        case .notAnswering: return "Vox's background service isn't answering"
+        case .busy: return "Another copy of Vox is using this node"
+        case .other: return "Vox can't reach its background service"
+        }
+    }
+
+    /// One line of likely cause.
+    var cause: String {
+        switch kind {
+        case .exited: return "It stopped as it started. Your rooms are unreachable until it runs."
+        case .notAnswering: return "It may still be starting, or be stuck. Your rooms are unreachable until it answers."
+        case .busy: return "Only one copy may act as a node at a time: a command that has not finished, or another copy of Vox, holds it."
+        case .other: return "Your rooms are unreachable until it answers."
+        }
     }
 }

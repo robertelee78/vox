@@ -48,7 +48,10 @@ struct ServicesView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 Text("Services").heading()
-                if let did = model.did {
+                // What this view's last share, stop or copy did: its own, never another's (P6).
+                if let did = model.outcome.flatMap({
+                    $0.kind == .done && ["share", "stop-share", "copy"].contains($0.operation) ? $0.words : nil
+                }) {
                     StateMark(kind: .plain, words: did).textSelection(.enabled)
                         .accessibilityIdentifier("services-did")
                 }
@@ -105,7 +108,7 @@ struct ServicesView: View {
 
 /// One service shared with this node: its readable address, who shares it and its kind; each
 /// command shown with the readable address and copied with the canonical one (S-1, S-3); and what
-/// reaching it needs, each saying whether it holds.
+/// reaching it needs, as readiness ticks: ✓ when it holds, the missing one in amber with its fix.
 private struct SharedServiceBox: View {
     @ObservedObject var model: NodeModel
     let room: String
@@ -113,7 +116,16 @@ private struct SharedServiceBox: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(service.address).font(Theme.mono).fontWeight(.bold).textSelection(.enabled)
+            HStack(alignment: .firstTextBaseline) {
+                Text(service.address).font(Theme.mono).fontWeight(.bold).textSelection(.enabled)
+                Spacer()
+                // The whole address, copied canonical: it reaches the same service pasted on any
+                // member's machine (S-1, S-3).
+                Button("Copy Address") { model.copyAddress(of: service) }
+                    .accessibilityLabel("Copy the address \(service.address)")
+                    .accessibilityIdentifier("copy-address-\(service.address)")
+            }
+            AddressAnatomy(address: service.address)
             Text("by \(service.by) in \(room)  ·  \(service.kind)").caption().secondaryText()
             ForEach(Array(service.commands.enumerated()), id: \.offset) { _, command in
                 HStack(alignment: .firstTextBaseline) {
@@ -126,10 +138,16 @@ private struct SharedServiceBox: View {
                         .accessibilityIdentifier("copy-\(command.what)-\(service.address)")
                 }
             }
+            // What reaching it needs, as ticks (the App Study's readiness, in vox-core's words, the
+            // same as `vox service list` and the TUI): ✓ when it holds, and the missing one in
+            // amber with its fix, never only "connection failed".
             ForEach(Array(service.needs.enumerated()), id: \.offset) { _, need in
-                StateMark(kind: need.holds ? .plain : .attention,
-                          words: need.holds ? "needs \(need.need): yes"
-                              : "needs \(need.need): no — \(need.otherwise)")
+                if need.holds {
+                    Text("✓ \(need.need)").font(Theme.text).secondaryText()
+                        .accessibilityLabel("\(need.need): yes")
+                } else {
+                    StateMark(kind: .attention, words: "missing: \(need.need) — \(need.otherwise)")
+                }
             }
         }
         .padding(10)
@@ -142,15 +160,23 @@ private struct SharedServiceBox: View {
 /// One-step sharing (S-4): what listens on this Mac, with its program; picked, a suggested name,
 /// the address members will use, what sharing it does and who in the room can and cannot reach
 /// it, all said before it is shared.
+///
+/// **Share acts only on what is on screen** (D15, E-5). The preview is the picked service's and
+/// the audience the picked room's, each kept with what it describes: a new pick clears the
+/// preview, a new room clears the audience, an answer that comes back for a pick or a room no
+/// longer chosen is dropped, and Share is offered only while endpoint, room, warnings and
+/// audience all describe the one share it would make.
 private struct ShareForm: View {
     @ObservedObject var model: NodeModel
     let listening: ListeningServices?
     let shared: () async -> Void
     @State private var picked: ListeningService?
-    @State private var preview: ServicePreview?
+    /// The preview, and the listening service it was made for.
+    @State private var preview: (of: String, preview: ServicePreview)?
     @State private var name = ""
     @State private var room = ""
-    @State private var reach: (can: [String], cannot: [String]) = ([], [])
+    /// Who can and cannot reach a share, and the room that is true of.
+    @State private var reach: (room: String, can: [String], cannot: [String])?
     @State private var failed: String?
 
     var body: some View {
@@ -172,30 +198,35 @@ private struct ShareForm: View {
             } else {
                 ProgressView()
             }
-            if let picked, let preview {
+            if let picked, let preview = preview.flatMap({ $0.of == picked.line ? $0.preview : nil }) {
                 TextField("Name", text: $name).accessibilityIdentifier("share-name")
                     .accessibilityLabel("Service name")
                 Picker("Room", selection: $room) {
                     ForEach(model.rooms.filter(\.open)) { Text($0.name).tag($0.id) }
                 }
                 .accessibilityIdentifier("share-room")
-                .onChange(of: room) { r in Task { reach = await model.reach(in: r) } }
+                .onChange(of: room) { r in Task { await audience(of: r) } }
                 Text("Members will use \(shownTag).\(model.node).\(roomName).vox (each by their own name for this node).")
                     .accessibilityIdentifier("share-address")
                 ForEach(preview.warnings, id: \.self) { warning in
                     StateMark(kind: .attention, words: warning).accessibilityIdentifier("share-warning")
                 }
-                Text(reach.can.isEmpty ? "No one in \(roomName) can reach it: you trust none of its members."
-                     : "Can reach it: \(reach.can.joined(separator: ", ")).")
-                    .accessibilityIdentifier("share-can")
-                if !reach.cannot.isEmpty {
-                    Text("Cannot reach it (not in your keyring): \(reach.cannot.joined(separator: ", ")).")
-                        .secondaryText()
+                if let reach, reach.room == room {
+                    Text(reach.can.isEmpty ? "No one in \(roomName) can reach it: you trust none of its members."
+                         : "Can reach it: \(reach.can.joined(separator: ", ")).")
+                        .accessibilityIdentifier("share-can")
+                    if !reach.cannot.isEmpty {
+                        Text("Cannot reach it (not in your keyring): \(reach.cannot.joined(separator: ", ")).")
+                            .secondaryText()
+                    }
+                } else {
+                    Text("Finding who in \(roomName) can reach it…").secondaryText()
+                        .accessibilityIdentifier("share-can-pending")
                 }
                 Button("Share \(picked.program ?? "it") in \(roomName)") {
-                    Task { await share(preview) }
+                    Task { await share(preview, of: picked) }
                 }
-                .disabled(name.isEmpty || room.isEmpty)
+                .disabled(name.isEmpty || room.isEmpty || reach?.room != room)
                 .accessibilityIdentifier("share-submit")
             }
             // Said whether or not a preview came: a failed preview left nothing on screen, so a
@@ -213,21 +244,36 @@ private struct ShareForm: View {
     private var shownTag: String { name }
 
     private func pick(_ service: ListeningService) async {
+        // The last pick's preview goes at once: it is not this service's.
         picked = service
+        preview = nil
         failed = nil
         do {
             let p = try await model.previewShare(port: service.port, udp: service.udp)
-            preview = p
+            // An answer for a service no longer picked is dropped.
+            guard picked?.line == service.line else { return }
+            preview = (service.line, p)
             name = p.name
             if room.isEmpty, let first = model.rooms.first(where: \.open) { room = first.id }
-            reach = await model.reach(in: room)
+            await audience(of: room)
         } catch {
+            guard picked?.line == service.line else { return }
             preview = nil
             failed = sentence(error)
         }
     }
 
-    private func share(_ preview: ServicePreview) async {
+    /// Who in `room` can reach a share, kept only while `room` is still the one chosen.
+    private func audience(of room: String) async {
+        if reach?.room != room { reach = nil }
+        let found = await model.reach(in: room)
+        guard self.room == room else { return }
+        reach = (room, found.can, found.cannot)
+    }
+
+    private func share(_ preview: ServicePreview, of service: ListeningService) async {
+        // What Share was offered for, checked again as it acts.
+        guard picked?.line == service.line, reach?.room == room else { return }
         let tag = preview.tag.hasPrefix("udp/") ? "udp/\(name)" : name
         if let why = await model.shareService(room: room, tag: tag, local: preview.local) {
             failed = why
@@ -235,6 +281,43 @@ private struct ShareForm: View {
             picked = nil
             self.preview = nil
             await shared()
+        }
+    }
+}
+
+/// A service's readable address broken into its parts, each labelled (G3, ADR-017 S-1):
+/// `<service>.<node>.<room>.vox`, where the node and the room are this node's own aliases, so a
+/// person sees the names are theirs. The service and the room are one DNS label each; whatever is
+/// between them is the node part.
+struct AddressAnatomy: View {
+    let address: String
+
+    /// The parts with what each is, or nil for an address of another form.
+    static func parts(of address: String) -> [(part: String, what: String)]? {
+        guard address.hasSuffix(".vox") else { return nil }
+        let labels = address.dropLast(4).split(separator: ".", omittingEmptySubsequences: false)
+        guard labels.count >= 3, let service = labels.first, let room = labels.last,
+              !service.isEmpty, !room.isEmpty else { return nil }
+        let node = labels.dropFirst().dropLast().joined(separator: ".")
+        guard !node.isEmpty else { return nil }
+        return [(String(service), "service"), (node, "your node alias"),
+                (String(room), "your room alias"), ("vox", "Vox address")]
+    }
+
+    var body: some View {
+        if let parts = Self.parts(of: address) {
+            HStack(alignment: .top, spacing: 4) {
+                ForEach(Array(parts.enumerated()), id: \.offset) { n, p in
+                    if n > 0 { Text(".").font(Theme.mono).secondaryText().accessibilityHidden(true) }
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(p.part).font(Theme.mono)
+                        Text(p.what).caption().secondaryText()
+                    }
+                }
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(parts.map { "\($0.part), \($0.what)" }.joined(separator: "; "))
+            .accessibilityIdentifier("service-anatomy-\(address)")
         }
     }
 }

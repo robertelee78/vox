@@ -260,6 +260,56 @@ pub fn install_into(dir: &Path) -> std::io::Result<Vec<Done>> {
     Ok(done)
 }
 
+/// What `vox uninstall` takes out of the pack folder `dir`, by the rule install keeps: a file goes
+/// only when it is what Vox wrote (its manifest's hash, this version's, or, for a `SKILL.md` from
+/// before the manifest, a version Vox shipped). Returns what to remove (the whole folder when
+/// nothing else is in it) and what is left, each named: a file changed since, or one Vox did not
+/// write. Nothing is changed here.
+#[must_use]
+pub fn uninstall_plan(dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    if !dir.is_dir() {
+        return (Vec::new(), Vec::new());
+    }
+    let recorded: serde_json::Map<String, serde_json::Value> = std::fs::read(dir.join(MANIFEST))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("files").and_then(|f| f.as_object()).cloned())
+        .unwrap_or_default();
+    let mut remove = Vec::new();
+    let mut kept = Vec::new();
+    for (rel, content) in FILES {
+        let path = dir.join(rel);
+        let Some(now) = std::fs::read(&path).ok().map(|b| sha256_hex(&b)) else {
+            continue;
+        };
+        let vox_wrote = now == sha256_hex(content.as_bytes())
+            || recorded.get(*rel).and_then(|v| v.as_str()) == Some(now.as_str())
+            || (*rel == "SKILL.md" && recorded.is_empty() && EARLIER.contains(&now.as_str()));
+        if vox_wrote {
+            remove.push(path);
+        } else {
+            kept.push(path);
+        }
+    }
+    // Anything else in the folder is the operator's.
+    let ours: Vec<PathBuf> = FILES.iter().map(|(rel, _)| dir.join(rel)).collect();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                todo.push(p);
+            } else if !ours.contains(&p) && p != dir.join(MANIFEST) {
+                kept.push(p);
+            }
+        }
+    }
+    if kept.is_empty() {
+        return (vec![dir.to_path_buf()], kept);
+    }
+    (remove, kept)
+}
+
 /// `vox agent skill --install`: the pack for every harness present here, said line by line.
 /// Returns whether it was installed for every harness present.
 #[must_use]

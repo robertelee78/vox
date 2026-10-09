@@ -262,7 +262,9 @@ fn an_identity_made_over_a_leftover_store_unlocks() {
     let no_backup = |said: &str| {
         said.contains("there is no backup of a node")
             && said.contains("if this machine is lost")
-            && said.contains("untrust it")
+            // Remove is the one word for taking a node out of a keyring (ADR-028 E-2, #628).
+            && said.contains("remove it from their keyring")
+            && !said.to_lowercase().contains("untrust")
     };
     assert!(
         no_backup(&first.stderr),

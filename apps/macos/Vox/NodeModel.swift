@@ -11,6 +11,14 @@ import ServiceManagement
 /// 'subsystem == "us.vox.app"'`): ids and counts only, never message text.
 let readLog = Logger(subsystem: "us.vox.app", category: "read")
 
+/// A room's composer as it was left: its text, To:, Urgent and the reply being written (D12).
+struct RoomDraft {
+    var text = ""
+    var to: Set<String> = []
+    var urgent = false
+    var reply: RoomMessage?
+}
+
 @MainActor
 final class NodeModel: ObservableObject {
     /// What the window shows in its middle.
@@ -102,8 +110,35 @@ final class NodeModel: ObservableObject {
     @Published private(set) var retention = ""
     /// What the room on screen's timeline shows (ADR-029 CL-2): General each time a room opens.
     @Published var showing: Showing = .general {
-        didSet { if showing != oldValue { Task { await readSession() } } }
+        didSet {
+            guard showing != oldValue else { return }
+            // Another Session's entries are never drawn, nor acted on, under this one's header
+            // while it loads (D3): cleared, and said to be loading.
+            sessionEntries = []
+            sessionNote = nil
+            sessionLoading = showingSession
+            Task { await readSession() }
+        }
     }
+    /// The Session on screen is being read: its timeline says "Loading…" (D3).
+    @Published private(set) var sessionLoading = false
+
+    /// What is typed, kept per destination while the app runs, in memory only: nothing goes on
+    /// disk or the wire (D12). A room's draft, To:, Urgent and reply, by room id.
+    var roomDrafts: [String: RoomDraft] = [:]
+    /// A Session's draft, by its destination (`room/node/session`).
+    var sessionDrafts: [String: String] = [:]
+    /// What each room last showed (General, All, or a Session), restored when it opens again.
+    var lastShowing: [String: Showing] = [:]
+
+    /// The request selected in the Session on screen, by its reference: what Approve (⌥⌘Y) and
+    /// Reject (⌥⌘N) act on, and where ⌘J and a notification land (P1).
+    @Published var selectedRequest: String?
+    /// The requests waiting on this node already known, by `room/node/session/reference`: one
+    /// that is new notifies, once per Session (P1). Taken in silence the first time, so opening
+    /// Vox notifies nothing.
+    private var knownWaiting: Set<String> = []
+    private var waitingSeen = false
     /// The room on screen's Sessions, open and ended (ADR-029 CL-2).
     @Published private(set) var sessions: [FfiSession] = []
     /// The Session on screen's entries, oldest first, to a member with drive (SC-1).
@@ -124,6 +159,8 @@ final class NodeModel: ObservableObject {
     @Published var sheet: NodeSheet?
     /// Asks the room on screen to choose a file to attach (⌘O); each ask counts one up.
     @Published var attachAsked = 0
+    /// ⌘O while a Session is shown, to a member with drive: a file sent to that Session (D2).
+    @Published var sessionAttachAsked = 0
     /// Asks the room on screen to send its draft urgent (⌘↩).
     @Published var urgentAsked = 0
     /// The message selected in the timeline, and the one the composer replies to (⌘R).
@@ -131,17 +168,25 @@ final class NodeModel: ObservableObject {
     @Published var replyTo: RoomMessage?
     /// The service card selected above the timeline, whose command ⌘⇧C copies.
     @Published var selectedService: SharedService?
-    /// What a menu action last did, said where the person is (E-5).
-    @Published var did: String?
+    /// What the last operation came to (P6): done, refused, or not known whether it was done,
+    /// with the operation that made it. A sheet shows only its own; a new operation clears it.
+    @Published private(set) var outcome: Outcome?
+    /// The operation under way, which an outcome is filed under.
+    private var operation = ""
+    /// What the last operation did, said where the person is (E-5): `outcome`, when done.
+    var did: String? { outcome.flatMap { $0.kind == .done ? $0.words : nil } }
 
     /// The services members share in the room on screen, as cards above its timeline.
     @Published private(set) var roomServices: [SharedService] = []
     /// What the last keyring change did, or why it failed, in the daemon's words (E-5, M-7).
     @Published private(set) var keyringDid: String?
     @Published private(set) var keyringFailed: String?
-    /// The keyring window has closed: the change waiting is made once the passphrase is given.
-    @Published private(set) var keyringNeedsPassphrase = false
-    private var keyringWaiting: ((Passphrase?) async throws -> String)?
+    /// The keyring change waiting for the identity passphrase (the keyring window has closed,
+    /// ADR-026 N-2), bound to what it changes (D1): made only with it, cleared by Cancel and by
+    /// any keyring change that succeeds, and replaced only when the person says so.
+    @Published private(set) var keyringPending: KeyringPending?
+    /// A second gated change while one waits: asked about first, never put in silently (D1).
+    @Published private(set) var keyringReplacing: KeyringPending?
 
     /// Follows who has read what while a room is on screen.
     private var watching: Task<Void, Never>?
@@ -169,17 +214,18 @@ final class NodeModel: ObservableObject {
     @Published private(set) var lanFailed: [String: String] = [:]
 
     /// The family LAN's root helper: the bundle's launchd daemon (ADR-014 M-10).
-    private var lanHelper: SMAppService { .daemon(plistName: "us.vox.lanhelper.plist") }
+    private var lanHelper: any BackgroundItem { Daemon.lanHelper }
 
     /// The LAN helper's status, asked off the main thread. Asking is a call to launchd's smd that
     /// waits about 20 ms; made every few seconds on the main thread, it held up the answer to
     /// macOS's "may this notification show as a banner while Vox is in front?", macOS filed the
     /// notification in Notification Center first, and no banner showed (#450 walkthrough).
     private nonisolated static func lanHelperStatus() async -> SMAppService.Status {
-        await Task.detached { SMAppService.daemon(plistName: "us.vox.lanhelper.plist").status }.value
+        await Task.detached { Daemon.lanHelper.status }.value
     }
-    /// The last thing that failed, in the daemon's words (M-7), or the node's last notice.
-    @Published private(set) var said: String?
+    /// Why the last operation was not done, or may not have been, in the daemon's words (M-7):
+    /// `outcome`, when not done.
+    var said: String? { outcome.flatMap { $0.kind == .done ? nil : $0.words } }
     /// A room link to fill the Join sheet with, taken by the sheet when it opens.
     @Published var joinLink: String?
 
@@ -208,6 +254,9 @@ final class NodeModel: ObservableObject {
         notifies = notify
         guard notify else { return }
         notifier.open = { [weak self] room in Task { await self?.show(.room(room)) } }
+        notifier.openRequest = { [weak self] room, node, session, reference in
+            Task { await self?.openRequest(room: room, node: node, session: session, reference: reference) }
+        }
         notifier.allowed = { [weak self] granted in self?.notifying = granted }
         notifier.ask()
     }
@@ -227,7 +276,7 @@ final class NodeModel: ObservableObject {
         do {
             try await client.subscribe(listener: Listener(model: self))
         } catch {
-            said = sentence(error)
+            reportBackground(error)
         }
         follow()
     }
@@ -321,7 +370,7 @@ final class NodeModel: ObservableObject {
             let back = await readTrustsBack()
             if back != trustsBack { trustsBack = back }
         } catch {
-            said = sentence(error)
+            reportBackground(error)
         }
     }
 
@@ -329,6 +378,11 @@ final class NodeModel: ObservableObject {
     /// its own is read (show reads it).
     func select(_ selection: Selection?) {
         guard selection != self.selection else { return }
+        // The room left keeps what it showed and the reply being written (D12).
+        if case let .room(left) = self.selection {
+            lastShowing[left] = showing
+            roomDrafts[left, default: RoomDraft()].reply = replyTo
+        }
         self.selection = selection
         // An offer's view says what its own Trust did, never an earlier keyring change.
         if case .offer = selection {
@@ -344,7 +398,6 @@ final class NodeModel: ObservableObject {
         pulled = [:]
         retention = ""
         notices = []
-        showing = .general
         sessions = []
         sessionEntries = []
         sessionNote = nil
@@ -352,7 +405,14 @@ final class NodeModel: ObservableObject {
         roomServices = []
         selectedMessage = nil
         selectedService = nil
-        replyTo = nil
+        // What this room last showed, and its reply, come back (D12): General the first time.
+        if case let .room(opened) = selection {
+            showing = lastShowing[opened] ?? .general
+            replyTo = roomDrafts[opened]?.reply
+        } else {
+            showing = .general
+            replyTo = nil
+        }
     }
 
     /// Show `selection`; a room shown is read, so its unread counts end.
@@ -391,9 +451,11 @@ final class NodeModel: ObservableObject {
             retention = kept
             notices = done
             sessions = listed
+            // A Session restored as this room's last view is read once the room lists it (D12).
+            if showingSession { await readSession() }
             watchReads(id)
         } catch {
-            said = sentence(error)
+            reportBackground(error)
         }
     }
 
@@ -403,7 +465,9 @@ final class NodeModel: ObservableObject {
     /// K-16). Whether it was done.
     func trust(_ fingerprint: String, as alias: String, drive: Bool) async -> Bool {
         let fp = fingerprint.filter { !$0.isWhitespace && $0 != "-" && $0 != "·" }.lowercased()
-        return await keyringChange { [client] pass in
+        return await keyringChange(fingerprint: fp, alias: alias,
+                                   words: "trust \(alias), \(Capability.words(drive))",
+                                   action: "Trust") { [client] pass in
             try await client.trustAdd(fingerprint: fp, name: alias, drive: drive,
                                       identityPassphrase: pass)
             return "Trusting \(fp.prefix(12)) as \(alias), \(Capability.words(drive))."
@@ -412,7 +476,9 @@ final class NodeModel: ObservableObject {
 
     /// Give `node` drive as well as read, or (`drive` false) read only (K-14).
     func setCapability(_ node: TrustedNode, drive: Bool) async -> Bool {
-        await keyringChange { [client] pass in
+        await keyringChange(fingerprint: node.fingerprint, alias: node.name,
+                            words: "give \(node.name) \(Capability.words(drive))",
+                            action: drive ? "Give Drive" : "Read Only") { [client] pass in
             try await client.setCapability(fingerprint: node.fingerprint, drive: drive,
                                            identityPassphrase: pass)
             return "\(node.name) now has \(Capability.words(drive))."
@@ -421,37 +487,55 @@ final class NodeModel: ObservableObject {
 
     /// Show `fingerprint` as `alias` from now on.
     func rename(_ fingerprint: String, to alias: String) async -> Bool {
-        await keyringChange { [client] pass in
+        let was = trusted.first { $0.fingerprint == fingerprint }?.name ?? String(fingerprint.prefix(12))
+        return await keyringChange(fingerprint: fingerprint, alias: alias,
+                                   words: "rename \(was) to \(alias)", action: "Rename") { [client] pass in
             try await client.trustRename(fingerprint: fingerprint, name: alias,
                                          identityPassphrase: pass)
             return "\(fingerprint.prefix(12)) is now \(alias)."
         }
     }
 
-    /// Untrust `node`.
-    func untrust(_ node: TrustedNode) async {
-        _ = await keyringChange { [client] pass in
+    /// Remove `node` from the keyring.
+    /// Whether it was done; when not, why is `keyringFailed`, or the passphrase is asked for.
+    @discardableResult
+    func untrust(_ node: TrustedNode) async -> Bool {
+        await keyringChange(fingerprint: node.fingerprint, alias: node.name,
+                            words: "remove \(node.name) from your keyring", action: "Remove") { [client] pass in
             try await client.trustRemove(fingerprint: node.fingerprint, identityPassphrase: pass)
-            return "No longer trusting \(node.name). Your sender key is rotated, and everyone you "
+            return "Removed \(node.name) from your keyring. Your sender key is rotated, and everyone you "
                 + "still trust is re-keyed."
         }
     }
 
-    /// The change waiting for the passphrase, made with it; its bytes are wiped at once.
-    func retryKeyring(with secret: Secret) async {
+    /// The change `pending` names, made with the passphrase typed for it; its bytes are wiped at
+    /// once. Nothing is made unless `pending` is still the change waiting (D1): a prompt drawn for
+    /// one change never makes another.
+    func retryKeyring(_ pending: KeyringPending, with secret: Secret) async {
         defer { secret.wipe() }
-        guard let waiting = keyringWaiting else { return }
+        guard keyringPending?.id == pending.id else { return }
         do {
             let passphrase = try secret.passphrase()
             defer { passphrase.wipe() }
-            keyringDid = try await waiting(passphrase)
+            keyringDid = try await pending.run(passphrase)
             keyringFailed = nil
-            keyringNeedsPassphrase = false
-            keyringWaiting = nil
+            if keyringPending?.id == pending.id { keyringPending = nil }
             await refresh()
         } catch {
             keyringFailed = sentence(error)
         }
+    }
+
+    /// Cancel the change waiting for the passphrase: it is not made (D1).
+    func cancelKeyring() {
+        keyringPending = nil
+        keyringReplacing = nil
+    }
+
+    /// The person's answer to "Replace the waiting change?" (D1).
+    func replaceKeyring(_ yes: Bool) {
+        if yes, let next = keyringReplacing { keyringPending = next }
+        keyringReplacing = nil
     }
 
     // ---- trust offers (ADR-028 K-15 to K-18) ------------------------------------------------
@@ -467,33 +551,42 @@ final class NodeModel: ObservableObject {
     /// Dismiss `offer`: here only, and silently (K-18); the node stays not in keyring, and trust
     /// stays reachable from the member pane.
     func dismiss(_ offer: OfferInfo) async {
+        begin("dismiss-offer")
         do {
             try await client.dismissOffer(fingerprint: offer.fingerprint)
             if let waiting = try? await client.pendingOffers() { offers = waiting }
             if selection == .offer(offer.fingerprint) { selection = nil }
         } catch {
-            said = sentence(error)
+            report(error)
         }
     }
 
     /// Make a keyring change, asking for the passphrase when the node says the keyring window has
-    /// closed (ADR-026 N-2), and say what it did.
-    private func keyringChange(_ change: @escaping (Passphrase?) async throws -> String) async -> Bool {
+    /// closed (ADR-026 N-2, a typed refusal), and say what it did. The change waiting is named
+    /// (D1): what, on whom, and the action that makes it.
+    private func keyringChange(fingerprint: String, alias: String, words: String, action: String,
+                               _ change: @escaping (Passphrase?) async throws -> String) async -> Bool {
         keyringDid = nil
         keyringFailed = nil
         do {
             keyringDid = try await change(nil)
-            keyringNeedsPassphrase = false
+            // Any change that succeeds clears the one waiting: it was made in another way, or
+            // the person has moved on (D1).
+            keyringPending = nil
+            keyringReplacing = nil
             await refresh()
             return true
-        } catch {
-            let why = sentence(error)
-            if why.contains("needs your identity passphrase") {
-                keyringWaiting = change
-                keyringNeedsPassphrase = true
+        } catch VoxError.PassphraseNeeded {
+            let next = KeyringPending(fingerprint: fingerprint, alias: alias, words: words,
+                                      action: action, run: change)
+            if let waiting = keyringPending, waiting.words != next.words {
+                keyringReplacing = next
             } else {
-                keyringFailed = why
+                keyringPending = next
             }
+            return false
+        } catch {
+            keyringFailed = sentence(error)
             return false
         }
     }
@@ -508,17 +601,18 @@ final class NodeModel: ObservableObject {
     /// the helper is already enabled, it is unregistered before it is registered, so the item is
     /// made for this copy.
     func allowLanHelper() async {
+        begin("lan-helper")
         if await Self.lanHelperStatus() != .enabled {
             try? await lanHelper.unregister()
         }
         do {
             try lanHelper.register()
         } catch {
-            said = error.localizedDescription
+            report(error)
         }
         let status = await Self.lanHelperStatus()
         if status == .requiresApproval {
-            SMAppService.openSystemSettingsLoginItems()
+            Daemon.openLoginItems()
         }
         lanHelperReady = status == .enabled
     }
@@ -526,10 +620,11 @@ final class NodeModel: ObservableObject {
     /// Remove the LAN helper: launchd stops it and it is no longer registered, so nothing of Vox
     /// runs as root. The family LAN is offered again only after the next approval (M-12).
     func removeLanHelper() async {
+        begin("lan-helper")
         do {
             try await lanHelper.unregister()
         } catch {
-            said = error.localizedDescription
+            report(error)
         }
         lanHelperReady = await Self.lanHelperStatus() == .enabled
     }
@@ -579,12 +674,14 @@ final class NodeModel: ObservableObject {
 
     /// Create a room named `name` under `passphrase`, and show it.
     func createRoom(_ name: String, passphrase secret: Secret) async -> Bool {
-        await withPassphrase(secret) { [client] p in try await client.createRoom(name: name, passphrase: p) }
+        begin("create-room")
+        return await withPassphrase(secret) { [client] p in try await client.createRoom(name: name, passphrase: p) }
     }
 
     /// Join a room by its link and passphrase, and show it. It keeps the name its members gave it.
     func joinRoom(_ link: String, passphrase secret: Secret) async -> Bool {
-        await withPassphrase(secret) { [client] p in
+        begin("join-room")
+        return await withPassphrase(secret) { [client] p in
             try await client.joinRoom(link: link, passphrase: p)
         }
     }
@@ -599,47 +696,53 @@ final class NodeModel: ObservableObject {
             await show(.room(room))
             return true
         } catch {
-            said = sentence(error)
+            report(error)
             return false
         }
     }
 
     /// Copy the room on screen's link (⌘L), saying what it carries.
     func copyRoomLink() async {
+        begin("copy-link")
         guard let id = roomOnScreen else { return }
         do {
             let link = try await client.link(room: id)
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(link.url, forType: .string)
-            did = link.note.isEmpty ? "Room link copied." : "Room link copied. \(link.note)"
+            report(done: link.note.isEmpty ? "Room link copied." : "Room link copied. \(link.note)")
         } catch {
-            said = sentence(error)
+            report(error)
         }
     }
 
-    /// Leave the room on screen, or end it for everyone.
-    func leaveRoom(endingIt: Bool) async {
-        guard let id = roomOnScreen else { return }
+    /// Leave the room on screen, or end it for everyone: nil once done, else why not (D19), for
+    /// the sheet that asked to say where it was asked.
+    func leaveRoom(endingIt: Bool) async -> String? {
+        begin("leave")
+        guard let id = roomOnScreen else { return "No room is on screen to leave." }
         do {
             if endingIt { try await client.end(room: id) } else { try await client.leave(room: id) }
-            did = endingIt ? "The room is ended for everyone." : "You left the room."
+            report(done: endingIt ? "The room is ended for everyone." : "You left the room.")
             selection = nil
             await refresh()
+            return nil
         } catch {
-            said = sentence(error)
+            report(error)
+            return sentence(error)
         }
     }
 
     /// Set the room on screen's retention: no passphrase (ADR-028 K-11).
     func setRetention(_ seconds: UInt64) async -> Bool {
+        begin("retention")
         guard let id = roomOnScreen else { return false }
         do {
             try await client.setRetention(room: id, ttlSecs: seconds)
-            did = seconds == 0 ? "Messages here are kept for good."
-                : "Messages here are kept for \(Retention.words(seconds)), then deleted everywhere."
+            report(done: seconds == 0 ? "Messages here are kept for good."
+                : "Messages here are kept for \(Retention.words(seconds)), then deleted everywhere.")
             return true
         } catch {
-            said = sentence(error)
+            report(error)
             return false
         }
     }
@@ -647,14 +750,15 @@ final class NodeModel: ObservableObject {
     /// Rename the room on screen: its one name, as every member sees it (ADR-028 R-1). Only its
     /// creator or an admin may; the node's refusal is said as it comes. No passphrase (K-11).
     func renameRoom(to name: String) async -> Bool {
+        begin("rename")
         guard let id = roomOnScreen else { return false }
         do {
             try await client.renameRoom(room: id, name: name)
-            did = "The room is now \(name) for every member."
+            report(done: "The room is now \(name) for every member.")
             await refresh()
             return true
         } catch {
-            said = sentence(error)
+            report(error)
             return false
         }
     }
@@ -667,7 +771,7 @@ final class NodeModel: ObservableObject {
         do {
             return try await client.decisions()
         } catch {
-            said = sentence(error)
+            reportBackground(error)
             return []
         }
     }
@@ -680,28 +784,40 @@ final class NodeModel: ObservableObject {
 
     /// Make a member an admin of the room on screen, or take it back.
     func setAdmin(_ member: String, _ admin: Bool) async {
+        begin("admins")
         guard let id = roomOnScreen else { return }
         do {
             try await client.setAdmin(room: id, member: member, admin: admin)
         } catch {
-            said = sentence(error)
+            report(error)
         }
     }
 
     /// Copy the selected service's address (⌘⇧C): its canonical form, which works pasted on any
     /// member's machine (ADR-028 S-1, S-3), said by its readable one.
     func copyServiceCommand() {
+        begin("copy")
         guard let service = selectedService else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(service.canonical, forType: .string)
-        did = "Copied the address of \(service.address)."
+        report(done: "Copied the address of \(service.address).")
+    }
+
+    /// Copy a service's whole address: its canonical form, which works pasted on any member's
+    /// machine (S-1, S-3), said by its readable one (G3).
+    func copyAddress(of service: SharedService) {
+        begin("copy")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(service.canonical, forType: .string)
+        report(done: "Copied the address of \(service.address).")
     }
 
     /// Copy a service's command, as given: with the canonical address (S-3).
     func copyCommand(_ command: String) {
+        begin("copy")
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(command, forType: .string)
-        did = "Copied: \(command)"
+        report(done: "Copied: \(command)")
     }
 
     /// A room's services, as the daemon lists them.
@@ -726,29 +842,38 @@ final class NodeModel: ObservableObject {
 
     /// Share `local` in `room` as `tag`; nil when shared, else the daemon's sentence.
     func shareService(room: String, tag: String, local: String) async -> String? {
+        begin("share")
         do {
             try await client.serviceAdd(room: room, tag: tag, local: local)
-            did = "Shared \(tag) (\(local))."
+            report(done: "Shared \(tag) (\(local)).")
             return nil
         } catch {
+            report(error)
             return sentence(error)
         }
     }
 
     /// Stop sharing `tag` in `room`.
     func stopService(room: String, tag: String) async {
+        begin("stop-share")
         do {
             try await client.serviceRemove(room: room, tag: tag)
-            did = "Stopped sharing \(tag)."
+            report(done: "Stopped sharing \(tag).")
         } catch {
-            said = sentence(error)
+            report(error)
         }
     }
 
     /// The next room that needs the person, if any (W-2).
     func nextNeedingYou() async {
         if let room = group(.needsYou).first {
-            await show(.room(room.id))
+            // A request waiting in one of its Sessions: that Session, that request (P1).
+            if let waiting = await firstWaiting(in: room.id) {
+                await openRequest(room: room.id, node: waiting.node, session: waiting.session,
+                                  reference: waiting.reference)
+            } else {
+                await show(.room(room.id))
+            }
         } else if let offer = offers.first {
             await show(.offer(offer.fingerprint))
         }
@@ -757,25 +882,65 @@ final class NodeModel: ObservableObject {
     /// Share the file or folder at `url` in the room on screen, addressed to `to` (members'
     /// fingerprints; none: the room) with `note`, in one message (ADR-028 F-1). Whether it was.
     func attach(_ url: URL, to: [String], note: String) async -> Bool {
+        begin("attach")
         guard case let .room(id) = selection else { return false }
         do {
             _ = try await client.share(room: id, path: url.path, to: to, note: note, re: "",
                                        urgent: false, count: 0, forSecs: 0)
             return true
         } catch {
-            said = sentence(error)
+            report(error)
             return false
         }
     }
 
     /// Post `text` to the room on screen.
     func post(_ text: String, to: [String] = [], urgent: Bool = false, re: String = "") async {
+        begin("post")
         guard case let .room(id) = selection else { return }
         do {
             try await client.post(room: id, text: text, to: to, re: re, urgent: urgent)
         } catch {
-            said = sentence(error)
+            report(error)
         }
+    }
+
+    // ---- what an operation came to (P6) ------------------------------------------------------
+
+    /// Start an operation: what the last one came to is cleared, so a result is never left over
+    /// from another (P6).
+    func begin(_ operation: String) {
+        self.operation = operation
+        outcome = nil
+    }
+
+    /// Why `operation` was not done, or may not have been: what its own sheet shows, and nothing
+    /// another operation left (P6).
+    func failure(of operation: String) -> Outcome? {
+        outcome.flatMap { $0.operation == operation && $0.kind != .done ? $0 : nil }
+    }
+
+    /// Take the outcome down: the status bar's dismiss, and a sheet that opens afresh.
+    func clearOutcome(of operation: String? = nil) {
+        if operation == nil || outcome?.operation == operation { outcome = nil }
+    }
+
+    /// The operation under way was done.
+    private func report(done words: String) {
+        outcome = Outcome(operation: operation, kind: .done, words: words)
+    }
+
+    /// The operation under way was refused, or whether it was done is not known: the daemon's
+    /// sentence, never a type's name (M-7).
+    private func report(_ error: Error) {
+        outcome = Outcome(operation: operation, kind: Outcome.kind(of: error), words: sentence(error))
+    }
+
+    /// Something the app does on its own failed (a refresh, a read): said in the status bar, but
+    /// never over what a person's own operation came to.
+    private func reportBackground(_ error: Error) {
+        guard outcome == nil || outcome?.operation == "" else { return }
+        outcome = Outcome(operation: "", kind: Outcome.kind(of: error), words: sentence(error))
     }
 
     // ---- what the node says -------------------------------------------------------------------
@@ -811,7 +976,7 @@ final class NodeModel: ObservableObject {
                     readLog.debug("mark read failed in \(room, privacy: .public): \(sentence(error), privacy: .public)")
                     // Not recorded: drawn again, it is told again.
                     ids.forEach { self.marked.remove($0) }
-                    self.said = sentence(error)
+                    self.reportBackground(error)
                 }
             }
         }
@@ -934,15 +1099,15 @@ final class NodeModel: ObservableObject {
     /// Attach this node again after it stopped, with `secret` if it needs its passphrase, and
     /// follow it as before: the window and its drafts stay.
     func attachAgain(_ secret: Secret?) async {
+        begin("attach")
         do {
             let passphrase = try secret?.passphrase()
             defer { passphrase?.wipe() }
             _ = try await client.attach(node: node, passphrase: passphrase)
             ended = nil
-            said = nil
             await start()
         } catch {
-            said = sentence(error)
+            report(error)
         }
     }
 
@@ -985,16 +1150,22 @@ extension NodeModel {
         guard let room = roomOnScreen, let s = shownSession, s.canDrive else {
             if !sessionEntries.isEmpty { sessionEntries = [] }
             if sessionNote != nil { sessionNote = nil }
+            sessionLoading = false
             return
         }
         do {
             let read = try await client.sessionRead(room: room, node: s.nodeFingerprint,
                                                     sessionId: s.sessionId)
-            guard shownSession?.sessionId == s.sessionId else { return }
+            // Drawn only for the destination it was read for, still on screen and still driven
+            // (D3): the room, the Session's node and its id, and drive held.
+            guard roomOnScreen == room, let now = shownSession, now.nodeFingerprint == s.nodeFingerprint,
+                  now.sessionId == s.sessionId, now.canDrive else { return }
             if read.entries != sessionEntries { sessionEntries = read.entries }
             if read.note != sessionNote { sessionNote = read.note }
+            sessionLoading = false
         } catch {
-            said = sentence(error)
+            reportBackground(error)
+            sessionLoading = false
         }
     }
 
@@ -1008,6 +1179,92 @@ extension NodeModel {
                 rooms[i].waiting = n
             }
         }
+        await noteWaiting()
+    }
+
+    /// The requests open in `room`'s Sessions this node drives, waiting on it, in each Session's
+    /// order: `(node, session, reference, label)`.
+    private func waiting(in room: String) async -> [(node: String, session: String, reference: String, label: String)] {
+        guard let listed = try? await client.sessions(room: room) else { return [] }
+        var found: [(node: String, session: String, reference: String, label: String)] = []
+        for s in listed where s.pending > 0 && s.canDrive && s.open {
+            guard let read = try? await client.sessionRead(room: room, node: s.nodeFingerprint,
+                                                           sessionId: s.sessionId) else { continue }
+            for e in read.entries {
+                if let r = e.request, r.state == nil {
+                    found.append((s.nodeFingerprint, s.sessionId, r.reference, s.label))
+                }
+            }
+        }
+        return found
+    }
+
+    /// The first request waiting in `room`, for ⌘J.
+    private func firstWaiting(in room: String) async -> (node: String, session: String, reference: String)? {
+        guard let w = await waiting(in: room).first else { return nil }
+        return (w.node, w.session, w.reference)
+    }
+
+    /// A request that is new since the last look notifies, once per Session, replacing that
+    /// Session's earlier one; a Session no longer waiting has its notification withdrawn (P1).
+    /// Never the request's text (R-10).
+    private func noteWaiting() async {
+        var now: Set<String> = []
+        var bySession: [String: (room: String, node: String, session: String, reference: String, label: String)] = [:]
+        for room in rooms where room.open {
+            for w in await waiting(in: room.id) {
+                let key = "\(room.id)/\(w.node)/\(w.session)/\(w.reference)"
+                now.insert(key)
+                if !knownWaiting.contains(key) && waitingSeen {
+                    bySession["\(room.id)/\(w.node)/\(w.session)"] = (room.id, w.node, w.session, w.reference, w.label)
+                }
+            }
+        }
+        for (_, w) in bySession {
+            let name = rooms.first { $0.id == w.room }?.name ?? "a room"
+            notifier.postWaiting(room: w.room, roomName: name, node: w.node, session: w.session,
+                                 reference: w.reference, label: w.label)
+        }
+        let stillWaiting = Set(now.map { $0.split(separator: "/").prefix(3).joined(separator: "/") })
+        for gone in Set(knownWaiting.map { $0.split(separator: "/").prefix(3).joined(separator: "/") })
+            .subtracting(stillWaiting) {
+            notifier.withdrawWaiting(sessionKey: gone)
+        }
+        knownWaiting = now
+        waitingSeen = true
+    }
+
+    /// Open `room`, its Session `session` of `node`, and select its request `reference`, centred
+    /// (P1): where a notification and ⌘J land.
+    func openRequest(room: String, node: String, session: String, reference: String) async {
+        await show(.room(room))
+        showing = .session(node: node, id: session)
+        selectedRequest = reference
+    }
+
+    /// The approval selected in the Session on screen, open and this node's to answer: what
+    /// ⌥⌘Y and ⌥⌘N act on (P1). Questions are answered by their options, not these keys.
+    var selectedApproval: (session: FfiSession, room: String, reference: String)? {
+        guard let reference = selectedRequest, let s = shownSession, s.canDrive, s.open,
+              let room = roomOnScreen,
+              let r = sessionEntries.compactMap(\.request).first(where: { $0.reference == reference }),
+              r.state == nil, !r.isQuestion else { return nil }
+        return (s, room, reference)
+    }
+
+    /// Approve (⌥⌘Y) or Reject (⌥⌘N) the selected approval, and say what came of it (P1).
+    func answerSelected(approve: Bool) async {
+        guard let a = selectedApproval else { return }
+        let action: DriveAction = approve ? .approve(reference: a.reference)
+            : .reject(reference: a.reference, why: nil)
+        // What came of it is this operation's outcome (P6): done, refused, or not known.
+        begin(approve ? "approve-request" : "reject-request")
+        switch await driveResult(a.session, in: a.room, action) {
+        case let .taken(words): report(done: asSentence(words))
+        case let .refused(words): outcome = Outcome(operation: operation, kind: .refused, words: asSentence(words))
+        case let .unknown(words): outcome = Outcome(operation: operation, kind: .unknown, words: asSentence(words))
+        }
+        await readSession()
     }
 
     /// A Session in `room` opened, ended or was renamed, or what waits on this node changed.
@@ -1017,6 +1274,7 @@ extension NodeModel {
             let n = listed.reduce(0) { $0 + Int($1.pending) }
             if rooms[i].waiting != n { rooms[i].waiting = n }
         }
+        await noteWaiting()
         guard roomOnScreen == room, let listed = try? await client.sessions(room: room),
               roomOnScreen == room else { return }
         if listed != sessions { sessions = listed }
@@ -1068,10 +1326,27 @@ extension NodeModel {
 
     /// Stop one of this node's shares.
     func stopShare(_ share: MenuBarFacts.Share) async {
+        begin("stop-share")
         do {
             _ = try await client.shareStop(room: share.room, selector: share.tag)
         } catch {
-            said = sentence(error)
+            report(error)
         }
+    }
+}
+
+/// What one operation came to (P6), kept apart: done, refused, or not known whether it was done
+/// (the daemon stopped answering after it was asked).
+struct Outcome: Equatable {
+    enum Kind: Equatable { case done, refused, unknown }
+    /// The operation that made it: a sheet shows only its own.
+    let operation: String
+    let kind: Kind
+    /// What to say: what it did, or the daemon's sentence for why not.
+    let words: String
+
+    static func kind(of error: Error) -> Kind {
+        if case VoxError.Unknown(_) = error { return .unknown }
+        return .refused
     }
 }

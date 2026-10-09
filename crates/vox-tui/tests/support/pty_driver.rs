@@ -54,8 +54,9 @@ pub struct Driven {
 }
 
 /// The words a driver's verdict line carries, after its tag.
-const VERDICTS: [&str; 6] = [
+const VERDICTS: [&str; 7] = [
     "PASS",
+    "REFUSED",
     "RED",
     "APPARATUS",
     "HUNG at",
