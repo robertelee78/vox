@@ -1066,6 +1066,26 @@ fn said(socket: &std::path::Path, e: Error) -> VoxError {
     })
 }
 
+/// An attach's failure, typed where a client acts on it (P4): a wrong passphrase is asked for
+/// again; another process holding the node is no passphrase's to fix. Told apart by the daemon's
+/// own refusal sentence for this node, word for word; anything else as [`said`] says it.
+fn attach_said(socket: &std::path::Path, node: &NodeName, e: Error) -> VoxError {
+    use vox_core::node::daemonipc::Refusal;
+    if let Error::Ipc(IpcHandshake::Refused { reason }) = &e {
+        if *reason == (Refusal::WrongPassphrase { node: node.clone() }).to_string() {
+            return VoxError::WrongPassphrase {
+                reason: reason.clone(),
+            };
+        }
+        if *reason == (Refusal::NodeInUse { node: node.clone() }).to_string() {
+            return VoxError::Busy {
+                reason: reason.clone(),
+            };
+        }
+    }
+    said(socket, e)
+}
+
 /// A node's answer, with its refusal and a detach as errors.
 fn answered(frame: Frame) -> Result<Frame, VoxError> {
     match frame {
@@ -1603,7 +1623,7 @@ impl VoxClient {
             *slot = None;
             let client = IpcClient::open_at(&at)
                 .await
-                .map_err(|e| said(&socket, e))?;
+                .map_err(|e| attach_said(&socket, &name, e))?;
             let me = client.me().map(|f| b32_encode(&f)).unwrap_or_default();
             *slot = Some(Held {
                 node: name,

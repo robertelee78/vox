@@ -356,10 +356,11 @@ final class FirstRunProof: XCTestCase {
         let data = root.appendingPathComponent("data").path
         let config = root.appendingPathComponent("config").path
         let home = root.appendingPathComponent("home").path
-        // A data root as v0.2.x left it, which this version refuses; the answer Keep Running; and
-        // the line the login item's daemon wrote as it ended.
-        try stager.write(Data("an earlier release's vault".utf8), to: data + "/default/vault.cbor")
-        try stager.write(Data("an earlier release's store".utf8), to: data + "/default/store.redb")
+        // A data root no daemon can serve (a file where its directory would be), so the daemon
+        // Vox starts stops as it starts; the answer Keep Running; and the line the login item's
+        // daemon wrote as it ended. (An earlier release's data root is the welcome's to move
+        // aside, #576, not this screen's.)
+        try stager.write(Data("not a data directory".utf8), to: data)
         try stager.write(Data("keep\n".utf8), to: config + "/app/login-item")
         let reason = "vox daemon will not start: STAGED-REASON is not a Vox data directory this version reads"
         try stager.write(Data("1791262600000 \(reason)\n".utf8),
@@ -374,6 +375,13 @@ final class FirstRunProof: XCTestCase {
         let quoted = words(ui, said, timeout: 30,
                            "with Keep Running chosen and its daemon refusing for good, the app must quote the login item's own line",
                            until: { $0.contains("STAGED-REASON is not a Vox data directory this version reads") }) ?? ""
+        // P4: the failure is said as what it is, with the daemon's own sentence under Details,
+        // copyable, never as the bare sentence alone.
+        words(ui, Key.id("start-failure"), timeout: 10,
+              "a daemon that stops as it starts must be said plainly, as a background service that cannot start",
+              until: { $0 == "Vox can't start its background service" })
+        present(ui, Key.id("start-failure-copy"), timeout: 5,
+                "the failure's own sentence must be under Details, with Copy")
         tap(ui, Key.id("login-item-off"), "Turn Keep Running Off")
         if !el(ui, said).waitForNonExistence(timeout: 30) {
             XCTFail("PRODUCT: Turn Keep Running Off must leave Keep Running off; the login item's line is still shown: \(shown(el(ui, said)))")

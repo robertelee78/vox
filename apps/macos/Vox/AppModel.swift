@@ -16,8 +16,9 @@ final class AppModel: ObservableObject {
         case loginItemApproval(said: String?)
         /// Reaching the daemon.
         case starting
-        /// The daemon did not answer; its sentence.
-        case unreachable(String)
+        /// The daemon could not be reached, or the node not attached for a reason no passphrase
+        /// fixes: what kind of failure, and the sentence said (P4).
+        case unreachable(StartFailure)
         /// The data root holds an earlier release's node directories, which this version does not
         /// read (the daemon refuses it): offered to be moved aside (#576). Their paths; the
         /// sentence after a failed move.
@@ -136,7 +137,7 @@ final class AppModel: ObservableObject {
             if let dirs = try? oldLayout(dataRoot: ""), !dirs.isEmpty {
                 phase = .oldLayout(dirs: dirs, said: nil)
             } else {
-                phase = .unreachable(sentence(error))
+                phase = .unreachable(StartFailure(error))
             }
         }
     }
@@ -218,7 +219,7 @@ final class AppModel: ObservableObject {
             }
             await use(node)
         } catch {
-            phase = .unreachable(sentence(error))
+            phase = .unreachable(StartFailure(error))
         }
     }
 
@@ -244,8 +245,11 @@ final class AppModel: ObservableObject {
             let fingerprint = try await client.attach(node: node, passphrase: passphrase)
             remember(node, client)
             enter(node, fingerprint, client)
+        } catch VoxError.WrongPassphrase(let reason) {
+            phase = .passphrase(node: node, said: reason)
         } catch {
-            phase = .passphrase(node: node, said: sentence(error))
+            // No passphrase fixes it (busy, gone, not answering): said as what it is (P4).
+            phase = .unreachable(StartFailure(error))
         }
     }
 
@@ -258,7 +262,7 @@ final class AppModel: ObservableObject {
             self.node = nil
             phase = .choosing(try await client.nodes().map(\.name))
         } catch {
-            phase = .unreachable(sentence(error))
+            phase = .unreachable(StartFailure(error))
         }
     }
 
@@ -273,7 +277,7 @@ final class AppModel: ObservableObject {
         do {
             try await Daemon.stopKeeping()
         } catch {
-            phase = .unreachable(sentence(error))
+            phase = .unreachable(StartFailure(error))
             return
         }
         keepRunning = false
@@ -391,7 +395,7 @@ final class AppModel: ObservableObject {
                     _ = try await client.nodes()
                     phase = .passphrase(node: node.name, said: nil)
                 } catch {
-                    phase = .unreachable(sentence(error))
+                    phase = .unreachable(StartFailure(error))
                 }
                 return
             }
@@ -401,6 +405,9 @@ final class AppModel: ObservableObject {
             let fingerprint = try await client.attach(node: node.name, passphrase: nil)
             remember(node.name, client)
             enter(node.name, fingerprint, client)
+        } catch VoxError.Busy(let reason) {
+            // Another process holds the node: no passphrase fixes that (P4).
+            phase = .unreachable(StartFailure(kind: .busy, said: reason))
         } catch {
             // A node not attached that wants its passphrase: asked for, with nothing said yet.
             phase = .passphrase(node: node.name,
@@ -448,3 +455,56 @@ func sentence(_ error: Error) -> String {
     default: return error.localizedDescription
     }
 }
+
+/// Why Vox could not start acting as a node, by kind, with the sentence said (P4): the card says
+/// what happened and what can help, and keeps the sentence under Details.
+struct StartFailure: Error, Equatable {
+    enum Kind: Equatable {
+        /// The daemon Vox started stopped as it started (`vox daemon` exited).
+        case exited
+        /// No daemon answered within Vox's patience.
+        case notAnswering
+        /// Another process holds the node (an older `vox` still running as it).
+        case busy
+        /// Anything else.
+        case other
+    }
+
+    let kind: Kind
+    let said: String
+
+    init(kind: Kind, said: String) {
+        self.kind = kind
+        self.said = said
+    }
+
+    /// `error`, by kind: one Vox threw itself as such, the daemon's typed refusals, else other.
+    init(_ error: Error) {
+        switch error {
+        case let failure as StartFailure: self = failure
+        case let VoxError.Busy(reason): self.init(kind: .busy, said: reason)
+        default: self.init(kind: .other, said: sentence(error))
+        }
+    }
+
+    /// The card's headline.
+    var headline: String {
+        switch kind {
+        case .exited: return "Vox can't start its background service"
+        case .notAnswering: return "Vox's background service isn't answering"
+        case .busy: return "Another copy of Vox is using this node"
+        case .other: return "Vox can't reach its background service"
+        }
+    }
+
+    /// One line of likely cause.
+    var cause: String {
+        switch kind {
+        case .exited: return "It stopped as it started. Your rooms are unreachable until it runs."
+        case .notAnswering: return "It may still be starting, or be stuck. Your rooms are unreachable until it answers."
+        case .busy: return "Only one copy may act as a node at a time: a command that has not finished, or another copy of Vox, holds it."
+        case .other: return "Your rooms are unreachable until it answers."
+        }
+    }
+}
+

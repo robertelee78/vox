@@ -45,10 +45,14 @@ struct RootView: View {
                 LoginItemApproval(said: said, model: model)
             case .starting:
                 ProgressView("Reaching the vox daemon…")
-            case let .unreachable(said):
-                Text("Vox could not reach the vox daemon.")
+            case let .unreachable(failure):
+                // A plain headline, one line of cause, then what can help; the sentence said under
+                // Details, selectable and copyable (P4).
+                Text(failure.headline)
                     .heading()
-                Said(text: said)
+                    .accessibilityIdentifier("start-failure")
+                Text(failure.cause).secondaryText()
+                    .accessibilityIdentifier("start-failure-cause")
                 if let why = model.loginItemSaid {
                     // The login item's daemon ended on a refusal no retry changes: said here,
                     // with the way out (ADR-014 M-8).
@@ -59,8 +63,26 @@ struct RootView: View {
                     Button("Turn Keep Running Off") { Task { await model.stopKeepingRunning() } }
                         .accessibilityIdentifier("login-item-off")
                 }
-                Button("Try Again") { Task { await model.start() } }
-                    .accessibilityIdentifier("retry")
+                HStack {
+                    Button("Try Again") { Task { await model.start() } }
+                        .keyboardShortcut(.defaultAction)
+                        .accessibilityIdentifier("retry")
+                    if model.loginItemSaid != nil {
+                        Button("Show Log in Finder") {
+                            let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+                            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: home)
+                                .appendingPathComponent("Library/Logs/Vox/login-item.log")])
+                        }
+                        .accessibilityIdentifier("start-failure-log")
+                    }
+                }
+                Text("DETAILS").eyebrow().secondaryText()
+                Said(text: failure.said)
+                Button("Copy") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(failure.said, forType: .string)
+                }
+                .accessibilityIdentifier("start-failure-copy")
             case let .oldLayout(dirs, said):
                 OldLayout(dirs: dirs, said: said, model: model)
             case let .welcome(said):
