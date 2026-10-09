@@ -120,8 +120,14 @@ struct NodeCard: View {
                 default:
                     EmptyView()
                 }
-                if model.keyringNeedsPassphrase {
-                    KeyringPassphrase(model: model)
+                KeyringReplaceAsk(model: model)
+                // The prompt only for this node's change; another waiting is one line (D1).
+                if let pending = model.keyringPending {
+                    if pending.fingerprint == node.fingerprint {
+                        KeyringPassphrase(model: model, pending: pending)
+                    } else {
+                        KeyringWaitingLine(model: model, pending: pending)
+                    }
                 }
                 if let failed = model.keyringFailed {
                     StateMark(kind: .danger, words: failed).textSelection(.enabled)
