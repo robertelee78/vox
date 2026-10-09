@@ -36,9 +36,15 @@ decider named: read records, the room's shared name, the decision record and the
   what either client or the CLI says.
 - **E-3.** There MUST be no contacts list, no directory and no separate 1:1 path (ADR-001): a
   direct message is a two-member room.
-- **E-4.** Each client MUST act as exactly one node, the one it was opened with. The TUI and the
-  app MUST refuse to post, trust or share as any other node, including an agent's node on the same
-  machine. Other nodes on the machine appear only as members of rooms this node shares with them.
+- **E-4.** Each client MUST act as exactly one node: the one it was signed in as, until it signs
+  out. The TUI and the app MUST refuse to post, trust or share as any other node, including an
+  agent's node on the same machine. Other nodes on the machine appear only as members of rooms
+  this node shares with them. Sign Out (the app's Node › Sign Out…, `vox node signout`; the
+  decider, 2026-10-08) MUST detach the node and forget everything that would bring it back without
+  the person: its keep (`.daemon/attach`), the passphrase kept for it in the Keychain, and the app's
+  remembered node; it MUST leave the node, its rooms and its messages on disk. Signed out, the app
+  offers the first-run sign-in: choose a node on the machine, or make a new one. Detach MUST NOT
+  sign out: after Detach the app offers to attach the same node again, and Quit.
 - **E-5.** Every action that changes access MUST state its effect in words before it acts and
   report what it did after: trusting (which rooms and services it covers, now and later),
   removing a node (what stops, what was already read, which live sessions were cut), leaving, ending,
@@ -470,6 +476,7 @@ Each line below is amended as stated. Where code already matches, the ADR text i
 | ADR-017 3.4 | Window counted from when the passphrase was last entered | From when it was last entered for a keyring change (K-12) |
 | ADR-020 6.10, 12.2 | A hook starts the daemon and attaches its node implicitly | Starts the daemon; never attaches (K-13) |
 | ADR-028 W-2 | Needs you: an unread message addressed to this node | Also a waiting trust offer (K-15) |
+| ADR-028 E-4 | A client acts as the node it was opened with | As the node it was signed in as, until it signs out; Sign Out detaches and forgets the node's keep, Keychain passphrase and the app's choice, then the first-run sign-in; Detach never signs out (the decider, 2026-10-08) |
 
 ## Fixes outside this repository
 
