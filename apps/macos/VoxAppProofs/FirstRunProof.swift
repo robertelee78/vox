@@ -24,7 +24,7 @@
 //    agent drain (`vox agent hook`), shows "read by bob" under it in her timeline.
 // 5. The keyring view (ADR-014 M-16, ADR-028 K-3, E-5, #443): a pasted fingerprint with an alias
 //    says what trusting does before it is done, and is listed, as `vox trust list` lists it;
-//    removing it says what untrusting does first, and only then removes it.
+//    removing it says what removing does first, and only then removes it.
 // 6. Attaching a file (ADR-014 M-24, ADR-028 F-1, #449): chosen with Attach…, addressed To: bob
 //    with a note, it is one share: bob's node pulls it by itself, byte for byte, and the note is
 //    in the share's announcement, never a message of its own.
@@ -55,6 +55,13 @@
 //     timeline with its newest message selected; ↑ and ↓ move the selection, as Reply to Selected
 //     Message (⌘R) then says; Space and Return on a row whose file alice pulled open it in Quick
 //     Look; Tab from the timeline reaches the composer.
+// 16. What an operation comes to (#608, #611, #615), run after step 5, or alone with
+//     VOX_PROOF_FROM=16: New Room with an empty passphrase says what that means and makes the
+//     room; a refused End for Everyone keeps its sheet open with the reason; that refusal is the
+//     status bar's, never another sheet's, and dismissed it goes. And G3 (ADR-017 S-1): a service
+//     bob shares in mission, in the services view, shows its address broken into its parts, each
+//     labelled (service, your node alias, your room alias, Vox address), and Copy Address copies
+//     it whole, canonical.
 //
 // Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
 // place of the app's hold), and quitting leaves it attached: (12) goes red. A room with a message
@@ -811,9 +818,9 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("keyring-remove-carol"), "Remove… on carol",
             premise: trusted(vox, voxEnv, carolFp, "carol"))
         words(ui, Key.id("keyring-remove-effect"), timeout: 10,
-              "removing must say what untrusting does before it is done",
+              "removing must say what removing does before it is done",
               until: { $0.contains("reads nothing you write from now on") })
-        tap(ui, Key.id("keyring-untrust-confirm"), "Untrust")
+        tap(ui, Key.id("keyring-remove-confirm"), "Remove, in its sheet")
         keyringPassphraseIfAsked(ui) { self.locate(ui, carolRow) == nil }
         var after5 = ""
         let goneUntil = Date().addingTimeInterval(30)
@@ -829,8 +836,20 @@ final class FirstRunProof: XCTestCase {
         if windowReadable(ui), let row = locate(ui, carolRow) {
             XCTFail("PRODUCT: once untrusted, carol must be gone from the keyring view; it still shows \"\(shown(row))\"")
         }
-        print("[proof] keyring: added and listed carol, then removed her after saying what untrusting does")
+        print("[proof] keyring: added and listed carol, then removed her after saying what removing does")
 
+        }
+
+        // (16) Outcomes (#608, #611, #615): run here, with the room and bob's trust in place, so
+        // that VOX_PROOF_FROM=16 runs it alone, on what steps 1 to 5 leave (staged by `vox`), and
+        // stops after it.
+        if from <= 5 || from == 16 {
+            try outcomes(ui, vox: vox, voxEnv: voxEnv, roomPass: roomPass)
+            try addressAnatomy(ui, vox: vox, voxEnv: voxEnv, room: room)
+            if from == 16 {
+                print("[proof] VOX_PROOF_FROM=16: step 16 run alone; steps 6 to 15 NOT RUN")
+                return
+            }
         }
 
         // (6) Attach a file to the room, To: bob, with a note.
@@ -1171,9 +1190,9 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("keyring"), "Keyring in the sidebar")
         tap(ui, Key.id("keyring-remove-bob"), "Remove… on bob", premise: trusted(vox, voxEnv, bobFp, "bob"))
         words(ui, Key.id("keyring-remove-effect"), timeout: 10,
-              "removing bob must say what untrusting does first",
+              "removing bob must say what removing does first",
               until: { $0.contains("reads nothing you write from now on") })
-        tap(ui, Key.id("keyring-untrust-confirm"), "Untrust")
+        tap(ui, Key.id("keyring-remove-confirm"), "Remove, in its sheet")
         keyringPassphraseIfAsked(ui) { self.locate(ui, Key.id("keyring-row-bob")) == nil }
         XCTAssertTrue(live.cut(within: 30),
                       "PRODUCT: alice untrusted bob in the keyring view; bob's live connection into her service must be cut within 30 s, and it was not")
@@ -1306,6 +1325,137 @@ final class FirstRunProof: XCTestCase {
         handOff(ui, "q")
         _ = ui.wait(for: .notRunning, timeout: 30)
         _ = run(vox, ["node", "detach", "alice"], env: voxEnv)
+    }
+
+    /// (16) What an operation comes to, as a person meets it.
+    /// - #608 (D16): New Room with its passphrase field left empty says "No passphrase: anyone
+    ///   with the link can join." and makes the room, as `vox room list` lists it.
+    /// - #611 (D19): End for Everyone in a room alice did not create is refused by her node; the
+    ///   sheet stays open and says why, under its button.
+    /// - #615 (P6): that refusal is the status bar's, as a refusal, and is not shown in the
+    ///   Retention sheet opened next, which is another operation's; dismissed, it is gone.
+    ///
+    /// Mutants: New Room taking an empty field as nothing typed (D16): no room, red. The End sheet
+    /// closing whatever leaving did (D19): no reason shown, red. A sheet showing any operation's
+    /// failure (`failure(of:)` ignoring the operation, P6): the Retention sheet shows End's
+    /// refusal, red.
+    private func outcomes(_ ui: XCUIApplication, vox: String, voxEnv: [String: String],
+                          roomPass: String) throws {
+        // #608: a room with no passphrase, made by the app.
+        ui.typeKey("n", modifierFlags: .command)
+        let roomName = Key.id("room-form-name")
+        present(ui, roomName, timeout: 10, "⌘N must open the New Room form")
+        type(ui, roomName, "open", "the room's name field")
+        words(ui, Key.id("room-form-no-passphrase"), timeout: 10,
+              "with its passphrase field empty, New Room must say what no passphrase means",
+              until: { $0 == "No passphrase: anyone with the link can join." })
+        tap(ui, Key.id("room-form-submit"), "Create, the passphrase field left empty")
+        var rooms = ""
+        let madeUntil = Date().addingTimeInterval(60)
+        while Date() < madeUntil && !rooms.contains(" open") {
+            rooms = run(vox, ["room", "list", "--node", "alice"], env: voxEnv).out
+            if !rooms.contains(" open") { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        guard rooms.contains(" open") else {
+            throw Product("New Room with an empty passphrase field must make a room with none; "
+                + "alice's `vox room list` lists no room \"open\": \(rooms)")
+        }
+        print("[proof] New Room with no passphrase made \"open\"")
+
+        // #611: a room bob made, which alice joins: her End for Everyone there is refused.
+        try staged(vox, ["room", "create", "--node", "bob", "--passphrase-file", roomPass,
+                         "--name", "bobs"], env: voxEnv)
+        let bobsRoom = try line(staged(vox, ["room", "list", "--node", "bob"], env: voxEnv)) {
+            $0.contains(" bobs")
+        }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        let bobsLink = try line(staged(vox, ["room", "link", "--node", "bob", bobsRoom], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        try staged(vox, ["room", "join", "--node", "alice", "--passphrase-file", roomPass, bobsLink],
+                   env: voxEnv)
+        tap(ui, Key.id("room-bobs"), "bobs in the sidebar", premise: inRoom(vox, voxEnv, "bobs"))
+        ui.menuBars.menuBarItems["Room"].click()
+        tap(ui, Key.menuItem("End for Everyone…"), "Room > End for Everyone…")
+        tap(ui, Key.id("leave-confirm"), "End for Everyone, in its sheet")
+        let refusal = words(ui, Key.id("leave-failed"), timeout: 30,
+                            "End for Everyone, refused by alice's node (she did not make bobs), must keep its sheet open and say why",
+                            until: { $0.contains("creator") }) ?? ""
+        if locate(ui, Key.id("leave-confirm")) == nil {
+            XCTFail("PRODUCT: a refused End for Everyone must keep its sheet open; it closed")
+        }
+        print("[proof] End for Everyone refused, said in its sheet: \(refusal)")
+        ui.typeKey(.escape, modifierFlags: [])
+
+        // #615: the refusal is the status bar's, as a refusal; not the Retention sheet's.
+        let barSays = words(ui, Key.id("status-outcome-refused"), timeout: 10,
+                            "the status bar must say End for Everyone was refused, as a refusal",
+                            until: { $0.contains("creator") }) ?? ""
+        ui.menuBars.menuBarItems["Room"].click()
+        tap(ui, Key.menuItem("Retention…"), "Room > Retention…")
+        present(ui, Key.id("retention-effect"), timeout: 10, "Room > Retention… must open its sheet")
+        if let shownThere = locateEverywhere(ui, Key.id("retention-said")) {
+            keepTree(ui, "the Retention sheet showed another operation's result")
+            XCTFail("PRODUCT: the Retention sheet must show only its own result; it shows End for Everyone's: \"\(shown(shownThere))\"")
+        }
+        ui.typeKey(.escape, modifierFlags: [])
+        tap(ui, Key.id("status-dismiss"), "the status bar's dismiss")
+        let goneUntil = Date().addingTimeInterval(5)
+        while Date() < goneUntil && locate(ui, Key.id("status-outcome-refused")) != nil {
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        if locate(ui, Key.id("status-outcome-refused")) != nil {
+            XCTFail("PRODUCT: dismissed, the status bar's result must go; it still says it")
+        }
+        print("[proof] status bar said \(barSays) as a refusal; the Retention sheet did not; dismissed, it went")
+    }
+
+    /// (16, G3) A service's address in its parts (ADR-017 S-1): bob shares `photos` in mission;
+    /// alice's services view shows its readable address with each part labelled, as alice's
+    /// `vox service list --json` gives the address, and Copy Address copies its canonical form.
+    ///
+    /// Mutant: no anatomy under the address (`AddressAnatomy` drawing nothing): red.
+    private func addressAnatomy(_ ui: XCUIApplication, vox: String, voxEnv: [String: String],
+                                room: String) throws {
+        let echo = try EchoServer(stager)
+        try staged(vox, ["service", "add", "--node", "bob", room, "photos", "127.0.0.1:\(echo.port)"],
+                   env: voxEnv)
+        var readable = ""
+        var canonical = ""
+        let until = Date().addingTimeInterval(60)
+        while Date() < until && canonical.isEmpty {
+            let listed = run(vox, ["service", "list", "--node", "alice", "--json", room], env: voxEnv).out
+            let json = (try? JSONSerialization.jsonObject(with: Data(listed.utf8))) as? [String: Any]
+            let photos = (json?["shared"] as? [[String: Any]] ?? []).first {
+                ($0["readable"] as? String)?.hasPrefix("photos.") == true
+            }
+            readable = photos?["readable"] as? String ?? ""
+            canonical = photos?["address"] as? String ?? ""
+            if canonical.isEmpty { Thread.sleep(forTimeInterval: 1) }
+        }
+        guard !canonical.isEmpty else {
+            throw Apparatus("alice's `vox service list --json` never listed bob's photos share")
+        }
+        // The parts, from the address `vox` gives: service and room one label each, the node
+        // part between them.
+        let labels = readable.dropLast(4).split(separator: ".").map(String.init)
+        guard readable.hasSuffix(".vox"), labels.count >= 3 else {
+            throw Apparatus("alice's `vox service list` gave the address \(readable), not <service>.<node>.<room>.vox")
+        }
+        let want = "\(labels[0]), service; \(labels.dropFirst().dropLast().joined(separator: ".")), your node alias; "
+            + "\(labels[labels.count - 1]), your room alias; vox, Vox address"
+        ui.typeKey("s", modifierFlags: [.command, .shift])
+        present(ui, Key.id("service-box-\(readable)"), timeout: 30,
+                "the services view must list bob's photos share \(readable)")
+        let said = words(ui, Key.id("service-anatomy-\(readable)"), timeout: 10,
+                         "the services view must show \(readable) in its parts, each labelled: \(want)",
+                         until: { $0 == want }) ?? ""
+        let pasted = copiedBy(ui) {
+            tap(ui, Key.id("copy-address-\(readable)"), "Copy Address on bob's photos share")
+        }
+        if pasted != canonical {
+            XCTFail("PRODUCT: Copy Address must copy the whole address, canonical (\(canonical)); the pasteboard holds \(pasted.debugDescription)")
+        }
+        print("[proof] G3: \(readable) shown as \(said); Copy Address copied \(pasted)")
     }
 
     // ---- every check on the window proves its own query first --------------------------------

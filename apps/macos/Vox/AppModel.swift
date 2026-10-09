@@ -265,11 +265,22 @@ final class AppModel: ObservableObject {
     }
 }
 
-/// A failure as the daemon said it (M-7): the sentence alone, never a type's name.
+/// A failure as the daemon said it (M-7): the sentence alone, never a type's name, begun with a
+/// capital and ended with a full stop (P6).
 func sentence(_ error: Error) -> String {
     switch error {
-    case let VoxError.Failed(reason): return reason
-    case let VoxError.Detached(reason): return reason
-    default: return error.localizedDescription
+    case let VoxError.Failed(reason): return asSentence(reason)
+    case let VoxError.Detached(reason): return asSentence(reason)
+    case let VoxError.Unknown(reason): return asSentence(reason)
+    default: return asSentence(error.localizedDescription)
     }
+}
+
+/// `text` begun with a capital and ended with a full stop, its words otherwise as they came.
+func asSentence(_ text: String) -> String {
+    var said = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let first = said.first else { return said }
+    said = first.uppercased() + said.dropFirst()
+    if let last = said.last, !".!?".contains(last) { said += "." }
+    return said
 }
