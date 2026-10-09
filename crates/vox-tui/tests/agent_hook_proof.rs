@@ -2390,19 +2390,72 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
          show it, and still be shown one addressed to the node (ADR-029 TA-2, TA-4); its turn \
          said:\n{sibling_turn}"
     );
-    // (8) The daemon restarts mid-session; the session's next turn opens no second Session.
+    // (10b) A file bob shares to that one session is pulled by the session's node by itself, as a
+    // share to the node is (ADR-028 F-3, ADR-029 TA-1): it matched `to` against the node's whole
+    // fingerprint only, and a `<fp>/<session>` entry never matched.
+    let to_session = tmp.path().join("to-one-session.bin");
+    let to_session_bytes: Vec<u8> = (0..90_000u32).map(|i| (i * 7 % 239) as u8).collect();
+    std::fs::write(&to_session, &to_session_bytes).expect("APPARATUS: write the file bob shares");
+    let (ok, _, err) = hook(
+        &bob.data,
+        &bob.cfg,
+        &[
+            "share",
+            &room,
+            to_session.to_str().expect("APPARATUS: a UTF-8 path"),
+            "--to",
+            "codex@device-2/gso-cap-2",
+        ],
+        "",
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): bob's `vox share --to codex@device-2/gso-cap-2` failed: {err}"
+    );
+    let landed = data
+        .join("nodes/default/files")
+        .join(&daemon.room_key)
+        .join("to-one-session.bin");
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while std::fs::read(&landed).ok().as_deref() != Some(&to_session_bytes[..])
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let pulled_whole = std::fs::read(&landed).ok().as_deref() == Some(&to_session_bytes[..]);
+    assert!(
+        pulled_whole,
+        "PRODUCT: a file shared to one session of a node must be pulled by that node by itself, \
+         byte for byte, into {} within 90 s; there is {}",
+        landed.display(),
+        std::fs::read_dir(landed.parent().expect("APPARATUS: a parent"))
+            .map(|d| d
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(", "))
+            .unwrap_or_else(|_| "no files directory".into())
+    );
+    // (8) The daemon restarts mid-session; the session's next turn opens no second Session. The
+    // Session's records on the log are counted on each side of the restart: a rename posts the
+    // record again (it names it, c6b218c3a), so a count of every record is not a count of openings;
+    // the restart must add none.
+    let records_of = |d: &Daemon| {
+        shown_rows(d)
+            .into_iter()
+            .filter_map(|(_, t)| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .filter(|v| v["type"] == "session" && v["from"] == at)
+            .count()
+    };
+    let before_restart = records_of(&daemon);
     restart(&mut daemon, tmp.path());
     run(
         claude_event_at(at, "UserPromptSubmit", r#","prompt":"again""#, &transcript),
         &person,
     );
     let after_restart = sessions();
-    // On the log itself: one opening, however many turns and restarts.
-    let openings = shown_rows(&daemon)
-        .into_iter()
-        .filter_map(|(_, t)| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .filter(|v| v["type"] == "session" && v["from"] == at)
-        .count();
+    // On the log itself: no record of it more than before the restart.
+    let openings = records_of(&daemon) - before_restart.min(records_of(&daemon));
     // (4) The turn ends: `Stop`. (5) A resume: `SessionEnd` whose reason is `resume`.
     run(claude_event(at, "Stop", ""), &person);
     run(
@@ -2501,9 +2554,10 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
          sessions` labelled it {bob_renamed:?} after the post"
     );
     assert!(
-        of(&after_restart, at).len() == 1 && openings == 1,
+        of(&after_restart, at).len() == 1 && openings == 0,
         "PRODUCT: a daemon restarted mid-session must not open the session's Session again; the \
-         room's log holds {openings} opening(s) for it, and lists {after_restart:?}"
+         room's log holds {openings} record(s) of it more than before the restart ({before_restart} \
+         before), and lists {after_restart:?}"
     );
     assert!(
         of(&after_resume, at).len() == 1 && of(&after_resume, at)[0]["open"] == true,

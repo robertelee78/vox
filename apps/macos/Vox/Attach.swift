@@ -13,14 +13,25 @@ struct Attaching: Identifiable {
     var id: String { url.path }
 }
 
-/// To: and note for a file, then Send.
+/// To: and note for a file, then Send. It starts from the composer's To: and Urgent, and sends
+/// both with the file (F-1, D11): it started with nobody addressed and was never urgent.
 struct AttachSheet: View {
     @ObservedObject var model: NodeModel
     let file: Attaching
     let done: () -> Void
-    @State private var to: Set<String> = []
+    @State private var to: Set<String>
+    @State private var urgent: Bool
     @State private var note = ""
     @State private var sending = false
+
+    init(model: NodeModel, file: Attaching, to: Set<String> = [], urgent: Bool = false,
+         done: @escaping () -> Void) {
+        self.model = model
+        self.file = file
+        self.done = done
+        _to = State(initialValue: to)
+        _urgent = State(initialValue: urgent)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s12) {
@@ -41,6 +52,9 @@ struct AttachSheet: View {
             }
             Text(to.isEmpty ? "For the whole room." : "For the members ticked; the room sees it too.")
                 .secondaryText()
+            Toggle(isOn: $urgent) { Text("Urgent") }
+                .accessibilityIdentifier("attach-urgent")
+                .accessibilityLabel(urgent ? "Urgent, on" : "Urgent, off")
             TextField("Note (optional)", text: $note)
                 .accessibilityLabel("Note")
                 .accessibilityIdentifier("attach-note")
@@ -48,9 +62,11 @@ struct AttachSheet: View {
                 Button("Cancel", action: done).keyboardShortcut(.cancelAction)
                 Button("Share") {
                     sending = true
-                    let (recipients, text) = (Array(to), note)
+                    let (recipients, text, now) = (Array(to), note, urgent)
                     Task {
-                        if await model.attach(file.url, to: recipients, note: text) { done() }
+                        if await model.attach(file.url, to: recipients, note: text, urgent: now) {
+                            done()
+                        }
                         sending = false
                     }
                 }

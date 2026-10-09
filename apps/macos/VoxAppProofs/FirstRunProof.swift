@@ -37,6 +37,16 @@
 // 6. Attaching a file (ADR-014 M-24, ADR-028 F-1, #449): chosen with Attach…, addressed To: bob
 //    with a note, it is one share: bob's node pulls it by itself, byte for byte, and the note is
 //    in the share's announcement, never a message of its own.
+//    6a. (D11) The composer's To: bob and Urgent, set before Attach, are what the Attach sheet
+//        starts with, and the share goes urgent: it started with nobody and was never urgent.
+//    6b. (D11) A send the node refuses keeps its text: 70,000 characters pasted and sent are
+//        refused ("a post holds at most"), and the composer still holds all of them.
+//    6c. (D14) Retention opens at the room's own value (1 year, set by `vox`), Set is disabled
+//        until another is chosen, Return never sets it, and the effect names the files and
+//        previews that go with the messages.
+//    6d. (D5) A file bob shares addressed to himself alone: its card says "Addressed to bob"
+//        (never "only") with Download; Download pulls it, verified, byte for byte, and only then
+//        offers Quick Look.
 // 7. (The lanes view: removed, ADR-029.)
 // 8. Notifications, a case of its own (testNotificationSaysWhoWroteNeverWhat), the one step that
 //    needs a person at the Mac (ADR-014 M-23, ADR-028 R-10, #448): with the keyring on screen, bob's message
@@ -3007,6 +3017,11 @@ final class FirstRunProof: XCTestCase {
         let file = scratch.appendingPathComponent("for-bob.bin")
         let bytes = Data((0..<150_000).map { UInt8(truncatingIfNeeded: $0 &* 31 % 253) })
         try stager.write(bytes, to: file.path)
+        // (6a) The composer's To: and Urgent, set first: the file takes them (F-1, D11).
+        tap(ui, Key.id("compose-to"), "the composer's To:")
+        tap(ui, Key.id("to-bob"), "To: bob in the composer", premise: member(vox, voxEnv, room, bobFp, "bob"))
+        ui.typeKey(.escape, modifierFlags: [])
+        tap(ui, Key.id("compose-urgent"), "the composer's Urgent")
         let attachButton = Key.id("attach")
         present(ui, attachButton, timeout: 10, "the room must offer Attach")
         tap(ui, attachButton, "Attach (the paperclip)")
@@ -3042,7 +3057,13 @@ final class FirstRunProof: XCTestCase {
         let toBob = Key.id("attach-to-bob")
         present(ui, toBob, timeout: 10, "attaching a file must ask To: with bob in it",
                 premise: member(vox, voxEnv, room, bobFp, "bob"))
-        tap(ui, toBob, "To: bob", premise: member(vox, voxEnv, room, bobFp, "bob"))
+        // Ticked already, and urgent already: from the composer, never clicked here (D11).
+        let seededTo = el(ui, toBob).value as? Int
+        let seededUrgent = el(ui, Key.id("attach-urgent")).value as? Int
+        XCTAssertEqual(seededTo, 1,
+                       "PRODUCT: the Attach sheet must start with the composer's To: (bob) ticked (D11); it shows \(String(describing: seededTo))")
+        XCTAssertEqual(seededUrgent, 1,
+                       "PRODUCT: the Attach sheet must start Urgent when the composer is (D11); it shows \(String(describing: seededUrgent))")
         let noteField = Key.id("attach-note")
         type(ui, noteField, "FOR-BOB-NOTE", "the note field")
         tap(ui, Key.id("attach-send"), "Send")
@@ -3064,6 +3085,8 @@ final class FirstRunProof: XCTestCase {
             let alices = run(vox, ["room", "read", "--node", "alice", "--json", room], env: voxEnv).out
             XCTFail("PRODUCT: the file attached in the app, with its note FOR-BOB-NOTE, never reached the room as bob's node reads it in 60 s; alice's node reads: \(alices.suffix(1500))")
         }
+        XCTAssertTrue(bobRows.first?.contains("\"urgent\":true") ?? false,
+                      "PRODUCT: the file attached with the composer's Urgent on must be sent urgent (D11); bob's row: \(bobRows)")
         XCTAssertTrue(bobRows.count == 1 && bobRows[0].contains("for-bob.bin"),
                       "PRODUCT: the note must travel in the share itself, as one message; bob's `vox room read --json` has \(bobRows.count) row(s) with it: \(bobRows)")
         // Bob's copy, read outside the runner's sandbox (by the stager): its size and SHA-256
@@ -3100,6 +3123,78 @@ final class FirstRunProof: XCTestCase {
         }
         let pulledBytes: Data? = got == want ? bytes : nil
         print("[proof] attached for-bob.bin To: bob; bob pulled \(pulledBytes?.count ?? 0) bytes; rows with the note: \(bobRows.count)")
+        // The composer as it was: nobody addressed, not urgent.
+        tap(ui, Key.id("compose-urgent"), "the composer's Urgent, off again")
+        tap(ui, Key.id("compose-to"), "the composer's To:")
+        tap(ui, Key.id("to-bob"), "To: bob in the composer, off again")
+        ui.typeKey(.escape, modifierFlags: [])
+
+        // (6b) A send the node refuses keeps its text (D11): past what a post holds, pasted.
+        let long = String(repeating: "x", count: 70_000)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(long, forType: .string)
+        tap(ui, Key.id("compose"), "the composer")
+        ui.typeKey("v", modifierFlags: .command)
+        ui.typeKey(.return, modifierFlags: [])
+        words(ui, Key.id("status"), timeout: 30,
+              "a post past what a post holds must be refused, said where the app says what failed",
+              until: { $0.contains("a post holds at most") })
+        let kept = (el(ui, Key.id("compose")).value as? String)?.count ?? 0
+        XCTAssertEqual(kept, 70_000,
+                       "PRODUCT: a send the node refused must leave its text in the composer (D11); it holds \(kept) characters")
+        el(ui, Key.id("compose")).typeKey("a", modifierFlags: .command)
+        el(ui, Key.id("compose")).typeKey(.delete, modifierFlags: [])
+
+        // (6c) Retention opens at what the room keeps; Return never sets it (D14).
+        try staged(vox, ["room", "retention", "--node", "alice", room, String(365 * 86_400)], env: voxEnv)
+        ui.menuBars.menuBarItems["Room"].click()
+        ui.menuBars.menuItems["Retention…"].click()
+        let choice = Key.id("retention-choice")
+        let submit = Key.id("retention-submit")
+        present(ui, choice, timeout: 15, "Room > Retention… must open the Retention sheet")
+        var openedAt = ""
+        let openUntil = Date().addingTimeInterval(15)
+        while Date() < openUntil && openedAt != "1 year" {
+            openedAt = (el(ui, choice).value as? String) ?? ""
+            if openedAt != "1 year" { Thread.sleep(forTimeInterval: 0.25) }
+        }
+        XCTAssertEqual(openedAt, "1 year",
+                       "PRODUCT: the Retention sheet must open at the room's own retention, 1 year (D14)")
+        XCTAssertFalse(el(ui, submit).isEnabled,
+                       "PRODUCT: Set must be disabled while the choice is what the room keeps (D14)")
+        el(ui, choice).click()
+        ui.menuItems["30 days"].click()
+        let effect = words(ui, Key.id("retention-effect"), timeout: 10,
+                           "a shorter retention must say the files and previews go too (D14)",
+                           until: { $0.contains("the files it shared and their previews") }) ?? ""
+        XCTAssertTrue(el(ui, submit).isEnabled,
+                      "PRODUCT: Set must be enabled once another retention is chosen (D14)")
+        ui.typeKey(.return, modifierFlags: [])
+        Thread.sleep(forTimeInterval: 2)
+        XCTAssertTrue(el(ui, submit).exists,
+                      "PRODUCT: Return must not set a retention: the sheet closed as if Set were pressed (D14)")
+        ui.typeKey(.escape, modifierFlags: [])
+        print("[proof] retention sheet opened at \(openedAt); effect: \(effect)")
+
+        // (6d) A file addressed to someone else (F-3, D5): bob shares one addressed to himself.
+        let own = scratch.appendingPathComponent("bobs-own.bin")
+        let ownBytes = Data((0..<120_000).map { UInt8(truncatingIfNeeded: $0 &* 17 % 251) })
+        try stager.write(ownBytes, to: own.path)
+        try staged(vox, ["share", "--node", "bob", room, own.path, "--to", bobFp], env: bobSession)
+        words(ui, Key.id("file-addressed-bobs-own.bin"), timeout: 60,
+              "a file shared To: bob alone must say whom it is for, never \"only\" (D5)",
+              until: { $0 == "Addressed to bob" })
+        tap(ui, Key.id("file-download-bobs-own.bin"), "Download on bobs-own.bin")
+        present(ui, Key.id("quick-look-bobs-own.bin"), timeout: 90,
+                "Download must pull the file, verified, and offer Quick Look once it has (D5)")
+        let aliceCopy = URL(fileURLWithPath: data)
+            .appendingPathComponent("nodes/alice/files/\(fullRoom)/bobs-own.bin")
+        let ownWant = stager.run(["/usr/bin/shasum", "-a", "256", own.path], env: [:]).out
+            .split(separator: " ").first.map(String.init) ?? ""
+        let ownGot = stager.run(["/usr/bin/shasum", "-a", "256", aliceCopy.path], env: [:]).out
+            .split(separator: " ").first.map(String.init) ?? ""
+        XCTAssertTrue(!ownWant.isEmpty && ownGot == ownWant,
+                      "PRODUCT: the file Download pulled must be bob's, byte for byte, in alice's files (D5): want \(ownWant), \(aliceCopy.path) has \(ownGot.isEmpty ? "nothing" : ownGot)")
 
         // (7) The lanes view was removed (ADR-029 Sessions replace it; ADR-028 W-3 withdrawn).
 

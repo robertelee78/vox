@@ -58,6 +58,13 @@
 //!    the request open with its reference; and the listener heard of the entries and of the
 //!    room's Sessions changing.
 //!
+//! 9. **A file addressed to someone else** (ADR-028 F-3, D5): the peer shares a file addressed to
+//!    itself alone. Its card says whom it is for (`to`, the peer) and that its sharer is in the
+//!    keyring; the app's node does not pull it by itself; `get` pulls it when asked, verified,
+//!    byte for byte, into the node's files directory, and no pull of it is left pending.
+//! 10. **What a retention change starts from** (D14): `retentionSecs` gives the room's own value,
+//!     7 days once the app sets it so, never a default.
+//!
 //! Mutant for (3): `services` drops the address (`SharedService.address` empty): red PRODUCT.
 //! Mutant for (3): the FFI's commands carry the readable address: red PRODUCT.
 //! Mutant for (6): `servicePreview` says no warning: red PRODUCT.
@@ -65,6 +72,8 @@
 //! `RoomMessage.image` always nil; `renameRoom` answers without asking the node; `pulledBy`
 //! always empty.
 //! Mutant for (8): `sessionRead` gives each entry's kind for its line: red PRODUCT.
+//! Mutant for (9): the node answers `get` without pulling: red PRODUCT.
+//! Mutant for (10): `retentionSecs` gives 30 days whatever the room keeps: red PRODUCT.
 //!
 //! **The iOS app's embedded node** (`VoxNode`, ADR-026 S-4's exception): the Swift program runs
 //! the node in its own process, against a real `vox daemon`. What must hold:
@@ -202,22 +211,31 @@ fn build_harnesses(out: &Path) -> Harnesses {
     .output()
     .expect("APPARATUS: could not start build-xcframework.sh");
     if !built.status.success() {
-        // A red names its reason and its side: a toolchain this machine lacks is the machine's,
-        // anything else the script (shipped with vox) did is the product's.
+        // A red names its reason and its side. This is the proof building the library it runs
+        // against, before any product step: a build that fails is the apparatus's (APPARATUS),
+        // and a Rust target this machine lacks is a precondition unmet. It was called PRODUCT
+        // (staging), which a build cut short by the machine's compiler cache ("can't find crate
+        // for `zeroize_derive`", 2026-10-08) is not.
         let said = format!(
             "{}{}",
             String::from_utf8_lossy(&built.stdout),
             String::from_utf8_lossy(&built.stderr)
         );
+        let errors: Vec<&str> = said
+            .lines()
+            .filter(|l| l.starts_with("error"))
+            .take(5)
+            .collect();
         let side = if said.contains("is not installed; run: rustup target add") {
             "CANNOT MEASURE (precondition unmet): this machine lacks a Rust target the \
              xcframework needs"
         } else {
-            "PRODUCT (staging)"
+            "APPARATUS: the proof's own build of the xcframework failed"
         };
         panic!(
-            "{side}: build-xcframework.sh exited {}; it said:\n{said}",
-            built.status
+            "{side}: build-xcframework.sh exited {}; its errors:\n{}\nall it said:\n{said}",
+            built.status,
+            errors.join("\n")
         );
     }
     let lib = out.join("VoxFFI.xcframework/macos-arm64");
@@ -772,6 +790,40 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
     let pulled = expect(&from_app, &seen, "PULLED ")[7..].to_owned();
     let at_app = std::fs::read(&pulled).ok();
 
+    // (9) A file the peer shares addressed to itself alone (D5).
+    let for_peer = tmp.path().join("for-peer.bin");
+    let for_peer_bytes: Vec<u8> = (0..150_000u32).map(|i| (i * 13 % 241) as u8).collect();
+    std::fs::write(&for_peer, &for_peer_bytes).unwrap();
+    peer.run(
+        &["share", &room, for_peer.to_str().unwrap(), "--to", &peer_fp],
+        "",
+    );
+    writeln!(to_app, "for-peer.bin").unwrap();
+    let offer_line = expect(&from_app, &seen, "OFFER ");
+    // Not "GOT ": every message the listener hears is said as "GOT <text>".
+    let got_path = expect(&from_app, &seen, "FETCHED ")[8..].to_owned();
+    let got_bytes = std::fs::read(&got_path).ok();
+    let states_left = expect(&from_app, &seen, "STATES ");
+    eprintln!(
+        "{offer_line}\nFETCHED {got_path} ({} bytes, same: {})\n{states_left}",
+        got_bytes.as_ref().map_or(0, Vec::len),
+        got_bytes.as_deref() == Some(&for_peer_bytes[..])
+    );
+    assert_eq!(
+        offer_line,
+        format!("OFFER TO {peer_fp} TRUSTED true BY_ITSELF false"),
+        "PRODUCT: a share addressed to another member must say whom it is for and whether its \
+         sharer is trusted, and must not be pulled by this node by itself"
+    );
+    assert!(
+        got_bytes.as_deref() == Some(&for_peer_bytes[..])
+            && got_path.contains("/files/")
+            && states_left == "STATES 0",
+        "PRODUCT: `get` must pull a file addressed to someone else when asked, verified, byte for \
+         byte, into the node's files directory, and leave no pull of it pending: FETCHED {got_path}, \
+         {states_left}"
+    );
+
     // (5) The family LAN, through a stand-in helper.
     let helper = tmp.path().join("helper.sock");
     let os = lan_standin::Os::default();
@@ -905,6 +957,13 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
     );
     writeln!(to_app).unwrap();
     let renamed = expect(&from_app, &seen, "RENAMED");
+    // (10) What a retention change starts from (D14).
+    let retention_secs = expect(&from_app, &seen, "RETENTION_SECS ");
+    assert_eq!(
+        retention_secs,
+        format!("RETENTION_SECS {}", 7 * 86_400),
+        "PRODUCT: `retentionSecs` must give the room's own retention"
+    );
     // `vox room list` shows a room by its short id, then its name.
     let shows_renamed = |l: &str, id: &str| {
         let mut w = l.split_whitespace();

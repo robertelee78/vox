@@ -383,32 +383,78 @@ enum Retention {
 }
 
 /// Retention, saying what it does before it is set (E-5); no passphrase (ADR-028 K-11).
+///
+/// **It opens at what the room keeps, and Return never sets it** (D14): it opened at 30 days
+/// whatever the room kept, with Set as the default, so Return on a room kept forever shortened
+/// it. Set waits for a choice that differs, and a shorter retention deletes files and previews
+/// too (F-5), which it says.
 private struct RetentionSheet: View {
     @ObservedObject var model: NodeModel
-    @State private var seconds: UInt64 = 30 * 86_400
+    @State private var seconds: UInt64 = 0
+    @State private var opened = false
+
+    /// What the room keeps now, `nil` until it is known.
+    private var current: UInt64? { model.retentionSecs }
+
+    /// The choices, with the room's own value among them when it is none of the usual ones.
+    private var choices: [(String, UInt64)] {
+        guard let current, !Retention.choices.contains(where: { $0.1 == current }) else {
+            return Retention.choices
+        }
+        return Retention.choices + [(model.retention.isEmpty ? "\(current) seconds" : model.retention,
+                                     current)]
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s12) {
             Text("Retention").title()
             Picker("Keep messages", selection: $seconds) {
-                ForEach(Retention.choices, id: \.1) { Text($0.0).tag($0.1) }
+                ForEach(choices, id: \.1) { Text($0.0).tag($0.1) }
             }
-            Text(seconds == 0 ? "Every member keeps every message's text for good."
-                : "Every member deletes a message's text \(Retention.words(seconds)) after it was "
-                    + "sent, and older ones at once. Deleted text cannot be read again.")
+            .disabled(current == nil)
+            .accessibilityIdentifier("retention-choice")
+            Text(effect)
                 .secondaryText()
                 .accessibilityIdentifier("retention-effect")
             OutcomeMark(outcome: model.failure(of: "retention"), id: "retention-said")
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
-                // No default (A9): a retention deletes text, so Return never sets one.
+                // Never the Return default (A9): a retention deletes text, so Set is pressed on
+                // purpose, and only once another retention is chosen (D14).
                 Button("Set", role: seconds == 0 ? nil : .destructive) { submit() }
+                    .disabled(current == nil || seconds == current)
                     .accessibilityIdentifier("retention-submit")
             }
         }
         .padding(Space.s24)
         .frame(width: Theme.scaled(440))
-        .onAppear { model.clearOutcome(of: "retention") }
+        .onAppear {
+            model.clearOutcome(of: "retention")
+            open()
+        }
+        .onChange(of: model.retentionSecs) { _ in open() }
+    }
+
+    /// What the choice does, said before it is set: the text, the files it shared and their
+    /// previews go together (F-5).
+    private var effect: String {
+        if current != nil, seconds == current {
+            return seconds == 0 ? "This room keeps every message for good. Choose another to change it."
+                : "This room keeps messages for \(Retention.words(seconds)). Choose another to change it."
+        }
+        if seconds == 0 {
+            return "Every member keeps every message, the files it shared and their previews, for good."
+        }
+        return "Every member deletes each message, with the files it shared and their previews, "
+            + "\(Retention.words(seconds)) after it was sent, and older ones at once. What is "
+            + "deleted cannot be read or opened again."
+    }
+
+    /// The sheet starts at what the room keeps, once that is known.
+    private func open() {
+        guard !opened, let current else { return }
+        seconds = current
+        opened = true
     }
 
     private func submit() {

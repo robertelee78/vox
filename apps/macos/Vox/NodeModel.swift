@@ -122,6 +122,9 @@ final class NodeModel: ObservableObject {
     @Published private(set) var pulledBy: [String: [String]] = [:]
     /// The room on screen's retention, as a person reads it (ADR-028 R-7).
     @Published private(set) var retention = ""
+    /// The room on screen's retention in seconds, 0 for forever; `nil` until read. What the
+    /// Retention sheet opens at (D14).
+    @Published private(set) var retentionSecs: UInt64?
     /// What the room on screen's timeline shows (ADR-029 CL-2): General each time a room opens.
     @Published var showing: Showing = .general {
         didSet {
@@ -169,6 +172,9 @@ final class NodeModel: ObservableObject {
     /// Where this node's verified copy of each share it pulled in the room on screen is, by the
     /// share's message id (ADR-028 F-3, F-4): what its card opens with Quick Look.
     @Published private(set) var pulled: [String: String] = [:]
+    /// Where each pull of the room on screen's file offers stands that is not done, by the
+    /// share's message id (F-3, D5): being pulled, waiting for its sharer, or failed.
+    @Published private(set) var pulling: [String: PullState] = [:]
     /// A file handed to Vox from elsewhere (the Finder Services item, M-24), waiting for the room
     /// on screen to take it: its To: and note are asked there.
     @Published var incoming: URL?
@@ -459,7 +465,9 @@ final class NodeModel: ObservableObject {
         joins = []
         pulledBy = [:]
         pulled = [:]
+        pulling = [:]
         retention = ""
+        retentionSecs = nil
         notices = []
         sessions = []
         sessionEntries = []
@@ -507,12 +515,14 @@ final class NodeModel: ObservableObject {
             let services = (try? await client.services(room: id).shared) ?? []
             let rows = try await memberRows(id)
             let kept = (try? await client.retention(room: id)) ?? ""
+            let keptSecs = try? await client.retentionSecs(room: id)
             let done = (try? await client.notices(room: id)) ?? []
             let listed = (try? await client.sessions(room: id)) ?? []
             guard case .room(id) = self.selection else { return }
             roomServices = services
             members = rows
             retention = kept
+            retentionSecs = keptSecs
             notices = done
             sessions = listed
             // A Session restored as this room's last view is read once the room lists it (D12).
@@ -776,6 +786,46 @@ final class NodeModel: ObservableObject {
         await show(.room(ordered[n - 1].id))
     }
 
+    /// **Pull a file offer now** (F-3, D5): the card's Download, as `vox room get` does. The node
+    /// checks its SHA-256 before it keeps it, so the card shows a copy only once it is verified.
+    /// How it goes is in `pulling`; where it landed, in `pulled`.
+    func download(_ message: RoomMessage) async {
+        guard let room = roomOnScreen, let file = message.file else { return }
+        pulling[message.id] = .pulling(bytes: 0, of: file.size)
+        do {
+            let path = try await client.get(room: room, entry: message.id)
+            guard roomOnScreen == room else { return }
+            pulled[message.id] = path
+            pulling[message.id] = nil
+        } catch {
+            guard roomOnScreen == room else { return }
+            pulling[message.id] = .failed(why: sentence(error))
+        }
+    }
+
+    /// Open the keyring's add form with `fingerprint` in it: the card's Trust… for a sharer not in
+    /// the keyring (D5). Trusting it is still the person's own step.
+    func askTrust(_ fingerprint: String) {
+        select(.keyring)
+        Task {
+            await show(.keyring)
+            keyringAsk = KeyringAsk(kind: .add, fingerprint: fingerprint)
+        }
+    }
+
+    /// How this node names `fingerprint`: its alias, "you", or the fingerprint cut short.
+    func nodeName(_ fingerprint: String) -> String {
+        let node = fingerprint.split(separator: "/").first.map(String.init) ?? fingerprint
+        if node == me { return "you" }
+        if let alias = trusted.first(where: { $0.fingerprint == node })?.name, !alias.isEmpty {
+            return alias
+        }
+        if let alias = members.first(where: { $0.id == node })?.name, !alias.isEmpty {
+            return alias
+        }
+        return String(node.prefix(12))
+    }
+
     /// Open the keyring view and ask it for `kind`: the add form, or the selected row's compare,
     /// rename or remove (M-21).
     func askKeyring(_ kind: KeyringAsk.Kind) {
@@ -1003,12 +1053,12 @@ final class NodeModel: ObservableObject {
 
     /// Share the file or folder at `url` in the room on screen, addressed to `to` (members'
     /// fingerprints; none: the room) with `note`, in one message (ADR-028 F-1). Whether it was.
-    func attach(_ url: URL, to: [String], note: String) async -> Bool {
+    func attach(_ url: URL, to: [String], note: String, urgent: Bool = false) async -> Bool {
         begin("attach")
         guard case let .room(id) = selection else { return false }
         do {
             _ = try await client.share(room: id, path: url.path, to: to, note: note, re: "",
-                                       urgent: false, count: 0, forSecs: 0)
+                                       urgent: urgent, count: 0, forSecs: 0)
             return true
         } catch {
             report(error)
@@ -1016,14 +1066,17 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// Post `text` to the room on screen.
-    func post(_ text: String, to: [String] = [], urgent: Bool = false, re: String = "") async {
+    /// Post `text` to the room on screen; whether the node took it.
+    @discardableResult
+    func post(_ text: String, to: [String] = [], urgent: Bool = false, re: String = "") async -> Bool {
         begin("post")
-        guard case let .room(id) = selection else { return }
+        guard case let .room(id) = selection else { return false }
         do {
             try await client.post(room: id, text: text, to: to, re: re, urgent: urgent)
+            return true
         } catch {
             report(error)
+            return false
         }
     }
 
@@ -1141,12 +1194,15 @@ final class NodeModel: ObservableObject {
                 let where_ = try? await self.client.whereabouts(room: room)
                 let pulls = try? await self.client.pulledBy(room: room)
                 let copies = try? await self.client.pulled(room: room)
+                let states = try? await self.client.pullStates(room: room)
                 let services = try? await self.client.services(room: room).shared
                 let rows = try? await self.memberRows(room)
                 let kept = try? await self.client.retention(room: room)
+                let keptSecs = try? await self.client.retentionSecs(room: room)
                 let done = try? await self.client.notices(room: room)
                 guard case .room(room) = self.selection else { return }
                 if let kept, kept != self.retention { self.retention = kept }
+                if let keptSecs, keptSecs != self.retentionSecs { self.retentionSecs = keptSecs }
                 if let done, done != self.notices { self.notices = done }
                 let listed = try? await self.client.sessions(room: room)
                 guard case .room(room) = self.selection else { return }
@@ -1166,6 +1222,10 @@ final class NodeModel: ObservableObject {
                 if let copies {
                     let now = Dictionary(copies.map { ($0.entry, $0.path) }) { $1 }
                     if now != self.pulled { self.pulled = now }
+                }
+                if let states {
+                    let now = Dictionary(states.map { ($0.entry, $0.state) }) { $1 }
+                    if now != self.pulling { self.pulling = now }
                 }
                 if let services, services != self.roomServices { self.roomServices = services }
                 if let rows, rows != self.members {
