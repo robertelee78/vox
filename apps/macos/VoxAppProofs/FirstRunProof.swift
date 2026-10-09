@@ -715,6 +715,87 @@ final class FirstRunProof: XCTestCase {
               until: { $0 == says })
         print("[proof] inspector: \(says)")
 
+        // (3d) Watching a Session (P7), and what comes meanwhile in General (D18). bob's agent
+        // session opens a Session in mission through its hook, as Claude Code's does, and bob's
+        // node lets alice read it (drive). Its 30 tool calls are more than the timeline shows.
+        try staged(vox, ["trust", "drive", "--node", "bob", aliceFp,
+                         "--identity-passphrase-file", bobPass], env: voxEnv)
+        let sid = "p7proofs-session"
+        let hookEnv = voxEnv.merging(["CLAUDE_CODE_ENTRYPOINT": "cli"]) { $1 }
+        func hook(_ event: [String: Any]) throws {
+            var input: [String: Any] = ["session_id": sid, "cwd": "/tmp",
+                                        "transcript_path": "/tmp/p7.jsonl"]
+            input.merge(event) { $1 }
+            let json = String(decoding: try JSONSerialization.data(withJSONObject: input), as: UTF8.self)
+            let r = run(vox, ["agent", "hook", "--node", "bob", "--room", room], env: hookEnv, input: json)
+            guard r.status == 0 else {
+                throw Apparatus("bob's session hook (\(event["hook_event_name"] ?? "")) exited \(r.status): \(r.out)")
+            }
+        }
+        func toolCall(_ n: Int) throws {
+            try hook(["hook_event_name": "PostToolUse", "tool_name": "Bash",
+                      "tool_use_id": "p7-\(n)", "tool_input": ["command": "echo P7-LINE-\(n)"],
+                      "tool_response": ["stdout": "P7-LINE-\(n)", "stderr": "", "interrupted": false]])
+        }
+        try hook(["hook_event_name": "UserPromptSubmit", "prompt": "sort the photos"])
+        for n in 1...30 { try toolCall(n) }
+        let sessionRow = Key.id("session-p7proofs")
+        present(ui, sessionRow, timeout: 60,
+                "bob's Session, opened by his session's hook, must be listed in mission")
+        // D18's premise: what mission's row counts as new before anything is posted.
+        func newCount() -> Int? {
+            let words = shown(el(ui, Key.id("room-mission")))
+            guard let r = words.range(of: #"(\d+) new"#, options: .regularExpression) else { return 0 }
+            return Int(words[r].split(separator: " ")[0])
+        }
+        tap(ui, sessionRow, "bob's Session")
+        let newestLine = Key.showing("P7-LINE-30")
+        let openedUntil = Date().addingTimeInterval(20)
+        while Date() < openedUntil && !el(ui, newestLine).isHittable { Thread.sleep(forTimeInterval: 0.25) }
+        if el(ui, Key.showing("P7-LINE-1")).isHittable && el(ui, newestLine).isHittable {
+            throw Apparatus("all 30 of the Session's lines fit in the timeline, so opening at its newest cannot be told from opening at its top")
+        }
+        if !el(ui, newestLine).isHittable {
+            keepTree(ui, "the Session did not open at its newest line")
+            XCTFail("PRODUCT: a Session opened must show its newest line, P7-LINE-30, in view; it is not on screen 20 s after bob's Session was chosen")
+        }
+        try toolCall(31)
+        let followUntil = Date().addingTimeInterval(30)
+        while Date() < followUntil && !el(ui, Key.showing("P7-LINE-31")).isHittable {
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        if !el(ui, Key.showing("P7-LINE-31")).isHittable {
+            keepTree(ui, "the Session did not follow its new line")
+            XCTFail("PRODUCT: a Session watched at its newest line must follow what it prints next; P7-LINE-31 is not on screen 30 s after bob's session made it")
+        }
+        // D18: a message to the room while the Session is shown is not seen, so it counts.
+        guard let before = newCount() else {
+            throw Apparatus("mission's sidebar row could not be read")
+        }
+        try staged(vox, ["room", "post", "--node", "bob", room, "D18-UNSEEN"], env: voxEnv)
+        var counted = before
+        let countUntil = Date().addingTimeInterval(30)
+        while Date() < countUntil && counted <= before {
+            counted = newCount() ?? before
+            if counted <= before { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        if counted <= before {
+            keepTree(ui, "a message posted while a Session was shown was not counted")
+            XCTFail("PRODUCT: bob's D18-UNSEEN, posted to mission while alice watched a Session there, is not seen, so mission's row must count it new; it says \"\(shown(el(ui, Key.id("room-mission"))))\" (\(before) new before)")
+        }
+        tap(ui, Key.id("session-general"), "General")
+        let seenUntil = Date().addingTimeInterval(20)
+        var after = counted
+        while Date() < seenUntil && after >= counted {
+            after = newCount() ?? counted
+            if after >= counted { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        if after >= counted {
+            keepTree(ui, "a message seen in General was still counted")
+            XCTFail("PRODUCT: General shown with D18-UNSEEN in view must read it, so mission's row counts one fewer new; it still says \"\(shown(el(ui, Key.id("room-mission"))))\"")
+        }
+        print("[proof] Session opened at P7-LINE-30 and followed P7-LINE-31; D18-UNSEEN counted while a Session was shown (\(before) → \(counted) new), read once General showed it (\(after))")
+
         // (4) Read each way. Bob's NEEDS-YOU is on alice's screen now: her node says she read it.
         var readByAlice: [String] = []
         let readUntil = Date().addingTimeInterval(60)
