@@ -301,17 +301,21 @@ final class FirstRunProof: XCTestCase {
     /// Another app's window in front of Vox's main window and over a quarter of it (a person's
     /// window, a system overlay such as the screenshot tool's), by the window list's owner, layer
     /// and bounds only: never an image. Nil when nothing covers it, or Vox has no window.
-    /// A Notification Center window over the screen point `at` (a banner, or the panel), by the
-    /// window list's owner, layer and bounds only, never an image: its bounds, else nil.
-    private func notificationOver(_ at: CGPoint) -> String? {
+    /// A window of the system's over the screen point `at` that takes clicks there and is no part
+    /// of Vox: a Notification Center banner or panel, or the screenshot overlay (screencaptureui,
+    /// "Screenshot"), which may be the person's own. By the window list's owner, layer and bounds
+    /// only, never an image. Its owner, layer and bounds, else nil. Never stopped: waited out.
+    private func systemOverlayOver(_ at: CGPoint) -> String? {
         let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
                                                  kCGNullWindowID) as? [[String: Any]] ?? []
-        for w in windows where (w[kCGWindowOwnerName as String] as? String) == "Notification Center" {
-            guard (w[kCGWindowLayer as String] as? Int ?? -1) >= 0,
+        for w in windows {
+            guard let owner = w[kCGWindowOwnerName as String] as? String,
+                  owner == "Notification Center" || owner == "Screenshot",
+                  (w[kCGWindowLayer as String] as? Int ?? -1) >= 0,
                   (w[kCGWindowAlpha as String] as? Double ?? 1) > 0,
                   let b = w[kCGWindowBounds as String] as? NSDictionary,
                   let r = CGRect(dictionaryRepresentation: b as CFDictionary), r.contains(at) else { continue }
-            return "layer \(w[kCGWindowLayer as String] ?? "?"), \(Int(r.width))×\(Int(r.height)) at \(Int(r.minX)),\(Int(r.minY))"
+            return "\(owner), layer \(w[kCGWindowLayer as String] ?? "?"), \(Int(r.width))×\(Int(r.height)) at \(Int(r.minX)),\(Int(r.minY))"
         }
         return nil
     }
@@ -1947,17 +1951,17 @@ final class FirstRunProof: XCTestCase {
                 if case .menuItem = key { reached = { e.isHittable } } else { reached = { self.inView(ui, e) } }
                 if !reached() { scrollTo(ui, e) }
                 if reached() {
-                    // A notification banner (anyone's: the person's own Vox posts too) over the
-                    // click's point would take the click: waited out, as a person waits.
+                    // A notification banner, or the screenshot overlay (the person may be taking
+                    // a screenshot), over the click's point would take the click: waited out, as
+                    // a person waits, and never stopped: it may be theirs.
                     let at = CGPoint(x: e.frame.midX, y: e.frame.midY)
                     let clearBy = Date().addingTimeInterval(20)
-                    while let banner = notificationOver(at), Date() < clearBy {
-                        _ = banner
+                    while systemOverlayOver(at) != nil, Date() < clearBy {
                         Thread.sleep(forTimeInterval: 0.5)
                     }
-                    if let held = notificationOver(at) {
-                        keepTree(ui, "Notification Center covered \(what)")
-                        XCTFail("APPARATUS: Notification Center (\(held)) covered \(what) (\(key)) for 20 s: a panel left open, not Vox's",
+                    if let held = systemOverlayOver(at) {
+                        keepTree(ui, "a system window covered \(what)")
+                        XCTFail("APPARATUS: \(held) covered \(what) (\(key)) for 20 s; not Vox's, and left alone",
                                 file: file, line: line)
                         return false
                     }
