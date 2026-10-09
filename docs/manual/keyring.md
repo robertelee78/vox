@@ -14,6 +14,7 @@ vox node create robertgpt
 vox node attach robertgpt
 vox node list
 vox node detach robertgpt
+vox node signout robertgpt
 ```
 
 **Every node has an identity passphrase.** `node create` asks for it twice at the terminal, or
@@ -30,7 +31,11 @@ until the daemon stops. `node list` shows each node as `attached` or `detached`,
 it has been attached (a detached node's from a file kept beside its identity, shown only while it
 matches that identity). `node detach` closes that
 node's connections, stops its services and wipes its keys from memory; other attached nodes keep
-running. Detaching is not deleting: the node, its rooms and its keyring stay on disk.
+running. Detaching is not deleting: the node, its rooms and its keyring stay on disk. `node signout` detaches the
+node and forgets what would bring it back without you: it is no longer kept attached (`node attach
+--keep`), its passphrase leaves the Keychain, and the app no longer opens it by itself. It says
+so: ``node robertgpt signed out: detached, no longer kept, its Keychain passphrase forgotten; its
+rooms and messages stay here, and `vox node attach robertgpt` uses it again``.
 
 ## When the passphrase is asked for
 

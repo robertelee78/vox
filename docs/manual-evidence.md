@@ -52,8 +52,9 @@ later parser or implementation may invalidate both an example and its troublesho
 
 ## v0.4.1 command check
 
-Checked on 2026-10-09 against `integrate/v0.4.1` at `ecf5add86`, and the command check again at
-`5c2bb70e9` (G4 and tail merged), with a release `vox` built there
+Checked on 2026-10-09 against `integrate/v0.4.1` at `ecf5add86`, the command check again at
+`5c2bb70e9` (G4 and tail merged), and the final pass at `88f971269` (every v0.4.1 item but the
+app's files work, #597), with a release `vox` built there
 (`cargo build --release -p vox-tui --bin vox`, no features; it still says `vox 0.4.0` until the
 bump). Every process had a scratch `VOX_DATA_DIR`, `VOX_CONFIG_DIR` and `HOME`, and none used
 `sudo`.
@@ -64,9 +65,12 @@ each inline `` `vox …` `` span that is a command, not an output quote, was run
 nothing else. A word the manual writes as a placeholder was given a value of its shape: `<…>`
 became `X`, `:PORT` became `:1080`, `NUMBER` became `1`. A choice written `add|remove` was checked
 as each choice, and an option named alone (`--to`) was checked with a value. Result: 329 commands,
-0 refused at `ecf5add86`; 330, 0 refused, at `5c2bb70e9` with this branch's pages. Mutant: `vox uninstall` in install.md changed to `vox uninstall --keep-nodes` was
-caught: `REJECTED install.md:149: vox uninstall --keep-nodes`, `error: unexpected argument
-'--keep-nodes' found`. The check is a spike, run and reported here, not committed.
+0 refused at `ecf5add86`; 330, 0 refused, at `5c2bb70e9` with this branch's pages; 362, 0
+refused, at `88f971269` with the final pages. Mutants: `vox uninstall` in install.md changed to
+`vox uninstall --keep-nodes` was caught: `REJECTED install.md:149: vox uninstall --keep-nodes`,
+`error: unexpected argument '--keep-nodes' found`; at `88f971269`, `vox node signout robertgpt`
+in keyring.md changed to `vox node signoff robertgpt` was caught: `REJECTED keyring.md:17: vox
+node signoff robertgpt`, `error: unrecognized subcommand 'signoff'`, 1 of 362 refused, exit 1. The check is a spike, run and reported here, not committed.
 
 | Manual claim | Where and how | Observed |
 |---|---|---|
@@ -80,6 +84,9 @@ caught: `REJECTED install.md:149: vox uninstall --keep-nodes`, `error: unexpecte
 | What the identity exchange protects (#581) | `the_identity_exchange_holds_against_an_attacker_proof`, release, at `ade22271e` | 14 of 14, each claim with its mutant; concepts.md says it in a person's words |
 | Readiness ticks under a service (G4) | `service_rehearsal_proof`, release, at `ae116069` (merged `5c2bb70e9`) | the trusted guest: `✓ proxy configured`, `✓ node attached`, `✓ HOST trusts you`, `✓ HOST online`; the untrusted joiner: ``missing: HOST trusts you — HOST must trust this node: there, `vox trust add` the fingerprint `vox id` prints here``, then `✓` once the host trusts it; the host stopped: `missing: HOST online — HOST is not reachable now; it is reached when it comes back`; the proxy port taken: `missing: proxy configured — the .vox proxy is not running: …` |
 | `vox room tail` leaves Session records out | `read_render_proof`'s tail journey as merged (`1cb13670b`) | plain tail printed neither of a renamed Session's two records; `--json` gave both, then the message after them |
+| `vox node signout` (#642) | `vox node create e1 --passphrase-file F`, `vox node attach e1 --keep --passphrase-file F`, `vox node list`, `vox node signout e1`, `vox node list`, at `88f971269` | `vox: node e1 attached (kept)`; `e1 attached   FINGERPRINT (kept)`; ``vox: node e1 signed out: detached, no longer kept, its Keychain passphrase forgotten; its rooms and messages stay here, and `vox node attach e1` uses it again``; `e1 detached   FINGERPRINT` (a detached node's fingerprint shown); `.daemon/attach` empty |
+| An empty identity passphrase is refused | `vox node create e1 --passphrase-file EMPTY`, at `88f971269` | `vox node: every node has an identity passphrase, and an empty one is refused; nothing was created`, exit 1; `vox node list` then says `no node yet` and the name is free (an empty `nodes/e1/` directory is left). `vox node --help` says of `create` that an empty one "is allowed": the help is wrong, reported as a product finding |
+| The app (app.md) | read against `apps/macos/Vox` at `88f971269`: each quoted sentence, label and key found in the Swift source or in the vox-core/vox-ffi words it shows | not driven here: the app's own walkthrough (`scripts/app-proofs.sh`) proves the app, as merged |
 | The agent skill pack, room binding (#586, #587) | as merged with their own proofs (`skill_cli_proof`, `agent_hook_proof`); agents.md and sessions.md came with those merges | the commands parse (above); not run again here |
 
 ## v0.4.0 command check

@@ -120,6 +120,7 @@ vox node create alice       # make a node (its passphrase is asked twice; every 
 vox node attach alice       # attach it to the daemon, starting the daemon if none runs
 vox node list               # every node here, and whether it is attached
 vox node detach alice       # its connections close and its keys leave memory
+vox node signout alice      # detached, no longer kept, its Keychain passphrase forgotten
 ```
 
 Every verb acts as one node: `--node <name>` after the verb, or `VOX_NODE`; with only one node
@@ -370,11 +371,12 @@ also as **Vox.app**, a native app for Apple Silicon and macOS 13 or later
 one daemon per data root with any number of nodes; rooms over the real network through the full NAT
 ladder, with port mappings renewed and released and a change of network noticed and acted on at
 once; trust per keyring entry, as read or read + drive; replication and sync; room-bound TCP and UDP
-services reached as `<service>.<node>.<room>.vox`, and `ssh` over Vox; shares as addressed messages,
+services reached as `<service>.<node>.<room>.vox`, each saying what reaching it needs, and `ssh`
+over Vox; shares as addressed messages,
 pulled automatically; the family LAN (macOS); leaving and ending rooms, admins and retention; key
 rotation and per-member revocation; Claude Code, Codex and OpenCode sessions, each agent its own
 node, with a Session per interactive session that members trusted with drive can read and drive
-from the CLI, the TUI or the app; the agent skill pack kept current for every harness, and a repo
+from the CLI, the TUI or the app; on the Mac, a first run entirely in Vox.app; the agent skill pack kept current for every harness, and a repo
 bound to its room once; an upgrade that keeps your data, and `vox uninstall`.
 
 iOS is a separate, later capability.

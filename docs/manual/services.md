@@ -274,8 +274,11 @@ shared in it.
 `vox lan up ROOM_ID` puts this machine on a network interface on which the room's trusted
 members are one subnet, so local-network discovery works across Vox. Creating an interface needs
 root, and only a separate helper has it: run `sudo vox lan helper` in another terminal, then run
-`vox lan up` as yourself, not with sudo. Without the helper it stops with `no LAN helper is
-answering on /var/run/vox-lan.sock`. The manual's command check went no further than that message.
+`vox lan up` as yourself, not with sudo. On a Mac with Vox.app the helper is the app's instead:
+turn on the room's **FAMILY LAN** switch in the app once and allow it in System Settings ([the
+app](app.md#members-and-trust)). Without the helper it stops with `no LAN helper is answering on
+/var/run/vox-lan.sock`, and says which of the two to do. The manual's command check went no
+further than that message.
 
 ## When an anchor is needed
 

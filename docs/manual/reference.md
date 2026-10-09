@@ -23,7 +23,7 @@ is not an alias for your parser.
 
 | Intent | Entry point | Prerequisite |
 |---|---|---|
-| Make, attach, list or detach a node | `vox node create`, `attach`, `list`, `detach` | Node passphrase, if it has one |
+| Make, attach, list, detach or sign out a node | `vox node create`, `attach`, `list`, `detach`, `signout` | Node passphrase, if it has one |
 | Interactive client | `vox` or `vox tui` | Terminal; a client of the daemon |
 | Run the daemon in a terminal | `vox daemon` | Optional: attaching a node starts one |
 | Run an anchor | `vox node` with no subcommand | A headless node; reachable infrastructure |
