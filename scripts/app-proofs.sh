@@ -30,41 +30,67 @@ DERIVED="$ROOT/target/xcode"
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/vox-app-proofs.XXXXXX")"
 trap 'rm -rf "$SCRATCH"' EXIT
 
-# **Never the person's own Vox** (APPARATUS before anything runs). A login item registered on this
-# Mac runs the bundle's `vox daemon` under launchd, with none of this run's scratch directories:
-# on the person's real profile. And whatever the run does, the real data root and config
-# directory must be as they were: listed (names, sizes, times; never contents) before and after.
+# **Never the person's own Vox, and never its profile** (APPARATUS). The person's own Vox.app
+# (us.vox.app), its login item and its daemon may be installed and running on the real profile:
+# they are theirs, and what they do to the real profile is theirs. What refuses is the proof
+# build's own: a login item whose parent is the proof build (us.vox.app.proof) loaded or allowed,
+# and any sign that a proof reached the real data root (see check_real).
 REAL="$HOME/Library/Application Support/vox"
-if launchctl print "gui/$(id -u)/us.vox.daemon" >/dev/null 2>&1; then
-    echo "app-proofs: APPARATUS (precondition unmet): a Vox login item (us.vox.daemon) is loaded on" \
-        "this Mac, and it runs on the real profile; turn it off (System Settings, General, Login" \
-        "Items, Vox) before a run" >&2
+if launchctl print "gui/$(id -u)/us.vox.daemon" 2>/dev/null \
+    | grep -q "parent bundle identifier = us\.vox\.app\.proof$"; then
+    echo "app-proofs: APPARATUS (precondition unmet): a proof build's login item (us.vox.daemon of" \
+        "us.vox.app.proof) is loaded on this Mac, and it runs without this run's scratch" \
+        "directories; turn it off (System Settings, General, Login Items) before a run" >&2
     exit 2
 fi
-# Nor one that is registered and allowed but not loaded yet: launchd would start it at the next
-# login, or as soon as anything enables it. `sfltool dumpbtm` reads the background items without
-# privileges; a us.vox.daemon item whose disposition says "allowed" (not "disallowed") refuses.
-if /usr/bin/sfltool dumpbtm </dev/null 2>/dev/null | awk '
+# Nor one registered and allowed but not loaded yet. `sfltool dumpbtm` reads the background items
+# without privileges: an item of the proof build (identifier, parent or bundle us.vox.app.proof,
+# or a URL under this run's derived data) not "disallowed" refuses.
+if /usr/bin/sfltool dumpbtm </dev/null 2>/dev/null | awk -v derived="$DERIVED" '
     /Disposition:/ { d = $0 }
-    /Identifier:[ \t]+8\.us\.vox\.daemon$/ && d !~ /disallowed/ { found = 1 }
+    (/us\.vox\.app\.proof/ || index($0, derived) > 0) && d !~ /disallowed/ { found = 1 }
     END { exit !found }'; then
-    echo "app-proofs: APPARATUS (precondition unmet): a Vox login item (us.vox.daemon) is" \
-        "registered and allowed on this Mac, and it runs on the real profile; switch Vox off under" \
-        "System Settings, General, Login Items & Extensions, Allow in the Background, before a run" >&2
+    echo "app-proofs: APPARATUS (precondition unmet): a proof build's background item" \
+        "(us.vox.app.proof) is registered and allowed on this Mac; switch it off under System" \
+        "Settings, General, Login Items & Extensions before a run" >&2
     exit 2
 fi
-real_listing() {
-    if [ -e "$REAL" ]; then find "$REAL" -exec stat -f '%N %z %m' {} + | sort; else echo absent; fi
+# The names the proofs give nodes: none of them is the person's, so one appearing in the real
+# data root, or chosen there, is a proof's doing.
+PROOF_NAMES="alice bob carol dora $(grep -ho '"node", "create", "[a-z0-9._-]*"' apps/macos/VoxAppProofs/*.swift \
+    | sed -E 's/.*"([a-z0-9._-]*)"$/\1/' | sort -u | tr '\n' ' ')"
+proof_marks() {
+    for n in $PROOF_NAMES; do [ -e "$REAL/nodes/$n" ] && echo "$REAL/nodes/$n"; done
+    [ -e "$REAL/moved-aside" ] && echo "$REAL/moved-aside"
+    if [ -f "$REAL/app/node" ]; then
+        chosen="$(head -c 64 "$REAL/app/node" | tr -d '[:space:]')"
+        for n in $PROOF_NAMES; do [ "$chosen" = "$n" ] && echo "$REAL/app/node names $n"; done
+    fi
+    true
 }
-REAL_BEFORE="$(real_listing)"
+MARKS_BEFORE="$(proof_marks)"
+# While the suite runs, every 2 s: a proof process (its command under this run's derived data or
+# scratch root) with a file open under the real data root.
+REAL_TOUCH="$SCRATCH/real-touch.log"
+watch_real() {
+    while true; do
+        pids="$(pgrep -f "$DERIVED/|$SCRATCH" | tr '\n' ',' | sed 's/,$//')"
+        if [ -n "$pids" ] && [ -e "$REAL" ]; then
+            lsof -a -p "$pids" -Fpn 2>/dev/null | awk -v real="$(cd "$REAL" && pwd -P)/" '
+                /^p/ { p = substr($0, 2) } /^n/ && index(substr($0, 2), real) == 1 { print "pid " p ": " substr($0, 2) }' \
+                >> "$REAL_TOUCH"
+        fi
+        sleep 2
+    done
+}
 check_real() {
-    if [ "$(real_listing)" != "$REAL_BEFORE" ]; then
-        echo "app-proofs: APPARATUS: the run changed the real profile ($REAL): a Vox started without" \
-            "this run's scratch directories (a crash dialog's Reopen does that: click Ignore), or" \
-            "the person used Vox meanwhile. Before:" >&2
-        echo "$REAL_BEFORE" >&2
-        echo "After:" >&2
-        real_listing >&2
+    local marks touched
+    marks="$(proof_marks)"
+    touched="$(sort -u "$REAL_TOUCH" 2>/dev/null)"
+    if [ "$marks" != "$MARKS_BEFORE" ] || [ -n "$touched" ]; then
+        echo "app-proofs: APPARATUS: a proof reached the real profile ($REAL):" >&2
+        [ "$marks" != "$MARKS_BEFORE" ] && echo "  what a proof stages appeared there: $marks" >&2
+        [ -n "$touched" ] && echo "  a proof process held a file there: $touched" >&2
         return 1
     fi
 }
@@ -175,6 +201,9 @@ trap_unregister() {
 # The launch proof (#438) drives no UI, so it needs no automation approval: it runs first, alone
 # when asked for by name.
 launch_status=0
+watch_real &
+WATCH_REAL=$!
+trap 'kill "$WATCH_REAL" 2>/dev/null; rm -rf "$SCRATCH"' EXIT
 if [ "$#" -eq 0 ] || [ "$*" = "LaunchProof" ]; then
     python3 scripts/app-launch-proof.py "$APP" || launch_status=$?
     if [ "$*" = "LaunchProof" ]; then
@@ -201,6 +230,7 @@ STAGER=$!
 # reading the red; a green run removes it.
 finish() {
     local status=$?
+    kill "$WATCH_REAL" 2>/dev/null
     kill "$STAGER" 2>/dev/null; wait "$STAGER" 2>/dev/null
     trap_unregister
     if [ "$status" -ne 0 ]; then
