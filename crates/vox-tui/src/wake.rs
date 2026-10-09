@@ -148,7 +148,8 @@ pub struct TmuxClaim {
 }
 
 /// Where a session's terminal is, in tmux, and the process that ties the session to it: found by
-/// the session's own hook ([`crate::claude_injector::bind_here`]) and checked again at every send.
+/// the session's own hook ([`crate::claude_injector::claim_here`]), proved by the daemon
+/// ([`crate::claude_injector::prove`]) and checked again at every send.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TmuxPane {
     /// The tmux server's socket: the first field of `$TMUX`.

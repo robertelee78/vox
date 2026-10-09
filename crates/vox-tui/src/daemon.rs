@@ -43,10 +43,10 @@ const START_GRACE: Duration = Duration::from_secs(10);
 /// This exists because neither of the other two ways to run a node can serve an
 /// unattended host:
 ///
-/// - [`run_live`] is the TUI. It is the only other caller of `node::ipc::bind`, it
+/// - [`run_live`](crate::app::run_live) is the TUI. It is the only other caller of `node::ipc::bind`, it
 ///   needs a TTY to prompt for the passphrase, and per ADR-015 it **locks the node
 ///   on SIGHUP** — so detaching it from a terminal defeats it by design.
-/// - [`run_node`] is an anchor. It serves the board and carries circuits, but it is
+/// - [`run_node`](crate::app::run_node) is an anchor. It serves the board and carries circuits, but it is
 ///   headless in the other sense: no identity is unlocked, it holds no room and it
 ///   can read nothing.
 ///

@@ -599,8 +599,9 @@ impl NodeNet {
 
     /// The endpoints this node advertises.
     ///
-    /// After [`NodeNet::refresh_advertised`] this is the ADR-012 ladder's composed
-    /// set (routable address, port-mapped address, loopback). Before it — and if the
+    /// Once the presence has run the ADR-012 ladder
+    /// ([`NetPresence::advertised_now`](crate::node::presence::NetPresence::advertised_now)),
+    /// this is its composed set (routable address, port-mapped address, loopback). Before it — and if the
     /// ladder found nothing — it falls back to the bound socket, which is right for a
     /// node bound to a concrete address and merely useless for one bound to the
     /// wildcard.

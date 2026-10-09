@@ -5,7 +5,7 @@
 //! is one, the announcement carries its dimensions, a thumbnail and a BlurHash, inside the
 //! encrypted message: the thumbnail is a JPEG of at most [`MAX_THUMB_BYTES`], so it fits a message
 //! with room to spare (ADR-028's exception to "file bytes never enter the log", ADR-020 11.1). A
-//! file that is not an image, or that cannot be decoded within [`limits`], gets no preview; the
+//! file that is not an image, or that cannot be decoded within this module's decode limits, gets no preview; the
 //! share goes ahead without one.
 
 use std::path::Path;
@@ -63,7 +63,7 @@ fn limits() -> image::Limits {
     l
 }
 
-/// The image in the file at `path`, decoded within [`limits`], or `None` when it is not one this
+/// The image in the file at `path`, decoded within this module's decode limits, or `None` when it is not one this
 /// build reads (JPEG, PNG, GIF, WebP).
 #[must_use]
 pub fn decode(path: &Path) -> Option<image::DynamicImage> {

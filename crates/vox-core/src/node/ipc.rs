@@ -625,7 +625,7 @@ pub enum Request {
         channel_id: Digest32,
     },
     /// Add an identity to the trust keyring. Needs the identity passphrase once more than
-    /// [`KEYRING_WINDOW_SECS`](crate::node::actor::KEYRING_WINDOW_SECS) have passed since it was
+    /// [`KEYRING_WINDOW_MS`](crate::node::actor::KEYRING_WINDOW_MS) have passed since it was
     /// last entered (V210-159).
     Trust {
         /// Who to trust, as a full fingerprint.

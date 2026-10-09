@@ -10,7 +10,7 @@
 //! - **What is drawn** comes from a [`NodeSnapshot`] (rooms, members, consents, shares, keyring,
 //!   connected peers, this node's tunnels), asked again when an event says something changed and
 //!   once a second besides; and from the room on screen, read in pages once and then extended from
-//!   its newest row as events say rows arrived ([`Timeline`]), so a frame never costs a room's
+//!   its newest row as events say rows arrived (`Timeline`), so a frame never costs a room's
 //!   whole history.
 //! - **Events** come on two connections of their own, read by tasks on the runtime: the node's
 //!   (a subscribed `Use` of the same node), and the daemon's (attach and detach of every node,
