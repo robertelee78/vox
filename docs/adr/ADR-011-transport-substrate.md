@@ -5,7 +5,8 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 **Status**: built (`crates/vox-core/src/transport/`), except where a requirement says otherwise: the
 interop matrix (requirement 14) and a TCP fallback (requirement 2) are not built. The identity
 exchange (requirements 27–39, 38a) is built and replaces requirements 5–8, which are not in the
-code; of requirement 40's proofs, path privacy is proved by real use and the rest in process only.
+code; of requirement 40's proofs, path privacy is proved by real use, and the rest have no proof:
+the in-process tests that stood for them were deleted in v0.4.1 (AGENTS.md: no unit tests).
 **Date**: 2026-06-19
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: transport, quic, tls, post-quantum, multiplexing, datagrams
@@ -275,8 +276,9 @@ connection, bound to the TLS session by its exporter.
     - re-attach: a node that detaches and re-attaches is seen by its peers as a new process (mutant:
       the instance left out of the process identity).
 
-    Every proof but path privacy is *proved in process only* (`transport::identity` and
-    `node::presence` tests); its real-binary form is not built.
+    Every proof but path privacy is **not built**. The in-process tests that stood for them
+    (`transport::identity` and `node::presence`) were deleted in v0.4.1 (AGENTS.md: no unit
+    tests), and the real-binary form, a test-side attacker against a running `vox`, is not built.
 
 ## Known limits
 

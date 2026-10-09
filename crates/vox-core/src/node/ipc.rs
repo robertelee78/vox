@@ -5479,19 +5479,3 @@ impl IpcClient {
         }
     }
 }
-
-#[cfg(test)]
-mod account_socket_tests {
-    /// The account socket admits its own user only, and never root, even a daemon run as root
-    /// (ADR-026 C-1, S-5).
-    #[test]
-    fn only_the_same_user_and_never_root() {
-        assert!(super::admitted(Some(501), 501));
-        assert!(!super::admitted(Some(502), 501));
-        assert!(!super::admitted(None, 501));
-        assert!(
-            !super::admitted(Some(0), 0),
-            "PRODUCT: the account socket admitted uid 0"
-        );
-    }
-}
