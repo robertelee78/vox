@@ -734,6 +734,9 @@ private struct RoomView: View {
                                     scroller.scrollTo(last, anchor: .bottom)
                                 }
                                 newest = model.followItem
+                                // Again once the rows are laid out: a scroll asked for in the
+                                // same pass as the rows it scrolls to can do nothing.
+                                DispatchQueue.main.async { openAtNewest(scroller) }
                             }
                             // A request ⌘J or a notification landed on, centred once its
                             // Session's entries are drawn (P1).
@@ -745,11 +748,19 @@ private struct RoomView: View {
                             // newest line, or, a Session with a request waiting, at that request,
                             // centred, so going to an approval shows it (P7).
                             .onChange(of: model.showing) { _ in
-                                openAtNewest(scroller)
+                                // The rows of what is now shown are laid out after this change,
+                                // so the scroll waits for the next turn of the main loop: asked
+                                // for at once, it could land before them and do nothing, leaving
+                                // the view short of the newest line, which was then neither read
+                                // nor followed (the merged build's walkthrough, D18-UNSEEN).
                                 // A Session's lines are read after it is chosen: it is opened
                                 // again at its newest once they land.
                                 opened = model.showsSessionToRead
                                 newest = model.followItem
+                                DispatchQueue.main.async {
+                                    openAtNewest(scroller)
+                                    newest = model.followItem
+                                }
                             }
                             // Each new line followed while the newest was in view: by the last
                             // real line's identity and the count (a Session's note, kept at the
