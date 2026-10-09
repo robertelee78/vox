@@ -15,6 +15,9 @@ struct MainWindow: View {
                 Sidebar(model: model)
                     .navigationSplitViewColumnWidth(min: Theme.scaled(220), ideal: Theme.scaled(260))
             } detail: {
+                // Every word shown here can be selected and copied (the decider, v0.4.1): set
+                // once for the whole detail, so a view added later is selectable too.
+                Group {
                 switch model.selection {
                 case let .room(id):
                     // One view per room: its draft, To:, urgent and attachment do not carry over.
@@ -52,12 +55,15 @@ struct MainWindow: View {
                         .secondaryText()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
+                }
+                .textSelection(.enabled)
             }
             Divider()
             StatusBar(model: model)
+                .textSelection(.enabled)
         }
         .contentSurface()
-        .sheet(item: $model.sheet) { NodeSheets(model: model, sheet: $0) }
+        .sheet(item: $model.sheet) { NodeSheets(model: model, sheet: $0).textSelection(.enabled) }
         .toolbar {
             // W-2: a key moves to the next room that needs the person; Control-N, as in the TUI.
             Button("Next Room That Needs You") { Task { await model.nextNeedingYou() } }
@@ -80,6 +86,7 @@ private struct Sidebar: View {
                                 })) {
             Section {
                 StateMark(kind: .live, words: "node \(model.node), attached")
+                    .copyMenu([("Copy Name", model.node)])
                     .accessibilityIdentifier("attached")
                     .background(SidebarHighlightOff())
             }
@@ -93,10 +100,12 @@ private struct Sidebar: View {
                         RoomRow(room: room, selected: model.selection == .room(room.id))
                             .tag(NodeModel.Selection.room(room.id))
                             .sidebarRow(model.selection == .room(room.id))
+                            .copyMenu([("Copy Name", room.name)])
                     }
                     ForEach(offers, id: \.fingerprint) { offer in
                         OfferRow(offer: offer).tag(NodeModel.Selection.offer(offer.fingerprint))
                             .sidebarRow(model.selection == .offer(offer.fingerprint))
+                            .copyMenu([("Copy Fingerprint", offer.fingerprint)])
                     }
                 } header: {
                     Text("\(need.words) (\(count))")
@@ -120,7 +129,8 @@ private struct Sidebar: View {
                 ForEach(model.nodes, id: \.name) { node in
                     StateMark(kind: node.state == "attached" ? .live : .plain,
                               words: "\(node.name) \(node.state)")
-                            .accessibilityIdentifier("node-\(node.name)")
+                        .copyMenu([("Copy Name", node.name), ("Copy Fingerprint", node.fingerprint)])
+                        .accessibilityIdentifier("node-\(node.name)")
                 }
             } header: {
                 Text("nodes on this Mac").eyebrow().accessibilityAddTraits(.isHeader)
@@ -237,17 +247,22 @@ private struct TimelineKeys: NSViewRepresentable {
     @Binding var focused: Bool
     /// A key, answered with whether it did anything (a key that does nothing goes on up).
     let key: (TimelineKey) -> Bool
+    /// What ⌘C and Edit › Copy copy while the keyboard is on the timeline: the selected
+    /// messages, or nil when none is.
+    let copied: () -> String?
 
     func makeNSView(context: Context) -> KeyView {
         let view = KeyView()
         view.onFocus = report
         view.onKey = key
+        view.onCopy = copied
         return view
     }
 
     func updateNSView(_ view: KeyView, context: Context) {
         view.onKey = key
         view.onFocus = report
+        view.onCopy = copied
     }
 
     /// Whether the view has the keyboard, written only when it changes, so a render does not
@@ -256,9 +271,21 @@ private struct TimelineKeys: NSViewRepresentable {
         DispatchQueue.main.async { if focused != has { focused = has } }
     }
 
-    final class KeyView: NSView {
+    final class KeyView: NSView, NSMenuItemValidation {
         var onFocus: ((Bool) -> Void)?
         var onKey: ((TimelineKey) -> Bool)?
+        var onCopy: (() -> String?)?
+
+        /// ⌘C and Edit › Copy: the selected messages, one line each (v0.4.1).
+        @objc func copy(_ sender: Any?) {
+            guard let lines = onCopy?(), !lines.isEmpty else { return NSSound.beep() }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(lines, forType: .string)
+        }
+
+        func validateMenuItem(_ item: NSMenuItem) -> Bool {
+            item.action == #selector(copy(_:)) ? !(onCopy?() ?? "").isEmpty : true
+        }
         private var asked: NSObjectProtocol?
         /// Set while Focus Timeline or a row's click hands it the keyboard.
         private var taking = false
@@ -332,16 +359,20 @@ private struct TimelineKeys: NSViewRepresentable {
                 }
                 return
             }
+            let shift = event.modifierFlags.contains(.shift)
             let key: TimelineKey?
             switch event.keyCode {
-            case 126: key = .up
-            case 125: key = .down
+            case 126: key = shift ? .extendUp : .up
+            case 125: key = shift ? .extendDown : .down
             case 36, 76: key = .open // Return, Enter
             case 49: key = .look // Space
             case 53: key = .close // Escape
             default: key = nil
             }
-            // Only the bare key: ⌘↑ and the like are the menus' and the system's.
+            // Only the bare key (⇧ only with ↑/↓): ⌘↑ and the like are the menus' and the system's;
+            // but ⌘↑ on a reply goes to the message it quotes (ADR-028 R-9).
+            let held = event.modifierFlags.intersection([.command, .option, .control, .shift])
+            if event.keyCode == 126, held == .command, onKey?(.quoted) == true { return }
             let bare = event.modifierFlags.intersection([.command, .option, .control]).isEmpty
             if let key, bare, onKey?(key) == true { return }
             super.keyDown(with: event)
@@ -351,7 +382,9 @@ private struct TimelineKeys: NSViewRepresentable {
 
 /// A key the timeline acts on.
 private enum TimelineKey {
-    case up, down, open, look, close
+    /// ⇧↑ and ⇧↓ add the message above or below to the selection (v0.4.1); `quoted`: ⌘↑ on a
+    /// reply, to the message it quotes (ADR-028 R-9).
+    case up, down, extendUp, extendDown, open, look, close, quoted
 }
 
 /// The room on screen: its timeline and a field to post, with its members beside it.
@@ -381,6 +414,8 @@ private struct RoomView: View {
     /// Whether the keyboard is on the timeline (WCAG 2.1.1): ↑/↓ move the selection, Return
     /// opens the selected message's first action, Space Quick Looks its pulled file.
     @State private var timelineFocused = false
+    /// Each drawn row's frame in the timeline, for a drag across rows.
+    @State private var rowFrames: [String: CGRect] = [:]
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -432,18 +467,17 @@ private struct RoomView: View {
                                     ForEach(model.timelineItems) { item in
                                         if let message = item.message {
                                             MessageRow(message: message, me: model.me,
+                                                       quote: model.quote(of: message),
+                                                       jump: { model.jumpTo = $0 },
                                                        readBy: model.readBy[message.id] ?? [],
                                                        pulledBy: model.pulledBy[message.id] ?? [],
                                                        pulled: model.pulled[message.id]) { looking = $0 }
                                                 .frame(maxWidth: .infinity, alignment: .leading)
                                                 .padding(4)
-                                                .selectable(model.selectedMessage == message.id,
+                                                .selectable(model.selectedMessages.contains(message.id),
                                                             focused: timelineFocused
                                                                 && model.selectedMessage == message.id) {
-                                                    model.selectedMessage = message.id
-                                                    // Clicked: the keyboard follows, as in a list.
-                                                    NotificationCenter.default.post(
-                                                        name: .voxFocusTimeline, object: nil)
+                                                    clicked(message.id)
                                                 }
                                                 .reportsFrame(of: message.id)
                                                 .id(message.id)
@@ -458,32 +492,78 @@ private struct RoomView: View {
                                                   let room = model.roomOnScreen {
                                             SessionEntryRow(model: model, room: room, session: session,
                                                             entry: entry) { looking = $0 }
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                                // Selected like a message: ↑/↓ reach it (P14).
+                                                .selectable(model.selectedMessages.contains(item.id),
+                                                            focused: timelineFocused
+                                                                && model.selectedMessage == item.id) {
+                                                    clicked(item.id)
+                                                }
+                                                .accessibilityIdentifier("entry-row-\(entry.id)")
                                                 .id(item.id)
                                         }
                                     }
                                 }
                                 .padding(12)
+                                // A drag from one message to another selects them and those
+                                // between (v0.4.1); a drag inside one message selects its words.
+                                .simultaneousGesture(
+                                    DragGesture(minimumDistance: 6, coordinateSpace: .named("timeline"))
+                                        .onChanged { drag in dragged(from: drag.startLocation, to: drag.location) }
+                                        .onEnded { drag in
+                                            if dragged(from: drag.startLocation, to: drag.location) {
+                                                // The keyboard takes it, so ⌘C copies the rows.
+                                                NotificationCenter.default.post(name: .voxFocusTimeline,
+                                                                                object: nil)
+                                            }
+                                        })
                             }
                             .coordinateSpace(name: "timeline")
                             // **Operable from the keyboard** (WCAG 2.1.1, 2.4.7): see
                             // `TimelineKeys`. The focused row is outlined by `selectable`.
-                            .background(TimelineKeys(focused: $timelineFocused) { key in
+                            .background(TimelineKeys(focused: $timelineFocused, key: { key in
                                 switch key {
                                 case .up: return move(.up, scroller)
                                 case .down: return move(.down, scroller)
+                                case .extendUp: return move(.up, scroller, extending: true)
+                                case .extendDown: return move(.down, scroller, extending: true)
                                 case .open: return openSelected()
                                 case .look: return toggleLook()
                                 case .close: return closeLook()
+                                case .quoted:
+                                    guard let quoted = selected.flatMap({ model.quote(of: $0) }) else {
+                                        return false
+                                    }
+                                    model.jumpTo = quoted.id
+                                    return true
                                 }
-                            })
+                            }, copied: {
+                                model.selectedMessages.isEmpty ? nil : model.copiedLines
+                            }))
+                            // A quote clicked, or ⌘↑ on a reply: the message it quotes, scrolled to
+                            // and selected (ADR-028 R-9). One this room does not hold stays where
+                            // it is.
+                            .onChange(of: model.jumpTo) { id in
+                                guard let id else { return }
+                                model.jumpTo = nil
+                                guard model.byID[id] != nil else { return }
+                                select(id)
+                                withAnimation(Theme.motion(reduced: reduceMotion)) {
+                                    scroller.scrollTo(id, anchor: .center)
+                                }
+                                NotificationCenter.default.post(name: .voxFocusTimeline, object: nil)
+                            }
                             .onReceive(NotificationCenter.default.publisher(for: .voxFocusTimeline)) { _ in
-                                // Taken: the newest row, when none was selected.
-                                if model.selectedMessage == nil, let last = model.messages.last {
-                                    model.selectedMessage = last.id
+                                // Taken: the newest row, when none was selected: a message, or in a
+                                // Session its newest entry (P14).
+                                if model.selectedMessage == nil,
+                                   let last = model.timelineItems.last(where: { $0.message != nil || $0.entry != nil }) {
+                                    select(last.id)
                                     scroller.scrollTo(last.id)
                                 }
                             }
                             .onPreferenceChange(RowFrames.self) { frames in
+                                rowFrames = frames
                                 // Seen: at least half of the row inside the timeline's bounds.
                                 let bounds = CGRect(origin: .zero, size: viewport.size)
                                 inView = Set(frames.compactMap { id, frame in
@@ -581,7 +661,7 @@ private struct RoomView: View {
         // On the room, not its timeline: ⌘O, ⌘↩ and a file from the Finder Services item work
         // wherever the room's focus is.
         .sheet(item: $attaching) { file in
-            AttachSheet(model: model, file: file) { attaching = nil }
+            AttachSheet(model: model, file: file) { attaching = nil }.textSelection(.enabled)
         }
         .onChange(of: model.attachAsked) { _ in
             // After the update, not inside it: a modal panel run from within a view update did
@@ -624,13 +704,31 @@ private struct RoomView: View {
         Divider()
         if let reply = model.replyTo {
             HStack {
-                Text("Replying to \(reply.authorName.isEmpty ? String(reply.author.prefix(12)) : reply.authorName): \(reply.text.prefix(60))")
-                    .lineLimit(1).secondaryText()
+                // The message replied to, as a link to it (ADR-028 R-9).
+                Button { model.jumpTo = reply.id } label: {
+                    Text("Replying to \(reply.authorName.isEmpty ? String(reply.author.prefix(12)) : reply.authorName): \(reply.text.prefix(60))")
+                        .lineLimit(1).secondaryText()
+                }
+                .buttonStyle(.plain)
+                .help("Go to the message you are replying to")
+                .accessibilityIdentifier("replying-to-quote")
                 Spacer()
                 Button("Cancel") { model.replyTo = nil }.buttonStyle(.borderless)
             }
             .padding(.horizontal, 12).padding(.top, 8)
             .accessibilityIdentifier("replying-to")
+        }
+        if !mentions.isEmpty {
+            // Typing @ offers the keyring's members of this room by name (ADR-028 K-4).
+            HStack(spacing: 8) {
+                ForEach(mentions) { member in
+                    Button("@\(member.name)") { mention(member) }
+                        .buttonStyle(.borderless)
+                        .accessibilityIdentifier("mention-\(member.name)")
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 12).padding(.top, 8)
         }
         HStack(spacing: 8) {
             Button {
@@ -642,7 +740,10 @@ private struct RoomView: View {
             .help("Attach a file or folder")
             .accessibilityLabel("Attach a file or folder")
             .accessibilityIdentifier("attach")
-            TextField("Say something to the room", text: $draft)
+            // Up to 12 lines, so a long message is read before it goes; Return sends, ⌥↩ adds a
+            // line (P19).
+            TextField("Say something to the room", text: $draft, axis: .vertical)
+                .lineLimit(1...12)
                 .accessibilityLabel("Message to the room")
                 .textFieldStyle(.plain)
                 .frame(minWidth: Theme.scaled(160), maxWidth: .infinity)
@@ -656,7 +757,13 @@ private struct RoomView: View {
 
     /// Post the draft, To: and replying as set; urgent when asked (⌘↩ or the switch).
     private func send(urgent now: Bool) {
-        let (text, recipients, re) = (draft, Array(to), model.replyTo?.id ?? "")
+        // An @alias typed in full addresses that member, as ticking it in To: does (K-4).
+        let named = draft.split(whereSeparator: \.isWhitespace).compactMap { word -> String? in
+            guard word.hasPrefix("@") else { return nil }
+            let alias = word.dropFirst().trimmingCharacters(in: .punctuationCharacters.subtracting(["#"]))
+            return mentionable.first { $0.name == alias }?.id
+        }
+        let (text, recipients, re) = (draft, Array(to.union(named)), model.replyTo?.id ?? "")
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         draft = ""
         urgent = false
@@ -664,10 +771,37 @@ private struct RoomView: View {
         Task { await model.post(text, to: recipients, urgent: now, re: re) }
     }
 
+    /// The members an @alias can name (ADR-028 K-4): those in the keyring, by the names the node
+    /// gives them (an alias the same as another but for case carries its fingerprint's start).
+    private var mentionable: [NodeModel.MemberRow] { model.members.filter { $0.trust != .none } }
+
+    /// The @word being typed at the end of the draft: what follows "@", or nil.
+    private var mentioning: String? {
+        guard let at = draft.lastIndex(of: "@"),
+              at == draft.startIndex || draft[draft.index(before: at)].isWhitespace else { return nil }
+        let word = draft[draft.index(after: at)...]
+        return word.contains(where: \.isWhitespace) ? nil : String(word)
+    }
+
+    /// The members the @word being typed could name, by the start of their names.
+    private var mentions: [NodeModel.MemberRow] {
+        guard let typed = mentioning?.lowercased() else { return [] }
+        return mentionable.filter { $0.name.lowercased().hasPrefix(typed) }
+    }
+
+    /// `member` picked for the @word being typed: written in full, and addressed (K-4).
+    private func mention(_ member: NodeModel.MemberRow) {
+        guard let at = draft.lastIndex(of: "@") else { return }
+        draft = String(draft[..<at]) + "@\(member.name) "
+        to.insert(member.id)
+    }
+
     /// ↑/↓ on the timeline: the selection moves to the message before or after it, scrolled into
     /// view; with none selected, ↑ takes the newest and ↓ the oldest.
-    private func move(_ direction: MoveCommandDirection, _ scroller: ScrollViewProxy) -> Bool {
-        let ids = model.timelineItems.compactMap { $0.message?.id }
+    private func move(_ direction: MoveCommandDirection, _ scroller: ScrollViewProxy,
+                      extending: Bool = false) -> Bool {
+        // Every drawn row with an identity: a message, or a Session's entry or request (P14).
+        let ids = model.timelineItems.filter { $0.message != nil || $0.entry != nil }.map(\.id)
         guard !ids.isEmpty else { return false }
         let at = model.selectedMessage.flatMap { ids.firstIndex(of: $0) }
         let next: Int
@@ -676,10 +810,65 @@ private struct RoomView: View {
         case .down: next = at.map { min($0 + 1, ids.count - 1) } ?? 0
         default: return false
         }
-        model.selectedMessage = ids[next]
+        if extending { extend(to: ids[next]) } else { select(ids[next]) }
         withAnimation(Theme.motion(reduced: reduceMotion)) {
             scroller.scrollTo(ids[next])
         }
+        return true
+    }
+
+    /// The messages in the timeline's order, oldest first.
+    private var messageIDs: [String] { model.timelineItems.compactMap { $0.message?.id } }
+
+    /// One message selected, alone: where a range starts.
+    private func select(_ id: String) {
+        model.selectedMessage = id
+        model.selectedMessages = [id]
+        model.selectionAnchor = id
+    }
+
+    /// The messages from the range's start to `id`, selected; the keyboard on `id`.
+    private func extend(to id: String) {
+        let ids = messageIDs
+        guard let from = ids.firstIndex(of: model.selectionAnchor ?? id),
+              let to = ids.firstIndex(of: id) else { return select(id) }
+        model.selectedMessages = Set(ids[min(from, to)...max(from, to)])
+        model.selectedMessage = id
+    }
+
+    /// A row clicked: alone; with ⌘, added or taken out; with ⇧, the range to it. The keyboard
+    /// follows, as in a list.
+    private func clicked(_ id: String) {
+        let flags = NSEvent.modifierFlags
+        if flags.contains(.command) {
+            if model.selectedMessages.contains(id) {
+                model.selectedMessages.remove(id)
+            } else {
+                model.selectedMessages.insert(id)
+            }
+            model.selectedMessage = id
+            model.selectionAnchor = id
+        } else if flags.contains(.shift), model.selectionAnchor != nil {
+            extend(to: id)
+        } else {
+            select(id)
+        }
+        NotificationCenter.default.post(name: .voxFocusTimeline, object: nil)
+    }
+
+    /// A drag in the timeline from `start` to `now`: when it reaches from one message to another,
+    /// those two and every message between are selected. Whether it did.
+    @discardableResult
+    private func dragged(from start: CGPoint, to now: CGPoint) -> Bool {
+        let rows = rowFrames.filter { model.byID[$0.key] != nil }
+        // The row under `y`, else the nearest (the gaps between rows, or past the last).
+        func row(at y: CGFloat) -> String? {
+            func away(_ f: CGRect) -> CGFloat { y < f.minY ? f.minY - y : y > f.maxY ? y - f.maxY : 0 }
+            return rows.min { away($0.value) < away($1.value) }?.key
+        }
+        guard let first = row(at: start.y), let last = row(at: now.y), first != last else { return false }
+        model.selectionAnchor = first
+        extend(to: last)
         return true
     }
 
@@ -746,6 +935,11 @@ private struct RoomView: View {
 private struct MessageRow: View {
     let message: RoomMessage
     let me: String
+    /// What it replies to, quoted (ADR-028 R-9): the message's id, and "<who>: <first line>", or
+    /// nil words while this room does not hold it.
+    let quote: (id: String, words: String?)?
+    /// Go to a quoted message.
+    let jump: (String) -> Void
     /// Who has read it, when it is this node's own (R-6).
     let readBy: [String]
     /// Who has pulled it, verified, when it is this node's own share (#498).
@@ -767,6 +961,17 @@ private struct MessageRow: View {
                         .accessibilityIdentifier("late-\(message.id)")
                 }
             }
+            if let quote {
+                // The message it replies to, one level, as a link to it (ADR-028 R-9).
+                Button { jump(quote.id) } label: {
+                    Text("re \(quote.words ?? "a message this room does not hold yet")")
+                        .italic().secondaryText().lineLimit(1).truncationMode(.tail)
+                }
+                .buttonStyle(.plain)
+                .disabled(quote.words == nil)
+                .help(quote.words == nil ? "This room does not hold it yet" : "Go to the message it replies to (⌘↑)")
+                .accessibilityIdentifier("quote-\(message.id)")
+            }
             if let file = message.file {
                 FileCard(file: file, image: message.image, pulled: pulled, look: look)
             }
@@ -778,16 +983,16 @@ private struct MessageRow: View {
                 LinkCardView(card: card)
             }
             if !pulledBy.isEmpty {
+                // No label of its own: a selectable Text with one sends SwiftUI's accessibility
+                // into endless recursion. Its words are what it says.
                 Text("pulled by \(pulledBy.joined(separator: ", "))")
                     .caption().secondaryText()
                     .accessibilityIdentifier("pulled-by-\(message.id)")
-                    .accessibilityLabel("pulled by \(pulledBy.joined(separator: ", "))")
             }
             if !readBy.isEmpty {
                 Text("read by \(readBy.joined(separator: ", "))")
                     .caption().secondaryText()
                     .accessibilityIdentifier("read-by-\(message.id)")
-                    .accessibilityLabel("read by \(readBy.joined(separator: ", "))")
             }
         }
         // VoiceOver reads the row first as one sentence, in the order it is drawn; its parts
@@ -818,10 +1023,7 @@ private struct MessageRow: View {
     /// A share's text is its note.
     private var shownText: String { message.file?.note ?? message.text }
 
-    private var author: String {
-        if message.author == me { return "you" }
-        return message.authorName.isEmpty ? String(message.author.prefix(12)) : message.authorName
-    }
+    private var author: String { NodeModel.author(message, me: me) }
 }
 
 /// A file or folder offered in the room (ADR-028 F-1): its name, size and SHA-256, as the share's
@@ -944,6 +1146,7 @@ private struct Inspector: View {
                 .accessibilityAddTraits(.isHeader)
             ForEach(model.members) { member in
                 TrustMark(name: member.name, trust: member.trust)
+                    .copyMenu([("Copy Name", member.name), ("Copy Fingerprint", member.id)])
                     .accessibilityIdentifier("member-\(member.name)")
                 // What this node's keyring grants it (K-14), once it is in the keyring.
                 if member.trust != .none {
@@ -953,13 +1156,17 @@ private struct Inspector: View {
                 }
                 // The platform its node says it runs on (ADR-020 §4.9b): its claim, said as one.
                 if let platform = model.platforms[member.id] {
-                    Text("says it runs on \(Platform.words(platform))")
-                        .font(Theme.mono).secondaryText()
-                        .padding(.leading, 18)
-                        // Not selectable: a selectable Text with its own label sent SwiftUI's
-                        // accessibility into endless recursion, and the app crashed when read.
-                        .accessibilityLabel("\(member.name) says it runs on \(Platform.words(platform))")
-                        .accessibilityIdentifier("member-platform-\(member.name)")
+                    // Selectable, so its label is on a container that hides the Text: a selectable
+                    // Text with its own label sent SwiftUI's accessibility into endless recursion,
+                    // and the app crashed when read.
+                    HStack {
+                        Text("says it runs on \(Platform.words(platform))")
+                            .font(Theme.mono).secondaryText()
+                    }
+                    .padding(.leading, 18)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("\(member.name) says it runs on \(Platform.words(platform))")
+                    .accessibilityIdentifier("member-platform-\(member.name)")
                 }
             }
             Divider().padding(.vertical, 8)

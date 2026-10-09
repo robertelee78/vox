@@ -267,6 +267,26 @@ private struct SelectionMark: ViewModifier {
     }
 }
 
+/// A warning, before an alias is given, that the keyring holds another that equals it but for case
+/// (ADR-028 K-4): both are then shown with their fingerprint's first characters. Nothing when
+/// there is no clash.
+struct AliasClash: View {
+    @ObservedObject var model: NodeModel
+    let alias: String
+    /// The node being renamed, whose own alias is no clash.
+    var except: String? = nil
+
+    var body: some View {
+        if let other = clashingAlias(
+            others: model.trusted.filter { $0.fingerprint != except }.map(\.name), alias: alias) {
+            StateMark(kind: .attention,
+                      words: "Your keyring already has \(other), the same but for case: both will "
+                          + "be shown with the first characters of their fingerprints.")
+                .accessibilityIdentifier("alias-clash")
+        }
+    }
+}
+
 extension View {
     /// Draw as secondary text.
     func secondaryText() -> some View { modifier(SecondaryText()) }
@@ -317,6 +337,20 @@ extension View {
             .onTapGesture(perform: select)
             .accessibilityAddTraits(.isButton)
             .accessibilityAction(.default, select)
+    }
+
+    /// A right-click Copy for what a row names, each item copying its words (the decider, v0.4.1:
+    /// all text can be copied): for rows whose words cannot be selected, as a navigation list's
+    /// rows are, where a drag selects the row. Empty words give no item.
+    func copyMenu(_ items: [(title: String, words: String)]) -> some View {
+        contextMenu {
+            ForEach(items.filter { !$0.words.isEmpty }, id: \.title) { item in
+                Button(item.title) {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(item.words, forType: .string)
+                }
+            }
+        }
     }
 
     /// The content surface: bg.base, text.primary (L-6).

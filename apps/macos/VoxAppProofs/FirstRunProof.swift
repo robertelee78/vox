@@ -24,6 +24,13 @@
 //    is read, and bob's `vox room read --json` says alice read it; one bob posts while alice's
 //    app is hidden is not read, until she brings it back; a message alice posts, read by bob's
 //    agent drain (`vox agent hook`), shows "read by bob" under it in her timeline.
+//    A reply quotes what it answers (ADR-028 R-9, D6): bob's reply to FROM-ALICE shows "re you:
+//    FROM-ALICE" above it, and its quote, clicked, or ⌘↑ with the reply selected, selects FROM-ALICE.
+//    To: offers bob's open Session under him (MADR W-4, ADR-029 TA-1, D7): ticked, alice's post is
+//    addressed to that Session alone, <bob>/<session>, as bob's node holds it.
+//    @alias (ADR-028 K-4, D8): "@b" offers @bob, and picked, it addresses bob. Step 5 warns of an
+//    alias the same as bob's but for case before it is given, and (5b) with carol trusted as "Bob",
+//    bob is told apart in mission's members as bob#<his fingerprint's first 6>.
 // 5. The keyring view (ADR-014 M-16, ADR-028 K-3, E-5, #443): a pasted fingerprint with an alias
 //    says what trusting does before it is done, and is listed, as `vox trust list` lists it;
 //    removing it says what removing does first, and only then removes it.
@@ -81,6 +88,11 @@
 // Untrust that leaves a member's live sessions running: (11) goes red. An app that counts
 // nothing from before it opened (no seeding from VoxClient.unread): (13) goes red. ↑/↓ that do not
 // move the selection, or Space and Return that open nothing: (14) goes red.
+// A quote that goes nowhere (MessageRow's quote button not calling `jump`): (4) goes red.
+// To: that ticks the member for one of its Sessions (the Session's tick inserting the member's
+// fingerprint alone): (4) goes red.
+// An @alias picked that is only written, not addressed: (4) goes red. The FFI's names() without
+// the clash suffix: (5) goes red.
 
 // Every check on the window proves its own query first (ADR-018: a red names its side): Vox is in
 // front and XCTest reads words in what it shows, else the red is APPARATUS; then a red is PRODUCT
@@ -230,6 +242,9 @@ final class FirstRunProof: XCTestCase {
     /// Set while the proof itself has hidden or quit Vox (⌘H, ⌘Q), until Vox is active again:
     /// what takes the foreground meanwhile was handed it by the proof, not taken.
     private var handedOff = false
+    /// The person's clipboard as it was before the case: every item, every type, restored exactly
+    /// in tearDown, red or green (app-proofs.sh restores it too, should the runner itself die).
+    private var keptPasteboard: [[NSPasteboard.PasteboardType: Data]] = []
 
     override func setUpWithError() throws {
         // A case stops at its first red: one red, with its side, and no cascade behind it. A
@@ -237,6 +252,9 @@ final class FirstRunProof: XCTestCase {
         // red; whoever runs it keeps out any mutant whose red could follow from another's. A
         // case's closing `[proof]` line still prints there, and holds only in a run with no red.
         continueAfterFailure = ProcessInfo.processInfo.environment["VOX_PROOF_CONTINUE"] == "1"
+        keptPasteboard = (NSPasteboard.general.pasteboardItems ?? []).map { item in
+            Dictionary(uniqueKeysWithValues: item.types.compactMap { t in item.data(forType: t).map { (t, $0) } })
+        }
         stager = try Stager.fromEnvironment()
         let workspace = NSWorkspace.shared
         watchingVox = workspace.notificationCenter.addObserver(
@@ -277,6 +295,15 @@ final class FirstRunProof: XCTestCase {
         if let watchingForeground { NSWorkspace.shared.notificationCenter.removeObserver(watchingForeground) }
         if let watchingVox { NSWorkspace.shared.notificationCenter.removeObserver(watchingVox) }
         daemon?.terminate()
+        // The person's clipboard back, exactly as it was.
+        let board = NSPasteboard.general
+        board.clearContents()
+        let items = keptPasteboard.map { kept -> NSPasteboardItem in
+            let item = NSPasteboardItem()
+            for (type, data) in kept { item.setData(data, forType: type) }
+            return item
+        }
+        if !items.isEmpty { board.writeObjects(items) }
         super.tearDown()
     }
 
@@ -1467,8 +1494,14 @@ final class FirstRunProof: XCTestCase {
               "a wrong passphrase must show the daemon's own sentence where it was typed",
               until: { $0.lowercased().contains("that passphrase does not open node alice's identity") })
 
-        // (2) The right one attaches it.
-        type(ui, field, "alice identity", "the passphrase field")
+        // (2) The right one attaches it, pasted with ⌘V, as from a password manager (v0.4.1).
+        if let held = paste(ui, field, "alice identity", "the passphrase field") {
+            if held.count != "alice identity".count {
+                XCTFail("PRODUCT: ⌘V into the passphrase field must paste the passphrase on the pasteboard (\("alice identity".count) characters); the field holds \(held.count)")
+            }
+        } else if locate(ui, field) != nil {
+            XCTFail("APPARATUS: XCTest reads no value from the passphrase field after ⌘V")
+        }
         tap(ui, Key.id("attach"), "Attach")
         present(ui, Key.id("attached"), timeout: 60,
                 "the right passphrase must attach node alice")
@@ -1605,6 +1638,29 @@ final class FirstRunProof: XCTestCase {
         }
         XCTAssertTrue(readByAlice.contains("alice"),
                       "PRODUCT: bob's message drawn in alice's timeline must be read: bob's `vox room read --json` must say alice read it; it says read_by \(readByAlice)")
+        // Bob's message, selected by dragging across it and copied, as a person copies what a
+        // member wrote (v0.4.1).
+        if windowReadable(ui) {
+            if let body = textSaying(ui, "NEEDS-YOU") {
+                let copied = selectAndCopy(ui, body, "bob's message NEEDS-YOU")
+                XCTAssertEqual(copied, "NEEDS-YOU",
+                               "PRODUCT: bob's message, selected by dragging across it and copied with ⌘C, must put NEEDS-YOU on the pasteboard; it holds \(copied.debugDescription)")
+            } else {
+                keepTree(ui, "no Text says exactly NEEDS-YOU")
+                XCTFail("APPARATUS: XCTest finds no element whose words are exactly NEEDS-YOU, though bob's message was read on alice's screen")
+            }
+        }
+        // A sidebar row's name, whose words a drag cannot select (it selects the row): copied
+        // from its right-click Copy Name (v0.4.1).
+        let missionRow = Key.id("room-mission")
+        if present(ui, missionRow, timeout: 10, "the sidebar must list mission") {
+            let named = copiedBy(ui, {
+                self.el(ui, missionRow).rightClick()
+                self.tap(ui, Key.menuItem("Copy Name"), "Copy Name in mission's right-click menu")
+            })
+            XCTAssertEqual(named, "mission",
+                           "PRODUCT: Copy Name in the right-click menu of mission's sidebar row must put mission on the pasteboard; it holds \(named.debugDescription)")
+        }
         // Hidden (⌘H), alice's app shows nobody bob's next message: it is not read.
         handOff(ui, "h")
         XCTAssertTrue(ui.wait(for: .runningBackground, timeout: 10),
@@ -1643,7 +1699,12 @@ final class FirstRunProof: XCTestCase {
         // Alice posts; bob's agent reads it in a drain, as a harness does before every prompt.
         let compose = Key.id("compose")
         present(ui, compose, timeout: 10, "the room must have a field to post")
-        type(ui, compose, "FROM-ALICE\r", "the composer")
+        // Pasted (⌘V), then sent with Return (v0.4.1).
+        let composed = paste(ui, compose, "FROM-ALICE", "the composer")
+        if composed != "FROM-ALICE" {
+            XCTFail("PRODUCT: ⌘V into the composer must paste FROM-ALICE; it holds \(composed.debugDescription)")
+        }
+        el(ui, compose).typeText("\r")
         var drained = ""
         let drainUntil = Date().addingTimeInterval(60)
         while Date() < drainUntil && !drained.contains("FROM-ALICE") {
@@ -1662,6 +1723,262 @@ final class FirstRunProof: XCTestCase {
                               until: { $0 == "read by bob" }) ?? ""
         print("[proof] bob's message read by \(readByAlice); alice's message: \(readWords)")
 
+        // (4b) Several messages copied at once (v0.4.1): three of bob's, by a drag from the first
+        // to the last, by ⇧-click, by ⌘-click with Edit › Copy, and by ⇧↑ from the keyboard. Each
+        // copies "<author>, <time>: <text>" lines, oldest first, the times as alice's node has them.
+        let three = ["COPY ONE", "COPY TWO", "COPY THREE"]
+        for text in three {
+            try staged(vox, ["room", "post", "--node", "bob", room, text], env: voxEnv)
+        }
+        var postedAt: [String: UInt64] = [:]
+        let postedUntil = Date().addingTimeInterval(60)
+        while Date() < postedUntil && postedAt.count < three.count {
+            let rows = run(vox, ["room", "read", "--node", "alice", "--json", room], env: voxEnv).out
+            for line in rows.split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      let text = row["text"] as? String, three.contains(text),
+                      let at = (row["created_millis"] as? NSNumber)?.uint64Value else { continue }
+                postedAt[text] = at
+            }
+            if postedAt.count < three.count { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        guard postedAt.count == three.count else {
+            throw Apparatus("alice's `vox room read --json` holds \(postedAt.count) of bob's three COPY posts after 60 s")
+        }
+        let want = three.sorted { postedAt[$0]! < postedAt[$1]! }
+            .map { "bob, \(copiedTime(postedAt[$0]!)): \($0)" }.joined(separator: "\n")
+        var shownRows: [XCUIElement] = []
+        for text in three {
+            let until = Date().addingTimeInterval(30)
+            var row: XCUIElement?
+            while Date() < until && row == nil {
+                row = rowSaying(ui, "bob: \(text)")
+                if row == nil { Thread.sleep(forTimeInterval: 0.25) }
+            }
+            guard let row else {
+                keepTree(ui, "no row says bob: \(text)")
+                XCTFail("PRODUCT: alice's timeline must show bob's \(text) as its own row within 30 s")
+                return
+            }
+            shownRows.append(row)
+        }
+        // A click on a row's empty right side selects the row, never its words.
+        func click(_ row: XCUIElement, _ keys: XCUIElement.KeyModifierFlags = []) {
+            if !inView(ui, row) { scrollTo(ui, row) }
+            let at = row.coordinate(withNormalizedOffset: CGVector(dx: 0.97, dy: 0.5))
+            XCUIElement.perform(withKeyModifiers: keys) { at.click() }
+        }
+        func check(_ how: String, _ copied: String) {
+            XCTAssertEqual(copied, want,
+                           "PRODUCT: bob's three messages, \(how), must copy as \(want.debugDescription); the pasteboard holds \(copied.debugDescription)")
+        }
+        // A drag from the first message's words to the last's.
+        if let first = textSaying(ui, three[0]), let last = textSaying(ui, three[2]) {
+            check("selected by a drag from the first to the last and copied with ⌘C", copiedBy(ui, {
+                let from = first.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.5)).withOffset(CGVector(dx: 1, dy: 0))
+                let to = last.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.5)).withOffset(CGVector(dx: -1, dy: 0))
+                from.click(forDuration: 0.3, thenDragTo: to)
+                ui.typeKey("c", modifierFlags: .command)
+            }))
+        } else {
+            keepTree(ui, "no Text says exactly a COPY post")
+            XCTFail("APPARATUS: XCTest finds no element whose words are exactly COPY ONE and COPY THREE, though their rows are shown")
+        }
+        check("the first clicked and the last ⇧-clicked, copied with ⌘C", copiedBy(ui, {
+            click(shownRows[0])
+            click(shownRows[2], .shift)
+            ui.typeKey("c", modifierFlags: .command)
+        }))
+        check("the first clicked and the others ⌘-clicked, copied with Edit › Copy", copiedBy(ui, {
+            click(shownRows[0])
+            click(shownRows[1], .command)
+            click(shownRows[2], .command)
+            ui.menuBars.menuBarItems["Edit"].click()
+            self.tap(ui, Key.menuItem("Copy"), "Edit › Copy")
+        }))
+        check("the last clicked and ⇧↑ pressed twice, copied with ⌘C", copiedBy(ui, {
+            click(shownRows[2])
+            ui.typeKey(.upArrow, modifierFlags: .shift)
+            ui.typeKey(.upArrow, modifierFlags: .shift)
+            ui.typeKey("c", modifierFlags: .command)
+        }))
+        print("[proof] three messages copied four ways: \(want.debugDescription)")
+
+        // (4c) A reply quotes what it answers, and the quote goes to it (ADR-028 R-9, D6): bob
+        // replies to FROM-ALICE; alice's timeline shows "re you: FROM-ALICE" above his reply, and
+        // clicking it, or ⌘↑ with the reply selected, selects FROM-ALICE.
+        func entry(_ text: String) -> String? {
+            let rows = run(vox, ["room", "read", "--node", "alice", "--json", room], env: voxEnv).out
+            for line in rows.split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      (row["text"] as? String)?.contains(text) == true else { continue }
+                return row["entry_hash"] as? String
+            }
+            return nil
+        }
+        guard let fromAlice = entry("FROM-ALICE") else {
+            throw Apparatus("alice's `vox room read --json` holds no FROM-ALICE to reply to")
+        }
+        try staged(vox, ["room", "post", "--node", "bob", "--re", fromAlice, room, "REPLY-TO-ALICE"],
+                   env: voxEnv)
+        let quote = Key.idPrefix("quote-")
+        words(ui, quote, timeout: 30,
+              "bob's reply must show what it replies to, quoted above it: \"re you: FROM-ALICE\"",
+              until: { $0 == "re you: FROM-ALICE" })
+        func selectedRow(_ start: String) -> Bool? {
+            let row = ui.windows.firstMatch.descendants(matching: .any)
+                .matching(NSPredicate(format: "label BEGINSWITH %@", start)).firstMatch
+            return row.exists ? row.isSelected : nil
+        }
+        func reaches(_ how: String, _ act: () -> Void) {
+            // From the reply, so a selection of FROM-ALICE is the jump's.
+            tap(ui, Key.showing("bob: REPLY-TO-ALICE"), "bob's reply")
+            act()
+            let until = Date().addingTimeInterval(5)
+            var now = selectedRow("you: FROM-ALICE")
+            while Date() < until && now != true {
+                Thread.sleep(forTimeInterval: 0.2)
+                now = selectedRow("you: FROM-ALICE")
+            }
+            switch now {
+            case nil:
+                keepTree(ui, "no row starts \"you: FROM-ALICE\"")
+                XCTFail("APPARATUS: XCTest finds no row saying \"you: FROM-ALICE\", though its reply quotes it")
+            case false?:
+                XCTFail("PRODUCT: \(how) must select the message the reply quotes, FROM-ALICE; it is not selected")
+            case true?:
+                break
+            }
+        }
+        reaches("clicking the reply's quote") { tap(ui, quote, "the reply's quote") }
+        reaches("⌘↑ with the reply selected") { ui.typeKey(.upArrow, modifierFlags: .command) }
+        print("[proof] bob's reply quotes \"re you: FROM-ALICE\", and its quote and ⌘↑ go to it")
+
+        // (4d) To: offers bob's open Session under him, and a message to it alone is addressed to
+        // that Session (MADR W-4, ADR-029 TA-1, D7): bob's Claude Code session opens a Session in
+        // mission by its hook, as a person's does; alice ticks it in To: and posts; bob's node holds
+        // the post addressed to <bob>/<session>, as `vox room post --to bob/<session>` sends it.
+        let d7Session = "d7-proof-session"
+        let opened = run(vox, ["agent", "hook", "--node", "bob", "--room", room, "--format", "text"],
+                         env: voxEnv.merging(["CLAUDE_CODE_ENTRYPOINT": "cli"]) { $1 },
+                         input: "{\"session_id\":\"\(d7Session)\",\"hook_event_name\":\"UserPromptSubmit\",\"cwd\":\"/tmp\",\"transcript_path\":\"/tmp/t.jsonl\",\"prompt\":\"go\"}")
+        guard opened.status == 0 else {
+            throw Apparatus("bob's Claude Code hook, to open a Session in mission, exited \(opened.status): \(opened.out)")
+        }
+        let sessionsUntil = Date().addingTimeInterval(30)
+        var listed = ""
+        while Date() < sessionsUntil && !listed.contains(d7Session.prefix(8)) {
+            listed = run(vox, ["room", "sessions", "--node", "alice", room], env: voxEnv).out
+            if !listed.contains(d7Session.prefix(8)) { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        guard listed.contains(d7Session.prefix(8)) else {
+            throw Apparatus("alice's `vox room sessions` never listed bob's Session \(d7Session) in 30 s: \(listed)")
+        }
+        let toBox = Key.id("compose-to")
+        tap(ui, toBox, "To:")
+        // By its own id: bob has another Session open in mission (bob-proof, his hook's from step 4).
+        tap(ui, Key.id("to-bob-\(d7Session.prefix(8))"), "bob's open Session \(d7Session) under bob in To:",
+            premise: Premise("alice's `vox room sessions` lists bob's open Session \(d7Session)") {
+                let now = self.run(vox, ["room", "sessions", "--node", "alice", room], env: voxEnv).out
+                return (now.contains(d7Session.prefix(8)), now)
+            })
+        ui.typeKey(.escape, modifierFlags: [])
+        type(ui, Key.id("compose"), "TO-BOB-SESSION\r", "the composer")
+        var addressedTo: [String] = []
+        let addressedUntil = Date().addingTimeInterval(30)
+        while Date() < addressedUntil && addressedTo.isEmpty {
+            let rows = run(vox, ["room", "read", "--node", "bob", "--json", room], env: voxEnv).out
+            for line in rows.split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      (row["text"] as? String)?.contains("TO-BOB-SESSION") == true else { continue }
+                addressedTo = (row["envelope"] as? [String: Any])?["to"] as? [String] ?? ["(not addressed)"]
+            }
+            if addressedTo.isEmpty { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        XCTAssertTrue(addressedTo.count == 1 && addressedTo[0].hasSuffix("/\(d7Session)")
+                      && addressedTo[0].lowercased().hasPrefix(bobFp.lowercased()),
+                      "PRODUCT: alice's post with bob's Session ticked in To: must be addressed to that Session alone, <bob>/\(d7Session); bob's node holds it addressed to \(addressedTo)")
+        print("[proof] To: bob's Session: the post is addressed to \(addressedTo)")
+
+        // (4e) @alias (ADR-028 K-4, D8): typing "@b" in the composer offers @bob; picked, it is
+        // written in full and bob is addressed, as ticking him in To: does.
+        // From an empty To:: bob's d7 Session, ticked in 4d, stays ticked in the room after its post.
+        tap(ui, Key.id("compose-to"), "To:")
+        tap(ui, Key.id("to-bob-\(d7Session.prefix(8))"), "bob's Session \(d7Session), ticked in 4d, to untick it")
+        ui.typeKey(.escape, modifierFlags: [])
+        words(ui, Key.id("compose-to"), timeout: 10, "To: with bob's Session unticked must say the room",
+              until: { $0 == "To: the room" })
+        let composeBox = Key.id("compose")
+        type(ui, composeBox, "MENTION @b", "the composer")
+        tap(ui, Key.id("mention-bob"), "@bob offered for \"@b\"",
+            premise: member(vox, voxEnv, room, bobFp, "bob"))
+        words(ui, Key.id("compose-to"), timeout: 10, "@bob picked must address bob, as To: says",
+              until: { $0 == "To: bob" })
+        el(ui, composeBox).typeText("\r")
+        var mentionedTo: [String] = []
+        let mentionUntil = Date().addingTimeInterval(30)
+        while Date() < mentionUntil && mentionedTo.isEmpty {
+            let rows = run(vox, ["room", "read", "--node", "bob", "--json", room], env: voxEnv).out
+            for line in rows.split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      (row["text"] as? String)?.contains("MENTION @bob") == true else { continue }
+                mentionedTo = (row["envelope"] as? [String: Any])?["to"] as? [String] ?? ["(not addressed)"]
+            }
+            if mentionedTo.isEmpty { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        XCTAssertEqual(mentionedTo.map { $0.lowercased() }, [bobFp.lowercased()],
+                       "PRODUCT: \"MENTION @bob\", @bob picked in the composer, must be addressed to bob; bob's node holds it addressed to \(mentionedTo)")
+
+        // (4e2) The composer takes more than one line (P19): ⌥↩ adds a line, Return sends both.
+        type(ui, Key.id("compose"), "LINE ONE", "the composer")
+        el(ui, Key.id("compose")).typeKey(.return, modifierFlags: .option)
+        el(ui, Key.id("compose")).typeText("LINE TWO\r")
+        var twoLines: String?
+        let linesUntil = Date().addingTimeInterval(30)
+        while Date() < linesUntil && twoLines == nil {
+            let rows = run(vox, ["room", "read", "--node", "bob", "--json", room], env: voxEnv).out
+            for line in rows.split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      let text = row["text"] as? String, text.contains("LINE TWO") else { continue }
+                twoLines = text
+            }
+            if twoLines == nil { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        XCTAssertEqual(twoLines, "LINE ONE\nLINE TWO",
+                       "PRODUCT: \"LINE ONE\", ⌥↩, \"LINE TWO\", Return in the composer must post one message of two lines; bob's node holds \(twoLines.debugDescription)")
+
+        // (4f) ↑/↓ reach a Session's entries (P14): bob grants alice drive, so she reads inside his
+        // Session; with it shown, View > Focus Timeline selects its newest entry and ↑ the one
+        // before it, as among messages.
+        try staged(vox, ["trust", "drive", "--node", "bob", aliceFp,
+                         "--identity-passphrase-file", bobPass], env: voxEnv)
+        let again = run(vox, ["agent", "hook", "--node", "bob", "--room", room, "--format", "text"],
+                        env: voxEnv.merging(["CLAUDE_CODE_ENTRYPOINT": "cli"]) { $1 },
+                        input: "{\"session_id\":\"\(d7Session)\",\"hook_event_name\":\"UserPromptSubmit\",\"cwd\":\"/tmp\",\"transcript_path\":\"/tmp/t.jsonl\",\"prompt\":\"again\"}")
+        guard again.status == 0 else {
+            throw Apparatus("bob's Claude Code hook, to write a second entry in his Session, exited \(again.status): \(again.out)")
+        }
+        tap(ui, Key.id("session-\(d7Session.prefix(8))"), "bob's Session in mission's Sessions")
+        let entryRows = ui.windows.firstMatch.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH %@", "entry-row-"))
+        let entriesUntil = Date().addingTimeInterval(30)
+        while Date() < entriesUntil && entryRows.count < 2 { Thread.sleep(forTimeInterval: 0.5) }
+        guard entryRows.count >= 2 else {
+            keepTree(ui, "bob's Session shows fewer than two entries")
+            throw Product("bob's Session, shown to alice whom bob trusts with drive, must show its two entries; it shows \(entryRows.count)")
+        }
+        let rows = entryRows.allElementsBoundByIndex.sorted { $0.frame.minY < $1.frame.minY }
+        ui.typeKey("t", modifierFlags: [.command, .control])
+        func onlySelected(_ want: XCUIElement, _ how: String) {
+            let until = Date().addingTimeInterval(5)
+            while Date() < until && !want.isSelected { Thread.sleep(forTimeInterval: 0.2) }
+            XCTAssertTrue(want.isSelected && rows.filter(\.isSelected).count == 1,
+                          "PRODUCT: \(how) must select \(want.identifier) alone; selected: \(rows.filter(\.isSelected).map(\.identifier))")
+        }
+        onlySelected(rows[rows.count - 1], "View > Focus Timeline on bob's Session")
+        ui.typeKey(.upArrow, modifierFlags: [])
+        onlySelected(rows[rows.count - 2], "↑ from the newest entry")
+
         // (5) The keyring: carol, a node made here, added by her pasted fingerprint, then removed.
         try staged(vox, ["node", "create", "carol"],
                    env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "carol identity"]) { $1 })
@@ -1669,8 +1986,19 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("keyring"), "Keyring in the sidebar")
         let addFp = Key.id("keyring-add-fingerprint")
         present(ui, addFp, timeout: 10, "the keyring view must offer to add a node")
-        type(ui, addFp, carolFp, "the fingerprint field")
+        // Pasted from Edit › Paste, as the field invites ("paste or type", v0.4.1).
+        let pastedFp = paste(ui, addFp, carolFp, "the fingerprint field", fromMenu: true)
+        if pastedFp != carolFp {
+            XCTFail("PRODUCT: Edit › Paste into the fingerprint field must paste carol's fingerprint \(carolFp); it holds \(pastedFp.debugDescription)")
+        }
         let addAlias = Key.id("keyring-add-alias")
+        // An alias the same as bob's but for case is warned of before it is given (K-4, D8).
+        type(ui, addAlias, "BOB", "the alias field")
+        words(ui, Key.id("alias-clash"), timeout: 10,
+              "an alias the same as bob's but for case must be warned of before it is given",
+              until: { $0.contains("Your keyring already has bob") })
+        el(ui, addAlias).typeKey("a", modifierFlags: .command)
+        el(ui, addAlias).typeText(XCUIKeyboardKey.delete.rawValue)
         type(ui, addAlias, "carol", "the alias field")
         // The effect sentences are Texts: their words are their accessibility value.
         words(ui, Key.id("keyring-add-effect"), timeout: 10,
@@ -1680,6 +2008,11 @@ final class FirstRunProof: XCTestCase {
         let carolRow = Key.id("keyring-row-carol")
         keyringPassphraseIfAsked(ui) { self.locate(ui, carolRow) != nil }
         present(ui, carolRow, timeout: 30, "carol, once trusted, must be listed in the keyring view")
+        // Her grouped fingerprint, selected and copied, as a person copies it to compare (v0.4.1).
+        let copiedFp = selectAndCopy(ui, Key.id("keyring-fingerprint-carol"), "carol's grouped fingerprint")
+        if copiedFp.filter({ !$0.isWhitespace }) != carolFp {
+            XCTFail("PRODUCT: carol's grouped fingerprint, selected by dragging across it and copied with ⌘C, must put her fingerprint \(carolFp) on the pasteboard; it holds \(copiedFp.debugDescription)")
+        }
         let trustList = run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out
         XCTAssertTrue(trustList.contains(carolFp),
                       "PRODUCT: `vox trust list` must list carol once the app trusted her; it said: \(trustList)")
@@ -1705,6 +2038,17 @@ final class FirstRunProof: XCTestCase {
             XCTFail("PRODUCT: once untrusted, carol must be gone from the keyring view; it still shows \"\(shown(row))\"")
         }
         print("[proof] keyring: added and listed carol, then removed her after saying what removing does")
+
+        // (5b) Two aliases the same but for case are told apart (ADR-028 K-4, D8): carol trusted as
+        // "Bob", bob is shown in mission's members as bob#<his fingerprint's first 6>.
+        try staged(vox, ["trust", "add", "--node", "alice", carolFp, "--name", "Bob",
+                         "--identity-passphrase-file", alicePass], env: voxEnv)
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
+        present(ui, Key.id("member-bob#\(bobFp.prefix(6).lowercased())"), timeout: 30,
+                "with carol trusted as \"Bob\", bob must be told apart in mission's members as bob#\(bobFp.prefix(6).lowercased())",
+                premise: trusted(vox, voxEnv, carolFp, "Bob"))
+        try staged(vox, ["trust", "remove", "--node", "alice", carolFp,
+                         "--identity-passphrase-file", alicePass], env: voxEnv)
 
         }
 
@@ -2717,6 +3061,93 @@ final class FirstRunProof: XCTestCase {
             view.scroll(byDeltaX: 0, deltaY: down ? -200 : 200)
             if e.frame == now { return }
         }
+    }
+
+    /// Paste `text` into `key` as a person does (the decider, v0.4.1: "All input fields, I
+    /// should be able to paste into"): put on the pasteboard, the field clicked, then ⌘V, or Edit ›
+    /// Paste from the menu bar. What the field then holds (a secure field's value is one bullet per
+    /// character), or nil when the field was not reached. The person's clipboard is put back by
+    /// tearDown.
+    /// Premise: the runner reads back what it puts on the pasteboard, else APPARATUS.
+    @discardableResult
+    private func paste(_ ui: XCUIApplication, _ key: Key, _ text: String, _ what: String,
+                       fromMenu: Bool = false,
+                       file: StaticString = #filePath, line: UInt = #line) -> String? {
+        let board = NSPasteboard.general
+        board.clearContents()
+        board.setString(text, forType: .string)
+        guard board.string(forType: .string) == text else {
+            XCTFail("APPARATUS: the proof cannot put what it pastes into \(what) on the pasteboard",
+                    file: file, line: line)
+            return nil
+        }
+        guard tap(ui, key, what, file: file, line: line) else { return nil }
+        if fromMenu {
+            let edit = ui.menuBars.menuBarItems["Edit"]
+            guard edit.waitForExistence(timeout: 10) else {
+                keepTree(ui, "no Edit menu")
+                XCTFail("PRODUCT: the app must have an Edit menu to paste into \(what) from; the menu bar has none",
+                        file: file, line: line)
+                return nil
+            }
+            edit.click()
+            guard tap(ui, Key.menuItem("Paste"), "Edit › Paste, into \(what)", file: file, line: line) else {
+                return nil
+            }
+        } else {
+            el(ui, key).typeKey("v", modifierFlags: .command)
+        }
+        Thread.sleep(forTimeInterval: 0.5)
+        return el(ui, key).value as? String
+    }
+
+    /// Select what `key` shows by dragging across it, as a person does, and copy it with ⌘C: what
+    /// the pasteboard then holds (the decider, v0.4.1: "All text in the app, I should be able to
+    /// select it for copy purposes").
+    private func selectAndCopy(_ ui: XCUIApplication, _ key: Key, _ what: String,
+                               file: StaticString = #filePath, line: UInt = #line) -> String {
+        guard let e = locate(ui, key) else {
+            missing(ui, key, "the app must show \(what)", file: file, line: line)
+            return ""
+        }
+        return selectAndCopy(ui, e, what, file: file, line: line)
+    }
+
+    /// A timeline row by what it says as one sentence ("bob: COPY ONE"), not by its words alone.
+    private func rowSaying(_ ui: XCUIApplication, _ sentence: String) -> XCUIElement? {
+        let e = ui.windows.firstMatch.descendants(matching: .any)
+            .matching(NSPredicate(format: "label == %@", sentence)).firstMatch
+        return e.exists ? e : nil
+    }
+
+    /// A message's time as ⌘C copies it: this Mac's time zone, to the minute.
+    private func copiedTime(_ millis: UInt64) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = .current
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f.string(from: Date(timeIntervalSince1970: Double(millis) / 1000))
+    }
+
+    /// The element whose own words are exactly `words` (a Text's value, or its label), in the
+    /// window: one Text, not a row that says it among other things.
+    private func textSaying(_ ui: XCUIApplication, _ words: String) -> XCUIElement? {
+        let e = ui.windows.firstMatch.descendants(matching: .any)
+            .matching(NSPredicate(format: "value == %@ OR label == %@", words, words)).firstMatch
+        return e.exists ? e : nil
+    }
+
+    private func selectAndCopy(_ ui: XCUIApplication, _ e: XCUIElement, _ what: String,
+                               file: StaticString = #filePath, line: UInt = #line) -> String {
+        if !inView(ui, e) { scrollTo(ui, e) }
+        return copiedBy(ui, {
+            // From just inside its first character to just inside its last, on its first line and
+            // its last if it wraps: the whole of it.
+            let from = e.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.25)).withOffset(CGVector(dx: 1, dy: 0))
+            let to = e.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.75)).withOffset(CGVector(dx: -1, dy: 0))
+            from.click(forDuration: 0.3, thenDragTo: to)
+            ui.typeKey("c", modifierFlags: .command)
+        }, file: file, line: line)
     }
 
     /// Type `text` into `key`, only once it was clicked.

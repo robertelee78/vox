@@ -63,7 +63,7 @@ struct KeyringView: View {
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .sheet(item: Binding(get: { removing.map(Removal.init) }, set: { removing = $0?.node })) {
-            RemoveSheet(model: model, node: $0.node) { removing = nil }
+            RemoveSheet(model: model, node: $0.node) { removing = nil }.textSelection(.enabled)
         }
         .onChange(of: model.keyringAsk) { ask in
             guard let ask else { return }
@@ -89,6 +89,7 @@ struct KeyringView: View {
             TextField("Alias", text: $alias)
                 .accessibilityLabel("Alias")
                 .accessibilityIdentifier("keyring-add-alias")
+            AliasClash(model: model, alias: alias)
             Picker("Grants", selection: $drive) {
                 Text(Capability.words(false)).tag(false)
                 Text(Capability.words(true)).tag(true)
@@ -215,6 +216,7 @@ private struct KeyringRow: View {
                 }
                 if !newAlias.isEmpty && newAlias != node.name {
                     Text(Effects.renaming(newAlias)).secondaryText()
+                    AliasClash(model: model, alias: newAlias, except: node.fingerprint)
                 }
             }
             if comparing {
