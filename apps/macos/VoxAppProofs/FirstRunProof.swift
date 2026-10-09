@@ -515,9 +515,10 @@ final class FirstRunProof: XCTestCase {
         print("[proof] keep running: off kept \(answerOff.debugDescription) and left the login item \(itemOff.debugDescription); on kept \(answerOn.debugDescription) and left it \(itemOn.debugDescription)")
     }
 
-    /// Settings (⌘,), v0.4.1, the UX review's proposal 1, alone. Staged by `vox`: node alice with
-    /// no passphrase, first run answered Keep Running with alice chosen, the menu bar item off, the
-    /// stand-in login item registered as approved.
+    /// Settings (⌘,), v0.4.1, the UX review's proposal 1, alone. Staged by `vox`: node alice kept
+    /// (`--keep`), first run answered Keep Running with alice chosen, the menu bar item off, the
+    /// stand-in login item registered as approved. Keep Running is turned off and on last: on
+    /// again, the app offers to keep alice, which Escape leaves.
     /// - **menu bar**: Settings' "Show Vox in the menu bar" turns the item on and off again, kept
     ///   in `<config>/app/menubar`. Mutation: the toggle's setter dropped → red at "on".
     /// - **keep running**: Settings' switch turns Keep Running off and on, the answer and the
@@ -545,9 +546,12 @@ final class FirstRunProof: XCTestCase {
         let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
         daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
-        let empty = root.appendingPathComponent("empty.pass").path
-        try stager.write(Data("\n".utf8), to: empty)
-        try staged(vox, ["node", "create", "alice", "--passphrase-file", empty], env: voxEnv)
+        // Alice kept as Keep Running keeps a node (`--keep`, its passphrase from a scratch file: the
+        // Keychain is the person's, never a proof's), so the app opens acting as her.
+        let pass = root.appendingPathComponent("alice.pass").path
+        try stager.write(Data("alice identity\n".utf8), to: pass)
+        try staged(vox, ["node", "create", "alice", "--passphrase-file", pass], env: voxEnv)
+        try staged(vox, ["node", "attach", "alice", "--keep", "--passphrase-file", pass], env: voxEnv)
         try stager.write(Data("keep\n".utf8), to: config + "/app/login-item")
         try stager.write(Data("alice\n".utf8), to: config + "/app/node")
         try stager.write(Data("off\n".utf8), to: config + "/app/menubar")
@@ -595,6 +599,22 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(barOn == "on" && barOff == "off",
                       "PRODUCT: Settings > Show Vox in the menu bar must turn the item on and off; the choice was kept as \(barOn.debugDescription), then \(barOff.debugDescription)")
 
+        // text size: 130%, then back to Actual Size.
+        let before = textScale()
+        tap(ui, Key.id("settings-text-size"), "Settings > Text size")
+        tap(ui, Key.menuItem("130%"), "Settings > Text size > 130%")
+        var scaled = textScale()
+        let until = Date().addingTimeInterval(10)
+        while scaled != "1.3" && Date() < until { Thread.sleep(forTimeInterval: 0.25); scaled = textScale() }
+        // The window is drawn again at the new size, so the control is looked up afresh.
+        tap(ui, Key.id("settings-text-size"), "Settings > Text size, again")
+        tap(ui, Key.menuItem("100% (Actual Size)"), "Settings > Text size > 100% (Actual Size)")
+        var back = textScale()
+        let until2 = Date().addingTimeInterval(10)
+        while back != "1" && Date() < until2 { Thread.sleep(forTimeInterval: 0.25); back = textScale() }
+        XCTAssertTrue(scaled == "1.3" && back == "1",
+                      "PRODUCT: Settings > Text size must set the app's text size, as View > Bigger keeps it; 130% left it \(scaled.debugDescription) and Actual Size \(back.debugDescription) (it was \(before.debugDescription) before)")
+
         // keep running: off from Settings, the Vox menu agreeing; then on again.
         tap(ui, Key.id("settings-keep-running"), "Settings > Keep Vox running while you're logged in")
         let answerOff = settle("login-item") { $0 == "no" }
@@ -615,22 +635,7 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(answerOn == "keep" && itemOn.hasPrefix("registered"),
                       "PRODUCT: turning Keep Running on in Settings must keep the answer as Keep Running and register the login item; the answer is \(answerOn.debugDescription), the login item was left \(itemOn.debugDescription)")
 
-        // text size: 130%, then back to Actual Size.
-        let before = textScale()
-        tap(ui, Key.id("settings-text-size"), "Settings > Text size")
-        tap(ui, Key.menuItem("130%"), "Settings > Text size > 130%")
-        var scaled = textScale()
-        let until = Date().addingTimeInterval(10)
-        while scaled != "1.3" && Date() < until { Thread.sleep(forTimeInterval: 0.25); scaled = textScale() }
-        // The window is drawn again at the new size, so the control is looked up afresh.
-        tap(ui, Key.id("settings-text-size"), "Settings > Text size, again")
-        tap(ui, Key.menuItem("100% (Actual Size)"), "Settings > Text size > 100% (Actual Size)")
-        var back = textScale()
-        let until2 = Date().addingTimeInterval(10)
-        while back != "1" && Date() < until2 { Thread.sleep(forTimeInterval: 0.25); back = textScale() }
-        XCTAssertTrue(scaled == "1.3" && back == "1",
-                      "PRODUCT: Settings > Text size must set the app's text size, as View > Bigger keeps it; 130% left it \(scaled.debugDescription) and Actual Size \(back.debugDescription) (it was \(before.debugDescription) before)")
-
+        ui.typeKey(.escape, modifierFlags: [])
         let uid = stager.run(["/usr/bin/id", "-u"], env: [:]).out.trimmingCharacters(in: .whitespacesAndNewlines)
         let loaded = stager.run(["/bin/launchctl", "print", "gui/\(uid)/us.vox.daemon"], env: [:])
         XCTAssertNotEqual(loaded.status, 0,
