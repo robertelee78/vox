@@ -80,8 +80,9 @@ private struct Sidebar: View {
                                     model.select(s)
                                     Task { await model.show(s) }
                                 })) {
+            // Who you are, first (G5): the node's mark, its name, and that it is attached.
             Section {
-                StateMark(kind: .live, words: "node \(model.node), attached")
+                NodeIdentity(name: model.node)
                     .accessibilityIdentifier("attached")
                     .background(SidebarHighlightOff())
             }
@@ -118,17 +119,10 @@ private struct Sidebar: View {
                     .sidebarRow(model.selection == .services)
                     .accessibilityIdentifier("services")
             }
-            Section {
-                ForEach(model.nodes, id: \.name) { node in
-                    StateMark(kind: node.state == "attached" ? .live : .plain,
-                              words: "\(node.name) \(node.state)")
-                            .accessibilityIdentifier("node-\(node.name)")
-                }
-            } header: {
-                Text("nodes on this Mac").eyebrow().accessibilityAddTraits(.isHeader)
-            }
         }
         .listStyle(.sidebar)
+        // The nodes on this Mac, at the sidebar's foot (G5), whatever the rooms above scroll to.
+        .safeAreaInset(edge: .bottom, spacing: 0) { OnThisMachine(nodes: model.nodes) }
         // On bg.panel, not the system's sidebar material (L-6).
         .scrollContentBackground(.hidden)
         .panelSurface()
@@ -185,6 +179,59 @@ private struct SelectionFill: NSViewRepresentable {
 /// Turns off the sidebar table's own selection highlight, from inside one of its rows: the
 /// selected row is drawn by `sidebarRow` instead. Selection, keyboard and accessibility are the
 /// table's as before; only the drawing of the highlight changes.
+/// The acting node at the top of the sidebar (G5): its mark, its name, and an ice dot with "node
+/// attached", the dot in the accent because attached is live (L-3).
+private struct NodeIdentity: View {
+    let name: String
+
+    var body: some View {
+        HStack(alignment: .center, spacing: Space.s8) {
+            Text("◈").font(Theme.title).accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: Space.s4) {
+                Text(name).fontWeight(.semibold)
+                HStack(spacing: Space.s4) {
+                    Circle().fill(VoxTokens.Colors.accent).frame(width: 6, height: 6)
+                    Text("node attached").secondaryText()
+                }
+            }
+        }
+        .padding(.vertical, Space.s4)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("node \(name), attached")
+    }
+}
+
+/// The nodes on this Mac and their state, at the foot of the sidebar (G5): one daemon holds them,
+/// each a separate identity.
+private struct OnThisMachine: View {
+    let nodes: [NodeSummary]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.s4) {
+            Hairline()
+            Text("ON THIS MACHINE").eyebrow().secondaryText()
+                .accessibilityAddTraits(.isHeader)
+                .accessibilityIdentifier("on-this-machine")
+                .padding(.top, Space.s8)
+            ForEach(nodes, id: \.name) { node in
+                HStack {
+                    Text(node.name)
+                    Spacer()
+                    Text(node.state).secondaryText()
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("\(node.name) \(node.state)")
+                .accessibilityIdentifier("node-\(node.name)")
+            }
+            Text("Separate identities. One daemon.").secondaryText()
+                .padding(.top, Space.s4)
+        }
+        .padding(.horizontal, Space.s16)
+        .padding(.bottom, Space.s12)
+        .panelSurface()
+    }
+}
+
 private struct SidebarHighlightOff: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView { Finder() }
     func updateNSView(_ view: NSView, context: Context) { (view as? Finder)?.apply() }

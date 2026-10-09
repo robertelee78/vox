@@ -762,7 +762,9 @@ final class FirstRunProof: XCTestCase {
     /// "title"; Set the default again → red at "Retention"; Give Drive the default → red at
     /// "drive". Then Node > Detach: the chooser lists alice, detached, with her fingerprint and
     /// "Everything you post, trust and share will be as alice."; `vox node list` shows the same
-    /// fingerprint; and with bob's vault copied over hers, it shows none (P8). Mutations: the
+    /// fingerprint; and with bob's vault copied over hers, it shows none (P8). Before that, the
+    /// sidebar opens with "node alice, attached" and ends with ON THIS MACHINE listing bob as
+    /// attached, below Services (G5; mutation: the footer gone → red at "foot"). Mutations: the
     /// fingerprint file not written → red at "chooser must show"; its vault hash not checked → red
     /// at "stale".
     func testTheLookIsTheTokensAndReturnNeverGivesWhatItShouldNot() throws {
@@ -917,6 +919,16 @@ final class FirstRunProof: XCTestCase {
                                "bob's row must say what it grants") ?? ""
         XCTAssertEqual(capability, "read",
                        "PRODUCT: Return in the drive sheet must give nothing (P5); bob's row says \(capability.debugDescription)")
+
+        // G5: the sidebar opens with who you are, and ends with this Mac's nodes and their state.
+        words(ui, Key.id("attached"), timeout: 10, "the sidebar must open with the acting node (G5)",
+              until: { $0 == "node alice, attached" })
+        words(ui, Key.id("node-bob"), timeout: 10, "the sidebar's foot must list bob and his state (G5)",
+              until: { $0 == "bob attached" })
+        let foot = locate(ui, Key.id("on-this-machine"))?.frame ?? .null
+        let lastAbove = locate(ui, Key.id("services"))?.frame ?? .null
+        XCTAssertTrue(!foot.isNull && !lastAbove.isNull && foot.minY > lastAbove.maxY,
+                      "PRODUCT: \"ON THIS MACHINE\" must be at the sidebar's foot, below Services (G5); it is at \(foot), Services at \(lastAbove)")
 
         // P8: Node > Detach, and the chooser lists alice, now detached, with her fingerprint (from
         // her fingerprint file) and what choosing her means; `vox node list` shows it too. Then a

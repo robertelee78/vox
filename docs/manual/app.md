@@ -8,9 +8,10 @@ nodes, rooms, trust, services and files.
 
 Vox.app is a window onto the account's vox daemon, the same daemon `vox` commands and `vox tui`
 use. The app holds no node of its own. It acts as **one node** on this Mac, which you choose the
-first time you open it, and everything you post, trust and share in the app is that node's. Your
-other nodes, such as an agent's, appear under **nodes on this Mac** in the sidebar and stay with
-the `vox` commands.
+first time you open it, and everything you post, trust and share in the app is that node's. The
+sidebar opens with that node: its mark, its name and `node attached`. At its foot, **ON THIS
+MACHINE** lists every node on this Mac with its state (`attached` or `detached`): separate
+identities, one daemon. The other nodes stay with the `vox` commands.
 
 ## Install
 
@@ -130,7 +131,7 @@ status bar along the bottom.
 
 ### The sidebar
 
-- At the top, your node: `node NAME, attached`.
+- At the top, your node: its mark, its name, and an ice dot with `node attached`.
 - Your rooms, in three groups, each with its count:
   - **needs you**: a message addressed to your node is unread.
   - **active**: new messages are unread.
@@ -141,7 +142,8 @@ status bar along the bottom.
 - Trust offers, first under **needs you**: `offer: xgfm gktt… joined`, or `… trusts you` (see
   [Trust offers](#trust-offers)).
 - **Keyring**, **Decision record** and **Services**: views of this window, described below.
-- **nodes on this Mac**, each with whether it is attached.
+- At the foot, **ON THIS MACHINE**: every node on this Mac with its state, `attached` or
+  `detached`, and `Separate identities. One daemon.`
 
 ### The room
 
