@@ -50,10 +50,17 @@
 //!     held, 1124 attempts at once have 100 refused at once (1024 wait). Mutants: no cap of 64; no
 //!     cap of 1024.
 //!
+//! 13. **The previous published release and this build** (requirement 14): the newest published
+//!     release's `vox daemon` (downloaded, digest-checked) and this build's join each other's
+//!     rooms, both dial directions, and read each other's posts; this build's flights and labels
+//!     complete an exchange with the published daemon. Mutant: one exchange label changed.
+//! 14. **A circuit for one node cannot ask for another** (requirement 32, ADR-026 P-1): over a
+//!     circuit the anchor carries for node A, an exchange asking for A completes and one asking
+//!     for B, attached to the same daemon, is refused. Mutant: `serves_on` answering for any node.
+//!
 //! **Not measurable from outside, so not claimed here:** that a rate-limited `ASK` is refused
 //! *before* its target is looked up (requirement 34's order: the lookup leaves no trace on the
-//! wire); a circuit's `ASK` for another node; and a listener whose exporter fails (an internal
-//! failure no attacker can cause).
+//! wire), and a listener whose exporter fails (an internal failure no attacker can cause).
 //!
 //! **Which side a red is on.** The daemon doing what an attack wanted (answering, accepting,
 //! leaking a reason, a code, a flight or a time) is `PRODUCT:`; a daemon that would not start, an
@@ -66,6 +73,8 @@
 mod hostile;
 #[path = "support/ports.rs"]
 mod ports;
+#[path = "support/previous_release.rs"]
+mod previous_release;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 #[path = "support/world.rs"]
@@ -1265,4 +1274,417 @@ fn a_flood_of_pre_identity_connections_is_capped() {
         );
         drop(silent);
     });
+}
+
+/// `exe` (a `vox`) run once on the data root `data`, as `vox_once_plain` runs this build: the
+/// identity passphrase in its environment, a keyring change typed at a terminal, `stdin` given.
+fn run_as(exe: &Path, data: &Path, argv: &[&str], stdin: Option<&str>) -> (bool, String) {
+    use std::io::Write as _;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(argv)
+        .env("VOX_PROXY", world::proxy())
+        .env("VOX_DATA_DIR", data)
+        .env("VOX_CONFIG_DIR", data.join("cfg"))
+        .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
+        .env_remove("VOX_ROOM_PASSPHRASE");
+    if world::typed::is_keyring_change(argv) {
+        return world::typed::keyring(&cmd);
+    }
+    let mut child = cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not run {}: {e}", exe.display()));
+    if let Some(input) = stdin {
+        let _ = child
+            .stdin
+            .take()
+            .expect("APPARATUS: a piped stdin")
+            .write_all(input.as_bytes());
+    }
+    drop(child.stdin.take());
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr),
+    )
+}
+
+/// A `vox daemon` of `exe` for a fresh identity named `name` under `root`, with `--anchor spec`.
+fn daemon_of(exe: &Path, root: &Path, name: &str, spec: &str) -> Daemon {
+    let data = hostile::profile_dir(root, name);
+    let pass = root.join(format!("{name}.pass"));
+    std::fs::write(&pass, IDENTITY).expect("APPARATUS: write the passphrase file");
+    let (ok, said) = run_as(exe, &data, &["id"], None);
+    assert!(ok, "APPARATUS: staging {name}'s `vox id`: {said}");
+    let fp = said
+        .split_whitespace()
+        .find_map(|t| b32_decode(t, "fingerprint").ok())
+        .unwrap_or_else(|| panic!("APPARATUS: {name}'s `vox id` printed no fingerprint: {said}"));
+    let proc = VoxProc::spawn_exe(
+        exe,
+        name,
+        &data,
+        &args(&[
+            "daemon",
+            "--listen",
+            "127.0.0.1:0",
+            "--anchor",
+            spec,
+            "--passphrase-file",
+            pass.to_str().expect("APPARATUS: a UTF-8 path"),
+        ]),
+        &[],
+    );
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !run_as(exe, &data, &["room", "list"], None).0 {
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: {name}'s daemon ({}) never answered `vox room list`",
+            exe.display()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let port = hostile::listening_port(&data);
+    Daemon {
+        _proc: proc,
+        data,
+        fp,
+        addr: SocketAddr::from(([127, 0, 0, 1], port)),
+    }
+}
+
+/// Claim 13 (requirement 14). **The previous published release and this build complete the
+/// exchange, both ways.** The previous release's `vox daemon` (downloaded, its digest checked)
+/// and this build's are members of each other's rooms: the old one joins a room the new one made
+/// (old dials new) and the new one joins a room the old one made (new dials old); each trusts the
+/// other, and each reads the other's post in both rooms. And this build's flights and labels are
+/// the previous release's: a `PROVE` from the old daemon verifies under this build's `resp_input`
+/// and exporter label, and a `CLAIM` this build signs is accepted by the old daemon.
+#[test]
+#[ignore = "downloads the previous release; real daemons of each; run in release"]
+fn the_previous_release_and_this_build_complete_the_exchange_both_ways() {
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    watchdog::arm_for(Duration::from_secs(900));
+    let w = world();
+    let (version, old) = previous_release::previous_release(w._tmp.path());
+    let new = Path::new(world::VOX);
+    let old_d = daemon_of(&old, w._tmp.path(), "old", &w.spec);
+    let new_d = &w.host;
+
+    // Labels and flights: this build's library against the old daemon.
+    let rt = runtime();
+    rt.block_on(async {
+        let e = endpoint(false);
+        let me = stranger();
+        let c = connect(&e, old_d.addr).await;
+        dial(&c, &me, new_instance().expect("APPARATUS: an instance"), old_d.fp)
+            .await
+            .unwrap_or_else(|f| {
+                panic!(
+                    "PRODUCT: this build's exchange with v{version}'s daemon failed: {f:?} (its PROVE \
+                     did not verify under this build's labels, or it refused this build's CLAIM)"
+                )
+            });
+        // Taken: the limits are raised, three more streams at once, and the connection stays.
+        let mut held = Vec::new();
+        for i in 0..3 {
+            let opened = tokio::time::timeout(Duration::from_millis(2000), c.open_bi()).await;
+            let Ok(Ok(pair)) = opened else {
+                panic!(
+                    "PRODUCT: v{version}'s daemon did not take this build's CLAIM: stream {i} after \
+                     it did not open in 2000 ms"
+                )
+            };
+            held.push(pair);
+        }
+        assert!(
+            closed(&c, Duration::from_millis(1000)).await.is_none(),
+            "PRODUCT: v{version}'s daemon closed the connection after this build's CLAIM"
+        );
+        println!("[proof] this build's flights and labels against v{version}'s daemon: exchanged");
+    });
+
+    // Real use, both ways.
+    let room_pass = "room pass";
+    let make_room = |exe: &Path, d: &Daemon, name: &str| -> String {
+        let (ok, said) = run_as(
+            exe,
+            &d.data,
+            &["room", "create", "--passphrase-file", "-", "--name", name],
+            Some(room_pass),
+        );
+        assert!(ok, "APPARATUS: staging `vox room create {name}`: {said}");
+        let (ok, list) = run_as(exe, &d.data, &["room", "list"], None);
+        assert!(ok, "APPARATUS: staging `vox room list`: {list}");
+        let short = list
+            .split_whitespace()
+            .next()
+            .unwrap_or_else(|| panic!("APPARATUS: no room listed: {list}"))
+            .to_owned();
+        let (ok, link) = run_as(exe, &d.data, &["room", "link", &short], None);
+        assert!(ok, "APPARATUS: staging `vox room link`: {link}");
+        link.split_whitespace()
+            .find(|t| t.starts_with("vox://"))
+            .unwrap_or_else(|| panic!("APPARATUS: no room link in {link:?}"))
+            .to_owned()
+    };
+    let to_new = make_room(new, new_d, "made-by-new");
+    let to_old = make_room(&old, &old_d, "made-by-old");
+    let mut red = Vec::new();
+    let mut joined = Vec::new();
+    for (who, exe, d, link) in [
+        (
+            format!("v{version} (old dials new)"),
+            old.as_path(),
+            &old_d,
+            &to_new,
+        ),
+        ("this build (new dials old)".to_owned(), new, new_d, &to_old),
+    ] {
+        let (ok, said) = run_as(
+            exe,
+            &d.data,
+            &["room", "join", "--passphrase-file", "-", link],
+            Some(room_pass),
+        );
+        println!("[proof] {who} joined: {ok}");
+        joined.push(ok);
+        if !ok {
+            red.push(format!("{who} could not join: {said}"));
+        }
+    }
+    for (exe, d, other, name) in [
+        (old.as_path(), &old_d, new_d, "new"),
+        (new, new_d, &old_d, "old"),
+    ] {
+        let fp = b32_encode(&other.fp);
+        let (ok, said) = run_as(exe, &d.data, &["trust", "add", &fp, "--name", name], None);
+        assert!(ok, "APPARATUS: staging `vox trust add {name}`: {said}");
+    }
+    // The room made by new is the one old joined, and the other way round.
+    for (room_of, was_joined) in [("new", joined[0]), ("old", joined[1])] {
+        if !was_joined {
+            continue;
+        }
+        let marker_old = format!("from-old-in-{room_of}");
+        let marker_new = format!("from-new-in-{room_of}");
+        let room = |exe: &Path, d: &Daemon| -> String {
+            let (_, list) = run_as(exe, &d.data, &["room", "list"], None);
+            list.lines()
+                .find(|l| l.contains(&format!("made-by-{room_of}")))
+                .and_then(|l| l.split_whitespace().next())
+                .unwrap_or_else(|| panic!("APPARATUS: room made-by-{room_of} not listed: {list}"))
+                .to_owned()
+        };
+        let (r_old, r_new) = (room(&old, &old_d), room(new, new_d));
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let (mut new_reads_old, mut old_reads_new) = (false, false);
+        while Instant::now() < deadline && !(new_reads_old && old_reads_new) {
+            let _ = run_as(
+                &old,
+                &old_d.data,
+                &["room", "post", &r_old, &marker_old],
+                None,
+            );
+            let _ = run_as(
+                new,
+                &new_d.data,
+                &["room", "post", &r_new, &marker_new],
+                None,
+            );
+            std::thread::sleep(Duration::from_secs(1));
+            new_reads_old |= run_as(
+                new,
+                &new_d.data,
+                &["room", "read", &r_new, "--limit", "500"],
+                None,
+            )
+            .1
+            .contains(&marker_old);
+            old_reads_new |= run_as(
+                &old,
+                &old_d.data,
+                &["room", "read", &r_old, "--limit", "500"],
+                None,
+            )
+            .1
+            .contains(&marker_new);
+        }
+        println!(
+            "[proof] in the room made by {room_of}: this build read v{version}: {new_reads_old}; \
+             v{version} read this build: {old_reads_new}"
+        );
+        if !new_reads_old {
+            red.push(format!(
+                "this build never read v{version}'s post in the room made by {room_of}"
+            ));
+        }
+        if !old_reads_new {
+            red.push(format!(
+                "v{version} never read this build's post in the room made by {room_of}"
+            ));
+        }
+    }
+    assert!(red.is_empty(), "PRODUCT: {red:#?}");
+}
+
+/// Claim 14 (requirement 32, ADR-026 P-1). **A relayed connection for node A cannot ask for node
+/// B on the same daemon.** The host's daemon holds two nodes, A (its own) and B. The attacker, a
+/// member of A's room whose key it holds (its own daemon stopped), asks the room's anchor for a
+/// circuit to A, which the anchor carries; over it, an exchange asking for A completes, and one
+/// asking for B is refused, though B is attached to the same daemon: a relay cannot use one node's
+/// circuit to learn whether another is hosted there.
+#[test]
+#[ignore = "real daemons and a test-side attacker; run in release"]
+fn a_circuit_for_one_node_cannot_ask_for_another() {
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    watchdog::arm();
+    let w = world();
+    let a_fp = w.host.fp;
+    // A member of A's room, known to the anchor, whose key the attacker then holds.
+    let (_room, link) = hostile::create_room(&w.host.data, "team", "room pass");
+    let member = {
+        let m = daemon(w._tmp.path(), "member", &w.spec);
+        let (ok, out, err) = hostile::vox_in(
+            &m.data,
+            &["room", "join", "--passphrase-file", "-", &link],
+            "room pass",
+        );
+        assert!(
+            ok,
+            "APPARATUS: staging: the member could not join: {out}{err}"
+        );
+        std::thread::sleep(Duration::from_secs(3));
+        m.data.clone()
+    };
+    // Node B, attached to the same daemon (after the room: a data root of several nodes asks
+    // which one a verb is for).
+    let pass = w._tmp.path().join("host.pass");
+    let pass = pass.to_str().expect("APPARATUS: a UTF-8 path");
+    let (ok, out, err) = vox_once_plain(
+        &w.host.data,
+        &args(&["node", "create", "b", "--passphrase-file", pass]),
+    );
+    assert!(ok, "APPARATUS: staging `vox node create b`: {out}{err}");
+    let b_fp = out
+        .split_whitespace()
+        .find_map(|t| b32_decode(t, "fingerprint").ok())
+        .unwrap_or_else(|| panic!("APPARATUS: `vox node create b` printed no fingerprint: {out}"));
+    let (ok, out, err) = vox_once_plain(
+        &w.host.data,
+        &args(&["node", "attach", "b", "--passphrase-file", pass]),
+    );
+    assert!(ok, "APPARATUS: staging `vox node attach b`: {out}{err}");
+    let signer = hostile::member_signer(&member);
+    let anchor_addr = world::spec_addr(&w.spec);
+    let anchor_fp = b32_decode(
+        w.spec.split('@').next().expect("APPARATUS: a spec"),
+        "anchor fingerprint",
+    )
+    .expect("APPARATUS: the anchor's spec carries its fingerprint");
+    let rt = runtime();
+    let (to_a, to_b) = rt.block_on(async {
+        let (endpoint, relay) = hostile::connect(&signer, anchor_addr, anchor_fp).await;
+        let endpoint = Arc::new(endpoint);
+        let to_a = over_circuit_for(&endpoint, &relay, a_fp, a_fp).await;
+        let to_b = over_circuit_for(&endpoint, &relay, a_fp, b_fp).await;
+        (to_a, to_b)
+    });
+    println!(
+        "[proof] over a circuit for A: asking for A {}; asking for B (same daemon) {}",
+        to_a.as_ref()
+            .map_or_else(|e| format!("failed: {e}"), |()| "completed".to_owned()),
+        to_b.as_ref()
+            .map_or_else(|e| format!("failed: {e}"), |()| "completed".to_owned()),
+    );
+    assert!(
+        to_a.is_ok(),
+        "APPARATUS: the circuit for A did not carry an exchange with A: {to_a:?}"
+    );
+    assert!(
+        to_b.is_err(),
+        "PRODUCT: over a circuit attached for node A, an exchange asking for node B completed: the \
+         daemon answered for another node than the circuit's"
+    );
+}
+
+/// Ask `relay` for a circuit to `circuit_for`, then dial over it expecting `ask_for`: `Ok` if the
+/// exchange completed. The circuit's datagrams are moved by a loop of this test's own, as
+/// `circuitstream::connect_through` moves them.
+async fn over_circuit_for(
+    endpoint: &Arc<vox_core::transport::quic::VoxEndpoint>,
+    relay: &Arc<vox_core::transport::quic::VoxConnection>,
+    circuit_for: Digest32,
+    ask_for: Digest32,
+) -> Result<(), String> {
+    use vox_core::node::circuitstream::{CircuitFrame, CIRCUIT_DATAGRAM_MAX};
+    use vox_core::transport::framing::read_frame;
+    use vox_core::transport::streams::open_typed;
+    let (mut send, mut recv) = open_typed(relay, StreamKind::Circuit)
+        .await
+        .map_err(|e| format!("circuit stream: {e:?}"))?;
+    write_frame(
+        &mut send,
+        &CircuitFrame::Open { peer: circuit_for }.to_bytes(),
+    )
+    .await
+    .map_err(|e| format!("OPEN: {e:?}"))?;
+    let answer = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut recv, 64 * 1024))
+        .await
+        .map_err(|_| "the relay did not answer the OPEN in 10000 ms".to_owned())?
+        .map_err(|e| format!("the relay's answer: {e:?}"))?
+        .ok_or("the relay closed the circuit stream")?;
+    match CircuitFrame::from_bytes(&answer) {
+        Ok(CircuitFrame::Opened) => {}
+        other => panic!("APPARATUS: the anchor did not open a circuit to A: {other:?}"),
+    }
+    let mut flow = relay
+        .bind_flow(send, recv)
+        .map_err(|e| format!("bind the flow: {e:?}"))?;
+    flow.cap_datagrams(CIRCUIT_DATAGRAM_MAX);
+    let mut port = endpoint
+        .attach_circuit_via(&circuit_for, &relay.peer_id(), Some(relay.as_carrier()))
+        .map_err(|e| format!("attach the circuit: {e:?}"))?;
+    let target = port.addr();
+    let mut outbound = port
+        .take_outbound()
+        .expect("APPARATUS: the port's outbound");
+    let inlet = port.inlet();
+    let mover = tokio::spawn(async move {
+        let _port = port;
+        loop {
+            tokio::select! {
+                out = outbound.recv() => {
+                    let Some(packet) = out else { break };
+                    if flow.send(&packet).is_err() { break; }
+                }
+                inbound = flow.recv() => {
+                    let Some(packet) = inbound else { break };
+                    inlet.deliver(packet);
+                }
+            }
+        }
+    });
+    let dialled = tokio::time::timeout(
+        Duration::from_secs(15),
+        vox_core::nat::reachability::connect_direct(
+            Arc::clone(endpoint),
+            &[target],
+            ask_for,
+            hostile::now_ms(),
+        ),
+    )
+    .await;
+    mover.abort();
+    match dialled {
+        Ok(Ok(_conn)) => Ok(()),
+        Ok(Err(e)) => Err(format!("{e}")),
+        Err(_) => Err("no answer in 15000 ms".to_owned()),
+    }
 }

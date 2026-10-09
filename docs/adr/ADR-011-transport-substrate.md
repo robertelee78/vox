@@ -2,8 +2,8 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: built (`crates/vox-core/src/transport/`), except where a requirement says otherwise: the
-interop matrix (requirement 14) and a TCP fallback (requirement 2) are not built. The identity
+**Status**: built (`crates/vox-core/src/transport/`), except where a requirement says otherwise: a
+second implementation (requirement 14) and a TCP fallback (requirement 2) are not built. The identity
 exchange (requirements 27–39, 38a) is built and replaces requirements 5–8, which are not in the
 code; every proof requirement 40 names is by real use of the shipped binary.
 **Date**: 2026-06-19
@@ -87,7 +87,12 @@ Requirements 5–8 are **superseded** by requirements 27–40 and are not in the
     X25519MLKEM768 provider, version-pinned) and a cross-version interop matrix (each supported
     client and library pair completes the handshake and the identity exchange, with the exchange's
     flights, signature labels and exporter label pinned) MUST be release gates. The required-suite
-    floor is versioned (ADR-003). *Not built:* there is no second implementation, matrix or CI job.
+    floor is versioned (ADR-003). The matrix is this build against the newest published release
+    (decider, 2026-10-08): each one's `vox daemon` joins a room the other made and reads the
+    other's posts, and this build's flights and labels complete an exchange with the published
+    daemon (`the_previous_release_and_this_build_complete_the_exchange_both_ways`, mutant: one
+    label changed). It runs in the release gate's suite, before every tag. *Not built:* a second
+    implementation.
 
 ### Datagram flows (ADR-022 M22.1)
 
@@ -277,18 +282,18 @@ connection, bound to the TLS session by its exporter.
 
     Exporter binding, the one-exchange rule (a second flight, and an identity stream after the
     exchange), reflection, responder first, no further oracle (the one refusal, the floor and the
-    random delay), the pre-identity limits and datagram, the cap on a flood of pre-identity
-    connections (64 in flight, 1024 waiting), requirement 34's rate limit, requirement 33's 5 s
-    bound and the re-attach as a new process are proved against a running `vox daemon` by a
-    test-side attacker (`the_identity_exchange_holds_against_an_attacker_proof`, one mutant
-    each). Not measurable from outside, so not claimed: that a rate-limited `ASK` is refused
-    before its target is looked up, a circuit's `ASK` for another node, and a listener whose
-    exporter fails.
+    random delay, and a circuit's `ASK` for another node of the same daemon), the pre-identity
+    limits and datagram, the cap on a flood of pre-identity connections (64 in flight, 1024
+    waiting), requirement 34's rate limit, requirement 33's 5 s bound and the re-attach as a new
+    process are proved against a running `vox daemon` by a test-side attacker
+    (`the_identity_exchange_holds_against_an_attacker_proof`, one mutant each). Not measurable
+    from outside, so not claimed: that a rate-limited `ASK` is refused before its target is
+    looked up, and a listener whose exporter fails.
 
 ## Known limits
 
-- **The interop matrix** (requirement 14) is an open release gate, awaiting the decider (V030-29
-  decider question 32).
+- **The interop matrix** (requirement 14) is this build against the newest published release
+  only; there is no second implementation to pair with.
 
 ## Consequences
 
