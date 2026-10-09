@@ -833,6 +833,17 @@ final class FirstRunProof: XCTestCase {
 
         }
 
+        // (15) Outcomes (#608, #611, #615): run here, with the room and bob's trust in place, so
+        // that VOX_PROOF_FROM=15 runs it alone, on what steps 1 to 5 leave (staged by `vox`), and
+        // stops after it.
+        if from <= 5 || from == 15 {
+            try outcomes(ui, vox: vox, voxEnv: voxEnv, roomPass: roomPass)
+            if from == 15 {
+                print("[proof] VOX_PROOF_FROM=15: step 15 run alone; steps 6 to 14 NOT RUN")
+                return
+            }
+        }
+
         // (6) Attach a file to the room, To: bob, with a note.
         tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         let file = scratch.appendingPathComponent("for-bob.bin")
@@ -1306,6 +1317,88 @@ final class FirstRunProof: XCTestCase {
         handOff(ui, "q")
         _ = ui.wait(for: .notRunning, timeout: 30)
         _ = run(vox, ["node", "detach", "alice"], env: voxEnv)
+    }
+
+    /// (15) What an operation comes to, as a person meets it.
+    /// - #608 (D16): New Room with its passphrase field left empty says "No passphrase: anyone
+    ///   with the link can join." and makes the room, as `vox room list` lists it.
+    /// - #611 (D19): End for Everyone in a room alice did not create is refused by her node; the
+    ///   sheet stays open and says why, under its button.
+    /// - #615 (P6): that refusal is the status bar's, as a refusal, and is not shown in the
+    ///   Retention sheet opened next, which is another operation's; dismissed, it is gone.
+    ///
+    /// Mutants: New Room taking an empty field as nothing typed (D16): no room, red. The End sheet
+    /// closing whatever leaving did (D19): no reason shown, red. A sheet showing any operation's
+    /// failure (`failure(of:)` ignoring the operation, P6): the Retention sheet shows End's
+    /// refusal, red.
+    private func outcomes(_ ui: XCUIApplication, vox: String, voxEnv: [String: String],
+                          roomPass: String) throws {
+        // #608: a room with no passphrase, made by the app.
+        ui.typeKey("n", modifierFlags: .command)
+        let roomName = Key.id("room-form-name")
+        present(ui, roomName, timeout: 10, "⌘N must open the New Room form")
+        type(ui, roomName, "open", "the room's name field")
+        words(ui, Key.id("room-form-no-passphrase"), timeout: 10,
+              "with its passphrase field empty, New Room must say what no passphrase means",
+              until: { $0 == "No passphrase: anyone with the link can join." })
+        tap(ui, Key.id("room-form-submit"), "Create, the passphrase field left empty")
+        var rooms = ""
+        let madeUntil = Date().addingTimeInterval(60)
+        while Date() < madeUntil && !rooms.contains(" open") {
+            rooms = run(vox, ["room", "list", "--node", "alice"], env: voxEnv).out
+            if !rooms.contains(" open") { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        guard rooms.contains(" open") else {
+            throw Product("New Room with an empty passphrase field must make a room with none; "
+                + "alice's `vox room list` lists no room \"open\": \(rooms)")
+        }
+        print("[proof] New Room with no passphrase made \"open\"")
+
+        // #611: a room bob made, which alice joins: her End for Everyone there is refused.
+        try staged(vox, ["room", "create", "--node", "bob", "--passphrase-file", roomPass,
+                         "--name", "bobs"], env: voxEnv)
+        let bobsRoom = try line(staged(vox, ["room", "list", "--node", "bob"], env: voxEnv)) {
+            $0.contains(" bobs")
+        }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        let bobsLink = try line(staged(vox, ["room", "link", "--node", "bob", bobsRoom], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        try staged(vox, ["room", "join", "--node", "alice", "--passphrase-file", roomPass, bobsLink],
+                   env: voxEnv)
+        tap(ui, Key.id("room-bobs"), "bobs in the sidebar", premise: inRoom(vox, voxEnv, "bobs"))
+        ui.menuBars.menuBarItems["Room"].click()
+        tap(ui, Key.menuItem("End for Everyone…"), "Room > End for Everyone…")
+        tap(ui, Key.id("leave-confirm"), "End for Everyone, in its sheet")
+        let refusal = words(ui, Key.id("leave-failed"), timeout: 30,
+                            "End for Everyone, refused by alice's node (she did not make bobs), must keep its sheet open and say why",
+                            until: { $0.contains("creator") }) ?? ""
+        if locate(ui, Key.id("leave-confirm")) == nil {
+            XCTFail("PRODUCT: a refused End for Everyone must keep its sheet open; it closed")
+        }
+        print("[proof] End for Everyone refused, said in its sheet: \(refusal)")
+        ui.typeKey(.escape, modifierFlags: [])
+
+        // #615: the refusal is the status bar's, as a refusal; not the Retention sheet's.
+        let barSays = words(ui, Key.id("status-outcome-refused"), timeout: 10,
+                            "the status bar must say End for Everyone was refused, as a refusal",
+                            until: { $0.contains("creator") }) ?? ""
+        ui.menuBars.menuBarItems["Room"].click()
+        tap(ui, Key.menuItem("Retention…"), "Room > Retention…")
+        present(ui, Key.id("retention-effect"), timeout: 10, "Room > Retention… must open its sheet")
+        if let shownThere = locateEverywhere(ui, Key.id("retention-said")) {
+            keepTree(ui, "the Retention sheet showed another operation's result")
+            XCTFail("PRODUCT: the Retention sheet must show only its own result; it shows End for Everyone's: \"\(shown(shownThere))\"")
+        }
+        ui.typeKey(.escape, modifierFlags: [])
+        tap(ui, Key.id("status-dismiss"), "the status bar's dismiss")
+        let goneUntil = Date().addingTimeInterval(5)
+        while Date() < goneUntil && locate(ui, Key.id("status-outcome-refused")) != nil {
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        if locate(ui, Key.id("status-outcome-refused")) != nil {
+            XCTFail("PRODUCT: dismissed, the status bar's result must go; it still says it")
+        }
+        print("[proof] status bar said \(barSays) as a refusal; the Retention sheet did not; dismissed, it went")
     }
 
     // ---- every check on the window proves its own query first --------------------------------
