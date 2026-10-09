@@ -521,8 +521,19 @@ final class FirstRunProof: XCTestCase {
         words(ui, Key.showing("node alice is not kept"), timeout: 10,
               "declining must say plainly that node alice is not kept and needs her passphrase after a restart",
               until: { $0.contains("after a restart Vox asks for its passphrase again") })
-        let ok = ui.buttons["OK"].firstMatch
-        if ok.waitForExistence(timeout: 5) { ok.click() }
+        // The alert's own OK, in its sheet or dialog: `ui.buttons["OK"]` also finds the Touch Bar's
+        // copy of it, which XCTest cannot click (rooms2's run, APPARATUS).
+        let okUntil = Date().addingTimeInterval(5)
+        var ok: XCUIElement?
+        repeat {
+            ok = [ui.sheets, ui.dialogs, ui.windows].lazy
+                .map { $0.buttons["OK"].firstMatch }
+                .first { $0.exists && $0.isHittable }
+            if ok == nil { Thread.sleep(forTimeInterval: 0.25) }
+        } while ok == nil && Date() < okUntil
+        if let ok { ok.click() } else {
+            XCTFail("APPARATUS: XCTest finds no clickable OK in the alert's sheet or dialog (only, perhaps, the Touch Bar's)")
+        }
         let notKept = aliceLine()
         XCTAssertTrue(notKept.contains("attached") && !notKept.hasSuffix("(kept)"),
                       "PRODUCT: declining the offer must leave node alice attached and not kept; `vox node list` says \(notKept.debugDescription)")
