@@ -330,6 +330,8 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
     {
         let tmp = tempfile::tempdir().staged();
         let home = tmp.path();
+        // Claude Code is here (its settings folder): the installer gives it the agent skill pack.
+        std::fs::create_dir_all(home.join(".claude")).staged();
         let (ok, text) = run_installer(&server, home, "stable");
         let version = Command::new(home.join("bin/vox"))
             .arg("--version")
@@ -353,6 +355,20 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
             "install.runs_shell_setup",
             rc.contains(">>> vox >>>") && rc.contains("VOX_PROOF_USER_LINE=kept"),
             format!("the rc is {rc:?}"),
+        ));
+        // **The agent skill pack, installed with Vox** (v0.4.1): where Claude Code reads it, and
+        // none for a harness that is not here.
+        let pack = home.join(".claude/skills/vox-agent-comms");
+        let entry =
+            pack.join("SKILL.md").is_file() && pack.join("references/sessions.md").is_file();
+        claims.push(claim(
+            "install.installs_the_agent_skill_pack",
+            ok && entry && !home.join(".codex").exists(),
+            format!(
+                "{} holds SKILL.md and references/sessions.md: {entry}; .codex made: {}",
+                pack.display(),
+                home.join(".codex").exists()
+            ),
         ));
         receipts.insert("install.happy_path".into(), text);
     }
