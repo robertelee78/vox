@@ -273,7 +273,9 @@ Each claim MUST be proved by real use of the shipped binary (ADR-018), with one 
 3. detaching one node keeps the other's live tunnel and sync (mutant: endpoint closed on detach)
    (`the_nodes_of_one_daemon_proof`);
 4. tunnels, counters, status and metrics are per node; node A cannot list or close B's tunnel
-   (`two_nodes_are_clients_of_one_daemon_proof`);
+   (`two_nodes_are_clients_of_one_daemon_proof`). The metrics exposition's shape, with each
+   family's `HELP` and `TYPE` once across nodes and `node` first among a sample's labels, has no
+   proof: its in-process test was deleted in v0.4.1 (AGENTS.md: no unit tests);
 5. a panic in one node's actor leaves the daemon and the other nodes serving
    (`the_daemon_and_its_nodes_proof`);
 6. two clients attaching one node at once both succeed with one attach; a detach with a request in
