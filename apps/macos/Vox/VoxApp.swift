@@ -30,8 +30,10 @@ struct VoxApp: App {
                 .preferredColorScheme(.dark)
         }
         .commands { VoxCommands(app: model) }
-        // Off until the person turns it on (M-22).
-        MenuBarExtra("Vox", systemImage: "bubble.left.and.bubble.right",
+        // Off until the person turns it on (M-22). Its image is the Vox mark as a template
+        // (assets/brand/vox-menubar.svg, made into MenuBarIcon by scripts/brand-icon.sh), which
+        // macOS draws in the menu bar's own colour.
+        MenuBarExtra("Vox", image: "MenuBarIcon",
                      isInserted: Binding(get: { model.menuBar },
                                          set: { model.showMenuBar($0) })) {
             MenuBarContent(app: model)
