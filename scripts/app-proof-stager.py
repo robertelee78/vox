@@ -146,6 +146,18 @@ def stop_all(*_):
 
 signal.signal(signal.SIGTERM, stop_all)
 signal.signal(signal.SIGINT, stop_all)
+
+
+def outlive_no_parent():
+    """The run that started this stager gone (killed, or ended without stopping it): stop too,
+    with everything it started, instead of staying behind under launchd."""
+    parent = os.getppid()
+    while os.getppid() == parent:
+        time.sleep(1)
+    stop_all()
+
+
+threading.Thread(target=outlive_no_parent, daemon=True).start()
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.bind(("127.0.0.1", 0))
 server.listen(8)

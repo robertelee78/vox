@@ -382,7 +382,9 @@ pub enum Error {
     /// a bad base32 digest, a malformed or over-long anchor list, a duplicate or
     /// unknown query field. A link is untrusted input from a chat message, so
     /// nothing about it is guessed. Carries a static reason.
-    #[error("malformed room link: {0}")]
+    // One sentence: what failed, and what to do (ADR-028 E-7). A base32 id that will not parse is
+    // this error too (`link::b32_decode`), so it names both.
+    #[error("that room link or id will not parse ({0}): check you copied all of it, exactly as it was sent")]
     MalformedLink(&'static str),
 
     /// An `--anchor` spec, or a line of the anchors file, could not be used: it is not

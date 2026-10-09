@@ -74,12 +74,11 @@ struct AttachSheet: View {
                 .disabled(sending)
                 .accessibilityIdentifier("attach-send")
             }
-            if let said = model.said {
-                StateMark(kind: .danger, words: said).textSelection(.enabled)
-            }
+            OutcomeMark(outcome: model.failure(of: "attach"))
         }
         .padding(24)
         .frame(width: Theme.scaled(440))
+        .onAppear { model.clearOutcome(of: "attach") }
     }
 }
 

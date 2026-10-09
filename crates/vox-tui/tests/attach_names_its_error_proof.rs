@@ -15,7 +15,8 @@
 //! three ways, on the words a person reads:
 //!
 //! 1. a **stale socket** (bound, then its listener gone): no vox daemon is running for this data
-//!    root, how to start one, and the OS reason ("Connection refused");
+//!    root, how to start one (with `vox daemon`, or by opening Vox.app: vox-core's one sentence,
+//!    which the app shows too, ADR-028 E-7), and the OS reason ("Connection refused");
 //! 2. a socket that **closes before greeting**: it accepted, "the node closed the connection before
 //!    greeting", and that it may be stopping;
 //! 3. a daemon on **another protocol**: "speaks a different control protocol", both protocol
@@ -24,7 +25,8 @@
 //! No message may say "identity bundle", and each exits non-zero.
 //!
 //! Mutations, each red: the old `attach`, which drops the error (0 of 3); the new `attach` over
-//! the old errors, "malformed identity bundle: …" (red on the identity-bundle words).
+//! the old errors, "malformed identity bundle: …" (red on the identity-bundle words); the CLI's own
+//! sentence back in place of vox-core's (red on the stale socket's "Vox.app starts one").
 
 #![cfg(unix)]
 
@@ -145,9 +147,12 @@ fn a_failed_attach_says_why_in_a_persons_words() {
         stale.path(),
         // Since ADR-026 a refused connect means no daemon holds the data root: said as that,
         // with how to start one.
+        // The sentence vox-core writes once, which Vox.app shows too (ADR-028 E-7, #629): it
+        // says what to do in either client.
         &[
             "no vox daemon is running for this data root",
             "Start one:  vox daemon",
+            "Vox.app starts one when it opens",
             // The cause, named (#191): the OS's reason the connect failed.
             "Connection refused",
         ],

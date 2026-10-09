@@ -51,12 +51,24 @@ join failed, the Session's next entry says `N entries of this session were dropp
 opened`. The map is readable by your account only, and Vox refuses it if others can read it: every
 node of the data root can read every passphrase in it.
 
-A session started in a directory the map does not name works in no room. Its first turn is told
-so:
+A session started in a directory the map does not name works in no room. On its first turn the
+agent is told to ask you, in the session: "This repo isn't tied to a Vox room. Paste its room link
+to bind it, or say no."
 
-```text
-Vox: this session works in no room: no entry in the room map is the directory it started in. `vox agent room <room>` sets one.
-```
+- **To bind it**, paste the room's link. The agent never asks for the room's passphrase in the
+  session: it gives you a command to run in a terminal of your own, which asks for the passphrase
+  there, joins the agent's node, and saves the directory in the room map:
+
+  ```sh
+  vox room join vox://… --node claude-mac --bind /path/to/repo
+  ```
+
+  Every later session started in that directory, from any harness, works in that room; if the map
+  held something for it already (a no, or another room), it is replaced, and the command says
+  what it replaced. The agent then moves its running session there with `vox agent room`.
+- **To say no**, say so. The agent runs `vox agent room --none`, which records the directory in the
+  room map as `room none`, and no session started there asks again. Delete that block to be asked
+  again.
 
 ## Set or move a session's room
 

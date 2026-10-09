@@ -4,8 +4,9 @@
 //! (ADR-026 F-1, D-3). A directory of the root itself holding a vault (`vault.cbor`), an anchor's
 //! key (`node-identity.key`) or a store (`store.redb`) is not a node, and a data root holding one
 //! is not one this version reads: it is refused by every verb before anything is written
-//! ([`refuse_old_layout`]), and left exactly as it is. Vox carries no code that reads, converts or
-//! moves such a directory.
+//! ([`refuse_old_layout`]), and left exactly as it is. Vox carries no code that reads or converts
+//! such a directory; only the app, when the person asks (#576), renames it into
+//! [`MOVED_ASIDE_DIR`], unread and whole ([`move_old_layout_aside`]).
 //!
 //! **What wrote a data root is written in it** (ADR-026 F-3): `.daemon/format` names the data
 //! root's format and the version of vox that last served it ([`stamp_format`]). A release that
@@ -31,21 +32,27 @@ pub fn anchor_name_of(name: &NodeName) -> Result<NodeName> {
     NodeName::parse(&format!("{name}{ANCHOR_SUFFIX}"))
 }
 
-/// **Refuse a data root this version does not read**, reading it only: a directory of the root
-/// that is not hidden, is not `nodes/`, and holds a vault, an anchor's key or a store is not a
-/// node. Nothing is created, locked or written either way.
-///
-/// # Errors
-/// [`Error::DataRootNotRead`], naming the root and the first such directory.
-pub fn refuse_old_layout(account: &Account) -> Result<()> {
+/// Where the app moves an earlier release's node directories when the person asks: under the
+/// data root, so they stay where the person looked, and out of the way of [`refuse_old_layout`].
+pub const MOVED_ASIDE_DIR: &str = "moved-aside";
+
+/// The directories of the data root that make it one this version does not read, by name, sorted:
+/// not hidden, not `nodes/` nor [`MOVED_ASIDE_DIR`], and holding a vault, an anchor's key or a
+/// store. Read only.
+#[must_use]
+pub fn old_layout_dirs(account: &Account) -> Vec<String> {
     let Ok(dir) = std::fs::read_dir(&account.data_root) else {
-        return Ok(());
+        return Vec::new();
     };
     let mut old: Vec<String> = dir
         .filter_map(std::result::Result::ok)
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
-            if name.starts_with('.') || name == NODES_DIR || !e.file_type().ok()?.is_dir() {
+            if name.starts_with('.')
+                || name == NODES_DIR
+                || name == MOVED_ASIDE_DIR
+                || !e.file_type().ok()?.is_dir()
+            {
                 return None;
             }
             let p = e.path();
@@ -56,6 +63,55 @@ pub fn refuse_old_layout(account: &Account) -> Result<()> {
         })
         .collect();
     old.sort();
+    old
+}
+
+/// **Move an earlier release's node directories aside**, when the person asks (#576): each of
+/// [`old_layout_dirs`] is renamed, whole and unread, to `<data root>/moved-aside/<name>-<date>`
+/// (`-2`, `-3`… when that is taken); nothing is deleted, converted or opened. Returns each move,
+/// from and to.
+///
+/// # Errors
+/// The `moved-aside` directory cannot be made, or a rename fails (the moves before it stand).
+pub fn move_old_layout_aside(
+    account: &Account,
+    date: &str,
+) -> Result<Vec<(std::path::PathBuf, std::path::PathBuf)>> {
+    let aside = account.data_root.join(MOVED_ASIDE_DIR);
+    let mut moved = Vec::new();
+    for name in old_layout_dirs(account) {
+        std::fs::create_dir_all(&aside).map_err(|e| Error::DataRootNotRead {
+            root: account.data_root.display().to_string(),
+            why: format!("{} could not be made: {e}", aside.display()),
+        })?;
+        let from = account.data_root.join(&name);
+        let mut to = aside.join(format!("{name}-{date}"));
+        let mut n = 2;
+        while to.exists() {
+            to = aside.join(format!("{name}-{date}-{n}"));
+            n += 1;
+        }
+        std::fs::rename(&from, &to).map_err(|e| Error::DataRootNotRead {
+            root: account.data_root.display().to_string(),
+            why: format!(
+                "{} could not be moved to {}: {e}",
+                from.display(),
+                to.display()
+            ),
+        })?;
+        moved.push((from, to));
+    }
+    Ok(moved)
+}
+
+/// **Refuse a data root this version does not read**, reading it only: a directory of the root
+/// that is not hidden, is not `nodes/`, and holds a vault, an anchor's key or a store is not a
+/// node. Nothing is created, locked or written either way.
+///
+/// # Errors
+/// [`Error::DataRootNotRead`], naming the root and the first such directory.
+pub fn refuse_old_layout(account: &Account) -> Result<()> {
+    let old = old_layout_dirs(account);
     match old.first() {
         None => Ok(()),
         Some(first) => Err(Error::DataRootNotRead {
