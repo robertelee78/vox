@@ -45,8 +45,9 @@ extension VoxAction {
     /// menu that is empty when the app opens and does not bring it back later, and the File menu
     /// went missing that way.
     @MainActor static func all(_ node: NodeModel?) -> [VoxAction] {
-        let live = node != nil
-        let inRoom = node?.roomOnScreen != nil
+        // A detached node acts on nothing until it is attached again.
+        let live = node != nil && node?.ended == nil
+        let inRoom = live && node?.roomOnScreen != nil
         // A keyring row selected, in the keyring view: what Compare, Rename and Remove act on.
         let picked = node?.selection == .keyring && node?.keyringSelected != nil
         let digits: [VoxAction] = (1...9).map { n in

@@ -11,6 +11,10 @@ struct MainWindow: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if model.ended != nil {
+                NodeStopped(model: model)
+                Divider()
+            }
             NavigationSplitView {
                 Sidebar(model: model)
                     .navigationSplitViewColumnWidth(min: Theme.scaled(220), ideal: Theme.scaled(260))
@@ -65,9 +69,10 @@ private struct Sidebar: View {
                                     Task { await model.show(s) }
                                 })) {
             Section {
-                StateMark(kind: .live, words: "node \(model.node), attached")
+                StateMark(kind: model.ended == nil ? .live : .danger,
+                          words: "node \(model.node), \(model.ended == nil ? "attached" : "detached")")
                     .font(Theme.text)
-                    .accessibilityIdentifier("attached")
+                    .accessibilityIdentifier(model.ended == nil ? "attached" : "detached")
                     .background(SidebarHighlightOff())
             }
             ForEach([RoomGroup.needsYou, .active, .quiet], id: \.self) { need in
@@ -604,6 +609,8 @@ private struct RoomView: View {
     private func send(urgent now: Bool) {
         let (text, recipients, re) = (draft, Array(to), model.replyTo?.id ?? "")
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        // A detached node posts nothing: the draft stays until it is attached again.
+        guard model.ended == nil else { return }
         draft = ""
         urgent = false
         model.replyTo = nil
@@ -758,6 +765,42 @@ private struct MessageRow: View {
     private var author: String {
         if message.author == me { return "you" }
         return message.authorName.isEmpty ? String(message.author.prefix(12)) : message.authorName
+    }
+}
+
+/// The node stopped under the window (detached elsewhere, or the daemon stopped): said at the top,
+/// with the way back. The window and everything typed in it stay; attaching the same node again
+/// picks up where it was. Start Over goes back to reaching the daemon, as at launch.
+private struct NodeStopped: View {
+    @ObservedObject var model: NodeModel
+    @State private var field = SecureFieldHolder()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            StateMark(kind: .danger, words: "Node \(model.node) is detached: \(model.ended ?? "")")
+                .textSelection(.enabled)
+                .accessibilityIdentifier("node-stopped")
+            Text("Nothing you typed is lost. Type node \(model.node)'s identity passphrase to attach "
+                + "it again; leave it empty if it needs none.")
+                .secondaryText()
+            HStack {
+                SecureInput(holder: field) { again() }
+                    .frame(width: Theme.scaled(260))
+                    .accessibilityIdentifier("node-stopped-passphrase")
+                    .accessibilityLabel("Identity passphrase for node \(model.node)")
+                Button("Attach Again") { again() }
+                    .accessibilityIdentifier("node-stopped-attach")
+                Button("Start Over") { Task { await AppModel.shared.start() } }
+                    .accessibilityIdentifier("node-stopped-start-over")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+    }
+
+    private func again() {
+        let secret = field.take()
+        Task { await model.attachAgain(secret) }
     }
 }
 

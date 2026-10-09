@@ -914,6 +914,21 @@ final class NodeModel: ObservableObject {
         ended = text
     }
 
+    /// Attach this node again after it stopped, with `secret` if it needs its passphrase, and
+    /// follow it as before: the window and its drafts stay.
+    func attachAgain(_ secret: Secret?) async {
+        do {
+            let passphrase = try secret?.passphrase()
+            defer { passphrase?.wipe() }
+            _ = try await client.attach(node: node, passphrase: passphrase)
+            ended = nil
+            said = nil
+            await start()
+        } catch {
+            said = sentence(error)
+        }
+    }
+
     private func name(of room: RoomSummary) -> String {
         room.name.isEmpty ? String(room.id.prefix(12)) : room.name
     }
