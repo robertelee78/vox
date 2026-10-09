@@ -3458,7 +3458,7 @@ final class FirstRunProof: XCTestCase {
         let rowSaid = words(ui, daveRow, timeout: 60,
                             "dave trusts alice and she has not trusted him: her member pane must say \"not in keyring, trusts you\"",
                             until: { $0.hasSuffix("not in keyring, trusts you") }) ?? ""
-        let banner = words(ui, Key.id("trust-banner"), timeout: 10,
+        let trustBanner = words(ui, Key.id("trust-banner"), timeout: 10,
                            "mission must say whom alice does not yet read each other with: dave",
                            until: { $0.contains(String(daveFp.prefix(12))) }) ?? ""
         // (15e, #624) Compare, group by group: on dave's offer, collapsed until asked for, a
@@ -3508,7 +3508,7 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(ring.contains(daveFp),
                       "PRODUCT: trusted from his card, dave must be in alice's keyring; `vox trust list` said: \(ring)")
         tap(ui, Key.id("card-close"), "Close on dave's card")
-        print("[proof] dave's row: \(rowSaid); banner: \(banner); card: \(directions) → \(cardSaid)")
+        print("[proof] dave's row: \(rowSaid); banner: \(trustBanner); card: \(directions) → \(cardSaid)")
         // (15f, G2) The keyring's card for dave: each direction, the room it covers, and what
         // removing him would change, behind a disclosure.
         tap(ui, Key.id("keyring"), "Keyring in the sidebar")
