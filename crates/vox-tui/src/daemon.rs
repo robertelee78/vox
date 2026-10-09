@@ -407,6 +407,10 @@ pub(crate) fn take_account(
     };
     let lock = Arc::new(Mutex::new(lock));
     write_pid(&lock);
+    // **What serves this data root is written in it** (ADR-026 F-3), under the lock, so a later
+    // release can tell which formats it holds.
+    vox_core::node::layout::stamp_format(account, env!("CARGO_PKG_VERSION"))
+        .map_err(|e| AppError::Usage(e.to_string()))?;
     let mut anchors = vox_core::nat::bootstrap::BootstrapSet::new();
     for spec in anchor_specs {
         if !spec.trim().is_empty() {
