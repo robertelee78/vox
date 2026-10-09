@@ -453,11 +453,23 @@ final class FirstRunProof: XCTestCase {
         guard window.frame.width >= needed else {
             throw Apparatus("staging not achieved: the window is \(window.frame.width) wide after widening, and both drags need \(needed) (the timeline keeps 400)")
         }
+        // What the sidebar is, seen two ways: the splitter XCTest finds, and a row inside the
+        // sidebar (Keyring spans its width). Both, before and after, are printed with every
+        // splitter, so a red says whether the divider moved at all.
+        func rowEdge() -> CGFloat {
+            (locate(ui, Key.id("keyring"))?.frame.maxX ?? -1) - window.frame.minX
+        }
+        func splitters() -> String {
+            window.splitters.allElementsBoundByIndex.map { "\($0.frame)" }.joined(separator: " ")
+        }
+        let row0 = rowEdge(), split0 = splitters()
         drag(side, by: 80)
+        let row1 = rowEdge(), split1 = splitters()
+        print("[proof] columns: sidebar drag: splitter \(sidebar0) → \(sidebarWidth()); Keyring row's edge \(row0) → \(row1); splitters before \(split0); after \(split1); window \(window.frame)")
         drag(inspectorDivider(), by: -60)
         let sidebar1 = sidebarWidth(), inspector1 = inspectorWidth()
         XCTAssertTrue(sidebar1 > sidebar0 + 40,
-                      "PRODUCT: dragging the sidebar's divider 80 points right must widen the sidebar; it went from \(sidebar0) to \(sidebar1)")
+                      "PRODUCT: dragging the sidebar's divider 80 points right must widen the sidebar; it went from \(sidebar0) to \(sidebar1) (the Keyring row's edge \(row0) → \(row1))")
         XCTAssertTrue(inspector1 > inspector0 + 30,
                       "PRODUCT: dragging the inspector's divider 60 points left must widen the inspector; it went from \(inspector0) to \(inspector1)")
 
