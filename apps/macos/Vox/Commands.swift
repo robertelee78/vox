@@ -45,8 +45,9 @@ extension VoxAction {
     /// menu that is empty when the app opens and does not bring it back later, and the File menu
     /// went missing that way.
     @MainActor static func all(_ node: NodeModel?) -> [VoxAction] {
-        let live = node != nil
-        let inRoom = node?.roomOnScreen != nil
+        // A detached node acts on nothing until it is attached again.
+        let live = node != nil && node?.ended == nil
+        let inRoom = live && node?.roomOnScreen != nil
         // What the room's commands act on: the Session on screen, when one is, never the room
         // behind it (D2).
         let inSession = node?.showingSession ?? false
@@ -79,7 +80,7 @@ extension VoxAction {
             VoxAction("Room", "Retention…", enabled: inRoom) { node?.sheet = .retention },
             VoxAction("Room", "Admins…", enabled: inRoom) { node?.sheet = .admins },
             VoxAction("Room", "Reply to Selected Message", "r",
-                      enabled: inRoom && node?.selectedMessage != nil) {
+                      enabled: inRoom && node?.messages.contains { $0.id == node?.selectedMessage } == true) {
                 node?.replyTo = node?.messages.first { $0.id == node?.selectedMessage }
             },
             // The room's composer only: never while a Session is shown (D2).
@@ -91,6 +92,9 @@ extension VoxAction {
             VoxAction("View", "Focus Timeline", "t", [.command, .control], enabled: inRoom) {
                 NotificationCenter.default.post(name: .voxFocusTimeline, object: nil)
             },
+            // The room's inspector, hidden or shown again; ⌥⌘I, as in the Finder.
+            VoxAction("View", node?.inspectorShown == false ? "Show Inspector" : "Hide Inspector", "i",
+                      [.command, .option], enabled: inRoom) { node?.inspectorShown.toggle() },
             // On the selected request of the Session on screen (P1). ⌥⌘Y and ⌥⌘N: ⌘Y is the
             // system's history and ⌘N New Room.
             VoxAction("Room", "Approve Request", "y", [.command, .option],
@@ -149,6 +153,10 @@ struct VoxCommands: Commands {
                 .disabled(app.node != nil)
             Button("Detach") { Task { await app.detachNode() } }
                 .disabled(app.node == nil)
+            Hairline()
+            // E-4: the one way to act as another node: sign out, then sign in.
+            Button("Sign Out…") { app.signingOut = true }
+                .disabled(app.signedInAs == nil)
             items("Node")
         }
         CommandMenu("Keyring") { items("Keyring") }
@@ -202,13 +210,13 @@ struct Palette: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: Space.s8) {
             TextField("Type a command", text: $query)
                 .accessibilityLabel("Command")
                 .onSubmit { if let first = found.first { done(first) } }
                 .accessibilityIdentifier("palette-query")
             ScrollView {
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: Space.s4) {
                     ForEach(found) { action in
                         Button { done(action) } label: {
                             HStack {
@@ -224,7 +232,7 @@ struct Palette: View {
             }
             .frame(height: 280)
         }
-        .padding(16)
+        .padding(Space.s16)
         .frame(width: Theme.scaled(420))
     }
 
@@ -240,17 +248,20 @@ struct NodeSheets: View {
     let sheet: NodeSheet
 
     var body: some View {
-        switch sheet {
-        case .palette: Palette(model: model)
-        case .newRoom: RoomForm(model: model, joining: false)
-        case .joinRoom: RoomForm(model: model, joining: true)
-        case .fingerprint: FingerprintSheet(model: model)
-        case .rename: RenameSheet(model: model)
-        case .retention: RetentionSheet(model: model)
-        case .admins: AdminsSheet(model: model)
-        case .leave: LeaveSheet(model: model, ending: false)
-        case .end: LeaveSheet(model: model, ending: true)
+        Group {
+            switch sheet {
+            case .palette: Palette(model: model)
+            case .newRoom: RoomForm(model: model, joining: false)
+            case .joinRoom: RoomForm(model: model, joining: true)
+            case .fingerprint: FingerprintSheet(model: model)
+            case .rename: RenameSheet(model: model)
+            case .retention: RetentionSheet(model: model)
+            case .admins: AdminsSheet(model: model)
+            case .leave: LeaveSheet(model: model, ending: false)
+            case .end: LeaveSheet(model: model, ending: true)
+            }
         }
+        .panelSurface()
     }
 }
 
@@ -268,11 +279,12 @@ private struct RoomForm: View {
     @State private var submitting = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(joining ? "Join a room" : "New room").heading()
+        VStack(alignment: .leading, spacing: Space.s12) {
+            Text(joining ? "Join a room" : "New room").title()
             if joining {
                 TextField("Room link (vox://…)", text: $link).font(Theme.mono)
                     .accessibilityLabel("Room link")
+                    .accessibilityIdentifier("room-form-link")
             } else {
                 TextField("Its name, as every member sees it", text: $name)
                     .accessibilityLabel("Room name")
@@ -293,13 +305,22 @@ private struct RoomForm: View {
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 Button(joining ? "Join" : "Create") { submit() }.keyboardShortcut(.defaultAction)
+                    .buttonStyle(.voxPrimary)
                     .disabled(submitting || (joining ? link.isEmpty : name.isEmpty))
                     .accessibilityIdentifier("room-form-submit")
             }
         }
-        .padding(24)
+        .padding(Space.s24)
         .frame(width: Theme.scaled(440))
-        .onAppear { model.clearOutcome(of: operation) }
+        .onAppear {
+            model.clearOutcome(of: operation)
+            // A link the system opened the app with fills the field; nothing is joined until the
+            // person types the passphrase and clicks Join.
+            if joining, let given = model.joinLink {
+                link = given
+                model.joinLink = nil
+            }
+        }
     }
 
     private var operation: String { joining ? "join-room" : "create-room" }
@@ -327,8 +348,8 @@ private struct FingerprintSheet: View {
 
     var body: some View {
         let card = fingerprintCard(fingerprint: model.me)
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Node \(model.node)").heading()
+        VStack(alignment: .leading, spacing: Space.s12) {
+            Text("Node \(model.node)").title()
             VStack(spacing: 0) {
                 ForEach(Array(card.art.enumerated()), id: \.offset) { Text($0.element) }
             }
@@ -345,7 +366,7 @@ private struct FingerprintSheet: View {
                 Button("Done") { model.sheet = nil }.keyboardShortcut(.defaultAction)
             }
         }
-        .padding(24)
+        .padding(Space.s24)
     }
 }
 
@@ -385,8 +406,8 @@ private struct RetentionSheet: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Retention").heading()
+        VStack(alignment: .leading, spacing: Space.s12) {
+            Text("Retention").title()
             Picker("Keep messages", selection: $seconds) {
                 ForEach(choices, id: \.1) { Text($0.0).tag($0.1) }
             }
@@ -398,13 +419,14 @@ private struct RetentionSheet: View {
             OutcomeMark(outcome: model.failure(of: "retention"), id: "retention-said")
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
-                // Never the Return default: Set is pressed on purpose.
-                Button("Set") { submit() }
+                // Never the Return default (A9): a retention deletes text, so Set is pressed on
+                // purpose, and only once another retention is chosen (D14).
+                Button("Set", role: seconds == 0 ? nil : .destructive) { submit() }
                     .disabled(current == nil || seconds == current)
                     .accessibilityIdentifier("retention-submit")
             }
         }
-        .padding(24)
+        .padding(Space.s24)
         .frame(width: Theme.scaled(440))
         .onAppear {
             model.clearOutcome(of: "retention")
@@ -448,8 +470,8 @@ private struct RenameSheet: View {
     @State private var name = ""
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Rename the room").heading()
+        VStack(alignment: .leading, spacing: Space.s12) {
+            Text("Rename the room").title()
             TextField("Its new name", text: $name).onSubmit { submit() }
                 .accessibilityLabel("New room name")
                 .accessibilityIdentifier("rename-name")
@@ -461,11 +483,12 @@ private struct RenameSheet: View {
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 Button("Rename") { submit() }.keyboardShortcut(.defaultAction)
+                    .buttonStyle(.voxPrimary)
                     .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
                     .accessibilityIdentifier("rename-submit")
             }
         }
-        .padding(24)
+        .padding(Space.s24)
         .frame(width: Theme.scaled(440))
         .onAppear { model.clearOutcome(of: "rename") }
     }
@@ -481,28 +504,60 @@ private struct RenameSheet: View {
 private struct AdminsSheet: View {
     @ObservedObject var model: NodeModel
     @State private var admins: [String] = []
+    /// The member about to be made an admin, asked first: an admin can end the room for everyone
+    /// (E-5). Taking adminship away goes through at once.
+    @State private var asking: NodeModel.MemberRow?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Admins").heading()
+        VStack(alignment: .leading, spacing: Space.s12) {
+            Text("Admins").title()
             Text("An admin may end the room and set its retention.").secondaryText()
             ForEach(model.members) { member in
                 Toggle(isOn: Binding(get: { admins.contains(member.id) }, set: { on in
+                    if on {
+                        asking = member
+                        return
+                    }
                     Task {
-                        await model.setAdmin(member.id, on)
+                        await model.setAdmin(member.id, false)
                         admins = await model.admins()
                     }
                 })) {
                     TrustMark(name: member.name, trust: member.trust)
                 }
-                .disabled(admins.first == member.id)
+                .disabled(admins.first == member.id || asking != nil)
+                .accessibilityIdentifier("admin-\(member.name)")
                 .accessibilityLabel(admins.contains(member.id) ? "\(member.name), admin"
                                                                : "\(member.name), not an admin")
             }
+            if let member = asking {
+                VStack(alignment: .leading, spacing: 8) {
+                    StateMark(kind: .attention,
+                              words: "Make \(member.name) an admin? An admin can end this room for "
+                                  + "everyone and change its retention.")
+                        .accessibilityIdentifier("admin-confirm")
+                    HStack {
+                        Spacer()
+                        Button("Cancel") { asking = nil }
+                            .keyboardShortcut(.cancelAction)
+                            .accessibilityIdentifier("admin-confirm-cancel")
+                        Button("Make Admin") {
+                            asking = nil
+                            Task {
+                                await model.setAdmin(member.id, true)
+                                admins = await model.admins()
+                            }
+                        }
+                        .accessibilityIdentifier("admin-confirm-make")
+                    }
+                }
+            }
             OutcomeMark(outcome: model.failure(of: "admins"))
-            Button("Done") { model.sheet = nil }.keyboardShortcut(.defaultAction)
+            if asking == nil {
+                Button("Done") { model.sheet = nil }.keyboardShortcut(.defaultAction)
+            }
         }
-        .padding(24)
+        .padding(Space.s24)
         .frame(width: Theme.scaled(440))
         .onAppear { model.clearOutcome(of: "admins") }
         .task { admins = await model.admins() }
@@ -518,8 +573,8 @@ private struct LeaveSheet: View {
     @State private var working = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(ending ? "End this room for everyone?" : "Leave this room?").heading()
+        VStack(alignment: .leading, spacing: Space.s12) {
+            Text(ending ? "End this room for everyone?" : "Leave this room?").title()
             Text(ending
                 ? "Every member's copy of the room is deleted, and no one can post in it again. "
                     + "Only its creator or an admin can do this."
@@ -548,7 +603,7 @@ private struct LeaveSheet: View {
                     .accessibilityIdentifier("leave-failed")
             }
         }
-        .padding(24)
+        .padding(Space.s24)
         .frame(width: Theme.scaled(440))
     }
 }

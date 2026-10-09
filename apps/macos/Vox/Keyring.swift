@@ -19,15 +19,14 @@ struct KeyringView: View {
     @ObservedObject var model: NodeModel
     @State private var fingerprint = ""
     @State private var alias = ""
-    /// What trusting grants: read, the default (K-16), or read + drive.
-    @State private var drive = false
     @State private var removing: TrustedNode?
+    @State private var drivingAsk: TrustedNode?
     @FocusState private var adding: Bool
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                Text("Keyring").heading()
+            VStack(alignment: .leading, spacing: Space.s16) {
+                Text("Keyring").title()
                 Text(model.keyring).font(Theme.mono).secondaryText()
                 if let did = model.keyringDid {
                     StateMark(kind: .plain, words: did)
@@ -47,23 +46,34 @@ struct KeyringView: View {
                     KeyringPassphrase(model: model, pending: pending)
                 }
                 addForm
-                Divider()
+                Hairline()
                 if model.trusted.isEmpty {
                     Text("This node trusts no one yet: nobody can read what you write until you "
                         + "trust them.").secondaryText()
                 }
                 ForEach(model.trusted, id: \.fingerprint) { node in
-                    KeyringRow(model: model, node: node) { removing = node }
+                    KeyringRow(model: model, node: node, remove: { removing = node },
+                               giveDrive: { drivingAsk = node })
                         .selectable(model.keyringSelected == node.fingerprint) {
                             model.keyringSelected = node.fingerprint
                         }
+                    // The selected entry's card (G2): each direction, the rooms, what removing it
+                    // would change.
+                    if model.keyringSelected == node.fingerprint {
+                        KeyringCard(model: model, node: node)
+                    }
                 }
             }
-            .padding(24)
+            .padding(Space.s24)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .sheet(item: Binding(get: { removing.map(Removal.init) }, set: { removing = $0?.node })) {
-            RemoveSheet(model: model, node: $0.node) { removing = nil }
+            RemoveSheet(model: model, node: $0.node) { removing = nil }.textSelection(.enabled)
+                .panelSurface()
+        }
+        .sheet(item: Binding(get: { drivingAsk.map(Removal.init) }, set: { drivingAsk = $0?.node })) {
+            DriveSheet(model: model, node: $0.node) { drivingAsk = nil }
+                .panelSurface()
         }
         .onChange(of: model.keyringAsk) { ask in
             guard let ask else { return }
@@ -81,7 +91,7 @@ struct KeyringView: View {
     /// Add: the fingerprint pasted or typed, an alias (K-3), and what trusting does, before it is
     /// done (E-5).
     private var addForm: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: Space.s8) {
             Text("ADD A NODE").eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
             TextField("Fingerprint (paste or type)", text: $fingerprint)
                 .accessibilityLabel("Fingerprint")
@@ -91,25 +101,20 @@ struct KeyringView: View {
             TextField("Alias", text: $alias)
                 .accessibilityLabel("Alias")
                 .accessibilityIdentifier("keyring-add-alias")
-            Picker("Grants", selection: $drive) {
-                Text(Capability.words(false)).tag(false)
-                Text(Capability.words(true)).tag(true)
-            }
-            .pickerStyle(.segmented)
-            .fixedSize()
-            .accessibilityIdentifier("keyring-add-capability")
+            // Read is the only grant here (K-16, P5): drive is its own step on the node's row,
+            // through a confirm sheet.
+            AliasClash(model: model, alias: alias)
             if !fingerprint.isEmpty && !alias.isEmpty {
-                Text(Effects.trusting(alias) + " " + Effects.granting(alias, drive: drive))
+                Text(Effects.trusting(alias) + " " + Effects.granting(alias, drive: false))
                     .secondaryText()
                     .accessibilityIdentifier("keyring-add-effect")
             }
             Button("Trust") {
-                let (fp, name, grant) = (fingerprint, alias, drive)
+                let (fp, name) = (fingerprint, alias)
                 Task {
-                    if await model.trust(fp, as: name, drive: grant) {
+                    if await model.trust(fp, as: name, drive: false) {
                         fingerprint = ""
                         alias = ""
-                        drive = false
                     }
                 }
             }
@@ -159,6 +164,8 @@ private struct KeyringRow: View {
     @ObservedObject var model: NodeModel
     let node: TrustedNode
     let remove: () -> Void
+    /// Ask to give it drive, through its confirm sheet (P5).
+    let giveDrive: () -> Void
     @State private var renaming = false
     @State private var newAlias = ""
     @State private var comparing = false
@@ -167,14 +174,14 @@ private struct KeyringRow: View {
 
     var body: some View {
         let card = fingerprintCard(fingerprint: node.fingerprint)
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .top, spacing: 16) {
+        VStack(alignment: .leading, spacing: Space.s8) {
+            HStack(alignment: .top, spacing: Space.s16) {
                 VStack(spacing: 0) {
                     ForEach(Array(card.art.enumerated()), id: \.offset) { Text($0.element) }
                 }
                 .font(Theme.mono)
                 .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: Space.s4) {
                     // ⇄ once it trusts this node back, → until then (L-4).
                     TrustMark(name: node.name,
                               trust: model.trustsBack.contains(node.fingerprint) ? .mutual : .oneWay)
@@ -185,8 +192,13 @@ private struct KeyringRow: View {
                 }
             }
             HStack {
-                Button("Change…") { changing.toggle() }
-                    .accessibilityIdentifier("keyring-change-\(node.name)")
+                if node.drive {
+                    Button("Make Read Only…") { changing.toggle() }
+                        .accessibilityIdentifier("keyring-change-\(node.name)")
+                } else {
+                    Button("Also let \(node.name) drive my Sessions…", action: giveDrive)
+                        .accessibilityIdentifier("keyring-give-drive-\(node.name)")
+                }
                 Button("Rename…") { renaming.toggle(); newAlias = node.name }
                 Button("Compare…") { comparing.toggle(); other = "" }
                 Button("Remove…", role: .destructive, action: remove)
@@ -195,13 +207,12 @@ private struct KeyringRow: View {
             if let pending = model.keyringPending, pending.fingerprint == node.fingerprint {
                 KeyringPassphrase(model: model, pending: pending)
             }
-            if changing {
-                // The other grant, said before it is made (E-5).
-                Text(Effects.granting(node.name, drive: !node.drive)).secondaryText()
+            if changing && node.drive {
+                // Lowering stays inline, said before it is made (E-5).
+                Text(Effects.granting(node.name, drive: false)).secondaryText()
                     .accessibilityIdentifier("keyring-change-effect-\(node.name)")
-                Button(node.drive ? "Read only" : "Give drive") {
-                    let grant = !node.drive
-                    Task { if await model.setCapability(node, drive: grant) { changing = false } }
+                Button("Make Read Only") {
+                    Task { if await model.setCapability(node, drive: false) { changing = false } }
                 }
                 .accessibilityIdentifier("keyring-change-confirm-\(node.name)")
             }
@@ -217,26 +228,16 @@ private struct KeyringRow: View {
                 }
                 if !newAlias.isEmpty && newAlias != node.name {
                     Text(Effects.renaming(newAlias)).secondaryText()
+                    AliasClash(model: model, alias: newAlias, except: node.fingerprint)
                 }
             }
             if comparing {
-                TextField("Their fingerprint, pasted or typed", text: $other).font(Theme.mono)
-                    .accessibilityLabel("Their fingerprint, to compare with \(node.name)'s")
-                    .accessibilityIdentifier("keyring-compare-\(node.name)")
-                if !other.isEmpty {
-                    if Compare.same(other, node.fingerprint) {
-                        StateMark(kind: .plain, words: "Matches \(node.name)'s fingerprint.")
-                    } else {
-                        // K-5: a mismatch is its own action, which says not to trust the node.
-                        StateMark(kind: .danger,
-                                  words: "Does not match. This is not the node you trusted as "
-                                      + "\(node.name): do not trust it.")
-                        Button("Remove \(node.name)…", role: .destructive, action: remove)
-                    }
-                }
+                // Group by group (#624): only a real mismatch says not to trust it (K-5).
+                CompareField(fingerprint: node.fingerprint, name: node.name,
+                             id: "keyring-\(node.name)", remove: remove)
             }
         }
-        .padding(.vertical, 8)
+        .padding(.vertical, Space.s8)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("keyring-row-\(node.name)")
         .onChange(of: model.keyringAsk) { ask in
@@ -279,8 +280,8 @@ private struct RemoveSheet: View {
     @State private var working = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Remove \(node.name)?").heading()
+        VStack(alignment: .leading, spacing: Space.s16) {
+            Text("Remove \(node.name)?").title()
             Text(Effects.untrusting(node.name))
                 .accessibilityIdentifier("keyring-remove-effect")
             HStack {
@@ -317,10 +318,82 @@ private struct RemoveSheet: View {
                     .accessibilityIdentifier("keyring-remove-failed")
             }
         }
-        .padding(24)
+        .padding(Space.s24)
         .frame(width: Theme.scaled(440))
         // The passphrase given: done once the change is made, else why not, here. Cancelled, or
         // the other change kept, nothing was removed and the sheet stays.
+        .onChange(of: model.keyringPending?.id) { _ in
+            guard asking, model.keyringPending?.fingerprint != node.fingerprint,
+                  model.keyringReplacing?.fingerprint != node.fingerprint else { return }
+            asking = false
+            if model.keyringFailed == nil, model.keyringDid != nil { done() }
+        }
+        .onChange(of: model.keyringReplacing?.id) { _ in
+            guard asking, model.keyringReplacing == nil,
+                  model.keyringPending?.fingerprint != node.fingerprint else { return }
+            asking = false
+        }
+        .onChange(of: model.keyringFailed) { why in
+            if asking, let why { failed = why }
+        }
+    }
+}
+
+/// Drive, asked for on its own (P5): what it lets the node do, said first, then given only when
+/// the person presses Give Drive. Cancel is what Return presses; Give Drive has no key. The
+/// passphrase gate stays: asked for here, bound to this change (D1), when the keyring window has
+/// closed.
+private struct DriveSheet: View {
+    @ObservedObject var model: NodeModel
+    let node: TrustedNode
+    let done: () -> Void
+    /// Why the last try did not give it: the sheet stays open and says so (D19).
+    @State private var failed: String?
+    /// The change is waiting for the identity passphrase, asked for here.
+    @State private var asking = false
+    @State private var working = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.s16) {
+            Text("Let \(node.name) drive your Sessions?").title()
+            Text("\(node.name) can then answer approvals and type into this node's Sessions, now "
+                + "and later, with their permissions. " + Effects.granting(node.name, drive: true))
+                .accessibilityIdentifier("keyring-drive-effect")
+            HStack {
+                Button("Cancel", action: done).keyboardShortcut(.defaultAction)
+                Button("Give Drive", role: .destructive) {
+                    working = true
+                    failed = nil
+                    Task {
+                        if await model.setCapability(node, drive: true) {
+                            done()
+                        } else if model.keyringPending?.fingerprint == node.fingerprint
+                                    || model.keyringReplacing?.fingerprint == node.fingerprint {
+                            asking = true
+                        } else {
+                            failed = model.keyringFailed
+                        }
+                        working = false
+                    }
+                }
+                .disabled(working || asking)
+                .accessibilityIdentifier("keyring-drive-confirm")
+            }
+            if asking {
+                KeyringReplaceAsk(model: model)
+                if let pending = model.keyringPending, pending.fingerprint == node.fingerprint {
+                    KeyringPassphrase(model: model, pending: pending)
+                }
+            }
+            if let failed {
+                StateMark(kind: .danger, words: failed).textSelection(.enabled)
+            }
+        }
+        .padding(Space.s24)
+        .frame(width: Theme.scaled(440))
+        // Escape cancels too: Cancel holds Return.
+        .onExitCommand(perform: done)
+        // The passphrase given: done once the change is made, else why not, here.
         .onChange(of: model.keyringPending?.id) { _ in
             guard asking, model.keyringPending?.fingerprint != node.fingerprint,
                   model.keyringReplacing?.fingerprint != node.fingerprint else { return }
@@ -360,7 +433,7 @@ struct KeyringPassphrase: View {
     @State private var field = SecureFieldHolder()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: Space.s8) {
             Text("Type your identity passphrase to \(pending.words).").secondaryText()
                 .accessibilityIdentifier("keyring-passphrase-why")
             SecureInput(holder: field) { submit() }
@@ -409,7 +482,7 @@ struct KeyringReplaceAsk: View {
 
     var body: some View {
         if let next = model.keyringReplacing, let waiting = model.keyringPending {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: Space.s8) {
                 Text("Replace the waiting change? \(waiting.words.prefix(1).uppercased() + waiting.words.dropFirst()) "
                     + "is waiting for your passphrase; \(next.words) would take its place.")
                     .secondaryText()

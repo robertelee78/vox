@@ -46,8 +46,8 @@ struct ServicesView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                Text("Services").heading()
+            VStack(alignment: .leading, spacing: Space.s16) {
+                Text("Services").title()
                 // What this view's last share, stop or copy did: its own, never another's (P6).
                 if let did = model.outcome.flatMap({
                     $0.kind == .done && ["share", "stop-share", "copy"].contains($0.operation) ? $0.words : nil
@@ -63,7 +63,7 @@ struct ServicesView: View {
                 ForEach(theirs, id: \.1.canonical) { room, service in
                     SharedServiceBox(model: model, room: room.name, service: service)
                 }
-                Divider()
+                Hairline()
                 Text("YOUR SHARES").eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
                 let mine = rows.flatMap { r in r.offered.map { (r, $0) } }
                 if mine.isEmpty { Text("This node shares nothing.").secondaryText() }
@@ -83,12 +83,12 @@ struct ServicesView: View {
                     .accessibilityElement(children: .contain)
                     .accessibilityIdentifier("service-mine-\(offered.tag)")
                 }
-                Divider()
+                Hairline()
                 ShareForm(model: model, listening: listening) {
                     rows = await model.readServices()
                 }
             }
-            .padding(24)
+            .padding(Space.s24)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .accessibilityIdentifier("services-view")
@@ -115,7 +115,7 @@ private struct SharedServiceBox: View {
     let service: SharedService
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: Space.s8) {
             HStack(alignment: .firstTextBaseline) {
                 Text(service.address).font(Theme.mono).fontWeight(.bold).textSelection(.enabled)
                 Spacer()
@@ -150,7 +150,7 @@ private struct SharedServiceBox: View {
                 }
             }
         }
-        .padding(10)
+        .padding(Space.s12)
         .cardOutline()
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("service-box-\(service.address)")
@@ -180,7 +180,7 @@ private struct ShareForm: View {
     @State private var failed: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: Space.s8) {
             Text("SHARE A SERVICE").eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
             if let listening {
                 ForEach(listening.services, id: \.line) { service in
@@ -190,7 +190,7 @@ private struct ShareForm: View {
                         Text(service.line).font(Theme.mono).frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .buttonStyle(.plain)
-                    .padding(4)
+                    .padding(Space.s4)
                     .selectionMark(picked?.line == service.line)
                     .accessibilityIdentifier("listening-\(service.port)")
                 }
@@ -306,10 +306,10 @@ struct AddressAnatomy: View {
 
     var body: some View {
         if let parts = Self.parts(of: address) {
-            HStack(alignment: .top, spacing: 4) {
+            HStack(alignment: .top, spacing: Space.s4) {
                 ForEach(Array(parts.enumerated()), id: \.offset) { n, p in
                     if n > 0 { Text(".").font(Theme.mono).secondaryText().accessibilityHidden(true) }
-                    VStack(alignment: .leading, spacing: 1) {
+                    VStack(alignment: .leading, spacing: 0) {
                         Text(p.part).font(Theme.mono)
                         Text(p.what).caption().secondaryText()
                     }

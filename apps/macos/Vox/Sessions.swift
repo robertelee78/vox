@@ -26,6 +26,26 @@ extension NodeModel {
     }
 
     /// Whether one Session is on screen, rather than the room's conversation or All.
+    /// What needs the person, as the sidebar's NEEDS YOU counts it: its rooms and trust offers.
+    var needsYouCount: Int { group(.needsYou).count + offers.count }
+
+    /// A room's name as the sidebar says it, else its id's start.
+    func roomName(_ room: String) -> String {
+        rooms.first { $0.id == room }?.name ?? String(room.prefix(12))
+    }
+
+    /// The room header's facts: members, what is shown, and the retention, always (R-7).
+    var roomHeaderMeta: String {
+        let people = members.count + 1
+        let shown: String
+        switch showing {
+        case .general: shown = "General"
+        case .all: shown = "All"
+        case .session: shown = shownSession?.label ?? "a Session"
+        }
+        return "\(people == 1 ? "1 member" : "\(people) members") · \(shown) · ⏱ \(retention)"
+    }
+
     var showingSession: Bool {
         if case .session = showing { return true }
         return false
@@ -50,12 +70,16 @@ extension NodeModel {
 /// this node marked "!", CL-2), and the ended ones under "Ended (N)", folded until opened.
 struct SessionsList: View {
     @ObservedObject var model: NodeModel
+    /// Its own SESSIONS heading; off where the heading is drawn above it (the inspector pins it).
+    var heading = true
     @State private var endedOpen = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("SESSIONS").eyebrow().secondaryText()
-                .accessibilityAddTraits(.isHeader)
+        VStack(alignment: .leading, spacing: Space.s4) {
+            if heading {
+                Text("SESSIONS").eyebrow().secondaryText()
+                    .accessibilityAddTraits(.isHeader)
+            }
             row("General", .general, id: "session-general")
             row("All", .all, id: "session-all")
             ForEach(model.openSessions, id: \.self) { s in
@@ -104,6 +128,7 @@ struct SessionsList: View {
 /// session` prints it, and its Details (the full input and output) when asked; an open request's
 /// answers (SessionDrive.swift), or its state once it is resolved or not answerable.
 struct SessionEntryRow: View {
+    @Environment(\.voxTextScale) private var scale
     @ObservedObject var model: NodeModel
     /// The room it was drawn in: its actions go there and to `session` only (D3).
     let room: String
@@ -115,13 +140,20 @@ struct SessionEntryRow: View {
 
     var body: some View {
         let reference = entry.request?.reference
-        VStack(alignment: .leading, spacing: 4) {
-            Text(entry.line).voxFont(VoxTokens.Fonts.appMono).textSelection(.enabled)
-                .accessibilityIdentifier("entry-line-\(entry.id)")
-            if let request = entry.request {
-                RequestView(model: model, room: room, session: session, request: request,
-                            about: entry.line)
+        VStack(alignment: .leading, spacing: Space.s4 * scale) {
+            // The line and its request's answers are the request's own element, inside the row:
+            // the row is selected like a message (P14), the request as the one ⌥⌘Y and ⌥⌘N act
+            // on (P1), and neither takes the other's place.
+            VStack(alignment: .leading, spacing: Space.s4 * scale) {
+                Text(entry.line).voxFont(VoxTokens.Fonts.appMono).textSelection(.enabled)
+                    .accessibilityIdentifier("entry-line-\(entry.id)")
+                if let request = entry.request {
+                    RequestView(model: model, room: room, session: session, request: request,
+                                about: entry.line)
+                }
             }
+            // A request is selected by clicking it: what ⌥⌘Y and ⌥⌘N act on (P1).
+            .modifier(RequestSelection(model: model, reference: reference))
             // A file the session sent, once this node has a verified copy (ADR-029 DR-1, F-11).
             if let file = entry.file, let pulled = file.pulledPath {
                 HStack {
@@ -142,9 +174,7 @@ struct SessionEntryRow: View {
                 }
             }
         }
-        .padding(.horizontal, 4)
-        // A request is selected by clicking it: what ⌥⌘Y and ⌥⌘N act on (P1).
-        .modifier(RequestSelection(model: model, reference: reference))
+        .voxPadding(.horizontal, Space.s4)
     }
 }
 

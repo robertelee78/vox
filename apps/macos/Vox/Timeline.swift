@@ -70,6 +70,11 @@ extension NodeModel {
         for n in notices where !n.after.isEmpty && !shown.contains(n.after) {
             items.insert(item(n), at: items.firstIndex { $0.millis > n.createdMillis } ?? items.count)
         }
+        // Who joined while the room was on screen, and which of the keyring's nodes trust it (K-7).
+        for j in joins where !j.said.isEmpty {
+            let line = TimelineItem.notice("join-\(j.fingerprint)", j.said, at: j.at)
+            items.insert(line, at: items.firstIndex { $0.millis > j.at } ?? items.count)
+        }
         return items
     }
 
@@ -106,11 +111,141 @@ extension NodeModel {
         }
     }
 
+    /// The messages selected in the timeline as ⌘C copies them (v0.4.1): one line each, oldest
+    /// first, "<author>, <time>: <text>".
+    var copiedLines: String {
+        timelineItems.compactMap(\.message)
+            .filter { selectedMessages.contains($0.id) }
+            .map { "\(Self.author($0, me: me)), \(Self.copiedTime($0.createdMillis)): \(Self.body($0))" }
+            .joined(separator: "\n")
+    }
+
+    /// Who wrote it, as its row names them: you, the alias, or the fingerprint's first 12
+    /// characters.
+    static func author(_ m: RoomMessage, me: String) -> String {
+        if m.author == me { return "you" }
+        return m.authorName.isEmpty ? String(m.author.prefix(12)) : m.authorName
+    }
+
+    /// What it says: its text; a share, its file or folder and its note; one still owed, that.
+    static func body(_ m: RoomMessage) -> String {
+        if m.owed { return "not received yet" }
+        guard let file = m.file else { return m.text }
+        let what = "\(file.folder ? "folder" : "file") \(file.name)"
+        return file.note.isEmpty ? what : "\(what): \(file.note)"
+    }
+
+    /// When it was written, in this Mac's time zone, to the minute: 2026-10-08 19:42.
+    static func copiedTime(_ millis: UInt64) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = .current
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f.string(from: Date(timeIntervalSince1970: Double(millis) / 1000))
+    }
+
+    /// What a reply quotes (ADR-028 R-9), as the TUI quotes it: "<who>: <its first line>", cut at
+    /// 80 characters, or nil while this room does not hold that message. Nil for a message that
+    /// replies to nothing.
+    func quote(of m: RoomMessage) -> (id: String, words: String?)? {
+        let re = m.re.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !re.isEmpty else { return nil }
+        guard let held = byID[re], !held.owed else { return (re, nil) }
+        let said = held.file.map { $0.note.isEmpty ? $0.name : $0.note } ?? held.text
+        let first = said.split(separator: "\n", omittingEmptySubsequences: false).first.map(String.init) ?? ""
+        let more = first.count > 80 || said.contains("\n") ? "…" : ""
+        let who = held.author == me ? "you"
+            : held.authorName.isEmpty ? String(held.author.prefix(12)) : held.authorName
+        return (re, "\(who): \(first.prefix(80))\(more)")
+    }
+
+    /// The newest line of what is shown, to follow: the last one with a time of its own (a
+    /// Session's closing note, kept at the end, is not one).
+    var followItem: String? {
+        timelineItems.last { $0.millis != .max }?.id
+    }
+
+    /// A Session shown whose lines this member may read and has not read yet.
+    var showsSessionToRead: Bool {
+        guard let s = shownSession else { return false }
+        return s.canDrive && (sessionLoading || (sessionEntries.isEmpty && sessionNote == nil))
+    }
+
+    /// What following watches: the newest line and how many there are.
+    var followSignature: String {
+        "\(followItem ?? "")#\(timelineItems.count)"
+    }
+
+    /// The shown Session's request still waiting for an answer, if one is: the line to go to.
+    var waitingEntry: String? {
+        guard case .session = showing else { return nil }
+        return sessionEntries.last { $0.request != nil && $0.request?.state == nil }
+            .map { "entry-\($0.id)" }
+    }
+
     /// "<who> <what>", who named as the TUI names them: you, the alias, or the fingerprint's first
     /// 26 characters marked "(not in keyring)".
     func noticeWords(_ n: RoomNoticeRow) -> String {
         let who = n.author == me ? "you"
             : n.authorName.isEmpty ? "\(n.author.prefix(26)) (not in keyring)" : n.authorName
         return "\(who) \(n.what)"
+    }
+}
+
+/// When a message or a line happened, as the timeline says it. Every time is kept in milliseconds
+/// and rounded only here, for display.
+enum TimelineTime {
+    static func date(_ millis: UInt64) -> Date {
+        Date(timeIntervalSince1970: TimeInterval(millis) / 1_000)
+    }
+
+    /// The time of day, local, in the person's own form: "9:41 AM", or "09:41".
+    static func short(_ millis: UInt64) -> String {
+        date(millis).formatted(.dateTime.hour().minute())
+    }
+
+    /// The whole date and time, for the tooltip and VoiceOver: "Sunday, October 4, 2026 at
+    /// 9:41:07 AM".
+    static func full(_ millis: UInt64) -> String {
+        date(millis).formatted(date: .complete, time: .standard)
+    }
+
+    /// Whether `millis` is a time to place a day by: a line kept at the end (`.max`) or without a
+    /// time (0) has none.
+    static func placed(_ millis: UInt64) -> Bool { millis != 0 && millis != .max }
+
+    /// The local day `millis` falls on, as a key: "2026-10-04".
+    static func day(_ millis: UInt64) -> String {
+        let c = Calendar.current.dateComponents([.year, .month, .day], from: date(millis))
+        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
+    }
+
+    /// The day as a divider says it: "Today", "Yesterday", "Sunday, October 4", and the year when
+    /// it is not this one.
+    static func dayWords(_ millis: UInt64, now: Date = Date()) -> String {
+        let when = date(millis)
+        let calendar = Calendar.current
+        if calendar.isDate(when, inSameDayAs: now) { return "Today" }
+        if let yesterday = calendar.date(byAdding: .day, value: -1, to: now),
+           calendar.isDate(when, inSameDayAs: yesterday) {
+            return "Yesterday"
+        }
+        if calendar.component(.year, from: when) == calendar.component(.year, from: now) {
+            return when.formatted(.dateTime.weekday(.wide).month(.wide).day())
+        }
+        return when.formatted(.dateTime.weekday(.wide).month(.wide).day().year())
+    }
+
+    /// The items a day divider goes above, each with its day's key: the first item, and each one
+    /// whose local day is not the day of the item above it that has a time.
+    static func dividers(_ items: [TimelineItem]) -> [String: String] {
+        var above: String?
+        var out: [String: String] = [:]
+        for item in items where placed(item.millis) {
+            let day = day(item.millis)
+            if day != above { out[item.id] = day }
+            above = day
+        }
+        return out
     }
 }

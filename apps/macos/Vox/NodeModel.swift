@@ -65,6 +65,13 @@ final class NodeModel: ObservableObject {
         }
     }
 
+    /// A member that joined the room on screen while it was on screen (K-7).
+    struct JoinLine: Equatable {
+        let fingerprint: String
+        let at: UInt64
+        var said: String
+    }
+
     /// A member of the room on screen.
     struct MemberRow: Identifiable, Equatable {
         let id: String
@@ -72,6 +79,9 @@ final class NodeModel: ObservableObject {
         let trust: Trust
         /// Whether this node's keyring entry for it grants drive as well as read (K-14).
         let drive: Bool
+        /// Whether it trusts this node: it has granted this node consent (ADR-007 G-9), whether
+        /// or not this node trusts it back.
+        var trustsYou = false
     }
 
     let node: String
@@ -80,6 +90,11 @@ final class NodeModel: ObservableObject {
 
     @Published private(set) var rooms: [Room] = []
     @Published var selection: Selection?
+    /// The first message that was unread when the room came on screen, and how many were: where
+    /// the timeline draws its unread line. It stays while the room is on screen; what arrives
+    /// meanwhile is read as it is shown.
+    @Published private(set) var unreadFrom: String?
+    @Published private(set) var unreadCount = 0
     @Published private(set) var messages: [RoomMessage] = [] {
         didSet {
             byID = Dictionary(messages.map { ($0.id, $0) }) { $1 }
@@ -95,6 +110,13 @@ final class NodeModel: ObservableObject {
     @Published private(set) var platforms: [String: NodePlatform] = [:]
     /// Who has read each of this node's own messages in the room on screen, by message id (R-6).
     @Published private(set) var readBy: [String: [String]] = [:]
+    /// Where each of this node's own messages is, while no member is known to have read it
+    /// (ADR-028 R-6, D9): "only on this machine", "on N of M members' nodes".
+    @Published private(set) var whereabouts: [String: String] = [:]
+    /// Who joined the room on screen while it was on screen, and when (ADR-028 K-7, D10): said
+    /// in its timeline with which of the keyring's nodes trust the newcomer, said again as that
+    /// grows.
+    @Published private(set) var joins: [JoinLine] = []
     /// Who has pulled each of this node's own shares in the room on screen, verified, by the
     /// share's message id (ADR-028 F-6, #498).
     @Published private(set) var pulledBy: [String: [String]] = [:]
@@ -155,15 +177,28 @@ final class NodeModel: ObservableObject {
 
     /// The sheet a menu, key or palette action opened.
     @Published var sheet: NodeSheet?
+    /// Whether the room's inspector shows (View > Hide Inspector, ⌥⌘I), kept across launches.
+    @Published var inspectorShown = Columns.inspectorShown {
+        didSet { UserDefaults.standard.set(inspectorShown, forKey: Columns.inspectorShownKey) }
+    }
     /// Asks the room on screen to choose a file to attach (⌘O); each ask counts one up.
     @Published var attachAsked = 0
     /// ⌘O while a Session is shown, to a member with drive: a file sent to that Session (D2).
     @Published var sessionAttachAsked = 0
     /// Asks the room on screen to send its draft urgent (⌘↩).
     @Published var urgentAsked = 0
-    /// The message selected in the timeline, and the one the composer replies to (⌘R).
+    /// The message selected in the timeline, and the one the composer replies to (⌘R): the one
+    /// the keyboard is on.
     @Published var selectedMessage: String?
+    /// Every message selected in the timeline, for ⌘C (v0.4.1): the one above, and those ⌘-click,
+    /// ⇧-click, ⇧↑/⇧↓ or a drag across rows added.
+    @Published var selectedMessages: Set<String> = []
+    /// Where a ⇧-click or ⇧↑/⇧↓ range starts.
+    var selectionAnchor: String?
     @Published var replyTo: RoomMessage?
+    /// A message a quote was clicked to reach (ADR-028 R-9): the room's timeline scrolls to it and
+    /// selects it, then sets this back to nil.
+    @Published var jumpTo: String?
     /// The service card selected above the timeline, whose command ⌘⇧C copies.
     @Published var selectedService: SharedService?
     /// What the last operation came to (P6): done, refused, or not known whether it was done,
@@ -196,6 +231,11 @@ final class NodeModel: ObservableObject {
     @Published private(set) var offers: [OfferInfo] = []
     /// The trusted nodes that trust this node back, as the rooms shared with them record it (L-4).
     @Published private(set) var trustsBack: Set<String> = []
+    /// The members of the room on screen whose trust in this node has reached it, in the keyring
+    /// or not (ADR-028 R-5, D4).
+    @Published private(set) var trustsMe: Set<String> = []
+    /// The node whose card is open (D4): from a member row, a message's author or a decision row.
+    @Published var card: NodeCardFor?
     /// The keyring row selected, by fingerprint: what Keyring > Compare, Rename and Remove act on.
     @Published var keyringSelected: String?
     /// What a Keyring menu action asks the keyring view to open; each ask counts one up.
@@ -210,6 +250,9 @@ final class NodeModel: ObservableObject {
     @Published private(set) var lanOn: Set<String> = []
     @Published private(set) var lanSaid: [String: String] = [:]
     @Published private(set) var lanFailed: [String: String] = [:]
+    /// The room whose family LAN was turned on while the LAN helper waits for the person's
+    /// approval: its sheet is up, and the LAN goes on once the helper is allowed.
+    @Published private(set) var lanAsking: String?
 
     /// The family LAN's root helper: the bundle's launchd daemon (ADR-014 M-10).
     private var lanHelper: any BackgroundItem { Daemon.lanHelper }
@@ -224,6 +267,15 @@ final class NodeModel: ObservableObject {
     /// Why the last operation was not done, or may not have been, in the daemon's words (M-7):
     /// `outcome`, when not done.
     var said: String? { outcome.flatMap { $0.kind == .done ? nil : $0.words } }
+    /// A room link to fill the Join sheet with, taken by the sheet when it opens.
+    @Published var joinLink: String?
+
+    /// Open the Join sheet with `link` filled in (a vox:// link the system opened the app with).
+    func offerJoin(_ link: String) {
+        joinLink = link
+        sheet = .joinRoom
+    }
+
     /// The node ended: detached, or the daemon stopped.
     @Published private(set) var ended: String?
 
@@ -296,8 +348,7 @@ final class NodeModel: ObservableObject {
             if Int(view.peers) != peers { peers = Int(view.peers) }
             if view.keyring != keyring { keyring = view.keyring }
         }
-        let ready = await Self.lanHelperStatus() == .enabled
-        if ready != lanHelperReady { lanHelperReady = ready }
+        await recheckLanHelper()
         if selection == .keyring {
             let back = await readTrustsBack()
             if back != trustsBack { trustsBack = back }
@@ -322,19 +373,41 @@ final class NodeModel: ObservableObject {
     /// (ADR-028 R-8): what came while the app was closed. The node's events count from there.
     func seedUnread() async {
         for room in rooms where room.open && !seeded.contains(room.id) {
-            if case .room(room.id) = selection { continue }
-            guard let rows = try? await client.unread(room: room.id),
-                  let i = rooms.firstIndex(where: { $0.id == room.id }) else { continue }
+            guard let rows = try? await client.unread(room: room.id) else { continue }
             seeded.insert(room.id)
-            for message in rows where message.author != me {
-                switch message.level {
-                case .toYou:
-                    rooms[i].addressed += 1
-                    if message.urgent { rooms[i].urgent += 1 }
-                case .new: rooms[i].new += 1
-                case .coordination: rooms[i].coordination += 1
-                }
-            }
+            for message in rows { count(message, in: room.id) }
+        }
+    }
+
+    /// Each room's unread messages, by id: counted once each, from what the node recorded as
+    /// unread and from what arrives, and no longer counted once drawn in view with the window in
+    /// front ([`drawn`]). Selecting a room reads nothing (ADR-028 R-6; the app panel's D18).
+    private var counted: [String: [String: RoomMessage]] = [:]
+
+    /// `message` counted unread in `room`, once: never this node's own.
+    private func count(_ message: RoomMessage, in room: String) {
+        guard message.author != me, counted[room]?[message.id] == nil,
+              let i = rooms.firstIndex(where: { $0.id == room }) else { return }
+        counted[room, default: [:]][message.id] = message
+        switch message.level {
+        case .toYou:
+            rooms[i].addressed += 1
+            if message.urgent { rooms[i].urgent += 1 }
+        case .new: rooms[i].new += 1
+        case .coordination: rooms[i].coordination += 1
+        }
+    }
+
+    /// Message `id` seen in `room`: no longer counted.
+    private func uncount(_ id: String, in room: String) {
+        guard let message = counted[room]?.removeValue(forKey: id),
+              let i = rooms.firstIndex(where: { $0.id == room }) else { return }
+        switch message.level {
+        case .toYou:
+            rooms[i].addressed = max(0, rooms[i].addressed - 1)
+            if message.urgent { rooms[i].urgent = max(0, rooms[i].urgent - 1) }
+        case .new: rooms[i].new = max(0, rooms[i].new - 1)
+        case .coordination: rooms[i].coordination = max(0, rooms[i].coordination - 1)
         }
     }
 
@@ -380,7 +453,11 @@ final class NodeModel: ObservableObject {
         }
         guard case .room = selection else { return }
         messages = []
+        unreadFrom = nil
+        unreadCount = 0
         readBy = [:]
+        whereabouts = [:]
+        joins = []
         pulledBy = [:]
         pulled = [:]
         pulling = [:]
@@ -393,6 +470,8 @@ final class NodeModel: ObservableObject {
         members = []
         roomServices = []
         selectedMessage = nil
+        selectedMessages = []
+        selectionAnchor = nil
         selectedService = nil
         // What this room last showed, and its reply, come back (D12): General the first time.
         if case let .room(opened) = selection {
@@ -404,24 +483,29 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// Show `selection`; a room shown is read, so its unread counts end.
+    /// Show `selection`. A room shown is not read by being chosen: each message is read as it is
+    /// drawn in view with the window in front ([`drawn`], ADR-028 R-6).
     func show(_ selection: Selection?) async {
         select(selection)
         if case .decisions = selection {
             decisionEvents = await decisions()
         }
         guard case let .room(id) = selection else { return }
-        if let i = rooms.firstIndex(where: { $0.id == id }) {
-            rooms[i].addressed = 0
-            rooms[i].urgent = 0
-            rooms[i].new = 0
-            rooms[i].coordination = 0
+        if !seeded.contains(id), let rows = try? await client.unread(room: id) {
+            seeded.insert(id)
+            for message in rows { count(message, in: id) }
         }
         do {
             // Each read lands only if the room is still the one on screen: a quick switch must not
             // draw one room's messages under another.
+            // What was unread as the room came on screen, before showing it marks it read: the
+            // timeline's unread line goes above the first of it (ADR-028 R-8).
+            let unread = ((try? await client.unread(room: id)) ?? []).filter { $0.author != me }
             let read = try await client.read(room: id, after: "", limit: 0)
             guard case .room(id) = self.selection else { return }
+            let unreadIDs = Set(unread.map(\.id))
+            unreadFrom = read.first { unreadIDs.contains($0.id) }?.id
+            unreadCount = unread.count
             messages = read
             let services = (try? await client.services(room: id).shared) ?? []
             let rows = try await memberRows(id)
@@ -445,6 +529,41 @@ final class NodeModel: ObservableObject {
     }
 
     // ---- the keyring (M-16) ----------------------------------------------------------------
+
+    /// Where `fingerprint` stands with this node, each direction, as far as this node knows: its
+    /// keyring, and the consent grants of the room on screen and of every trusted node (D4).
+    func trust(of fingerprint: String) -> Trust {
+        Trust.of(inKeyring: trusted.contains { $0.fingerprint == fingerprint },
+                 trustsYou: trustsMe.contains(fingerprint) || trustsBack.contains(fingerprint))
+    }
+
+    /// The members of the room on screen this node does not yet read each other with, each by its
+    /// alias (else its short fingerprint) and where it stands (R-5, D4); nil when there are none.
+    var notMutual: String? {
+        let waiting = members.filter { $0.trust != .mutual }
+        guard !waiting.isEmpty else { return nil }
+        let named = waiting.map { "\($0.name) (\($0.trust.words))" }.joined(separator: ", ")
+        return "Not reading each other yet: \(named). A member's card says who still has to trust whom."
+    }
+
+    /// The rooms this node holds that `fingerprint` is a member of, by name (G2).
+    func sharedRooms(with fingerprint: String) async -> [String] {
+        var names: [String] = []
+        for room in rooms {
+            if let roster = try? await client.roster(room: room.id),
+               roster.contains(where: { $0.fingerprint == fingerprint }) {
+                names.append(room.name)
+            }
+        }
+        return names
+    }
+
+    /// Open `fingerprint`'s card (D4), named `name` as the room names it.
+    func openCard(_ fingerprint: String, name: String, act: NodeCardFor.Act? = nil) {
+        keyringDid = nil
+        keyringFailed = nil
+        card = NodeCardFor(fingerprint: fingerprint, name: name, act: act)
+    }
 
     /// Trust `fingerprint` as `alias`, granting read, and drive as well when `drive` (K-14,
     /// K-16). Whether it was done.
@@ -600,6 +719,37 @@ final class NodeModel: ObservableObject {
             Daemon.openLoginItems()
         }
         lanHelperReady = status == .enabled
+    }
+
+    /// The family LAN turned on for `room`: at once when the LAN helper is allowed, else the helper
+    /// is asked for (its sheet says where to allow it) and the LAN goes on once it is
+    /// ([`recheckLanHelper`]). The helper is asked for only here, never before (ADR-014 M-12).
+    func turnLanOn(_ room: String) async {
+        if await Self.lanHelperStatus() == .enabled {
+            lanHelperReady = true
+            await setLan(room, on: true)
+            return
+        }
+        lanAsking = room
+        await allowLanHelper()
+        await recheckLanHelper()
+    }
+
+    /// Whether the LAN helper is allowed now, as on every refresh and whenever Vox comes back to the
+    /// front (the person returning from System Settings); allowed while a room's LAN waits for it,
+    /// that room's sheet closes and its LAN goes on.
+    func recheckLanHelper() async {
+        let ready = await Self.lanHelperStatus() == .enabled
+        if ready != lanHelperReady { lanHelperReady = ready }
+        if ready, let room = lanAsking {
+            lanAsking = nil
+            await setLan(room, on: true)
+        }
+    }
+
+    /// The helper's sheet closed without it: the LAN stays off.
+    func cancelLanAsk() {
+        lanAsking = nil
     }
 
     /// Remove the LAN helper: launchd stops it and it is no longer registered, so nothing of Vox
@@ -987,6 +1137,7 @@ final class NodeModel: ObservableObject {
         }
         readLog.debug("drawn: \(message.id, privacy: .public) in \(room, privacy: .public)")
         marked.insert(message.id)
+        uncount(message.id, in: room)
         unmarked[room, default: []].append(message.id)
         guard flushing == nil else { return }
         flushing = Task { [weak self] in
@@ -1020,12 +1171,15 @@ final class NodeModel: ObservableObject {
         let consents = try await client.consents(room: room)
         let keyring = Dictionary(trusted.map { ($0.fingerprint, $0.drive) }) { $1 }
         let back = Set(consents.inbound)
+        // Their trust in this node, whether or not this node trusts them (D4): both directions.
+        if back != trustsMe { trustsMe = back }
         return roster.filter { $0.fingerprint != me }.map { m in
-            let trust: Trust = keyring[m.fingerprint] != nil
-                ? (back.contains(m.fingerprint) ? .mutual : .oneWay) : .none
+            let trust = Trust.of(inKeyring: keyring[m.fingerprint] != nil,
+                                 trustsYou: back.contains(m.fingerprint))
             return MemberRow(id: m.fingerprint,
                              name: m.name.isEmpty ? String(m.fingerprint.prefix(12)) : m.name,
-                             trust: trust, drive: keyring[m.fingerprint] ?? false)
+                             trust: trust, drive: keyring[m.fingerprint] ?? false,
+                             trustsYou: back.contains(m.fingerprint))
         }
     }
 
@@ -1040,6 +1194,7 @@ final class NodeModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 guard let self, case .room(room) = self.selection else { return }
                 let reads = try? await self.client.readBy(room: room)
+                let where_ = try? await self.client.whereabouts(room: room)
                 let pulls = try? await self.client.pulledBy(room: room)
                 let copies = try? await self.client.pulled(room: room)
                 let states = try? await self.client.pullStates(room: room)
@@ -1059,6 +1214,10 @@ final class NodeModel: ObservableObject {
                     let now = Dictionary(uniqueKeysWithValues: reads.map { ($0.id, $0.names) })
                     if now != self.readBy { self.readBy = now }
                 }
+                if let where_ {
+                    let now = Dictionary(where_.map { ($0.id, $0.words) }) { $1 }
+                    if now != self.whereabouts { self.whereabouts = now }
+                }
                 if let pulls {
                     let now = Dictionary(pulls.map { ($0.id, $0.names) }) { $1 }
                     if now != self.pulledBy { self.pulledBy = now }
@@ -1072,16 +1231,36 @@ final class NodeModel: ObservableObject {
                     if now != self.pulling { self.pulling = now }
                 }
                 if let services, services != self.roomServices { self.roomServices = services }
-                if let rows, rows != self.members { self.members = rows }
+                if let rows, rows != self.members {
+                    // A member not listed before joined while the room was on screen (K-7).
+                    let before = Set(self.members.map(\.id))
+                    let came = rows.filter { !before.contains($0.id) }
+                    self.members = rows
+                    if !before.isEmpty || !came.isEmpty {
+                        let at = UInt64(Date().timeIntervalSince1970 * 1000)
+                        for m in came where !self.joins.contains(where: { $0.fingerprint == m.id }) {
+                            self.joins.append(JoinLine(fingerprint: m.id, at: at, said: ""))
+                        }
+                    }
+                }
+                // Each join said, and said again as the room's consent grants name more of the
+                // keyring's nodes trusting the newcomer.
+                for (i, line) in self.joins.enumerated() {
+                    if let said = try? await self.client.joinSaid(room: room, member: line.fingerprint),
+                       case .room(room) = self.selection, i < self.joins.count,
+                       self.joins[i].said != said {
+                        self.joins[i].said = said
+                    }
+                }
             }
         }
     }
 
     fileprivate func arrived(_ message: RoomMessage, in room: String) {
-        let focused: Bool = {
-            if case .room(room) = selection { return NSApp.isActive }
-            return false
-        }()
+        // Looked at: the room's own timeline (General or All) on screen in a window in front of
+        // the person, following its newest message, so this one is drawn in view as it lands. A
+        // room chosen but with a Session shown, scrolled up, or behind another window is not.
+        let focused = lookingAt == room
         // A message the person is not looking at is notified: never this node's own, nor
         // coordination traffic, nor one whose body has not arrived.
         if notifies && !focused && message.author != me && message.level != .coordination
@@ -1098,11 +1277,10 @@ final class NodeModel: ObservableObject {
             } else {
                 messages.append(message)
             }
-            return
         }
-        // This node's own posts are never unread.
-        guard message.author != me else { return }
-        guard let i = rooms.firstIndex(where: { $0.id == room }) else {
+        // Unread until drawn in view (this node's own never are), the room on screen too.
+        guard message.author != me, !marked.contains(message.id) else { return }
+        guard rooms.contains(where: { $0.id == room }) else {
             // A room joined or made since the rooms were read (by `vox room join`, say): read
             // them again, then count it.
             Task {
@@ -1111,16 +1289,13 @@ final class NodeModel: ObservableObject {
             }
             return
         }
-        switch message.level {
-        case .toYou:
-            rooms[i].addressed += 1
-            if message.urgent { rooms[i].urgent += 1 }
-        case .new:
-            rooms[i].new += 1
-        case .coordination:
-            rooms[i].coordination += 1
-        }
+        count(message, in: room)
     }
+
+    /// The room whose own timeline is in view and following its newest message, in a window in
+    /// front of the person, as RoomView last said; nil otherwise. A message arriving there is
+    /// seen as it lands, so it is not notified.
+    var lookingAt: String?
 
     fileprivate func noticed(_ text: String) {
         Task { await refresh() }
@@ -1128,6 +1303,21 @@ final class NodeModel: ObservableObject {
 
     fileprivate func stopped(_ text: String) {
         ended = text
+    }
+
+    /// Attach this node again after it stopped, with `secret` if it needs its passphrase, and
+    /// follow it as before: the window and its drafts stay.
+    func attachAgain(_ secret: Secret?) async {
+        begin("attach")
+        do {
+            let passphrase = try secret?.passphrase()
+            defer { passphrase?.wipe() }
+            _ = try await client.attach(node: node, passphrase: passphrase)
+            ended = nil
+            await start()
+        } catch {
+            report(error)
+        }
     }
 
     private func name(of room: RoomSummary) -> String {

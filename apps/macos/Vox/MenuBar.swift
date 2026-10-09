@@ -66,7 +66,7 @@ struct MenuBarContent: View {
     @StateObject private var window = WindowSeen()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: Space.s12) {
             if let model = app.node {
                 NodeFacts(model: model, facts: facts)
                     .task { facts = await model.menuBarFacts() }
@@ -77,7 +77,7 @@ struct MenuBarContent: View {
             } else {
                 Text("Vox is not acting as a node yet.").secondaryText()
             }
-            Divider()
+            Hairline()
             Button("Open Vox") {
                 NSApp.activate(ignoringOtherApps: true)
                 NSApp.windows.first { $0.identifier?.rawValue.contains("main") ?? false }?
@@ -85,7 +85,7 @@ struct MenuBarContent: View {
             }
             Button("Hide This Menu Bar Item") { app.showMenuBar(false) }
         }
-        .padding(12)
+        .padding(Space.s12)
         .frame(width: Theme.scaled(320))
         .background(WindowReader(seen: window))
         .font(Theme.text)
@@ -97,7 +97,8 @@ private struct NodeFacts: View {
     let facts: MenuBarFacts
 
     var body: some View {
-        StateMark(kind: .live, words: "node \(model.node), attached")
+        StateMark(kind: model.ended == nil ? .live : .danger,
+                  words: "node \(model.node), \(model.ended == nil ? "attached" : "detached")")
         Text(model.keyring).font(Theme.mono).secondaryText()
         section("NEEDS YOU") {
             let rooms = model.group(.needsYou)

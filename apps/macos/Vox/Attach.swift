@@ -34,8 +34,8 @@ struct AttachSheet: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Share \(file.url.lastPathComponent)").heading()
+        VStack(alignment: .leading, spacing: Space.s12) {
+            Text("Share \(file.url.lastPathComponent)").title()
             Text("TO").eyebrow().secondaryText()
             if model.members.isEmpty {
                 Text("No one else is in this room yet.").secondaryText()
@@ -71,12 +71,13 @@ struct AttachSheet: View {
                     }
                 }
                 .keyboardShortcut(.defaultAction)
+                .buttonStyle(.voxPrimary)
                 .disabled(sending)
                 .accessibilityIdentifier("attach-send")
             }
             OutcomeMark(outcome: model.failure(of: "attach"))
         }
-        .padding(24)
+        .padding(Space.s24)
         .frame(width: Theme.scaled(440))
         .onAppear { model.clearOutcome(of: "attach") }
     }

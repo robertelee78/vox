@@ -24,6 +24,8 @@ use crate::error::{Error, Result};
 pub const VAULT_FILE: &str = "vault.cbor";
 /// The store file name inside a profile directory.
 pub const STORE_FILE: &str = "store.redb";
+/// The node's fingerprint, public and **for display only** (P8): see [`Paths::fingerprint_file`].
+pub const FINGERPRINT_FILE: &str = "fingerprint";
 /// The ADR-020 §7 local control socket, inside the profile directory.
 pub const SOCKET_FILE: &str = "node.sock";
 
@@ -441,6 +443,31 @@ impl Paths {
     #[must_use]
     pub fn store_file(&self) -> PathBuf {
         self.profile_dir.join(STORE_FILE)
+    }
+
+    /// `<profile_dir>/fingerprint`: the node's identity fingerprint, base32, then the SHA-256 of
+    /// the `vault.cbor` it was written beside, hex, a line each. Written from the unlocked profile
+    /// when it is made and each time it is unlocked, so a node not attached can be shown with it
+    /// (the app's chooser, `vox node list`). **For display only**: nothing decides trust, an
+    /// attach or anything else from it, since whoever can write the data root can write it; the
+    /// fingerprint that counts is the store's, checked against the vault at unlock.
+    #[must_use]
+    pub fn fingerprint_file(&self) -> PathBuf {
+        self.profile_dir.join(FINGERPRINT_FILE)
+    }
+
+    /// The fingerprint [`Self::fingerprint_file`] names, for display only. `None` (not known)
+    /// when the file is missing (a node not attached since v0.4.1) or malformed, or when it was
+    /// written beside another `vault.cbor` than the one here now (a vault copied or restored in,
+    /// or made again): a fingerprint people read out to each other is never shown stale.
+    #[must_use]
+    pub fn shown_fingerprint(&self) -> Option<crate::hash::Digest32> {
+        let text = std::fs::read_to_string(self.fingerprint_file()).ok()?;
+        let mut lines = text.lines();
+        let fingerprint = crate::node::link::b32_decode(lines.next()?, "fingerprint file").ok()?;
+        let vault = std::fs::read(self.vault_file()).ok()?;
+        let beside = format!("{:?}", crate::hash::Hex(&crate::hash::sha256(&vault)));
+        (lines.next()? == beside).then_some(fingerprint)
     }
 
     /// `<profile_dir>/node.sock` — the ADR-020 §7 local control socket.

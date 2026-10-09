@@ -28,7 +28,30 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 DERIVED="$ROOT/target/xcode"
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/vox-app-proofs.XXXXXX")"
-trap 'rm -rf "$SCRATCH"' EXIT
+# **The person's clipboard is put back as it was** (v0.4.1): the proofs paste and copy through the
+# general pasteboard. Every item and type is kept here and restored at exit, red, green or a crash
+# of the runner (each case restores it too, in its tearDown).
+# A concealed item (a password manager's) is never written down: the run is refused instead. The
+# kept copy is the person's only (mode 600, in the 700 scratch) and goes with the scratch at exit.
+if ! kept="$( (umask 077; osascript -l JavaScript "$ROOT/scripts/pasteboard-keep.js" save "$SCRATCH/pasteboard.plist") 2>&1)"; then
+    rm -rf "$SCRATCH"
+    if [[ "$kept" == *CONCEALED* ]]; then
+        echo "app-proofs: APPARATUS: the clipboard holds a concealed item; copy-steps not run" >&2
+    else
+        echo "app-proofs: APPARATUS: cannot keep the clipboard to put it back after the run; not running: $kept" >&2
+    fi
+    exit 2
+fi
+chmod 600 "$SCRATCH/pasteboard.plist"
+# Put the clipboard back and delete the kept copy: called first by every EXIT trap below, green or
+# red (a red keeps the scratch for reading, never the clipboard). Safe to call twice.
+restore_clipboard() {
+    [ -e "$SCRATCH/pasteboard.plist" ] || return 0
+    osascript -l JavaScript "$ROOT/scripts/pasteboard-keep.js" restore "$SCRATCH/pasteboard.plist" >/dev/null 2>&1 \
+        || echo "app-proofs: the clipboard could not be put back as it was" >&2
+    rm -f "$SCRATCH/pasteboard.plist"
+}
+trap 'restore_clipboard; rm -rf "$SCRATCH"' EXIT
 # Killed or interrupted, the run still ends through its EXIT trap (which stops what it started).
 trap 'exit 130' INT TERM HUP
 
@@ -167,6 +190,10 @@ echo "app-proofs: preflight: whether Vox may notify is checked first by the noti
 
 XCFRAMEWORK_SLICES=macos scripts/build-xcframework.sh
 cargo build --release --bin vox
+# Apparatus, never the app's: a `vox` built with test-knobs, for a peer whose clock is set behind
+# (FirstRunProof step 3d, VOX_TEST_CLOCK_SKEW_MS), in a target directory of its own so the app's
+# `vox` is never one with knobs.
+cargo build --release --bin vox --features vox-tui/test-knobs --target-dir target/proof-knobs
 
 # **The app under proof registers no background item** (#571): built with
 # VOX_PROOF_STUB_SERVICES, its login item and its LAN helper are stand-ins that record what was
@@ -212,7 +239,7 @@ trap_unregister() {
 launch_status=0
 watch_real &
 WATCH_REAL=$!
-trap 'kill "$WATCH_REAL" 2>/dev/null || true; rm -rf "$SCRATCH"' EXIT
+trap 'restore_clipboard; kill "$WATCH_REAL" 2>/dev/null || true; rm -rf "$SCRATCH"' EXIT
 if [ "$#" -eq 0 ] || [ "$*" = "LaunchProof" ]; then
     python3 scripts/app-launch-proof.py "$APP" || launch_status=$?
     if [ "$*" = "LaunchProof" ]; then
@@ -239,6 +266,7 @@ STAGER=$!
 # reading the red; a green run removes it.
 finish() {
     local status=$?
+    restore_clipboard
     # Each may have ended already (the stager stops itself with its run): under `set -e` a
     # failed kill or wait would become the run's exit status, a green run exiting 1.
     kill "$WATCH_REAL" 2>/dev/null || true
@@ -277,6 +305,7 @@ TEST_RUNNER_VOX_PROOF_APP="$APP" TEST_RUNNER_VOX_PROOF_SCRATCH="$SCRATCH" \
     TEST_RUNNER_VOX_PROOF_STAGER_PORT="$(cat "$SCRATCH/stager.port")" \
     TEST_RUNNER_VOX_PROOF_STAGER_TOKEN="$TOKEN" \
     TEST_RUNNER_VOX_PROOF_FROM="${VOX_PROOF_FROM:-}" \
+    TEST_RUNNER_VOX_PROOF_KNOBS_VOX="$ROOT/target/proof-knobs/release/vox" \
     TEST_RUNNER_VOX_PROOF_CONTINUE="${VOX_PROOF_CONTINUE:-}" \
     xcodebuild -project apps/macos/Vox.xcodeproj -scheme Vox -configuration Release \
     -derivedDataPath "$DERIVED" ${only[@]+"${only[@]}"} test-without-building \

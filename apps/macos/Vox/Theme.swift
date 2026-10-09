@@ -13,6 +13,11 @@
 import AppKit
 import SwiftUI
 
+/// The spacing scale and the two corner radii, from the token file (L-1a). Inside the
+/// conversation they are taken at its text size (`voxPadding`, `voxTextScale`); elsewhere as they are.
+typealias Space = VoxTokens.Space
+typealias Radius = VoxTokens.Radius
+
 enum Theme {
     /// The face for running text: SF Pro (L-7).
     static var text: Font { font(VoxTokens.Fonts.appText) }
@@ -20,7 +25,10 @@ enum Theme {
     static var mono: Font { font(VoxTokens.Fonts.appMono) }
     /// Uppercase eyebrow labels: SF Mono, tracked (L-7).
     static var eyebrow: Font { font(VoxTokens.Fonts.appEyebrow) }
-    /// Large headings: Inter Display ExtraBold, which the app carries (L-7).
+    /// Pane, sheet and dialog titles: SF Pro semibold (L-7), at a steady size.
+    static var title: Font { font(VoxTokens.Fonts.appTitle) }
+    /// Large headings, on the first-run screens only: Inter Display ExtraBold, which the app
+    /// carries (L-7).
     static var heading: Font { font(VoxTokens.Fonts.appHeading, defaultSize: headingSize,
                                     relativeTo: .largeTitle) }
     /// A file's or folder's symbol in its card: the title style, so it follows the text size.
@@ -212,31 +220,66 @@ private struct Typeset: ViewModifier {
 /// 1.4.4: macOS draws its own buttons in a fixed control font): bg.overlay with a text.muted edge
 /// (1.4.11), the label in text.primary, or danger for a destructive one; dimmer while pressed or
 /// off. A button styled plain or borderless keeps its own.
+///
+/// **Prominence is chosen, never taken from Return** (A9): a screen's main action is `.voxPrimary`,
+/// drawn filled in text.primary with its label in bg.base, and that is set on the button itself.
+/// Which button Return presses (`.defaultAction`) is a separate choice each screen makes, and
+/// drive, approve, a retention that deletes and a login item have none. Never the accent, which
+/// means only focus or live (L-3).
 struct VoxButtonStyle: ButtonStyle {
+    enum Kind { case standard, primary }
+
+    var kind = Kind.standard
     @Environment(\.isEnabled) private var enabled
+    @Environment(\.voxTextScale) private var scale
 
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(Theme.text)
-            .foregroundStyle(configuration.role == .destructive ? VoxTokens.Colors.danger
-                                                                : VoxTokens.Colors.textPrimary)
-            .padding(.horizontal, Theme.scaled(10))
-            .padding(.vertical, Theme.scaled(4))
-            .background(RoundedRectangle(cornerRadius: 5)
-                .fill(configuration.isPressed ? VoxTokens.Colors.bgPanel : VoxTokens.Colors.bgOverlay))
-            .overlay(RoundedRectangle(cornerRadius: 5).stroke(VoxTokens.Colors.textMuted))
+        let primary = kind == .primary && configuration.role != .destructive
+        let fill = primary ? (configuration.isPressed ? VoxTokens.Colors.textSecondary
+                                                      : VoxTokens.Colors.textPrimary)
+                           : (configuration.isPressed ? VoxTokens.Colors.bgPanel
+                                                      : VoxTokens.Colors.bgOverlay)
+        let label = primary ? VoxTokens.Colors.bgBase
+            : configuration.role == .destructive ? VoxTokens.Colors.danger
+            : VoxTokens.Colors.textPrimary
+        return configuration.label
+            .font(Theme.font(VoxTokens.Fonts.appText, scale: scale))
+            .fontWeight(primary ? .semibold : nil)
+            .foregroundStyle(label)
+            .padding(.horizontal, Space.s12 * scale)
+            .padding(.vertical, Space.s4 * scale)
+            .background(RoundedRectangle(cornerRadius: Radius.control * scale).fill(fill))
+            .overlay(RoundedRectangle(cornerRadius: Radius.control * scale)
+                .stroke(primary ? fill : VoxTokens.Colors.textMuted))
             .opacity(enabled ? 1 : 0.45)
             .contentShape(Rectangle())
     }
+}
+
+extension ButtonStyle where Self == VoxButtonStyle {
+    /// A screen's main action, prominent by choice (A9).
+    static var voxPrimary: VoxButtonStyle { VoxButtonStyle(kind: .primary) }
 }
 
 /// A card's outline: text.muted, 4.5:1 or more on every background, since an outline is all that
 /// marks a card's edge (WCAG 2.1 1.4.11); under Increase Contrast its token's hex_hc, which the
 /// colour set carries (L-5, #450).
 private struct CardOutline: ViewModifier {
+    @Environment(\.voxTextScale) private var scale
+
     func body(content: Content) -> some View {
-        content.overlay(RoundedRectangle(cornerRadius: 6).stroke(VoxTokens.Colors.textMuted))
+        content.overlay(RoundedRectangle(cornerRadius: Radius.control * scale)
+            .stroke(VoxTokens.Colors.textMuted))
     }
+}
+
+/// Padding of a spacing step at the text size of where it is drawn (L-1a).
+private struct ScaledPadding: ViewModifier {
+    @Environment(\.voxTextScale) private var scale
+    let edges: Edge.Set
+    let points: CGFloat
+
+    func body(content: Content) -> some View { content.padding(edges, points * scale) }
 }
 
 /// A selected row or card: drawn on bg.overlay with a bar in the accent at its leading edge, so
@@ -247,6 +290,7 @@ private struct SelectionMark: ViewModifier {
     /// The row the keyboard is on (WCAG 2.4.7): outlined in the focus accent, as well as marked.
     var focused = false
     @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.voxTextScale) private var scale
 
     func body(content: Content) -> some View {
         content
@@ -258,12 +302,34 @@ private struct SelectionMark: ViewModifier {
             }
             .overlay {
                 if focused {
-                    RoundedRectangle(cornerRadius: 4).stroke(VoxTokens.Colors.accent, lineWidth: 2)
+                    RoundedRectangle(cornerRadius: Radius.control * scale)
+                        .stroke(VoxTokens.Colors.accent, lineWidth: 2)
                 } else if selected && contrast == .increased {
-                    RoundedRectangle(cornerRadius: 4).stroke(VoxTokens.Colors.accent)
+                    RoundedRectangle(cornerRadius: Radius.control * scale)
+                        .stroke(VoxTokens.Colors.accent)
                 }
             }
             .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+/// A warning, before an alias is given, that the keyring holds another that equals it but for case
+/// (ADR-028 K-4): both are then shown with their fingerprint's first characters. Nothing when
+/// there is no clash.
+struct AliasClash: View {
+    @ObservedObject var model: NodeModel
+    let alias: String
+    /// The node being renamed, whose own alias is no clash.
+    var except: String? = nil
+
+    var body: some View {
+        if let other = clashingAlias(
+            others: model.trusted.filter { $0.fingerprint != except }.map(\.name), alias: alias) {
+            StateMark(kind: .attention,
+                      words: "Your keyring already has \(other), the same but for case: both will "
+                          + "be shown with the first characters of their fingerprints.")
+                .accessibilityIdentifier("alias-clash")
+        }
     }
 }
 
@@ -284,7 +350,14 @@ extension View {
                                keepCase: true))
     }
 
-    /// A large heading, in the token file's face and tracking (L-7).
+    /// A pane's, sheet's or dialog's title: SF Pro semibold, never scaled, and a header to
+    /// assistive technologies (L-7).
+    func title() -> some View {
+        font(Theme.title).accessibilityAddTraits(.isHeader)
+    }
+
+    /// A large heading, in the token file's face and tracking (L-7): the first-run screens only
+    /// (RootView's setup), never a pane, sheet or dialog.
     func heading() -> some View {
         modifier(ScaledTypeset(face: VoxTokens.Fonts.appHeading, defaultSize: Theme.headingSize,
                                relativeTo: .largeTitle))
@@ -300,6 +373,17 @@ extension View {
 
     /// `face`, at the text size of where it is drawn: the conversation's inside it, steady outside.
     func voxFont(_ face: VoxTokens.Face) -> some View { modifier(ScaledFont(face: face)) }
+
+    /// Padding of a spacing step (`Space`): at the conversation's text size inside it, as it is
+    /// elsewhere (L-1a).
+    func voxPadding(_ edges: Edge.Set, _ points: CGFloat) -> some View {
+        modifier(ScaledPadding(edges: edges, points: points))
+    }
+
+    /// `voxPadding` on every edge.
+    func voxPadding(_ points: CGFloat) -> some View {
+        modifier(ScaledPadding(edges: .all, points: points))
+    }
 
     /// Outline a card (L-5).
     func cardOutline() -> some View { modifier(CardOutline()) }
@@ -319,54 +403,124 @@ extension View {
             .accessibilityAction(.default, select)
     }
 
-    /// The content surface: bg.base, text.primary (L-6).
+    /// A right-click Copy for what a row names, each item copying its words (the decider, v0.4.1:
+    /// all text can be copied): for rows whose words cannot be selected, as a navigation list's
+    /// rows are, where a drag selects the row. Empty words give no item.
+    func copyMenu(_ items: [(title: String, words: String)]) -> some View {
+        contextMenu {
+            ForEach(items.filter { !$0.words.isEmpty }, id: \.title) { item in
+                Button(item.title) {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(item.words, forType: .string)
+                }
+            }
+        }
+    }
+
+    /// The content surface, the timeline and the content panes: bg.base, text.primary (L-6).
     func contentSurface() -> some View {
         background(VoxTokens.Colors.bgBase)
             .foregroundStyle(VoxTokens.Colors.textPrimary)
     }
+
+    /// The sidebar's and a sheet's surface: bg.panel, never the system's material (L-6).
+    func panelSurface() -> some View {
+        background(VoxTokens.Colors.bgPanel)
+            .foregroundStyle(VoxTokens.Colors.textPrimary)
+    }
+
+    /// The inspector's and the status bar's surface: bg.raised (L-6).
+    func raisedSurface() -> some View {
+        background(VoxTokens.Colors.bgRaised)
+            .foregroundStyle(VoxTokens.Colors.textPrimary)
+    }
 }
 
-/// Whether a node is in this node's keyring, shown by glyph, weight and words, never by colour
-/// alone (ADR-028 L-4, E-6).
+/// The line between two surfaces, or two parts of one: line.hair, one point wide, never the
+/// system's divider (L-6).
+struct Hairline: View {
+    var vertical = false
+
+    var body: some View {
+        Rectangle().fill(VoxTokens.Colors.lineHair)
+            .frame(width: vertical ? 1 : nil, height: vertical ? nil : 1)
+            .accessibilityHidden(true)
+    }
+}
+
+/// Who trusts whom between this node and another, each direction (ADR-028 L-4, R-5), shown by
+/// glyph, weight and words, never by colour alone (E-6). Words for every state, the TUI's (CL-1).
 enum Trust: Equatable {
-    /// In the keyring, and it trusts this node back.
+    /// In the keyring, and it trusts this node back: they read each other.
     case mutual
-    /// In the keyring; it does not trust this node.
+    /// In the keyring; its trust in this node has not reached it: waiting for the other side.
     case oneWay
-    /// Not in the keyring.
+    /// Not in the keyring, and it trusts this node.
+    case theyOnly
+    /// Not in the keyring, and no trust of it in this node has reached it.
     case none
+
+    /// The state from its two directions.
+    static func of(inKeyring: Bool, trustsYou: Bool) -> Trust {
+        switch (inKeyring, trustsYou) {
+        case (true, true): return .mutual
+        case (true, false): return .oneWay
+        case (false, true): return .theyOnly
+        case (false, false): return .none
+        }
+    }
+
+    /// Whether this node's keyring holds it.
+    var inKeyring: Bool { self == .mutual || self == .oneWay }
 
     var glyph: String {
         switch self {
         case .mutual: return "⇄"
         case .oneWay: return "→"
-        case .none: return "·"
+        case .theyOnly, .none: return "·"
         }
     }
 
     /// What the state is, in words.
     var words: String {
         switch self {
-        case .mutual: return "in keyring, trusts you"
-        case .oneWay: return "in keyring"
+        case .mutual: return "trusted both ways"
+        case .oneWay: return "waiting for the other side"
+        case .theyOnly: return "not in keyring, trusts you"
         case .none: return "not in keyring"
+        }
+    }
+
+    /// Both directions in a sentence, naming the node as `name` (D4): who trusts whom, and so
+    /// whether they read each other.
+    func sentence(_ name: String) -> String {
+        switch self {
+        case .mutual:
+            return "You trust \(name), and \(name) trusts you: you read each other."
+        case .oneWay:
+            return "You trust \(name); \(name)'s trust in you has not reached this node yet, so "
+                + "you can't read each other. Waiting for the other side."
+        case .theyOnly:
+            return "\(name) trusts you; you haven't trusted \(name), so you can't read each other "
+                + "until you do."
+        case .none:
+            return "You haven't trusted \(name), and no trust of \(name)'s in you has reached "
+                + "this node: you can't read each other."
         }
     }
 }
 
-/// A member's name with its trust: in the keyring in text.primary bold with ⇄ or →; not in it
-/// in text.secondary with · and the words "not in keyring" (L-4).
+/// A member's name with its trust in words, whatever the state: in the keyring in text.primary
+/// bold with ⇄ or →; not in it in text.secondary with · (L-4).
 struct TrustMark: View {
     let name: String
     let trust: Trust
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: Space.s8) {
             Text(trust.glyph).font(Theme.mono)
-            Text(name).fontWeight(trust == .none ? .regular : .bold)
-            if trust == .none {
-                Text(trust.words).font(Theme.eyebrow)
-            }
+            Text(name).fontWeight(trust.inKeyring ? .bold : .regular)
+            Text(trust.words).font(Theme.eyebrow)
         }
         .modifier(TrustStyle(trust: trust))
         .accessibilityElement(children: .ignore)
@@ -379,7 +533,7 @@ private struct TrustStyle: ViewModifier {
     @Environment(\.colorSchemeContrast) private var contrast
 
     func body(content: Content) -> some View {
-        content.foregroundStyle(trust == .none && contrast != .increased
+        content.foregroundStyle(!trust.inKeyring && contrast != .increased
                                 ? VoxTokens.Colors.textSecondary : VoxTokens.Colors.textPrimary)
     }
 }
@@ -395,7 +549,7 @@ struct StateMark: View {
     let words: String
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: Space.s8) {
             Text(glyph).font(Theme.mono)
             // Its own face: a sidebar list sets its rows' font over the one inherited.
             Text(words).font(Theme.text)
