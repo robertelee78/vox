@@ -54,7 +54,7 @@ struct CompareField: View {
     @State private var typed = ""
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: Space.s8) {
             TextField("Their fingerprint, pasted or typed", text: $typed).font(Theme.mono)
                 .accessibilityLabel("Their fingerprint, to compare with \(name)'s")
                 .accessibilityIdentifier("\(id)-compare")
@@ -65,7 +65,7 @@ struct CompareField: View {
                 StateMark(kind: .plain, words: "So far matches \(groups) of \(of) groups.")
                     .accessibilityIdentifier("\(id)-compare-said")
             case let .matches(of):
-                HStack(spacing: 6) {
+                HStack(spacing: Space.s8) {
                     Text("✓").font(Theme.mono)
                     Text("Matches \(name)'s fingerprint, all \(of) groups.")
                 }

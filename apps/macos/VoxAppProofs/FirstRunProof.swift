@@ -762,11 +762,12 @@ final class FirstRunProof: XCTestCase {
         print("[proof] settings: menu bar \(barOn.debugDescription) then \(barOff.debugDescription); keep running \(answerOff.debugDescription)/\(itemOff.debugDescription) then \(answerOn.debugDescription)/\(itemOn.debugDescription); text size \(scaled.debugDescription) then \(back.debugDescription)")
     }
 
-    /// View > Bigger (⌘+) scales the conversation only (the decider, v0.4.1), alone. Staged by
-    /// `vox`: alice attached, with one room holding one message of hers, chosen before. Two ⌘+
-    /// grow the message's text; a sidebar row and the inspector's MEMBERS line keep their size.
-    /// ⌘0 puts the size back. Mutation: the conversation's scale applied to the whole window → red
-    /// at "unchanged".
+    /// View > Bigger (⌘+) scales the conversation only (the decider, v0.4.1; ADR-028 L-1a, L-1b),
+    /// alone. Staged by `vox`: alice attached, with one room holding two messages of hers, chosen
+    /// before. Two ⌘+ grow the message's text and the space between the two messages with it; a
+    /// sidebar row and the inspector's MEMBERS line keep their size. ⌘0 puts the size back.
+    /// Mutations: the conversation's scale applied to the whole window → red at "unchanged";
+    /// voxPadding and the timeline's spacing left at Actual Size → red at "spacing".
     func testBiggerScalesTheConversationOnly() throws {
         let env = ProcessInfo.processInfo.environment
         guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
@@ -793,6 +794,7 @@ final class FirstRunProof: XCTestCase {
             $0.contains(" talk")
         }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
         try staged(vox, ["room", "post", "--node", "alice", room, "MEASURE-THIS-MESSAGE"], env: voxEnv)
+        try staged(vox, ["room", "post", "--node", "alice", room, "AND-THE-NEXT-ONE"], env: voxEnv)
         try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
         try stager.write(Data("alice\n".utf8), to: config + "/app/node")
 
@@ -810,21 +812,417 @@ final class FirstRunProof: XCTestCase {
             return e.frame.height
         }
         let message = Key.showing("MEASURE-THIS-MESSAGE")
+        let next = Key.showing("AND-THE-NEXT-ONE")
         let sidebarRow = Key.id("room-talk")
         let members = Key.showing("MEMBERS")
+        // From one message's text to the next one's: the rows' padding, the timeline's spacing and
+        // the next row's author line, all of which are the conversation's (L-1a).
+        func gap() -> CGFloat {
+            guard let a = locate(ui, message), let b = locate(ui, next) else { return -1 }
+            return b.frame.minY - a.frame.maxY
+        }
+        present(ui, next, timeout: 20, "alice's second message must show in the timeline")
         Thread.sleep(forTimeInterval: 1)
-        let m0 = height(message), s0 = height(sidebarRow), i0 = height(members)
+        let m0 = height(message), s0 = height(sidebarRow), i0 = height(members), g0 = gap()
         ui.typeKey("+", modifierFlags: .command)
         ui.typeKey("+", modifierFlags: .command)
         Thread.sleep(forTimeInterval: 2)
         present(ui, message, timeout: 10, "after View > Bigger, the message must still show")
-        let m1 = height(message), s1 = height(sidebarRow), i1 = height(members)
+        let m1 = height(message), s1 = height(sidebarRow), i1 = height(members), g1 = gap()
         ui.typeKey("0", modifierFlags: .command)
         XCTAssertTrue(m0 > 0 && m1 > m0 * 1.15,
                       "PRODUCT: View > Bigger twice must grow the conversation's text; the message was \(m0) high and is \(m1)")
         XCTAssertTrue(s0 > 0 && i0 > 0 && abs(s1 - s0) <= 1 && abs(i1 - i0) <= 1,
                       "PRODUCT: View > Bigger must leave the sidebar and the inspector unchanged; a sidebar row went from \(s0) to \(s1), the inspector's MEMBERS line from \(i0) to \(i1)")
-        print("[proof] bigger: message \(m0) → \(m1); sidebar row \(s0) → \(s1); inspector line \(i0) → \(i1)")
+        // Two steps are 1.3 times Actual Size: spacing taken at the text size grows the gap by
+        // about that; spacing left at Actual Size grows it by only the author line's share.
+        XCTAssertTrue(g0 > 0 && g1 >= g0 * 1.24,
+                      "PRODUCT: View > Bigger twice must grow the conversation's spacing with its text (L-1a); the gap between two messages was \(g0) and is \(g1)")
+        print("[proof] bigger: message \(m0) → \(m1); gap between messages \(g0) → \(g1); sidebar row \(s0) → \(s1); inspector line \(i0) → \(i1)")
+    }
+
+    /// The look as a person sees it (ADR-028 L-2, L-6, L-7; A9; P5), alone. Staged by `vox`:
+    /// alice and bob, alice attached and trusting bob with read, with one room holding a message
+    /// of hers, chosen before. Read from the window's own pixels where a person sees them: the
+    /// sidebar on bg.panel, the timeline on bg.base, the inspector and the status bar on
+    /// bg.raised, and between the timeline and the inspector a line of line.hair. Room > Rename's
+    /// sheet is on bg.panel, its title SF Pro semibold (one line of about 24 points, not Inter
+    /// Display's 34). Return in Room > Retention sets nothing: the sheet stays. On bob's keyring
+    /// row, "Also let bob drive my Sessions…" opens its confirm sheet, and Return there cancels:
+    /// the sheet goes and bob still has read. Colours are compared in sRGB, within 4 of 255 per
+    /// channel. Mutations: the inspector without bg.raised → red at "inspector"; the hairline the
+    /// system's divider again → red at "line.hair"; a sheet title in Inter Display → red at
+    /// "title"; Set the default again → red at "Retention"; Give Drive the default → red at
+    /// "drive". Then Node > Detach: the chooser lists alice, detached, with her fingerprint and
+    /// "Everything you post, trust and share will be as alice."; `vox node list` shows the same
+    /// fingerprint; and with bob's vault copied over hers, it shows none (P8). Before that, the
+    /// sidebar opens with "node alice, attached" and ends with ON THIS MACHINE listing bob as
+    /// attached, below Services (G5; mutation: the footer gone → red at "foot"). Mutations: the
+    /// fingerprint file not written → red at "chooser must show"; its vault hash not checked → red
+    /// at "stale".
+    func testTheLookIsTheTokensAndReturnNeverGivesWhatItShouldNot() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
+            throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are set by scripts/app-proofs.sh")
+        }
+        let vox = URL(fileURLWithPath: appPath).appendingPathComponent("Contents/Helpers/vox").path
+        let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("look")
+        let data = root.appendingPathComponent("data").path
+        let config = root.appendingPathComponent("config").path
+        let home = root.appendingPathComponent("home").path
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        let pass = { (name: String) in root.appendingPathComponent("\(name).pass").path }
+        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+                           until: "vox daemon: control socket")
+        try stager.write(Data("alice identity\n".utf8), to: pass("alice"))
+        try stager.write(Data("bob identity\n".utf8), to: pass("bob"))
+        try stager.write(Data("look room\n".utf8), to: pass("room"))
+        for (name, words) in [("alice", "alice identity"), ("bob", "bob identity")] {
+            try staged(vox, ["node", "create", name],
+                       env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": words]) { $1 })
+        }
+        try staged(vox, ["node", "attach", "alice", "--passphrase-file", pass("alice")], env: voxEnv)
+        try staged(vox, ["node", "attach", "bob", "--passphrase-file", pass("bob")], env: voxEnv)
+        let bobFp = try line(staged(vox, ["id", "--node", "bob"], env: voxEnv)) { $0.count == 52 }
+        let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
+        try staged(vox, ["trust", "add", "--node", "alice", bobFp, "--name", "bob",
+                         "--identity-passphrase-file", pass("alice")], env: voxEnv)
+        try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", pass("room"),
+                         "--name", "talk"], env: voxEnv)
+        let room = try line(staged(vox, ["room", "list", "--node", "alice"], env: voxEnv)) {
+            $0.contains(" talk")
+        }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        try staged(vox, ["room", "post", "--node", "alice", room, "LOOK-AT-THIS"], env: voxEnv)
+        try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
+        try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+
+        let ui = voxApp(appPath)
+        ui.launchEnvironment = voxEnv.merging(["HOME": home]) { $1 }
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        defer { ui.terminate() }
+        present(ui, Key.id("attached"), timeout: 60, "the app must open attached as alice")
+        ui.typeKey("0", modifierFlags: .command)
+        tap(ui, Key.id("room-talk"), "the room talk in the sidebar")
+        present(ui, Key.showing("LOOK-AT-THIS"), timeout: 20, "alice's message must show in the timeline")
+        Thread.sleep(forTimeInterval: 1.5)
+
+        // The window's pixels, in sRGB, at a point in screen coordinates.
+        let window = ui.windows.firstMatch
+        guard let status = locate(ui, Key.id("status")), let members = locate(ui, Key.showing("MEMBERS")),
+              let message = locate(ui, Key.showing("LOOK-AT-THIS")) else {
+            throw Apparatus("the status bar, MEMBERS or the message is not readable to XCTest, so no point can be placed")
+        }
+        let frame = window.frame
+        let shot = window.screenshot().image
+        guard let cg = shot.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            throw Apparatus("XCTest's screenshot of the window has no bitmap")
+        }
+        let bitmap = NSBitmapImageRep(cgImage: cg)
+        let perPoint = CGFloat(cg.width) / frame.width
+        func rgb(_ p: CGPoint) -> (Int, Int, Int)? {
+            let x = Int((p.x - frame.minX) * perPoint), y = Int((p.y - frame.minY) * perPoint)
+            guard x >= 0, y >= 0, x < cg.width, y < cg.height,
+                  let c = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { return nil }
+            return (Int((c.redComponent * 255).rounded()), Int((c.greenComponent * 255).rounded()),
+                    Int((c.blueComponent * 255).rounded()))
+        }
+        func hex(_ c: (Int, Int, Int)?) -> String {
+            guard let c else { return "nothing (off the window)" }
+            return String(format: "#%02x%02x%02x", c.0, c.1, c.2)
+        }
+        func near(_ c: (Int, Int, Int)?, _ want: String) -> Bool {
+            guard let c, let v = Int(want.dropFirst(), radix: 16) else { return false }
+            return abs(c.0 - (v >> 16 & 0xff)) <= 4 && abs(c.1 - (v >> 8 & 0xff)) <= 4
+                && abs(c.2 - (v & 0xff)) <= 4
+        }
+        let above = status.frame.minY - 24
+        let points: [(String, CGPoint, String)] = [
+            // Inside the sidebar's left margin: the foot's words (ON THIS MACHINE) start 16 in.
+            ("the sidebar", CGPoint(x: frame.minX + 6, y: above), "#16171a"),
+            ("the timeline", CGPoint(x: message.frame.minX + 40, y: message.frame.maxY + 40), "#0c0d0f"),
+            ("the inspector", CGPoint(x: frame.maxX - 16, y: above), "#131417"),
+            ("the status bar", CGPoint(x: status.frame.minX + 3, y: status.frame.midY), "#131417"),
+        ]
+        var read: [String] = []
+        for (place, point, want) in points {
+            let got = rgb(point)
+            read.append("\(place) \(hex(got))")
+            XCTAssertTrue(near(got, want),
+                          "PRODUCT: \(place) must be drawn in \(want) (L-6); at \(point) it is \(hex(got))")
+        }
+        // The line between the timeline and the inspector: line.hair somewhere in the 40 points
+        // left of the inspector's MEMBERS, at the height of the timeline's middle.
+        let y = (message.frame.maxY + status.frame.minY) / 2
+        var hair: CGFloat?
+        var x = members.frame.minX - 40
+        while x < members.frame.minX && hair == nil {
+            if near(rgb(CGPoint(x: x, y: y)), "#303137") { hair = x }
+            x += 0.5
+        }
+        XCTAssertNotNil(hair, "PRODUCT: the timeline and the inspector must be separated by line.hair #303137 (L-2, L-6); no pixel of it in the 40 points left of the inspector, at height \(y)")
+        read.append("line.hair at x \(hair.map { "\($0)" } ?? "none")")
+
+        // Room > Rename…: a sheet on bg.panel, its title SF Pro semibold.
+        ui.menuBars.menuBarItems["Room"].click()
+        tap(ui, Key.menuItem("Rename…"), "Room > Rename…")
+        let title = Key.showing("Rename the room")
+        present(ui, title, timeout: 10, "Room > Rename… must open its sheet")
+        Thread.sleep(forTimeInterval: 1)
+        let titleHeight = locate(ui, title)?.frame.height ?? -1
+        XCTAssertTrue(titleHeight > 0 && titleHeight <= 28,
+                      "PRODUCT: a sheet's title must be SF Pro semibold, one line of about 24 points (L-7); \"Rename the room\" is \(titleHeight) high")
+        if let sheet = ui.sheets.firstMatch.exists ? ui.sheets.firstMatch : nil,
+           let t = locate(ui, title) {
+            let shotSheet = window.screenshot().image
+            if let cgs = shotSheet.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                let b = NSBitmapImageRep(cgImage: cgs)
+                let p = CGPoint(x: t.frame.minX - 12, y: t.frame.minY - 12)
+                let px = Int((p.x - frame.minX) * perPoint), py = Int((p.y - frame.minY) * perPoint)
+                let c = b.colorAt(x: px, y: py)?.usingColorSpace(.sRGB)
+                let got = c.map { (Int(($0.redComponent * 255).rounded()), Int(($0.greenComponent * 255).rounded()),
+                                   Int(($0.blueComponent * 255).rounded())) }
+                read.append("sheet \(hex(got))")
+                XCTAssertTrue(near(got, "#16171a"),
+                              "PRODUCT: a sheet must be drawn in bg.panel #16171a (L-6); inside Rename's, at \(p), it is \(hex(got)) (sheet at \(sheet.frame))")
+            }
+        } else {
+            XCTFail("APPARATUS: Rename's title shows, but XCTest finds no sheet to read")
+        }
+        ui.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+        missingWithin(ui, title, 5, "Escape must close Rename's sheet")
+
+        // Room > Retention…: Return sets nothing (A9: a retention that deletes has no default).
+        ui.menuBars.menuBarItems["Room"].click()
+        tap(ui, Key.menuItem("Retention…"), "Room > Retention…")
+        present(ui, Key.id("retention-effect"), timeout: 10, "Room > Retention… must open its sheet")
+        ui.typeKey(XCUIKeyboardKey.return.rawValue, modifierFlags: [])
+        Thread.sleep(forTimeInterval: 2)
+        XCTAssertNotNil(locate(ui, Key.id("retention-effect")),
+                        "PRODUCT: Return in Retention must set nothing (A9); the sheet closed, as if Set was pressed")
+        ui.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+        missingWithin(ui, Key.id("retention-effect"), 5, "Escape must close Retention's sheet")
+
+        // The keyring: drive through its own sheet, whose Return is Cancel (P5).
+        ui.typeKey("k", modifierFlags: [.command, .shift])
+        tap(ui, Key.id("keyring-give-drive-bob"), "\"Also let bob drive my Sessions…\" on bob's row")
+        present(ui, Key.id("keyring-drive-effect"), timeout: 10, "the drive confirm sheet must open")
+        ui.typeKey(XCUIKeyboardKey.return.rawValue, modifierFlags: [])
+        missingWithin(ui, Key.id("keyring-drive-effect"), 5,
+                      "Return in the drive sheet must be Cancel, closing it (P5)")
+        let capability = words(ui, Key.id("keyring-capability-bob"), timeout: 10,
+                               "bob's row must say what it grants") ?? ""
+        XCTAssertEqual(capability, "read",
+                       "PRODUCT: Return in the drive sheet must give nothing (P5); bob's row says \(capability.debugDescription)")
+
+        // G5: the sidebar opens with who you are, and ends with this Mac's nodes and their state.
+        words(ui, Key.id("attached"), timeout: 10, "the sidebar must open with the acting node (G5)",
+              until: { $0 == "node alice, attached" })
+        words(ui, Key.id("node-bob"), timeout: 10, "the sidebar's foot must list bob and his state (G5)",
+              until: { $0 == "bob attached" })
+        let foot = locate(ui, Key.id("on-this-machine"))?.frame ?? .null
+        let lastAbove = locate(ui, Key.id("services"))?.frame ?? .null
+        XCTAssertTrue(!foot.isNull && !lastAbove.isNull && foot.minY > lastAbove.maxY,
+                      "PRODUCT: \"ON THIS MACHINE\" must be at the sidebar's foot, below Services (G5); it is at \(foot), Services at \(lastAbove)")
+
+        // P8: Node > Detach, and the chooser lists alice, now detached, with her fingerprint (from
+        // her fingerprint file) and what choosing her means; `vox node list` shows it too. Then a
+        // vault copied over hers, as a restore would: her fingerprint is not known, never stale.
+        ui.menuBars.menuBarItems["Node"].click()
+        tap(ui, Key.menuItem("Detach"), "Node > Detach")
+        let plain = { (s: String) in s.lowercased().filter { $0.isLetter || $0.isNumber } }
+        let shown = words(ui, Key.id("node-fingerprint-alice"), timeout: 30,
+                          "after Detach, the chooser must list alice with her fingerprint (P8)") ?? ""
+        XCTAssertEqual(plain(shown), plain(aliceFp),
+                       "PRODUCT: the chooser must show detached alice's fingerprint, \(aliceFp) (P8); it shows \(shown.debugDescription)")
+        words(ui, Key.id("node-acting-as-alice"), timeout: 5, "the chooser must say what choosing alice means (P8)",
+              until: { $0 == "Everything you post, trust and share will be as alice." })
+        let listed = run(vox, ["node", "list"], env: voxEnv).out
+        let aliceLine = nodeLine(listed, "alice") ?? ""
+        XCTAssertTrue(aliceLine.contains(" detached ") && plain(aliceLine).contains(plain(aliceFp)),
+                      "PRODUCT: `vox node list` must show detached alice with her fingerprint; it says \(aliceLine.debugDescription)")
+        guard stager.run(["/bin/cp", data + "/nodes/bob/vault.cbor", data + "/nodes/alice/vault.cbor"],
+                         env: [:]).status == 0 else {
+            throw Apparatus("staging not achieved: bob's vault.cbor could not be copied over alice's")
+        }
+        let restored = nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "alice") ?? ""
+        XCTAssertFalse(plain(restored).contains(plain(aliceFp)) || plain(restored).contains(plain(bobFp)),
+                       "PRODUCT: with another vault in alice's place, `vox node list` must not show a fingerprint for her, stale or otherwise; it says \(restored.debugDescription)")
+        print("[proof] look: \(read.joined(separator: "; ")); title \(titleHeight) high; retention kept by Return; bob \(capability.debugDescription) after Return; chooser shows alice \(shown.debugDescription); node list \(aliceLine.debugDescription), then with bob's vault \(restored.debugDescription)")
+    }
+
+    /// `key` gone within `timeout`: PRODUCT naming what still shows it.
+    private func missingWithin(_ ui: XCUIApplication, _ key: Key, _ timeout: TimeInterval, _ product: String,
+                               file: StaticString = #filePath, line: UInt = #line) {
+        let end = Date().addingTimeInterval(timeout)
+        while locate(ui, key) != nil && Date() < end { Thread.sleep(forTimeInterval: 0.25) }
+        if locate(ui, key) != nil {
+            XCTFail("PRODUCT: \(product); \(key) still shows", file: file, line: line)
+        }
+    }
+
+    /// The window's side columns (v0.4.1, the decider: "I should also be able to resize it, and
+    /// resize the one on the right too"), alone. Staged by `vox`: alice attached, with one room,
+    /// chosen before; Keep Running not chosen. Dragging the sidebar's divider and the inspector's
+    /// changes each column's width; both widths are the same after ⌘Q and a new launch; and View >
+    /// Hide Inspector (⌥⌘I) hides the inspector and Show Inspector brings it back. Made short, the
+    /// window cuts the inspector's family LAN section off, and scrolling the inspector brings it
+    /// into view with MEMBERS still at the top (P13).
+    /// Mutations: Columns.remember a no-op → red at "after a new launch"; the inspector without
+    /// its scroll view → red at "must scroll".
+    func testColumnsResizeAndAreRememberedAndTheInspectorHides() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
+            throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are set by scripts/app-proofs.sh")
+        }
+        let vox = URL(fileURLWithPath: appPath).appendingPathComponent("Contents/Helpers/vox").path
+        let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("columns")
+        let data = root.appendingPathComponent("data").path
+        let config = root.appendingPathComponent("config").path
+        let home = root.appendingPathComponent("home").path
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+                           until: "vox daemon: control socket")
+        let idPass = root.appendingPathComponent("alice.pass").path
+        let roomPass = root.appendingPathComponent("room.pass").path
+        try stager.write(Data("alice identity\n".utf8), to: idPass)
+        try stager.write(Data("columns room\n".utf8), to: roomPass)
+        try staged(vox, ["node", "create", "alice"],
+                   env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "alice identity"]) { $1 })
+        try staged(vox, ["node", "attach", "alice", "--passphrase-file", idPass], env: voxEnv)
+        try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", roomPass,
+                         "--name", "columns"], env: voxEnv)
+        try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
+        try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+        // The widths start from the standard ones: the column keys, in the bundle under proof's
+        // own defaults (never the person's Vox), are removed first.
+        let domain = stager.run(["/usr/bin/defaults", "read", appPath + "/Contents/Info", "CFBundleIdentifier"],
+                                env: [:]).out.trimmingCharacters(in: .whitespacesAndNewlines)
+        let proofID = "us.vox.app.proof"  // app-proofs.sh's VOX_APP_ID
+        guard domain == proofID else {
+            throw Apparatus("\(appPath) is \(domain.debugDescription), not \(proofID): its defaults could be the person's")
+        }
+        for key in ["column.sidebar.width", "column.inspector.width", "column.inspector.shown"] {
+            _ = stager.run(["/usr/bin/defaults", "delete", domain, key], env: [:])
+        }
+
+        let ui = voxApp(appPath)
+        ui.launchEnvironment = voxEnv.merging(["HOME": home]) { $1 }
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        defer { ui.terminate() }
+        present(ui, Key.id("attached"), timeout: 60, "the app must open attached as alice")
+        tap(ui, Key.id("room-columns"), "the room columns in the sidebar")
+        present(ui, Key.id("inspector"), timeout: 10, "a room on screen must show its inspector")
+
+        /// The sidebar's divider: the window's split view's (NavigationSplitView).
+        func sidebarDivider() -> XCUIElement? {
+            ui.windows.firstMatch.splitters.allElementsBoundByIndex
+                .filter { $0.exists && $0.frame.width > 0 }
+                .min { $0.frame.minX < $1.frame.minX }
+        }
+        func inspectorDivider() -> XCUIElement {
+            ui.descendants(matching: .any).matching(identifier: "inspector-divider").firstMatch
+        }
+        func sidebarWidth() -> CGFloat {
+            guard let d = sidebarDivider() else { return -1 }
+            return d.frame.minX - ui.windows.firstMatch.frame.minX
+        }
+        func inspectorWidth() -> CGFloat {
+            let e = ui.descendants(matching: .any).matching(identifier: "inspector").firstMatch
+            return e.exists ? e.frame.width : -1
+        }
+        /// A person's drag: press, move slowly, and hold before letting go.
+        func drag(_ divider: XCUIElement, by dx: CGFloat) {
+            let at = divider.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            at.press(forDuration: 0.5, thenDragTo: at.withOffset(CGVector(dx: dx, dy: 0)),
+                     withVelocity: .slow, thenHoldForDuration: 0.5)
+            Thread.sleep(forTimeInterval: 1)
+        }
+        guard let side = sidebarDivider() else {
+            throw Apparatus("XCTest finds no split view divider in the window for the sidebar")
+        }
+        guard inspectorDivider().waitForExistence(timeout: 10) else {
+            throw Apparatus("XCTest finds no \"inspector-divider\" beside the inspector")
+        }
+        // Room to widen both: the timeline keeps 400 points (its minimum), so a window only as
+        // wide as the three columns need leaves the sidebar nowhere to go. Widen the window first,
+        // from its right edge, as a person would.
+        let window = ui.windows.firstMatch
+        let edge = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.5))
+            .withOffset(CGVector(dx: -1, dy: 0))
+        edge.press(forDuration: 0.5, thenDragTo: edge.withOffset(CGVector(dx: 400, dy: 0)),
+                   withVelocity: .slow, thenHoldForDuration: 0.5)
+        Thread.sleep(forTimeInterval: 1)
+        let sidebar0 = sidebarWidth(), inspector0 = inspectorWidth()
+        let needed = sidebar0 + 80 + 400 + 7 + inspector0 + 60
+        guard window.frame.width >= needed else {
+            throw Apparatus("staging not achieved: the window is \(window.frame.width) wide after widening, and both drags need \(needed) (the timeline keeps 400)")
+        }
+        // What the sidebar is, seen two ways: the splitter XCTest finds, and a row inside the
+        // sidebar (Keyring spans its width). Both, before and after, are printed with every
+        // splitter, so a red says whether the divider moved at all.
+        func rowEdge() -> CGFloat {
+            (locate(ui, Key.id("keyring"))?.frame.maxX ?? -1) - window.frame.minX
+        }
+        func splitters() -> String {
+            window.splitters.allElementsBoundByIndex.map { "\($0.frame)" }.joined(separator: " ")
+        }
+        let row0 = rowEdge(), split0 = splitters()
+        drag(side, by: 80)
+        let row1 = rowEdge(), split1 = splitters()
+        print("[proof] columns: sidebar drag: splitter \(sidebar0) → \(sidebarWidth()); Keyring row's edge \(row0) → \(row1); splitters before \(split0); after \(split1); window \(window.frame)")
+        drag(inspectorDivider(), by: -60)
+        let sidebar1 = sidebarWidth(), inspector1 = inspectorWidth()
+        XCTAssertTrue(sidebar1 > sidebar0 + 40,
+                      "PRODUCT: dragging the sidebar's divider 80 points right must widen the sidebar; it went from \(sidebar0) to \(sidebar1) (the Keyring row's edge \(row0) → \(row1))")
+        XCTAssertTrue(inspector1 > inspector0 + 30,
+                      "PRODUCT: dragging the inspector's divider 60 points left must widen the inspector; it went from \(inspector0) to \(inspector1)")
+
+        // ⌘Q, and a new launch: the same widths.
+        handOff(ui, "q")
+        XCTAssertTrue(ui.wait(for: .notRunning, timeout: 30), "PRODUCT: ⌘Q did not quit the app")
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        present(ui, Key.id("attached"), timeout: 60, "after a new launch, the app must open attached as alice")
+        tap(ui, Key.id("room-columns"), "after a new launch, the room columns")
+        present(ui, Key.id("inspector"), timeout: 10, "after a new launch, the room's inspector")
+        Thread.sleep(forTimeInterval: 1)
+        let sidebar2 = sidebarWidth(), inspector2 = inspectorWidth()
+        XCTAssertTrue(abs(sidebar2 - sidebar1) <= 4 && abs(inspector2 - inspector1) <= 4,
+                      "PRODUCT: the column widths must be the same after a new launch; the sidebar was \(sidebar1) and is \(sidebar2), the inspector was \(inspector1) and is \(inspector2)")
+
+        // Hide the inspector, then show it again, with ⌥⌘I.
+        ui.typeKey("i", modifierFlags: [.command, .option])
+        let hidden = ui.descendants(matching: .any).matching(identifier: "inspector").firstMatch
+            .waitForNonExistence(timeout: 5)
+        ui.typeKey("i", modifierFlags: [.command, .option])
+        let back = present(ui, Key.id("inspector"), timeout: 5, "⌥⌘I again must show the inspector")
+        XCTAssertTrue(hidden && back,
+                      "PRODUCT: View > Hide Inspector (⌥⌘I) must hide the inspector and Show Inspector bring it back; hidden \(hidden), back \(back)")
+
+        // A short window (P13): the inspector's last section, the family LAN, is below its
+        // bottom, and scrolling the inspector brings it into view while MEMBERS stays pinned.
+        let bottom = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 1))
+            .withOffset(CGVector(dx: 0, dy: -1))
+        bottom.press(forDuration: 0.5, thenDragTo: bottom.withOffset(CGVector(dx: 0, dy: -(window.frame.height - 300))),
+                     withVelocity: .slow, thenHoldForDuration: 0.5)
+        Thread.sleep(forTimeInterval: 1)
+        let inspector = ui.descendants(matching: .any).matching(identifier: "inspector").firstMatch
+        // The section's last control: Allow the LAN Helper, or Remove it once it is allowed.
+        let lan = ui.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier == 'family-lan-allow' OR identifier == 'family-lan-remove'")).firstMatch
+        func lanInView() -> Bool {
+            lan.exists && lan.frame.maxY <= inspector.frame.maxY + 1 && lan.frame.minY >= inspector.frame.minY
+        }
+        guard !lanInView() else {
+            throw Apparatus("staging not achieved: the window is \(window.frame.height) high and the inspector's family LAN section still fits (\(lan.frame) in \(inspector.frame)), so there is nothing to scroll")
+        }
+        inspector.scroll(byDeltaX: 0, deltaY: -2000)
+        Thread.sleep(forTimeInterval: 1)
+        let members = locate(ui, Key.showing("MEMBERS"))?.frame ?? .null
+        XCTAssertTrue(lanInView(),
+                      "PRODUCT: the inspector must scroll (P13): in a window \(window.frame.height) high, scrolled down, its family LAN section is still out of view (\(lan.exists ? "\(lan.frame)" : "not shown") in \(inspector.frame))")
+        XCTAssertTrue(!members.isNull && members.minY >= inspector.frame.minY - 1 && members.maxY <= inspector.frame.maxY,
+                      "PRODUCT: scrolled, the inspector's MEMBERS heading must stay in view (P13); it is at \(members) in \(inspector.frame)")
+        print("[proof] columns: sidebar \(sidebar0) → \(sidebar1) → after relaunch \(sidebar2); inspector \(inspector0) → \(inspector1) → \(inspector2); hide \(hidden), show \(back); scrolled, LAN in view \(lanInView()), MEMBERS at \(members.minY)")
     }
 
     /// (8) Notifications (ADR-014 M-23, ADR-028 R-10, #448), alone: the one step that needs a

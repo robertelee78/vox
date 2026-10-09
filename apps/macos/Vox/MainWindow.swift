@@ -8,6 +8,9 @@ import SwiftUI
 
 struct MainWindow: View {
     @ObservedObject var model: NodeModel
+    /// The sidebar's width at launch, read once: given afresh on every update, the split view
+    /// put the sidebar back to it, and a drag never stuck (259 → 259 in the columns case).
+    @State private var sidebarIdeal = Columns.width(.sidebar)
 
     var body: some View {
         VStack(spacing: 0) {
@@ -16,8 +19,12 @@ struct MainWindow: View {
                 Divider()
             }
             NavigationSplitView {
+                // Dragged wider or narrower, and remembered (Columns).
                 Sidebar(model: model)
-                    .navigationSplitViewColumnWidth(min: Theme.scaled(220), ideal: Theme.scaled(260))
+                    .remembersWidth(of: .sidebar)
+                    .navigationSplitViewColumnWidth(min: Columns.Side.sidebar.min,
+                                                    ideal: sidebarIdeal,
+                                                    max: Columns.Side.sidebar.max)
             } detail: {
                 // Every word shown here can be selected and copied (the decider, v0.4.1): set
                 // once for the whole detail, so a view added later is selectable too.
@@ -37,8 +44,8 @@ struct MainWindow: View {
                 case nil where model.rooms.isEmpty:
                     // A node in no room yet (its first run, most often): the two ways in, here,
                     // not only in the File menu.
-                    VStack(spacing: 12) {
-                        Text("You are in no room yet.").heading()
+                    VStack(spacing: Space.s12) {
+                        Text("You are in no room yet.").title()
                         Text("Make a room and share its link, or join one with the link and "
                             + "passphrase someone sent you.")
                             .secondaryText()
@@ -46,6 +53,7 @@ struct MainWindow: View {
                         HStack {
                             Button("New Room…") { model.sheet = .newRoom }
                                 .keyboardShortcut(.defaultAction)
+                                .buttonStyle(.voxPrimary)
                                 .accessibilityIdentifier("empty-new-room")
                             Button("Join Room…") { model.sheet = .joinRoom }
                                 .accessibilityIdentifier("empty-join-room")
@@ -62,8 +70,9 @@ struct MainWindow: View {
                 }
                 .textSelection(.enabled)
             }
-            Divider()
+            Hairline()
             StatusBar(model: model)
+                .raisedSurface()
                 .textSelection(.enabled)
         }
         .contentSurface()
@@ -76,12 +85,20 @@ struct MainWindow: View {
         .sheet(item: $model.sheet) { NodeSheets(model: model, sheet: $0).textSelection(.enabled) }
         .sheet(item: $model.card) { node in
             NodeCard(model: model, node: node) { model.card = nil }.textSelection(.enabled)
+                .panelSurface()
         }
         .toolbar {
             // W-2: a key moves to the next room that needs the person; Control-N, as in the TUI.
             Button("Next Room That Needs You") { Task { await model.nextNeedingYou() } }
                 .keyboardShortcut("n", modifiers: .control)
                 .accessibilityIdentifier("next-needs-you")
+            // The inspector, shown or hidden, as the sidebar's own button does for the sidebar.
+            Button { model.inspectorShown.toggle() } label: {
+                Label(model.inspectorShown ? "Hide Inspector" : "Show Inspector",
+                      systemImage: "sidebar.right")
+            }
+            .help(model.inspectorShown ? "Hide Inspector (⌥⌘I)" : "Show Inspector (⌥⌘I)")
+            .accessibilityIdentifier("toggle-inspector")
         }
     }
 }
@@ -97,9 +114,9 @@ private struct Sidebar: View {
                                     model.select(s)
                                     Task { await model.show(s) }
                                 })) {
+            // Who you are, first (G5): the node's mark, its name, and that it is attached.
             Section {
-                StateMark(kind: model.ended == nil ? .live : .danger,
-                          words: "node \(model.node), \(model.ended == nil ? "attached" : "detached")")
+                NodeIdentity(name: model.node, attached: model.ended == nil)
                     .copyMenu([("Copy Name", model.node)])
                     .accessibilityIdentifier(model.ended == nil ? "attached" : "detached")
                     .background(SidebarHighlightOff())
@@ -139,18 +156,15 @@ private struct Sidebar: View {
                     .sidebarRow(model.selection == .services)
                     .accessibilityIdentifier("services")
             }
-            Section {
-                ForEach(model.nodes, id: \.name) { node in
-                    StateMark(kind: node.state == "attached" ? .live : .plain,
-                              words: "\(node.name) \(node.state)")
-                        .copyMenu([("Copy Name", node.name), ("Copy Fingerprint", node.fingerprint)])
-                        .accessibilityIdentifier("node-\(node.name)")
-                }
-            } header: {
-                Text("nodes on this Mac").eyebrow().accessibilityAddTraits(.isHeader)
-            }
         }
         .listStyle(.sidebar)
+        // The nodes on this Mac, at the sidebar's foot (G5), whatever the rooms above scroll to.
+        .safeAreaInset(edge: .bottom, spacing: 0) { OnThisMachine(nodes: model.nodes) }
+        // On bg.panel, not the system's sidebar material (L-6), drawn where the sidebar's
+        // vibrancy cannot tint it (PanelFill).
+        .scrollContentBackground(.hidden)
+        .background(PanelFill())
+        .foregroundStyle(VoxTokens.Colors.textPrimary)
         // The sidebar's rows keep macOS's sidebar size (System Settings, Appearance, Sidebar icon
         // size), never the conversation's text size (the decider, v0.4.1).
         .font(nil)
@@ -164,7 +178,7 @@ extension View {
     /// `.tint` and drew text.primary at 3.1:1, is off (`SidebarHighlightOff`); the row is still the
     /// list's selection, so arrow keys move it and VoiceOver says it is selected.
     fileprivate func sidebarRow(_ selected: Bool) -> some View {
-        listRowBackground(SelectionFill(selected: selected).padding(.horizontal, 10))
+        listRowBackground(SelectionFill(selected: selected).padding(.horizontal, Space.s8))
     }
 }
 
@@ -172,6 +186,22 @@ extension View {
 /// was blended with the sidebar's material, and #1767b5 read #3e7bbd (text.primary about 4.0:1).
 /// Its colour is the token's, resolved for the view's appearance, so Increase Contrast gives
 /// `hex_hc`.
+/// The sidebar's surface, bg.panel exactly as the token file has it (L-6). Drawn by SwiftUI, a
+/// colour in the sidebar is blended by its material: the look case read #16171a as #1d1e21. An
+/// AppKit view that refuses vibrancy draws the token itself, as SelectionFill does.
+private struct PanelFill: NSViewRepresentable {
+    func makeNSView(context: Context) -> Fill { Fill() }
+    func updateNSView(_ view: Fill, context: Context) { view.needsDisplay = true }
+
+    final class Fill: NSView {
+        override var allowsVibrancy: Bool { false }
+        override func draw(_ dirty: NSRect) {
+            NSColor(named: "BgPanel")?.setFill()
+            bounds.fill()
+        }
+    }
+}
+
 private struct SelectionFill: NSViewRepresentable {
     let selected: Bool
 
@@ -204,6 +234,64 @@ private struct SelectionFill: NSViewRepresentable {
 /// Turns off the sidebar table's own selection highlight, from inside one of its rows: the
 /// selected row is drawn by `sidebarRow` instead. Selection, keyboard and accessibility are the
 /// table's as before; only the drawing of the highlight changes.
+/// The acting node at the top of the sidebar (G5): its mark, its name, and an ice dot with "node
+/// attached", the dot in the accent because attached is live (L-3).
+private struct NodeIdentity: View {
+    let name: String
+    /// False once the node stopped or was detached from outside (P12): said, not hidden.
+    var attached = true
+
+    var body: some View {
+        HStack(alignment: .center, spacing: Space.s8) {
+            Text("◈").font(Theme.title).accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: Space.s4) {
+                Text(name).fontWeight(.semibold)
+                HStack(spacing: Space.s4) {
+                    Circle().fill(attached ? VoxTokens.Colors.accent : VoxTokens.Colors.danger)
+                        .frame(width: 6, height: 6)
+                    Text(attached ? "node attached" : "node detached").secondaryText()
+                }
+            }
+        }
+        .padding(.vertical, Space.s4)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("node \(name), \(attached ? "attached" : "detached")")
+    }
+}
+
+/// The nodes on this Mac and their state, at the foot of the sidebar (G5): one daemon holds them,
+/// each a separate identity.
+private struct OnThisMachine: View {
+    let nodes: [NodeSummary]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.s4) {
+            Hairline()
+            Text("ON THIS MACHINE").eyebrow().secondaryText()
+                .accessibilityAddTraits(.isHeader)
+                .accessibilityIdentifier("on-this-machine")
+                .padding(.top, Space.s8)
+            ForEach(nodes, id: \.name) { node in
+                HStack {
+                    Text(node.name)
+                    Spacer()
+                    Text(node.state).secondaryText()
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("\(node.name) \(node.state)")
+                .copyMenu([("Copy Name", node.name), ("Copy Fingerprint", node.fingerprint)])
+                .accessibilityIdentifier("node-\(node.name)")
+            }
+            Text("Separate identities. One daemon.").secondaryText()
+                .padding(.top, Space.s4)
+        }
+        .padding(.horizontal, Space.s16)
+        .padding(.bottom, Space.s12)
+        .background(PanelFill())
+        .foregroundStyle(VoxTokens.Colors.textPrimary)
+    }
+}
+
 private struct SidebarHighlightOff: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView { Finder() }
     func updateNSView(_ view: NSView, context: Context) { (view as? Finder)?.apply() }
@@ -230,7 +318,7 @@ private struct RoomRow: View {
     var selected = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: Space.s4) {
             Text(room.name).fontWeight(room.need == .quiet ? .regular : .bold)
             if room.need != .quiet {
                 if selected {
@@ -403,6 +491,9 @@ private enum TimelineKey {
 
 /// The room on screen: its timeline and a field to post, with its members beside it.
 private struct RoomView: View {
+    /// The conversation's text size, for its spacing (L-1a): this view sets it on the timeline and
+    /// the composer, so it reads it from Theme rather than from its own environment.
+    private var scale: Double { Theme.scale }
     @ObservedObject var model: NodeModel
     let room: String
     @State private var draft = ""
@@ -433,15 +524,21 @@ private struct RoomView: View {
     /// Each drawn row's frame in the timeline, for a drag across rows.
     @State private var rowFrames: [String: CGRect] = [:]
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// The inspector's width: the one last dragged to, kept across launches (Columns).
+    @State private var inspectorWidth = Columns.width(.inspector)
 
     var body: some View {
+        // The timeline and the inspector, with a divider the person drags; the inspector's width is
+        // remembered (Columns), and it can be hidden (View > Hide Inspector). Its width is the one
+        // dragged to, not HSplitView's: that gave the inspector its maximum and ignored the width
+        // kept from last time.
         HStack(spacing: 0) {
             VStack(spacing: 0) {
                 RoomHeader(model: model, room: room)
                 Divider()
                 if !model.roomServices.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 8) {
+                        HStack(spacing: Space.s8 * scale) {
                             ForEach(model.roomServices, id: \.address) { service in
                                 let selected = model.selectedService?.address == service.address
                                 // A button, so a click anywhere on the card selects it, as AppKit
@@ -458,27 +555,27 @@ private struct RoomView: View {
                                 .accessibilityAddTraits(selected ? .isSelected : [])
                             }
                         }
-                        .padding(8)
+                        .voxPadding(Space.s8)
                     }
-                    Divider()
+                    Hairline()
                 }
                 Text(model.timelineTitle)
                     .secondaryText()
                     .lineLimit(1).truncationMode(.middle)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 12).padding(.top, 8)
+                    .voxPadding(.horizontal, Space.s12).voxPadding(.top, Space.s8)
                     .accessibilityIdentifier("timeline-title")
                 // Who this node and a member do not yet read each other with (R-5, D4).
                 if let banner = model.notMutual {
                     StateMark(kind: .attention, words: banner)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 12).padding(.top, 4)
+                        .voxPadding(.horizontal, Space.s12).voxPadding(.top, Space.s4)
                         .accessibilityIdentifier("trust-banner")
                 }
                 if let header = model.sessionHeader {
                     Text(header)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 12).padding(.top, 4)
+                        .voxPadding(.horizontal, Space.s12).voxPadding(.top, Space.s4)
                         .accessibilityIdentifier("session-header")
                 }
                 Group {
@@ -490,7 +587,7 @@ private struct RoomView: View {
                             ScrollView {
                                 let items = model.timelineItems
                                 let days = TimelineTime.dividers(items)
-                                LazyVStack(alignment: .leading, spacing: 10) {
+                                LazyVStack(alignment: .leading, spacing: Space.s12 * scale) {
                                     ForEach(items) { item in
                                         // A new day starts above the first line that falls on it.
                                         if let day = days[item.id] {
@@ -509,7 +606,7 @@ private struct RoomView: View {
                                                        pulledBy: model.pulledBy[message.id] ?? [],
                                                        pulled: model.pulled[message.id]) { looking = $0 }
                                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                                .padding(4)
+                                                .voxPadding(Space.s4)
                                                 .selectable(model.selectedMessages.contains(message.id),
                                                             focused: timelineFocused
                                                                 && model.selectedMessage == message.id) {
@@ -521,7 +618,7 @@ private struct RoomView: View {
                                             // What was done to the room: a line among the
                                             // messages, not one of them (ADR-028 R-1, R-7).
                                             Text(notice).secondaryText().italic()
-                                                .padding(.horizontal, 4)
+                                                .voxPadding(.horizontal, Space.s4)
                                                 .accessibilityIdentifier(item.id)
                                                 .reportsFrame(of: item.id)
                                                 .id(item.id)
@@ -542,7 +639,7 @@ private struct RoomView: View {
                                         }
                                     }
                                 }
-                                .padding(12)
+                                .voxPadding(Space.s12)
                                 // A drag from one message to another selects them and those
                                 // between (v0.4.1); a drag inside one message selects its words.
                                 .simultaneousGesture(
@@ -713,7 +810,7 @@ private struct RoomView: View {
                     TrustBanner(model: model)
                     composer
                 } else if let s = model.shownSession, s.canDrive, s.open, let room = model.roomOnScreen {
-                    Divider()
+                    Hairline()
                     // One composer per Session: a draft for one never shows in another (D12).
                     SessionComposer(model: model, room: room, session: s)
                         .id("\(room)/\(s.nodeFingerprint)/\(s.sessionId)")
@@ -722,14 +819,20 @@ private struct RoomView: View {
             // The conversation, the timeline and the composer, at the text size View > Bigger and
             // Smaller set (the decider, v0.4.1); the inspector beside it keeps a steady size.
             .conversationScale(Theme.scale)
-            Divider()
-            Inspector(model: model, room: room)
-                .frame(width: Theme.scaled(240))
+            // At least wide enough for the composer's field beside its To: and Urgent.
+            .frame(minWidth: Theme.scaled(400), maxWidth: .infinity)
+            if model.inspectorShown {
+                ColumnDivider(width: $inspectorWidth, side: .inspector)
+                Inspector(model: model, room: room)
+                    .raisedSurface()
+                    .frame(width: inspectorWidth)
+            }
         }
         // On the room, not its timeline: ⌘O, ⌘↩ and a file from the Finder Services item work
         // wherever the room's focus is.
         .sheet(item: $attaching) { file in
             AttachSheet(model: model, file: file) { attaching = nil }.textSelection(.enabled)
+                .panelSurface()
         }
         .onChange(of: model.attachAsked) { _ in
             // After the update, not inside it: a modal panel run from within a view update did
@@ -769,7 +872,7 @@ private struct RoomView: View {
 
     /// The room's composer, To: and urgent, under its own conversation and All.
     @ViewBuilder private var composer: some View {
-        Divider()
+        Hairline()
         if let reply = model.replyTo {
             HStack {
                 // The message replied to, as a link to it (ADR-028 R-9).
@@ -783,12 +886,12 @@ private struct RoomView: View {
                 Spacer()
                 Button("Cancel") { model.replyTo = nil }.buttonStyle(.borderless)
             }
-            .padding(.horizontal, 12).padding(.top, 8)
+            .voxPadding(.horizontal, Space.s12).voxPadding(.top, Space.s8)
             .accessibilityIdentifier("replying-to")
         }
         if !mentions.isEmpty {
             // Typing @ offers the keyring's members of this room by name (ADR-028 K-4).
-            HStack(spacing: 8) {
+            HStack(spacing: Space.s8 * scale) {
                 ForEach(mentions) { member in
                     Button("@\(member.name)") { mention(member) }
                         .buttonStyle(.borderless)
@@ -796,9 +899,9 @@ private struct RoomView: View {
                 }
                 Spacer()
             }
-            .padding(.horizontal, 12).padding(.top, 8)
+            .voxPadding(.horizontal, Space.s12).voxPadding(.top, Space.s8)
         }
-        HStack(spacing: 8) {
+        HStack(spacing: Space.s8 * scale) {
             Button {
                 if let url = chooseFile() { attaching = Attaching(url: url) }
             } label: {
@@ -824,7 +927,7 @@ private struct RoomView: View {
                 .accessibilityIdentifier("compose")
             ComposerAddress(model: model, to: $to, urgent: $urgent)
         }
-        .padding(12)
+        .voxPadding(Space.s12)
     }
 
     /// Post the draft, To: and replying as set; urgent when asked (⌘↩ or the switch).
@@ -1030,6 +1133,7 @@ private struct RoomView: View {
 
 /// One message in the timeline.
 private struct MessageRow: View {
+    @Environment(\.voxTextScale) private var scale
     /// What opens its author's card (D4); not observed, so a row redraws only with its own data.
     let model: NodeModel
     let message: RoomMessage
@@ -1051,8 +1155,8 @@ private struct MessageRow: View {
     let look: (URL) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: Space.s4 * scale) {
+            HStack(spacing: Space.s8 * scale) {
                 if message.author == me {
                     Text(author).fontWeight(.bold)
                 } else {
@@ -1304,6 +1408,7 @@ private struct UnreadDivider: View {
 /// A file or folder offered in the room (ADR-028 F-1): its name, size and SHA-256, as the share's
 /// signed announcement states them.
 private struct FileCard: View {
+    @Environment(\.voxTextScale) private var scale
     let file: FileOffer
     /// The image's preview its share announced (ADR-028 F-9): shown while the sharer is offline.
     let image: ImagePreview?
@@ -1312,13 +1417,13 @@ private struct FileCard: View {
     let look: (URL) -> Void
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
+        HStack(alignment: .top, spacing: Space.s12 * scale) {
             if let image, let thumb = NSImage(data: image.thumb) {
                 Image(nsImage: thumb)
                     .resizable()
                     .aspectRatio(CGFloat(image.width) / CGFloat(max(image.height, 1)), contentMode: .fit)
                     .frame(maxWidth: 160, maxHeight: 120)
-                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                    .clipShape(RoundedRectangle(cornerRadius: Radius.control * scale))
                     .accessibilityLabel("image \(image.width) by \(image.height)")
                     .accessibilityIdentifier("thumb-\(file.name)")
             } else {
@@ -1326,7 +1431,7 @@ private struct FileCard: View {
                     .voxFont(VoxTokens.Fonts.appGlyph)
                     .accessibilityHidden(true)
             }
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: Space.s4 * scale) {
                 Text(file.name).fontWeight(.bold)
                 Text("\(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file))"
                     + "  ·  sha256 \(file.sha256.prefix(16))…")
@@ -1344,7 +1449,7 @@ private struct FileCard: View {
                 }
             }
         }
-        .padding(8)
+        .voxPadding(Space.s8)
         .cardOutline()
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("file-\(file.name)")
@@ -1355,17 +1460,18 @@ private struct FileCard: View {
 /// A link's card (ADR-028 F-10): what the sender's node found at the message's first link, carried
 /// in the message, so drawing it fetches nothing. Opening the link is the person's own choice.
 private struct LinkCardView: View {
+    @Environment(\.voxTextScale) private var scale
     let card: LinkCard
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
+        HStack(alignment: .top, spacing: Space.s12 * scale) {
             if let data = card.image, let picture = NSImage(data: data) {
                 Image(nsImage: picture).resizable().aspectRatio(contentMode: .fit)
                     .frame(maxWidth: 72, maxHeight: 72)
-                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                    .clipShape(RoundedRectangle(cornerRadius: Radius.control * scale))
                     .accessibilityHidden(true)
             }
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: Space.s4 * scale) {
                 if !card.title.isEmpty { Text(card.title).fontWeight(.bold) }
                 if !card.description.isEmpty { Text(card.description).secondaryText().lineLimit(3) }
                 // Clickable only for http and https (a whitelist): the link is the peer's, and any
@@ -1383,7 +1489,7 @@ private struct LinkCardView: View {
                 }
             }
         }
-        .padding(8)
+        .voxPadding(Space.s8)
         .cardOutline()
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier("card-\(card.url)")
@@ -1392,18 +1498,19 @@ private struct LinkCardView: View {
 
 /// A service a member shares in the room: its address, who shares it, and what it is (ADR-028 S-2).
 private struct ServiceCard: View {
+    @Environment(\.voxTextScale) private var scale
     let service: SharedService
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: Space.s8 * scale) {
             Image(systemName: "point.3.connected.trianglepath.dotted").accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: Space.s4 * scale) {
                 Text(service.address).voxFont(VoxTokens.Fonts.appMono).textSelection(.enabled)
                 Text("by \(service.by)  ·  \(service.kind)\(service.udp && service.kind != "udp" ? "/udp" : "")")
                     .caption().secondaryText()
             }
         }
-        .padding(8)
+        .voxPadding(Space.s8)
         .cardOutline()
     }
 }
@@ -1414,45 +1521,64 @@ private struct Inspector: View {
     let room: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            SessionsList(model: model)
-            Divider().padding(.vertical, 8)
-            Text("MEMBERS").eyebrow().secondaryText()
-                .accessibilityAddTraits(.isHeader)
-            ForEach(model.members) { member in
-                TrustMark(name: member.name, trust: member.trust)
-                    .nodeCard(model, member.id, name: member.name)
-                    .accessibilityIdentifier("member-\(member.name)")
-                // What this node's keyring grants it (K-14), once it is in the keyring.
-                if member.trust.inKeyring {
-                    Text(Capability.words(member.drive)).eyebrow().secondaryText()
-                        .padding(.leading, 18)
-                        .accessibilityIdentifier("member-capability-\(member.name)")
+        // It scrolls (P13): a room with many Sessions or members cut off the bottom, the family
+        // LAN section with it. Each section's heading stays in view while its rows scroll.
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: Space.s8, pinnedViews: [.sectionHeaders]) {
+                Section {
+                    SessionsList(model: model, heading: false)
+                } header: {
+                    heading("SESSIONS")
                 }
-                // The platform its node says it runs on (ADR-020 §4.9b): its claim, said as one.
-                if let platform = model.platforms[member.id] {
-                    // Selectable, so its label is on a container that hides the Text: a selectable
-                    // Text with its own label sent SwiftUI's accessibility into endless recursion,
-                    // and the app crashed when read.
-                    HStack {
-                        Text("says it runs on \(Platform.words(platform))")
-                            .font(Theme.mono).secondaryText()
+                Section {
+                    ForEach(model.members) { member in
+                        TrustMark(name: member.name, trust: member.trust)
+                            .nodeCard(model, member.id, name: member.name)
+                            .accessibilityIdentifier("member-\(member.name)")
+                        // What this node's keyring grants it (K-14), once it is in the keyring.
+                        if member.trust.inKeyring {
+                            Text(Capability.words(member.drive)).eyebrow().secondaryText()
+                                .padding(.leading, Space.s20)
+                                .accessibilityIdentifier("member-capability-\(member.name)")
+                        }
+                        // The platform its node says it runs on (ADR-020 §4.9b): its claim, said
+                        // as one.
+                        if let platform = model.platforms[member.id] {
+                            // Selectable, so its label is on a container that hides the Text: a
+                            // selectable Text with its own label sent SwiftUI's accessibility into
+                            // endless recursion, and the app crashed when read.
+                            HStack {
+                                Text("says it runs on \(Platform.words(platform))")
+                                    .font(Theme.mono).secondaryText()
+                            }
+                            .padding(.leading, Space.s20)
+                            .accessibilityElement(children: .ignore)
+                            .accessibilityLabel("\(member.name) says it runs on \(Platform.words(platform))")
+                            .accessibilityIdentifier("member-platform-\(member.name)")
+                        }
                     }
-                    .padding(.leading, 18)
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel("\(member.name) says it runs on \(Platform.words(platform))")
-                    .accessibilityIdentifier("member-platform-\(member.name)")
+                    Hairline().padding(.vertical, Space.s8)
+                    FamilyLan(model: model, room: room)
+                } header: {
+                    heading("MEMBERS")
                 }
             }
-            Divider().padding(.vertical, 8)
-            FamilyLan(model: model, room: room)
-            Spacer()
+            .padding(Space.s12)
         }
-        .padding(12)
         .frame(maxHeight: .infinity, alignment: .topLeading)
         // A container, so each row keeps its own identifier (member-<name>) under this one.
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("inspector")
+    }
+
+    /// A section's heading, pinned while its rows scroll under it: drawn on the inspector's own
+    /// surface, so the rows do not show through.
+    private func heading(_ words: String) -> some View {
+        Text(words).eyebrow().secondaryText()
+            .accessibilityAddTraits(.isHeader)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, Space.s4)
+            .background(VoxTokens.Colors.bgRaised)
     }
 }
 
@@ -1484,6 +1610,7 @@ private struct FamilyLan: View {
             .sheet(isPresented: Binding(get: { model.lanAsking == room },
                                         set: { if !$0 { model.cancelLanAsk() } })) {
                 LanHelperSheet(model: model, room: room)
+                    .panelSurface()
             }
         if let said = model.lanSaid[room] {
             Text(said).font(Theme.mono).secondaryText().textSelection(.enabled)
@@ -1508,15 +1635,15 @@ private struct LanHelperSheet: View {
     let room: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: Space.s12) {
             // A room's name is its content: never uppercased.
             Text("Family LAN for \u{201C}\(name)\u{201D}").caption().secondaryText()
-            Text("Allow Vox's LAN helper").heading()
+            Text("Allow Vox's LAN helper").title()
                 .accessibilityAddTraits(.isHeader)
             Text("The family LAN needs one helper that runs as root and creates network interfaces "
                 + "for Vox, and nothing else.")
                 .fixedSize(horizontal: false, vertical: true)
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: Space.s8) {
                 Text("1. Open System Settings › General › Login Items & Extensions.")
                 Text("2. Under \u{201C}Allow in the Background\u{201D}, turn on Vox.")
                 Text("3. Come back here; Vox notices and turns the LAN on.")
@@ -1524,7 +1651,7 @@ private struct LanHelperSheet: View {
             .fixedSize(horizontal: false, vertical: true)
             .accessibilityElement(children: .combine)
             .accessibilityIdentifier("lan-helper-steps")
-            HStack(spacing: 8) {
+            HStack(spacing: Space.s8) {
                 ProgressView().controlSize(.small)
                 Text("Waiting for you to allow it…").secondaryText()
             }
@@ -1539,7 +1666,7 @@ private struct LanHelperSheet: View {
                     .accessibilityIdentifier("lan-helper-open")
             }
         }
-        .padding(20)
+        .padding(Space.s20)
         .frame(width: 460)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task { await model.recheckLanHelper() }
@@ -1559,7 +1686,7 @@ private struct StatusBar: View {
     @ObservedObject var model: NodeModel
 
     var body: some View {
-        HStack(spacing: 16) {
+        HStack(spacing: Space.s16) {
             Text("node \(model.node)")
             Text(model.peers == 1 ? "1 peer" : "\(model.peers) peers")
             Text(model.keyring)
@@ -1586,8 +1713,8 @@ private struct StatusBar: View {
             }
         }
         .font(Theme.mono)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+        .padding(.horizontal, Space.s12)
+        .padding(.vertical, Space.s8)
         // A container, so "notifications-off" keeps its identifier; its label says the whole bar.
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("status")

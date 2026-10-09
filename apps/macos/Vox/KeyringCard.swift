@@ -36,17 +36,17 @@ struct KeyringCard: View {
 
     var body: some View {
         let back = model.trustsBack.contains(node.fingerprint)
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: Space.s12) {
             Text("UNDERSTANDING \(node.name.uppercased())'S ACCESS").eyebrow().secondaryText()
-            Text("\(node.name) \(back ? "⇄" : "→") you").heading()
+            Text("\(node.name) \(back ? "⇄" : "→") you").title()
                 .accessibilityLabel("\(node.name), \(back ? "trusted both ways" : "waiting for the other side")")
                 .accessibilityIdentifier("keyring-card-heading")
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: Space.s4) {
                 Text("you → \(node.name)").fontWeight(.bold)
                 Text(Trust.youTrust(node.name))
                     .accessibilityIdentifier("keyring-card-yours")
             }
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: Space.s4) {
                 Text("\(node.name) → you").fontWeight(.bold)
                 Text(Trust.theyTrust(node.name, back))
                     .accessibilityIdentifier("keyring-card-theirs")
@@ -73,7 +73,7 @@ struct KeyringCard: View {
                     .accessibilityIdentifier("keyring-card-removal")
             }
         }
-        .padding(12)
+        .padding(Space.s12)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("keyring-card")
         .task(id: node.fingerprint) { shared = await model.sharedRooms(with: node.fingerprint) }

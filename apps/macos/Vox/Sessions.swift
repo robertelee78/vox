@@ -70,12 +70,16 @@ extension NodeModel {
 /// this node marked "!", CL-2), and the ended ones under "Ended (N)", folded until opened.
 struct SessionsList: View {
     @ObservedObject var model: NodeModel
+    /// Its own SESSIONS heading; off where the heading is drawn above it (the inspector pins it).
+    var heading = true
     @State private var endedOpen = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("SESSIONS").eyebrow().secondaryText()
-                .accessibilityAddTraits(.isHeader)
+        VStack(alignment: .leading, spacing: Space.s4) {
+            if heading {
+                Text("SESSIONS").eyebrow().secondaryText()
+                    .accessibilityAddTraits(.isHeader)
+            }
             row("General", .general, id: "session-general")
             row("All", .all, id: "session-all")
             ForEach(model.openSessions, id: \.self) { s in
@@ -124,6 +128,7 @@ struct SessionsList: View {
 /// session` prints it, and its Details (the full input and output) when asked; an open request's
 /// answers (SessionDrive.swift), or its state once it is resolved or not answerable.
 struct SessionEntryRow: View {
+    @Environment(\.voxTextScale) private var scale
     @ObservedObject var model: NodeModel
     /// The room it was drawn in: its actions go there and to `session` only (D3).
     let room: String
@@ -135,7 +140,7 @@ struct SessionEntryRow: View {
 
     var body: some View {
         let reference = entry.request?.reference
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: Space.s4 * scale) {
             Text(entry.line).voxFont(VoxTokens.Fonts.appMono).textSelection(.enabled)
                 .accessibilityIdentifier("entry-line-\(entry.id)")
             if let request = entry.request {
@@ -162,7 +167,7 @@ struct SessionEntryRow: View {
                 }
             }
         }
-        .padding(.horizontal, 4)
+        .voxPadding(.horizontal, Space.s4)
         // A request is selected by clicking it: what ⌥⌘Y and ⌥⌘N act on (P1).
         .modifier(RequestSelection(model: model, reference: reference))
     }

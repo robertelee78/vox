@@ -210,12 +210,16 @@ network presence from the start: there is no interim design with one socket per 
   ```
   <data root>/.daemon/        lock, vox.sock, port, log, attach, format,
                               config (listen, metrics, relay limits)
-  <data root>/nodes/<name>/   vault.cbor | node-identity.key, store.redb,
+  <data root>/nodes/<name>/   vault.cbor | node-identity.key, store.redb, fingerprint,
                               config/   (today's file names: anchors, config,
                                          retention, serve, downloads,
                                          tunnel-stuck-after)
                               cursors/, sessions/
   ```
+  `fingerprint` is the node's identity fingerprint (base32) and the SHA-256 of the `vault.cbor`
+  beside it, written from the unlocked profile at create and unlock, so a node not attached can be
+  shown with it (P8, #617). It MUST be shown only while that hash matches the vault there, and is
+  for display only: nothing MAY decide trust, an attach or anything else from it.
 - **F-2.** A node's setting MUST be read from `nodes/<name>/config/<file>`; when that file is missing,
   from the same file in the account's config directory. The daemon's own settings (listen, metrics,
   relay limits) MUST be read from `.daemon/config`; the relay limits are `relay-circuits` and
@@ -248,6 +252,10 @@ network presence from the start: there is no interim design with one socket per 
     v0.4.0 wrote. Nothing a person had may be lost: the node's identity, its keyring, its rooms,
     and every row with its time. A data root an upgrade cannot read MUST be refused unchanged, with
     the reason.
+    An optional file that only says something already true of the node, that every release may
+    lack or ignore, and that nothing reads for trust, attach, routing or any other decision (such
+    as `fingerprint`), does not change the format. The day something depends on it, that is a
+    format change: raise the format, and upgrade every root that lacks it.
   - Upgrade code MUST NOT be deleted while a supported release could have written data in the
     format it reads.
   - Each release MUST prove it on a data root the newest published release wrote
@@ -300,9 +308,7 @@ Each claim MUST be proved by real use of the shipped binary (ADR-018), with one 
 3. detaching one node keeps the other's live tunnel and sync (mutant: endpoint closed on detach)
    (`the_nodes_of_one_daemon_proof`);
 4. tunnels, counters, status and metrics are per node; node A cannot list or close B's tunnel
-   (`two_nodes_are_clients_of_one_daemon_proof`). The metrics exposition's shape, with each
-   family's `HELP` and `TYPE` once across nodes and `node` first among a sample's labels, has no
-   proof: its in-process test was deleted in v0.4.1 (AGENTS.md: no unit tests);
+   (`two_nodes_are_clients_of_one_daemon_proof`);
 5. a panic in one node's actor leaves the daemon and the other nodes serving
    (`the_daemon_and_its_nodes_proof`);
 6. two clients attaching one node at once both succeed with one attach; a detach with a request in

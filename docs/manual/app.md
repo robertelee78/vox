@@ -8,9 +8,10 @@ nodes, rooms, trust, services and files.
 
 Vox.app is a window onto the account's vox daemon, the same daemon `vox` commands and `vox tui`
 use. The app holds no node of its own. It acts as **one node** on this Mac, which you make or choose the
-first time you open it, and everything you post, trust and share in the app is that node's. Your
-other nodes, such as an agent's, appear under **nodes on this Mac** in the sidebar and stay with
-the `vox` commands.
+first time you open it, and everything you post, trust and share in the app is that node's. The
+sidebar opens with that node: its mark, its name and `node attached`. At its foot, **ON THIS
+MACHINE** lists every node on this Mac with its state (`attached` or `detached`): separate
+identities, one daemon. The other nodes stay with the `vox` commands.
 
 ## Install
 
@@ -82,8 +83,10 @@ version too, until you quit it and open it again.
    ```
 
    The app then attaches the new node with that passphrase and opens its window.
-3. **Which node are you?** With several nodes on this Mac, the app lists them: pick the one you
-   post, trust and share as here. With exactly one, the app uses it without asking.
+3. **Which node are you?** With several nodes on this Mac, the app lists them, each with its
+   fingerprint art and fingerprint (once the node has been attached) and the line `Everything you
+   post, trust and share will be as NAME.`: pick the one you post, trust and share as here. With
+   exactly one, the app uses it without asking.
 4. **Attach node NAME.** For a node that is not attached yet, type its identity passphrase. The app
    hands the passphrase to the daemon and does not store it. A wrong one is refused in the daemon's
    own words, under the field:
@@ -171,7 +174,7 @@ status bar along the bottom.
 
 ### The sidebar
 
-- At the top, your node: `node NAME, attached`.
+- At the top, your node: its mark, its name, and an ice dot with `node attached`.
 - Your rooms, in three groups, each with its count:
   - **needs you**: a message addressed to your node is unread.
   - **active**: new messages are unread.
@@ -182,7 +185,8 @@ status bar along the bottom.
 - Trust offers, first under **needs you**: `offer: xgfm gktt… joined`, or `… trusts you` (see
   [Trust offers](#trust-offers)).
 - **Keyring**, **Decision record** and **Services**: views of this window, described below.
-- **nodes on this Mac**, each with whether it is attached.
+- At the foot, **ON THIS MACHINE**: every node on this Mac with its state, `attached` or
+  `detached`, and `Separate identities. One daemon.`
 
 ### The room
 
@@ -297,15 +301,17 @@ your alias for it, with its fingerprint art and its fingerprint in groups, and a
 whether it trusts you back (⇄) or not yet (→), and what its entry grants: `read` or `read +
 drive`. See [Identity and keyring](keyring.md) for what trust grants.
 
-- **Add a node**: paste or type its fingerprint, give it an alias, and choose what it
-  **Grants**: `read` or `read + drive`. Before you choose **Trust**, the view says what trusting
-  does: it may read what you write in every room you share, now and later; you read what it
+- **Add a node**: paste or type its fingerprint and give it an alias. It is given `read`; drive
+  is a separate step on its row. Before you choose **Trust**, the view says what trusting does: it may read what you write in every room you share, now and later; you read what it
   writes once it trusts you too; and it reaches every service you bind to a room you are both in.
-- **Change…**: switch between read and read + drive, saying first what that does: "With drive,
-  NAME also sees inside your Sessions and may type into them, interrupt or stop them, answer their
-  approvals and questions, and send and receive their files." or "With read only, NAME sees each
-  of your Sessions' name and whether it is open, and nothing inside it." Then **Give drive** or
-  **Read only**.
+- **Also let NAME drive my Sessions…**: opens a sheet that says first what drive does: NAME can
+  then answer approvals and type into this node's Sessions, now and later, with their permissions;
+  "With drive, NAME also sees inside your Sessions and may type into them, interrupt or stop them,
+  answer their approvals and questions, and send and receive their files." Return chooses
+  **Cancel**. Only **Give Drive** gives it, and it asks for your identity passphrase if the keyring
+  window has closed.
+- **Make Read Only…** (a node with drive): says "With read only, NAME sees each of your Sessions'
+  name and whether it is open, and nothing inside it." Then **Make Read Only**.
 - **Compare…**: paste or type the fingerprint the person gave you another way. Case, spaces and
   dashes do not count. A match says `Matches NAME's fingerprint.`; a mismatch says
   `Does not match. This is not the node you trusted as NAME: do not trust it.` and offers to
@@ -330,8 +336,8 @@ A node that joined a room after yours, or that trusts you, and is not in your ke
 an offer under **needs you** in the sidebar (see [Offers](keyring.md#offers-nodes-waiting-for-your-trust)).
 Select it to see a **Trust offer**: its fingerprint with its art, the same sentence `vox trust
 offers` prints (`ben joined. ann trusts it.`), the rooms you share (`In: family`), and what
-trusting and dismissing do. Give it an alias, choose **Grants** (`read` or `read + drive`), and
-**Trust**; the view says what that grant does first, and asks for your identity passphrase if the
+trusting and dismissing do. Give it an alias and choose **Trust**: it is given `read` (drive is a
+separate step in the keyring); the view says what that grant does first, and asks for your identity passphrase if the
 keyring window has closed. You are not asked to compare fingerprints. **Dismiss** removes the offer
 on your node alone: it is not told, and stays out of your keyring.
 

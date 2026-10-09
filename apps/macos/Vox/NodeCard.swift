@@ -70,15 +70,15 @@ struct NodeCard: View {
         // Its alias once the keyring holds it, else as the room named it.
         let name = entry?.name ?? node.name
         ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                Text(name).heading()
-                HStack(alignment: .top, spacing: 16) {
+            VStack(alignment: .leading, spacing: Space.s12) {
+                Text(name).title()
+                HStack(alignment: .top, spacing: Space.s16) {
                     VStack(spacing: 0) {
                         ForEach(Array(card.art.enumerated()), id: \.offset) { Text($0.element) }
                     }
                     .font(Theme.mono)
                     .accessibilityHidden(true)
-                    VStack(alignment: .leading, spacing: 6) {
+                    VStack(alignment: .leading, spacing: Space.s8) {
                         Text(card.grouped).font(Theme.mono).textSelection(.enabled)
                             .accessibilityIdentifier("card-fingerprint")
                         Button("Copy") {
@@ -111,7 +111,7 @@ struct NodeCard: View {
                     Button("Close", action: done).keyboardShortcut(.cancelAction)
                         .accessibilityIdentifier("card-close")
                 }
-                Divider()
+                Hairline()
                 switch act {
                 case .trust? where !trust.inKeyring:
                     trusting
@@ -139,7 +139,7 @@ struct NodeCard: View {
                     Text(did).accessibilityIdentifier("card-did")
                 }
             }
-            .padding(24)
+            .padding(Space.s24)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(width: Theme.scaled(520), height: Theme.scaled(520))

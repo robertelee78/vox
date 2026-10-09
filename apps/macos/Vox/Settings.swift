@@ -10,7 +10,7 @@ struct SettingsView: View {
     @ObservedObject var app: AppModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
+        VStack(alignment: .leading, spacing: Space.s20) {
             setting {
                 // The one Keep Running switch: the same call as Vox > Keep Running While Logged In
                 // (#571), so the two always agree.
@@ -52,7 +52,7 @@ struct SettingsView: View {
                     + "sidebar keeps macOS's sidebar size.")
             }
         }
-        .padding(24)
+        .padding(Space.s24)
         .frame(width: Theme.scaled(460), alignment: .topLeading)
         .contentSurface()
     }
@@ -60,9 +60,9 @@ struct SettingsView: View {
     /// One setting: its control, then what it does in secondary text.
     private func setting(@ViewBuilder _ control: () -> some View,
                          @ViewBuilder said: () -> some View) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: Space.s8) {
             control()
-            VStack(alignment: .leading, spacing: 4) { said() }
+            VStack(alignment: .leading, spacing: Space.s4) { said() }
                 .secondaryText()
                 .fixedSize(horizontal: false, vertical: true)
         }
