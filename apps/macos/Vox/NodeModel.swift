@@ -404,8 +404,10 @@ final class NodeModel: ObservableObject {
     }
 
     /// Untrust `node`.
-    func untrust(_ node: TrustedNode) async {
-        _ = await keyringChange { [client] pass in
+    /// Whether it was done; when not, why is `keyringFailed`, or the passphrase is asked for.
+    @discardableResult
+    func untrust(_ node: TrustedNode) async -> Bool {
+        await keyringChange { [client] pass in
             try await client.trustRemove(fingerprint: node.fingerprint, identityPassphrase: pass)
             return "No longer trusting \(node.name). Your sender key is rotated, and everyone you "
                 + "still trust is re-keyed."
@@ -592,16 +594,18 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// Leave the room on screen, or end it for everyone.
-    func leaveRoom(endingIt: Bool) async {
-        guard let id = roomOnScreen else { return }
+    /// Leave the room on screen, or end it for everyone: nil once done, else why not (D19), for
+    /// the sheet that asked to say where it was asked.
+    func leaveRoom(endingIt: Bool) async -> String? {
+        guard let id = roomOnScreen else { return "No room is on screen to leave." }
         do {
             if endingIt { try await client.end(room: id) } else { try await client.leave(room: id) }
             did = endingIt ? "The room is ended for everyone." : "You left the room."
             selection = nil
             await refresh()
+            return nil
         } catch {
-            said = sentence(error)
+            return sentence(error)
         }
     }
 

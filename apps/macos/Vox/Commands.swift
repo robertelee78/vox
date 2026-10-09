@@ -439,6 +439,9 @@ private struct AdminsSheet: View {
 private struct LeaveSheet: View {
     @ObservedObject var model: NodeModel
     let ending: Bool
+    /// Why the last try did not leave: the sheet stays open and says so (D19).
+    @State private var failed: String?
+    @State private var working = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -448,15 +451,27 @@ private struct LeaveSheet: View {
                     + "Only its creator or an admin can do this."
                 : "This node stops reading and posting here, and the room is deleted here. "
                     + "The others go on; to come back you need its link and passphrase again.")
-            if let said = model.said { StateMark(kind: .danger, words: said).textSelection(.enabled) }
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 Button(ending ? "End for Everyone" : "Leave", role: .destructive) {
+                    working = true
+                    failed = nil
                     Task {
-                        await model.leaveRoom(endingIt: ending)
-                        model.sheet = nil
+                        // Closed only once it is done; a failure stays, with its reason.
+                        if let why = await model.leaveRoom(endingIt: ending) {
+                            failed = why
+                        } else {
+                            model.sheet = nil
+                        }
+                        working = false
                     }
                 }
+                .disabled(working)
+                .accessibilityIdentifier("leave-confirm")
+            }
+            if let failed {
+                StateMark(kind: .danger, words: failed).textSelection(.enabled)
+                    .accessibilityIdentifier("leave-failed")
             }
         }
         .padding(24)

@@ -263,6 +263,11 @@ private struct RemoveSheet: View {
     @ObservedObject var model: NodeModel
     let node: TrustedNode
     let done: () -> Void
+    /// Why the last try did not remove it: the sheet stays open and says so (D19).
+    @State private var failed: String?
+    /// The change is waiting for the identity passphrase, asked for here.
+    @State private var asking = false
+    @State private var working = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -272,16 +277,42 @@ private struct RemoveSheet: View {
             HStack {
                 Button("Cancel", action: done).keyboardShortcut(.cancelAction)
                 Button("Untrust", role: .destructive) {
+                    working = true
+                    failed = nil
                     Task {
-                        await model.untrust(node)
-                        done()
+                        // Closed only once it is done; a failure stays, with its reason.
+                        if await model.untrust(node) {
+                            done()
+                        } else if model.keyringNeedsPassphrase {
+                            asking = true
+                        } else {
+                            failed = model.keyringFailed
+                        }
+                        working = false
                     }
                 }
+                .disabled(working || asking)
                 .accessibilityIdentifier("keyring-untrust-confirm")
+            }
+            if asking {
+                KeyringPassphrase(model: model)
+            }
+            if let failed {
+                StateMark(kind: .danger, words: failed).textSelection(.enabled)
+                    .accessibilityIdentifier("keyring-remove-failed")
             }
         }
         .padding(24)
         .frame(width: Theme.scaled(440))
+        // The passphrase given: done once the change is made, else why not, here.
+        .onChange(of: model.keyringNeedsPassphrase) { needs in
+            guard asking, !needs else { return }
+            asking = false
+            if model.keyringFailed == nil { done() }
+        }
+        .onChange(of: model.keyringFailed) { why in
+            if asking, let why { failed = why }
+        }
     }
 }
 
