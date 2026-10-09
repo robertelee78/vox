@@ -42,14 +42,42 @@ enum Columns {
     }
 }
 
-extension View {
-    /// Keep this column's width as it is dragged.
-    func remembersWidth(of side: Columns.Side) -> some View {
-        background(GeometryReader { geometry in
-            Color.clear
-                .onAppear { Columns.remember(side, geometry.size.width) }
-                .onChange(of: geometry.size.width) { Columns.remember(side, $0) }
-        })
+extension Columns {
+    /// Keep the sidebar's width as the person left it: read from the window's split view when the
+    /// window closes, the app stops being active or it quits, never while a drag is going on. Each
+    /// frame of a live resize had written the defaults (a GeometryReader under the sidebar), and
+    /// the split view did not take the drag (the sidebar-resize spike, 2026-10-09).
+    static func keepSidebarWidth() {
+        guard !keeping else { return }
+        keeping = true
+        let centre = NotificationCenter.default
+        for name in [NSWindow.willCloseNotification, NSApplication.willResignActiveNotification,
+                     NSApplication.willTerminateNotification] {
+            centre.addObserver(forName: name, object: nil, queue: .main) { _ in rememberSidebar() }
+        }
+    }
+
+    private static var keeping = false
+
+    /// The sidebar's width now, from the first window's split view: its first pane.
+    private static func rememberSidebar() {
+        for window in NSApp.windows {
+            if let split = splitView(in: window.contentView), let pane = split.arrangedSubviews.first {
+                remember(.sidebar, pane.frame.width)
+                return
+            }
+        }
+    }
+
+    private static func splitView(in view: NSView?) -> NSSplitView? {
+        guard let view else { return nil }
+        if let split = view as? NSSplitView, split.isVertical, split.arrangedSubviews.count > 1 {
+            return split
+        }
+        for child in view.subviews {
+            if let found = splitView(in: child) { return found }
+        }
+        return nil
     }
 }
 

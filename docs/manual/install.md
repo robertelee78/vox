@@ -85,6 +85,13 @@ An open `vox tui` or Vox app keeps running the old version until you restart it.
 participants to run the same Vox version; update the group deliberately, not one worker in
 the middle of a claim.
 
+**Your nodes come through an update.** From v0.4.0 on, every release opens what the release before
+it wrote, and upgrades it if it must, with nothing lost: each node's identity, its keyring, its
+rooms, and every message in order with its time. Each release is checked against the previous
+published one before it ships. Vox records which version last used the data in
+`.daemon/format` under the data root, so a later release knows what it is upgrading. Data written
+before v0.3.0 is still refused, and left as it is (see [local state](reference.md#local-state)).
+
 ## Roll back the binary
 
 ```sh
@@ -92,8 +99,9 @@ vox update --rollback
 ```
 
 This restores the binary retained by the updater. It is **not a state-directory rollback**:
-your nodes and rooms stay as the replaced binary left them, and the restored binary is not
-guaranteed to read them. Do not open valuable state with a guessed executable.
+your nodes and rooms stay as the newer binary left them. An upgrade goes forward only, so the
+restored binary is not guaranteed to read what a newer one upgraded. Do not open valuable state with
+a guessed executable.
 
 ## Run Vox in a container
 
@@ -134,20 +142,46 @@ On macOS, Podman runs containers in a Linux virtual machine. Check that machine'
 `podman machine ssh sysctl net.core.rmem_max`; the one checked for this manual already had
 `net.core.rmem_max = 4194304`.
 
-## Remove shell integration or the executable
+## Remove Vox
+
+```sh
+vox uninstall --dry-run
+vox uninstall
+```
+
+The first lists everything it would do and changes nothing. The second does it, in an order that
+removes nothing still running:
+- it stops the daemon, and quits Vox.app;
+- on a Mac, it removes Vox's login item and LAN helper, through Vox.app itself, with no
+  administrator rights;
+- it removes the Keychain items stored for kept nodes;
+- it removes the `vox agent hook` entries, plugin and skill pack installed for Claude Code, Codex
+  and OpenCode;
+- it removes the shell completions and startup-file block `vox shell-setup` added;
+- it removes Vox.app or the `vox` binary, with its update record, lock and previous copy.
+
+A file you changed, or one Vox did not write, is named and kept. A login item run by another copy of
+Vox is left alone, and you are told the one step that removes it: switch Vox off in System Settings,
+General, Login Items & Extensions. A `vox` built from source or copied by hand is refused:
+`… was not installed by vox's installer (no .vox-standalone.json beside it), so vox uninstall will
+not remove it or anything it may have set up; remove it the way it was put there`.
+
+**Your nodes are kept.** The data root and the config directory stay, and `vox uninstall` names
+them, with the reminder that there is no backup of a node. To remove them too:
+
+```sh
+vox uninstall --purge
+```
+
+It asks you to type each node's name first, and only at a terminal. A node removed this way
+cannot be recovered, by you or by anyone: Vox has no central account. See
+[local state](reference.md#local-state) first.
+
+To remove only the shell integration (the completions and the startup-file block), and keep Vox:
 
 ```sh
 vox shell-setup --remove
 ```
-
-This removes the marked shell setup and completion files. It does not erase your identity or
-rooms. To remove the executable as well, first identify it with `command -v vox`, stop the Vox
-processes you intend to stop, and remove that exact installation file through your file manager.
-An installation may also retain update metadata and a previous binary beside it.
-
-Do not delete the Vox data directory as an ordinary uninstall step. It contains identities and
-room state, and deleting it is not recoverable through a central Vox account. See
-[local state](reference.md#local-state) before making any deliberate data-removal decision.
 
 ## Next
 

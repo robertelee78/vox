@@ -8,8 +8,7 @@ import SwiftUI
 
 struct MainWindow: View {
     @ObservedObject var model: NodeModel
-    /// The sidebar's width at launch, read once: given afresh on every update, the split view
-    /// put the sidebar back to it, and a drag never stuck (259 → 259 in the columns case).
+    /// The sidebar's width at launch, the one last kept, read once for this window.
     @State private var sidebarIdeal = Columns.width(.sidebar)
 
     var body: some View {
@@ -21,7 +20,7 @@ struct MainWindow: View {
             NavigationSplitView {
                 // Dragged wider or narrower, and remembered (Columns).
                 Sidebar(model: model)
-                    .remembersWidth(of: .sidebar)
+                    .onAppear { Columns.keepSidebarWidth() }
                     .navigationSplitViewColumnWidth(min: Columns.Side.sidebar.min,
                                                     ideal: sidebarIdeal,
                                                     max: Columns.Side.sidebar.max)
@@ -76,6 +75,9 @@ struct MainWindow: View {
                 .textSelection(.enabled)
         }
         .contentSurface()
+        // The window's own background, which shows around the floating sidebar's rounded pane,
+        // from the tokens too (L-6: never the system background).
+        .background(WindowBackground())
         // The Dock says how many things need the person, the same count as the sidebar's NEEDS
         // YOU: rooms (a message to them, or a Session waiting on them) and trust offers. Gone
         // while nothing does, and when the window is.
@@ -198,6 +200,26 @@ private struct PanelFill: NSViewRepresentable {
         override func draw(_ dirty: NSRect) {
             NSColor(named: "BgPanel")?.setFill()
             bounds.fill()
+        }
+    }
+}
+
+/// Paints the window's background bg.panel (L-6). macOS draws the sidebar as a pane floating in
+/// the window, with rounded corners and a margin, and what shows there is the window's own
+/// background, not any view of ours (the look case read #1d1e21 there, against bg.panel #16171a).
+private struct WindowBackground: NSViewRepresentable {
+    func makeNSView(context: Context) -> Watcher { Watcher() }
+    func updateNSView(_ view: Watcher, context: Context) { view.paint() }
+
+    final class Watcher: NSView {
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            paint()
+        }
+
+        func paint() {
+            guard let window, let panel = NSColor(named: "BgPanel") else { return }
+            if window.backgroundColor != panel { window.backgroundColor = panel }
         }
     }
 }
@@ -497,6 +519,8 @@ private struct RoomView: View {
     @ObservedObject var model: NodeModel
     let room: String
     @State private var draft = ""
+    /// Whether the composer has the keyboard: ⇧↩ adds a line only then (P19).
+    @FocusState private var composing: Bool
     @StateObject private var window = WindowSeen()
     /// A file dropped, pasted or chosen, waiting for its To: and note.
     @State private var attaching: Attaching?
@@ -567,13 +591,6 @@ private struct RoomView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .voxPadding(.horizontal, Space.s12).voxPadding(.top, Space.s8)
                     .accessibilityIdentifier("timeline-title")
-                // Who this node and a member do not yet read each other with (R-5, D4).
-                if let banner = model.notMutual {
-                    StateMark(kind: .attention, words: banner)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .voxPadding(.horizontal, Space.s12).voxPadding(.top, Space.s4)
-                        .accessibilityIdentifier("trust-banner")
-                }
                 if let header = model.sessionHeader {
                     Text(header)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -916,13 +933,16 @@ private struct RoomView: View {
             .accessibilityLabel("Attach a file or folder")
             .accessibilityIdentifier("attach")
             // Who posts (E-4): the node this window acts as, before the field.
+            // No label of its own (a selectable Text with one recurses); the field says "as ann".
             Text("\(model.node) ▸").font(Theme.mono).secondaryText()
-                .accessibilityLabel("posting as \(model.node)")
                 .accessibilityIdentifier("compose-as")
-            // Up to 12 lines, so a long message is read before it goes; Return sends, ⌥↩ adds a
-            // line (P19).
+            // Up to 12 lines, so a long message is read before it goes; Return sends, ⇧↩ (or ⌥↩)
+            // adds a line (P19).
             TextField("Message \(model.roomName(room))…", text: $draft, axis: .vertical)
                 .lineLimit(1...12)
+                .focused($composing)
+                .shiftReturnAddsLine(composing)
+                .help("Return sends; ⇧Return starts a new line")
                 .accessibilityLabel("Message \(model.roomName(room)), as \(model.node)")
                 .textFieldStyle(.plain)
                 .frame(minWidth: Theme.scaled(160), maxWidth: .infinity)
@@ -1178,12 +1198,12 @@ private struct MessageRow: View {
                         .nodeCard(model, message.author, name: author)
                         .accessibilityIdentifier("author-\(message.id)")
                 }
-                // Its time of day; the whole date and time on hover and to VoiceOver.
+                // Its time of day; the whole date and time on hover, and in the row's spoken label.
+                // No label of its own: a selectable Text with one sends SwiftUI's accessibility into
+                // endless recursion (the detail pane is selectable).
                 Text(TimelineTime.short(message.createdMillis))
                     .font(Theme.mono).secondaryText()
                     .help(TimelineTime.full(message.createdMillis))
-                    .accessibilityLabel(TimelineTime.full(message.createdMillis))
-                    .accessibilityValue(TimelineTime.short(message.createdMillis))
                     .accessibilityIdentifier("time-\(message.id)")
                 if message.urgent { StateMark(kind: .attention, words: "urgent") }
                 if message.to.contains(me) { Text("to you").eyebrow() }
@@ -1318,11 +1338,11 @@ private struct TrustBanner: View {
                 StateMark(kind: .attention, words: words(cut))
                     .accessibilityIdentifier("trust-banner")
                 Spacer()
-                if cut.count == 1, let member = cut.first, member.trust == .none,
+                if cut.count == 1, let member = cut.first, !member.trust.inKeyring,
                    model.offers.contains(where: { $0.fingerprint == member.id }) {
                     Button("Trust \(member.name)…") { Task { await model.show(.offer(member.id)) } }
                         .accessibilityIdentifier("trust-banner-offer")
-                } else if cut.contains(where: { $0.trust == .none }) {
+                } else if cut.contains(where: { !$0.trust.inKeyring }) {
                     Button("Show Keyring") { Task { await model.show(.keyring) } }
                         .accessibilityIdentifier("trust-banner-keyring")
                 }
@@ -1333,13 +1353,17 @@ private struct TrustBanner: View {
 
     private func words(_ cut: [NodeModel.MemberRow]) -> String {
         guard cut.count == 1, let m = cut.first else {
-            return "\(cut.count) members here and you can't read each other yet: reading needs both "
-                + "sides to trust each other."
+            // Every one named (D4), as the room names them: the alias, else the fingerprint's start.
+            let names = cut.map(\.name)
+            let listed = names.dropLast().joined(separator: ", ") + " and " + (names.last ?? "")
+            return "\(listed) aren't reading each other with you yet: reading needs both sides to "
+                + "trust each other."
         }
         switch (m.trust, m.trustsYou) {
         case (.oneWay, _):
             return "You trust \(m.name). Waiting for \(m.name) to trust you back before you can read each other."
-        case (.none, true):
+        // Not in the keyring and trusting this node: D4's theyOnly, or none with its trust seen.
+        case (.theyOnly, _), (.none, true):
             return "\(m.name) trusts you. Trust \(m.name) too, and you can read each other."
         default:
             return "You and \(m.name) can't read each other yet: each of you has to trust the other."

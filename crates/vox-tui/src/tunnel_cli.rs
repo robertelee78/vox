@@ -127,21 +127,46 @@ pub fn identity_passphrase_for(
     given: Option<String>,
     file: Option<std::path::PathBuf>,
 ) -> Result<String, AppError> {
-    let creates = !vox_core::node::profile::Profile::exists(paths);
-    if let Some(p) = identity_passphrase_given(given, file)? {
-        return if creates { not_empty(p) } else { Ok(p) };
+    if vox_core::node::profile::Profile::exists(paths) {
+        return match identity_passphrase_given(given, file)? {
+            Some(p) => Ok(p),
+            None => ask_identity_passphrase(),
+        };
     }
-    if !creates {
-        return ask_identity_passphrase();
+    let made = new_identity_passphrase(
+        given,
+        file,
+        "Make one at a terminal with `vox id`, or give its new passphrase with \
+         --identity-passphrase-file <path> (`-` reads stdin) or VOX_IDENTITY_PASSPHRASE.",
+    );
+    // **A refusal leaves no node behind**: resolving the paths made the node's directory, and
+    // "nothing was created" must be true on disk. Only an empty directory is removed.
+    if made.is_err() {
+        let _ = std::fs::remove_dir(&paths.profile_dir);
+    }
+    made
+}
+
+/// The passphrase for an identity about to be made: given, or asked twice at the terminal, and
+/// refused when empty. It touches no file, so a refusal leaves nothing behind. `how` says how
+/// to give it when there is no terminal to ask at, in the words of the verb that asks.
+///
+/// # Errors
+/// An empty passphrase, two that differ, no terminal to ask at, or a file that cannot be read.
+pub fn new_identity_passphrase(
+    given: Option<String>,
+    file: Option<std::path::PathBuf>,
+    how: &str,
+) -> Result<String, AppError> {
+    if let Some(p) = identity_passphrase_given(given, file)? {
+        return not_empty(p);
     }
     // **Without a terminal there is nobody to ask twice.**
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        return Err(AppError::Usage(
+        return Err(AppError::Usage(format!(
             "this node has no identity yet, and there is no terminal to ask at.\n\
-             \x20      Make one at a terminal with `vox id`, or give its new passphrase with \
-             --identity-passphrase-file <path> (`-` reads stdin) or VOX_IDENTITY_PASSPHRASE."
-                .into(),
-        ));
+             \x20      {how}"
+        )));
     }
     println!("vox: this node has no identity yet; creating one.");
     let first = not_empty(prompt_passphrase("new identity passphrase")?)?;

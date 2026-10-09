@@ -1081,8 +1081,9 @@ final class FirstRunProof: XCTestCase {
 
     /// The window's side columns (v0.4.1, the decider: "I should also be able to resize it, and
     /// resize the one on the right too"), alone. Staged by `vox`: alice attached, with one room,
-    /// chosen before; Keep Running not chosen. Dragging the sidebar's divider and the inspector's
-    /// changes each column's width; both widths are the same after ⌘Q and a new launch; and View >
+    /// chosen before; Keep Running not chosen. Dragging the inspector's divider changes its width,
+    /// and the width is the same after ⌘Q and a new launch; the sidebar's own resize is the
+    /// decider's hand test (XCTest's drag does not reach it; see below); and View >
     /// Hide Inspector (⌥⌘I) hides the inspector and Show Inspector brings it back. Made short, the
     /// window cuts the inspector's family LAN section off, and scrolling the inspector brings it
     /// into view with MEMBERS still at the top (P13).
@@ -1176,23 +1177,25 @@ final class FirstRunProof: XCTestCase {
         guard window.frame.width >= needed else {
             throw Apparatus("staging not achieved: the window is \(window.frame.width) wide after widening, and both drags need \(needed) (the timeline keeps 400)")
         }
-        // What the sidebar is, seen two ways: the splitter XCTest finds, and a row inside the
-        // sidebar (Keyring spans its width). Both, before and after, are printed with every
-        // splitter, so a red says whether the divider moved at all.
-        func rowEdge() -> CGFloat {
-            (locate(ui, Key.id("keyring"))?.frame.maxX ?? -1) - window.frame.minX
-        }
-        func splitters() -> String {
-            window.splitters.allElementsBoundByIndex.map { "\($0.frame)" }.joined(separator: " ")
-        }
-        let row0 = rowEdge(), split0 = splitters()
-        drag(side, by: 80)
-        let row1 = rowEdge(), split1 = splitters()
-        print("[proof] columns: sidebar drag: splitter \(sidebar0) → \(sidebarWidth()); Keyring row's edge \(row0) → \(row1); splitters before \(split0); after \(split1); window \(window.frame)")
+        // The sidebar's own resize is not driven here: XCTest's drag does not reach the split
+        // view's resize area (the sidebar-resize spike, 2026-10-09: 13 grips around the separator,
+        // with and without a hover and a long press; and this case's hover +5 point grip, 233 →
+        // 233 on 2026-10-09). A person's drag there resizes it (the decider, by hand, on a proof
+        // build without remembersWidth). That claim rests on the hand test and on 9f0559f6, which
+        // keeps the width out of the live resize; this case says what XCTest's drag did, as
+        // information, and asserts nothing about it.
+        let grip = window.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: side.frame.midX + 5 - window.frame.minX,
+                                 dy: side.frame.midY - window.frame.minY))
+        grip.hover()
+        Thread.sleep(forTimeInterval: 0.5)
+        grip.press(forDuration: 0.5, thenDragTo: grip.withOffset(CGVector(dx: 80, dy: 0)),
+                   withVelocity: .slow, thenHoldForDuration: 0.5)
+        Thread.sleep(forTimeInterval: 1)
+        let sidebar1 = sidebarWidth()
+        print("[proof] columns: XCTest's sidebar drag (not asserted): \(sidebar0) → \(sidebar1)")
         drag(inspectorDivider(), by: -60)
-        let sidebar1 = sidebarWidth(), inspector1 = inspectorWidth()
-        XCTAssertTrue(sidebar1 > sidebar0 + 40,
-                      "PRODUCT: dragging the sidebar's divider 80 points right must widen the sidebar; it went from \(sidebar0) to \(sidebar1) (the Keyring row's edge \(row0) → \(row1))")
+        let inspector1 = inspectorWidth()
         XCTAssertTrue(inspector1 > inspector0 + 30,
                       "PRODUCT: dragging the inspector's divider 60 points left must widen the inspector; it went from \(inspector0) to \(inspector1)")
 
@@ -1205,8 +1208,8 @@ final class FirstRunProof: XCTestCase {
         present(ui, Key.id("inspector"), timeout: 10, "after a new launch, the room's inspector")
         Thread.sleep(forTimeInterval: 1)
         let sidebar2 = sidebarWidth(), inspector2 = inspectorWidth()
-        XCTAssertTrue(abs(sidebar2 - sidebar1) <= 4 && abs(inspector2 - inspector1) <= 4,
-                      "PRODUCT: the column widths must be the same after a new launch; the sidebar was \(sidebar1) and is \(sidebar2), the inspector was \(inspector1) and is \(inspector2)")
+        XCTAssertTrue(abs(inspector2 - inspector1) <= 4,
+                      "PRODUCT: the inspector's width must be the same after a new launch; it was \(inspector1) and is \(inspector2) (the sidebar was \(sidebar1) and is \(sidebar2))")
 
         // Hide the inspector, then show it again, with ⌥⌘I.
         ui.typeKey("i", modifierFlags: [.command, .option])
@@ -2602,9 +2605,17 @@ final class FirstRunProof: XCTestCase {
         XCTAssertEqual(mentionedTo.map { $0.lowercased() }, [bobFp.lowercased()],
                        "PRODUCT: \"MENTION @bob\", @bob picked in the composer, must be addressed to bob; bob's node holds it addressed to \(mentionedTo)")
 
-        // (4e2) The composer takes more than one line (P19): ⌥↩ adds a line, Return sends both.
+        // (4e2) The composer takes more than one line (P19): ⇧↩ adds a line, Return sends both.
+        // ⇧↩, not ⌥↩: a Mac's global hotkey may take ⌥↩ (the decider's brings Alacritty forward).
+        // To the room, so bob's node holds the text alone: 4e left bob ticked in To:, and an
+        // addressed post is held as its envelope.
+        tap(ui, Key.id("compose-to"), "To:")
+        tap(ui, Key.id("to-bob"), "bob, ticked in 4e by @bob, to untick him")
+        ui.typeKey(.escape, modifierFlags: [])
+        words(ui, Key.id("compose-to"), timeout: 10, "To: with bob unticked must say the room",
+              until: { $0 == "To: the room" })
         type(ui, Key.id("compose"), "LINE ONE", "the composer")
-        el(ui, Key.id("compose")).typeKey(.return, modifierFlags: .option)
+        el(ui, Key.id("compose")).typeKey(.return, modifierFlags: .shift)
         el(ui, Key.id("compose")).typeText("LINE TWO\r")
         var twoLines: String?
         let linesUntil = Date().addingTimeInterval(30)
@@ -2618,7 +2629,7 @@ final class FirstRunProof: XCTestCase {
             if twoLines == nil { Thread.sleep(forTimeInterval: 0.5) }
         }
         XCTAssertEqual(twoLines, "LINE ONE\nLINE TWO",
-                       "PRODUCT: \"LINE ONE\", ⌥↩, \"LINE TWO\", Return in the composer must post one message of two lines; bob's node holds \(twoLines.debugDescription)")
+                       "PRODUCT: \"LINE ONE\", ⇧↩, \"LINE TWO\", Return in the composer must post one message of two lines; bob's node holds \(twoLines.debugDescription)")
 
         // (4f) ↑/↓ reach a Session's entries (P14): bob grants alice drive, so she reads inside his
         // Session; with it shown, View > Focus Timeline selects its newest entry and ↑ the one
@@ -2730,6 +2741,8 @@ final class FirstRunProof: XCTestCase {
         //
         // The room's header: its name and its retention, always (R-7); the window takes its name.
         tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
+        // A room opens at what it last showed (D12), here bob's Session from 4f: General first.
+        tap(ui, Key.id("session-general"), "General in mission's Sessions")
         words(ui, Key.id("room-header-name"), timeout: 10, "the room's header must name it: \"mission\"",
               until: { $0 == "mission" })
         words(ui, Key.id("room-header-meta"), timeout: 10,
@@ -2767,6 +2780,19 @@ final class FirstRunProof: XCTestCase {
               until: { $0.contains("\(erinShort) trusts you") })
         present(ui, Key.id("trust-banner-offer"), timeout: 10,
                 "the line must offer erin's trust offer, \"Trust \(erinShort)…\"")
+        // With two members alice can't read, the line names both (D4): fay joins too.
+        let fayPass = scratch.appendingPathComponent("fay.pass").path
+        try stager.write(Data("fay identity\n".utf8), to: fayPass)
+        try staged(vox, ["node", "create", "fay"],
+                   env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "fay identity"]) { $1 })
+        try staged(vox, ["node", "attach", "fay", "--passphrase-file", fayPass], env: voxEnv)
+        let fayFp = try line(staged(vox, ["id", "--node", "fay"], env: voxEnv)) { $0.count == 52 }
+        try staged(vox, ["room", "join", "--node", "fay", "--passphrase-file", roomPass, erinLink],
+                   env: voxEnv)
+        let fayShort = String(fayFp.prefix(12))
+        words(ui, banner, timeout: 60,
+              "erin and fay can't read alice: the line must name them both, \"… \(erinShort) … \(fayShort) aren't reading each other with you yet\"",
+              until: { $0.contains(erinShort) && $0.contains(fayShort) && $0.contains("aren't reading each other with you yet") })
 
         // The Dock badge: the same count as the sidebar's NEEDS YOU, read from what macOS shows.
         func badge() -> String {
@@ -2840,8 +2866,8 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         if present(ui, Key.id("compose-as"), timeout: 10, "the composer must say who posts: \"alice ▸\"") {
             let shownAs = el(ui, Key.id("compose-as"))
-            XCTAssertTrue((shownAs.value as? String) == "alice ▸" || shownAs.label == "posting as alice",
-                          "PRODUCT: the composer must say who posts, \"alice ▸\"; it shows \(String(describing: shownAs.value)) (\(shownAs.label))")
+            XCTAssertEqual(shown(shownAs), "alice ▸",
+                           "PRODUCT: the composer must say who posts, \"alice ▸\"; it shows \"\(shown(shownAs))\"")
         }
         if present(ui, Key.id("compose"), timeout: 10, "the room must have its composer") {
             XCTAssertEqual(el(ui, Key.id("compose")).placeholderValue, "Message mission…",
@@ -2891,10 +2917,11 @@ final class FirstRunProof: XCTestCase {
             let e = el(ui, needsTime)
             let short = needsAt.formatted(.dateTime.hour().minute())
             let full = needsAt.formatted(date: .complete, time: .standard)
-            XCTAssertEqual(e.value as? String, short,
-                           "PRODUCT: UNREAD-579, posted at \(full) (\(unread579.millis) ms), must show its time of day \"\(short)\"; it shows \(String(describing: e.value))")
-            XCTAssertEqual(e.label, full,
-                           "PRODUCT: UNREAD-579's time must say the whole date and time to VoiceOver, \"\(full)\"; it says \"\(e.label)\"")
+            XCTAssertEqual(shown(e), short,
+                           "PRODUCT: UNREAD-579, posted at \(full) (\(unread579.millis) ms), must show its time of day \"\(short)\"; it shows \"\(shown(e))\"")
+            // The whole date and time is in the message row's spoken label, for VoiceOver.
+            present(ui, Key.showing("at \(full)"), timeout: 10,
+                    "UNREAD-579's row must say the whole date and time to VoiceOver, \"at \(full)\"")
         }
         let unreadLine = Key.id("unread-divider")
         words(ui, unreadLine, timeout: 10,
@@ -3561,17 +3588,15 @@ final class FirstRunProof: XCTestCase {
                              "dave joined mission while it was on screen; its timeline must say so, and that bob (whom alice trusts) trusts him: \"\(daveNamed) joined. bob trusts it.\"",
                              until: { $0 == "\(daveNamed) joined. bob trusts it." }) ?? ""
         print("[proof] join: \(joinSaid)")
-        // (15b, D4) Dave trusts alice; she has not trusted him. His row says so, the room says who
-        // does not read her yet, and his card says each direction and trusts him from there.
+        // (15b, D4) Dave trusts alice; she has not trusted him. His row says so, and his card says
+        // each direction and trusts him from there; the room's banner naming who does not read
+        // her yet is P2's TrustBanner, proved at 5d.
         try staged(vox, ["trust", "add", "--node", "dave", aliceFp, "--name", "alice",
                          "--identity-passphrase-file", davePass], env: voxEnv)
         let daveRow = Key.id("member-\(daveFp.prefix(12))")
         let rowSaid = words(ui, daveRow, timeout: 60,
                             "dave trusts alice and she has not trusted him: her member pane must say \"not in keyring, trusts you\"",
                             until: { $0.hasSuffix("not in keyring, trusts you") }) ?? ""
-        let trustBanner = words(ui, Key.id("trust-banner"), timeout: 10,
-                           "mission must say whom alice does not yet read each other with: dave",
-                           until: { $0.contains(String(daveFp.prefix(12))) }) ?? ""
         // (15e, #624) Compare, group by group: on dave's offer, collapsed until asked for, a
         // partial entry says how far it matches.
         tap(ui, Key.id("offer-\(daveFp.prefix(12))"), "dave's offer under needs you")
@@ -3619,7 +3644,7 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(ring.contains(daveFp),
                       "PRODUCT: trusted from his card, dave must be in alice's keyring; `vox trust list` said: \(ring)")
         tap(ui, Key.id("card-close"), "Close on dave's card")
-        print("[proof] dave's row: \(rowSaid); banner: \(trustBanner); card: \(directions) → \(cardSaid)")
+        print("[proof] dave's row: \(rowSaid); card: \(directions) → \(cardSaid)")
         // (15f, G2) The keyring's card for dave: each direction, the room it covers, and what
         // removing him would change, behind a disclosure.
         tap(ui, Key.id("keyring"), "Keyring in the sidebar")

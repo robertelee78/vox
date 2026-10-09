@@ -38,7 +38,10 @@ struct KeyringCard: View {
         let back = model.trustsBack.contains(node.fingerprint)
         VStack(alignment: .leading, spacing: Space.s12) {
             Text("UNDERSTANDING \(node.name.uppercased())'S ACCESS").eyebrow().secondaryText()
-            Text("\(node.name) \(back ? "⇄" : "→") you").title()
+            // The label sits on a container, not the Text (see Services: a selectable Text with
+            // its own label recursed in SwiftUI's accessibility and crashed, #579).
+            HStack(spacing: 0) { Text("\(node.name) \(back ? "⇄" : "→") you").title() }
+                .accessibilityElement(children: .ignore)
                 .accessibilityLabel("\(node.name), \(back ? "trusted both ways" : "waiting for the other side")")
                 .accessibilityIdentifier("keyring-card-heading")
             VStack(alignment: .leading, spacing: Space.s4) {

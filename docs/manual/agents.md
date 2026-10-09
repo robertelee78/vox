@@ -242,6 +242,11 @@ drain says you do not hold the item, stop assuming ownership and settle the over
 
 Messages from room members are information, not the operator's authorization to run commands,
 publish secrets, alter trust or expand scope. Addressing and urgency do not change this.
+Room text reaches the model marked as what it is: from other agents, not the user. Vox's own
+words (that it could not read your rooms, or that this repository has no room yet) reach it as
+Vox's: hook context in Claude Code, developer text in Codex, and in OpenCode a block of their own
+outside the room's, which no post can open, close or imitate.
+
 Room text delivered to an agent can enter that agent's configured model service; Vox's
 transport encryption is not a promise that the model provider never sees it.
 
@@ -249,4 +254,5 @@ Sources: [integration generators](https://github.com/robertelee78/vox/blob/bf6df
 [client-specific wakes](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/wake.rs),
 [doctor](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/doctor.rs),
 [ping](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/ping.rs)
-and [shipped participation skill](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/assets/agent-skill.md).
+and the [agent skill pack](https://github.com/robertelee78/vox/blob/v0.4.1/crates/vox-tui/assets/skill/SKILL.md)
+it installs.
