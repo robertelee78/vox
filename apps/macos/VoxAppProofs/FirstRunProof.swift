@@ -439,7 +439,20 @@ final class FirstRunProof: XCTestCase {
         guard inspectorDivider().waitForExistence(timeout: 10) else {
             throw Apparatus("XCTest finds no \"inspector-divider\" beside the inspector")
         }
+        // Room to widen both: the timeline keeps 400 points (its minimum), so a window only as
+        // wide as the three columns need leaves the sidebar nowhere to go. Widen the window first,
+        // from its right edge, as a person would.
+        let window = ui.windows.firstMatch
+        let edge = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.5))
+            .withOffset(CGVector(dx: -1, dy: 0))
+        edge.press(forDuration: 0.5, thenDragTo: edge.withOffset(CGVector(dx: 400, dy: 0)),
+                   withVelocity: .slow, thenHoldForDuration: 0.5)
+        Thread.sleep(forTimeInterval: 1)
         let sidebar0 = sidebarWidth(), inspector0 = inspectorWidth()
+        let needed = sidebar0 + 80 + 400 + 7 + inspector0 + 60
+        guard window.frame.width >= needed else {
+            throw Apparatus("staging not achieved: the window is \(window.frame.width) wide after widening, and both drags need \(needed) (the timeline keeps 400)")
+        }
         drag(side, by: 80)
         drag(inspectorDivider(), by: -60)
         let sidebar1 = sidebarWidth(), inspector1 = inspectorWidth()
@@ -471,7 +484,6 @@ final class FirstRunProof: XCTestCase {
 
         // A short window (P13): the inspector's last section, the family LAN, is below its
         // bottom, and scrolling the inspector brings it into view while MEMBERS stays pinned.
-        let window = ui.windows.firstMatch
         let bottom = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 1))
             .withOffset(CGVector(dx: 0, dy: -1))
         bottom.press(forDuration: 0.5, thenDragTo: bottom.withOffset(CGVector(dx: 0, dy: -(window.frame.height - 300))),
