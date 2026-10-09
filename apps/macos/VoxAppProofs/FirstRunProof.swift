@@ -437,7 +437,7 @@ final class FirstRunProof: XCTestCase {
                       "PRODUCT: dragging the dividers must widen the sidebar and the inspector; the sidebar went from \(sidebar0) to \(sidebar1), the inspector from \(inspector0) to \(inspector1)")
 
         // ⌘Q, and a new launch: the same widths.
-        ui.typeKey("q", modifierFlags: .command)
+        handOff(ui, "q")
         XCTAssertTrue(ui.wait(for: .notRunning, timeout: 30), "PRODUCT: ⌘Q did not quit the app")
         try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
         present(ui, Key.id("attached"), timeout: 60, "after a new launch, the app must open attached as alice")
