@@ -37,6 +37,12 @@ struct MainWindow: View {
             StatusBar(model: model)
         }
         .contentSurface()
+        // The Dock says how many things need the person, the same count as the sidebar's NEEDS
+        // YOU: rooms (a message to them, or a Session waiting on them) and trust offers. Gone
+        // while nothing does, and when the window is.
+        .onAppear { DockBadge.show(model.needsYouCount) }
+        .onChange(of: model.needsYouCount) { DockBadge.show($0) }
+        .onDisappear { DockBadge.show(0) }
         .sheet(item: $model.sheet) { NodeSheets(model: model, sheet: $0) }
         .toolbar {
             // W-2: a key moves to the next room that needs the person; Control-N, as in the TUI.
@@ -752,6 +758,13 @@ private struct MessageRow: View {
     private var author: String {
         if message.author == me { return "you" }
         return message.authorName.isEmpty ? String(message.author.prefix(12)) : message.authorName
+    }
+}
+
+/// The Dock icon's badge.
+enum DockBadge {
+    static func show(_ count: Int) {
+        NSApp.dockTile.badgeLabel = count > 0 ? "\(count)" : nil
     }
 }
 
