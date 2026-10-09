@@ -148,21 +148,29 @@ pub fn run(dry_run: bool, purge: bool) -> Result<(), AppError> {
             plan.remove(root.clone());
         }
     } else {
+        // Each kept directory said once, with what it holds: the data root the nodes, their keys
+        // and their rooms; the config directory only the settings read for them.
         for root in &roots {
+            let what = if *root == account.data_root {
+                format!(
+                    "your nodes, their keys and their rooms ({}); {}",
+                    if nodes.is_empty() {
+                        "none yet".to_owned()
+                    } else {
+                        nodes
+                            .iter()
+                            .map(NodeName::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    },
+                    crate::ident::NO_BACKUP
+                )
+            } else {
+                "the settings Vox reads for your nodes".to_owned()
+            };
             plan.kept.push(format!(
-                "{} is kept: it holds your nodes, their keys and their rooms ({}). {} \
-                 `vox uninstall --purge` removes it.",
-                root.display(),
-                if nodes.is_empty() {
-                    "none yet".to_owned()
-                } else {
-                    nodes
-                        .iter()
-                        .map(NodeName::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                },
-                crate::ident::NO_BACKUP
+                "{}: {what}. `vox uninstall --purge` removes it.",
+                root.display()
             ));
         }
     }
@@ -173,7 +181,7 @@ pub fn run(dry_run: bool, purge: bool) -> Result<(), AppError> {
             println!("  {}", s.what);
         }
         for k in &plan.kept {
-            println!("  keep: {k}");
+            println!("  keep {k}");
         }
         return Ok(());
     }
@@ -193,7 +201,7 @@ pub fn run(dry_run: bool, purge: bool) -> Result<(), AppError> {
         }
     }
     for k in &plan.kept {
-        println!("vox uninstall: kept: {k}");
+        println!("vox uninstall: kept {k}");
     }
     if failed > 0 {
         return Err(AppError::Usage(format!(
