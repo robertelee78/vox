@@ -44,6 +44,8 @@ struct MainWindow: View {
                                 .accessibilityIdentifier("empty-join-room")
                         }
                     }
+                    .accessibilityElement(children: .contain)
+                    .accessibilityIdentifier("no-room-yet")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 case nil:
                     Text("Pick a room.")
