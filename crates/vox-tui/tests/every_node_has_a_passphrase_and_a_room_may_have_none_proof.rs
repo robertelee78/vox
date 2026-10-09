@@ -5,7 +5,10 @@
 //! 1. A node is never made with an empty identity passphrase, however it is given: `vox id` with
 //!    `VOX_IDENTITY_PASSPHRASE` set to nothing, `vox node create` with an empty
 //!    `--passphrase-file`, and `vox node create` at a terminal with Enter alone each refuse,
-//!    saying every node has an identity passphrase, and leave no identity behind.
+//!    saying every node has an identity passphrase, and leave no identity behind; a refused
+//!    `vox node create` leaves no `nodes/<name>/` either. With no terminal and no passphrase given,
+//!    `vox node create` says how to give one in its own words (`--passphrase-file`), and leaves
+//!    nothing. `vox node create --help` says what it does: an empty passphrase is refused.
 //! 2. `vox room create` makes a room with no passphrase (an empty line on `--passphrase-file -`),
 //!    saying the line that encourages one.
 //! 3. A join to that room with a wrong, non-empty passphrase is refused, naming the passphrase.
@@ -13,7 +16,9 @@
 //!    each other's posts both ways.
 //!
 //! Mutations: an empty identity passphrase accepted again (the node's and the CLI's checks) — red,
-//! PRODUCT (claim 1); the room's empty passphrase read as locked again (`join_passphrase` refusing
+//! PRODUCT (claim 1); `node_create` resolving its paths before it has the passphrase — red,
+//! PRODUCT (claim 1: `nodes/e/` left behind); the help saying "an empty one is allowed" again —
+//! red, PRODUCT (claim 1); the room's empty passphrase read as locked again (`join_passphrase` refusing
 //! an empty one) — red, PRODUCT (claim 4: the join is refused).
 
 #![cfg(unix)]
@@ -328,7 +333,14 @@ fn every_node_has_a_passphrase_and_a_room_may_have_none() {
 
     // ---- claim 1: no node is made with an empty identity passphrase ----
     let refused = |how: &str, d: &std::path::Path, ok: bool, said: &str| {
-        let left = vaults(d);
+        let mut left = vaults(d);
+        left.extend(
+            std::fs::read_dir(d.join("nodes"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path()),
+        );
         assert!(
             !ok && said.contains(EVERY_NODE) && left.is_empty(),
             "PRODUCT: {how} must refuse, saying {EVERY_NODE:?}, and make nothing (ADR-028 K-11); \
@@ -368,6 +380,38 @@ fn every_node_has_a_passphrase_and_a_room_may_have_none() {
         &at_terminal,
         shown.contains("EXIT 0\n"),
         &shown,
+    );
+    let no_terminal = dir("no-terminal");
+    let out = Command::new(VOX)
+        .args(["node", "create", "n"])
+        .env("VOX_DATA_DIR", &no_terminal)
+        .env("VOX_CONFIG_DIR", no_terminal.join("cfg"))
+        .env_remove("VOX_IDENTITY_PASSPHRASE")
+        .stdin(Stdio::null())
+        .output()
+        .expect("APPARATUS: cannot run vox");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success()
+            && said.contains("--passphrase-file <path>")
+            && !said.contains("--identity-passphrase-file")
+            && !no_terminal.join("nodes").join("n").exists(),
+        "PRODUCT: `vox node create` with no terminal must refuse, name its own --passphrase-file, \
+         and leave no nodes/n/: exit {:?}, nodes/n/ there: {}, said:\n{said}",
+        out.status.code(),
+        no_terminal.join("nodes").join("n").exists()
+    );
+    let (_, help, _) = vox_as(&by_file, &s(&["node", "--help"]), None, PASS);
+    let create = help
+        .lines()
+        .skip_while(|l| !l.trim_start().starts_with("create "))
+        .take_while(|l| !l.trim_start().starts_with("attach "))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        create.contains("an empty") && create.contains("refused") && !create.contains("allowed"),
+        "PRODUCT: `vox node --help` must say an empty passphrase is refused, as `vox node create` \
+         does; it says of create: {create:?}"
     );
     let fp = |d: &std::path::Path| {
         let (ok, out, err) = vox(d, &s(&["id"]), None);
