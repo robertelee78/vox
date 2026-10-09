@@ -143,7 +143,10 @@ private struct SharedServiceBox: View {
             // amber with its fix, never only "connection failed".
             ForEach(Array(service.needs.enumerated()), id: \.offset) { _, need in
                 if need.holds {
-                    Text("✓ \(need.need)").font(Theme.text).secondaryText()
+                    // The label is the container's, never the Text's (a selectable Text with a label
+                    // of its own recurses in SwiftUI's accessibility).
+                    HStack { Text("✓ \(need.need)").font(Theme.text).secondaryText() }
+                        .accessibilityElement(children: .ignore)
                         .accessibilityLabel("\(need.need): yes")
                 } else {
                     StateMark(kind: .attention, words: "missing: \(need.need) — \(need.otherwise)")
