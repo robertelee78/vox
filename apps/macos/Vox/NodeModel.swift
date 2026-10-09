@@ -57,6 +57,13 @@ final class NodeModel: ObservableObject {
         }
     }
 
+    /// A member that joined the room on screen while it was on screen (K-7).
+    struct JoinLine: Equatable {
+        let fingerprint: String
+        let at: UInt64
+        var said: String
+    }
+
     /// A member of the room on screen.
     struct MemberRow: Identifiable, Equatable {
         let id: String
@@ -90,6 +97,10 @@ final class NodeModel: ObservableObject {
     /// Where each of this node's own messages is, while no member is known to have read it
     /// (ADR-028 R-6, D9): "only on this machine", "on N of M members' nodes".
     @Published private(set) var whereabouts: [String: String] = [:]
+    /// Who joined the room on screen while it was on screen, and when (ADR-028 K-7, D10): said
+    /// in its timeline with which of the keyring's nodes trust the newcomer, said again as that
+    /// grows.
+    @Published private(set) var joins: [JoinLine] = []
     /// Who has pulled each of this node's own shares in the room on screen, verified, by the
     /// share's message id (ADR-028 F-6, #498).
     @Published private(set) var pulledBy: [String: [String]] = [:]
@@ -330,6 +341,7 @@ final class NodeModel: ObservableObject {
         messages = []
         readBy = [:]
         whereabouts = [:]
+        joins = []
         pulledBy = [:]
         pulled = [:]
         retention = ""
@@ -886,7 +898,27 @@ final class NodeModel: ObservableObject {
                     if now != self.pulled { self.pulled = now }
                 }
                 if let services, services != self.roomServices { self.roomServices = services }
-                if let rows, rows != self.members { self.members = rows }
+                if let rows, rows != self.members {
+                    // A member not listed before joined while the room was on screen (K-7).
+                    let before = Set(self.members.map(\.id))
+                    let came = rows.filter { !before.contains($0.id) }
+                    self.members = rows
+                    if !before.isEmpty || !came.isEmpty {
+                        let at = UInt64(Date().timeIntervalSince1970 * 1000)
+                        for m in came where !self.joins.contains(where: { $0.fingerprint == m.id }) {
+                            self.joins.append(JoinLine(fingerprint: m.id, at: at, said: ""))
+                        }
+                    }
+                }
+                // Each join said, and said again as the room's consent grants name more of the
+                // keyring's nodes trusting the newcomer.
+                for (i, line) in self.joins.enumerated() {
+                    if let said = try? await self.client.joinSaid(room: room, member: line.fingerprint),
+                       case .room(room) = self.selection, i < self.joins.count,
+                       self.joins[i].said != said {
+                        self.joins[i].said = said
+                    }
+                }
             }
         }
     }

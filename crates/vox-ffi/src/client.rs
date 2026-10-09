@@ -2983,6 +2983,33 @@ impl VoxClient {
             .collect())
     }
 
+    /// What a member's client says when `member` joins `room` (ADR-028 K-7), word for word as the
+    /// TUI says it: its name (alias, else its fingerprint marked "(not in keyring)"), "joined.",
+    /// and which nodes in this node's keyring trust it, from the consent grants on the room's log.
+    /// It adds nothing to any keyring.
+    ///
+    /// # Errors
+    /// A malformed id, the room not open here, or the daemon's refusal.
+    pub async fn join_said(&self, room: String, member: String) -> Result<String, VoxError> {
+        let who = digest(&member, "member fingerprint")?;
+        let (open, names) = self.open_snap(&room).await?;
+        let Some(open) = open else {
+            return Err(failed("the room is not open on this node"));
+        };
+        let mut trusters: Vec<String> = open
+            .trusted_by
+            .iter()
+            .find(|(m, _)| *m == who)
+            .map(|(_, by)| by.iter().filter_map(|fp| names.get(fp).cloned()).collect())
+            .unwrap_or_default();
+        trusters.sort();
+        let name = vox_text::offer::name(names.get(&who).map(String::as_str), &b32_encode(&who));
+        Ok(format!(
+            "{name} joined. {}",
+            vox_text::offer::trusted_by(&trusters)
+        ))
+    }
+
     /// Where each of this node's own recent messages in `room` is (ADR-028 R-6), from how many of
     /// the other members' nodes said they hold it, in the TUI's words: what a message no member
     /// has read says.
