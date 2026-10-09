@@ -209,7 +209,7 @@ trap_unregister() {
 launch_status=0
 watch_real &
 WATCH_REAL=$!
-trap 'kill "$WATCH_REAL" 2>/dev/null; rm -rf "$SCRATCH"' EXIT
+trap 'kill "$WATCH_REAL" 2>/dev/null || true; rm -rf "$SCRATCH"' EXIT
 if [ "$#" -eq 0 ] || [ "$*" = "LaunchProof" ]; then
     python3 scripts/app-launch-proof.py "$APP" || launch_status=$?
     if [ "$*" = "LaunchProof" ]; then
@@ -236,8 +236,11 @@ STAGER=$!
 # reading the red; a green run removes it.
 finish() {
     local status=$?
-    kill "$WATCH_REAL" 2>/dev/null
-    kill "$STAGER" 2>/dev/null; wait "$STAGER" 2>/dev/null
+    # Each may have ended already (the stager stops itself with its run): under `set -e` a
+    # failed kill or wait would become the run's exit status, a green run exiting 1.
+    kill "$WATCH_REAL" 2>/dev/null || true
+    kill "$STAGER" 2>/dev/null || true
+    wait "$STAGER" 2>/dev/null || true
     trap_unregister
     if [ "$status" -ne 0 ]; then
         echo "app-proofs: kept for reading the red: $SCRATCH" >&2
