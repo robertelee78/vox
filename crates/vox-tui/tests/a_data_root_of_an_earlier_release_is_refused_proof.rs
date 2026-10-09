@@ -20,6 +20,11 @@
 //! identical. The config directory and `HOME` are outside it, so nothing legitimate writes inside
 //! it.
 //!
+//! **Arm 3, a data root of the previous published release** (ADR-026 F-4, decider 2026-10-08):
+//! made by that release, downloaded and digest-checked, and opened by this build with nothing lost
+//! ([`a_data_root_of_the_previous_release_opens_with_nothing_lost`]). It runs before every
+//! release.
+//!
 //! **Which side a red is on.** A verb that succeeds, one that refuses for another reason, or a
 //! data root that changed is `PRODUCT:`; the proof's own I/O is `APPARATUS:`.
 //!
@@ -257,5 +262,361 @@ fn a_data_root_of_an_earlier_release_is_refused_and_unchanged() {
         after.len(),
         after == before
     );
+    assert!(red.is_empty(), "PRODUCT: {red:#?}");
+}
+
+/// The repository whose releases are the upgrade's source.
+const REPO: &str = "robertelee78/vox";
+
+/// This build's target, as the release names its assets.
+fn target_triple() -> &'static str {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "aarch64-apple-darwin"
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "x86_64-unknown-linux-gnu"
+    } else {
+        panic!("APPARATUS: no release asset is published for this target")
+    }
+}
+
+/// `url` fetched to `out` by curl (https only); `Err` says what went wrong. Every failure here is
+/// the network's or the release's, never this build's.
+fn fetch(url: &str, out: &Path) -> Result<(), String> {
+    let o = Command::new("curl")
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--tlsv1.2",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "300",
+            "--output",
+        ])
+        .arg(out)
+        .arg(url)
+        .output()
+        .map_err(|e| format!("curl could not be run: {e}"))?;
+    if o.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "curl {url}: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ))
+    }
+}
+
+/// The string value of `key` in a flat JSON record.
+fn field(json: &str, key: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    match &v[key] {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// **The published release a person upgrades from**: `VOX_UPGRADE_FROM` (a version, `0.4.0`), or
+/// the newest stable release. Its binary is downloaded into `dir` and checked against the size and
+/// SHA-256 its release record gives, as `vox update` checks it. `(version, path)`.
+fn previous_release(dir: &Path) -> (String, PathBuf) {
+    use sha2::Digest as _;
+    let triple = target_triple();
+    let record_path = dir.join("record.json");
+    let version = match std::env::var("VOX_UPGRADE_FROM") {
+        Ok(v) if !v.trim().is_empty() => v.trim().trim_start_matches('v').to_owned(),
+        _ => {
+            let url =
+                format!("https://github.com/{REPO}/releases/latest/download/stable-{triple}.json");
+            fetch(&url, &record_path)
+                .unwrap_or_else(|e| panic!("APPARATUS: the newest release's record: {e}"));
+            let json = std::fs::read_to_string(&record_path).unwrap_or_default();
+            field(&json, "version").unwrap_or_else(|| {
+                panic!("APPARATUS: the newest release's record names no version: {json:?}")
+            })
+        }
+    };
+    let base = format!("https://github.com/{REPO}/releases/download/v{version}");
+    fetch(&format!("{base}/stable-{triple}.json"), &record_path)
+        .unwrap_or_else(|e| panic!("APPARATUS: v{version}'s release record: {e}"));
+    let record = std::fs::read_to_string(&record_path).unwrap_or_default();
+    let (Some(size), Some(sha)) = (field(&record, "size"), field(&record, "sha256")) else {
+        panic!("APPARATUS: v{version}'s release record gives no size and digest: {record:?}")
+    };
+    let bin = dir.join(format!("vox-{version}"));
+    fetch(&format!("{base}/vox-{triple}"), &bin)
+        .unwrap_or_else(|e| panic!("APPARATUS: v{version}'s vox: {e}"));
+    let bytes = std::fs::read(&bin).expect("APPARATUS: reading the downloaded vox");
+    let got = format!("{:x}", sha2::Sha256::digest(&bytes));
+    assert!(
+        bytes.len().to_string() == size && got == sha,
+        "APPARATUS: the vox downloaded for v{version} is not the published one: {} bytes, sha256 \
+         {got}; the record says {size} bytes, sha256 {sha}",
+        bytes.len()
+    );
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("APPARATUS: making the downloaded vox executable");
+    }
+    let said = Command::new(&bin)
+        .arg("--version")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    assert!(
+        said.contains(&version),
+        "APPARATUS: the downloaded vox does not say it is v{version}: {said:?}"
+    );
+    println!(
+        "[proof] upgrading from v{version}: {} ({size} bytes, sha256 {sha})",
+        bin.display()
+    );
+    (version, bin)
+}
+
+/// What a person sees of their node, read by `exe`: its fingerprint, the fingerprints in its
+/// keyring, its rooms, and the room's rows as `(entry hash, author, created ms, text)`.
+#[derive(Debug, PartialEq, Eq)]
+struct Seen {
+    id: String,
+    keyring: Vec<String>,
+    rooms: Vec<String>,
+    rows: Vec<(String, String, u64, String)>,
+}
+
+/// [`Seen`] by `w`'s `vox`; a verb that fails is a red on `side` (`APPARATUS:` while the old
+/// release stages, `PRODUCT:` for this build).
+fn seen(w: &room::Worker, room: &str, others: &[String], side: &str) -> Seen {
+    let ok = |args: &[&str]| {
+        let o = w.vox(None, args);
+        assert!(
+            o.ok,
+            "{side} {}'s `{}` failed (exit {:?}): {} {}",
+            w.name,
+            o.argv,
+            o.code,
+            o.stdout.trim(),
+            o.stderr.trim()
+        );
+        o
+    };
+    let id = ok(&["id"]).stdout.trim().to_owned();
+    let ring = &ok(&["trust", "list"]).stdout;
+    let squeezed: String = ring.chars().filter(|c| !c.is_whitespace()).collect();
+    let keyring = others
+        .iter()
+        .filter(|fp| squeezed.contains(fp.as_str()))
+        .cloned()
+        .collect();
+    let rooms = ok(&["room", "list"])
+        .stdout
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|r| room.starts_with(r))
+        .map(str::to_owned)
+        .collect();
+    let rows = ok(&["room", "read", room, "--json", "--limit", "1000"])
+        .ndjson()
+        .iter()
+        .map(|r| {
+            (
+                r["entry_hash"].as_str().unwrap_or_default().to_owned(),
+                r["author"].as_str().unwrap_or_default().to_owned(),
+                r["created_millis"].as_u64().unwrap_or_default(),
+                r["text"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    Seen {
+        id,
+        keyring,
+        rooms,
+        rows,
+    }
+}
+
+/// ADR-026 F-4 — **a data root the previous published release wrote opens in this build with
+/// nothing lost.** The previous release (downloaded, digest-checked) makes an anchor and two
+/// members, alice and bob: a room, trust both ways, posts each way and a share. Each member's
+/// view is read with that release. Then every process is stopped as a person stops it and started
+/// again from this build on the same data roots, and each member must see the same fingerprint,
+/// the same keyring, the same room, and the same rows in the same order with the same times; the
+/// share must still be listed; a post written after the upgrade must reach the other member; and
+/// `.daemon/format` must say format 1, written by this build.
+///
+/// Run before every release with the newest published release as the source (`VOX_UPGRADE_FROM`
+/// names another); it needs GitHub.
+///
+/// **Which side a red is on.** A download, a digest or a staging step of the old release that
+/// fails is `APPARATUS:`; this build failing a verb, or seeing anything other than what the old
+/// release saw, is `PRODUCT:`.
+///
+/// Mutant: the vault's AEAD label changed in this build (`VAULT_AAD_V2`) → red, `PRODUCT:` this
+/// build cannot unlock the node the previous release made.
+#[test]
+#[ignore = "downloads the previous release; an anchor and two daemons of each; run in release"]
+fn a_data_root_of_the_previous_release_opens_with_nothing_lost() {
+    watchdog::arm_for(Duration::from_secs(1200));
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temp dir");
+    let (version, old) = previous_release(tmp.path());
+    let old = old.to_str().expect("APPARATUS: a UTF-8 path").to_owned();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("APPARATUS: a runtime");
+    let t0 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("APPARATUS: the clock")
+        .as_millis();
+    let t0 = u64::try_from(t0).expect("APPARATUS: the clock");
+    let mut r = rt.block_on(room::room_as(tmp.path(), &["alice", "bob"], &old));
+
+    // What a person has made with the previous release: posts each way, a second apart, and a
+    // share with a note.
+    let fps: Vec<String> = r.workers.iter().map(room::Worker::b32).collect();
+    let staged = |what: &str, o: &room::Out| {
+        assert!(
+            o.ok,
+            "APPARATUS: staging with v{version}: {what} failed: {}",
+            o.stderr.trim()
+        );
+    };
+    for n in 1..=3 {
+        for w in &r.workers {
+            let text = format!("upgrade: {} {n}", w.name);
+            staged(&text, &w.vox(None, &["room", "post", &r.id, &text]));
+        }
+        std::thread::sleep(Duration::from_millis(1100));
+    }
+    let file = tmp.path().join("upgrade-note.txt");
+    std::fs::write(&file, b"shared before the upgrade").expect("APPARATUS: the shared file");
+    staged(
+        "alice's share",
+        &r.workers[0].vox(
+            None,
+            &[
+                "share",
+                &r.id,
+                file.to_str().unwrap_or_default(),
+                "-m",
+                "upgrade share",
+            ],
+        ),
+    );
+    // Staged when each member reads every post of the other's and the share.
+    let room_id = r.id.clone();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let all_read = |w: &room::Worker| {
+        let o = w.vox(None, &["room", "read", &room_id, "--limit", "1000"]);
+        o.ok && (1..=3).all(|n| {
+            o.stdout.contains(&format!("upgrade: alice {n}"))
+                && o.stdout.contains(&format!("upgrade: bob {n}"))
+        }) && o.stdout.contains("upgrade-note.txt")
+    };
+    while !r.workers.iter().all(all_read) {
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: staging with v{version}: the members never read each other's posts and \
+             the share within 120 s"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let shares = |w: &room::Worker| {
+        let o = w.vox(None, &["share", "list", &room_id]);
+        o.ok && o.stdout.contains("upgrade-note.txt")
+    };
+    assert!(
+        shares(&r.workers[0]),
+        "APPARATUS: staging with v{version}: alice's `vox share list` does not list her share"
+    );
+    let before: Vec<Seen> = r
+        .workers
+        .iter()
+        .map(|w| seen(w, &r.id, &fps, "APPARATUS: staging:"))
+        .collect();
+    let t1 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("APPARATUS: the clock")
+        .as_millis();
+    let t1 = u64::try_from(t1).expect("APPARATUS: the clock");
+    for (w, s) in r.workers.iter().zip(&before) {
+        assert!(
+            s.rows.len() >= 7 && s.keyring.len() == 1 && s.rooms.len() == 1,
+            "APPARATUS: staging with v{version}: {} sees {} rows, keyring {:?}, rooms {:?}",
+            w.name,
+            s.rows.len(),
+            s.keyring,
+            s.rooms
+        );
+    }
+
+    // The upgrade, as a person makes it: everything stopped, then started from this build.
+    r.upgrade(VOX);
+    let mut red = Vec::new();
+    for (w, b) in r.workers.iter().zip(&before) {
+        let a = seen(w, &r.id, &fps, "PRODUCT:");
+        let times_ok = a.rows.iter().all(|(_, _, t, _)| (t0..=t1).contains(t));
+        println!(
+            "[proof] {}: fingerprint same {}; keyring same {}; room same {}; {} rows, same and in \
+             order {}; every time inside the staging window {times_ok}",
+            w.name,
+            a.id == b.id,
+            a.keyring == b.keyring,
+            a.rooms == b.rooms,
+            a.rows.len(),
+            a.rows == b.rows
+        );
+        if a != *b || !times_ok {
+            red.push(format!(
+                "{} after the upgrade from v{version} sees {a:#?}; with v{version} it saw {b:#?}; \
+                 every time inside [{t0}, {t1}]: {times_ok}",
+                w.name
+            ));
+        }
+        let format = std::fs::read_to_string(w.data.join(".daemon/format")).unwrap_or_default();
+        let want = format!("format 1\nwritten-by vox {}\n", env!("CARGO_PKG_VERSION"));
+        if format != want {
+            red.push(format!(
+                "{}'s .daemon/format says {format:?}; this build serving it must write {want:?}",
+                w.name
+            ));
+        }
+    }
+    let listed = shares(&r.workers[0]);
+    println!("[proof] alice's share still listed: {listed}");
+    if !listed {
+        red.push("alice's `vox share list` no longer lists her share after the upgrade".to_owned());
+    }
+    // And the room still works: a post after the upgrade reaches the other member.
+    let after = "written after the upgrade";
+    let posted = r.workers[1].vox(None, &["room", "post", &r.id, after]);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let reached = posted.ok
+        && loop {
+            let o = r.workers[0].vox(None, &["room", "read", &r.id, "--limit", "1000"]);
+            if o.ok && o.stdout.contains(after) {
+                break true;
+            }
+            if Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        };
+    println!("[proof] bob's post after the upgrade reached alice: {reached}");
+    if !reached {
+        red.push(format!(
+            "bob's post after the upgrade never reached alice in 60 s (post: {})",
+            posted.stderr.trim()
+        ));
+    }
     assert!(red.is_empty(), "PRODUCT: {red:#?}");
 }

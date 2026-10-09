@@ -97,6 +97,29 @@ pub fn strip_harness_env(cmd: &mut Command) {
 /// pattern (a path-pattern `pkill` once missed every node and leaked hundreds).
 pub struct Proc(Child);
 
+impl Proc {
+    /// Stop it as a person does — `signal` is `TERM` for a `vox daemon`, `INT` (Ctrl-C) for
+    /// `vox node` — and wait for it; killed by its PID only if it has not ended in 60 s.
+    pub fn stop(mut self, who: &str, signal: &str) {
+        let pid = self.0.id().to_string();
+        let sent = Command::new("kill")
+            .args([&format!("-{signal}"), &pid])
+            .status();
+        assert!(
+            sent.as_ref().is_ok_and(|s| s.success()),
+            "APPARATUS: could not send SIG{signal} to {who} (pid {pid}): {sent:?}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            if self.0.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        eprintln!("[harness] {who} (pid {pid}) had not stopped 60 s after SIG{signal}; killed");
+    }
+}
+
 impl Drop for Proc {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -173,6 +196,9 @@ pub struct Worker {
     daemon: Option<Proc>,
     /// The anchor its daemon was started with, so it can be started again the same way.
     anchor: String,
+    /// The `vox` this worker runs: the one under test, or a published release
+    /// ([`room_as`]).
+    pub exe: String,
 }
 
 impl Drop for Worker {
@@ -197,7 +223,7 @@ impl Worker {
 
     /// As [`Worker::vox`], with `stdin`.
     pub fn vox_in(&self, session: Option<&str>, args: &[&str], stdin: Option<&str>) -> Out {
-        self.vox_bin(VOX, session, args, stdin)
+        self.vox_bin(&self.exe, session, args, stdin)
     }
 
     /// As [`Worker::vox_in`], with extra environment — for what a harness sets beside
@@ -209,7 +235,7 @@ impl Worker {
         args: &[&str],
         stdin: Option<&str>,
     ) -> Out {
-        self.vox_bin_env(VOX, session, env, args, stdin)
+        self.vox_bin_env(&self.exe, session, env, args, stdin)
     }
 
     /// Run a given `vox` binary — the one under test, or a published release — as this
@@ -364,7 +390,7 @@ pub struct Room {
     pub workers: Vec<Worker>,
     pub id: String,
     pub cid: [u8; 32],
-    _anchor: Proc,
+    _anchor: Option<Proc>,
     anchor: String,
     tmp: std::path::PathBuf,
 }
@@ -401,10 +427,53 @@ impl Room {
 }
 
 impl Room {
+    /// **Run the room on `exe` from now on**, as a person upgrades: every daemon and the anchor
+    /// stopped, then the anchor started from `exe` on its own data root and port, and each worker's
+    /// daemon from `exe` on its own data root with its identity passphrase, which reopens its
+    /// rooms. Returns once each worker's daemon answers again.
+    pub fn upgrade(&mut self, exe: &str) {
+        for w in &mut self.workers {
+            if let Some(d) = w.daemon.take() {
+                d.stop(&w.name, "TERM");
+            }
+        }
+        if let Some(a) = self._anchor.take() {
+            a.stop("the anchor", "INT");
+        }
+        let port = self
+            .anchor
+            .rsplit("/udp/")
+            .next()
+            .and_then(|p| p.split('/').next())
+            .unwrap_or_else(|| panic!("APPARATUS: no port in the anchor spec {:?}", self.anchor))
+            .to_owned();
+        let (anchor, spec) = spawn_anchor_as(
+            &self.tmp,
+            exe,
+            &format!("127.0.0.1:{port}"),
+            "anchor.upgraded",
+        );
+        assert_eq!(
+            spec, self.anchor,
+            "PRODUCT: the anchor started again by {exe} on its own data root and port names \
+             another spec"
+        );
+        self._anchor = Some(anchor);
+        for w in &mut self.workers {
+            w.exe = exe.to_owned();
+            let err = self.tmp.join(format!("{}.daemon.upgraded.err", w.name));
+            start_daemon(w, &self.anchor, &err);
+        }
+    }
+
     /// The anchor's pid, for a proof that must stop it: it holds the room's entries too, and
     /// would otherwise serve a stopped member's posts to the others.
     pub fn anchor_pid(&self) -> u32 {
-        self._anchor.0.id()
+        self._anchor
+            .as_ref()
+            .expect("APPARATUS: the anchor is running")
+            .0
+            .id()
     }
 }
 
@@ -469,18 +538,32 @@ impl Looks {
 }
 
 pub fn spawn_anchor(tmp: &std::path::Path) -> (Proc, String) {
+    spawn_anchor_as(tmp, VOX, "127.0.0.1:0", "anchor")
+}
+
+/// [`spawn_anchor`] from `exe`, listening on `listen`, its output in `<tmp>/<log>.out` and
+/// `.err`: a published release's anchor, or the anchor started again on its own port.
+pub fn spawn_anchor_as(
+    tmp: &std::path::Path,
+    exe: &str,
+    listen: &str,
+    log: &str,
+) -> (Proc, String) {
     let (data, cfg) = (tmp.join("anchor/data"), tmp.join("anchor/cfg"));
     mkdir(&cfg);
-    let (out, err) = (tmp.join("anchor.out"), tmp.join("anchor.err"));
+    let (out, err) = (
+        tmp.join(format!("{log}.out")),
+        tmp.join(format!("{log}.err")),
+    );
     let mut anchor = Proc(
-        Command::new(VOX)
-            .args(["node", "--listen", "127.0.0.1:0"])
+        Command::new(exe)
+            .args(["node", "--listen", listen])
             .env("VOX_DATA_DIR", &data)
             .env("VOX_CONFIG_DIR", &cfg)
             .stdout(log_file(&out))
             .stderr(log_file(&err))
             .spawn()
-            .unwrap_or_else(|e| panic!("APPARATUS: could not spawn {VOX} node: {e}")),
+            .unwrap_or_else(|e| panic!("APPARATUS: could not spawn {exe} node: {e}")),
     );
     let mut looks = Looks::new();
     let deadline = Instant::now() + TIMEOUT;
@@ -511,6 +594,11 @@ pub fn spawn_anchor(tmp: &std::path::Path) -> (Proc, String) {
 }
 
 pub fn worker(tmp: &std::path::Path, name: &str) -> Worker {
+    worker_as(tmp, name, VOX)
+}
+
+/// [`worker`], made and run by `exe`.
+pub fn worker_as(tmp: &std::path::Path, name: &str, exe: &str) -> Worker {
     let data = tmp.join(name).join("data");
     let cfg = tmp.join(name).join("cfg");
     mkdir(&cfg);
@@ -528,6 +616,7 @@ pub fn worker(tmp: &std::path::Path, name: &str) -> Worker {
         pass,
         daemon: None,
         anchor: String::new(),
+        exe: exe.to_owned(),
     };
     // `vox id` creates the identity on first use and prints its fingerprint.
     let o = w.vox(None, &["id", "--identity-passphrase-file", utf8(&w.pass)]);
@@ -540,7 +629,8 @@ pub fn worker(tmp: &std::path::Path, name: &str) -> Worker {
 }
 
 pub fn start_daemon(w: &mut Worker, anchor: &str, err: &std::path::Path) {
-    start_daemon_as(w, VOX, &[], anchor, err);
+    let exe = w.exe.clone();
+    start_daemon_as(w, &exe, &[], anchor, err);
 }
 
 /// [`start_daemon`] from `exe` with `env` beside it: a proof that runs one member as a faulty
@@ -610,8 +700,14 @@ fn start_daemon_as(
 /// creating the room and the rest joining it, every worker trusting every other. Ready
 /// when every worker has rendered a post by every other.
 pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
-    let (anchor, spec) = spawn_anchor(tmp);
-    let mut workers: Vec<Worker> = names.iter().map(|n| worker(tmp, n)).collect();
+    room_as(tmp, names, VOX).await
+}
+
+/// [`room`], every process of it — the anchor, each `vox daemon` and each verb — run by `exe`: a
+/// published release, whose data roots a later build then opens ([`Room::upgrade`]).
+pub async fn room_as(tmp: &std::path::Path, names: &[&str], exe: &str) -> Room {
+    let (anchor, spec) = spawn_anchor_as(tmp, exe, "127.0.0.1:0", "anchor");
+    let mut workers: Vec<Worker> = names.iter().map(|n| worker_as(tmp, n, exe)).collect();
     for w in &mut workers {
         let err = tmp.join(format!("{}.daemon.err", w.name));
         start_daemon(w, &spec, &err);
@@ -783,7 +879,7 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
         id: full,
         cid,
         workers,
-        _anchor: anchor,
+        _anchor: Some(anchor),
         anchor: spec,
         tmp: tmp.to_path_buf(),
     }
