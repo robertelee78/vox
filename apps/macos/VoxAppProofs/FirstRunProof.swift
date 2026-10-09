@@ -1183,7 +1183,8 @@ final class FirstRunProof: XCTestCase {
         }
         let toBox = Key.id("compose-to")
         tap(ui, toBox, "To:")
-        tap(ui, Key.idPrefix("to-bob-"), "bob's open Session under bob in To:",
+        // By its own id: bob has another Session open in mission (bob-proof, his hook's from step 4).
+        tap(ui, Key.id("to-bob-\(d7Session.prefix(8))"), "bob's open Session \(d7Session) under bob in To:",
             premise: Premise("alice's `vox room sessions` lists bob's open Session \(d7Session)") {
                 let now = self.run(vox, ["room", "sessions", "--node", "alice", room], env: voxEnv).out
                 return (now.contains(d7Session.prefix(8)), now)
