@@ -75,6 +75,11 @@ final class NodeModel: ObservableObject {
 
     @Published private(set) var rooms: [Room] = []
     @Published var selection: Selection?
+    /// The first message that was unread when the room came on screen, and how many were: where
+    /// the timeline draws its unread line. It stays while the room is on screen; what arrives
+    /// meanwhile is read as it is shown.
+    @Published private(set) var unreadFrom: String?
+    @Published private(set) var unreadCount = 0
     @Published private(set) var messages: [RoomMessage] = [] {
         didSet {
             byID = Dictionary(messages.map { ($0.id, $0) }) { $1 }
@@ -332,6 +337,8 @@ final class NodeModel: ObservableObject {
         }
         guard case .room = selection else { return }
         messages = []
+        unreadFrom = nil
+        unreadCount = 0
         readBy = [:]
         pulledBy = [:]
         pulled = [:]
@@ -364,8 +371,14 @@ final class NodeModel: ObservableObject {
         do {
             // Each read lands only if the room is still the one on screen: a quick switch must not
             // draw one room's messages under another.
+            // What was unread as the room came on screen, before showing it marks it read: the
+            // timeline's unread line goes above the first of it (ADR-028 R-8).
+            let unread = ((try? await client.unread(room: id)) ?? []).filter { $0.author != me }
             let read = try await client.read(room: id, after: "", limit: 0)
             guard case .room(id) = self.selection else { return }
+            let unreadIDs = Set(unread.map(\.id))
+            unreadFrom = read.first { unreadIDs.contains($0.id) }?.id
+            unreadCount = unread.count
             messages = read
             let services = (try? await client.services(room: id).shared) ?? []
             let rows = try await memberRows(id)
