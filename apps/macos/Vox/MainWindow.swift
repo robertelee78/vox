@@ -350,6 +350,8 @@ private struct RoomView: View {
     var body: some View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
+                RoomHeader(model: model, room: room)
+                Divider()
                 if !model.roomServices.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 8) {
@@ -750,6 +752,33 @@ private struct MessageRow: View {
     private var author: String {
         if message.author == me { return "you" }
         return message.authorName.isEmpty ? String(message.author.prefix(12)) : message.authorName
+    }
+}
+
+/// The room's own header, pinned above its timeline: its name, how many members it has, what the
+/// timeline shows (General, All, or a Session), and its retention, which is always said (R-7).
+/// The window takes the room's name as its title, so the Window menu and ⌘` say which room it is.
+private struct RoomHeader: View {
+    @ObservedObject var model: NodeModel
+    let room: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("ROOM").eyebrow().secondaryText()
+            Text(model.roomName(room)).fontWeight(.semibold)
+                .lineLimit(1).truncationMode(.middle)
+                .textSelection(.enabled)
+                .accessibilityIdentifier("room-header-name")
+                .accessibilityAddTraits(.isHeader)
+            Text(model.roomHeaderMeta)
+                .secondaryText()
+                .lineLimit(1).truncationMode(.middle)
+                .accessibilityIdentifier("room-header-meta")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .navigationTitle(model.roomName(room))
+        .navigationSubtitle(model.roomHeaderMeta)
     }
 }
 
