@@ -61,6 +61,10 @@ struct RootView: View {
                 }
                 Button("Try Again") { Task { await model.start() } }
                     .accessibilityIdentifier("retry")
+            case let .welcome(said):
+                Welcome(said: said, model: model)
+            case let .creating(node):
+                ProgressView("Making node \(node)…")
             case let .choosing(nodes):
                 Chooser(nodes: nodes, model: model)
             case let .passphrase(node, said):
@@ -177,27 +181,93 @@ private struct LoginItemApproval: View {
     }
 }
 
-/// First run: which node this app acts as (ADR-028 E-4).
+/// First run on a Mac with no node yet: the node is made here, in the window, as `vox node create`
+/// makes it (a name, and its identity passphrase typed twice), then attached. Nothing on the way
+/// sends the person anywhere else.
+private struct Welcome: View {
+    let said: String?
+    @ObservedObject var model: AppModel
+    @State private var name = Welcome.suggestedName
+    @State private var first = SecureFieldHolder()
+    @State private var again = SecureFieldHolder()
+
+    var body: some View {
+        Text("Welcome to Vox").heading()
+        Text("To start, make your node: who you are in every room. Everything you post, trust and "
+            + "share is your node's.")
+            .secondaryText()
+            .accessibilityIdentifier("welcome-why")
+        TextField("Name", text: $name)
+            .frame(width: Theme.scaled(320))
+            .accessibilityIdentifier("new-node-name")
+            .accessibilityLabel("Node name")
+        Text("Lowercase letters, digits, dots, dashes and underscores.").secondaryText()
+        SecureInput(holder: first) { again.field.becomeFirstResponder() }
+            .frame(width: Theme.scaled(320))
+            .accessibilityIdentifier("new-node-passphrase")
+            .accessibilityLabel("Identity passphrase")
+        SecureInput(holder: again) { submit() }
+            .frame(width: Theme.scaled(320))
+            .accessibilityIdentifier("new-node-passphrase-again")
+            .accessibilityLabel("Identity passphrase again")
+        Text("The identity passphrase unlocks your node on this Mac. Nobody can recover it for you: "
+            + "keep it somewhere safe.")
+            .secondaryText()
+            .accessibilityIdentifier("new-node-passphrase-why")
+        Text(Welcome.capitalized(noBackupNotice()))
+            .secondaryText()
+            .accessibilityIdentifier("new-node-no-backup")
+        if let said {
+            Said(text: said)
+        }
+        Button("Make Node") { submit() }
+            .keyboardShortcut(.defaultAction)
+            .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+            .accessibilityIdentifier("new-node-make")
+    }
+
+    private func submit() {
+        // Return and the button may both ask: the second finds the fields empty.
+        guard let secret = first.take() else { return }
+        let repeated = again.take() ?? Secret(Data())
+        let node = name.trimmingCharacters(in: .whitespaces)
+        Task { await model.createNode(node, passphrase: secret, again: repeated) }
+    }
+
+    /// The Mac's own name, in the letters a node name may have: a start the person may change.
+    static var suggestedName: String {
+        let raw = (Host.current().localizedName ?? "").lowercased()
+        var name = ""
+        for c in raw {
+            if c.isASCII && (c.isLetter || c.isNumber || c == "." || c == "_" || c == "-") {
+                name.append(c)
+            } else if c == " " && !name.hasSuffix("-") && !name.isEmpty {
+                name.append("-")
+            }
+        }
+        while name.hasSuffix("-") { name.removeLast() }
+        return String(name.prefix(32))
+    }
+
+    static func capitalized(_ sentence: String) -> String {
+        sentence.prefix(1).uppercased() + sentence.dropFirst() + "."
+    }
+}
+
+/// First run with several nodes on this Mac: which one is you here (ADR-028 E-4).
 private struct Chooser: View {
     let nodes: [String]
     @ObservedObject var model: AppModel
 
     var body: some View {
-        Text("Which node is this app?").heading()
-        Text(
-            "Vox acts as one node on this Mac: everything you post, trust and share is that node's."
-        )
-        .secondaryText()
-        if nodes.isEmpty {
-            Text("There is no node on this Mac yet. Make one in Terminal with `vox node create <name>`, then try again.")
-            Button("Try Again") { Task { await model.start() } }
-                .accessibilityIdentifier("retry")
-        } else {
-            ForEach(nodes, id: \.self) { node in
-                Button(node) { Task { await model.choose(node) } }
-                    .accessibilityIdentifier("node-\(node)")
-                    .accessibilityLabel("Act as node \(node)")
-            }
+        Text("Which node are you?").heading()
+        Text("This Mac has several nodes. Pick the one you post, trust and share as here; you "
+            + "can switch later.")
+            .secondaryText()
+        ForEach(nodes, id: \.self) { node in
+            Button(node) { Task { await model.choose(node) } }
+                .accessibilityIdentifier("node-\(node)")
+                .accessibilityLabel("Act as node \(node)")
         }
     }
 }
@@ -259,6 +329,14 @@ final class Secret: @unchecked Sendable {
     }
 
     func wipe() { bytes.resetBytes(in: 0..<bytes.count) }
+
+    /// Whether `other` holds the same bytes, compared without stopping at the first difference.
+    func matches(_ other: Secret) -> Bool {
+        guard bytes.count == other.bytes.count else { return false }
+        var diff: UInt8 = 0
+        for (a, b) in zip(bytes, other.bytes) { diff |= a ^ b }
+        return diff == 0
+    }
 
     deinit { wipe() }
 }

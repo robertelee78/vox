@@ -313,6 +313,14 @@ pub fn config_dir(data_root: String) -> Result<String, VoxError> {
         .map_err(|e| failed(format!("data root: {e}")))
 }
 
+/// What a person is told wherever a node is made, as `vox node create` says it (ADR-028 K-8): a
+/// node has no backup.
+#[uniffi::export]
+#[must_use]
+pub fn no_backup_notice() -> String {
+    vox_text::node::NO_BACKUP.to_owned()
+}
+
 /// The group a room's unread counts, by [`UnreadLevel`], put it in: the TUI's rule
 /// (`vox_agentcomms::attention::group`).
 #[uniffi::export]
@@ -1458,6 +1466,52 @@ impl VoxClient {
                 "the vox daemon did not list its nodes; restart it so it is this vox's version",
             )),
         }
+    }
+
+    /// Make node `node` on this machine, as `vox node create` does: its identity sealed under
+    /// `passphrase` (every node has one: an empty one is refused, ADR-028 K-11), with its prekey
+    /// ring, in this client's data root; nothing goes over the socket. Returns its fingerprint,
+    /// base32. Attach it next with [`VoxClient::attach`].
+    ///
+    /// # Errors
+    /// A name a node cannot have, a node by that name already, an empty passphrase, another vox
+    /// holding the node's directory, or one that cannot be written.
+    pub async fn create_node(
+        &self,
+        node: String,
+        passphrase: Arc<Passphrase>,
+    ) -> Result<String, VoxError> {
+        let name = NodeName::parse(&node).map_err(|e| failed(e.to_string()))?;
+        let account = Account::of(Some(&self.data_root), Some(&self.config_dir))
+            .map_err(|e| failed(format!("data root: {e}")))?;
+        if account.nodes_on_disk().contains(&name) {
+            return Err(failed(format!("there is a node {name} already")));
+        }
+        let paths = vox_core::node::paths::Paths::resolve(
+            name.as_str(),
+            Some(&self.data_root),
+            Some(&self.config_dir),
+        )
+        .map_err(|e| failed(e.to_string()))?;
+        let secret = passphrase.copy();
+        // The node's own clock, a test step included (V210-64), as `vox node create` stamps it.
+        let now_ms = (vox_core::time::clock_with_test_skew())();
+        self.on_rt(async move {
+            // Argon2id and the files: off the runtime's workers.
+            tokio::task::spawn_blocking(move || {
+                vox_core::node::profile::Profile::create_node(paths, secret.as_bytes(), now_ms, &|| {})
+                    .map(|fp| b32_encode(&fp))
+                    .map_err(|e| match vox_core::node::actor::fault_of(&e) {
+                        f @ (vox_core::node::api::Fault::IdentityFileUnwritable
+                        | vox_core::node::api::Fault::Storage
+                        | vox_core::node::api::Fault::ProfileBusy) => failed(f.to_string()),
+                        _ => failed(e.to_string()),
+                    })
+            })
+            .await
+            .map_err(|_| failed("making the node stopped"))?
+        })
+        .await
     }
 
     /// Act as `node`, attaching it if it is not attached (with `passphrase`, its identity's), and

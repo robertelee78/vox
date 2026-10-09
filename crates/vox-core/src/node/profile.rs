@@ -89,6 +89,27 @@ impl Profile {
         Self::create_noting(paths, passphrase, now_secs, argon2, &|| {})
     }
 
+    /// A new node's identity, as `vox node create` and the app's first run make it: the profile
+    /// at `paths`, sealed under `passphrase` (refused when empty), with its prekey ring made with
+    /// it, so the ring's age is the identity's (V210-77). Returns its fingerprint. `now_ms` is the
+    /// node's own clock; `waiting` is called once if another vox holds the profile's lock.
+    ///
+    /// # Errors
+    /// An empty passphrase, an identity that exists already, another vox holding the profile, or
+    /// one that cannot be written.
+    pub fn create_node(
+        paths: Paths,
+        passphrase: &[u8],
+        now_ms: u64,
+        waiting: LockWaitNotice<'_>,
+    ) -> Result<Digest32> {
+        let p = Self::create_noting(paths, passphrase, now_ms / 1_000, Argon2Profile::default(), waiting)?;
+        let signer = p.signer()?;
+        let dh_secret = *signer.x25519_identity_secret();
+        crate::node::prekeys::load_or_create(p.store(), signer, &dh_secret, now_ms)?;
+        Ok(p.fingerprint())
+    }
+
     /// [`Profile::create_with_profile`], calling `waiting` once if another vox holds the
     /// profile's lock for longer than a second, so the caller can say so where its user will
     /// see it (see [`LockWaitNotice`]).

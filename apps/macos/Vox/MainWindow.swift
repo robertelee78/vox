@@ -27,6 +27,24 @@ struct MainWindow: View {
                     ServicesView(model: model)
                 case let .offer(fingerprint):
                     OfferView(model: model, fingerprint: fingerprint).id(fingerprint)
+                case nil where model.rooms.isEmpty:
+                    // A node in no room yet (its first run, most often): the two ways in, here,
+                    // not only in the File menu.
+                    VStack(spacing: 12) {
+                        Text("You are in no room yet.").heading()
+                        Text("Make a room and share its link, or join one with the link and "
+                            + "passphrase someone sent you.")
+                            .secondaryText()
+                            .multilineTextAlignment(.center)
+                        HStack {
+                            Button("New Room…") { model.sheet = .newRoom }
+                                .keyboardShortcut(.defaultAction)
+                                .accessibilityIdentifier("empty-new-room")
+                            Button("Join Room…") { model.sheet = .joinRoom }
+                                .accessibilityIdentifier("empty-join-room")
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 case nil:
                     Text("Pick a room.")
                         .secondaryText()
