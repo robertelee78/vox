@@ -411,6 +411,18 @@ final class NodeModel: ObservableObject {
         return "Not reading each other yet: \(named). A member's card says who still has to trust whom."
     }
 
+    /// The rooms this node holds that `fingerprint` is a member of, by name (G2).
+    func sharedRooms(with fingerprint: String) async -> [String] {
+        var names: [String] = []
+        for room in rooms {
+            if let roster = try? await client.roster(room: room.id),
+               roster.contains(where: { $0.fingerprint == fingerprint }) {
+                names.append(room.name)
+            }
+        }
+        return names
+    }
+
     /// Open `fingerprint`'s card (D4), named `name` as the room names it.
     func openCard(_ fingerprint: String, name: String, act: NodeCardFor.Act? = nil) {
         keyringDid = nil

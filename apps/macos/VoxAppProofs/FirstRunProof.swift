@@ -67,12 +67,14 @@
 //     Compare goes group by group (#624): four groups of dave's fingerprint on his offer say "So
 //     far matches 4 of 13 groups."; on his card two say 2 of 13, a wrong third is named as group 3
 //     with no Remove (he is not in the keyring), and the whole of it is marked a match.
+//     The keyring's card for dave (G2) heads "dave ⇄ you", says he trusts alice too, names
+//     mission as a shared room, and its disclosure says what removing him would change.
 //
 // Mutants for (15), one each: the member rows drop a node's trust in alice unless she trusts it
 // (D4: the row reads "not in keyring"); the timeline drops the whereabouts line (D9); the join
 // line leaves out who trusts the newcomer (D10); Detach goes back to the chooser of every node
-// (D17); a compare that calls any partial entry a mismatch (#624). Each turns (15) red on its own
-// assertion.
+// (D17); a compare that calls any partial entry a mismatch (#624); the keyring card saying a node
+// that trusts alice back is still waiting (G2). Each turns (15) red on its own assertion.
 // Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
 // place of the app's hold), and quitting leaves it attached: (12) goes red. A room with a message
 // addressed to this node grouped as quiet (`attention::group`): (3) goes red. An app that never
@@ -1400,6 +1402,25 @@ final class FirstRunProof: XCTestCase {
                       "PRODUCT: trusted from his card, dave must be in alice's keyring; `vox trust list` said: \(ring)")
         tap(ui, Key.id("card-close"), "Close on dave's card")
         print("[proof] dave's row: \(rowSaid); banner: \(banner); card: \(directions) → \(cardSaid)")
+        // (15f, G2) The keyring's card for dave: each direction, the room it covers, and what
+        // removing him would change, behind a disclosure.
+        tap(ui, Key.id("keyring"), "Keyring in the sidebar")
+        tap(ui, Key.id("keyring-row-dave"), "dave's keyring entry", premise: trusted(vox, voxEnv, daveFp, "dave"))
+        let ringHead = words(ui, Key.id("keyring-card-heading"), timeout: 15,
+                             "dave's keyring card must head \"dave ⇄ you\": he trusts alice too",
+                             until: { $0 == "dave, trusted both ways" }) ?? ""
+        let theirs = words(ui, Key.id("keyring-card-theirs"), timeout: 5,
+                           "dave's direction must say he trusts alice too",
+                           until: { $0.hasPrefix("dave trusts you too.") }) ?? ""
+        let rooms = words(ui, Key.id("keyring-card-rooms"), timeout: 15,
+                          "dave's card must name the room alice shares with him, mission",
+                          until: { $0.hasPrefix("Shared rooms: ") && $0.contains("mission") }) ?? ""
+        tap(ui, Key.id("keyring-card-removal-open"), "What would removing dave change?")
+        let removal = words(ui, Key.id("keyring-card-removal"), timeout: 5,
+                            "the disclosure must say what removing dave would change",
+                            until: { $0.hasPrefix("Removing dave: it reads nothing you write from now on") }) ?? ""
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
+        print("[proof] keyring card: \(ringHead); \(theirs); \(rooms); \(removal.prefix(40))…")
         // (15c, D9) A message of alice's no member's node holds says so, then where it is.
         try staged(vox, ["node", "detach", "bob"], env: voxEnv)
         try staged(vox, ["node", "detach", "dave"], env: voxEnv)

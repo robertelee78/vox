@@ -175,9 +175,7 @@ struct NodeCard: View {
 
     /// Remove it from the keyring: what that does said first (E-5), done only when confirmed.
     @ViewBuilder private func removing(_ entry: TrustedNode) -> some View {
-        Text("Removing \(entry.name): it reads nothing you write from now on, and you read nothing "
-            + "it writes. What it already read stays read. Its live sessions into your services are "
-            + "cut. Your sender key is rotated, and everyone you still trust is re-keyed.")
+        Text(Effects.removing(entry.name))
             .accessibilityIdentifier("card-remove-effect")
         Button("Remove", role: .destructive) {
             Task { await model.untrust(entry) }

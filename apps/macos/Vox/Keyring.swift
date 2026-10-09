@@ -53,6 +53,11 @@ struct KeyringView: View {
                         .selectable(model.keyringSelected == node.fingerprint) {
                             model.keyringSelected = node.fingerprint
                         }
+                    // The selected entry's card (G2): each direction, the rooms, what removing it
+                    // would change.
+                    if model.keyringSelected == node.fingerprint {
+                        KeyringCard(model: model, node: node)
+                    }
                 }
             }
             .padding(24)
