@@ -89,6 +89,35 @@ pub struct NodeSummary {
     pub fingerprint: String,
     /// Attached with `--keep`: attached again whenever the daemon starts.
     pub keep: bool,
+    /// The harness whose sessions have run as this node (`claude`, `codex`, `opencode`), as its
+    /// `vox agent hook` recorded them in the node's `sessions/` directory; empty when no agent
+    /// session has. What the node is for, for display only (P8): a node no hook has run on yet
+    /// is not known to be an agent's.
+    pub harness: String,
+}
+
+/// The harness that `node`'s agent sessions recorded (see [`NodeSummary::harness`]); empty when
+/// none has. Read from the session registrations `vox agent hook` writes; the first by file
+/// name when there are several.
+fn harness_of(account: &Account, node: &str) -> String {
+    let Some(paths) = vox_core::node::paths::NodeName::parse(node)
+        .ok()
+        .and_then(|n| account.node_paths(&n).ok())
+    else {
+        return String::new();
+    };
+    let Ok(dir) = std::fs::read_dir(paths.session_dir()) else {
+        return String::new();
+    };
+    let mut files: Vec<PathBuf> = dir.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    files.sort();
+    files
+        .iter()
+        .filter(|f| f.extension().is_some_and(|x| x == "json"))
+        .filter_map(|f| std::fs::read(f).ok())
+        .filter_map(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .find_map(|v| v["harness"].as_str().filter(|h| !h.is_empty()).map(str::to_owned))
+        .unwrap_or_default()
 }
 
 /// A room the acting node holds.
@@ -1499,10 +1528,15 @@ impl VoxClient {
     /// # Errors
     /// The daemon did not answer.
     pub async fn nodes(&self) -> Result<Vec<NodeSummary>, VoxError> {
+        let account = Account::of(Some(&self.data_root), Some(&self.config_dir)).ok();
         match self.daemon(DaemonRequest::Nodes).await? {
             DaemonFrame::Nodes(infos) => Ok(infos
                 .into_iter()
                 .map(|n| NodeSummary {
+                    harness: account
+                        .as_ref()
+                        .map(|a| harness_of(a, n.name.as_str()))
+                        .unwrap_or_default(),
                     name: n.name.to_string(),
                     state: match n.state {
                         NodeState::Detached => "detached",

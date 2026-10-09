@@ -71,8 +71,9 @@ version too, until you quit it and open it again.
    [The menu bar item](#the-menu-bar-item)).
 2. **Which node is this app?** The app lists the nodes in this data root, each with its
    fingerprint art and fingerprint (once the node has been attached) and the line `Everything you
-   post, trust and share will be as NAME.` Check the fingerprint before you pick: an agent's node
-   is listed too. Pick yours. With no
+   post, trust and share will be as NAME.` A node an agent's sessions have run as is listed only
+   after **Show agent nodes**, and then says so: `An agent's node: Claude Code sessions run as it.`
+   Pick yours. With no
    node yet, it says so: make one in Terminal with `vox node create NAME`, then choose
    **Try Again**.
 3. **Attach node NAME.** Type the node's identity passphrase. The app hands the passphrase to the

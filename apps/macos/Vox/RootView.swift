@@ -304,20 +304,28 @@ private struct Welcome: View {
 private struct Chooser: View {
     let nodes: [String]
     @ObservedObject var model: AppModel
-    /// Each node's fingerprint, where the daemon knows it (P8).
-    @State private var known: [String: String] = [:]
+    /// What Vox knows of each node (P8).
+    @State private var known: [String: NodeSummary] = [:]
+    /// Agent nodes are listed only when asked for (P8): a relative must not pick one.
+    @State private var showAgents = false
+
+    /// The harness an agent node's sessions recorded; nil for any other node.
+    private func harness(_ node: String) -> String? {
+        known[node].map(\.harness).flatMap { $0.isEmpty ? nil : $0 }
+    }
 
     var body: some View {
         Text("Which node are you?").heading()
-            .task(id: nodes) { known = await model.fingerprints() }
+            .task(id: nodes) { known = await model.nodeFacts() }
         Text("This Mac has several nodes. Pick the one you post, trust and share as here; you "
             + "can switch later.")
             .secondaryText()
-        // Each node with its fingerprint art and its fingerprint, and what choosing it means, so
-        // a relative does not take an agent's node for theirs (P8).
-        ForEach(nodes, id: \.self) { node in
+        let agents = nodes.filter { harness($0) != nil }
+        // Each node with its fingerprint art and its fingerprint, what it is for where Vox knows
+        // it, and what choosing it means, so a relative does not take an agent's node for theirs.
+        ForEach(nodes.filter { showAgents || harness($0) == nil }, id: \.self) { node in
             HStack(alignment: .top, spacing: Space.s16) {
-                if let fingerprint = known[node] {
+                if let fingerprint = known[node]?.fingerprint, !fingerprint.isEmpty {
                     VStack(spacing: 0) {
                         ForEach(Array(fingerprintCard(fingerprint: fingerprint).art.enumerated()),
                                 id: \.offset) { Text($0.element) }
@@ -329,7 +337,13 @@ private struct Chooser: View {
                     Button(node) { Task { await model.choose(node) } }
                         .accessibilityIdentifier("node-\(node)")
                         .accessibilityLabel("Act as node \(node)")
-                    Text(known[node].map { fingerprintCard(fingerprint: $0).grouped }
+                    if let harness = harness(node) {
+                        Text("An agent's node: \(Chooser.harnessName(harness)) sessions run as it.")
+                            .secondaryText()
+                            .accessibilityIdentifier("node-for-\(node)")
+                    }
+                    Text(known[node].map(\.fingerprint).flatMap { $0.isEmpty ? nil : $0 }
+                            .map { fingerprintCard(fingerprint: $0).grouped }
                          ?? "Its fingerprint is known once this node has been attached.")
                         .font(Theme.mono).secondaryText().textSelection(.enabled)
                         .accessibilityIdentifier("node-fingerprint-\(node)")
@@ -339,6 +353,22 @@ private struct Chooser: View {
                 }
             }
             .padding(.vertical, Space.s8)
+        }
+        if !agents.isEmpty {
+            Toggle(agents.count == 1 ? "Show agent nodes (1)" : "Show agent nodes (\(agents.count))",
+                   isOn: $showAgents)
+                .accessibilityIdentifier("show-agent-nodes")
+        }
+    }
+
+    /// A harness as a person names it.
+    static func harnessName(_ key: String) -> String {
+        switch key {
+        case "claude": return "Claude Code"
+        case "codex": return "Codex"
+        case "opencode": return "OpenCode"
+        case "unknown": return "agent"
+        default: return key
         }
     }
 }

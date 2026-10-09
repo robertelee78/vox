@@ -214,13 +214,12 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Each node's fingerprint, by name, where the daemon knows it: an attached node's own, a
-    /// detached node's from its fingerprint file (P8). For display only.
-    func fingerprints() async -> [String: String] {
+    /// What Vox knows of each node, by name (P8): its fingerprint (an attached node's own, a
+    /// detached node's from its fingerprint file) and the harness its agent sessions recorded.
+    /// For display only.
+    func nodeFacts() async -> [String: NodeSummary] {
         guard let client, let nodes = try? await client.nodes() else { return [:] }
-        var known: [String: String] = [:]
-        for node in nodes where !node.fingerprint.isEmpty { known[node.name] = node.fingerprint }
-        return known
+        return Dictionary(nodes.map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a })
     }
 
     /// The person picked `name` at first run.
