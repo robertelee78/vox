@@ -475,7 +475,17 @@ final class NodeModel: ObservableObject {
 
     /// Register the LAN helper; macOS asks the person to approve it in System Settings, which
     /// the app opens and never clicks through (M-10, M-33).
+    ///
+    /// **Any earlier registration goes first.** macOS keeps the helper's background item by bundle
+    /// identifier and label, so every copy of Vox.app shares it: a copy that registers finds the
+    /// item another copy left and inherits its launch constraint, and launchd refuses this copy's
+    /// helper as a code-signing violation, approved or not (#439, on the v0.4.0 release). Unless
+    /// the helper is already enabled, it is unregistered before it is registered, so the item is
+    /// made for this copy.
     func allowLanHelper() async {
+        if await Self.lanHelperStatus() != .enabled {
+            try? await lanHelper.unregister()
+        }
         do {
             try lanHelper.register()
         } catch {
@@ -486,6 +496,17 @@ final class NodeModel: ObservableObject {
             SMAppService.openSystemSettingsLoginItems()
         }
         lanHelperReady = status == .enabled
+    }
+
+    /// Remove the LAN helper: launchd stops it and it is no longer registered, so nothing of Vox
+    /// runs as root. The family LAN is offered again only after the next approval (M-12).
+    func removeLanHelper() async {
+        do {
+            try await lanHelper.unregister()
+        } catch {
+            said = error.localizedDescription
+        }
+        lanHelperReady = await Self.lanHelperStatus() == .enabled
     }
 
     /// Bring this Mac onto `room`'s family LAN, or take it down; a failure is the daemon's

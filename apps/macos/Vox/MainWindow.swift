@@ -930,6 +930,8 @@ private struct FamilyLan: View {
                 Text(said).font(Theme.mono).secondaryText().textSelection(.enabled)
                     .accessibilityIdentifier("family-lan-said")
             }
+            Button("Remove the LAN Helper") { Task { await model.removeLanHelper() } }
+                .accessibilityIdentifier("family-lan-remove")
         } else {
             Text("The family LAN needs Vox's LAN helper: one root process that creates network "
                 + "interfaces for Vox and nothing else. Approve it once in System Settings.")

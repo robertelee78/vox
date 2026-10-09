@@ -1148,6 +1148,47 @@ fn lan_up_without_a_helper_refuses_and_creates_nothing() {
         !tmp.path().join("data").exists() && !tmp.path().join("cfg").exists(),
         "it touched the profile before refusing"
     );
+
+    // On a Mac, a `vox` inside Vox.app (as install.sh lays it out) points at the app's helper, which
+    // replaces `sudo vox lan helper` there (ADR-014 M-10). The default socket is the app helper's.
+    // Mutant: `lan_cli::vox_app` returns None; red as PRODUCT, it still says sudo.
+    #[cfg(target_os = "macos")]
+    {
+        const DEFAULT_SOCKET: &str = "/var/run/vox-lan.sock";
+        if std::os::unix::net::UnixStream::connect(DEFAULT_SOCKET).is_ok() {
+            panic!(
+                "CANNOT MEASURE (precondition unmet): a helper answers on {DEFAULT_SOCKET}, so \
+                 `vox lan up` would not refuse; stop it and run this again"
+            );
+        }
+        let app = tmp.path().join("Vox.app");
+        let helpers = app.join("Contents/Helpers");
+        std::fs::create_dir_all(&helpers).expect("APPARATUS: make the stand-in Vox.app");
+        std::fs::copy(VOX, helpers.join("vox"))
+            .expect("APPARATUS: put vox in the stand-in Vox.app");
+        let out = Command::new(helpers.join("vox"))
+            .args(["lan", "up", "family"])
+            .env("VOX_DATA_DIR", tmp.path().join("data"))
+            .env("VOX_CONFIG_DIR", tmp.path().join("cfg"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        eprintln!("[Vox.app's vox lan up] exit {:?}: {err}", out.status.code());
+        assert!(
+            !out.status.success()
+                && err.contains("Allow the LAN Helper")
+                && err.contains("Vox.app")
+                && !err.contains("sudo vox lan helper"),
+            "PRODUCT: the vox inside Vox.app did not point at the app's LAN helper: exit {:?}, \
+             said: {err}",
+            out.status.code()
+        );
+        assert!(
+            !tmp.path().join("data").exists() && !tmp.path().join("cfg").exists(),
+            "PRODUCT: the vox inside Vox.app touched the profile before refusing"
+        );
+    }
 }
 
 /// Something listening on the helper's path that is not a helper is refused **at once**, named,
