@@ -8,8 +8,7 @@ import SwiftUI
 
 struct MainWindow: View {
     @ObservedObject var model: NodeModel
-    /// The sidebar's width at launch, read once: given afresh on every update, the split view
-    /// put the sidebar back to it, and a drag never stuck (259 → 259 in the columns case).
+    /// The sidebar's width at launch, the one last kept, read once for this window.
     @State private var sidebarIdeal = Columns.width(.sidebar)
 
     var body: some View {
@@ -21,7 +20,7 @@ struct MainWindow: View {
             NavigationSplitView {
                 // Dragged wider or narrower, and remembered (Columns).
                 Sidebar(model: model)
-                    .remembersWidth(of: .sidebar)
+                    .onAppear { Columns.keepSidebarWidth() }
                     .navigationSplitViewColumnWidth(min: Columns.Side.sidebar.min,
                                                     ideal: sidebarIdeal,
                                                     max: Columns.Side.sidebar.max)

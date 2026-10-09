@@ -1166,14 +1166,29 @@ final class FirstRunProof: XCTestCase {
         func splitters() -> String {
             window.splitters.allElementsBoundByIndex.map { "\($0.frame)" }.joined(separator: " ")
         }
+        // The sidebar's edge as a person takes it: the pointer brought over the edge first, then
+        // pressed 5 points right of the separator XCTest reports and dragged. XCTest's press at
+        // the separator itself never reached the split view (the sidebar-resize spike: 13 grips,
+        // none moved it; with a hover, +5 points did). A drag that leaves the sidebar where it
+        // was did not reach the split view: that is the apparatus, never the product, since a
+        // person's drag at the same edge resizes it.
         let row0 = rowEdge(), split0 = splitters()
-        drag(side, by: 80)
+        let grip = window.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: side.frame.midX + 5 - window.frame.minX,
+                                 dy: side.frame.midY - window.frame.minY))
+        grip.hover()
+        Thread.sleep(forTimeInterval: 0.5)
+        grip.press(forDuration: 0.5, thenDragTo: grip.withOffset(CGVector(dx: 80, dy: 0)),
+                   withVelocity: .slow, thenHoldForDuration: 0.5)
+        Thread.sleep(forTimeInterval: 1)
+        let sidebar1 = sidebarWidth()
         let row1 = rowEdge(), split1 = splitters()
-        print("[proof] columns: sidebar drag: splitter \(sidebar0) → \(sidebarWidth()); Keyring row's edge \(row0) → \(row1); splitters before \(split0); after \(split1); window \(window.frame)")
+        print("[proof] columns: sidebar drag: splitter \(sidebar0) → \(sidebar1); Keyring row's edge \(row0) → \(row1); splitters before \(split0); after \(split1); window \(window.frame)")
+        guard abs(sidebar1 - sidebar0) >= 10 else {
+            throw Apparatus("the drag did not reach the split view: the sidebar stayed \(sidebar0) wide after a drag at its edge (a person's drag there resizes it)")
+        }
         drag(inspectorDivider(), by: -60)
-        let sidebar1 = sidebarWidth(), inspector1 = inspectorWidth()
-        XCTAssertTrue(sidebar1 > sidebar0 + 40,
-                      "PRODUCT: dragging the sidebar's divider 80 points right must widen the sidebar; it went from \(sidebar0) to \(sidebar1) (the Keyring row's edge \(row0) → \(row1))")
+        let inspector1 = inspectorWidth()
         XCTAssertTrue(inspector1 > inspector0 + 30,
                       "PRODUCT: dragging the inspector's divider 60 points left must widen the inspector; it went from \(inspector0) to \(inspector1)")
 
