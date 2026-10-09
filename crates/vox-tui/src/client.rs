@@ -663,7 +663,7 @@ pub async fn events(at: &NodeSocket) -> Result<IpcClient, AppError> {
 /// `vox node create <name> [--headless]`: write the node's files here (C-5), sending nothing over
 /// the socket.
 /// Its passphrase comes from `--passphrase-file`, `VOX_IDENTITY_PASSPHRASE`, or the terminal
-/// (asked twice); an empty one is allowed.
+/// (asked twice); an empty one is refused, before anything is written.
 ///
 /// # Errors
 /// A bad name, a node that exists, or a passphrase that cannot be had.
@@ -680,11 +680,6 @@ pub fn node_create(
             "there is a node {name} already; `vox node list` lists them"
         )));
     }
-    let paths = Paths::resolve(
-        name.as_str(),
-        args.data_dir.as_deref(),
-        args.config_dir.as_deref(),
-    )?;
     // **A headless node is an anchor's** (ADR-026 N-5, ADR-016): a key file and no vault, so it
     // runs with nobody at a keyboard; it holds no room and can read nothing.
     if headless {
@@ -693,6 +688,11 @@ pub fn node_create(
                 "a headless node has no passphrase: its key is a file only you can read".into(),
             ));
         }
+        let paths = Paths::resolve(
+            name.as_str(),
+            args.data_dir.as_deref(),
+            args.config_dir.as_deref(),
+        )?;
         let fp = vox_core::identity::composite::RootSigner::fingerprint(
             &vox_core::node::headless::load_or_create_identity(&paths)?,
         );
@@ -703,11 +703,19 @@ pub fn node_create(
         eprintln!("vox: {}", crate::ident::NO_BACKUP);
         return Ok(());
     }
-    let passphrase = Zeroizing::new(crate::tunnel_cli::identity_passphrase_for(
-        &paths,
+    // **The passphrase is had, and an empty one refused, before anything is written** (K-11):
+    // resolving the paths makes `nodes/<name>/`, and a refused create leaves nothing behind.
+    let passphrase = Zeroizing::new(crate::tunnel_cli::new_identity_passphrase(
         None,
         passphrase_file,
+        "Run it at a terminal, or give the new passphrase with --passphrase-file <path> (`-` \
+         reads stdin) or VOX_IDENTITY_PASSPHRASE; nothing was created.",
     )?);
+    let paths = Paths::resolve(
+        name.as_str(),
+        args.data_dir.as_deref(),
+        args.config_dir.as_deref(),
+    )?;
     let fp = create_identity(&paths, &passphrase)?;
     println!("vox: created node {name}");
     println!("{}", vox_core::node::link::b32_encode(&fp));
