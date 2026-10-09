@@ -1060,6 +1060,7 @@ fn said(socket: &std::path::Path, e: Error) -> VoxError {
 /// again; another process holding the node is no passphrase's to fix. Told apart by the daemon's
 /// own refusal sentence for this node, word for word; anything else as [`said`] says it.
 fn attach_said(socket: &std::path::Path, node: &NodeName, e: Error) -> VoxError {
+    use vox_core::error::IpcHandshake;
     use vox_core::node::daemonipc::Refusal;
     if let Error::Ipc(IpcHandshake::Refused { reason }) = &e {
         if *reason == (Refusal::WrongPassphrase { node: node.clone() }).to_string() {
