@@ -133,11 +133,11 @@ enum Effects {
     static func trusting(_ alias: String) -> String {
         "Trusting \(alias): it may read what you write in every room you share, now and later; you "
             + "read what it writes once it trusts you too; and it reaches every service you bind "
-            + "to a room you are both in. Untrusting it undoes this."
+            + "to a room you are both in. Removing it undoes this."
     }
 
     static func untrusting(_ alias: String) -> String {
-        "Untrusting \(alias): it reads nothing you write from now on, and you read nothing it "
+        "Removing \(alias): it reads nothing you write from now on, and you read nothing it "
             + "writes. What it already read stays read. Its live sessions into your services are "
             + "cut. Your sender key is rotated, and everyone you still trust is re-keyed."
     }
@@ -222,7 +222,7 @@ private struct KeyringRow: View {
                         StateMark(kind: .danger,
                                   words: "Does not match. This is not the node you trusted as "
                                       + "\(node.name): do not trust it.")
-                        Button("Untrust \(node.name)…", role: .destructive, action: remove)
+                        Button("Remove \(node.name)…", role: .destructive, action: remove)
                     }
                 }
             }
@@ -258,7 +258,7 @@ private struct Removal: Identifiable {
     var id: String { node.fingerprint }
 }
 
-/// Remove: what untrusting does, said first (E-5), then done only when the person confirms.
+/// Remove: what removing does, said first (E-5), then done only when the person confirms.
 private struct RemoveSheet: View {
     @ObservedObject var model: NodeModel
     let node: TrustedNode
@@ -271,12 +271,12 @@ private struct RemoveSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Untrust \(node.name)?").heading()
+            Text("Remove \(node.name)?").heading()
             Text(Effects.untrusting(node.name))
                 .accessibilityIdentifier("keyring-remove-effect")
             HStack {
                 Button("Cancel", action: done).keyboardShortcut(.cancelAction)
-                Button("Untrust", role: .destructive) {
+                Button("Remove", role: .destructive) {
                     working = true
                     failed = nil
                     Task {
@@ -292,7 +292,7 @@ private struct RemoveSheet: View {
                     }
                 }
                 .disabled(working || asking)
-                .accessibilityIdentifier("keyring-untrust-confirm")
+                .accessibilityIdentifier("keyring-remove-confirm")
             }
             if asking {
                 KeyringPassphrase(model: model)

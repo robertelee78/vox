@@ -24,7 +24,7 @@
 //    agent drain (`vox agent hook`), shows "read by bob" under it in her timeline.
 // 5. The keyring view (ADR-014 M-16, ADR-028 K-3, E-5, #443): a pasted fingerprint with an alias
 //    says what trusting does before it is done, and is listed, as `vox trust list` lists it;
-//    removing it says what untrusting does first, and only then removes it.
+//    removing it says what removing does first, and only then removes it.
 // 6. Attaching a file (ADR-014 M-24, ADR-028 F-1, #449): chosen with Attach…, addressed To: bob
 //    with a note, it is one share: bob's node pulls it by itself, byte for byte, and the note is
 //    in the share's announcement, never a message of its own.
@@ -811,9 +811,9 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("keyring-remove-carol"), "Remove… on carol",
             premise: trusted(vox, voxEnv, carolFp, "carol"))
         words(ui, Key.id("keyring-remove-effect"), timeout: 10,
-              "removing must say what untrusting does before it is done",
+              "removing must say what removing does before it is done",
               until: { $0.contains("reads nothing you write from now on") })
-        tap(ui, Key.id("keyring-untrust-confirm"), "Untrust")
+        tap(ui, Key.id("keyring-remove-confirm"), "Remove, in its sheet")
         keyringPassphraseIfAsked(ui) { self.locate(ui, carolRow) == nil }
         var after5 = ""
         let goneUntil = Date().addingTimeInterval(30)
@@ -829,7 +829,7 @@ final class FirstRunProof: XCTestCase {
         if windowReadable(ui), let row = locate(ui, carolRow) {
             XCTFail("PRODUCT: once untrusted, carol must be gone from the keyring view; it still shows \"\(shown(row))\"")
         }
-        print("[proof] keyring: added and listed carol, then removed her after saying what untrusting does")
+        print("[proof] keyring: added and listed carol, then removed her after saying what removing does")
 
         }
 
@@ -1182,9 +1182,9 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("keyring"), "Keyring in the sidebar")
         tap(ui, Key.id("keyring-remove-bob"), "Remove… on bob", premise: trusted(vox, voxEnv, bobFp, "bob"))
         words(ui, Key.id("keyring-remove-effect"), timeout: 10,
-              "removing bob must say what untrusting does first",
+              "removing bob must say what removing does first",
               until: { $0.contains("reads nothing you write from now on") })
-        tap(ui, Key.id("keyring-untrust-confirm"), "Untrust")
+        tap(ui, Key.id("keyring-remove-confirm"), "Remove, in its sheet")
         keyringPassphraseIfAsked(ui) { self.locate(ui, Key.id("keyring-row-bob")) == nil }
         XCTAssertTrue(live.cut(within: 30),
                       "PRODUCT: alice untrusted bob in the keyring view; bob's live connection into her service must be cut within 30 s, and it was not")
