@@ -234,6 +234,10 @@ private struct RoomForm: View {
     @State private var link = ""
     @State private var name = ""
     @State private var field = SecureFieldHolder()
+    /// Whether the passphrase field is empty: a room may have none (ADR-005 J-2 as amended).
+    @State private var noPassphrase = true
+    /// A create or join under way: Return and the button may both ask.
+    @State private var submitting = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -248,14 +252,20 @@ private struct RoomForm: View {
             }
             Text(joining ? "The room's passphrase, sent to you another way than its link."
                 : "A passphrase for the room: send it another way than its link.").secondaryText()
-            SecureInput(holder: field) { submit() }.frame(width: Theme.scaled(320))
+            SecureInput(holder: field, onEmpty: { noPassphrase = $0 }) { submit() }
+                .frame(width: Theme.scaled(320))
                 .accessibilityLabel(joining ? "Room passphrase" : "Passphrase for the new room")
                 .accessibilityIdentifier("room-form-passphrase")
+            if noPassphrase {
+                // Allowed, and said (D16): a room without one is open to anyone with its link.
+                Text("No passphrase: anyone with the link can join.")
+                    .accessibilityIdentifier("room-form-no-passphrase")
+            }
             if let said = model.said { StateMark(kind: .danger, words: said).textSelection(.enabled) }
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 Button(joining ? "Join" : "Create") { submit() }.keyboardShortcut(.defaultAction)
-                    .disabled(joining ? link.isEmpty : name.isEmpty)
+                    .disabled(submitting || (joining ? link.isEmpty : name.isEmpty))
                     .accessibilityIdentifier("room-form-submit")
             }
         }
@@ -264,12 +274,17 @@ private struct RoomForm: View {
     }
 
     private func submit() {
-        // Return and the button may both ask: the second finds the field empty.
-        guard let secret = field.take() else { return }
+        // Return and the button may both ask: the second finds one under way. An empty field is
+        // a room with no passphrase, never nothing done (D16).
+        guard !submitting, joining ? !link.isEmpty : !name.isEmpty else { return }
+        submitting = true
+        let secret = field.takeAllowingEmpty()
+        noPassphrase = true
         let (l, n) = (link, name)
         Task {
             let ok = joining ? await model.joinRoom(l, passphrase: secret)
                 : await model.createRoom(n, passphrase: secret)
+            submitting = false
             if ok { model.sheet = nil }
         }
     }
