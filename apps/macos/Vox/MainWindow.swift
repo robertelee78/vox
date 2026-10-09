@@ -475,6 +475,8 @@ private struct RoomView: View {
                     }
                     .background(WindowReader(seen: window))
                     .onChange(of: window.seen) { _ in markSeen() }
+                    .onChange(of: model.showing) { _ in updateLooking() }
+                    .onDisappear { if model.lookingAt == room { model.lookingAt = nil } }
                     // A row whose body has just arrived is read now, even if its frame is
                     // unchanged (no new measure to trigger it).
                     .onChange(of: model.messages) { _ in markSeen() }
@@ -661,9 +663,21 @@ private struct RoomView: View {
         return true
     }
 
+    /// Tell the model whether this room's own timeline is being looked at as it grows: in a window
+    /// in front of the person, General or All shown (not a Session), and its newest message in
+    /// view, so the next one is drawn in view as it lands (D18).
+    private func updateLooking() {
+        var ownTimeline = true
+        if case .session = model.showing { ownTimeline = false }
+        let following = newest == nil || inView.contains(newest ?? "")
+        let now = window.seen && ownTimeline && following ? room : nil
+        if model.lookingAt != now { model.lookingAt = now }
+    }
+
     /// The rows in view are read, only while the window is in front of the person (R-6).
     private func markSeen() {
         readLog.debug("seen check in \(room, privacy: .public): window seen \(window.seen), \(inView.count) rows in view")
+        updateLooking()
         guard window.seen else { return }
         for id in inView {
             if let message = model.byID[id] { model.drawn(message, in: room) }
