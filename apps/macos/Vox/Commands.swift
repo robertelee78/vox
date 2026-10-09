@@ -91,6 +91,16 @@ extension VoxAction {
             VoxAction("View", "Focus Timeline", "t", [.command, .control], enabled: inRoom) {
                 NotificationCenter.default.post(name: .voxFocusTimeline, object: nil)
             },
+            // On the selected request of the Session on screen (P1). ⌥⌘Y and ⌥⌘N: ⌘Y is the
+            // system's history and ⌘N New Room.
+            VoxAction("Room", "Approve Request", "y", [.command, .option],
+                      enabled: node?.selectedApproval != nil) {
+                Task { await node?.answerSelected(approve: true) }
+            },
+            VoxAction("Room", "Reject Request", "n", [.command, .option],
+                      enabled: node?.selectedApproval != nil) {
+                Task { await node?.answerSelected(approve: false) }
+            },
             VoxAction("Room", "Copy Selected Service's Address", "c", [.command, .shift],
                       enabled: node?.selectedService != nil) { node?.copyServiceCommand() },
             VoxAction("Room", "Next Room That Needs You", "j", enabled: live) {

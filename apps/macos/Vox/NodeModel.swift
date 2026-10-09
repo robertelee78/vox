@@ -122,6 +122,15 @@ final class NodeModel: ObservableObject {
     var sessionDrafts: [String: String] = [:]
     /// What each room last showed (General, All, or a Session), restored when it opens again.
     var lastShowing: [String: Showing] = [:]
+
+    /// The request selected in the Session on screen, by its reference: what Approve (⌥⌘Y) and
+    /// Reject (⌥⌘N) act on, and where ⌘J and a notification land (P1).
+    @Published var selectedRequest: String?
+    /// The requests waiting on this node already known, by `room/node/session/reference`: one
+    /// that is new notifies, once per Session (P1). Taken in silence the first time, so opening
+    /// Vox notifies nothing.
+    private var knownWaiting: Set<String> = []
+    private var waitingSeen = false
     /// The room on screen's Sessions, open and ended (ADR-029 CL-2).
     @Published private(set) var sessions: [FfiSession] = []
     /// The Session on screen's entries, oldest first, to a member with drive (SC-1).
@@ -222,6 +231,9 @@ final class NodeModel: ObservableObject {
         notifies = notify
         guard notify else { return }
         notifier.open = { [weak self] room in Task { await self?.show(.room(room)) } }
+        notifier.openRequest = { [weak self] room, node, session, reference in
+            Task { await self?.openRequest(room: room, node: node, session: session, reference: reference) }
+        }
         notifier.allowed = { [weak self] granted in self?.notifying = granted }
         notifier.ask()
     }
@@ -795,7 +807,13 @@ final class NodeModel: ObservableObject {
     /// The next room that needs the person, if any (W-2).
     func nextNeedingYou() async {
         if let room = group(.needsYou).first {
-            await show(.room(room.id))
+            // A request waiting in one of its Sessions: that Session, that request (P1).
+            if let waiting = await firstWaiting(in: room.id) {
+                await openRequest(room: room.id, node: waiting.node, session: waiting.session,
+                                  reference: waiting.reference)
+            } else {
+                await show(.room(room.id))
+            }
         } else if let offer = offers.first {
             await show(.offer(offer.fingerprint))
         }
@@ -1045,6 +1063,86 @@ extension NodeModel {
                 rooms[i].waiting = n
             }
         }
+        await noteWaiting()
+    }
+
+    /// The requests open in `room`'s Sessions this node drives, waiting on it, in each Session's
+    /// order: `(node, session, reference, label)`.
+    private func waiting(in room: String) async -> [(node: String, session: String, reference: String, label: String)] {
+        guard let listed = try? await client.sessions(room: room) else { return [] }
+        var found: [(node: String, session: String, reference: String, label: String)] = []
+        for s in listed where s.pending > 0 && s.canDrive && s.open {
+            guard let read = try? await client.sessionRead(room: room, node: s.nodeFingerprint,
+                                                           sessionId: s.sessionId) else { continue }
+            for e in read.entries {
+                if let r = e.request, r.state == nil {
+                    found.append((s.nodeFingerprint, s.sessionId, r.reference, s.label))
+                }
+            }
+        }
+        return found
+    }
+
+    /// The first request waiting in `room`, for ⌘J.
+    private func firstWaiting(in room: String) async -> (node: String, session: String, reference: String)? {
+        guard let w = await waiting(in: room).first else { return nil }
+        return (w.node, w.session, w.reference)
+    }
+
+    /// A request that is new since the last look notifies, once per Session, replacing that
+    /// Session's earlier one; a Session no longer waiting has its notification withdrawn (P1).
+    /// Never the request's text (R-10).
+    private func noteWaiting() async {
+        var now: Set<String> = []
+        var bySession: [String: (room: String, node: String, session: String, reference: String, label: String)] = [:]
+        for room in rooms where room.open {
+            for w in await waiting(in: room.id) {
+                let key = "\(room.id)/\(w.node)/\(w.session)/\(w.reference)"
+                now.insert(key)
+                if !knownWaiting.contains(key) && waitingSeen {
+                    bySession["\(room.id)/\(w.node)/\(w.session)"] = (room.id, w.node, w.session, w.reference, w.label)
+                }
+            }
+        }
+        for (_, w) in bySession {
+            let name = rooms.first { $0.id == w.room }?.name ?? "a room"
+            notifier.postWaiting(room: w.room, roomName: name, node: w.node, session: w.session,
+                                 reference: w.reference, label: w.label)
+        }
+        let stillWaiting = Set(now.map { $0.split(separator: "/").prefix(3).joined(separator: "/") })
+        for gone in Set(knownWaiting.map { $0.split(separator: "/").prefix(3).joined(separator: "/") })
+            .subtracting(stillWaiting) {
+            notifier.withdrawWaiting(sessionKey: gone)
+        }
+        knownWaiting = now
+        waitingSeen = true
+    }
+
+    /// Open `room`, its Session `session` of `node`, and select its request `reference`, centred
+    /// (P1): where a notification and ⌘J land.
+    func openRequest(room: String, node: String, session: String, reference: String) async {
+        await show(.room(room))
+        showing = .session(node: node, id: session)
+        selectedRequest = reference
+    }
+
+    /// The approval selected in the Session on screen, open and this node's to answer: what
+    /// ⌥⌘Y and ⌥⌘N act on (P1). Questions are answered by their options, not these keys.
+    var selectedApproval: (session: FfiSession, room: String, reference: String)? {
+        guard let reference = selectedRequest, let s = shownSession, s.canDrive, s.open,
+              let room = roomOnScreen,
+              let r = sessionEntries.compactMap(\.request).first(where: { $0.reference == reference }),
+              r.state == nil, !r.isQuestion else { return nil }
+        return (s, room, reference)
+    }
+
+    /// Approve (⌥⌘Y) or Reject (⌥⌘N) the selected approval, and say what came of it (P1).
+    func answerSelected(approve: Bool) async {
+        guard let a = selectedApproval else { return }
+        let action: DriveAction = approve ? .approve(reference: a.reference)
+            : .reject(reference: a.reference, why: nil)
+        did = await drive(a.session, in: a.room, action)
+        await readSession()
     }
 
     /// A Session in `room` opened, ended or was renamed, or what waits on this node changed.
@@ -1054,6 +1152,7 @@ extension NodeModel {
             let n = listed.reduce(0) { $0 + Int($1.pending) }
             if rooms[i].waiting != n { rooms[i].waiting = n }
         }
+        await noteWaiting()
         guard roomOnScreen == room, let listed = try? await client.sessions(room: room),
               roomOnScreen == room else { return }
         if listed != sessions { sessions = listed }

@@ -465,6 +465,12 @@ private struct RoomView: View {
                                 }
                                 newest = model.messages.last?.id
                             }
+                            // A request ⌘J or a notification landed on, centred once its
+                            // Session's entries are drawn (P1).
+                            .onChange(of: model.selectedRequest) { ref in centre(ref, scroller) }
+                            .onChange(of: model.sessionEntries.count) { _ in
+                                centre(model.selectedRequest, scroller)
+                            }
                             .onChange(of: model.messages.count) { _ in
                                 let following = newest == nil || inView.contains(newest ?? "")
                                 if following, let last = model.messages.last {
@@ -636,6 +642,15 @@ private struct RoomView: View {
             scroller.scrollTo(ids[next])
         }
         return true
+    }
+
+    /// Scroll the request `reference`'s entry to the middle of the timeline, once it is drawn.
+    private func centre(_ reference: String?, _ scroller: ScrollViewProxy) {
+        guard let reference,
+              let entry = model.sessionEntries.first(where: { $0.request?.reference == reference }) else { return }
+        withAnimation(Theme.motion(reduced: reduceMotion)) {
+            scroller.scrollTo("entry-\(entry.id)", anchor: .center)
+        }
     }
 
     /// The selected message, as the timeline shows it.

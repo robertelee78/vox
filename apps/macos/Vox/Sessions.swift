@@ -114,6 +114,7 @@ struct SessionEntryRow: View {
     @State private var details = false
 
     var body: some View {
+        let reference = entry.request?.reference
         VStack(alignment: .leading, spacing: 4) {
             Text(entry.line).font(Theme.mono).textSelection(.enabled)
                 .accessibilityIdentifier("entry-line-\(entry.id)")
@@ -142,5 +143,23 @@ struct SessionEntryRow: View {
             }
         }
         .padding(.horizontal, 4)
+        // A request is selected by clicking it: what ⌥⌘Y and ⌥⌘N act on (P1).
+        .modifier(RequestSelection(model: model, reference: reference))
+    }
+}
+
+/// A request's row marked while it is the one selected, and selected by a click (P1); any other
+/// row as it is.
+private struct RequestSelection: ViewModifier {
+    @ObservedObject var model: NodeModel
+    let reference: String?
+
+    func body(content: Content) -> some View {
+        if let reference {
+            content.selectable(model.selectedRequest == reference) { model.selectedRequest = reference }
+                .accessibilityIdentifier("request-row-\(reference)")
+        } else {
+            content
+        }
     }
 }
