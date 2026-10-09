@@ -17,6 +17,9 @@ struct VoxApp: App {
     var body: some Scene {
         Window("Vox", id: "main") {
             RootView(model: model)
+                // A vox:// room link opened anywhere (Mail, Messages, a browser) opens the Join
+                // sheet with it filled in; joining still takes the room's passphrase and a click.
+                .onOpenURL { model.openLink($0) }
                 // Every view's text in the app's face and size; drawn again when the size
                 // changes (View > Bigger, Smaller, Actual Size).
                 .font(Theme.text)

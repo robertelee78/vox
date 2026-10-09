@@ -241,6 +241,7 @@ private struct RoomForm: View {
             if joining {
                 TextField("Room link (vox://…)", text: $link).font(Theme.mono)
                     .accessibilityLabel("Room link")
+                    .accessibilityIdentifier("room-form-link")
             } else {
                 TextField("Its name, as every member sees it", text: $name)
                     .accessibilityLabel("Room name")
@@ -261,6 +262,14 @@ private struct RoomForm: View {
         }
         .padding(24)
         .frame(width: Theme.scaled(440))
+        .onAppear {
+            // A link the system opened the app with fills the field; nothing is joined until the
+            // person types the passphrase and clicks Join.
+            if joining, let given = model.joinLink {
+                link = given
+                model.joinLink = nil
+            }
+        }
     }
 
     private func submit() {

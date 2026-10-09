@@ -172,6 +172,15 @@ final class NodeModel: ObservableObject {
     }
     /// The last thing that failed, in the daemon's words (M-7), or the node's last notice.
     @Published private(set) var said: String?
+    /// A room link to fill the Join sheet with, taken by the sheet when it opens.
+    @Published var joinLink: String?
+
+    /// Open the Join sheet with `link` filled in (a vox:// link the system opened the app with).
+    func offerJoin(_ link: String) {
+        joinLink = link
+        sheet = .joinRoom
+    }
+
     /// The node ended: detached, or the daemon stopped.
     @Published private(set) var ended: String?
 

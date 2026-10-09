@@ -197,6 +197,21 @@ final class AppModel: ObservableObject {
         await reach()
     }
 
+    /// A vox:// room link the system opened the app with, held until a node is attached: it fills
+    /// in the Join sheet, and never joins by itself.
+    private var pendingLink: String?
+
+    /// The system opened `url`: a room link goes to the Join sheet, now or once a node is attached.
+    func openLink(_ url: URL) {
+        guard url.scheme?.lowercased() == "vox" else { return }
+        let link = url.absoluteString
+        if let node {
+            node.offerJoin(link)
+        } else {
+            pendingLink = link
+        }
+    }
+
     /// Let go of the node and end the client (A-4).
     func quit() async {
         await client?.close()
@@ -238,6 +253,10 @@ final class AppModel: ObservableObject {
         let model = NodeModel(client: client, node: node, me: fingerprint)
         self.node = model
         phase = .attached(node: node, fingerprint: fingerprint)
+        if let link = pendingLink {
+            pendingLink = nil
+            model.offerJoin(link)
+        }
         Task { await model.start() }
     }
 
