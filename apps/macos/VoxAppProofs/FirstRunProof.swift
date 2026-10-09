@@ -356,6 +356,109 @@ final class FirstRunProof: XCTestCase {
         print("[proof] login item: quoted \"\(quoted)\"; after Turn Keep Running Off the answer is \(answer.debugDescription)")
     }
 
+    /// The window's side columns (v0.4.1, the decider: "I should also be able to resize it, and
+    /// resize the one on the right too"), alone. Staged by `vox`: alice attached, with one room,
+    /// chosen before; Keep Running not chosen. Dragging the sidebar's divider and the inspector's
+    /// changes each column's width; both widths are the same after ⌘Q and a new launch; and View >
+    /// Hide Inspector (⌥⌘I) hides the inspector and Show Inspector brings it back.
+    /// Mutation: Columns.remember a no-op → red at "after a new launch".
+    func testColumnsResizeAndAreRememberedAndTheInspectorHides() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
+            throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are set by scripts/app-proofs.sh")
+        }
+        let vox = URL(fileURLWithPath: appPath).appendingPathComponent("Contents/Helpers/vox").path
+        let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("columns")
+        let data = root.appendingPathComponent("data").path
+        let config = root.appendingPathComponent("config").path
+        let home = root.appendingPathComponent("home").path
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+                           until: "vox daemon: control socket")
+        let idPass = root.appendingPathComponent("alice.pass").path
+        let roomPass = root.appendingPathComponent("room.pass").path
+        try stager.write(Data("alice identity\n".utf8), to: idPass)
+        try stager.write(Data("columns room\n".utf8), to: roomPass)
+        try staged(vox, ["node", "create", "alice"],
+                   env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "alice identity"]) { $1 })
+        try staged(vox, ["node", "attach", "alice", "--passphrase-file", idPass], env: voxEnv)
+        try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", roomPass,
+                         "--name", "columns"], env: voxEnv)
+        try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
+        try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+        // The widths start from the standard ones: the column keys, in the bundle under proof's
+        // own defaults (never the person's Vox), are removed first.
+        let domain = stager.run(["/usr/bin/defaults", "read", appPath + "/Contents/Info", "CFBundleIdentifier"],
+                                env: [:]).out.trimmingCharacters(in: .whitespacesAndNewlines)
+        let proofID = "us.vox.app.proof"  // app-proofs.sh's VOX_APP_ID
+        guard domain == proofID else {
+            throw Apparatus("\(appPath) is \(domain.debugDescription), not \(proofID): its defaults could be the person's")
+        }
+        for key in ["column.sidebar.width", "column.inspector.width", "column.inspector.shown"] {
+            _ = stager.run(["/usr/bin/defaults", "delete", domain, key], env: [:])
+        }
+
+        let ui = voxApp(appPath)
+        ui.launchEnvironment = voxEnv.merging(["HOME": home]) { $1 }
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        defer { ui.terminate() }
+        present(ui, Key.id("attached"), timeout: 60, "the app must open attached as alice")
+        tap(ui, Key.id("room-columns"), "the room columns in the sidebar")
+        present(ui, Key.id("inspector"), timeout: 10, "a room on screen must show its inspector")
+
+        /// The window's dividers, left to right: the sidebar's, then the inspector's.
+        func dividers() -> [XCUIElement] {
+            ui.windows.firstMatch.splitters.allElementsBoundByIndex
+                .filter { $0.exists && $0.frame.width > 0 }
+                .sorted { $0.frame.minX < $1.frame.minX }
+        }
+        func sidebarWidth() -> CGFloat {
+            guard let d = dividers().first else { return -1 }
+            return d.frame.minX - ui.windows.firstMatch.frame.minX
+        }
+        func inspectorWidth() -> CGFloat {
+            let e = ui.descendants(matching: .any).matching(identifier: "inspector").firstMatch
+            return e.exists ? e.frame.width : -1
+        }
+        func drag(_ divider: XCUIElement, by dx: CGFloat) {
+            let at = divider.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            at.press(forDuration: 0.3, thenDragTo: at.withOffset(CGVector(dx: dx, dy: 0)))
+            Thread.sleep(forTimeInterval: 1)
+        }
+        let found = dividers()
+        guard found.count >= 2 else {
+            throw Apparatus("XCTest finds \(found.count) divider(s) in the window, not the sidebar's and the inspector's: \(found.map { $0.frame })")
+        }
+        let sidebar0 = sidebarWidth(), inspector0 = inspectorWidth()
+        drag(found[0], by: 80)
+        drag(dividers()[1], by: -60)
+        let sidebar1 = sidebarWidth(), inspector1 = inspectorWidth()
+        XCTAssertTrue(sidebar1 > sidebar0 + 40 && inspector1 > inspector0 + 30,
+                      "PRODUCT: dragging the dividers must widen the sidebar and the inspector; the sidebar went from \(sidebar0) to \(sidebar1), the inspector from \(inspector0) to \(inspector1)")
+
+        // ⌘Q, and a new launch: the same widths.
+        ui.typeKey("q", modifierFlags: .command)
+        XCTAssertTrue(ui.wait(for: .notRunning, timeout: 30), "PRODUCT: ⌘Q did not quit the app")
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        present(ui, Key.id("attached"), timeout: 60, "after a new launch, the app must open attached as alice")
+        tap(ui, Key.id("room-columns"), "after a new launch, the room columns")
+        present(ui, Key.id("inspector"), timeout: 10, "after a new launch, the room's inspector")
+        Thread.sleep(forTimeInterval: 1)
+        let sidebar2 = sidebarWidth(), inspector2 = inspectorWidth()
+        XCTAssertTrue(abs(sidebar2 - sidebar1) <= 4 && abs(inspector2 - inspector1) <= 4,
+                      "PRODUCT: the column widths must be the same after a new launch; the sidebar was \(sidebar1) and is \(sidebar2), the inspector was \(inspector1) and is \(inspector2)")
+
+        // Hide the inspector, then show it again, with ⌥⌘I.
+        ui.typeKey("i", modifierFlags: [.command, .option])
+        let hidden = ui.descendants(matching: .any).matching(identifier: "inspector").firstMatch
+            .waitForNonExistence(timeout: 5)
+        ui.typeKey("i", modifierFlags: [.command, .option])
+        let back = present(ui, Key.id("inspector"), timeout: 5, "⌥⌘I again must show the inspector")
+        XCTAssertTrue(hidden && back,
+                      "PRODUCT: View > Hide Inspector (⌥⌘I) must hide the inspector and Show Inspector bring it back; hidden \(hidden), back \(back)")
+        print("[proof] columns: sidebar \(sidebar0) → \(sidebar1) → after relaunch \(sidebar2); inspector \(inspector0) → \(inspector1) → \(inspector2); hide \(hidden), show \(back)")
+    }
+
     /// (8) Notifications (ADR-014 M-23, ADR-028 R-10, #448), alone: the one step that needs a
     /// person at the Mac, so it is run by itself, in about a minute, with no replay of the
     /// journey. Staged by `vox` alone: alice and bob, a room of alice's that bob joined, each

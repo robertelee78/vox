@@ -12,8 +12,12 @@ struct MainWindow: View {
     var body: some View {
         VStack(spacing: 0) {
             NavigationSplitView {
+                // Dragged wider or narrower, and remembered (Columns).
                 Sidebar(model: model)
-                    .navigationSplitViewColumnWidth(min: Theme.scaled(220), ideal: Theme.scaled(260))
+                    .remembersWidth(of: .sidebar)
+                    .navigationSplitViewColumnWidth(min: Columns.Side.sidebar.min,
+                                                    ideal: Columns.width(.sidebar),
+                                                    max: Columns.Side.sidebar.max)
             } detail: {
                 switch model.selection {
                 case let .room(id):
@@ -43,6 +47,13 @@ struct MainWindow: View {
             Button("Next Room That Needs You") { Task { await model.nextNeedingYou() } }
                 .keyboardShortcut("n", modifiers: .control)
                 .accessibilityIdentifier("next-needs-you")
+            // The inspector, shown or hidden, as the sidebar's own button does for the sidebar.
+            Button { model.inspectorShown.toggle() } label: {
+                Label(model.inspectorShown ? "Hide Inspector" : "Show Inspector",
+                      systemImage: "sidebar.right")
+            }
+            .help(model.inspectorShown ? "Hide Inspector (⌥⌘I)" : "Show Inspector (⌥⌘I)")
+            .accessibilityIdentifier("toggle-inspector")
         }
     }
 }
@@ -348,7 +359,9 @@ private struct RoomView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        HStack(spacing: 0) {
+        // The timeline and the inspector, with a divider the person drags (HSplitView); the
+        // inspector's width is remembered (Columns), and it can be hidden (View > Hide Inspector).
+        HSplitView {
             VStack(spacing: 0) {
                 if !model.roomServices.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
@@ -526,9 +539,15 @@ private struct RoomView: View {
                     SessionComposer(model: model, session: s)
                 }
             }
-            Divider()
-            Inspector(model: model, room: room)
-                .frame(width: Theme.scaled(240))
+            // At least wide enough for the composer's field beside its To: and Urgent.
+            .frame(minWidth: Theme.scaled(400), maxWidth: .infinity)
+            if model.inspectorShown {
+                Inspector(model: model, room: room)
+                    .remembersWidth(of: .inspector)
+                    .frame(minWidth: Columns.Side.inspector.min,
+                           idealWidth: Columns.width(.inspector),
+                           maxWidth: Columns.Side.inspector.max)
+            }
         }
         // On the room, not its timeline: ⌘O, ⌘↩ and a file from the Finder Services item work
         // wherever the room's focus is.

@@ -79,6 +79,9 @@ extension VoxAction {
             VoxAction("View", "Focus Timeline", "t", [.command, .control], enabled: inRoom) {
                 NotificationCenter.default.post(name: .voxFocusTimeline, object: nil)
             },
+            // The room's inspector, hidden or shown again; ⌥⌘I, as in the Finder.
+            VoxAction("View", node?.inspectorShown == false ? "Show Inspector" : "Hide Inspector", "i",
+                      [.command, .option], enabled: inRoom) { node?.inspectorShown.toggle() },
             VoxAction("Room", "Copy Selected Service's Address", "c", [.command, .shift],
                       enabled: node?.selectedService != nil) { node?.copyServiceCommand() },
             VoxAction("Room", "Next Room That Needs You", "j", enabled: live) {
