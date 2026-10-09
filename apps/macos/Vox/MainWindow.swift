@@ -407,6 +407,7 @@ private struct RoomView: View {
                                         if let message = item.message {
                                             MessageRow(model: model, message: message, me: model.me,
                                                        readBy: model.readBy[message.id] ?? [],
+                                                       whereabouts: model.whereabouts[message.id],
                                                        pulledBy: model.pulledBy[message.id] ?? [],
                                                        pulled: model.pulled[message.id]) { looking = $0 }
                                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -689,6 +690,8 @@ private struct MessageRow: View {
     let me: String
     /// Who has read it, when it is this node's own (R-6).
     let readBy: [String]
+    /// Where it is while nobody has read it, when it is this node's own (R-6, D9).
+    let whereabouts: String?
     /// Who has pulled it, verified, when it is this node's own share (#498).
     let pulledBy: [String]
     /// Where this node's verified copy of the file it shares is, once pulled.
@@ -736,6 +739,11 @@ private struct MessageRow: View {
                     .caption().secondaryText()
                     .accessibilityIdentifier("read-by-\(message.id)")
                     .accessibilityLabel("read by \(readBy.joined(separator: ", "))")
+            } else if let whereabouts, message.author == me {
+                Text(whereabouts)
+                    .caption().secondaryText()
+                    .accessibilityIdentifier("whereabouts-\(message.id)")
+                    .accessibilityLabel(whereabouts)
             }
         }
         // VoiceOver reads the row first as one sentence, in the order it is drawn; its parts
@@ -759,7 +767,11 @@ private struct MessageRow: View {
         }
         if let card = message.card, !card.title.isEmpty { said += ", link: \(card.title)" }
         if !pulledBy.isEmpty { said += ", pulled by \(pulledBy.joined(separator: ", "))" }
-        if !readBy.isEmpty { said += ", read by \(readBy.joined(separator: ", "))" }
+        if !readBy.isEmpty {
+            said += ", read by \(readBy.joined(separator: ", "))"
+        } else if let whereabouts, message.author == me {
+            said += ", \(whereabouts)"
+        }
         return said
     }
 

@@ -267,6 +267,16 @@ pub struct ReadBy {
     pub names: Vec<String>,
 }
 
+/// Where one of this node's own messages is (ADR-028 R-6): said while no member is known to have
+/// read it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct Whereabouts {
+    /// The message's id.
+    pub id: String,
+    /// "only on this machine", or "on N of M members' nodes", as the TUI says it.
+    pub words: String,
+}
+
 /// Who has pulled one of this node's own shares whole and verified it (ADR-028 F-7).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct PulledBy {
@@ -1337,6 +1347,22 @@ impl VoxClient {
         ),
         VoxError,
     > {
+        let (open, names, _) = self.open_snap_me(room).await?;
+        Ok((open, names))
+    }
+
+    /// [`Self::open_snap`], and this node's own fingerprint as the snapshot names it.
+    async fn open_snap_me(
+        &self,
+        room: &str,
+    ) -> Result<
+        (
+            Option<vox_core::node::snapshot::OpenRoomSnap>,
+            HashMap<Digest32, String>,
+            Option<Digest32>,
+        ),
+        VoxError,
+    > {
         let channel_id = digest(room, "room id")?;
         let body = vox_core::node::snapshot::request_body();
         let (reply, names) = on_held!(self, |c| {
@@ -1355,6 +1381,7 @@ impl VoxClient {
         Ok((
             snap.open.into_iter().find(|o| o.channel_id == channel_id),
             names,
+            snap.me,
         ))
     }
 
@@ -2953,6 +2980,28 @@ impl VoxClient {
             .await?
             .into_iter()
             .map(|(id, names)| ReadBy { id, names })
+            .collect())
+    }
+
+    /// Where each of this node's own recent messages in `room` is (ADR-028 R-6), from how many of
+    /// the other members' nodes said they hold it, in the TUI's words: what a message no member
+    /// has read says.
+    ///
+    /// # Errors
+    /// A malformed id, or the daemon's refusal.
+    pub async fn whereabouts(&self, room: String) -> Result<Vec<Whereabouts>, VoxError> {
+        let (open, _, me) = self.open_snap_me(&room).await?;
+        let Some(open) = open else {
+            return Ok(Vec::new());
+        };
+        let others = open.members.iter().filter(|m| me != Some(**m)).count() as u64;
+        Ok(open
+            .held
+            .iter()
+            .map(|(entry, held)| Whereabouts {
+                id: b32_encode(entry),
+                words: vox_text::read::whereabouts(*held, others),
+            })
             .collect())
     }
 

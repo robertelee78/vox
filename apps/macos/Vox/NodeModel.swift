@@ -87,6 +87,9 @@ final class NodeModel: ObservableObject {
     @Published private(set) var platforms: [String: NodePlatform] = [:]
     /// Who has read each of this node's own messages in the room on screen, by message id (R-6).
     @Published private(set) var readBy: [String: [String]] = [:]
+    /// Where each of this node's own messages is, while no member is known to have read it
+    /// (ADR-028 R-6, D9): "only on this machine", "on N of M members' nodes".
+    @Published private(set) var whereabouts: [String: String] = [:]
     /// Who has pulled each of this node's own shares in the room on screen, verified, by the
     /// share's message id (ADR-028 F-6, #498).
     @Published private(set) var pulledBy: [String: [String]] = [:]
@@ -326,6 +329,7 @@ final class NodeModel: ObservableObject {
         guard case .room = selection else { return }
         messages = []
         readBy = [:]
+        whereabouts = [:]
         pulledBy = [:]
         pulled = [:]
         retention = ""
@@ -852,6 +856,7 @@ final class NodeModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 guard let self, case .room(room) = self.selection else { return }
                 let reads = try? await self.client.readBy(room: room)
+                let where_ = try? await self.client.whereabouts(room: room)
                 let pulls = try? await self.client.pulledBy(room: room)
                 let copies = try? await self.client.pulled(room: room)
                 let services = try? await self.client.services(room: room).shared
@@ -867,6 +872,10 @@ final class NodeModel: ObservableObject {
                 if let reads {
                     let now = Dictionary(uniqueKeysWithValues: reads.map { ($0.id, $0.names) })
                     if now != self.readBy { self.readBy = now }
+                }
+                if let where_ {
+                    let now = Dictionary(where_.map { ($0.id, $0.words) }) { $1 }
+                    if now != self.whereabouts { self.whereabouts = now }
                 }
                 if let pulls {
                     let now = Dictionary(pulls.map { ($0.id, $0.names) }) { $1 }
