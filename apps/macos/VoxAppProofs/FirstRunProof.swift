@@ -406,35 +406,44 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("room-columns"), "the room columns in the sidebar")
         present(ui, Key.id("inspector"), timeout: 10, "a room on screen must show its inspector")
 
-        /// The window's dividers, left to right: the sidebar's, then the inspector's.
-        func dividers() -> [XCUIElement] {
+        /// The sidebar's divider: the window's split view's (NavigationSplitView).
+        func sidebarDivider() -> XCUIElement? {
             ui.windows.firstMatch.splitters.allElementsBoundByIndex
                 .filter { $0.exists && $0.frame.width > 0 }
-                .sorted { $0.frame.minX < $1.frame.minX }
+                .min { $0.frame.minX < $1.frame.minX }
+        }
+        func inspectorDivider() -> XCUIElement {
+            ui.descendants(matching: .any).matching(identifier: "inspector-divider").firstMatch
         }
         func sidebarWidth() -> CGFloat {
-            guard let d = dividers().first else { return -1 }
+            guard let d = sidebarDivider() else { return -1 }
             return d.frame.minX - ui.windows.firstMatch.frame.minX
         }
         func inspectorWidth() -> CGFloat {
             let e = ui.descendants(matching: .any).matching(identifier: "inspector").firstMatch
             return e.exists ? e.frame.width : -1
         }
+        /// A person's drag: press, move slowly, and hold before letting go.
         func drag(_ divider: XCUIElement, by dx: CGFloat) {
             let at = divider.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-            at.press(forDuration: 0.3, thenDragTo: at.withOffset(CGVector(dx: dx, dy: 0)))
+            at.press(forDuration: 0.5, thenDragTo: at.withOffset(CGVector(dx: dx, dy: 0)),
+                     withVelocity: .slow, thenHoldForDuration: 0.5)
             Thread.sleep(forTimeInterval: 1)
         }
-        let found = dividers()
-        guard found.count >= 2 else {
-            throw Apparatus("XCTest finds \(found.count) divider(s) in the window, not the sidebar's and the inspector's: \(found.map { $0.frame })")
+        guard let side = sidebarDivider() else {
+            throw Apparatus("XCTest finds no split view divider in the window for the sidebar")
+        }
+        guard inspectorDivider().waitForExistence(timeout: 10) else {
+            throw Apparatus("XCTest finds no \"inspector-divider\" beside the inspector")
         }
         let sidebar0 = sidebarWidth(), inspector0 = inspectorWidth()
-        drag(found[0], by: 80)
-        drag(dividers()[1], by: -60)
+        drag(side, by: 80)
+        drag(inspectorDivider(), by: -60)
         let sidebar1 = sidebarWidth(), inspector1 = inspectorWidth()
-        XCTAssertTrue(sidebar1 > sidebar0 + 40 && inspector1 > inspector0 + 30,
-                      "PRODUCT: dragging the dividers must widen the sidebar and the inspector; the sidebar went from \(sidebar0) to \(sidebar1), the inspector from \(inspector0) to \(inspector1)")
+        XCTAssertTrue(sidebar1 > sidebar0 + 40,
+                      "PRODUCT: dragging the sidebar's divider 80 points right must widen the sidebar; it went from \(sidebar0) to \(sidebar1)")
+        XCTAssertTrue(inspector1 > inspector0 + 30,
+                      "PRODUCT: dragging the inspector's divider 60 points left must widen the inspector; it went from \(inspector0) to \(inspector1)")
 
         // ⌘Q, and a new launch: the same widths.
         handOff(ui, "q")

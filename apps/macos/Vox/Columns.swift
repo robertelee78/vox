@@ -3,6 +3,7 @@
 // and a maximum that leaves the timeline its room; each width, and whether the inspector shows, is
 // kept in the app's defaults and used again at the next launch.
 
+import AppKit
 import SwiftUI
 
 enum Columns {
@@ -49,5 +50,39 @@ extension View {
                 .onAppear { Columns.remember(side, geometry.size.width) }
                 .onChange(of: geometry.size.width) { Columns.remember(side, $0) }
         })
+    }
+}
+
+/// The line between the timeline and the inspector, which the person drags: the inspector's
+/// width follows within its bounds and is kept when the drag ends. A resize cursor shows over it.
+struct ColumnDivider: View {
+    @Binding var width: CGFloat
+    let side: Columns.Side
+    @State private var start: CGFloat?
+
+    var body: some View {
+        Rectangle()
+            .fill(Color.clear)
+            .frame(width: 7)
+            .overlay(Divider())
+            .contentShape(Rectangle())
+            .onHover { inside in
+                if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+            }
+            .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                .onChanged { drag in
+                    let from = start ?? width
+                    start = from
+                    // Dragging left widens a column on the right.
+                    width = Swift.min(Swift.max(from - drag.translation.width, side.min), side.max)
+                }
+                .onEnded { _ in
+                    start = nil
+                    Columns.remember(side, width)
+                })
+            .accessibilityElement()
+            .accessibilityLabel("Inspector width")
+            .accessibilityValue("\(Int(width)) points")
+            .accessibilityIdentifier("inspector-divider")
     }
 }

@@ -357,11 +357,15 @@ private struct RoomView: View {
     /// opens the selected message's first action, Space Quick Looks its pulled file.
     @State private var timelineFocused = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// The inspector's width: the one last dragged to, kept across launches (Columns).
+    @State private var inspectorWidth = Columns.width(.inspector)
 
     var body: some View {
-        // The timeline and the inspector, with a divider the person drags (HSplitView); the
-        // inspector's width is remembered (Columns), and it can be hidden (View > Hide Inspector).
-        HSplitView {
+        // The timeline and the inspector, with a divider the person drags; the inspector's width is
+        // remembered (Columns), and it can be hidden (View > Hide Inspector). Its width is the one
+        // dragged to, not HSplitView's: that gave the inspector its maximum and ignored the width
+        // kept from last time.
+        HStack(spacing: 0) {
             VStack(spacing: 0) {
                 if !model.roomServices.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
@@ -542,11 +546,9 @@ private struct RoomView: View {
             // At least wide enough for the composer's field beside its To: and Urgent.
             .frame(minWidth: Theme.scaled(400), maxWidth: .infinity)
             if model.inspectorShown {
+                ColumnDivider(width: $inspectorWidth, side: .inspector)
                 Inspector(model: model, room: room)
-                    .remembersWidth(of: .inspector)
-                    .frame(minWidth: Columns.Side.inspector.min,
-                           idealWidth: Columns.width(.inspector),
-                           maxWidth: Columns.Side.inspector.max)
+                    .frame(width: inspectorWidth)
             }
         }
         // On the room, not its timeline: ⌘O, ⌘↩ and a file from the Finder Services item work
