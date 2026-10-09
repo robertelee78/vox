@@ -18,7 +18,15 @@ final class AppModel: ObservableObject {
         case starting
         /// The daemon did not answer; its sentence.
         case unreachable(String)
-        /// First run: no node chosen yet. The nodes on this Mac.
+        /// The data root holds an earlier release's node directories, which this version does not
+        /// read (the daemon refuses it): offered to be moved aside (#576). Their paths; the
+        /// sentence after a failed move.
+        case oldLayout(dirs: [String], said: String?)
+        /// First run on a Mac with no node yet: make one here; the sentence after a failed try.
+        case welcome(said: String?)
+        /// Making node `node`, then attaching it.
+        case creating(node: String)
+        /// First run: several nodes on this Mac, none chosen yet. Their names.
         case choosing([String])
         /// The node needs its identity passphrase to attach; the daemon's sentence after a
         /// failed try.
@@ -128,10 +136,81 @@ final class AppModel: ObservableObject {
             if let chosen = chosenNode(client), let node = nodes.first(where: { $0.name == chosen }) {
                 await use(node)
             } else {
-                phase = .choosing(nodes.map(\.name))
+                await offerNodes(nodes)
             }
         } catch {
-            phase = .unreachable(sentence(error))
+            // Refused for an earlier release's node directories: said plainly, with a way on.
+            if let dirs = try? oldLayout(dataRoot: ""), !dirs.isEmpty {
+                phase = .oldLayout(dirs: dirs, said: nil)
+            } else {
+                phase = .unreachable(sentence(error))
+            }
+        }
+    }
+
+    /// What was moved aside, from and to, said on the welcome that follows.
+    @Published private(set) var movedAside: [MovedAside] = []
+
+    /// Move the earlier release's node directories aside, whole and unread (#576), then start as on
+    /// a Mac with no node: the welcome.
+    func moveAside() async {
+        let day = DateFormatter()
+        day.locale = Locale(identifier: "en_US_POSIX")
+        day.dateFormat = "yyyy-MM-dd"
+        do {
+            movedAside = try moveOldLayoutAside(dataRoot: "", date: day.string(from: Date()))
+        } catch {
+            let dirs = (try? oldLayout(dataRoot: "")) ?? []
+            phase = .oldLayout(dirs: dirs, said: sentence(error))
+            return
+        }
+        await reach()
+    }
+
+    /// No node chosen yet: none on this Mac, so make one here; one, so act as it without asking
+    /// which; several, so ask which.
+    private func offerNodes(_ nodes: [NodeSummary]) async {
+        switch nodes.count {
+        case 0: phase = .welcome(said: nil)
+        case 1: await use(nodes[0])
+        default: phase = .choosing(nodes.map(\.name))
+        }
+    }
+
+    /// First run with no node: make node `name` here, as `vox node create` does, under the
+    /// identity passphrase typed twice, then attach it with that passphrase. The bytes go into a
+    /// `Passphrase` at once and are wiped (M-5).
+    func createNode(_ name: String, passphrase secret: Secret, again: Secret) async {
+        guard let client else { return }
+        let same = secret.matches(again)
+        again.wipe()
+        guard same else {
+            secret.wipe()
+            phase = .welcome(said: "the two passphrases differ; nothing was created")
+            return
+        }
+        phase = .creating(node: name)
+        let passphrase: Passphrase
+        do {
+            passphrase = try secret.passphrase()
+        } catch {
+            phase = .welcome(said: sentence(error))
+            return
+        }
+        defer { passphrase.wipe() }
+        do {
+            _ = try await client.createNode(node: name, passphrase: passphrase)
+        } catch {
+            phase = .welcome(said: sentence(error))
+            return
+        }
+        do {
+            let fingerprint = try await client.attach(node: name, passphrase: passphrase)
+            remember(name, client)
+            enter(name, fingerprint, client)
+        } catch {
+            // Made, but not attached: it is asked for as any node is.
+            phase = .passphrase(node: name, said: sentence(error))
         }
     }
 
@@ -141,7 +220,7 @@ final class AppModel: ObservableObject {
         do {
             let nodes = try await client.nodes()
             guard let node = nodes.first(where: { $0.name == name }) else {
-                phase = .choosing(nodes.map(\.name))
+                await offerNodes(nodes)
                 return
             }
             await use(node)
