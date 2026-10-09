@@ -94,7 +94,13 @@ final class NodeModel: ObservableObject {
     @Published private(set) var retention = ""
     /// What the room on screen's timeline shows (ADR-029 CL-2): General each time a room opens.
     @Published var showing: Showing = .general {
-        didSet { if showing != oldValue { Task { await readSession() } } }
+        didSet {
+            guard showing != oldValue else { return }
+            // Never another Session's lines under this one while its own are read.
+            if !sessionEntries.isEmpty { sessionEntries = [] }
+            if sessionNote != nil { sessionNote = nil }
+            Task { await readSession() }
+        }
     }
     /// The room on screen's Sessions, open and ended (ADR-029 CL-2).
     @Published private(set) var sessions: [FfiSession] = []
