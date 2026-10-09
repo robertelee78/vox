@@ -944,6 +944,18 @@ final class FirstRunProof: XCTestCase {
         XCTAssertFalse(aliceRooms.contains(" orient"),
                        "PRODUCT: opening a room link must never join by itself; alice's `vox room list` says: \(aliceRooms)")
 
+        // The composer says who posts (E-4): alice, before a field that names the room.
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
+        if present(ui, Key.id("compose-as"), timeout: 10, "the composer must say who posts: \"alice ▸\"") {
+            let shownAs = el(ui, Key.id("compose-as"))
+            XCTAssertTrue((shownAs.value as? String) == "alice ▸" || shownAs.label == "posting as alice",
+                          "PRODUCT: the composer must say who posts, \"alice ▸\"; it shows \(String(describing: shownAs.value)) (\(shownAs.label))")
+        }
+        if present(ui, Key.id("compose"), timeout: 10, "the room must have its composer") {
+            XCTAssertEqual(el(ui, Key.id("compose")).placeholderValue, "Message mission…",
+                           "PRODUCT: the composer's field must name the room it posts to")
+        }
+
         // A stopped node shows as detached, keeps what was typed, and attaches again.
         tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         type(ui, Key.id("compose"), "DRAFT-KEPT-P12", "the composer")
