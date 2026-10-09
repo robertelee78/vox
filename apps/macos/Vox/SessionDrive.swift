@@ -85,6 +85,12 @@ struct SessionComposer: View {
             }
         }
         .padding(12)
+        // ⌘O while this Session is shown: a file sent to it, not the room (D2).
+        .onChange(of: model.sessionAttachAsked) { _ in
+            DispatchQueue.main.async {
+                if let url = chooseFile() { act(.file(path: url.path, note: nil)) }
+            }
+        }
     }
 
     /// Type the draft, or send it as a slash command when it starts with "/".

@@ -116,6 +116,8 @@ final class NodeModel: ObservableObject {
     @Published var sheet: NodeSheet?
     /// Asks the room on screen to choose a file to attach (⌘O); each ask counts one up.
     @Published var attachAsked = 0
+    /// ⌘O while a Session is shown, to a member with drive: a file sent to that Session (D2).
+    @Published var sessionAttachAsked = 0
     /// Asks the room on screen to send its draft urgent (⌘↩).
     @Published var urgentAsked = 0
     /// The message selected in the timeline, and the one the composer replies to (⌘R).

@@ -47,6 +47,10 @@ extension VoxAction {
     @MainActor static func all(_ node: NodeModel?) -> [VoxAction] {
         let live = node != nil
         let inRoom = node?.roomOnScreen != nil
+        // What the room's commands act on: the Session on screen, when one is, never the room
+        // behind it (D2).
+        let inSession = node?.showingSession ?? false
+        let driven = node?.shownSession.flatMap { $0.canDrive && $0.open ? $0 : nil }
         // A keyring row selected, in the keyring view: what Compare, Rename and Remove act on.
         let picked = node?.selection == .keyring && node?.keyringSelected != nil
         let digits: [VoxAction] = (1...9).map { n in
@@ -59,7 +63,12 @@ extension VoxAction {
             VoxAction("File", "Join Room…", "j", [.command, .shift], enabled: live) {
                 node?.sheet = .joinRoom
             },
-            VoxAction("File", "Attach File…", "o", enabled: inRoom) { node?.attachAsked += 1 },
+            inSession
+                ? VoxAction("File", "Attach File to \(driven?.label ?? "the Session")…", "o",
+                            enabled: inRoom && driven != nil) { node?.sessionAttachAsked += 1 }
+                : VoxAction("File", "Attach File to the Room…", "o", enabled: inRoom) {
+                    node?.attachAsked += 1
+                },
             VoxAction("File", "Share Service…", enabled: live) {
                 Task { await node?.show(.services) }
             },
@@ -73,7 +82,10 @@ extension VoxAction {
                       enabled: inRoom && node?.selectedMessage != nil) {
                 node?.replyTo = node?.messages.first { $0.id == node?.selectedMessage }
             },
-            VoxAction("Room", "Send Urgent", .return, enabled: inRoom) { node?.urgentAsked += 1 },
+            // The room's composer only: never while a Session is shown (D2).
+            VoxAction("Room", "Send Urgent", .return, enabled: inRoom && !inSession) {
+                node?.urgentAsked += 1
+            },
             // The keyboard's way into the messages (WCAG 2.1.1): ↑/↓ then move through them.
             // ⌃⌘T: ⇧⌘T is the system's View > Show Tab Bar, and ⌥⌘T its Show Toolbar.
             VoxAction("View", "Focus Timeline", "t", [.command, .control], enabled: inRoom) {

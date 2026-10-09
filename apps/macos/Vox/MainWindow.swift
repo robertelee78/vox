@@ -537,12 +537,15 @@ private struct RoomView: View {
         }
         .onChange(of: model.attachAsked) { _ in
             // After the update, not inside it: a modal panel run from within a view update did
-            // not open (⌘O, seen in the QE pass).
+            // not open (⌘O, seen in the QE pass). The room's sheet only while the room is shown.
+            guard !model.showingSession else { return }
             DispatchQueue.main.async {
                 if let url = chooseFile() { attaching = Attaching(url: url) }
             }
         }
-        .onChange(of: model.urgentAsked) { _ in send(urgent: true) }
+        // Only while the room's own composer is on screen: never a General draft sent while a
+        // Session is shown (D2).
+        .onChange(of: model.urgentAsked) { _ in if !model.showingSession { send(urgent: true) } }
         .onChange(of: model.incoming) { url in
             if let url {
                 attaching = Attaching(url: url)
