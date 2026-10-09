@@ -392,8 +392,18 @@ private struct RoomView: View {
                             // do not measure in this coordinate space, so what is in view could not be
                             // told.
                             ScrollView {
+                                let items = model.timelineItems
+                                let days = TimelineTime.dividers(items)
                                 LazyVStack(alignment: .leading, spacing: 10) {
-                                    ForEach(model.timelineItems) { item in
+                                    ForEach(items) { item in
+                                        // A new day starts above the first line that falls on it.
+                                        if let day = days[item.id] {
+                                            DayDivider(key: day, words: TimelineTime.dayWords(item.millis))
+                                        }
+                                        // What was unread as the room came on screen starts here.
+                                        if let id = item.message?.id, id == model.unreadFrom {
+                                            UnreadDivider(count: model.unreadCount)
+                                        }
                                         if let message = item.message {
                                             MessageRow(message: message, me: model.me,
                                                        readBy: model.readBy[message.id] ?? [],
@@ -688,6 +698,12 @@ private struct MessageRow: View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
                 Text(author).fontWeight(.bold)
+                // Its time of day; the whole date and time on hover and to VoiceOver.
+                Text(TimelineTime.short(message.createdMillis))
+                    .font(Theme.mono).secondaryText()
+                    .help(TimelineTime.full(message.createdMillis))
+                    .accessibilityLabel(TimelineTime.full(message.createdMillis))
+                    .accessibilityIdentifier("time-\(message.id)")
                 if message.urgent { StateMark(kind: .attention, words: "urgent") }
                 if message.to.contains(me) { Text("to you").eyebrow() }
                 if message.late {
@@ -731,6 +747,7 @@ private struct MessageRow: View {
         if message.to.contains(me) { parts.append("to you") }
         if message.urgent { parts.append("urgent") }
         if message.late { parts.append("arrived late") }
+        parts.append("at \(TimelineTime.full(message.createdMillis))")
         var said = parts.joined(separator: ", ") + ": "
         if let file = message.file {
             said += "\(file.folder ? "folder" : "file") \(file.name)"
@@ -750,6 +767,44 @@ private struct MessageRow: View {
     private var author: String {
         if message.author == me { return "you" }
         return message.authorName.isEmpty ? String(message.author.prefix(12)) : message.authorName
+    }
+}
+
+/// Where a new day starts in the timeline: its words between two hairlines.
+private struct DayDivider: View {
+    /// The day, "2026-10-04", as the divider's identifier says it.
+    let key: String
+    let words: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            VStack { Divider() }
+            Text(words).caption().secondaryText()
+            VStack { Divider() }
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .ignore)
+        .accessibilityAddTraits(.isHeader)
+        .accessibilityLabel(words)
+        .accessibilityIdentifier("day-\(key)")
+    }
+}
+
+/// Where what was unread when the room came on screen starts.
+private struct UnreadDivider: View {
+    let count: Int
+
+    var body: some View {
+        let words = count == 1 ? "1 unread" : "\(count) unread"
+        HStack(spacing: 8) {
+            VStack { Divider() }
+            Text(words).caption()
+            VStack { Divider() }
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(words)
+        .accessibilityIdentifier("unread-divider")
     }
 }
 
