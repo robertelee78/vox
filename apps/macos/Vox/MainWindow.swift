@@ -780,6 +780,15 @@ private struct RoomView: View {
                                     let following = newest == nil || inView.contains(newest ?? "")
                                     if following, let last = model.followItem {
                                         scroller.scrollTo(last, anchor: .bottom)
+                                        // Again once the new rows are laid out: a room opened
+                                        // with ⌘J gets its messages after it appears, and a
+                                        // scroll asked for in the pass that brings them can
+                                        // do nothing (as on a change of what is shown).
+                                        DispatchQueue.main.async {
+                                            if model.followItem == last {
+                                                scroller.scrollTo(last, anchor: .bottom)
+                                            }
+                                        }
                                     }
                                 }
                                 newest = model.followItem
