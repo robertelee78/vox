@@ -163,9 +163,18 @@ final class NodeModel: ObservableObject {
     @Published var sessionAttachAsked = 0
     /// Asks the room on screen to send its draft urgent (⌘↩).
     @Published var urgentAsked = 0
-    /// The message selected in the timeline, and the one the composer replies to (⌘R).
+    /// The message selected in the timeline, and the one the composer replies to (⌘R): the one
+    /// the keyboard is on.
     @Published var selectedMessage: String?
+    /// Every message selected in the timeline, for ⌘C (v0.4.1): the one above, and those ⌘-click,
+    /// ⇧-click, ⇧↑/⇧↓ or a drag across rows added.
+    @Published var selectedMessages: Set<String> = []
+    /// Where a ⇧-click or ⇧↑/⇧↓ range starts.
+    var selectionAnchor: String?
     @Published var replyTo: RoomMessage?
+    /// A message a quote was clicked to reach (ADR-028 R-9): the room's timeline scrolls to it and
+    /// selects it, then sets this back to nil.
+    @Published var jumpTo: String?
     /// The service card selected above the timeline, whose command ⌘⇧C copies.
     @Published var selectedService: SharedService?
     /// What the last operation came to (P6): done, refused, or not known whether it was done,
@@ -404,6 +413,8 @@ final class NodeModel: ObservableObject {
         members = []
         roomServices = []
         selectedMessage = nil
+        selectedMessages = []
+        selectionAnchor = nil
         selectedService = nil
         // What this room last showed, and its reply, come back (D12): General the first time.
         if case let .room(opened) = selection {

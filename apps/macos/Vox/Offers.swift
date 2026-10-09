@@ -80,6 +80,7 @@ struct OfferView: View {
             .accessibilityLabel("Alias")
             .frame(width: 320)
             .accessibilityIdentifier("offer-alias")
+        AliasClash(model: model, alias: alias)
         Picker("Grants", selection: $drive) {
             Text(Capability.words(false)).tag(false)
             Text(Capability.words(true)).tag(true)
