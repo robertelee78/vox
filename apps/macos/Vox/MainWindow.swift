@@ -327,7 +327,15 @@ private struct SidebarHighlightOff: NSViewRepresentable {
         func apply() {
             var up = superview
             while let v = up, !(v is NSTableView) { up = v.superview }
-            (up as? NSTableView)?.selectionHighlightStyle = .none
+            guard let table = up as? NSTableView else { return }
+            table.selectionHighlightStyle = .none
+            // With no highlight style the table draws its own background, controlBackgroundColor
+            // (#1d1e21 where the look case read the sidebar), over anything behind it: it draws
+            // bg.panel instead (L-6), and its scroll view none of its own.
+            if let panel = NSColor(named: "BgPanel"), table.backgroundColor != panel {
+                table.backgroundColor = panel
+            }
+            table.enclosingScrollView?.drawsBackground = false
         }
     }
 }
