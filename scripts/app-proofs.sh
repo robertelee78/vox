@@ -131,15 +131,18 @@ vox_registrations() {
         | awk '/^path:/{p=$0} /identifier: +us\.vox\.app\.proof$/{print p}' \
         | sed -E 's/^path: *//; s/ \(0x[0-9a-f]+\)$//' | sort -u
 }
-STRAY="$(vox_registrations | grep -vxF "$APP" || true)"
-if [ -n "$STRAY" ]; then
-    echo "app-proofs: APPARATUS (precondition unmet): other Vox Proof builds (us.vox.app.proof)" \
-        "are registered with LaunchServices, and any of them can be opened on the real profile;" \
-        "unregister them" \
-        "(lsregister -u <path>, registration only) before a run:" >&2
-    echo "$STRAY" >&2
-    exit 2
-fi
+# Another proof build that is registered but not running is unregistered here (registration only: no
+# file is deleted, no process stopped). LaunchServices re-registers built bundles it finds on disk by
+# itself, so refusing on sight starved every run. One whose app is running is another run in progress:
+# that refuses (APPARATUS).
+for b in $(vox_registrations | grep -vxF "$APP" || true); do
+    if pgrep -f "$b/Contents/MacOS" >/dev/null 2>&1; then
+        echo "app-proofs: APPARATUS (precondition unmet): another Vox Proof is running ($b);" \
+            "only one proof run may use the screen at a time" >&2
+        exit 2
+    fi
+    "$LSREGISTER" -u "$b" 2>/dev/null && echo "app-proofs: unregistered another proof build (not running): $b"
+done
 # UI automation: developer mode on (the one-time approval macOS asks for is not readable here;
 # without it xcodebuild says so at once, below).
 if ! DevToolsSecurity -status 2>/dev/null | grep -q "enabled"; then
