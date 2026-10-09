@@ -45,10 +45,14 @@ struct RootView: View {
                 LoginItemApproval(said: said, model: model)
             case .starting:
                 ProgressView("Reaching the vox daemon…")
-            case let .unreachable(said):
-                Text("Vox could not reach the vox daemon.")
+            case let .unreachable(failure):
+                // A plain headline, one line of cause, then what can help; the sentence said under
+                // Details, selectable and copyable (P4).
+                Text(failure.headline)
                     .heading()
-                Said(text: said)
+                    .accessibilityIdentifier("start-failure")
+                Text(failure.cause).secondaryText()
+                    .accessibilityIdentifier("start-failure-cause")
                 if let why = model.loginItemSaid {
                     // The login item's daemon ended on a refusal no retry changes: said here,
                     // with the way out (ADR-014 M-8).
@@ -59,8 +63,32 @@ struct RootView: View {
                     Button("Turn Keep Running Off") { Task { await model.stopKeepingRunning() } }
                         .accessibilityIdentifier("login-item-off")
                 }
-                Button("Try Again") { Task { await model.start() } }
-                    .accessibilityIdentifier("retry")
+                HStack {
+                    Button("Try Again") { Task { await model.start() } }
+                        .keyboardShortcut(.defaultAction)
+                        .accessibilityIdentifier("retry")
+                    if model.loginItemSaid != nil {
+                        Button("Show Log in Finder") {
+                            let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+                            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: home)
+                                .appendingPathComponent("Library/Logs/Vox/login-item.log")])
+                        }
+                        .accessibilityIdentifier("start-failure-log")
+                    }
+                }
+                Text("DETAILS").eyebrow().secondaryText()
+                Said(text: failure.said)
+                Button("Copy") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(failure.said, forType: .string)
+                }
+                .accessibilityIdentifier("start-failure-copy")
+            case let .oldLayout(dirs, said):
+                OldLayout(dirs: dirs, said: said, model: model)
+            case let .welcome(said):
+                Welcome(said: said, model: model)
+            case let .creating(node):
+                ProgressView("Making node \(node)…")
             case let .choosing(nodes):
                 Chooser(nodes: nodes, model: model)
             case let .passphrase(node, said):
@@ -179,27 +207,133 @@ private struct LoginItemApproval: View {
     }
 }
 
-/// First run: which node this app acts as (ADR-028 E-4).
+/// The data root holds an earlier release's node directories, which this version does not read
+/// (#576): said plainly, with the way on, not the daemon's sentence alone.
+private struct OldLayout: View {
+    let dirs: [String]
+    let said: String?
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        Text("This Mac has a node from an earlier Vox").heading()
+        Text("This version of Vox cannot read "
+            + dirs.map { URL(fileURLWithPath: $0).lastPathComponent }.joined(separator: ", ")
+            + ", kept the way an earlier release kept its nodes. Vox can move it aside, whole and "
+            + "untouched, and start fresh: you make a new node next. Nothing in it is deleted.")
+            .secondaryText()
+            .accessibilityIdentifier("old-layout-why")
+        ForEach(dirs, id: \.self) { dir in
+            Text(dir).font(Theme.mono).secondaryText().textSelection(.enabled)
+        }
+        Text("Your new node is a new identity: people you shared rooms with add it to their keyring "
+            + "again.")
+            .secondaryText()
+        if let said {
+            Said(text: said)
+        }
+        HStack {
+            Button("Move It Aside and Start Fresh") { Task { await model.moveAside() } }
+                .keyboardShortcut(.defaultAction)
+                .accessibilityIdentifier("old-move-aside")
+            Button("Try Again") { Task { await model.start() } }
+                .accessibilityIdentifier("retry")
+        }
+    }
+}
+
+/// First run on a Mac with no node yet: the node is made here, in the window, as `vox node create`
+/// makes it (a name, and its identity passphrase typed twice), then attached. Nothing on the way
+/// sends the person anywhere else.
+private struct Welcome: View {
+    let said: String?
+    @ObservedObject var model: AppModel
+    @State private var name = Welcome.suggestedName
+    @State private var first = SecureFieldHolder()
+    @State private var again = SecureFieldHolder()
+
+    var body: some View {
+        Text("Welcome to Vox").heading()
+        Text("To start, make your node: who you are in every room. Everything you post, trust and "
+            + "share is your node's.")
+            .secondaryText()
+            .accessibilityIdentifier("welcome-why")
+        TextField("Name", text: $name)
+            .frame(width: Theme.scaled(320))
+            .accessibilityIdentifier("new-node-name")
+            .accessibilityLabel("Node name")
+        Text("Lowercase letters, digits, dots, dashes and underscores.").secondaryText()
+        SecureInput(holder: first) { again.field.becomeFirstResponder() }
+            .frame(width: Theme.scaled(320))
+            .accessibilityIdentifier("new-node-passphrase")
+            .accessibilityLabel("Identity passphrase")
+        SecureInput(holder: again) { submit() }
+            .frame(width: Theme.scaled(320))
+            .accessibilityIdentifier("new-node-passphrase-again")
+            .accessibilityLabel("Identity passphrase again")
+        Text("The identity passphrase unlocks your node on this Mac. Nobody can recover it for you: "
+            + "keep it somewhere safe.")
+            .secondaryText()
+            .accessibilityIdentifier("new-node-passphrase-why")
+        Text(Welcome.capitalized(noBackupNotice()))
+            .secondaryText()
+            .accessibilityIdentifier("new-node-no-backup")
+        ForEach(model.movedAside, id: \.to) { moved in
+            Text("Moved aside, untouched: \(moved.from) is now \(moved.to).")
+                .secondaryText()
+                .textSelection(.enabled)
+                .accessibilityIdentifier("moved-aside-note")
+        }
+        if let said {
+            Said(text: said)
+        }
+        Button("Make Node") { submit() }
+            .keyboardShortcut(.defaultAction)
+            .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+            .accessibilityIdentifier("new-node-make")
+    }
+
+    private func submit() {
+        // Return and the button may both ask: the second finds the fields empty.
+        guard let secret = first.take() else { return }
+        let repeated = again.take() ?? Secret(Data())
+        let node = name.trimmingCharacters(in: .whitespaces)
+        Task { await model.createNode(node, passphrase: secret, again: repeated) }
+    }
+
+    /// The Mac's own name, in the letters a node name may have: a start the person may change.
+    static var suggestedName: String {
+        let raw = (Host.current().localizedName ?? "").lowercased()
+        var name = ""
+        for c in raw {
+            if c.isASCII && (c.isLetter || c.isNumber || c == "." || c == "_" || c == "-") {
+                name.append(c)
+            } else if c == " " && !name.hasSuffix("-") && !name.isEmpty {
+                name.append("-")
+            }
+        }
+        while name.hasSuffix("-") { name.removeLast() }
+        return String(name.prefix(32))
+    }
+
+    static func capitalized(_ sentence: String) -> String {
+        sentence.prefix(1).uppercased() + sentence.dropFirst() + "."
+    }
+}
+
+/// First run with several nodes on this Mac: which one is you here (ADR-028 E-4).
 private struct Chooser: View {
     let nodes: [String]
     @ObservedObject var model: AppModel
 
     var body: some View {
-        Text("Which node is this app?").heading()
-        Text(
-            "Vox acts as one node on this Mac: everything you post, trust and share is that node's."
-        )
-        .secondaryText()
-        if nodes.isEmpty {
-            Text("There is no node on this Mac yet. Make one in Terminal with `vox node create <name>`, then try again.")
-            Button("Try Again") { Task { await model.start() } }
-                .accessibilityIdentifier("retry")
-        } else {
-            ForEach(nodes, id: \.self) { node in
-                Button(node) { Task { await model.choose(node) } }
-                    .accessibilityIdentifier("node-\(node)")
-                    .accessibilityLabel("Act as node \(node)")
-            }
+        Text("Which node are you?").heading()
+        Text("This Mac has several nodes. Pick the one you post, trust and share as here; you "
+            + "can switch later.")
+            .secondaryText()
+        ForEach(nodes, id: \.self) { node in
+            Button(node) { Task { await model.choose(node) } }
+                .accessibilityIdentifier("node-\(node)")
+                .accessibilityLabel("Act as node \(node)")
         }
     }
 }
@@ -262,6 +396,14 @@ final class Secret: @unchecked Sendable {
 
     func wipe() { bytes.resetBytes(in: 0..<bytes.count) }
 
+    /// Whether `other` holds the same bytes, compared without stopping at the first difference.
+    func matches(_ other: Secret) -> Bool {
+        guard bytes.count == other.bytes.count else { return false }
+        var diff: UInt8 = 0
+        for (a, b) in zip(bytes, other.bytes) { diff |= a ^ b }
+        return diff == 0
+    }
+
     deinit { wipe() }
 }
 
@@ -277,6 +419,17 @@ final class SecureFieldHolder {
         guard !text.isEmpty else { return nil }
         return Secret(Data(text.utf8))
     }
+
+    /// The typed bytes, the field emptied: empty when nothing was typed. Only for a room's
+    /// passphrase, which a room may go without (ADR-005 J-2 as amended); an identity's never.
+    func takeAllowingEmpty() -> Secret {
+        let text = field.stringValue
+        field.stringValue = ""
+        return Secret(Data(text.utf8))
+    }
+
+    /// Whether nothing is typed now.
+    var isEmpty: Bool { field.stringValue.isEmpty }
 }
 
 /// An `NSSecureTextField`, read only by `SecureFieldHolder.take`. What M-5 leaves: AppKit holds
@@ -285,23 +438,35 @@ final class SecureFieldHolder {
 /// wiped in place once used.
 struct SecureInput: NSViewRepresentable {
     let holder: SecureFieldHolder
+    /// Told whether the field is empty as it changes (never what it holds).
+    var onEmpty: ((Bool) -> Void)? = nil
     let onSubmit: () -> Void
 
     func makeNSView(context: Context) -> NSSecureTextField {
         holder.field.target = context.coordinator
         holder.field.action = #selector(Coordinator.submit)
+        holder.field.delegate = context.coordinator
         return holder.field
     }
 
     func updateNSView(_ view: NSSecureTextField, context: Context) {
         context.coordinator.onSubmit = onSubmit
+        context.coordinator.onEmpty = onEmpty
     }
 
-    func makeCoordinator() -> Coordinator { Coordinator(onSubmit: onSubmit) }
+    func makeCoordinator() -> Coordinator { Coordinator(onSubmit: onSubmit, onEmpty: onEmpty) }
 
-    final class Coordinator: NSObject {
+    final class Coordinator: NSObject, NSTextFieldDelegate {
         var onSubmit: () -> Void
-        init(onSubmit: @escaping () -> Void) { self.onSubmit = onSubmit }
+        var onEmpty: ((Bool) -> Void)?
+        init(onSubmit: @escaping () -> Void, onEmpty: ((Bool) -> Void)?) {
+            self.onSubmit = onSubmit
+            self.onEmpty = onEmpty
+        }
         @objc func submit() { onSubmit() }
+        func controlTextDidChange(_ note: Notification) {
+            guard let field = note.object as? NSTextField else { return }
+            onEmpty?(field.stringValue.isEmpty)
+        }
     }
 }

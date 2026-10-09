@@ -39,7 +39,8 @@ struct ComposerAddress: View {
                         }
                     }
                 }
-                .font(Theme.text)
+                // Part of the composer, so at the conversation's text size (L-1b).
+                .conversationScale(Theme.scale)
                 .padding(12)
             }
             Toggle(isOn: $urgent) { Text("Urgent") }

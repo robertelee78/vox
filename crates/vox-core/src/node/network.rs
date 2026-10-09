@@ -686,19 +686,22 @@ impl NodeNet {
         peer: Digest32,
     ) -> Result<(StreamKind, SendStream, RecvStream)> {
         let typed = accept_typed_on(conn).await?;
-        self.authorize_typed(peer, typed)
+        self.authorize_typed(conn, peer, typed)
     }
 
     /// Authorize a stream whose kind has been read: refused, with the coded answer, when `peer`
-    /// may not open that kind (see [`Self::classify`]).
+    /// may not open that kind (see [`Self::classify`]); one of the identity kind closes `conn`
+    /// first, whoever opened it (`net::refuse_second_exchange`).
     ///
     /// # Errors
     /// [`crate::error::Error::StreamRefused`] when the peer may not open that kind.
     pub fn authorize_typed(
         &self,
+        conn: &quinn::Connection,
         peer: Digest32,
         (kind, mut send, mut recv): (StreamKind, SendStream, RecvStream),
     ) -> Result<(StreamKind, SendStream, RecvStream)> {
+        crate::node::net::refuse_second_exchange(conn, kind)?;
         let class = self.classify(&peer);
         if !PeerPolicy::allows(class, kind) {
             crate::node::net::refuse_disallowed(class, kind, &mut send, &mut recv);
@@ -897,14 +900,11 @@ impl NodeNet {
             StreamKind::Sync => Ok(Inbound::Sync { peer, send, recv }),
             StreamKind::Agree => Ok(Inbound::Agree { peer, send, recv }),
             StreamKind::Seat => Ok(Inbound::Seat { peer, send, recv }),
-            // The exchange is over by the time a stream is dispatched: one more identity stream is
-            // a second exchange on one connection, which closes it (ADR-011 requirement 33).
-            StreamKind::Identity => {
-                conn.close(crate::wire::WireError::NotAvailable);
-                Err(Error::MalformedBundle(
-                    "an identity stream after the identity exchange",
-                ))
-            }
+            // Closed at the gate (`net::refuse_second_exchange`) before any stream is dispatched: one more
+            // identity stream is a second exchange on one connection (ADR-011 requirement 33).
+            StreamKind::Identity => Err(Error::StreamRefused(
+                "an identity stream after the identity exchange",
+            )),
             StreamKind::Coord => {
                 // The answer to `WHOAMI` is this connection's source address as *this*
                 // node sees it — the peer's reflexive address (ADR-012 rung 3).

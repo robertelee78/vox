@@ -26,10 +26,8 @@ pub const AUTHOR_CHARS: usize = 26;
 /// the longer "(not in your keyring)" was cut off there, which the proof caught.
 pub const NOT_IN_KEYRING: &str = "(not in keyring)";
 
-/// What a person is told wherever a node is made (ADR-028 K-8): a node has no backup, so a lost
-/// machine means a new node, which the people who trusted the old one untrust.
-pub const NO_BACKUP: &str = "there is no backup of a node: if this machine is lost, so is this \
-     node; make a new one, and ask everyone who trusts this one to untrust it and trust the new one";
+/// What a person is told wherever a node is made (ADR-028 K-8), the app's words too.
+pub use vox_text::node::NO_BACKUP;
 
 /// A member's fingerprint as shown on screen: its first [`AUTHOR_CHARS`] base32 characters.
 #[must_use]

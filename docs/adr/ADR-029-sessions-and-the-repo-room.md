@@ -148,7 +148,8 @@ relies on is ADR-028 K-14.
   ```
 
   `room` and `passphrase` MUST be separate fields; the passphrase MUST NOT be part of the link
-  (ADR-005). Every node of the data root can read every passphrase in the map, so any of them can
+  (ADR-005). A block whose `room` is `none` records that the operator said no to binding
+  that directory (RB-7), and holds no passphrase. Every node of the data root can read every passphrase in the map, so any of them can
   join any mapped room; whatever writes the map (setup, `vox agent room`) MUST say so (ADR-028 E-5).
 - **RB-2.** When a harness session starts, its node's hook MUST look up the session's start
   directory in the room map. The match MUST be exact: `/opt/vox` matches a session started in
@@ -158,9 +159,32 @@ relies on is ADR-028 K-14.
 - **RB-4.** A session's room MUST NOT change during the session's life because of where it works
   afterwards: new branches, worktrees, or reading or editing other repositories' files do not move
   it.
-- **RB-5.** With no match, the session MUST work in no room, and the hook MUST say so in the
-  harness session with the command that sets one: `vox agent room <room>`. The same command, run
-  later, MUST move the session to that room; a session MUST work in one room at a time.
+- **RB-5.** With no match, the session MUST work in no room, and on its first turn the hook MUST
+  tell it, once, that its repository is not tied to a Vox room and to ask the operator, in the
+  session, for the room's link or a no: "This repo isn't tied to a Vox room. Paste its room link to
+  bind it, or say no." It MUST also tell the agent what to do with each answer (RB-6, RB-7).
+  `vox agent room <room>`, run later, MUST move the session to that room; a session MUST work in
+  one room at a time.
+- **RB-6.** A link is bound by the operator, never by the agent: the agent MUST NOT ask for, and
+  the operator MUST NOT be asked to give, the room's passphrase in the session. The agent MUST give
+  the operator the command to run in a terminal of their own, `vox room join <link> --node <the
+  agent's node> --bind <the start directory>`, which asks for the passphrase there, joins the
+  agent's node, and writes the directory's block to the room map with that link and passphrase,
+  saying first who can read the map (ADR-028 E-5). The agent MUST give that command with its node
+  and the absolute directory filled in, and the link the operator pasted, so it can be run as it
+  stands. A block the map held for that directory, a no or another room, MUST be replaced, and the
+  command MUST say what it replaced. Every later session started in that directory,
+  from any harness, MUST then work in that room (RB-2, RB-3). Binding needs no identity passphrase
+  and changes no trust (ADR-028 K-13). The agent then puts its running session in the room with
+  `vox agent room <room>`.
+- **RB-7.** A no MUST be recorded for that directory, as a block whose `room` is `none`
+  (`vox agent room --none`, which the agent may run: it holds no secret), and a session started
+  there MUST NOT be asked again. The operator removes the block to be asked again; a later `--bind`
+  replaces it.
+
+(The decider, 2026-10-08: "if I start a session in claude/codex/opencode etc. in a repo, and we
+don't have the configuration set up yet where the repo is tied to a room, ask if there's a room
+url/link for it to bind to"; the passphrase is typed by the operator in another shell.)
 
 ### 7. Setting up a machine
 

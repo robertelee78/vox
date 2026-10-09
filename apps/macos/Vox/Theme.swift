@@ -29,17 +29,21 @@ enum Theme {
     /// A heading's size when the token file gives none.
     static let headingSize = 28.0
 
-    /// The app's text size, a multiple of Actual Size (View > Bigger, Smaller, Actual Size): every
-    /// face the app draws scales by it, to twice its size (WCAG 2.1 1.4.4). macOS has no app-wide
-    /// text size, so the app keeps its own, on this Mac.
+    /// The conversation's text size, a multiple of Actual Size (View > Bigger, Smaller, Actual
+    /// Size, and Settings), up to twice its size (WCAG 2.1 1.4.4). The decider (v0.4.1): it scales
+    /// the conversation only, the timeline and the composer, as in Messages and Slack; the sidebar
+    /// and the inspector keep a steady size, the sidebar following macOS's sidebar size. Kept on
+    /// this Mac.
     static var scale: Double {
         let kept = UserDefaults.standard.double(forKey: scaleKey)
         return scales.contains(kept) ? kept : 1
     }
     static let scaleKey = "textScale"
-    /// Buttons, menus and toggles at the app's text size: macOS draws a control's label in the
-    /// control's own size, not the view's font.
-    static var controls: ControlSize {
+    /// Buttons, menus and toggles outside the conversation: a steady size.
+    static var controls: ControlSize { .regular }
+    /// Buttons and menus in the conversation, at its text size: macOS draws a control's label in
+    /// the control's own size, not the view's font.
+    static func controls(_ scale: Double) -> ControlSize {
         switch scale {
         case ..<1.15: return .regular
         case ..<1.75: return .large
@@ -49,15 +53,15 @@ enum Theme {
         }
     }
 
-    /// A width that holds text, at the app's text size.
-    static func scaled(_ points: CGFloat) -> CGFloat { points * CGFloat(scale) }
+    /// A width that holds text outside the conversation, whose text keeps a steady size.
+    static func scaled(_ points: CGFloat) -> CGFloat { points }
     /// The sizes Bigger and Smaller step through.
     static let scales: [Double] = [0.85, 1, 1.15, 1.3, 1.5, 1.75, 2]
 
     /// `face` as a font. A bundled face scales with `relativeTo`; a system face that names a text
     /// style is that style; a size the token file gives is kept as it is.
     static func font(_ face: VoxTokens.Face, defaultSize: Double? = nil,
-                     relativeTo: Font.TextStyle = .body) -> Font {
+                     relativeTo: Font.TextStyle = .body, scale: Double = 1) -> Font {
         let weight = Font.Weight(face.weight)
         if let bundled = face.bundled, registered(bundled) {
             // A bundled file is one face: it is named by its PostScript name, the file's name.
@@ -154,6 +158,42 @@ struct SecondaryText: ViewModifier {
 }
 
 /// A face's tracking and case, which a `Font` cannot carry (L-7).
+/// The conversation's text size, where one applies (`conversationScale`); 1 elsewhere.
+private struct VoxTextScale: EnvironmentKey {
+    static let defaultValue = 1.0
+}
+
+extension EnvironmentValues {
+    var voxTextScale: Double {
+        get { self[VoxTextScale.self] }
+        set { self[VoxTextScale.self] = newValue }
+    }
+}
+
+/// A face at the text size of where it is drawn.
+private struct ScaledFont: ViewModifier {
+    @Environment(\.voxTextScale) private var scale
+    let face: VoxTokens.Face
+
+    func body(content: Content) -> some View { content.font(Theme.font(face, scale: scale)) }
+}
+
+/// A typeset face (tracking, case) at the text size of where it is drawn.
+private struct ScaledTypeset: ViewModifier {
+    @Environment(\.voxTextScale) private var scale
+    let face: VoxTokens.Face
+    let defaultSize: Double
+    var relativeTo: Font.TextStyle = .body
+    var keepCase = false
+
+    func body(content: Content) -> some View {
+        content.modifier(Typeset(face: face,
+                                 font: Theme.font(face, defaultSize: defaultSize,
+                                                  relativeTo: relativeTo, scale: scale),
+                                 size: (face.size ?? defaultSize) * scale, keepCase: keepCase))
+    }
+}
+
 private struct Typeset: ViewModifier {
     let face: VoxTokens.Face
     let font: Font
@@ -253,27 +293,33 @@ extension View {
 
     /// An uppercase eyebrow label, in the token file's face, tracking and case (L-7).
     func eyebrow() -> some View {
-        let face = VoxTokens.Fonts.appEyebrow
-        return modifier(Typeset(face: face, font: Theme.eyebrow,
-                                size: (face.size ?? NSFont.systemFontSize) * Theme.scale))
+        modifier(ScaledTypeset(face: VoxTokens.Fonts.appEyebrow, defaultSize: NSFont.systemFontSize))
     }
 
     /// The eyebrow's face, size and tracking, never its case: for what carries a name, a link or
     /// anything a person or a peer wrote, whose case is its content (an uppercased URL is another
     /// URL, an uppercased alias another name).
     func caption() -> some View {
-        let face = VoxTokens.Fonts.appEyebrow
-        return modifier(Typeset(face: face, font: Theme.eyebrow,
-                                size: (face.size ?? NSFont.systemFontSize) * Theme.scale,
-                                keepCase: true))
+        modifier(ScaledTypeset(face: VoxTokens.Fonts.appEyebrow, defaultSize: NSFont.systemFontSize,
+                               keepCase: true))
     }
 
     /// A large heading, in the token file's face and tracking (L-7).
     func heading() -> some View {
-        let face = VoxTokens.Fonts.appHeading
-        return modifier(Typeset(face: face, font: Theme.heading,
-                                size: (face.size ?? Theme.headingSize) * Theme.scale))
+        modifier(ScaledTypeset(face: VoxTokens.Fonts.appHeading, defaultSize: Theme.headingSize,
+                               relativeTo: .largeTitle))
     }
+
+    /// The conversation's text size for everything inside: the timeline and the composer (the
+    /// decider, v0.4.1). Outside it, text keeps a steady size.
+    func conversationScale(_ scale: Double) -> some View {
+        environment(\.voxTextScale, scale)
+            .font(Theme.font(VoxTokens.Fonts.appText, scale: scale))
+            .controlSize(Theme.controls(scale))
+    }
+
+    /// `face`, at the text size of where it is drawn: the conversation's inside it, steady outside.
+    func voxFont(_ face: VoxTokens.Face) -> some View { modifier(ScaledFont(face: face)) }
 
     /// Outline a card (L-5).
     func cardOutline() -> some View { modifier(CardOutline()) }

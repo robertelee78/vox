@@ -20,6 +20,7 @@ pub const COLORS: &[&str] = &[
     "bg.panel",
     "bg.overlay",
     "selection",
+    "selection.secondary",
     "line.hair",
     "text.primary",
     "text.secondary",

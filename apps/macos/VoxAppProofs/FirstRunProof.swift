@@ -5,6 +5,8 @@
 // (through xcodebuild's TEST_RUNNER_ prefix):
 //   VOX_PROOF_APP      the Vox.app under proof; its Contents/Helpers/vox runs the daemon
 //   VOX_PROOF_SCRATCH  a scratch directory: the data root and config directory go there
+//   VOX_PROOF_CONTINUE 1 for a combined mutant build: a case goes on past a red (its
+//                      closing [proof] line then holds nothing)
 //
 // What must hold, as a person sees it:
 // 1. At first run the app asks once whether to keep the daemon running while logged in, saying
@@ -31,7 +33,7 @@
 //    bob is told apart in mission's members as bob#<his fingerprint's first 6>.
 // 5. The keyring view (ADR-014 M-16, ADR-028 K-3, E-5, #443): a pasted fingerprint with an alias
 //    says what trusting does before it is done, and is listed, as `vox trust list` lists it;
-//    removing it says what untrusting does first, and only then removes it.
+//    removing it says what removing does first, and only then removes it.
 // 6. Attaching a file (ADR-014 M-24, ADR-028 F-1, #449): chosen with Attach…, addressed To: bob
 //    with a note, it is one share: bob's node pulls it by itself, byte for byte, and the note is
 //    in the share's announcement, never a message of its own.
@@ -62,6 +64,13 @@
 //     timeline with its newest message selected; ↑ and ↓ move the selection, as Reply to Selected
 //     Message (⌘R) then says; Space and Return on a row whose file alice pulled open it in Quick
 //     Look; Tab from the timeline reaches the composer.
+// 16. What an operation comes to (#608, #611, #615), run after step 5, or alone with
+//     VOX_PROOF_FROM=16: New Room with an empty passphrase says what that means and makes the
+//     room; a refused End for Everyone keeps its sheet open with the reason; that refusal is the
+//     status bar's, never another sheet's, and dismissed it goes. And G3 (ADR-017 S-1): a service
+//     bob shares in mission, in the services view, shows its address broken into its parts, each
+//     labelled (service, your node alias, your room alias, Vox address), and Copy Address copies
+//     it whole, canonical.
 //
 // Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
 // place of the app's hold), and quitting leaves it attached: (12) goes red. A room with a message
@@ -113,6 +122,12 @@ func shown(_ element: XCUIElement) -> String {
     if let value = element.value as? String, !value.isEmpty { return value }
     // A menu button's words are its title.
     return element.title
+}
+
+/// What is typed in a text field: its value, never its label (a composer's label names it, as
+/// "Message to the room", whatever is typed). Empty when nothing is.
+func typed(_ field: XCUIElement) -> String {
+    (field.value as? String) ?? ""
 }
 
 /// Refuse (APPARATUS) to launch the app with a data root or config directory outside this run's
@@ -232,8 +247,11 @@ final class FirstRunProof: XCTestCase {
     private var keptPasteboard: [[NSPasteboard.PasteboardType: Data]] = []
 
     override func setUpWithError() throws {
-        // A case stops at its first red: one red, with its side, and no cascade behind it.
-        continueAfterFailure = false
+        // A case stops at its first red: one red, with its side, and no cascade behind it. A
+        // combined mutant build (VOX_PROOF_CONTINUE=1) goes on, so each mutated claim says its own
+        // red; whoever runs it keeps out any mutant whose red could follow from another's. A
+        // case's closing `[proof]` line still prints there, and holds only in a run with no red.
+        continueAfterFailure = ProcessInfo.processInfo.environment["VOX_PROOF_CONTINUE"] == "1"
         keptPasteboard = (NSPasteboard.general.pasteboardItems ?? []).map { item in
             Dictionary(uniqueKeysWithValues: item.types.compactMap { t in item.data(forType: t).map { (t, $0) } })
         }
@@ -270,6 +288,10 @@ final class FirstRunProof: XCTestCase {
     }
 
     override func tearDown() {
+        // A red stops a case without running its `defer`s (continueAfterFailure is false), so the
+        // Vox it started would still run into the next case: quit here each Vox this case started.
+        for ui in launched where ui.state != .notRunning { ui.terminate() }
+        launched = []
         if let watchingForeground { NSWorkspace.shared.notificationCenter.removeObserver(watchingForeground) }
         if let watchingVox { NSWorkspace.shared.notificationCenter.removeObserver(watchingVox) }
         daemon?.terminate()
@@ -383,10 +405,11 @@ final class FirstRunProof: XCTestCase {
         let data = root.appendingPathComponent("data").path
         let config = root.appendingPathComponent("config").path
         let home = root.appendingPathComponent("home").path
-        // A data root as v0.2.x left it, which this version refuses; the answer Keep Running; and
-        // the line the login item's daemon wrote as it ended.
-        try stager.write(Data("an earlier release's vault".utf8), to: data + "/default/vault.cbor")
-        try stager.write(Data("an earlier release's store".utf8), to: data + "/default/store.redb")
+        // A data root no daemon can serve (a file where its directory would be), so the daemon
+        // Vox starts stops as it starts; the answer Keep Running; and the line the login item's
+        // daemon wrote as it ended. (An earlier release's data root is the welcome's to move
+        // aside, #576, not this screen's.)
+        try stager.write(Data("not a data directory".utf8), to: data)
         try stager.write(Data("keep\n".utf8), to: config + "/app/login-item")
         let reason = "vox daemon will not start: STAGED-REASON is not a Vox data directory this version reads"
         try stager.write(Data("1791262600000 \(reason)\n".utf8),
@@ -401,6 +424,13 @@ final class FirstRunProof: XCTestCase {
         let quoted = words(ui, said, timeout: 30,
                            "with Keep Running chosen and its daemon refusing for good, the app must quote the login item's own line",
                            until: { $0.contains("STAGED-REASON is not a Vox data directory this version reads") }) ?? ""
+        // P4: the failure is said as what it is, with the daemon's own sentence under Details,
+        // copyable, never as the bare sentence alone.
+        words(ui, Key.id("start-failure"), timeout: 10,
+              "a daemon that stops as it starts must be said plainly, as a background service that cannot start",
+              until: { $0 == "Vox can't start its background service" })
+        present(ui, Key.id("start-failure-copy"), timeout: 5,
+                "the failure's own sentence must be under Details, with Copy")
         tap(ui, Key.id("login-item-off"), "Turn Keep Running Off")
         if !el(ui, said).waitForNonExistence(timeout: 30) {
             XCTFail("PRODUCT: Turn Keep Running Off must leave Keep Running off; the login item's line is still shown: \(shown(el(ui, said)))")
@@ -548,8 +578,19 @@ final class FirstRunProof: XCTestCase {
         words(ui, Key.showing("node alice is not kept"), timeout: 10,
               "declining must say plainly that node alice is not kept and needs her passphrase after a restart",
               until: { $0.contains("after a restart Vox asks for its passphrase again") })
-        let ok = ui.buttons["OK"].firstMatch
-        if ok.waitForExistence(timeout: 5) { ok.click() }
+        // The alert's own OK, in its sheet or dialog: `ui.buttons["OK"]` also finds the Touch Bar's
+        // copy of it, which XCTest cannot click (rooms2's run, APPARATUS).
+        let okUntil = Date().addingTimeInterval(5)
+        var ok: XCUIElement?
+        repeat {
+            ok = [ui.sheets, ui.dialogs, ui.windows].lazy
+                .map { $0.buttons["OK"].firstMatch }
+                .first { $0.exists && $0.isHittable }
+            if ok == nil { Thread.sleep(forTimeInterval: 0.25) }
+        } while ok == nil && Date() < okUntil
+        if let ok { ok.click() } else {
+            XCTFail("APPARATUS: XCTest finds no clickable OK in the alert's sheet or dialog (only, perhaps, the Touch Bar's)")
+        }
         let notKept = aliceLine()
         XCTAssertTrue(notKept.contains("attached") && !notKept.hasSuffix("(kept)"),
                       "PRODUCT: declining the offer must leave node alice attached and not kept; `vox node list` says \(notKept.debugDescription)")
@@ -559,10 +600,209 @@ final class FirstRunProof: XCTestCase {
         ui.typeKey(.escape, modifierFlags: [])
         // Nothing here registered a real login item: none is loaded for this user.
         let uid = stager.run(["/usr/bin/id", "-u"], env: [:]).out.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Only the proof build's own: the person's own Vox (us.vox.app) may have its login item
+        // loaded, and launchd names whose it is.
         let loaded = stager.run(["/bin/launchctl", "print", "gui/\(uid)/us.vox.daemon"], env: [:])
-        XCTAssertNotEqual(loaded.status, 0,
-                          "PRODUCT: a Vox login item is loaded after this case: the app registered a real one past its stand-in (app-proofs.sh refused to start with one loaded): \(loaded.out.prefix(200))")
+        let proofs = loaded.status == 0 && loaded.out.contains("parent bundle identifier = \(proofAppID)\n")
+        XCTAssertFalse(proofs,
+                       "PRODUCT: Vox Proof's login item is loaded after this case: the app registered a real one past its stand-in (app-proofs.sh refused to start with one loaded): \(loaded.out.prefix(200))")
         print("[proof] keep running: off kept \(answerOff.debugDescription) and left the login item \(itemOff.debugDescription); on kept \(answerOn.debugDescription) and left it \(itemOn.debugDescription)")
+    }
+
+    /// Settings (⌘,), v0.4.1, the UX review's proposal 1, alone. Staged by `vox`: node alice kept
+    /// (`--keep`), first run answered Keep Running with alice chosen, the menu bar item off, the
+    /// stand-in login item registered as approved. Keep Running is turned off and on last: on
+    /// again, the app offers to keep alice, which Escape leaves.
+    /// - **menu bar**: Settings' "Show Vox in the menu bar" turns the item on and off again, kept
+    ///   in `<config>/app/menubar`. Mutation: the toggle's setter dropped → red at "on".
+    /// - **keep running**: Settings' switch turns Keep Running off and on, the answer and the
+    ///   stand-in login item following, and the Vox menu agrees (one implementation, #571).
+    ///   Mutation: the switch's setter dropped → red at "no".
+    /// - **text size**: Settings' Text size sets the app's size (the defaults key View > Bigger
+    ///   uses) and sets it back. Mutation: setTextSize a no-op → red at 1.3.
+    ///
+    /// **No login item is registered**: the same stand-in as testKeepRunning…; the case refuses an
+    /// executable without it.
+    func testSettingsKeepRunningMenuBarAndTextSize() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
+            throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are set by scripts/app-proofs.sh")
+        }
+        let exe = appPath + "/Contents/MacOS/Vox"
+        guard stager.run(["/usr/bin/grep", "-q", "vox-proof-service-stand-in", exe], env: [:]).status == 0 else {
+            throw Apparatus("\(exe) carries no stand-in background items (VOX_PROOF_STUB_SERVICES): it would register a real login item, which runs on the real profile; build it with scripts/app-proofs.sh")
+        }
+        let vox = URL(fileURLWithPath: appPath).appendingPathComponent("Contents/Helpers/vox").path
+        let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("settings")
+        let data = root.appendingPathComponent("data").path
+        let config = root.appendingPathComponent("config").path
+        let home = root.appendingPathComponent("home").path
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+                           until: "vox daemon: control socket")
+        // Alice kept as Keep Running keeps a node (`--keep`, its passphrase from a scratch file: the
+        // Keychain is the person's, never a proof's), so the app opens acting as her.
+        let pass = root.appendingPathComponent("alice.pass").path
+        try stager.write(Data("alice identity\n".utf8), to: pass)
+        try staged(vox, ["node", "create", "alice", "--passphrase-file", pass], env: voxEnv)
+        try staged(vox, ["node", "attach", "alice", "--keep", "--passphrase-file", pass], env: voxEnv)
+        try stager.write(Data("keep\n".utf8), to: config + "/app/login-item")
+        try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+        try stager.write(Data("off\n".utf8), to: config + "/app/menubar")
+        try stager.write(Data("registered vox-proof-service-stand-in\n".utf8),
+                         to: config + "/app/proof-login-item")
+        func read(_ name: String) -> String {
+            stager.run(["/bin/cat", config + "/app/" + name], env: [:]).out
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        func settle(_ name: String, _ want: (String) -> Bool) -> String {
+            var got = read(name)
+            let until = Date().addingTimeInterval(10)
+            while !want(got) && Date() < until {
+                Thread.sleep(forTimeInterval: 0.25)
+                got = read(name)
+            }
+            return got
+        }
+        /// The app's text size as View > Bigger keeps it, in its defaults (read, never written):
+        /// the domain of the bundle under proof, whatever its identifier.
+        let domain = stager.run(["/usr/bin/defaults", "read", appPath + "/Contents/Info", "CFBundleIdentifier"],
+                                env: [:]).out.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !domain.isEmpty else { throw Apparatus("\(appPath) has no CFBundleIdentifier to read its text size under") }
+        func textScale() -> String {
+            stager.run(["/usr/bin/defaults", "read", domain, "textScale"], env: [:]).out
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let ui = voxApp(appPath)
+        ui.launchEnvironment = voxEnv.merging(["HOME": home]) { $1 }
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        defer { ui.terminate() }
+        present(ui, Key.id("attached"), timeout: 60,
+                "with Keep Running chosen and alice needing no passphrase, the app must open attached as alice")
+
+        // Settings, by ⌘, as a person opens it.
+        ui.typeKey(",", modifierFlags: .command)
+        present(ui, Key.id("settings-menu-bar"), timeout: 10, "⌘, must open Settings")
+
+        // menu bar: on, then off again.
+        tap(ui, Key.id("settings-menu-bar"), "Settings > Show Vox in the menu bar")
+        let barOn = settle("menubar") { $0 == "on" }
+        tap(ui, Key.id("settings-menu-bar"), "Settings > Show Vox in the menu bar, again")
+        let barOff = settle("menubar") { $0 == "off" }
+        XCTAssertTrue(barOn == "on" && barOff == "off",
+                      "PRODUCT: Settings > Show Vox in the menu bar must turn the item on and off; the choice was kept as \(barOn.debugDescription), then \(barOff.debugDescription)")
+
+        // text size: 130%, then back to Actual Size.
+        let before = textScale()
+        tap(ui, Key.id("settings-text-size"), "Settings > Text size")
+        tap(ui, Key.menuItem("130%"), "Settings > Text size > 130%")
+        var scaled = textScale()
+        let until = Date().addingTimeInterval(10)
+        while scaled != "1.3" && Date() < until { Thread.sleep(forTimeInterval: 0.25); scaled = textScale() }
+        // The window is drawn again at the new size, so the control is looked up afresh.
+        tap(ui, Key.id("settings-text-size"), "Settings > Text size, again")
+        tap(ui, Key.menuItem("100% (Actual Size)"), "Settings > Text size > 100% (Actual Size)")
+        var back = textScale()
+        let until2 = Date().addingTimeInterval(10)
+        while back != "1" && Date() < until2 { Thread.sleep(forTimeInterval: 0.25); back = textScale() }
+        XCTAssertTrue(scaled == "1.3" && back == "1",
+                      "PRODUCT: Settings > Text size must set the app's text size, as View > Bigger keeps it; 130% left it \(scaled.debugDescription) and Actual Size \(back.debugDescription) (it was \(before.debugDescription) before)")
+
+        // keep running: off from Settings, the Vox menu agreeing; then on again.
+        tap(ui, Key.id("settings-keep-running"), "Settings > Keep Vox running while you're logged in")
+        let answerOff = settle("login-item") { $0 == "no" }
+        let itemOff = settle("proof-login-item") { $0.hasPrefix("unregistered") }
+        XCTAssertTrue(answerOff == "no" && itemOff.hasPrefix("unregistered"),
+                      "PRODUCT: turning Keep Running off in Settings must keep the answer as Not Now and unregister the login item; the answer is \(answerOff.debugDescription), the login item was left \(itemOff.debugDescription)")
+        let voxMenu = ui.menuBars.menuBarItems["Vox"]
+        guard voxMenu.waitForExistence(timeout: 10) else {
+            throw Apparatus("XCTest finds no Vox menu in the menu bar")
+        }
+        voxMenu.click()
+        present(ui, Key.menuItem("Keep Running While Logged In"), timeout: 10,
+                "with Keep Running turned off in Settings, the Vox menu must offer Keep Running While Logged In")
+        ui.typeKey(.escape, modifierFlags: [])
+        tap(ui, Key.id("settings-keep-running"), "Settings > Keep Vox running while you're logged in, again")
+        let answerOn = settle("login-item") { $0 == "keep" }
+        let itemOn = settle("proof-login-item") { $0.hasPrefix("registered") }
+        XCTAssertTrue(answerOn == "keep" && itemOn.hasPrefix("registered"),
+                      "PRODUCT: turning Keep Running on in Settings must keep the answer as Keep Running and register the login item; the answer is \(answerOn.debugDescription), the login item was left \(itemOn.debugDescription)")
+
+        ui.typeKey(.escape, modifierFlags: [])
+        let uid = stager.run(["/usr/bin/id", "-u"], env: [:]).out.trimmingCharacters(in: .whitespacesAndNewlines)
+        // The person's own Vox may keep its login item loaded (us.vox.app's); only one whose parent
+        // bundle is the proof build would mean the app registered a real one past its stand-in.
+        let loaded = stager.run(["/bin/launchctl", "print", "gui/\(uid)/us.vox.daemon"], env: [:])
+        let proofs = loaded.status == 0 && loaded.out.contains("parent bundle identifier = \(proofAppID)\n")
+        XCTAssertFalse(proofs,
+                       "PRODUCT: the proof build's own login item is loaded after this case: the app registered a real one past its stand-in")
+        print("[proof] settings: menu bar \(barOn.debugDescription) then \(barOff.debugDescription); keep running \(answerOff.debugDescription)/\(itemOff.debugDescription) then \(answerOn.debugDescription)/\(itemOn.debugDescription); text size \(scaled.debugDescription) then \(back.debugDescription)")
+    }
+
+    /// View > Bigger (⌘+) scales the conversation only (the decider, v0.4.1), alone. Staged by
+    /// `vox`: alice attached, with one room holding one message of hers, chosen before. Two ⌘+
+    /// grow the message's text; a sidebar row and the inspector's MEMBERS line keep their size.
+    /// ⌘0 puts the size back. Mutation: the conversation's scale applied to the whole window → red
+    /// at "unchanged".
+    func testBiggerScalesTheConversationOnly() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
+            throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are set by scripts/app-proofs.sh")
+        }
+        let vox = URL(fileURLWithPath: appPath).appendingPathComponent("Contents/Helpers/vox").path
+        let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("bigger")
+        let data = root.appendingPathComponent("data").path
+        let config = root.appendingPathComponent("config").path
+        let home = root.appendingPathComponent("home").path
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+                           until: "vox daemon: control socket")
+        let idPass = root.appendingPathComponent("alice.pass").path
+        let roomPass = root.appendingPathComponent("room.pass").path
+        try stager.write(Data("alice identity\n".utf8), to: idPass)
+        try stager.write(Data("bigger room\n".utf8), to: roomPass)
+        try staged(vox, ["node", "create", "alice"],
+                   env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "alice identity"]) { $1 })
+        try staged(vox, ["node", "attach", "alice", "--passphrase-file", idPass], env: voxEnv)
+        try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", roomPass,
+                         "--name", "talk"], env: voxEnv)
+        let room = try line(staged(vox, ["room", "list", "--node", "alice"], env: voxEnv)) {
+            $0.contains(" talk")
+        }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        try staged(vox, ["room", "post", "--node", "alice", room, "MEASURE-THIS-MESSAGE"], env: voxEnv)
+        try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
+        try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+
+        let ui = voxApp(appPath)
+        ui.launchEnvironment = voxEnv.merging(["HOME": home]) { $1 }
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        defer { ui.terminate() }
+        present(ui, Key.id("attached"), timeout: 60, "the app must open attached as alice")
+        ui.typeKey("0", modifierFlags: .command)
+        tap(ui, Key.id("room-talk"), "the room talk in the sidebar")
+        present(ui, Key.showing("MEASURE-THIS-MESSAGE"), timeout: 20, "alice's message must show in the timeline")
+
+        func height(_ key: Key) -> CGFloat {
+            guard let e = locate(ui, key) else { return -1 }
+            return e.frame.height
+        }
+        let message = Key.showing("MEASURE-THIS-MESSAGE")
+        let sidebarRow = Key.id("room-talk")
+        let members = Key.showing("MEMBERS")
+        Thread.sleep(forTimeInterval: 1)
+        let m0 = height(message), s0 = height(sidebarRow), i0 = height(members)
+        ui.typeKey("+", modifierFlags: .command)
+        ui.typeKey("+", modifierFlags: .command)
+        Thread.sleep(forTimeInterval: 2)
+        present(ui, message, timeout: 10, "after View > Bigger, the message must still show")
+        let m1 = height(message), s1 = height(sidebarRow), i1 = height(members)
+        ui.typeKey("0", modifierFlags: .command)
+        XCTAssertTrue(m0 > 0 && m1 > m0 * 1.15,
+                      "PRODUCT: View > Bigger twice must grow the conversation's text; the message was \(m0) high and is \(m1)")
+        XCTAssertTrue(s0 > 0 && i0 > 0 && abs(s1 - s0) <= 1 && abs(i1 - i0) <= 1,
+                      "PRODUCT: View > Bigger must leave the sidebar and the inspector unchanged; a sidebar row went from \(s0) to \(s1), the inspector's MEMBERS line from \(i0) to \(i1)")
+        print("[proof] bigger: message \(m0) → \(m1); sidebar row \(s0) → \(s1); inspector line \(i0) → \(i1)")
     }
 
     /// (8) Notifications (ADR-014 M-23, ADR-028 R-10, #448), alone: the one step that needs a
@@ -678,6 +918,459 @@ final class FirstRunProof: XCTestCase {
         print("[proof] notification: \(shown(banner))")
     }
 
+    /// A new person, with no node on this Mac, starts in the app and ends in a room with a post,
+    /// never sent to Terminal: the welcome makes their node (a name, the identity passphrase typed
+    /// twice, the no-backup notice), as `vox node create` makes it, and attaches it; the empty
+    /// window offers New Room; the room takes a post. Every screen on the way is read for Terminal
+    /// or a `vox` command. Mutant: the welcome sending the person to `vox node create` in Terminal
+    /// → red at "must not send a person to Terminal".
+    func testANewPersonMakesTheirNodeAndARoomInTheApp() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
+            throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are set by scripts/app-proofs.sh")
+        }
+        let vox = URL(fileURLWithPath: appPath).appendingPathComponent("Contents/Helpers/vox").path
+        let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("new-person")
+        let data = root.appendingPathComponent("data").path
+        let config = root.appendingPathComponent("config").path
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        // An empty data root and its daemon: no node on this Mac.
+        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+                           until: "vox daemon: control socket")
+        let before = run(vox, ["node", "list"], env: voxEnv)
+        guard before.status == 0, nodeLine(before.out, "alice") == nil else {
+            throw Apparatus("staging not achieved: the data root is to hold no node; `vox node list` said \(before.out)")
+        }
+
+        let ui = voxApp(appPath)
+        ui.launchEnvironment = voxEnv
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        defer {
+            ui.terminate()
+            _ = run(vox, ["node", "detach", "alice"], env: voxEnv)
+        }
+        present(ui, Key.id("login-item-why"), timeout: 30, "at first run the app must ask about Keep Running")
+        tap(ui, Key.id("login-item-not-now"), "Not Now")
+
+        // The welcome: the node is made here.
+        let name = Key.id("new-node-name")
+        present(ui, name, timeout: 30,
+                "with no node on this Mac, the first run must offer to make one in the app")
+        noCommandLine(ui, "the welcome")
+        words(ui, Key.id("new-node-no-backup"), timeout: 5,
+              "making a node must say there is no backup of it",
+              until: { $0.lowercased().contains("there is no backup of a node") })
+        if tap(ui, name, "the node's name field") {
+            ui.typeKey("a", modifierFlags: .command)
+            el(ui, name).typeText("alice")
+        }
+        // Typed twice, differently: refused, and nothing made.
+        type(ui, Key.id("new-node-passphrase"), "alice identity", "the passphrase field")
+        type(ui, Key.id("new-node-passphrase-again"), "not the same", "the passphrase again field")
+        tap(ui, Key.id("new-node-make"), "Make Node")
+        words(ui, Key.id("said"), timeout: 15,
+              "a passphrase typed twice differently must be refused, where it was typed",
+              until: { $0.lowercased().contains("the two passphrases differ") })
+        let refused = run(vox, ["node", "list"], env: voxEnv).out
+        XCTAssertNil(nodeLine(refused, "alice"),
+                     "PRODUCT: refused for two different passphrases, the app must have made no node; `vox node list` says \(refused)")
+        noCommandLine(ui, "the welcome, after a refusal")
+        type(ui, Key.id("new-node-passphrase"), "alice identity", "the passphrase field")
+        type(ui, Key.id("new-node-passphrase-again"), "alice identity", "the passphrase again field")
+        tap(ui, Key.id("new-node-make"), "Make Node")
+        present(ui, Key.id("attached"), timeout: 90,
+                "made in the app, node alice must be attached in its window")
+        let listed = run(vox, ["node", "list"], env: voxEnv).out
+        XCTAssertTrue(nodeLine(listed, "alice")?.contains(" attached ") ?? false,
+                      "PRODUCT: the app's new node must be alice, attached, as `vox node list` lists it; it says \(listed)")
+
+        // In no room yet: the window offers the ways in.
+        let newRoom = Key.id("empty-new-room")
+        present(ui, newRoom, timeout: 15, "a node in no room must be offered New Room in the window")
+        noCommandLine(ui, "the window of a node in no room")
+        tap(ui, newRoom, "New Room…")
+        let roomName = Key.id("room-form-name")
+        present(ui, roomName, timeout: 10, "New Room… must open the New Room form")
+        noCommandLine(ui, "the New Room form")
+        type(ui, roomName, "first", "the room's name field")
+        type(ui, Key.id("room-form-passphrase"), "first room", "the room's passphrase field")
+        tap(ui, Key.id("room-form-submit"), "Create")
+        tap(ui, Key.id("room-first"), "first in the sidebar", premise: inRoom(vox, voxEnv, "first"))
+        let compose = Key.id("compose")
+        present(ui, compose, timeout: 15, "the new room must offer its composer")
+        type(ui, compose, "HELLO-FIRST-RUN\r", "the composer")
+        present(ui, Key.showing("HELLO-FIRST-RUN"), timeout: 15, "alice's post must show in her new room")
+        noCommandLine(ui, "the new room")
+        let rooms = run(vox, ["room", "list", "--node", "alice"], env: voxEnv).out
+        let room = rooms.split(separator: "\n").first { $0.contains(" first") }?
+            .split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        let read = run(vox, ["room", "read", "--node", "alice", room], env: voxEnv).out
+        XCTAssertTrue(!room.isEmpty && read.contains("HELLO-FIRST-RUN"),
+                      "PRODUCT: the room made in the app must hold alice's post, as `vox room read` reads it; `vox room list` says \(rooms), and the room reads \(read)")
+        print("[proof] new person: node alice made and attached in the app, room \(room) made from the empty window, HELLO-FIRST-RUN posted; no screen named Terminal or a vox command")
+    }
+
+    /// Red when what the app shows sends a person to Terminal or names a `vox` command: every
+    /// label and value in its windows, sheets and dialogs, read as they are.
+    private func noCommandLine(_ ui: XCUIApplication, _ where: String,
+                               file: StaticString = #filePath, line: UInt = #line) {
+        let shownNow = containers(ui).flatMap { $0.descendants(matching: .any).allElementsBoundByIndex.prefix(400) }
+            .map(shown).filter { !$0.isEmpty }
+        let words = ["Terminal", "terminal", "command line", "vox node", "vox room", "vox id", "vox trust", "`vox"]
+        if let said = shownNow.first(where: { text in words.contains { text.contains($0) } }) {
+            keepTree(ui, "\(`where`) named Terminal or a command")
+            XCTFail("PRODUCT: \(`where`) must not send a person to Terminal or name a vox command; it shows \"\(said)\"",
+                    file: file, line: line)
+        }
+    }
+
+    /// A data root an earlier release left (a node directory beside `nodes/`, which this version
+    /// refuses) is said plainly in the app, with "Move It Aside and Start Fresh": the directory is
+    /// moved, whole and unread, under `moved-aside/`, nothing deleted, and the welcome follows,
+    /// saying where it went. Staged with dummy files only. Mutant: the move deleting the directory
+    /// instead of renaming it → red at "must be kept, whole".
+    func testAnEarlierReleasesNodeIsMovedAsideInTheApp() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
+            throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are set by scripts/app-proofs.sh")
+        }
+        let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("old-node")
+        let data = root.appendingPathComponent("data").path
+        let config = root.appendingPathComponent("config").path
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        // The layout an earlier release left: dummy files, no real data.
+        let vault = "STAGED-OLD-VAULT \(UUID().uuidString)"
+        try stager.write(Data(vault.utf8), to: data + "/default/vault.cbor")
+        try stager.write(Data("STAGED-OLD-STORE".utf8), to: data + "/default/store.redb")
+        // The daemon the app starts after the move, stopped by its pid when the case ends.
+        defer {
+            let pid = stager.run(["/bin/cat", data + "/.daemon/lock"], env: [:]).out
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if Int32(pid) != nil { _ = stager.run(["/bin/kill", pid], env: [:]) }
+        }
+
+        let ui = voxApp(appPath)
+        ui.launchEnvironment = voxEnv
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        defer { ui.terminate() }
+        present(ui, Key.id("login-item-why"), timeout: 30, "at first run the app must ask about Keep Running")
+        tap(ui, Key.id("login-item-not-now"), "Not Now")
+
+        let moveAside = Key.id("old-move-aside")
+        present(ui, moveAside, timeout: 30,
+                "a data root an earlier release left must be said in the app, with a way to move it aside")
+        words(ui, Key.id("old-layout-why"), timeout: 5,
+              "the app must say plainly which node it cannot read",
+              until: { $0.contains("cannot read default") && $0.contains("Nothing in it is deleted") })
+        noCommandLine(ui, "the earlier-release screen")
+        tap(ui, moveAside, "Move It Aside and Start Fresh")
+        present(ui, Key.id("new-node-name"), timeout: 60,
+                "moved aside, the app must go on to the welcome that makes a node")
+        let note = words(ui, Key.id("moved-aside-note"), timeout: 10,
+                         "the welcome must say where the old node went",
+                         until: { $0.contains("/moved-aside/default-") }) ?? ""
+        noCommandLine(ui, "the welcome after the move")
+        let gone = stager.run(["/bin/test", "-e", data + "/default"], env: [:]).status != 0
+        let kept = stager.run(["/bin/sh", "-c", "cat \"$0\"/moved-aside/default-*/vault.cbor", data], env: [:]).out
+        XCTAssertTrue(gone && kept == vault,
+                      "PRODUCT: Move It Aside must move the old node directory, whole: it must be kept under moved-aside/ with its vault as it was, and gone from where it was; gone from there: \(gone), the kept vault reads \(kept.debugDescription); the app said \(note.debugDescription)")
+        print("[proof] earlier release: default moved aside whole (\(note)); the welcome followed; no screen named Terminal or a vox command")
+    }
+
+    /// Driving Sessions in the app goes where it is shown (D2, D12, D13, P1). Alice and the
+    /// agent node claude-a share rooms work and other; claude-a's two Sessions S1 and S2 are opened
+    /// by `vox agent hook` as Claude Code runs it, and S1 asks an approval. Claims, each with its
+    /// mutant:
+    /// - D12: work's draft survives going to other and back (mutant: the draft not restored);
+    ///   S1's draft never shows in S2, and comes back in S1 (mutant: the composer not keyed by
+    ///   its Session).
+    /// - D2: with S1 shown, ⌘↩ sends nothing to the room, and Send Urgent is disabled (mutant:
+    ///   Send Urgent enabled in a Session).
+    /// - D13: a prompt the Session does not take stays in its composer (mutant: cleared before
+    ///   delivery), and ⌃C asks before stopping.
+    /// - P1: ⌘J opens S1 with its waiting request selected, and ⌥⌘Y approves it: the hook gets
+    ///   "allow" (mutant: ⌘J opening the room only).
+    func testSessionsAreDrivenWhereTheyAreShown() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
+            throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are set by scripts/app-proofs.sh")
+        }
+        let vox = URL(fileURLWithPath: appPath).appendingPathComponent("Contents/Helpers/vox").path
+        let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("sessions")
+        let data = root.appendingPathComponent("data").path
+        let config = root.appendingPathComponent("config").path
+        let work = root.appendingPathComponent("work").path
+        let home = root.appendingPathComponent("home").path
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        let pass = { (name: String) in root.appendingPathComponent("\(name).pass").path }
+        try stager.write(Data("alice identity\n".utf8), to: pass("alice"))
+        try stager.write(Data("agent identity\n".utf8), to: pass("claude-a"))
+        try stager.write(Data("work room\n".utf8), to: pass("room"))
+        try stager.write(Data("keep\n".utf8), to: work + "/.keep")
+        try stager.write(Data("keep\n".utf8), to: home + "/.keep")
+        // The first run answered (Not Now) and the node chosen: the app opens as alice.
+        try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
+        try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+                           until: "vox daemon: control socket")
+        for (name, words) in [("alice", "alice identity"), ("claude-a", "agent identity")] {
+            try staged(vox, ["node", "create", name],
+                       env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": words]) { $1 })
+            try staged(vox, ["node", "attach", name, "--passphrase-file", pass(name)], env: voxEnv)
+        }
+        let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
+        let agentFp = try line(staged(vox, ["id", "--node", "claude-a"], env: voxEnv)) { $0.count == 52 }
+        var rooms: [String: String] = [:]
+        for name in ["work", "other"] {
+            try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", pass("room"),
+                             "--name", name], env: voxEnv)
+            let id = try line(staged(vox, ["room", "list", "--node", "alice"], env: voxEnv)) {
+                $0.contains(" \(name)")
+            }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+            let link = try line(staged(vox, ["room", "link", "--node", "alice", id], env: voxEnv)) {
+                $0.hasPrefix("vox://")
+            }
+            try staged(vox, ["room", "join", "--node", "claude-a", "--passphrase-file", pass("room"), link],
+                       env: voxEnv)
+            rooms[name] = id
+        }
+        let room = rooms["work"] ?? ""
+        try staged(vox, ["trust", "add", "--node", "alice", agentFp, "--name", "claude-a",
+                         "--identity-passphrase-file", pass("alice")], env: voxEnv)
+        try staged(vox, ["trust", "add", "--node", "claude-a", aliceFp, "--name", "alice", "--drive",
+                         "--identity-passphrase-file", pass("claude-a")], env: voxEnv)
+        // Claude Code's two sessions, opened by its hook as it runs it.
+        let hookEnv = voxEnv.merging(["HOME": home, "VOX_NODE": "claude-a",
+                                      "VOX_IDENTITY_PASSPHRASE": "agent identity",
+                                      "CLAUDE_CODE_ENTRYPOINT": "cli", "PATH": "/usr/bin:/bin"]) { $1 }
+        let s1 = "51aaaaaa-4c0e-4f00-9a1b-0c0ffee54001", s2 = "52bbbbbb-4c0e-4f00-9a1b-0c0ffee54002"
+        func event(_ session: String, _ name: String, _ extra: [String: Any] = [:]) -> String {
+            var e: [String: Any] = ["session_id": session, "transcript_path": work + "/\(session).jsonl",
+                                    "cwd": work, "permission_mode": "default", "hook_event_name": name]
+            for (k, v) in extra { e[k] = v }
+            let bytes = (try? JSONSerialization.data(withJSONObject: e)) ?? Data()
+            return String(decoding: bytes, as: UTF8.self)
+        }
+        func hook(_ json: String) throws {
+            let r = stager.run(["/bin/sh", "-c", "cd \"$1\" && exec \"$2\" agent hook --node claude-a --room \"$3\"",
+                                "hook", work, vox, room], env: hookEnv, input: json)
+            guard r.status == 0 else { throw Apparatus("`vox agent hook` exited \(r.status): \(r.out)") }
+        }
+        for (session, words) in [(s1, "S1-WORDS"), (s2, "S2-WORDS")] {
+            try stager.write(Data(), to: work + "/\(session).jsonl")
+            try hook(event(session, "UserPromptSubmit", ["prompt": words]))
+        }
+        // S1 asks an approval: its hook waits for the answer, in the background, its pid kept.
+        // Only the hook itself goes to the background, with its own output in a file, so nothing
+        // left running holds the stager's pipe open; `&&` would background a subshell holding it.
+        let touch: [String: Any] = ["command": "touch p1", "description": "Make p1"]
+        try hook(event(s1, "PreToolUse", ["tool_name": "Bash", "tool_input": touch, "tool_use_id": "toolu_P1"]))
+        let asked = root.appendingPathComponent("asked")
+        try stager.write(Data(event(s1, "PermissionRequest", ["tool_name": "Bash", "tool_input": touch,
+                                                               "permission_suggestions": []]).utf8),
+                         to: asked.path + ".json")
+        let started = stager.run(["/bin/sh", "-c",
+                                  "cd \"$1\" || exit 1; \"$2\" agent hook --node claude-a --room \"$3\" < \"$4.json\" > \"$4.out\" 2>&1 & echo $!",
+                                  "hook", work, vox, room, asked.path], env: hookEnv)
+        let hookPid = started.out.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard started.status == 0, Int32(hookPid) != nil else {
+            throw Apparatus("the waiting PermissionRequest hook did not start: \(started.out)")
+        }
+        defer { _ = stager.run(["/bin/kill", hookPid], env: [:]) }
+        let waitingUntil = Date().addingTimeInterval(20)
+        var sessionsNow = ""
+        while Date() < waitingUntil && !sessionsNow.contains("waiting") {
+            sessionsNow = run(vox, ["room", "sessions", "--node", "alice", room], env: voxEnv).out
+            if !sessionsNow.contains("waiting") { Thread.sleep(forTimeInterval: 0.5) }
+        }
+
+        let ui = voxApp(appPath)
+        ui.launchEnvironment = voxEnv
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        defer { ui.terminate() }
+        present(ui, Key.id("attached"), timeout: 60, "the app must open attached as alice")
+
+        // P1: ⌘J lands on S1, its waiting request selected.
+        ui.typeKey("j", modifierFlags: .command)
+        let requestRow = Key.idPrefix("request-row-")
+        present(ui, requestRow, timeout: 30,
+                "⌘J must open S1, the Session waiting on alice, with its request",
+                premise: Premise("S1 has a request waiting on alice") {
+                    (sessionsNow.contains("waiting"), "`vox room sessions` said \(sessionsNow.debugDescription)")
+                })
+        if let row = locate(ui, requestRow), !row.isSelected {
+            keepTree(ui, "the request ⌘J landed on was not selected")
+            XCTFail("PRODUCT: ⌘J must select the waiting request in S1; its row is not selected")
+        }
+        // ⌥⌘Y approves the selected request: the hook gets allow.
+        ui.typeKey("y", modifierFlags: [.command, .option])
+        let answerUntil = Date().addingTimeInterval(20)
+        var answered = ""
+        while Date() < answerUntil && !answered.contains("behavior") {
+            answered = stager.run(["/bin/cat", asked.path + ".out"], env: [:]).out
+            if !answered.contains("behavior") { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        XCTAssertTrue(answered.contains("\"allow\""),
+                      "PRODUCT: ⌥⌘Y must approve the selected request: S1's hook must get allow; it printed \(answered.debugDescription)")
+
+        // D12: work's draft survives going to other and back.
+        tap(ui, Key.id("session-general"), "General in work's Sessions")
+        let compose = Key.id("compose")
+        type(ui, compose, "KEEP-ROOM-DRAFT", "work's composer")
+        tap(ui, Key.id("room-other"), "other in the sidebar", premise: inRoom(vox, voxEnv, "other"))
+        tap(ui, Key.id("room-work"), "work in the sidebar", premise: inRoom(vox, voxEnv, "work"))
+        tap(ui, Key.id("session-general"), "General in work's Sessions")
+        words(ui, compose, timeout: 10, "work's draft must be kept when another room is opened and work again",
+              until: { $0.contains("KEEP-ROOM-DRAFT") }, field: true)
+
+        // D2: with S1 shown, ⌘↩ sends nothing to the room, and Send Urgent is disabled.
+        let s1Row = Key.id("session-\(s1.prefix(8))"), s2Row = Key.id("session-\(s2.prefix(8))")
+        tap(ui, s1Row, "S1 in work's Sessions")
+        ui.typeKey(.return, modifierFlags: .command)
+        Thread.sleep(forTimeInterval: 3)
+        let roomRead = run(vox, ["room", "read", "--node", "alice", room], env: voxEnv).out
+        XCTAssertFalse(roomRead.contains("KEEP-ROOM-DRAFT"),
+                       "PRODUCT: ⌘↩ while S1 is shown must not send work's General draft to the room; the room reads it")
+        let urgent = ui.menuBars.menuItems["Send Urgent"]
+        if urgent.exists && urgent.isEnabled {
+            XCTFail("PRODUCT: Send Urgent must be disabled while a Session is shown; it is enabled")
+        }
+
+        // D12: S1's draft never shows in S2, and comes back in S1.
+        let sessionCompose = Key.id("session-compose")
+        type(ui, sessionCompose, "S1-DRAFT", "S1's composer")
+        tap(ui, s2Row, "S2 in work's Sessions")
+        Thread.sleep(forTimeInterval: 1)
+        if let e = locate(ui, sessionCompose), typed(e).contains("S1-DRAFT") {
+            keepTree(ui, "S1's draft showed in S2")
+            XCTFail("PRODUCT: S1's draft must not show in S2's composer; it shows \"\(typed(e))\"")
+        }
+        tap(ui, s1Row, "S1 in work's Sessions")
+        words(ui, sessionCompose, timeout: 10, "S1's draft must come back in S1",
+              until: { $0.contains("S1-DRAFT") }, field: true)
+
+        // D13: a prompt S2 does not take stays. claude-a is detached first, so nothing can take
+        // it: refused or unanswered, the text must stay.
+        try staged(vox, ["node", "detach", "claude-a"], env: voxEnv)
+        tap(ui, s2Row, "S2 in work's Sessions")
+        type(ui, sessionCompose, "S2-PROMPT\r", "S2's composer")
+        let said = words(ui, Key.id("session-said"), timeout: 30, "S2 must say what came of the prompt",
+                         until: { !$0.isEmpty }) ?? ""
+        words(ui, sessionCompose, timeout: 5,
+              "a prompt S2 did not take must stay in its composer (S2 said \"\(said)\")",
+              until: { $0.contains("S2-PROMPT") }, field: true)
+        ui.typeKey("c", modifierFlags: .control)
+        present(ui, Key.showing("It ends the session."), timeout: 10,
+                "⌃C must ask before stopping the Session")
+        ui.typeKey(.escape, modifierFlags: [])
+        print("[proof] sessions: ⌘J landed on S1's request and ⌥⌘Y approved it; work's draft kept; ⌘↩ in S1 sent nothing; S1's draft stayed in S1; S2 said \(said.debugDescription) and kept the prompt; ⌃C asked")
+    }
+
+    /// A keyring change waiting for the passphrase is bound to what it changes (D1). Alice is
+    /// attached with her keyring window closed, so a change asks for the passphrase. She adds
+    /// bob; the prompt names it ("trust bob"). Carol, a newcomer to her room, is offered: carol's
+    /// offer shows no prompt, only that a change is waiting; trusting carol there asks first
+    /// whether to replace it, and kept, the passphrase typed makes bob's change, not carol's.
+    /// Mutant: the prompt shown wherever a change waits → red at "carol's offer must not show
+    /// the prompt".
+    func testAKeyringChangeWaitsWhereItWasMade() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
+            throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are set by scripts/app-proofs.sh")
+        }
+        let vox = URL(fileURLWithPath: appPath).appendingPathComponent("Contents/Helpers/vox").path
+        let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("keyring-pending")
+        let data = root.appendingPathComponent("data").path
+        let config = root.appendingPathComponent("config").path
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        let pass = { (name: String) in root.appendingPathComponent("\(name).pass").path }
+        for name in ["alice", "bob", "carol"] {
+            try stager.write(Data("\(name) identity\n".utf8), to: pass(name))
+        }
+        try stager.write(Data("pending room\n".utf8), to: pass("room"))
+        try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
+        try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+                           until: "vox daemon: control socket")
+        for name in ["alice", "bob", "carol"] {
+            try staged(vox, ["node", "create", name],
+                       env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "\(name) identity"]) { $1 })
+            try staged(vox, ["node", "attach", name, "--passphrase-file", pass(name)], env: voxEnv)
+        }
+        let bobFp = try line(staged(vox, ["id", "--node", "bob"], env: voxEnv)) { $0.count == 52 }
+        let carolFp = try line(staged(vox, ["id", "--node", "carol"], env: voxEnv)) { $0.count == 52 }
+        try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", pass("room"),
+                         "--name", "pending"], env: voxEnv)
+        let room = try line(staged(vox, ["room", "list", "--node", "alice"], env: voxEnv)) {
+            $0.contains(" pending")
+        }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        let link = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        // Carol joins: alice is offered carol (K-15).
+        try staged(vox, ["room", "join", "--node", "carol", "--passphrase-file", pass("room"), link],
+                   env: voxEnv)
+        let offerUntil = Date().addingTimeInterval(30)
+        var offers = ""
+        while Date() < offerUntil && !offers.contains(String(carolFp.prefix(12))) {
+            offers = run(vox, ["trust", "offers", "--node", "alice"], env: voxEnv).out
+            if !offers.contains(String(carolFp.prefix(12))) { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        guard offers.contains(String(carolFp.prefix(12))) else {
+            throw Apparatus("staging not achieved: alice was never offered carol: `vox trust offers` said \(offers)")
+        }
+
+        let ui = voxApp(appPath)
+        ui.launchEnvironment = voxEnv
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        defer { ui.terminate() }
+        present(ui, Key.id("attached"), timeout: 60, "the app must open attached as alice")
+
+        // Bob's change, waiting for the passphrase, named.
+        tap(ui, Key.id("keyring"), "Keyring in the sidebar")
+        type(ui, Key.id("keyring-add-fingerprint"), bobFp, "the fingerprint field")
+        type(ui, Key.id("keyring-add-alias"), "bob", "the alias field")
+        tap(ui, Key.id("keyring-trust"), "Trust")
+        words(ui, Key.id("keyring-passphrase-why"), timeout: 15,
+              "a change waiting for the passphrase must name itself",
+              until: { $0.contains("trust bob") })
+
+        // Carol's offer: no prompt there, only that bob's change waits.
+        let offer = Key.id("offer-\(carolFp.prefix(12))")
+        tap(ui, offer, "carol's offer in the sidebar",
+            premise: Premise("carol is offered to alice") {
+                (offers.contains(String(carolFp.prefix(12))), "`vox trust offers` said \(offers.debugDescription)")
+            })
+        present(ui, Key.id("offer-alias"), timeout: 10, "carol's offer must open")
+        if locate(ui, Key.id("keyring-passphrase")) != nil {
+            keepTree(ui, "carol's offer showed the passphrase prompt")
+            XCTFail("PRODUCT: carol's offer must not show the passphrase prompt for bob's change")
+        }
+        words(ui, Key.id("keyring-waiting"), timeout: 10,
+              "carol's offer must say a keyring change is waiting, and which",
+              until: { $0.contains("trust bob") })
+        // Trusting carol while bob's waits: asked first; kept.
+        type(ui, Key.id("offer-alias"), "carol", "carol's alias field")
+        tap(ui, Key.id("offer-accept"), "Trust on carol's offer")
+        present(ui, Key.id("keyring-replace-ask"), timeout: 15,
+                "a second change waiting for the passphrase must ask before replacing the first")
+        tap(ui, Key.id("keyring-replace-no"), "Keep Waiting Change")
+
+        // The passphrase, typed where bob's change waits, makes bob's change only.
+        tap(ui, Key.id("keyring"), "Keyring in the sidebar")
+        type(ui, Key.id("keyring-passphrase"), "alice identity", "the keyring's passphrase field")
+        tap(ui, Key.id("keyring-passphrase-continue"), "Trust (with the passphrase)")
+        let listUntil = Date().addingTimeInterval(30)
+        var list = ""
+        while Date() < listUntil && !list.contains(bobFp) {
+            list = run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out
+            if !list.contains(bobFp) { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        XCTAssertTrue(list.contains(bobFp) && !list.contains(carolFp),
+                      "PRODUCT: the passphrase typed for bob's change must trust bob, and not carol; `vox trust list` says \(list)")
+        print("[proof] keyring: bob's change named and waiting; carol's offer showed only the waiting line; a second change asked first; the passphrase trusted bob only")
+    }
+
     func testFirstRunAttachesTheNodeAndQuitDetachesIt() throws {
         let env = ProcessInfo.processInfo.environment
         guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
@@ -772,8 +1465,8 @@ final class FirstRunProof: XCTestCase {
             listed = run(vox, ["node", "list"], env: voxEnv).out
         } else {
         // (1) First run: the login item is asked about once, and declined here (approving it is
-        // the manual check manual.login_item); then pick the node, and a wrong passphrase is the
-        // daemon's sentence.
+        // the manual check manual.login_item); then the one node is asked for, and a wrong
+        // passphrase is the daemon's sentence.
         words(ui, Key.id("login-item-why"), timeout: 30,
               "at first run the app must ask whether to keep the daemon running, saying what that does",
               until: { $0.contains("keeps Vox running in the background while you're logged in, even with the app closed") })
@@ -790,16 +1483,16 @@ final class FirstRunProof: XCTestCase {
             }
         }
         tap(ui, Key.id("login-item-not-now"), "Not Now")
-        let pick = Key.id("node-alice")
-        present(ui, pick, timeout: 30, "at first run the app must offer node alice")
-        tap(ui, pick, "node alice")
+        // Alice is the one node on this Mac: the app acts as her without asking which, and asks
+        // only for her passphrase.
         let field = Key.id("passphrase")
-        present(ui, field, timeout: 10, "the app must ask for node alice's passphrase")
+        present(ui, field, timeout: 30,
+                "with one node on this Mac, the app must ask for node alice's passphrase, not which node")
         type(ui, field, "not the passphrase", "the passphrase field")
         tap(ui, Key.id("attach"), "Attach")
         words(ui, Key.id("said"), timeout: 30,
               "a wrong passphrase must show the daemon's own sentence where it was typed",
-              until: { $0.contains("that passphrase does not open node alice's identity") })
+              until: { $0.lowercased().contains("that passphrase does not open node alice's identity") })
 
         // (2) The right one attaches it, pasted with ⌘V, as from a password manager (v0.4.1).
         if let held = paste(ui, field, "alice identity", "the passphrase field") {
@@ -1326,9 +2019,9 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("keyring-remove-carol"), "Remove… on carol",
             premise: trusted(vox, voxEnv, carolFp, "carol"))
         words(ui, Key.id("keyring-remove-effect"), timeout: 10,
-              "removing must say what untrusting does before it is done",
+              "removing must say what removing does before it is done",
               until: { $0.contains("reads nothing you write from now on") })
-        tap(ui, Key.id("keyring-untrust-confirm"), "Untrust")
+        tap(ui, Key.id("keyring-remove-confirm"), "Remove, in its sheet")
         keyringPassphraseIfAsked(ui) { self.locate(ui, carolRow) == nil }
         var after5 = ""
         let goneUntil = Date().addingTimeInterval(30)
@@ -1344,7 +2037,7 @@ final class FirstRunProof: XCTestCase {
         if windowReadable(ui), let row = locate(ui, carolRow) {
             XCTFail("PRODUCT: once untrusted, carol must be gone from the keyring view; it still shows \"\(shown(row))\"")
         }
-        print("[proof] keyring: added and listed carol, then removed her after saying what untrusting does")
+        print("[proof] keyring: added and listed carol, then removed her after saying what removing does")
 
         // (5b) Two aliases the same but for case are told apart (ADR-028 K-4, D8): carol trusted as
         // "Bob", bob is shown in mission's members as bob#<his fingerprint's first 6>.
@@ -1357,6 +2050,18 @@ final class FirstRunProof: XCTestCase {
         try staged(vox, ["trust", "remove", "--node", "alice", carolFp,
                          "--identity-passphrase-file", alicePass], env: voxEnv)
 
+        }
+
+        // (16) Outcomes (#608, #611, #615): run here, with the room and bob's trust in place, so
+        // that VOX_PROOF_FROM=16 runs it alone, on what steps 1 to 5 leave (staged by `vox`), and
+        // stops after it.
+        if from <= 5 || from == 16 {
+            try outcomes(ui, vox: vox, voxEnv: voxEnv, roomPass: roomPass)
+            try addressAnatomy(ui, vox: vox, voxEnv: voxEnv, room: room)
+            if from == 16 {
+                print("[proof] VOX_PROOF_FROM=16: step 16 run alone; steps 6 to 15 NOT RUN")
+                return
+            }
         }
 
         // (6) Attach a file to the room, To: bob, with a note.
@@ -1697,9 +2402,9 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("keyring"), "Keyring in the sidebar")
         tap(ui, Key.id("keyring-remove-bob"), "Remove… on bob", premise: trusted(vox, voxEnv, bobFp, "bob"))
         words(ui, Key.id("keyring-remove-effect"), timeout: 10,
-              "removing bob must say what untrusting does first",
+              "removing bob must say what removing does first",
               until: { $0.contains("reads nothing you write from now on") })
-        tap(ui, Key.id("keyring-untrust-confirm"), "Untrust")
+        tap(ui, Key.id("keyring-remove-confirm"), "Remove, in its sheet")
         keyringPassphraseIfAsked(ui) { self.locate(ui, Key.id("keyring-row-bob")) == nil }
         XCTAssertTrue(live.cut(within: 30),
                       "PRODUCT: alice untrusted bob in the keyring view; bob's live connection into her service must be cut within 30 s, and it was not")
@@ -1834,6 +2539,137 @@ final class FirstRunProof: XCTestCase {
         _ = run(vox, ["node", "detach", "alice"], env: voxEnv)
     }
 
+    /// (16) What an operation comes to, as a person meets it.
+    /// - #608 (D16): New Room with its passphrase field left empty says "No passphrase: anyone
+    ///   with the link can join." and makes the room, as `vox room list` lists it.
+    /// - #611 (D19): End for Everyone in a room alice did not create is refused by her node; the
+    ///   sheet stays open and says why, under its button.
+    /// - #615 (P6): that refusal is the status bar's, as a refusal, and is not shown in the
+    ///   Retention sheet opened next, which is another operation's; dismissed, it is gone.
+    ///
+    /// Mutants: New Room taking an empty field as nothing typed (D16): no room, red. The End sheet
+    /// closing whatever leaving did (D19): no reason shown, red. A sheet showing any operation's
+    /// failure (`failure(of:)` ignoring the operation, P6): the Retention sheet shows End's
+    /// refusal, red.
+    private func outcomes(_ ui: XCUIApplication, vox: String, voxEnv: [String: String],
+                          roomPass: String) throws {
+        // #608: a room with no passphrase, made by the app.
+        ui.typeKey("n", modifierFlags: .command)
+        let roomName = Key.id("room-form-name")
+        present(ui, roomName, timeout: 10, "⌘N must open the New Room form")
+        type(ui, roomName, "open", "the room's name field")
+        words(ui, Key.id("room-form-no-passphrase"), timeout: 10,
+              "with its passphrase field empty, New Room must say what no passphrase means",
+              until: { $0 == "No passphrase: anyone with the link can join." })
+        tap(ui, Key.id("room-form-submit"), "Create, the passphrase field left empty")
+        var rooms = ""
+        let madeUntil = Date().addingTimeInterval(60)
+        while Date() < madeUntil && !rooms.contains(" open") {
+            rooms = run(vox, ["room", "list", "--node", "alice"], env: voxEnv).out
+            if !rooms.contains(" open") { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        guard rooms.contains(" open") else {
+            throw Product("New Room with an empty passphrase field must make a room with none; "
+                + "alice's `vox room list` lists no room \"open\": \(rooms)")
+        }
+        print("[proof] New Room with no passphrase made \"open\"")
+
+        // #611: a room bob made, which alice joins: her End for Everyone there is refused.
+        try staged(vox, ["room", "create", "--node", "bob", "--passphrase-file", roomPass,
+                         "--name", "bobs"], env: voxEnv)
+        let bobsRoom = try line(staged(vox, ["room", "list", "--node", "bob"], env: voxEnv)) {
+            $0.contains(" bobs")
+        }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        let bobsLink = try line(staged(vox, ["room", "link", "--node", "bob", bobsRoom], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        try staged(vox, ["room", "join", "--node", "alice", "--passphrase-file", roomPass, bobsLink],
+                   env: voxEnv)
+        tap(ui, Key.id("room-bobs"), "bobs in the sidebar", premise: inRoom(vox, voxEnv, "bobs"))
+        ui.menuBars.menuBarItems["Room"].click()
+        tap(ui, Key.menuItem("End for Everyone…"), "Room > End for Everyone…")
+        tap(ui, Key.id("leave-confirm"), "End for Everyone, in its sheet")
+        let refusal = words(ui, Key.id("leave-failed"), timeout: 30,
+                            "End for Everyone, refused by alice's node (she did not make bobs), must keep its sheet open and say why",
+                            until: { $0.contains("creator") }) ?? ""
+        if locate(ui, Key.id("leave-confirm")) == nil {
+            XCTFail("PRODUCT: a refused End for Everyone must keep its sheet open; it closed")
+        }
+        print("[proof] End for Everyone refused, said in its sheet: \(refusal)")
+        ui.typeKey(.escape, modifierFlags: [])
+
+        // #615: the refusal is the status bar's, as a refusal; not the Retention sheet's.
+        let barSays = words(ui, Key.id("status-outcome-refused"), timeout: 10,
+                            "the status bar must say End for Everyone was refused, as a refusal",
+                            until: { $0.contains("creator") }) ?? ""
+        ui.menuBars.menuBarItems["Room"].click()
+        tap(ui, Key.menuItem("Retention…"), "Room > Retention…")
+        present(ui, Key.id("retention-effect"), timeout: 10, "Room > Retention… must open its sheet")
+        if let shownThere = locateEverywhere(ui, Key.id("retention-said")) {
+            keepTree(ui, "the Retention sheet showed another operation's result")
+            XCTFail("PRODUCT: the Retention sheet must show only its own result; it shows End for Everyone's: \"\(shown(shownThere))\"")
+        }
+        ui.typeKey(.escape, modifierFlags: [])
+        tap(ui, Key.id("status-dismiss"), "the status bar's dismiss")
+        let goneUntil = Date().addingTimeInterval(5)
+        while Date() < goneUntil && locate(ui, Key.id("status-outcome-refused")) != nil {
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        if locate(ui, Key.id("status-outcome-refused")) != nil {
+            XCTFail("PRODUCT: dismissed, the status bar's result must go; it still says it")
+        }
+        print("[proof] status bar said \(barSays) as a refusal; the Retention sheet did not; dismissed, it went")
+    }
+
+    /// (16, G3) A service's address in its parts (ADR-017 S-1): bob shares `photos` in mission;
+    /// alice's services view shows its readable address with each part labelled, as alice's
+    /// `vox service list --json` gives the address, and Copy Address copies its canonical form.
+    ///
+    /// Mutant: no anatomy under the address (`AddressAnatomy` drawing nothing): red.
+    private func addressAnatomy(_ ui: XCUIApplication, vox: String, voxEnv: [String: String],
+                                room: String) throws {
+        let echo = try EchoServer(stager)
+        try staged(vox, ["service", "add", "--node", "bob", room, "photos", "127.0.0.1:\(echo.port)"],
+                   env: voxEnv)
+        var readable = ""
+        var canonical = ""
+        let until = Date().addingTimeInterval(60)
+        while Date() < until && canonical.isEmpty {
+            let listed = run(vox, ["service", "list", "--node", "alice", "--json", room], env: voxEnv).out
+            let json = (try? JSONSerialization.jsonObject(with: Data(listed.utf8))) as? [String: Any]
+            let photos = (json?["shared"] as? [[String: Any]] ?? []).first {
+                ($0["readable"] as? String)?.hasPrefix("photos.") == true
+            }
+            readable = photos?["readable"] as? String ?? ""
+            canonical = photos?["address"] as? String ?? ""
+            if canonical.isEmpty { Thread.sleep(forTimeInterval: 1) }
+        }
+        guard !canonical.isEmpty else {
+            throw Apparatus("alice's `vox service list --json` never listed bob's photos share")
+        }
+        // The parts, from the address `vox` gives: service and room one label each, the node
+        // part between them.
+        let labels = readable.dropLast(4).split(separator: ".").map(String.init)
+        guard readable.hasSuffix(".vox"), labels.count >= 3 else {
+            throw Apparatus("alice's `vox service list` gave the address \(readable), not <service>.<node>.<room>.vox")
+        }
+        let want = "\(labels[0]), service; \(labels.dropFirst().dropLast().joined(separator: ".")), your node alias; "
+            + "\(labels[labels.count - 1]), your room alias; vox, Vox address"
+        ui.typeKey("s", modifierFlags: [.command, .shift])
+        present(ui, Key.id("service-box-\(readable)"), timeout: 30,
+                "the services view must list bob's photos share \(readable)")
+        let said = words(ui, Key.id("service-anatomy-\(readable)"), timeout: 10,
+                         "the services view must show \(readable) in its parts, each labelled: \(want)",
+                         until: { $0 == want }) ?? ""
+        let pasted = copiedBy(ui) {
+            tap(ui, Key.id("copy-address-\(readable)"), "Copy Address on bob's photos share")
+        }
+        if pasted != canonical {
+            XCTFail("PRODUCT: Copy Address must copy the whole address, canonical (\(canonical)); the pasteboard holds \(pasted.debugDescription)")
+        }
+        print("[proof] G3: \(readable) shown as \(said); Copy Address copied \(pasted)")
+    }
+
     // ---- every check on the window proves its own query first --------------------------------
     //
     // A red must say whose it is (ADR-018): one that cannot tell a broken app from a broken proof
@@ -1934,6 +2770,9 @@ final class FirstRunProof: XCTestCase {
         URL(fileURLWithPath: path).resolvingSymlinksInPath().path
     }
 
+    /// Each Vox.app this case started, quit at its end however it ends.
+    private var launched: [XCUIApplication] = []
+
     /// The app the proof drives: this build's own Vox.app, by its path (app-proofs.sh refuses any
     /// other: XCTest launches another bundle without the environment).
     private func voxApp(_ appPath: String) -> XCUIApplication {
@@ -1957,6 +2796,7 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("refusing to start Vox Proof: one already runs (pid \(running), \(executable(running))), and the proof could drive it")
         }
         ui.launch()
+        launched.append(ui)
         let running = proofApps()
         guard running.count == 1, let pid = running.first, executable(pid) == appExe else {
             throw Apparatus("after starting Vox Proof, the \(proofAppID) processes are \(running.map { "\($0) \(executable($0))" }), not one of \(appExe)")
@@ -2081,11 +2921,13 @@ final class FirstRunProof: XCTestCase {
 
     /// `key`'s words once `holds` is true of them, within `timeout`, the premise holding: PRODUCT
     /// quoting them when it never is; `missing` when it never shows; APPARATUS when it shows and
-    /// XCTest reads neither its label nor its value.
+    /// XCTest reads neither its label nor its value. A `field` is read by what is typed in it
+    /// (`typed`), and an empty one is read as empty.
     @discardableResult
     private func words(_ ui: XCUIApplication, _ key: Key, timeout: TimeInterval, _ product: String,
-                       until holds: (String) -> Bool = { _ in true },
+                       until holds: (String) -> Bool = { _ in true }, field: Bool = false,
                        file: StaticString = #filePath, line: UInt = #line) -> String? {
+        let read = field ? typed : shown
         guard windowReadable(ui, file: file, line: line) else { return nil }
         let end = Date().addingTimeInterval(timeout)
         var last = ""
@@ -2093,19 +2935,19 @@ final class FirstRunProof: XCTestCase {
         repeat {
             if let e = locate(ui, key) {
                 seen = true
-                last = shown(e)
-                if !last.isEmpty && holds(last) { return last }
+                last = read(e)
+                if (field || !last.isEmpty) && holds(last) { return last }
             }
             Thread.sleep(forTimeInterval: 0.25)
         } while Date() < end
         if !seen, let e = locateEverywhere(ui, key) {
             seen = true
-            last = shown(e)
-            if !last.isEmpty && holds(last) { return last }
+            last = read(e)
+            if (field || !last.isEmpty) && holds(last) { return last }
         }
         if !seen {
             missing(ui, key, product, file: file, line: line)
-        } else if last.isEmpty {
+        } else if last.isEmpty && !field {
             keepTree(ui, "\(key) could not be read")
             XCTFail("APPARATUS: \(key) is shown and XCTest reads neither its label nor its value",
                     file: file, line: line)

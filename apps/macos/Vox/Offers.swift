@@ -93,8 +93,14 @@ struct OfferView: View {
                 .secondaryText()
                 .accessibilityIdentifier("offer-effect")
         }
-        if model.keyringNeedsPassphrase {
-            KeyringPassphrase(model: model)
+        KeyringReplaceAsk(model: model)
+        // The prompt only for this offer's change; another waiting is one line (D1).
+        if let pending = model.keyringPending {
+            if pending.fingerprint == offer.fingerprint {
+                KeyringPassphrase(model: model, pending: pending)
+            } else {
+                KeyringWaitingLine(model: model, pending: pending)
+            }
         }
         if let failed = model.keyringFailed {
             StateMark(kind: .danger, words: failed).textSelection(.enabled)

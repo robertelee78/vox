@@ -896,7 +896,8 @@ fn render_sessions(
 }
 
 /// The Shared pane's lines (ADR-028 S-3): each service, and under the one selected while the pane
-/// has focus, what it needs that does not hold and, in full, the command `y` copies.
+/// has focus, what reaching it needs, each fact ✓ or missing with its fix, and, in full, the
+/// command `y` copies.
 fn shared_lines(
     shared: &[crate::viewmodel::SharedView],
     selected: usize,
@@ -912,8 +913,14 @@ fn shared_lines(
             s.line
         )));
         if here {
-            for m in &s.missing {
-                lines.push(Line::from(format!("    needs: {m}")));
+            for r in &s.ready {
+                // A terminal that cannot show ✓ is told the same in letters.
+                let r = if theme::ascii() {
+                    r.replacen("✓ ", "ok: ", 1)
+                } else {
+                    r.clone()
+                };
+                lines.push(Line::from(format!("    {r}")));
             }
             lines.push(Line::from("    y copies:"));
             let chars: Vec<char> = s.copy.chars().collect();

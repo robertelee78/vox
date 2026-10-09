@@ -14,6 +14,13 @@
 //! `/opt/vox/crates` or in a worktree beside it. The link and the passphrase are separate fields;
 //! the passphrase is never part of the link (ADR-005). Every node of the data root can read every
 //! passphrase here, which whatever writes the map says (ADR-028 E-5).
+//!
+//! **A repo with no room asks once, and a "no" is kept** (ADR-029 RB-5 – RB-7, v0.4.1): a session
+//! started in a directory the map does not name is told to ask the operator for the repo's room
+//! link, or a no. The operator binds a link with `vox room join <link> --node <agent node> --bind
+//! <dir>` at a terminal of their own, so the room's passphrase is typed there and never given in the
+//! session; a no is a block whose room is `none` (`vox agent room --none`), and silences the ask
+//! for that directory.
 
 use std::path::{Path, PathBuf};
 
@@ -21,11 +28,14 @@ use zeroize::Zeroizing;
 
 use crate::app::AppError;
 
+/// What a `room` field holds for a directory whose operator said no to binding it (RB-7).
+pub const DECLINED: &str = "none";
+
 /// One `repo` block.
 pub struct Entry {
     /// The start directory, as written.
     pub repo: PathBuf,
-    /// The room link (`vox://…`).
+    /// The room link (`vox://…`), or [`DECLINED`].
     pub room: String,
     /// The room's passphrase; empty when the block gives none.
     pub passphrase: Zeroizing<String>,
@@ -103,6 +113,10 @@ fn parse(text: &str) -> Result<Vec<Entry>, (usize, String)> {
                     return Err((n, format!("`{key}` before any `repo`")));
                 };
                 if key == "room" {
+                    if value == DECLINED {
+                        DECLINED.clone_into(&mut e.room);
+                        continue;
+                    }
                     if let Err(why) = vox_core::node::link::InviteLink::parse(value) {
                         return Err((n, format!("`room` is not a room link (vox://…): {why}")));
                     }
@@ -149,6 +163,9 @@ pub fn room_for(
 ) -> Result<Option<(String, String, Zeroizing<String>)>, AppError> {
     let entries = read(data_root)?;
     Ok(lookup(&entries, start).and_then(|e| {
+        if e.room == DECLINED {
+            return None;
+        }
         let link = vox_core::node::link::InviteLink::parse(&e.room).ok()?;
         Some((
             vox_core::node::link::b32_encode(&link.channel_id),
@@ -158,10 +175,19 @@ pub fn room_for(
     }))
 }
 
+/// Whether the operator said no to binding `start` to a room (RB-7): its block's room is `none`.
+#[must_use]
+pub fn declined(data_root: &Path, start: &Path) -> bool {
+    read(data_root)
+        .ok()
+        .is_some_and(|entries| lookup(&entries, start).is_some_and(|e| e.room == DECLINED))
+}
+
 /// What the hook tells a session about its room this turn, before its rooms' news (ADR-029
 /// RB-5), or `None` when there is nothing to tell:
-/// - a session new to its node that works in no room is told so, once, with the command that sets
-///   one;
+/// - a session new to its node that works in no room is told, once, that its repo is not tied to a
+///   room, and to ask the operator for the room's link or a no, with what to do with each (RB-5,
+///   RB-6); unless the operator said no for that directory already (RB-7);
 /// - a session whose room is being joined is told that, or why the join failed;
 /// - a room map that cannot be read is named, with why, so a person can fix it.
 #[must_use]
@@ -170,6 +196,8 @@ pub fn note(
     new: bool,
     joining: Option<&str>,
     data_root: &Path,
+    start: &Path,
+    node: &str,
 ) -> Option<String> {
     if let Err(e) = read(data_root) {
         return Some(format!("Vox: {e}\n"));
@@ -177,11 +205,24 @@ pub fn note(
     if let Some(j) = joining {
         return Some(format!("Vox: {j}\n"));
     }
-    (new && room.is_none()).then(|| {
-        "Vox: this session works in no room: no entry in the room map is the directory it \
-         started in. `vox agent room <room>` sets one.\n"
-            .to_owned()
-    })
+    if !new || room.is_some() || declined(data_root, start) {
+        return None;
+    }
+    // As the map will hold it: the directory itself, a symlink to it resolved.
+    let dir = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+    let dir = dir.display();
+    Some(format!(
+        "Vox: this repo ({dir}) isn't tied to a Vox room. Ask the operator now, in these words: \
+         \"This repo isn't tied to a Vox room. Paste its room link to bind it, or say no.\"\n\
+         - If they paste a link: never ask for the room's passphrase here. Give them this command \
+         exactly, with the link they pasted in place of <link>, to run in a terminal of their own \
+         (it asks for the passphrase there, and saves the link for this repo so every later \
+         session started here works in that room):\n    \
+         vox room join <link> --node {node} --bind {dir}\n  \
+         Once it says joined, put this session in the room: vox agent room <room> --node {node}\n\
+         - If they say no: run vox agent room --none --node {node}, and no session started here is \
+         asked again.\n"
+    ))
 }
 
 /// Add a `repo` block to `data_root`'s room map: `repo` works in the room `link` names, joined with
@@ -205,6 +246,95 @@ pub fn add(data_root: &Path, repo: &Path, link: &str, passphrase: &str) -> Resul
         block.push_str(&format!("    passphrase {passphrase}\n"));
     }
     let block = Zeroizing::new(block);
+    let file = path(data_root);
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&file)
+        .map_err(|e| {
+            AppError::Usage(format!("cannot write the room map {}: {e}", file.display()))
+        })?;
+    f.write_all(block.as_bytes())
+        .and_then(|()| f.sync_all())
+        .map_err(|e| AppError::Usage(format!("cannot write the room map {}: {e}", file.display())))
+}
+
+/// Record that the operator said no to binding `repo` to a room (RB-7): a block whose room is
+/// `none`, which no passphrase rides on. A directory the map names already is left as it is.
+///
+/// # Errors
+/// The map cannot be read or written.
+pub fn decline(data_root: &Path, repo: &Path) -> Result<bool, AppError> {
+    let entries = read(data_root)?;
+    if lookup(&entries, repo).is_some() {
+        return Ok(false);
+    }
+    append(
+        data_root,
+        &format!("\nrepo {}\n    room       {DECLINED}\n", repo.display()),
+    )?;
+    Ok(true)
+}
+
+/// Bind `repo` to the room `link` names, joined with `passphrase` (RB-6), replacing whatever the
+/// map held for it: a `no`, or another room. Returns what was replaced, as a person reads it:
+/// `None` when the map held nothing for `repo`.
+///
+/// # Errors
+/// The map cannot be read or written.
+pub fn bind(
+    data_root: &Path,
+    repo: &Path,
+    link: &str,
+    passphrase: &str,
+) -> Result<Option<String>, AppError> {
+    let entries = read(data_root)?;
+    let before = lookup(&entries, repo).map(|e| {
+        if e.room == DECLINED {
+            "a no (`room none`)".to_owned()
+        } else {
+            let room = vox_core::node::link::InviteLink::parse(&e.room)
+                .map(|l| vox_core::node::link::b32_encode(&l.channel_id))
+                .unwrap_or_default();
+            format!("room {}", room.chars().take(12).collect::<String>())
+        }
+    });
+    if before.is_some() {
+        drop_block(data_root, repo)?;
+    }
+    add(data_root, repo, link, passphrase)?;
+    Ok(before)
+}
+
+/// Take `repo`'s block out of the map, keeping every other line as it is.
+fn drop_block(data_root: &Path, repo: &Path) -> Result<(), AppError> {
+    let file = path(data_root);
+    let text = Zeroizing::new(std::fs::read_to_string(&file).map_err(|e| {
+        AppError::Usage(format!("cannot read the room map {}: {e}", file.display()))
+    })?);
+    let same = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let target = same(repo);
+    let mut kept = Zeroizing::new(String::new());
+    let mut skipping = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(dir) = t.strip_prefix("repo").filter(|_| t.starts_with("repo ")) {
+            skipping = same(Path::new(dir.trim())) == target;
+        }
+        if !skipping {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    vox_core::node::paths::write_private_file_unique(&file, kept.as_bytes())
+        .map_err(|e| AppError::Usage(format!("cannot write the room map {}: {e}", file.display())))
+}
+
+/// Append `block` to the map, made mode 0600 when there is none.
+fn append(data_root: &Path, block: &str) -> Result<(), AppError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let file = path(data_root);
     let mut f = std::fs::OpenOptions::new()
         .create(true)
