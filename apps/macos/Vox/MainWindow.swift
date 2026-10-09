@@ -427,6 +427,16 @@ private struct RoomView: View {
                                         } else if let entry = item.entry, let session = model.shownSession {
                                             SessionEntryRow(model: model, session: session,
                                                             entry: entry) { looking = $0 }
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                                // Selected like a message: ↑/↓ reach it (P14).
+                                                .selectable(model.selectedMessage == item.id,
+                                                            focused: timelineFocused
+                                                                && model.selectedMessage == item.id) {
+                                                    model.selectedMessage = item.id
+                                                    NotificationCenter.default.post(
+                                                        name: .voxFocusTimeline, object: nil)
+                                                }
+                                                .accessibilityIdentifier("entry-row-\(entry.id)")
                                                 .id(item.id)
                                         }
                                     }
@@ -465,8 +475,10 @@ private struct RoomView: View {
                                 NotificationCenter.default.post(name: .voxFocusTimeline, object: nil)
                             }
                             .onReceive(NotificationCenter.default.publisher(for: .voxFocusTimeline)) { _ in
-                                // Taken: the newest row, when none was selected.
-                                if model.selectedMessage == nil, let last = model.messages.last {
+                                // Taken: the newest row, when none was selected: a message, or in a
+                                // Session its newest entry (P14).
+                                if model.selectedMessage == nil,
+                                   let last = model.timelineItems.last(where: { $0.message != nil || $0.entry != nil }) {
                                     model.selectedMessage = last.id
                                     scroller.scrollTo(last.id)
                                 }
@@ -679,7 +691,8 @@ private struct RoomView: View {
     /// ↑/↓ on the timeline: the selection moves to the message before or after it, scrolled into
     /// view; with none selected, ↑ takes the newest and ↓ the oldest.
     private func move(_ direction: MoveCommandDirection, _ scroller: ScrollViewProxy) -> Bool {
-        let ids = model.timelineItems.compactMap { $0.message?.id }
+        // Every drawn row with an identity: a message, or a Session's entry or request (P14).
+        let ids = model.timelineItems.filter { $0.message != nil || $0.entry != nil }.map(\.id)
         guard !ids.isEmpty else { return false }
         let at = model.selectedMessage.flatMap { ids.firstIndex(of: $0) }
         let next: Int

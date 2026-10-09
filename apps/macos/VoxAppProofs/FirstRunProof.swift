@@ -917,6 +917,38 @@ final class FirstRunProof: XCTestCase {
         XCTAssertEqual(mentionedTo.map { $0.lowercased() }, [bobFp.lowercased()],
                        "PRODUCT: \"MENTION @bob\", @bob picked in the composer, must be addressed to bob; bob's node holds it addressed to \(mentionedTo)")
 
+        // (4f) ↑/↓ reach a Session's entries (P14): bob grants alice drive, so she reads inside his
+        // Session; with it shown, View > Focus Timeline selects its newest entry and ↑ the one
+        // before it, as among messages.
+        try staged(vox, ["trust", "drive", "--node", "bob", aliceFp,
+                         "--identity-passphrase-file", bobPass], env: voxEnv)
+        let again = run(vox, ["agent", "hook", "--node", "bob", "--room", room, "--format", "text"],
+                        env: voxEnv.merging(["CLAUDE_CODE_ENTRYPOINT": "cli"]) { $1 },
+                        input: "{\"session_id\":\"\(d7Session)\",\"hook_event_name\":\"UserPromptSubmit\",\"cwd\":\"/tmp\",\"transcript_path\":\"/tmp/t.jsonl\",\"prompt\":\"again\"}")
+        guard again.status == 0 else {
+            throw Apparatus("bob's Claude Code hook, to write a second entry in his Session, exited \(again.status): \(again.out)")
+        }
+        tap(ui, Key.id("session-\(d7Session.prefix(8))"), "bob's Session in mission's Sessions")
+        let entryRows = ui.windows.firstMatch.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH %@", "entry-row-"))
+        let entriesUntil = Date().addingTimeInterval(30)
+        while Date() < entriesUntil && entryRows.count < 2 { Thread.sleep(forTimeInterval: 0.5) }
+        guard entryRows.count >= 2 else {
+            keepTree(ui, "bob's Session shows fewer than two entries")
+            throw Product("bob's Session, shown to alice whom bob trusts with drive, must show its two entries; it shows \(entryRows.count)")
+        }
+        let rows = entryRows.allElementsBoundByIndex.sorted { $0.frame.minY < $1.frame.minY }
+        ui.typeKey("t", modifierFlags: [.command, .control])
+        func onlySelected(_ want: XCUIElement, _ how: String) {
+            let until = Date().addingTimeInterval(5)
+            while Date() < until && !want.isSelected { Thread.sleep(forTimeInterval: 0.2) }
+            XCTAssertTrue(want.isSelected && rows.filter(\.isSelected).count == 1,
+                          "PRODUCT: \(how) must select \(want.identifier) alone; selected: \(rows.filter(\.isSelected).map(\.identifier))")
+        }
+        onlySelected(rows[rows.count - 1], "View > Focus Timeline on bob's Session")
+        ui.typeKey(.upArrow, modifierFlags: [])
+        onlySelected(rows[rows.count - 2], "↑ from the newest entry")
+
         // (5) The keyring: carol, a node made here, added by her pasted fingerprint, then removed.
         try staged(vox, ["node", "create", "carol"],
                    env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "carol identity"]) { $1 })
