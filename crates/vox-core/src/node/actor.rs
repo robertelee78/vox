@@ -1572,7 +1572,7 @@ async fn serve_typed(
     // this many consecutive failures, which cannot happen without the connection being unusable
     // and which keeps a pathological peer from spinning this task.
     const MAX_CONSECUTIVE_STREAM_FAILURES: u32 = 16;
-    let (kind, send, recv) = match stream.and_then(|t| net.authorize_typed(peer, t)) {
+    let (kind, send, recv) = match stream.and_then(|t| net.authorize_typed(quic, peer, t)) {
         Ok(accepted) => accepted,
         // **A refusal is not a failure.** The stream was typed and answered; the peer may not
         // open that kind *yet* — a joiner syncing before it is a member, a responder pushing

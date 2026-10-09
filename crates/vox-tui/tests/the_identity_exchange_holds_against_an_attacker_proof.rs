@@ -34,9 +34,10 @@
 //!    stream closes the connection with the refusal. Mutant: no check for a second flight.
 //! 8. **A silent dialler** (requirement 33): a connection that never asks is closed with the
 //!    refusal 5000 ms after its handshake. Mutant: no bound on the wait for the `ASK`.
-//! 9. **No second exchange after the first** (requirement 33): a member's stream of the identity
-//!    kind after its exchange closes the connection with the refusal's code. Mutant: the host
-//!    leaves the connection open.
+//! 9. **No second exchange after the first** (requirement 33): a stream of the identity kind
+//!    after the exchange closes the connection with the refusal's code, a member's and a
+//!    stranger's alike (same code and reason, at once). Mutant: the gate's stream refusal kept for
+//!    a stranger.
 //! 10. **The answer's random delay** (requirement 32): of 16 `PROVE`s, some leave in the first
 //!     half of the 50–100 ms window and some in the second. Mutant: no random delay.
 //! 11. **A node that comes back is a new process** (requirement 40, ADR-026 I-3): the host's
@@ -863,9 +864,10 @@ fn a_silent_dialler_is_closed_at_five_seconds() {
 }
 
 /// Claim 9 (requirement 33's last rule). Once the exchange is done, a stream that opens with the
-/// identity kind is a second exchange, and closes the connection with the refusal. Played by a
-/// member of the host's room, whose key the attacker holds (its own daemon stopped): the host
-/// dispatches a member's streams, so the rule is reached.
+/// identity kind is a second exchange, and closes the connection with the refusal, **whoever opens
+/// it**: a member of the host's room (whose key the attacker holds, its own daemon stopped) and a
+/// stranger alike, with the same code and reason text, at once. A stranger's used to be refused as
+/// a stream, like any kind it may not open, and its connection stayed.
 #[test]
 #[ignore = "real daemons and a test-side attacker; run in release"]
 fn an_identity_stream_after_the_exchange_closes_the_connection() {
@@ -891,42 +893,92 @@ fn an_identity_stream_after_the_exchange_closes_the_connection() {
         m.data.clone()
     };
     let signer = hostile::member_signer(&member);
+    let stranger = stranger();
     let rt = runtime();
-    rt.block_on(async {
+    let (as_member, as_stranger) = rt.block_on(async {
         let e = endpoint(false);
-        let instance = new_instance().expect("APPARATUS: an instance");
-        let c = connect(&e, w.host.addr).await;
-        dial(&c, &*signer, instance, w.host.fp)
-            .await
-            .unwrap_or_else(|f| panic!("PRODUCT: the member's dial was refused: {f:?}"));
-        let (mut send, _recv) = c
-            .open_bi()
-            .await
-            .expect("PRODUCT: a stream after the exchange did not open");
-        write_frame(&mut send, &StreamKind::Identity.frame())
-            .await
-            .expect("APPARATUS: write the stream's kind");
-        write_frame(&mut send, &Ask { target: w.host.fp }.encode())
-            .await
-            .expect("APPARATUS: write the ASK");
-        // After the exchange the peer is known, so the close may say why; what must hold is that
-        // the connection ends, with the refusal's code.
-        let Some(seen) = closed(&c, Duration::from_millis(2000)).await else {
-            panic!(
-                "PRODUCT: an identity stream after the exchange left the connection open 2000 ms \
-                 later"
-            )
-        };
-        assert_eq!(
-            seen.code,
-            refusal(),
-            "PRODUCT: an identity stream after the exchange closed the connection with code {}, \
-             not the refusal's ({})",
-            seen.code,
-            refusal()
-        );
-        println!("[proof] an identity stream after the exchange: the connection closed");
+        let member = second_exchange(&e, w.host.addr, w.host.fp, &*signer).await;
+        let stranger = second_exchange(&e, w.host.addr, w.host.fp, &stranger).await;
+        (member, stranger)
     });
+    let mut red = Vec::new();
+    for (who, seen) in [("a member", &as_member), ("a stranger", &as_stranger)] {
+        let Some((code, reason, after)) = seen else {
+            red.push(format!(
+                "{who}'s identity stream after the exchange left the connection open 2000 ms later"
+            ));
+            continue;
+        };
+        println!(
+            "[proof] {who}'s identity stream after the exchange: closed {} ms after it opened, code \
+             {code}, reason {reason:?}",
+            ms(*after)
+        );
+        if *code != refusal() {
+            red.push(format!(
+                "{who}'s identity stream closed the connection with code {code}, not the \
+                 refusal's ({})",
+                refusal()
+            ));
+        }
+    }
+    // **A stranger learns nothing a member does not**: the same code and reason text, and both at
+    // once (the timing class of a stream refusal, which was also at once).
+    if let (Some(m), Some(s)) = (&as_member, &as_stranger) {
+        if m.1 != s.1 || m.0 != s.0 {
+            red.push(format!(
+                "a stranger's close ({}, {:?}) differs from a member's ({}, {:?})",
+                s.0, s.1, m.0, m.1
+            ));
+        }
+        for (who, after) in [("member", m.2), ("stranger", s.2)] {
+            if after > Duration::from_millis(500) {
+                red.push(format!(
+                    "the {who}'s close came {} ms after the stream opened, not at once",
+                    ms(after)
+                ));
+            }
+        }
+    }
+    assert!(red.is_empty(), "PRODUCT: {red:#?}");
+}
+
+/// After an honest exchange as `who`, open a stream of the identity kind: how the connection was
+/// closed (code, reason, ms after the stream opened), or `None` if it was still open 2000 ms later.
+async fn second_exchange(
+    e: &Endpoint,
+    to: SocketAddr,
+    target: Digest32,
+    who: &(dyn RootSigner + Send + Sync),
+) -> Option<(u64, String, Duration)> {
+    let c = connect(e, to).await;
+    dial(
+        &c,
+        who,
+        new_instance().expect("APPARATUS: an instance"),
+        target,
+    )
+    .await
+    .unwrap_or_else(|f| panic!("PRODUCT: an honest dial was refused: {f:?}"));
+    let (mut send, _recv) = c
+        .open_bi()
+        .await
+        .expect("PRODUCT: a stream after the exchange did not open");
+    let opened = Instant::now();
+    write_frame(&mut send, &StreamKind::Identity.frame())
+        .await
+        .expect("APPARATUS: write the stream's kind");
+    write_frame(&mut send, &Ask { target }.encode())
+        .await
+        .expect("APPARATUS: write the ASK");
+    // After the exchange the peer is known, so the close may say why ("not available").
+    closed(&c, Duration::from_millis(2000)).await.map(|seen| {
+        (
+            seen.code,
+            String::from_utf8_lossy(&seen.reason).into_owned(),
+            seen.at.duration_since(opened),
+        )
+    })
 }
 
 /// Claim 10 (requirement 32's timing). Each `PROVE` leaves no earlier than the 50 ms floor after
@@ -1186,27 +1238,30 @@ fn a_flood_of_pre_identity_connections_is_capped() {
                 })
             })
             .collect();
-        let mut refused_at_once = 0usize;
-        let mut other = 0usize;
+        // A slot freed while the burst arrived (one of the 64 closing early) lets an attempt run at
+        // once, so it never queues: the queue's bound shows as the refusals at once plus those.
+        let (mut refused_at_once, mut admitted_at_once, mut other) = (0usize, 0usize, 0usize);
         for a in attempts {
             let (r, at) = a.await.expect("APPARATUS: an attempt task");
+            let at_once = at.duration_since(fired) < Duration::from_millis(2000);
             match r {
-                Ok(Err(quinn::ConnectionError::ConnectionClosed(_)))
-                    if at.duration_since(fired) < Duration::from_millis(2000) =>
-                {
+                Ok(Err(quinn::ConnectionError::ConnectionClosed(_))) if at_once => {
                     refused_at_once += 1;
                 }
+                Ok(Ok(_)) if at_once => admitted_at_once += 1,
                 _ => other += 1,
             }
         }
         println!(
             "[proof] with every slot held, 1124 attempts at once: {refused_at_once} refused within \
-             2000 ms, {other} waited (admitted or refused later)"
+             2000 ms, {admitted_at_once} admitted within 2000 ms (a slot came free), {other} \
+             waited longer"
         );
         assert!(
-            refused_at_once >= 100,
+            refused_at_once + admitted_at_once >= 1124 - 1024,
             "PRODUCT: with every slot held, {refused_at_once} of 1124 attempts were refused at \
-             once: the 1024 waiting places did not bound the queue"
+             once and {admitted_at_once} admitted at once: the 1024 waiting places did not bound \
+             the queue"
         );
         drop(silent);
     });
