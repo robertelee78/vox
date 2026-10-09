@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Args;
-use vox_core::error::{Error, IpcHandshake};
+use vox_core::error::Error;
 use vox_core::hash::Digest32;
 use vox_core::nat::bootstrap::BootstrapSet;
 use vox_core::node::daemonipc::{
@@ -307,24 +307,11 @@ pub async fn open(at: &NodeSocket) -> Result<IpcClient, AppError> {
 
 /// A failure to reach the node `at` names, for a person.
 pub fn said(at: &NodeSocket, e: Error) -> AppError {
-    let node = &at.using.node;
-    let path = at.path.display();
-    AppError::Usage(match e {
-        // The cause stays named (#191): the OS's reason the connect failed, beside the socket.
-        Error::Ipc(IpcHandshake::Unreachable { reason }) => format!(
-            "no vox daemon is running for this data root, so node {node} is not attached.\n\
-             \x20      Start one:  vox daemon      (or `vox node attach {node}`)\n\
-             \x20      Socket: {path} ({reason})"
-        ),
-        Error::Ipc(IpcHandshake::Refused { reason }) => reason,
-        Error::Ipc(h @ IpcHandshake::ClosedBeforeHello) => {
-            format!(
-                "the daemon's socket at {path} accepted, but {h}: it may be stopping. Try again."
-            )
-        }
-        Error::Ipc(h) => format!("{h}. Socket: {path}"),
-        other => format!("the daemon at {path} did not answer ({other})"),
-    })
+    AppError::Usage(vox_core::node::daemonipc::unreached(
+        &at.path,
+        Some(at.using.node.as_str()),
+        e,
+    ))
 }
 
 /// Make sure the account's daemon is running, starting it with `listen` and

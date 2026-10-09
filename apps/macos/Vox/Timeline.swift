@@ -94,6 +94,9 @@ extension NodeModel {
             guard let s = shownSession else { return [] }
             var lines = TimelineItem.openedAndEnded(s)
             if s.canDrive {
+                if sessionLoading && sessionEntries.isEmpty {
+                    lines.append(.notice("loading-\(s.sessionId)", "Loading…", at: .max))
+                }
                 lines += sessionEntries.map(TimelineItem.entry)
                 lines.sort { $0.millis < $1.millis }
                 if let note = sessionNote {

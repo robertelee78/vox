@@ -76,6 +76,13 @@
 //! directory in the room map; run by the operator at a terminal (a pty), it offers to, says what
 //! that changes, and on yes saves it with the room's passphrase typed there, so the next session
 //! started in that directory works in the room by itself. Mutant: the save writes nothing.
+//! A session started in a directory the map does not name is told to ask the operator for the
+//! repo's room link or a no (ADR-029 RB-5 – RB-7, v0.4.1): on a no (`vox agent room --none`) no
+//! session started there asks again; on a link, the operator's `vox room join <link> --node <node>
+//! --bind <dir>` at a terminal joins the agent's node, typed passphrase and all, and binds the
+//! directory, so a session started there works in that room, asked nothing. Mutants: the no not
+//! honoured (the ask comes back); the bind not written (the next session works in no room). Binding
+//! a directory the map held a no or another room for replaces it, and says what it replaced.
 //! A session started in a mapped directory whose room's host is gone is told the join is under way,
 //! then, on a later turn, why it could not join, though that turn tries again. Mutant: the retry's
 //! "joining" overwrites the failure before the turn reads it.
@@ -2706,10 +2713,18 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     let below = "22222222-aaaa-4bbb-8ccc-000000000002";
     let told = turn(below, &repo.join("sub"));
     eprintln!("[proof] (2) a session started in repo/sub was told: {told:?}");
+    let sub = repo.join("sub");
+    let sub = std::fs::canonicalize(&sub).unwrap_or(sub);
     assert!(
-        told.contains("this session works in no room") && told.contains("vox agent room <room>"),
-        "PRODUCT: a session started in a subfolder of a mapped directory must be told it works in \
-         no room, with the command that sets one; it was told {told:?}"
+        told.contains("isn't tied to a Vox room")
+            && told.contains("Paste its room link to bind it, or say no.")
+            && told.contains(&format!(
+                "vox room join <link> --node default --bind {}",
+                sub.display()
+            ))
+            && told.contains("vox agent room --none --node default"),
+        "PRODUCT: a session started in a directory the room map does not name must be told to ask \
+         the operator for its room link or a no, with what to do with each; it was told {told:?}"
     );
     assert!(
         !sessions(&home).iter().any(|r| r["id"] == below),
@@ -2841,6 +2856,118 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         sessions(&home),
         sessions(&scratch)
     );
+
+    // (5b) The operator says no for a repo: recorded, and no session started there asks again.
+    let declined_repo = tmp.path().join("declined-repo");
+    std::fs::create_dir_all(&declined_repo).expect("APPARATUS: cannot make a repository directory");
+    let asked = "55555555-aaaa-4bbb-8ccc-000000000005";
+    let first_ask = turn(asked, &declined_repo);
+    assert!(
+        first_ask.contains("isn't tied to a Vox room"),
+        "PRODUCT: a session started in an unbound directory must be asked about its room; it was \
+         told {first_ask:?}"
+    );
+    let as_asked = [("VOX_SESSION", asked), ("VOX_NODE", "default")];
+    let (ok, no, err) = hook_env(&data, &cfg, &["agent", "room", "--none"], "", &as_asked);
+    eprintln!("[proof] (5b) `vox agent room --none` said: {no}{err}");
+    let again = "66666666-aaaa-4bbb-8ccc-000000000006";
+    let second_ask = turn(again, &declined_repo);
+    eprintln!("[proof] (5b) the next session started there was told: {second_ask:?}");
+    assert!(
+        ok && no.contains("is to stay tied to no room") && !second_ask.contains("isn't tied to a Vox room"),
+        "PRODUCT: after the operator said no for a repo, no session started there may be asked \
+         again; `vox agent room --none` said {no}{err}, and the next session was told {second_ask:?}"
+    );
+
+    // (5c) The operator binds a repo to a room at a terminal of their own: the agent's node joins,
+    // the no recorded for that repo is replaced (and said), and every later session started there
+    // works in that room, asked nothing.
+    let bound_dir = std::fs::canonicalize(&declined_repo).unwrap_or(declined_repo.clone());
+    let bind = |link: &str, passphrase: &str| {
+        in_terminal(
+            &data,
+            &cfg,
+            &[
+                "room",
+                "join",
+                link,
+                "--node",
+                "default",
+                "--bind",
+                &bound_dir.to_string_lossy(),
+            ],
+            &[("passphrase", &format!("{passphrase}\r"))],
+        )
+    };
+    let lands_in = |room: &str, session: &str| {
+        let first = turn(session, &declined_repo);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !open_in(room, session) {
+            assert!(
+                Instant::now() < deadline,
+                "PRODUCT: after `vox room join --bind`, a session started in the bound directory \
+                 must work in room {room}: its Sessions {:?}; its first turn was told {first:?}",
+                sessions(room)
+            );
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        assert!(
+            !first.contains("isn't tied to a Vox room"),
+            "PRODUCT: a session started in a bound directory must not be asked about its room: \
+             {first:?}"
+        );
+    };
+    let joined = bind(&link_other, "other passphrase");
+    eprintln!("[proof] (5c) `vox room join --bind` at a terminal said: {joined}");
+    assert!(
+        joined.contains("vox: joined")
+            && joined.contains("every node of this data root can read the map")
+            && joined.contains(&format!(
+                "vox: bound {}, replacing what the room map held for it: a no",
+                bound_dir.display()
+            )),
+        "PRODUCT: `vox room join --bind` must join, say what binding changes, bind, and say it \
+         replaced the no recorded for the directory: {joined}"
+    );
+    lands_in(&other, "77777777-aaaa-4bbb-8ccc-000000000007");
+    eprintln!("[proof] (5c) a session started in the bound directory works in {other}");
+
+    // (5d) Bound again, to another room: the earlier room is replaced, and named.
+    let (ok, _, err) = hook(
+        &alice.data,
+        &alice.cfg,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "third",
+        ],
+        "third passphrase",
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's third `vox room create` failed: {err}"
+    );
+    let (_, listed, _) = hook(&alice.data, &alice.cfg, &["room", "list"], "");
+    let third = listed
+        .lines()
+        .find(|l| l.contains("third"))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_default()
+        .to_owned();
+    let rebound = bind(&alice.link(&third), "third passphrase");
+    eprintln!("[proof] (5d) bound again, to {third}: {rebound}");
+    assert!(
+        rebound.contains(&format!(
+            "vox: bound {}, replacing what the room map held for it: room {other}",
+            bound_dir.display()
+        )),
+        "PRODUCT: `vox room join --bind` for a directory bound to another room must replace it and \
+         name the room it replaced: {rebound}"
+    );
+    lands_in(&third, "88888888-aaaa-4bbb-8ccc-000000000008");
 
     // (6) A mapped room whose host is gone: the join fails, and the session is told why on a
     // later turn, even though that turn tries the join again.

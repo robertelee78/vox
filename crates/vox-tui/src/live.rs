@@ -96,6 +96,10 @@ impl Drop for Conn {
     }
 }
 
+/// How often the TUI asks whether the daemon's `.vox` proxy runs: it changes only when the
+/// daemon starts or its port is taken, so not with every snapshot.
+const PROXY_EVERY: Duration = Duration::from_secs(5);
+
 /// The TUI's binding to the daemon.
 pub struct DaemonCore {
     rt: tokio::runtime::Handle,
@@ -119,6 +123,11 @@ pub struct DaemonCore {
     snapshot: NodeSnapshot,
     /// When the snapshot was last asked for; `None` asks now.
     asked: Option<Instant>,
+    /// Whether the daemon's `.vox` proxy runs, and where, as last asked: the Shared pane's
+    /// `proxy configured` fact (ADR-028 S-3). `None` until asked.
+    proxy: Option<Result<std::net::SocketAddr, String>>,
+    /// When the proxy was last asked about.
+    proxy_asked: Option<Instant>,
     /// The room on screen (drives `ViewModel::active` and unread resets).
     active: Option<Digest32>,
     /// The Session the room's timeline shows: its room, node and session id (ADR-029 CL-2).
@@ -409,6 +418,8 @@ impl DaemonCore {
             daemon_events,
             snapshot: NodeSnapshot::default(),
             asked: None,
+            proxy: None,
+            proxy_asked: None,
             active: None,
             unread: BTreeMap::new(),
             seeded: BTreeSet::new(),
@@ -591,12 +602,8 @@ impl DaemonCore {
                 self.has_identity = true;
                 CommandStatus::Failed(UiError::IdentityMadeElsewhere)
             }
-            Ok(Err(vox_core::error::Error::Profile(_))) => {
-                CommandStatus::Failed(UiError::IdentityExists)
-            }
-            Ok(Err(vox_core::error::Error::ProfileBusy)) => {
-                CommandStatus::Failed(UiError::ProfileBusy)
-            }
+            Ok(Err(vox_core::error::Error::Profile(_))) => fault_status(Fault::IdentityExists),
+            Ok(Err(vox_core::error::Error::ProfileBusy)) => fault_status(Fault::ProfileBusy),
             // The identity file, the store, or a directory: in the fault's own words.
             Ok(Err(e)) => fault_status(vox_core::node::actor::fault_of(&e)),
             Err(_) => CommandStatus::Failed(UiError::Internal),
@@ -936,6 +943,7 @@ impl DaemonCore {
             return;
         }
         self.asked = Some(Instant::now());
+        self.ask_proxy();
         self.on_disk = self
             .account
             .nodes_on_disk()
@@ -967,6 +975,35 @@ impl DaemonCore {
                 self.ended
                     .get_or_insert(format!("the vox daemon stopped answering: {e}"));
             }
+        }
+    }
+
+    /// Ask the daemon whether its `.vox` proxy runs, every [`PROXY_EVERY`], on a connection of
+    /// its own that attaches nothing: the Shared pane's `proxy configured` fact.
+    fn ask_proxy(&mut self) {
+        if self
+            .proxy_asked
+            .is_some_and(|at| at.elapsed() < PROXY_EVERY)
+        {
+            return;
+        }
+        self.proxy_asked = Some(Instant::now());
+        let at = vox_core::node::ipc::NodeSocket {
+            path: self.account.socket(),
+            using: UseNode {
+                node: self.node.clone(),
+                attach: AttachMode::No,
+                passphrase: None,
+                anchors: Vec::new(),
+            },
+            waiting: None,
+        };
+        let asked = until_stopped(&self.rt, &self.stop, vox_core::node::nameipc::proxy(&at));
+        if let Some(asked) = asked {
+            self.proxy = Some(asked.map_err(|e| match e {
+                vox_core::error::Error::AppRefused(reason) => reason,
+                other => other.to_string(),
+            }));
         }
     }
 
@@ -1866,13 +1903,15 @@ impl DaemonCore {
                                         .next()
                                         .map(|(_, c)| c)
                                         .unwrap_or_default(),
-                                    missing: crate::tunnel_cli::service_needs(&svc, None)
-                                        .into_iter()
-                                        .filter(|(_, holds, _)| !holds)
-                                        .map(|(need, _, otherwise)| {
-                                            format!("{need}: no — {otherwise}")
-                                        })
-                                        .collect(),
+                                    ready: crate::tunnel_cli::service_needs(
+                                        &svc,
+                                        self.proxy.as_ref(),
+                                    )
+                                    .into_iter()
+                                    .map(|(need, holds, otherwise)| {
+                                        crate::tunnel_cli::service_tick(&need, holds, &otherwise)
+                                    })
+                                    .collect(),
                                 }
                             })
                             .collect()
@@ -2148,17 +2187,11 @@ fn lost_status(lost: Lost) -> CommandStatus {
 /// A daemon's refusal of a `Use`, as the TUI says it: a failed unlock in the daemon's words,
 /// which carry the fault's own (the identity file that could not be written, say), on one line.
 fn refused(refusal: &Refusal) -> CommandStatus {
-    match refusal {
-        Refusal::WrongPassphrase { .. } => CommandStatus::Failed(UiError::WrongPassphrase),
-        Refusal::NodeInUse { .. } => CommandStatus::Failed(UiError::ProfileBusy),
-        Refusal::NoIdentity { .. } => CommandStatus::Failed(UiError::NoIdentity),
-        other => CommandStatus::Said(one_line(&other.to_string())),
-    }
+    CommandStatus::Said(one_line(&refusal.to_string()))
 }
 
-/// A node's error answer, as the TUI says it: the fault it names, mapped onto the UI's closed set
-/// — or in the fault's own words where the closed set has none that fit — or the node's own
-/// sentence when it names none.
+/// A node's error answer, as the TUI says it: in the words vox-core gives the fault it names, or the
+/// node's own sentence when it names none (ADR-028 E-7).
 fn failed(reason: &str) -> CommandStatus {
     match Fault::from_explanation(reason) {
         Some(f) => fault_status(f),
@@ -2166,29 +2199,10 @@ fn failed(reason: &str) -> CommandStatus {
     }
 }
 
-/// How the TUI says fault `f`: the UI's closed set where it has the words, else the words the CLI
-/// prints for `f`, on one line (R36: a refusal names its own cause).
+/// How the TUI says fault `f`: the sentence vox-core writes for it, once, which the CLI and the app
+/// show too (ADR-028 E-7), its advice after a dash on one status line. The TUI never rewords it.
 fn fault_status(f: Fault) -> CommandStatus {
-    if in_its_own_words(f) {
-        CommandStatus::Said(one_line(f.explain()))
-    } else {
-        CommandStatus::Failed(ui_error(f))
-    }
-}
-
-/// Faults the UI's closed set would say wrongly: a file that could not be written is named by
-/// the fault and by nothing in the set, and "may end it" is not what an admin change or an idle
-/// end is refused for, nor is "no reachable peer" a member that left the room.
-const fn in_its_own_words(f: Fault) -> bool {
-    matches!(
-        f,
-        Fault::Storage
-            | Fault::IdentityFileUnwritable
-            | Fault::RetentionFileUnwritable
-            | Fault::NotCreator
-            | Fault::NotRoomCreator
-            | Fault::ResponderLeft
-    )
+    CommandStatus::Said(one_line(f.explain()))
 }
 
 /// `text`'s lines as one status line: a fault's advice follows its cause after a dash.
@@ -2198,54 +2212,6 @@ fn one_line(text: &str) -> String {
         .filter(|l| !l.is_empty())
         .collect::<Vec<_>>()
         .join(" — ")
-}
-
-/// Map a node [`Fault`] onto the UI's closed error set.
-#[must_use]
-pub fn ui_error(f: Fault) -> UiError {
-    match f {
-        Fault::NoIdentity => UiError::NoIdentity,
-        Fault::IdentityExists => UiError::IdentityExists,
-        Fault::ProfileBusy => UiError::ProfileBusy,
-        Fault::Locked => UiError::NotAttached,
-        Fault::WrongPassphrase => UiError::WrongPassphrase,
-        Fault::PassphraseEmpty => UiError::PassphraseEmpty,
-        Fault::UnknownChannel | Fault::ChannelNotOpen => UiError::ChannelNotOpen,
-        Fault::TooLong => UiError::TooLong,
-        Fault::KeyringFull => UiError::KeyringFull,
-        Fault::Storage | Fault::IdentityFileUnwritable | Fault::RetentionFileUnwritable => {
-            UiError::Storage
-        }
-        Fault::SealedUnreadable => UiError::SealedUnreadable,
-        Fault::ShuttingDown | Fault::Internal => UiError::Internal,
-        // A link that will not parse is malformed input, not a network failure.
-        Fault::BadLink => UiError::Malformed,
-        // Nobody has published the room where we looked: a reachability problem, not bad input.
-        Fault::Unreachable | Fault::BoardUnreachable | Fault::RoomNotOnBoard => {
-            UiError::Unreachable
-        }
-        Fault::SolveTooSlow => UiError::JoinPowTooSlow,
-        Fault::MembersBusy => UiError::JoinMembersBusy,
-        Fault::RoomFull => UiError::JoinRoomFull,
-        Fault::NotAdmittedAfterJoin => UiError::JoinNotAdmitted,
-        Fault::Refused => UiError::Refused,
-        Fault::NotAdmitted => UiError::NotAdmitted,
-        Fault::JoinedRoomEnded => UiError::RoomEnded,
-        Fault::ResponderLeft => UiError::Unreachable,
-        Fault::NotConsented => UiError::NotConsented,
-        Fault::NotNetworked => UiError::NotNetworked,
-        Fault::AddressInUse => UiError::AddressInUse,
-        Fault::AddressNotHere => UiError::AddressNotHere,
-        Fault::BindFailed => UiError::BindFailed,
-        Fault::AlreadyMember => UiError::AlreadyMember,
-        Fault::RoomEnded => UiError::RoomEnded,
-        Fault::LeaveNotHeard => UiError::LeaveNotHeard,
-        Fault::LeaveUndone => UiError::LeaveUndone,
-        Fault::NotCreator | Fault::NotRoomCreator => UiError::NotCreator,
-        Fault::RoomNotSynced => UiError::StillJoining,
-        #[allow(unreachable_patterns)]
-        _ => UiError::Internal,
-    }
 }
 
 impl CoreHandle for DaemonCore {

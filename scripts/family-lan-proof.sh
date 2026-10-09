@@ -31,14 +31,23 @@
 # **With Vox.app's registered helper** (ADR-014 M-10, #439), after approving the LAN helper in
 # System Settings (the manual check `manual.lan_helper`):
 #
-#     sudo scripts/family-lan-proof.sh --registered-helper /Applications/Vox.app
+#     sudo scripts/family-lan-proof.sh --registered-helper /Applications/Vox.app \
+#         [--owner-mutant <vox built with the helper's uid check skipped>]
 #
 # It then starts no helper of its own: every `vox` is the bundle's, and every `vox lan up` uses
-# the helper launchd runs on /var/run/vox-lan.sock, as the app does. One more check comes first:
+# the helper launchd runs on /var/run/vox-lan.sock, as the app does.
 #
-#   0. owner     the registered helper serves only the person who owns Vox.app: a request from
-#                another uid (root, this script) is refused with "serves only uid <yours>", and
-#                no interface is made. Mutant: the helper skips its uid check; 0 goes red.
+# Check 0 comes first, in either mode, against whichever helper the run uses:
+#
+#   0. owner     the helper serves only its owner (the person who owns Vox.app, or who ran
+#                sudo): the socket is theirs, mode 0600; root, which the file mode does not stop,
+#                is refused by the helper's own uid check ("uid 0 asked, and this helper serves
+#                only uid <yours>"); another account (`nobody`) cannot even connect. Neither is
+#                answered as a helper.
+#   0m. mutant   with --owner-mutant, the same check against a helper started from that vox, whose
+#                uid check is skipped: check 0 must go red there (root is answered), in the same
+#                sudo run, so the check is shown able to fail. The mutant is built without sudo:
+#                see `manual.lan_helper` in docs/release/optional-proofs.md.
 #
 # What runs as root, and why: `vox lan helper` (it creates the utun interfaces — that is
 # its whole job) and this script's own bookkeeping (killing what it started, `ifconfig`
@@ -82,12 +91,19 @@ fi
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 REGISTERED=0
+MUTANT=
 if [[ ${1:-} == --registered-helper ]]; then
     REGISTERED=1
     APP=${2:?--registered-helper needs the registered Vox.app, e.g. /Applications/Vox.app}
     VOX=$APP/Contents/Helpers/vox
+    shift 2
 else
-    VOX=${1:-$REPO/target/release/vox}
+    VOX=$REPO/target/release/vox
+    if [[ -n ${1:-} && ${1:-} != --owner-mutant ]]; then VOX=$1; shift; fi
+fi
+if [[ ${1:-} == --owner-mutant ]]; then
+    MUTANT=${2:?--owner-mutant needs a vox built with the helper uid check skipped}
+    [[ -x $MUTANT ]] || { echo "no mutant vox at $MUTANT" >&2; exit 2; }
 fi
 HELPER_SOCK=/var/run/vox-lan.sock
 PY=/usr/bin/python3
@@ -463,28 +479,45 @@ stop_pid "$PID_serve"
 # The decider's rule: nothing is reachable over the LAN unless its port is listed. The
 # checks' own ports are listed; 47040 and 47041 are the unlisted ones check 6 knocks on.
 ALLOW=47010,47011,47030
+# owner_check SOCK LABEL: the helper on SOCK serves only the invoking account. Root, which a 0600
+# socket does not stop, must be refused by the helper's uid check; `nobody` must not be answered
+# (the file mode refuses it at connect). Neither may get a helper's answer ("vox lan helper 1").
+owner_check() {
+    local sock=$1 label=$2 me owner asked other
+    me=$(id -u "$SUDO_USER")
+    owner=$(stat -f %u "$sock")
+    local ask='
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(10)
+try:
+    s.connect(sys.argv[1])
+except OSError as e:
+    print("connect refused:", e.strerror)
+    sys.exit(0)
+s.sendall(b"hello\n")
+print(s.recv(4096).decode(errors="replace").strip())
+'
+    asked=$("$PY" -c "$ask" "$sock" 2>&1)
+    other=$(sudo -u nobody "$PY" -c "$ask" "$sock" 2>&1)
+    echo "$label: socket owner uid $owner ($SUDO_USER is $me); root was answered: $asked; nobody was answered: $other"
+    [[ $owner == "$me" \
+        && $asked == *"uid 0 asked, and this helper serves only uid $me"* \
+        && $other != *"vox lan helper "* && -n $other ]]
+}
+
 if [[ $REGISTERED == 1 ]]; then
     # ---- 0. the registered helper serves only Vox.app's owner ----
-    say "0. owner: the registered helper on $HELPER_SOCK, asked by root (another uid)"
+    say "0. owner: the registered helper on $HELPER_SOCK, asked by root and by nobody"
     if [[ ! -S $HELPER_SOCK ]]; then
         echo "APPARATUS: no helper listens on $HELPER_SOCK: approve Vox's LAN helper in System" \
             "Settings (manual.lan_helper) and run this again" >&2
         exit 1
     fi
-    OWNER=$(stat -f %u "$HELPER_SOCK")
-    ASKED=$("$PY" -c '
-import socket, sys
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.settimeout(10)
-s.connect(sys.argv[1])
-s.sendall(b"hello\n")
-print(s.recv(4096).decode(errors="replace").strip())
-' "$HELPER_SOCK" 2>&1)
-    echo "socket owner uid $OWNER ($SUDO_USER is $(id -u "$SUDO_USER")); root was answered: $ASKED"
-    if [[ $OWNER == "$(id -u "$SUDO_USER")" && $ASKED == *"uid 0 asked, and this helper serves only uid $OWNER"* ]]; then
-        pass "owner: the registered helper serves only uid $OWNER, who owns Vox.app; root was refused"
+    if owner_check "$HELPER_SOCK" "registered helper"; then
+        pass "owner: the registered helper serves only uid $(id -u "$SUDO_USER"), who owns Vox.app; root and nobody were refused"
     else
-        fail "owner: socket owned by uid $OWNER, and root was answered: $ASKED"
+        fail "owner: the registered helper answered another uid, or its socket is not $SUDO_USER's (above)"
     fi
     HELPER_AT=$HELPER_SOCK
     say "the registered helper (launchd) and three vox lan up (as $SUDO_USER), each --allow $ALLOW"
@@ -493,6 +526,24 @@ else
     say "vox lan helper (root) and three vox lan up (as $SUDO_USER), each --allow $ALLOW"
     bg helper "$VOX" lan helper --socket "$HELPER_AT"
     wait_line "$WORK/helper.log" 'serving uid' 30 "$PID_helper" || exit 1
+    say "0. owner: this run's helper on $HELPER_AT, asked by root and by nobody"
+    if owner_check "$HELPER_AT" "this run's helper"; then
+        pass "owner: the helper serves only uid $(id -u "$SUDO_USER"), who ran sudo; root and nobody were refused"
+    else
+        fail "owner: the helper answered another uid, or its socket is not $SUDO_USER's (above)"
+    fi
+fi
+if [[ -n $MUTANT ]]; then
+    # ---- 0m. the same check against a helper whose uid check is skipped: it must go red ----
+    say "0m. mutant: check 0 against a helper from $MUTANT (uid check skipped)"
+    bg mutant_helper "$MUTANT" lan helper --socket "$WORK/mutant.sock"
+    wait_line "$WORK/mutant_helper.log" 'serving uid' 30 "$PID_mutant_helper" || exit 1
+    if owner_check "$WORK/mutant.sock" "mutant helper"; then
+        fail "mutant: check 0 passed against a helper with its uid check skipped, so it cannot tell"
+    else
+        pass "mutant: check 0 goes red against a helper with its uid check skipped (root was answered)"
+    fi
+    kill -INT "$PID_mutant_helper" 2>/dev/null
 fi
 # Each `vox lan up` is a client holding its member's node: its daemon, as $SUDO_USER, asks
 # the helper on helper.sock for the utun and runs the LAN, writing the stats file.

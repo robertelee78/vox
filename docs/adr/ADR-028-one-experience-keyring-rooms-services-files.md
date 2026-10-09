@@ -207,9 +207,14 @@ by any of them (ADR-001: there is no typed agent or human).
   commands are: for `ssh`,
   `ssh USER@ADDRESS`, a `vox forward ADDRESS 127.0.0.1:PORT` pair and an `~/.ssh/config` block; for
   `http`/`https`, a browser URL through the proxy and a forward; for `tcp`/`udp`, a forward. Each
-  MUST show what it needs and whether it holds: the sharer trusts this node, this node is
-  attached, the proxy is running, the sharer is online. Copy MUST use the system clipboard in the
-  app and OSC 52 in the TUI, and the command MUST also be printed.
+  MUST show what it needs as readiness ticks, in this order and these words in every client and
+  `vox service list`: `proxy configured` (for what goes through the proxy), `node attached`,
+  `<sharer> trusts you`, `<sharer> online`, each `✓` when it holds and, when it does not,
+  `missing:` with what to do (decider, 2026-10-08, G4). `<sharer> trusts you` MUST come only from
+  the sharer's own consent to this node in the room's log, never from reading anyone's keyring;
+  `<sharer> online` is whether this node holds a live connection to the sharer; nothing is sent to
+  learn any of them. Copy MUST use the system clipboard in the app and OSC 52 in the TUI, and the
+  command MUST also be printed.
 - **S-4.** Sharing MUST be one step in both clients: the client MUST list the services listening
   on this machine with their process names, suggest a name, and before sharing show the address
   members will use and name who in the room can and cannot reach it (ADR-017 4.2). A share of an
@@ -320,7 +325,8 @@ keep code in sync through GitHub.
   | bg.raised | `#131417` | 233 | default bg |
   | bg.panel | `#16171a` | 234 | default bg |
   | bg.overlay | `#1c1d21` | 234 | black |
-  | selection | `#1767b5` (Increase Contrast `#1b70c6`) | 25 | blue |
+  | selection | `#45474f` (Increase Contrast `#55575f`), with an accent bar at its leading edge: text.primary on it 7.86:1 (hc 7.20), the bar against bg.panel 9.54:1 (hc 11.73) | 239 | bright black |
+  | selection.secondary | `#dcd7cf` (Increase Contrast `#e2ddd5`): a selected row's second line, 6.47:1 on selection (hc 5.33) | 252 | default fg |
   | line.hair | `#303137` (Increase Contrast `#8c8780`) | 236 | bright black |
   | text.primary | `#f0ece4` | 255 | default fg |
   | text.secondary | `#a8a299` | 247 | default fg |
