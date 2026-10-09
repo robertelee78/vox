@@ -56,6 +56,7 @@ struct DecisionsView: View {
                 LazyVStack(alignment: .leading, spacing: Space.s12) {
                     ForEach(Array(shown.enumerated()), id: \.offset) { index, event in
                         DecisionRow(event: event, who: name(event))
+                            .nodeCard(model, event.by, name: name(event))
                             .accessibilityIdentifier("decision-\(index)")
                     }
                 }

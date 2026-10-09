@@ -79,7 +79,7 @@ extension VoxAction {
             VoxAction("Room", "Retention…", enabled: inRoom) { node?.sheet = .retention },
             VoxAction("Room", "Admins…", enabled: inRoom) { node?.sheet = .admins },
             VoxAction("Room", "Reply to Selected Message", "r",
-                      enabled: inRoom && node?.selectedMessage != nil) {
+                      enabled: inRoom && node?.messages.contains { $0.id == node?.selectedMessage } == true) {
                 node?.replyTo = node?.messages.first { $0.id == node?.selectedMessage }
             },
             // The room's composer only: never while a Session is shown (D2).
@@ -152,6 +152,10 @@ struct VoxCommands: Commands {
                 .disabled(app.node != nil)
             Button("Detach") { Task { await app.detachNode() } }
                 .disabled(app.node == nil)
+            Hairline()
+            // E-4: the one way to act as another node: sign out, then sign in.
+            Button("Sign Out…") { app.signingOut = true }
+                .disabled(app.signedInAs == nil)
             items("Node")
         }
         CommandMenu("Keyring") { items("Keyring") }

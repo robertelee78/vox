@@ -57,13 +57,18 @@ struct KeyringView: View {
                         .selectable(model.keyringSelected == node.fingerprint) {
                             model.keyringSelected = node.fingerprint
                         }
+                    // The selected entry's card (G2): each direction, the rooms, what removing it
+                    // would change.
+                    if model.keyringSelected == node.fingerprint {
+                        KeyringCard(model: model, node: node)
+                    }
                 }
             }
             .padding(Space.s24)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .sheet(item: Binding(get: { removing.map(Removal.init) }, set: { removing = $0?.node })) {
-            RemoveSheet(model: model, node: $0.node) { removing = nil }
+            RemoveSheet(model: model, node: $0.node) { removing = nil }.textSelection(.enabled)
                 .panelSurface()
         }
         .sheet(item: Binding(get: { drivingAsk.map(Removal.init) }, set: { drivingAsk = $0?.node })) {
@@ -96,6 +101,7 @@ struct KeyringView: View {
                 .accessibilityIdentifier("keyring-add-alias")
             // Read is the only grant here (K-16, P5): drive is its own step on the node's row,
             // through a confirm sheet.
+            AliasClash(model: model, alias: alias)
             if !fingerprint.isEmpty && !alias.isEmpty {
                 Text(Effects.trusting(alias) + " " + Effects.granting(alias, drive: false))
                     .secondaryText()
@@ -220,23 +226,13 @@ private struct KeyringRow: View {
                 }
                 if !newAlias.isEmpty && newAlias != node.name {
                     Text(Effects.renaming(newAlias)).secondaryText()
+                    AliasClash(model: model, alias: newAlias, except: node.fingerprint)
                 }
             }
             if comparing {
-                TextField("Their fingerprint, pasted or typed", text: $other).font(Theme.mono)
-                    .accessibilityLabel("Their fingerprint, to compare with \(node.name)'s")
-                    .accessibilityIdentifier("keyring-compare-\(node.name)")
-                if !other.isEmpty {
-                    if Compare.same(other, node.fingerprint) {
-                        StateMark(kind: .plain, words: "Matches \(node.name)'s fingerprint.")
-                    } else {
-                        // K-5: a mismatch is its own action, which says not to trust the node.
-                        StateMark(kind: .danger,
-                                  words: "Does not match. This is not the node you trusted as "
-                                      + "\(node.name): do not trust it.")
-                        Button("Remove \(node.name)…", role: .destructive, action: remove)
-                    }
-                }
+                // Group by group (#624): only a real mismatch says not to trust it (K-5).
+                CompareField(fingerprint: node.fingerprint, name: node.name,
+                             id: "keyring-\(node.name)", remove: remove)
             }
         }
         .padding(.vertical, Space.s8)

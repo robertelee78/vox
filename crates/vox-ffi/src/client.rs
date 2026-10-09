@@ -267,6 +267,16 @@ pub struct ReadBy {
     pub names: Vec<String>,
 }
 
+/// Where one of this node's own messages is (ADR-028 R-6): said while no member is known to have
+/// read it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct Whereabouts {
+    /// The message's id.
+    pub id: String,
+    /// "only on this machine", or "on N of M members' nodes", as the TUI says it.
+    pub words: String,
+}
+
 /// Who has pulled one of this node's own shares whole and verified it (ADR-028 F-7).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct PulledBy {
@@ -1257,11 +1267,22 @@ fn file_offer(env: &vox_agentcomms::envelope::Envelope) -> Option<FileOffer> {
 }
 
 /// The keyring's names, by fingerprint. A read: the node checks no passphrase.
+/// The keyring's names as a person reads them in messages, members, To: and the decision
+/// record: two aliases that differ only in case each carry their fingerprint's first characters
+/// (ADR-028 K-4, [`vox_text::alias::alias_of`]). The keyring's own rows keep the bare alias.
 async fn names(client: &mut IpcClient) -> Result<HashMap<Digest32, String>, VoxError> {
-    Ok(keyring(client)
+    let entries: Vec<(Digest32, String)> = keyring(client)
         .await?
         .into_iter()
         .map(|(fp, name, _)| (fp, name))
+        .collect();
+    Ok(entries
+        .iter()
+        .map(|(fp, name)| {
+            let shown =
+                vox_text::alias::alias_of(&entries, fp, b32_encode).unwrap_or_else(|| name.clone());
+            (*fp, shown)
+        })
         .collect())
 }
 
@@ -1416,6 +1437,22 @@ impl VoxClient {
         ),
         VoxError,
     > {
+        let (open, names, _) = self.open_snap_me(room).await?;
+        Ok((open, names))
+    }
+
+    /// [`Self::open_snap`], and this node's own fingerprint as the snapshot names it.
+    async fn open_snap_me(
+        &self,
+        room: &str,
+    ) -> Result<
+        (
+            Option<vox_core::node::snapshot::OpenRoomSnap>,
+            HashMap<Digest32, String>,
+            Option<Digest32>,
+        ),
+        VoxError,
+    > {
         let channel_id = digest(room, "room id")?;
         let body = vox_core::node::snapshot::request_body();
         let (reply, names) = on_held!(self, |c| {
@@ -1434,6 +1471,7 @@ impl VoxClient {
         Ok((
             snap.open.into_iter().find(|o| o.channel_id == channel_id),
             names,
+            snap.me,
         ))
     }
 
@@ -3099,6 +3137,55 @@ impl VoxClient {
             .await?
             .into_iter()
             .map(|(id, names)| ReadBy { id, names })
+            .collect())
+    }
+
+    /// What a member's client says when `member` joins `room` (ADR-028 K-7), word for word as the
+    /// TUI says it: its name (alias, else its fingerprint marked "(not in keyring)"), "joined.",
+    /// and which nodes in this node's keyring trust it, from the consent grants on the room's log.
+    /// It adds nothing to any keyring.
+    ///
+    /// # Errors
+    /// A malformed id, the room not open here, or the daemon's refusal.
+    pub async fn join_said(&self, room: String, member: String) -> Result<String, VoxError> {
+        let who = digest(&member, "member fingerprint")?;
+        let (open, names) = self.open_snap(&room).await?;
+        let Some(open) = open else {
+            return Err(failed("the room is not open on this node"));
+        };
+        let mut trusters: Vec<String> = open
+            .trusted_by
+            .iter()
+            .find(|(m, _)| *m == who)
+            .map(|(_, by)| by.iter().filter_map(|fp| names.get(fp).cloned()).collect())
+            .unwrap_or_default();
+        trusters.sort();
+        let name = vox_text::offer::name(names.get(&who).map(String::as_str), &b32_encode(&who));
+        Ok(format!(
+            "{name} joined. {}",
+            vox_text::offer::trusted_by(&trusters)
+        ))
+    }
+
+    /// Where each of this node's own recent messages in `room` is (ADR-028 R-6), from how many of
+    /// the other members' nodes said they hold it, in the TUI's words: what a message no member
+    /// has read says.
+    ///
+    /// # Errors
+    /// A malformed id, or the daemon's refusal.
+    pub async fn whereabouts(&self, room: String) -> Result<Vec<Whereabouts>, VoxError> {
+        let (open, _, me) = self.open_snap_me(&room).await?;
+        let Some(open) = open else {
+            return Ok(Vec::new());
+        };
+        let others = open.members.iter().filter(|m| me != Some(**m)).count() as u64;
+        Ok(open
+            .held
+            .iter()
+            .map(|(entry, held)| Whereabouts {
+                id: b32_encode(entry),
+                words: vox_text::read::whereabouts(*held, others),
+            })
             .collect())
     }
 

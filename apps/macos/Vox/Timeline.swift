@@ -70,6 +70,11 @@ extension NodeModel {
         for n in notices where !n.after.isEmpty && !shown.contains(n.after) {
             items.insert(item(n), at: items.firstIndex { $0.millis > n.createdMillis } ?? items.count)
         }
+        // Who joined while the room was on screen, and which of the keyring's nodes trust it (K-7).
+        for j in joins where !j.said.isEmpty {
+            let line = TimelineItem.notice("join-\(j.fingerprint)", j.said, at: j.at)
+            items.insert(line, at: items.firstIndex { $0.millis > j.at } ?? items.count)
+        }
         return items
     }
 
@@ -104,6 +109,78 @@ extension NodeModel {
             }
             return lines
         }
+    }
+
+    /// The messages selected in the timeline as ⌘C copies them (v0.4.1): one line each, oldest
+    /// first, "<author>, <time>: <text>".
+    var copiedLines: String {
+        timelineItems.compactMap(\.message)
+            .filter { selectedMessages.contains($0.id) }
+            .map { "\(Self.author($0, me: me)), \(Self.copiedTime($0.createdMillis)): \(Self.body($0))" }
+            .joined(separator: "\n")
+    }
+
+    /// Who wrote it, as its row names them: you, the alias, or the fingerprint's first 12
+    /// characters.
+    static func author(_ m: RoomMessage, me: String) -> String {
+        if m.author == me { return "you" }
+        return m.authorName.isEmpty ? String(m.author.prefix(12)) : m.authorName
+    }
+
+    /// What it says: its text; a share, its file or folder and its note; one still owed, that.
+    static func body(_ m: RoomMessage) -> String {
+        if m.owed { return "not received yet" }
+        guard let file = m.file else { return m.text }
+        let what = "\(file.folder ? "folder" : "file") \(file.name)"
+        return file.note.isEmpty ? what : "\(what): \(file.note)"
+    }
+
+    /// When it was written, in this Mac's time zone, to the minute: 2026-10-08 19:42.
+    static func copiedTime(_ millis: UInt64) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = .current
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f.string(from: Date(timeIntervalSince1970: Double(millis) / 1000))
+    }
+
+    /// What a reply quotes (ADR-028 R-9), as the TUI quotes it: "<who>: <its first line>", cut at
+    /// 80 characters, or nil while this room does not hold that message. Nil for a message that
+    /// replies to nothing.
+    func quote(of m: RoomMessage) -> (id: String, words: String?)? {
+        let re = m.re.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !re.isEmpty else { return nil }
+        guard let held = byID[re], !held.owed else { return (re, nil) }
+        let said = held.file.map { $0.note.isEmpty ? $0.name : $0.note } ?? held.text
+        let first = said.split(separator: "\n", omittingEmptySubsequences: false).first.map(String.init) ?? ""
+        let more = first.count > 80 || said.contains("\n") ? "…" : ""
+        let who = held.author == me ? "you"
+            : held.authorName.isEmpty ? String(held.author.prefix(12)) : held.authorName
+        return (re, "\(who): \(first.prefix(80))\(more)")
+    }
+
+    /// The newest line of what is shown, to follow: the last one with a time of its own (a
+    /// Session's closing note, kept at the end, is not one).
+    var followItem: String? {
+        timelineItems.last { $0.millis != .max }?.id
+    }
+
+    /// A Session shown whose lines this member may read and has not read yet.
+    var showsSessionToRead: Bool {
+        guard let s = shownSession else { return false }
+        return s.canDrive && (sessionLoading || (sessionEntries.isEmpty && sessionNote == nil))
+    }
+
+    /// What following watches: the newest line and how many there are.
+    var followSignature: String {
+        "\(followItem ?? "")#\(timelineItems.count)"
+    }
+
+    /// The shown Session's request still waiting for an answer, if one is: the line to go to.
+    var waitingEntry: String? {
+        guard case .session = showing else { return nil }
+        return sessionEntries.last { $0.request != nil && $0.request?.state == nil }
+            .map { "entry-\($0.id)" }
     }
 
     /// "<who> <what>", who named as the TUI names them: you, the alias, or the fingerprint's first

@@ -23,7 +23,8 @@ use vox_core::error::Error;
 use vox_core::hash::Digest32;
 use vox_core::nat::bootstrap::BootstrapSet;
 use vox_core::node::daemonipc::{
-    AttachMode, DaemonClient, DaemonFrame, DaemonRequest, KeepSource, NodeInfo, NodeState, UseNode,
+    AttachMode, DaemonClient, DaemonFrame, DaemonRequest, KeepSource, NodeInfo, NodeState, Refusal,
+    UseNode,
 };
 use vox_core::node::ipc::{Frame, IpcClient, NodeSocket};
 use vox_core::node::link::{merge_anchor_spec, merge_anchors_file};
@@ -796,6 +797,67 @@ pub async fn node_detach(args: &NodeArgs, name: &str) -> Result<(), AppError> {
         Ok(other) => Err(crate::client::unexpected_daemon(&other)),
         Err(e) => Err(AppError::Usage(format!("the daemon did not answer: {e}"))),
     }
+}
+
+/// `vox node signout`: detach `name` and forget everything that would bring it back without the
+/// person (ADR-028 E-4): its line in `.daemon/attach` and its Keychain passphrase (the daemon's
+/// unkeep), and the app's remembered node when it names it. The node itself, its rooms and its
+/// messages stay on disk.
+///
+/// # Errors
+/// No such node, no daemon answering, or the daemon's refusal.
+pub async fn node_signout(args: &NodeArgs, name: &str) -> Result<(), AppError> {
+    let name = NodeName::parse(name)?;
+    let account = args.account()?;
+    if !account.nodes_on_disk().contains(&name) {
+        return Err(AppError::Usage(format!(
+            "no node {name} in this data root; `vox node list` lists them"
+        )));
+    }
+    let mut d = daemon(&account).await?;
+    let asked = |what: &str, r: Result<DaemonFrame, Error>| -> Result<bool, AppError> {
+        match r {
+            Ok(DaemonFrame::Ok) => Ok(true),
+            Ok(DaemonFrame::Refused(Refusal::NotAttached { .. })) => Ok(false),
+            Ok(DaemonFrame::Refused(r)) => Err(AppError::Usage(r.to_string())),
+            Ok(other) => Err(crate::client::unexpected_daemon(&other)),
+            Err(e) => Err(AppError::Usage(format!(
+                "the daemon did not answer {what}: {e}"
+            ))),
+        }
+    };
+    // Not kept first, so nothing attaches it again: its line and its Keychain item go.
+    asked(
+        "the unkeep",
+        d.request(DaemonRequest::Unkeep { node: name.clone() })
+            .await,
+    )?;
+    // A connection of its own: the daemon answers one such request per connection.
+    let mut d = daemon(&account).await?;
+    let detached = asked(
+        "the detach",
+        d.request(DaemonRequest::Detach { node: name.clone() })
+            .await,
+    )?;
+    // The app opens the node it remembers by itself: not this one any more.
+    let chosen = account.config_dir.join("app").join("node");
+    let remembered = std::fs::read_to_string(&chosen).is_ok_and(|s| s.trim() == name.to_string());
+    if remembered {
+        std::fs::remove_file(&chosen).map_err(|e| {
+            AppError::Usage(format!(
+                "node {name} is detached and no longer kept, but the app's choice of it, {}, could \
+                 not be removed: {e}",
+                chosen.display()
+            ))
+        })?;
+    }
+    println!(
+        "vox: node {name} signed out: {}, no longer kept, its Keychain passphrase forgotten{}; its \
+         rooms and messages stay here, and `vox node attach {name}` uses it again",
+        if detached { "detached" } else { "not attached" },
+        if remembered { ", and the app no longer opens it by itself" } else { "" }
+    );
+    Ok(())
 }
 
 /// `vox node list`: every node on disk, with what the daemon says of each, if one runs.

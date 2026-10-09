@@ -316,7 +316,7 @@ impl std::fmt::Debug for DaemonCore {
 }
 
 /// Said under a message this node sent that no other member's node is known to hold (ADR-028 R-6).
-pub const ONLY_HERE: &str = "only on this machine";
+pub const ONLY_HERE: &str = vox_text::read::ONLY_HERE;
 
 /// Short display form of a fingerprint (first 8 hex chars).
 #[must_use]
@@ -1533,8 +1533,7 @@ impl DaemonCore {
             }
             match own.held.iter().find(|(e, _)| *e == r.entry_hash) {
                 None => String::new(),
-                Some((_, 0)) => ONLY_HERE.to_owned(),
-                Some((_, n)) => format!("on {n} of {} members' nodes", own.others),
+                Some((_, n)) => vox_text::read::whereabouts(*n, own.others),
             }
         };
         let view_of = |r: &MessageRow| MessageView {
