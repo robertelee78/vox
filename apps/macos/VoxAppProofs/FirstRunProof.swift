@@ -717,7 +717,8 @@ final class FirstRunProof: XCTestCase {
 
         // (3d) Watching a Session (P7), and what comes meanwhile in General (D18). bob's agent
         // session opens a Session in mission through its hook, as Claude Code's does, and bob's
-        // node lets alice read it (drive). Its 30 tool calls are more than the timeline shows.
+        // node lets alice read it (drive). Its 60 tool calls are more than the timeline shows,
+        // with room to spare on a tall display.
         try staged(vox, ["trust", "drive", "--node", "bob", aliceFp,
                          "--identity-passphrase-file", bobPass], env: voxEnv)
         let sid = "p7proofs-session"
@@ -755,9 +756,9 @@ final class FirstRunProof: XCTestCase {
             return false
         }
         try hook(["hook_event_name": "UserPromptSubmit", "prompt": "sort the photos"])
-        for n in 1...30 { try toolCall(n) }
-        guard sessionHolds("P7-LINE-030", within: 60) else {
-            throw Apparatus("bob's Session never showed P7-LINE-030 to alice's node: `vox room session --node alice` says \(run(vox, ["room", "session", "--node", "alice", room, "p7proofs"], env: voxEnv).out.suffix(600)), so the app's Session cannot be checked")
+        for n in 1...60 { try toolCall(n) }
+        guard sessionHolds("P7-LINE-060", within: 60) else {
+            throw Apparatus("bob's Session never showed P7-LINE-060 to alice's node: `vox room session --node alice` says \(run(vox, ["room", "session", "--node", "alice", room, "p7proofs"], env: voxEnv).out.suffix(600)), so the app's Session cannot be checked")
         }
         let sessionRow = Key.id("session-p7proofs")
         present(ui, sessionRow, timeout: 60,
@@ -768,28 +769,37 @@ final class FirstRunProof: XCTestCase {
             guard let r = words.range(of: #"(\d+) new"#, options: .regularExpression) else { return 0 }
             return Int(words[r].split(separator: " ")[0])
         }
+        // In view: at least half of it inside the timeline's frame, as Seen counts a row seen.
+        // (Hit-testing is not this: the line at the bottom of the timeline, drawn and in view in
+        // the first run's kept tree, was still not hittable, a false red.)
+        func inTimeline(_ key: Key) -> Bool {
+            let e = el(ui, key), t = el(ui, Key.id("timeline"))
+            guard e.exists, t.exists else { return false }
+            let shown = e.frame.intersection(t.frame)
+            return !shown.isNull && shown.height * 2 >= e.frame.height
+        }
         tap(ui, sessionRow, "bob's Session")
-        let newestLine = Key.showing("P7-LINE-030")
+        let newestLine = Key.showing("P7-LINE-060")
         let openedUntil = Date().addingTimeInterval(20)
-        while Date() < openedUntil && !el(ui, newestLine).isHittable { Thread.sleep(forTimeInterval: 0.25) }
-        if el(ui, Key.showing("P7-LINE-001")).isHittable && el(ui, newestLine).isHittable {
-            throw Apparatus("all 30 of the Session's lines fit in the timeline, so opening at its newest cannot be told from opening at its top")
+        while Date() < openedUntil && !inTimeline(newestLine) { Thread.sleep(forTimeInterval: 0.25) }
+        if inTimeline(Key.showing("P7-LINE-001")) && inTimeline(newestLine) {
+            throw Apparatus("all 60 of the Session's lines fit in the timeline, so opening at its newest cannot be told from opening at its top")
         }
-        if !el(ui, newestLine).isHittable {
+        if !inTimeline(newestLine) {
             keepTree(ui, "the Session did not open at its newest line")
-            XCTFail("PRODUCT: a Session opened must show its newest line, P7-LINE-030, in view; it is not on screen 20 s after bob's Session was chosen")
+            XCTFail("PRODUCT: a Session opened must show its newest line, P7-LINE-060, in view; it is not on screen 20 s after bob's Session was chosen")
         }
-        try toolCall(31)
-        guard sessionHolds("P7-LINE-031", within: 30) else {
-            throw Apparatus("bob's 31st tool call never reached alice's node (`vox room session --node alice`), so following it cannot be checked")
+        try toolCall(61)
+        guard sessionHolds("P7-LINE-061", within: 30) else {
+            throw Apparatus("bob's 61st tool call never reached alice's node (`vox room session --node alice`), so following it cannot be checked")
         }
         let followUntil = Date().addingTimeInterval(30)
-        while Date() < followUntil && !el(ui, Key.showing("P7-LINE-031")).isHittable {
+        while Date() < followUntil && !inTimeline(Key.showing("P7-LINE-061")) {
             Thread.sleep(forTimeInterval: 0.25)
         }
-        if !el(ui, Key.showing("P7-LINE-031")).isHittable {
+        if !inTimeline(Key.showing("P7-LINE-061")) {
             keepTree(ui, "the Session did not follow its new line")
-            XCTFail("PRODUCT: a Session watched at its newest line must follow what it prints next; P7-LINE-031 is not on screen 30 s after bob's session made it")
+            XCTFail("PRODUCT: a Session watched at its newest line must follow what it prints next; P7-LINE-061 is not on screen 30 s after bob's session made it")
         }
         // D18: a message to the room while the Session is shown is not seen, so it counts.
         guard let before = newCount() else {
@@ -817,7 +827,7 @@ final class FirstRunProof: XCTestCase {
             keepTree(ui, "a message seen in General was still counted")
             XCTFail("PRODUCT: General shown with D18-UNSEEN in view must read it, so mission's row counts one fewer new; it still says \"\(shown(el(ui, Key.id("room-mission"))))\"")
         }
-        print("[proof] Session opened at P7-LINE-030 and followed P7-LINE-031; D18-UNSEEN counted while a Session was shown (\(before) → \(counted) new), read once General showed it (\(after))")
+        print("[proof] Session opened at P7-LINE-060 and followed P7-LINE-061; D18-UNSEEN counted while a Session was shown (\(before) → \(counted) new), read once General showed it (\(after))")
 
         // (4) Read each way. Bob's NEEDS-YOU is on alice's screen now: her node says she read it.
         var readByAlice: [String] = []
