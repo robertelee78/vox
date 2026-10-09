@@ -70,6 +70,11 @@ extension NodeModel {
         for n in notices where !n.after.isEmpty && !shown.contains(n.after) {
             items.insert(item(n), at: items.firstIndex { $0.millis > n.createdMillis } ?? items.count)
         }
+        // Who joined while the room was on screen, and which of the keyring's nodes trust it (K-7).
+        for j in joins where !j.said.isEmpty {
+            let line = TimelineItem.notice("join-\(j.fingerprint)", j.said, at: j.at)
+            items.insert(line, at: items.firstIndex { $0.millis > j.at } ?? items.count)
+        }
         return items
     }
 

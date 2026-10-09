@@ -64,6 +64,20 @@
 //     timeline with its newest message selected; ↑ and ↓ move the selection, as Reply to Selected
 //     Message (⌘R) then says; Space and Return on a row whose file alice pulled open it in Quick
 //     Look; Tab from the timeline reaches the composer.
+// 15. Who trusts whom (ADR-028 K-5, K-7, R-5, R-6, E-4). Dave, whom bob trusts, joins mission
+//     while it is on screen: its timeline says "<dave> (not in keyring) joined. bob trusts it."
+//     (D10). Dave trusts alice; her member pane says he is "not in keyring, trusts you", the room
+//     names him as not yet reading each other with her, and his card says both directions; Trust…
+//     there, with his alias, makes him "trusted both ways" and puts him in her keyring, through
+//     the passphrase gate if the keyring window has closed (D4). With bob's and dave's nodes
+//     detached, a message she posts says "only on this machine"; once bob's node is back, "on 1 of
+//     2 members' nodes" (D9). Node > Detach then offers only to attach alice again, never another
+//     node of this Mac's, and attaching again makes the window hers (D17).
+//     Compare goes group by group (#624): four groups of dave's fingerprint on his offer say "So
+//     far matches 4 of 13 groups."; on his card two say 2 of 13, a wrong third is named as group 3
+//     with no Remove (he is not in the keyring), and the whole of it is marked a match.
+//     The keyring's card for dave (G2) heads "dave ⇄ you", says he trusts alice too, names
+//     mission as a shared room, and its disclosure says what removing him would change.
 // 16. What an operation comes to (#608, #611, #615), run after step 5, or alone with
 //     VOX_PROOF_FROM=16: New Room with an empty passphrase says what that means and makes the
 //     room; a refused End for Everyone keeps its sheet open with the reason; that refusal is the
@@ -72,6 +86,11 @@
 //     labelled (service, your node alias, your room alias, Vox address), and Copy Address copies
 //     it whole, canonical.
 //
+// Mutants for (15), one each: the member rows drop a node's trust in alice unless she trusts it
+// (D4: the row reads "not in keyring"); the timeline drops the whereabouts line (D9); the join
+// line leaves out who trusts the newcomer (D10); Detach goes back to the chooser of every node
+// (D17); a compare that calls any partial entry a mismatch (#624); the keyring card saying a node
+// that trusts alice back is still waiting (G2). Each turns (15) red on its own assertion.
 // Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
 // place of the app's hold), and quitting leaves it attached: (12) goes red. A room with a message
 // addressed to this node grouped as quiet (`attention::group`): (3) goes red. An app that never
@@ -1008,6 +1027,59 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(!room.isEmpty && read.contains("HELLO-FIRST-RUN"),
                       "PRODUCT: the room made in the app must hold alice's post, as `vox room read` reads it; `vox room list` says \(rooms), and the room reads \(read)")
         print("[proof] new person: node alice made and attached in the app, room \(room) made from the empty window, HELLO-FIRST-RUN posted; no screen named Terminal or a vox command")
+
+        // **Sign Out, then sign in as a new node (ADR-028 E-4, the decider 2026-10-08).** Alice is
+        // kept as Keep Running keeps a node (`--keep`, from a scratch file: the Keychain is the
+        // person's, never a proof's). Node › Sign Out… says what it does; confirmed, alice is
+        // detached, no longer kept, and the app's choice of her forgotten, her room still on disk;
+        // the sign-in lists her with her fingerprint and offers New Node…, which makes and attaches
+        // bob, and the app acts as bob.
+        let alicePass = root.appendingPathComponent("alice.pass").path
+        try stager.write(Data("alice identity\n".utf8), to: alicePass)
+        try staged(vox, ["node", "attach", "alice", "--keep", "--passphrase-file", alicePass], env: voxEnv)
+        let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
+        func aliceLine() -> String { nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "alice") ?? "" }
+        guard aliceLine().hasSuffix("(kept)") else {
+            throw Apparatus("staging not achieved: node alice is not kept before Sign Out; `vox node list` says \(aliceLine().debugDescription)")
+        }
+        let nodeMenu = ui.menuBars.menuBarItems["Node"]
+        guard nodeMenu.waitForExistence(timeout: 10) else { throw Apparatus("XCTest finds no Node menu") }
+        nodeMenu.click()
+        tap(ui, Key.menuItem("Sign Out…"), "Node › Sign Out…")
+        words(ui, Key.id("sign-out-effect"), timeout: 10,
+              "Sign Out… must say what it does before it does it",
+              until: { $0.contains("stay on this Mac") && $0.contains("Keychain") })
+        tap(ui, Key.id("sign-out-confirm"), "Sign Out")
+        let signIn = Key.id("node-alice")
+        let listedAlice = words(ui, signIn, timeout: 30,
+                                "signed out, the app must offer the sign-in, listing node alice with her fingerprint",
+                                until: { $0.contains("Act as node alice") && $0.contains(String(aliceFp.prefix(4))) }) ?? ""
+        let out = aliceLine()
+        let keepFile = stager.run(["/bin/sh", "-c", "cat \"$0\" 2>/dev/null", data + "/.daemon/attach"], env: [:]).out
+        let choice = stager.run(["/bin/sh", "-c", "cat \"$0\" 2>/dev/null", config + "/app/node"], env: [:]).out
+        XCTAssertTrue(!out.contains(" attached") && !out.hasSuffix("(kept)")
+                        && !keepFile.split(separator: "\n").contains { $0.hasPrefix("alice\t") },
+                      "PRODUCT: signed out, node alice must be detached and no longer kept: `vox node list` says \(out.debugDescription), the attach file \(keepFile.debugDescription)")
+        XCTAssertTrue(choice.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      "PRODUCT: signed out, the app must forget it opens node alice; its choice file says \(choice.debugDescription)")
+        let aliceDir = stager.run(["/bin/ls", data + "/nodes/alice"], env: [:])
+        XCTAssertEqual(aliceDir.status, 0, "PRODUCT: signed out, node alice must stay on disk: \(aliceDir.out)")
+        tap(ui, Key.id("new-node"), "New Node… in the sign-in")
+        if tap(ui, name, "the node's name field") {
+            ui.typeKey("a", modifierFlags: .command)
+            el(ui, name).typeText("bob")
+        }
+        type(ui, Key.id("new-node-passphrase"), "bob identity", "the passphrase field")
+        type(ui, Key.id("new-node-passphrase-again"), "bob identity", "the passphrase again field")
+        tap(ui, Key.id("new-node-make"), "Make Node")
+        present(ui, Key.id("attached"), timeout: 90, "made at the sign-in, node bob must be attached in the window")
+        let nodes = run(vox, ["node", "list"], env: voxEnv).out
+        let chosen = stager.run(["/bin/sh", "-c", "cat \"$0\" 2>/dev/null", config + "/app/node"], env: [:]).out
+        XCTAssertTrue((nodeLine(nodes, "bob")?.contains(" attached ") ?? false)
+                        && chosen.trimmingCharacters(in: .whitespacesAndNewlines) == "bob",
+                      "PRODUCT: signed in as the new node bob, the app must act as bob: `vox node list` says \(nodes), its choice \(chosen.debugDescription)")
+        _ = run(vox, ["node", "detach", "bob"], env: voxEnv)
+        print("[proof] sign out: \(out.debugDescription) after; sign-in listed \(listedAlice.debugDescription); signed in as new node bob")
     }
 
     /// Red when what the app shows sends a person to Terminal or names a `vox` command: every
@@ -1570,7 +1642,7 @@ final class FirstRunProof: XCTestCase {
         // trusted meanwhile, is listed in its inspector without the room being opened again.
         words(ui, Key.id("member-bob"), timeout: 30,
               "bob joined and was trusted while the room was on screen: its inspector must list him in alice's keyring",
-              until: { $0.hasPrefix("bob, in keyring") })
+              until: { $0.hasPrefix("bob, trusted both ways") || $0.hasPrefix("bob, waiting for the other side") })
         // Off the room, so a message to alice is unread: a room on screen is read.
         tap(ui, Key.id("keyring"), "Keyring in the sidebar")
         try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "NEEDS-YOU"],
@@ -1584,7 +1656,7 @@ final class FirstRunProof: XCTestCase {
         tap(ui, row, "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         let bob = Key.id("member-bob")
         let bobWords = words(ui, bob, timeout: 30, "the inspector must list bob in alice's keyring",
-                             until: { $0.hasPrefix("bob, in keyring") }) ?? ""
+                             until: { $0.hasPrefix("bob, trusted both ways") || $0.hasPrefix("bob, waiting for the other side") }) ?? ""
         let bar = words(ui, Key.id("status"), timeout: 10,
                         "the status bar must say the node, its peers and the keyring window",
                         until: { $0.contains("node alice") && $0.contains("peer") && $0.contains("keyring") }) ?? ""
@@ -2534,6 +2606,153 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(el(ui, compose).value(forKey: "hasKeyboardFocus") as? Bool == true,
                       "PRODUCT: Tab from the timeline must reach the composer; after \(tabs) Tabs it has no keyboard focus")
         print("[proof] keyboard: Space and Return opened Quick Look; ↑ ↑ ↓ selected KEYS-B, KEYS-A, KEYS-B; Tab reached the composer in \(tabs)")
+
+        // (15) Who trusts whom, from a member (ADR-028 K-5, K-7, R-5, R-6, E-4; D4, D9, D10, D17).
+        // Dave, a node made here, is trusted by bob before he joins, so bob's grant to him is on
+        // mission's log once he is in.
+        let davePass = scratch.appendingPathComponent("dave.pass").path
+        try stager.write(Data("dave identity\n".utf8), to: davePass)
+        try staged(vox, ["node", "create", "dave"],
+                   env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "dave identity"]) { $1 })
+        try staged(vox, ["node", "attach", "dave", "--passphrase-file", davePass], env: voxEnv)
+        let daveFp = try line(staged(vox, ["id", "--node", "dave"], env: voxEnv)) { $0.count == 52 }
+        try staged(vox, ["trust", "add", "--node", "bob", daveFp, "--name", "dave",
+                         "--identity-passphrase-file", bobPass], env: voxEnv)
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
+        try staged(vox, ["room", "join", "--node", "dave", "--passphrase-file", roomPass, missionLink],
+                   env: voxEnv)
+        // (15a, D10) The join is said in mission's timeline with who alice trusts that trusts dave.
+        let daveNamed = "\(daveFp.prefix(26)) (not in keyring)"
+        let joinSaid = words(ui, Key.id("join-\(daveFp)"), timeout: 90,
+                             "dave joined mission while it was on screen; its timeline must say so, and that bob (whom alice trusts) trusts him: \"\(daveNamed) joined. bob trusts it.\"",
+                             until: { $0 == "\(daveNamed) joined. bob trusts it." }) ?? ""
+        print("[proof] join: \(joinSaid)")
+        // (15b, D4) Dave trusts alice; she has not trusted him. His row says so, the room says who
+        // does not read her yet, and his card says each direction and trusts him from there.
+        try staged(vox, ["trust", "add", "--node", "dave", aliceFp, "--name", "alice",
+                         "--identity-passphrase-file", davePass], env: voxEnv)
+        let daveRow = Key.id("member-\(daveFp.prefix(12))")
+        let rowSaid = words(ui, daveRow, timeout: 60,
+                            "dave trusts alice and she has not trusted him: her member pane must say \"not in keyring, trusts you\"",
+                            until: { $0.hasSuffix("not in keyring, trusts you") }) ?? ""
+        let banner = words(ui, Key.id("trust-banner"), timeout: 10,
+                           "mission must say whom alice does not yet read each other with: dave",
+                           until: { $0.contains(String(daveFp.prefix(12))) }) ?? ""
+        // (15e, #624) Compare, group by group: on dave's offer, collapsed until asked for, a
+        // partial entry says how far it matches.
+        tap(ui, Key.id("offer-\(daveFp.prefix(12))"), "dave's offer under needs you")
+        tap(ui, Key.id("offer-compare-open"), "Compare… on dave's offer")
+        type(ui, Key.id("offer-compare"), String(daveFp.prefix(16)), "the offer's compare field")
+        let offerSoFar = words(ui, Key.id("offer-compare-said"), timeout: 10,
+                               "four groups of dave's own fingerprint typed on his offer must say \"So far matches 4 of 13 groups.\"",
+                               until: { $0 == "So far matches 4 of 13 groups." }) ?? ""
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
+        tap(ui, daveRow, "dave in the member pane")
+        let directions = words(ui, Key.id("card-directions"), timeout: 10,
+                               "dave's card must say both directions: he trusts alice, she has not trusted him",
+                               until: { $0.contains("trusts you; you haven't trusted") }) ?? ""
+        // On his card: two groups so far; a wrong third named, with no Remove (he is not in the
+        // keyring); the whole of it marked as a match.
+        tap(ui, Key.id("card-compare-open"), "Compare… on dave's card")
+        let field = Key.id("card-compare")
+        type(ui, field, String(daveFp.prefix(8)), "the card's compare field")
+        let soFar = words(ui, Key.id("card-compare-said"), timeout: 10,
+                          "two groups of dave's fingerprint typed must say \"So far matches 2 of 13 groups.\"",
+                          until: { $0 == "So far matches 2 of 13 groups." }) ?? ""
+        let third = daveFp.dropFirst(8).prefix(4)
+        el(ui, field).typeText(String(third.map { $0 == "a" ? "b" : "a" }))
+        let wrong = words(ui, Key.id("card-compare-said"), timeout: 10,
+                          "a third group that differs must be named: \"Group 3 does not match: you have …\"",
+                          until: { $0.hasPrefix("Group 3 does not match: you have ") && $0.hasSuffix("do not trust it.") }) ?? ""
+        XCTAssertNil(locate(ui, Key.id("card-compare-remove")),
+                     "PRODUCT: dave is not in alice's keyring, so his compare must offer no Remove")
+        el(ui, field).typeKey("a", modifierFlags: .command)
+        el(ui, field).typeText(daveFp)
+        let whole = words(ui, Key.id("card-compare-said"), timeout: 10,
+                          "dave's whole fingerprint typed must be marked as a match of all 13 groups",
+                          until: { $0.hasSuffix("all 13 groups.") && $0.hasPrefix("Matches ") }) ?? ""
+        print("[proof] compare: offer \(offerSoFar); card \(soFar) → \(wrong) → \(whole)")
+        tap(ui, Key.id("card-trust-open"), "Trust… on dave's card")
+        type(ui, Key.id("card-alias"), "dave", "the card's alias field")
+        tap(ui, Key.id("card-trust-confirm"), "Trust")
+        keyringPassphraseIfAsked(ui) {
+            self.run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out.contains(daveFp)
+        }
+        let cardSaid = words(ui, Key.id("card-trust"), timeout: 60,
+                             "trusted from his card, dave, who trusts alice, must read \"dave, trusted both ways\"",
+                             until: { $0 == "dave, trusted both ways" }) ?? ""
+        let ring = run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out
+        XCTAssertTrue(ring.contains(daveFp),
+                      "PRODUCT: trusted from his card, dave must be in alice's keyring; `vox trust list` said: \(ring)")
+        tap(ui, Key.id("card-close"), "Close on dave's card")
+        print("[proof] dave's row: \(rowSaid); banner: \(banner); card: \(directions) → \(cardSaid)")
+        // (15f, G2) The keyring's card for dave: each direction, the room it covers, and what
+        // removing him would change, behind a disclosure.
+        tap(ui, Key.id("keyring"), "Keyring in the sidebar")
+        tap(ui, Key.id("keyring-row-dave"), "dave's keyring entry", premise: trusted(vox, voxEnv, daveFp, "dave"))
+        let ringHead = words(ui, Key.id("keyring-card-heading"), timeout: 15,
+                             "dave's keyring card must head \"dave ⇄ you\": he trusts alice too",
+                             until: { $0 == "dave, trusted both ways" }) ?? ""
+        let theirs = words(ui, Key.id("keyring-card-theirs"), timeout: 5,
+                           "dave's direction must say he trusts alice too",
+                           until: { $0.hasPrefix("dave trusts you too.") }) ?? ""
+        let rooms = words(ui, Key.id("keyring-card-rooms"), timeout: 15,
+                          "dave's card must name the room alice shares with him, mission",
+                          until: { $0.hasPrefix("Shared rooms: ") && $0.contains("mission") }) ?? ""
+        tap(ui, Key.id("keyring-card-removal-open"), "What would removing dave change?")
+        let removal = words(ui, Key.id("keyring-card-removal"), timeout: 5,
+                            "the disclosure must say what removing dave would change",
+                            until: { $0.hasPrefix("Removing dave: it reads nothing you write from now on") }) ?? ""
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
+        print("[proof] keyring card: \(ringHead); \(theirs); \(rooms); \(removal.prefix(40))…")
+        // (15c, D9) A message of alice's no member's node holds says so, then where it is.
+        try staged(vox, ["node", "detach", "bob"], env: voxEnv)
+        try staged(vox, ["node", "detach", "dave"], env: voxEnv)
+        try staged(vox, ["room", "post", "--node", "alice", room, "WHERE-15"], env: voxEnv)
+        var whereId = ""
+        for row in run(vox, ["room", "read", "--node", "alice", "--json", room], env: voxEnv).out
+            .split(separator: "\n") {
+            guard let r = try? JSONSerialization.jsonObject(with: Data(row.utf8)) as? [String: Any],
+                  r["text"] as? String == "WHERE-15", let id = r["entry_hash"] as? String else { continue }
+            whereId = id
+        }
+        guard !whereId.isEmpty else { throw Apparatus("alice's `vox room read --json` lists no WHERE-15") }
+        let alone = words(ui, Key.id("whereabouts-\(whereId)"), timeout: 60,
+                          "alice's WHERE-15, posted with bob's and dave's nodes detached, must say \"only on this machine\"",
+                          until: { $0 == "only on this machine" }) ?? ""
+        try staged(vox, ["node", "attach", "bob", "--passphrase-file", bobPass], env: voxEnv)
+        let spread = words(ui, Key.id("whereabouts-\(whereId)"), timeout: 90,
+                           "once bob's node is back and holds WHERE-15, it must say \"on 1 of 2 members' nodes\"",
+                           until: { $0 == "on 1 of 2 members' nodes" }) ?? ""
+        print("[proof] whereabouts: \(alone) → \(spread)")
+        // (15d, D17) Node > Detach leaves the window alice's: Attach again (or Quit), never another
+        // node of this Mac's.
+        ui.menuBars.menuBarItems["Node"].click()
+        tap(ui, Key.menuItem("Detach"), "Node > Detach")
+        var offered = ""
+        let detachedUntil = Date().addingTimeInterval(30)
+        while Date() < detachedUntil && offered.isEmpty {
+            if locate(ui, Key.id("node-carol")) != nil || locate(ui, Key.id("node-bob")) != nil {
+                offered = "another node"
+            } else if locate(ui, Key.id("attach-again")) != nil {
+                offered = "attach again"
+            } else {
+                Thread.sleep(forTimeInterval: 0.25)
+            }
+        }
+        XCTAssertEqual(offered, "attach again",
+                       "PRODUCT: after Node > Detach the window must offer only to attach alice again (E-4); it offered \(offered.isEmpty ? "neither within 30 s" : offered): \(onScreen(ui))")
+        tap(ui, Key.id("attach-again"), "Attach alice Again")
+        let again = Key.id("passphrase")
+        if present(ui, again, timeout: 15, "Attach alice Again must ask for her passphrase") {
+            type(ui, again, "alice identity", "the passphrase field")
+            tap(ui, Key.id("attach"), "Attach")
+        }
+        present(ui, Key.id("attached"), timeout: 60, "attached again, the window must be alice's")
+        let fp = run(vox, ["node", "list"], env: voxEnv).out
+        XCTAssertTrue(nodeLine(fp, "alice")?.contains(" attached ") ?? false,
+                      "PRODUCT: attached again, `vox node list` must say alice is attached: \(fp)")
+        print("[proof] after Detach: \(offered); attached again")
         handOff(ui, "q")
         _ = ui.wait(for: .notRunning, timeout: 30)
         _ = run(vox, ["node", "detach", "alice"], env: voxEnv)

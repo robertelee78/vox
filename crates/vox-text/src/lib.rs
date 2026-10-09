@@ -10,6 +10,7 @@ pub mod alias;
 pub mod fingerprint;
 pub mod node;
 pub mod offer;
+pub mod read;
 
 /// Whether `c` may not appear in text printed for somebody reading (V210-123): every control
 /// character (which includes `\n`, `\r`, VT, FF, NEL, ESC and NUL), the Unicode line and

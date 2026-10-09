@@ -65,6 +65,13 @@ final class NodeModel: ObservableObject {
         }
     }
 
+    /// A member that joined the room on screen while it was on screen (K-7).
+    struct JoinLine: Equatable {
+        let fingerprint: String
+        let at: UInt64
+        var said: String
+    }
+
     /// A member of the room on screen.
     struct MemberRow: Identifiable, Equatable {
         let id: String
@@ -95,6 +102,13 @@ final class NodeModel: ObservableObject {
     @Published private(set) var platforms: [String: NodePlatform] = [:]
     /// Who has read each of this node's own messages in the room on screen, by message id (R-6).
     @Published private(set) var readBy: [String: [String]] = [:]
+    /// Where each of this node's own messages is, while no member is known to have read it
+    /// (ADR-028 R-6, D9): "only on this machine", "on N of M members' nodes".
+    @Published private(set) var whereabouts: [String: String] = [:]
+    /// Who joined the room on screen while it was on screen, and when (ADR-028 K-7, D10): said
+    /// in its timeline with which of the keyring's nodes trust the newcomer, said again as that
+    /// grows.
+    @Published private(set) var joins: [JoinLine] = []
     /// Who has pulled each of this node's own shares in the room on screen, verified, by the
     /// share's message id (ADR-028 F-6, #498).
     @Published private(set) var pulledBy: [String: [String]] = [:]
@@ -199,6 +213,11 @@ final class NodeModel: ObservableObject {
     @Published private(set) var offers: [OfferInfo] = []
     /// The trusted nodes that trust this node back, as the rooms shared with them record it (L-4).
     @Published private(set) var trustsBack: Set<String> = []
+    /// The members of the room on screen whose trust in this node has reached it, in the keyring
+    /// or not (ADR-028 R-5, D4).
+    @Published private(set) var trustsMe: Set<String> = []
+    /// The node whose card is open (D4): from a member row, a message's author or a decision row.
+    @Published var card: NodeCardFor?
     /// The keyring row selected, by fingerprint: what Keyring > Compare, Rename and Remove act on.
     @Published var keyringSelected: String?
     /// What a Keyring menu action asks the keyring view to open; each ask counts one up.
@@ -384,6 +403,8 @@ final class NodeModel: ObservableObject {
         guard case .room = selection else { return }
         messages = []
         readBy = [:]
+        whereabouts = [:]
+        joins = []
         pulledBy = [:]
         pulled = [:]
         retention = ""
@@ -446,6 +467,41 @@ final class NodeModel: ObservableObject {
     }
 
     // ---- the keyring (M-16) ----------------------------------------------------------------
+
+    /// Where `fingerprint` stands with this node, each direction, as far as this node knows: its
+    /// keyring, and the consent grants of the room on screen and of every trusted node (D4).
+    func trust(of fingerprint: String) -> Trust {
+        Trust.of(inKeyring: trusted.contains { $0.fingerprint == fingerprint },
+                 trustsYou: trustsMe.contains(fingerprint) || trustsBack.contains(fingerprint))
+    }
+
+    /// The members of the room on screen this node does not yet read each other with, each by its
+    /// alias (else its short fingerprint) and where it stands (R-5, D4); nil when there are none.
+    var notMutual: String? {
+        let waiting = members.filter { $0.trust != .mutual }
+        guard !waiting.isEmpty else { return nil }
+        let named = waiting.map { "\($0.name) (\($0.trust.words))" }.joined(separator: ", ")
+        return "Not reading each other yet: \(named). A member's card says who still has to trust whom."
+    }
+
+    /// The rooms this node holds that `fingerprint` is a member of, by name (G2).
+    func sharedRooms(with fingerprint: String) async -> [String] {
+        var names: [String] = []
+        for room in rooms {
+            if let roster = try? await client.roster(room: room.id),
+               roster.contains(where: { $0.fingerprint == fingerprint }) {
+                names.append(room.name)
+            }
+        }
+        return names
+    }
+
+    /// Open `fingerprint`'s card (D4), named `name` as the room names it.
+    func openCard(_ fingerprint: String, name: String, act: NodeCardFor.Act? = nil) {
+        keyringDid = nil
+        keyringFailed = nil
+        card = NodeCardFor(fingerprint: fingerprint, name: name, act: act)
+    }
 
     /// Trust `fingerprint` as `alias`, granting read, and drive as well when `drive` (K-14,
     /// K-16). Whether it was done.
@@ -978,9 +1034,11 @@ final class NodeModel: ObservableObject {
         let consents = try await client.consents(room: room)
         let keyring = Dictionary(trusted.map { ($0.fingerprint, $0.drive) }) { $1 }
         let back = Set(consents.inbound)
+        // Their trust in this node, whether or not this node trusts them (D4): both directions.
+        if back != trustsMe { trustsMe = back }
         return roster.filter { $0.fingerprint != me }.map { m in
-            let trust: Trust = keyring[m.fingerprint] != nil
-                ? (back.contains(m.fingerprint) ? .mutual : .oneWay) : .none
+            let trust = Trust.of(inKeyring: keyring[m.fingerprint] != nil,
+                                 trustsYou: back.contains(m.fingerprint))
             return MemberRow(id: m.fingerprint,
                              name: m.name.isEmpty ? String(m.fingerprint.prefix(12)) : m.name,
                              trust: trust, drive: keyring[m.fingerprint] ?? false)
@@ -998,6 +1056,7 @@ final class NodeModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 guard let self, case .room(room) = self.selection else { return }
                 let reads = try? await self.client.readBy(room: room)
+                let where_ = try? await self.client.whereabouts(room: room)
                 let pulls = try? await self.client.pulledBy(room: room)
                 let copies = try? await self.client.pulled(room: room)
                 let services = try? await self.client.services(room: room).shared
@@ -1014,6 +1073,10 @@ final class NodeModel: ObservableObject {
                     let now = Dictionary(uniqueKeysWithValues: reads.map { ($0.id, $0.names) })
                     if now != self.readBy { self.readBy = now }
                 }
+                if let where_ {
+                    let now = Dictionary(where_.map { ($0.id, $0.words) }) { $1 }
+                    if now != self.whereabouts { self.whereabouts = now }
+                }
                 if let pulls {
                     let now = Dictionary(pulls.map { ($0.id, $0.names) }) { $1 }
                     if now != self.pulledBy { self.pulledBy = now }
@@ -1023,7 +1086,27 @@ final class NodeModel: ObservableObject {
                     if now != self.pulled { self.pulled = now }
                 }
                 if let services, services != self.roomServices { self.roomServices = services }
-                if let rows, rows != self.members { self.members = rows }
+                if let rows, rows != self.members {
+                    // A member not listed before joined while the room was on screen (K-7).
+                    let before = Set(self.members.map(\.id))
+                    let came = rows.filter { !before.contains($0.id) }
+                    self.members = rows
+                    if !before.isEmpty || !came.isEmpty {
+                        let at = UInt64(Date().timeIntervalSince1970 * 1000)
+                        for m in came where !self.joins.contains(where: { $0.fingerprint == m.id }) {
+                            self.joins.append(JoinLine(fingerprint: m.id, at: at, said: ""))
+                        }
+                    }
+                }
+                // Each join said, and said again as the room's consent grants name more of the
+                // keyring's nodes trusting the newcomer.
+                for (i, line) in self.joins.enumerated() {
+                    if let said = try? await self.client.joinSaid(room: room, member: line.fingerprint),
+                       case .room(room) = self.selection, i < self.joins.count,
+                       self.joins[i].said != said {
+                        self.joins[i].said = said
+                    }
+                }
             }
         }
     }

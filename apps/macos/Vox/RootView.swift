@@ -18,6 +18,14 @@ struct RootView: View {
                 setup
             }
         }
+        // Node › Sign Out…: what it does, said first (E-5), done only when confirmed.
+        .sheet(isPresented: $model.signingOut) {
+            if let node = model.signedInAs {
+                SignOutSheet(node: node, model: model)
+                    .padding(24)
+                    .font(Theme.text)
+            }
+        }
         // Keep Running turned on with a node attached: keep it now, with its passphrase.
         .sheet(isPresented: Binding(get: { model.keepNodeAsk != nil },
                                     set: { if !$0, let n = model.keepNodeAsk { model.declineToKeepNode(n) } })) {
@@ -97,6 +105,19 @@ struct RootView: View {
                 ProgressView("Attaching node \(node)…")
             case .attached:
                 ProgressView("Opening the node…")
+            case let .detached(node):
+                // E-4: this window is node <node>'s, attached or not. Attach it again, or quit.
+                Text("Node \(node) is detached.").heading()
+                Text("This window acts only as node \(node). Attach it again to go on, or quit Vox.")
+                    .secondaryText()
+                    .accessibilityIdentifier("detached-why")
+                HStack {
+                    Button("Attach \(node) Again") { Task { await model.attachAgain() } }
+                        .keyboardShortcut(.defaultAction)
+                        .accessibilityIdentifier("attach-again")
+                    Button("Quit Vox") { NSApp.terminate(nil) }
+                        .accessibilityIdentifier("detached-quit")
+                }
             }
         }
         .padding(24)
@@ -327,14 +348,53 @@ private struct Chooser: View {
 
     var body: some View {
         Text("Which node are you?").heading()
-        Text("This Mac has several nodes. Pick the one you post, trust and share as here; you "
-            + "can switch later.")
+        Text("Pick the node you post, trust and share as here, or make a new one. Vox acts as it "
+            + "until you sign out.")
             .secondaryText()
         ForEach(nodes, id: \.self) { node in
-            Button(node) { Task { await model.choose(node) } }
-                .accessibilityIdentifier("node-\(node)")
-                .accessibilityLabel("Act as node \(node)")
+            let fp = model.nodeList.first { $0.name == node }?.fingerprint ?? ""
+            Button {
+                Task { await model.choose(node) }
+            } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(node).fontWeight(.bold)
+                    if !fp.isEmpty {
+                        Text(fingerprintCard(fingerprint: fp).grouped).font(Theme.mono)
+                            .secondaryText()
+                    }
+                }
+            }
+            .accessibilityIdentifier("node-\(node)")
+            .accessibilityLabel(fp.isEmpty ? "Act as node \(node)"
+                : "Act as node \(node), fingerprint \(fingerprintCard(fingerprint: fp).grouped)")
         }
+        Button("New Node…") { model.newNode() }
+            .accessibilityIdentifier("new-node")
+    }
+}
+
+/// Node › Sign Out…: what signing out does, then Sign Out or Cancel.
+private struct SignOutSheet: View {
+    let node: String
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Sign out of node \(node)?").heading()
+            Text("Vox detaches node \(node), stops keeping it attached, and forgets its passphrase "
+                + "in the Keychain and that this app opens it. Node \(node), its rooms and its "
+                + "messages stay on this Mac. Then you choose a node to sign in as, or make a new "
+                + "one.")
+                .accessibilityIdentifier("sign-out-effect")
+            HStack {
+                Button("Cancel") { model.signingOut = false }
+                    .keyboardShortcut(.cancelAction)
+                Button("Sign Out") { Task { await model.signOut() } }
+                    .keyboardShortcut(.defaultAction)
+                    .accessibilityIdentifier("sign-out-confirm")
+            }
+        }
+        .frame(width: Theme.scaled(440))
     }
 }
 

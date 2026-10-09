@@ -35,6 +35,7 @@ struct OfferView: View {
     let fingerprint: String
     @State private var alias = ""
     @State private var drive = false
+    @State private var comparing = false
 
     var body: some View {
         ScrollView {
@@ -68,6 +69,13 @@ struct OfferView: View {
                 .accessibilityIdentifier("offer-fingerprint")
         }
         Text(offer.said).accessibilityIdentifier("offer-said")
+        // The same compare as the keyring's, collapsed until asked for (#624): nothing to remove
+        // here.
+        Button(comparing ? "Hide Compare" : "Compare…") { comparing.toggle() }
+            .accessibilityIdentifier("offer-compare-open")
+        if comparing {
+            CompareField(fingerprint: offer.fingerprint, name: offer.short, id: "offer")
+        }
         Text("In: \(offer.rooms.map(\.name).joined(separator: ", "))")
             .accessibilityIdentifier("offer-rooms")
         Text("It is not in your keyring. Trusting it lets it read what you write in every room "
