@@ -669,11 +669,12 @@ final class FirstRunProof: XCTestCase {
         print("[proof] settings: menu bar \(barOn.debugDescription) then \(barOff.debugDescription); keep running \(answerOff.debugDescription)/\(itemOff.debugDescription) then \(answerOn.debugDescription)/\(itemOn.debugDescription); text size \(scaled.debugDescription) then \(back.debugDescription)")
     }
 
-    /// View > Bigger (⌘+) scales the conversation only (the decider, v0.4.1), alone. Staged by
-    /// `vox`: alice attached, with one room holding one message of hers, chosen before. Two ⌘+
-    /// grow the message's text; a sidebar row and the inspector's MEMBERS line keep their size.
-    /// ⌘0 puts the size back. Mutation: the conversation's scale applied to the whole window → red
-    /// at "unchanged".
+    /// View > Bigger (⌘+) scales the conversation only (the decider, v0.4.1; ADR-028 L-1a, L-1b),
+    /// alone. Staged by `vox`: alice attached, with one room holding two messages of hers, chosen
+    /// before. Two ⌘+ grow the message's text and the space between the two messages with it; a
+    /// sidebar row and the inspector's MEMBERS line keep their size. ⌘0 puts the size back.
+    /// Mutations: the conversation's scale applied to the whole window → red at "unchanged";
+    /// voxPadding and the timeline's spacing left at Actual Size → red at "spacing".
     func testBiggerScalesTheConversationOnly() throws {
         let env = ProcessInfo.processInfo.environment
         guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
@@ -700,6 +701,7 @@ final class FirstRunProof: XCTestCase {
             $0.contains(" talk")
         }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
         try staged(vox, ["room", "post", "--node", "alice", room, "MEASURE-THIS-MESSAGE"], env: voxEnv)
+        try staged(vox, ["room", "post", "--node", "alice", room, "AND-THE-NEXT-ONE"], env: voxEnv)
         try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
         try stager.write(Data("alice\n".utf8), to: config + "/app/node")
 
@@ -717,21 +719,210 @@ final class FirstRunProof: XCTestCase {
             return e.frame.height
         }
         let message = Key.showing("MEASURE-THIS-MESSAGE")
+        let next = Key.showing("AND-THE-NEXT-ONE")
         let sidebarRow = Key.id("room-talk")
         let members = Key.showing("MEMBERS")
+        // From one message's text to the next one's: the rows' padding, the timeline's spacing and
+        // the next row's author line, all of which are the conversation's (L-1a).
+        func gap() -> CGFloat {
+            guard let a = locate(ui, message), let b = locate(ui, next) else { return -1 }
+            return b.frame.minY - a.frame.maxY
+        }
+        present(ui, next, timeout: 20, "alice's second message must show in the timeline")
         Thread.sleep(forTimeInterval: 1)
-        let m0 = height(message), s0 = height(sidebarRow), i0 = height(members)
+        let m0 = height(message), s0 = height(sidebarRow), i0 = height(members), g0 = gap()
         ui.typeKey("+", modifierFlags: .command)
         ui.typeKey("+", modifierFlags: .command)
         Thread.sleep(forTimeInterval: 2)
         present(ui, message, timeout: 10, "after View > Bigger, the message must still show")
-        let m1 = height(message), s1 = height(sidebarRow), i1 = height(members)
+        let m1 = height(message), s1 = height(sidebarRow), i1 = height(members), g1 = gap()
         ui.typeKey("0", modifierFlags: .command)
         XCTAssertTrue(m0 > 0 && m1 > m0 * 1.15,
                       "PRODUCT: View > Bigger twice must grow the conversation's text; the message was \(m0) high and is \(m1)")
         XCTAssertTrue(s0 > 0 && i0 > 0 && abs(s1 - s0) <= 1 && abs(i1 - i0) <= 1,
                       "PRODUCT: View > Bigger must leave the sidebar and the inspector unchanged; a sidebar row went from \(s0) to \(s1), the inspector's MEMBERS line from \(i0) to \(i1)")
-        print("[proof] bigger: message \(m0) → \(m1); sidebar row \(s0) → \(s1); inspector line \(i0) → \(i1)")
+        // Two steps are 1.3 times Actual Size: spacing taken at the text size grows the gap by
+        // about that; spacing left at Actual Size grows it by only the author line's share.
+        XCTAssertTrue(g0 > 0 && g1 >= g0 * 1.24,
+                      "PRODUCT: View > Bigger twice must grow the conversation's spacing with its text (L-1a); the gap between two messages was \(g0) and is \(g1)")
+        print("[proof] bigger: message \(m0) → \(m1); gap between messages \(g0) → \(g1); sidebar row \(s0) → \(s1); inspector line \(i0) → \(i1)")
+    }
+
+    /// The look as a person sees it (ADR-028 L-2, L-6, L-7; A9; P5), alone. Staged by `vox`:
+    /// alice and bob, alice attached and trusting bob with read, with one room holding a message
+    /// of hers, chosen before. Read from the window's own pixels where a person sees them: the
+    /// sidebar on bg.panel, the timeline on bg.base, the inspector and the status bar on
+    /// bg.raised, and between the timeline and the inspector a line of line.hair. Room > Rename's
+    /// sheet is on bg.panel, its title SF Pro semibold (one line of about 24 points, not Inter
+    /// Display's 34). Return in Room > Retention sets nothing: the sheet stays. On bob's keyring
+    /// row, "Also let bob drive my Sessions…" opens its confirm sheet, and Return there cancels:
+    /// the sheet goes and bob still has read. Colours are compared in sRGB, within 4 of 255 per
+    /// channel. Mutations: the inspector without bg.raised → red at "inspector"; the hairline the
+    /// system's divider again → red at "line.hair"; a sheet title in Inter Display → red at
+    /// "title"; Set the default again → red at "Retention"; Give Drive the default → red at
+    /// "drive".
+    func testTheLookIsTheTokensAndReturnNeverGivesWhatItShouldNot() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
+            throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are set by scripts/app-proofs.sh")
+        }
+        let vox = URL(fileURLWithPath: appPath).appendingPathComponent("Contents/Helpers/vox").path
+        let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("look")
+        let data = root.appendingPathComponent("data").path
+        let config = root.appendingPathComponent("config").path
+        let home = root.appendingPathComponent("home").path
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        let pass = { (name: String) in root.appendingPathComponent("\(name).pass").path }
+        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+                           until: "vox daemon: control socket")
+        try stager.write(Data("alice identity\n".utf8), to: pass("alice"))
+        try stager.write(Data("bob identity\n".utf8), to: pass("bob"))
+        try stager.write(Data("look room\n".utf8), to: pass("room"))
+        for (name, words) in [("alice", "alice identity"), ("bob", "bob identity")] {
+            try staged(vox, ["node", "create", name],
+                       env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": words]) { $1 })
+        }
+        try staged(vox, ["node", "attach", "alice", "--passphrase-file", pass("alice")], env: voxEnv)
+        try staged(vox, ["node", "attach", "bob", "--passphrase-file", pass("bob")], env: voxEnv)
+        let bobFp = try line(staged(vox, ["id", "--node", "bob"], env: voxEnv)) { $0.count == 52 }
+        try staged(vox, ["trust", "add", "--node", "alice", bobFp, "--name", "bob",
+                         "--identity-passphrase-file", pass("alice")], env: voxEnv)
+        try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", pass("room"),
+                         "--name", "talk"], env: voxEnv)
+        let room = try line(staged(vox, ["room", "list", "--node", "alice"], env: voxEnv)) {
+            $0.contains(" talk")
+        }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        try staged(vox, ["room", "post", "--node", "alice", room, "LOOK-AT-THIS"], env: voxEnv)
+        try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
+        try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+
+        let ui = voxApp(appPath)
+        ui.launchEnvironment = voxEnv.merging(["HOME": home]) { $1 }
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        defer { ui.terminate() }
+        present(ui, Key.id("attached"), timeout: 60, "the app must open attached as alice")
+        ui.typeKey("0", modifierFlags: .command)
+        tap(ui, Key.id("room-talk"), "the room talk in the sidebar")
+        present(ui, Key.showing("LOOK-AT-THIS"), timeout: 20, "alice's message must show in the timeline")
+        Thread.sleep(forTimeInterval: 1.5)
+
+        // The window's pixels, in sRGB, at a point in screen coordinates.
+        let window = ui.windows.firstMatch
+        guard let status = locate(ui, Key.id("status")), let members = locate(ui, Key.showing("MEMBERS")),
+              let message = locate(ui, Key.showing("LOOK-AT-THIS")) else {
+            throw Apparatus("the status bar, MEMBERS or the message is not readable to XCTest, so no point can be placed")
+        }
+        let frame = window.frame
+        let shot = window.screenshot().image
+        guard let cg = shot.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            throw Apparatus("XCTest's screenshot of the window has no bitmap")
+        }
+        let bitmap = NSBitmapImageRep(cgImage: cg)
+        let perPoint = CGFloat(cg.width) / frame.width
+        func rgb(_ p: CGPoint) -> (Int, Int, Int)? {
+            let x = Int((p.x - frame.minX) * perPoint), y = Int((p.y - frame.minY) * perPoint)
+            guard x >= 0, y >= 0, x < cg.width, y < cg.height,
+                  let c = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { return nil }
+            return (Int((c.redComponent * 255).rounded()), Int((c.greenComponent * 255).rounded()),
+                    Int((c.blueComponent * 255).rounded()))
+        }
+        func hex(_ c: (Int, Int, Int)?) -> String {
+            guard let c else { return "nothing (off the window)" }
+            return String(format: "#%02x%02x%02x", c.0, c.1, c.2)
+        }
+        func near(_ c: (Int, Int, Int)?, _ want: String) -> Bool {
+            guard let c, let v = Int(want.dropFirst(), radix: 16) else { return false }
+            return abs(c.0 - (v >> 16 & 0xff)) <= 4 && abs(c.1 - (v >> 8 & 0xff)) <= 4
+                && abs(c.2 - (v & 0xff)) <= 4
+        }
+        let above = status.frame.minY - 24
+        let points: [(String, CGPoint, String)] = [
+            ("the sidebar", CGPoint(x: frame.minX + 24, y: above), "#16171a"),
+            ("the timeline", CGPoint(x: message.frame.minX + 40, y: message.frame.maxY + 40), "#0c0d0f"),
+            ("the inspector", CGPoint(x: frame.maxX - 16, y: above), "#131417"),
+            ("the status bar", CGPoint(x: status.frame.minX + 3, y: status.frame.midY), "#131417"),
+        ]
+        var read: [String] = []
+        for (place, point, want) in points {
+            let got = rgb(point)
+            read.append("\(place) \(hex(got))")
+            XCTAssertTrue(near(got, want),
+                          "PRODUCT: \(place) must be drawn in \(want) (L-6); at \(point) it is \(hex(got))")
+        }
+        // The line between the timeline and the inspector: line.hair somewhere in the 40 points
+        // left of the inspector's MEMBERS, at the height of the timeline's middle.
+        let y = (message.frame.maxY + status.frame.minY) / 2
+        var hair: CGFloat?
+        var x = members.frame.minX - 40
+        while x < members.frame.minX && hair == nil {
+            if near(rgb(CGPoint(x: x, y: y)), "#303137") { hair = x }
+            x += 0.5
+        }
+        XCTAssertNotNil(hair, "PRODUCT: the timeline and the inspector must be separated by line.hair #303137 (L-2, L-6); no pixel of it in the 40 points left of the inspector, at height \(y)")
+        read.append("line.hair at x \(hair.map { "\($0)" } ?? "none")")
+
+        // Room > Rename…: a sheet on bg.panel, its title SF Pro semibold.
+        ui.menuBars.menuBarItems["Room"].click()
+        tap(ui, Key.menuItem("Rename…"), "Room > Rename…")
+        let title = Key.showing("Rename the room")
+        present(ui, title, timeout: 10, "Room > Rename… must open its sheet")
+        Thread.sleep(forTimeInterval: 1)
+        let titleHeight = locate(ui, title)?.frame.height ?? -1
+        XCTAssertTrue(titleHeight > 0 && titleHeight <= 28,
+                      "PRODUCT: a sheet's title must be SF Pro semibold, one line of about 24 points (L-7); \"Rename the room\" is \(titleHeight) high")
+        if let sheet = ui.sheets.firstMatch.exists ? ui.sheets.firstMatch : nil,
+           let t = locate(ui, title) {
+            let shotSheet = window.screenshot().image
+            if let cgs = shotSheet.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                let b = NSBitmapImageRep(cgImage: cgs)
+                let p = CGPoint(x: t.frame.minX - 12, y: t.frame.minY - 12)
+                let px = Int((p.x - frame.minX) * perPoint), py = Int((p.y - frame.minY) * perPoint)
+                let c = b.colorAt(x: px, y: py)?.usingColorSpace(.sRGB)
+                let got = c.map { (Int(($0.redComponent * 255).rounded()), Int(($0.greenComponent * 255).rounded()),
+                                   Int(($0.blueComponent * 255).rounded())) }
+                read.append("sheet \(hex(got))")
+                XCTAssertTrue(near(got, "#16171a"),
+                              "PRODUCT: a sheet must be drawn in bg.panel #16171a (L-6); inside Rename's, at \(p), it is \(hex(got)) (sheet at \(sheet.frame))")
+            }
+        } else {
+            XCTFail("APPARATUS: Rename's title shows, but XCTest finds no sheet to read")
+        }
+        ui.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+        missingWithin(ui, title, 5, "Escape must close Rename's sheet")
+
+        // Room > Retention…: Return sets nothing (A9: a retention that deletes has no default).
+        ui.menuBars.menuBarItems["Room"].click()
+        tap(ui, Key.menuItem("Retention…"), "Room > Retention…")
+        present(ui, Key.id("retention-effect"), timeout: 10, "Room > Retention… must open its sheet")
+        ui.typeKey(XCUIKeyboardKey.return.rawValue, modifierFlags: [])
+        Thread.sleep(forTimeInterval: 2)
+        XCTAssertNotNil(locate(ui, Key.id("retention-effect")),
+                        "PRODUCT: Return in Retention must set nothing (A9); the sheet closed, as if Set was pressed")
+        ui.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+        missingWithin(ui, Key.id("retention-effect"), 5, "Escape must close Retention's sheet")
+
+        // The keyring: drive through its own sheet, whose Return is Cancel (P5).
+        ui.typeKey("k", modifierFlags: [.command, .shift])
+        tap(ui, Key.id("keyring-give-drive-bob"), "\"Also let bob drive my Sessions…\" on bob's row")
+        present(ui, Key.id("keyring-drive-effect"), timeout: 10, "the drive confirm sheet must open")
+        ui.typeKey(XCUIKeyboardKey.return.rawValue, modifierFlags: [])
+        missingWithin(ui, Key.id("keyring-drive-effect"), 5,
+                      "Return in the drive sheet must be Cancel, closing it (P5)")
+        let capability = words(ui, Key.id("keyring-capability-bob"), timeout: 10,
+                               "bob's row must say what it grants") ?? ""
+        XCTAssertEqual(capability, "read",
+                       "PRODUCT: Return in the drive sheet must give nothing (P5); bob's row says \(capability.debugDescription)")
+        print("[proof] look: \(read.joined(separator: "; ")); title \(titleHeight) high; retention kept by Return; bob \(capability.debugDescription) after Return")
+    }
+
+    /// `key` gone within `timeout`: PRODUCT naming what still shows it.
+    private func missingWithin(_ ui: XCUIApplication, _ key: Key, _ timeout: TimeInterval, _ product: String,
+                               file: StaticString = #filePath, line: UInt = #line) {
+        let end = Date().addingTimeInterval(timeout)
+        while locate(ui, key) != nil && Date() < end { Thread.sleep(forTimeInterval: 0.25) }
+        if locate(ui, key) != nil {
+            XCTFail("PRODUCT: \(product); \(key) still shows", file: file, line: line)
+        }
     }
 
     /// (8) Notifications (ADR-014 M-23, ADR-028 R-10, #448), alone: the one step that needs a
