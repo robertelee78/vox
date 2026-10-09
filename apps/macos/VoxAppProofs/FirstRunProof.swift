@@ -844,7 +844,8 @@ final class FirstRunProof: XCTestCase {
         }
         let above = status.frame.minY - 24
         let points: [(String, CGPoint, String)] = [
-            ("the sidebar", CGPoint(x: frame.minX + 24, y: above), "#16171a"),
+            // Inside the sidebar's left margin: the foot's words (ON THIS MACHINE) start 16 in.
+            ("the sidebar", CGPoint(x: frame.minX + 6, y: above), "#16171a"),
             ("the timeline", CGPoint(x: message.frame.minX + 40, y: message.frame.maxY + 40), "#0c0d0f"),
             ("the inspector", CGPoint(x: frame.maxX - 16, y: above), "#131417"),
             ("the status bar", CGPoint(x: status.frame.minX + 3, y: status.frame.midY), "#131417"),
