@@ -637,9 +637,12 @@ final class FirstRunProof: XCTestCase {
 
         ui.typeKey(.escape, modifierFlags: [])
         let uid = stager.run(["/usr/bin/id", "-u"], env: [:]).out.trimmingCharacters(in: .whitespacesAndNewlines)
+        // The person's own Vox may keep its login item loaded (us.vox.app's); only one whose parent
+        // bundle is the proof build would mean the app registered a real one past its stand-in.
         let loaded = stager.run(["/bin/launchctl", "print", "gui/\(uid)/us.vox.daemon"], env: [:])
-        XCTAssertNotEqual(loaded.status, 0,
-                          "PRODUCT: a Vox login item is loaded after this case: the app registered a real one past its stand-in: \(loaded.out.prefix(200))")
+        let proofs = loaded.status == 0 && loaded.out.contains("parent bundle identifier = \(proofAppID)\n")
+        XCTAssertFalse(proofs,
+                       "PRODUCT: the proof build's own login item is loaded after this case: the app registered a real one past its stand-in")
         print("[proof] settings: menu bar \(barOn.debugDescription) then \(barOff.debugDescription); keep running \(answerOff.debugDescription)/\(itemOff.debugDescription) then \(answerOn.debugDescription)/\(itemOn.debugDescription); text size \(scaled.debugDescription) then \(back.debugDescription)")
     }
 
