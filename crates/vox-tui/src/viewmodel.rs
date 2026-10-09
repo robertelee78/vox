@@ -247,8 +247,9 @@ pub struct SharedView {
     /// The command a copy gives, carrying the canonical address (S-1) so it works pasted on any
     /// member's machine: the first of its kind's commands.
     pub copy: String,
-    /// What it needs that does not hold, each in words; empty when nothing is missing.
-    pub missing: Vec<String>,
+    /// What reaching it needs, each fact `✓ <fact>` or `missing: <fact> — <fix>` (ADR-028 S-3,
+    /// the readiness ticks `vox service list` and the app show).
+    pub ready: Vec<String>,
 }
 
 /// One Session in a room, as the TUI lists it (ADR-029 SE-3, CL-2).
