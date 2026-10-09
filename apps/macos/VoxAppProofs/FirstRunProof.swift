@@ -760,7 +760,11 @@ final class FirstRunProof: XCTestCase {
     /// channel. Mutations: the inspector without bg.raised → red at "inspector"; the hairline the
     /// system's divider again → red at "line.hair"; a sheet title in Inter Display → red at
     /// "title"; Set the default again → red at "Retention"; Give Drive the default → red at
-    /// "drive".
+    /// "drive". Then Node > Detach: the chooser lists alice, detached, with her fingerprint and
+    /// "Everything you post, trust and share will be as alice."; `vox node list` shows the same
+    /// fingerprint; and with bob's vault copied over hers, it shows none (P8). Mutations: the
+    /// fingerprint file not written → red at "chooser must show"; its vault hash not checked → red
+    /// at "stale".
     func testTheLookIsTheTokensAndReturnNeverGivesWhatItShouldNot() throws {
         let env = ProcessInfo.processInfo.environment
         guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
@@ -785,6 +789,7 @@ final class FirstRunProof: XCTestCase {
         try staged(vox, ["node", "attach", "alice", "--passphrase-file", pass("alice")], env: voxEnv)
         try staged(vox, ["node", "attach", "bob", "--passphrase-file", pass("bob")], env: voxEnv)
         let bobFp = try line(staged(vox, ["id", "--node", "bob"], env: voxEnv)) { $0.count == 52 }
+        let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
         try staged(vox, ["trust", "add", "--node", "alice", bobFp, "--name", "bob",
                          "--identity-passphrase-file", pass("alice")], env: voxEnv)
         try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", pass("room"),
@@ -912,7 +917,31 @@ final class FirstRunProof: XCTestCase {
                                "bob's row must say what it grants") ?? ""
         XCTAssertEqual(capability, "read",
                        "PRODUCT: Return in the drive sheet must give nothing (P5); bob's row says \(capability.debugDescription)")
-        print("[proof] look: \(read.joined(separator: "; ")); title \(titleHeight) high; retention kept by Return; bob \(capability.debugDescription) after Return")
+
+        // P8: Node > Detach, and the chooser lists alice, now detached, with her fingerprint (from
+        // her fingerprint file) and what choosing her means; `vox node list` shows it too. Then a
+        // vault copied over hers, as a restore would: her fingerprint is not known, never stale.
+        ui.menuBars.menuBarItems["Node"].click()
+        tap(ui, Key.menuItem("Detach"), "Node > Detach")
+        let plain = { (s: String) in s.lowercased().filter { $0.isLetter || $0.isNumber } }
+        let shown = words(ui, Key.id("node-fingerprint-alice"), timeout: 30,
+                          "after Detach, the chooser must list alice with her fingerprint (P8)") ?? ""
+        XCTAssertEqual(plain(shown), plain(aliceFp),
+                       "PRODUCT: the chooser must show detached alice's fingerprint, \(aliceFp) (P8); it shows \(shown.debugDescription)")
+        words(ui, Key.id("node-acting-as-alice"), timeout: 5, "the chooser must say what choosing alice means (P8)",
+              until: { $0 == "Everything you post, trust and share will be as alice." })
+        let listed = run(vox, ["node", "list"], env: voxEnv).out
+        let aliceLine = nodeLine(listed, "alice") ?? ""
+        XCTAssertTrue(aliceLine.contains(" detached ") && plain(aliceLine).contains(plain(aliceFp)),
+                      "PRODUCT: `vox node list` must show detached alice with her fingerprint; it says \(aliceLine.debugDescription)")
+        guard stager.run(["/bin/cp", data + "/nodes/bob/vault.cbor", data + "/nodes/alice/vault.cbor"],
+                         env: [:]).status == 0 else {
+            throw Apparatus("staging not achieved: bob's vault.cbor could not be copied over alice's")
+        }
+        let restored = nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "alice") ?? ""
+        XCTAssertFalse(plain(restored).contains(plain(aliceFp)) || plain(restored).contains(plain(bobFp)),
+                       "PRODUCT: with another vault in alice's place, `vox node list` must not show a fingerprint for her, stale or otherwise; it says \(restored.debugDescription)")
+        print("[proof] look: \(read.joined(separator: "; ")); title \(titleHeight) high; retention kept by Return; bob \(capability.debugDescription) after Return; chooser shows alice \(shown.debugDescription); node list \(aliceLine.debugDescription), then with bob's vault \(restored.debugDescription)")
     }
 
     /// `key` gone within `timeout`: PRODUCT naming what still shows it.

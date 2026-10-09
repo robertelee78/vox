@@ -60,6 +60,25 @@ impl std::fmt::Debug for Profile {
     }
 }
 
+/// Write the node's public `fingerprint` file (P8), from a profile whose identity is proved: made
+/// here, or unlocked. It names the `vault.cbor` beside it by hash, so it is never shown for
+/// another one. Atomic; rewritten only when it says something else. For display only, so a
+/// failure to write it costs only that display, and is not an error of the create or unlock.
+fn note_fingerprint(paths: &Paths, fingerprint: &Digest32) {
+    let Ok(vault) = std::fs::read(paths.vault_file()) else {
+        return;
+    };
+    let text = format!(
+        "{}\n{:?}\n",
+        crate::node::link::b32_encode(fingerprint),
+        crate::hash::Hex(&crate::hash::sha256(&vault))
+    );
+    let file = paths.fingerprint_file();
+    if std::fs::read_to_string(&file).ok().as_deref() != Some(text.as_str()) {
+        let _ = crate::node::paths::write_private_file_unique(&file, text.as_bytes());
+    }
+}
+
 /// Why an identity was not made with an empty passphrase (ADR-028 K-11).
 pub const EMPTY_PASSPHRASE: &str = "every node has an identity passphrase; an empty one is refused";
 
@@ -221,6 +240,7 @@ impl Profile {
                 return Err(e);
             }
         };
+        note_fingerprint(&paths, &fingerprint);
         let signer = VaultRootSigner::from_backup(&backup)?;
         drop(backup);
         Ok(Self {
@@ -291,6 +311,7 @@ impl Profile {
         self.store.make_writable()?;
         drop(backup);
         self.unlocked = Some(Arc::new(signer));
+        note_fingerprint(&self.paths, &self.fingerprint);
         Ok(())
     }
 

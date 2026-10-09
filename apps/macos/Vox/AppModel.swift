@@ -214,6 +214,15 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Each node's fingerprint, by name, where the daemon knows it: an attached node's own, a
+    /// detached node's from its fingerprint file (P8). For display only.
+    func fingerprints() async -> [String: String] {
+        guard let client, let nodes = try? await client.nodes() else { return [:] }
+        var known: [String: String] = [:]
+        for node in nodes where !node.fingerprint.isEmpty { known[node.name] = node.fingerprint }
+        return known
+    }
+
     /// The person picked `name` at first run.
     func choose(_ name: String) async {
         guard let client else { return }

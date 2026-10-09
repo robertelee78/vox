@@ -304,16 +304,41 @@ private struct Welcome: View {
 private struct Chooser: View {
     let nodes: [String]
     @ObservedObject var model: AppModel
+    /// Each node's fingerprint, where the daemon knows it (P8).
+    @State private var known: [String: String] = [:]
 
     var body: some View {
         Text("Which node are you?").heading()
+            .task(id: nodes) { known = await model.fingerprints() }
         Text("This Mac has several nodes. Pick the one you post, trust and share as here; you "
             + "can switch later.")
             .secondaryText()
+        // Each node with its fingerprint art and its fingerprint, and what choosing it means, so
+        // a relative does not take an agent's node for theirs (P8).
         ForEach(nodes, id: \.self) { node in
-            Button(node) { Task { await model.choose(node) } }
-                .accessibilityIdentifier("node-\(node)")
-                .accessibilityLabel("Act as node \(node)")
+            HStack(alignment: .top, spacing: Space.s16) {
+                if let fingerprint = known[node] {
+                    VStack(spacing: 0) {
+                        ForEach(Array(fingerprintCard(fingerprint: fingerprint).art.enumerated()),
+                                id: \.offset) { Text($0.element) }
+                    }
+                    .font(Theme.mono)
+                    .accessibilityHidden(true)
+                }
+                VStack(alignment: .leading, spacing: Space.s4) {
+                    Button(node) { Task { await model.choose(node) } }
+                        .accessibilityIdentifier("node-\(node)")
+                        .accessibilityLabel("Act as node \(node)")
+                    Text(known[node].map { fingerprintCard(fingerprint: $0).grouped }
+                         ?? "Its fingerprint is known once this node has been attached.")
+                        .font(Theme.mono).secondaryText().textSelection(.enabled)
+                        .accessibilityIdentifier("node-fingerprint-\(node)")
+                    Text("Everything you post, trust and share will be as \(node).")
+                        .secondaryText()
+                        .accessibilityIdentifier("node-acting-as-\(node)")
+                }
+            }
+            .padding(.vertical, Space.s8)
         }
     }
 }

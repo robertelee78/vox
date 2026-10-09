@@ -26,7 +26,9 @@ passphrase is a separate thing, and it may be empty.
 everyone who trusts this one to untrust it and trust the new one`. That is the whole recovery
 plan: a node's keys never leave its machine, so no copy of them exists to restore. `node attach`
 takes the identity passphrase once and runs the node in full until `node detach` or until the
-daemon stops. `node list` shows each node as `attached` or `detached`. `node detach` closes that
+daemon stops. `node list` shows each node as `attached` or `detached`, with its fingerprint once
+it has been attached (a detached node's from a file kept beside its identity, shown only while it
+matches that identity). `node detach` closes that
 node's connections, stops its services and wipes its keys from memory; other attached nodes keep
 running. Detaching is not deleting: the node, its rooms and its keyring stay on disk.
 

@@ -358,7 +358,19 @@ impl Router {
         names.extend(slots.keys().cloned());
         names
             .into_iter()
-            .map(|name| info_of(&name, slots.get(&name)))
+            .map(|name| {
+                let mut info = info_of(&name, slots.get(&name));
+                // A node not attached: its public fingerprint file, for display only (P8).
+                if info.fingerprint.is_none() {
+                    info.fingerprint = self
+                        .inner
+                        .account
+                        .node_paths(&name)
+                        .ok()
+                        .and_then(|p| p.shown_fingerprint());
+                }
+                info
+            })
             .collect()
     }
 
