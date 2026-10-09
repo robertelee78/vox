@@ -1306,6 +1306,8 @@ pub async fn run(
                 answer.new,
                 answer.joining.as_deref(),
                 &daemon.account.data_root,
+                std::path::Path::new(&input.cwd),
+                daemon.node.as_str(),
             );
             drain(paths, room_arg, &input, &raw, format, note).await
         }

@@ -4113,9 +4113,26 @@ pub async fn join(
     paths: &Paths,
     link: &str,
     passphrase_file: Option<&std::path::Path>,
+    bind: Option<&std::path::Path>,
 ) -> Result<(), AppError> {
     // An address that will not parse is refused before anything is asked, with what is wrong.
     crate::tunnel_cli::readable(link)?;
+    // `--bind DIR` (ADR-029 RB-6): a directory that exists, and a room map that can be read,
+    // checked before anything is asked. What the map held for it is replaced, and said.
+    let data_root = paths.account().data_root;
+    let bind = match bind {
+        Some(dir) => {
+            let dir = std::fs::canonicalize(dir).map_err(|e| {
+                AppError::Usage(format!(
+                    "--bind {}: not a directory here: {e}",
+                    dir.display()
+                ))
+            })?;
+            crate::room_map::read(&data_root)?;
+            Some(dir)
+        }
+        None => None,
+    };
     let mut client = attach(paths).await?;
     // A room this node holds open, and has not left, is not joined again: its address is taken
     // as where the room's host is now, and the host is dialled there (V210-167). No passphrase is read for it: none
@@ -4136,6 +4153,13 @@ pub async fn join(
             }),
         Err(_) => None,
     };
+    if let (Some(name), Some(dir)) = (held.as_ref(), bind.as_ref()) {
+        return Err(AppError::Usage(format!(
+            "this node already holds {name}, so nothing was joined and no passphrase checked; to \
+             bind {} to it, run `vox agent room {name}` from a session started there, at a terminal",
+            dir.display()
+        )));
+    }
     if let Some(name) = held {
         return match client
             .request(&Request::Join {
@@ -4167,6 +4191,12 @@ pub async fn join(
         };
     }
     let passphrase = room_passphrase(passphrase_file, "the room's passphrase", false)?;
+    // Kept for the room map when binding, wiped either way.
+    let passphrase_kept = zeroize::Zeroizing::new(if bind.is_some() {
+        passphrase.clone()
+    } else {
+        String::new()
+    });
     match client
         .request(&Request::Join {
             link: link.to_owned(),
@@ -4187,6 +4217,24 @@ pub async fn join(
                 Err(_) => None,
             };
             println!("vox: joined {}", joined.as_deref().unwrap_or("the room"));
+            if let Some(dir) = bind.as_ref() {
+                // Said before it is written (ADR-028 E-5): who can read what is saved.
+                println!(
+                    "vox: binding {} to this room in the room map {}: every agent session started \
+                     there, from any harness, is to work in it, its node joining with this \
+                     passphrase; every node of this data root can read the map, the passphrase \
+                     included",
+                    dir.display(),
+                    crate::room_map::path(&data_root).display()
+                );
+                match crate::room_map::bind(&data_root, dir, link, &passphrase_kept)? {
+                    Some(was) => println!(
+                        "vox: bound {}, replacing what the room map held for it: {was}",
+                        dir.display()
+                    ),
+                    None => println!("vox: bound {}", dir.display()),
+                }
+            }
             println!("     you read a member once you trust it and it trusts you: `vox trust add`");
             if let Ok(parsed) = vox_core::node::link::InviteLink::parse(link) {
                 who_reads_whom(&mut client, parsed.channel_id).await;
