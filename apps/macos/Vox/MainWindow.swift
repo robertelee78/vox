@@ -8,12 +8,19 @@ import SwiftUI
 
 struct MainWindow: View {
     @ObservedObject var model: NodeModel
+    /// The sidebar's width at launch, read once: given afresh on every update, the split view
+    /// put the sidebar back to it, and a drag never stuck (259 → 259 in the columns case).
+    @State private var sidebarIdeal = Columns.width(.sidebar)
 
     var body: some View {
         VStack(spacing: 0) {
             NavigationSplitView {
+                // Dragged wider or narrower, and remembered (Columns).
                 Sidebar(model: model)
-                    .navigationSplitViewColumnWidth(min: Theme.scaled(220), ideal: Theme.scaled(260))
+                    .remembersWidth(of: .sidebar)
+                    .navigationSplitViewColumnWidth(min: Columns.Side.sidebar.min,
+                                                    ideal: sidebarIdeal,
+                                                    max: Columns.Side.sidebar.max)
             } detail: {
                 switch model.selection {
                 case let .room(id):
@@ -65,6 +72,13 @@ struct MainWindow: View {
             Button("Next Room That Needs You") { Task { await model.nextNeedingYou() } }
                 .keyboardShortcut("n", modifiers: .control)
                 .accessibilityIdentifier("next-needs-you")
+            // The inspector, shown or hidden, as the sidebar's own button does for the sidebar.
+            Button { model.inspectorShown.toggle() } label: {
+                Label(model.inspectorShown ? "Hide Inspector" : "Show Inspector",
+                      systemImage: "sidebar.right")
+            }
+            .help(model.inspectorShown ? "Hide Inspector (⌥⌘I)" : "Show Inspector (⌥⌘I)")
+            .accessibilityIdentifier("toggle-inspector")
         }
     }
 }
@@ -437,8 +451,14 @@ private struct RoomView: View {
     /// opens the selected message's first action, Space Quick Looks its pulled file.
     @State private var timelineFocused = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// The inspector's width: the one last dragged to, kept across launches (Columns).
+    @State private var inspectorWidth = Columns.width(.inspector)
 
     var body: some View {
+        // The timeline and the inspector, with a divider the person drags; the inspector's width is
+        // remembered (Columns), and it can be hidden (View > Hide Inspector). Its width is the one
+        // dragged to, not HSplitView's: that gave the inspector its maximum and ignored the width
+        // kept from last time.
         HStack(spacing: 0) {
             VStack(spacing: 0) {
                 if !model.roomServices.isEmpty {
@@ -620,10 +640,14 @@ private struct RoomView: View {
             // The conversation, the timeline and the composer, at the text size View > Bigger and
             // Smaller set (the decider, v0.4.1); the inspector beside it keeps a steady size.
             .conversationScale(Theme.scale)
-            Hairline(vertical: true)
-            Inspector(model: model, room: room)
-                .raisedSurface()
-                .frame(width: Theme.scaled(240))
+            // At least wide enough for the composer's field beside its To: and Urgent.
+            .frame(minWidth: Theme.scaled(400), maxWidth: .infinity)
+            if model.inspectorShown {
+                ColumnDivider(width: $inspectorWidth, side: .inspector)
+                Inspector(model: model, room: room)
+                    .raisedSurface()
+                    .frame(width: inspectorWidth)
+            }
         }
         // On the room, not its timeline: ⌘O, ⌘↩ and a file from the Finder Services item work
         // wherever the room's focus is.
@@ -966,40 +990,60 @@ private struct Inspector: View {
     let room: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Space.s8) {
-            SessionsList(model: model)
-            Hairline().padding(.vertical, Space.s8)
-            Text("MEMBERS").eyebrow().secondaryText()
-                .accessibilityAddTraits(.isHeader)
-            ForEach(model.members) { member in
-                TrustMark(name: member.name, trust: member.trust)
-                    .accessibilityIdentifier("member-\(member.name)")
-                // What this node's keyring grants it (K-14), once it is in the keyring.
-                if member.trust != .none {
-                    Text(Capability.words(member.drive)).eyebrow().secondaryText()
-                        .padding(.leading, Space.s20)
-                        .accessibilityIdentifier("member-capability-\(member.name)")
+        // It scrolls (P13): a room with many Sessions or members cut off the bottom, the family
+        // LAN section with it. Each section's heading stays in view while its rows scroll.
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: Space.s8, pinnedViews: [.sectionHeaders]) {
+                Section {
+                    SessionsList(model: model, heading: false)
+                } header: {
+                    heading("SESSIONS")
                 }
-                // The platform its node says it runs on (ADR-020 §4.9b): its claim, said as one.
-                if let platform = model.platforms[member.id] {
-                    Text("says it runs on \(Platform.words(platform))")
-                        .font(Theme.mono).secondaryText()
-                        .padding(.leading, Space.s20)
-                        // Not selectable: a selectable Text with its own label sent SwiftUI's
-                        // accessibility into endless recursion, and the app crashed when read.
-                        .accessibilityLabel("\(member.name) says it runs on \(Platform.words(platform))")
-                        .accessibilityIdentifier("member-platform-\(member.name)")
+                Section {
+                    ForEach(model.members) { member in
+                        TrustMark(name: member.name, trust: member.trust)
+                            .accessibilityIdentifier("member-\(member.name)")
+                        // What this node's keyring grants it (K-14), once it is in the keyring.
+                        if member.trust != .none {
+                            Text(Capability.words(member.drive)).eyebrow().secondaryText()
+                                .padding(.leading, Space.s20)
+                                .accessibilityIdentifier("member-capability-\(member.name)")
+                        }
+                        // The platform its node says it runs on (ADR-020 §4.9b): its claim, said
+                        // as one.
+                        if let platform = model.platforms[member.id] {
+                            Text("says it runs on \(Platform.words(platform))")
+                                .font(Theme.mono).secondaryText()
+                                .padding(.leading, Space.s20)
+                                // Not selectable: a selectable Text with its own label sent
+                                // SwiftUI's accessibility into endless recursion, and the app
+                                // crashed when read.
+                                .accessibilityLabel("\(member.name) says it runs on \(Platform.words(platform))")
+                                .accessibilityIdentifier("member-platform-\(member.name)")
+                        }
+                    }
+                    Hairline().padding(.vertical, Space.s8)
+                    FamilyLan(model: model, room: room)
+                } header: {
+                    heading("MEMBERS")
                 }
             }
-            Hairline().padding(.vertical, Space.s8)
-            FamilyLan(model: model, room: room)
-            Spacer()
+            .padding(Space.s12)
         }
-        .padding(Space.s12)
         .frame(maxHeight: .infinity, alignment: .topLeading)
         // A container, so each row keeps its own identifier (member-<name>) under this one.
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("inspector")
+    }
+
+    /// A section's heading, pinned while its rows scroll under it: drawn on the inspector's own
+    /// surface, so the rows do not show through.
+    private func heading(_ words: String) -> some View {
+        Text(words).eyebrow().secondaryText()
+            .accessibilityAddTraits(.isHeader)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, Space.s4)
+            .background(VoxTokens.Colors.bgRaised)
     }
 }
 

@@ -50,12 +50,16 @@ extension NodeModel {
 /// this node marked "!", CL-2), and the ended ones under "Ended (N)", folded until opened.
 struct SessionsList: View {
     @ObservedObject var model: NodeModel
+    /// Its own SESSIONS heading; off where the heading is drawn above it (the inspector pins it).
+    var heading = true
     @State private var endedOpen = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s4) {
-            Text("SESSIONS").eyebrow().secondaryText()
-                .accessibilityAddTraits(.isHeader)
+            if heading {
+                Text("SESSIONS").eyebrow().secondaryText()
+                    .accessibilityAddTraits(.isHeader)
+            }
             row("General", .general, id: "session-general")
             row("All", .all, id: "session-all")
             ForEach(model.openSessions, id: \.self) { s in

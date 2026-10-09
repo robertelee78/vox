@@ -114,6 +114,10 @@ final class NodeModel: ObservableObject {
 
     /// The sheet a menu, key or palette action opened.
     @Published var sheet: NodeSheet?
+    /// Whether the room's inspector shows (View > Hide Inspector, ⌥⌘I), kept across launches.
+    @Published var inspectorShown = Columns.inspectorShown {
+        didSet { UserDefaults.standard.set(inspectorShown, forKey: Columns.inspectorShownKey) }
+    }
     /// Asks the room on screen to choose a file to attach (⌘O); each ask counts one up.
     @Published var attachAsked = 0
     /// Asks the room on screen to send its draft urgent (⌘↩).
