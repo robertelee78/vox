@@ -131,6 +131,11 @@ final class NodeModel: ObservableObject {
             sessionEntries = []
             sessionNote = nil
             sessionLoading = showingSession
+            // What was selected was in the other view's rows: Focus Timeline and ↑/↓ start
+            // afresh in this one (P14), as on opening another room.
+            selectedMessage = nil
+            selectedMessages = []
+            selectionAnchor = nil
             Task { await readSession() }
         }
     }
