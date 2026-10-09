@@ -134,6 +134,15 @@ struct Product: Error, CustomStringConvertible {
     var description: String { "PRODUCT: \(why)" }
 }
 
+/// A timeline row saying `sentence` ("bob: COPY ONE"): its author first, then what it says, with
+/// whatever the row adds around them (", to you", ", at 12:05", ", read by …"), as VoiceOver reads it.
+func rowSays(_ sentence: String) -> NSPredicate {
+    guard let colon = sentence.range(of: ": ") else { return NSPredicate(format: "label == %@", sentence) }
+    let author = String(sentence[..<colon.lowerBound]), words = String(sentence[colon.lowerBound...])
+    return NSPredicate(format: "label == %@ OR (label BEGINSWITH %@ AND label CONTAINS %@)",
+                       sentence, author + ", ", words)
+}
+
 /// What an element says to VoiceOver: its label, else its value (a Text's words), else its title
 /// (a menu button's).
 func shown(_ element: XCUIElement) -> String {
@@ -2481,12 +2490,12 @@ final class FirstRunProof: XCTestCase {
               until: { $0 == "re you: FROM-ALICE" })
         func selectedRow(_ start: String) -> Bool? {
             let row = ui.windows.firstMatch.descendants(matching: .any)
-                .matching(NSPredicate(format: "label BEGINSWITH %@", start)).firstMatch
+                .matching(rowSays(start)).firstMatch
             return row.exists ? row.isSelected : nil
         }
         func reaches(_ how: String, _ act: () -> Void) {
             // From the reply, so a selection of FROM-ALICE is the jump's.
-            tap(ui, Key.showing("bob: REPLY-TO-ALICE"), "bob's reply")
+            tap(ui, Key.showing(": REPLY-TO-ALICE"), "bob's reply")
             act()
             let until = Date().addingTimeInterval(5)
             var now = selectedRow("you: FROM-ALICE")
@@ -4165,7 +4174,7 @@ final class FirstRunProof: XCTestCase {
     /// A timeline row by what it says as one sentence ("bob: COPY ONE"), not by its words alone.
     private func rowSaying(_ ui: XCUIApplication, _ sentence: String) -> XCUIElement? {
         let e = ui.windows.firstMatch.descendants(matching: .any)
-            .matching(NSPredicate(format: "label == %@", sentence)).firstMatch
+            .matching(rowSays(sentence)).firstMatch
         return e.exists ? e : nil
     }
 
