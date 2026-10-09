@@ -159,6 +159,9 @@ final class NodeModel: ObservableObject {
     @Published private(set) var lanOn: Set<String> = []
     @Published private(set) var lanSaid: [String: String] = [:]
     @Published private(set) var lanFailed: [String: String] = [:]
+    /// The room whose family LAN was turned on while the LAN helper waits for the person's
+    /// approval: its sheet is up, and the LAN goes on once the helper is allowed.
+    @Published private(set) var lanAsking: String?
 
     /// The family LAN's root helper: the bundle's launchd daemon (ADR-014 M-10).
     private var lanHelper: any BackgroundItem { Daemon.lanHelper }
@@ -241,8 +244,7 @@ final class NodeModel: ObservableObject {
             if Int(view.peers) != peers { peers = Int(view.peers) }
             if view.keyring != keyring { keyring = view.keyring }
         }
-        let ready = await Self.lanHelperStatus() == .enabled
-        if ready != lanHelperReady { lanHelperReady = ready }
+        await recheckLanHelper()
         if selection == .keyring {
             let back = await readTrustsBack()
             if back != trustsBack { trustsBack = back }
@@ -496,6 +498,37 @@ final class NodeModel: ObservableObject {
             Daemon.openLoginItems()
         }
         lanHelperReady = status == .enabled
+    }
+
+    /// The family LAN turned on for `room`: at once when the LAN helper is allowed, else the helper
+    /// is asked for (its sheet says where to allow it) and the LAN goes on once it is
+    /// ([`recheckLanHelper`]). The helper is asked for only here, never before (ADR-014 M-12).
+    func turnLanOn(_ room: String) async {
+        if await Self.lanHelperStatus() == .enabled {
+            lanHelperReady = true
+            await setLan(room, on: true)
+            return
+        }
+        lanAsking = room
+        await allowLanHelper()
+        await recheckLanHelper()
+    }
+
+    /// Whether the LAN helper is allowed now, as on every refresh and whenever Vox comes back to the
+    /// front (the person returning from System Settings); allowed while a room's LAN waits for it,
+    /// that room's sheet closes and its LAN goes on.
+    func recheckLanHelper() async {
+        let ready = await Self.lanHelperStatus() == .enabled
+        if ready != lanHelperReady { lanHelperReady = ready }
+        if ready, let room = lanAsking {
+            lanAsking = nil
+            await setLan(room, on: true)
+        }
+    }
+
+    /// The helper's sheet closed without it: the LAN stays off.
+    func cancelLanAsk() {
+        lanAsking = nil
     }
 
     /// Remove the LAN helper: launchd stops it and it is no longer registered, so nothing of Vox
