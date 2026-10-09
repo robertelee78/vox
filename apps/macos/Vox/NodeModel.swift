@@ -232,6 +232,9 @@ final class NodeModel: ObservableObject {
     @Published private(set) var lanOn: Set<String> = []
     @Published private(set) var lanSaid: [String: String] = [:]
     @Published private(set) var lanFailed: [String: String] = [:]
+    /// The room whose family LAN was turned on while the LAN helper waits for the person's
+    /// approval: its sheet is up, and the LAN goes on once the helper is allowed.
+    @Published private(set) var lanAsking: String?
 
     /// The family LAN's root helper: the bundle's launchd daemon (ADR-014 M-10).
     private var lanHelper: any BackgroundItem { Daemon.lanHelper }
@@ -318,8 +321,7 @@ final class NodeModel: ObservableObject {
             if Int(view.peers) != peers { peers = Int(view.peers) }
             if view.keyring != keyring { keyring = view.keyring }
         }
-        let ready = await Self.lanHelperStatus() == .enabled
-        if ready != lanHelperReady { lanHelperReady = ready }
+        await recheckLanHelper()
         if selection == .keyring {
             let back = await readTrustsBack()
             if back != trustsBack { trustsBack = back }
@@ -344,19 +346,41 @@ final class NodeModel: ObservableObject {
     /// (ADR-028 R-8): what came while the app was closed. The node's events count from there.
     func seedUnread() async {
         for room in rooms where room.open && !seeded.contains(room.id) {
-            if case .room(room.id) = selection { continue }
-            guard let rows = try? await client.unread(room: room.id),
-                  let i = rooms.firstIndex(where: { $0.id == room.id }) else { continue }
+            guard let rows = try? await client.unread(room: room.id) else { continue }
             seeded.insert(room.id)
-            for message in rows where message.author != me {
-                switch message.level {
-                case .toYou:
-                    rooms[i].addressed += 1
-                    if message.urgent { rooms[i].urgent += 1 }
-                case .new: rooms[i].new += 1
-                case .coordination: rooms[i].coordination += 1
-                }
-            }
+            for message in rows { count(message, in: room.id) }
+        }
+    }
+
+    /// Each room's unread messages, by id: counted once each, from what the node recorded as
+    /// unread and from what arrives, and no longer counted once drawn in view with the window in
+    /// front ([`drawn`]). Selecting a room reads nothing (ADR-028 R-6; the app panel's D18).
+    private var counted: [String: [String: RoomMessage]] = [:]
+
+    /// `message` counted unread in `room`, once: never this node's own.
+    private func count(_ message: RoomMessage, in room: String) {
+        guard message.author != me, counted[room]?[message.id] == nil,
+              let i = rooms.firstIndex(where: { $0.id == room }) else { return }
+        counted[room, default: [:]][message.id] = message
+        switch message.level {
+        case .toYou:
+            rooms[i].addressed += 1
+            if message.urgent { rooms[i].urgent += 1 }
+        case .new: rooms[i].new += 1
+        case .coordination: rooms[i].coordination += 1
+        }
+    }
+
+    /// Message `id` seen in `room`: no longer counted.
+    private func uncount(_ id: String, in room: String) {
+        guard let message = counted[room]?.removeValue(forKey: id),
+              let i = rooms.firstIndex(where: { $0.id == room }) else { return }
+        switch message.level {
+        case .toYou:
+            rooms[i].addressed = max(0, rooms[i].addressed - 1)
+            if message.urgent { rooms[i].urgent = max(0, rooms[i].urgent - 1) }
+        case .new: rooms[i].new = max(0, rooms[i].new - 1)
+        case .coordination: rooms[i].coordination = max(0, rooms[i].coordination - 1)
         }
     }
 
@@ -428,18 +452,17 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// Show `selection`; a room shown is read, so its unread counts end.
+    /// Show `selection`. A room shown is not read by being chosen: each message is read as it is
+    /// drawn in view with the window in front ([`drawn`], ADR-028 R-6).
     func show(_ selection: Selection?) async {
         select(selection)
         if case .decisions = selection {
             decisionEvents = await decisions()
         }
         guard case let .room(id) = selection else { return }
-        if let i = rooms.firstIndex(where: { $0.id == id }) {
-            rooms[i].addressed = 0
-            rooms[i].urgent = 0
-            rooms[i].new = 0
-            rooms[i].coordination = 0
+        if !seeded.contains(id), let rows = try? await client.unread(room: id) {
+            seeded.insert(id)
+            for message in rows { count(message, in: id) }
         }
         do {
             // Each read lands only if the room is still the one on screen: a quick switch must not
@@ -657,6 +680,37 @@ final class NodeModel: ObservableObject {
             Daemon.openLoginItems()
         }
         lanHelperReady = status == .enabled
+    }
+
+    /// The family LAN turned on for `room`: at once when the LAN helper is allowed, else the helper
+    /// is asked for (its sheet says where to allow it) and the LAN goes on once it is
+    /// ([`recheckLanHelper`]). The helper is asked for only here, never before (ADR-014 M-12).
+    func turnLanOn(_ room: String) async {
+        if await Self.lanHelperStatus() == .enabled {
+            lanHelperReady = true
+            await setLan(room, on: true)
+            return
+        }
+        lanAsking = room
+        await allowLanHelper()
+        await recheckLanHelper()
+    }
+
+    /// Whether the LAN helper is allowed now, as on every refresh and whenever Vox comes back to the
+    /// front (the person returning from System Settings); allowed while a room's LAN waits for it,
+    /// that room's sheet closes and its LAN goes on.
+    func recheckLanHelper() async {
+        let ready = await Self.lanHelperStatus() == .enabled
+        if ready != lanHelperReady { lanHelperReady = ready }
+        if ready, let room = lanAsking {
+            lanAsking = nil
+            await setLan(room, on: true)
+        }
+    }
+
+    /// The helper's sheet closed without it: the LAN stays off.
+    func cancelLanAsk() {
+        lanAsking = nil
     }
 
     /// Remove the LAN helper: launchd stops it and it is no longer registered, so nothing of Vox
@@ -1001,6 +1055,7 @@ final class NodeModel: ObservableObject {
         }
         readLog.debug("drawn: \(message.id, privacy: .public) in \(room, privacy: .public)")
         marked.insert(message.id)
+        uncount(message.id, in: room)
         unmarked[room, default: []].append(message.id)
         guard flushing == nil else { return }
         flushing = Task { [weak self] in
@@ -1112,10 +1167,10 @@ final class NodeModel: ObservableObject {
     }
 
     fileprivate func arrived(_ message: RoomMessage, in room: String) {
-        let focused: Bool = {
-            if case .room(room) = selection { return NSApp.isActive }
-            return false
-        }()
+        // Looked at: the room's own timeline (General or All) on screen in a window in front of
+        // the person, following its newest message, so this one is drawn in view as it lands. A
+        // room chosen but with a Session shown, scrolled up, or behind another window is not.
+        let focused = lookingAt == room
         // A message the person is not looking at is notified: never this node's own, nor
         // coordination traffic, nor one whose body has not arrived.
         if notifies && !focused && message.author != me && message.level != .coordination
@@ -1132,11 +1187,10 @@ final class NodeModel: ObservableObject {
             } else {
                 messages.append(message)
             }
-            return
         }
-        // This node's own posts are never unread.
-        guard message.author != me else { return }
-        guard let i = rooms.firstIndex(where: { $0.id == room }) else {
+        // Unread until drawn in view (this node's own never are), the room on screen too.
+        guard message.author != me, !marked.contains(message.id) else { return }
+        guard rooms.contains(where: { $0.id == room }) else {
             // A room joined or made since the rooms were read (by `vox room join`, say): read
             // them again, then count it.
             Task {
@@ -1145,16 +1199,13 @@ final class NodeModel: ObservableObject {
             }
             return
         }
-        switch message.level {
-        case .toYou:
-            rooms[i].addressed += 1
-            if message.urgent { rooms[i].urgent += 1 }
-        case .new:
-            rooms[i].new += 1
-        case .coordination:
-            rooms[i].coordination += 1
-        }
+        count(message, in: room)
     }
+
+    /// The room whose own timeline is in view and following its newest message, in a window in
+    /// front of the person, as RoomView last said; nil otherwise. A message arriving there is
+    /// seen as it lands, so it is not notified.
+    var lookingAt: String?
 
     fileprivate func noticed(_ text: String) {
         Task { await refresh() }

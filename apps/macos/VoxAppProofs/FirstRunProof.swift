@@ -1695,6 +1695,173 @@ final class FirstRunProof: XCTestCase {
               until: { $0 == says })
         print("[proof] inspector: \(says)")
 
+        // (3d) Watching a Session (P7), and what comes meanwhile in General (D18). bob's agent
+        // session opens a Session in mission through its hook, as Claude Code's does, and bob's
+        // node lets alice read it (drive). Its 60 tool calls are more than the timeline shows,
+        // with room to spare on a tall display.
+        try staged(vox, ["trust", "drive", "--node", "bob", aliceFp,
+                         "--identity-passphrase-file", bobPass], env: voxEnv)
+        let sid = "p7proofs-session"
+        let hookEnv = voxEnv.merging(["CLAUDE_CODE_ENTRYPOINT": "cli"]) { $1 }
+        func hook(_ event: [String: Any]) throws {
+            var input: [String: Any] = ["session_id": sid, "cwd": "/tmp",
+                                        "transcript_path": "/tmp/p7.jsonl"]
+            input.merge(event) { $1 }
+            let json = String(decoding: try JSONSerialization.data(withJSONObject: input), as: UTF8.self)
+            let r = run(vox, ["agent", "hook", "--node", "bob", "--room", room], env: hookEnv, input: json)
+            guard r.status == 0 else {
+                throw Apparatus("bob's session hook (\(event["hook_event_name"] ?? "")) exited \(r.status): \(r.out)")
+            }
+        }
+        // A tool call is its PreToolUse and its PostToolUse: the Session's line is the call
+        // ("Bash: echo P7-LINE-n → P7-LINE-n"); a result with no call shows nothing.
+        // Three digits, so no line's name is part of another's ("P7-LINE-1" is in "P7-LINE-12").
+        func p7Line(_ n: Int) -> String { String(format: "P7-LINE-%03d", n) }
+        func toolCall(_ n: Int) throws {
+            let call: [String: Any] = ["tool_name": "Bash", "tool_use_id": "p7-\(n)",
+                                       "tool_input": ["command": "echo \(p7Line(n))"]]
+            try hook(call.merging(["hook_event_name": "PreToolUse"]) { $1 })
+            try hook(call.merging(["hook_event_name": "PostToolUse",
+                                   "tool_response": ["stdout": p7Line(n), "stderr": "",
+                                                     "interrupted": false]]) { $1 })
+        }
+        // What alice's node holds of the Session, as `vox room session` prints it to her.
+        func sessionHolds(_ text: String, within seconds: TimeInterval) -> Bool {
+            let end = Date().addingTimeInterval(seconds)
+            repeat {
+                let r = run(vox, ["room", "session", "--node", "alice", room, "p7proofs"], env: voxEnv)
+                if r.status == 0 && r.out.contains(text) { return true }
+                Thread.sleep(forTimeInterval: 1)
+            } while Date() < end
+            return false
+        }
+        try hook(["hook_event_name": "UserPromptSubmit", "prompt": "sort the photos"])
+        for n in 1...60 { try toolCall(n) }
+        guard sessionHolds("P7-LINE-060", within: 60) else {
+            throw Apparatus("bob's Session never showed P7-LINE-060 to alice's node: `vox room session --node alice` says \(run(vox, ["room", "session", "--node", "alice", room, "p7proofs"], env: voxEnv).out.suffix(600)), so the app's Session cannot be checked")
+        }
+        let sessionRow = Key.id("session-p7proofs")
+        present(ui, sessionRow, timeout: 60,
+                "bob's Session, opened by his session's hook, must be listed in mission")
+        // D18's premise: what mission's row counts as new before anything is posted.
+        func newCount() -> Int? {
+            let words = shown(el(ui, Key.id("room-mission")))
+            guard let r = words.range(of: #"(\d+) new"#, options: .regularExpression) else { return 0 }
+            return Int(words[r].split(separator: " ")[0])
+        }
+        // In view: at least half of it inside the timeline's frame, as Seen counts a row seen.
+        // (Hit-testing is not this: the line at the bottom of the timeline, drawn and in view in
+        // the first run's kept tree, was still not hittable, a false red.)
+        func inTimeline(_ key: Key) -> Bool {
+            let e = el(ui, key), t = el(ui, Key.id("timeline"))
+            guard e.exists, t.exists else { return false }
+            let shown = e.frame.intersection(t.frame)
+            return !shown.isNull && shown.height * 2 >= e.frame.height
+        }
+        tap(ui, sessionRow, "bob's Session")
+        let newestLine = Key.showing("P7-LINE-060")
+        let openedUntil = Date().addingTimeInterval(20)
+        while Date() < openedUntil && !inTimeline(newestLine) { Thread.sleep(forTimeInterval: 0.25) }
+        if inTimeline(Key.showing("P7-LINE-001")) && inTimeline(newestLine) {
+            throw Apparatus("all 60 of the Session's lines fit in the timeline, so opening at its newest cannot be told from opening at its top")
+        }
+        if !inTimeline(newestLine) {
+            keepTree(ui, "the Session did not open at its newest line")
+            XCTFail("PRODUCT: a Session opened must show its newest line, P7-LINE-060, in view; it is not on screen 20 s after bob's Session was chosen")
+        }
+        try toolCall(61)
+        guard sessionHolds("P7-LINE-061", within: 30) else {
+            throw Apparatus("bob's 61st tool call never reached alice's node (`vox room session --node alice`), so following it cannot be checked")
+        }
+        let followUntil = Date().addingTimeInterval(30)
+        while Date() < followUntil && !inTimeline(Key.showing("P7-LINE-061")) {
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        if !inTimeline(Key.showing("P7-LINE-061")) {
+            keepTree(ui, "the Session did not follow its new line")
+            XCTFail("PRODUCT: a Session watched at its newest line must follow what it prints next; P7-LINE-061 is not on screen 30 s after bob's session made it")
+        }
+        // D18: a message to the room while the Session is shown is not seen, so it counts.
+        guard let before = newCount() else {
+            throw Apparatus("mission's sidebar row could not be read")
+        }
+        try staged(vox, ["room", "post", "--node", "bob", room, "D18-UNSEEN"], env: voxEnv)
+        var counted = before
+        let countUntil = Date().addingTimeInterval(30)
+        while Date() < countUntil && counted <= before {
+            counted = newCount() ?? before
+            if counted <= before { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        if counted <= before {
+            keepTree(ui, "a message posted while a Session was shown was not counted")
+            XCTFail("PRODUCT: bob's D18-UNSEEN, posted to mission while alice watched a Session there, is not seen, so mission's row must count it new; it says \"\(shown(el(ui, Key.id("room-mission"))))\" (\(before) new before)")
+        }
+        tap(ui, Key.id("session-general"), "General")
+        let seenUntil = Date().addingTimeInterval(20)
+        var after = counted
+        while Date() < seenUntil && after >= counted {
+            after = newCount() ?? counted
+            if after >= counted { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        if after >= counted {
+            keepTree(ui, "a message seen in General was still counted")
+            XCTFail("PRODUCT: General shown with D18-UNSEEN in view must read it, so mission's row counts one fewer new; it still says \"\(shown(el(ui, Key.id("room-mission"))))\"")
+        }
+        print("[proof] Session opened at P7-LINE-060 and followed P7-LINE-061; D18-UNSEEN counted while a Session was shown (\(before) → \(counted) new), read once General showed it (\(after))")
+
+        // (3c) The family LAN asks for its helper only when turned on (the app review's proposal 4): a sheet
+        // that names where to allow it, waits, and, once macOS says it is allowed and the person is
+        // back in Vox, closes by itself and asks the daemon to bring the LAN up. The helper is the
+        // proof build's stand-in (VOX_PROOF_STUB_SERVICES): it registers nothing, and here makes
+        // register wait for an approval the proof gives by writing its file, as the person's switch
+        // in System Settings would.
+        let helperFile = config + "/app/proof-lan-helper"
+        try stager.write(Data("ask\n".utf8), to: helperFile + ".approval")
+        tap(ui, Key.id("family-lan"), "the family LAN's toggle in mission's inspector")
+        let steps = words(ui, Key.id("lan-helper-steps"), timeout: 15,
+                          "turning the family LAN on, with no LAN helper allowed, must ask for it and say where: \"System Settings › General › Login Items & Extensions\", then \"Allow in the Background\"",
+                          until: { $0.contains("System Settings › General › Login Items & Extensions")
+                              && $0.contains("Allow in the Background") }) ?? ""
+        present(ui, Key.id("lan-helper-waiting"), timeout: 5,
+                "the LAN helper's sheet must say it is waiting for the person to allow it")
+        let asked = stager.run(["/bin/cat", helperFile], env: [:]).out
+        guard asked.hasPrefix("awaiting-approval") else {
+            throw Apparatus("the stand-in LAN helper was to wait for approval once registered; its file says \"\(asked)\", so the wait for the person cannot be staged")
+        }
+        // The person goes to System Settings, turns Vox on there, and comes back. The proof hands
+        // the foreground away itself, so it is not counted as lost.
+        handedOff = true
+        XCUIApplication(bundleIdentifier: "com.apple.finder").activate()
+        try stager.write(Data("registered vox-proof-service-stand-in\n".utf8), to: helperFile)
+        ui.activate()
+        var sheetGone = false
+        let allowedUntil = Date().addingTimeInterval(15)
+        while Date() < allowedUntil && !sheetGone {
+            sheetGone = locate(ui, Key.id("lan-helper-sheet")) == nil
+                && locate(ui, Key.id("lan-helper-waiting")) == nil
+            if !sheetGone { Thread.sleep(forTimeInterval: 0.25) }
+        }
+        if !sheetGone {
+            keepTree(ui, "the LAN helper's sheet stayed after approval")
+            XCTFail("PRODUCT: once the LAN helper is allowed and Vox is in front again, its sheet must close by itself and the LAN go on; after 15 s it still says \"\(shown(el(ui, Key.id("lan-helper-waiting"))))\"")
+        } else {
+            // The LAN asked of the daemon: its line, or why it could not (no real helper runs here).
+            var answer = ""
+            let answerUntil = Date().addingTimeInterval(15)
+            while Date() < answerUntil && answer.isEmpty {
+                for key in [Key.id("family-lan-said"), Key.id("family-lan-failed")] {
+                    if let e = locate(ui, key) { answer = shown(e) }
+                }
+                if answer.isEmpty { Thread.sleep(forTimeInterval: 0.25) }
+            }
+            if answer.isEmpty {
+                keepTree(ui, "the family LAN was not asked for after approval")
+                XCTFail("PRODUCT: with the LAN helper allowed, Vox must go on to turn mission's family LAN on and say the daemon's answer; the inspector shows neither family-lan-said nor family-lan-failed")
+            }
+            print("[proof] family LAN: asked (\(steps)); allowed; the daemon said \(answer)")
+        }
+        try stager.write(Data("unregistered vox-proof-service-stand-in\n".utf8), to: helperFile)
+
         // (4) Read each way. Bob's NEEDS-YOU is on alice's screen now: her node says she read it.
         var readByAlice: [String] = []
         let readUntil = Date().addingTimeInterval(60)

@@ -414,6 +414,8 @@ private struct RoomView: View {
     /// The newest message when the messages last changed: if it was in view, the timeline follows
     /// the next one; scrolled up to read, it stays (as the TUI does, V210-82).
     @State private var newest: String?
+    /// What is shown just changed, and has not been scrolled to its newest line yet.
+    @State private var opened = false
     /// Whether the keyboard is on the timeline (WCAG 2.1.1): ↑/↓ move the selection, Return
     /// opens the selected message's first action, Space Quick Looks its pulled file.
     @State private var timelineFocused = false
@@ -498,6 +500,7 @@ private struct RoomView: View {
                                             Text(notice).secondaryText().italic()
                                                 .padding(.horizontal, 4)
                                                 .accessibilityIdentifier(item.id)
+                                                .reportsFrame(of: item.id)
                                                 .id(item.id)
                                         } else if let entry = item.entry, let session = model.shownSession,
                                                   let room = model.roomOnScreen {
@@ -511,6 +514,7 @@ private struct RoomView: View {
                                                     clicked(item.id)
                                                 }
                                                 .accessibilityIdentifier("entry-row-\(entry.id)")
+                                                .reportsFrame(of: item.id)
                                                 .id(item.id)
                                         }
                                     }
@@ -587,10 +591,10 @@ private struct RoomView: View {
                             // appeared, its count never changed and it stayed at the top, so the
                             // newest rows were never in view, and never read.
                             .onAppear {
-                                if let last = model.messages.last {
-                                    scroller.scrollTo(last.id, anchor: .bottom)
+                                if let last = model.followItem {
+                                    scroller.scrollTo(last, anchor: .bottom)
                                 }
-                                newest = model.messages.last?.id
+                                newest = model.followItem
                             }
                             // A request ⌘J or a notification landed on, centred once its
                             // Session's entries are drawn (P1).
@@ -598,17 +602,44 @@ private struct RoomView: View {
                             .onChange(of: model.sessionEntries.count) { _ in
                                 centre(model.selectedRequest, scroller)
                             }
-                            .onChange(of: model.messages.count) { _ in
-                                let following = newest == nil || inView.contains(newest ?? "")
-                                if following, let last = model.messages.last {
-                                    scroller.scrollTo(last.id, anchor: .bottom)
+                            // What is shown changed (General, All, a Session): it opens at its
+                            // newest line, or, a Session with a request waiting, at that request,
+                            // centred, so going to an approval shows it (P7).
+                            .onChange(of: model.showing) { _ in
+                                openAtNewest(scroller)
+                                // A Session's lines are read after it is chosen: it is opened
+                                // again at its newest once they land.
+                                opened = model.showsSessionToRead
+                                newest = model.followItem
+                            }
+                            // Each new line followed while the newest was in view: by the last
+                            // real line's identity and the count (a Session's note, kept at the
+                            // end, is not a line to follow), so a Session follows its output
+                            // as General follows its messages.
+                            .onChange(of: model.followSignature) { _ in
+                                // A request gone to (⌘J, a notification) stays where it was
+                                // centred: new output does not scroll it away (P1, P7).
+                                if model.selectedRequest != nil, !opened {
+                                    newest = model.followItem
+                                    return
                                 }
-                                newest = model.messages.last?.id
+                                if opened, !model.showsSessionToRead {
+                                    opened = false
+                                    openAtNewest(scroller)
+                                } else {
+                                    let following = newest == nil || inView.contains(newest ?? "")
+                                    if following, let last = model.followItem {
+                                        scroller.scrollTo(last, anchor: .bottom)
+                                    }
+                                }
+                                newest = model.followItem
                             }
                         }
                     }
                     .background(WindowReader(seen: window))
                     .onChange(of: window.seen) { _ in markSeen() }
+                    .onChange(of: model.showing) { _ in updateLooking() }
+                    .onDisappear { if model.lookingAt == room { model.lookingAt = nil } }
                     // A row whose body has just arrived is read now, even if its frame is
                     // unchanged (no new measure to trigger it).
                     .onChange(of: model.messages) { _ in markSeen() }
@@ -932,9 +963,32 @@ private struct RoomView: View {
         return true
     }
 
+    /// What is shown, at its newest line; or a Session's request waiting for an answer, centred.
+    private func openAtNewest(_ scroller: ScrollViewProxy) {
+        if model.selectedRequest != nil {
+            centre(model.selectedRequest, scroller)
+        } else if let waiting = model.waitingEntry {
+            scroller.scrollTo(waiting, anchor: .center)
+        } else if let last = model.followItem {
+            scroller.scrollTo(last, anchor: .bottom)
+        }
+    }
+
+    /// Tell the model whether this room's own timeline is being looked at as it grows: in a window
+    /// in front of the person, General or All shown (not a Session), and its newest message in
+    /// view, so the next one is drawn in view as it lands (D18).
+    private func updateLooking() {
+        var ownTimeline = true
+        if case .session = model.showing { ownTimeline = false }
+        let following = newest == nil || inView.contains(newest ?? "")
+        let now = window.seen && ownTimeline && following ? room : nil
+        if model.lookingAt != now { model.lookingAt = now }
+    }
+
     /// The rows in view are read, only while the window is in front of the person (R-6).
     private func markSeen() {
         readLog.debug("seen check in \(room, privacy: .public): window seen \(window.seen), \(inView.count) rows in view")
+        updateLooking()
         guard window.seen else { return }
         for id in inView {
             if let message = model.byID[id] { model.drawn(message, in: room) }
@@ -1221,8 +1275,9 @@ enum Platform {
     }
 }
 
-/// The room's family LAN (ADR-013): offered only once the LAN helper is approved, and before
-/// that, what approving it grants (ADR-014 M-12).
+/// The room's family LAN (ADR-013): a toggle. The LAN helper it needs is asked for only when the
+/// LAN is turned on, in a sheet that says where to allow it and goes on by itself once it is
+/// (ADR-014 M-12).
 private struct FamilyLan: View {
     @ObservedObject var model: NodeModel
     let room: String
@@ -1230,29 +1285,82 @@ private struct FamilyLan: View {
     var body: some View {
         Text("FAMILY LAN").eyebrow().secondaryText()
             .accessibilityAddTraits(.isHeader)
-        if model.lanHelperReady {
-            Toggle("On this room's LAN", isOn: Binding(
-                get: { model.lanOn.contains(room) },
-                set: { on in Task { await model.setLan(room, on: on) } }))
-                .accessibilityIdentifier("family-lan")
-            if let said = model.lanSaid[room] {
-                Text(said).font(Theme.mono).secondaryText().textSelection(.enabled)
-                    .accessibilityIdentifier("family-lan-said")
+        Toggle("On this room's LAN", isOn: Binding(
+            get: { model.lanOn.contains(room) },
+            set: { on in
+                Task { if on { await model.turnLanOn(room) } else { await model.setLan(room, on: false) } }
+            }))
+            .accessibilityIdentifier("family-lan")
+            .sheet(isPresented: Binding(get: { model.lanAsking == room },
+                                        set: { if !$0 { model.cancelLanAsk() } })) {
+                LanHelperSheet(model: model, room: room)
             }
-            Button("Remove the LAN Helper") { Task { await model.removeLanHelper() } }
-                .accessibilityIdentifier("family-lan-remove")
-        } else {
-            Text("The family LAN needs Vox's LAN helper: one root process that creates network "
-                + "interfaces for Vox and nothing else. Approve it once in System Settings.")
-                .secondaryText()
-                .accessibilityIdentifier("family-lan-why")
-            Button("Allow the LAN Helper") { Task { await model.allowLanHelper() } }
-                .accessibilityIdentifier("family-lan-allow")
+        if let said = model.lanSaid[room] {
+            Text(said).font(Theme.mono).secondaryText().textSelection(.enabled)
+                .accessibilityIdentifier("family-lan-said")
         }
         if let failed = model.lanFailed[room] {
             StateMark(kind: .danger, words: failed).textSelection(.enabled)
+                .accessibilityIdentifier("family-lan-failed")
+        }
+        if model.lanHelperReady {
+            Button("Remove the LAN Helper") { Task { await model.removeLanHelper() } }
+                .accessibilityIdentifier("family-lan-remove")
         }
     }
+}
+
+/// Asking for the LAN helper, once someone turns a family LAN on: what it is, the exact place to
+/// allow it, and a wait that ends by itself when macOS says it is allowed, noticed on every
+/// refresh and as soon as Vox is back in front.
+private struct LanHelperSheet: View {
+    @ObservedObject var model: NodeModel
+    let room: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            // A room's name is its content: never uppercased.
+            Text("Family LAN for \u{201C}\(name)\u{201D}").caption().secondaryText()
+            Text("Allow Vox's LAN helper").heading()
+                .accessibilityAddTraits(.isHeader)
+            Text("The family LAN needs one helper that runs as root and creates network interfaces "
+                + "for Vox, and nothing else.")
+                .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("1. Open System Settings › General › Login Items & Extensions.")
+                Text("2. Under \u{201C}Allow in the Background\u{201D}, turn on Vox.")
+                Text("3. Come back here; Vox notices and turns the LAN on.")
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("lan-helper-steps")
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Waiting for you to allow it…").secondaryText()
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("lan-helper-waiting")
+            HStack {
+                Spacer()
+                Button("Cancel") { model.cancelLanAsk() }
+                    .keyboardShortcut(.cancelAction)
+                    .accessibilityIdentifier("lan-helper-cancel")
+                Button("Open Login Items") { Daemon.openLoginItems() }
+                    .accessibilityIdentifier("lan-helper-open")
+            }
+        }
+        .padding(20)
+        .frame(width: 460)
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await model.recheckLanHelper() }
+        }
+        // A container, so its steps and its wait keep their own identifiers: given to the whole
+        // sheet without it, the identifier replaced every one of theirs.
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("lan-helper-sheet")
+    }
+
+    private var name: String { model.rooms.first { $0.id == room }?.name ?? String(room.prefix(12)) }
 }
 
 /// The node, its peers and the keyring window (W-1, K-9); and the last thing that failed, in the
