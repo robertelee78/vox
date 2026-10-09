@@ -3479,17 +3479,15 @@ final class FirstRunProof: XCTestCase {
                              "dave joined mission while it was on screen; its timeline must say so, and that bob (whom alice trusts) trusts him: \"\(daveNamed) joined. bob trusts it.\"",
                              until: { $0 == "\(daveNamed) joined. bob trusts it." }) ?? ""
         print("[proof] join: \(joinSaid)")
-        // (15b, D4) Dave trusts alice; she has not trusted him. His row says so, the room says who
-        // does not read her yet, and his card says each direction and trusts him from there.
+        // (15b, D4) Dave trusts alice; she has not trusted him. His row says so, and his card says
+        // each direction and trusts him from there; the room's banner naming who does not read
+        // her yet is P2's TrustBanner, proved at 5d.
         try staged(vox, ["trust", "add", "--node", "dave", aliceFp, "--name", "alice",
                          "--identity-passphrase-file", davePass], env: voxEnv)
         let daveRow = Key.id("member-\(daveFp.prefix(12))")
         let rowSaid = words(ui, daveRow, timeout: 60,
                             "dave trusts alice and she has not trusted him: her member pane must say \"not in keyring, trusts you\"",
                             until: { $0.hasSuffix("not in keyring, trusts you") }) ?? ""
-        let trustBanner = words(ui, Key.id("trust-banner"), timeout: 10,
-                           "mission must say whom alice does not yet read each other with: dave",
-                           until: { $0.contains(String(daveFp.prefix(12))) }) ?? ""
         // (15e, #624) Compare, group by group: on dave's offer, collapsed until asked for, a
         // partial entry says how far it matches.
         tap(ui, Key.id("offer-\(daveFp.prefix(12))"), "dave's offer under needs you")
@@ -3537,7 +3535,7 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(ring.contains(daveFp),
                       "PRODUCT: trusted from his card, dave must be in alice's keyring; `vox trust list` said: \(ring)")
         tap(ui, Key.id("card-close"), "Close on dave's card")
-        print("[proof] dave's row: \(rowSaid); banner: \(trustBanner); card: \(directions) → \(cardSaid)")
+        print("[proof] dave's row: \(rowSaid); card: \(directions) → \(cardSaid)")
         // (15f, G2) The keyring's card for dave: each direction, the room it covers, and what
         // removing him would change, behind a disclosure.
         tap(ui, Key.id("keyring"), "Keyring in the sidebar")
