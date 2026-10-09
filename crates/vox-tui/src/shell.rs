@@ -356,6 +356,25 @@ pub fn provision(install_dir: &Path) -> Report {
     r
 }
 
+/// What [`provision`] wrote that is there now: each startup file holding the block, and each
+/// completion file. Nothing is changed.
+pub fn provisioned() -> Vec<String> {
+    let home = home_dir();
+    let mut found = Vec::new();
+    for shell in [Shell::Zsh, Shell::Bash, Shell::Fish] {
+        for rc in rc_files(&home, shell) {
+            if fs::read_to_string(&rc).is_ok_and(|t| t.contains(BEGIN)) {
+                found.push(format!("the block in {}", rc.display()));
+            }
+        }
+        let cpath = completion_path(&home, shell);
+        if cpath.exists() {
+            found.push(cpath.display().to_string());
+        }
+    }
+    found
+}
+
 /// Remove everything [`provision`] wrote.
 pub fn deprovision() -> Report {
     let mut r = Report::default();

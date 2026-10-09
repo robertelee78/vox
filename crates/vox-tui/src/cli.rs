@@ -2120,6 +2120,23 @@ enum Cmd {
         #[arg(long)]
         remove: bool,
     },
+    /// Remove vox from this machine: what install.sh, `vox shell-setup` and `vox setup` put here.
+    ///
+    /// It stops the daemon and Vox.app, unregisters Vox's login item and LAN helper (on a Mac),
+    /// removes the Keychain items it stored for kept nodes, the `vox agent hook` entries, plugin
+    /// and skill it installed for Claude Code, Codex and OpenCode (only what is still as it wrote
+    /// it; anything edited is named and left), the shell completions and startup-file block, and
+    /// Vox.app or the `vox` binary with its link. Your nodes, their keys and rooms are kept, and
+    /// it says where; a node has no backup. `--purge` removes them too.
+    Uninstall {
+        /// List everything it would do, and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also remove the data root and config directory: every node, its keys and its rooms.
+        /// Asks you to type each node's name first, at a terminal only.
+        #[arg(long)]
+        purge: bool,
+    },
     /// Replace this `vox` with the latest GitHub release.
     ///
     /// Fetches the per-target release record, verifies the download's size and SHA-256 against
@@ -3172,6 +3189,13 @@ pub fn run() -> ExitCode {
             }
         },
         Cmd::ShellSetup { remove } => crate::shell::run(remove),
+        Cmd::Uninstall { dry_run, purge } => match crate::uninstall::run(dry_run, purge) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("vox: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Cmd::Update { check, rollback } => match crate::update::run(check, rollback) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
