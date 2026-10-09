@@ -833,6 +833,138 @@ final class FirstRunProof: XCTestCase {
 
         }
 
+        // (5d) Finding your way (v0.4.1). Each part is what a person sees, and stages what it needs
+        // itself, so it runs from step 6 too (VOX_PROOF_FROM=6).
+        //
+        // The room's header: its name and its retention, always (R-7); the window takes its name.
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
+        words(ui, Key.id("room-header-name"), timeout: 10, "the room's header must name it: \"mission\"",
+              until: { $0 == "mission" })
+        words(ui, Key.id("room-header-meta"), timeout: 10,
+              "the room's header must say what is shown and the room's retention: \"… · General · ⏱ …\"",
+              until: { $0.contains("General") && $0.contains("⏱") })
+        let titled = Date().addingTimeInterval(10)
+        while Date() < titled && !ui.windows.firstMatch.title.hasPrefix("mission") {
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        XCTAssertTrue(ui.windows.firstMatch.title.hasPrefix("mission"),
+                      "PRODUCT: the window must take the room's name as its title; it is \"\(ui.windows.firstMatch.title)\"")
+
+        // Who you can't read yet, and why: erin joins, and neither she nor alice has trusted the
+        // other; then erin trusts alice, and the line says so and offers her offer.
+        let erinPass = scratch.appendingPathComponent("erin.pass").path
+        try stager.write(Data("erin identity\n".utf8), to: erinPass)
+        try staged(vox, ["node", "create", "erin"],
+                   env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "erin identity"]) { $1 })
+        try staged(vox, ["node", "attach", "erin", "--passphrase-file", erinPass], env: voxEnv)
+        let erinFp = try line(staged(vox, ["id", "--node", "erin"], env: voxEnv)) { $0.count == 52 }
+        let erinLink = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        try staged(vox, ["room", "join", "--node", "erin", "--passphrase-file", roomPass, erinLink],
+                   env: voxEnv)
+        let erinShort = String(erinFp.prefix(12))
+        let banner = Key.id("trust-banner")
+        words(ui, banner, timeout: 60,
+              "erin joined and nobody trusted anybody: the room must say \"You and \(erinShort) can't read each other yet\"",
+              until: { $0.contains(erinShort) && $0.contains("can't read each other") })
+        try staged(vox, ["trust", "add", "--node", "erin", aliceFp, "--name", "alice",
+                         "--identity-passphrase-file", erinPass], env: voxEnv)
+        words(ui, banner, timeout: 60,
+              "erin trusts alice now: the room must say \"\(erinShort) trusts you. Trust \(erinShort) too\"",
+              until: { $0.contains("\(erinShort) trusts you") })
+        present(ui, Key.id("trust-banner-offer"), timeout: 10,
+                "the line must offer erin's trust offer, \"Trust \(erinShort)…\"")
+
+        // The Dock badge: the same count as the sidebar's NEEDS YOU, read from what macOS shows.
+        func badge() -> String {
+            let id = Bundle(path: appPath)?.bundleIdentifier ?? ""
+            let out = run("/usr/bin/lsappinfo", ["info", "-only", "StatusLabel", "-app", id], env: [:]).out
+            guard let r = out.range(of: "\"label\"=\"") else { return "" }
+            return String(out[r.upperBound...].prefix { $0 != "\"" })
+        }
+        let needs = words(ui, Key.id("group-needs you"), timeout: 10,
+                          "the sidebar must count what needs alice", until: { $0.lowercased().hasPrefix("needs you (") }) ?? ""
+        let counted = needs.filter(\.isNumber)
+        var badged = ""
+        let badgeUntil = Date().addingTimeInterval(10)
+        while Date() < badgeUntil {
+            badged = badge()
+            if badged == (counted == "0" ? "" : counted) { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        XCTAssertEqual(badged, counted == "0" ? "" : counted,
+                       "PRODUCT: the Dock badge must say what the sidebar's NEEDS YOU counts, \"\(needs)\"; macOS shows \"\(badged)\"")
+
+        // Making an admin asks first; Cancel makes nobody an admin; Make Admin does.
+        ui.typeKey("k", modifierFlags: .command)
+        type(ui, Key.id("palette-query"), "Admins", "the command palette")
+        ui.typeKey(.return, modifierFlags: [])
+        let bobAdmin = Key.id("admin-bob")
+        if present(ui, bobAdmin, timeout: 10, "the Admins sheet must list bob") {
+            tap(ui, bobAdmin, "bob's admin switch")
+            words(ui, Key.id("admin-confirm"), timeout: 10,
+                  "turning bob into an admin must ask first, saying what an admin can do",
+                  until: { $0.contains("Make bob an admin?") && $0.contains("end this room for everyone") })
+            tap(ui, Key.id("admin-confirm-cancel"), "Cancel")
+            let listed = run(vox, ["room", "admin", "list", "--node", "alice", room], env: voxEnv).out
+            XCTAssertFalse(listed.contains(bobFp) || listed.contains("bob"),
+                           "PRODUCT: Cancel must make nobody an admin; `vox room admin list` says: \(listed)")
+            tap(ui, bobAdmin, "bob's admin switch")
+            tap(ui, Key.id("admin-confirm-make"), "Make Admin")
+            var made = ""
+            let madeUntil = Date().addingTimeInterval(15)
+            while Date() < madeUntil && !(made.contains(bobFp) || made.contains("bob")) {
+                made = run(vox, ["room", "admin", "list", "--node", "alice", room], env: voxEnv).out
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+            XCTAssertTrue(made.contains(bobFp) || made.contains("bob"),
+                          "PRODUCT: Make Admin must make bob an admin; `vox room admin list` says: \(made)")
+            ui.typeKey(.return, modifierFlags: [])  // Done
+        }
+
+        // A vox:// link opened by the system fills in the Join sheet; nothing is joined by it.
+        try staged(vox, ["room", "create", "--node", "bob", "--passphrase-file", roomPass, "--name", "orient"],
+                   env: voxEnv)
+        let orient = try line(staged(vox, ["room", "list", "--node", "bob"], env: voxEnv)) {
+            $0.contains(" orient")
+        }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        let orientLink = try line(staged(vox, ["room", "link", "--node", "bob", orient], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        _ = run("/usr/bin/open", ["-a", appPath, orientLink], env: [:])
+        let linkField = Key.id("room-form-link")
+        if present(ui, linkField, timeout: 15, "opening a vox:// link must open the Join sheet") {
+            XCTAssertEqual(el(ui, linkField).value as? String, orientLink,
+                           "PRODUCT: the Join sheet must hold the link Vox was opened with")
+            ui.typeKey(.escape, modifierFlags: [])
+        }
+        Thread.sleep(forTimeInterval: 2)
+        let aliceRooms = run(vox, ["room", "list", "--node", "alice"], env: voxEnv).out
+        XCTAssertFalse(aliceRooms.contains(" orient"),
+                       "PRODUCT: opening a room link must never join by itself; alice's `vox room list` says: \(aliceRooms)")
+
+        // A stopped node shows as detached, keeps what was typed, and attaches again.
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
+        type(ui, Key.id("compose"), "DRAFT-KEPT-P12", "the composer")
+        try staged(vox, ["node", "detach", "alice"], env: voxEnv)
+        words(ui, Key.id("node-stopped"), timeout: 30,
+              "node alice was detached from outside: the window must say so",
+              until: { $0.contains("detached") })
+        present(ui, Key.id("detached"), timeout: 10, "the sidebar must say node alice is detached")
+        XCTAssertEqual(el(ui, Key.id("compose")).value as? String, "DRAFT-KEPT-P12",
+                       "PRODUCT: what was typed must stay while the node is detached")
+        type(ui, Key.id("node-stopped-passphrase"), "alice identity", "the passphrase field")
+        tap(ui, Key.id("node-stopped-attach"), "Attach Again")
+        present(ui, Key.id("attached"), timeout: 60, "Attach Again must attach node alice again")
+        XCTAssertEqual(el(ui, Key.id("compose")).value as? String, "DRAFT-KEPT-P12",
+                       "PRODUCT: what was typed must still be there once the node is attached again")
+        // The draft goes, so later steps start from an empty composer.
+        tap(ui, Key.id("compose"), "the composer")
+        ui.typeKey("a", modifierFlags: .command)
+        ui.typeKey(.delete, modifierFlags: [])
+        print("[proof] finding your way: header, who can't read whom, Dock badge \(badged.isEmpty ? "none" : badged), admin asked first, a link fills Join, a stopped node attaches again with its draft")
+
         // (6) Attach a file to the room, To: bob, with a note.
         tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         let file = scratch.appendingPathComponent("for-bob.bin")
