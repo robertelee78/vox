@@ -1,11 +1,11 @@
-# Vox Lux — text from elsewhere, made safe to print (V210-123, V210-154).
+# Vox Lucis — text from elsewhere, made safe to print (V210-123, V210-154).
 #
 # One rule for every string another party wrote and vox prints: an author's name in a room, a
 # peer's connection-close reason. Its own crate, with no dependencies, because both the core and
 # the app tier print such strings, and neither may depend on the other for it.
 [package]
 name = "vox-text"
-description = "Vox Lux: the one sanitiser for text another party wrote, before it is printed"
+description = "Vox Lucis: the one sanitiser for text another party wrote, before it is printed"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

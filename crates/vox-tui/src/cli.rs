@@ -1952,7 +1952,7 @@ pub struct UpArgs {
 
 use crate::client::DEFAULT_LISTEN;
 
-/// Vox Lux — serverless, end-to-end-encrypted terminal client.
+/// Vox Lucis — serverless, end-to-end-encrypted terminal client.
 #[derive(Parser)]
 #[command(name = "vox", version, about, long_about = None)]
 pub struct Cli {

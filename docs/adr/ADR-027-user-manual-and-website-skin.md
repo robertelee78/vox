@@ -1,7 +1,7 @@
-# ADR-027: One user manual, automatically skinned by voxlux.us
+# ADR-027: One user manual, automatically skinned by voxlucis.us
 
 **Status**: Accepted — decider authorization 2026-10-04; independent technical review by `manual_practice_research` on 2026-10-04.
-**Execution**: [manual work and acceptance](https://github.com/robertelee78/vox/issues/421); [website work and publication](https://github.com/robertelee78/voxlux.us/issues/2). Acceptance of this decision is not a delivery claim.
+**Execution**: [manual work and acceptance](https://github.com/robertelee78/vox/issues/421); [website work and publication](https://github.com/robertelee78/voxlucis.us/issues/2). Acceptance of this decision is not a delivery claim.
 **Date**: 2026-10-04
 **Deciders**: Robert E. Lee
 **Tags**: documentation, user-experience, website, troubleshooting
@@ -32,7 +32,7 @@ what instructions claim; an accepted but unimplemented ADR does not.
 
 `docs/manual/` is the canonical user manual. It contains plain Markdown chapters and a small
 `manifest.json` defining ordered navigation, stable slugs, descriptions and applicability.
-GitHub renders the same Markdown a user can read offline. voxlux.us owns layout, typography,
+GitHub renders the same Markdown a user can read offline. voxlucis.us owns layout, typography,
 navigation and rendering only. No independently edited manual prose lives in the website.
 
 The manifest has schema version 1 and a nonempty `pages` array. Each page declares `slug`,
@@ -64,7 +64,7 @@ recipient's independently retained copy.
 
 Every page shows applicability. The manual describes the current release, v0.3.0, as it is; it
 carries no chapter or passage about earlier releases or how they differed.
-The installer follows the established `https://voxlux.us/install.sh` transport; GitHub remains
+The installer follows the established `https://voxlucis.us/install.sh` transport; GitHub remains
 the executable source of truth. Updating the manual must not change installer promotion policy.
 
 An evidence map records implementation refs, paths and the behavior each chapter depends on.
@@ -139,12 +139,12 @@ Delivery boundary: public evidence attached to the manual work item.
 
 ### M27.3 — Website contract
 
-Implement D4/D5 in voxlux.us under a related, repository-owned work item. Acceptance: a source-only
+Implement D4/D5 in voxlucis.us under a related, repository-owned work item. Acceptance: a source-only
 chapter edit flows into a rebuild without website prose changes; all chapters share one resolved
 source revision; unsupported content and broken navigation are refused; browser checks prove
 reading/navigation at narrow width, with keyboard and without JavaScript; exact public files match
 the accepted artifact. Existing installer and landing pages must remain working.
-Delivery boundary: verified public manual at `https://voxlux.us/docs/manual/`.
+Delivery boundary: verified public manual at `https://voxlucis.us/docs/manual/`.
 
 Order: approve the content/rendering contract; implement canonical content and skin independently;
 verify both together; publish the canonical source, build from it, then publish the website.

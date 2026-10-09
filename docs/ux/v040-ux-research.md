@@ -570,7 +570,7 @@ A 5×5 facet mosaic of split triangles driven by the fingerprint bytes, in the m
 
 #### The Vox mark
 
-A faceted V of five sharp planes, like a cut gem seen from above; the arms are blades narrowing to the vertex. At the vertex a small triangle is cut out, with one glint in the accent: *vox lux*, "voice of light". Off-white planes on warm black, no outline, no animal. The node mosaics use the same triangles, so the brand and every identity share one grammar. (The header mark on this page is a sketch of it.)
+A faceted V of five sharp planes, like a cut gem seen from above; the arms are blades narrowing to the vertex. At the vertex a small triangle is cut out, with one glint in the accent: *vox lucis*, "voice of light". Off-white planes on warm black, no outline, no animal. The node mosaics use the same triangles, so the brand and every identity share one grammar. (The header mark on this page is a sketch of it.)
 
 ### TUI mockups
 

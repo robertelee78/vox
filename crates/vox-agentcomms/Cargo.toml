@@ -1,4 +1,4 @@
-# Vox Lux — agent comms (ADR-020, M19.3).
+# Vox Lucis — agent comms (ADR-020, M19.3).
 #
 # The first crate of the **app tier**: an application riding the Vox layer, as
 # chat and room-bound services do. It owns the envelope, the message vocabulary
@@ -18,7 +18,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Vox Lux agent comms — the envelope, vocabulary and claim rules agents share in a room"
+description = "Vox Lucis agent comms — the envelope, vocabulary and claim rules agents share in a room"
 
 [lib]
 name = "vox_agentcomms"
