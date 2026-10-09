@@ -734,6 +734,59 @@ final class FirstRunProof: XCTestCase {
         }
     }
 
+    /// A data root an earlier release left (a node directory beside `nodes/`, which this version
+    /// refuses) is said plainly in the app, with "Move It Aside and Start Fresh": the directory is
+    /// moved, whole and unread, under `moved-aside/`, nothing deleted, and the welcome follows,
+    /// saying where it went. Staged with dummy files only. Mutant: the move deleting the directory
+    /// instead of renaming it → red at "must be kept, whole".
+    func testAnEarlierReleasesNodeIsMovedAsideInTheApp() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
+            throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are set by scripts/app-proofs.sh")
+        }
+        let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("old-node")
+        let data = root.appendingPathComponent("data").path
+        let config = root.appendingPathComponent("config").path
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        // The layout an earlier release left: dummy files, no real data.
+        let vault = "STAGED-OLD-VAULT \(UUID().uuidString)"
+        try stager.write(Data(vault.utf8), to: data + "/default/vault.cbor")
+        try stager.write(Data("STAGED-OLD-STORE".utf8), to: data + "/default/store.redb")
+        // The daemon the app starts after the move, stopped by its pid when the case ends.
+        defer {
+            let pid = stager.run(["/bin/cat", data + "/.daemon/lock"], env: [:]).out
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if Int32(pid) != nil { _ = stager.run(["/bin/kill", pid], env: [:]) }
+        }
+
+        let ui = voxApp(appPath)
+        ui.launchEnvironment = voxEnv
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        defer { ui.terminate() }
+        present(ui, Key.id("login-item-why"), timeout: 30, "at first run the app must ask about Keep Running")
+        tap(ui, Key.id("login-item-not-now"), "Not Now")
+
+        let moveAside = Key.id("old-move-aside")
+        present(ui, moveAside, timeout: 30,
+                "a data root an earlier release left must be said in the app, with a way to move it aside")
+        words(ui, Key.id("old-layout-why"), timeout: 5,
+              "the app must say plainly which node it cannot read",
+              until: { $0.contains("cannot read default") && $0.contains("Nothing in it is deleted") })
+        noCommandLine(ui, "the earlier-release screen")
+        tap(ui, moveAside, "Move It Aside and Start Fresh")
+        present(ui, Key.id("new-node-name"), timeout: 60,
+                "moved aside, the app must go on to the welcome that makes a node")
+        let note = words(ui, Key.id("moved-aside-note"), timeout: 10,
+                         "the welcome must say where the old node went",
+                         until: { $0.contains("/moved-aside/default-") }) ?? ""
+        noCommandLine(ui, "the welcome after the move")
+        let gone = stager.run(["/bin/test", "-e", data + "/default"], env: [:]).status != 0
+        let kept = stager.run(["/bin/sh", "-c", "cat \"$0\"/moved-aside/default-*/vault.cbor", data], env: [:]).out
+        XCTAssertTrue(gone && kept == vault,
+                      "PRODUCT: Move It Aside must move the old node directory, whole: it must be kept under moved-aside/ with its vault as it was, and gone from where it was; gone from there: \(gone), the kept vault reads \(kept.debugDescription); the app said \(note.debugDescription)")
+        print("[proof] earlier release: default moved aside whole (\(note)); the welcome followed; no screen named Terminal or a vox command")
+    }
+
     func testFirstRunAttachesTheNodeAndQuitDetachesIt() throws {
         let env = ProcessInfo.processInfo.environment
         guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {

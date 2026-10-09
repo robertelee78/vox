@@ -18,6 +18,10 @@ final class AppModel: ObservableObject {
         case starting
         /// The daemon did not answer; its sentence.
         case unreachable(String)
+        /// The data root holds an earlier release's node directories, which this version does not
+        /// read (the daemon refuses it): offered to be moved aside (#576). Their paths; the
+        /// sentence after a failed move.
+        case oldLayout(dirs: [String], said: String?)
         /// First run on a Mac with no node yet: make one here; the sentence after a failed try.
         case welcome(said: String?)
         /// Making node `node`, then attaching it.
@@ -128,8 +132,32 @@ final class AppModel: ObservableObject {
                 await offerNodes(nodes)
             }
         } catch {
-            phase = .unreachable(sentence(error))
+            // Refused for an earlier release's node directories: said plainly, with a way on.
+            if let dirs = try? oldLayout(dataRoot: ""), !dirs.isEmpty {
+                phase = .oldLayout(dirs: dirs, said: nil)
+            } else {
+                phase = .unreachable(sentence(error))
+            }
         }
+    }
+
+    /// What was moved aside, from and to, said on the welcome that follows.
+    @Published private(set) var movedAside: [MovedAside] = []
+
+    /// Move the earlier release's node directories aside, whole and unread (#576), then start as on
+    /// a Mac with no node: the welcome.
+    func moveAside() async {
+        let day = DateFormatter()
+        day.locale = Locale(identifier: "en_US_POSIX")
+        day.dateFormat = "yyyy-MM-dd"
+        do {
+            movedAside = try moveOldLayoutAside(dataRoot: "", date: day.string(from: Date()))
+        } catch {
+            let dirs = (try? oldLayout(dataRoot: "")) ?? []
+            phase = .oldLayout(dirs: dirs, said: sentence(error))
+            return
+        }
+        await reach()
     }
 
     /// No node chosen yet: none on this Mac, so make one here; one, so act as it without asking

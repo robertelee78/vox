@@ -313,6 +313,59 @@ pub fn config_dir(data_root: String) -> Result<String, VoxError> {
         .map_err(|e| failed(format!("data root: {e}")))
 }
 
+/// A node directory of an earlier release, moved aside (#576): where it was, and where it is now.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MovedAside {
+    /// The directory it was.
+    pub from: String,
+    /// The directory it is now, under the data root's `moved-aside/`.
+    pub to: String,
+}
+
+/// The node directories of an earlier release that make the data root `data_root` (empty: the
+/// default one) one this version does not read, as full paths: what the daemon refuses it for.
+/// Read only.
+///
+/// # Errors
+/// The data root cannot be found.
+#[uniffi::export]
+pub fn old_layout(data_root: String) -> Result<Vec<String>, VoxError> {
+    let root = (!data_root.is_empty()).then(|| PathBuf::from(&data_root));
+    let account =
+        Account::of(root.as_deref(), None).map_err(|e| failed(format!("data root: {e}")))?;
+    Ok(vox_core::node::layout::old_layout_dirs(&account)
+        .into_iter()
+        .map(|name| account.data_root.join(name).display().to_string())
+        .collect())
+}
+
+/// Move the data root's earlier-release node directories aside, as the person asked (#576): each
+/// renamed, whole and unread, into `<data root>/moved-aside/<name>-<date>`, `date` being the
+/// person's day (`YYYY-MM-DD`). Nothing is deleted. Each move, from and to.
+///
+/// # Errors
+/// A `date` that is not `YYYY-MM-DD`, or a move that fails (the ones before it stand).
+#[uniffi::export]
+pub fn move_old_layout_aside(data_root: String, date: String) -> Result<Vec<MovedAside>, VoxError> {
+    if date.len() != 10 || !date.chars().all(|c| c.is_ascii_digit() || c == '-') {
+        return Err(failed(format!("{date:?} is not a date (YYYY-MM-DD)")));
+    }
+    let root = (!data_root.is_empty()).then(|| PathBuf::from(&data_root));
+    let account =
+        Account::of(root.as_deref(), None).map_err(|e| failed(format!("data root: {e}")))?;
+    vox_core::node::layout::move_old_layout_aside(&account, &date)
+        .map(|moved| {
+            moved
+                .into_iter()
+                .map(|(from, to)| MovedAside {
+                    from: from.display().to_string(),
+                    to: to.display().to_string(),
+                })
+                .collect()
+        })
+        .map_err(|e| failed(e.to_string()))
+}
+
 /// What a person is told wherever a node is made, as `vox node create` says it (ADR-028 K-8): a
 /// node has no backup.
 #[uniffi::export]
@@ -1499,14 +1552,19 @@ impl VoxClient {
         self.on_rt(async move {
             // Argon2id and the files: off the runtime's workers.
             tokio::task::spawn_blocking(move || {
-                vox_core::node::profile::Profile::create_node(paths, secret.as_bytes(), now_ms, &|| {})
-                    .map(|fp| b32_encode(&fp))
-                    .map_err(|e| match vox_core::node::actor::fault_of(&e) {
-                        f @ (vox_core::node::api::Fault::IdentityFileUnwritable
-                        | vox_core::node::api::Fault::Storage
-                        | vox_core::node::api::Fault::ProfileBusy) => failed(f.to_string()),
-                        _ => failed(e.to_string()),
-                    })
+                vox_core::node::profile::Profile::create_node(
+                    paths,
+                    secret.as_bytes(),
+                    now_ms,
+                    &|| {},
+                )
+                .map(|fp| b32_encode(&fp))
+                .map_err(|e| match vox_core::node::actor::fault_of(&e) {
+                    f @ (vox_core::node::api::Fault::IdentityFileUnwritable
+                    | vox_core::node::api::Fault::Storage
+                    | vox_core::node::api::Fault::ProfileBusy) => failed(f.to_string()),
+                    _ => failed(e.to_string()),
+                })
             })
             .await
             .map_err(|_| failed("making the node stopped"))?

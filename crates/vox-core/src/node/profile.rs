@@ -103,7 +103,13 @@ impl Profile {
         now_ms: u64,
         waiting: LockWaitNotice<'_>,
     ) -> Result<Digest32> {
-        let p = Self::create_noting(paths, passphrase, now_ms / 1_000, Argon2Profile::default(), waiting)?;
+        let p = Self::create_noting(
+            paths,
+            passphrase,
+            now_ms / 1_000,
+            Argon2Profile::default(),
+            waiting,
+        )?;
         let signer = p.signer()?;
         let dh_secret = *signer.x25519_identity_secret();
         crate::node::prekeys::load_or_create(p.store(), signer, &dh_secret, now_ms)?;

@@ -61,6 +61,8 @@ struct RootView: View {
                 }
                 Button("Try Again") { Task { await model.start() } }
                     .accessibilityIdentifier("retry")
+            case let .oldLayout(dirs, said):
+                OldLayout(dirs: dirs, said: said, model: model)
             case let .welcome(said):
                 Welcome(said: said, model: model)
             case let .creating(node):
@@ -181,6 +183,40 @@ private struct LoginItemApproval: View {
     }
 }
 
+/// The data root holds an earlier release's node directories, which this version does not read
+/// (#576): said plainly, with the way on, not the daemon's sentence alone.
+private struct OldLayout: View {
+    let dirs: [String]
+    let said: String?
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        Text("This Mac has a node from an earlier Vox").heading()
+        Text("This version of Vox cannot read "
+            + dirs.map { URL(fileURLWithPath: $0).lastPathComponent }.joined(separator: ", ")
+            + ", kept the way an earlier release kept its nodes. Vox can move it aside, whole and "
+            + "untouched, and start fresh: you make a new node next. Nothing in it is deleted.")
+            .secondaryText()
+            .accessibilityIdentifier("old-layout-why")
+        ForEach(dirs, id: \.self) { dir in
+            Text(dir).font(Theme.mono).secondaryText().textSelection(.enabled)
+        }
+        Text("Your new node is a new identity: people you shared rooms with add it to their keyring "
+            + "again.")
+            .secondaryText()
+        if let said {
+            Said(text: said)
+        }
+        HStack {
+            Button("Move It Aside and Start Fresh") { Task { await model.moveAside() } }
+                .keyboardShortcut(.defaultAction)
+                .accessibilityIdentifier("old-move-aside")
+            Button("Try Again") { Task { await model.start() } }
+                .accessibilityIdentifier("retry")
+        }
+    }
+}
+
 /// First run on a Mac with no node yet: the node is made here, in the window, as `vox node create`
 /// makes it (a name, and its identity passphrase typed twice), then attached. Nothing on the way
 /// sends the person anywhere else.
@@ -217,6 +253,12 @@ private struct Welcome: View {
         Text(Welcome.capitalized(noBackupNotice()))
             .secondaryText()
             .accessibilityIdentifier("new-node-no-backup")
+        ForEach(model.movedAside, id: \.to) { moved in
+            Text("Moved aside, untouched: \(moved.from) is now \(moved.to).")
+                .secondaryText()
+                .textSelection(.enabled)
+                .accessibilityIdentifier("moved-aside-note")
+        }
         if let said {
             Said(text: said)
         }
