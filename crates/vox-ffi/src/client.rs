@@ -1011,6 +1011,13 @@ fn answered(frame: Frame) -> Result<Frame, VoxError> {
         Frame::NodeDetached { node } => Err(VoxError::Detached {
             reason: format!("node {node} was detached from the vox daemon"),
         }),
+        // The node says why as a sentence; the passphrase gate's is its own fault's, word for
+        // word, so it is told apart here, once, and typed for the client (D1).
+        Frame::Error { reason }
+            if reason == vox_core::node::api::Fault::PassphraseNeeded.explain() =>
+        {
+            Err(VoxError::PassphraseNeeded { reason })
+        }
         Frame::Error { reason } => Err(failed(reason)),
         other => Ok(other),
     }

@@ -59,6 +59,13 @@ pub enum VoxError {
         /// What happened, for a person.
         reason: String,
     },
+    /// A keyring change needs the identity passphrase: none was entered for one within the keyring
+    /// window (ADR-026 N-2, ADR-028 K-12). A client asks for it and makes the same change again.
+    #[error("{reason}")]
+    PassphraseNeeded {
+        /// The node's sentence, for a person.
+        reason: String,
+    },
 }
 
 fn failed(reason: impl Into<String>) -> VoxError {

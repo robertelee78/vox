@@ -131,9 +131,12 @@ final class NodeModel: ObservableObject {
     /// What the last keyring change did, or why it failed, in the daemon's words (E-5, M-7).
     @Published private(set) var keyringDid: String?
     @Published private(set) var keyringFailed: String?
-    /// The keyring window has closed: the change waiting is made once the passphrase is given.
-    @Published private(set) var keyringNeedsPassphrase = false
-    private var keyringWaiting: ((Passphrase?) async throws -> String)?
+    /// The keyring change waiting for the identity passphrase (the keyring window has closed,
+    /// ADR-026 N-2), bound to what it changes (D1): made only with it, cleared by Cancel and by
+    /// any keyring change that succeeds, and replaced only when the person says so.
+    @Published private(set) var keyringPending: KeyringPending?
+    /// A second gated change while one waits: asked about first, never put in silently (D1).
+    @Published private(set) var keyringReplacing: KeyringPending?
 
     /// Follows who has read what while a room is on screen.
     private var watching: Task<Void, Never>?
@@ -378,7 +381,9 @@ final class NodeModel: ObservableObject {
     /// K-16). Whether it was done.
     func trust(_ fingerprint: String, as alias: String, drive: Bool) async -> Bool {
         let fp = fingerprint.filter { !$0.isWhitespace && $0 != "-" && $0 != "·" }.lowercased()
-        return await keyringChange { [client] pass in
+        return await keyringChange(fingerprint: fp, alias: alias,
+                                   words: "trust \(alias), \(Capability.words(drive))",
+                                   action: "Trust") { [client] pass in
             try await client.trustAdd(fingerprint: fp, name: alias, drive: drive,
                                       identityPassphrase: pass)
             return "Trusting \(fp.prefix(12)) as \(alias), \(Capability.words(drive))."
@@ -387,7 +392,9 @@ final class NodeModel: ObservableObject {
 
     /// Give `node` drive as well as read, or (`drive` false) read only (K-14).
     func setCapability(_ node: TrustedNode, drive: Bool) async -> Bool {
-        await keyringChange { [client] pass in
+        await keyringChange(fingerprint: node.fingerprint, alias: node.name,
+                            words: "give \(node.name) \(Capability.words(drive))",
+                            action: drive ? "Give Drive" : "Read Only") { [client] pass in
             try await client.setCapability(fingerprint: node.fingerprint, drive: drive,
                                            identityPassphrase: pass)
             return "\(node.name) now has \(Capability.words(drive))."
@@ -396,7 +403,9 @@ final class NodeModel: ObservableObject {
 
     /// Show `fingerprint` as `alias` from now on.
     func rename(_ fingerprint: String, to alias: String) async -> Bool {
-        await keyringChange { [client] pass in
+        let was = trusted.first { $0.fingerprint == fingerprint }?.name ?? String(fingerprint.prefix(12))
+        return await keyringChange(fingerprint: fingerprint, alias: alias,
+                                   words: "rename \(was) to \(alias)", action: "Rename") { [client] pass in
             try await client.trustRename(fingerprint: fingerprint, name: alias,
                                          identityPassphrase: pass)
             return "\(fingerprint.prefix(12)) is now \(alias)."
@@ -405,28 +414,42 @@ final class NodeModel: ObservableObject {
 
     /// Untrust `node`.
     func untrust(_ node: TrustedNode) async {
-        _ = await keyringChange { [client] pass in
+        _ = await keyringChange(fingerprint: node.fingerprint, alias: node.name,
+                                words: "stop trusting \(node.name)", action: "Untrust") { [client] pass in
             try await client.trustRemove(fingerprint: node.fingerprint, identityPassphrase: pass)
             return "No longer trusting \(node.name). Your sender key is rotated, and everyone you "
                 + "still trust is re-keyed."
         }
     }
 
-    /// The change waiting for the passphrase, made with it; its bytes are wiped at once.
-    func retryKeyring(with secret: Secret) async {
+    /// The change `pending` names, made with the passphrase typed for it; its bytes are wiped at
+    /// once. Nothing is made unless `pending` is still the change waiting (D1): a prompt drawn for
+    /// one change never makes another.
+    func retryKeyring(_ pending: KeyringPending, with secret: Secret) async {
         defer { secret.wipe() }
-        guard let waiting = keyringWaiting else { return }
+        guard keyringPending?.id == pending.id else { return }
         do {
             let passphrase = try secret.passphrase()
             defer { passphrase.wipe() }
-            keyringDid = try await waiting(passphrase)
+            keyringDid = try await pending.run(passphrase)
             keyringFailed = nil
-            keyringNeedsPassphrase = false
-            keyringWaiting = nil
+            if keyringPending?.id == pending.id { keyringPending = nil }
             await refresh()
         } catch {
             keyringFailed = sentence(error)
         }
+    }
+
+    /// Cancel the change waiting for the passphrase: it is not made (D1).
+    func cancelKeyring() {
+        keyringPending = nil
+        keyringReplacing = nil
+    }
+
+    /// The person's answer to "Replace the waiting change?" (D1).
+    func replaceKeyring(_ yes: Bool) {
+        if yes, let next = keyringReplacing { keyringPending = next }
+        keyringReplacing = nil
     }
 
     // ---- trust offers (ADR-028 K-15 to K-18) ------------------------------------------------
@@ -452,23 +475,31 @@ final class NodeModel: ObservableObject {
     }
 
     /// Make a keyring change, asking for the passphrase when the node says the keyring window has
-    /// closed (ADR-026 N-2), and say what it did.
-    private func keyringChange(_ change: @escaping (Passphrase?) async throws -> String) async -> Bool {
+    /// closed (ADR-026 N-2, a typed refusal), and say what it did. The change waiting is named
+    /// (D1): what, on whom, and the action that makes it.
+    private func keyringChange(fingerprint: String, alias: String, words: String, action: String,
+                               _ change: @escaping (Passphrase?) async throws -> String) async -> Bool {
         keyringDid = nil
         keyringFailed = nil
         do {
             keyringDid = try await change(nil)
-            keyringNeedsPassphrase = false
+            // Any change that succeeds clears the one waiting: it was made in another way, or
+            // the person has moved on (D1).
+            keyringPending = nil
+            keyringReplacing = nil
             await refresh()
             return true
-        } catch {
-            let why = sentence(error)
-            if why.contains("needs your identity passphrase") {
-                keyringWaiting = change
-                keyringNeedsPassphrase = true
+        } catch VoxError.PassphraseNeeded {
+            let next = KeyringPending(fingerprint: fingerprint, alias: alias, words: words,
+                                      action: action, run: change)
+            if let waiting = keyringPending, waiting.words != next.words {
+                keyringReplacing = next
             } else {
-                keyringFailed = why
+                keyringPending = next
             }
+            return false
+        } catch {
+            keyringFailed = sentence(error)
             return false
         }
     }
