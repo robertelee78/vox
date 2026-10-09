@@ -694,6 +694,15 @@ final class NodeModel: ObservableObject {
         report(done: "Copied the address of \(service.address).")
     }
 
+    /// Copy a service's whole address: its canonical form, which works pasted on any member's
+    /// machine (S-1, S-3), said by its readable one (G3).
+    func copyAddress(of service: SharedService) {
+        begin("copy")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(service.canonical, forType: .string)
+        report(done: "Copied the address of \(service.address).")
+    }
+
     /// Copy a service's command, as given: with the canonical address (S-3).
     func copyCommand(_ command: String) {
         begin("copy")

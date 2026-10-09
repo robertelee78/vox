@@ -58,7 +58,10 @@
 // 16. What an operation comes to (#608, #611, #615), run after step 5, or alone with
 //     VOX_PROOF_FROM=16: New Room with an empty passphrase says what that means and makes the
 //     room; a refused End for Everyone keeps its sheet open with the reason; that refusal is the
-//     status bar's, never another sheet's, and dismissed it goes.
+//     status bar's, never another sheet's, and dismissed it goes. And G3 (ADR-017 S-1): a service
+//     bob shares in mission, in the services view, shows its address broken into its parts, each
+//     labelled (service, your node alias, your room alias, Vox address), and Copy Address copies
+//     it whole, canonical.
 //
 // Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
 // place of the app's hold), and quitting leaves it attached: (12) goes red. A room with a message
@@ -842,6 +845,7 @@ final class FirstRunProof: XCTestCase {
         // stops after it.
         if from <= 5 || from == 16 {
             try outcomes(ui, vox: vox, voxEnv: voxEnv, roomPass: roomPass)
+            try addressAnatomy(ui, vox: vox, voxEnv: voxEnv, room: room)
             if from == 16 {
                 print("[proof] VOX_PROOF_FROM=16: step 16 run alone; steps 6 to 15 NOT RUN")
                 return
@@ -1403,6 +1407,55 @@ final class FirstRunProof: XCTestCase {
             XCTFail("PRODUCT: dismissed, the status bar's result must go; it still says it")
         }
         print("[proof] status bar said \(barSays) as a refusal; the Retention sheet did not; dismissed, it went")
+    }
+
+    /// (16, G3) A service's address in its parts (ADR-017 S-1): bob shares `photos` in mission;
+    /// alice's services view shows its readable address with each part labelled, as alice's
+    /// `vox service list --json` gives the address, and Copy Address copies its canonical form.
+    ///
+    /// Mutant: no anatomy under the address (`AddressAnatomy` drawing nothing): red.
+    private func addressAnatomy(_ ui: XCUIApplication, vox: String, voxEnv: [String: String],
+                                room: String) throws {
+        let echo = try EchoServer(stager)
+        try staged(vox, ["service", "add", "--node", "bob", room, "photos", "127.0.0.1:\(echo.port)"],
+                   env: voxEnv)
+        var readable = ""
+        var canonical = ""
+        let until = Date().addingTimeInterval(60)
+        while Date() < until && canonical.isEmpty {
+            let listed = run(vox, ["service", "list", "--node", "alice", "--json", room], env: voxEnv).out
+            let json = (try? JSONSerialization.jsonObject(with: Data(listed.utf8))) as? [String: Any]
+            let photos = (json?["shared"] as? [[String: Any]] ?? []).first {
+                ($0["readable"] as? String)?.hasPrefix("photos.") == true
+            }
+            readable = photos?["readable"] as? String ?? ""
+            canonical = photos?["address"] as? String ?? ""
+            if canonical.isEmpty { Thread.sleep(forTimeInterval: 1) }
+        }
+        guard !canonical.isEmpty else {
+            throw Apparatus("alice's `vox service list --json` never listed bob's photos share")
+        }
+        // The parts, from the address `vox` gives: service and room one label each, the node
+        // part between them.
+        let labels = readable.dropLast(4).split(separator: ".").map(String.init)
+        guard readable.hasSuffix(".vox"), labels.count >= 3 else {
+            throw Apparatus("alice's `vox service list` gave the address \(readable), not <service>.<node>.<room>.vox")
+        }
+        let want = "\(labels[0]), service; \(labels.dropFirst().dropLast().joined(separator: ".")), your node alias; "
+            + "\(labels[labels.count - 1]), your room alias; vox, Vox address"
+        ui.typeKey("s", modifierFlags: [.command, .shift])
+        present(ui, Key.id("service-box-\(readable)"), timeout: 30,
+                "the services view must list bob's photos share \(readable)")
+        let said = words(ui, Key.id("service-anatomy-\(readable)"), timeout: 10,
+                         "the services view must show \(readable) in its parts, each labelled: \(want)",
+                         until: { $0 == want }) ?? ""
+        let pasted = copiedBy(ui) {
+            tap(ui, Key.id("copy-address-\(readable)"), "Copy Address on bob's photos share")
+        }
+        if pasted != canonical {
+            XCTFail("PRODUCT: Copy Address must copy the whole address, canonical (\(canonical)); the pasteboard holds \(pasted.debugDescription)")
+        }
+        print("[proof] G3: \(readable) shown as \(said); Copy Address copied \(pasted)")
     }
 
     // ---- every check on the window proves its own query first --------------------------------

@@ -116,7 +116,16 @@ private struct SharedServiceBox: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(service.address).font(Theme.mono).fontWeight(.bold).textSelection(.enabled)
+            HStack(alignment: .firstTextBaseline) {
+                Text(service.address).font(Theme.mono).fontWeight(.bold).textSelection(.enabled)
+                Spacer()
+                // The whole address, copied canonical: it reaches the same service pasted on any
+                // member's machine (S-1, S-3).
+                Button("Copy Address") { model.copyAddress(of: service) }
+                    .accessibilityLabel("Copy the address \(service.address)")
+                    .accessibilityIdentifier("copy-address-\(service.address)")
+            }
+            AddressAnatomy(address: service.address)
             Text("by \(service.by) in \(room)  ·  \(service.kind)").caption().secondaryText()
             ForEach(Array(service.commands.enumerated()), id: \.offset) { _, command in
                 HStack(alignment: .firstTextBaseline) {
@@ -266,6 +275,43 @@ private struct ShareForm: View {
             picked = nil
             self.preview = nil
             await shared()
+        }
+    }
+}
+
+/// A service's readable address broken into its parts, each labelled (G3, ADR-017 S-1):
+/// `<service>.<node>.<room>.vox`, where the node and the room are this node's own aliases, so a
+/// person sees the names are theirs. The service and the room are one DNS label each; whatever is
+/// between them is the node part.
+struct AddressAnatomy: View {
+    let address: String
+
+    /// The parts with what each is, or nil for an address of another form.
+    static func parts(of address: String) -> [(part: String, what: String)]? {
+        guard address.hasSuffix(".vox") else { return nil }
+        let labels = address.dropLast(4).split(separator: ".", omittingEmptySubsequences: false)
+        guard labels.count >= 3, let service = labels.first, let room = labels.last,
+              !service.isEmpty, !room.isEmpty else { return nil }
+        let node = labels.dropFirst().dropLast().joined(separator: ".")
+        guard !node.isEmpty else { return nil }
+        return [(String(service), "service"), (node, "your node alias"),
+                (String(room), "your room alias"), ("vox", "Vox address")]
+    }
+
+    var body: some View {
+        if let parts = Self.parts(of: address) {
+            HStack(alignment: .top, spacing: 4) {
+                ForEach(Array(parts.enumerated()), id: \.offset) { n, p in
+                    if n > 0 { Text(".").font(Theme.mono).secondaryText().accessibilityHidden(true) }
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(p.part).font(Theme.mono)
+                        Text(p.what).caption().secondaryText()
+                    }
+                }
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(parts.map { "\($0.part), \($0.what)" }.joined(separator: "; "))
+            .accessibilityIdentifier("service-anatomy-\(address)")
         }
     }
 }
