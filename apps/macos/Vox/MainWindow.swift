@@ -703,6 +703,7 @@ private struct MessageRow: View {
                     .font(Theme.mono).secondaryText()
                     .help(TimelineTime.full(message.createdMillis))
                     .accessibilityLabel(TimelineTime.full(message.createdMillis))
+                    .accessibilityValue(TimelineTime.short(message.createdMillis))
                     .accessibilityIdentifier("time-\(message.id)")
                 if message.urgent { StateMark(kind: .attention, words: "urgent") }
                 if message.to.contains(me) { Text("to you").eyebrow() }
