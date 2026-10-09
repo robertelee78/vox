@@ -256,6 +256,10 @@ final class FirstRunProof: XCTestCase {
     }
 
     override func tearDown() {
+        // A red stops a case without running its `defer`s (continueAfterFailure is false), so the
+        // Vox it started would still run into the next case: quit here each Vox this case started.
+        for ui in launched where ui.state != .notRunning { ui.terminate() }
+        launched = []
         if let watchingForeground { NSWorkspace.shared.notificationCenter.removeObserver(watchingForeground) }
         if let watchingVox { NSWorkspace.shared.notificationCenter.removeObserver(watchingVox) }
         daemon?.terminate()
@@ -1706,6 +1710,9 @@ final class FirstRunProof: XCTestCase {
 
     /// The app the proof drives: this build's own Vox.app, by its path (app-proofs.sh refuses any
     /// other: XCTest launches another bundle without the environment).
+    /// Each Vox.app this case started, quit at its end however it ends.
+    private var launched: [XCUIApplication] = []
+
     private func voxApp(_ appPath: String) -> XCUIApplication {
         XCUIApplication(url: URL(fileURLWithPath: appPath))
     }
@@ -1727,6 +1734,7 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("refusing to start Vox.app: a Vox.app already runs (pid \(running), \(executable(running))), and the proof could drive it")
         }
         ui.launch()
+        launched.append(ui)
         let running = pids("Vox")
         guard running.count == 1, let pid = running.first, executable(pid) == appExe else {
             throw Apparatus("after starting Vox.app, the Vox processes are \(running.map { "\($0) \(executable($0))" }), not one of \(appExe)")
