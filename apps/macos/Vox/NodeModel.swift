@@ -409,13 +409,13 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// Untrust `node`.
+    /// Remove `node` from the keyring.
     /// Whether it was done; when not, why is `keyringFailed`, or the passphrase is asked for.
     @discardableResult
     func untrust(_ node: TrustedNode) async -> Bool {
         await keyringChange { [client] pass in
             try await client.trustRemove(fingerprint: node.fingerprint, identityPassphrase: pass)
-            return "No longer trusting \(node.name). Your sender key is rotated, and everyone you "
+            return "Removed \(node.name) from your keyring. Your sender key is rotated, and everyone you "
                 + "still trust is re-keyed."
         }
     }
