@@ -211,22 +211,31 @@ fn build_harnesses(out: &Path) -> Harnesses {
     .output()
     .expect("APPARATUS: could not start build-xcframework.sh");
     if !built.status.success() {
-        // A red names its reason and its side: a toolchain this machine lacks is the machine's,
-        // anything else the script (shipped with vox) did is the product's.
+        // A red names its reason and its side. This is the proof building the library it runs
+        // against, before any product step: a build that fails is the apparatus's (APPARATUS),
+        // and a Rust target this machine lacks is a precondition unmet. It was called PRODUCT
+        // (staging), which a build cut short by the machine's compiler cache ("can't find crate
+        // for `zeroize_derive`", 2026-10-08) is not.
         let said = format!(
             "{}{}",
             String::from_utf8_lossy(&built.stdout),
             String::from_utf8_lossy(&built.stderr)
         );
+        let errors: Vec<&str> = said
+            .lines()
+            .filter(|l| l.starts_with("error"))
+            .take(5)
+            .collect();
         let side = if said.contains("is not installed; run: rustup target add") {
             "CANNOT MEASURE (precondition unmet): this machine lacks a Rust target the \
              xcframework needs"
         } else {
-            "PRODUCT (staging)"
+            "APPARATUS: the proof's own build of the xcframework failed"
         };
         panic!(
-            "{side}: build-xcframework.sh exited {}; it said:\n{said}",
-            built.status
+            "{side}: build-xcframework.sh exited {}; its errors:\n{}\nall it said:\n{said}",
+            built.status,
+            errors.join("\n")
         );
     }
     let lib = out.join("VoxFFI.xcframework/macos-arm64");
