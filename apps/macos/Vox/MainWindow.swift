@@ -1324,11 +1324,11 @@ private struct TrustBanner: View {
                 StateMark(kind: .attention, words: words(cut))
                     .accessibilityIdentifier("trust-banner")
                 Spacer()
-                if cut.count == 1, let member = cut.first, member.trust == .none,
+                if cut.count == 1, let member = cut.first, !member.trust.inKeyring,
                    model.offers.contains(where: { $0.fingerprint == member.id }) {
                     Button("Trust \(member.name)…") { Task { await model.show(.offer(member.id)) } }
                         .accessibilityIdentifier("trust-banner-offer")
-                } else if cut.contains(where: { $0.trust == .none }) {
+                } else if cut.contains(where: { !$0.trust.inKeyring }) {
                     Button("Show Keyring") { Task { await model.show(.keyring) } }
                         .accessibilityIdentifier("trust-banner-keyring")
                 }
@@ -1348,7 +1348,8 @@ private struct TrustBanner: View {
         switch (m.trust, m.trustsYou) {
         case (.oneWay, _):
             return "You trust \(m.name). Waiting for \(m.name) to trust you back before you can read each other."
-        case (.none, true):
+        // Not in the keyring and trusting this node: D4's theyOnly, or none with its trust seen.
+        case (.theyOnly, _), (.none, true):
             return "\(m.name) trusts you. Trust \(m.name) too, and you can read each other."
         default:
             return "You and \(m.name) can't read each other yet: each of you has to trust the other."
