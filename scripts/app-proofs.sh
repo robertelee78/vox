@@ -29,6 +29,8 @@ cd "$ROOT"
 DERIVED="$ROOT/target/xcode"
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/vox-app-proofs.XXXXXX")"
 trap 'rm -rf "$SCRATCH"' EXIT
+# Killed or interrupted, the run still ends through its EXIT trap (which stops what it started).
+trap 'exit 130' INT TERM HUP
 
 # **Never the person's own Vox, and never its profile** (APPARATUS). The person's own Vox.app
 # (us.vox.app), its login item and its daemon may be installed and running on the real profile:
