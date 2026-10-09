@@ -26,6 +26,9 @@
 //    FROM-ALICE" above it, and its quote, clicked, or ⌘↑ with the reply selected, selects FROM-ALICE.
 //    To: offers bob's open Session under him (MADR W-4, ADR-029 TA-1, D7): ticked, alice's post is
 //    addressed to that Session alone, <bob>/<session>, as bob's node holds it.
+//    @alias (ADR-028 K-4, D8): "@b" offers @bob, and picked, it addresses bob. Step 5 warns of an
+//    alias the same as bob's but for case before it is given, and (5b) with carol trusted as "Bob",
+//    bob is told apart in mission's members as bob#<his fingerprint's first 6>.
 // 5. The keyring view (ADR-014 M-16, ADR-028 K-3, E-5, #443): a pasted fingerprint with an alias
 //    says what trusting does before it is done, and is listed, as `vox trust list` lists it;
 //    removing it says what untrusting does first, and only then removes it.
@@ -79,6 +82,8 @@
 // A quote that goes nowhere (MessageRow's quote button not calling `jump`): (4) goes red.
 // To: that ticks the member for one of its Sessions (the Session's tick inserting the member's
 // fingerprint alone): (4) goes red.
+// An @alias picked that is only written, not addressed: (4) goes red. The FFI's names() without
+// the clash suffix: (5) goes red.
 
 // Every check on the window proves its own query first (ADR-018: a red names its side): Vox is in
 // front and XCTest reads words in what it shows, else the red is APPARATUS; then a red is PRODUCT
@@ -889,6 +894,29 @@ final class FirstRunProof: XCTestCase {
                       "PRODUCT: alice's post with bob's Session ticked in To: must be addressed to that Session alone, <bob>/\(d7Session); bob's node holds it addressed to \(addressedTo)")
         print("[proof] To: bob's Session: the post is addressed to \(addressedTo)")
 
+        // (4e) @alias (ADR-028 K-4, D8): typing "@b" in the composer offers @bob; picked, it is
+        // written in full and bob is addressed, as ticking him in To: does.
+        let composeBox = Key.id("compose")
+        type(ui, composeBox, "MENTION @b", "the composer")
+        tap(ui, Key.id("mention-bob"), "@bob offered for \"@b\"",
+            premise: member(vox, voxEnv, room, bobFp, "bob"))
+        words(ui, Key.id("compose-to"), timeout: 10, "@bob picked must address bob, as To: says",
+              until: { $0 == "To: bob" })
+        el(ui, composeBox).typeText("\r")
+        var mentionedTo: [String] = []
+        let mentionUntil = Date().addingTimeInterval(30)
+        while Date() < mentionUntil && mentionedTo.isEmpty {
+            let rows = run(vox, ["room", "read", "--node", "bob", "--json", room], env: voxEnv).out
+            for line in rows.split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      (row["text"] as? String)?.contains("MENTION @bob") == true else { continue }
+                mentionedTo = (row["envelope"] as? [String: Any])?["to"] as? [String] ?? ["(not addressed)"]
+            }
+            if mentionedTo.isEmpty { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        XCTAssertEqual(mentionedTo.map { $0.lowercased() }, [bobFp.lowercased()],
+                       "PRODUCT: \"MENTION @bob\", @bob picked in the composer, must be addressed to bob; bob's node holds it addressed to \(mentionedTo)")
+
         // (5) The keyring: carol, a node made here, added by her pasted fingerprint, then removed.
         try staged(vox, ["node", "create", "carol"],
                    env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "carol identity"]) { $1 })
@@ -898,6 +926,13 @@ final class FirstRunProof: XCTestCase {
         present(ui, addFp, timeout: 10, "the keyring view must offer to add a node")
         type(ui, addFp, carolFp, "the fingerprint field")
         let addAlias = Key.id("keyring-add-alias")
+        // An alias the same as bob's but for case is warned of before it is given (K-4, D8).
+        type(ui, addAlias, "BOB", "the alias field")
+        words(ui, Key.id("alias-clash"), timeout: 10,
+              "an alias the same as bob's but for case must be warned of before it is given",
+              until: { $0.contains("Your keyring already has bob") })
+        el(ui, addAlias).typeKey("a", modifierFlags: .command)
+        el(ui, addAlias).typeText(XCUIKeyboardKey.delete.rawValue)
         type(ui, addAlias, "carol", "the alias field")
         // The effect sentences are Texts: their words are their accessibility value.
         words(ui, Key.id("keyring-add-effect"), timeout: 10,
@@ -932,6 +967,17 @@ final class FirstRunProof: XCTestCase {
             XCTFail("PRODUCT: once untrusted, carol must be gone from the keyring view; it still shows \"\(shown(row))\"")
         }
         print("[proof] keyring: added and listed carol, then removed her after saying what untrusting does")
+
+        // (5b) Two aliases the same but for case are told apart (ADR-028 K-4, D8): carol trusted as
+        // "Bob", bob is shown in mission's members as bob#<his fingerprint's first 6>.
+        try staged(vox, ["trust", "add", "--node", "alice", carolFp, "--name", "Bob",
+                         "--identity-passphrase-file", alicePass], env: voxEnv)
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
+        present(ui, Key.id("member-bob#\(bobFp.prefix(6).lowercased())"), timeout: 30,
+                "with carol trusted as \"Bob\", bob must be told apart in mission's members as bob#\(bobFp.prefix(6).lowercased())",
+                premise: trusted(vox, voxEnv, carolFp, "Bob"))
+        try staged(vox, ["trust", "remove", "--node", "alice", carolFp,
+                         "--identity-passphrase-file", alicePass], env: voxEnv)
 
         }
 

@@ -601,6 +601,18 @@ private struct RoomView: View {
             .padding(.horizontal, 12).padding(.top, 8)
             .accessibilityIdentifier("replying-to")
         }
+        if !mentions.isEmpty {
+            // Typing @ offers the keyring's members of this room by name (ADR-028 K-4).
+            HStack(spacing: 8) {
+                ForEach(mentions) { member in
+                    Button("@\(member.name)") { mention(member) }
+                        .buttonStyle(.borderless)
+                        .accessibilityIdentifier("mention-\(member.name)")
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 12).padding(.top, 8)
+        }
         HStack(spacing: 8) {
             Button {
                 if let url = chooseFile() { attaching = Attaching(url: url) }
@@ -625,12 +637,43 @@ private struct RoomView: View {
 
     /// Post the draft, To: and replying as set; urgent when asked (⌘↩ or the switch).
     private func send(urgent now: Bool) {
-        let (text, recipients, re) = (draft, Array(to), model.replyTo?.id ?? "")
+        // An @alias typed in full addresses that member, as ticking it in To: does (K-4).
+        let named = draft.split(whereSeparator: \.isWhitespace).compactMap { word -> String? in
+            guard word.hasPrefix("@") else { return nil }
+            let alias = word.dropFirst().trimmingCharacters(in: .punctuationCharacters.subtracting(["#"]))
+            return mentionable.first { $0.name == alias }?.id
+        }
+        let (text, recipients, re) = (draft, Array(to.union(named)), model.replyTo?.id ?? "")
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         draft = ""
         urgent = false
         model.replyTo = nil
         Task { await model.post(text, to: recipients, urgent: now, re: re) }
+    }
+
+    /// The members an @alias can name (ADR-028 K-4): those in the keyring, by the names the node
+    /// gives them (an alias the same as another but for case carries its fingerprint's start).
+    private var mentionable: [NodeModel.MemberRow] { model.members.filter { $0.trust != .none } }
+
+    /// The @word being typed at the end of the draft: what follows "@", or nil.
+    private var mentioning: String? {
+        guard let at = draft.lastIndex(of: "@"),
+              at == draft.startIndex || draft[draft.index(before: at)].isWhitespace else { return nil }
+        let word = draft[draft.index(after: at)...]
+        return word.contains(where: \.isWhitespace) ? nil : String(word)
+    }
+
+    /// The members the @word being typed could name, by the start of their names.
+    private var mentions: [NodeModel.MemberRow] {
+        guard let typed = mentioning?.lowercased() else { return [] }
+        return mentionable.filter { $0.name.lowercased().hasPrefix(typed) }
+    }
+
+    /// `member` picked for the @word being typed: written in full, and addressed (K-4).
+    private func mention(_ member: NodeModel.MemberRow) {
+        guard let at = draft.lastIndex(of: "@") else { return }
+        draft = String(draft[..<at]) + "@\(member.name) "
+        to.insert(member.id)
     }
 
     /// ↑/↓ on the timeline: the selection moves to the message before or after it, scrolled into

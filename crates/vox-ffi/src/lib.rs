@@ -101,6 +101,18 @@ pub fn fingerprint_card(fingerprint: String) -> FingerprintCard {
     }
 }
 
+/// Which of `others` (the keyring's other aliases) `alias` would be taken for (ADR-028 K-4): the
+/// first that equals it but for case, by the one rule every client follows
+/// ([`vox_text::alias::clashes`]); `None` when none does. What the app's add, rename and accept
+/// forms warn of before the alias is given.
+#[uniffi::export]
+#[must_use]
+pub fn clashing_alias(others: Vec<String>, alias: String) -> Option<String> {
+    others
+        .into_iter()
+        .find(|other| vox_text::alias::clashes(&[(0_u8, other.clone())], &1, &alias))
+}
+
 /// A room this node holds.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct Room {

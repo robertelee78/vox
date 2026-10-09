@@ -66,29 +66,13 @@ pub fn typed_fingerprint(text: &str) -> String {
 }
 
 /// How many fingerprint characters follow an alias that another node's alias equals but for case.
-pub const CLASH_SUFFIX: usize = 6;
+pub const CLASH_SUFFIX: usize = vox_text::alias::CLASH_SUFFIX;
 
-/// `fp`'s alias as a person reads it (ADR-028 K-4): the alias, and, when another node in the
-/// keyring has the same alias but for case ("Ann" and "ann"), `#` and the first [`CLASH_SUFFIX`]
-/// characters of the fingerprint, so the two are never taken for one. `None` when `fp` has no
-/// alias.
+/// `fp`'s alias as a person reads it (ADR-028 K-4), by the one rule every client follows
+/// ([`vox_text::alias::alias_of`]). `None` when `fp` has no alias.
 #[must_use]
 pub fn alias_of(trusted: &[(Digest32, String)], fp: &Digest32) -> Option<String> {
-    let (_, alias) = trusted.iter().find(|(id, _)| id == fp)?;
-    let alias = alias.trim();
-    if alias.is_empty() {
-        return None;
-    }
-    let clash = trusted
-        .iter()
-        .any(|(id, other)| id != fp && other.trim().to_lowercase() == alias.to_lowercase());
-    Some(if clash {
-        let mut suffix = b32_encode(fp);
-        suffix.truncate(CLASH_SUFFIX);
-        format!("{alias}#{suffix}")
-    } else {
-        alias.to_owned()
-    })
+    vox_text::alias::alias_of(trusted, fp, b32_encode)
 }
 
 /// A member's name where the keyring is known: its alias ([`alias_of`]), or its fingerprint at
