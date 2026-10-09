@@ -60,16 +60,20 @@ if launchctl print "gui/$(id -u)/us.vox.daemon" 2>/dev/null \
         "directories; turn it off (System Settings, General, Login Items) before a run" >&2
     exit 2
 fi
-# Nor one registered and allowed but not loaded yet. `sfltool dumpbtm` reads the background items
-# without privileges: an item of the proof build (identifier, parent or bundle us.vox.app.proof,
-# or a URL under this run's derived data) not "disallowed" refuses.
-if /usr/bin/sfltool dumpbtm </dev/null 2>/dev/null | awk -v derived="$DERIVED" '
-    /Disposition:/ { d = $0 }
-    (/us\.vox\.app\.proof/ || index($0, derived) > 0) && d !~ /disallowed/ { found = 1 }
-    END { exit !found }'; then
-    echo "app-proofs: APPARATUS (precondition unmet): a proof build's background item" \
-        "(us.vox.app.proof) is registered and allowed on this Mac; switch it off under System" \
-        "Settings, General, Login Items & Extensions before a run" >&2
+# Nor the proof build's LAN helper (a launchd daemon), nor any job labelled for it. All read
+# without administrator rights: `launchctl print`/`list` only, never a tool that asks for them.
+# A background item registered but not loaded, which only the background-task database would show,
+# the proof build cannot make: its login item and LAN helper are stand-ins (ProofBackgroundItem,
+# VOX_PROOF_STUB_SERVICES) that register nothing.
+if launchctl print system/us.vox.lanhelper 2>/dev/null \
+    | grep -q "parent bundle identifier = us\.vox\.app\.proof$"; then
+    echo "app-proofs: APPARATUS (precondition unmet): a proof build's LAN helper (us.vox.lanhelper of" \
+        "us.vox.app.proof) is loaded on this Mac; remove it before a run" >&2
+    exit 2
+fi
+if launchctl list 2>/dev/null | grep -q "us\.vox\.app\.proof"; then
+    echo "app-proofs: APPARATUS (precondition unmet): a launchd job of the proof build" \
+        "(us.vox.app.proof) is loaded on this Mac: $(launchctl list | grep "us\.vox\.app\.proof")" >&2
     exit 2
 fi
 # The names the proofs give nodes: none of them is the person's, so one appearing in the real
