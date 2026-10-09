@@ -37,6 +37,16 @@ struct VoxApp: App {
                 .preferredColorScheme(.dark)
         }
         .commands { VoxCommands(app: model) }
+        // Vox > Settings… (⌘,): Keep Running, the menu bar item and the text size, where a person
+        // looks for them after first run.
+        Settings {
+            SettingsView(app: model)
+                .font(Theme.text)
+                .controlSize(Theme.controls)
+                .buttonStyle(VoxButtonStyle())
+                .id(model.textScale)
+                .preferredColorScheme(.dark)
+        }
         // Off until the person turns it on (M-22). Its image is the Vox mark as a template
         // (assets/brand/vox-menubar.svg, made into MenuBarIcon by scripts/brand-icon.sh), which
         // macOS draws in the menu bar's own colour.

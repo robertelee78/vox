@@ -60,7 +60,6 @@ private struct Sidebar: View {
                                 })) {
             Section {
                 StateMark(kind: .live, words: "node \(model.node), attached")
-                    .font(Theme.text)
                     .accessibilityIdentifier("attached")
                     .background(SidebarHighlightOff())
             }
@@ -71,7 +70,8 @@ private struct Sidebar: View {
                 let count = rooms.count + offers.count
                 Section {
                     ForEach(rooms) { room in
-                        RoomRow(room: room).tag(NodeModel.Selection.room(room.id))
+                        RoomRow(room: room, selected: model.selection == .room(room.id))
+                            .tag(NodeModel.Selection.room(room.id))
                             .sidebarRow(model.selection == .room(room.id))
                     }
                     ForEach(offers, id: \.fingerprint) { offer in
@@ -86,13 +86,13 @@ private struct Sidebar: View {
                 }
             }
             Section {
-                Text("Keyring").font(Theme.text).tag(NodeModel.Selection.keyring)
+                Text("Keyring").tag(NodeModel.Selection.keyring)
                     .sidebarRow(model.selection == .keyring)
                     .accessibilityIdentifier("keyring")
-                Text("Decision record").font(Theme.text).tag(NodeModel.Selection.decisions)
+                Text("Decision record").tag(NodeModel.Selection.decisions)
                     .sidebarRow(model.selection == .decisions)
                     .accessibilityIdentifier("decisions")
-                Text("Services").font(Theme.text).tag(NodeModel.Selection.services)
+                Text("Services").tag(NodeModel.Selection.services)
                     .sidebarRow(model.selection == .services)
                     .accessibilityIdentifier("services")
             }
@@ -100,23 +100,23 @@ private struct Sidebar: View {
                 ForEach(model.nodes, id: \.name) { node in
                     StateMark(kind: node.state == "attached" ? .live : .plain,
                               words: "\(node.name) \(node.state)")
-                        .font(Theme.text)
-                        .accessibilityIdentifier("node-\(node.name)")
+                            .accessibilityIdentifier("node-\(node.name)")
                 }
             } header: {
                 Text("nodes on this Mac").eyebrow().accessibilityAddTraits(.isHeader)
             }
         }
         .listStyle(.sidebar)
-        // The sidebar's rows in the app's face and size: a sidebar list sets its own otherwise.
-        .font(Theme.text)
+        // The sidebar's rows keep macOS's sidebar size (System Settings, Appearance, Sidebar icon
+        // size), never the conversation's text size (the decider, v0.4.1).
+        .font(nil)
         .environment(\.defaultMinListRowHeight, Theme.scaled(24))
     }
 }
 
 extension View {
     /// A sidebar row's fill while it is the one selected: the selection token, on which
-    /// text.primary is 4.89:1 (WCAG 2.1 1.4.3, #450). The system's own highlight, which ignores
+    /// text.primary is 7.86:1 (WCAG 2.1 1.4.3, #450). The system's own highlight, which ignores
     /// `.tint` and drew text.primary at 3.1:1, is off (`SidebarHighlightOff`); the row is still the
     /// list's selection, so arrow keys move it and VoiceOver says it is selected.
     fileprivate func sidebarRow(_ selected: Bool) -> some View {
@@ -144,6 +144,15 @@ private struct SelectionFill: NSViewRepresentable {
             guard selected, let color = NSColor(named: "Selection") else { return }
             color.setFill()
             NSBezierPath(roundedRect: bounds, xRadius: 5, yRadius: 5).fill()
+            // The accent bar at the leading edge: the selection's mark, 9.54:1 against the panel
+            // (the fill alone is 1.94:1), so the selection never rests on its fill (the decider,
+            // v0.4.1: grey, with ice for focus and live state).
+            if let accent = NSColor(named: "Accent") {
+                accent.setFill()
+                NSBezierPath(roundedRect: NSRect(x: bounds.minX + 2, y: bounds.minY + 5, width: 3,
+                                                 height: Swift.max(bounds.height - 10, 0)),
+                             xRadius: 1.5, yRadius: 1.5).fill()
+            }
         }
     }
 }
@@ -172,12 +181,19 @@ private struct SidebarHighlightOff: NSViewRepresentable {
 /// A room in the sidebar: its name, and its unread in words.
 private struct RoomRow: View {
     let room: NodeModel.Room
+    /// Whether it is the row selected: its second line then takes selection.secondary, which
+    /// reads on the selection's fill (text.secondary would not: 3.66:1).
+    var selected = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(room.name).font(Theme.text).fontWeight(room.need == .quiet ? .regular : .bold)
+            Text(room.name).fontWeight(room.need == .quiet ? .regular : .bold)
             if room.need != .quiet {
-                Text(room.words).eyebrow().secondaryText()
+                if selected {
+                    Text(room.words).eyebrow().foregroundStyle(VoxTokens.Colors.selectionSecondary)
+                } else {
+                    Text(room.words).eyebrow().secondaryText()
+                }
             }
         }
         .accessibilityElement(children: .ignore)
@@ -526,6 +542,9 @@ private struct RoomView: View {
                     SessionComposer(model: model, session: s)
                 }
             }
+            // The conversation, the timeline and the composer, at the text size View > Bigger and
+            // Smaller set (the decider, v0.4.1); the inspector beside it keeps a steady size.
+            .conversationScale(Theme.scale)
             Divider()
             Inspector(model: model, room: room)
                 .frame(width: Theme.scaled(240))
@@ -775,14 +794,14 @@ private struct FileCard: View {
                     .accessibilityIdentifier("thumb-\(file.name)")
             } else {
                 Image(systemName: file.folder ? "folder" : "doc")
-                    .font(Theme.glyph)
+                    .voxFont(VoxTokens.Fonts.appGlyph)
                     .accessibilityHidden(true)
             }
             VStack(alignment: .leading, spacing: 2) {
                 Text(file.name).fontWeight(.bold)
                 Text("\(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file))"
                     + "  ·  sha256 \(file.sha256.prefix(16))…")
-                    .font(Theme.mono).secondaryText()
+                    .voxFont(VoxTokens.Fonts.appMono).secondaryText()
                 if let pulled {
                     // Opened only once verified: a copy is linked into place only after its size
                     // and SHA-256 matched the signed announcement (F-11).
@@ -850,7 +869,7 @@ private struct ServiceCard: View {
         HStack(spacing: 8) {
             Image(systemName: "point.3.connected.trianglepath.dotted").accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
-                Text(service.address).font(Theme.mono).textSelection(.enabled)
+                Text(service.address).voxFont(VoxTokens.Fonts.appMono).textSelection(.enabled)
                 Text("by \(service.by)  ·  \(service.kind)\(service.udp && service.kind != "udp" ? "/udp" : "")")
                     .caption().secondaryText()
             }

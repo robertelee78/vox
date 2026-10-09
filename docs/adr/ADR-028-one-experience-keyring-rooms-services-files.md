@@ -319,7 +319,8 @@ keep code in sync through GitHub.
   | bg.raised | `#131417` | 233 | default bg |
   | bg.panel | `#16171a` | 234 | default bg |
   | bg.overlay | `#1c1d21` | 234 | black |
-  | selection | `#1767b5` (Increase Contrast `#1b70c6`) | 25 | blue |
+  | selection | `#45474f` (Increase Contrast `#55575f`), with an accent bar at its leading edge: text.primary on it 7.86:1 (hc 7.20), the bar against bg.panel 9.54:1 (hc 11.73) | 239 | bright black |
+  | selection.secondary | `#dcd7cf` (Increase Contrast `#e2ddd5`): a selected row's second line, 6.47:1 on selection (hc 5.33) | 252 | default fg |
   | line.hair | `#303137` (Increase Contrast `#8c8780`) | 236 | bright black |
   | text.primary | `#f0ece4` | 255 | default fg |
   | text.secondary | `#a8a299` | 247 | default fg |

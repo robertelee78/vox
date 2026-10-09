@@ -366,20 +366,24 @@ Notifications, Vox.
 ## Contrast and display settings
 
 Text is drawn at a contrast of 4.5:1 or more against its background, and card outlines at 4.5:1
-or more. A selected sidebar row is filled with a darker blue than the system's, so its text reads
-at 4.89:1. A selected row or card also has a bar along its leading edge, so a selection never
-rests on colour alone.
+or more. A selected sidebar row is a grey fill with a blue bar along its leading edge; its text
+reads at 7.86:1 and its second line at 6.47:1. A selected row or card always has that bar, so a
+selection never rests on colour alone.
 
 The app follows your Mac's display settings (System Settings, Accessibility, Display):
 
 - **Increase Contrast** switches to brighter colours: every text colour at 7:1 or more against
   its background (an error on a selected row at 6:1), outlines at 3.9:1 or more, the selected
-  sidebar row's text at 5.02:1, and the selection marked with the focus colour.
+  sidebar row's text at 7.20:1 and its second line at 5.33:1, and the selection marked with the
+  focus colour.
 - **Reduce Motion** stops its animations.
 - **Reduce Transparency**: content is drawn in opaque colours only.
 
-**View > Bigger** (⌘+), **Smaller** (⌘-) and **Actual Size** (⌘0) change the size of all the
-app's text, buttons and controls, up to twice the usual size.
+**View > Bigger** (⌘+), **Smaller** (⌘-) and **Actual Size** (⌘0) change the size of the
+conversation, the messages and the composer, up to twice the usual size, as in Messages. The
+sidebar keeps macOS's sidebar size (System Settings, Appearance) and the inspector a steady size.
+**Vox > Settings…** (⌘,) sets the same size, and also turns Keep Running and the menu bar item on
+or off.
 
 The timeline works from the keyboard. **View > Focus Timeline** (⌃⌘T), Tab, or a click on a
 message puts the keyboard on it; ↑ and ↓ select a message, Space opens its pulled file in Quick
