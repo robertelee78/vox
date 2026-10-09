@@ -92,7 +92,7 @@ unreachable when it was reached. When an anchor is missing, say truthfully what 
   v0.4.0, proven on a data root the previous published release wrote
   (`a_data_root_of_the_previous_release_opens_with_nothing_lost`), and raises the data root's format
   (`.daemon/format`). Upgrade code is never deleted while a supported release could have written
-  the data. Data from before v0.4.0 is out of scope. (The decider, 2026-10-08; ADR-026 F-4)
+  the data. Data from before v0.4.0 is out of scope. (The decider, 2026-10-08; ADR-026 F-3)
 
 ## Safety
 
