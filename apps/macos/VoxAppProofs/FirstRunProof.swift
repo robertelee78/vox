@@ -98,6 +98,12 @@ func shown(_ element: XCUIElement) -> String {
     return element.title
 }
 
+/// What is typed in a text field: its value, never its label (a composer's label names it, as
+/// "Message to the room", whatever is typed). Empty when nothing is.
+func typed(_ field: XCUIElement) -> String {
+    (field.value as? String) ?? ""
+}
+
 /// Refuse (APPARATUS) to launch the app with a data root or config directory outside this run's
 /// scratch: a Vox started without them acts on the person's real profile.
 func scratchOnly(_ env: [String: String], under scratch: String) throws {
@@ -613,7 +619,7 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("room-work"), "work in the sidebar", premise: inRoom(vox, voxEnv, "work"))
         tap(ui, Key.id("session-general"), "General in work's Sessions")
         words(ui, compose, timeout: 10, "work's draft must be kept when another room is opened and work again",
-              until: { $0.contains("KEEP-ROOM-DRAFT") })
+              until: { $0.contains("KEEP-ROOM-DRAFT") }, field: true)
 
         // D2: with S1 shown, ⌘↩ sends nothing to the room, and Send Urgent is disabled.
         let s1Row = Key.id("session-\(s1.prefix(8))"), s2Row = Key.id("session-\(s2.prefix(8))")
@@ -633,13 +639,13 @@ final class FirstRunProof: XCTestCase {
         type(ui, sessionCompose, "S1-DRAFT", "S1's composer")
         tap(ui, s2Row, "S2 in work's Sessions")
         Thread.sleep(forTimeInterval: 1)
-        if let e = locate(ui, sessionCompose), shown(e).contains("S1-DRAFT") {
+        if let e = locate(ui, sessionCompose), typed(e).contains("S1-DRAFT") {
             keepTree(ui, "S1's draft showed in S2")
-            XCTFail("PRODUCT: S1's draft must not show in S2's composer; it shows \"\(shown(e))\"")
+            XCTFail("PRODUCT: S1's draft must not show in S2's composer; it shows \"\(typed(e))\"")
         }
         tap(ui, s1Row, "S1 in work's Sessions")
         words(ui, sessionCompose, timeout: 10, "S1's draft must come back in S1",
-              until: { $0.contains("S1-DRAFT") })
+              until: { $0.contains("S1-DRAFT") }, field: true)
 
         // D13: a prompt S2 does not take stays. claude-a is detached first, so nothing can take
         // it: refused or unanswered, the text must stay.
@@ -650,7 +656,7 @@ final class FirstRunProof: XCTestCase {
                          until: { !$0.isEmpty }) ?? ""
         words(ui, sessionCompose, timeout: 5,
               "a prompt S2 did not take must stay in its composer (S2 said \"\(said)\")",
-              until: { $0.contains("S2-PROMPT") })
+              until: { $0.contains("S2-PROMPT") }, field: true)
         ui.typeKey("c", modifierFlags: .control)
         present(ui, Key.showing("It ends the session."), timeout: 10,
                 "⌃C must ask before stopping the Session")
@@ -1842,11 +1848,13 @@ final class FirstRunProof: XCTestCase {
 
     /// `key`'s words once `holds` is true of them, within `timeout`, the premise holding: PRODUCT
     /// quoting them when it never is; `missing` when it never shows; APPARATUS when it shows and
-    /// XCTest reads neither its label nor its value.
+    /// XCTest reads neither its label nor its value. A `field` is read by what is typed in it
+    /// (`typed`), and an empty one is read as empty.
     @discardableResult
     private func words(_ ui: XCUIApplication, _ key: Key, timeout: TimeInterval, _ product: String,
-                       until holds: (String) -> Bool = { _ in true },
+                       until holds: (String) -> Bool = { _ in true }, field: Bool = false,
                        file: StaticString = #filePath, line: UInt = #line) -> String? {
+        let read = field ? typed : shown
         guard windowReadable(ui, file: file, line: line) else { return nil }
         let end = Date().addingTimeInterval(timeout)
         var last = ""
@@ -1854,19 +1862,19 @@ final class FirstRunProof: XCTestCase {
         repeat {
             if let e = locate(ui, key) {
                 seen = true
-                last = shown(e)
-                if !last.isEmpty && holds(last) { return last }
+                last = read(e)
+                if (field || !last.isEmpty) && holds(last) { return last }
             }
             Thread.sleep(forTimeInterval: 0.25)
         } while Date() < end
         if !seen, let e = locateEverywhere(ui, key) {
             seen = true
-            last = shown(e)
-            if !last.isEmpty && holds(last) { return last }
+            last = read(e)
+            if (field || !last.isEmpty) && holds(last) { return last }
         }
         if !seen {
             missing(ui, key, product, file: file, line: line)
-        } else if last.isEmpty {
+        } else if last.isEmpty && !field {
             keepTree(ui, "\(key) could not be read")
             XCTFail("APPARATUS: \(key) is shown and XCTest reads neither its label nor its value",
                     file: file, line: line)
