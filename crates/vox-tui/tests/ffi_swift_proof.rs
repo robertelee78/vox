@@ -800,11 +800,12 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
     );
     writeln!(to_app, "for-peer.bin").unwrap();
     let offer_line = expect(&from_app, &seen, "OFFER ");
-    let got_path = expect(&from_app, &seen, "GOT ")[4..].to_owned();
+    // Not "GOT ": every message the listener hears is said as "GOT <text>".
+    let got_path = expect(&from_app, &seen, "FETCHED ")[8..].to_owned();
     let got_bytes = std::fs::read(&got_path).ok();
     let states_left = expect(&from_app, &seen, "STATES ");
     eprintln!(
-        "{offer_line}\nGOT {got_path} ({} bytes, same: {})\n{states_left}",
+        "{offer_line}\nFETCHED {got_path} ({} bytes, same: {})\n{states_left}",
         got_bytes.as_ref().map_or(0, Vec::len),
         got_bytes.as_deref() == Some(&for_peer_bytes[..])
     );
@@ -819,7 +820,7 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
             && got_path.contains("/files/")
             && states_left == "STATES 0",
         "PRODUCT: `get` must pull a file addressed to someone else when asked, verified, byte for \
-         byte, into the node's files directory, and leave no pull of it pending: GOT {got_path}, \
+         byte, into the node's files directory, and leave no pull of it pending: FETCHED {got_path}, \
          {states_left}"
     );
 

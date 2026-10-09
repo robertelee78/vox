@@ -32,7 +32,7 @@
 //   OFFER TO <fps> TRUSTED <bool> BY_ITSELF <bool>
 //                           that share's card: whom it is addressed to, whether its sharer is in
 //                           the keyring, and whether this node pulled it by itself within 5 s
-//   GOT <path>              `get`: where the verified copy landed
+//   FETCHED <path>          `get`: where the verified copy landed
 //   STATES <n>              `pullStates` for it, once got: none left
 //   (waits for a line on stdin: a stand-in LAN helper's socket)
 //   LAN_UP <line>           `lanUp`, allowing port 5000, answered with the daemon's first line
@@ -211,7 +211,7 @@ do {
     let byItself = try await client.pulled(room: room).contains { $0.entry == offer.id }
     say("OFFER TO \(offered.to.joined(separator: ",")) TRUSTED \(offered.sharerTrusted) "
         + "BY_ITSELF \(byItself)")
-    say("GOT \(try await client.get(room: room, entry: offer.id))")
+    say("FETCHED \(try await client.get(room: room, entry: offer.id))")
     say("STATES \(try await client.pullStates(room: room).filter { $0.entry == offer.id }.count)")
     // The family LAN, through the helper the proof stands in for.
     let helper = readLine() ?? ""
