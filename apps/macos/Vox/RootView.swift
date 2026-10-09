@@ -74,6 +74,8 @@ struct RootView: View {
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .font(Theme.text)
+        // Every word shown can be selected and copied (the decider, v0.4.1).
+        .textSelection(.enabled)
         .contentSurface()
         .animation(Theme.motion(reduced: reduceMotion), value: model.phase)
     }

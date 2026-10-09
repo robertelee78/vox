@@ -15,6 +15,9 @@ struct MainWindow: View {
                 Sidebar(model: model)
                     .navigationSplitViewColumnWidth(min: Theme.scaled(220), ideal: Theme.scaled(260))
             } detail: {
+                // Every word shown here can be selected and copied (the decider, v0.4.1): set
+                // once for the whole detail, so a view added later is selectable too.
+                Group {
                 switch model.selection {
                 case let .room(id):
                     // One view per room: its draft, To:, urgent and attachment do not carry over.
@@ -32,12 +35,15 @@ struct MainWindow: View {
                         .secondaryText()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
+                }
+                .textSelection(.enabled)
             }
             Divider()
             StatusBar(model: model)
+                .textSelection(.enabled)
         }
         .contentSurface()
-        .sheet(item: $model.sheet) { NodeSheets(model: model, sheet: $0) }
+        .sheet(item: $model.sheet) { NodeSheets(model: model, sheet: $0).textSelection(.enabled) }
         .toolbar {
             // W-2: a key moves to the next room that needs the person; Control-N, as in the TUI.
             Button("Next Room That Needs You") { Task { await model.nextNeedingYou() } }
@@ -533,7 +539,7 @@ private struct RoomView: View {
         // On the room, not its timeline: ⌘O, ⌘↩ and a file from the Finder Services item work
         // wherever the room's focus is.
         .sheet(item: $attaching) { file in
-            AttachSheet(model: model, file: file) { attaching = nil }
+            AttachSheet(model: model, file: file) { attaching = nil }.textSelection(.enabled)
         }
         .onChange(of: model.attachAsked) { _ in
             // After the update, not inside it: a modal panel run from within a view update did
@@ -707,16 +713,16 @@ private struct MessageRow: View {
                 LinkCardView(card: card)
             }
             if !pulledBy.isEmpty {
+                // No label of its own: a selectable Text with one sends SwiftUI's accessibility
+                // into endless recursion. Its words are what it says.
                 Text("pulled by \(pulledBy.joined(separator: ", "))")
                     .caption().secondaryText()
                     .accessibilityIdentifier("pulled-by-\(message.id)")
-                    .accessibilityLabel("pulled by \(pulledBy.joined(separator: ", "))")
             }
             if !readBy.isEmpty {
                 Text("read by \(readBy.joined(separator: ", "))")
                     .caption().secondaryText()
                     .accessibilityIdentifier("read-by-\(message.id)")
-                    .accessibilityLabel("read by \(readBy.joined(separator: ", "))")
             }
         }
         // VoiceOver reads the row first as one sentence, in the order it is drawn; its parts
@@ -882,13 +888,17 @@ private struct Inspector: View {
                 }
                 // The platform its node says it runs on (ADR-020 §4.9b): its claim, said as one.
                 if let platform = model.platforms[member.id] {
-                    Text("says it runs on \(Platform.words(platform))")
-                        .font(Theme.mono).secondaryText()
-                        .padding(.leading, 18)
-                        // Not selectable: a selectable Text with its own label sent SwiftUI's
-                        // accessibility into endless recursion, and the app crashed when read.
-                        .accessibilityLabel("\(member.name) says it runs on \(Platform.words(platform))")
-                        .accessibilityIdentifier("member-platform-\(member.name)")
+                    // Selectable, so its label is on a container that hides the Text: a selectable
+                    // Text with its own label sent SwiftUI's accessibility into endless recursion,
+                    // and the app crashed when read.
+                    HStack {
+                        Text("says it runs on \(Platform.words(platform))")
+                            .font(Theme.mono).secondaryText()
+                    }
+                    .padding(.leading, 18)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("\(member.name) says it runs on \(Platform.words(platform))")
+                    .accessibilityIdentifier("member-platform-\(member.name)")
                 }
             }
             Divider().padding(.vertical, 8)
