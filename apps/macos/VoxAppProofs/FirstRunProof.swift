@@ -5,6 +5,7 @@
 // (through xcodebuild's TEST_RUNNER_ prefix):
 //   VOX_PROOF_APP      the Vox.app under proof; its Contents/Helpers/vox runs the daemon
 //   VOX_PROOF_SCRATCH  a scratch directory: the data root and config directory go there
+//   VOX_PROOF_CONTINUE 1 for a combined mutant build: a case goes on past a red
 //
 // What must hold, as a person sees it:
 // 1. At first run the app asks once whether to keep the daemon running while logged in, saying
@@ -218,8 +219,10 @@ final class FirstRunProof: XCTestCase {
     private var handedOff = false
 
     override func setUpWithError() throws {
-        // A case stops at its first red: one red, with its side, and no cascade behind it.
-        continueAfterFailure = false
+        // A case stops at its first red: one red, with its side, and no cascade behind it. A
+        // combined mutant build (VOX_PROOF_CONTINUE=1) goes on, so each mutated claim says its own
+        // red; whoever runs it keeps out any mutant whose red could follow from another's.
+        continueAfterFailure = ProcessInfo.processInfo.environment["VOX_PROOF_CONTINUE"] == "1"
         stager = try Stager.fromEnvironment()
         let workspace = NSWorkspace.shared
         watchingVox = workspace.notificationCenter.addObserver(
