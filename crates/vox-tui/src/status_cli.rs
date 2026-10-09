@@ -269,7 +269,7 @@ fn render(v: &Value) -> String {
     );
     let _ = writeln!(
         o,
-        "app streams  in {}  accepted {}  opened {}  refused: untrusted {}, busy {}, no listener {}, unaccepted {}, locally {}  withdrawn {}",
+        "app streams  in {}  accepted {}  opened {}  refused: not in keyring {}, busy {}, no listener {}, unaccepted {}, locally {}  withdrawn {}",
         n(a, "inbound"),
         n(a, "accepted"),
         n(a, "opened"),

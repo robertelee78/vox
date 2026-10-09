@@ -14,6 +14,13 @@ struct VoxApp: App {
     /// extra's `isInserted` is read again when the person turns it on or off.
     @StateObject private var model = AppModel.shared
 
+    init() {
+        // `vox uninstall`: unregister the background items and exit, before any window or daemon.
+        if CommandLine.arguments.contains(Uninstall.flag) {
+            Uninstall.unregisterAndExit()
+        }
+    }
+
     var body: some Scene {
         Window("Vox", id: "main") {
             RootView(model: model)

@@ -23,10 +23,10 @@ passphrase is a separate thing, and it may be empty.
 
 `node create` writes the identity and prints its fingerprint; it attaches nothing. It also says
 `there is no backup of a node: if this machine is lost, so is this node; make a new one, and ask
-everyone who trusts this one to untrust it and trust the new one`. That is the whole recovery
-plan: a node's keys never leave its machine, so no copy of them exists to restore. `node attach`
-takes the identity passphrase once and runs the node in full until `node detach` or until the
-daemon stops. `node list` shows each node as `attached` or `detached`, with its fingerprint once
+everyone who trusts this one to remove it from their keyring and trust the new one`. That is the
+whole recovery plan: a node's keys never leave its machine, so no copy of them exists to restore.
+`node attach` takes the identity passphrase once and runs the node in full until `node detach` or
+until the daemon stops. `node list` shows each node as `attached` or `detached`, with its fingerprint once
 it has been attached (a detached node's from a file kept beside its identity, shown only while it
 matches that identity). `node detach` closes that
 node's connections, stops its services and wipes its keys from memory; other attached nodes keep
@@ -305,7 +305,7 @@ card. Esc returns to the list.
 If the state and your expectation differ, check each person's selected node and keyring,
 then connectivity. Do not add an unfamiliar fingerprint simply to silence a warning.
 
-## Remove trust
+## Remove a node from your keyring
 
 Before removing a node, understand the scope: its access to your future messages and shared
 services is withdrawn across the rooms you share. Your sender key is rotated and everyone you
@@ -318,16 +318,16 @@ vox trust remove FULL_FINGERPRINT
 vox trust list
 ```
 
-Before it acts, Vox says what the node is to lose: `it is to read nothing you write from now on
-in "family"; what it already read stays read`, `and to reach none of your services from now on: it
-loses ssh in "family"`, and which of its live sessions into your services are to be cut. After,
-it reports `your sender key is rotated and everyone still trusted is re-keyed`, the sessions it
-cut (`cut: tunnel 1: ann reaching your ssh`, or `cut: none was open`), and that your own sessions
-into the other node's services are untouched: those are the other node's keyring's to grant, not
-yours. Verify the
-fingerprint is absent from `vox trust list`, and inspect any affected service or conversation
-from the other side if you need operational confirmation. Do not run this as an experiment on a
-family member's or production agent's identity.
+Before it acts, Vox says `about to remove ann from your keyring` and what the node is to lose: `it
+is to read nothing you write from now on in "family"; what it already read stays read`, `and to
+reach none of your services from now on: it loses ssh in "family"`, and which of its live sessions
+into your services are to be cut. After, it says `removed ann from your keyring`, and reports `your
+sender key is rotated and everyone still trusted is re-keyed`, the sessions it cut (`cut: tunnel 1:
+ann reaching your ssh`, or `cut: none was open`), and that your own sessions into the other node's
+services are untouched: those are the other node's keyring's to grant, not yours. Verify the
+fingerprint is absent from `vox trust list`, and inspect any affected service or conversation from
+the other side if you need operational confirmation. Do not run this as an experiment on a family
+member's or production agent's identity.
 
 For passphrases and paths, see [Commands and local state](reference.md). For a one-way
 conversation, see [the trust troubleshooting entry](troubleshooting.md#we-joined-but-cannot-read-each-other).

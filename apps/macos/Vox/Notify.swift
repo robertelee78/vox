@@ -9,6 +9,8 @@ import UserNotifications
 final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     /// Opens the room a notification is about.
     var open: ((String) -> Void)?
+    /// Opens a Session's waiting request a notification is about: room, node, session, reference.
+    var openRequest: ((String, String, String, String) -> Void)?
     /// Told whether Vox may notify, once macOS says: the status bar says when it may not.
     var allowed: ((Bool) -> Void)?
     private var asked = false
@@ -39,6 +41,30 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         UNUserNotificationCenter.current().add(request) { _ in }
     }
 
+    /// One notification for a Session waiting on this node (P1), replacing that Session's earlier
+    /// one: which Session, never what it asks (R-10). Clicking it opens that request.
+    func postWaiting(room: String, roomName: String, node: String, session: String,
+                     reference: String, label: String) {
+        let content = UNMutableNotificationContent()
+        content.title = roomName
+        content.body = "\(label) is waiting on you"
+        content.threadIdentifier = room
+        content.userInfo = ["room": room, "node": node, "session": session, "reference": reference]
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: Notifier.waitingID("\(room)/\(node)/\(session)"),
+                                            content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request) { _ in }
+    }
+
+    /// A Session no longer waiting: its notification goes.
+    func withdrawWaiting(sessionKey: String) {
+        let id = Notifier.waitingID(sessionKey)
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [id])
+        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [id])
+    }
+
+    nonisolated static func waitingID(_ sessionKey: String) -> String { "waiting-\(sessionKey)" }
+
     /// What a notification says: never the message's text.
     nonisolated static func body(who: String, toYou: Bool, urgent: Bool, file: Bool) -> String {
         let what = file ? "shared a file" : "wrote"
@@ -52,9 +78,17 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
                                             didReceive response: UNNotificationResponse,
                                             withCompletionHandler done: @escaping () -> Void) {
-        let room = response.notification.request.content.userInfo["room"] as? String
+        let info = response.notification.request.content.userInfo
+        let room = info["room"] as? String
+        let node = info["node"] as? String
+        let session = info["session"] as? String
+        let reference = info["reference"] as? String
         Task { @MainActor in
-            if let room { self.open?(room) }
+            if let room, let node, let session, let reference {
+                self.openRequest?(room, node, session, reference)
+            } else if let room {
+                self.open?(room)
+            }
             NSApp.activate(ignoringOtherApps: true)
             done()
         }

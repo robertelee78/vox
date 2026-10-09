@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::runtime::{Handle, Runtime};
-use vox_core::error::{Error, IpcHandshake};
+use vox_core::error::Error;
 use vox_core::hash::Digest32;
 use vox_core::node::api::{MessageRow, NodeEvent};
 use vox_core::node::daemonipc::{
@@ -1051,19 +1051,30 @@ pub struct VoxClient {
 }
 
 /// A failure to reach the daemon, said for a person.
+/// The sentence vox-core writes for it, which the CLI shows too (ADR-028 E-7).
 fn said(socket: &std::path::Path, e: Error) -> VoxError {
-    let path = socket.display();
-    failed(match e {
-        Error::Ipc(IpcHandshake::Unreachable { reason }) => {
-            format!("no vox daemon is running for this data root ({path}: {reason})")
+    failed(vox_core::node::daemonipc::unreached(socket, None, e))
+}
+
+/// An attach's failure, typed where a client acts on it (P4): a wrong passphrase is asked for
+/// again; another process holding the node is no passphrase's to fix. Told apart by the daemon's
+/// own refusal sentence for this node, word for word; anything else as [`said`] says it.
+fn attach_said(socket: &std::path::Path, node: &NodeName, e: Error) -> VoxError {
+    use vox_core::error::IpcHandshake;
+    use vox_core::node::daemonipc::Refusal;
+    if let Error::Ipc(IpcHandshake::Refused { reason }) = &e {
+        if *reason == (Refusal::WrongPassphrase { node: node.clone() }).to_string() {
+            return VoxError::WrongPassphrase {
+                reason: reason.clone(),
+            };
         }
-        Error::Ipc(IpcHandshake::Refused { reason }) => reason,
-        Error::Ipc(h @ IpcHandshake::ClosedBeforeHello) => {
-            format!("the vox daemon accepted, but {h}: it may be stopping. Try again.")
+        if *reason == (Refusal::NodeInUse { node: node.clone() }).to_string() {
+            return VoxError::Busy {
+                reason: reason.clone(),
+            };
         }
-        Error::Ipc(h) => format!("{h} ({path})"),
-        other => format!("the vox daemon at {path} did not answer ({other})"),
-    })
+    }
+    said(socket, e)
 }
 
 /// A node's answer, with its refusal and a detach as errors.
@@ -1072,6 +1083,13 @@ fn answered(frame: Frame) -> Result<Frame, VoxError> {
         Frame::NodeDetached { node } => Err(VoxError::Detached {
             reason: format!("node {node} was detached from the vox daemon"),
         }),
+        // The node says why as a sentence; the passphrase gate's is its own fault's, word for
+        // word, so it is told apart here, once, and typed for the client (D1).
+        Frame::Error { reason }
+            if reason == vox_core::node::api::Fault::PassphraseNeeded.explain() =>
+        {
+            Err(VoxError::PassphraseNeeded { reason })
+        }
         Frame::Error { reason } => Err(failed(reason)),
         other => Ok(other),
     }
@@ -1272,14 +1290,14 @@ async fn room_ids(
     }
 }
 
-/// Send `req` and read its answer, as a refusal or a detach where it is one.
+/// Send `req` and read its answer, as a refusal or a detach where it is one. A daemon that stops
+/// answering once it was asked leaves it not known whether it was done.
 async fn ask(client: &mut IpcClient, req: &Request) -> Result<Frame, VoxError> {
-    answered(
-        client
-            .request(req)
-            .await
-            .map_err(|e| failed(format!("the vox daemon stopped answering: {e}")))?,
-    )
+    answered(client.request(req).await.map_err(|e| VoxError::Unknown {
+        reason: format!(
+            "the vox daemon stopped answering before it said whether this was done: {e}"
+        ),
+    })?)
 }
 
 async fn done(client: &mut IpcClient, req: &Request) -> Result<(), VoxError> {
@@ -1603,7 +1621,7 @@ impl VoxClient {
             *slot = None;
             let client = IpcClient::open_at(&at)
                 .await
-                .map_err(|e| said(&socket, e))?;
+                .map_err(|e| attach_said(&socket, &name, e))?;
             let me = client.me().map(|f| b32_encode(&f)).unwrap_or_default();
             *slot = Some(Held {
                 node: name,
@@ -2374,7 +2392,7 @@ impl VoxClient {
             let resolve = || async {
                 vox_core::node::nameipc::resolve(&at, &address)
                     .await
-                    .map_err(|e| failed(format!("{address}: {e}")))
+                    .map_err(|e| failed(e.to_string()))
             };
             let mut room = resolve().await?;
             let deadline = tokio::time::Instant::now() + vox_core::node::up::HOST_PATIENCE;

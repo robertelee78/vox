@@ -612,7 +612,7 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
         ],
     );
     assert!(ok, "PRODUCT (staging): the host shares nas-ssh: {out}{err}");
-    let listing = |dir: &std::path::Path, want: &dyn Fn(&str) -> bool| {
+    let listing = |dir: &std::path::Path, what: &str, want: &dyn Fn(&str) -> bool| {
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             let (ok, out, err) = vox_once(dir, &["service".into(), "list".into(), room.clone()]);
@@ -621,22 +621,45 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
             }
             assert!(
                 Instant::now() < deadline,
-                "PRODUCT: `vox service list` never showed what was expected: {out}{err}"
+                "PRODUCT: `vox service list` never showed {what} in 90 s: {out}{err}"
             );
             std::thread::sleep(Duration::from_millis(500));
         }
     };
-    let guest_list = listing(&guest_dir, &|o| o.contains("nas-ssh."));
-    // What it needs, and that it holds: the host trusts the guest, and is online.
-    let trust_line = guest_list
-        .lines()
-        .skip_while(|l| !l.contains("nas-ssh."))
-        .find(|l| l.contains("needs") && l.contains("trusts this node"))
-        .unwrap_or_default()
-        .to_owned();
-    assert!(
-        trust_line.ends_with(": yes"),
-        "PRODUCT: the guest's listing must say the host trusts it: {trust_line:?}\n{guest_list}"
+    let guest_list = listing(&guest_dir, "nas-ssh", &|o| o.contains("nas-ssh."));
+    // **The readiness ticks** (ADR-028 S-3, G4): under nas-ssh, every fact reaching it needs, ✓
+    // when it holds: the proxy, the node attached, the host trusting the guest, the host online.
+    let host_as = |list: &str| -> String {
+        list.lines()
+            .find(|l| l.contains("nas-ssh.") && l.contains(" by "))
+            .and_then(|l| l.split(" by ").nth(1))
+            .and_then(|r| r.split_whitespace().next())
+            .unwrap_or_else(|| panic!("PRODUCT: the listing names no sharer for nas-ssh: {list}"))
+            .to_owned()
+    };
+    let ticks = |list: &str| -> Vec<String> {
+        list.lines()
+            .skip_while(|l| !l.contains("nas-ssh."))
+            .skip(1)
+            .take_while(|l| !l.contains(" by "))
+            .map(str::trim)
+            .filter(|l| l.starts_with("✓ ") || l.starts_with("missing: "))
+            .map(str::to_owned)
+            .collect()
+    };
+    let host_name = host_as(&guest_list);
+    let want = [
+        "✓ proxy configured".to_owned(),
+        "✓ node attached".to_owned(),
+        format!("✓ {host_name} trusts you"),
+        format!("✓ {host_name} online"),
+    ];
+    let guest_ticks = ticks(&guest_list);
+    eprintln!("[test] G4: the guest's ticks for nas-ssh: {guest_ticks:?}");
+    assert_eq!(
+        guest_ticks, want,
+        "PRODUCT: the guest, trusted and with the host online, must see four ✓ under nas-ssh\n\
+         {guest_list}"
     );
 
     drop(up);
@@ -723,25 +746,117 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
         l.starts_with("! ") && l.contains("the host refused")
     });
     eprintln!("[test] the stranger's vox up said: {why}");
-    // ADR-028 S-3: its listing names the condition that does not hold, before it tries.
-    let (_, stranger_list, _) = vox_once(
-        &stranger_dir,
-        &["service".into(), "list".into(), room.clone()],
-    );
-    let stranger_needs = stranger_list
-        .lines()
-        .skip_while(|l| !l.contains("nas-ssh."))
-        .find(|l| l.contains("needs") && l.contains("trusts this node"))
-        .unwrap_or_default()
-        .to_owned();
-    eprintln!("[test] S-3: the stranger's listing:\n{stranger_list}");
+    // ADR-028 S-3, G4: its listing names the fact that does not hold, before it tries.
+    drop(stranger_up);
+    let stranger_list = listing(&stranger_dir, "nas-ssh", &|o| o.contains("nas-ssh."));
+    let as_stranger = host_as(&stranger_list);
+    let stranger_ticks = ticks(&stranger_list);
+    eprintln!("[test] G4: the stranger's ticks for nas-ssh, untrusted: {stranger_ticks:?}");
+    let missing_trust = format!("missing: {as_stranger} trusts you — ");
     assert!(
-        stranger_needs.contains(": NO") && stranger_needs.contains("must trust this node"),
-        "PRODUCT: the untrusted joiner's `vox service list` must name what is missing, that the \
-         host does not trust it: {stranger_needs:?}\n{stranger_list}"
+        stranger_ticks
+            .iter()
+            .any(|t| t.starts_with(&missing_trust) && t.contains("must trust this node"))
+            && stranger_ticks.contains(&format!("✓ {as_stranger} online")),
+        "PRODUCT: the untrusted joiner's `vox service list` must say the host does not trust it, \
+         and name the fix, with the host online: {stranger_ticks:?}\n{stranger_list}"
     );
 
-    drop(stranger_up);
+    // **Then the host trusts it**: the tick turns, from what the host itself wrote into the room.
+    let (ok, stranger_id, err) = vox_once(&stranger_dir, &["id".into()]);
+    assert!(ok, "PRODUCT (staging): vox id (stranger): {err}");
+    let (ok, out, err) = vox_once(
+        &host_dir,
+        &[
+            "trust".into(),
+            "add".into(),
+            stranger_id.trim().to_owned(),
+            "--name".into(),
+            "the stranger".into(),
+        ],
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): the host trusts the stranger: {out}{err}"
+    );
+    let trusted = format!("✓ {as_stranger} trusts you");
+    let stranger_list = listing(
+        &stranger_dir,
+        &format!("{trusted:?} once the host trusts it"),
+        &|o| ticks(o).contains(&trusted),
+    );
+    eprintln!(
+        "[test] G4: the stranger's ticks once the host trusts it: {:?}",
+        ticks(&stranger_list)
+    );
+
+    // **The host stops**: it is no longer online, said as the missing fact.
     drop(host);
+    let offline = format!("missing: {as_stranger} online — ");
+    let stranger_list = listing(
+        &stranger_dir,
+        &format!("{offline:?}… with the host stopped"),
+        &|o| ticks(o).iter().any(|t| t.starts_with(&offline)),
+    );
+    eprintln!(
+        "[test] G4: the stranger's ticks with the host stopped: {:?}",
+        ticks(&stranger_list)
+    );
+
+    // **The proxy cannot listen**: the guest's daemon started on a proxy port already taken.
+    // The daemon its verbs started is stopped as a person stops it (SIGTERM, by the pid it
+    // wrote in its lock), and one is started by hand, as `vox daemon --proxy` is, on a port this
+    // proof holds.
+    let taken = TcpListener::bind("127.0.0.1:0").expect("APPARATUS: hold a port");
+    let taken_at = taken.local_addr().expect("APPARATUS: the held port");
+    let lock = guest_dir.join(".daemon").join("lock");
+    let held =
+        |lock: &std::path::Path| std::fs::File::open(lock).is_ok_and(|f| f.try_lock().is_err());
+    if held(&lock) {
+        let pid = std::fs::read_to_string(&lock).unwrap_or_default();
+        let pid = pid.trim();
+        assert!(
+            !pid.is_empty() && pid.chars().all(|c| c.is_ascii_digit()),
+            "APPARATUS: the guest's daemon lock names no pid: {pid:?}"
+        );
+        let _ = Command::new("kill").args(["-TERM", pid]).status();
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while held(&lock) {
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: the guest's daemon did not stop in 60 s after SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let mut guest_daemon = VoxProc::spawn(
+        "guest-daemon",
+        &guest_dir,
+        &[
+            "daemon".into(),
+            "--listen".into(),
+            "127.0.0.1:0".into(),
+            "--proxy".into(),
+            taken_at.to_string(),
+            "--anchor".into(),
+            anchor_spec.clone(),
+        ],
+    );
+    let guest_list = listing(
+        &guest_dir,
+        "\"missing: proxy configured — …\" with its proxy port taken",
+        &|o| {
+            ticks(o)
+                .iter()
+                .any(|t| t.starts_with("missing: proxy configured — "))
+        },
+    );
+    eprintln!(
+        "[test] G4: the guest's ticks with its proxy port taken: {:?}",
+        ticks(&guest_list)
+    );
+    let _ = guest_daemon.transcript();
+    drop(guest_daemon);
+    drop(taken);
     drop(anchor);
 }

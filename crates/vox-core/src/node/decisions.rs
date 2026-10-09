@@ -101,7 +101,9 @@ impl Decided {
         match self {
             Decided::Refused => "refused",
             Decided::Trusted => "trusted",
-            Decided::Untrusted => "untrusted",
+            // "Remove" is the one word for it (ADR-028 E-2, K-6); a record written before said
+            // "untrusted", and is read as "removed" (`Event::of`).
+            Decided::Untrusted => "removed",
             Decided::Cut => "cut",
             Decided::Stopped => "stopped",
         }
@@ -154,7 +156,10 @@ impl Event {
             asked: v["asked"].as_str()?.to_owned(),
             by: v["by"].as_str()?.to_owned(),
             alias: v["alias"].as_str().map(str::to_owned),
-            decided: v["decided"].as_str()?.to_owned(),
+            decided: match v["decided"].as_str()? {
+                "untrusted" => Decided::Untrusted.as_str().to_owned(),
+                d => d.to_owned(),
+            },
             why: v["why"].as_str()?.to_owned(),
             room: v["room"].as_str().map(str::to_owned),
         })

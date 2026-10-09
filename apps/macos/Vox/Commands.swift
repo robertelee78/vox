@@ -47,6 +47,10 @@ extension VoxAction {
     @MainActor static func all(_ node: NodeModel?) -> [VoxAction] {
         let live = node != nil
         let inRoom = node?.roomOnScreen != nil
+        // What the room's commands act on: the Session on screen, when one is, never the room
+        // behind it (D2).
+        let inSession = node?.showingSession ?? false
+        let driven = node?.shownSession.flatMap { $0.canDrive && $0.open ? $0 : nil }
         // A keyring row selected, in the keyring view: what Compare, Rename and Remove act on.
         let picked = node?.selection == .keyring && node?.keyringSelected != nil
         let digits: [VoxAction] = (1...9).map { n in
@@ -59,7 +63,12 @@ extension VoxAction {
             VoxAction("File", "Join Room…", "j", [.command, .shift], enabled: live) {
                 node?.sheet = .joinRoom
             },
-            VoxAction("File", "Attach File…", "o", enabled: inRoom) { node?.attachAsked += 1 },
+            inSession
+                ? VoxAction("File", "Attach File to \(driven?.label ?? "the Session")…", "o",
+                            enabled: inRoom && driven != nil) { node?.sessionAttachAsked += 1 }
+                : VoxAction("File", "Attach File to the Room…", "o", enabled: inRoom) {
+                    node?.attachAsked += 1
+                },
             VoxAction("File", "Share Service…", enabled: live) {
                 Task { await node?.show(.services) }
             },
@@ -73,7 +82,10 @@ extension VoxAction {
                       enabled: inRoom && node?.selectedMessage != nil) {
                 node?.replyTo = node?.messages.first { $0.id == node?.selectedMessage }
             },
-            VoxAction("Room", "Send Urgent", .return, enabled: inRoom) { node?.urgentAsked += 1 },
+            // The room's composer only: never while a Session is shown (D2).
+            VoxAction("Room", "Send Urgent", .return, enabled: inRoom && !inSession) {
+                node?.urgentAsked += 1
+            },
             // The keyboard's way into the messages (WCAG 2.1.1): ↑/↓ then move through them.
             // ⌃⌘T: ⇧⌘T is the system's View > Show Tab Bar, and ⌥⌘T its Show Toolbar.
             VoxAction("View", "Focus Timeline", "t", [.command, .control], enabled: inRoom) {
@@ -82,6 +94,16 @@ extension VoxAction {
             // The room's inspector, hidden or shown again; ⌥⌘I, as in the Finder.
             VoxAction("View", node?.inspectorShown == false ? "Show Inspector" : "Hide Inspector", "i",
                       [.command, .option], enabled: inRoom) { node?.inspectorShown.toggle() },
+            // On the selected request of the Session on screen (P1). ⌥⌘Y and ⌥⌘N: ⌘Y is the
+            // system's history and ⌘N New Room.
+            VoxAction("Room", "Approve Request", "y", [.command, .option],
+                      enabled: node?.selectedApproval != nil) {
+                Task { await node?.answerSelected(approve: true) }
+            },
+            VoxAction("Room", "Reject Request", "n", [.command, .option],
+                      enabled: node?.selectedApproval != nil) {
+                Task { await node?.answerSelected(approve: false) }
+            },
             VoxAction("Room", "Copy Selected Service's Address", "c", [.command, .shift],
                       enabled: node?.selectedService != nil) { node?.copyServiceCommand() },
             VoxAction("Room", "Next Room That Needs You", "j", enabled: live) {
@@ -246,6 +268,10 @@ private struct RoomForm: View {
     @State private var link = ""
     @State private var name = ""
     @State private var field = SecureFieldHolder()
+    /// Whether the passphrase field is empty: a room may have none (ADR-005 J-2 as amended).
+    @State private var noPassphrase = true
+    /// A create or join under way: Return and the button may both ask.
+    @State private var submitting = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s12) {
@@ -260,29 +286,43 @@ private struct RoomForm: View {
             }
             Text(joining ? "The room's passphrase, sent to you another way than its link."
                 : "A passphrase for the room: send it another way than its link.").secondaryText()
-            SecureInput(holder: field) { submit() }.frame(width: Theme.scaled(320))
+            SecureInput(holder: field, onEmpty: { noPassphrase = $0 }) { submit() }
+                .frame(width: Theme.scaled(320))
                 .accessibilityLabel(joining ? "Room passphrase" : "Passphrase for the new room")
                 .accessibilityIdentifier("room-form-passphrase")
-            if let said = model.said { StateMark(kind: .danger, words: said).textSelection(.enabled) }
+            if noPassphrase {
+                // Allowed, and said (D16): a room without one is open to anyone with its link.
+                Text("No passphrase: anyone with the link can join.")
+                    .accessibilityIdentifier("room-form-no-passphrase")
+            }
+            OutcomeMark(outcome: model.failure(of: operation))
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 Button(joining ? "Join" : "Create") { submit() }.keyboardShortcut(.defaultAction)
                     .buttonStyle(.voxPrimary)
-                    .disabled(joining ? link.isEmpty : name.isEmpty)
+                    .disabled(submitting || (joining ? link.isEmpty : name.isEmpty))
                     .accessibilityIdentifier("room-form-submit")
             }
         }
         .padding(Space.s24)
         .frame(width: Theme.scaled(440))
+        .onAppear { model.clearOutcome(of: operation) }
     }
 
+    private var operation: String { joining ? "join-room" : "create-room" }
+
     private func submit() {
-        // Return and the button may both ask: the second finds the field empty.
-        guard let secret = field.take() else { return }
+        // Return and the button may both ask: the second finds one under way. An empty field is
+        // a room with no passphrase, never nothing done (D16).
+        guard !submitting, joining ? !link.isEmpty : !name.isEmpty else { return }
+        submitting = true
+        let secret = field.takeAllowingEmpty()
+        noPassphrase = true
         let (l, n) = (link, name)
         Task {
             let ok = joining ? await model.joinRoom(l, passphrase: secret)
                 : await model.createRoom(n, passphrase: secret)
+            submitting = false
             if ok { model.sheet = nil }
         }
     }
@@ -344,10 +384,7 @@ private struct RetentionSheet: View {
                     + "sent, and older ones at once. Deleted text cannot be read again.")
                 .secondaryText()
                 .accessibilityIdentifier("retention-effect")
-            if let said = model.said {
-                StateMark(kind: .danger, words: said).textSelection(.enabled)
-                    .accessibilityIdentifier("retention-said")
-            }
+            OutcomeMark(outcome: model.failure(of: "retention"), id: "retention-said")
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 // No default (A9): a retention deletes text, so Return never sets one.
@@ -357,6 +394,7 @@ private struct RetentionSheet: View {
         }
         .padding(Space.s24)
         .frame(width: Theme.scaled(440))
+        .onAppear { model.clearOutcome(of: "retention") }
     }
 
     private func submit() {
@@ -381,10 +419,7 @@ private struct RenameSheet: View {
                 + "room's services. Only the room's creator or an admin may rename it.")
                 .secondaryText()
                 .accessibilityIdentifier("rename-effect")
-            if let said = model.said {
-                StateMark(kind: .danger, words: said).textSelection(.enabled)
-                    .accessibilityIdentifier("rename-said")
-            }
+            OutcomeMark(outcome: model.failure(of: "rename"), id: "rename-said")
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 Button("Rename") { submit() }.keyboardShortcut(.defaultAction)
@@ -395,6 +430,7 @@ private struct RenameSheet: View {
         }
         .padding(Space.s24)
         .frame(width: Theme.scaled(440))
+        .onAppear { model.clearOutcome(of: "rename") }
     }
 
     private func submit() {
@@ -426,11 +462,12 @@ private struct AdminsSheet: View {
                 .accessibilityLabel(admins.contains(member.id) ? "\(member.name), admin"
                                                                : "\(member.name), not an admin")
             }
-            if let said = model.said { StateMark(kind: .danger, words: said).textSelection(.enabled) }
+            OutcomeMark(outcome: model.failure(of: "admins"))
             Button("Done") { model.sheet = nil }.keyboardShortcut(.defaultAction)
         }
         .padding(Space.s24)
         .frame(width: Theme.scaled(440))
+        .onAppear { model.clearOutcome(of: "admins") }
         .task { admins = await model.admins() }
     }
 }
@@ -439,6 +476,9 @@ private struct AdminsSheet: View {
 private struct LeaveSheet: View {
     @ObservedObject var model: NodeModel
     let ending: Bool
+    /// Why the last try did not leave: the sheet stays open and says so (D19).
+    @State private var failed: String?
+    @State private var working = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s12) {
@@ -448,15 +488,27 @@ private struct LeaveSheet: View {
                     + "Only its creator or an admin can do this."
                 : "This node stops reading and posting here, and the room is deleted here. "
                     + "The others go on; to come back you need its link and passphrase again.")
-            if let said = model.said { StateMark(kind: .danger, words: said).textSelection(.enabled) }
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 Button(ending ? "End for Everyone" : "Leave", role: .destructive) {
+                    working = true
+                    failed = nil
                     Task {
-                        await model.leaveRoom(endingIt: ending)
-                        model.sheet = nil
+                        // Closed only once it is done; a failure stays, with its reason.
+                        if let why = await model.leaveRoom(endingIt: ending) {
+                            failed = why
+                        } else {
+                            model.sheet = nil
+                        }
+                        working = false
                     }
                 }
+                .disabled(working)
+                .accessibilityIdentifier("leave-confirm")
+            }
+            if let failed {
+                StateMark(kind: .danger, words: failed).textSelection(.enabled)
+                    .accessibilityIdentifier("leave-failed")
             }
         }
         .padding(Space.s24)

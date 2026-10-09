@@ -89,7 +89,7 @@ private struct DecisionRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s4) {
             HStack(spacing: Space.s8) {
-                StateMark(kind: kind, words: event.decided)
+                StateMark(kind: kind, words: decided)
                 Text(event.asked)
                 Text("·").secondaryText()
                 Text(who).fontWeight(.bold)
@@ -101,13 +101,17 @@ private struct DecisionRow: View {
             Text(event.why).secondaryText().textSelection(.enabled)
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(event.decided): \(event.asked), \(who): \(event.why)")
+        .accessibilityLabel("\(decided): \(event.asked), \(who): \(event.why)")
     }
+
+    /// The decision in the app's words: a node taken out of the keyring was removed (#628), as
+    /// every keyring action says it.
+    private var decided: String { event.decided == "untrusted" ? "removed" : event.decided }
 
     private var kind: StateMark.Kind {
         switch event.decided {
         case "refused", "cut": return .danger
-        case "untrusted", "stopped": return .attention
+        case "removed", "untrusted", "stopped": return .attention
         default: return .plain
         }
     }

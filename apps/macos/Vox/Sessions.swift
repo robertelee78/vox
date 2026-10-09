@@ -110,6 +110,8 @@ struct SessionsList: View {
 struct SessionEntryRow: View {
     @Environment(\.voxTextScale) private var scale
     @ObservedObject var model: NodeModel
+    /// The room it was drawn in: its actions go there and to `session` only (D3).
+    let room: String
     let session: FfiSession
     let entry: FfiSessionEntry
     /// Open a pulled copy with Quick Look.
@@ -117,11 +119,13 @@ struct SessionEntryRow: View {
     @State private var details = false
 
     var body: some View {
+        let reference = entry.request?.reference
         VStack(alignment: .leading, spacing: Space.s4 * scale) {
             Text(entry.line).voxFont(VoxTokens.Fonts.appMono).textSelection(.enabled)
                 .accessibilityIdentifier("entry-line-\(entry.id)")
             if let request = entry.request {
-                RequestView(model: model, session: session, request: request, about: entry.line)
+                RequestView(model: model, room: room, session: session, request: request,
+                            about: entry.line)
             }
             // A file the session sent, once this node has a verified copy (ADR-029 DR-1, F-11).
             if let file = entry.file, let pulled = file.pulledPath {
@@ -144,5 +148,23 @@ struct SessionEntryRow: View {
             }
         }
         .voxPadding(.horizontal, Space.s4)
+        // A request is selected by clicking it: what ⌥⌘Y and ⌥⌘N act on (P1).
+        .modifier(RequestSelection(model: model, reference: reference))
+    }
+}
+
+/// A request's row marked while it is the one selected, and selected by a click (P1); any other
+/// row as it is.
+private struct RequestSelection: ViewModifier {
+    @ObservedObject var model: NodeModel
+    let reference: String?
+
+    func body(content: Content) -> some View {
+        if let reference {
+            content.selectable(model.selectedRequest == reference) { model.selectedRequest = reference }
+                .accessibilityIdentifier("request-row-\(reference)")
+        } else {
+            content
+        }
     }
 }

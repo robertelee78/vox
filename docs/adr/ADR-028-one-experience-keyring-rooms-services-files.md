@@ -201,9 +201,14 @@ by any of them (ADR-001: there is no typed agent or human).
   commands are: for `ssh`,
   `ssh USER@ADDRESS`, a `vox forward ADDRESS 127.0.0.1:PORT` pair and an `~/.ssh/config` block; for
   `http`/`https`, a browser URL through the proxy and a forward; for `tcp`/`udp`, a forward. Each
-  MUST show what it needs and whether it holds: the sharer trusts this node, this node is
-  attached, the proxy is running, the sharer is online. Copy MUST use the system clipboard in the
-  app and OSC 52 in the TUI, and the command MUST also be printed.
+  MUST show what it needs as readiness ticks, in this order and these words in every client and
+  `vox service list`: `proxy configured` (for what goes through the proxy), `node attached`,
+  `<sharer> trusts you`, `<sharer> online`, each `✓` when it holds and, when it does not,
+  `missing:` with what to do (decider, 2026-10-08, G4). `<sharer> trusts you` MUST come only from
+  the sharer's own consent to this node in the room's log, never from reading anyone's keyring;
+  `<sharer> online` is whether this node holds a live connection to the sharer; nothing is sent to
+  learn any of them. Copy MUST use the system clipboard in the app and OSC 52 in the TUI, and the
+  command MUST also be printed.
 - **S-4.** Sharing MUST be one step in both clients: the client MUST list the services listening
   on this machine with their process names, suggest a name, and before sharing show the address
   members will use and name who in the room can and cannot reach it (ADR-017 4.2). A share of an

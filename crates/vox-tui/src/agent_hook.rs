@@ -1159,9 +1159,13 @@ pub enum Format {
     /// Claude Code: `{"hookSpecificOutput":{"hookEventName":…,"additionalContext":…}}`.
     Claude,
     /// Codex, and the safe default for anything unknown: **plain stdout becomes
-    /// the injected context**. Also what a person sees when running this by hand,
-    /// and what the OpenCode plugin consumes before putting it in `output.parts`.
+    /// the injected context**. Also what a person sees when running this by hand.
     Text,
+    /// The OpenCode plugin: `{"vox":…,"room":…}`, Vox's own notices apart from what room
+    /// members wrote, so the plugin can label the first as Vox's outside the room's fence and
+    /// fence the second (OpenCode gives a plugin no channel of its own; both share the
+    /// operator's message).
+    OpenCode,
 }
 
 impl std::str::FromStr for Format {
@@ -1171,15 +1175,19 @@ impl std::str::FromStr for Format {
             "auto" => Ok(Format::Auto),
             "claude" | "claude-code" => Ok(Format::Claude),
             "text" | "codex" | "plain" => Ok(Format::Text),
+            "opencode" => Ok(Format::OpenCode),
             other => Err(format!(
-                "unknown format {other:?}; use auto, claude or text"
+                "unknown format {other:?}; use auto, claude, text or opencode"
             )),
         }
     }
 }
 
-/// Emit injected context in the shape this harness reads.
-fn emit(format: Format, raw_input: &str, event: &str, context: &str) {
+/// Emit injected context in the shape this harness reads: `vox`, Vox's own notices (no byte a
+/// room member chose), then `room`, everything drawn from the rooms. Claude Code and Codex take
+/// them as one text, as before; OpenCode's plugin takes them apart (see [`Format::OpenCode`]).
+fn emit(format: Format, raw_input: &str, event: &str, vox: &str, room: &str) {
+    let context = format!("{vox}{room}");
     let chosen = match format {
         Format::Auto => {
             // Claude Code's hook input carries `hook_event_name`; Codex's plain
@@ -1209,6 +1217,9 @@ fn emit(format: Format, raw_input: &str, event: &str, context: &str) {
         // SubagentStart and UserPromptSubmit" — and the hook must be registered
         // with `async: false`, or the output is observed and discarded.
         Format::Text | Format::Auto => print!("{context}"),
+        Format::OpenCode => {
+            println!("{}", serde_json::json!({ "vox": vox, "room": room }));
+        }
     }
 }
 
@@ -1306,6 +1317,8 @@ pub async fn run(
                 answer.new,
                 answer.joining.as_deref(),
                 &daemon.account.data_root,
+                std::path::Path::new(&input.cwd),
+                daemon.node.as_str(),
             );
             drain(paths, room_arg, &input, &raw, format, note).await
         }
@@ -1324,6 +1337,7 @@ pub async fn run(
                 "Vox could not read your rooms this turn: {}\n",
                 one_line_reason(&e)
             ),
+            "",
         );
     }
     Ok(())
@@ -1814,9 +1828,11 @@ async fn drain(
 
     // Who does what is settled in the room; progress is recorded on the issue (V210-131).
     // A word about this session's room (ADR-029 RB-5): before anything else, in the one emit.
-    let mut context = note.map(|n| format!("{n}\n")).unwrap_or_default();
-    context.push_str(ROOM_AND_ISSUE);
-    context.push_str(&unread.concat());
+    // Vox's own words, with no byte a room member chose, apart from what the rooms said, which
+    // names rooms, members and sessions as they chose them (`Format::OpenCode`).
+    let mut vox = note.map(|n| format!("{n}\n")).unwrap_or_default();
+    vox.push_str(ROOM_AND_ISSUE);
+    let mut context = unread.concat();
     context.push_str(&offers_said(paths, &offered));
     // **The notices sit under a framing line** (V210-123): they quote session and resource
     // names that room members chose, so, like the messages, they say first whose words
@@ -1865,7 +1881,7 @@ async fn drain(
     }
     let mut budget = Budget::new(
         news.iter().filter(|d| !d.fresh.is_empty()).count(),
-        context.len(),
+        vox.len() + context.len(),
     );
     // **What a wake announced goes first, then oldest news** (V030-15, V210-163): a room holding
     // messages owed to this session leads, then the room whose oldest unread message is oldest,
@@ -1910,7 +1926,7 @@ async fn drain(
         shown_in[i] = shown;
     }
     context.push_str(&render_skipped(&skipped));
-    emit(format, raw_input, &input.event, &context);
+    emit(format, raw_input, &input.event, &vox, &context);
 
     for (d, shown) in drains.iter().zip(shown_in) {
         d.commit(paths, &input.session_id, shown);

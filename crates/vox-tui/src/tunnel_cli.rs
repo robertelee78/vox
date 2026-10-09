@@ -352,7 +352,9 @@ pub fn named_spec(spec: &str) -> Result<(u16, String), AppError> {
 
 // The commands and the needs of a shared service (ADR-028 S-3) are said from one place for the
 // CLI, the TUI and the app (`vox_core::node::service_reach`).
-pub use vox_core::node::service_reach::{commands as service_commands, needs as service_needs};
+pub use vox_core::node::service_reach::{
+    commands as service_commands, needs as service_needs, tick as service_tick,
+};
 
 /// What `vox service list` prints, from the daemon: the services shared in the room by every
 /// member, each with its readable address and its canonical one beneath it (V030-25, ADR-028
@@ -418,12 +420,10 @@ pub fn print_services(
             for (what, command) in service_commands(s) {
                 println!("      {what:<8}{command}");
             }
+            // What reaching it needs, each fact ✓ or missing with its fix (the App Study's
+            // readiness ticks, in the words the TUI and the app use).
             for (need, holds, otherwise) in service_needs(s, Some(proxy)) {
-                if holds {
-                    println!("      needs   {need}: yes");
-                } else {
-                    println!("      needs   {need}: NO — {otherwise}");
-                }
+                println!("      {}", service_tick(&need, holds, &otherwise));
             }
         }
         // `ssh <address>` needs ssh pointed at the proxy, once (what `vox up` prints).

@@ -488,6 +488,130 @@ fn runs_vox_hook(command: &str) -> bool {
         .any(|w| (w[0] == "vox" || w[0].ends_with("/vox")) && w[1] == "agent" && w[2] == "hook")
 }
 
+/// What `vox uninstall` does to the wiring `vox setup` installed.
+pub(crate) enum Unwire {
+    /// A harness's settings file, rewritten without Vox's entries (everything else kept).
+    Rewrite {
+        /// What it does, said first.
+        what: String,
+        path: PathBuf,
+        /// The file as it is to be.
+        text: String,
+    },
+    /// A file Vox wrote whole and nobody edited since.
+    Remove(PathBuf),
+    /// Something left, and why.
+    Keep(String),
+}
+
+/// Undo [`Wiring::install`] for every harness: in Claude Code's and Codex's settings, the entries
+/// that run `vox agent hook` and the `VOX_NODE` Vox set; OpenCode's plugin and the agent skill,
+/// only when each is byte for byte what Vox writes (for a node on disk); anything else is named
+/// and left. Nothing is changed here: the caller does it, or lists it in a dry run.
+pub(crate) fn unwire(account: &vox_core::node::paths::Account) -> Vec<Unwire> {
+    let mut out = Vec::new();
+    let nodes = account.nodes_on_disk();
+    for h in &HARNESSES {
+        let Ok(w) = Wiring::of(h.key) else { continue };
+        let hook = w.hook_file();
+        if h.key == "opencode" {
+            if let Ok(text) = std::fs::read_to_string(&hook) {
+                if nodes
+                    .iter()
+                    .any(|n| crate::agent_hook::opencode_plugin(n) == text)
+                {
+                    out.push(Unwire::Remove(hook.clone()));
+                } else if text.contains("vox agent hook") {
+                    out.push(Unwire::Keep(format!(
+                        "{} is kept: it is not the plugin Vox writes for a node here (edited, or for a node no longer on this machine); remove it yourself if it is Vox's",
+                        hook.display()
+                    )));
+                }
+            }
+        } else if let Some(text) = without_vox_hooks(&hook) {
+            out.push(Unwire::Rewrite {
+                what: format!(
+                    "take Vox's `vox agent hook` entries out of {} (nothing else in it)",
+                    hook.display()
+                ),
+                path: hook.clone(),
+                text,
+            });
+            if h.key == "codex" {
+                out.push(Unwire::Keep(
+                    "Codex's app-server, which vox setup started, is Codex's own and is left running; `codex app-server daemon stop` stops it"
+                        .into(),
+                ));
+            }
+        }
+        // The skill pack, by the rule install keeps (crate::skill_pack): only what Vox wrote
+        // and nobody changed goes.
+        if let Some(dir) = crate::skill_pack::pack_dir(h.key) {
+            let (remove, kept) = crate::skill_pack::uninstall_plan(&dir);
+            out.extend(remove.into_iter().map(Unwire::Remove));
+            for k in kept {
+                out.push(Unwire::Keep(format!(
+                    "{} is kept: Vox did not write it, or it was changed after Vox did; remove \
+                     it yourself if you do not want it",
+                    k.display()
+                )));
+            }
+        }
+    }
+    out
+}
+
+/// The settings file at `path` without Vox's hook entries and `VOX_NODE`, when it has any; `None`
+/// when it has none, is missing, or is not a JSON object.
+fn without_vox_hooks(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut settings: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let obj = settings.as_object_mut()?;
+    let mut changed = false;
+    if let Some(hooks) = obj
+        .get_mut("hooks")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for list in hooks.values_mut() {
+            let Some(groups) = list.as_array_mut() else {
+                continue;
+            };
+            for group in groups.iter_mut() {
+                if let Some(entries) = group["hooks"].as_array_mut() {
+                    let before = entries.len();
+                    entries.retain(|h| !h["command"].as_str().is_some_and(runs_vox_hook));
+                    changed |= entries.len() != before;
+                }
+            }
+            groups.retain(|g| g["hooks"].as_array().is_none_or(|e| !e.is_empty()));
+        }
+        hooks.retain(|_, list| list.as_array().is_none_or(|l| !l.is_empty()));
+        if hooks.is_empty() {
+            obj.remove("hooks");
+        }
+    }
+    if let Some(env) = obj
+        .get_mut("env")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        changed |= env.remove("VOX_NODE").is_some();
+        if env.is_empty() {
+            obj.remove("env");
+        }
+    }
+    if !changed {
+        return None;
+    }
+    let mut out = serde_json::to_string_pretty(&settings).ok()?;
+    out.push('\n');
+    Some(out)
+}
+
+/// [`write`], for `vox uninstall`.
+pub(crate) fn write_whole(path: &Path, text: &str) -> Result<(), AppError> {
+    write(path, text)
+}
+
 /// Write `text` to `path` whole: a temporary file beside it, renamed over it, so a harness never
 /// reads half a file. The file keeps the mode it had.
 fn write(path: &Path, text: &str) -> Result<(), AppError> {

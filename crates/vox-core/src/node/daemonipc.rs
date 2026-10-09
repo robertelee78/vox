@@ -1353,3 +1353,35 @@ pub fn attached_nodes(path: &std::path::Path, wait: std::time::Duration) -> Vec<
         _ => Vec::new(),
     }
 }
+
+/// **Why a client could not reach the daemon, in the one sentence every client shows** (ADR-028
+/// E-7): what failed, what to do, and the socket with the system's own reason. `node` is the node
+/// the client was to act as, when it names one. The CLI and the app both say this; neither words it
+/// itself.
+#[must_use]
+pub fn unreached(socket: &std::path::Path, node: Option<&str>, e: crate::error::Error) -> String {
+    use crate::error::{Error, IpcHandshake};
+    let path = socket.display();
+    match e {
+        // The cause stays named (#191): the OS's reason the connect failed, beside the socket.
+        Error::Ipc(IpcHandshake::Unreachable { reason }) => {
+            let (detached, attach) = node.map_or((String::new(), String::new()), |n| {
+                (
+                    format!(", so node {n} is not attached"),
+                    format!(", or `vox node attach {n}`"),
+                )
+            });
+            format!(
+                "no vox daemon is running for this data root{detached}.\n\
+                 \x20      Start one:  vox daemon      (Vox.app starts one when it opens{attach})\n\
+                 \x20      Socket: {path} ({reason})"
+            )
+        }
+        Error::Ipc(IpcHandshake::Refused { reason }) => reason,
+        Error::Ipc(h @ IpcHandshake::ClosedBeforeHello) => {
+            format!("the daemon's socket at {path} accepted, but {h}: it may be stopping. Try again.")
+        }
+        Error::Ipc(h) => format!("{h}. Socket: {path}"),
+        other => format!("the daemon at {path} did not answer ({other}). Try again; if it still does not answer, stop it and start it again."),
+    }
+}

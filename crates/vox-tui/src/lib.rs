@@ -60,6 +60,7 @@ pub mod status_cli;
 pub mod theme;
 pub mod tunnel_cli;
 pub mod ui;
+pub mod uninstall;
 pub mod update;
 pub mod viewmodel;
 pub mod wake;

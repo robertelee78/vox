@@ -131,15 +131,18 @@ vox_registrations() {
         | awk '/^path:/{p=$0} /identifier: +us\.vox\.app\.proof$/{print p}' \
         | sed -E 's/^path: *//; s/ \(0x[0-9a-f]+\)$//' | sort -u
 }
-STRAY="$(vox_registrations | grep -vxF "$APP" || true)"
-if [ -n "$STRAY" ]; then
-    echo "app-proofs: APPARATUS (precondition unmet): other Vox Proof builds (us.vox.app.proof)" \
-        "are registered with LaunchServices, and any of them can be opened on the real profile;" \
-        "unregister them" \
-        "(lsregister -u <path>, registration only) before a run:" >&2
-    echo "$STRAY" >&2
-    exit 2
-fi
+# Another proof build that is registered but not running is unregistered here (registration only: no
+# file is deleted, no process stopped). LaunchServices re-registers built bundles it finds on disk by
+# itself, so refusing on sight starved every run. One whose app is running is another run in progress:
+# that refuses (APPARATUS).
+for b in $(vox_registrations | grep -vxF "$APP" || true); do
+    if pgrep -f "$b/Contents/MacOS" >/dev/null 2>&1; then
+        echo "app-proofs: APPARATUS (precondition unmet): another Vox Proof is running ($b);" \
+            "only one proof run may use the screen at a time" >&2
+        exit 2
+    fi
+    "$LSREGISTER" -u "$b" 2>/dev/null && echo "app-proofs: unregistered another proof build (not running): $b"
+done
 # UI automation: developer mode on (the one-time approval macOS asks for is not readable here;
 # without it xcodebuild says so at once, below).
 if ! DevToolsSecurity -status 2>/dev/null | grep -q "enabled"; then
@@ -209,7 +212,7 @@ trap_unregister() {
 launch_status=0
 watch_real &
 WATCH_REAL=$!
-trap 'kill "$WATCH_REAL" 2>/dev/null; rm -rf "$SCRATCH"' EXIT
+trap 'kill "$WATCH_REAL" 2>/dev/null || true; rm -rf "$SCRATCH"' EXIT
 if [ "$#" -eq 0 ] || [ "$*" = "LaunchProof" ]; then
     python3 scripts/app-launch-proof.py "$APP" || launch_status=$?
     if [ "$*" = "LaunchProof" ]; then
@@ -236,8 +239,11 @@ STAGER=$!
 # reading the red; a green run removes it.
 finish() {
     local status=$?
-    kill "$WATCH_REAL" 2>/dev/null
-    kill "$STAGER" 2>/dev/null; wait "$STAGER" 2>/dev/null
+    # Each may have ended already (the stager stops itself with its run): under `set -e` a
+    # failed kill or wait would become the run's exit status, a green run exiting 1.
+    kill "$WATCH_REAL" 2>/dev/null || true
+    kill "$STAGER" 2>/dev/null || true
+    wait "$STAGER" 2>/dev/null || true
     trap_unregister
     if [ "$status" -ne 0 ]; then
         echo "app-proofs: kept for reading the red: $SCRATCH" >&2
@@ -271,6 +277,7 @@ TEST_RUNNER_VOX_PROOF_APP="$APP" TEST_RUNNER_VOX_PROOF_SCRATCH="$SCRATCH" \
     TEST_RUNNER_VOX_PROOF_STAGER_PORT="$(cat "$SCRATCH/stager.port")" \
     TEST_RUNNER_VOX_PROOF_STAGER_TOKEN="$TOKEN" \
     TEST_RUNNER_VOX_PROOF_FROM="${VOX_PROOF_FROM:-}" \
+    TEST_RUNNER_VOX_PROOF_CONTINUE="${VOX_PROOF_CONTINUE:-}" \
     xcodebuild -project apps/macos/Vox.xcodeproj -scheme Vox -configuration Release \
     -derivedDataPath "$DERIVED" ${only[@]+"${only[@]}"} test-without-building \
     2>&1 | tee "$SCRATCH/xcodebuild.log" || status=$?

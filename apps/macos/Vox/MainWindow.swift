@@ -529,8 +529,9 @@ private struct RoomView: View {
                                                 .voxPadding(.horizontal, Space.s4)
                                                 .accessibilityIdentifier(item.id)
                                                 .id(item.id)
-                                        } else if let entry = item.entry, let session = model.shownSession {
-                                            SessionEntryRow(model: model, session: session,
+                                        } else if let entry = item.entry, let session = model.shownSession,
+                                                  let room = model.roomOnScreen {
+                                            SessionEntryRow(model: model, room: room, session: session,
                                                             entry: entry) { looking = $0 }
                                                 .id(item.id)
                                         }
@@ -574,6 +575,12 @@ private struct RoomView: View {
                                     scroller.scrollTo(last.id, anchor: .bottom)
                                 }
                                 newest = model.messages.last?.id
+                            }
+                            // A request ⌘J or a notification landed on, centred once its
+                            // Session's entries are drawn (P1).
+                            .onChange(of: model.selectedRequest) { ref in centre(ref, scroller) }
+                            .onChange(of: model.sessionEntries.count) { _ in
+                                centre(model.selectedRequest, scroller)
                             }
                             .onChange(of: model.messages.count) { _ in
                                 let following = newest == nil || inView.contains(newest ?? "")
@@ -632,9 +639,11 @@ private struct RoomView: View {
                 // a Session. An open one's own composer is for a member with drive only (CL-3).
                 if !model.showingSession {
                     composer
-                } else if let s = model.shownSession, s.canDrive, s.open {
+                } else if let s = model.shownSession, s.canDrive, s.open, let room = model.roomOnScreen {
                     Hairline()
-                    SessionComposer(model: model, session: s)
+                    // One composer per Session: a draft for one never shows in another (D12).
+                    SessionComposer(model: model, room: room, session: s)
+                        .id("\(room)/\(s.nodeFingerprint)/\(s.sessionId)")
                 }
             }
             // The conversation, the timeline and the composer, at the text size View > Bigger and
@@ -657,12 +666,26 @@ private struct RoomView: View {
         }
         .onChange(of: model.attachAsked) { _ in
             // After the update, not inside it: a modal panel run from within a view update did
-            // not open (⌘O, seen in the QE pass).
+            // not open (⌘O, seen in the QE pass). The room's sheet only while the room is shown.
+            guard !model.showingSession else { return }
             DispatchQueue.main.async {
                 if let url = chooseFile() { attaching = Attaching(url: url) }
             }
         }
-        .onChange(of: model.urgentAsked) { _ in send(urgent: true) }
+        // Only while the room's own composer is on screen: never a General draft sent while a
+        // Session is shown (D2).
+        .onChange(of: model.urgentAsked) { _ in if !model.showingSession { send(urgent: true) } }
+        // The room's draft, To: and Urgent are kept while the app runs, as the room was left
+        // (D12); in memory only.
+        .onAppear {
+            let kept = model.roomDrafts[room] ?? RoomDraft()
+            draft = kept.text
+            to = kept.to
+            urgent = kept.urgent
+        }
+        .onChange(of: draft) { model.roomDrafts[room, default: RoomDraft()].text = $0 }
+        .onChange(of: to) { model.roomDrafts[room, default: RoomDraft()].to = $0 }
+        .onChange(of: urgent) { model.roomDrafts[room, default: RoomDraft()].urgent = $0 }
         .onChange(of: model.incoming) { url in
             if let url {
                 attaching = Attaching(url: url)
@@ -739,6 +762,15 @@ private struct RoomView: View {
             scroller.scrollTo(ids[next])
         }
         return true
+    }
+
+    /// Scroll the request `reference`'s entry to the middle of the timeline, once it is drawn.
+    private func centre(_ reference: String?, _ scroller: ScrollViewProxy) {
+        guard let reference,
+              let entry = model.sessionEntries.first(where: { $0.request?.reference == reference }) else { return }
+        withAnimation(Theme.motion(reduced: reduceMotion)) {
+            scroller.scrollTo("entry-\(entry.id)", anchor: .center)
+        }
     }
 
     /// The selected message, as the timeline shows it.
@@ -1100,9 +1132,6 @@ private struct StatusBar: View {
             Text("node \(model.node)")
             Text(model.peers == 1 ? "1 peer" : "\(model.peers) peers")
             Text(model.keyring)
-            if let did = model.did {
-                Text(did)
-            }
             if model.notifying == false {
                 // M-23: said where the person works, so a missing notification is explained.
                 Text("notifications off (System Settings, Notifications, Vox)")
@@ -1111,8 +1140,18 @@ private struct StatusBar: View {
             Spacer()
             if let ended = model.ended {
                 StateMark(kind: .danger, words: ended)
-            } else if let said = model.said {
-                StateMark(kind: .danger, words: said).textSelection(.enabled)
+            } else if let outcome = model.outcome {
+                // What the last operation came to, kept until the next starts or it is dismissed
+                // (P6): done, refused and not known each said as itself.
+                OutcomeMark(outcome: outcome, id: "status-outcome-\(outcome.kindName)")
+                Button {
+                    model.clearOutcome()
+                } label: {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss")
+                .accessibilityIdentifier("status-dismiss")
             }
         }
         .font(Theme.mono)
@@ -1128,12 +1167,13 @@ private struct StatusBar: View {
     private var words: String {
         var parts = ["node \(model.node)", model.peers == 1 ? "1 peer" : "\(model.peers) peers",
                      model.keyring]
-        if let did = model.did { parts.append(did) }
         if model.notifying == false {
             parts.append("notifications off (System Settings, Notifications, Vox)")
         }
-        if let ended = model.ended { parts.append(ended) } else if let said = model.said {
-            parts.append(said)
+        if let ended = model.ended {
+            parts.append(ended)
+        } else if let outcome = model.outcome {
+            parts.append(outcome.said)
         }
         return parts.filter { !$0.isEmpty }.joined(separator: ", ")
     }
@@ -1142,4 +1182,42 @@ private struct StatusBar: View {
 extension RoomGroup {
     /// The group, as the sidebar heads it (the TUI's words).
     var words: String { roomGroupWords(group: self) }
+}
+
+/// What one operation came to, as a person reads it (P6): done plainly, refused as a danger, and
+/// not known whether it was done as an attention, each with its own words; nothing when there is
+/// none.
+struct OutcomeMark: View {
+    let outcome: Outcome?
+    /// Where it is shown, as its identifier says it; else its kind (`outcome-refused`).
+    var id: String? = nil
+
+    var body: some View {
+        if let outcome {
+            StateMark(kind: outcome.kind == .done ? .plain
+                          : outcome.kind == .refused ? .danger : .attention,
+                      words: outcome.said)
+                .textSelection(.enabled)
+                .accessibilityIdentifier(id ?? "outcome-\(outcome.kindName)")
+        }
+    }
+}
+
+extension Outcome {
+    /// Its words, with what it was where that is not plain from them.
+    var said: String {
+        switch kind {
+        case .done, .refused: return words
+        case .unknown: return "Not known whether it was done. \(words)"
+        }
+    }
+
+    /// Its kind, as an identifier says it.
+    var kindName: String {
+        switch kind {
+        case .done: return "done"
+        case .refused: return "refused"
+        case .unknown: return "unknown"
+        }
+    }
 }

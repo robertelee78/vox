@@ -1,13 +1,13 @@
 # The Vox app on a Mac
 
-Applies to: v0.4.0, Apple Silicon Macs with macOS 13 or later. The app does what the `vox`
+Applies to: v0.4.1, Apple Silicon Macs with macOS 13 or later. The app does what the `vox`
 commands do; this chapter describes where each thing is in the app. The other chapters explain
 nodes, rooms, trust, services and files.
 
 ## What the app is
 
 Vox.app is a window onto the account's vox daemon, the same daemon `vox` commands and `vox tui`
-use. The app holds no node of its own. It acts as **one node** on this Mac, which you choose the
+use. The app holds no node of its own. It acts as **one node** on this Mac, which you make or choose the
 first time you open it, and everything you post, trust and share in the app is that node's. The
 sidebar opens with that node: its mark, its name and `node attached`. At its foot, **ON THIS
 MACHINE** lists every node on this Mac with its state (`attached` or `detached`): separate
@@ -59,8 +59,9 @@ version too, until you quit it and open it again.
 
 ## The first run
 
-1. **Keep Vox running while you're logged in?** The app asks this once: "Vox keeps your rooms
-   reachable while you are logged in, even with the app closed."
+1. **Keep Vox running while you're logged in?** The app asks this once: "Keep Running keeps Vox
+   running in the background while you're logged in, even with the app closed, so your rooms stay
+   reachable."
    - **Keep Running** registers Vox's login item, which starts the daemon each time you log in.
      macOS may want your approval first: the app then says **Allow Vox in Login Items**, with a
      button that opens System Settings, General, Login Items. Until you approve it, Vox runs
@@ -70,26 +71,68 @@ version too, until you quit it and open it again.
 
    The same screen offers **Show Vox in the menu bar**, off unless you turn it on (see
    [The menu bar item](#the-menu-bar-item)).
-2. **Which node is this app?** The app lists the nodes in this data root, each with its
-   fingerprint art and fingerprint (once the node has been attached) and the line `Everything you
-   post, trust and share will be as NAME.` Check the fingerprint before you pick: an agent's node
-   is listed too. Pick yours. With no
-   node yet, it says so: make one in Terminal with `vox node create NAME`, then choose
-   **Try Again**.
-3. **Attach node NAME.** Type the node's identity passphrase. The app hands the passphrase to the
-   daemon and does not store it. A wrong one is refused in the daemon's own words, under the field:
+2. **Welcome to Vox.** With no node on this Mac yet, the app makes one in its window, as
+   `vox node create` does; nothing sends you to Terminal. Type a **Name** (lowercase letters,
+   digits, dots, dashes and underscores) and the identity passphrase twice, then choose
+   **Make Node**. The passphrase unlocks your node on this Mac, and nobody can recover it for you.
+   The app says, as `vox node create` does, that there is no backup of a node: if this Mac is
+   lost, so is the node. Two passphrases that differ are refused, and nothing is created:
 
    ```text
-   that passphrase does not open node NAME's identity
+   The two passphrases differ; nothing was created.
+   ```
+
+   The app then attaches the new node with that passphrase and opens its window.
+3. **Which node are you?** With several nodes on this Mac, the app lists them, each with its
+   fingerprint art and fingerprint (once the node has been attached) and the line `Everything you
+   post, trust and share will be as NAME.`: pick the one you post, trust and share as here. With
+   exactly one, the app uses it without asking.
+4. **Attach node NAME.** For a node that is not attached yet, type its identity passphrase. The app
+   hands the passphrase to the daemon and does not store it. A wrong one is refused in the daemon's
+   own words, under the field:
+
+   ```text
+   That passphrase does not open node NAME's identity.
    ```
 
 The app remembers the node you chose, and attaches it each time it opens. The answers are kept
 in Vox's config directory, under `app/` (`login-item`, `node`, `menubar`).
 
-If the app cannot reach the daemon it says **Vox could not reach the vox daemon.**, with the
-daemon's own reason and a **Try Again** button. If you chose Keep Running and the login item
-stopped for a reason a restart cannot fix, the app quotes the login item's last word on it (with
-when) and offers **Turn Keep Running Off**.
+A new node is in no room yet. Its window says **You are in no room yet.**, with
+**New Room…** to make a room and share its link, and **Join Room…** to join one with the link
+and passphrase someone sent you (see [Rooms from the menus](#rooms-from-the-menus)).
+
+### A node from an earlier Vox
+
+If the data root still holds nodes kept the way an earlier release kept them, which this version
+cannot read, the app says **This Mac has a node from an earlier Vox**, names the directories, and
+offers **Move It Aside and Start Fresh**. That moves each of them, whole and untouched, into
+`moved-aside/` in the data root, as `NAME-YYYY-MM-DD` (with `-2`, `-3` and so on if that name is
+taken); nothing in them is deleted. The welcome that follows says what moved where, as full paths:
+
+```text
+Moved aside, untouched: DATA_ROOT/NAME is now DATA_ROOT/moved-aside/NAME-YYYY-MM-DD.
+```
+
+Your new node is a new identity: people you shared rooms with add it to their keyring again.
+**Try Again** looks again without moving anything.
+
+### When Vox cannot start
+
+If the app cannot reach the daemon, it shows a card with a plain headline, one line of likely
+cause, and **Try Again**:
+
+| Headline | Cause |
+|---|---|
+| Vox can't start its background service | It stopped as it started. Your rooms are unreachable until it runs. |
+| Vox's background service isn't answering | It may still be starting, or be stuck. Your rooms are unreachable until it answers. |
+| Another copy of Vox is using this node | Only one copy may act as a node at a time: a command that has not finished, or another copy of Vox, holds it. |
+| Vox can't reach its background service | Your rooms are unreachable until it answers. |
+
+Under **DETAILS** is the daemon's own sentence, which you can select, and **Copy** puts it on the
+clipboard for a bug report. If you chose Keep Running and the login item stopped for a reason a
+restart cannot fix, the card also quotes the login item's last word on it, with
+**Turn Keep Running Off** and **Show Log in Finder** (`~/Library/Logs/Vox/login-item.log`).
 
 ## Opening and quitting
 
@@ -272,13 +315,13 @@ drive`. See [Identity and keyring](keyring.md) for what trust grants.
 - **Compare…**: paste or type the fingerprint the person gave you another way. Case, spaces and
   dashes do not count. A match says `Matches NAME's fingerprint.`; a mismatch says
   `Does not match. This is not the node you trusted as NAME: do not trust it.` and offers to
-  untrust it.
+  remove it.
 - **Rename…**: the new alias, and that the node's services are then reachable as
   `<service>.NEWALIAS.<room>.vox`.
-- **Remove…**: the sheet says what untrusting does before you confirm: it reads nothing you
-  write from now on, and you read nothing it writes; what it already read stays read; its live
-  sessions into your services are cut; your sender key is rotated, and everyone you still trust is
-  re-keyed.
+- **Remove…**: the sheet asks `Remove NAME from your keyring?` and says what removing does before
+  you confirm: it reads nothing you write from now on, and you read nothing it writes; what it
+  already read stays read; its live sessions into your services are cut; your sender key is
+  rotated, and everyone you still trust is re-keyed.
 
 The **Keyring** menu does the same for the row selected in this view.
 
