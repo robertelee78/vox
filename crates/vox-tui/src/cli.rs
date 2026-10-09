@@ -1511,6 +1511,15 @@ pub enum NodeCmd {
         #[command(flatten)]
         account: AccountArgs,
     },
+    /// Sign a node out: detach it, stop keeping it (its `.daemon/attach` line and Keychain
+    /// passphrase go), and forget the app's choice of it, so nothing brings it back without you.
+    /// Its rooms and messages stay on disk; `vox node attach` uses it again.
+    Signout {
+        /// The node.
+        name: String,
+        #[command(flatten)]
+        account: AccountArgs,
+    },
     /// Every node in this data root, with whether it is attached.
     List {
         #[command(flatten)]
@@ -1537,6 +1546,9 @@ fn run_node_cmd(cmd: NodeCmd) -> ExitCode {
         }),
         NodeCmd::Detach { name, account } => block_on_client(async move {
             crate::client::node_detach(&account.as_node_args(), &name).await
+        }),
+        NodeCmd::Signout { name, account } => block_on_client(async move {
+            crate::client::node_signout(&account.as_node_args(), &name).await
         }),
         NodeCmd::List { account } => {
             block_on_client(async move { crate::client::node_list(&account.as_node_args()).await })

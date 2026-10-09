@@ -14,6 +14,11 @@
 //!    hand, the daemon the hooks started exits (L-8).
 //! 3. **Keep (proof 7, L-4).** `vox daemon --keep` records its node; after the daemon stops, a
 //!    daemon started in the background attaches it again with its room open.
+//!    **Sign out (ADR-028 E-4).** `vox node signout` then detaches it and forgets what would bring
+//!    it back without the person: its `.daemon/attach` line and the app's remembered node; a
+//!    daemon started again leaves it detached, and attached by hand its room still holds what was
+//!    posted. Mutations: a signout that does not detach turns it red at "detached and not kept"; one
+//!    that leaves the app's choice turns it red at "must be forgotten".
 //! 4. **Two clients, one daemon (proof 8, D-1, S-2).** Two `vox daemon --detach` at once end with
 //!    one daemon: one process holds `.daemon/lock`. With no client, it is still there 3 s after it
 //!    serves (the 10 s start grace, L-8) and answers `vox node list`, and it exits on its own once
@@ -451,7 +456,6 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
             .contains("before the restart")
     });
     let log = a.log();
-    stop_pid(pid);
     assert!(
         back,
         "PRODUCT: the kept node's room did not come back after the restart\nlog:\n{log}"
@@ -459,6 +463,80 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
     assert!(
         log.contains("vox daemon: attached kept node default"),
         "PRODUCT: the restart did not say it attached the kept node\nlog:\n{log}"
+    );
+
+    // **Sign out (ADR-028 E-4).** The app remembers the node it opens; `vox node signout` detaches
+    // the node and forgets all that would bring it back without the person: its keep line and the
+    // app's choice. Its rooms and messages stay.
+    let chosen = a.cfg.join("app").join("node");
+    std::fs::create_dir_all(chosen.parent().unwrap()).unwrap();
+    std::fs::write(&chosen, "default\n").unwrap();
+    let (ok, out, err) = a.run(&["node", "signout", "default"], "");
+    assert!(ok, "PRODUCT: vox node signout default failed: {out}{err}");
+    let attach = std::fs::read_to_string(a.data.join(".daemon/attach")).unwrap_or_default();
+    let (_, listed, _) = a.run(&["node", "list"], "");
+    let line = listed
+        .lines()
+        .find(|l| l.starts_with("default "))
+        .unwrap_or("")
+        .to_owned();
+    assert!(
+        !attach
+            .lines()
+            .any(|l| l.split_whitespace().next() == Some("default")),
+        "PRODUCT: signed out, node default must no longer be kept; .daemon/attach still has it:\n\
+         {attach}"
+    );
+    assert!(
+        !line.contains(" attached") && !line.contains("(kept)"),
+        "PRODUCT: signed out, `vox node list` must say default is detached and not kept: {line:?}"
+    );
+    assert!(
+        !chosen.exists(),
+        "PRODUCT: signed out, the app's remembered node ({}) must be forgotten",
+        chosen.display()
+    );
+    stop_pid(pid);
+    // Nothing brings it back: a daemon started again does not attach it.
+    let (ok, out, err) = a.run(&["daemon", "--detach"], "");
+    assert!(
+        ok,
+        "PRODUCT: vox daemon --detach failed after signout: {out}{err}"
+    );
+    let pid = a
+        .lock_pid()
+        .expect("PRODUCT: no daemon holds the lock after signout");
+    std::thread::sleep(Duration::from_secs(3));
+    let (_, listed, _) = a.run(&["node", "list"], "");
+    let again = listed
+        .lines()
+        .find(|l| l.starts_with("default "))
+        .unwrap_or("")
+        .to_owned();
+    // Still on disk: attached by hand, its room has what was posted before.
+    let pass_arg = pass.to_str().unwrap().to_owned();
+    std::fs::write(&pass, format!("{PASS}\n")).unwrap();
+    let (ok, out, err) = a.run(
+        &["node", "attach", "default", "--passphrase-file", &pass_arg],
+        "",
+    );
+    let kept_room = ok
+        && wait_until(Duration::from_secs(60), || {
+            a.run(&["room", "read", &room], "")
+                .1
+                .contains("before the restart")
+        });
+    let log = a.log();
+    stop_pid(pid);
+    assert!(
+        !again.contains(" attached"),
+        "PRODUCT: signed out, node default must not be attached again by a daemon's start: \
+         {again:?}\nlog:\n{log}"
+    );
+    assert!(
+        kept_room,
+        "PRODUCT: signed out, node default's rooms and messages must stay: attached again by hand \
+         ({ok}: {out}{err}) its room must still read \"before the restart\"\nlog:\n{log}"
     );
 }
 
