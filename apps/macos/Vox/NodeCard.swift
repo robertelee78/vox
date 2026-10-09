@@ -46,12 +46,17 @@ struct NodeActions: ViewModifier {
 
 extension View {
     /// Open `fingerprint`'s card on a click, with its actions in a context menu (D4).
+    ///
+    /// A plain button, not a tap gesture: on macOS a tap gesture on a row in a scroll view lets a
+    /// click through unanswered now and then (as it did on a service card, f12e1f77), and the card
+    /// never opened (4 of 7 runs of step 15 on the v0.4.1 merged build). A button takes the
+    /// click as AppKit does, and VoiceOver presses it.
     func nodeCard(_ model: NodeModel, _ fingerprint: String, name: String) -> some View {
-        self.contentShape(Rectangle())
-            .onTapGesture { model.openCard(fingerprint, name: name) }
-            .modifier(NodeActions(model: model, fingerprint: fingerprint, name: name))
-            .accessibilityAddTraits(.isButton)
-            .accessibilityAction { model.openCard(fingerprint, name: name) }
+        Button { model.openCard(fingerprint, name: name) } label: {
+            self.contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .modifier(NodeActions(model: model, fingerprint: fingerprint, name: name))
     }
 }
 
