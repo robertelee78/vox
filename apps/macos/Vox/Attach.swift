@@ -55,6 +55,7 @@ struct AttachSheet: View {
                     }
                 }
                 .keyboardShortcut(.defaultAction)
+                .buttonStyle(.voxPrimary)
                 .disabled(sending)
                 .accessibilityIdentifier("attach-send")
             }

@@ -264,6 +264,7 @@ private struct RoomForm: View {
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 Button(joining ? "Join" : "Create") { submit() }.keyboardShortcut(.defaultAction)
+                    .buttonStyle(.voxPrimary)
                     .disabled(joining ? link.isEmpty : name.isEmpty)
                     .accessibilityIdentifier("room-form-submit")
             }
@@ -346,7 +347,8 @@ private struct RetentionSheet: View {
             }
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
-                Button("Set") { submit() }.keyboardShortcut(.defaultAction)
+                // No default (A9): a retention deletes text, so Return never sets one.
+                Button("Set", role: seconds == 0 ? nil : .destructive) { submit() }
                     .accessibilityIdentifier("retention-submit")
             }
         }
@@ -383,6 +385,7 @@ private struct RenameSheet: View {
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 Button("Rename") { submit() }.keyboardShortcut(.defaultAction)
+                    .buttonStyle(.voxPrimary)
                     .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
                     .accessibilityIdentifier("rename-submit")
             }

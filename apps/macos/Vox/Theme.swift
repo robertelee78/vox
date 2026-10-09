@@ -220,24 +220,45 @@ private struct Typeset: ViewModifier {
 /// 1.4.4: macOS draws its own buttons in a fixed control font): bg.overlay with a text.muted edge
 /// (1.4.11), the label in text.primary, or danger for a destructive one; dimmer while pressed or
 /// off. A button styled plain or borderless keeps its own.
+///
+/// **Prominence is chosen, never taken from Return** (A9): a screen's main action is `.voxPrimary`,
+/// drawn filled in text.primary with its label in bg.base, and that is set on the button itself.
+/// Which button Return presses (`.defaultAction`) is a separate choice each screen makes, and
+/// drive, approve, a retention that deletes and a login item have none. Never the accent, which
+/// means only focus or live (L-3).
 struct VoxButtonStyle: ButtonStyle {
+    enum Kind { case standard, primary }
+
+    var kind = Kind.standard
     @Environment(\.isEnabled) private var enabled
     @Environment(\.voxTextScale) private var scale
 
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label
+        let primary = kind == .primary && configuration.role != .destructive
+        let fill = primary ? (configuration.isPressed ? VoxTokens.Colors.textSecondary
+                                                      : VoxTokens.Colors.textPrimary)
+                           : (configuration.isPressed ? VoxTokens.Colors.bgPanel
+                                                      : VoxTokens.Colors.bgOverlay)
+        let label = primary ? VoxTokens.Colors.bgBase
+            : configuration.role == .destructive ? VoxTokens.Colors.danger
+            : VoxTokens.Colors.textPrimary
+        return configuration.label
             .font(Theme.font(VoxTokens.Fonts.appText, scale: scale))
-            .foregroundStyle(configuration.role == .destructive ? VoxTokens.Colors.danger
-                                                                : VoxTokens.Colors.textPrimary)
+            .fontWeight(primary ? .semibold : nil)
+            .foregroundStyle(label)
             .padding(.horizontal, Space.s12 * scale)
             .padding(.vertical, Space.s4 * scale)
-            .background(RoundedRectangle(cornerRadius: Radius.control * scale)
-                .fill(configuration.isPressed ? VoxTokens.Colors.bgPanel : VoxTokens.Colors.bgOverlay))
+            .background(RoundedRectangle(cornerRadius: Radius.control * scale).fill(fill))
             .overlay(RoundedRectangle(cornerRadius: Radius.control * scale)
-                .stroke(VoxTokens.Colors.textMuted))
+                .stroke(primary ? fill : VoxTokens.Colors.textMuted))
             .opacity(enabled ? 1 : 0.45)
             .contentShape(Rectangle())
     }
+}
+
+extension ButtonStyle where Self == VoxButtonStyle {
+    /// A screen's main action, prominent by choice (A9).
+    static var voxPrimary: VoxButtonStyle { VoxButtonStyle(kind: .primary) }
 }
 
 /// A card's outline: text.muted, 4.5:1 or more on every background, since an outline is all that

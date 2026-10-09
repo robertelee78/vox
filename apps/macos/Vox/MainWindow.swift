@@ -39,6 +39,7 @@ struct MainWindow: View {
                         HStack {
                             Button("New Room…") { model.sheet = .newRoom }
                                 .keyboardShortcut(.defaultAction)
+                                .buttonStyle(.voxPrimary)
                                 .accessibilityIdentifier("empty-new-room")
                             Button("Join Room…") { model.sheet = .joinRoom }
                                 .accessibilityIdentifier("empty-join-room")

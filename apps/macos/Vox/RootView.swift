@@ -179,6 +179,7 @@ private struct LoginItemApproval: View {
                 .accessibilityIdentifier("login-item-settings")
             Button("Continue") { Task { await model.reach() } }
                 .keyboardShortcut(.defaultAction)
+                .buttonStyle(.voxPrimary)
                 .accessibilityIdentifier("login-item-continue")
         }
     }
@@ -211,6 +212,7 @@ private struct OldLayout: View {
         HStack {
             Button("Move It Aside and Start Fresh") { Task { await model.moveAside() } }
                 .keyboardShortcut(.defaultAction)
+                .buttonStyle(.voxPrimary)
                 .accessibilityIdentifier("old-move-aside")
             Button("Try Again") { Task { await model.start() } }
                 .accessibilityIdentifier("retry")
@@ -265,6 +267,7 @@ private struct Welcome: View {
         }
         Button("Make Node") { submit() }
             .keyboardShortcut(.defaultAction)
+            .buttonStyle(.voxPrimary)
             .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
             .accessibilityIdentifier("new-node-make")
     }
@@ -347,6 +350,7 @@ private struct PassphraseForm: View {
         }
         Button("Attach") { submit() }
             .keyboardShortcut(.defaultAction)
+            .buttonStyle(.voxPrimary)
             .accessibilityIdentifier("attach")
     }
 
