@@ -9,7 +9,7 @@ import SwiftUI
 struct KeyringAsk: Equatable {
     enum Kind { case add, compare, rename, remove }
     let kind: Kind
-    /// The row it is for; nil for add.
+    /// The row it is for; for add, a fingerprint to fill in (a file card's Trust…), or nil.
     let fingerprint: String?
     /// Each ask is new, so asking the same twice opens it twice.
     let id = UUID()
@@ -64,7 +64,9 @@ struct KeyringView: View {
         .onChange(of: model.keyringAsk) { ask in
             guard let ask else { return }
             switch ask.kind {
-            case .add: adding = true
+            case .add:
+                if let given = ask.fingerprint { fingerprint = given }
+                adding = true
             case .remove:
                 removing = model.trusted.first { $0.fingerprint == ask.fingerprint }
             case .compare, .rename: break // the row opens its own

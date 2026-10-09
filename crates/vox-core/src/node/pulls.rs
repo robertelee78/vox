@@ -384,9 +384,38 @@ pub fn numbered(name: &str, n: usize) -> String {
 /// What is known about one announcement this node may pull.
 enum State {
     /// Pulling now.
-    Running,
+    Running(Offer),
     /// Failed; tried again once this instant has passed, after waiting `wait`.
-    Waiting { until: Instant, wait: Duration },
+    Waiting {
+        until: Instant,
+        wait: Duration,
+        room: Digest32,
+        why: String,
+    },
+    /// Asked for and failed (`get`): said until it is asked for again, or pulled by itself.
+    Failed { room: Digest32, why: String },
+}
+
+/// Where one offer's pull stands on this node, for a client to say (ADR-028 F-3; D5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PullState {
+    /// Being pulled: `bytes` of `of` have come (a folder's are not counted).
+    Pulling {
+        /// What has come.
+        bytes: u64,
+        /// What was announced.
+        of: u64,
+    },
+    /// Failed, and tried again later by itself: the sharer may be offline.
+    Waiting {
+        /// Why the last try failed.
+        why: String,
+    },
+    /// Asked for, and failed.
+    Failed {
+        /// Why.
+        why: String,
+    },
 }
 
 /// The pulls of one node.
@@ -400,6 +429,12 @@ pub(crate) struct Pulls {
     /// Entries decided for good: pulled, or never this node's to pull.
     settled: Mutex<HashSet<Digest32>>,
     pending: Mutex<BTreeMap<Digest32, State>>,
+}
+
+impl std::fmt::Debug for Pulls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Pulls")
+    }
 }
 
 /// The node's clock in milliseconds, a test step included, as the node's own clock has it.
@@ -558,6 +593,16 @@ fn copy_checked(from: &Path, to: &Path, size: u64, sha: &str) -> Result<(), Stri
 /// `me` or to no one. `None` for anything else, for good.
 #[allow(clippy::type_complexity)]
 fn offer_in(text: &str, me: &str) -> Option<(String, u64, String, String, bool, Option<u64>)> {
+    offer_fields(text, Some(me))
+}
+
+/// What a share's announcement offers. With `me`, only one addressed to this node, one of its
+/// sessions (ADR-029 TA-1), or no one: what this node pulls by itself. Without, any: what a
+/// person may pull with `get` (ADR-028 F-3).
+fn offer_fields(
+    text: &str,
+    me: Option<&str>,
+) -> Option<(String, u64, String, String, bool, Option<u64>)> {
     let v: serde_json::Value = serde_json::from_str(text.trim_start()).ok()?;
     if v.get("type").and_then(serde_json::Value::as_str) != Some(crate::node::shares::FILE) {
         return None;
@@ -567,14 +612,14 @@ fn offer_in(text: &str, me: &str) -> Option<(String, u64, String, String, bool, 
         .and_then(serde_json::Value::as_array)
         .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
         .unwrap_or_default();
-    // A share addressed to one session of this node (`<fingerprint>/<session id>`, ADR-029
-    // TA-1) is this node's to pull, as one addressed to the node is.
-    if !to.is_empty()
-        && !to
-            .iter()
-            .any(|t| vox_agentcomms::envelope::addressee(t).0 == me)
-    {
-        return None;
+    if let Some(me) = me {
+        if !to.is_empty()
+            && !to
+                .iter()
+                .any(|t| vox_agentcomms::envelope::addressee(t).0 == me)
+        {
+            return None;
+        }
     }
     let d = v.get("data")?;
     let s = |k: &str| {
@@ -657,7 +702,7 @@ impl Pulls {
         cmd: mpsc::WeakSender<(NodeCommand, oneshot::Sender<Outcome>)>,
         view: watch::Receiver<NodeView>,
         events: tokio::sync::broadcast::Sender<crate::node::api::NodeEvent>,
-    ) {
+    ) -> Arc<Self> {
         let pulls = Arc::new(Self {
             events,
             short: Mutex::new(HashSet::new()),
@@ -667,6 +712,7 @@ impl Pulls {
             view,
             pending: Mutex::new(BTreeMap::new()),
         });
+        let held = Arc::clone(&pulls);
         tokio::spawn(async move {
             let mut view = pulls.view.clone();
             loop {
@@ -679,6 +725,146 @@ impl Pulls {
                 tokio::time::sleep(SCAN).await;
             }
         });
+        held
+    }
+
+    /// Where each pull of `room` stands that is not done: pulling, waiting to try again, or
+    /// asked for and failed (D5). A pulled one is in [`recorded`].
+    pub(crate) async fn states(&self, room: &Digest32) -> Vec<(Digest32, PullState)> {
+        let pending = self.pending.lock().await;
+        pending
+            .iter()
+            .filter_map(|(entry, s)| match s {
+                State::Running(o) if o.room == *room => Some((
+                    *entry,
+                    PullState::Pulling {
+                        bytes: std::fs::metadata(self.part_of(o)).map_or(0, |m| m.len()),
+                        of: o.size,
+                    },
+                )),
+                State::Waiting { room: r, why, .. } if r == room => {
+                    Some((*entry, PullState::Waiting { why: why.clone() }))
+                }
+                State::Failed { room: r, why } if r == room => {
+                    Some((*entry, PullState::Failed { why: why.clone() }))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// **Pull one offer now, as `vox room get` does** (ADR-028 F-3; D5): whoever it is addressed
+    /// to, and from a member this node has not trusted too, since a person asked. Verified by its
+    /// SHA-256 before it is put in place and recorded, as every pull is; nothing unverified is
+    /// ever where a client looks. Where it landed, or why not. One already pulled is not pulled
+    /// again; one being pulled is waited for.
+    ///
+    /// # Errors
+    /// The offer cannot be found or pulled, said in plain words.
+    pub(crate) async fn get(&self, room: Digest32, entry: Digest32) -> Result<PathBuf, String> {
+        let landed = |paths: &Paths| {
+            recorded(paths)
+                .into_iter()
+                .find(|p| p.room == room && p.entry == entry && p.path.exists())
+                .map(|p| p.path)
+        };
+        let offer = self.offer_of(&room, &entry)?;
+        loop {
+            if let Some(path) = landed(&self.paths) {
+                return Ok(path);
+            }
+            let mut pending = self.pending.lock().await;
+            if matches!(pending.get(&entry), Some(State::Running(_))) {
+                drop(pending);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+            let dir = room_dir(&self.paths, &room);
+            let _ = crate::node::paths::create_private_dir(&dir);
+            if let Some(why) = short_of_space(&dir, offer.size) {
+                pending.insert(
+                    entry,
+                    State::Failed {
+                        room,
+                        why: why.clone(),
+                    },
+                );
+                return Err(why);
+            }
+            pending.insert(entry, State::Running(offer.clone()));
+            break;
+        }
+        let done = self.pull(&offer).await;
+        let mut pending = self.pending.lock().await;
+        match done {
+            Ok(()) => {
+                pending.remove(&entry);
+                self.settled.lock().await.insert(entry);
+                landed(&self.paths).ok_or_else(|| "it was pulled, but its record is gone".into())
+            }
+            Err(why) => {
+                pending.insert(
+                    entry,
+                    State::Failed {
+                        room,
+                        why: why.clone(),
+                    },
+                );
+                Err(why)
+            }
+        }
+    }
+
+    /// The offer `entry` of `room` makes, whoever it is addressed to.
+    fn offer_of(&self, room: &Digest32, entry: &Digest32) -> Result<Offer, String> {
+        let now = now_ms();
+        let view = self.view.borrow();
+        let me = view.identity.as_ref().map(|i| i.fingerprint);
+        let d = view
+            .open_channels
+            .iter()
+            .find(|d| d.channel_id == *room)
+            .ok_or("the room is not open on this node")?;
+        let (author, created, fields) =
+            if let Some(r) = d.timeline.iter().find(|r| r.entry_hash == *entry) {
+                if r.owed {
+                    return Err("that message has not arrived yet".into());
+                }
+                (r.author, r.created_millis, offer_fields(&r.text, None))
+            } else if let Some(r) = d.session_files.iter().find(|r| r.entry_hash == *entry) {
+                (r.author, r.created_millis, offer_in_session(&r.body))
+            } else {
+                return Err("no message in this room has that id".into());
+            };
+        if Some(author) == me {
+            return Err("it is this node's own share".into());
+        }
+        let (name, size, sha256, tag, http, files) = fields.ok_or("that message offers no file")?;
+        let created = created.min(now);
+        if d.retention > 0 && now >= created.saturating_add(d.retention.saturating_mul(1_000)) {
+            return Err("its message has expired here, and the file with it".into());
+        }
+        Ok(Offer {
+            room: *room,
+            entry: *entry,
+            author,
+            name,
+            size,
+            sha256,
+            tag,
+            http,
+            created_ms: created,
+            files,
+        })
+    }
+
+    /// Where a file offer is written while it comes.
+    fn part_of(&self, offer: &Offer) -> PathBuf {
+        room_dir(&self.paths, &offer.room).join(format!(
+            ".{}.{}.part",
+            safe_file_name(&offer.name),
+            hex(&offer.entry[..8])
+        ))
     }
 
     async fn apply(&self, command: NodeCommand) -> Outcome {
@@ -788,7 +974,7 @@ impl Pulls {
         let mut pending = self.pending.lock().await;
         let mut running = pending
             .values()
-            .filter(|s| matches!(s, State::Running))
+            .filter(|s| matches!(s, State::Running(_)))
             .count();
         let at = Instant::now();
         for offer in found {
@@ -823,12 +1009,12 @@ impl Pulls {
                 continue;
             }
             let wait = match pending.get(&offer.entry) {
-                Some(State::Running) => continue,
+                Some(State::Running(_)) => continue,
                 Some(State::Waiting { until, .. }) if *until > at => continue,
                 Some(State::Waiting { wait, .. }) => *wait,
-                None => RETRY_MIN / 2,
+                Some(State::Failed { .. }) | None => RETRY_MIN / 2,
             };
-            pending.insert(offer.entry, State::Running);
+            pending.insert(offer.entry, State::Running(offer.clone()));
             running += 1;
             let pulls = Arc::clone(&self);
             tokio::spawn(async move {
@@ -839,13 +1025,15 @@ impl Pulls {
                         pending.remove(&offer.entry);
                         pulls.settled.lock().await.insert(offer.entry);
                     }
-                    Err(_) => {
+                    Err(why) => {
                         let wait = (wait * 2).clamp(RETRY_MIN, RETRY_MAX);
                         pending.insert(
                             offer.entry,
                             State::Waiting {
                                 until: Instant::now() + wait,
                                 wait,
+                                room: offer.room,
+                                why,
                             },
                         );
                     }
@@ -874,7 +1062,7 @@ impl Pulls {
             other => return Err(other.to_string()),
         };
         let name = safe_file_name(&offer.name);
-        let part = dir.join(format!(".{name}.{}.part", hex(&offer.entry[..8])));
+        let part = self.part_of(offer);
         let received = receive(bound, &part, offer).await;
         let _ = self.apply(NodeCommand::StopForward { local: bound }).await;
         if let Err(e) = received {

@@ -110,6 +110,9 @@ final class NodeModel: ObservableObject {
     /// Where this node's verified copy of each share it pulled in the room on screen is, by the
     /// share's message id (ADR-028 F-3, F-4): what its card opens with Quick Look.
     @Published private(set) var pulled: [String: String] = [:]
+    /// Where each pull of the room on screen's file offers stands that is not done, by the
+    /// share's message id (F-3, D5): being pulled, waiting for its sharer, or failed.
+    @Published private(set) var pulling: [String: PullState] = [:]
     /// A file handed to Vox from elsewhere (the Finder Services item, M-24), waiting for the room
     /// on screen to take it: its To: and note are asked there.
     @Published var incoming: URL?
@@ -326,6 +329,7 @@ final class NodeModel: ObservableObject {
         readBy = [:]
         pulledBy = [:]
         pulled = [:]
+        pulling = [:]
         retention = ""
         retentionSecs = nil
         notices = []
@@ -538,6 +542,46 @@ final class NodeModel: ObservableObject {
         let ordered = group(.needsYou) + group(.active) + group(.quiet)
         guard n >= 1 && n <= ordered.count else { return }
         await show(.room(ordered[n - 1].id))
+    }
+
+    /// **Pull a file offer now** (F-3, D5): the card's Download, as `vox room get` does. The node
+    /// checks its SHA-256 before it keeps it, so the card shows a copy only once it is verified.
+    /// How it goes is in `pulling`; where it landed, in `pulled`.
+    func download(_ message: RoomMessage) async {
+        guard let room = roomOnScreen, let file = message.file else { return }
+        pulling[message.id] = .pulling(bytes: 0, of: file.size)
+        do {
+            let path = try await client.get(room: room, entry: message.id)
+            guard roomOnScreen == room else { return }
+            pulled[message.id] = path
+            pulling[message.id] = nil
+        } catch {
+            guard roomOnScreen == room else { return }
+            pulling[message.id] = .failed(why: sentence(error))
+        }
+    }
+
+    /// Open the keyring's add form with `fingerprint` in it: the card's Trust… for a sharer not in
+    /// the keyring (D5). Trusting it is still the person's own step.
+    func askTrust(_ fingerprint: String) {
+        select(.keyring)
+        Task {
+            await show(.keyring)
+            keyringAsk = KeyringAsk(kind: .add, fingerprint: fingerprint)
+        }
+    }
+
+    /// How this node names `fingerprint`: its alias, "you", or the fingerprint cut short.
+    func nodeName(_ fingerprint: String) -> String {
+        let node = fingerprint.split(separator: "/").first.map(String.init) ?? fingerprint
+        if node == me { return "you" }
+        if let alias = trusted.first(where: { $0.fingerprint == node })?.name, !alias.isEmpty {
+            return alias
+        }
+        if let alias = members.first(where: { $0.id == node })?.name, !alias.isEmpty {
+            return alias
+        }
+        return String(node.prefix(12))
     }
 
     /// Open the keyring view and ask it for `kind`: the add form, or the selected row's compare,
@@ -833,6 +877,7 @@ final class NodeModel: ObservableObject {
                 let reads = try? await self.client.readBy(room: room)
                 let pulls = try? await self.client.pulledBy(room: room)
                 let copies = try? await self.client.pulled(room: room)
+                let states = try? await self.client.pullStates(room: room)
                 let services = try? await self.client.services(room: room).shared
                 let rows = try? await self.memberRows(room)
                 let kept = try? await self.client.retention(room: room)
@@ -856,6 +901,10 @@ final class NodeModel: ObservableObject {
                 if let copies {
                     let now = Dictionary(copies.map { ($0.entry, $0.path) }) { $1 }
                     if now != self.pulled { self.pulled = now }
+                }
+                if let states {
+                    let now = Dictionary(states.map { ($0.entry, $0.state) }) { $1 }
+                    if now != self.pulling { self.pulling = now }
                 }
                 if let services, services != self.roomServices { self.roomServices = services }
                 if let rows, rows != self.members { self.members = rows }

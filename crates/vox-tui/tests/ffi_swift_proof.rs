@@ -58,6 +58,10 @@
 //!    the request open with its reference; and the listener heard of the entries and of the
 //!    room's Sessions changing.
 //!
+//! 9. **A file addressed to someone else** (ADR-028 F-3, D5): the peer shares a file addressed to
+//!    itself alone. Its card says whom it is for (`to`, the peer) and that its sharer is in the
+//!    keyring; the app's node does not pull it by itself; `get` pulls it when asked, verified,
+//!    byte for byte, into the node's files directory, and no pull of it is left pending.
 //! 10. **What a retention change starts from** (D14): `retentionSecs` gives the room's own value,
 //!     7 days once the app sets it so, never a default.
 //!
@@ -68,6 +72,7 @@
 //! `RoomMessage.image` always nil; `renameRoom` answers without asking the node; `pulledBy`
 //! always empty.
 //! Mutant for (8): `sessionRead` gives each entry's kind for its line: red PRODUCT.
+//! Mutant for (9): the node answers `get` without pulling: red PRODUCT.
 //! Mutant for (10): `retentionSecs` gives 30 days whatever the room keeps: red PRODUCT.
 //!
 //! **The iOS app's embedded node** (`VoxNode`, ADR-026 S-4's exception): the Swift program runs
@@ -775,6 +780,39 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
     writeln!(to_app).unwrap();
     let pulled = expect(&from_app, &seen, "PULLED ")[7..].to_owned();
     let at_app = std::fs::read(&pulled).ok();
+
+    // (9) A file the peer shares addressed to itself alone (D5).
+    let for_peer = tmp.path().join("for-peer.bin");
+    let for_peer_bytes: Vec<u8> = (0..150_000u32).map(|i| (i * 13 % 241) as u8).collect();
+    std::fs::write(&for_peer, &for_peer_bytes).unwrap();
+    peer.run(
+        &["share", &room, for_peer.to_str().unwrap(), "--to", &peer_fp],
+        "",
+    );
+    writeln!(to_app, "for-peer.bin").unwrap();
+    let offer_line = expect(&from_app, &seen, "OFFER ");
+    let got_path = expect(&from_app, &seen, "GOT ")[4..].to_owned();
+    let got_bytes = std::fs::read(&got_path).ok();
+    let states_left = expect(&from_app, &seen, "STATES ");
+    eprintln!(
+        "{offer_line}\nGOT {got_path} ({} bytes, same: {})\n{states_left}",
+        got_bytes.as_ref().map_or(0, Vec::len),
+        got_bytes.as_deref() == Some(&for_peer_bytes[..])
+    );
+    assert_eq!(
+        offer_line,
+        format!("OFFER TO {peer_fp} TRUSTED true BY_ITSELF false"),
+        "PRODUCT: a share addressed to another member must say whom it is for and whether its \
+         sharer is trusted, and must not be pulled by this node by itself"
+    );
+    assert!(
+        got_bytes.as_deref() == Some(&for_peer_bytes[..])
+            && got_path.contains("/files/")
+            && states_left == "STATES 0",
+        "PRODUCT: `get` must pull a file addressed to someone else when asked, verified, byte for \
+         byte, into the node's files directory, and leave no pull of it pending: GOT {got_path}, \
+         {states_left}"
+    );
 
     // (5) The family LAN, through a stand-in helper.
     let helper = tmp.path().join("helper.sock");

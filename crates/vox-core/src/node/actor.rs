@@ -3543,6 +3543,8 @@ pub struct NodeHandle {
     keyring: KeyringWindow,
     /// The files this node serves (ADR-028 F-2).
     shares: Arc<crate::node::shares::Shares>,
+    /// The files this node pulls (ADR-028 F-3).
+    pulls: Arc<crate::node::pulls::Pulls>,
     /// Where the node's files are: its sessions' registrations among them (ADR-029 MD-2).
     paths: Paths,
     /// The node's decision record (ADR-028 §7), which only the node opens (#563).
@@ -3579,6 +3581,12 @@ impl NodeHandle {
     #[must_use]
     pub fn shares(&self) -> &Arc<crate::node::shares::Shares> {
         &self.shares
+    }
+
+    /// The files this node pulls (ADR-028 F-3).
+    #[must_use]
+    pub(crate) fn pulls(&self) -> &Arc<crate::node::pulls::Pulls> {
+        &self.pulls
     }
 
     /// How many seconds a keyring change still goes without the identity passphrase, or `None`
@@ -4707,7 +4715,7 @@ impl Node {
             node.view_tx.subscribe(),
             handle_event_tx.clone(),
         );
-        crate::node::pulls::Pulls::spawn(
+        let pulls = crate::node::pulls::Pulls::spawn(
             node.paths.clone(),
             cmd_tx.downgrade(),
             node.view_tx.subscribe(),
@@ -4727,6 +4735,7 @@ impl Node {
             sync_book,
             keyring,
             shares,
+            pulls,
             paths,
             decisions,
         };

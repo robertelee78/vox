@@ -361,6 +361,16 @@ const T_SESSION_APPEND: u64 = 5430;
 const T_SESSION_ENTRIES: u64 = 5431;
 /// [`Frame::SessionEntries`].
 const T_SESSION_ROWS: u64 = 5432;
+// Pulling one offer on request, and where pulls stand (ADR-028 F-3; D5). Additive.
+/// `[5460, channel_id, entry]` — [`Request::Pull`].
+const T_PULL: u64 = 5460;
+/// `[5461, path]` — [`Frame::Pulled`].
+const T_PULLED: u64 = 5461;
+/// `[5462, channel_id]` — [`Request::PullStates`].
+const T_PULL_STATES_REQ: u64 = 5462;
+/// `[5463, [[entry, kind, bytes, of, why], …]]` — [`Frame::PullStates`]; kind 0 pulling,
+/// 1 waiting, 2 failed.
+const T_PULL_STATES: u64 = 5463;
 const T_SESSIONS_REQ: u64 = 4940;
 const T_SESSIONS: u64 = 4941;
 /// `[5450, limit]` — [`Request::Decisions`] (#563).
@@ -535,6 +545,21 @@ pub enum Request {
     },
     /// A room's Sessions (ADR-029), as its log says, answered with [`Frame::Sessions`].
     Sessions {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// Pull the file the message `entry` of a room offers, now, as `vox room get` does (ADR-028
+    /// F-3; D5): whoever it is addressed to, verified before it is kept. Answered
+    /// [`Frame::Pulled`] once it has landed, or [`Frame::Error`] saying why not.
+    Pull {
+        /// The room.
+        channel_id: Digest32,
+        /// The share's announcement.
+        entry: Digest32,
+    },
+    /// Where the pulls of a room's offers stand that are not done, answered
+    /// [`Frame::PullStates`].
+    PullStates {
         /// The room.
         channel_id: Digest32,
     },
@@ -943,6 +968,12 @@ impl Request {
             }
             Request::SessionEntries { channel_id } => {
                 e.array(2).uint(T_SESSION_ENTRIES).bytes(channel_id);
+            }
+            Request::Pull { channel_id, entry } => {
+                e.array(3).uint(T_PULL).bytes(channel_id).bytes(entry);
+            }
+            Request::PullStates { channel_id } => {
+                e.array(2).uint(T_PULL_STATES_REQ).bytes(channel_id);
             }
             Request::SessionShare {
                 channel_id,
@@ -1471,6 +1502,19 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::SessionEntries { channel_id })
             }
+            (T_PULL, 3) => {
+                let channel_id = digest(&mut d)?;
+                let entry = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Pull { channel_id, entry })
+            }
+            (T_PULL_STATES_REQ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::PullStates { channel_id })
+            }
             (T_SESSIONS_REQ, 2) => {
                 let channel_id = digest(&mut d)?;
                 d.finish()
@@ -1788,6 +1832,16 @@ pub enum Frame {
         /// Each Session.
         sessions: Vec<crate::node::sessions::SessionRow>,
     },
+    /// Where a [`Request::Pull`] put the verified copy.
+    Pulled {
+        /// Its path.
+        path: String,
+    },
+    /// Each pull of a room's offers that is not done, as a [`Request::PullStates`] asked for.
+    PullStates {
+        /// The announcement each is of, and where it stands.
+        states: Vec<(Digest32, crate::node::pulls::PullState)>,
+    },
     /// The decision record's newest events, as a [`Request::Decisions`] asked for.
     Decisions {
         /// Each event, newest first.
@@ -1956,6 +2010,26 @@ impl Frame {
                         .uint(r.created_millis)
                         .text(&r.session_id)
                         .text(&r.body);
+                }
+            }
+            Frame::Pulled { path } => {
+                e.array(2).uint(T_PULLED).text(path);
+            }
+            Frame::PullStates { states } => {
+                use crate::node::pulls::PullState;
+                e.array(2).uint(T_PULL_STATES).array(states.len());
+                for (entry, state) in states {
+                    let (kind, bytes, of, why) = match state {
+                        PullState::Pulling { bytes, of } => (0, *bytes, *of, ""),
+                        PullState::Waiting { why } => (1, 0, 0, why.as_str()),
+                        PullState::Failed { why } => (2, 0, 0, why.as_str()),
+                    };
+                    e.array(5)
+                        .bytes(entry)
+                        .uint(kind)
+                        .uint(bytes)
+                        .uint(of)
+                        .text(why);
                 }
             }
             Frame::Sessions { sessions } => {
@@ -2610,6 +2684,44 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 });
             }
             return Ok(Frame::SessionEntries { rows });
+        }
+        (T_PULLED, 2) => {
+            let path = text(d, "ipc pulled path")?;
+            return Ok(Frame::Pulled { path });
+        }
+        (T_PULL_STATES, 2) => {
+            use crate::node::pulls::PullState;
+            let count = d
+                .array()
+                .map_err(|_| Error::MalformedIpc("ipc pull states array"))?;
+            let mut states = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                if d.array()
+                    .map_err(|_| Error::MalformedIpc("ipc pull state row"))?
+                    != 5
+                {
+                    return Err(Error::MalformedIpc("ipc pull state arity"));
+                }
+                let entry = digest(d)?;
+                let kind = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc pull state kind"))?;
+                let bytes = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc pull state bytes"))?;
+                let of = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc pull state size"))?;
+                let why = text(d, "ipc pull state why")?;
+                let state = match kind {
+                    0 => PullState::Pulling { bytes, of },
+                    1 => PullState::Waiting { why },
+                    2 => PullState::Failed { why },
+                    _ => return Err(Error::MalformedIpc("ipc pull state kind")),
+                };
+                states.push((entry, state));
+            }
+            return Ok(Frame::PullStates { states });
         }
         (T_SESSIONS, 2) => {
             let sessions = crate::node::sessions::read_rows(d)?;
@@ -4386,6 +4498,15 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             other => Frame::Error {
                 reason: other.to_string(),
             },
+        },
+        Request::Pull { channel_id, entry } => match handle.pulls().get(channel_id, entry).await {
+            Ok(path) => Frame::Pulled {
+                path: path.to_string_lossy().into_owned(),
+            },
+            Err(reason) => Frame::Error { reason },
+        },
+        Request::PullStates { channel_id } => Frame::PullStates {
+            states: handle.pulls().states(&channel_id).await,
         },
         Request::SessionEntries { channel_id } => match handle.session_rows(channel_id).await {
             Some(rows) => Frame::SessionEntries { rows },

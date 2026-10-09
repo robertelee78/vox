@@ -235,6 +235,45 @@ pub struct FileOffer {
     pub folder: bool,
     /// The sharer's note, or empty.
     pub note: String,
+    /// Whom it is addressed to, as whole fingerprints (a session of one as
+    /// `<fingerprint>/<session id>`); empty for the whole room. A card addressed to others names
+    /// them, and the sharer (ADR-028 F-3; D5).
+    pub to: Vec<String>,
+    /// Whether the sharer is in this node's keyring. This node pulls a share by itself only from
+    /// one it trusts; another's it pulls only when asked (`get`).
+    pub sharer_trusted: bool,
+}
+
+/// Where the pull of one file offer stands on this node (ADR-028 F-3; D5). One pulled is in
+/// [`VoxClient::pulled`].
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum PullState {
+    /// Being pulled: `bytes` of `of` have come (a folder's are not counted).
+    Pulling {
+        /// What has come.
+        bytes: u64,
+        /// What was announced.
+        of: u64,
+    },
+    /// The last try failed, and it is tried again by itself: the sharer may be offline.
+    Waiting {
+        /// Why the last try failed, in the node's words.
+        why: String,
+    },
+    /// Asked for with `get`, and failed.
+    Failed {
+        /// Why, in the node's words.
+        why: String,
+    },
+}
+
+/// One offer's pull, by its announcement's id.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct OfferPull {
+    /// The announcement's message id.
+    pub entry: String,
+    /// Where it stands.
+    pub state: PullState,
 }
 
 /// One event of this node's decision record (ADR-028 §7): what it decided, about whom, and why,
@@ -1094,7 +1133,7 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str
                 env.to.iter().map(|t| shown_name(t)).collect(),
                 env.re.as_deref().map(shown_name).unwrap_or_default(),
                 env.urgent,
-                file_offer(&env),
+                file_offer(&env, names.contains_key(&row.author)),
                 image_of(&env),
                 card_of(&env),
                 platform_of(&env),
@@ -1162,7 +1201,7 @@ fn platform_of(env: &vox_agentcomms::envelope::Envelope) -> Option<NodePlatform>
 }
 
 /// The file a `file` envelope offers, from the fields its sharer's daemon filled in.
-fn file_offer(env: &vox_agentcomms::envelope::Envelope) -> Option<FileOffer> {
+fn file_offer(env: &vox_agentcomms::envelope::Envelope, sharer_trusted: bool) -> Option<FileOffer> {
     if env.kind != vox_core::node::shares::FILE {
         return None;
     }
@@ -1174,6 +1213,8 @@ fn file_offer(env: &vox_agentcomms::envelope::Envelope) -> Option<FileOffer> {
         sha256: text("sha256")?,
         folder: text("kind").as_deref() == Some("folder"),
         note: text("note").unwrap_or_default(),
+        to: env.to.iter().map(|t| shown_name(t)).collect(),
+        sharer_trusted,
     })
 }
 
@@ -2691,6 +2732,64 @@ impl VoxClient {
             Ok(events)
         })
         .await
+    }
+
+    /// **Pull the file the message `entry` of `room` offers, now** (ADR-028 F-3; D5), as `vox
+    /// room get` does: whoever it is addressed to, and from a sharer not in the keyring too, since
+    /// a person asked. Its SHA-256 is checked before it is kept, so nothing unverified is ever
+    /// where the app looks. Returns where the verified copy is; one already pulled is not pulled
+    /// again. [`Self::pull_states`] says how it is going meanwhile.
+    ///
+    /// # Errors
+    /// No node attached, a malformed id, or why it could not be pulled, in the node's words.
+    pub async fn get(&self, room: String, entry: String) -> Result<String, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let entry = digest(&entry, "message id")?;
+        // On a connection of its own: a pull can take as long as the file does, and the app's
+        // other requests do not wait behind it.
+        let held = Arc::clone(&self.held);
+        let socket = self.socket.clone();
+        self.on_rt(async move {
+            let at = {
+                let slot = held.lock().await;
+                slot.as_ref().ok_or_else(not_attached)?.at.clone()
+            };
+            let mut c = IpcClient::open_at(&at)
+                .await
+                .map_err(|e| said(&socket, e))?;
+            match ask(&mut c, &Request::Pull { channel_id, entry }).await? {
+                Frame::Pulled { path } => Ok(path),
+                other => Err(unexpected(&other)),
+            }
+        })
+        .await
+    }
+
+    /// Where the pulls of `room`'s file offers stand that are not done (D5): being pulled, with
+    /// how much has come; waiting to be tried again; or asked for and failed. One pulled is in
+    /// [`Self::pulled`].
+    ///
+    /// # Errors
+    /// No node attached, a malformed id, or the node's refusal.
+    pub async fn pull_states(&self, room: String) -> Result<Vec<OfferPull>, VoxError> {
+        use vox_core::node::pulls::PullState as P;
+        let channel_id = digest(&room, "room id")?;
+        on_held!(self, |c| {
+            match ask(c, &Request::PullStates { channel_id }).await? {
+                Frame::PullStates { states } => Ok(states
+                    .into_iter()
+                    .map(|(entry, state)| OfferPull {
+                        entry: b32_encode(&entry),
+                        state: match state {
+                            P::Pulling { bytes, of } => PullState::Pulling { bytes, of },
+                            P::Waiting { why } => PullState::Waiting { why },
+                            P::Failed { why } => PullState::Failed { why },
+                        },
+                    })
+                    .collect()),
+                other => Err(unexpected(&other)),
+            }
+        })
     }
 
     /// What this node pulled by itself in `room` and verified, oldest first, each where `vox room

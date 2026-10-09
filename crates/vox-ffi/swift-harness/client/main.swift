@@ -28,6 +28,12 @@
 //   LISTED_FILES <n> <name> `shares`: this node's shares in the room
 //   (waits for a line on stdin: the peer has shared a file to this node)
 //   PULLED <path>           `pulled`: the file this node pulled by itself (up to 90 s)
+//   (waits for a line on stdin: the name of a file the peer shared addressed to itself)
+//   OFFER TO <fps> TRUSTED <bool> BY_ITSELF <bool>
+//                           that share's card: whom it is addressed to, whether its sharer is in
+//                           the keyring, and whether this node pulled it by itself within 5 s
+//   GOT <path>              `get`: where the verified copy landed
+//   STATES <n>              `pullStates` for it, once got: none left
 //   (waits for a line on stdin: a stand-in LAN helper's socket)
 //   LAN_UP <line>           `lanUp`, allowing port 5000, answered with the daemon's first line
 //   LAN_SAID <lines>        `lanSaid`: what the LAN has said, joined with " | "
@@ -187,6 +193,26 @@ do {
         if pulled.isEmpty { try await Task.sleep(nanoseconds: 250_000_000) }
     }
     say("PULLED \(pulled.first?.path ?? "")")
+    // A share addressed to someone else (ADR-028 F-3, D5): its card names whom it is for, this
+    // node does not pull it by itself, and `get` pulls it, verified, when asked.
+    let otherName = (readLine() ?? "").trimmingCharacters(in: .whitespaces)
+    var offer: RoomMessage? = nil
+    let offerUntil = Date().addingTimeInterval(90)
+    while offer == nil && Date() < offerUntil {
+        offer = try await client.read(room: room, after: "", limit: 0)
+            .first { $0.file?.name == otherName }
+        if offer == nil { try await Task.sleep(nanoseconds: 250_000_000) }
+    }
+    guard let offer, let offered = offer.file else {
+        say("ERROR the share addressed to the peer never arrived")
+        exit(1)
+    }
+    try await Task.sleep(nanoseconds: 5_000_000_000)
+    let byItself = try await client.pulled(room: room).contains { $0.entry == offer.id }
+    say("OFFER TO \(offered.to.joined(separator: ",")) TRUSTED \(offered.sharerTrusted) "
+        + "BY_ITSELF \(byItself)")
+    say("GOT \(try await client.get(room: room, entry: offer.id))")
+    say("STATES \(try await client.pullStates(room: room).filter { $0.entry == offer.id }.count)")
     // The family LAN, through the helper the proof stands in for.
     let helper = readLine() ?? ""
     say("LAN_UP \(try await client.lanUp(room: room, allow: [5000], helperSocket: helper))")

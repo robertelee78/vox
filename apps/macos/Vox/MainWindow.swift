@@ -397,7 +397,7 @@ private struct RoomView: View {
                                 LazyVStack(alignment: .leading, spacing: 10) {
                                     ForEach(model.timelineItems) { item in
                                         if let message = item.message {
-                                            MessageRow(message: message, me: model.me,
+                                            MessageRow(model: model, message: message, me: model.me,
                                                        readBy: model.readBy[message.id] ?? [],
                                                        pulledBy: model.pulledBy[message.id] ?? [],
                                                        pulled: model.pulled[message.id]) { looking = $0 }
@@ -685,6 +685,7 @@ private struct RoomView: View {
 
 /// One message in the timeline.
 private struct MessageRow: View {
+    @ObservedObject var model: NodeModel
     let message: RoomMessage
     let me: String
     /// Who has read it, when it is this node's own (R-6).
@@ -709,7 +710,8 @@ private struct MessageRow: View {
                 }
             }
             if let file = message.file {
-                FileCard(file: file, image: message.image, pulled: pulled, look: look)
+                FileCard(model: model, message: message, file: file, image: message.image,
+                         pulled: pulled, look: look)
             }
             if message.file == nil || !(message.file?.note.isEmpty ?? true) {
                 Text(message.owed ? "not received yet" : shownText)
@@ -765,15 +767,37 @@ private struct MessageRow: View {
     }
 }
 
-/// A file or folder offered in the room (ADR-028 F-1): its name, size and SHA-256, as the share's
-/// signed announcement states them.
+/// A shared file's card (ADR-028 F-1, F-3; D5): what it is, whom it is for, and one line on where
+/// this node's copy stands, with at most one way on. Nothing unverified is ever opened: a copy is
+/// shown only once the node has checked it against the announced SHA-256 (F-11).
 private struct FileCard: View {
+    @ObservedObject var model: NodeModel
+    let message: RoomMessage
     let file: FileOffer
     /// The image's preview its share announced (ADR-028 F-9): shown while the sharer is offline.
     let image: ImagePreview?
     /// This node's verified copy, once pulled (F-3, F-4).
     let pulled: String?
     let look: (URL) -> Void
+    @State private var details = false
+    /// Why a copy was not saved, said on the card.
+    @State private var saveFailed: String?
+
+    private var sharer: String {
+        message.authorName.isEmpty ? String(message.author.prefix(12)) : message.authorName
+    }
+
+    /// "Addressed to Ann": whom it is for, when not the whole room. Never "only" (F-1: the room
+    /// sees it too).
+    private var addressed: String? {
+        guard !file.to.isEmpty else { return nil }
+        var names: [String] = []
+        for t in file.to {
+            let n = model.nodeName(t)
+            if !names.contains(n) { names.append(n) }
+        }
+        return "Addressed to " + names.joined(separator: ", ")
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -790,22 +814,24 @@ private struct FileCard: View {
                     .font(Theme.glyph)
                     .accessibilityHidden(true)
             }
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(file.name).fontWeight(.bold)
-                Text("\(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file))"
-                    + "  ·  sha256 \(file.sha256.prefix(16))…")
-                    .font(Theme.mono).secondaryText()
-                if let pulled {
-                    // Opened only once verified: a copy is linked into place only after its size
-                    // and SHA-256 matched the signed announcement (F-11).
-                    HStack {
-                        Button("Quick Look") { look(URL(fileURLWithPath: pulled)) }
-                            .accessibilityIdentifier("quick-look-\(file.name)")
-                        Button("Show in Finder") {
-                            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: pulled)])
-                        }
-                    }
+                Text(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file))
+                    .secondaryText()
+                if let addressed {
+                    Text(addressed).secondaryText()
+                        .accessibilityIdentifier("file-addressed-\(file.name)")
                 }
+                state
+                DisclosureGroup("Details", isExpanded: $details) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("SHA-256 \(file.sha256)").font(Theme.mono).textSelection(.enabled)
+                        Text("Shared by \(sharer) (\(message.author))").font(Theme.mono)
+                            .textSelection(.enabled)
+                    }
+                    .secondaryText()
+                }
+                .accessibilityIdentifier("file-details-\(file.name)")
             }
         }
         .padding(8)
@@ -813,6 +839,81 @@ private struct FileCard: View {
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("file-\(file.name)")
         .accessibilityLabel("\(file.folder ? "folder" : "file") \(file.name), \(file.size) bytes")
+    }
+
+    /// Where this node's copy stands, in one line, with at most one way on.
+    @ViewBuilder private var state: some View {
+        if let pulled {
+            // Opened only once verified: a copy is linked into place only after its size and
+            // SHA-256 matched the signed announcement (F-11).
+            HStack {
+                Button("Quick Look") { look(URL(fileURLWithPath: pulled)) }
+                    .accessibilityIdentifier("quick-look-\(file.name)")
+                Button("Show in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: pulled)])
+                }
+                Button("Save a Copy…") { saveCopy(of: pulled) }
+                    .accessibilityIdentifier("file-save-\(file.name)")
+            }
+            if let saveFailed {
+                StateMark(kind: .danger, words: saveFailed).textSelection(.enabled)
+            }
+        } else if message.author == model.me {
+            EmptyView()
+        } else {
+            switch model.pulling[message.id] {
+            case let .pulling(bytes, of):
+                HStack {
+                    ProgressView(value: Double(bytes), total: Double(max(of, 1)))
+                        .frame(maxWidth: 160)
+                    Text("\(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)) of "
+                        + ByteCountFormatter.string(fromByteCount: Int64(of), countStyle: .file))
+                        .secondaryText()
+                }
+                .accessibilityIdentifier("file-state-\(file.name)")
+                .accessibilityLabel("Pulling \(file.name): \(bytes) of \(of) bytes")
+            case .waiting:
+                Text("Waiting for \(sharer) to come online.").secondaryText()
+                    .accessibilityIdentifier("file-state-\(file.name)")
+            case let .failed(why):
+                HStack {
+                    StateMark(kind: .danger, words: "Not pulled: \(why)").textSelection(.enabled)
+                    Button("Try Again") { Task { await model.download(message) } }
+                        .accessibilityIdentifier("file-retry-\(file.name)")
+                }
+                .accessibilityIdentifier("file-state-\(file.name)")
+            case nil:
+                if !file.sharerTrusted {
+                    HStack {
+                        Text("From a node not in your keyring").secondaryText()
+                            .accessibilityIdentifier("file-state-\(file.name)")
+                        Button("Trust…") { model.askTrust(message.author) }
+                            .accessibilityIdentifier("file-trust-\(file.name)")
+                        Button("Download Anyway") { Task { await model.download(message) } }
+                            .accessibilityIdentifier("file-download-\(file.name)")
+                    }
+                } else {
+                    Button("Download") { Task { await model.download(message) } }
+                        .accessibilityIdentifier("file-download-\(file.name)")
+                }
+            }
+        }
+    }
+
+    /// Save a copy of the verified file where the person chooses: copied, never moved, so the
+    /// node's own copy stays where it ages with the room (F-5).
+    private func saveCopy(of path: String) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = URL(fileURLWithPath: path).lastPathComponent
+        guard panel.runModal() == .OK, let to = panel.url else { return }
+        do {
+            if FileManager.default.fileExists(atPath: to.path) {
+                try FileManager.default.removeItem(at: to)
+            }
+            try FileManager.default.copyItem(at: URL(fileURLWithPath: path), to: to)
+        } catch {
+            saveFailed = "The copy was not saved: \(error.localizedDescription)"
+        }
     }
 }
 

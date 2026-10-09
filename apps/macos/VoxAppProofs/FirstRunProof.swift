@@ -35,6 +35,9 @@
 //    6c. (D14) Retention opens at the room's own value (1 year, set by `vox`), Set is disabled
 //        until another is chosen, Return never sets it, and the effect names the files and
 //        previews that go with the messages.
+//    6d. (D5) A file bob shares addressed to himself alone: its card says "Addressed to bob"
+//        (never "only") with Download; Download pulls it, verified, byte for byte, and only then
+//        offers Quick Look.
 // 7. (The lanes view: removed, ADR-029.)
 // 8. Notifications, a case of its own (testNotificationSaysWhoWroteNeverWhat), the one step that
 //    needs a person at the Mac (ADR-014 M-23, ADR-028 R-10, #448): with the keyring on screen, bob's message
@@ -1004,6 +1007,25 @@ final class FirstRunProof: XCTestCase {
         ui.typeKey(.escape, modifierFlags: [])
         print("[proof] retention sheet opened at \(openedAt); effect: \(effect)")
 
+        // (6d) A file addressed to someone else (F-3, D5): bob shares one addressed to himself.
+        let own = scratch.appendingPathComponent("bobs-own.bin")
+        let ownBytes = Data((0..<120_000).map { UInt8(truncatingIfNeeded: $0 &* 17 % 251) })
+        try stager.write(ownBytes, to: own.path)
+        try staged(vox, ["share", "--node", "bob", room, own.path, "--to", bobFp], env: bobSession)
+        words(ui, Key.id("file-addressed-bobs-own.bin"), timeout: 60,
+              "a file shared To: bob alone must say whom it is for, never \"only\" (D5)",
+              until: { $0 == "Addressed to bob" })
+        tap(ui, Key.id("file-download-bobs-own.bin"), "Download on bobs-own.bin")
+        present(ui, Key.id("quick-look-bobs-own.bin"), timeout: 90,
+                "Download must pull the file, verified, and offer Quick Look once it has (D5)")
+        let aliceCopy = URL(fileURLWithPath: data)
+            .appendingPathComponent("nodes/alice/files/\(fullRoom)/bobs-own.bin")
+        let ownWant = stager.run(["/usr/bin/shasum", "-a", "256", own.path], env: [:]).out
+            .split(separator: " ").first.map(String.init) ?? ""
+        let ownGot = stager.run(["/usr/bin/shasum", "-a", "256", aliceCopy.path], env: [:]).out
+            .split(separator: " ").first.map(String.init) ?? ""
+        XCTAssertTrue(!ownWant.isEmpty && ownGot == ownWant,
+                      "PRODUCT: the file Download pulled must be bob's, byte for byte, in alice's files (D5): want \(ownWant), \(aliceCopy.path) has \(ownGot.isEmpty ? "nothing" : ownGot)")
 
         // (7) The lanes view was removed (ADR-029 Sessions replace it; ADR-028 W-3 withdrawn).
 
