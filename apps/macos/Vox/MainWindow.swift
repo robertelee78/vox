@@ -211,17 +211,22 @@ private struct TimelineKeys: NSViewRepresentable {
     @Binding var focused: Bool
     /// A key, answered with whether it did anything (a key that does nothing goes on up).
     let key: (TimelineKey) -> Bool
+    /// What ⌘C and Edit › Copy copy while the keyboard is on the timeline: the selected
+    /// messages, or nil when none is.
+    let copied: () -> String?
 
     func makeNSView(context: Context) -> KeyView {
         let view = KeyView()
         view.onFocus = report
         view.onKey = key
+        view.onCopy = copied
         return view
     }
 
     func updateNSView(_ view: KeyView, context: Context) {
         view.onKey = key
         view.onFocus = report
+        view.onCopy = copied
     }
 
     /// Whether the view has the keyboard, written only when it changes, so a render does not
@@ -230,9 +235,21 @@ private struct TimelineKeys: NSViewRepresentable {
         DispatchQueue.main.async { if focused != has { focused = has } }
     }
 
-    final class KeyView: NSView {
+    final class KeyView: NSView, NSMenuItemValidation {
         var onFocus: ((Bool) -> Void)?
         var onKey: ((TimelineKey) -> Bool)?
+        var onCopy: (() -> String?)?
+
+        /// ⌘C and Edit › Copy: the selected messages, one line each (v0.4.1).
+        @objc func copy(_ sender: Any?) {
+            guard let lines = onCopy?(), !lines.isEmpty else { return NSSound.beep() }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(lines, forType: .string)
+        }
+
+        func validateMenuItem(_ item: NSMenuItem) -> Bool {
+            item.action == #selector(copy(_:)) ? !(onCopy?() ?? "").isEmpty : true
+        }
         private var asked: NSObjectProtocol?
         /// Set while Focus Timeline or a row's click hands it the keyboard.
         private var taking = false
@@ -306,16 +323,17 @@ private struct TimelineKeys: NSViewRepresentable {
                 }
                 return
             }
+            let shift = event.modifierFlags.contains(.shift)
             let key: TimelineKey?
             switch event.keyCode {
-            case 126: key = .up
-            case 125: key = .down
+            case 126: key = shift ? .extendUp : .up
+            case 125: key = shift ? .extendDown : .down
             case 36, 76: key = .open // Return, Enter
             case 49: key = .look // Space
             case 53: key = .close // Escape
             default: key = nil
             }
-            // Only the bare key: ⌘↑ and the like are the menus' and the system's.
+            // Only the bare key (⇧ only with ↑/↓): ⌘↑ and the like are the menus' and the system's.
             let bare = event.modifierFlags.intersection([.command, .option, .control]).isEmpty
             if let key, bare, onKey?(key) == true { return }
             super.keyDown(with: event)
@@ -325,7 +343,8 @@ private struct TimelineKeys: NSViewRepresentable {
 
 /// A key the timeline acts on.
 private enum TimelineKey {
-    case up, down, open, look, close
+    /// ⇧↑ and ⇧↓ add the message above or below to the selection (v0.4.1).
+    case up, down, extendUp, extendDown, open, look, close
 }
 
 /// The room on screen: its timeline and a field to post, with its members beside it.
@@ -355,6 +374,8 @@ private struct RoomView: View {
     /// Whether the keyboard is on the timeline (WCAG 2.1.1): ↑/↓ move the selection, Return
     /// opens the selected message's first action, Space Quick Looks its pulled file.
     @State private var timelineFocused = false
+    /// Each drawn row's frame in the timeline, for a drag across rows.
+    @State private var rowFrames: [String: CGRect] = [:]
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -411,13 +432,10 @@ private struct RoomView: View {
                                                        pulled: model.pulled[message.id]) { looking = $0 }
                                                 .frame(maxWidth: .infinity, alignment: .leading)
                                                 .padding(4)
-                                                .selectable(model.selectedMessage == message.id,
+                                                .selectable(model.selectedMessages.contains(message.id),
                                                             focused: timelineFocused
                                                                 && model.selectedMessage == message.id) {
-                                                    model.selectedMessage = message.id
-                                                    // Clicked: the keyboard follows, as in a list.
-                                                    NotificationCenter.default.post(
-                                                        name: .voxFocusTimeline, object: nil)
+                                                    clicked(message.id)
                                                 }
                                                 .reportsFrame(of: message.id)
                                                 .id(message.id)
@@ -436,27 +454,44 @@ private struct RoomView: View {
                                     }
                                 }
                                 .padding(12)
+                                // A drag from one message to another selects them and those
+                                // between (v0.4.1); a drag inside one message selects its words.
+                                .simultaneousGesture(
+                                    DragGesture(minimumDistance: 6, coordinateSpace: .named("timeline"))
+                                        .onChanged { drag in dragged(from: drag.startLocation, to: drag.location) }
+                                        .onEnded { drag in
+                                            if dragged(from: drag.startLocation, to: drag.location) {
+                                                // The keyboard takes it, so ⌘C copies the rows.
+                                                NotificationCenter.default.post(name: .voxFocusTimeline,
+                                                                                object: nil)
+                                            }
+                                        })
                             }
                             .coordinateSpace(name: "timeline")
                             // **Operable from the keyboard** (WCAG 2.1.1, 2.4.7): see
                             // `TimelineKeys`. The focused row is outlined by `selectable`.
-                            .background(TimelineKeys(focused: $timelineFocused) { key in
+                            .background(TimelineKeys(focused: $timelineFocused, key: { key in
                                 switch key {
                                 case .up: return move(.up, scroller)
                                 case .down: return move(.down, scroller)
+                                case .extendUp: return move(.up, scroller, extending: true)
+                                case .extendDown: return move(.down, scroller, extending: true)
                                 case .open: return openSelected()
                                 case .look: return toggleLook()
                                 case .close: return closeLook()
                                 }
-                            })
+                            }, copied: {
+                                model.selectedMessages.isEmpty ? nil : model.copiedLines
+                            }))
                             .onReceive(NotificationCenter.default.publisher(for: .voxFocusTimeline)) { _ in
                                 // Taken: the newest row, when none was selected.
                                 if model.selectedMessage == nil, let last = model.messages.last {
-                                    model.selectedMessage = last.id
+                                    select(last.id)
                                     scroller.scrollTo(last.id)
                                 }
                             }
                             .onPreferenceChange(RowFrames.self) { frames in
+                                rowFrames = frames
                                 // Seen: at least half of the row inside the timeline's bounds.
                                 let bounds = CGRect(origin: .zero, size: viewport.size)
                                 inView = Set(frames.compactMap { id, frame in
@@ -614,7 +649,8 @@ private struct RoomView: View {
 
     /// ↑/↓ on the timeline: the selection moves to the message before or after it, scrolled into
     /// view; with none selected, ↑ takes the newest and ↓ the oldest.
-    private func move(_ direction: MoveCommandDirection, _ scroller: ScrollViewProxy) -> Bool {
+    private func move(_ direction: MoveCommandDirection, _ scroller: ScrollViewProxy,
+                      extending: Bool = false) -> Bool {
         let ids = model.timelineItems.compactMap { $0.message?.id }
         guard !ids.isEmpty else { return false }
         let at = model.selectedMessage.flatMap { ids.firstIndex(of: $0) }
@@ -624,10 +660,65 @@ private struct RoomView: View {
         case .down: next = at.map { min($0 + 1, ids.count - 1) } ?? 0
         default: return false
         }
-        model.selectedMessage = ids[next]
+        if extending { extend(to: ids[next]) } else { select(ids[next]) }
         withAnimation(Theme.motion(reduced: reduceMotion)) {
             scroller.scrollTo(ids[next])
         }
+        return true
+    }
+
+    /// The messages in the timeline's order, oldest first.
+    private var messageIDs: [String] { model.timelineItems.compactMap { $0.message?.id } }
+
+    /// One message selected, alone: where a range starts.
+    private func select(_ id: String) {
+        model.selectedMessage = id
+        model.selectedMessages = [id]
+        model.selectionAnchor = id
+    }
+
+    /// The messages from the range's start to `id`, selected; the keyboard on `id`.
+    private func extend(to id: String) {
+        let ids = messageIDs
+        guard let from = ids.firstIndex(of: model.selectionAnchor ?? id),
+              let to = ids.firstIndex(of: id) else { return select(id) }
+        model.selectedMessages = Set(ids[min(from, to)...max(from, to)])
+        model.selectedMessage = id
+    }
+
+    /// A row clicked: alone; with ⌘, added or taken out; with ⇧, the range to it. The keyboard
+    /// follows, as in a list.
+    private func clicked(_ id: String) {
+        let flags = NSEvent.modifierFlags
+        if flags.contains(.command) {
+            if model.selectedMessages.contains(id) {
+                model.selectedMessages.remove(id)
+            } else {
+                model.selectedMessages.insert(id)
+            }
+            model.selectedMessage = id
+            model.selectionAnchor = id
+        } else if flags.contains(.shift), model.selectionAnchor != nil {
+            extend(to: id)
+        } else {
+            select(id)
+        }
+        NotificationCenter.default.post(name: .voxFocusTimeline, object: nil)
+    }
+
+    /// A drag in the timeline from `start` to `now`: when it reaches from one message to another,
+    /// those two and every message between are selected. Whether it did.
+    @discardableResult
+    private func dragged(from start: CGPoint, to now: CGPoint) -> Bool {
+        let rows = rowFrames.filter { model.byID[$0.key] != nil }
+        // The row under `y`, else the nearest (the gaps between rows, or past the last).
+        func row(at y: CGFloat) -> String? {
+            func away(_ f: CGRect) -> CGFloat { y < f.minY ? f.minY - y : y > f.maxY ? y - f.maxY : 0 }
+            return rows.min { away($0.value) < away($1.value) }?.key
+        }
+        guard let first = row(at: start.y), let last = row(at: now.y), first != last else { return false }
+        model.selectionAnchor = first
+        extend(to: last)
         return true
     }
 
@@ -757,10 +848,7 @@ private struct MessageRow: View {
     /// A share's text is its note.
     private var shownText: String { message.file?.note ?? message.text }
 
-    private var author: String {
-        if message.author == me { return "you" }
-        return message.authorName.isEmpty ? String(message.author.prefix(12)) : message.authorName
-    }
+    private var author: String { NodeModel.author(message, me: me) }
 }
 
 /// A file or folder offered in the room (ADR-028 F-1): its name, size and SHA-256, as the share's

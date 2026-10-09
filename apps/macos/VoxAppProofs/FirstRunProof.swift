@@ -215,10 +215,16 @@ final class FirstRunProof: XCTestCase {
     /// Set while the proof itself has hidden or quit Vox (⌘H, ⌘Q), until Vox is active again:
     /// what takes the foreground meanwhile was handed it by the proof, not taken.
     private var handedOff = false
+    /// The person's clipboard as it was before the case: every item, every type, restored exactly
+    /// in tearDown, red or green (app-proofs.sh restores it too, should the runner itself die).
+    private var keptPasteboard: [[NSPasteboard.PasteboardType: Data]] = []
 
     override func setUpWithError() throws {
         // A case stops at its first red: one red, with its side, and no cascade behind it.
         continueAfterFailure = false
+        keptPasteboard = (NSPasteboard.general.pasteboardItems ?? []).map { item in
+            Dictionary(uniqueKeysWithValues: item.types.compactMap { t in item.data(forType: t).map { (t, $0) } })
+        }
         stager = try Stager.fromEnvironment()
         let workspace = NSWorkspace.shared
         watchingVox = workspace.notificationCenter.addObserver(
@@ -255,6 +261,15 @@ final class FirstRunProof: XCTestCase {
         if let watchingForeground { NSWorkspace.shared.notificationCenter.removeObserver(watchingForeground) }
         if let watchingVox { NSWorkspace.shared.notificationCenter.removeObserver(watchingVox) }
         daemon?.terminate()
+        // The person's clipboard back, exactly as it was.
+        let board = NSPasteboard.general
+        board.clearContents()
+        let items = keptPasteboard.map { kept -> NSPasteboardItem in
+            let item = NSPasteboardItem()
+            for (type, data) in kept { item.setData(data, forType: type) }
+            return item
+        }
+        if !items.isEmpty { board.writeObjects(items) }
         super.tearDown()
     }
 
@@ -979,6 +994,87 @@ final class FirstRunProof: XCTestCase {
                               "alice's message read by bob must show \"read by bob\" under it",
                               until: { $0 == "read by bob" }) ?? ""
         print("[proof] bob's message read by \(readByAlice); alice's message: \(readWords)")
+
+        // (4b) Several messages copied at once (v0.4.1): three of bob's, by a drag from the first
+        // to the last, by ⇧-click, by ⌘-click with Edit › Copy, and by ⇧↑ from the keyboard. Each
+        // copies "<author>, <time>: <text>" lines, oldest first, the times as alice's node has them.
+        let three = ["COPY ONE", "COPY TWO", "COPY THREE"]
+        for text in three {
+            try staged(vox, ["room", "post", "--node", "bob", room, text], env: voxEnv)
+        }
+        var postedAt: [String: UInt64] = [:]
+        let postedUntil = Date().addingTimeInterval(60)
+        while Date() < postedUntil && postedAt.count < three.count {
+            let rows = run(vox, ["room", "read", "--node", "alice", "--json", room], env: voxEnv).out
+            for line in rows.split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      let text = row["text"] as? String, three.contains(text),
+                      let at = (row["created_millis"] as? NSNumber)?.uint64Value else { continue }
+                postedAt[text] = at
+            }
+            if postedAt.count < three.count { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        guard postedAt.count == three.count else {
+            throw Apparatus("alice's `vox room read --json` holds \(postedAt.count) of bob's three COPY posts after 60 s")
+        }
+        let want = three.sorted { postedAt[$0]! < postedAt[$1]! }
+            .map { "bob, \(copiedTime(postedAt[$0]!)): \($0)" }.joined(separator: "\n")
+        var shownRows: [XCUIElement] = []
+        for text in three {
+            let until = Date().addingTimeInterval(30)
+            var row: XCUIElement?
+            while Date() < until && row == nil {
+                row = rowSaying(ui, "bob: \(text)")
+                if row == nil { Thread.sleep(forTimeInterval: 0.25) }
+            }
+            guard let row else {
+                keepTree(ui, "no row says bob: \(text)")
+                XCTFail("PRODUCT: alice's timeline must show bob's \(text) as its own row within 30 s")
+                return
+            }
+            shownRows.append(row)
+        }
+        // A click on a row's empty right side selects the row, never its words.
+        func click(_ row: XCUIElement, _ keys: XCUIElement.KeyModifierFlags = []) {
+            if !inView(ui, row) { scrollTo(ui, row) }
+            let at = row.coordinate(withNormalizedOffset: CGVector(dx: 0.97, dy: 0.5))
+            XCUIElement.perform(withKeyModifiers: keys) { at.click() }
+        }
+        func check(_ how: String, _ copied: String) {
+            XCTAssertEqual(copied, want,
+                           "PRODUCT: bob's three messages, \(how), must copy as \(want.debugDescription); the pasteboard holds \(copied.debugDescription)")
+        }
+        // A drag from the first message's words to the last's.
+        if let first = textSaying(ui, three[0]), let last = textSaying(ui, three[2]) {
+            check("selected by a drag from the first to the last and copied with ⌘C", copiedBy(ui, {
+                let from = first.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.5)).withOffset(CGVector(dx: 1, dy: 0))
+                let to = last.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.5)).withOffset(CGVector(dx: -1, dy: 0))
+                from.click(forDuration: 0.3, thenDragTo: to)
+                ui.typeKey("c", modifierFlags: .command)
+            }))
+        } else {
+            keepTree(ui, "no Text says exactly a COPY post")
+            XCTFail("APPARATUS: XCTest finds no element whose words are exactly COPY ONE and COPY THREE, though their rows are shown")
+        }
+        check("the first clicked and the last ⇧-clicked, copied with ⌘C", copiedBy(ui, {
+            click(shownRows[0])
+            click(shownRows[2], .shift)
+            ui.typeKey("c", modifierFlags: .command)
+        }))
+        check("the first clicked and the others ⌘-clicked, copied with Edit › Copy", copiedBy(ui, {
+            click(shownRows[0])
+            click(shownRows[1], .command)
+            click(shownRows[2], .command)
+            ui.menuBars.menuBarItems["Edit"].click()
+            self.tap(ui, Key.menuItem("Copy"), "Edit › Copy")
+        }))
+        check("the last clicked and ⇧↑ pressed twice, copied with ⌘C", copiedBy(ui, {
+            click(shownRows[2])
+            ui.typeKey(.upArrow, modifierFlags: .shift)
+            ui.typeKey(.upArrow, modifierFlags: .shift)
+            ui.typeKey("c", modifierFlags: .command)
+        }))
+        print("[proof] three messages copied four ways: \(want.debugDescription)")
 
         // (5) The keyring: carol, a node made here, added by her pasted fingerprint, then removed.
         try staged(vox, ["node", "create", "carol"],
@@ -1886,14 +1982,14 @@ final class FirstRunProof: XCTestCase {
     /// Paste `text` into `key` as a person does (the decider, v0.4.1: "All input fields, I
     /// should be able to paste into"): put on the pasteboard, the field clicked, then ⌘V, or Edit ›
     /// Paste from the menu bar. What the field then holds (a secure field's value is one bullet per
-    /// character), or nil when the field was not reached. The pasteboard is cleared after.
+    /// character), or nil when the field was not reached. The person's clipboard is put back by
+    /// tearDown.
     /// Premise: the runner reads back what it puts on the pasteboard, else APPARATUS.
     @discardableResult
     private func paste(_ ui: XCUIApplication, _ key: Key, _ text: String, _ what: String,
                        fromMenu: Bool = false,
                        file: StaticString = #filePath, line: UInt = #line) -> String? {
         let board = NSPasteboard.general
-        defer { board.clearContents() }
         board.clearContents()
         board.setString(text, forType: .string)
         guard board.string(forType: .string) == text else {
@@ -1931,6 +2027,22 @@ final class FirstRunProof: XCTestCase {
             return ""
         }
         return selectAndCopy(ui, e, what, file: file, line: line)
+    }
+
+    /// A timeline row by what it says as one sentence ("bob: COPY ONE"), not by its words alone.
+    private func rowSaying(_ ui: XCUIApplication, _ sentence: String) -> XCUIElement? {
+        let e = ui.windows.firstMatch.descendants(matching: .any)
+            .matching(NSPredicate(format: "label == %@", sentence)).firstMatch
+        return e.exists ? e : nil
+    }
+
+    /// A message's time as ⌘C copies it: this Mac's time zone, to the minute.
+    private func copiedTime(_ millis: UInt64) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = .current
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f.string(from: Date(timeIntervalSince1970: Double(millis) / 1000))
     }
 
     /// The element whose own words are exactly `words` (a Text's value, or its label), in the

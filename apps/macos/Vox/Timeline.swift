@@ -103,6 +103,39 @@ extension NodeModel {
         }
     }
 
+    /// The messages selected in the timeline as ⌘C copies them (v0.4.1): one line each, oldest
+    /// first, "<author>, <time>: <text>".
+    var copiedLines: String {
+        timelineItems.compactMap(\.message)
+            .filter { selectedMessages.contains($0.id) }
+            .map { "\(Self.author($0, me: me)), \(Self.copiedTime($0.createdMillis)): \(Self.body($0))" }
+            .joined(separator: "\n")
+    }
+
+    /// Who wrote it, as its row names them: you, the alias, or the fingerprint's first 12
+    /// characters.
+    static func author(_ m: RoomMessage, me: String) -> String {
+        if m.author == me { return "you" }
+        return m.authorName.isEmpty ? String(m.author.prefix(12)) : m.authorName
+    }
+
+    /// What it says: its text; a share, its file or folder and its note; one still owed, that.
+    static func body(_ m: RoomMessage) -> String {
+        if m.owed { return "not received yet" }
+        guard let file = m.file else { return m.text }
+        let what = "\(file.folder ? "folder" : "file") \(file.name)"
+        return file.note.isEmpty ? what : "\(what): \(file.note)"
+    }
+
+    /// When it was written, in this Mac's time zone, to the minute: 2026-10-08 19:42.
+    static func copiedTime(_ millis: UInt64) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = .current
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f.string(from: Date(timeIntervalSince1970: Double(millis) / 1000))
+    }
+
     /// "<who> <what>", who named as the TUI names them: you, the alias, or the fingerprint's first
     /// 26 characters marked "(not in keyring)".
     func noticeWords(_ n: RoomNoticeRow) -> String {

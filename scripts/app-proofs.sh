@@ -28,7 +28,16 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 DERIVED="$ROOT/target/xcode"
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/vox-app-proofs.XXXXXX")"
-trap 'rm -rf "$SCRATCH"' EXIT
+# **The person's clipboard is put back as it was** (v0.4.1): the proofs paste and copy through the
+# general pasteboard. Every item and type is kept here and restored at exit, red, green or a crash
+# of the runner (each case restores it too, in its tearDown).
+osascript -l JavaScript "$ROOT/scripts/pasteboard-keep.js" save "$SCRATCH/pasteboard.plist" >/dev/null || {
+    echo "app-proofs: APPARATUS: cannot keep the clipboard to put it back after the run; not running" >&2
+    exit 2
+}
+trap 'osascript -l JavaScript "$ROOT/scripts/pasteboard-keep.js" restore "$SCRATCH/pasteboard.plist" >/dev/null \
+          || echo "app-proofs: the clipboard could not be put back: $SCRATCH/pasteboard.plist is lost with the scratch" >&2
+      rm -rf "$SCRATCH"' EXIT
 
 # **Never the person's own Vox** (APPARATUS before anything runs). A login item registered on this
 # Mac runs the bundle's `vox daemon` under launchd, with none of this run's scratch directories:

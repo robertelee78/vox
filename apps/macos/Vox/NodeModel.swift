@@ -118,8 +118,14 @@ final class NodeModel: ObservableObject {
     @Published var attachAsked = 0
     /// Asks the room on screen to send its draft urgent (⌘↩).
     @Published var urgentAsked = 0
-    /// The message selected in the timeline, and the one the composer replies to (⌘R).
+    /// The message selected in the timeline, and the one the composer replies to (⌘R): the one
+    /// the keyboard is on.
     @Published var selectedMessage: String?
+    /// Every message selected in the timeline, for ⌘C (v0.4.1): the one above, and those ⌘-click,
+    /// ⇧-click, ⇧↑/⇧↓ or a drag across rows added.
+    @Published var selectedMessages: Set<String> = []
+    /// Where a ⇧-click or ⇧↑/⇧↓ range starts.
+    var selectionAnchor: String?
     @Published var replyTo: RoomMessage?
     /// The service card selected above the timeline, whose command ⌘⇧C copies.
     @Published var selectedService: SharedService?
@@ -332,6 +338,8 @@ final class NodeModel: ObservableObject {
         members = []
         roomServices = []
         selectedMessage = nil
+        selectedMessages = []
+        selectionAnchor = nil
         selectedService = nil
         replyTo = nil
     }
