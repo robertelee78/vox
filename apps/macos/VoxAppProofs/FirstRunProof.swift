@@ -907,6 +907,17 @@ final class FirstRunProof: XCTestCase {
                 XCTFail("APPARATUS: XCTest finds no element whose words are exactly NEEDS-YOU, though bob's message was read on alice's screen")
             }
         }
+        // A sidebar row's name, whose words a drag cannot select (it selects the row): copied
+        // from its right-click Copy Name (v0.4.1).
+        let missionRow = Key.id("room-mission")
+        if present(ui, missionRow, timeout: 10, "the sidebar must list mission") {
+            let named = copiedBy(ui, {
+                self.el(ui, missionRow).rightClick()
+                self.tap(ui, Key.menuItem("Copy Name"), "Copy Name in mission's right-click menu")
+            })
+            XCTAssertEqual(named, "mission",
+                           "PRODUCT: Copy Name in the right-click menu of mission's sidebar row must put mission on the pasteboard; it holds \(named.debugDescription)")
+        }
         // Hidden (⌘H), alice's app shows nobody bob's next message: it is not read.
         handOff(ui, "h")
         XCTAssertTrue(ui.wait(for: .runningBackground, timeout: 10),

@@ -273,6 +273,20 @@ extension View {
             .accessibilityAction(.default, select)
     }
 
+    /// A right-click Copy for what a row names, each item copying its words (the decider, v0.4.1:
+    /// all text can be copied): for rows whose words cannot be selected, as a navigation list's
+    /// rows are, where a drag selects the row. Empty words give no item.
+    func copyMenu(_ items: [(title: String, words: String)]) -> some View {
+        contextMenu {
+            ForEach(items.filter { !$0.words.isEmpty }, id: \.title) { item in
+                Button(item.title) {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(item.words, forType: .string)
+                }
+            }
+        }
+    }
+
     /// The content surface: bg.base, text.primary (L-6).
     func contentSurface() -> some View {
         background(VoxTokens.Colors.bgBase)

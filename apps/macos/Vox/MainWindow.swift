@@ -67,6 +67,7 @@ private struct Sidebar: View {
             Section {
                 StateMark(kind: .live, words: "node \(model.node), attached")
                     .font(Theme.text)
+                    .copyMenu([("Copy Name", model.node)])
                     .accessibilityIdentifier("attached")
                     .background(SidebarHighlightOff())
             }
@@ -79,10 +80,12 @@ private struct Sidebar: View {
                     ForEach(rooms) { room in
                         RoomRow(room: room).tag(NodeModel.Selection.room(room.id))
                             .sidebarRow(model.selection == .room(room.id))
+                            .copyMenu([("Copy Name", room.name)])
                     }
                     ForEach(offers, id: \.fingerprint) { offer in
                         OfferRow(offer: offer).tag(NodeModel.Selection.offer(offer.fingerprint))
                             .sidebarRow(model.selection == .offer(offer.fingerprint))
+                            .copyMenu([("Copy Fingerprint", offer.fingerprint)])
                     }
                 } header: {
                     Text("\(need.words) (\(count))")
@@ -107,6 +110,7 @@ private struct Sidebar: View {
                     StateMark(kind: node.state == "attached" ? .live : .plain,
                               words: "\(node.name) \(node.state)")
                         .font(Theme.text)
+                        .copyMenu([("Copy Name", node.name), ("Copy Fingerprint", node.fingerprint)])
                         .accessibilityIdentifier("node-\(node.name)")
                 }
             } header: {
@@ -879,6 +883,7 @@ private struct Inspector: View {
                 .accessibilityAddTraits(.isHeader)
             ForEach(model.members) { member in
                 TrustMark(name: member.name, trust: member.trust)
+                    .copyMenu([("Copy Name", member.name), ("Copy Fingerprint", member.id)])
                     .accessibilityIdentifier("member-\(member.name)")
                 // What this node's keyring grants it (K-14), once it is in the keyring.
                 if member.trust != .none {
