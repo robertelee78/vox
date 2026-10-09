@@ -41,7 +41,7 @@ Install through the Vox vanity address; GitHub Releases remains the source of th
 and its release record. No package manager, account or token is required:
 
 ```
-curl -fsSL https://voxlux.us/install.sh | sh
+curl -fsSL https://voxlucis.us/install.sh | sh
 ```
 
 Targets: `x86_64-unknown-linux-gnu`, and `aarch64-apple-darwin` on macOS 13 or later. An Intel
@@ -94,7 +94,7 @@ too if you mean it — nobody can recover a room for you.
 
 The [user manual](docs/manual/README.md) has a complete first-room walkthrough, task guides,
 and troubleshooting organised by symptom. Read the same canonical manual at
-[voxlux.us](https://voxlux.us/docs/manual/).
+[voxlucis.us](https://voxlucis.us/docs/manual/).
 
 ### The daemon and your nodes
 

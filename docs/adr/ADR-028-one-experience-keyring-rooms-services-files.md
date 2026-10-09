@@ -11,7 +11,7 @@ removed, from the decider's answers of 2026-10-06. Nothing in this ADR is built 
 **Inputs**: [docs/ux/v040-ux-research.md](../ux/v040-ux-research.md) and the decider's answers in
 [docs/ux/v040-ux-interview-decisions.md](../ux/v040-ux-interview-decisions.md) (2026-10-03, 2026-10-04,
 2026-10-05, including the answers to this ADR's first draft's open questions, and 2026-10-06 for
-§2a, W-3 and W-4); the website's app study (`voxlux.us` `src/components/Experience.astro`).
+§2a, W-3 and W-4); the website's app study (`voxlucis.us` `src/components/Experience.astro`).
 
 ## Context
 
@@ -334,7 +334,7 @@ keep code in sync through GitHub.
 
 ### 9. Layout
 
-The website's app study (`voxlux.us`, `src/components/Experience.astro`) is the baseline
+The website's app study (`voxlucis.us`, `src/components/Experience.astro`) is the baseline
 structure for both clients; the TUI renders the same regions in text.
 
 - **W-1.** The window MUST have: a sidebar with the acting node (alias, attached state), the rooms,
@@ -455,7 +455,7 @@ Each line below is amended as stated. Where code already matches, the ADR text i
 
 ## Fixes outside this repository
 
-- `voxlux.us` `src/components/Experience.astro`, address anatomy: `family` is labelled "your room
+- `voxlucis.us` `src/components/Experience.astro`, address anatomy: `family` is labelled "your room
   alias"; under S-1a it is the room's shared name. The anatomy should also show that what is copied
   is the canonical form, `<service id>.<node fingerprint>.<room id>.vox` (S-1, S-3).
 
