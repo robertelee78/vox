@@ -234,6 +234,30 @@ fn every_verb_and_flag_the_skill_names_exists_in_the_cli() {
         })
         .collect::<Vec<_>>()
         .join("\n");
+    // **What each harness loads** (Claude Code, Codex, OpenCode): a `SKILL.md` whose front matter
+    // names the skill as its folder is named, and describes it on one line of at most 1024
+    // characters; OpenCode refuses a skill whose name is not its folder's.
+    let front = skill
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---\n"))
+        .map(|(f, _)| f)
+        .unwrap_or_else(|| panic!("PRODUCT: the pack's SKILL.md has no front matter:\n{skill}"));
+    let field = |k: &str| {
+        front
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{k}: ")))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let (name, description) = (field("name"), field("description"));
+    assert!(
+        name == "vox-agent-comms"
+            && !description.is_empty()
+            && description.chars().count() <= 1024
+            && front.lines().count() == 2,
+        "PRODUCT: the pack's front matter must name it as its folder (vox-agent-comms) and \
+         describe it on one line of at most 1024 characters: {front:?}"
+    );
     let (cmds, bare) = extract(&skill);
     assert!(
         cmds.len() >= 10,

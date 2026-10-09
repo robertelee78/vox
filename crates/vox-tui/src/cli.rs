@@ -532,6 +532,11 @@ pub struct JoinRoomArgs {
     /// asked for at the terminal, and with no terminal the command fails at once.
     #[arg(long)]
     pub passphrase_file: Option<PathBuf>,
+    /// Also bind this directory to the room, in the room map: every agent session started in it,
+    /// from any harness, then works in this room, its node joining with the passphrase given
+    /// here. What an agent asks you to run when its repo is tied to no room.
+    #[arg(long, value_name = "DIR")]
+    pub bind: Option<PathBuf>,
 }
 
 /// `vox room create`
@@ -1080,7 +1085,12 @@ pub struct AgentRoomArgs {
     #[command(flatten)]
     pub profile: AccountArgs,
     /// The room: its id, a unique start of it, or its name.
-    pub room: String,
+    #[arg(required_unless_present = "none")]
+    pub room: Option<String>,
+    /// The operator said no to binding this session's repo to a room: record it in the room map,
+    /// so no session started in that directory is asked again.
+    #[arg(long, conflicts_with = "room")]
+    pub none: bool,
     /// The agent's own node, as its hook names it; `VOX_NODE` in the session's environment.
     #[arg(long, env = "VOX_NODE", required = true)]
     pub node: String,
@@ -2460,8 +2470,13 @@ pub fn run() -> ExitCode {
                                 .await
                         }
                         RoomCmd::Join(a) => {
-                            crate::room_cli::join(&paths, &a.link, a.passphrase_file.as_deref())
-                                .await
+                            crate::room_cli::join(
+                                &paths,
+                                &a.link,
+                                a.passphrase_file.as_deref(),
+                                a.bind.as_deref(),
+                            )
+                            .await
                         }
                         RoomCmd::Create(a) => {
                             crate::room_cli::create(
@@ -2732,8 +2747,20 @@ pub fn run() -> ExitCode {
                     )?;
                     vox_core::node::layout::refuse_old_layout(&account)?;
                     block_on_client(async move {
-                        crate::agent_room::run(&account, &node, args.session.as_deref(), &args.room)
-                            .await
+                        match args.room.as_deref() {
+                            Some(room) => {
+                                crate::agent_room::run(
+                                    &account,
+                                    &node,
+                                    args.session.as_deref(),
+                                    room,
+                                )
+                                .await
+                            }
+                            None => {
+                                crate::agent_room::decline(&account, &node, args.session.as_deref())
+                            }
+                        }
                     })
                 });
             match outcome {
