@@ -497,6 +497,8 @@ private struct RoomView: View {
     @ObservedObject var model: NodeModel
     let room: String
     @State private var draft = ""
+    /// Whether the composer has the keyboard: ⇧↩ adds a line only then (P19).
+    @FocusState private var composing: Bool
     @StateObject private var window = WindowSeen()
     /// A file dropped, pasted or chosen, waiting for its To: and note.
     @State private var attaching: Attaching?
@@ -915,10 +917,13 @@ private struct RoomView: View {
             Text("\(model.node) ▸").font(Theme.mono).secondaryText()
                 .accessibilityLabel("posting as \(model.node)")
                 .accessibilityIdentifier("compose-as")
-            // Up to 12 lines, so a long message is read before it goes; Return sends, ⌥↩ adds a
-            // line (P19).
+            // Up to 12 lines, so a long message is read before it goes; Return sends, ⇧↩ (or ⌥↩)
+            // adds a line (P19).
             TextField("Message \(model.roomName(room))…", text: $draft, axis: .vertical)
                 .lineLimit(1...12)
+                .focused($composing)
+                .shiftReturnAddsLine(composing)
+                .help("Return sends; ⇧Return starts a new line")
                 .accessibilityLabel("Message \(model.roomName(room)), as \(model.node)")
                 .textFieldStyle(.plain)
                 .frame(minWidth: Theme.scaled(160), maxWidth: .infinity)

@@ -264,7 +264,7 @@ trust is missing: `Waiting for ann to trust you back`, `ann trusts you. Trust an
 neither has trusted the other, with a way to trust them.
 
 Type in **Message ROOM…**, after your node’s name (`ann ▸`, who posts), and press Return. The
-field grows to 12 lines; ⌥Return starts a new line. Type `@` and the start of a name to pick a member
+field grows to 12 lines; ⇧Return (or ⌥Return) starts a new line. Type `@` and the start of a name to pick a member
 you trust: the message is addressed to them, as with **To:**. An alias that differs from another
 only by case carries `#` and the first 6 characters of its fingerprint, so the two are never taken
 for one. What you were writing in a room, with its To:,
@@ -538,7 +538,7 @@ With drive, an open Session has its own composer, `Composer — to LABEL` after 
 - What you type goes to the session as its operator's input; a line starting with `/` is sent as
   a slash command. It stays in the field until the session's node takes it: refused, it is back
   as you typed it; with no answer it is kept, marked `delivery unknown`, and never sent again by
-  itself.
+  itself. Return sends it; the field grows to 12 lines, and ⇧Return (or ⌥Return) starts a new one.
 - **Interrupt** (Esc) stops the turn it is running. **Stop** (⌃C) asks `Stop LABEL? It ends the
   session.` first. Both work while a send waits.
 - The paper clip sends the session a file. While a Session is shown, **File > Attach File to

@@ -1,7 +1,42 @@
 // The composer's To: and urgent (ADR-014 M-15): who a message is addressed to, and whether it may
 // interrupt their agents mid-turn.
 
+import AppKit
 import SwiftUI
+
+/// **⇧↩ adds a line** in a composer (P19), as ⌥↩ does, while the field has the keyboard; Return
+/// still sends. ⌥↩ alone was not enough: on a Mac where a global hotkey takes ⌥↩ (the decider's
+/// brings Alacritty forward), the composer never sees it. ⇧↩ is the common convention.
+struct ShiftReturnAddsLine: ViewModifier {
+    /// Whether the composer has the keyboard: only then is ⇧↩ taken.
+    let focused: Bool
+    @State private var monitor: Any?
+
+    func body(content: Content) -> some View {
+        content
+            .onAppear { watch(focused) }
+            .onChange(of: focused) { watch($0) }
+            .onDisappear { watch(false) }
+    }
+
+    private func watch(_ on: Bool) {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+        monitor = nil
+        guard on else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            let held = event.modifierFlags.intersection([.shift, .command, .option, .control])
+            guard held == .shift, event.keyCode == 36 || event.keyCode == 76 else { return event }
+            // The line goes in where the insertion point is, as ⌥↩ puts it.
+            NSApp.sendAction(#selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)), to: nil, from: nil)
+            return nil
+        }
+    }
+}
+
+extension View {
+    /// ⇧↩ adds a line while `focused` (see `ShiftReturnAddsLine`).
+    func shiftReturnAddsLine(_ focused: Bool) -> some View { modifier(ShiftReturnAddsLine(focused: focused)) }
+}
 
 /// To: and urgent for what the composer posts (M-15): the members ticked are written into `to` as
 /// whole fingerprints, and a member's open Session as `<fingerprint>/<session id>`, the addressing
