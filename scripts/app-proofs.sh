@@ -41,6 +41,18 @@ if launchctl print "gui/$(id -u)/us.vox.daemon" >/dev/null 2>&1; then
         "Items, Vox) before a run" >&2
     exit 2
 fi
+# Nor one that is registered and allowed but not loaded yet: launchd would start it at the next
+# login, or as soon as anything enables it. `sfltool dumpbtm` reads the background items without
+# privileges; a us.vox.daemon item whose disposition says "allowed" (not "disallowed") refuses.
+if /usr/bin/sfltool dumpbtm </dev/null 2>/dev/null | awk '
+    /Disposition:/ { d = $0 }
+    /Identifier:[ \t]+8\.us\.vox\.daemon$/ && d !~ /disallowed/ { found = 1 }
+    END { exit !found }'; then
+    echo "app-proofs: APPARATUS (precondition unmet): a Vox login item (us.vox.daemon) is" \
+        "registered and allowed on this Mac, and it runs on the real profile; switch Vox off under" \
+        "System Settings, General, Login Items & Extensions, Allow in the Background, before a run" >&2
+    exit 2
+fi
 real_listing() {
     if [ -e "$REAL" ]; then find "$REAL" -exec stat -f '%N %z %m' {} + | sort; else echo absent; fi
 }
@@ -75,20 +87,23 @@ if [ -n "${VOX_PROOF_APP:-}" ]; then
     fi
     unset VOX_PROOF_APP
 fi
-# **No other Vox.app is registered** (APPARATUS before anything runs): LaunchServices opens a
-# registered us.vox.app for a notification click, Spotlight, Launchpad or a login item's lookup,
-# with none of this run's scratch directories, so on the person's real profile. Only this run's
-# own build may be registered, and it is unregistered when the run ends.
+# **A proof build is not Vox** (#571): it is built as us.vox.app.proof, named "Vox Proof" (its
+# share extension us.vox.app.proof.share), so the person's own Vox.app (us.vox.app), which may be
+# installed and running, is never the one a lookup, a notification or XCTest reaches. No other
+# proof build may be registered (APPARATUS before anything runs): LaunchServices opens a
+# registered one for a notification click, Spotlight or Launchpad with none of this run's scratch
+# directories. Only this run's own build may be, and it is unregistered when the run ends.
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 vox_registrations() {
     "$LSREGISTER" -dump 2>/dev/null \
-        | awk '/^path:/{p=$0} /identifier: +us\.vox\.app$/{print p}' \
+        | awk '/^path:/{p=$0} /identifier: +us\.vox\.app\.proof$/{print p}' \
         | sed -E 's/^path: *//; s/ \(0x[0-9a-f]+\)$//' | sort -u
 }
 STRAY="$(vox_registrations | grep -vxF "$APP" || true)"
 if [ -n "$STRAY" ]; then
-    echo "app-proofs: APPARATUS (precondition unmet): other Vox.app builds are registered with" \
-        "LaunchServices, and any of them can be opened on the real profile; unregister them" \
+    echo "app-proofs: APPARATUS (precondition unmet): other Vox Proof builds (us.vox.app.proof)" \
+        "are registered with LaunchServices, and any of them can be opened on the real profile;" \
+        "unregister them" \
         "(lsregister -u <path>, registration only) before a run:" >&2
     echo "$STRAY" >&2
     exit 2
@@ -118,9 +133,28 @@ echo "app-proofs: preflight: whether Vox may notify is checked first by the noti
 XCFRAMEWORK_SLICES=macos scripts/build-xcframework.sh
 cargo build --release --bin vox
 
+# **The app under proof registers no background item** (#571): built with
+# VOX_PROOF_STUB_SERVICES, its login item and its LAN helper are stand-ins that record what was
+# asked and register nothing. A real login item runs `vox daemon` under launchd on the real
+# profile, and a real LAN helper is a root daemon. A release is never built this way, and
+# scripts/assemble-macos-app.sh refuses a bundle carrying the stand-ins.
 xcodebuild -project apps/macos/Vox.xcodeproj -scheme Vox -configuration Release \
     -derivedDataPath "$DERIVED" ARCHS=arm64 CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual \
+    SWIFT_ACTIVE_COMPILATION_CONDITIONS='$(inherited) VOX_PROOF_STUB_SERVICES' \
+    VOX_APP_ID=us.vox.app.proof VOX_APP_NAME="Vox Proof" \
     build-for-testing
+built_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+    "$DERIVED/Build/Products/Release/Vox.app/Contents/Info.plist" 2>/dev/null || true)"
+[ "$built_id" = us.vox.app.proof ] || {
+    echo "app-proofs: APPARATUS: the app under proof is $built_id, not us.vox.app.proof, so it" \
+        "would share the person's Vox's identity; not running" >&2
+    exit 2
+}
+grep -q vox-proof-service-stand-in "$DERIVED/Build/Products/Release/Vox.app/Contents/MacOS/Vox" || {
+    echo "app-proofs: APPARATUS: the app was built without its stand-in login item and LAN" \
+        "helper, so a proof could register real ones; not running" >&2
+    exit 2
+}
 
 APP="$DERIVED/Build/Products/Release/Vox.app"
 mkdir -p "$APP/Contents/Helpers"

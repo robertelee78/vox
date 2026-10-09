@@ -114,6 +114,12 @@ struct VoxCommands: Commands {
     @ObservedObject var app: AppModel
 
     var body: some Commands {
+        // Keep Running, reachable while Vox runs (#571): its title says what choosing it does.
+        CommandGroup(after: .appSettings) {
+            Button(app.keepRunning ? "Turn Keep Running Off" : "Keep Running While Logged In") {
+                Task { await app.setKeepRunning(!app.keepRunning) }
+            }
+        }
         CommandGroup(replacing: .newItem) { items("File") }
         CommandMenu("Room") { items("Room") }
         CommandMenu("Node") {
