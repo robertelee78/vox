@@ -4962,14 +4962,14 @@ pub async fn trust_remove(paths: &Paths, target: Digest32) -> Result<(), AppErro
         .map(|(_, t)| t)
         .collect();
     println!(
-        "vox: about to stop trusting {}",
+        "vox: about to remove {} from your keyring",
         crate::ident::author_id(&target)
     );
     println!(
         "     it is to read nothing you write from now on in {}; what it already read stays read",
         listed(&room_names, "any room")
     );
-    // What it is to lose, never what it is to keep: once untrusted it reaches none of them.
+    // What it is to lose, never what it is to keep: once removed it reaches none of them.
     if services.is_empty() {
         println!("     and to reach none of your services (you offer none in a room you share)");
     } else {
@@ -4991,7 +4991,7 @@ pub async fn trust_remove(paths: &Paths, target: Digest32) -> Result<(), AppErro
     {
         Ok(Frame::Ok) => {
             println!(
-                "vox: no longer trusting {}",
+                "vox: removed {} from your keyring",
                 crate::ident::author_id(&target)
             );
             println!("     your sender key is rotated and everyone still trusted is re-keyed");

@@ -226,7 +226,7 @@ fail, report each side's trust direction and reachability without posting messag
 **Symptom:** `(not received yet)` occupies a position in the timeline.
 
 **Meaning:** this node holds the signed envelope, but its unexpired message body is still
-owed. It is not a blanket label for an untrusted sender and does not expose that sender's
+owed. It is not a blanket label for a sender not in your keyring and does not expose that sender's
 plaintext. The row has no arrival cursor until the body arrives.
 
 **Check:** inspect `vox status`, the affected room and peer connectivity. Compare whether

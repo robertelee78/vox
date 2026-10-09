@@ -667,7 +667,7 @@ pub enum TunnelCmd {
     /// service. `vox status` lists them, with their numbers.
     ///
     /// On the host, this closes a member's sessions to your services; on a guest, a session your
-    /// `vox up` or `vox forward` carries. Nobody is untrusted and no service is removed: the
+    /// `vox up` or `vox forward` carries. Nobody leaves a keyring and no service is removed: the
     /// member can open a new tunnel at once. The far end is told the tunnel was closed.
     Close(TunnelCloseArgs),
 }
@@ -1707,9 +1707,9 @@ enum TrustCmd {
     Add(TrustAddArgs),
     /// List the identities this node trusts, and what it calls them.
     List(IdentityArgs),
-    /// Stop trusting an identity, and change the lock.
+    /// Remove an identity from your keyring, and change the lock.
     ///
-    /// Removes the ring entry, then rotates this identity's sender key and re-keys
+    /// Removes its keyring entry, then rotates this identity's sender key and re-keys
     /// everyone still trusted, in every room shared with the removed key — so it stops
     /// reading what comes next, everywhere. It keeps what it already
     /// read; that cannot be taken back.
@@ -1815,7 +1815,7 @@ pub struct TrustAddArgs {
 pub struct TrustRemoveArgs {
     #[command(flatten)]
     pub profile: NodeArgs,
-    /// The identity to stop trusting.
+    /// The identity to remove from your keyring.
     pub fingerprint: String,
     /// **Refused.** A command line is world-readable while the process runs — `ps`, or
     /// `/proc/<pid>/cmdline` — so a passphrase here is disclosed to every process on the

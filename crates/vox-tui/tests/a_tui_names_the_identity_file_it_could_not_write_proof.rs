@@ -95,7 +95,9 @@ fn a_tui_names_the_identity_file_it_could_not_write() {
     assert!(
         first_run.contains("there is no backup of a node")
             && first_run.contains("if this machine is lost")
-            && first_run.contains("untrust it"),
+            // Remove is the one word for taking a node out of a keyring (ADR-028 E-2, #628).
+            && first_run.contains("remove it from their keyring")
+            && !first_run.to_lowercase().contains("untrust"),
         "PRODUCT: the TUI's first run must say a node has no backup and what a lost machine \
          means: it showed {first_run:?}"
     );

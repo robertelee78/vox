@@ -516,7 +516,7 @@ impl VoxNode {
     ) -> Result<(), VoxError> {
         let fingerprint = digest(&fingerprint, "fingerprint")?;
         self.keyring_change(
-            "untrusting",
+            "removing from the keyring",
             NodeCommand::Untrust { fingerprint },
             passphrase,
         )

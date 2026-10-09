@@ -107,7 +107,7 @@ private struct DecisionRow: View {
     private var kind: StateMark.Kind {
         switch event.decided {
         case "refused", "cut": return .danger
-        case "untrusted", "stopped": return .attention
+        case "removed", "untrusted", "stopped": return .attention
         default: return .plain
         }
     }

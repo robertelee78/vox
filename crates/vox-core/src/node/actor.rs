@@ -5196,7 +5196,7 @@ impl Node {
                     self.decisions.record(
                         (self.millis_clock)(),
                         &crate::node::decisions::Decision {
-                            asked: "to stop trusting a member",
+                            asked: "to remove a member from the keyring",
                             by: fingerprint,
                             alias,
                             decided: crate::node::decisions::Decided::Untrusted,

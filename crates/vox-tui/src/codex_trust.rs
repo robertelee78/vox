@@ -241,7 +241,7 @@ pub fn trust(codex: &str) -> Result<Report, String> {
     let after = ours(&app.call("hooks/list", json!({}))?, this_exe.as_deref());
     if let Some((key, _, _, _)) = after.iter().find(|(_, _, trusted, _)| !trusted) {
         return Err(format!(
-            "Codex still reports {key} as untrusted after the write"
+            "Codex still reports {key} as not trusted after the write"
         ));
     }
     Ok(report)
