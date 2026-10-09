@@ -1487,8 +1487,15 @@ final class FirstRunProof: XCTestCase {
     /// label and value in its windows, sheets and dialogs, read as they are.
     private func noCommandLine(_ ui: XCUIApplication, _ where: String,
                                file: StaticString = #filePath, line: UInt = #line) {
-        let shownNow = containers(ui).flatMap { $0.descendants(matching: .any).allElementsBoundByIndex.prefix(400) }
-            .map(shown).filter { !$0.isEmpty }
+        // Read from one snapshot per container: an element looked up again by its index can be
+        // gone by then (a menu closing), which XCTest fails on as no match.
+        func words(_ s: XCUIElementSnapshot) -> [String] {
+            let own = [s.label, (s.value as? String) ?? "", s.title].filter { !$0.isEmpty }
+            return own + s.children.flatMap(words)
+        }
+        let shownNow = containers(ui).flatMap { $0.allElementsBoundByIndex }
+            .compactMap { try? $0.snapshot() }
+            .flatMap(words)
         let words = ["Terminal", "terminal", "command line", "vox node", "vox room", "vox id", "vox trust", "`vox"]
         if let said = shownNow.first(where: { text in words.contains { text.contains($0) } }) {
             keepTree(ui, "\(`where`) named Terminal or a command")
