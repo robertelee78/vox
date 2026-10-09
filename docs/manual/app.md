@@ -249,9 +249,18 @@ A message counts as read only while the window is in front of you: Vox in front,
 key, not minimized and not covered, and the message at least half in view. Nothing is read while
 the app is hidden.
 
-A shared file or folder is a card with its name, size and the start of its SHA-256. An image
-shows its preview, carried in the share, even while the sharer is offline. Once your node has
-pulled a copy and checked it, the card offers **Quick Look** and **Show in Finder**.
+A shared file or folder is a card with its name, its size and, when it is not for the whole
+room, `Addressed to ann, bo`; **Details** shows its whole SHA-256 and who shared it. An image
+shows its preview, carried in the share, even while the sharer is offline. The card says where
+your copy stands, with one way on:
+
+- **Download** pulls it, with its progress (`1.2 MB of 4 MB`). From a node not in your keyring it
+  says so, and offers **Trust…** or **Download Anyway**.
+- `Waiting for ann to come online.` while the sharer cannot be reached.
+- `Not pulled:` and the reason, with **Try Again**.
+- Once your node has pulled a copy and checked its size and SHA-256 against the share,
+  **Quick Look**, **Show in Finder** and **Save a Copy…**. Nothing unchecked is ever opened, and a
+  copy saved elsewhere is copied, never moved, so the room's own copy ages with the room.
 
 A message that starts with a link may carry a card for the page: its title, description and
 picture, found by the sender's node when it posted, so showing it fetches nothing. Only `http`
@@ -259,16 +268,20 @@ and `https` links can be opened from a card; any other link is shown as text.
 
 ### Posting
 
-While a member cannot read you, or you them, a line above the composer says who and which way
-trust is missing: `Waiting for ann to trust you back`, `ann trusts you. Trust ann too`, or that
-neither has trusted the other, with a way to trust them.
+While a member cannot read you, or you them, one line above the composer says who and which way
+trust is missing: `You trust ann. Waiting for ann to trust you back before you can read each
+other.`, `ann trusts you. Trust ann too, and you can read each other.` (with **Trust ann…**), or
+that neither has trusted the other. With several, it names every one, by alias or the start of
+the fingerprint. **Show Keyring** is offered when one of them is not in your keyring.
 
 Type in **Message ROOM…**, after your node’s name (`ann ▸`, who posts), and press Return. The
 field grows to 12 lines; ⇧Return (or ⌥Return) starts a new line. Type `@` and the start of a name to pick a member
 you trust: the message is addressed to them, as with **To:**. An alias that differs from another
 only by case carries `#` and the first 6 characters of its fingerprint, so the two are never taken
 for one. What you were writing in a room, with its To:,
-Urgent and reply, is kept while you look at another room or Session. Beside the field:
+Urgent and reply, is kept while you look at another room or Session. What you send stays in the
+field until your node has it: a send that fails leaves your text, To:, Urgent and reply as they
+were, and what you typed meanwhile is kept too. Beside the field:
 
 - **To:** opens the room's members to tick the ones the message is addressed to, and under each,
   their open Sessions: a Session ticked is addressed alone. With none ticked it goes to the room.
@@ -285,7 +298,8 @@ says `Replying to NAME: …` until you send or choose **Cancel**.
 ### Files: drag, paste, Attach or Share
 
 Drop a file or folder on the timeline, paste one into it, or choose the paper clip
-(**File > Attach File…**, ⌘O). The app asks for a **To:** and an optional **Note**, then
+(**File > Attach File…**, ⌘O). The app asks for a **To:** and an optional **Note**, starting
+from the composer's To: and Urgent, then
 **Share** sends them as one share: the note and the addressees travel in the share, never as a
 message of their own. With no one ticked the share is for the whole room; with members ticked
 the room still sees it. It is the same as `vox share` (see [Send and receive files](files.md)).
@@ -339,10 +353,12 @@ clears it, and a sheet shows only what came of its own action. If macOS does not
 - **Room > Copy Room Link** (⌘L).
 - **Room > Rename…**: the room's one name, as every member sees it, in their sidebar and in
   every address of the room's services. Only the room's creator or an admin may rename it.
-- **Room > Retention…**: 1 day, 7 days, 30 days, 1 year or forever. The sheet says what it does
-  before you set it: "Every member deletes a message's text 7 days after it was sent, and older
-  ones at once. Deleted text cannot be read again." Neither rename nor retention asks for a
-  passphrase.
+- **Room > Retention…**: 1 day, 7 days, 30 days, 1 year or forever. The sheet opens at what the
+  room keeps now (`This room keeps messages for 7 days. Choose another to change it.`), and
+  **Set** works only once you choose another; Return never sets it. It says what the choice does
+  before you set it: "Every member deletes each message, with the files it shared and their
+  previews, 7 days after it was sent, and older ones at once. What is deleted cannot be read or
+  opened again." Neither rename nor retention asks for a passphrase.
 - **Room > Admins…**: the creator first, then the members it made admins. An admin may end the
   room and set its retention, so making one asks first: `Make bo an admin? An admin can end this
   room for everyone and change its retention.` Taking it away happens at once.
