@@ -8,7 +8,7 @@
     "bg.overlay":     { "hex": "#1c1d21", "hex_hc": "#2a2c31", "xterm256": 234, "ansi16": "black" },
     "selection":      { "hex": "#45474f", "hex_hc": "#55575f", "xterm256": 239, "ansi16": "bright-black" },
     "selection.secondary": { "hex": "#dcd7cf", "hex_hc": "#e2ddd5", "xterm256": 252, "ansi16": "default-fg" },
-    "line.hair":      { "hex": "#26272b", "hex_hc": "#8c8780", "xterm256": 235, "ansi16": "bright-black" },
+    "line.hair":      { "hex": "#303137", "hex_hc": "#8c8780", "xterm256": 236, "ansi16": "bright-black" },
     "text.primary":   { "hex": "#f0ece4", "hex_hc": "#ffffff", "xterm256": 255, "ansi16": "default-fg" },
     "text.secondary": { "hex": "#a8a299", "hex_hc": "#dcd7cf", "xterm256": 247, "ansi16": "default-fg" },
     "text.muted":     { "hex": "#8a857f", "hex_hc": "#c2bcb3", "xterm256": 244, "ansi16": "bright-black" },
