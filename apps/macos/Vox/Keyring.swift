@@ -211,20 +211,9 @@ private struct KeyringRow: View {
                 }
             }
             if comparing {
-                TextField("Their fingerprint, pasted or typed", text: $other).font(Theme.mono)
-                    .accessibilityLabel("Their fingerprint, to compare with \(node.name)'s")
-                    .accessibilityIdentifier("keyring-compare-\(node.name)")
-                if !other.isEmpty {
-                    if Compare.same(other, node.fingerprint) {
-                        StateMark(kind: .plain, words: "Matches \(node.name)'s fingerprint.")
-                    } else {
-                        // K-5: a mismatch is its own action, which says not to trust the node.
-                        StateMark(kind: .danger,
-                                  words: "Does not match. This is not the node you trusted as "
-                                      + "\(node.name): do not trust it.")
-                        Button("Untrust \(node.name)…", role: .destructive, action: remove)
-                    }
-                }
+                // Group by group (#624): only a real mismatch says not to trust it (K-5).
+                CompareField(fingerprint: node.fingerprint, name: node.name,
+                             id: "keyring-\(node.name)", remove: remove)
             }
         }
         .padding(.vertical, 8)

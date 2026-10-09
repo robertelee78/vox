@@ -60,7 +60,6 @@ struct NodeCard: View {
     @State private var act: NodeCardFor.Act?
     @State private var alias = ""
     @State private var drive = false
-    @State private var other = ""
 
     var body: some View {
         let card = fingerprintCard(fingerprint: node.fingerprint)
@@ -100,7 +99,7 @@ struct NodeCard: View {
                         Button("Trust…") { act = .trust }
                             .accessibilityIdentifier("card-trust-open")
                     }
-                    Button("Compare…") { act = .compare; other = "" }
+                    Button("Compare…") { act = .compare }
                         .accessibilityIdentifier("card-compare-open")
                     if trust.inKeyring {
                         Button("Remove…", role: .destructive) { act = .remove }
@@ -167,26 +166,11 @@ struct NodeCard: View {
         .accessibilityIdentifier("card-trust-confirm")
     }
 
-    /// Compare a fingerprint pasted or typed with this node's; a mismatch is its own action, which
-    /// says not to trust it (K-5).
+    /// Compare a fingerprint pasted or typed with this node's, group by group (K-5, #624): only a
+    /// real mismatch says not to trust it, and only then is Remove offered.
     @ViewBuilder private func comparing(_ entry: TrustedNode?) -> some View {
-        TextField("Their fingerprint, pasted or typed", text: $other).font(Theme.mono)
-            .accessibilityLabel("Their fingerprint, to compare with \(node.name)'s")
-            .accessibilityIdentifier("card-compare")
-        if !other.isEmpty {
-            if Compare.same(other, node.fingerprint) {
-                StateMark(kind: .plain, words: "Matches \(node.name)'s fingerprint.")
-                    .accessibilityIdentifier("card-compare-said")
-            } else {
-                StateMark(kind: .danger,
-                          words: "Does not match. This is not the node you were given as "
-                              + "\(node.name): do not trust it.")
-                    .accessibilityIdentifier("card-compare-said")
-                if entry != nil {
-                    Button("Remove \(node.name)…", role: .destructive) { act = .remove }
-                }
-            }
-        }
+        CompareField(fingerprint: node.fingerprint, name: entry?.name ?? node.name, id: "card",
+                     remove: entry == nil ? nil : { act = .remove })
     }
 
     /// Remove it from the keyring: what that does said first (E-5), done only when confirmed.

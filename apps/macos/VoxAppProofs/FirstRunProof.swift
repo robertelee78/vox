@@ -64,11 +64,15 @@
 //     detached, a message she posts says "only on this machine"; once bob's node is back, "on 1 of
 //     2 members' nodes" (D9). Node > Detach then offers only to attach alice again, never another
 //     node of this Mac's, and attaching again makes the window hers (D17).
+//     Compare goes group by group (#624): four groups of dave's fingerprint on his offer say "So
+//     far matches 4 of 13 groups."; on his card two say 2 of 13, a wrong third is named as group 3
+//     with no Remove (he is not in the keyring), and the whole of it is marked a match.
 //
 // Mutants for (15), one each: the member rows drop a node's trust in alice unless she trusts it
 // (D4: the row reads "not in keyring"); the timeline drops the whereabouts line (D9); the join
 // line leaves out who trusts the newcomer (D10); Detach goes back to the chooser of every node
-// (D17). Each turns (15) red on its own assertion.
+// (D17); a compare that calls any partial entry a mismatch (#624). Each turns (15) red on its own
+// assertion.
 // Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
 // place of the app's hold), and quitting leaves it attached: (12) goes red. A room with a message
 // addressed to this node grouped as quiet (`attention::group`): (3) goes red. An app that never
@@ -1348,10 +1352,40 @@ final class FirstRunProof: XCTestCase {
         let banner = words(ui, Key.id("trust-banner"), timeout: 10,
                            "mission must say whom alice does not yet read each other with: dave",
                            until: { $0.contains(String(daveFp.prefix(12))) }) ?? ""
+        // (15e, #624) Compare, group by group: on dave's offer, collapsed until asked for, a
+        // partial entry says how far it matches.
+        tap(ui, Key.id("offer-\(daveFp.prefix(12))"), "dave's offer under needs you")
+        tap(ui, Key.id("offer-compare-open"), "Compare… on dave's offer")
+        type(ui, Key.id("offer-compare"), String(daveFp.prefix(16)), "the offer's compare field")
+        let offerSoFar = words(ui, Key.id("offer-compare-said"), timeout: 10,
+                               "four groups of dave's own fingerprint typed on his offer must say \"So far matches 4 of 13 groups.\"",
+                               until: { $0 == "So far matches 4 of 13 groups." }) ?? ""
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         tap(ui, daveRow, "dave in the member pane")
         let directions = words(ui, Key.id("card-directions"), timeout: 10,
                                "dave's card must say both directions: he trusts alice, she has not trusted him",
                                until: { $0.contains("trusts you; you haven't trusted") }) ?? ""
+        // On his card: two groups so far; a wrong third named, with no Remove (he is not in the
+        // keyring); the whole of it marked as a match.
+        tap(ui, Key.id("card-compare-open"), "Compare… on dave's card")
+        let field = Key.id("card-compare")
+        type(ui, field, String(daveFp.prefix(8)), "the card's compare field")
+        let soFar = words(ui, Key.id("card-compare-said"), timeout: 10,
+                          "two groups of dave's fingerprint typed must say \"So far matches 2 of 13 groups.\"",
+                          until: { $0 == "So far matches 2 of 13 groups." }) ?? ""
+        let third = daveFp.dropFirst(8).prefix(4)
+        el(ui, field).typeText(String(third.map { $0 == "a" ? "b" : "a" }))
+        let wrong = words(ui, Key.id("card-compare-said"), timeout: 10,
+                          "a third group that differs must be named: \"Group 3 does not match: you have …\"",
+                          until: { $0.hasPrefix("Group 3 does not match: you have ") && $0.hasSuffix("do not trust it.") }) ?? ""
+        XCTAssertNil(locate(ui, Key.id("card-compare-remove")),
+                     "PRODUCT: dave is not in alice's keyring, so his compare must offer no Remove")
+        el(ui, field).typeKey("a", modifierFlags: .command)
+        el(ui, field).typeText(daveFp)
+        let whole = words(ui, Key.id("card-compare-said"), timeout: 10,
+                          "dave's whole fingerprint typed must be marked as a match of all 13 groups",
+                          until: { $0.hasSuffix("all 13 groups.") && $0.hasPrefix("Matches ") }) ?? ""
+        print("[proof] compare: offer \(offerSoFar); card \(soFar) → \(wrong) → \(whole)")
         tap(ui, Key.id("card-trust-open"), "Trust… on dave's card")
         type(ui, Key.id("card-alias"), "dave", "the card's alias field")
         tap(ui, Key.id("card-trust-confirm"), "Trust")
