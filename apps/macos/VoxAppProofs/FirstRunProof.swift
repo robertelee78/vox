@@ -732,13 +732,33 @@ final class FirstRunProof: XCTestCase {
                 throw Apparatus("bob's session hook (\(event["hook_event_name"] ?? "")) exited \(r.status): \(r.out)")
             }
         }
+        // A tool call is its PreToolUse and its PostToolUse: the Session's line is the call
+        // ("Bash: echo P7-LINE-n → P7-LINE-n"); a result with no call shows nothing.
+        // Three digits, so no line's name is part of another's ("P7-LINE-1" is in "P7-LINE-12").
+        func p7Line(_ n: Int) -> String { String(format: "P7-LINE-%03d", n) }
         func toolCall(_ n: Int) throws {
-            try hook(["hook_event_name": "PostToolUse", "tool_name": "Bash",
-                      "tool_use_id": "p7-\(n)", "tool_input": ["command": "echo P7-LINE-\(n)"],
-                      "tool_response": ["stdout": "P7-LINE-\(n)", "stderr": "", "interrupted": false]])
+            let call: [String: Any] = ["tool_name": "Bash", "tool_use_id": "p7-\(n)",
+                                       "tool_input": ["command": "echo \(p7Line(n))"]]
+            try hook(call.merging(["hook_event_name": "PreToolUse"]) { $1 })
+            try hook(call.merging(["hook_event_name": "PostToolUse",
+                                   "tool_response": ["stdout": p7Line(n), "stderr": "",
+                                                     "interrupted": false]]) { $1 })
+        }
+        // What alice's node holds of the Session, as `vox room session` prints it to her.
+        func sessionHolds(_ text: String, within seconds: TimeInterval) -> Bool {
+            let end = Date().addingTimeInterval(seconds)
+            repeat {
+                let r = run(vox, ["room", "session", "--node", "alice", room, "p7proofs"], env: voxEnv)
+                if r.status == 0 && r.out.contains(text) { return true }
+                Thread.sleep(forTimeInterval: 1)
+            } while Date() < end
+            return false
         }
         try hook(["hook_event_name": "UserPromptSubmit", "prompt": "sort the photos"])
         for n in 1...30 { try toolCall(n) }
+        guard sessionHolds("P7-LINE-030", within: 60) else {
+            throw Apparatus("bob's Session never showed P7-LINE-030 to alice's node: `vox room session --node alice` says \(run(vox, ["room", "session", "--node", "alice", room, "p7proofs"], env: voxEnv).out.suffix(600)), so the app's Session cannot be checked")
+        }
         let sessionRow = Key.id("session-p7proofs")
         present(ui, sessionRow, timeout: 60,
                 "bob's Session, opened by his session's hook, must be listed in mission")
@@ -749,24 +769,27 @@ final class FirstRunProof: XCTestCase {
             return Int(words[r].split(separator: " ")[0])
         }
         tap(ui, sessionRow, "bob's Session")
-        let newestLine = Key.showing("P7-LINE-30")
+        let newestLine = Key.showing("P7-LINE-030")
         let openedUntil = Date().addingTimeInterval(20)
         while Date() < openedUntil && !el(ui, newestLine).isHittable { Thread.sleep(forTimeInterval: 0.25) }
-        if el(ui, Key.showing("P7-LINE-1")).isHittable && el(ui, newestLine).isHittable {
+        if el(ui, Key.showing("P7-LINE-001")).isHittable && el(ui, newestLine).isHittable {
             throw Apparatus("all 30 of the Session's lines fit in the timeline, so opening at its newest cannot be told from opening at its top")
         }
         if !el(ui, newestLine).isHittable {
             keepTree(ui, "the Session did not open at its newest line")
-            XCTFail("PRODUCT: a Session opened must show its newest line, P7-LINE-30, in view; it is not on screen 20 s after bob's Session was chosen")
+            XCTFail("PRODUCT: a Session opened must show its newest line, P7-LINE-030, in view; it is not on screen 20 s after bob's Session was chosen")
         }
         try toolCall(31)
+        guard sessionHolds("P7-LINE-031", within: 30) else {
+            throw Apparatus("bob's 31st tool call never reached alice's node (`vox room session --node alice`), so following it cannot be checked")
+        }
         let followUntil = Date().addingTimeInterval(30)
-        while Date() < followUntil && !el(ui, Key.showing("P7-LINE-31")).isHittable {
+        while Date() < followUntil && !el(ui, Key.showing("P7-LINE-031")).isHittable {
             Thread.sleep(forTimeInterval: 0.25)
         }
-        if !el(ui, Key.showing("P7-LINE-31")).isHittable {
+        if !el(ui, Key.showing("P7-LINE-031")).isHittable {
             keepTree(ui, "the Session did not follow its new line")
-            XCTFail("PRODUCT: a Session watched at its newest line must follow what it prints next; P7-LINE-31 is not on screen 30 s after bob's session made it")
+            XCTFail("PRODUCT: a Session watched at its newest line must follow what it prints next; P7-LINE-031 is not on screen 30 s after bob's session made it")
         }
         // D18: a message to the room while the Session is shown is not seen, so it counts.
         guard let before = newCount() else {
@@ -794,7 +817,7 @@ final class FirstRunProof: XCTestCase {
             keepTree(ui, "a message seen in General was still counted")
             XCTFail("PRODUCT: General shown with D18-UNSEEN in view must read it, so mission's row counts one fewer new; it still says \"\(shown(el(ui, Key.id("room-mission"))))\"")
         }
-        print("[proof] Session opened at P7-LINE-30 and followed P7-LINE-31; D18-UNSEEN counted while a Session was shown (\(before) → \(counted) new), read once General showed it (\(after))")
+        print("[proof] Session opened at P7-LINE-030 and followed P7-LINE-031; D18-UNSEEN counted while a Session was shown (\(before) → \(counted) new), read once General showed it (\(after))")
 
         // (4) Read each way. Bob's NEEDS-YOU is on alice's screen now: her node says she read it.
         var readByAlice: [String] = []
