@@ -22,6 +22,8 @@
 //    is read, and bob's `vox room read --json` says alice read it; one bob posts while alice's
 //    app is hidden is not read, until she brings it back; a message alice posts, read by bob's
 //    agent drain (`vox agent hook`), shows "read by bob" under it in her timeline.
+//    A reply quotes what it answers (ADR-028 R-9, D6): bob's reply to FROM-ALICE shows "re you:
+//    FROM-ALICE" above it, and its quote, clicked, or ⌘↑ with the reply selected, selects FROM-ALICE.
 // 5. The keyring view (ADR-014 M-16, ADR-028 K-3, E-5, #443): a pasted fingerprint with an alias
 //    says what trusting does before it is done, and is listed, as `vox trust list` lists it;
 //    removing it says what untrusting does first, and only then removes it.
@@ -72,6 +74,7 @@
 // Untrust that leaves a member's live sessions running: (11) goes red. An app that counts
 // nothing from before it opened (no seeding from VoxClient.unread): (13) goes red. ↑/↓ that do not
 // move the selection, or Space and Return that open nothing: (14) goes red.
+// A quote that goes nowhere (MessageRow's quote button not calling `jump`): (4) goes red.
 
 // Every check on the window proves its own query first (ADR-018: a red names its side): Vox is in
 // front and XCTest reads words in what it shows, else the red is APPARATUS; then a red is PRODUCT
@@ -786,6 +789,56 @@ final class FirstRunProof: XCTestCase {
                               "alice's message read by bob must show \"read by bob\" under it",
                               until: { $0 == "read by bob" }) ?? ""
         print("[proof] bob's message read by \(readByAlice); alice's message: \(readWords)")
+
+        // (4c) A reply quotes what it answers, and the quote goes to it (ADR-028 R-9, D6): bob
+        // replies to FROM-ALICE; alice's timeline shows "re you: FROM-ALICE" above his reply, and
+        // clicking it, or ⌘↑ with the reply selected, selects FROM-ALICE.
+        func entry(_ text: String) -> String? {
+            let rows = run(vox, ["room", "read", "--node", "alice", "--json", room], env: voxEnv).out
+            for line in rows.split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      (row["text"] as? String)?.contains(text) == true else { continue }
+                return row["entry_hash"] as? String
+            }
+            return nil
+        }
+        guard let fromAlice = entry("FROM-ALICE") else {
+            throw Apparatus("alice's `vox room read --json` holds no FROM-ALICE to reply to")
+        }
+        try staged(vox, ["room", "post", "--node", "bob", "--re", fromAlice, room, "REPLY-TO-ALICE"],
+                   env: voxEnv)
+        let quote = Key.idPrefix("quote-")
+        words(ui, quote, timeout: 30,
+              "bob's reply must show what it replies to, quoted above it: \"re you: FROM-ALICE\"",
+              until: { $0 == "re you: FROM-ALICE" })
+        func selectedRow(_ start: String) -> Bool? {
+            let row = ui.windows.firstMatch.descendants(matching: .any)
+                .matching(NSPredicate(format: "label BEGINSWITH %@", start)).firstMatch
+            return row.exists ? row.isSelected : nil
+        }
+        func reaches(_ how: String, _ act: () -> Void) {
+            // From the reply, so a selection of FROM-ALICE is the jump's.
+            tap(ui, Key.showing("bob: REPLY-TO-ALICE"), "bob's reply")
+            act()
+            let until = Date().addingTimeInterval(5)
+            var now = selectedRow("you: FROM-ALICE")
+            while Date() < until && now != true {
+                Thread.sleep(forTimeInterval: 0.2)
+                now = selectedRow("you: FROM-ALICE")
+            }
+            switch now {
+            case nil:
+                keepTree(ui, "no row starts \"you: FROM-ALICE\"")
+                XCTFail("APPARATUS: XCTest finds no row saying \"you: FROM-ALICE\", though its reply quotes it")
+            case false?:
+                XCTFail("PRODUCT: \(how) must select the message the reply quotes, FROM-ALICE; it is not selected")
+            case true?:
+                break
+            }
+        }
+        reaches("clicking the reply's quote") { tap(ui, quote, "the reply's quote") }
+        reaches("⌘↑ with the reply selected") { ui.typeKey(.upArrow, modifierFlags: .command) }
+        print("[proof] bob's reply quotes \"re you: FROM-ALICE\", and its quote and ⌘↑ go to it")
 
         // (5) The keyring: carol, a node made here, added by her pasted fingerprint, then removed.
         try staged(vox, ["node", "create", "carol"],

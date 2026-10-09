@@ -305,7 +305,10 @@ private struct TimelineKeys: NSViewRepresentable {
             case 53: key = .close // Escape
             default: key = nil
             }
-            // Only the bare key: ⌘↑ and the like are the menus' and the system's.
+            // Only the bare key: ⌘↑ and the like are the menus' and the system's; but ⌘↑ on a reply
+            // goes to the message it quotes (ADR-028 R-9).
+            let held = event.modifierFlags.intersection([.command, .option, .control, .shift])
+            if event.keyCode == 126, held == .command, onKey?(.quoted) == true { return }
             let bare = event.modifierFlags.intersection([.command, .option, .control]).isEmpty
             if let key, bare, onKey?(key) == true { return }
             super.keyDown(with: event)
@@ -315,7 +318,8 @@ private struct TimelineKeys: NSViewRepresentable {
 
 /// A key the timeline acts on.
 private enum TimelineKey {
-    case up, down, open, look, close
+    /// `quoted`: ⌘↑ on a reply, to the message it quotes (ADR-028 R-9).
+    case up, down, open, look, close, quoted
 }
 
 /// The room on screen: its timeline and a field to post, with its members beside it.
@@ -396,6 +400,8 @@ private struct RoomView: View {
                                     ForEach(model.timelineItems) { item in
                                         if let message = item.message {
                                             MessageRow(message: message, me: model.me,
+                                                       quote: model.quote(of: message),
+                                                       jump: { model.jumpTo = $0 },
                                                        readBy: model.readBy[message.id] ?? [],
                                                        pulledBy: model.pulledBy[message.id] ?? [],
                                                        pulled: model.pulled[message.id]) { looking = $0 }
@@ -437,8 +443,27 @@ private struct RoomView: View {
                                 case .open: return openSelected()
                                 case .look: return toggleLook()
                                 case .close: return closeLook()
+                                case .quoted:
+                                    guard let quoted = selected.flatMap({ model.quote(of: $0) }) else {
+                                        return false
+                                    }
+                                    model.jumpTo = quoted.id
+                                    return true
                                 }
                             })
+                            // A quote clicked, or ⌘↑ on a reply: the message it quotes, scrolled to
+                            // and selected (ADR-028 R-9). One this room does not hold stays where
+                            // it is.
+                            .onChange(of: model.jumpTo) { id in
+                                guard let id else { return }
+                                model.jumpTo = nil
+                                guard model.byID[id] != nil else { return }
+                                model.selectedMessage = id
+                                withAnimation(Theme.motion(reduced: reduceMotion)) {
+                                    scroller.scrollTo(id, anchor: .center)
+                                }
+                                NotificationCenter.default.post(name: .voxFocusTimeline, object: nil)
+                            }
                             .onReceive(NotificationCenter.default.publisher(for: .voxFocusTimeline)) { _ in
                                 // Taken: the newest row, when none was selected.
                                 if model.selectedMessage == nil, let last = model.messages.last {
@@ -562,8 +587,14 @@ private struct RoomView: View {
         Divider()
         if let reply = model.replyTo {
             HStack {
-                Text("Replying to \(reply.authorName.isEmpty ? String(reply.author.prefix(12)) : reply.authorName): \(reply.text.prefix(60))")
-                    .lineLimit(1).secondaryText()
+                // The message replied to, as a link to it (ADR-028 R-9).
+                Button { model.jumpTo = reply.id } label: {
+                    Text("Replying to \(reply.authorName.isEmpty ? String(reply.author.prefix(12)) : reply.authorName): \(reply.text.prefix(60))")
+                        .lineLimit(1).secondaryText()
+                }
+                .buttonStyle(.plain)
+                .help("Go to the message you are replying to")
+                .accessibilityIdentifier("replying-to-quote")
                 Spacer()
                 Button("Cancel") { model.replyTo = nil }.buttonStyle(.borderless)
             }
@@ -675,6 +706,11 @@ private struct RoomView: View {
 private struct MessageRow: View {
     let message: RoomMessage
     let me: String
+    /// What it replies to, quoted (ADR-028 R-9): the message's id, and "<who>: <first line>", or
+    /// nil words while this room does not hold it.
+    let quote: (id: String, words: String?)?
+    /// Go to a quoted message.
+    let jump: (String) -> Void
     /// Who has read it, when it is this node's own (R-6).
     let readBy: [String]
     /// Who has pulled it, verified, when it is this node's own share (#498).
@@ -695,6 +731,17 @@ private struct MessageRow: View {
                     Text("arrived late").eyebrow().secondaryText()
                         .accessibilityIdentifier("late-\(message.id)")
                 }
+            }
+            if let quote {
+                // The message it replies to, one level, as a link to it (ADR-028 R-9).
+                Button { jump(quote.id) } label: {
+                    Text("re \(quote.words ?? "a message this room does not hold yet")")
+                        .italic().secondaryText().lineLimit(1).truncationMode(.tail)
+                }
+                .buttonStyle(.plain)
+                .disabled(quote.words == nil)
+                .help(quote.words == nil ? "This room does not hold it yet" : "Go to the message it replies to (⌘↑)")
+                .accessibilityIdentifier("quote-\(message.id)")
             }
             if let file = message.file {
                 FileCard(file: file, image: message.image, pulled: pulled, look: look)

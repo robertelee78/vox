@@ -121,6 +121,9 @@ final class NodeModel: ObservableObject {
     /// The message selected in the timeline, and the one the composer replies to (⌘R).
     @Published var selectedMessage: String?
     @Published var replyTo: RoomMessage?
+    /// A message a quote was clicked to reach (ADR-028 R-9): the room's timeline scrolls to it and
+    /// selects it, then sets this back to nil.
+    @Published var jumpTo: String?
     /// The service card selected above the timeline, whose command ⌘⇧C copies.
     @Published var selectedService: SharedService?
     /// What a menu action last did, said where the person is (E-5).
