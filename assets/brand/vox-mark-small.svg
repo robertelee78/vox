@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>Vox</title>
+  <!-- The Vox mark for the app icon's two smallest sizes (16 and 32 px), where five planes and the
+       glint blur into one grey shape: the same V, lit from the upper left, as two planes, the
+       light one in text.primary (#f0ece4) and the shadow one at 0.66, with heavier arms and no
+       glint. scripts/brand-icon.sh draws it for those sizes; vox-mark.svg for every other. -->
+  <g fill="#f0ece4">
+    <!-- left arm: in the light -->
+    <polygon points="72,104 196,104 256,256 256,412" fill-opacity="1"/>
+    <!-- right arm: in shadow -->
+    <polygon points="316,104 440,104 256,412 256,256" fill-opacity="0.66"/>
+  </g>
+</svg>

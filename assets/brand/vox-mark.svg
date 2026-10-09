@@ -5,22 +5,21 @@
        mark reads on bg.base; the glint is the accent (#5ec8ff). Colours are the token file's
        (assets/theme/vox-tokens.json). The app icon is made from this file by
        scripts/brand-icon.sh. -->
-  <!-- Drawn from y 112 to 444; raised 22 so it sits in the middle of the square. -->
-  <g transform="translate(0,-22)">
+  <!-- On a grid of 4 units: each arm is two faces of 44, the keel a diamond at the vertex. The
+       shadow face is 0.50, so the right arm holds at 128 px. Drawn from y 104 to 444. -->
   <g id="planes" fill="#f0ece4">
     <!-- left arm, outer face: in the light -->
-    <polygon points="96,112 136,112 222,340 256,416" fill-opacity="1"/>
+    <polygon points="80,104 124,104 220,328 256,400" fill-opacity="1"/>
     <!-- left arm, inner face -->
-    <polygon points="136,112 176,112 256,300 222,340" fill-opacity="0.56"/>
+    <polygon points="124,104 168,104 256,296 220,328" fill-opacity="0.62"/>
     <!-- right arm, inner face -->
-    <polygon points="336,112 376,112 290,340 256,300" fill-opacity="0.74"/>
+    <polygon points="344,104 388,104 292,328 256,296" fill-opacity="0.80"/>
     <!-- right arm, outer face: in shadow -->
-    <polygon points="376,112 416,112 256,416 290,340" fill-opacity="0.36"/>
+    <polygon points="388,104 432,104 256,400 292,328" fill-opacity="0.50"/>
     <!-- the keel, where the arms meet -->
-    <polygon points="256,300 290,340 256,416 222,340" fill-opacity="0.88"/>
+    <polygon points="256,296 292,328 256,400 220,328" fill-opacity="0.90"/>
   </g>
   <!-- the one glint, at the vertex -->
   <path id="glint" fill="#5ec8ff"
-        d="M256,388 L260,412 L284,416 L260,420 L256,444 L252,420 L228,416 L252,412 Z"/>
-  </g>
+        d="M256,372 L262,402 L292,408 L262,414 L256,444 L250,414 L220,408 L250,402 Z"/>
 </svg>
