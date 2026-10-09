@@ -113,7 +113,7 @@ struct SessionEntryRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(entry.line).font(Theme.mono).textSelection(.enabled)
+            Text(entry.line).voxFont(VoxTokens.Fonts.appMono).textSelection(.enabled)
                 .accessibilityIdentifier("entry-line-\(entry.id)")
             if let request = entry.request {
                 RequestView(model: model, session: session, request: request, about: entry.line)
@@ -133,7 +133,7 @@ struct SessionEntryRow: View {
                     .buttonStyle(.borderless)
                     .accessibilityIdentifier("entry-details-\(entry.id)")
                 if details {
-                    Text(entry.details).font(Theme.mono).secondaryText().textSelection(.enabled)
+                    Text(entry.details).voxFont(VoxTokens.Fonts.appMono).secondaryText().textSelection(.enabled)
                         .accessibilityIdentifier("entry-details-text-\(entry.id)")
                 }
             }

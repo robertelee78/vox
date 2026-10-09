@@ -378,8 +378,11 @@ The app follows your Mac's display settings (System Settings, Accessibility, Dis
 - **Reduce Motion** stops its animations.
 - **Reduce Transparency**: content is drawn in opaque colours only.
 
-**View > Bigger** (⌘+), **Smaller** (⌘-) and **Actual Size** (⌘0) change the size of all the
-app's text, buttons and controls, up to twice the usual size.
+**View > Bigger** (⌘+), **Smaller** (⌘-) and **Actual Size** (⌘0) change the size of the
+conversation, the messages and the composer, up to twice the usual size, as in Messages. The
+sidebar keeps macOS's sidebar size (System Settings, Appearance) and the inspector a steady size.
+**Vox > Settings…** (⌘,) sets the same size, and also turns Keep Running and the menu bar item on
+or off.
 
 The timeline works from the keyboard. **View > Focus Timeline** (⌃⌘T), Tab, or a click on a
 message puts the keyboard on it; ↑ and ↓ select a message, Space opens its pulled file in Quick

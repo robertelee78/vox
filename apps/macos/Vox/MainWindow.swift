@@ -60,7 +60,6 @@ private struct Sidebar: View {
                                 })) {
             Section {
                 StateMark(kind: .live, words: "node \(model.node), attached")
-                    .font(Theme.text)
                     .accessibilityIdentifier("attached")
                     .background(SidebarHighlightOff())
             }
@@ -86,13 +85,13 @@ private struct Sidebar: View {
                 }
             }
             Section {
-                Text("Keyring").font(Theme.text).tag(NodeModel.Selection.keyring)
+                Text("Keyring").tag(NodeModel.Selection.keyring)
                     .sidebarRow(model.selection == .keyring)
                     .accessibilityIdentifier("keyring")
-                Text("Decision record").font(Theme.text).tag(NodeModel.Selection.decisions)
+                Text("Decision record").tag(NodeModel.Selection.decisions)
                     .sidebarRow(model.selection == .decisions)
                     .accessibilityIdentifier("decisions")
-                Text("Services").font(Theme.text).tag(NodeModel.Selection.services)
+                Text("Services").tag(NodeModel.Selection.services)
                     .sidebarRow(model.selection == .services)
                     .accessibilityIdentifier("services")
             }
@@ -100,16 +99,16 @@ private struct Sidebar: View {
                 ForEach(model.nodes, id: \.name) { node in
                     StateMark(kind: node.state == "attached" ? .live : .plain,
                               words: "\(node.name) \(node.state)")
-                        .font(Theme.text)
-                        .accessibilityIdentifier("node-\(node.name)")
+                            .accessibilityIdentifier("node-\(node.name)")
                 }
             } header: {
                 Text("nodes on this Mac").eyebrow().accessibilityAddTraits(.isHeader)
             }
         }
         .listStyle(.sidebar)
-        // The sidebar's rows in the app's face and size: a sidebar list sets its own otherwise.
-        .font(Theme.text)
+        // The sidebar's rows keep macOS's sidebar size (System Settings, Appearance, Sidebar icon
+        // size), never the conversation's text size (the decider, v0.4.1).
+        .font(nil)
         .environment(\.defaultMinListRowHeight, Theme.scaled(24))
     }
 }
@@ -175,7 +174,7 @@ private struct RoomRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(room.name).font(Theme.text).fontWeight(room.need == .quiet ? .regular : .bold)
+            Text(room.name).fontWeight(room.need == .quiet ? .regular : .bold)
             if room.need != .quiet {
                 Text(room.words).eyebrow().secondaryText()
             }
@@ -526,6 +525,9 @@ private struct RoomView: View {
                     SessionComposer(model: model, session: s)
                 }
             }
+            // The conversation, the timeline and the composer, at the text size View > Bigger and
+            // Smaller set (the decider, v0.4.1); the inspector beside it keeps a steady size.
+            .conversationScale(Theme.scale)
             Divider()
             Inspector(model: model, room: room)
                 .frame(width: Theme.scaled(240))
@@ -775,14 +777,14 @@ private struct FileCard: View {
                     .accessibilityIdentifier("thumb-\(file.name)")
             } else {
                 Image(systemName: file.folder ? "folder" : "doc")
-                    .font(Theme.glyph)
+                    .voxFont(VoxTokens.Fonts.appGlyph)
                     .accessibilityHidden(true)
             }
             VStack(alignment: .leading, spacing: 2) {
                 Text(file.name).fontWeight(.bold)
                 Text("\(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file))"
                     + "  ·  sha256 \(file.sha256.prefix(16))…")
-                    .font(Theme.mono).secondaryText()
+                    .voxFont(VoxTokens.Fonts.appMono).secondaryText()
                 if let pulled {
                     // Opened only once verified: a copy is linked into place only after its size
                     // and SHA-256 matched the signed announcement (F-11).
@@ -850,7 +852,7 @@ private struct ServiceCard: View {
         HStack(spacing: 8) {
             Image(systemName: "point.3.connected.trianglepath.dotted").accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
-                Text(service.address).font(Theme.mono).textSelection(.enabled)
+                Text(service.address).voxFont(VoxTokens.Fonts.appMono).textSelection(.enabled)
                 Text("by \(service.by)  ·  \(service.kind)\(service.udp && service.kind != "udp" ? "/udp" : "")")
                     .caption().secondaryText()
             }

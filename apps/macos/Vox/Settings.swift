@@ -38,7 +38,7 @@ struct SettingsView: View {
                 Text("What needs you, your shares and your live tunnels, one click away.")
             }
             setting {
-                Picker("Text size", selection: Binding(
+                Picker("Conversation text size", selection: Binding(
                     get: { app.textScale },
                     set: { app.setTextSize($0) })) {
                     ForEach(Theme.scales, id: \.self) { scale in
@@ -48,7 +48,8 @@ struct SettingsView: View {
                 .fixedSize()
                 .accessibilityIdentifier("settings-text-size")
             } said: {
-                Text("View > Bigger (⌘+) and Smaller (⌘−) step through the same sizes.")
+                Text("The messages and the composer, as View > Bigger (⌘+) and Smaller (⌘−) set it. The "
+                    + "sidebar keeps macOS's sidebar size.")
             }
         }
         .padding(24)

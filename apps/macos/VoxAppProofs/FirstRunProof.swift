@@ -638,6 +638,71 @@ final class FirstRunProof: XCTestCase {
         print("[proof] settings: menu bar \(barOn.debugDescription) then \(barOff.debugDescription); keep running \(answerOff.debugDescription)/\(itemOff.debugDescription) then \(answerOn.debugDescription)/\(itemOn.debugDescription); text size \(scaled.debugDescription) then \(back.debugDescription)")
     }
 
+    /// View > Bigger (⌘+) scales the conversation only (the decider, v0.4.1), alone. Staged by
+    /// `vox`: alice attached, with one room holding one message of hers, chosen before. Two ⌘+
+    /// grow the message's text; a sidebar row and the inspector's MEMBERS line keep their size.
+    /// ⌘0 puts the size back. Mutation: the conversation's scale applied to the whole window → red
+    /// at "unchanged".
+    func testBiggerScalesTheConversationOnly() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
+            throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are set by scripts/app-proofs.sh")
+        }
+        let vox = URL(fileURLWithPath: appPath).appendingPathComponent("Contents/Helpers/vox").path
+        let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("bigger")
+        let data = root.appendingPathComponent("data").path
+        let config = root.appendingPathComponent("config").path
+        let home = root.appendingPathComponent("home").path
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+                           until: "vox daemon: control socket")
+        let idPass = root.appendingPathComponent("alice.pass").path
+        let roomPass = root.appendingPathComponent("room.pass").path
+        try stager.write(Data("alice identity\n".utf8), to: idPass)
+        try stager.write(Data("bigger room\n".utf8), to: roomPass)
+        try staged(vox, ["node", "create", "alice"],
+                   env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "alice identity"]) { $1 })
+        try staged(vox, ["node", "attach", "alice", "--passphrase-file", idPass], env: voxEnv)
+        try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", roomPass,
+                         "--name", "talk"], env: voxEnv)
+        let room = try line(staged(vox, ["room", "list", "--node", "alice"], env: voxEnv)) {
+            $0.contains(" talk")
+        }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        try staged(vox, ["room", "post", "--node", "alice", room, "MEASURE-THIS-MESSAGE"], env: voxEnv)
+        try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
+        try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+
+        let ui = voxApp(appPath)
+        ui.launchEnvironment = voxEnv.merging(["HOME": home]) { $1 }
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        defer { ui.terminate() }
+        present(ui, Key.id("attached"), timeout: 60, "the app must open attached as alice")
+        ui.typeKey("0", modifierFlags: .command)
+        tap(ui, Key.id("room-talk"), "the room talk in the sidebar")
+        present(ui, Key.showing("MEASURE-THIS-MESSAGE"), timeout: 20, "alice's message must show in the timeline")
+
+        func height(_ key: Key) -> CGFloat {
+            guard let e = locate(ui, key) else { return -1 }
+            return e.frame.height
+        }
+        let message = Key.showing("MEASURE-THIS-MESSAGE")
+        let sidebarRow = Key.id("room-talk")
+        let members = Key.showing("MEMBERS")
+        Thread.sleep(forTimeInterval: 1)
+        let m0 = height(message), s0 = height(sidebarRow), i0 = height(members)
+        ui.typeKey("+", modifierFlags: .command)
+        ui.typeKey("+", modifierFlags: .command)
+        Thread.sleep(forTimeInterval: 2)
+        present(ui, message, timeout: 10, "after View > Bigger, the message must still show")
+        let m1 = height(message), s1 = height(sidebarRow), i1 = height(members)
+        ui.typeKey("0", modifierFlags: .command)
+        XCTAssertTrue(m0 > 0 && m1 > m0 * 1.15,
+                      "PRODUCT: View > Bigger twice must grow the conversation's text; the message was \(m0) high and is \(m1)")
+        XCTAssertTrue(s0 > 0 && i0 > 0 && abs(s1 - s0) <= 1 && abs(i1 - i0) <= 1,
+                      "PRODUCT: View > Bigger must leave the sidebar and the inspector unchanged; a sidebar row went from \(s0) to \(s1), the inspector's MEMBERS line from \(i0) to \(i1)")
+        print("[proof] bigger: message \(m0) → \(m1); sidebar row \(s0) → \(s1); inspector line \(i0) → \(i1)")
+    }
+
     /// (8) Notifications (ADR-014 M-23, ADR-028 R-10, #448), alone: the one step that needs a
     /// person at the Mac, so it is run by itself, in about a minute, with no replay of the
     /// journey. Staged by `vox` alone: alice and bob, a room of alice's that bob joined, each
