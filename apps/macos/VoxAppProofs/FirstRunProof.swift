@@ -553,9 +553,12 @@ final class FirstRunProof: XCTestCase {
         ui.typeKey(.escape, modifierFlags: [])
         // Nothing here registered a real login item: none is loaded for this user.
         let uid = stager.run(["/usr/bin/id", "-u"], env: [:]).out.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Only the proof build's own: the person's own Vox (us.vox.app) may have its login item
+        // loaded, and launchd names whose it is.
         let loaded = stager.run(["/bin/launchctl", "print", "gui/\(uid)/us.vox.daemon"], env: [:])
-        XCTAssertNotEqual(loaded.status, 0,
-                          "PRODUCT: a Vox login item is loaded after this case: the app registered a real one past its stand-in (app-proofs.sh refused to start with one loaded): \(loaded.out.prefix(200))")
+        let proofs = loaded.status == 0 && loaded.out.contains("parent bundle identifier = \(proofAppID)\n")
+        XCTAssertFalse(proofs,
+                       "PRODUCT: Vox Proof's login item is loaded after this case: the app registered a real one past its stand-in (app-proofs.sh refused to start with one loaded): \(loaded.out.prefix(200))")
         print("[proof] keep running: off kept \(answerOff.debugDescription) and left the login item \(itemOff.debugDescription); on kept \(answerOn.debugDescription) and left it \(itemOn.debugDescription)")
     }
 
