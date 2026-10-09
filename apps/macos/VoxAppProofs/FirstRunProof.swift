@@ -515,6 +515,129 @@ final class FirstRunProof: XCTestCase {
         print("[proof] keep running: off kept \(answerOff.debugDescription) and left the login item \(itemOff.debugDescription); on kept \(answerOn.debugDescription) and left it \(itemOn.debugDescription)")
     }
 
+    /// Settings (⌘,), v0.4.1, the UX review's proposal 1, alone. Staged by `vox`: node alice with
+    /// no passphrase, first run answered Keep Running with alice chosen, the menu bar item off, the
+    /// stand-in login item registered as approved.
+    /// - **menu bar**: Settings' "Show Vox in the menu bar" turns the item on and off again, kept
+    ///   in `<config>/app/menubar`. Mutation: the toggle's setter dropped → red at "on".
+    /// - **keep running**: Settings' switch turns Keep Running off and on, the answer and the
+    ///   stand-in login item following, and the Vox menu agrees (one implementation, #571).
+    ///   Mutation: the switch's setter dropped → red at "no".
+    /// - **text size**: Settings' Text size sets the app's size (the defaults key View > Bigger
+    ///   uses) and sets it back. Mutation: setTextSize a no-op → red at 1.3.
+    ///
+    /// **No login item is registered**: the same stand-in as testKeepRunning…; the case refuses an
+    /// executable without it.
+    func testSettingsKeepRunningMenuBarAndTextSize() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
+            throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are set by scripts/app-proofs.sh")
+        }
+        let exe = appPath + "/Contents/MacOS/Vox"
+        guard stager.run(["/usr/bin/grep", "-q", "vox-proof-service-stand-in", exe], env: [:]).status == 0 else {
+            throw Apparatus("\(exe) carries no stand-in background items (VOX_PROOF_STUB_SERVICES): it would register a real login item, which runs on the real profile; build it with scripts/app-proofs.sh")
+        }
+        let vox = URL(fileURLWithPath: appPath).appendingPathComponent("Contents/Helpers/vox").path
+        let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("settings")
+        let data = root.appendingPathComponent("data").path
+        let config = root.appendingPathComponent("config").path
+        let home = root.appendingPathComponent("home").path
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+                           until: "vox daemon: control socket")
+        let empty = root.appendingPathComponent("empty.pass").path
+        try stager.write(Data("\n".utf8), to: empty)
+        try staged(vox, ["node", "create", "alice", "--passphrase-file", empty], env: voxEnv)
+        try stager.write(Data("keep\n".utf8), to: config + "/app/login-item")
+        try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+        try stager.write(Data("off\n".utf8), to: config + "/app/menubar")
+        try stager.write(Data("registered vox-proof-service-stand-in\n".utf8),
+                         to: config + "/app/proof-login-item")
+        func read(_ name: String) -> String {
+            stager.run(["/bin/cat", config + "/app/" + name], env: [:]).out
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        func settle(_ name: String, _ want: (String) -> Bool) -> String {
+            var got = read(name)
+            let until = Date().addingTimeInterval(10)
+            while !want(got) && Date() < until {
+                Thread.sleep(forTimeInterval: 0.25)
+                got = read(name)
+            }
+            return got
+        }
+        /// The app's text size as View > Bigger keeps it, in its defaults (read, never written):
+        /// the domain of the bundle under proof, whatever its identifier.
+        let domain = stager.run(["/usr/bin/defaults", "read", appPath + "/Contents/Info", "CFBundleIdentifier"],
+                                env: [:]).out.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !domain.isEmpty else { throw Apparatus("\(appPath) has no CFBundleIdentifier to read its text size under") }
+        func textScale() -> String {
+            stager.run(["/usr/bin/defaults", "read", domain, "textScale"], env: [:]).out
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let ui = voxApp(appPath)
+        ui.launchEnvironment = voxEnv.merging(["HOME": home]) { $1 }
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        defer { ui.terminate() }
+        present(ui, Key.id("attached"), timeout: 60,
+                "with Keep Running chosen and alice needing no passphrase, the app must open attached as alice")
+
+        // Settings, by ⌘, as a person opens it.
+        ui.typeKey(",", modifierFlags: .command)
+        present(ui, Key.id("settings-menu-bar"), timeout: 10, "⌘, must open Settings")
+
+        // menu bar: on, then off again.
+        tap(ui, Key.id("settings-menu-bar"), "Settings > Show Vox in the menu bar")
+        let barOn = settle("menubar") { $0 == "on" }
+        tap(ui, Key.id("settings-menu-bar"), "Settings > Show Vox in the menu bar, again")
+        let barOff = settle("menubar") { $0 == "off" }
+        XCTAssertTrue(barOn == "on" && barOff == "off",
+                      "PRODUCT: Settings > Show Vox in the menu bar must turn the item on and off; the choice was kept as \(barOn.debugDescription), then \(barOff.debugDescription)")
+
+        // keep running: off from Settings, the Vox menu agreeing; then on again.
+        tap(ui, Key.id("settings-keep-running"), "Settings > Keep Vox running while you're logged in")
+        let answerOff = settle("login-item") { $0 == "no" }
+        let itemOff = settle("proof-login-item") { $0.hasPrefix("unregistered") }
+        XCTAssertTrue(answerOff == "no" && itemOff.hasPrefix("unregistered"),
+                      "PRODUCT: turning Keep Running off in Settings must keep the answer as Not Now and unregister the login item; the answer is \(answerOff.debugDescription), the login item was left \(itemOff.debugDescription)")
+        let voxMenu = ui.menuBars.menuBarItems["Vox"]
+        guard voxMenu.waitForExistence(timeout: 10) else {
+            throw Apparatus("XCTest finds no Vox menu in the menu bar")
+        }
+        voxMenu.click()
+        present(ui, Key.menuItem("Keep Running While Logged In"), timeout: 10,
+                "with Keep Running turned off in Settings, the Vox menu must offer Keep Running While Logged In")
+        ui.typeKey(.escape, modifierFlags: [])
+        tap(ui, Key.id("settings-keep-running"), "Settings > Keep Vox running while you're logged in, again")
+        let answerOn = settle("login-item") { $0 == "keep" }
+        let itemOn = settle("proof-login-item") { $0.hasPrefix("registered") }
+        XCTAssertTrue(answerOn == "keep" && itemOn.hasPrefix("registered"),
+                      "PRODUCT: turning Keep Running on in Settings must keep the answer as Keep Running and register the login item; the answer is \(answerOn.debugDescription), the login item was left \(itemOn.debugDescription)")
+
+        // text size: 130%, then back to Actual Size.
+        let before = textScale()
+        tap(ui, Key.id("settings-text-size"), "Settings > Text size")
+        tap(ui, Key.menuItem("130%"), "Settings > Text size > 130%")
+        var scaled = textScale()
+        let until = Date().addingTimeInterval(10)
+        while scaled != "1.3" && Date() < until { Thread.sleep(forTimeInterval: 0.25); scaled = textScale() }
+        // The window is drawn again at the new size, so the control is looked up afresh.
+        tap(ui, Key.id("settings-text-size"), "Settings > Text size, again")
+        tap(ui, Key.menuItem("100% (Actual Size)"), "Settings > Text size > 100% (Actual Size)")
+        var back = textScale()
+        let until2 = Date().addingTimeInterval(10)
+        while back != "1" && Date() < until2 { Thread.sleep(forTimeInterval: 0.25); back = textScale() }
+        XCTAssertTrue(scaled == "1.3" && back == "1",
+                      "PRODUCT: Settings > Text size must set the app's text size, as View > Bigger keeps it; 130% left it \(scaled.debugDescription) and Actual Size \(back.debugDescription) (it was \(before.debugDescription) before)")
+
+        let uid = stager.run(["/usr/bin/id", "-u"], env: [:]).out.trimmingCharacters(in: .whitespacesAndNewlines)
+        let loaded = stager.run(["/bin/launchctl", "print", "gui/\(uid)/us.vox.daemon"], env: [:])
+        XCTAssertNotEqual(loaded.status, 0,
+                          "PRODUCT: a Vox login item is loaded after this case: the app registered a real one past its stand-in: \(loaded.out.prefix(200))")
+        print("[proof] settings: menu bar \(barOn.debugDescription) then \(barOff.debugDescription); keep running \(answerOff.debugDescription)/\(itemOff.debugDescription) then \(answerOn.debugDescription)/\(itemOn.debugDescription); text size \(scaled.debugDescription) then \(back.debugDescription)")
+    }
+
     /// (8) Notifications (ADR-014 M-23, ADR-028 R-10, #448), alone: the one step that needs a
     /// person at the Mac, so it is run by itself, in about a minute, with no replay of the
     /// journey. Staged by `vox` alone: alice and bob, a room of alice's that bob joined, each

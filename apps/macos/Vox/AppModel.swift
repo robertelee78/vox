@@ -52,6 +52,13 @@ final class AppModel: ObservableObject {
         textScale = next
     }
 
+    /// Set the app's text size to one of `Theme.scales` (Settings), as Bigger and Smaller step it.
+    func setTextSize(_ scale: Double) {
+        guard Theme.scales.contains(scale), scale != textScale else { return }
+        UserDefaults.standard.set(scale, forKey: Theme.scaleKey)
+        textScale = scale
+    }
+
     /// Show or hide the menu bar extra, and keep the choice. Setting the value it already has does
     /// nothing: SwiftUI sets a MenuBarExtra's `isInserted` on its updates, and a change notice for
     /// each of those started another update, so the main thread never went idle.
