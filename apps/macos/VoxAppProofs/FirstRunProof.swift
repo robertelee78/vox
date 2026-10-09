@@ -917,6 +917,24 @@ final class FirstRunProof: XCTestCase {
         XCTAssertEqual(mentionedTo.map { $0.lowercased() }, [bobFp.lowercased()],
                        "PRODUCT: \"MENTION @bob\", @bob picked in the composer, must be addressed to bob; bob's node holds it addressed to \(mentionedTo)")
 
+        // (4e2) The composer takes more than one line (P19): ⌥↩ adds a line, Return sends both.
+        type(ui, Key.id("compose"), "LINE ONE", "the composer")
+        el(ui, Key.id("compose")).typeKey(.return, modifierFlags: .option)
+        el(ui, Key.id("compose")).typeText("LINE TWO\r")
+        var twoLines: String?
+        let linesUntil = Date().addingTimeInterval(30)
+        while Date() < linesUntil && twoLines == nil {
+            let rows = run(vox, ["room", "read", "--node", "bob", "--json", room], env: voxEnv).out
+            for line in rows.split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      let text = row["text"] as? String, text.contains("LINE TWO") else { continue }
+                twoLines = text
+            }
+            if twoLines == nil { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        XCTAssertEqual(twoLines, "LINE ONE\nLINE TWO",
+                       "PRODUCT: \"LINE ONE\", ⌥↩, \"LINE TWO\", Return in the composer must post one message of two lines; bob's node holds \(twoLines.debugDescription)")
+
         // (4f) ↑/↓ reach a Session's entries (P14): bob grants alice drive, so she reads inside his
         // Session; with it shown, View > Focus Timeline selects its newest entry and ↑ the one
         // before it, as among messages.

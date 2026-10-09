@@ -635,7 +635,10 @@ private struct RoomView: View {
             .help("Attach a file or folder")
             .accessibilityLabel("Attach a file or folder")
             .accessibilityIdentifier("attach")
-            TextField("Say something to the room", text: $draft)
+            // Up to 12 lines, so a long message is read before it goes; Return sends, ⌥↩ adds a
+            // line (P19).
+            TextField("Say something to the room", text: $draft, axis: .vertical)
+                .lineLimit(1...12)
                 .accessibilityLabel("Message to the room")
                 .textFieldStyle(.plain)
                 .frame(minWidth: Theme.scaled(160), maxWidth: .infinity)
