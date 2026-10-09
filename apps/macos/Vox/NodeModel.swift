@@ -459,12 +459,12 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// Untrust `node`.
+    /// Remove `node` from the keyring.
     func untrust(_ node: TrustedNode) async {
         _ = await keyringChange { [client] pass in
             try await client.trustRemove(fingerprint: node.fingerprint, identityPassphrase: pass)
-            return "No longer trusting \(node.name). Your sender key is rotated, and everyone you "
-                + "still trust is re-keyed."
+            return "Removed \(node.name) from your keyring. Your sender key is rotated, and "
+                + "everyone you still trust is re-keyed."
         }
     }
 
