@@ -60,6 +60,7 @@ const T_REQ_SUBSCRIBE: u64 = 4107;
 const T_REQ_STOP: u64 = 4108;
 const T_REQ_SESSION_REGISTER: u64 = 4109;
 const T_REQ_SESSION_ROOM: u64 = 4110;
+const T_REQ_UNKEEP: u64 = 4111;
 /// 4120–4129: the Session activity sink (ADR-029 §2, §3).
 const T_REQ_SESSION_ACTIVITY: u64 = 4120;
 const T_REQ_SESSION_ASK: u64 = 4121;
@@ -188,6 +189,14 @@ pub enum DaemonRequest {
     },
     /// Detach `node` (L-3). Answered [`DaemonFrame::Ok`] once it has detached.
     Detach {
+        /// The node.
+        node: NodeName,
+    },
+    /// Stop keeping `node` (L-4, ADR-014 M-6): its line leaves the attach file, with any
+    /// Keychain item it names, and it is not attached again when the daemon starts. Attached and
+    /// held, it then detaches when its last holder goes, as a node never kept does; it is not
+    /// detached now. Answered [`DaemonFrame::Ok`].
+    Unkeep {
         /// The node.
         node: NodeName,
     },
@@ -790,6 +799,9 @@ impl Opening {
                 DaemonRequest::Detach { node } => {
                     e.array(2).uint(T_REQ_DETACH).text(node.as_str());
                 }
+                DaemonRequest::Unkeep { node } => {
+                    e.array(2).uint(T_REQ_UNKEEP).text(node.as_str());
+                }
                 DaemonRequest::SessionEnd {
                     node,
                     session,
@@ -943,6 +955,9 @@ impl Opening {
             }
             (T_REQ_DETACH, 2) => Opening::Daemon(DaemonRequest::Detach {
                 node: name(&mut d, "ipc detach node")?,
+            }),
+            (T_REQ_UNKEEP, 2) => Opening::Daemon(DaemonRequest::Unkeep {
+                node: name(&mut d, "ipc unkeep node")?,
             }),
             (T_REQ_SESSION_END, 4) => Opening::Daemon(DaemonRequest::SessionEnd {
                 node: name(&mut d, "ipc session end node")?,
