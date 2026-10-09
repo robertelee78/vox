@@ -59,6 +59,8 @@ struct SessionComposer: View {
     let room: String
     let session: FfiSession
     @State private var draft = ""
+    /// Whether the composer has the keyboard: ⇧↩ adds a line only then (P19).
+    @FocusState private var composing: Bool
     @State private var said = ""
     /// A send (or a file) waiting for its answer: only sending and the paperclip wait on it; Interrupt
     /// and Stop stay live (D13).
@@ -95,9 +97,12 @@ struct SessionComposer: View {
                     .accessibilityLabel("typing as \(model.node) into \(session.label)")
                     .accessibilityIdentifier("session-compose-as")
                 // Up to 12 lines, so a pasted stack trace or a long prompt is read before it goes;
-                // Return sends, ⌥↩ adds a line (P19).
+                // Return sends, ⇧↩ (or ⌥↩) adds a line (P19).
                 TextField("Composer — to \(session.label)", text: $draft, axis: .vertical)
                     .lineLimit(1...12)
+                    .focused($composing)
+                    .shiftReturnAddsLine(composing)
+                    .help("Return sends; ⇧Return starts a new line")
                     .accessibilityLabel("Message to \(session.label), as \(model.node)")
                     .textFieldStyle(.plain)
                     .frame(minWidth: Theme.scaled(160), maxWidth: .infinity)

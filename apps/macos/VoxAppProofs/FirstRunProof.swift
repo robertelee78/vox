@@ -2592,9 +2592,17 @@ final class FirstRunProof: XCTestCase {
         XCTAssertEqual(mentionedTo.map { $0.lowercased() }, [bobFp.lowercased()],
                        "PRODUCT: \"MENTION @bob\", @bob picked in the composer, must be addressed to bob; bob's node holds it addressed to \(mentionedTo)")
 
-        // (4e2) The composer takes more than one line (P19): ⌥↩ adds a line, Return sends both.
+        // (4e2) The composer takes more than one line (P19): ⇧↩ adds a line, Return sends both.
+        // ⇧↩, not ⌥↩: a Mac's global hotkey may take ⌥↩ (the decider's brings Alacritty forward).
+        // To the room, so bob's node holds the text alone: 4e left bob ticked in To:, and an
+        // addressed post is held as its envelope.
+        tap(ui, Key.id("compose-to"), "To:")
+        tap(ui, Key.id("to-bob"), "bob, ticked in 4e by @bob, to untick him")
+        ui.typeKey(.escape, modifierFlags: [])
+        words(ui, Key.id("compose-to"), timeout: 10, "To: with bob unticked must say the room",
+              until: { $0 == "To: the room" })
         type(ui, Key.id("compose"), "LINE ONE", "the composer")
-        el(ui, Key.id("compose")).typeKey(.return, modifierFlags: .option)
+        el(ui, Key.id("compose")).typeKey(.return, modifierFlags: .shift)
         el(ui, Key.id("compose")).typeText("LINE TWO\r")
         var twoLines: String?
         let linesUntil = Date().addingTimeInterval(30)
@@ -2608,7 +2616,7 @@ final class FirstRunProof: XCTestCase {
             if twoLines == nil { Thread.sleep(forTimeInterval: 0.5) }
         }
         XCTAssertEqual(twoLines, "LINE ONE\nLINE TWO",
-                       "PRODUCT: \"LINE ONE\", ⌥↩, \"LINE TWO\", Return in the composer must post one message of two lines; bob's node holds \(twoLines.debugDescription)")
+                       "PRODUCT: \"LINE ONE\", ⇧↩, \"LINE TWO\", Return in the composer must post one message of two lines; bob's node holds \(twoLines.debugDescription)")
 
         // (4f) ↑/↓ reach a Session's entries (P14): bob grants alice drive, so she reads inside his
         // Session; with it shown, View > Focus Timeline selects its newest entry and ↑ the one
