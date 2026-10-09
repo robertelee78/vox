@@ -553,6 +553,8 @@ final class FirstRunProof: XCTestCase {
             try hook(event(session, "UserPromptSubmit", ["prompt": words]))
         }
         // S1 asks an approval: its hook waits for the answer, in the background, its pid kept.
+        // Only the hook itself goes to the background, with its own output in a file, so nothing
+        // left running holds the stager's pipe open; `&&` would background a subshell holding it.
         let touch: [String: Any] = ["command": "touch p1", "description": "Make p1"]
         try hook(event(s1, "PreToolUse", ["tool_name": "Bash", "tool_input": touch, "tool_use_id": "toolu_P1"]))
         let asked = root.appendingPathComponent("asked")
@@ -560,7 +562,7 @@ final class FirstRunProof: XCTestCase {
                                                                "permission_suggestions": []]).utf8),
                          to: asked.path + ".json")
         let started = stager.run(["/bin/sh", "-c",
-                                  "cd \"$1\" && \"$2\" agent hook --node claude-a --room \"$3\" < \"$4.json\" > \"$4.out\" 2>&1 & echo $!",
+                                  "cd \"$1\" || exit 1; \"$2\" agent hook --node claude-a --room \"$3\" < \"$4.json\" > \"$4.out\" 2>&1 & echo $!",
                                   "hook", work, vox, room, asked.path], env: hookEnv)
         let hookPid = started.out.trimmingCharacters(in: .whitespacesAndNewlines)
         guard started.status == 0, Int32(hookPid) != nil else {
