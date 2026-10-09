@@ -52,7 +52,8 @@ later parser or implementation may invalidate both an example and its troublesho
 
 ## v0.4.1 command check
 
-Checked on 2026-10-09 against `integrate/v0.4.1` at `ecf5add86`, with a release `vox` built there
+Checked on 2026-10-09 against `integrate/v0.4.1` at `ecf5add86`, and the command check again at
+`5c2bb70e9` (G4 and tail merged), with a release `vox` built there
 (`cargo build --release -p vox-tui --bin vox`, no features; it still says `vox 0.4.0` until the
 bump). Every process had a scratch `VOX_DATA_DIR`, `VOX_CONFIG_DIR` and `HOME`, and none used
 `sudo`.
@@ -63,13 +64,13 @@ each inline `` `vox …` `` span that is a command, not an output quote, was run
 nothing else. A word the manual writes as a placeholder was given a value of its shape: `<…>`
 became `X`, `:PORT` became `:1080`, `NUMBER` became `1`. A choice written `add|remove` was checked
 as each choice, and an option named alone (`--to`) was checked with a value. Result: 329 commands,
-0 refused. Mutant: `vox uninstall` in install.md changed to `vox uninstall --keep-nodes` was
+0 refused at `ecf5add86`; 330, 0 refused, at `5c2bb70e9` with this branch's pages. Mutant: `vox uninstall` in install.md changed to `vox uninstall --keep-nodes` was
 caught: `REJECTED install.md:149: vox uninstall --keep-nodes`, `error: unexpected argument
 '--keep-nodes' found`. The check is a spike, run and reported here, not committed.
 
 | Manual claim | Where and how | Observed |
 |---|---|---|
-| `vox uninstall --dry-run` changes nothing (#588) | a standalone install staged in a scratch `HOME` (the release `vox` and a `.vox-standalone.json` marker in `~/.local/bin`), one node `docs` | `vox uninstall --dry-run: nothing is changed. It would:`, `remove …/.vox-standalone.json`, `remove …/vox`, and `keep: …` for the data root and the config directory; exit 0 |
+| `vox uninstall --dry-run` changes nothing (#588) | a standalone install staged in a scratch `HOME` (the release `vox` and a `.vox-standalone.json` marker in `~/.local/bin`), one node `docs` | `vox uninstall --dry-run: nothing is changed. It would:`, `remove …/.vox-standalone.json`, `remove …/vox`, and a `keep …` line for the data root and the config directory; exit 0 (the keep lines' words change on v041/uninstall-words, below) |
 | `vox uninstall` removes the install and keeps the nodes | the same | `vox uninstall: removed …/.vox-standalone.json`, `… removed …/vox`, `… kept: …`; `~/.local/bin` empty after, `nodes/` still in the data root |
 | `--purge` asks at a terminal only | the same, stdin not a terminal | `vox: vox uninstall --purge removes every node, and asks you to type each node's name first; there is no terminal to ask at, so nothing was changed`, exit 1 |
 | A `vox` not put there by the installer is refused | the release binary run where it was built | `vox: …/target/release/vox was not installed by vox's installer (no .vox-standalone.json beside it), so vox uninstall will not remove it or anything it may have set up; remove it the way it was put there`, exit 1 |
@@ -77,6 +78,8 @@ caught: `REJECTED install.md:149: vox uninstall --keep-nodes`, `error: unexpecte
 | A data root of a release before v0.3.0 is refused | a root holding `default/vault.cbor`; `vox node list` | `… is not a Vox data directory this version reads: …/default is not a node (a node lives under …/nodes). Use another data directory (--data-dir or VOX_DATA_DIR), or move this one aside; nothing in it was changed`, exit 1 |
 | Your nodes come through an update (#580) | `a_data_root_of_the_previous_release_opens_with_nothing_lost`, release, at `ff42ad0e7` | v0.4.0 → this build: fingerprint, keyring, room and rows the same and in order, times inside the staging window, the share listed, a new post delivered |
 | What the identity exchange protects (#581) | `the_identity_exchange_holds_against_an_attacker_proof`, release, at `ade22271e` | 14 of 14, each claim with its mutant; concepts.md says it in a person's words |
+| Readiness ticks under a service (G4) | `service_rehearsal_proof`, release, at `ae116069` (merged `5c2bb70e9`) | the trusted guest: `✓ proxy configured`, `✓ node attached`, `✓ HOST trusts you`, `✓ HOST online`; the untrusted joiner: ``missing: HOST trusts you — HOST must trust this node: there, `vox trust add` the fingerprint `vox id` prints here``, then `✓` once the host trusts it; the host stopped: `missing: HOST online — HOST is not reachable now; it is reached when it comes back`; the proxy port taken: `missing: proxy configured — the .vox proxy is not running: …` |
+| `vox room tail` leaves Session records out | `read_render_proof`'s tail journey as merged (`1cb13670b`) | plain tail printed neither of a renamed Session's two records; `--json` gave both, then the message after them |
 | The agent skill pack, room binding (#586, #587) | as merged with their own proofs (`skill_cli_proof`, `agent_hook_proof`); agents.md and sessions.md came with those merges | the commands parse (above); not run again here |
 
 ## v0.4.0 command check
@@ -340,8 +343,10 @@ During the `c142ddd3` recheck, `vox serve`'s output also printed once,
 after B joined, `sync of room … did not complete — sync failed: the peer refused: epoch mismatch`;
 B's join and the audience line both succeeded, and it was not investigated further.
 
-The v0.4.1 check (`ecf5add86`) found, in `vox uninstall`'s output, and reported them to the lead
-(not fixed on this branch; the manual quotes no such line):
+The v0.4.1 check (`ecf5add86`) found these in `vox uninstall`'s output and reported them. The first
+three are fixed on `v041/uninstall-words` (`c36e7af3`, proved by install_sh_proof's
+`uninstall.says_once_what_each_kept_directory_holds`), the fourth on `v041/words`; the manual
+quotes none of the old lines:
 
 - The kept line says "kept: … is kept", twice over.
 - It runs the no-backup sentence into `` `vox uninstall --purge` removes it. `` with no full stop

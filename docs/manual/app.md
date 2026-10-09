@@ -347,9 +347,11 @@ on your node alone: it is not told, and stays out of your keyring.
 rooms (see [Reach a shared service](services.md)):
 
 - **SHARED WITH YOU**: each service's readable address, who shares it, in which room, and its
-  kind; its commands, each with **Copy**; and what reaching it needs, each saying whether it holds
-  (`needs …: yes`, or `needs …: no — …` with what to do). A command is shown with the readable
-  address and copied with the full one, so it works however you named the node.
+  kind; its commands, each with **Copy**; and what reaching it needs, as ticks: `✓ proxy
+  configured`, `✓ node attached`, `✓ NAME trusts you`, `✓ NAME online`, and the one that does
+  not hold in amber as `missing: … — …` with what to do, the same words as `vox service list`. A
+  command is shown with the readable address and copied with the full one, so it works however you
+  named the node.
 - **YOUR SHARES**: each one with **Stop**.
 - **SHARE A SERVICE**: what is listening on this Mac, with its program. Pick one, and the view
   suggests a name, lets you pick the room, and says before you share it: the address members
