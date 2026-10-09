@@ -31,23 +31,6 @@ SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/vox-app-proofs.XXXXXX")"
 trap 'rm -rf "$SCRATCH"' EXIT
 # Killed or interrupted, the run still ends through its EXIT trap (which stops what it started).
 trap 'exit 130' INT TERM HUP
-RUN_T0="$(date +%s)"
-# macOS's screenshot overlay (screencaptureui) that XCTest's screen captures start during a run
-# can stay behind as a full-screen window over everything: one started since this run began is the
-# run's, and is stopped by pid at the end. One that was there before is the person's, left alone.
-stop_run_screencapture() {
-    local pid etime secs d h m s
-    for pid in $(pgrep -x screencaptureui || true); do
-        etime="$(ps -o etime= -p "$pid" | tr -d ' ')"
-        [ -n "$etime" ] || continue
-        d=0; h=0
-        case "$etime" in *-*) d="${etime%%-*}"; etime="${etime#*-}";; esac
-        IFS=: read -r a b c <<<"$etime"
-        if [ -n "$c" ]; then h=$a; m=$b; s=$c; else m=$a; s=$b; fi
-        secs=$(( 10#$d * 86400 + 10#$h * 3600 + 10#$m * 60 + 10#$s ))
-        if [ $(( $(date +%s) - secs )) -ge "$RUN_T0" ]; then kill "$pid" 2>/dev/null || true; fi
-    done
-}
 
 # **Never the person's own Vox, and never its profile** (APPARATUS). The person's own Vox.app
 # (us.vox.app), its login item and its daemon may be installed and running on the real profile:
@@ -226,7 +209,7 @@ trap_unregister() {
 launch_status=0
 watch_real &
 WATCH_REAL=$!
-trap 'kill "$WATCH_REAL" 2>/dev/null; stop_run_screencapture; rm -rf "$SCRATCH"' EXIT
+trap 'kill "$WATCH_REAL" 2>/dev/null; rm -rf "$SCRATCH"' EXIT
 if [ "$#" -eq 0 ] || [ "$*" = "LaunchProof" ]; then
     python3 scripts/app-launch-proof.py "$APP" || launch_status=$?
     if [ "$*" = "LaunchProof" ]; then
@@ -255,7 +238,6 @@ finish() {
     local status=$?
     kill "$WATCH_REAL" 2>/dev/null
     kill "$STAGER" 2>/dev/null; wait "$STAGER" 2>/dev/null
-    stop_run_screencapture
     trap_unregister
     if [ "$status" -ne 0 ]; then
         echo "app-proofs: kept for reading the red: $SCRATCH" >&2
