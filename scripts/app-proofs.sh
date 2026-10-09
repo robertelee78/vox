@@ -31,10 +31,18 @@ SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/vox-app-proofs.XXXXXX")"
 # **The person's clipboard is put back as it was** (v0.4.1): the proofs paste and copy through the
 # general pasteboard. Every item and type is kept here and restored at exit, red, green or a crash
 # of the runner (each case restores it too, in its tearDown).
-osascript -l JavaScript "$ROOT/scripts/pasteboard-keep.js" save "$SCRATCH/pasteboard.plist" >/dev/null || {
-    echo "app-proofs: APPARATUS: cannot keep the clipboard to put it back after the run; not running" >&2
+# A concealed item (a password manager's) is never written down: the run is refused instead. The
+# kept copy is the person's only (mode 600, in the 700 scratch) and goes with the scratch at exit.
+if ! kept="$( (umask 077; osascript -l JavaScript "$ROOT/scripts/pasteboard-keep.js" save "$SCRATCH/pasteboard.plist") 2>&1)"; then
+    rm -rf "$SCRATCH"
+    if [[ "$kept" == *CONCEALED* ]]; then
+        echo "app-proofs: APPARATUS: the clipboard holds a concealed item; copy-steps not run" >&2
+    else
+        echo "app-proofs: APPARATUS: cannot keep the clipboard to put it back after the run; not running: $kept" >&2
+    fi
     exit 2
-}
+fi
+chmod 600 "$SCRATCH/pasteboard.plist"
 trap 'osascript -l JavaScript "$ROOT/scripts/pasteboard-keep.js" restore "$SCRATCH/pasteboard.plist" >/dev/null \
           || echo "app-proofs: the clipboard could not be put back: $SCRATCH/pasteboard.plist is lost with the scratch" >&2
       rm -rf "$SCRATCH"' EXIT

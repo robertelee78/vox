@@ -3,6 +3,10 @@
 // `restore FILE` puts exactly those items back. The proofs paste and copy through the general
 // pasteboard, which is the person's own: it is put back as it was, red, green or crash.
 //
+// **A concealed item is never written down**: a clipboard holding a password manager's item
+// (org.nspasteboard.ConcealedType or org.nspasteboard.TransientType, nspasteboard.org) makes
+// `save` write nothing and exit with "CONCEALED", and the run is refused.
+//
 //   osascript -l JavaScript scripts/pasteboard-keep.js save FILE
 //   osascript -l JavaScript scripts/pasteboard-keep.js restore FILE
 ObjC.import('AppKit');
@@ -14,6 +18,15 @@ function run(argv) {
         const kept = $.NSMutableArray.array;
         const items = board.pasteboardItems;
         const count = items.isNil() ? 0 : items.count;
+        const concealed = ['org.nspasteboard.ConcealedType', 'org.nspasteboard.TransientType'];
+        for (let i = 0; i < count; i++) {
+            const types = items.objectAtIndex(i).types;
+            for (let j = 0; j < types.count; j++) {
+                if (concealed.includes(ObjC.unwrap(types.objectAtIndex(j)))) {
+                    throw new Error('CONCEALED');
+                }
+            }
+        }
         for (let i = 0; i < count; i++) {
             const item = items.objectAtIndex(i);
             const types = $.NSMutableDictionary.dictionary;
