@@ -286,6 +286,21 @@ final class FirstRunProof: XCTestCase {
     /// Another app's window in front of Vox's main window and over a quarter of it (a person's
     /// window, a system overlay such as the screenshot tool's), by the window list's owner, layer
     /// and bounds only: never an image. Nil when nothing covers it, or Vox has no window.
+    /// A Notification Center window over the screen point `at` (a banner, or the panel), by the
+    /// window list's owner, layer and bounds only, never an image: its bounds, else nil.
+    private func notificationOver(_ at: CGPoint) -> String? {
+        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                                 kCGNullWindowID) as? [[String: Any]] ?? []
+        for w in windows where (w[kCGWindowOwnerName as String] as? String) == "Notification Center" {
+            guard (w[kCGWindowLayer as String] as? Int ?? -1) >= 0,
+                  (w[kCGWindowAlpha as String] as? Double ?? 1) > 0,
+                  let b = w[kCGWindowBounds as String] as? NSDictionary,
+                  let r = CGRect(dictionaryRepresentation: b as CFDictionary), r.contains(at) else { continue }
+            return "layer \(w[kCGWindowLayer as String] ?? "?"), \(Int(r.width))×\(Int(r.height)) at \(Int(r.minX)),\(Int(r.minY))"
+        }
+        return nil
+    }
+
     private func coveredBy() -> String? {
         guard let vox = NSRunningApplication.runningApplications(withBundleIdentifier: proofAppID)
             .first(where: { !$0.isTerminated && ($0.bundleURL?.path.contains("/target/xcode/") ?? false) })
@@ -308,7 +323,11 @@ final class FirstRunProof: XCTestCase {
             let owner = w[kCGWindowOwnerName as String] as? String ?? "?"
             // The menu bar, and the overlay macOS shows while XCTest drives the Mac, which takes
             // no clicks, are always in front.
+            // Notification Center is left to tap(), which waits out a banner over what it clicks:
+            // its host window spans the screen's side whenever any app's banner shows (the
+            // person's own Vox's too), so its being there says nothing about this red.
             guard pid(w) != vox.processIdentifier, owner != "Window Server", owner != "AutomationModeUI",
+                  owner != "Notification Center",
                   layer(w) >= 0, (w[kCGWindowAlpha as String] as? Double ?? 1) > 0 else { continue }
             let over = bounds(w).intersection(area)
             if !over.isNull, over.width * over.height > area.width * area.height / 4 {
@@ -1948,6 +1967,20 @@ final class FirstRunProof: XCTestCase {
                 if case .menuItem = key { reached = { e.isHittable } } else { reached = { self.inView(ui, e) } }
                 if !reached() { scrollTo(ui, e) }
                 if reached() {
+                    // A notification banner (anyone's: the person's own Vox posts too) over the
+                    // click's point would take the click: waited out, as a person waits.
+                    let at = CGPoint(x: e.frame.midX, y: e.frame.midY)
+                    let clearBy = Date().addingTimeInterval(20)
+                    while let banner = notificationOver(at), Date() < clearBy {
+                        _ = banner
+                        Thread.sleep(forTimeInterval: 0.5)
+                    }
+                    if let held = notificationOver(at) {
+                        keepTree(ui, "Notification Center covered \(what)")
+                        XCTFail("APPARATUS: Notification Center (\(held)) covered \(what) (\(key)) for 20 s: a panel left open, not Vox's",
+                                file: file, line: line)
+                        return false
+                    }
                     e.click()
                     return true
                 }
