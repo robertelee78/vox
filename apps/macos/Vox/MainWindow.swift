@@ -887,40 +887,60 @@ private struct Inspector: View {
     let room: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            SessionsList(model: model)
-            Divider().padding(.vertical, 8)
-            Text("MEMBERS").eyebrow().secondaryText()
-                .accessibilityAddTraits(.isHeader)
-            ForEach(model.members) { member in
-                TrustMark(name: member.name, trust: member.trust)
-                    .accessibilityIdentifier("member-\(member.name)")
-                // What this node's keyring grants it (K-14), once it is in the keyring.
-                if member.trust != .none {
-                    Text(Capability.words(member.drive)).eyebrow().secondaryText()
-                        .padding(.leading, 18)
-                        .accessibilityIdentifier("member-capability-\(member.name)")
+        // It scrolls (P13): a room with many Sessions or members cut off the bottom, the family
+        // LAN section with it. Each section's heading stays in view while its rows scroll.
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 8, pinnedViews: [.sectionHeaders]) {
+                Section {
+                    SessionsList(model: model, heading: false)
+                } header: {
+                    heading("SESSIONS")
                 }
-                // The platform its node says it runs on (ADR-020 §4.9b): its claim, said as one.
-                if let platform = model.platforms[member.id] {
-                    Text("says it runs on \(Platform.words(platform))")
-                        .font(Theme.mono).secondaryText()
-                        .padding(.leading, 18)
-                        // Not selectable: a selectable Text with its own label sent SwiftUI's
-                        // accessibility into endless recursion, and the app crashed when read.
-                        .accessibilityLabel("\(member.name) says it runs on \(Platform.words(platform))")
-                        .accessibilityIdentifier("member-platform-\(member.name)")
+                Section {
+                    ForEach(model.members) { member in
+                        TrustMark(name: member.name, trust: member.trust)
+                            .accessibilityIdentifier("member-\(member.name)")
+                        // What this node's keyring grants it (K-14), once it is in the keyring.
+                        if member.trust != .none {
+                            Text(Capability.words(member.drive)).eyebrow().secondaryText()
+                                .padding(.leading, 18)
+                                .accessibilityIdentifier("member-capability-\(member.name)")
+                        }
+                        // The platform its node says it runs on (ADR-020 §4.9b): its claim, said
+                        // as one.
+                        if let platform = model.platforms[member.id] {
+                            Text("says it runs on \(Platform.words(platform))")
+                                .font(Theme.mono).secondaryText()
+                                .padding(.leading, 18)
+                                // Not selectable: a selectable Text with its own label sent
+                                // SwiftUI's accessibility into endless recursion, and the app
+                                // crashed when read.
+                                .accessibilityLabel("\(member.name) says it runs on \(Platform.words(platform))")
+                                .accessibilityIdentifier("member-platform-\(member.name)")
+                        }
+                    }
+                    Divider().padding(.vertical, 8)
+                    FamilyLan(model: model, room: room)
+                } header: {
+                    heading("MEMBERS")
                 }
             }
-            Divider().padding(.vertical, 8)
-            FamilyLan(model: model, room: room)
-            Spacer()
+            .padding(12)
         }
-        .padding(12)
         .frame(maxHeight: .infinity, alignment: .topLeading)
         // A container, so each row keeps its own identifier (member-<name>) under this one.
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("inspector")
+    }
+
+    /// A section's heading, pinned while its rows scroll under it: drawn on the inspector's own
+    /// surface, so the rows do not show through.
+    private func heading(_ words: String) -> some View {
+        Text(words).eyebrow().secondaryText()
+            .accessibilityAddTraits(.isHeader)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 4)
+            .background(VoxTokens.Colors.bgBase)
     }
 }
 

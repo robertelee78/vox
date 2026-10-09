@@ -360,8 +360,11 @@ final class FirstRunProof: XCTestCase {
     /// resize the one on the right too"), alone. Staged by `vox`: alice attached, with one room,
     /// chosen before; Keep Running not chosen. Dragging the sidebar's divider and the inspector's
     /// changes each column's width; both widths are the same after ⌘Q and a new launch; and View >
-    /// Hide Inspector (⌥⌘I) hides the inspector and Show Inspector brings it back.
-    /// Mutation: Columns.remember a no-op → red at "after a new launch".
+    /// Hide Inspector (⌥⌘I) hides the inspector and Show Inspector brings it back. Made short, the
+    /// window cuts the inspector's family LAN section off, and scrolling the inspector brings it
+    /// into view with MEMBERS still at the top (P13).
+    /// Mutations: Columns.remember a no-op → red at "after a new launch"; the inspector without
+    /// its scroll view → red at "must scroll".
     func testColumnsResizeAndAreRememberedAndTheInspectorHides() throws {
         let env = ProcessInfo.processInfo.environment
         guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
@@ -465,7 +468,33 @@ final class FirstRunProof: XCTestCase {
         let back = present(ui, Key.id("inspector"), timeout: 5, "⌥⌘I again must show the inspector")
         XCTAssertTrue(hidden && back,
                       "PRODUCT: View > Hide Inspector (⌥⌘I) must hide the inspector and Show Inspector bring it back; hidden \(hidden), back \(back)")
-        print("[proof] columns: sidebar \(sidebar0) → \(sidebar1) → after relaunch \(sidebar2); inspector \(inspector0) → \(inspector1) → \(inspector2); hide \(hidden), show \(back)")
+
+        // A short window (P13): the inspector's last section, the family LAN, is below its
+        // bottom, and scrolling the inspector brings it into view while MEMBERS stays pinned.
+        let window = ui.windows.firstMatch
+        let bottom = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 1))
+            .withOffset(CGVector(dx: 0, dy: -1))
+        bottom.press(forDuration: 0.5, thenDragTo: bottom.withOffset(CGVector(dx: 0, dy: -(window.frame.height - 300))),
+                     withVelocity: .slow, thenHoldForDuration: 0.5)
+        Thread.sleep(forTimeInterval: 1)
+        let inspector = ui.descendants(matching: .any).matching(identifier: "inspector").firstMatch
+        // The section's last control: Allow the LAN Helper, or Remove it once it is allowed.
+        let lan = ui.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier == 'family-lan-allow' OR identifier == 'family-lan-remove'")).firstMatch
+        func lanInView() -> Bool {
+            lan.exists && lan.frame.maxY <= inspector.frame.maxY + 1 && lan.frame.minY >= inspector.frame.minY
+        }
+        guard !lanInView() else {
+            throw Apparatus("staging not achieved: the window is \(window.frame.height) high and the inspector's family LAN section still fits (\(lan.frame) in \(inspector.frame)), so there is nothing to scroll")
+        }
+        inspector.scroll(byDeltaX: 0, deltaY: -2000)
+        Thread.sleep(forTimeInterval: 1)
+        let members = locate(ui, Key.showing("MEMBERS"))?.frame ?? .null
+        XCTAssertTrue(lanInView(),
+                      "PRODUCT: the inspector must scroll (P13): in a window \(window.frame.height) high, scrolled down, its family LAN section is still out of view (\(lan.exists ? "\(lan.frame)" : "not shown") in \(inspector.frame))")
+        XCTAssertTrue(!members.isNull && members.minY >= inspector.frame.minY - 1 && members.maxY <= inspector.frame.maxY,
+                      "PRODUCT: scrolled, the inspector's MEMBERS heading must stay in view (P13); it is at \(members) in \(inspector.frame)")
+        print("[proof] columns: sidebar \(sidebar0) → \(sidebar1) → after relaunch \(sidebar2); inspector \(inspector0) → \(inspector1) → \(inspector2); hide \(hidden), show \(back); scrolled, LAN in view \(lanInView()), MEMBERS at \(members.minY)")
     }
 
     /// (8) Notifications (ADR-014 M-23, ADR-028 R-10, #448), alone: the one step that needs a
