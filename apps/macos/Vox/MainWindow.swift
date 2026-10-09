@@ -533,6 +533,9 @@ private struct RoomView: View {
                 // A Session has no room composer (CL-1): the room's composer never speaks into
                 // a Session. An open one's own composer is for a member with drive only (CL-3).
                 if !model.showingSession {
+                    // Who here cannot read this node, or be read by it, and why: reading needs
+                    // trust both ways (ADR-028 R-5), which a newcomer is not told anywhere else.
+                    TrustBanner(model: model)
                     composer
                 } else if let s = model.shownSession, s.canDrive, s.open {
                     Divider()
@@ -801,6 +804,48 @@ private struct NodeStopped: View {
     private func again() {
         let secret = field.take()
         Task { await model.attachAgain(secret) }
+    }
+}
+
+/// A line above the composer while any member and this node cannot read each other, saying which
+/// way trust is missing and what to do. Members are named as the room names them: this node's
+/// alias, else the start of the fingerprint.
+private struct TrustBanner: View {
+    @ObservedObject var model: NodeModel
+
+    var body: some View {
+        let cut = model.members.filter { $0.trust != .mutual }
+        if !cut.isEmpty {
+            HStack(spacing: 8) {
+                StateMark(kind: .attention, words: words(cut))
+                    .accessibilityIdentifier("trust-banner")
+                Spacer()
+                if cut.count == 1, let member = cut.first, member.trust == .none,
+                   model.offers.contains(where: { $0.fingerprint == member.id }) {
+                    Button("Trust \(member.name)…") { Task { await model.show(.offer(member.id)) } }
+                        .accessibilityIdentifier("trust-banner-offer")
+                } else if cut.contains(where: { $0.trust == .none }) {
+                    Button("Show Keyring") { Task { await model.show(.keyring) } }
+                        .accessibilityIdentifier("trust-banner-keyring")
+                }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 6)
+        }
+    }
+
+    private func words(_ cut: [NodeModel.MemberRow]) -> String {
+        guard cut.count == 1, let m = cut.first else {
+            return "\(cut.count) members here and you can't read each other yet: reading needs both "
+                + "sides to trust each other."
+        }
+        switch (m.trust, m.trustsYou) {
+        case (.oneWay, _):
+            return "You trust \(m.name). Waiting for \(m.name) to trust you back before you can read each other."
+        case (.none, true):
+            return "\(m.name) trusts you. Trust \(m.name) too, and you can read each other."
+        default:
+            return "You and \(m.name) can't read each other yet: each of you has to trust the other."
+        }
     }
 }
 

@@ -64,6 +64,9 @@ final class NodeModel: ObservableObject {
         let trust: Trust
         /// Whether this node's keyring entry for it grants drive as well as read (K-14).
         let drive: Bool
+        /// Whether it trusts this node: it has granted this node consent (ADR-007 G-9), whether
+        /// or not this node trusts it back.
+        var trustsYou = false
     }
 
     let node: String
@@ -816,7 +819,8 @@ final class NodeModel: ObservableObject {
                 ? (back.contains(m.fingerprint) ? .mutual : .oneWay) : .none
             return MemberRow(id: m.fingerprint,
                              name: m.name.isEmpty ? String(m.fingerprint.prefix(12)) : m.name,
-                             trust: trust, drive: keyring[m.fingerprint] ?? false)
+                             trust: trust, drive: keyring[m.fingerprint] ?? false,
+                             trustsYou: back.contains(m.fingerprint))
         }
     }
 
