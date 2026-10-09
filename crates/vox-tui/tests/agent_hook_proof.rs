@@ -2383,6 +2383,52 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
          show it, and still be shown one addressed to the node (ADR-029 TA-2, TA-4); its turn \
          said:\n{sibling_turn}"
     );
+    // (10b) A file bob shares to that one session is pulled by the session's node by itself, as a
+    // share to the node is (ADR-028 F-3, ADR-029 TA-1): it matched `to` against the node's whole
+    // fingerprint only, and a `<fp>/<session>` entry never matched.
+    let to_session = tmp.path().join("to-one-session.bin");
+    let to_session_bytes: Vec<u8> = (0..90_000u32).map(|i| (i * 7 % 239) as u8).collect();
+    std::fs::write(&to_session, &to_session_bytes).expect("APPARATUS: write the file bob shares");
+    let (ok, _, err) = hook(
+        &bob.data,
+        &bob.cfg,
+        &[
+            "share",
+            &room,
+            to_session.to_str().expect("APPARATUS: a UTF-8 path"),
+            "--to",
+            "codex@device-2/gso-cap-2",
+        ],
+        "",
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): bob's `vox share --to codex@device-2/gso-cap-2` failed: {err}"
+    );
+    let landed = data
+        .join("nodes/default/files")
+        .join(&daemon.room_key)
+        .join("to-one-session.bin");
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while std::fs::read(&landed).ok().as_deref() != Some(&to_session_bytes[..])
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let pulled_whole = std::fs::read(&landed).ok().as_deref() == Some(&to_session_bytes[..]);
+    assert!(
+        pulled_whole,
+        "PRODUCT: a file shared to one session of a node must be pulled by that node by itself, \
+         byte for byte, into {} within 90 s; there is {}",
+        landed.display(),
+        std::fs::read_dir(landed.parent().expect("APPARATUS: a parent"))
+            .map(|d| d
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(", "))
+            .unwrap_or_else(|_| "no files directory".into())
+    );
     // (8) The daemon restarts mid-session; the session's next turn opens no second Session.
     restart(&mut daemon, tmp.path());
     run(

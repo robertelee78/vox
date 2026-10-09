@@ -567,7 +567,13 @@ fn offer_in(text: &str, me: &str) -> Option<(String, u64, String, String, bool, 
         .and_then(serde_json::Value::as_array)
         .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
         .unwrap_or_default();
-    if !to.is_empty() && !to.contains(&me) {
+    // A share addressed to one session of this node (`<fingerprint>/<session id>`, ADR-029
+    // TA-1) is this node's to pull, as one addressed to the node is.
+    if !to.is_empty()
+        && !to
+            .iter()
+            .any(|t| vox_agentcomms::envelope::addressee(t).0 == me)
+    {
         return None;
     }
     let d = v.get("data")?;
