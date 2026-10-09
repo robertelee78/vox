@@ -43,12 +43,12 @@ const START_GRACE: Duration = Duration::from_secs(10);
 /// This exists because neither of the other two ways to run a node can serve an
 /// unattended host:
 ///
-/// - [`run_live`] is the TUI. It is the only other caller of `node::ipc::bind`, it
-///   needs a TTY to prompt for the passphrase, and per ADR-015 it **locks the node
-///   on SIGHUP** — so detaching it from a terminal defeats it by design.
-/// - [`run_node`] is an anchor. It serves the board and carries circuits, but it is
-///   headless in the other sense: no identity is unlocked, it holds no room and it
-///   can read nothing.
+/// - [`run_live`](crate::app::run_live) is the TUI. It needs a terminal to prompt for the
+///   passphrase and draw on, and SIGHUP, its terminal going away, stops it (V210-85, V210-93),
+///   so detaching it from a terminal defeats it by design.
+/// - [`run_node`](crate::app::run_node) is an anchor. It serves the board and carries circuits,
+///   but it is headless in the other sense: no identity is unlocked, it holds no room and it can
+///   read nothing.
 ///
 /// So an agent on a server had no node to attach to, which contradicted this ADR's
 /// own premise that sessions may be on "n-count remote hosts".
@@ -407,6 +407,10 @@ pub(crate) fn take_account(
     };
     let lock = Arc::new(Mutex::new(lock));
     write_pid(&lock);
+    // **What serves this data root is written in it** (ADR-026 F-3), under the lock, so a later
+    // release can tell which formats it holds.
+    vox_core::node::layout::stamp_format(account, env!("CARGO_PKG_VERSION"))
+        .map_err(|e| AppError::Usage(e.to_string()))?;
     let mut anchors = vox_core::nat::bootstrap::BootstrapSet::new();
     for spec in anchor_specs {
         if !spec.trim().is_empty() {

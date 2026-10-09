@@ -4,7 +4,9 @@
 import SwiftUI
 
 /// To: and urgent for what the composer posts (M-15): the members ticked are written into `to` as
-/// whole fingerprints; urgent may interrupt their agents mid-turn.
+/// whole fingerprints, and a member's open Session as `<fingerprint>/<session id>`, the addressing
+/// `vox room post --to <member>/<session>` sends (MADR W-4, ADR-029 TA-1); urgent may interrupt
+/// their agents mid-turn.
 struct ComposerAddress: View {
     @ObservedObject var model: NodeModel
     @Binding var to: Set<String>
@@ -28,11 +30,13 @@ struct ComposerAddress: View {
                     Text("To").eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
                     if model.members.isEmpty { Text("No other members yet").secondaryText() }
                     ForEach(model.members) { member in
-                        Toggle(isOn: Binding(
-                            get: { to.contains(member.id) },
-                            set: { on in if on { to.insert(member.id) } else { to.remove(member.id) } }
-                        )) { Text(member.name) }
-                            .accessibilityIdentifier("to-\(member.name)")
+                        tick(member.id, member.name, id: "to-\(member.name)")
+                        // Its open Sessions, under it: one of them alone can be written to.
+                        ForEach(openSessions(of: member.id), id: \.sessionId) { s in
+                            tick("\(member.id)/\(s.sessionId)", s.label,
+                                 id: "to-\(member.name)-\(s.shortId)")
+                                .padding(.leading, 18)
+                        }
                     }
                 }
                 .font(Theme.text)
@@ -46,14 +50,36 @@ struct ComposerAddress: View {
         .caption()
     }
 
-    private var names: [String] { model.members.filter { to.contains($0.id) }.map(\.name) }
+    /// A line of the To: list: ticked, it is in `to` as `address`.
+    private func tick(_ address: String, _ name: String, id: String) -> some View {
+        Toggle(isOn: Binding(
+            get: { to.contains(address) },
+            set: { on in if on { to.insert(address) } else { to.remove(address) } }
+        )) { Text(name) }
+            .accessibilityIdentifier(id)
+    }
+
+    /// A member's Sessions open in the room on screen.
+    private func openSessions(of member: String) -> [FfiSession] {
+        model.sessions.filter { $0.open && $0.nodeFingerprint == member }
+    }
+
+    /// What is ticked, by name: each member, and each Session by its label.
+    private var names: [String] {
+        model.members.flatMap { member -> [String] in
+            (to.contains(member.id) ? [member.name] : [])
+                + openSessions(of: member.id)
+                .filter { to.contains("\(member.id)/\($0.sessionId)") }
+                .map(\.label)
+        }
+    }
 
     /// Short enough for the composer's row at the window's narrowest: one name, or how many.
     private var addressed: String {
         switch names.count {
         case 0: return "To: the room"
         case 1: return "To: \(names[0])"
-        default: return "To: \(names.count) members"
+        default: return "To: \(names.count) addressees"
         }
     }
 

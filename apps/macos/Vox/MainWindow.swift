@@ -333,7 +333,10 @@ private struct TimelineKeys: NSViewRepresentable {
             case 53: key = .close // Escape
             default: key = nil
             }
-            // Only the bare key (⇧ only with ↑/↓): ⌘↑ and the like are the menus' and the system's.
+            // Only the bare key (⇧ only with ↑/↓): ⌘↑ and the like are the menus' and the system's;
+            // but ⌘↑ on a reply goes to the message it quotes (ADR-028 R-9).
+            let held = event.modifierFlags.intersection([.command, .option, .control, .shift])
+            if event.keyCode == 126, held == .command, onKey?(.quoted) == true { return }
             let bare = event.modifierFlags.intersection([.command, .option, .control]).isEmpty
             if let key, bare, onKey?(key) == true { return }
             super.keyDown(with: event)
@@ -343,8 +346,9 @@ private struct TimelineKeys: NSViewRepresentable {
 
 /// A key the timeline acts on.
 private enum TimelineKey {
-    /// ⇧↑ and ⇧↓ add the message above or below to the selection (v0.4.1).
-    case up, down, extendUp, extendDown, open, look, close
+    /// ⇧↑ and ⇧↓ add the message above or below to the selection (v0.4.1); `quoted`: ⌘↑ on a
+    /// reply, to the message it quotes (ADR-028 R-9).
+    case up, down, extendUp, extendDown, open, look, close, quoted
 }
 
 /// The room on screen: its timeline and a field to post, with its members beside it.
@@ -427,6 +431,8 @@ private struct RoomView: View {
                                     ForEach(model.timelineItems) { item in
                                         if let message = item.message {
                                             MessageRow(message: message, me: model.me,
+                                                       quote: model.quote(of: message),
+                                                       jump: { model.jumpTo = $0 },
                                                        readBy: model.readBy[message.id] ?? [],
                                                        pulledBy: model.pulledBy[message.id] ?? [],
                                                        pulled: model.pulled[message.id]) { looking = $0 }
@@ -449,6 +455,14 @@ private struct RoomView: View {
                                         } else if let entry = item.entry, let session = model.shownSession {
                                             SessionEntryRow(model: model, session: session,
                                                             entry: entry) { looking = $0 }
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                                // Selected like a message: ↑/↓ reach it (P14).
+                                                .selectable(model.selectedMessages.contains(item.id),
+                                                            focused: timelineFocused
+                                                                && model.selectedMessage == item.id) {
+                                                    clicked(item.id)
+                                                }
+                                                .accessibilityIdentifier("entry-row-\(entry.id)")
                                                 .id(item.id)
                                         }
                                     }
@@ -479,13 +493,34 @@ private struct RoomView: View {
                                 case .open: return openSelected()
                                 case .look: return toggleLook()
                                 case .close: return closeLook()
+                                case .quoted:
+                                    guard let quoted = selected.flatMap({ model.quote(of: $0) }) else {
+                                        return false
+                                    }
+                                    model.jumpTo = quoted.id
+                                    return true
                                 }
                             }, copied: {
                                 model.selectedMessages.isEmpty ? nil : model.copiedLines
                             }))
+                            // A quote clicked, or ⌘↑ on a reply: the message it quotes, scrolled to
+                            // and selected (ADR-028 R-9). One this room does not hold stays where
+                            // it is.
+                            .onChange(of: model.jumpTo) { id in
+                                guard let id else { return }
+                                model.jumpTo = nil
+                                guard model.byID[id] != nil else { return }
+                                select(id)
+                                withAnimation(Theme.motion(reduced: reduceMotion)) {
+                                    scroller.scrollTo(id, anchor: .center)
+                                }
+                                NotificationCenter.default.post(name: .voxFocusTimeline, object: nil)
+                            }
                             .onReceive(NotificationCenter.default.publisher(for: .voxFocusTimeline)) { _ in
-                                // Taken: the newest row, when none was selected.
-                                if model.selectedMessage == nil, let last = model.messages.last {
+                                // Taken: the newest row, when none was selected: a message, or in a
+                                // Session its newest entry (P14).
+                                if model.selectedMessage == nil,
+                                   let last = model.timelineItems.last(where: { $0.message != nil || $0.entry != nil }) {
                                     select(last.id)
                                     scroller.scrollTo(last.id)
                                 }
@@ -607,13 +642,31 @@ private struct RoomView: View {
         Divider()
         if let reply = model.replyTo {
             HStack {
-                Text("Replying to \(reply.authorName.isEmpty ? String(reply.author.prefix(12)) : reply.authorName): \(reply.text.prefix(60))")
-                    .lineLimit(1).secondaryText()
+                // The message replied to, as a link to it (ADR-028 R-9).
+                Button { model.jumpTo = reply.id } label: {
+                    Text("Replying to \(reply.authorName.isEmpty ? String(reply.author.prefix(12)) : reply.authorName): \(reply.text.prefix(60))")
+                        .lineLimit(1).secondaryText()
+                }
+                .buttonStyle(.plain)
+                .help("Go to the message you are replying to")
+                .accessibilityIdentifier("replying-to-quote")
                 Spacer()
                 Button("Cancel") { model.replyTo = nil }.buttonStyle(.borderless)
             }
             .padding(.horizontal, 12).padding(.top, 8)
             .accessibilityIdentifier("replying-to")
+        }
+        if !mentions.isEmpty {
+            // Typing @ offers the keyring's members of this room by name (ADR-028 K-4).
+            HStack(spacing: 8) {
+                ForEach(mentions) { member in
+                    Button("@\(member.name)") { mention(member) }
+                        .buttonStyle(.borderless)
+                        .accessibilityIdentifier("mention-\(member.name)")
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 12).padding(.top, 8)
         }
         HStack(spacing: 8) {
             Button {
@@ -625,7 +678,10 @@ private struct RoomView: View {
             .help("Attach a file or folder")
             .accessibilityLabel("Attach a file or folder")
             .accessibilityIdentifier("attach")
-            TextField("Say something to the room", text: $draft)
+            // Up to 12 lines, so a long message is read before it goes; Return sends, ⌥↩ adds a
+            // line (P19).
+            TextField("Say something to the room", text: $draft, axis: .vertical)
+                .lineLimit(1...12)
                 .accessibilityLabel("Message to the room")
                 .textFieldStyle(.plain)
                 .frame(minWidth: Theme.scaled(160), maxWidth: .infinity)
@@ -639,7 +695,13 @@ private struct RoomView: View {
 
     /// Post the draft, To: and replying as set; urgent when asked (⌘↩ or the switch).
     private func send(urgent now: Bool) {
-        let (text, recipients, re) = (draft, Array(to), model.replyTo?.id ?? "")
+        // An @alias typed in full addresses that member, as ticking it in To: does (K-4).
+        let named = draft.split(whereSeparator: \.isWhitespace).compactMap { word -> String? in
+            guard word.hasPrefix("@") else { return nil }
+            let alias = word.dropFirst().trimmingCharacters(in: .punctuationCharacters.subtracting(["#"]))
+            return mentionable.first { $0.name == alias }?.id
+        }
+        let (text, recipients, re) = (draft, Array(to.union(named)), model.replyTo?.id ?? "")
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         draft = ""
         urgent = false
@@ -647,11 +709,37 @@ private struct RoomView: View {
         Task { await model.post(text, to: recipients, urgent: now, re: re) }
     }
 
+    /// The members an @alias can name (ADR-028 K-4): those in the keyring, by the names the node
+    /// gives them (an alias the same as another but for case carries its fingerprint's start).
+    private var mentionable: [NodeModel.MemberRow] { model.members.filter { $0.trust != .none } }
+
+    /// The @word being typed at the end of the draft: what follows "@", or nil.
+    private var mentioning: String? {
+        guard let at = draft.lastIndex(of: "@"),
+              at == draft.startIndex || draft[draft.index(before: at)].isWhitespace else { return nil }
+        let word = draft[draft.index(after: at)...]
+        return word.contains(where: \.isWhitespace) ? nil : String(word)
+    }
+
+    /// The members the @word being typed could name, by the start of their names.
+    private var mentions: [NodeModel.MemberRow] {
+        guard let typed = mentioning?.lowercased() else { return [] }
+        return mentionable.filter { $0.name.lowercased().hasPrefix(typed) }
+    }
+
+    /// `member` picked for the @word being typed: written in full, and addressed (K-4).
+    private func mention(_ member: NodeModel.MemberRow) {
+        guard let at = draft.lastIndex(of: "@") else { return }
+        draft = String(draft[..<at]) + "@\(member.name) "
+        to.insert(member.id)
+    }
+
     /// ↑/↓ on the timeline: the selection moves to the message before or after it, scrolled into
     /// view; with none selected, ↑ takes the newest and ↓ the oldest.
     private func move(_ direction: MoveCommandDirection, _ scroller: ScrollViewProxy,
                       extending: Bool = false) -> Bool {
-        let ids = model.timelineItems.compactMap { $0.message?.id }
+        // Every drawn row with an identity: a message, or a Session's entry or request (P14).
+        let ids = model.timelineItems.filter { $0.message != nil || $0.entry != nil }.map(\.id)
         guard !ids.isEmpty else { return false }
         let at = model.selectedMessage.flatMap { ids.firstIndex(of: $0) }
         let next: Int
@@ -776,6 +864,11 @@ private struct RoomView: View {
 private struct MessageRow: View {
     let message: RoomMessage
     let me: String
+    /// What it replies to, quoted (ADR-028 R-9): the message's id, and "<who>: <first line>", or
+    /// nil words while this room does not hold it.
+    let quote: (id: String, words: String?)?
+    /// Go to a quoted message.
+    let jump: (String) -> Void
     /// Who has read it, when it is this node's own (R-6).
     let readBy: [String]
     /// Who has pulled it, verified, when it is this node's own share (#498).
@@ -796,6 +889,17 @@ private struct MessageRow: View {
                     Text("arrived late").eyebrow().secondaryText()
                         .accessibilityIdentifier("late-\(message.id)")
                 }
+            }
+            if let quote {
+                // The message it replies to, one level, as a link to it (ADR-028 R-9).
+                Button { jump(quote.id) } label: {
+                    Text("re \(quote.words ?? "a message this room does not hold yet")")
+                        .italic().secondaryText().lineLimit(1).truncationMode(.tail)
+                }
+                .buttonStyle(.plain)
+                .disabled(quote.words == nil)
+                .help(quote.words == nil ? "This room does not hold it yet" : "Go to the message it replies to (⌘↑)")
+                .accessibilityIdentifier("quote-\(message.id)")
             }
             if let file = message.file {
                 FileCard(file: file, image: message.image, pulled: pulled, look: look)

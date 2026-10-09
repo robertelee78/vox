@@ -227,6 +227,26 @@ private struct SelectionMark: ViewModifier {
     }
 }
 
+/// A warning, before an alias is given, that the keyring holds another that equals it but for case
+/// (ADR-028 K-4): both are then shown with their fingerprint's first characters. Nothing when
+/// there is no clash.
+struct AliasClash: View {
+    @ObservedObject var model: NodeModel
+    let alias: String
+    /// The node being renamed, whose own alias is no clash.
+    var except: String? = nil
+
+    var body: some View {
+        if let other = clashingAlias(
+            others: model.trusted.filter { $0.fingerprint != except }.map(\.name), alias: alias) {
+            StateMark(kind: .attention,
+                      words: "Your keyring already has \(other), the same but for case: both will "
+                          + "be shown with the first characters of their fingerprints.")
+                .accessibilityIdentifier("alias-clash")
+        }
+    }
+}
+
 extension View {
     /// Draw as secondary text.
     func secondaryText() -> some View { modifier(SecondaryText()) }

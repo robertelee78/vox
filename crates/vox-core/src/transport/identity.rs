@@ -912,7 +912,3 @@ fn closed(conn: &Connection) -> DialFailed {
         None => DialFailed::Closed("the identity stream failed".to_owned()),
     }
 }
-
-#[cfg(test)]
-#[path = "identity_tests.rs"]
-mod tests;

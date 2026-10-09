@@ -1178,11 +1178,22 @@ fn file_offer(env: &vox_agentcomms::envelope::Envelope) -> Option<FileOffer> {
 }
 
 /// The keyring's names, by fingerprint. A read: the node checks no passphrase.
+/// The keyring's names as a person reads them in messages, members, To: and the decision
+/// record: two aliases that differ only in case each carry their fingerprint's first characters
+/// (ADR-028 K-4, [`vox_text::alias::alias_of`]). The keyring's own rows keep the bare alias.
 async fn names(client: &mut IpcClient) -> Result<HashMap<Digest32, String>, VoxError> {
-    Ok(keyring(client)
+    let entries: Vec<(Digest32, String)> = keyring(client)
         .await?
         .into_iter()
         .map(|(fp, name, _)| (fp, name))
+        .collect();
+    Ok(entries
+        .iter()
+        .map(|(fp, name)| {
+            let shown =
+                vox_text::alias::alias_of(&entries, fp, b32_encode).unwrap_or_else(|| name.clone());
+            (*fp, shown)
+        })
         .collect())
 }
 

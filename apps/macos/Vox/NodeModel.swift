@@ -127,6 +127,9 @@ final class NodeModel: ObservableObject {
     /// Where a ⇧-click or ⇧↑/⇧↓ range starts.
     var selectionAnchor: String?
     @Published var replyTo: RoomMessage?
+    /// A message a quote was clicked to reach (ADR-028 R-9): the room's timeline scrolls to it and
+    /// selects it, then sets this back to nil.
+    @Published var jumpTo: String?
     /// The service card selected above the timeline, whose command ⌘⇧C copies.
     @Published var selectedService: SharedService?
     /// What a menu action last did, said where the person is (E-5).

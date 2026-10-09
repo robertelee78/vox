@@ -48,7 +48,7 @@ impl NodeTasks {
     }
 
     /// End every task and wait for each to finish. A task ends at its next await once cancelled;
-    /// a wake already handed to its own task ([`deliver`]) runs to its own deadline.
+    /// a wake already handed to its own task (`deliver`) runs to its own deadline.
     pub async fn stop(mut self) {
         self.cancel.cancel();
         while self.set.join_next().await.is_some() {}

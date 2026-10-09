@@ -22,6 +22,13 @@
 //    is read, and bob's `vox room read --json` says alice read it; one bob posts while alice's
 //    app is hidden is not read, until she brings it back; a message alice posts, read by bob's
 //    agent drain (`vox agent hook`), shows "read by bob" under it in her timeline.
+//    A reply quotes what it answers (ADR-028 R-9, D6): bob's reply to FROM-ALICE shows "re you:
+//    FROM-ALICE" above it, and its quote, clicked, or ⌘↑ with the reply selected, selects FROM-ALICE.
+//    To: offers bob's open Session under him (MADR W-4, ADR-029 TA-1, D7): ticked, alice's post is
+//    addressed to that Session alone, <bob>/<session>, as bob's node holds it.
+//    @alias (ADR-028 K-4, D8): "@b" offers @bob, and picked, it addresses bob. Step 5 warns of an
+//    alias the same as bob's but for case before it is given, and (5b) with carol trusted as "Bob",
+//    bob is told apart in mission's members as bob#<his fingerprint's first 6>.
 // 5. The keyring view (ADR-014 M-16, ADR-028 K-3, E-5, #443): a pasted fingerprint with an alias
 //    says what trusting does before it is done, and is listed, as `vox trust list` lists it;
 //    removing it says what untrusting does first, and only then removes it.
@@ -72,6 +79,11 @@
 // Untrust that leaves a member's live sessions running: (11) goes red. An app that counts
 // nothing from before it opened (no seeding from VoxClient.unread): (13) goes red. ↑/↓ that do not
 // move the selection, or Space and Return that open nothing: (14) goes red.
+// A quote that goes nowhere (MessageRow's quote button not calling `jump`): (4) goes red.
+// To: that ticks the member for one of its Sessions (the Session's tick inserting the member's
+// fingerprint alone): (4) goes red.
+// An @alias picked that is only written, not addressed: (4) goes red. The FFI's names() without
+// the clash suffix: (5) goes red.
 
 // Every check on the window proves its own query first (ADR-018: a red names its side): Vox is in
 // front and XCTest reads words in what it shows, else the red is APPARATUS; then a red is PRODUCT
@@ -1099,6 +1111,174 @@ final class FirstRunProof: XCTestCase {
         }))
         print("[proof] three messages copied four ways: \(want.debugDescription)")
 
+        // (4c) A reply quotes what it answers, and the quote goes to it (ADR-028 R-9, D6): bob
+        // replies to FROM-ALICE; alice's timeline shows "re you: FROM-ALICE" above his reply, and
+        // clicking it, or ⌘↑ with the reply selected, selects FROM-ALICE.
+        func entry(_ text: String) -> String? {
+            let rows = run(vox, ["room", "read", "--node", "alice", "--json", room], env: voxEnv).out
+            for line in rows.split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      (row["text"] as? String)?.contains(text) == true else { continue }
+                return row["entry_hash"] as? String
+            }
+            return nil
+        }
+        guard let fromAlice = entry("FROM-ALICE") else {
+            throw Apparatus("alice's `vox room read --json` holds no FROM-ALICE to reply to")
+        }
+        try staged(vox, ["room", "post", "--node", "bob", "--re", fromAlice, room, "REPLY-TO-ALICE"],
+                   env: voxEnv)
+        let quote = Key.idPrefix("quote-")
+        words(ui, quote, timeout: 30,
+              "bob's reply must show what it replies to, quoted above it: \"re you: FROM-ALICE\"",
+              until: { $0 == "re you: FROM-ALICE" })
+        func selectedRow(_ start: String) -> Bool? {
+            let row = ui.windows.firstMatch.descendants(matching: .any)
+                .matching(NSPredicate(format: "label BEGINSWITH %@", start)).firstMatch
+            return row.exists ? row.isSelected : nil
+        }
+        func reaches(_ how: String, _ act: () -> Void) {
+            // From the reply, so a selection of FROM-ALICE is the jump's.
+            tap(ui, Key.showing("bob: REPLY-TO-ALICE"), "bob's reply")
+            act()
+            let until = Date().addingTimeInterval(5)
+            var now = selectedRow("you: FROM-ALICE")
+            while Date() < until && now != true {
+                Thread.sleep(forTimeInterval: 0.2)
+                now = selectedRow("you: FROM-ALICE")
+            }
+            switch now {
+            case nil:
+                keepTree(ui, "no row starts \"you: FROM-ALICE\"")
+                XCTFail("APPARATUS: XCTest finds no row saying \"you: FROM-ALICE\", though its reply quotes it")
+            case false?:
+                XCTFail("PRODUCT: \(how) must select the message the reply quotes, FROM-ALICE; it is not selected")
+            case true?:
+                break
+            }
+        }
+        reaches("clicking the reply's quote") { tap(ui, quote, "the reply's quote") }
+        reaches("⌘↑ with the reply selected") { ui.typeKey(.upArrow, modifierFlags: .command) }
+        print("[proof] bob's reply quotes \"re you: FROM-ALICE\", and its quote and ⌘↑ go to it")
+
+        // (4d) To: offers bob's open Session under him, and a message to it alone is addressed to
+        // that Session (MADR W-4, ADR-029 TA-1, D7): bob's Claude Code session opens a Session in
+        // mission by its hook, as a person's does; alice ticks it in To: and posts; bob's node holds
+        // the post addressed to <bob>/<session>, as `vox room post --to bob/<session>` sends it.
+        let d7Session = "d7-proof-session"
+        let opened = run(vox, ["agent", "hook", "--node", "bob", "--room", room, "--format", "text"],
+                         env: voxEnv.merging(["CLAUDE_CODE_ENTRYPOINT": "cli"]) { $1 },
+                         input: "{\"session_id\":\"\(d7Session)\",\"hook_event_name\":\"UserPromptSubmit\",\"cwd\":\"/tmp\",\"transcript_path\":\"/tmp/t.jsonl\",\"prompt\":\"go\"}")
+        guard opened.status == 0 else {
+            throw Apparatus("bob's Claude Code hook, to open a Session in mission, exited \(opened.status): \(opened.out)")
+        }
+        let sessionsUntil = Date().addingTimeInterval(30)
+        var listed = ""
+        while Date() < sessionsUntil && !listed.contains(d7Session.prefix(8)) {
+            listed = run(vox, ["room", "sessions", "--node", "alice", room], env: voxEnv).out
+            if !listed.contains(d7Session.prefix(8)) { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        guard listed.contains(d7Session.prefix(8)) else {
+            throw Apparatus("alice's `vox room sessions` never listed bob's Session \(d7Session) in 30 s: \(listed)")
+        }
+        let toBox = Key.id("compose-to")
+        tap(ui, toBox, "To:")
+        tap(ui, Key.idPrefix("to-bob-"), "bob's open Session under bob in To:",
+            premise: Premise("alice's `vox room sessions` lists bob's open Session \(d7Session)") {
+                let now = self.run(vox, ["room", "sessions", "--node", "alice", room], env: voxEnv).out
+                return (now.contains(d7Session.prefix(8)), now)
+            })
+        ui.typeKey(.escape, modifierFlags: [])
+        type(ui, Key.id("compose"), "TO-BOB-SESSION\r", "the composer")
+        var addressedTo: [String] = []
+        let addressedUntil = Date().addingTimeInterval(30)
+        while Date() < addressedUntil && addressedTo.isEmpty {
+            let rows = run(vox, ["room", "read", "--node", "bob", "--json", room], env: voxEnv).out
+            for line in rows.split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      (row["text"] as? String)?.contains("TO-BOB-SESSION") == true else { continue }
+                addressedTo = (row["envelope"] as? [String: Any])?["to"] as? [String] ?? ["(not addressed)"]
+            }
+            if addressedTo.isEmpty { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        XCTAssertTrue(addressedTo.count == 1 && addressedTo[0].hasSuffix("/\(d7Session)")
+                      && addressedTo[0].lowercased().hasPrefix(bobFp.lowercased()),
+                      "PRODUCT: alice's post with bob's Session ticked in To: must be addressed to that Session alone, <bob>/\(d7Session); bob's node holds it addressed to \(addressedTo)")
+        print("[proof] To: bob's Session: the post is addressed to \(addressedTo)")
+
+        // (4e) @alias (ADR-028 K-4, D8): typing "@b" in the composer offers @bob; picked, it is
+        // written in full and bob is addressed, as ticking him in To: does.
+        let composeBox = Key.id("compose")
+        type(ui, composeBox, "MENTION @b", "the composer")
+        tap(ui, Key.id("mention-bob"), "@bob offered for \"@b\"",
+            premise: member(vox, voxEnv, room, bobFp, "bob"))
+        words(ui, Key.id("compose-to"), timeout: 10, "@bob picked must address bob, as To: says",
+              until: { $0 == "To: bob" })
+        el(ui, composeBox).typeText("\r")
+        var mentionedTo: [String] = []
+        let mentionUntil = Date().addingTimeInterval(30)
+        while Date() < mentionUntil && mentionedTo.isEmpty {
+            let rows = run(vox, ["room", "read", "--node", "bob", "--json", room], env: voxEnv).out
+            for line in rows.split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      (row["text"] as? String)?.contains("MENTION @bob") == true else { continue }
+                mentionedTo = (row["envelope"] as? [String: Any])?["to"] as? [String] ?? ["(not addressed)"]
+            }
+            if mentionedTo.isEmpty { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        XCTAssertEqual(mentionedTo.map { $0.lowercased() }, [bobFp.lowercased()],
+                       "PRODUCT: \"MENTION @bob\", @bob picked in the composer, must be addressed to bob; bob's node holds it addressed to \(mentionedTo)")
+
+        // (4e2) The composer takes more than one line (P19): ⌥↩ adds a line, Return sends both.
+        type(ui, Key.id("compose"), "LINE ONE", "the composer")
+        el(ui, Key.id("compose")).typeKey(.return, modifierFlags: .option)
+        el(ui, Key.id("compose")).typeText("LINE TWO\r")
+        var twoLines: String?
+        let linesUntil = Date().addingTimeInterval(30)
+        while Date() < linesUntil && twoLines == nil {
+            let rows = run(vox, ["room", "read", "--node", "bob", "--json", room], env: voxEnv).out
+            for line in rows.split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      let text = row["text"] as? String, text.contains("LINE TWO") else { continue }
+                twoLines = text
+            }
+            if twoLines == nil { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        XCTAssertEqual(twoLines, "LINE ONE\nLINE TWO",
+                       "PRODUCT: \"LINE ONE\", ⌥↩, \"LINE TWO\", Return in the composer must post one message of two lines; bob's node holds \(twoLines.debugDescription)")
+
+        // (4f) ↑/↓ reach a Session's entries (P14): bob grants alice drive, so she reads inside his
+        // Session; with it shown, View > Focus Timeline selects its newest entry and ↑ the one
+        // before it, as among messages.
+        try staged(vox, ["trust", "drive", "--node", "bob", aliceFp,
+                         "--identity-passphrase-file", bobPass], env: voxEnv)
+        let again = run(vox, ["agent", "hook", "--node", "bob", "--room", room, "--format", "text"],
+                        env: voxEnv.merging(["CLAUDE_CODE_ENTRYPOINT": "cli"]) { $1 },
+                        input: "{\"session_id\":\"\(d7Session)\",\"hook_event_name\":\"UserPromptSubmit\",\"cwd\":\"/tmp\",\"transcript_path\":\"/tmp/t.jsonl\",\"prompt\":\"again\"}")
+        guard again.status == 0 else {
+            throw Apparatus("bob's Claude Code hook, to write a second entry in his Session, exited \(again.status): \(again.out)")
+        }
+        tap(ui, Key.id("session-\(d7Session.prefix(8))"), "bob's Session in mission's Sessions")
+        let entryRows = ui.windows.firstMatch.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH %@", "entry-row-"))
+        let entriesUntil = Date().addingTimeInterval(30)
+        while Date() < entriesUntil && entryRows.count < 2 { Thread.sleep(forTimeInterval: 0.5) }
+        guard entryRows.count >= 2 else {
+            keepTree(ui, "bob's Session shows fewer than two entries")
+            throw Product("bob's Session, shown to alice whom bob trusts with drive, must show its two entries; it shows \(entryRows.count)")
+        }
+        let rows = entryRows.allElementsBoundByIndex.sorted { $0.frame.minY < $1.frame.minY }
+        ui.typeKey("t", modifierFlags: [.command, .control])
+        func onlySelected(_ want: XCUIElement, _ how: String) {
+            let until = Date().addingTimeInterval(5)
+            while Date() < until && !want.isSelected { Thread.sleep(forTimeInterval: 0.2) }
+            XCTAssertTrue(want.isSelected && rows.filter(\.isSelected).count == 1,
+                          "PRODUCT: \(how) must select \(want.identifier) alone; selected: \(rows.filter(\.isSelected).map(\.identifier))")
+        }
+        onlySelected(rows[rows.count - 1], "View > Focus Timeline on bob's Session")
+        ui.typeKey(.upArrow, modifierFlags: [])
+        onlySelected(rows[rows.count - 2], "↑ from the newest entry")
+
         // (5) The keyring: carol, a node made here, added by her pasted fingerprint, then removed.
         try staged(vox, ["node", "create", "carol"],
                    env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "carol identity"]) { $1 })
@@ -1112,6 +1292,13 @@ final class FirstRunProof: XCTestCase {
             XCTFail("PRODUCT: Edit › Paste into the fingerprint field must paste carol's fingerprint \(carolFp); it holds \(pastedFp.debugDescription)")
         }
         let addAlias = Key.id("keyring-add-alias")
+        // An alias the same as bob's but for case is warned of before it is given (K-4, D8).
+        type(ui, addAlias, "BOB", "the alias field")
+        words(ui, Key.id("alias-clash"), timeout: 10,
+              "an alias the same as bob's but for case must be warned of before it is given",
+              until: { $0.contains("Your keyring already has bob") })
+        el(ui, addAlias).typeKey("a", modifierFlags: .command)
+        el(ui, addAlias).typeText(XCUIKeyboardKey.delete.rawValue)
         type(ui, addAlias, "carol", "the alias field")
         // The effect sentences are Texts: their words are their accessibility value.
         words(ui, Key.id("keyring-add-effect"), timeout: 10,
@@ -1151,6 +1338,17 @@ final class FirstRunProof: XCTestCase {
             XCTFail("PRODUCT: once untrusted, carol must be gone from the keyring view; it still shows \"\(shown(row))\"")
         }
         print("[proof] keyring: added and listed carol, then removed her after saying what untrusting does")
+
+        // (5b) Two aliases the same but for case are told apart (ADR-028 K-4, D8): carol trusted as
+        // "Bob", bob is shown in mission's members as bob#<his fingerprint's first 6>.
+        try staged(vox, ["trust", "add", "--node", "alice", carolFp, "--name", "Bob",
+                         "--identity-passphrase-file", alicePass], env: voxEnv)
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
+        present(ui, Key.id("member-bob#\(bobFp.prefix(6).lowercased())"), timeout: 30,
+                "with carol trusted as \"Bob\", bob must be told apart in mission's members as bob#\(bobFp.prefix(6).lowercased())",
+                premise: trusted(vox, voxEnv, carolFp, "Bob"))
+        try staged(vox, ["trust", "remove", "--node", "alice", carolFp,
+                         "--identity-passphrase-file", alicePass], env: voxEnv)
 
         }
 

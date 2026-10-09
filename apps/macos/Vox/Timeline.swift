@@ -136,6 +136,21 @@ extension NodeModel {
         return f.string(from: Date(timeIntervalSince1970: Double(millis) / 1000))
     }
 
+    /// What a reply quotes (ADR-028 R-9), as the TUI quotes it: "<who>: <its first line>", cut at
+    /// 80 characters, or nil while this room does not hold that message. Nil for a message that
+    /// replies to nothing.
+    func quote(of m: RoomMessage) -> (id: String, words: String?)? {
+        let re = m.re.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !re.isEmpty else { return nil }
+        guard let held = byID[re], !held.owed else { return (re, nil) }
+        let said = held.file.map { $0.note.isEmpty ? $0.name : $0.note } ?? held.text
+        let first = said.split(separator: "\n", omittingEmptySubsequences: false).first.map(String.init) ?? ""
+        let more = first.count > 80 || said.contains("\n") ? "…" : ""
+        let who = held.author == me ? "you"
+            : held.authorName.isEmpty ? String(held.author.prefix(12)) : held.authorName
+        return (re, "\(who): \(first.prefix(80))\(more)")
+    }
+
     /// "<who> <what>", who named as the TUI names them: you, the alias, or the fingerprint's first
     /// 26 characters marked "(not in keyring)".
     func noticeWords(_ n: RoomNoticeRow) -> String {

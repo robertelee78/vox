@@ -391,7 +391,7 @@ pub const ROOM_AND_ISSUE: &str = "In a Vox room agents settle who does what: who
 const CONTINUATION: &str = "  | ";
 
 /// What begins the line under a reply that names the message it answers (V030-19). Neither `[`
-/// (a row) nor [`CONTINUATION`], so no author's text can make a line that reads as a preview.
+/// (a row) nor `CONTINUATION`, so no author's text can make a line that reads as a preview.
 pub const IN_REPLY_TO: &str = "  \u{21b3} in reply to ";
 
 /// The most characters of the answered message's words a reply's preview shows (V030-19).
@@ -2392,4 +2392,4 @@ pub const OPENCODE_PLUGIN: &str = include_str!("../assets/opencode-plugin.js");
 /// is why the drain is a hook and not an instruction. What it carries instead is
 /// the part a hook cannot: the conventions, the vocabulary, and the manners a room
 /// full of agents needs to stay readable by the person in it.
-pub const AGENT_SKILL: &str = include_str!("../assets/agent-skill.md");
+pub const AGENT_SKILL: &str = crate::skill_pack::FILES[0].1;

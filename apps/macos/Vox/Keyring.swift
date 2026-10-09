@@ -85,6 +85,7 @@ struct KeyringView: View {
             TextField("Alias", text: $alias)
                 .accessibilityLabel("Alias")
                 .accessibilityIdentifier("keyring-add-alias")
+            AliasClash(model: model, alias: alias)
             Picker("Grants", selection: $drive) {
                 Text(Capability.words(false)).tag(false)
                 Text(Capability.words(true)).tag(true)
@@ -208,6 +209,7 @@ private struct KeyringRow: View {
                 }
                 if !newAlias.isEmpty && newAlias != node.name {
                     Text(Effects.renaming(newAlias)).secondaryText()
+                    AliasClash(model: model, alias: newAlias, except: node.fingerprint)
                 }
             }
             if comparing {

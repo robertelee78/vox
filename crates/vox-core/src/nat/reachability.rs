@@ -230,11 +230,11 @@ pub async fn local_route_ip() -> Option<IpAddr> {
 ///
 /// 1. the routable **IPv6** address the OS would use ([`local_route_ips`]) — nothing
 ///    is translated, so the address is dialable as it stands, and a PCP *pinhole*
-///    ([`open_ipv6_pinhole`]) is asked for alongside it to get through the stateful
+///    ([`open_ipv6_pinhole`](crate::nat::portmap::open_ipv6_pinhole)) is asked for alongside it to get through the stateful
 ///    firewall that is usually what stands in the way. This is the ADR's first rung;
 /// 2. the routable **IPv4** address (a LAN peer can use it) and the **mapped
 ///    external** address when a gateway grants one over PCP or NAT-PMP
-///    ([`map_port`]) — the second rung, and the only way an IPv4 node behind NAT is
+///    ([`map_port`](crate::nat::portmap::map_port)) — the second rung, and the only way an IPv4 node behind NAT is
 ///    dialable at all;
 /// 3. loopback, last, so two profiles on one machine still reach each other.
 ///

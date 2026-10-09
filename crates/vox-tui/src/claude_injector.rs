@@ -9,12 +9,12 @@
 //! guessed** (DR-5). ctm falls back to a positional target when `$TMUX_PANE` is unset, which its
 //! own log says "may misroute"; here no recorded pane is a refusal that says why.
 //!
-//! - **The pane** is the one the session's own hook proved ([`bind_here`]), refreshed by every hook,
-//!   keyed by session id: `$TMUX`'s socket, `$TMUX_PANE` (`%N`, stable for the pane's life, which
+//! - **The pane** is the one the session's own hook claimed ([`claim_here`]) and the daemon proved
+//!   ([`prove`]), refreshed by every hook, keyed by session id: `$TMUX`'s socket, `$TMUX_PANE` (`%N`, stable for the pane's life, which
 //!   tmux always sets inside a pane: dropping ctm's positional fallback loses nothing real), the
 //!   pane's process, and the session's process, found by walking the hook's own ancestry up to the
 //!   pane's process, with its start time from the process table (never from the hook's input).
-//! - **Before every send** ([`check`]) all of it is checked again; each case it settles is named
+//! - **Before every send** (`check`) all of it is checked again; each case it settles is named
 //!   beside its check.
 //! - **Text** is typed literally (`send-keys -l`), and submitted only once it is seen in Claude's
 //!   input box; the box must then empty, with Enter tried up to three times, or the driver is told

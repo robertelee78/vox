@@ -54,6 +54,7 @@ pub mod session_sink;
 pub mod setup;
 pub mod share_cli;
 pub mod shell;
+pub mod skill_pack;
 pub mod state;
 pub mod status_cli;
 pub mod theme;
