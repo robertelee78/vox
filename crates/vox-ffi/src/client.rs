@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::runtime::{Handle, Runtime};
-use vox_core::error::{Error, IpcHandshake};
+use vox_core::error::Error;
 use vox_core::hash::Digest32;
 use vox_core::node::api::{MessageRow, NodeEvent};
 use vox_core::node::daemonipc::{
@@ -990,19 +990,9 @@ pub struct VoxClient {
 }
 
 /// A failure to reach the daemon, said for a person.
+/// The sentence vox-core writes for it, which the CLI shows too (ADR-028 E-7).
 fn said(socket: &std::path::Path, e: Error) -> VoxError {
-    let path = socket.display();
-    failed(match e {
-        Error::Ipc(IpcHandshake::Unreachable { reason }) => {
-            format!("no vox daemon is running for this data root ({path}: {reason})")
-        }
-        Error::Ipc(IpcHandshake::Refused { reason }) => reason,
-        Error::Ipc(h @ IpcHandshake::ClosedBeforeHello) => {
-            format!("the vox daemon accepted, but {h}: it may be stopping. Try again.")
-        }
-        Error::Ipc(h) => format!("{h} ({path})"),
-        other => format!("the vox daemon at {path} did not answer ({other})"),
-    })
+    failed(vox_core::node::daemonipc::unreached(socket, None, e))
 }
 
 /// A node's answer, with its refusal and a detach as errors.
@@ -2246,7 +2236,7 @@ impl VoxClient {
             let resolve = || async {
                 vox_core::node::nameipc::resolve(&at, &address)
                     .await
-                    .map_err(|e| failed(format!("{address}: {e}")))
+                    .map_err(|e| failed(e.to_string()))
             };
             let mut room = resolve().await?;
             let deadline = tokio::time::Instant::now() + vox_core::node::up::HOST_PATIENCE;

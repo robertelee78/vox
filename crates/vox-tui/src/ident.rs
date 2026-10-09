@@ -27,9 +27,10 @@ pub const AUTHOR_CHARS: usize = 26;
 pub const NOT_IN_KEYRING: &str = "(not in keyring)";
 
 /// What a person is told wherever a node is made (ADR-028 K-8): a node has no backup, so a lost
-/// machine means a new node, which the people who trusted the old one untrust.
+/// machine means a new node, which the people who trusted the old one remove from their keyrings.
 pub const NO_BACKUP: &str = "there is no backup of a node: if this machine is lost, so is this \
-     node; make a new one, and ask everyone who trusts this one to untrust it and trust the new one";
+     node; make a new one, and ask everyone who trusts this one to remove it from their keyring \
+     and trust the new one";
 
 /// A member's fingerprint as shown on screen: its first [`AUTHOR_CHARS`] base32 characters.
 #[must_use]

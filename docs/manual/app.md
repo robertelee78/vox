@@ -265,13 +265,13 @@ drive`. See [Identity and keyring](keyring.md) for what trust grants.
 - **Compare…**: paste or type the fingerprint the person gave you another way. Case, spaces and
   dashes do not count. A match says `Matches NAME's fingerprint.`; a mismatch says
   `Does not match. This is not the node you trusted as NAME: do not trust it.` and offers to
-  untrust it.
+  remove it.
 - **Rename…**: the new alias, and that the node's services are then reachable as
   `<service>.NEWALIAS.<room>.vox`.
-- **Remove…**: the sheet says what untrusting does before you confirm: it reads nothing you
-  write from now on, and you read nothing it writes; what it already read stays read; its live
-  sessions into your services are cut; your sender key is rotated, and everyone you still trust is
-  re-keyed.
+- **Remove…**: the sheet asks `Remove NAME from your keyring?` and says what removing does before
+  you confirm: it reads nothing you write from now on, and you read nothing it writes; what it
+  already read stays read; its live sessions into your services are cut; your sender key is
+  rotated, and everyone you still trust is re-keyed.
 
 The **Keyring** menu does the same for the row selected in this view.
 

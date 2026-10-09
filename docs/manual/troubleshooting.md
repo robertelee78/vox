@@ -48,7 +48,8 @@ If not, report both paths/versions with personal directory components redacted.
 **Exact symptoms:**
 
 - `no vox daemon is running for this data root, so node robertgpt is not attached.` followed by
-  `Start one: vox daemon (or vox node attach robertgpt)`;
+  `Start one: vox daemon (Vox.app starts one when it opens, or vox node attach robertgpt)`. Vox.app
+  shows the same sentence;
 - `node robertgpt is not attached; attach it first: vox node attach robertgpt`;
 - `there is no node in … yet; make one: vox node create <name>`.
 
@@ -226,7 +227,7 @@ fail, report each side's trust direction and reachability without posting messag
 **Symptom:** `(not received yet)` occupies a position in the timeline.
 
 **Meaning:** this node holds the signed envelope, but its unexpired message body is still
-owed. It is not a blanket label for an untrusted sender and does not expose that sender's
+owed. It is not a blanket label for a sender not in your keyring and does not expose that sender's
 plaintext. The row has no arrival cursor until the body arrives.
 
 **Check:** inspect `vox status`, the affected room and peer connectivity. Compare whether

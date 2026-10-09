@@ -4955,6 +4955,21 @@ pub async fn trust_capability(
 /// `vox trust remove`, asked of the running node.
 pub async fn trust_remove(paths: &Paths, target: Digest32) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
+    // **Not in the keyring: refused first**, in vox-core's sentence (ADR-028 E-7), with nothing said
+    // of what it was to lose: there is nothing to remove. A read, so no passphrase (V210-165).
+    let entries = match client.trusted("").await {
+        Ok(Frame::Trusted { entries }) => entries,
+        Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
+        Err(e) => return Err(AppError::Usage(e.to_string())),
+    };
+    if !entries.iter().any(|(id, _, _)| *id == target) {
+        return Err(AppError::Usage(
+            vox_core::node::api::Fault::NotConsented
+                .explain()
+                .to_owned(),
+        ));
+    }
     // What it is to stop, said before it is done (ADR-028 E-5).
     let rooms = rooms_with(&mut client, &target).await;
     let room_names: Vec<String> = rooms.iter().map(|(id, n)| room_said(id, n)).collect();
@@ -4968,14 +4983,14 @@ pub async fn trust_remove(paths: &Paths, target: Digest32) -> Result<(), AppErro
         .map(|(_, t)| t)
         .collect();
     println!(
-        "vox: about to stop trusting {}",
+        "vox: about to remove {} from your keyring",
         crate::ident::author_id(&target)
     );
     println!(
         "     it is to read nothing you write from now on in {}; what it already read stays read",
         listed(&room_names, "any room")
     );
-    // What it is to lose, never what it is to keep: once untrusted it reaches none of them.
+    // What it is to lose, never what it is to keep: once removed it reaches none of them.
     if services.is_empty() {
         println!("     and to reach none of your services (you offer none in a room you share)");
     } else {
@@ -4997,7 +5012,7 @@ pub async fn trust_remove(paths: &Paths, target: Digest32) -> Result<(), AppErro
     {
         Ok(Frame::Ok) => {
             println!(
-                "vox: no longer trusting {}",
+                "vox: removed {} from your keyring",
                 crate::ident::author_id(&target)
             );
             println!("     your sender key is rotated and everyone still trusted is re-keyed");
