@@ -337,6 +337,8 @@ private struct RoomView: View {
 /// What the composer posts is addressed to, and whether it is urgent (M-15).
     @State private var to: Set<String> = []
     @State private var urgent = false
+    /// A send under way: Return again does nothing until it is answered (D11).
+    @State private var sending = false
     /// The rows inside the visible part of the timeline, as last measured.
     @State private var inView: Set<String> = []
     /// The newest message when the messages last changed: if it was in view, the timeline follows
@@ -533,7 +535,8 @@ private struct RoomView: View {
         // On the room, not its timeline: ⌘O, ⌘↩ and a file from the Finder Services item work
         // wherever the room's focus is.
         .sheet(item: $attaching) { file in
-            AttachSheet(model: model, file: file) { attaching = nil }
+            // The composer's To: and Urgent go with the file (F-1, D11).
+            AttachSheet(model: model, file: file, to: to, urgent: urgent) { attaching = nil }
         }
         .onChange(of: model.attachAsked) { _ in
             // After the update, not inside it: a modal panel run from within a view update did
@@ -593,13 +596,22 @@ private struct RoomView: View {
     }
 
     /// Post the draft, To: and replying as set; urgent when asked (⌘↩ or the switch).
+    ///
+    /// **What was typed stays until the node has it** (D11): the draft, Urgent and the reply were
+    /// cleared before the post, so one the node refused lost its text. They are cleared once the
+    /// post is answered, and only the draft that was sent: anything typed meanwhile stays.
     private func send(urgent now: Bool) {
         let (text, recipients, re) = (draft, Array(to), model.replyTo?.id ?? "")
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        draft = ""
-        urgent = false
-        model.replyTo = nil
-        Task { await model.post(text, to: recipients, urgent: now, re: re) }
+        guard !sending, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        sending = true
+        Task {
+            if await model.post(text, to: recipients, urgent: now, re: re) {
+                if draft == text { draft = "" }
+                urgent = false
+                if model.replyTo?.id == re { model.replyTo = nil }
+            }
+            sending = false
+        }
     }
 
     /// ↑/↓ on the timeline: the selection moves to the message before or after it, scrolled into

@@ -28,6 +28,10 @@
 // 6. Attaching a file (ADR-014 M-24, ADR-028 F-1, #449): chosen with Attach…, addressed To: bob
 //    with a note, it is one share: bob's node pulls it by itself, byte for byte, and the note is
 //    in the share's announcement, never a message of its own.
+//    6a. (D11) The composer's To: bob and Urgent, set before Attach, are what the Attach sheet
+//        starts with, and the share goes urgent: it started with nobody and was never urgent.
+//    6b. (D11) A send the node refuses keeps its text: 70,000 characters pasted and sent are
+//        refused ("a post holds at most"), and the composer still holds all of them.
 //    6c. (D14) Retention opens at the room's own value (1 year, set by `vox`), Set is disabled
 //        until another is chosen, Return never sets it, and the effect names the files and
 //        previews that go with the messages.
@@ -841,6 +845,11 @@ final class FirstRunProof: XCTestCase {
         let file = scratch.appendingPathComponent("for-bob.bin")
         let bytes = Data((0..<150_000).map { UInt8(truncatingIfNeeded: $0 &* 31 % 253) })
         try stager.write(bytes, to: file.path)
+        // (6a) The composer's To: and Urgent, set first: the file takes them (F-1, D11).
+        tap(ui, Key.id("compose-to"), "the composer's To:")
+        tap(ui, Key.id("to-bob"), "To: bob in the composer", premise: member(vox, voxEnv, room, bobFp, "bob"))
+        ui.typeKey(.escape, modifierFlags: [])
+        tap(ui, Key.id("compose-urgent"), "the composer's Urgent")
         let attachButton = Key.id("attach")
         present(ui, attachButton, timeout: 10, "the room must offer Attach")
         tap(ui, attachButton, "Attach (the paperclip)")
@@ -876,7 +885,13 @@ final class FirstRunProof: XCTestCase {
         let toBob = Key.id("attach-to-bob")
         present(ui, toBob, timeout: 10, "attaching a file must ask To: with bob in it",
                 premise: member(vox, voxEnv, room, bobFp, "bob"))
-        tap(ui, toBob, "To: bob", premise: member(vox, voxEnv, room, bobFp, "bob"))
+        // Ticked already, and urgent already: from the composer, never clicked here (D11).
+        let seededTo = el(ui, toBob).value as? Int
+        let seededUrgent = el(ui, Key.id("attach-urgent")).value as? Int
+        XCTAssertEqual(seededTo, 1,
+                       "PRODUCT: the Attach sheet must start with the composer's To: (bob) ticked (D11); it shows \(String(describing: seededTo))")
+        XCTAssertEqual(seededUrgent, 1,
+                       "PRODUCT: the Attach sheet must start Urgent when the composer is (D11); it shows \(String(describing: seededUrgent))")
         let noteField = Key.id("attach-note")
         type(ui, noteField, "FOR-BOB-NOTE", "the note field")
         tap(ui, Key.id("attach-send"), "Send")
@@ -898,6 +913,8 @@ final class FirstRunProof: XCTestCase {
             let alices = run(vox, ["room", "read", "--node", "alice", "--json", room], env: voxEnv).out
             XCTFail("PRODUCT: the file attached in the app, with its note FOR-BOB-NOTE, never reached the room as bob's node reads it in 60 s; alice's node reads: \(alices.suffix(1500))")
         }
+        XCTAssertTrue(bobRows.first?.contains("\"urgent\":true") ?? false,
+                      "PRODUCT: the file attached with the composer's Urgent on must be sent urgent (D11); bob's row: \(bobRows)")
         XCTAssertTrue(bobRows.count == 1 && bobRows[0].contains("for-bob.bin"),
                       "PRODUCT: the note must travel in the share itself, as one message; bob's `vox room read --json` has \(bobRows.count) row(s) with it: \(bobRows)")
         // Bob's copy, read outside the runner's sandbox (by the stager): its size and SHA-256
@@ -934,6 +951,28 @@ final class FirstRunProof: XCTestCase {
         }
         let pulledBytes: Data? = got == want ? bytes : nil
         print("[proof] attached for-bob.bin To: bob; bob pulled \(pulledBytes?.count ?? 0) bytes; rows with the note: \(bobRows.count)")
+        // The composer as it was: nobody addressed, not urgent.
+        tap(ui, Key.id("compose-urgent"), "the composer's Urgent, off again")
+        tap(ui, Key.id("compose-to"), "the composer's To:")
+        tap(ui, Key.id("to-bob"), "To: bob in the composer, off again")
+        ui.typeKey(.escape, modifierFlags: [])
+
+        // (6b) A send the node refuses keeps its text (D11): past what a post holds, pasted.
+        let long = String(repeating: "x", count: 70_000)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(long, forType: .string)
+        tap(ui, Key.id("compose"), "the composer")
+        ui.typeKey("v", modifierFlags: .command)
+        ui.typeKey(.return, modifierFlags: [])
+        words(ui, Key.id("status"), timeout: 30,
+              "a post past what a post holds must be refused, said where the app says what failed",
+              until: { $0.contains("a post holds at most") })
+        let kept = (el(ui, Key.id("compose")).value as? String)?.count ?? 0
+        XCTAssertEqual(kept, 70_000,
+                       "PRODUCT: a send the node refused must leave its text in the composer (D11); it holds \(kept) characters")
+        el(ui, Key.id("compose")).typeKey("a", modifierFlags: .command)
+        el(ui, Key.id("compose")).typeKey(.delete, modifierFlags: [])
+
         // (6c) Retention opens at what the room keeps; Return never sets it (D14).
         try staged(vox, ["room", "retention", "--node", "alice", room, String(365 * 86_400)], env: voxEnv)
         ui.menuBars.menuBarItems["Room"].click()

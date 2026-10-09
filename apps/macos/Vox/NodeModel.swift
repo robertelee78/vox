@@ -737,11 +737,11 @@ final class NodeModel: ObservableObject {
 
     /// Share the file or folder at `url` in the room on screen, addressed to `to` (members'
     /// fingerprints; none: the room) with `note`, in one message (ADR-028 F-1). Whether it was.
-    func attach(_ url: URL, to: [String], note: String) async -> Bool {
+    func attach(_ url: URL, to: [String], note: String, urgent: Bool = false) async -> Bool {
         guard case let .room(id) = selection else { return false }
         do {
             _ = try await client.share(room: id, path: url.path, to: to, note: note, re: "",
-                                       urgent: false, count: 0, forSecs: 0)
+                                       urgent: urgent, count: 0, forSecs: 0)
             return true
         } catch {
             said = sentence(error)
@@ -749,13 +749,16 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// Post `text` to the room on screen.
-    func post(_ text: String, to: [String] = [], urgent: Bool = false, re: String = "") async {
-        guard case let .room(id) = selection else { return }
+    /// Post `text` to the room on screen; whether the node took it.
+    @discardableResult
+    func post(_ text: String, to: [String] = [], urgent: Bool = false, re: String = "") async -> Bool {
+        guard case let .room(id) = selection else { return false }
         do {
             try await client.post(room: id, text: text, to: to, re: re, urgent: urgent)
+            return true
         } catch {
             said = sentence(error)
+            return false
         }
     }
 
