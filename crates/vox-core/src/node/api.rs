@@ -1077,7 +1077,9 @@ pub enum Fault {
     /// ADR-028 K-12). Not
     /// [`Fault::WrongPassphrase`]: none was given, and the client asks for it and tries again.
     PassphraseNeeded,
-    /// An identity was to be made with an empty passphrase: every node has one (ADR-028 K-11).
+    /// An identity was to be made with an empty passphrase, refused by v0.4.0 to v0.4.2 (ADR-028
+    /// K-11 before its amendment). No longer sent: an empty one is taken (ADR-005 J-2); kept so
+    /// an older daemon's refusal still reads.
     PassphraseEmpty,
     /// The trust keyring already holds its maximum number of identities
     /// (`trust::MAX_TRUSTED`). Not [`Fault::TooLong`]: nothing the person typed was too

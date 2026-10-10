@@ -11,7 +11,9 @@
 //! maintained — `prekeys.one_time` (left to offer), `prekeys.consumed` (used, still retained for a
 //! concurrent duplicate), `prekeys.signed_prekey` (the id offered now), what the running node did
 //! itself (`prekeys.rotated`, `prekeys.refilled`), and `prekeys.previous_used`, the sessions it set
-//! up with the signed prekey it had just rotated out.
+//! up with the signed prekey it had just rotated out; and, since ADR-030 P-1, `prekeys.retired`
+//! (unused one-time prekeys it retired), `prekeys.retired_held` (held, unadvertised, in their
+//! grace) and `prekeys.oldest_one_time` (when the oldest one it offers was made).
 //!
 //! Three stagings, each its own test:
 //!
@@ -21,7 +23,12 @@
 //!    v0.3.0 `VOX_TEST_CLOCK_SKEW_MS` moves only the milliseconds); its daemon runs on the true clock. So the signed prekey falls
 //!    due [`LEAD`] seconds after `vox id` — after the daemon's unlock, while it runs. Before:
 //!    signed prekey 1, nothing rotated (anything else is CANNOT MEASURE: the rotation came at
-//!    unlock). Within [`ROTATE_WITHIN`]: signed prekey 2, rotated once.
+//!    unlock). Within [`ROTATE_WITHIN`]: signed prekey 2, rotated once. The one-time prekeys were
+//!    made with the ring and none was used, so the same maintenance retires them all (ADR-030
+//!    P-1): `prekeys.retired` and `prekeys.retired_held` are the whole pool, and the pool offered
+//!    is full again, its oldest (`prekeys.oldest_one_time`) made in this run. Then the daemon is
+//!    started again with its clocks half an hour on: it still holds every retired prekey, so the
+//!    grace survived the restart; and an hour and a minute on: it holds none.
 //! 2. **A session started before a rotation completes after it.** A host made the same way, with
 //!    [`WINDOW_LEAD`] seconds to its rotation, and a guest that starts joining one of its rooms a
 //!    moment before. The guest's daemon is stopped (SIGSTOP, by its PID) mid-join and resumed
@@ -40,7 +47,9 @@
 //!
 //! Mutations that must turn it red: the tick's maintenance leaves the ring as it is (1 never
 //! rotates; 3 consumes exactly [`POOL`]); a rotation drops the signed prekey it replaces at once
-//! (2's join fails).
+//! (2's join fails); unused one-time prekeys never retired (1: `retired` 0, the old pool still
+//! offered); the retired set not saved (1: none held half an hour on); the grace never ending (1:
+//! all still held an hour and a minute on).
 
 #![cfg(unix)]
 
@@ -78,6 +87,10 @@ const WINDOW_TRIES: u64 = 4;
 const POOL: u64 = 8;
 /// Joins to the host in stage 3: past its whole first pool.
 const JOINS: usize = 12;
+/// Stage 1's restarts, inside and past a retired one-time prekey's one-hour grace (ADR-030 P-1),
+/// written out rather than read from the product.
+const HALF_HOUR_MS: i64 = 30 * 60 * 1000;
+const HOUR_AND_A_MINUTE_MS: i64 = 61 * 60 * 1000;
 
 /// A child killed and reaped by its own handle when dropped, never by a name pattern.
 struct Proc(Child);
@@ -181,6 +194,11 @@ impl Profile {
 
     /// `vox daemon`, answering `vox room list` before this returns.
     fn daemon(&self, anchor: Option<&str>) -> Proc {
+        self.daemon_stepped(anchor, None)
+    }
+
+    /// [`Profile::daemon`], its clocks moved by `step_ms` (`VOX_TEST_CLOCK_STEP_MS`) when given.
+    fn daemon_stepped(&self, anchor: Option<&str>, step_ms: Option<i64>) -> Proc {
         let mut args = vec!["daemon", "--listen", "127.0.0.1:0"];
         if let Some(a) = anchor {
             args.extend(["--anchor", a]);
@@ -193,9 +211,12 @@ impl Profile {
         args.push(pass);
         let err = std::fs::File::create(self.dir.join("daemon.err"))
             .expect("APPARATUS: create a staging file");
+        let mut c = self.command(&args);
+        if let Some(step) = step_ms {
+            c.env("VOX_TEST_CLOCK_STEP_MS", step.to_string());
+        }
         let p = Proc(
-            self.command(&args)
-                .stdin(Stdio::null())
+            c.stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::from(err))
                 .spawn()
@@ -304,6 +325,15 @@ fn anchor(tmp: &Path) -> (Proc, String) {
     }
 }
 
+/// The wall clock, in milliseconds since the epoch.
+fn wall_ms() -> u64 {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("APPARATUS: the clock")
+        .as_millis();
+    u64::try_from(ms).expect("APPARATUS: the clock")
+}
+
 /// Send `sig` to `pid` with `kill(1)`.
 fn signal(pid: u32, sig: &str) {
     let ok = Command::new("kill")
@@ -324,8 +354,9 @@ fn a_running_node_rotates_its_signed_prekey() {
     let behind_ms = (SEVEN_DAYS - LEAD) * 1000;
     let node = Profile::new(tmp.path(), "node", Some(format!("-{behind_ms}")), None);
     let made = Instant::now();
+    let made_ms = wall_ms();
     node.id();
-    let _daemon = node.daemon(None);
+    let daemon = node.daemon(None);
     let before = node.prekeys();
     eprintln!(
         "[proof] {:.1}s after the ring was made, before: {before}",
@@ -337,6 +368,12 @@ fn a_running_node_rotates_its_signed_prekey() {
          before the daemon ran ({:.1}s after the ring \
          was made, {LEAD}s lead): {before}",
         made.elapsed().as_secs_f64()
+    );
+    let pool = n(&before, "one_time");
+    assert!(
+        pool > 0 && n(&before, "retired") == 0 && n(&before, "retired_held") == 0,
+        "APPARATUS, CANNOT MEASURE: the one-time prekeys were retired, or there were none to \
+         retire, before the daemon ran: {before}"
     );
     let deadline = Instant::now() + ROTATE_WITHIN;
     let after = loop {
@@ -356,6 +393,49 @@ fn a_running_node_rotates_its_signed_prekey() {
         "PRODUCT: the running daemon must rotate its signed prekey once its seven days are up \
          (within {ROTATE_WITHIN:?} of answering): {after}"
     );
+
+    // ADR-030 P-1: the one-time prekeys were made with the ring, as old as its signed prekey, and
+    // none was used. The same maintenance retires every one, keeps each for its grace, and offers
+    // a fresh pool, none of it older than this run.
+    let oldest = after["oldest_one_time"].as_u64().unwrap_or(0);
+    let ok = n(&after, "retired") == pool
+        && n(&after, "retired_held") == pool
+        && n(&after, "one_time") == pool
+        && oldest >= made_ms;
+    eprintln!(
+        "[proof] unused one-time prekeys retired {}, held in their grace {}, offered {}, the \
+         oldest offered made at {oldest} (this run began at {made_ms})",
+        n(&after, "retired"),
+        n(&after, "retired_held"),
+        n(&after, "one_time")
+    );
+    assert!(
+        ok,
+        "PRODUCT: the running daemon must retire its {pool} unused one-time prekeys once they are \
+         seven days old, hold them for their grace, and offer {pool} made in this run (none \
+         before {made_ms}): {after}"
+    );
+
+    // The grace survives a restart, and ends at an hour: the daemon started again with its clocks
+    // half an hour on still holds every retired prekey, and an hour and a minute on holds none.
+    drop(daemon);
+    for (on_ms, held) in [(HALF_HOUR_MS, pool), (HOUR_AND_A_MINUTE_MS, 0)] {
+        let d = node.daemon_stepped(None, Some(on_ms));
+        let p = node.prekeys();
+        eprintln!(
+            "[proof] started again {} min on: retired held {}",
+            on_ms / 60_000,
+            n(&p, "retired_held")
+        );
+        assert_eq!(
+            n(&p, "retired_held"),
+            held,
+            "PRODUCT: a daemon started again {} min after its one-time prekeys were retired must \
+             hold {held} of them (the grace is one hour, kept across a restart): {p}",
+            on_ms / 60_000
+        );
+        drop(d);
+    }
 }
 
 #[test]

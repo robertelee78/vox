@@ -1558,9 +1558,9 @@ impl AccountArgs {
 #[derive(Subcommand, Debug, Clone)]
 pub enum NodeCmd {
     /// Make a new node: an identity with its own rooms, trust and services. Its files are
-    /// written here; nothing is attached until it is used or `vox node attach`ed. The
+    /// written here, and it is attached and remembered at once, as `vox node attach` does. The
     /// passphrase comes from `--passphrase-file`, `VOX_IDENTITY_PASSPHRASE`, or is asked twice;
-    /// an empty one is refused, and nothing is created.
+    /// an empty one gives the node none, and says that its key is then kept unencrypted.
     Create {
         /// The node's name: letters a-z, digits, '.', '_' and '-'.
         name: String,
@@ -1574,19 +1574,43 @@ pub enum NodeCmd {
         #[command(flatten)]
         account: AccountArgs,
     },
-    /// Attach a node to the daemon by hand (starting the daemon if none runs). It runs in full
-    /// until `vox node detach` or the daemon stops. `--keep` attaches it again whenever the
-    /// daemon starts, with its passphrase from `--passphrase-file`.
+    /// Attach a node to the daemon by hand (starting the daemon if none runs), until `vox node
+    /// detach`. It is remembered: its passphrase is stored in the Keychain (none is needed for a
+    /// node made with none), and the daemon attaches it again by itself whenever it starts, after
+    /// an update or a reboot too. `--no-remember` stores nothing; `vox node forget-passphrase`
+    /// forgets it later. Where there is no Keychain, `--keep --passphrase-file` keeps it.
     Attach {
         /// The node.
         name: String,
-        /// Attach it again whenever the daemon starts.
-        #[arg(long)]
+        /// With `--passphrase-file`: keep it by that file, read by the daemon at each start,
+        /// instead of the Keychain.
+        #[arg(long, requires = "passphrase_file", conflicts_with = "no_remember")]
         keep: bool,
-        /// Read the identity passphrase from this file (first line). With `--keep`, the daemon
-        /// reads it from there at each start.
+        /// Attach it until it is detached or the daemon stops, and store nothing.
+        #[arg(long)]
+        no_remember: bool,
+        /// Read the identity passphrase from this file (first line).
         #[arg(long)]
         passphrase_file: Option<PathBuf>,
+        #[command(flatten)]
+        account: AccountArgs,
+    },
+    /// Rename a node on this machine: detached if attached, its directory, its remembered
+    /// passphrase and every harness wired to it moved to the new name, and attached again. Its
+    /// identity stays: the fingerprint, and all that peers see, are the same.
+    Rename {
+        /// The node's name now.
+        old: String,
+        /// Its new name: letters a-z, digits, '.', '_' and '-'.
+        new: String,
+        #[command(flatten)]
+        account: AccountArgs,
+    },
+    /// Forget a node's remembered passphrase: it is removed from the Keychain, and the daemon no
+    /// longer attaches the node by itself when it starts. An attached node stays attached.
+    ForgetPassphrase {
+        /// The node.
+        name: String,
         #[command(flatten)]
         account: AccountArgs,
     },
@@ -1621,14 +1645,31 @@ fn run_node_cmd(cmd: NodeCmd) -> ExitCode {
             passphrase_file,
             headless,
             account,
-        } => crate::client::node_create(&account.as_node_args(), &name, passphrase_file, headless),
+        } => block_on_client(async move {
+            crate::client::node_create(&account.as_node_args(), &name, passphrase_file, headless)
+                .await
+        }),
         NodeCmd::Attach {
             name,
             keep,
+            no_remember,
             passphrase_file,
             account,
         } => block_on_client(async move {
-            crate::client::node_attach(&account.as_node_args(), &name, keep, passphrase_file).await
+            crate::client::node_attach(
+                &account.as_node_args(),
+                &name,
+                keep,
+                no_remember,
+                passphrase_file,
+            )
+            .await
+        }),
+        NodeCmd::Rename { old, new, account } => block_on_client(async move {
+            crate::client::node_rename(&account.as_node_args(), &old, &new).await
+        }),
+        NodeCmd::ForgetPassphrase { name, account } => block_on_client(async move {
+            crate::client::node_forget_passphrase(&account.as_node_args(), &name).await
         }),
         NodeCmd::Detach { name, account } => block_on_client(async move {
             crate::client::node_detach(&account.as_node_args(), &name).await

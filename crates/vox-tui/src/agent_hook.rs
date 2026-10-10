@@ -1269,7 +1269,7 @@ pub async fn run(
             // it proves, is refreshed on each event, so a session first seen by a tool call is
             // known, and a session resumed in another pane is rebound at once.
             if let Err(e) = daemon.register(&input, room_arg).await {
-                eprintln!("vox agent hook: {e}");
+                eprintln!("vox agent hook: {}", e.said());
             }
             if ev.name == "Stop" {
                 crate::wake::record_idle(paths, &input.session_id);
@@ -1311,7 +1311,32 @@ pub async fn run(
             );
             drain(paths, room_arg, &input, &raw, format, note).await
         }
-        Err(e) => Err(e),
+        Err(Unregistered::NotAttached(node)) => {
+            // **Said once per session, not every turn** (#666): the operator was told the
+            // command, and a macOS notification tells the person too; each later turn reads
+            // nothing until the node is attached, and says so only on stderr.
+            let words = Unregistered::NotAttached(node.clone()).said();
+            eprintln!("vox agent hook: {words}");
+            if crate::wake::first_detached_notice(paths, &input.session_id) {
+                crate::notify::raise_for(
+                    paths,
+                    &format!("Vox: node {node} needs its passphrase"),
+                    &format!("Run in a terminal: vox node attach {node}"),
+                );
+                emit(
+                    format,
+                    &raw,
+                    &input.event,
+                    &format!(
+                        "Vox could not read your rooms: {words}. Vox says this once in this \
+                         session.\n"
+                    ),
+                    "",
+                );
+            }
+            return Ok(());
+        }
+        Err(Unregistered::Failed(e)) => Err(e),
     };
     if let Err(e) = drained {
         // Report and carry on: a hook must never break the turn it rides on. **But say so to
@@ -1330,6 +1355,35 @@ pub async fn run(
         );
     }
     Ok(())
+}
+
+/// Why a turn's session was not registered.
+pub(crate) enum Unregistered {
+    /// The hook's node is not attached, and a hook never attaches it (ADR-028 K-13).
+    NotAttached(vox_core::node::paths::NodeName),
+    /// Anything else, in words.
+    Failed(AppError),
+}
+
+impl From<AppError> for Unregistered {
+    fn from(e: AppError) -> Self {
+        Self::Failed(e)
+    }
+}
+
+impl Unregistered {
+    /// In words, with the one command the operator runs for a node not attached.
+    fn said(&self) -> String {
+        match self {
+            Self::NotAttached(node) => format!(
+                "node {node} is not attached, and a hook never attaches it. Ask the operator to \
+                 run, in a terminal outside this session: vox node attach {node} (it asks there \
+                 for the node's passphrase once; Vox then remembers it, and attaches the node by \
+                 itself after every restart)"
+            ),
+            Self::Failed(e) => e.to_string(),
+        }
+    }
 }
 
 /// The longest a hook waits for the daemon to register its session (#408). ADR-020 states no hook
@@ -1359,7 +1413,7 @@ impl Daemon {
         &self,
         input: &HookInput,
         room_arg: Option<&str>,
-    ) -> Result<Registered, AppError> {
+    ) -> Result<Registered, Unregistered> {
         use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
         crate::daemon_client::ensure_daemon(&self.account, self.listen, &self.anchors).await?;
         let mut record = crate::wake::Session::from_env(&input.session_id, input.codex);
@@ -1410,16 +1464,14 @@ impl Daemon {
             DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::StillDetaching { node }) => {
                 Err(AppError::Usage(format!(
                     "node {node} is still detaching; this turn reads nothing"
-                )))
+                ))
+                .into())
             }
             DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::NotAttached { node }) => {
-                Err(AppError::Usage(format!(
-                    "node {node} is not attached, and a hook never attaches it. Ask the operator \
-                     to run, in a terminal outside this session: vox node attach {node}"
-                )))
+                Err(Unregistered::NotAttached(node))
             }
-            DaemonFrame::Refused(r) => Err(AppError::Usage(r.to_string())),
-            other => Err(crate::client::unexpected_daemon(&other)),
+            DaemonFrame::Refused(r) => Err(AppError::Usage(r.to_string()).into()),
+            other => Err(crate::client::unexpected_daemon(&other).into()),
         }
     }
 

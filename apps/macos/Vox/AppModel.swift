@@ -251,9 +251,10 @@ final class AppModel: ObservableObject {
         }
         defer { passphrase.wipe() }
         do {
-            // Kept (K-10, opt-in): the daemon attaches it with the passphrase, stores that in the
-            // login keychain, and keeps it attached past this app's quit.
-            if keepRunning && keepInKeychain {
+            // Remembered (K-10 as amended, #666; on unless turned off): the daemon attaches it
+            // with the passphrase, stores that in the login keychain, and keeps it attached past
+            // this app's quit and attaches it again at its every start.
+            if keepInKeychain {
                 try await client.keep(node: node, passphrase: passphrase)
             }
             let fingerprint = try await client.attach(node: node, passphrase: passphrase)
@@ -435,9 +436,14 @@ final class AppModel: ObservableObject {
     /// Why storing it failed, in the daemon's words, shown in the offer.
     @Published private(set) var keepNodeSaid: String?
 
-    /// Keep `node` with its passphrase in the Keychain (M-6, ADR-028 K-10): the daemon checks it
-    /// against the node's vault and stores it, so the node stays attached after quit and is
-    /// attached again when the daemon starts.
+    /// A node on this Mac whose Attach… was chosen under ON THIS MACHINE (#666), its passphrase
+    /// asked for; nil when none is asked.
+    @Published var attachNodeAsk: String?
+
+    /// Keep `node` with its passphrase in the Keychain (M-6, ADR-028 K-10): the daemon attaches
+    /// it, checks the passphrase against the node's vault and stores it, so the node stays
+    /// attached after quit and is attached again when the daemon starts. An empty passphrase, for
+    /// a node made with none, stores nothing.
     func keepNode(_ node: String, passphrase secret: Secret) async {
         guard let client else { return }
         do {
@@ -445,6 +451,7 @@ final class AppModel: ObservableObject {
             defer { passphrase.wipe() }
             try await client.keep(node: node, passphrase: passphrase)
             keepNodeAsk = nil
+            attachNodeAsk = nil
             keepNodeSaid = nil
         } catch {
             keepNodeSaid = sentence(error)

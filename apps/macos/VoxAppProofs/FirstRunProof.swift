@@ -2161,6 +2161,7 @@ final class FirstRunProof: XCTestCase {
             let field = Key.id("passphrase")
             present(ui, field, timeout: 30, "the app must ask for node alice's passphrase")
             type(ui, field, "alice identity", "the passphrase field")
+            noKeychain(ui)
             tap(ui, Key.id("attach"), "Attach")
             present(ui, Key.id("attached"), timeout: 60, "the app, its first run answered, must open attached as alice")
             listed = run(vox, ["node", "list"], env: voxEnv).out
@@ -2190,6 +2191,7 @@ final class FirstRunProof: XCTestCase {
         present(ui, field, timeout: 30,
                 "with one node on this Mac, the app must ask for node alice's passphrase, not which node")
         type(ui, field, "not the passphrase", "the passphrase field")
+        noKeychain(ui)
         tap(ui, Key.id("attach"), "Attach")
         words(ui, Key.id("said"), timeout: 30,
               "a wrong passphrase must show the daemon's own sentence where it was typed",
@@ -4075,6 +4077,7 @@ final class FirstRunProof: XCTestCase {
         let again = Key.id("passphrase")
         if present(ui, again, timeout: 15, "Attach alice Again must ask for her passphrase") {
             type(ui, again, "alice identity", "the passphrase field")
+            noKeychain(ui)
             tap(ui, Key.id("attach"), "Attach")
         }
         present(ui, Key.id("attached"), timeout: 60, "attached again, the window must be alice's")
@@ -4645,6 +4648,25 @@ final class FirstRunProof: XCTestCase {
     /// that as its premise; any other target is a control of the screen the proof has just
     /// reached, which the app must show.
     @discardableResult
+    /// The attach form remembers the passphrase in the Keychain unless told not to (ADR-028 K-10
+    /// as amended, #666). Storing is the person's, never a proof's: the proof's daemon would store
+    /// it in the real login keychain. So the toggle, on by default, is turned off before Attach.
+    private func noKeychain(_ ui: XCUIApplication) {
+        let toggle = ui.descendants(matching: .any)["keep-in-keychain"]
+        guard toggle.waitForExistence(timeout: 10) else {
+            XCTFail("PRODUCT: the attach form must offer to remember the passphrase in the Keychain (keep-in-keychain): \(onScreen(ui))")
+            ui.terminate()
+            return
+        }
+        let on = { (toggle.value as? Int) == 1 || (toggle.value as? String) == "1" }
+        if on() { toggle.click() }
+        if on() {
+            // Stopped here, so the Attach that follows stores nothing in the real login keychain.
+            XCTFail("APPARATUS: the keep-in-keychain toggle did not turn off; the app is stopped before Attach")
+            ui.terminate()
+        }
+    }
+
     private func tap(_ ui: XCUIApplication, _ key: Key, _ what: String, premise: Premise? = nil,
                      file: StaticString = #filePath, line: UInt = #line) -> Bool {
         let end = Date().addingTimeInterval(10)

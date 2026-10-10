@@ -426,6 +426,14 @@ pub fn no_backup_notice() -> String {
     vox_text::node::NO_BACKUP.to_owned()
 }
 
+/// What a person is told when a node is made with no identity passphrase, as `vox node create`
+/// says it (ADR-005 J-2, V030-36): the key is kept unencrypted.
+#[uniffi::export]
+#[must_use]
+pub fn no_passphrase_notice() -> String {
+    vox_text::node::NO_PASSPHRASE.to_owned()
+}
+
 /// The group a room's unread counts, by [`UnreadLevel`], put it in: the TUI's rule
 /// (`vox_agentcomms::attention::group`).
 #[uniffi::export]
@@ -1651,12 +1659,12 @@ impl VoxClient {
     }
 
     /// Make node `node` on this machine, as `vox node create` does: its identity sealed under
-    /// `passphrase` (every node has one: an empty one is refused, ADR-028 K-11), with its prekey
+    /// `passphrase` (an empty one gives none, ADR-005 J-2, V030-36), with its prekey
     /// ring, in this client's data root; nothing goes over the socket. Returns its fingerprint,
     /// base32. Attach it next with [`VoxClient::attach`].
     ///
     /// # Errors
-    /// A name a node cannot have, a node by that name already, an empty passphrase, another vox
+    /// A name a node cannot have, a node by that name already, another vox
     /// holding the node's directory, or one that cannot be written.
     pub async fn create_node(
         &self,
@@ -1761,14 +1769,15 @@ impl VoxClient {
         passphrase: Option<Arc<Passphrase>>,
     ) -> Result<(), VoxError> {
         let name = NodeName::parse(&node).map_err(|e| failed(e.to_string()))?;
-        let keep = if passphrase.is_some() {
-            KeepSource::Keychain(String::new())
-        } else {
-            KeepSource::None
+        let passphrase = passphrase.as_ref().map(|p| p.copy());
+        // An empty passphrase is a node made with none (ADR-005 J-2): nothing is stored for it.
+        let keep = match &passphrase {
+            Some(p) if !p.is_empty() => KeepSource::Keychain(String::new()),
+            _ => KeepSource::None,
         };
         let req = DaemonRequest::Attach {
             node: name,
-            passphrase: passphrase.as_ref().map(|p| p.copy()),
+            passphrase,
             keep: Some(keep),
             rooms: Vec::new(),
             anchors: Vec::new(),

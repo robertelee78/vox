@@ -160,6 +160,20 @@ fn raise(note: &Note, command: Option<&std::ffi::OsStr>) {
     }
 }
 
+/// Raise one notification for the person at node `paths`'s machine, where the daemon's watcher
+/// raises its own (#666: a node that waits for its passphrase), unless the node has notifications
+/// off. Waits for the notification program, so it is for a moment that happens once.
+pub fn raise_for(paths: &Paths, title: &str, body: &str) {
+    if disabled(paths) {
+        return;
+    }
+    let note = Note {
+        title: title.to_owned(),
+        body: body.to_owned(),
+    };
+    raise(&note, command(paths).as_deref());
+}
+
 /// Raise `note` from the TUI (ADR-028 R-10): to the node's notification program when it has one
 /// (`notify-command`, `VOX_NOTIFY_COMMAND`), run off the TUI's thread; else to the terminal the TUI
 /// draws in, as an OSC 9 desktop notification, or as a bell over SSH, where a terminal's OSC 9

@@ -666,6 +666,21 @@ fn start_daemon_as(
     let deadline = started + DAEMON_START_PATIENCE;
     let mut looks = Looks::new();
     loop {
+        // A daemon that already failed is said as itself, with its stderr: asked `vox room list`,
+        // the harness would attach the node for the verb and quote that attach instead.
+        let failed = w
+            .daemon
+            .as_mut()
+            .and_then(|d| d.0.try_wait().ok().flatten())
+            .filter(|s| !s.success());
+        if let Some(status) = failed {
+            panic!(
+                "PRODUCT: {}'s daemon failed ({status}) before it answered `vox room list`. Its \
+                 stderr:\n{}",
+                w.name,
+                read_log(err)
+            );
+        }
         let o = w.vox(None, &["room", "list"]);
         looks.looked();
         if o.ok {

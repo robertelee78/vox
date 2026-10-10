@@ -677,6 +677,28 @@ pub fn end(paths: &Paths, session: &str) {
     let _ = std::fs::remove_file(paths.session_file(session));
     let _ = std::fs::remove_file(notices_file(paths, session));
     let _ = std::fs::remove_file(woke_file(paths, session));
+    let _ = std::fs::remove_file(said_detached_file(paths, session));
+}
+
+fn said_detached_file(paths: &Paths, session: &str) -> std::path::PathBuf {
+    let reg = paths.session_file(session);
+    let dir = paths.session_dir().with_extension("said-detached");
+    dir.join(reg.file_name().unwrap_or_default())
+}
+
+/// Whether `session` is yet to be told that its node is not attached (#666): `true` the first
+/// time in the session, which is recorded, and `false` after, so the hook says it once per
+/// session, not every turn. A record that cannot be written says it again rather than never.
+pub fn first_detached_notice(paths: &Paths, session: &str) -> bool {
+    let file = said_detached_file(paths, session);
+    if file.exists() {
+        return false;
+    }
+    if let Some(dir) = file.parent() {
+        let _ = vox_core::node::paths::create_private_dir(dir);
+    }
+    let _ = vox_core::node::paths::write_private_file_unique(&file, b"");
+    true
 }
 
 /// The hop budget `envelope` really has left, given the `rows` of its room (ADR-020 §9): see

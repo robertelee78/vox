@@ -88,7 +88,8 @@ pub async fn status(args: &NodeArgs, key: &str, dir: &Path) -> Result<String, Ap
         return Ok(format!(
             "Vox: {} is node {node} here, and {node} is not attached, so this session is in no \
              Vox room. Tell the operator, in these words: \"Node {node} is not attached. Run \
-             this in a terminal of your own; it asks there for the node's passphrase. Then \
+             this in a terminal of your own; it asks there for the node's passphrase once, and \
+             Vox then remembers it and attaches the node by itself after every restart. Then \
              start a new session.\"\n    vox node attach {node}\n\
              Never run it yourself, and never ask for the passphrase here.\n",
             h.name
@@ -135,6 +136,27 @@ pub async fn connect(
     let name = NodeName::parse(name)?;
     let account = args.account()?;
     let wiring = Wiring::of(h.key)?;
+    // **A harness connected already is left as it is** (#666): to another node, nothing changes;
+    // to this one, it is attached and remembered below, and nothing else is made.
+    if let Some(wired) = crate::setup::connected(&account, &wiring) {
+        if wired == name {
+            println!(
+                "vox: {} is connected to node {name}; left as it is, and node {name} is to be \
+                 attached with its passphrase and remembered",
+                h.name
+            );
+            let typed =
+                passphrase_file.is_none() && std::env::var_os("VOX_IDENTITY_PASSPHRASE").is_none();
+            let passphrase = crate::client::attach_passphrase(None, passphrase_file)?;
+            return crate::client::attach_with(args, &name, passphrase, typed).await;
+        }
+        println!(
+            "vox: {} is connected to node {wired}; left as it is. `vox node attach {wired}` \
+             attaches it",
+            h.name
+        );
+        return Ok(());
+    }
     let exists = account.nodes_on_disk().contains(&name);
     println!(
         "vox: {} is to be wired to {} node {name}{}:",
@@ -149,6 +171,10 @@ pub async fn connect(
     for line in wiring.effects(&name) {
         println!("  {line}");
     }
+    // A new node's passphrase is typed unless it comes from a file; an existing node's, unless
+    // from a file or VOX_IDENTITY_PASSPHRASE, as `vox node attach` takes it.
+    let typed = passphrase_file.is_none()
+        && (!exists || std::env::var_os("VOX_IDENTITY_PASSPHRASE").is_none());
     let passphrase = if exists {
         crate::client::attach_passphrase(None, passphrase_file)?
     } else {
@@ -193,11 +219,9 @@ pub async fn connect(
             "vox: next, run `vox agent trust codex`: Codex runs a hook only once it is trusted"
         );
     }
-    if crate::client::attached(&account, &name).await {
-        println!("vox: node {name} is attached already");
-    } else {
-        crate::client::attach_with(args, &name, passphrase).await?;
-    }
+    // Attached already or not, it is attached and remembered (#666): an attach of an attached
+    // node checks the passphrase, and keeps it.
+    crate::client::attach_with(args, &name, passphrase, typed).await?;
     println!(
         "vox: {} is wired to node {name}; start a new {} session",
         h.name, h.name
