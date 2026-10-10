@@ -77,7 +77,9 @@
 //!    Sessions change, and `sessions` says the app may no longer drive. The peer gives drive again
 //!    and writes a second entry: within 30 s the listener hears the change again, `sessions` says
 //!    it may drive, and `sessionRead` gives both entries. An app reads a room's Sessions again only
-//!    when its listener says so, so an unheard change leaves it showing a stale capability.
+//!    when its listener says so, so an unheard change leaves it showing a stale capability. The
+//!    room's unread, what waits on the app (needs you), and the messages and notices its listener
+//!    was given are the same after as before: the change shows nowhere else.
 //!
 //! Mutant for (8): `sessionRead` gives each entry's kind for its line: red PRODUCT.
 //! Mutant for (8b): no Session news when another node's key moves away from this one: the revoke
@@ -1235,7 +1237,12 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
     peer_prompt("second, with drive given again");
     writeln!(to_app).unwrap();
     let regranted = expect(&from_app, &seen, "REGRANTED ");
-    eprintln!("(8b) {held}\n{revoked}\n{regranted}");
+    let counts_before = expect(&from_app, &seen, "COUNTS BEFORE ");
+    let counts_after = expect(&from_app, &seen, "COUNTS AFTER ");
+    let new_notices = expect(&from_app, &seen, "NEW NOTICES ");
+    eprintln!(
+        "(8b) {held}\n{revoked}\n{regranted}\n{counts_before}\n{counts_after}\n{new_notices}"
+    );
     assert!(
         held.starts_with("PEER DRIVE true ENTRIES ") && !held.ends_with(" 0"),
         "APPARATUS (staging): the peer gave the app's node drive and wrote an entry, yet the app \
@@ -1253,6 +1260,14 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
         "PRODUCT: when the peer gave drive again and wrote a second entry, the app's listener must \
          hear the room's Sessions change, `sessions` must say it may drive, and `sessionRead` must \
          give both entries: {regranted}"
+    );
+
+    assert_eq!(
+        counts_before["COUNTS BEFORE ".len()..],
+        counts_after["COUNTS AFTER ".len()..],
+        "PRODUCT: the drive being taken back and given again changed nothing but what the app may \
+         see of the Session: the room's unread, what waits on the app (needs you) and the messages \
+         and notices its listener was given must be as they were"
     );
 
     // (9) The app closes; the daemon lets the node go.

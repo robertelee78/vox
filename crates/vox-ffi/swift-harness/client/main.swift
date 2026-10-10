@@ -79,6 +79,9 @@
 //   (waits for a line on stdin: the peer gave drive again, and wrote a second entry)
 //   REGRANTED HEARD <bool> DRIVE <bool> ENTRIES <n>
 //                           the same, then `sessionRead`'s entries once there are two (up to 30 s)
+//   COUNTS BEFORE <counts>  before the peer took drive back: `unread`'s messages, what `sessions`
+//                           says waits on this node, and the messages and notices the listener got
+//   COUNTS AFTER <counts>   the same, after the re-grant
 //   (waits for a line on stdin)
 //   CLOSED                  the client has closed, letting go of the node
 //
@@ -106,12 +109,36 @@ final class Listener: ClientListener, @unchecked Sendable {
     private let lock = NSLock()
     private var entries: [String: Int] = [:]
     private var rooms: [String: Int] = [:]
+    private var told = (messages: 0, notices: 0)
+    private var notices: [String] = []
 
     func onMessage(room: String, message: RoomMessage) {
+        lock.lock()
+        told.messages += 1
+        lock.unlock()
         say("GOT \(message.text)")
     }
 
-    func onNotice(text: String) {}
+    func onNotice(text: String) {
+        lock.lock()
+        told.notices += 1
+        notices.append(text)
+        lock.unlock()
+    }
+
+    /// The notices given from the `from`th on.
+    func noticesSince(_ from: Int) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return Array(notices.dropFirst(from))
+    }
+
+    /// How many messages and notices the listener was given, all told.
+    func toldCounts() -> (Int, Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return told
+    }
 
     func onEnded(text: String) {
         say("ENDED \(text)")
@@ -335,6 +362,16 @@ do {
         }
         return false
     }
+    // What a person would see counted: the room's unread, what waits on them (needs you), and
+    // what the listener was told as messages or notices.
+    func seenCounts() async -> String {
+        let unread = (try? await client.unread(room: room).count) ?? -1
+        let pending = (try? await client.sessions(room: room).reduce(0) { $0 + Int($1.pending) }) ?? -1
+        let (messages, notices) = listener.toldCounts()
+        return "UNREAD \(unread) WAITING \(pending) MESSAGES \(messages) NOTICES \(notices)"
+    }
+    let countsBefore = await seenCounts()
+    let noticesBefore = listener.toldCounts().1
     var before = listener.heard(session: psid, room: room).1
     _ = readLine()
     let revokeHeard = await heardChange(after: before)
@@ -352,6 +389,9 @@ do {
         try await Task.sleep(nanoseconds: 250_000_000)
     }
     say("REGRANTED HEARD \(regrantHeard) DRIVE \(regained?.canDrive ?? false) ENTRIES \(count)")
+    say("COUNTS BEFORE \(countsBefore)")
+    say("COUNTS AFTER \(await seenCounts())")
+    say("NEW NOTICES \(listener.noticesSince(noticesBefore))")
     _ = readLine()
     await client.close()
     say("CLOSED")
