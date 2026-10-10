@@ -1056,14 +1056,29 @@ fn an_opencode_session_is_mirrored_and_driven() {
         child: Killed(run_child),
         lines: run_lines,
     };
-    let told = run_host.ask("turn hello", within)["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned();
+    // Something new in the room, so the run's turn shows its hook reached the room (a quiet room
+    // injects nothing).
+    let (ok, _, err) = w.vox(
+        PERSON,
+        &["room", "post", &w.room, "FOR-THE-RUN hello"],
+        None,
+    );
+    assert!(ok, "APPARATUS (staging): {PERSON}'s post failed: {err}");
+    let deadline = Instant::now() + within;
+    let told = loop {
+        let told = run_host.ask("turn hello", within)["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        if told.contains("FOR-THE-RUN") || Instant::now() >= deadline {
+            break told;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
     assert!(
-        told.contains("In a Vox room"),
-        "PRODUCT: the `opencode run` session's hook must reach its room and say so to the model; \
-         its turn was given {told:?}"
+        told.contains("FOR-THE-RUN"),
+        "PRODUCT: the `opencode run` session's hook must reach its room and give the model what \
+         is new there; within {within:?} its turn was given {told:?}"
     );
     let (_, listed, _) = w.vox(OPENCODE, &["room", "sessions", &w.room, "--json"], None);
     println!("[proof] (5) after an `opencode run` turn, the room's Sessions: {listed}");
