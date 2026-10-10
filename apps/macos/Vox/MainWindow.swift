@@ -674,6 +674,12 @@ private struct RoomView: View {
                                         })
                             }
                             .coordinateSpace(name: "timeline")
+                            // A scroll view of its own for each destination (General, All, each
+                            // Session): one kept across a switch kept its offset, and from far
+                            // down a long Session, General's few rows lay above it and none was
+                            // drawn, so nothing could be seen or read until the person scrolled
+                            // (the final RC's walkthrough, on a display shorter than before).
+                            .id(model.showing)
                             // **Operable from the keyboard** (WCAG 2.1.1, 2.4.7): see
                             // `TimelineKeys`. The focused row is outlined by `selectable`.
                             .background(TimelineKeys(focused: $timelineFocused, key: { key in
@@ -735,6 +741,7 @@ private struct RoomView: View {
                                     scroller.scrollTo(last, anchor: .bottom)
                                 }
                                 newest = model.followItem
+                                opened = model.showsSessionToRead
                                 // Again once the rows are laid out: a scroll asked for in the
                                 // same pass as the rows it scrolls to can do nothing.
                                 DispatchQueue.main.async { openAtNewest(scroller) }

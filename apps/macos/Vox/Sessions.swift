@@ -8,7 +8,7 @@ import SwiftUI
 
 /// What the room's timeline shows (CL-2): its own conversation, that and every Session's opening
 /// and end, or one Session, by its node and id.
-enum Showing: Equatable {
+enum Showing: Hashable {
     case general
     case all
     case session(node: String, id: String)
