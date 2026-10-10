@@ -48,23 +48,14 @@ struct TimelineItem: Identifiable {
 }
 
 extension NodeModel {
-    /// The timeline's title (CL-2): what is shown, and for the room's own lines (General, All) its
-    /// retention (ADR-028 R-7).
-    var timelineTitle: String {
-        switch showing {
-        case .general: return "Timeline · ⏱ \(retention)"
-        case .all: return "Timeline — All · ⏱ \(retention)"
-        // A Session's title has no retention: it is the room's (as the TUI says it).
-        case .session:
-            guard let s = shownSession else { return "Timeline — a Session this room no longer lists" }
-            return "Timeline — \(s.title)\(s.open ? " · open" : " · ended")"
-        }
-    }
-
     /// The room's messages and what was done to it, in the room's order: each notice right after
     /// the message the node says it follows (the tie-break for the same millisecond); one that
     /// follows a message not shown here, by time.
     var roomItems: [TimelineItem] {
+        // A Session's opening and end (and a rename, sent as an opening again) are not the room's
+        // conversation: All says each once, from the Sessions as the node folds them (the
+        // decider, v0.4.3).
+        let messages = self.messages.filter { $0.kind != "session" && $0.kind != "session-end" }
         let shown = Set(messages.map(\.id))
         let item = { (n: RoomNoticeRow) in
             TimelineItem.notice("notice-\(n.id)", self.noticeWords(n), at: n.createdMillis)
@@ -100,7 +91,8 @@ extension NodeModel {
             return items
         case .session:
             guard let s = shownSession else { return [] }
-            var lines = TimelineItem.openedAndEnded(s)
+            // Its opening and end are said in All only (the decider, v0.4.3).
+            var lines: [TimelineItem] = []
             if s.canDrive {
                 if sessionLoading && sessionEntries.isEmpty {
                     lines.append(.notice("loading-\(s.sessionId)", "Loading…", at: .max))

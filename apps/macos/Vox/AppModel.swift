@@ -557,13 +557,20 @@ func sentence(_ error: Error) -> String {
     }
 }
 
-/// `text` begun with a capital and ended with a full stop, its words otherwise as they came.
+/// `text` begun with a capital and ended with a full stop, its words otherwise as they came. A
+/// reason in vox-core's two lines (what failed, then on an indented line what to do, as a
+/// terminal shows it) is two sentences on one line here, with no hanging indent (the decider,
+/// v0.4.3).
 func asSentence(_ text: String) -> String {
-    var said = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard let first = said.first else { return said }
-    said = first.uppercased() + said.dropFirst()
-    if let last = said.last, !".!?".contains(last) { said += "." }
-    return said
+    text.split(separator: "\n").map { line -> String in
+        var said = line.trimmingCharacters(in: .whitespaces)
+        guard let first = said.first else { return said }
+        said = first.uppercased() + said.dropFirst()
+        if let last = said.last, !".!?".contains(last) { said += "." }
+        return said
+    }
+    .filter { !$0.isEmpty }
+    .joined(separator: " ")
 }
 
 /// Why Vox could not start acting as a node, by kind, with the sentence said (P4): the card says

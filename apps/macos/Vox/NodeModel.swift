@@ -153,8 +153,6 @@ final class NodeModel: ObservableObject {
     var roomDrafts: [String: RoomDraft] = [:]
     /// A Session's draft, by its destination (`room/node/session`).
     var sessionDrafts: [String: String] = [:]
-    /// What each room last showed (General, All, or a Session), restored when it opens again.
-    var lastShowing: [String: Showing] = [:]
 
     /// The request selected in the Session on screen, by its reference: what Approve (⌥⌘Y) and
     /// Reject (⌥⌘N) act on, and where ⌘J and a notification land (P1).
@@ -440,6 +438,43 @@ final class NodeModel: ObservableObject {
         }
     }
 
+    /// Mark everything unread in `room` read, as its row's Mark as Read does: what the node holds
+    /// as unread there, and what this app counts.
+    func markAllRead(in room: String) async {
+        let held = (try? await client.unread(room: room).map(\.id)) ?? []
+        let ids = Array(Set(held).union(counted[room]?.keys.map { $0 } ?? []))
+        guard !ids.isEmpty else { return }
+        do {
+            try await client.markRead(room: room, ids: ids)
+            for id in ids {
+                marked.insert(id)
+                uncount(id, in: room)
+            }
+        } catch {
+            reportBackground(error)
+        }
+    }
+
+    /// The rooms this node may end for everyone: those it created or was made an admin of, as
+    /// each room's admins list says (creator first). Read once per room, and again after Admins….
+    @Published private(set) var endable: Set<String> = []
+    /// The rooms whose admins were read for `endable`.
+    private var adminsRead: Set<String> = []
+
+    /// Whether `room`'s admins were read: until they are, End for Everyone is not offered on its
+    /// row, and its sheet says it is checking.
+    func adminsKnown(_ room: String) -> Bool { adminsRead.contains(room) }
+
+    /// Read again whether this node may end `room` (its Admins changed).
+    func readEndable(_ room: String) async {
+        guard let admins = try? await client.admins(room: room) else { return }
+        adminsRead.insert(room)
+        let mine = admins.contains { $0.caseInsensitiveCompare(me) == .orderedSame }
+        if mine != endable.contains(room) {
+            if mine { endable.insert(room) } else { endable.remove(room) }
+        }
+    }
+
     /// The rooms, the keyring, the nodes on this Mac and the peers, read again.
     func refresh() async {
         do {
@@ -456,6 +491,10 @@ final class NodeModel: ObservableObject {
                 return room
             }
             if now != rooms { rooms = now }
+            // Each room's once, and the room on screen's each time: an admin made elsewhere.
+            for room in now where !adminsRead.contains(room.id) || room.id == roomOnScreen {
+                await readEndable(room.id)
+            }
             await readWaiting()
             await readFacts()
             let back = await readTrustsBack()
@@ -469,9 +508,11 @@ final class NodeModel: ObservableObject {
     /// its own is read (show reads it).
     func select(_ selection: Selection?) {
         guard selection != self.selection else { return }
-        // The room left keeps what it showed and the reply being written (D12).
+        // What the last operation did ("You left the room.") is said until the person moves on:
+        // gone on the next thing chosen (the decider, v0.4.3). A refusal stays until dismissed.
+        if outcome?.kind == .done { outcome = nil }
+        // The room left keeps the reply being written (D12).
         if case let .room(left) = self.selection {
-            lastShowing[left] = showing
             roomDrafts[left, default: RoomDraft()].reply = replyTo
         }
         self.selection = selection
@@ -504,12 +545,13 @@ final class NodeModel: ObservableObject {
         selectedMessages = []
         selectionAnchor = nil
         selectedService = nil
-        // What this room last showed, and its reply, come back (D12): General the first time.
+        // A room opens at its conversation, General, always, however it is reached (the sidebar,
+        // ⌘1–9, Next Room): never at the Session it last showed (the decider, v0.4.3). Its reply
+        // comes back (D12).
+        showing = .general
         if case let .room(opened) = selection {
-            showing = lastShowing[opened] ?? .general
             replyTo = roomDrafts[opened]?.reply
         } else {
-            showing = .general
             replyTo = nil
         }
     }
@@ -899,10 +941,11 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// Copy the room on screen's link (⌘L), saying what it carries.
-    func copyRoomLink() async {
+    /// Copy the room on screen's link (⌘L), or `room`'s (its row's context menu), saying what it
+    /// carries.
+    func copyRoomLink(of room: String? = nil) async {
         begin("copy-link")
-        guard let id = roomOnScreen else { return }
+        guard let id = room ?? roomOnScreen else { return }
         do {
             let link = try await client.link(room: id)
             NSPasteboard.general.clearContents()

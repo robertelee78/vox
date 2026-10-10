@@ -207,6 +207,15 @@ url/link for it to bind to"; the passphrase is typed by the operator in another 
   entries; and one entry per open Session, with ended Sessions apart (SE-5). For a member with
   drive, a Session waiting on it (an approval or a question pending) MUST count under **needs you**
   (ADR-028 W-2 as amended).
+- **CL-2a.** *(The decider, v0.4.3.)* In the app, the room's conversation and its Sessions MUST be
+  tabs across the top of the timeline: **General** first, then **All**, then one tab per open
+  Session by its title with a mark when it waits on this node, and **Ended (N)** last. The
+  inspector MUST NOT list Sessions. ⌘⇧[ and ⌘⇧] MUST move between the tabs. A room MUST open at
+  **General** however it is reached (the sidebar, ⌘1–9, Next Room), never at the Session it last
+  showed.
+- **CL-2b.** *(The decider, v0.4.3.)* A Session's opening and end MUST be said once, quietly, in
+  **All** only: never as lines of **General**, nor of the Session's own view. A rename MUST NOT
+  be said as another opening.
 - **CL-3.** A member without drive MUST see a Session's entry (SC-3) and MUST NOT be offered any
   driving action on it.
 

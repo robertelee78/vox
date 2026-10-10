@@ -1352,7 +1352,7 @@ impl Fault {
                 "you left this room, so nothing more of yours is written to it\n       join it again with its link to write to it"
             }
             Fault::NotCreator => {
-                "only the room's creator, or an admin it delegated, may do that — and this identity is neither\n       ask the room's creator to do it, or to make you an admin"
+                "only the room's creator, or an admin it named, can do that, and this node is neither\n       ask the creator to do it, or to make you an admin"
             }
             Fault::JoinedRoomEnded => {
                 "that room has ended — a member or its board said so — so it takes nobody in\n       your passphrase was never checked; the room is over, not your access to it"

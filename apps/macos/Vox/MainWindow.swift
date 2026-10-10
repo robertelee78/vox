@@ -139,7 +139,7 @@ private struct Sidebar: View {
                         RoomRow(room: room, selected: model.selection == .room(room.id))
                             .tag(NodeModel.Selection.room(room.id))
                             .sidebarRow(model.selection == .room(room.id))
-                            .copyMenu([("Copy Name", room.name)])
+                            .contextMenu { RoomMenu(model: model, room: room) }
                     }
                     ForEach(offers, id: \.fingerprint) { offer in
                         OfferRow(offer: offer).tag(NodeModel.Selection.offer(offer.fingerprint))
@@ -166,6 +166,12 @@ private struct Sidebar: View {
             }
         }
         .listStyle(.sidebar)
+        // ⌘C and Edit › Copy with a room selected copy its name (the decider, v0.4.3).
+        .onCopyCommand {
+            guard case let .room(id) = model.selection,
+                  let room = model.rooms.first(where: { $0.id == id }) else { return [] }
+            return [NSItemProvider(object: room.name as NSString)]
+        }
         // The nodes on this Mac, at the sidebar's foot (G5), whatever the rooms above scroll to.
         .safeAreaInset(edge: .bottom, spacing: 0) { OnThisMachine(nodes: model.nodes) }
         // On bg.panel, not the system's sidebar material (L-6), drawn where the sidebar's
@@ -364,6 +370,36 @@ private struct SidebarHighlightOff: NSViewRepresentable {
     }
 }
 
+/// A room's row's context menu (the decider, v0.4.3): its name and link copied, its unread
+/// marked read, and leaving it or ending it, End for Everyone only where this node may.
+private struct RoomMenu: View {
+    @ObservedObject var model: NodeModel
+    let room: NodeModel.Room
+
+    var body: some View {
+        Button("Copy Name") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(room.name, forType: .string)
+        }
+        Button("Copy Room Link") { Task { await model.copyRoomLink(of: room.id) } }
+        Button("Mark as Read") { Task { await model.markAllRead(in: room.id) } }
+            .disabled(room.need == .quiet)
+        Divider()
+        // On the room: Leave and End act on the room on screen, so it is shown first.
+        Button("Leave Room…") { open(.leave) }
+        if model.endable.contains(room.id) {
+            Button("End for Everyone…") { open(.end) }
+        }
+    }
+
+    private func open(_ sheet: NodeSheet) {
+        let selection = NodeModel.Selection.room(room.id)
+        model.select(selection)
+        Task { await model.show(selection) }
+        model.sheet = sheet
+    }
+}
+
 /// A room in the sidebar: its name, and its unread in words.
 private struct RoomRow: View {
     let room: NodeModel.Room
@@ -375,10 +411,11 @@ private struct RoomRow: View {
         VStack(alignment: .leading, spacing: Space.s4) {
             Text(room.name).fontWeight(room.need == .quiet ? .regular : .bold)
             if room.need != .quiet {
+                // Quiet, in its own case: "7 to you", not "7 TO YOU" (the decider, v0.4.3).
                 if selected {
-                    Text(room.words).eyebrow().foregroundStyle(VoxTokens.Colors.selectionSecondary)
+                    Text(room.words).caption().foregroundStyle(VoxTokens.Colors.selectionSecondary)
                 } else {
-                    Text(room.words).eyebrow().secondaryText()
+                    Text(room.words).caption().secondaryText()
                 }
             }
         }
@@ -683,6 +720,8 @@ private struct RoomView: View {
             VStack(spacing: 0) {
             // The room's one header, at a steady size (L-1b: only the conversation scales).
             RoomHeader(model: model, room: room)
+            // Its conversation and its Sessions, as tabs (the decider, v0.4.3).
+            SessionTabs(model: model)
             Hairline()
             VStack(spacing: 0) {
                 if !model.roomServices.isEmpty {
@@ -1951,21 +1990,16 @@ private struct ServiceCard: View {
     }
 }
 
-/// The room's Sessions (ADR-029 CL-2), then its members and their trust (L-4).
+/// The room's members and their trust (L-4). Its Sessions are tabs over the timeline (v0.4.3).
 private struct Inspector: View {
     @ObservedObject var model: NodeModel
     let room: String
 
     var body: some View {
-        // It scrolls (P13): a room with many Sessions or members cut off the bottom, the family
+        // It scrolls (P13): a room with many members cut off the bottom, the family
         // LAN section with it. Each section's heading stays in view while its rows scroll.
         ScrollView {
             LazyVStack(alignment: .leading, spacing: Space.s8, pinnedViews: [.sectionHeaders]) {
-                Section {
-                    SessionsList(model: model, heading: false)
-                } header: {
-                    heading("SESSIONS")
-                }
                 Section {
                     ForEach(model.members) { member in
                         TrustMark(name: member.name, trust: member.trust)
@@ -2134,9 +2168,10 @@ private struct StatusBar: View {
             Spacer()
             if let ended = model.ended {
                 StateMark(kind: .danger, words: ended)
-            } else if let outcome = model.outcome {
+            } else if let outcome = model.outcome, model.sheet == nil {
                 // What the last operation came to, kept until the next starts or it is dismissed
-                // (P6): done, refused and not known each said as itself.
+                // (P6): done, refused and not known each said as itself. Not while a sheet is
+                // open, which says its own once (the decider, v0.4.3: said twice).
                 OutcomeMark(outcome: outcome, id: "status-outcome-\(outcome.kindName)")
                 Button {
                     model.clearOutcome()
@@ -2166,7 +2201,7 @@ private struct StatusBar: View {
         }
         if let ended = model.ended {
             parts.append(ended)
-        } else if let outcome = model.outcome {
+        } else if let outcome = model.outcome, model.sheet == nil {
             parts.append(outcome.said)
         }
         return parts.filter { !$0.isEmpty }.joined(separator: ", ")

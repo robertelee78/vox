@@ -2705,16 +2705,28 @@ final class FirstRunProof: XCTestCase {
         guard listed.contains(d7Session.prefix(8)) else {
             throw Apparatus("alice's `vox room sessions` never listed bob's Session \(d7Session) in 30 s: \(listed)")
         }
-        // Its opening is a line of the room, said as every reader says it (#406): "<title> opened",
-        // its harness and folder ("Claude Code · tmp opened"), as `vox room read` prints it, never
-        // a blank row under bob's name.
+        // Its opening is said once, quietly, in All, never in General (the decider, v0.4.3), as
+        // every reader says it (#406): "<title> opened", its harness and folder ("Claude Code ·
+        // tmp opened"), never a blank row under bob's name.
         let openedLine = Key.showing("Claude Code · tmp opened")
+        let openedPremise = Premise("alice's `vox room read` says bob's Session \(d7Session) opened") {
+            let read = self.run(vox, ["room", "read", "--node", "alice", room], env: voxEnv).out
+            return (read.contains("Claude Code · tmp opened"), String(read.suffix(800)))
+        }
+        tap(ui, Key.id("session-all"), "the All tab")
         present(ui, openedLine, timeout: 30,
-                "bob's Session's opening must read in alice's timeline as `vox room read` says it, \"Claude Code · tmp opened\", not as a blank row",
-                premise: Premise("alice's `vox room read` says bob's Session \(d7Session) opened") {
-                    let read = self.run(vox, ["room", "read", "--node", "alice", room], env: voxEnv).out
-                    return (read.contains("Claude Code · tmp opened"), String(read.suffix(800)))
-                })
+                "bob's Session's opening must read in All as `vox room read` says it, \"Claude Code · tmp opened\", not as a blank row",
+                premise: openedPremise)
+        let openedRows = ui.windows.firstMatch.descendants(matching: .any)
+            .matching(NSPredicate(format: "label == %@ OR value == %@", "Claude Code · tmp opened",
+                                  "Claude Code · tmp opened")).count
+        XCTAssertEqual(openedRows, 1,
+                       "PRODUCT: bob's Session's opening must be said once in All (v0.4.3); \"Claude Code · tmp opened\" shows \(openedRows) times")
+        tap(ui, Key.id("session-general"), "the General tab")
+        let generalUntil = Date().addingTimeInterval(3)
+        while Date() < generalUntil && locate(ui, openedLine) != nil { Thread.sleep(forTimeInterval: 0.25) }
+        XCTAssertNil(locate(ui, openedLine),
+                     "PRODUCT: a Session's opening must not be a line of General, the room's conversation (v0.4.3); \"Claude Code · tmp opened\" shows there")
         let toBox = Key.id("compose-to")
         tap(ui, toBox, "To:")
         // By its own id: bob has another Session open in mission (bob-proof, his hook's from step 4).
@@ -2856,12 +2868,19 @@ final class FirstRunProof: XCTestCase {
         // Its name, read: harness and folder, no id (3, 9).
         let shortSession = String(d7Session.prefix(8))
         let rowWords = words(ui, Key.id("session-\(shortSession)"), timeout: 10,
-                             "bob's Session must be listed under SESSIONS") ?? ""
+                             "bob's Session must have a tab over the timeline") ?? ""
         XCTAssertTrue(rowWords.contains("Claude Code · tmp") && !rowWords.contains(shortSession),
-                      "PRODUCT: a Session must be listed by its harness and folder, without its id (v0.4.3); its row says \(rowWords.debugDescription)")
+                      "PRODUCT: a Session's tab must name it by its harness and folder, without its id (v0.4.3); it says \(rowWords.debugDescription)")
+        // Named once, by its tab: the header says the room's facts, not the Session's name again.
         let headWords = words(ui, Key.id("room-header-meta"), timeout: 10, "the room's header") ?? ""
-        XCTAssertTrue(headWords.contains("Claude Code · tmp · open") && !headWords.contains(shortSession),
-                      "PRODUCT: the header must name the Session once, by harness and folder, without its id (v0.4.3); it says \(headWords.debugDescription)")
+        XCTAssertTrue(!headWords.contains("Claude Code") && !headWords.contains(shortSession),
+                      "PRODUCT: the Session must be named once, by its tab (v0.4.3); the header names it again: \(headWords.debugDescription)")
+        // Its tab over the timeline, not a list in the inspector (v0.4.3).
+        if let tab = locate(ui, Key.id("session-\(shortSession)")),
+           let timeline = locate(ui, Key.id("timeline")) {
+            XCTAssertTrue(tab.frame.maxY <= timeline.frame.minY + 1 && tab.frame.minX < timeline.frame.maxX,
+                          "PRODUCT: bob's Session's tab must be across the top of the timeline (v0.4.3); the tab is at \(tab.frame), the timeline at \(timeline.frame)")
+        }
         XCTAssertNil(locate(ui, Key.id("session-header")),
                      "PRODUCT: the Session's name and id as its node says them must be folded in Details (v0.4.3); they show")
         // What was typed in the text face, its words alone (13); the turn's end no words (12);
@@ -2974,13 +2993,28 @@ final class FirstRunProof: XCTestCase {
         //
         // The room's header: its name and its retention, always (R-7); the window takes its name.
         tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
-        // A room opens at what it last showed (D12), here bob's Session from 4f: General first.
-        tap(ui, Key.id("session-general"), "General in mission's Sessions")
+        // A room opens at its conversation, General, always (the decider, v0.4.3): mission was
+        // left showing bob's Session (4g), and another room was opened since.
+        let generalTab = el(ui, Key.id("session-general"))
+        let generalUntil = Date().addingTimeInterval(10)
+        while Date() < generalUntil && !generalTab.isSelected { Thread.sleep(forTimeInterval: 0.25) }
+        XCTAssertTrue(generalTab.isSelected,
+                      "PRODUCT: mission, clicked in the sidebar, must open at General, never at the Session it last showed (v0.4.3); the tab on screen is \(ui.windows.firstMatch.descendants(matching: .any).matching(NSPredicate(format: "identifier BEGINSWITH 'session-' AND selected == true")).allElementsBoundByIndex.map(\.identifier))")
+        // ⌘⇧] and ⌘⇧[ move between its tabs.
+        ui.typeKey("]", modifierFlags: [.command, .shift])
+        let allTab = el(ui, Key.id("session-all"))
+        let stepUntil = Date().addingTimeInterval(5)
+        while Date() < stepUntil && !allTab.isSelected { Thread.sleep(forTimeInterval: 0.25) }
+        XCTAssertTrue(allTab.isSelected, "PRODUCT: ⌘⇧] from General must show the next tab, All; it does not")
+        ui.typeKey("[", modifierFlags: [.command, .shift])
+        let backUntil = Date().addingTimeInterval(5)
+        while Date() < backUntil && !generalTab.isSelected { Thread.sleep(forTimeInterval: 0.25) }
+        XCTAssertTrue(generalTab.isSelected, "PRODUCT: ⌘⇧[ from All must show General again; it does not")
         words(ui, Key.id("room-header-name"), timeout: 10, "the room's header must name it: \"mission\"",
               until: { $0 == "mission" })
         words(ui, Key.id("room-header-meta"), timeout: 10,
-              "the room's header must say what is shown and the room's retention: \"… · General · ⏱ …\"",
-              until: { $0.contains("General") && $0.contains("⏱") })
+              "the room's header must say the room's retention: \"… · ⏱ …\"",
+              until: { $0.contains("⏱") })
         let titled = Date().addingTimeInterval(10)
         while Date() < titled && !ui.windows.firstMatch.title.hasPrefix("mission") {
             Thread.sleep(forTimeInterval: 0.25)
@@ -4009,15 +4043,17 @@ final class FirstRunProof: XCTestCase {
     /// (16) What an operation comes to, as a person meets it.
     /// - #608 (D16): New Room with its passphrase field left empty says "No passphrase: anyone
     ///   with the link can join." and makes the room, as `vox room list` lists it.
-    /// - #611 (D19): End for Everyone in a room alice did not create is refused by her node; the
-    ///   sheet stays open and says why, under its button.
-    /// - #615 (P6): that refusal is the status bar's, as a refusal, and is not shown in the
-    ///   Retention sheet opened next, which is another operation's; dismissed, it is gone.
+    /// - v0.4.3: End for Everyone in a room alice did not create is disabled, saying why, with the
+    ///   room drawn behind the sheet; her row's context menu does not offer it.
+    /// - #611 (D19), #615 (P6): Rename in that room is refused by her node; the sheet stays open
+    ///   and says why, once (not in the status bar too while open), on one line; closed, the
+    ///   refusal is the status bar's, as a refusal, and not the Retention sheet's; dismissed, gone.
+    /// - v0.4.3: ⌘C copies the selected room's name; Mark as Read empties a row's unread; "You left
+    ///   the room." clears when another room is chosen.
     ///
-    /// Mutants: New Room taking an empty field as nothing typed (D16): no room, red. The End sheet
-    /// closing whatever leaving did (D19): no reason shown, red. A sheet showing any operation's
-    /// failure (`failure(of:)` ignoring the operation, P6): the Retention sheet shows End's
-    /// refusal, red.
+    /// Mutants: New Room taking an empty field as nothing typed (D16): no room, red. A sheet
+    /// showing any operation's failure (`failure(of:)` ignoring the operation, P6): the Retention
+    /// sheet shows Rename's refusal, red. Others in ~/vox-coord/mutants (ux2, v0.4.3).
     private func outcomes(_ ui: XCUIApplication, vox: String, voxEnv: [String: String],
                           roomPass: String) throws {
         // #608: a room with no passphrase, made by the app.
@@ -4053,28 +4089,55 @@ final class FirstRunProof: XCTestCase {
         try staged(vox, ["room", "join", "--node", "alice", "--passphrase-file", roomPass, bobsLink],
                    env: voxEnv)
         tap(ui, Key.id("room-bobs"), "bobs in the sidebar", premise: inRoom(vox, voxEnv, "bobs"))
+        // (v0.4.3) End for Everyone, offered to one who may not end bobs, says why before she
+        // tries, under a disabled button; and bobs stays drawn behind the sheet.
         ui.menuBars.menuBarItems["Room"].click()
         tap(ui, Key.menuItem("End for Everyone…"), "Room > End for Everyone…")
-        tap(ui, Key.id("leave-confirm"), "End for Everyone, in its sheet")
-        let refusal = words(ui, Key.id("leave-failed"), timeout: 30,
-                            "End for Everyone, refused by alice's node (she did not make bobs), must keep its sheet open and say why",
-                            until: { $0.contains("creator") }) ?? ""
-        if locate(ui, Key.id("leave-confirm")) == nil {
-            XCTFail("PRODUCT: a refused End for Everyone must keep its sheet open; it closed")
+        let whyNot = words(ui, Key.id("leave-why-not"), timeout: 15,
+                           "End for Everyone, offered to alice who neither made bobs nor was made its admin, must say why she cannot",
+                           until: { $0.hasPrefix("Only the room's creator, or an admin it named, can end it") }) ?? ""
+        if let confirm = locate(ui, Key.id("leave-confirm")), confirm.isEnabled {
+            XCTFail("PRODUCT: End for Everyone must be disabled for alice, who may not end bobs (v0.4.3); it is enabled")
         }
-        print("[proof] End for Everyone refused, said in its sheet: \(refusal)")
+        if locate(ui, Key.id("room-header-name")) == nil || locate(ui, Key.id("timeline")) == nil {
+            keepTree(ui, "the room behind End for Everyone's sheet")
+            XCTFail("PRODUCT: bobs must stay drawn behind End for Everyone's sheet (v0.4.3); its header or timeline is gone")
+        }
+        print("[proof] End for Everyone disabled for alice, saying: \(whyNot)")
+        ui.typeKey(.escape, modifierFlags: [])
+        // Not offered on bobs's row either: its context menu has no End for Everyone….
+        el(ui, Key.id("room-bobs")).rightClick()
+        present(ui, Key.menuItem("Copy Room Link"), timeout: 5, "bobs's row's context menu must offer Copy Room Link")
+        if locate(ui, Key.menuItem("End for Everyone…")) != nil {
+            XCTFail("PRODUCT: a room alice may not end must not offer End for Everyone… on its row (v0.4.3)")
+        }
         ui.typeKey(.escape, modifierFlags: [])
 
-        // #615: the refusal is the status bar's, as a refusal; not the Retention sheet's.
+        // #611, #615: a refusal by alice's node, Rename in bobs, is said once: in its sheet while
+        // it is open, not in the status bar as well (v0.4.3), in one line with no hanging indent;
+        // the status bar's once the sheet is closed, as a refusal; not the Retention sheet's.
+        ui.menuBars.menuBarItems["Room"].click()
+        tap(ui, Key.menuItem("Rename…"), "Room > Rename…")
+        type(ui, Key.id("rename-name"), "mine", "the room's new name")
+        tap(ui, Key.id("rename-submit"), "Rename, in its sheet")
+        let refusal = words(ui, Key.id("rename-said"), timeout: 30,
+                            "Rename, refused by alice's node (she may not rename bobs), must keep its sheet open and say why",
+                            until: { $0.contains("admin") }) ?? ""
+        XCTAssertFalse(refusal.contains("\n") || refusal.contains("  "),
+                       "PRODUCT: a refusal must read as sentences on one line, no hanging indent (v0.4.3); it says \(refusal.debugDescription)")
+        if locate(ui, Key.id("status-outcome-refused")) != nil {
+            XCTFail("PRODUCT: a refusal its sheet says must not be said in the status bar as well while the sheet is open (v0.4.3)")
+        }
+        ui.typeKey(.escape, modifierFlags: [])
         let barSays = words(ui, Key.id("status-outcome-refused"), timeout: 10,
-                            "the status bar must say End for Everyone was refused, as a refusal",
-                            until: { $0.contains("creator") }) ?? ""
+                            "the status bar must say Rename was refused, as a refusal",
+                            until: { $0.contains("admin") }) ?? ""
         ui.menuBars.menuBarItems["Room"].click()
         tap(ui, Key.menuItem("Retention…"), "Room > Retention…")
         present(ui, Key.id("retention-effect"), timeout: 10, "Room > Retention… must open its sheet")
         if let shownThere = locateEverywhere(ui, Key.id("retention-said")) {
             keepTree(ui, "the Retention sheet showed another operation's result")
-            XCTFail("PRODUCT: the Retention sheet must show only its own result; it shows End for Everyone's: \"\(shown(shownThere))\"")
+            XCTFail("PRODUCT: the Retention sheet must show only its own result; it shows Rename's: \"\(shown(shownThere))\"")
         }
         ui.typeKey(.escape, modifierFlags: [])
         tap(ui, Key.id("status-dismiss"), "the status bar's dismiss")
@@ -4085,7 +4148,39 @@ final class FirstRunProof: XCTestCase {
         if locate(ui, Key.id("status-outcome-refused")) != nil {
             XCTFail("PRODUCT: dismissed, the status bar's result must go; it still says it")
         }
-        print("[proof] status bar said \(barSays) as a refusal; the Retention sheet did not; dismissed, it went")
+
+        // (v0.4.3) ⌘C with bobs selected in the sidebar copies its name.
+        tap(ui, Key.id("room-bobs"), "bobs in the sidebar")
+        let keyName = copiedBy(ui, { ui.typeKey("c", modifierFlags: .command) })
+        XCTAssertEqual(keyName, "bobs", "PRODUCT: ⌘C with bobs selected in the sidebar must copy its name; it copied \(keyName.debugDescription)")
+
+        // (v0.4.3) Mark as Read on bobs's row: bob posts there while alice is in open; its row
+        // counts it new; marked read, it counts nothing.
+        tap(ui, Key.id("room-open"), "open in the sidebar", premise: inRoom(vox, voxEnv, "open"))
+        try staged(vox, ["room", "post", "--node", "bob", bobsRoom, "MARK-ME-READ"], env: voxEnv)
+        words(ui, Key.id("room-bobs"), timeout: 30, "bob's MARK-ME-READ in bobs, unseen, must count new on its row",
+              until: { $0.contains("1 new") })
+        el(ui, Key.id("room-bobs")).rightClick()
+        tap(ui, Key.menuItem("Mark as Read"), "Mark as Read on bobs's row")
+        words(ui, Key.id("room-bobs"), timeout: 15, "Mark as Read on bobs's row must leave nothing unread there",
+              until: { !$0.contains("new") && !$0.contains("to you") })
+
+        // (v0.4.3) What leaving did is said until the person moves on: "You left the room.", then
+        // gone once another room is chosen.
+        el(ui, Key.id("room-bobs")).rightClick()
+        tap(ui, Key.menuItem("Leave Room…"), "Leave Room… on bobs's row")
+        tap(ui, Key.id("leave-confirm"), "Leave, in its sheet")
+        words(ui, Key.id("status-outcome-done"), timeout: 30, "leaving bobs must say so in the status bar",
+              until: { $0.contains("You left the room.") })
+        tap(ui, Key.id("room-open"), "open in the sidebar", premise: inRoom(vox, voxEnv, "open"))
+        let clearedUntil = Date().addingTimeInterval(5)
+        while Date() < clearedUntil && locate(ui, Key.id("status-outcome-done")) != nil {
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        if let left = locate(ui, Key.id("status-outcome-done")) {
+            XCTFail("PRODUCT: \"You left the room.\" must clear on the next thing chosen (v0.4.3); with another room open it still says \"\(shown(left))\"")
+        }
+        print("[proof] Rename refused once in its sheet (\(refusal)), then the status bar's (\(barSays)); not the Retention sheet's; context menu and ⌘C copied bobs; \"You left the room.\" cleared on the next room")
     }
 
     /// (16, G3) A service's address in its parts (ADR-017 S-1): bob shares `photos` in mission;

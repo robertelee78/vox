@@ -34,17 +34,13 @@ extension NodeModel {
         rooms.first { $0.id == room }?.name ?? String(room.prefix(12))
     }
 
-    /// The room header's facts: members, what is shown, and the retention, always (R-7).
+    /// The room header's facts: its members and its retention, always (R-7). What is shown is
+    /// said once, by its tab (the decider, v0.4.3: a Session was named four times); an ended
+    /// Session on screen is said to be one.
     var roomHeaderMeta: String {
         let people = members.count + 1
-        let shown: String
-        switch showing {
-        case .general: shown = "General"
-        case .all: shown = "All"
-        case .session:
-            shown = shownSession.map { "\($0.title) · \($0.open ? "open" : "ended")" } ?? "a Session"
-        }
-        return "\(people == 1 ? "1 member" : "\(people) members") · \(shown) · ⏱ \(retention)"
+        let ended = shownSession.map { $0.open ? "" : " · Session ended" } ?? ""
+        return "\(people == 1 ? "1 member" : "\(people) members") · ⏱ \(retention)\(ended)"
     }
 
     var showingSession: Bool {
@@ -67,61 +63,90 @@ extension NodeModel {
     }
 }
 
-/// The room's Sessions, above its members (CL-2): General, All, the open Sessions (one waiting on
-/// this node marked "!", CL-2), and the ended ones under "Ended (N)", folded until opened.
-struct SessionsList: View {
+/// The room's Sessions as tabs across the top of its conversation (CL-2, the decider v0.4.3):
+/// General first, then All, then one tab per open Session by its title, a dot on one waiting on
+/// this node; the ended ones under "Ended (N)" at the end, folded until opened. ⌘⇧[ and ⌘⇧] move
+/// between them.
+struct SessionTabs: View {
     @ObservedObject var model: NodeModel
-    /// Its own SESSIONS heading; off where the heading is drawn above it (the inspector pins it).
-    var heading = true
     @State private var endedOpen = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Space.s4) {
-            if heading {
-                Text("SESSIONS").eyebrow().secondaryText()
-                    .accessibilityAddTraits(.isHeader)
-            }
-            row("General", .general, id: "session-general")
-            row("All", .all, id: "session-all")
-            ForEach(model.openSessions, id: \.self) { s in
-                row(s.pending > 0 ? "! \(s.title) · waiting on you" : "● \(s.title)",
-                    .session(node: s.nodeFingerprint, id: s.sessionId), id: "session-\(s.shortId)")
-            }
-            let ended = model.endedSessions
-            if !ended.isEmpty {
-                Button { endedOpen.toggle() } label: {
-                    Label("Ended (\(ended.count))", systemImage: endedOpen ? "chevron.down" : "chevron.right")
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: Space.s4) {
+                tab("General", .general, id: "session-general")
+                tab("All", .all, id: "session-all")
+                ForEach(model.openSessions, id: \.self) { s in
+                    tab(s.title, .session(node: s.nodeFingerprint, id: s.sessionId),
+                        id: "session-\(s.shortId)", waiting: s.pending > 0)
                 }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("sessions-ended")
-                .accessibilityValue(endedOpen ? "expanded" : "collapsed")
-                if endedOpen {
-                    ForEach(ended, id: \.self) { s in
-                        row("\(s.title) · ended", .session(node: s.nodeFingerprint, id: s.sessionId),
-                            id: "session-\(s.shortId)")
+                let ended = model.endedSessions
+                if !ended.isEmpty {
+                    Button { endedOpen.toggle() } label: {
+                        Label("Ended (\(ended.count))", systemImage: endedOpen ? "chevron.down" : "chevron.right")
+                            .secondaryLine()
+                            .padding(.horizontal, Space.s8).padding(.vertical, Space.s4)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("sessions-ended")
+                    .accessibilityValue(endedOpen ? "expanded" : "collapsed")
+                    // An ended Session on screen keeps its tab while the others are folded.
+                    ForEach(ended.filter { endedOpen || model.showing == .session(node: $0.nodeFingerprint, id: $0.sessionId) },
+                            id: \.self) { s in
+                        tab(s.title, .session(node: s.nodeFingerprint, id: s.sessionId),
+                            id: "session-\(s.shortId)", ended: true)
                     }
                 }
             }
+            .padding(.horizontal, Space.s8)
         }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("sessions")
     }
 
-    private func row(_ words: String, _ showing: Showing, id: String) -> some View {
+    private func tab(_ title: String, _ showing: Showing, id: String, waiting: Bool = false,
+                     ended: Bool = false) -> some View {
         let on = model.showing == showing
+        let spoken = waiting ? "\(title), waiting on you" : ended ? "\(title), ended" : title
         return Button { model.showing = showing } label: {
-            // Two lines, not cut: a label's middle is the Session's name.
-            Text(words).lineLimit(2)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .selectionMark(on)
-                .contentShape(Rectangle())
+            HStack(spacing: Space.s4) {
+                if waiting {
+                    Circle().fill(VoxTokens.Colors.attention).frame(width: 6, height: 6)
+                        .accessibilityHidden(true)
+                }
+                Text(title).lineLimit(1).truncationMode(.middle)
+                    .fontWeight(on ? .semibold : .regular)
+                    .foregroundStyle(on || !ended ? VoxTokens.Colors.textPrimary : VoxTokens.Colors.textSecondary)
+            }
+            .frame(maxWidth: 220)
+            .padding(.horizontal, Space.s8).padding(.vertical, Space.s4)
+            // The tab on screen is underlined in the accent (L-3).
+            .overlay(alignment: .bottom) {
+                Rectangle().fill(on ? VoxTokens.Colors.accent : .clear).frame(height: 2)
+            }
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(words)
+        .help(spoken)
         .accessibilityIdentifier(id)
-        .accessibilityLabel(words)
+        .accessibilityLabel(spoken)
         .accessibilityAddTraits(on ? .isSelected : [])
+    }
+}
+
+extension NodeModel {
+    /// The tabs in their order, as SessionTabs draws them with Ended open: what ⌘⇧[ and ⌘⇧] step
+    /// through.
+    var tabOrder: [Showing] {
+        [.general, .all] + (openSessions + endedSessions).map { .session(node: $0.nodeFingerprint, id: $0.sessionId) }
+    }
+
+    /// The tab `by` places from the one on screen, stopping at either end (⌘⇧[ is -1, ⌘⇧] +1).
+    func stepTab(_ by: Int) {
+        let order = tabOrder
+        guard let at = order.firstIndex(of: showing) else { return showing = .general }
+        showing = order[max(0, min(order.count - 1, at + by))]
     }
 }
 

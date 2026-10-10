@@ -108,6 +108,13 @@ extension VoxAction {
             },
             VoxAction("Room", "Copy Selected Service's Address", "c", [.command, .shift],
                       enabled: node?.selectedService != nil) { node?.copyServiceCommand() },
+            // Between the room's tabs, General, All and its Sessions (the decider, v0.4.3).
+            VoxAction("View", "Previous Tab", "[", [.command, .shift], enabled: inRoom) {
+                node?.stepTab(-1)
+            },
+            VoxAction("View", "Next Tab", "]", [.command, .shift], enabled: inRoom) {
+                node?.stepTab(1)
+            },
             VoxAction("Room", "Next Room That Needs You", "j", enabled: live) {
                 Task { await node?.nextNeedingYou() }
             },
@@ -565,22 +572,39 @@ private struct AdminsSheet: View {
     }
 }
 
-/// Leave, or End for Everyone, each saying what it does first (E-5).
+/// Leave, or End for Everyone, each saying what it does first (E-5). End for Everyone is offered
+/// only to the room's creator or an admin it named; anyone else is told why, under a disabled
+/// button, before they try (the decider, v0.4.3).
 private struct LeaveSheet: View {
     @ObservedObject var model: NodeModel
     let ending: Bool
-    /// Why the last try did not leave: the sheet stays open and says so (D19).
+    /// Why the last try did not leave: the sheet stays open and says so (D19), once: not in the
+    /// status bar as well while the sheet is open.
     @State private var failed: String?
     @State private var working = false
+
+    /// Why this node may not end the room, when it may not; nil when it may, or while its admins
+    /// are still being read.
+    private var mayNot: String? {
+        guard ending, let room = model.roomOnScreen, model.adminsKnown(room),
+              !model.endable.contains(room) else { return nil }
+        return "Only the room's creator, or an admin it named, can end it, and this node is "
+            + "neither. Ask the creator to end it, or to make you an admin."
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s12) {
             Text(ending ? "End this room for everyone?" : "Leave this room?").title()
             Text(ending
-                ? "Every member's copy of the room is deleted, and no one can post in it again. "
-                    + "Only its creator or an admin can do this."
+                ? "Every member's copy of the room is deleted, and no one can post in it again."
                 : "This node stops reading and posting here, and the room is deleted here. "
                     + "The others go on; to come back you need its link and passphrase again.")
+                .fixedSize(horizontal: false, vertical: true)
+            if let mayNot {
+                Text(mayNot).secondaryText()
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("leave-why-not")
+            }
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 Button(ending ? "End for Everyone" : "Leave", role: .destructive) {
@@ -596,15 +620,19 @@ private struct LeaveSheet: View {
                         working = false
                     }
                 }
-                .disabled(working)
+                .disabled(working || mayNot != nil)
                 .accessibilityIdentifier("leave-confirm")
             }
             if let failed {
                 StateMark(kind: .danger, words: failed).textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("leave-failed")
             }
         }
         .padding(Space.s24)
         .frame(width: Theme.scaled(440))
+        .task {
+            if ending, let room = model.roomOnScreen { await model.readEndable(room) }
+        }
     }
 }
