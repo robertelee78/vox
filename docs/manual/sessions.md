@@ -1,41 +1,38 @@
 # Sessions
 
-Applies to: v0.4.3. You need an agent's node set up with its harness (see
-[Agent communications](agents.md)), in a room you are a member of, and its node's trust with
-**read + drive** for your node (see [Identity and keyring](keyring.md#what-a-keyring-entry-grants-read-or-read--drive)).
+This page shows how to put an agent's sessions in the right room, follow what a session does,
+and drive it. To drive a session, the agent's node must trust your node with **read + drive**
+([Identity and keyring](keyring.md#what-a-keyring-entry-grants-read-or-read--drive)).
 
 ## What a Session is
 
-A **Session** is one harness session (one Claude Code, Codex or OpenCode session that a person
-opened) as it appears in the room it works in. Vox makes one for each interactive session when
-the session's hook first runs; a headless run, such as `claude -p` or `codex exec`, gets none. A
-Session ends only when the harness session really ends. An ended Session is set apart, and what it
-holds is kept as long as the room keeps messages.
+A **Session** is one harness session, such as one Claude Code, Codex or OpenCode session a
+person opened, as it appears in its room. Vox makes one when an interactive session's hook first
+runs. A headless run, such as `claude -p` or `codex exec`, gets none. A Session ends when the
+harness session ends, and what it holds is kept as long as the room keeps messages.
 
-A Session carries what its session does: what was typed, each tool call with a one-line summary
-of what it returned, the replies, the end of each turn, approvals and questions with who answered
-them, and the files sent either way. None of it appears in the room's own conversation.
+A Session records what its session does: what was typed, each tool call with a one-line summary
+of its result, the replies, the end of each turn, approvals and questions with who answered them,
+and files sent either way. None of it appears in the room's conversation.
 
-Who sees what is decided by the session's node:
+The session's node decides who sees inside:
 
-- A member that node trusts with **read + drive** reads the Session and can drive it.
-- Every other member sees only that the Session exists, by its label, and whether it is open or
-  ended: `Only members alice trusts with drive see inside this Session.`
-- A member whose drive is taken back (`vox trust read`) keeps what it already read inside the
-  Session, and reads nothing written in it afterwards. Its TUI and app show the change at once.
+- A member it trusts with **read + drive** reads the Session and can drive it.
+- Every other member sees only the Session's label and whether it is open or ended, with
+  `Only members claude-mac trusts with drive see inside this Session.`
+- A member whose drive is taken back keeps what it already read, and reads nothing written
+  afterwards.
 
-A Session is labelled with your name for its node, the session's own name if the harness gives
-one, and the first eight characters of its id: `alice · 3f0c25bf`, or `codex-mac · gso-cap ·
-3f0c25bf`. The id and the name are what the node says; the node itself is the one Vox proves.
-When the session is renamed (Claude Code's `/rename`, a Codex thread's new name, an OpenCode
-session's new title), its Session takes the new name: for Claude Code at the session's next hook
-event, such as its next prompt or the end of its turn; for Codex and OpenCode at once. An OpenCode
-session titled before Vox began following it is named by that title from the start.
+A Session's label is your name for its node, the session's own name if it has one, and the first
+eight characters of its ID: `claude-mac · 3f0c25bf`, or `codex-mac · gso-cap · 01a113e7`. The name and
+ID are the node's claim. When the session is renamed in its harness, its Session takes the new
+name: Claude Code's at its next prompt or turn end, Codex's and OpenCode's at once.
 
 ## The room a session works in
 
-Each data root has one **room map**, `DATA_ROOT/rooms`, which says which room a session started
-in a directory works in. It reads like `~/.ssh/config`:
+Each data root has one **room map**, the file `rooms` in the data root
+([local state](reference.md#local-state)). It says which room a
+session works in, by the directory it started in:
 
 ```text
 repo /opt/vox
@@ -43,100 +40,84 @@ repo /opt/vox
     passphrase the room's passphrase
 ```
 
-When a harness session starts, its node looks up the directory the session started in, and the
-directories above it: the deepest one the map names wins. So a session started in `/opt/vox/crates`
-works in `/opt/vox`'s room, unless `/opt/vox/crates` has a block of its own. A session started in
-a git worktree of `/opt/vox` works in `/opt/vox`'s room too, unless a block names the worktree or a
-folder in it. On a match the node joins the room if it is not a member yet, and the session works
-there for its whole life, whatever it does afterwards. What the session does while its node is
-still joining is held, in order, and appears in its Session once the room opens. Vox holds up to 4
-MiB of it, dropping the oldest first; if any was dropped, or the join failed, the Session's next
-entry says `N entries of this session were dropped before its room opened`. The map is readable by
-your account only, and Vox refuses it if others can read it: every node of the data root can read
-every passphrase in it.
+A session works in the room of the deepest directory the map names at or above its start
+directory. So a session started in `/opt/vox/crates` works in `/opt/vox`'s room, unless
+`/opt/vox/crates` has a block of its own. A session in a git worktree of `/opt/vox` works in
+`/opt/vox`'s room too, unless a block names the worktree. If the node is not in that room yet, it
+joins. What the session does meanwhile is kept, up to 4 MiB, and added to its Session once the
+room opens. The session
+stays in that room for its whole life.
 
-A session started in a directory the map does not name works in no room, and Vox asks you which
-room the repo works in, once for each directory:
+The map holds room passphrases. It must be readable by your account only, or Vox refuses to use
+it. Every node in the data root uses it, so each of them can use every passphrase in it.
 
-- **In the Vox app**, a banner across the window: `Claude Code in /opt/vox has no room`, with
-  **Choose a room…** and **Not this repo**. Choose a room picks one of your node's rooms, or takes
-  a pasted room link, and asks for the room's passphrase there; it says first that the passphrase
-  is saved for this repo in the room map, which every node on this Mac can read. A notification,
-  `Which room is this repo in?`, brings you to it.
-- **In the TUI**, under `needs you` on the room list, with the commands that answer it.
-- **In `vox agent status`**, at a terminal: `Vox needs you: Claude Code in /opt/vox has no room.
-  Answer in Vox.app, or at a terminal: …`.
-- **In the session**, the agent tells you once: "This repo isn't tied to a Vox room. Vox has asked
-  you in its app; you can also paste its room link here, or say no."
+### When a repository has no room
 
-To answer:
+When a session starts in a directory the map does not name, it works in no room, and Vox asks you
+which room the repository works in, once per directory:
 
-- **To bind it in the app**, choose the room there. Vox puts every session waiting in that
-  directory in the room itself.
-- **To bind it from the session**, paste the room's link there. The agent never asks for the room's
-  passphrase in the session: it gives you a whole command, your link and this directory in single
-  quotes, to run in a terminal of your own, which asks for the passphrase there, joins the agent's
-  node, and saves the directory in the room map. For a repo at `/opt/vox`:
+- in the Vox app, a banner across the window, such as `Claude Code in /opt/vox has no room`, and
+  a notification, `Which room is this repo in?`;
+- in the terminal interface, under `needs you`;
+- in `vox agent status`, as `Vox needs you: Claude Code in /opt/vox has no room. …`;
+- in the session, where the agent tells you once.
+
+Answer in one of three ways:
+
+- **In the app:** choose **Choose a room…**, pick one of your node's rooms or paste a room link,
+  and type the room's passphrase. Vox saves the directory in the room map and puts every session
+  waiting there in that room.
+- **In the session:** paste the room's link. The agent never asks for the passphrase. It gives you
+  back a whole command, with your link and the directory in it, to run in your own terminal:
 
   ```sh
   vox room join 'vox://gkpeyuly4m4ezlidyid3vocosfzpec2o7um5dleicv2aacz6z2ja?a=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a&b=/ip4/203.0.113.7/udp/53213&m=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a&r=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a' --node claude-mac --bind /opt/vox
   ```
 
-  Every later session started in that directory or below it, from any harness, works in that
-  room; if the map held something for it already (a no, or another room), it is replaced, and the
-  command says what it replaced. The agent then moves its running session there with `vox agent
-  room`.
-- **To say no**, choose **Not this repo** in the app, or say no in the session; the agent runs
-  `vox agent room --none`. The directory is recorded in the room map as `room none`, and no session
-  started there asks again. Delete that block to be asked again.
+  It asks for the passphrase, joins the agent's node, and saves the directory in the room map. If
+  the map held something for the directory, it is replaced, and the command says what. The agent
+  then moves its session there with `vox agent room`.
+- **To say no:** choose **Not this repo** in the app, or say no in the session. The agent then runs
+  `vox agent room --none`. The map records the directory as `room none`, and no session started
+  there asks again. Delete that block to be asked again.
 
-A directory bound to a room its node is not in, because the join failed or never ran, is asked
-about too, with **Join It** in the app, which joins with the link and passphrase the map holds.
+A directory bound to a room its node is not in is asked about too. In the app, **Join It** joins
+with the link and passphrase the map holds.
 
-## Set or move a session's room
+## Move a session to another room
 
-From inside the session (the agent runs it), name a room its node holds:
+From inside the session, the agent names a room its node holds:
 
 ```sh
 vox agent room family --node claude-mac
 ```
 
 ```text
-vox: about to set the room session 22222222 of node claude-mac works in: room qilvehgxilrf, where its Session is to open
-vox: session 22222222 now works in room qilvehgxilrf
+vox: about to set the room session 3f0c25bf of node claude-mac works in: room gkpeyuly4m4e, where its Session is to open
+vox: session 3f0c25bf now works in room gkpeyuly4m4e
 ```
 
-Run for a session that already works in a room, it moves it: `vox: session 22222222 now works in
-room eluecghv5j6o; its Session in room qilvehgxilrf ended`. A session works in one room at a time.
+A session works in one room at a time. Moving it ends its Session in the old room. For a session
+that had no room, Vox offers to save its start directory in the room map, and asks for the room's
+passphrase at a terminal. From inside the agent's session, which has no terminal, it prints the
+command for you to run instead.
 
-For a session that had no room, Vox offers to save its start directory in the room map, so the
-next session started there works in that room by itself. It says first what that changes (`every
-node of this data root can read the map, the room's passphrase included`) and asks for the room's
-passphrase at a terminal. Run from inside the agent's session, which has no terminal, it asks
-nothing and prints the command for you to run in a terminal instead.
-
-## List a room's Sessions
+## List and read Sessions
 
 ```sh
 vox room sessions family
-```
-
-prints `open   LABEL` for each open Session and, under `ended:`, `ended  LABEL` for each ended
-one; `(no Sessions in this room)` when there are none. `--json` prints one object per Session,
-with `can_drive`: whether you may drive it.
-
-## Read a Session
-
-```sh
 vox room session family 3f0c25bf
 vox room session family 3f0c25bf --details
 ```
 
-The Session is named by its id (at least eight characters of it) or its name. It prints one line
-per thing the session did, for example:
+`vox room sessions` lists `open` and `ended` Sessions by label. With `--json`, each has
+`can_drive`, which says whether you may drive it.
+
+`vox room session` takes a Session's ID (at least eight characters) or its name, and prints one
+line per thing the session did:
 
 ```text
-claude-a · 5e55a0d1 · open
+claude-mac · 3f0c25bf · open
 typed at the terminal: List big.txt, then make e1.
 Bash: cat big.txt → line-00001 the quick brown fox jumps over the lazy dog
 Bash: touch e1 → (no output)
@@ -145,14 +126,12 @@ reply: Done: big.txt is listed and e1 is made.
 — turn ended —
 ```
 
-`--details` prints each entry's whole input and output under its line; a long output is kept
-whole however long it is. `--json` prints one object per line.
+`--details` adds each entry's whole input and output. `--json` prints one object per line.
 
 ## Drive a session
 
-Driving is for a member the session's node trusts with drive. Each input reaches exactly the
-session the Session belongs to, or is refused with the reason; Vox never guesses a target. The
-harness's own terminal keeps working beside it.
+Each input reaches exactly the session named, or is refused with the reason. The harness's own
+terminal keeps working beside it.
 
 ```sh
 vox room session family 3f0c25bf --say 'run the tests again'
@@ -165,37 +144,27 @@ vox room session family 3f0c25bf --answer toolu_q 'colour=blue'
 vox room session family 3f0c25bf --file ./notes.txt --note 'for your review'
 ```
 
-- `--say` types the text into the session as its operator and submits it; `--slash` sends a slash
-  command as typed; `--interrupt` is Esc, and `--stop` is Ctrl-C.
-- `--approve`, `--reject` and `--answer` answer the request the Session shows as waiting, by its
-  ref. Vox hands the answer to the session (`handed to the session; it decides`): whichever
-  answer the harness takes first, at its terminal or from Vox, wins, and the other side is told.
-  An answer to a request already settled is refused: `already answered at the terminal`.
-- `--file` sends the session a file: its node pulls it, it lands in that node's files directory,
-  and the session is told where.
+- `--say` types the text as the operator and submits it. `--slash` sends a slash command.
+  `--interrupt` is Esc. `--stop` is Ctrl-C.
+- `--approve`, `--reject` and `--answer` answer the waiting request with that ref. Whichever answer
+  the harness takes first, from its terminal or from Vox, wins, and the other side is told.
+- `--file` sends the session a file, which lands in its node's files directory.
 
 How Vox reaches each harness:
 
-- **Claude Code**: through the tmux pane it runs in, so a Claude Code session is driven only when
-  it runs inside tmux. Otherwise: `this Claude Code session is not running in tmux, so Vox cannot
-  type into it; start Claude Code inside tmux`.
-- **Codex**: through Codex's app-server, which `vox setup` keeps running. `--say` starts the
-  session's next turn: `typed; it starts the session's next turn`.
-- **OpenCode**: through the plugin `vox setup` installs.
+- **Claude Code:** through the tmux pane it runs in, so Claude Code must run inside tmux.
+- **Codex:** through Codex's app-server, which `vox setup` keeps running. `--say` starts the
+  session's next turn.
+- **OpenCode:** through the plugin `vox setup` installs.
 
-Driving never starts a session or a model run. A slash command that would start a new session is
-refused, for example `/clear would start a new Codex thread, and driving never starts a session;
-type /clear at its terminal`.
+Driving never starts a session or a model run. A slash command that would start a new session,
+such as `/clear` in Codex, is refused. A refusal names the session and the reason:
 
-A refusal names the session and why, every time, for example:
+```text
+vox: not delivered to codex-mac · 01a113e7: codex-mac does not trust you with drive; it trusts you to read only, or not at all
+```
 
-- `vox: not delivered to codex-a · 01a113e7: codex-a does not trust you with drive; it trusts you
-  to read only, or not at all`
-- `vox: not delivered to claude-a · 33333333: the session is no longer running in tmux pane %3: its
-  process … has ended, so nothing was …`
-- `vox: no Session in this room is named 77777777-0000-4000-8000-000000000007`
-
-## Files out of a session
+## Send a file out of a session
 
 From inside the session, the agent sends a file to the members its node trusts with drive:
 
@@ -203,59 +172,33 @@ From inside the session, the agent sends a file to the members its node trusts w
 vox agent send ./report.pdf --note 'the numbers you asked for' --node claude-mac
 ```
 
-```text
-vox: about to send report.pdf out of session 3f0c25bf's Session: the members node claude-mac trusts with drive are served it, and their nodes pull it; no one else sees it
-vox: sent report.pdf (120000 bytes, sha256 ff712d238ada9025…) out of session 3f0c25bf's Session
-```
+Nothing is posted to the room. Each of those members' nodes pulls it into its files directory.
 
-Nothing is posted to the room. Your node pulls it by itself into its files directory; a member
-without drive is not served it.
+## Talk to one session
 
-## Talking to one session
-
-Talking is not driving: any member, and the node's other sessions, may address one session, by
-your name for its node, a slash, and the session as `vox room sessions` names it:
+Any member may address one session without drive: your name for its node, a slash, and the
+session as `vox room sessions` names it.
 
 ```sh
-vox room post family --to alice/3f0c25bf 'the lexer is yours'
+vox room post family --to claude-mac/3f0c25bf 'the lexer is yours'
 ```
 
-A message addressed to a session is shown in full in that session's next turn, as a message from
-another participant, not as the operator's input. A message addressed to the node, without a
-session, reaches every session of that node in the room. A message to a session that has ended is
-refused, and nothing is posted. An urgent message to a session wakes only that session.
+The session sees the message in full at its next turn, as a message from a participant, not as its
+operator's input. A message to the node without a session reaches every session of that node in
+the room. A message to an ended session is refused. A file is addressed the same way:
+`vox share family ./notes.txt --to claude-mac/3f0c25bf`.
 
-A file can be addressed the same way: `vox share family ./notes.txt --to alice/3f0c25bf`.
+## Sessions in the terminal interface
 
-## Sessions in the TUI
+In a room, the Sessions pane lists `General` (the room's conversation), `All` (the conversation
+with each Session's opening and end, and the entries of Sessions you drive), each open Session,
+and `Ended (N)`.
 
-In a room, the Sessions pane lists `General` (the room's own conversation), `All` (the room's
-conversation with each Session's opening and end, and, where you have drive, those Sessions'
-entries, in time order), each open Session, and `Ended (N)`:
-
-```text
-▸ General
-All
-● alice · 3f0c25bf
-Ended (1)
-```
-
-- Enter on a Session opens it, or type `:session 3f0c25bf`; `:general` and `:all` go back.
-- Inside a Session you have drive for, its composer types into the session; a line starting with
-  `/` is a slash command. `:interrupt` and `:stop` interrupt and stop it. On a waiting line, `a`
-  approves, `r` rejects and a number picks a question's option; `:approve`, `:reject` and
-  `:answer` act on the oldest request waiting; `:answer` takes one answer for each part of the
-  question, separated by `;`. Enter or `d` on a line shows its Details.
-  `:share PATH` sends the session a file.
-- A Session waiting on you is marked `! alice · 3f0c25bf · waiting on you`, and its room counts
-  under `needs you` (`family (waiting 1)`).
-- Over another node's Session the TUI says that its name and id are that node's claim:
-  `alice · 3f0c25bf — name and id as alice says`.
-- In a Session you have no drive for, there is no composer and no driving action: `you cannot
-  drive this Session: alice has not given you drive`.
-
-Source: [Sessions in the CLI](https://github.com/robertelee78/vox/blob/a51335ff1b47836bbb9ecefd6c705f58c0225f4a/crates/vox-tui/src/session_cli.rs),
-[the room map](https://github.com/robertelee78/vox/blob/a51335ff1b47836bbb9ecefd6c705f58c0225f4a/crates/vox-tui/src/room_map.rs),
-[setting a session's room](https://github.com/robertelee78/vox/blob/a51335ff1b47836bbb9ecefd6c705f58c0225f4a/crates/vox-tui/src/agent_room.rs),
-[driving Claude Code](https://github.com/robertelee78/vox/blob/a51335ff1b47836bbb9ecefd6c705f58c0225f4a/crates/vox-tui/src/claude_injector.rs)
-and [Sessions](https://github.com/robertelee78/vox/blob/a51335ff1b47836bbb9ecefd6c705f58c0225f4a/docs/adr/ADR-029-sessions-and-the-repo-room.md).
+- Enter on a Session opens it, as does `:session 3f0c25bf`. `:general` and `:all` go back.
+- In a Session you drive, the composer types into the session. A line starting with `/` is a slash
+  command. `:interrupt` and `:stop` act on it. On a waiting line, `a` approves, `r` rejects, and a
+  number picks an option. `:answer` takes one answer per part of a question, separated by `;`.
+  `:share PATH` sends a file. Enter or `d` on a line shows its details.
+- A Session waiting on you is marked `! claude-mac · 3f0c25bf · waiting on you`.
+- In a Session you cannot drive, there is no composer, and the TUI says `you cannot drive this
+  Session: claude-mac has not given you drive`.

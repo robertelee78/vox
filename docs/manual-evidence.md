@@ -92,11 +92,14 @@ same-host, so no NAT or anchor path was exercised.
 **Every command in a `sh` block is whole, parses and is valid zsh.** Each block was given to
 `zsh -f -n -c` (syntax only) and searched for a placeholder (`<…>`, `ROOM_ID`, `FULL_FINGERPRINT`,
 `ROOM_LINK`, `[--…`); each `vox …` line in one was run as `vox <its words> --help`. Result: 128
-commands, 0 refused, no syntax error, no placeholder. Mutant: `vox room roster family` in rooms.md
+commands, 0 refused, no syntax error, no placeholder; after the rewrite for a first-time reader
+(no version labels or release history; a single-path tutorial; 33,564 words to 19,510), 105
+commands, 0 refused. Mutant: `vox room roster family` in rooms.md
 changed to `vox room rooster family` was caught: `REJECTED rooms.md: vox room rooster family`,
 `error: unrecognized subcommand 'rooster'`. The inline `` `vox …` `` spans were checked the same
 way: 223, the 3 refused each an output quote or an option named alone (`vox setup: Claude Code is
-connected…`, `vox daemon: deleted the port mapping…`, `vox room post --to`). The check is a
+connected…`, `vox daemon: deleted the port mapping…`, `vox room post --to`); after the rewrite,
+182, the 1 refused a shell redirect (`vox room link family > link.txt`). The check is a
 spike, run and reported here, not committed.
 
 | Manual claim | Where and how | Observed |
