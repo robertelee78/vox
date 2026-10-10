@@ -286,6 +286,8 @@ pub enum Showing {
     All,
     /// One Session, by its node and the harness's session id.
     Session(Digest32, String),
+    /// The room's messages tagged so (#636): a thread of one task, project or milestone.
+    Tag(String),
 }
 
 /// One row of a room's Sessions pane, top to bottom (ADR-029 CL-2).
@@ -1242,6 +1244,14 @@ impl UiState {
                 let Some(timeline) = vm.active.as_ref().map(|c| &c.timeline) else {
                     return;
                 };
+                // In a tag's thread, only its messages are there to select (#636).
+                let timeline: Vec<&crate::viewmodel::MessageView> = timeline
+                    .iter()
+                    .filter(|m| match &self.showing {
+                        Showing::Tag(tag) => m.tags.iter().any(|t| t == tag),
+                        _ => true,
+                    })
+                    .collect();
                 let at = self
                     .selected_message
                     .and_then(|h| timeline.iter().position(|m| m.entry_hash == h));
@@ -1431,7 +1441,7 @@ impl UiState {
         self.replying = None;
         let session = match &showing {
             Showing::Session(node, id) => Some((*node, id.clone())),
-            Showing::General | Showing::All => None,
+            Showing::General | Showing::All | Showing::Tag(_) => None,
         };
         self.showing = showing;
         // The core reads the Session's entries while it is shown (SC-1).
@@ -1821,6 +1831,20 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
     match verb {
         "general" => return Some(Parsed::Show(Showing::General)),
         "all" => return Some(Parsed::Show(Showing::All)),
+        // A thread of the room's messages by tag (#636); `:general` returns to the room.
+        "tag" if rest.is_empty() => {
+            return Some(Parsed::Refused(
+                ":tag takes a tag as a message shows it: task:#636, project:vox, milestone:v1"
+                    .into(),
+            ))
+        }
+        "tag" if !vox_agentcomms::envelope::is_valid_tag(rest) => {
+            return Some(Parsed::Refused(format!(
+                "{} is not a tag: use task:, project: or milestone: and a value",
+                vox_agentcomms::envelope::shown(rest, vox_agentcomms::envelope::SHOWN_NAME)
+            )))
+        }
+        "tag" => return Some(Parsed::Show(Showing::Tag(rest.to_owned()))),
         "session" => {
             let sessions = vm.active.as_ref().map_or(&[][..], |c| &c.sessions[..]);
             return Some(match find_session(sessions, rest) {

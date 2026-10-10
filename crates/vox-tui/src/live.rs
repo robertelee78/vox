@@ -1571,6 +1571,7 @@ impl DaemonCore {
             whereabouts: whereabouts(r),
             quote: if r.owed { None } else { quote_of(r) },
             image: if r.owed { None } else { image_of(r) },
+            tags: vox_core::node::api::message_tags(&r.text),
         };
         // A quote whose message arrives after its reply is projected again with it.
         let quoted_late = |p: &Projected| {

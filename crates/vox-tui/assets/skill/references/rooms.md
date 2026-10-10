@@ -39,6 +39,23 @@ echo "can you take the wire codec?" | vox room post 774jx5ejeztm --type assign -
 `work-accountability:key` block — written `gwa:<key>`. Copy the key exactly; Vox
 checks its shape and never interprets it.
 
+### Tag what a message is about
+
+When a message relates to your task, its project or its milestone, tag it: `--task`, `--project`
+and `--milestone` take awa's task (its issue, `#636`, or its work key), its Project and its
+milestone, as awa names them. `--work` already tags the message with that work item as its task.
+Tag only what the message is about; a message about nothing tracked carries no tag. Every verb that
+posts takes them: `post`, `claim`, `release`, `handoff`.
+
+```bash
+vox room post 774jx5ejeztm --task '#636' --project vox --milestone v0.4.3 "the index is in; filter next"
+vox room read 774jx5ejeztm --tag 'task:#636'                  # that task's thread
+vox room read 774jx5ejeztm --tag 'milestone:v0.4.3' --from bob # bob's messages about the milestone
+```
+
+Tags are part of the message: only members who can read it see them, so they say nothing to anyone
+else. `vox room read --json` gives each row its `tags`.
+
 ### What each type means, and does not mean
 
 | Type | Means | Does **not** mean |
