@@ -45,6 +45,20 @@
 //! Claude Code, the first harness run; OpenCode 1.18 does not refuse a name that differs from
 //! its folder, it lists the skill under that name); the pack put elsewhere for Codex alone (red
 //! at Codex) and for OpenCode alone (red at OpenCode); the ask not given (red at Claude Code).
+//!
+//! **At the start of a session, each harness finds its node, then its room, from the skill
+//! alone** (#666, the same optional proof): no harness is wired to Vox at first, so there is no
+//! hook, only the pack. The stand-in plays a model doing what the pack's description says
+//! (`model_standin.py --run-status`): it runs `vox agent status --harness <harness>` through the
+//! harness's own shell tool, and repeats what it printed. Each harness's first session prints
+//! that it has no node and the `vox agent connect <harness> --node <name>` command. The
+//! operator's command is then run, with the passphrase from a file (`--passphrase-file`): it
+//! makes the node, wires the hook, attaches the node. The next session is given the RB-5 ask by
+//! the hook (above), and prints the status saying the node is attached and the repo is tied to
+//! no room, with the `vox room join <link> --node <node> --bind <repo>` command. Mutants, each
+//! red as PRODUCT at Claude Code: `vox agent status` reporting nothing missing for a harness with
+//! no node; it leaving out the room ask; the pack's description without the status instruction
+//! (the stand-in, like a model reading it, then runs nothing).
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -654,36 +668,35 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
         )
     };
 
-    // ---- (1) the agent's node (`default`) and its daemon ----
+    // ---- (1) the account's daemon, with no node: no harness is wired to Vox yet ----
     let pass = root.join("identity.pass");
     std::fs::write(&pass, "identity passphrase").expect("APPARATUS: the passphrase file");
     let pass_arg = pass.to_str().expect("APPARATUS: a UTF-8 path");
-    let (ok, _, err) = vox(&["id", "--identity-passphrase-file", pass_arg]);
-    assert!(ok, "PRODUCT (staging): vox id failed: {err}");
     let daemon_err = root.join("daemon.err");
     let mut c = Command::new(&vox_bin);
     env(&mut c);
+    let daemon_log = std::fs::File::create(&daemon_err).expect("APPARATUS: the daemon's log file");
     let daemon = c
-        .args([
-            "daemon",
-            "--listen",
-            "127.0.0.1:0",
-            "--passphrase-file",
-            pass_arg,
-        ])
+        .args(["daemon", "--listen", "127.0.0.1:0"])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(
-            std::fs::File::create(&daemon_err).expect("APPARATUS: the daemon's stderr file"),
+        .stdout(Stdio::from(
+            daemon_log
+                .try_clone()
+                .expect("APPARATUS: the daemon's log file"),
         ))
+        .stderr(Stdio::from(daemon_log))
         .spawn()
         .expect("APPARATUS: cannot start vox daemon");
     let mut stop = Stop(vec![daemon]);
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !vox(&["room", "list"]).0 {
+    while !std::fs::read_to_string(&daemon_err)
+        .unwrap_or_default()
+        .contains("control socket")
+    {
         assert!(
             Instant::now() < deadline,
-            "PRODUCT (staging): the daemon never answered `vox room list` in 60 s; it said:\n{}",
+            "PRODUCT (staging): the daemon never said it listens on its control socket in 60 s; \
+             it said:\n{}",
             std::fs::read_to_string(&daemon_err).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(250));
@@ -702,17 +715,24 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
         .chars()
         .take(60)
         .collect();
-    let plugin = |harness: &str, to: &Path| {
-        let (ok, out, err) = vox(&["agent", "plugin", harness, "--node", "default"]);
+    // What the operator runs when the session says so: the node made, the harness wired to it,
+    // the node attached. The passphrase comes from a file here; at a terminal it is typed.
+    let connect = |harness: &str, node: &str| {
+        let (ok, out, err) = vox(&[
+            "agent",
+            "connect",
+            harness,
+            "--node",
+            node,
+            "--passphrase-file",
+            pass_arg,
+        ]);
+        println!("[proof] vox agent connect {harness} --node {node}:\n{out}{err}");
         assert!(
             ok,
-            "PRODUCT: `vox agent plugin {harness} --node default` failed: {err}"
+            "PRODUCT: `vox agent connect {harness} --node {node}` failed: {out}{err}"
         );
-        std::fs::write(to, out).unwrap_or_else(|e| panic!("APPARATUS: cannot write {to:?}: {e}"));
     };
-    plugin("claude", &home.join(".claude/settings.json"));
-    plugin("codex", &home.join(".codex/hooks.json"));
-    plugin("opencode", &home.join(".config/opencode/plugin/vox.js"));
 
     // ---- (3) the stand-in model, and the profile every harness runs under ----
     let port_file = root.join("model.port");
@@ -724,6 +744,7 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
         ))
         .arg(&port_file)
         .arg(&log)
+        .arg("--run-status")
         .env_clear()
         .env("PATH", oc_sandbox::SANDBOX_PATH)
         .stdin(Stdio::null())
@@ -765,7 +786,8 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
                 "options": { "baseURL": format!("{url}/v1"), "apiKey": "made-up-key-for-a-stand-in" },
                 "models": { "stub-model": { "name": "stub-model" } }
             }},
-            "model": "standin/stub-model"
+            "model": "standin/stub-model",
+            "permission": { "bash": "allow" }
         })
         .to_string(),
     )
@@ -783,7 +805,7 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
     // ---- (4) one turn in each harness, in the repo the room map does not name ----
     let sent = || std::fs::read_to_string(&log).unwrap_or_default();
     let turn =
-        |name: &str, program: &Path, args: &[&str], extra: &[(&str, &str)]| -> String {
+        |name: &str, program: &Path, args: &[&str], extra: &[(&str, &str)]| -> (String, String) {
             let before = sent().lines().count();
             let mut c = Command::new("/usr/bin/sandbox-exec");
             env(&mut c);
@@ -813,7 +835,7 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
             }
             canary.check(&said, &format!("{name}'s output"));
             canary.check(&text, &format!("what {name} sent its model"));
-            std::fs::write(root.join(format!("{name}.out")), &said)
+            std::fs::write(root.join(format!("{name}-{before}.out")), &said)
                 .unwrap_or_else(|e| panic!("APPARATUS: cannot keep {name}'s output: {e}"));
             println!(
                 "[proof] {name}: exit {:?} after {:.1}s; {} requests to the stand-in model",
@@ -829,12 +851,14 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
             lines.len(),
             said.chars().rev().take(3000).collect::<String>().chars().rev().collect::<String>()
         );
-            text
+            (text, said)
         };
-    let bind = format!(
-        "vox room join <link> --node default --bind {}",
-        repo.display()
-    );
+    let bind = |node: &str| {
+        format!(
+            "vox room join <link> --node {node} --bind {}",
+            repo.display()
+        )
+    };
     let vox_lines = |text: &str| -> String {
         text.lines()
             .filter(|l| l.to_ascii_lowercase().contains("vox"))
@@ -842,7 +866,7 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let check = |name: &str, text: &str, listed: &[String]| {
+    let loaded = |name: &str, text: &str, listed: &[String]| {
         assert!(
             listed.iter().all(|l| text.contains(l.as_str())),
             "PRODUCT: {name} did not load the installed pack: what it sent its model lists no skill \
@@ -850,6 +874,25 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
              naming vox were:\n{}",
             vox_lines(text)
         );
+    };
+    // A session with no node: the status it ran, repeated, says so and names the command.
+    let no_node = |name: &str, key: &str, said: &str| {
+        let want = [
+            "VOX STATUS SAID:".to_owned(),
+            format!("{name} has no node on this machine"),
+            format!("vox agent connect {key} --node {key}-"),
+        ];
+        assert!(
+            want.iter().all(|w| said.contains(w.as_str())),
+            "PRODUCT: {name}'s first session, with no node, did not say so from the skill alone: \
+             `vox agent status --harness {key}`, run as the pack says, was to print {want:?}; the \
+             session printed:\n{said}"
+        );
+        println!("[proof] {name}: with no node, the session said so and named `vox agent connect`");
+    };
+    // A session with its node attached and no room: the hook's ask, and the status's.
+    let no_room = |name: &str, node: &str, text: &str, said: &str| {
+        let bind = bind(node);
         assert!(
             text.contains(ASK) && text.contains(&bind),
             "PRODUCT: {name}'s first turn in a directory the room map does not name was not given \
@@ -857,32 +900,50 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
              vox were:\n{}",
             vox_lines(text)
         );
+        let want = [
+            "VOX STATUS SAID:".to_owned(),
+            format!("{name} is node {node}, attached."),
+            ASK.to_owned(),
+            bind.clone(),
+        ];
+        assert!(
+            want.iter().all(|w| said.contains(w.as_str())),
+            "PRODUCT: {name}'s session with node {node} attached and no room did not say so: \
+             `vox agent status`, run as the pack says, was to print {want:?}; the session \
+             printed:\n{said}"
+        );
         println!(
-            "[proof] {name}: lists `vox-agent-comms` and was given the RB-5 ask with `{bind}`"
+            "[proof] {name}: lists `vox-agent-comms`, and was given the RB-5 ask with `{bind}` by \
+             the hook and by the status"
         );
     };
     let skill_line = format!("- vox-agent-comms: {description}");
 
-    let sent_claude = turn(
-        "Claude Code",
-        &claude,
-        &["-p", "--model", "claude-sonnet-4-5", "hello"],
-        &[
-            ("ANTHROPIC_BASE_URL", url.as_str()),
-            ("ANTHROPIC_API_KEY", "made-up-key-for-a-stand-in"),
-            (
-                "CLAUDE_CODE_TMPDIR",
-                t.to_str().expect("APPARATUS: a UTF-8 path"),
-            ),
-            ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
-            ("DISABLE_AUTOUPDATER", "1"),
-        ],
-    );
-    check(
-        "Claude Code",
-        &sent_claude,
-        std::slice::from_ref(&skill_line),
-    );
+    let claude_args = [
+        "-p",
+        "--model",
+        "claude-sonnet-4-5",
+        // `=`: the flag takes several values, and would take the prompt as one.
+        "--allowedTools=Bash(vox agent status:*)",
+        "hello",
+    ];
+    let claude_env = [
+        ("ANTHROPIC_BASE_URL", url.as_str()),
+        ("ANTHROPIC_API_KEY", "made-up-key-for-a-stand-in"),
+        (
+            "CLAUDE_CODE_TMPDIR",
+            t.to_str().expect("APPARATUS: a UTF-8 path"),
+        ),
+        ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+        ("DISABLE_AUTOUPDATER", "1"),
+    ];
+    let (sent, said) = turn("Claude Code", &claude, &claude_args, &claude_env);
+    loaded("Claude Code", &sent, std::slice::from_ref(&skill_line));
+    no_node("Claude Code", "claude", &said);
+    connect("claude", "claude-proof");
+    let (sent, said) = turn("Claude Code", &claude, &claude_args, &claude_env);
+    loaded("Claude Code", &sent, std::slice::from_ref(&skill_line));
+    no_room("Claude Code", "claude-proof", &sent, &said);
 
     let codex_home = home.join(".codex");
     let codex_env = [
@@ -892,6 +953,16 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
         ),
         ("STANDIN_API_KEY", "made-up-key-for-a-stand-in"),
     ];
+    let codex_args = [
+        "exec",
+        "--skip-git-repo-check",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "hello",
+    ];
+    let (sent, said) = turn("Codex", &codex, &codex_args, &codex_env);
+    loaded("Codex", &sent, std::slice::from_ref(&skill_line));
+    no_node("Codex", "codex", &said);
+    connect("codex", "codex-proof");
     // Codex runs a hook only once it is trusted; `vox agent trust codex` is how an operator
     // trusts Vox's, through Codex's own app-server, in the same sandbox.
     let mut c = Command::new("/usr/bin/sandbox-exec");
@@ -912,40 +983,36 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
         String::from_utf8_lossy(&trusted.stdout),
         String::from_utf8_lossy(&trusted.stderr)
     );
-    let sent_codex = turn(
-        "Codex",
-        &codex,
-        &["exec", "--skip-git-repo-check", "hello"],
-        &codex_env,
-    );
-    check("Codex", &sent_codex, std::slice::from_ref(&skill_line));
+    let (sent, said) = turn("Codex", &codex, &codex_args, &codex_env);
+    loaded("Codex", &sent, std::slice::from_ref(&skill_line));
+    no_room("Codex", "codex-proof", &sent, &said);
 
     let xdg = |d: &str| root.join("xdg").join(d).display().to_string();
     let config = home.join(".config").display().to_string();
-    let sent_opencode = turn(
-        "OpenCode",
-        &opencode,
-        &["run", "--model", "standin/stub-model", "hello"],
-        &[
-            ("XDG_CONFIG_HOME", config.as_str()),
-            ("XDG_DATA_HOME", xdg("data").as_str()),
-            ("XDG_STATE_HOME", xdg("state").as_str()),
-            ("XDG_CACHE_HOME", xdg("cache").as_str()),
-            ("OPENCODE_DISABLE_MODELS_FETCH", "1"),
-            ("OPENCODE_DISABLE_AUTOUPDATE", "1"),
-            ("OPENCODE_DISABLE_LSP_DOWNLOAD", "1"),
-            // Its Claude Code compatibility would read ~/.claude/skills, where Claude Code's
-            // copy of the pack could stand in for OpenCode's own.
-            ("OPENCODE_DISABLE_CLAUDE_CODE", "1"),
-        ],
-    );
-    check(
-        "OpenCode",
-        &sent_opencode,
-        &[
-            "<name>vox-agent-comms</name>".to_owned(),
-            format!("<description>{description}"),
-        ],
-    );
+    let (xdg_data, xdg_state, xdg_cache) = (xdg("data"), xdg("state"), xdg("cache"));
+    let opencode_env = [
+        ("XDG_CONFIG_HOME", config.as_str()),
+        ("XDG_DATA_HOME", xdg_data.as_str()),
+        ("XDG_STATE_HOME", xdg_state.as_str()),
+        ("XDG_CACHE_HOME", xdg_cache.as_str()),
+        ("OPENCODE_DISABLE_MODELS_FETCH", "1"),
+        ("OPENCODE_DISABLE_AUTOUPDATE", "1"),
+        ("OPENCODE_DISABLE_LSP_DOWNLOAD", "1"),
+        // Its Claude Code compatibility would read ~/.claude/skills, where Claude Code's
+        // copy of the pack could stand in for OpenCode's own.
+        ("OPENCODE_DISABLE_CLAUDE_CODE", "1"),
+    ];
+    let opencode_args = ["run", "--model", "standin/stub-model", "hello"];
+    let opencode_listed = [
+        "<name>vox-agent-comms</name>".to_owned(),
+        format!("<description>{description}"),
+    ];
+    let (sent, said) = turn("OpenCode", &opencode, &opencode_args, &opencode_env);
+    loaded("OpenCode", &sent, &opencode_listed);
+    no_node("OpenCode", "opencode", &said);
+    connect("opencode", "opencode-proof");
+    let (sent, said) = turn("OpenCode", &opencode, &opencode_args, &opencode_env);
+    loaded("OpenCode", &sent, &opencode_listed);
+    no_room("OpenCode", "opencode-proof", &sent, &said);
     drop(stop);
 }

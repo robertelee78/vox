@@ -24,16 +24,17 @@ use crate::app::AppError;
 use crate::client::NodeArgs;
 
 /// A harness `vox setup` knows how to wire.
-struct Harness {
+pub(crate) struct Harness {
     /// How `vox agent plugin` and `vox agent skill` name it.
-    key: &'static str,
+    pub(crate) key: &'static str,
     /// How a person names it.
-    name: &'static str,
+    pub(crate) name: &'static str,
     /// Its program, looked for on `PATH`.
-    program: &'static str,
+    pub(crate) program: &'static str,
 }
 
-const HARNESSES: [Harness; 3] = [
+/// The harnesses `vox setup` and `vox agent connect` wire.
+pub(crate) const HARNESSES: [Harness; 3] = [
     Harness {
         key: "claude",
         name: "Claude Code",
@@ -217,8 +218,23 @@ pub fn run(args: &NodeArgs) -> Result<(), AppError> {
 
 /// Make node `name` with a passphrase typed twice, which may not be empty (ADR-028 K-11): its
 /// fingerprint, in base32.
-fn create(account: &vox_core::node::paths::Account, name: &NodeName) -> Result<String, AppError> {
-    let passphrase = loop {
+pub(crate) fn create(
+    account: &vox_core::node::paths::Account,
+    name: &NodeName,
+) -> Result<String, AppError> {
+    let passphrase = ask_new_passphrase(name)?;
+    let paths = account.node_paths(name)?;
+    let fp = crate::client::create_identity(&paths, &passphrase)?;
+    println!("vox setup: created node {name}");
+    Ok(vox_core::node::link::b32_encode(&fp))
+}
+
+/// A new node's passphrase, typed twice at the terminal, which may not be empty (ADR-028 K-11).
+///
+/// # Errors
+/// The terminal closed.
+pub(crate) fn ask_new_passphrase(name: &NodeName) -> Result<zeroize::Zeroizing<String>, AppError> {
+    loop {
         let first = zeroize::Zeroizing::new(crate::tunnel_cli::prompt_passphrase(&format!(
             "passphrase for {name}"
         ))?);
@@ -228,14 +244,10 @@ fn create(account: &vox_core::node::paths::Account, name: &NodeName) -> Result<S
         }
         let again = zeroize::Zeroizing::new(crate::tunnel_cli::prompt_passphrase("again")?);
         if *first == *again {
-            break first;
+            return Ok(first);
         }
         println!("  the two differ; type it again");
-    };
-    let paths = account.node_paths(name)?;
-    let fp = crate::client::create_identity(&paths, &passphrase)?;
-    println!("vox setup: created node {name}");
-    Ok(vox_core::node::link::b32_encode(&fp))
+    }
 }
 
 /// A node's name, typed after `prompt`: Enter takes `suggested`, `skip` or `n` takes none. A
@@ -295,7 +307,7 @@ fn line(prompt: &str) -> Result<String, AppError> {
 }
 
 /// `program` as an executable file in a directory of `PATH`.
-fn on_path(program: &str) -> Option<PathBuf> {
+pub(crate) fn on_path(program: &str) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path)
@@ -329,7 +341,7 @@ fn node_word(s: &str) -> String {
 }
 
 /// This machine's short host name, as a node name holds it.
-fn host_name() -> String {
+pub(crate) fn host_name() -> String {
     let out = std::process::Command::new("hostname")
         .arg("-s")
         .output()
@@ -368,14 +380,14 @@ fn os_name() -> String {
 }
 
 /// Where a harness reads its settings and skills, and what is written there.
-struct Wiring {
+pub(crate) struct Wiring {
     key: &'static str,
     /// The harness's configuration directory.
-    dir: PathBuf,
+    pub(crate) dir: PathBuf,
 }
 
 impl Wiring {
-    fn of(key: &'static str) -> Result<Self, AppError> {
+    pub(crate) fn of(key: &'static str) -> Result<Self, AppError> {
         let home = || {
             std::env::var_os("HOME")
                 .filter(|h| !h.is_empty())
@@ -398,8 +410,41 @@ impl Wiring {
         })
     }
 
+    /// The node this harness's Vox hook names, as its settings hold it now: `None` when it has
+    /// no Vox hook (Claude Code's and Codex's entries that run `vox agent hook --node <name>`,
+    /// OpenCode's plugin with its node written in).
+    pub(crate) fn wired_node(&self) -> Option<String> {
+        let text = std::fs::read_to_string(self.hook_file()).ok()?;
+        if self.key == "opencode" {
+            return text.lines().find_map(|l| {
+                l.trim()
+                    .strip_prefix("const VOX_NODE = \"")?
+                    .strip_suffix('"')
+                    .map(str::to_owned)
+            });
+        }
+        fn walk(v: &serde_json::Value, out: &mut Option<String>) {
+            match v {
+                serde_json::Value::String(c) if out.is_none() && runs_vox_hook(c) => {
+                    let t: Vec<&str> = c.split_whitespace().collect();
+                    *out = t
+                        .windows(2)
+                        .find(|w| w[0] == "--node")
+                        .map(|w| w[1].trim_matches(['"', '\'']).to_owned());
+                }
+                serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+                serde_json::Value::Object(o) => o.values().for_each(|x| walk(x, out)),
+                _ => {}
+            }
+        }
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let mut found = None;
+        walk(&v["hooks"], &mut found);
+        found
+    }
+
     /// The file the hook goes in.
-    fn hook_file(&self) -> PathBuf {
+    pub(crate) fn hook_file(&self) -> PathBuf {
         match self.key {
             "claude" => self.dir.join("settings.json"),
             "codex" => self.dir.join("hooks.json"),
@@ -412,7 +457,7 @@ impl Wiring {
     }
 
     /// What installing changes, said before it is done (ADR-028 E-5).
-    fn effects(&self, node: &NodeName) -> Vec<String> {
+    pub(crate) fn effects(&self, node: &NodeName) -> Vec<String> {
         let hook = match self.key {
             "claude" => format!(
                 "its hook, `vox agent hook --node {node}`, is to go in {}, with VOX_NODE={node} \
@@ -441,7 +486,7 @@ impl Wiring {
     }
 
     /// Install the hook and the skill for `node`: what was written, as a person reads it.
-    fn install(&self, node: &NodeName) -> Result<Vec<String>, AppError> {
+    pub(crate) fn install(&self, node: &NodeName) -> Result<Vec<String>, AppError> {
         let hook = self.hook_file();
         match self.key {
             "claude" => merge_hooks(&hook, &crate::agent_hook::claude_settings(node))?,

@@ -52,6 +52,28 @@ attach each in a terminal, `vox node attach claude-mac`, as below. Then map the 
 agent works in to their rooms, so each session it starts works in the right one (see
 [the room a session works in](sessions.md#the-room-a-session-works-in)).
 
+## A session in a harness that has no node yet
+
+You need not run `vox setup` first. Installing or updating Vox puts the agent skill in every
+harness here, and the skill has each session start by checking:
+
+```sh
+vox agent status --harness claude     # codex, opencode
+```
+
+It only reads. It says the first thing this harness needs before the session works in a room,
+and the one command for it, which the session repeats to you to run in a terminal of your own
+(each asks for a passphrase there, never in the session):
+
+- **No node for this harness**: choose a name, and run `vox agent connect claude --node
+  claude-mac`. It says what it is to do, makes the node (you type its passphrase twice), wires
+  Claude Code's hook to it in its settings with the skill beside it, and attaches it. For Codex,
+  run `vox agent trust codex` after it. Then start a new session.
+- **Its node is not attached**: `vox node attach claude-mac`. Then start a new session.
+- **This repo is tied to no room**: the session asks for the room's link, and gives you the
+  `vox room join <link> --node claude-mac --bind <this repo>` command to run (see [the room a
+  session works in](sessions.md#the-room-a-session-works-in)).
+
 The rest of this chapter is what setup does for you, done by hand, and what to check after.
 
 ## Give the agent its own node and room
