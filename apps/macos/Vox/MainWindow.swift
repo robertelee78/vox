@@ -1983,10 +1983,11 @@ private struct Inspector: View {
                                 .padding(.leading, Space.s20)
                                 .accessibilityIdentifier("member-capability-\(member.name)")
                         }
-                        // Why this node's key for it waits (ADR-030 D-5, W-4): a member on an
-                        // older Vox reads nothing new from this node until it updates.
-                        if let why = member.keyWaits {
-                            Text("Your key for it waits: \(why)").secondaryText()
+                        // What is said of it about this node's key (ADR-030 D-5, W-4): that the key
+                        // waits, and why, or that it runs an older Vox and reads without
+                        // post-compromise protection until it updates.
+                        if let said = member.keyWaits {
+                            Text("\(member.name) \(said)").secondaryText()
                                 .fixedSize(horizontal: false, vertical: true)
                                 .padding(.leading, Space.s20)
                                 .accessibilityIdentifier("member-key-waits-\(member.name)")

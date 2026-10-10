@@ -458,7 +458,8 @@ pub enum Request {
         /// The room.
         channel_id: Digest32,
     },
-    /// The members of a room this identity's key waits for, and why (ADR-030 D-5, W-4).
+    /// What is said of members of a room about this identity's key (ADR-030 D-5, W-4): that it
+    /// waits, and why, or that the member runs an older Vox.
     KeyWaits {
         /// The room.
         channel_id: Digest32,
@@ -1828,7 +1829,8 @@ pub enum Frame {
         /// Member fingerprints, in the order the node holds them.
         members: Vec<Digest32>,
     },
-    /// The answer to a [`Request::KeyWaits`]: `(member, why)`, in member order.
+    /// The answer to a [`Request::KeyWaits`]: `(member, said)`, what is said after its name, in
+    /// member order.
     KeyWaits {
         /// Each member the key waits for, and why.
         waits: Vec<(Digest32, String)>,
