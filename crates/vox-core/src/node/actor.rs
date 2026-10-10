@@ -49,6 +49,16 @@ use crate::node::status::PublishCause;
 use crate::pairwise::init_message::InitialMessage;
 use crate::transport::quic::VoxConnection;
 
+/// One key on its way to one member in a session of its own (ADR-030 D-1, D-4): the frame that
+/// carries it, kept so a re-carry resends exactly these bytes and opens no second session.
+#[derive(Debug, Clone)]
+struct Delivery {
+    /// `PairwiseFrame::RotationHello` bytes: the session's opening and the key sealed in it.
+    frame: Vec<u8>,
+    /// The one-time prekey of the member's the opening named, if any (ADR-030 P-3).
+    one_time_prekey: Option<u64>,
+}
+
 /// A pairwise session this node opened (ADR-004 O2, O3).
 #[derive(Debug, Clone)]
 struct Initiated {
@@ -4197,6 +4207,9 @@ pub struct Node {
     /// Per `(room, member)`: keys written and not yet answered (V210-88). In memory only, so a
     /// key cut off by a crash is owed again after the restart; see [`watch_delivery`].
     keys_in_flight: BTreeMap<(Digest32, Digest32), u32>,
+    /// Per `(room, member, generation)`: the key delivery opened for it (ADR-030 D-4), until the
+    /// member takes it, a later key supersedes it, or the member says its opening cannot work.
+    deliveries: BTreeMap<(Digest32, Digest32, u64), Delivery>,
     /// Per `(room, member)`: the history batch in flight, as the keys not yet answered and
     /// whether the batch fell short (a key refused, or not all of it written). The history is
     /// recorded as delivered only once every key of a whole batch was taken (V210-88).
@@ -4646,6 +4659,7 @@ impl Node {
             redeliver_now: false,
             reoffer: BTreeSet::new(),
             keys_in_flight: BTreeMap::new(),
+            deliveries: BTreeMap::new(),
             history_in_flight: BTreeMap::new(),
             delivery_epoch: 0,
             record_seq: BTreeMap::new(),
@@ -7363,6 +7377,29 @@ impl Node {
                         self.history_landed(channel_id, peer, false);
                     }
                 }
+                // **A delivery whose opening cannot work is opened afresh** (ADR-030 D-4, P-3): the
+                // member does not hold the one-time prekey it named, or the prekey it was opened
+                // against, or the key did not open under it. Resending its bytes would be refused
+                // the same way for good. A refusal of any other kind resends them exactly.
+                {
+                    use crate::node::pairwise_stream::KeyRefusal;
+                    let refused_as =
+                        |r: KeyRefusal| why == KeyRefusal::describe(r.code().into_inner());
+                    let delivery = (channel_id, peer, chain_id);
+                    if refused_as(KeyRefusal::UnknownPrekey) {
+                        if let Some(prekey_id) = self
+                            .deliveries
+                            .remove(&delivery)
+                            .and_then(|d| d.one_time_prekey)
+                        {
+                            self.note_refused_otp(peer, prekey_id);
+                        }
+                    } else if refused_as(KeyRefusal::HelloRefused)
+                        || refused_as(KeyRefusal::CannotOpen)
+                    {
+                        self.deliveries.remove(&delivery);
+                    }
+                }
                 let (Some(profile), Some(shared)) = (
                     self.profile.as_ref(),
                     self.channels.get(&channel_id).map(Arc::clone),
@@ -7454,8 +7491,9 @@ impl Node {
                 // with its connection, the retry here is what brings the next one: it stays at
                 // the first step rather than doubling, so one lost offer costs 2 s, not 2 + 4 + 8.
                 let now = self.now_ms().get();
-                let hello_refused =
-                    why == KeyRefusal::describe(KeyRefusal::HelloRefused.code().into_inner());
+                // A key delivery's opening refused is not a hello race: it backs off as any refusal.
+                let hello_refused = session.is_some()
+                    && why == KeyRefusal::describe(KeyRefusal::HelloRefused.code().into_inner());
                 let entry = self.key_backoff.entry((channel_id, peer)).or_insert((0, 0));
                 entry.0 = if hello_refused {
                     1
@@ -7670,6 +7708,8 @@ impl Node {
                 epoch,
             } => {
                 self.key_backoff.remove(&(channel_id, peer));
+                // Taken: its delivery is done with (ADR-030 D-4).
+                self.deliveries.remove(&(channel_id, peer, chain_id));
                 // Taken under the session still held: the peer holds its hello (V210-89).
                 if session.is_some()
                     && self.session_serial.get(&(channel_id, peer)).copied() == session
@@ -10238,12 +10278,10 @@ impl Node {
             {
                 continue;
             }
-            // Open a session from the member's bundle record if none exists, and reach
-            // them through the ladder rather than requiring a live connection: a re-key
-            // that only reaches members this process happened to join with is the M15
-            // gap ADR-016 recorded, and it is what made revocation undeliverable after
-            // a restart.
-            let hello = self.ensure_session(channel_id, target).await;
+            // Reach them through the ladder rather than requiring a live connection: a re-key
+            // that only reaches members this process happened to join with is the M15 gap
+            // ADR-016 recorded, and it is what made revocation undeliverable after a restart.
+            // No long-lived session is needed: each key opens its own (ADR-030 D-1).
             let Some(conn) = self.reach_member(channel_id, target, asked).await else {
                 continue;
             };
@@ -10256,43 +10294,33 @@ impl Node {
                     None => continue,
                 },
             };
+            // A delivery opened for a key no longer owed was superseded (ADR-030 D-4).
+            let owed_now: BTreeSet<u64> = keys.iter().map(|k| k.body.chain_id).collect();
+            self.deliveries.retain(|(room, member, generation), _| {
+                room != channel_id || *member != target || owed_now.contains(generation)
+            });
             let mut all_sent = true;
-            let mut hello_left = hello.as_ref();
             let mut jobs = Vec::with_capacity(keys.len());
             let mut watched = 0u32;
             for key in keys {
-                let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
+                // Each key in a session of its own, opened now against the member's current bundle
+                // and never sealed in one that existed before (ADR-030 D-1, D-2).
+                let Ok(frame) = self.delivery_frame(channel_id, target, key).await else {
                     all_sent = false;
                     break;
                 };
-                // The hello rides the first key only: the peer holds the session after it.
-                let mut frames = Vec::with_capacity(2);
-                let carries_hello = match hello_left.take() {
-                    Some(initial) => {
-                        frames.push(crate::node::pairwise_stream::hello_frame(
-                            channel_id, initial,
-                        ));
-                        true
-                    }
-                    None => false,
-                };
-                let Ok(frame) = crate::node::pairwise_stream::skdm_frame(channel_id, session, key)
-                else {
-                    all_sent = false;
-                    break;
-                };
-                frames.push(frame);
                 // Each key's own generation: a refusal re-owes exactly what was refused, and it is
                 // recorded as delivered only once taken (V210-88).
                 let epoch = self.key_in_flight(*channel_id, target);
                 jobs.push(PairwiseJob {
                     conn: Arc::clone(&conn),
-                    frames,
+                    frames: vec![frame],
                     channel_id: *channel_id,
                     after: AfterWrite::Key {
                         chain_id: key.body.chain_id,
-                        hello: carries_hello,
-                        session: self.session_serial.get(&(*channel_id, target)).copied(),
+                        hello: false,
+                        // In no long-lived session: a refusal says nothing about the one held.
+                        session: None,
                         history: owes_history,
                         epoch,
                     },
@@ -10314,6 +10342,65 @@ impl Node {
             }
         }
         delivered
+    }
+
+    /// The frame that delivers `key` to `target` in a session of its own (ADR-030 D-1, D-4): the
+    /// one already opened for this key, resent byte for byte, or else a session opened now with
+    /// `Session::initiate` against `target`'s current bundle, the key sealed as its first message.
+    /// This node is always the initiator (D-2). `Err(Some(why))` when no acceptable bundle is to be
+    /// had (P-2), `Err(None)` when no session could be opened from one; either way the key waits,
+    /// sealed nowhere else (D-5).
+    async fn delivery_frame(
+        &mut self,
+        channel_id: &Digest32,
+        target: Digest32,
+        key: &crate::group::skdm::Skdm,
+    ) -> Result<Vec<u8>, Option<prekeys::BundleWait>> {
+        let id = (*channel_id, target, key.body.chain_id);
+        if let Some(delivery) = self.deliveries.get(&id) {
+            return Ok(delivery.frame.clone());
+        }
+        let bundle = self.delivery_bundle(channel_id, target).await?;
+        let ctx = {
+            let shared = self.channels.get(channel_id).map(Arc::clone).ok_or(None)?;
+            let channel = shared.lock().await;
+            channel.join_context().map_err(|_| None)?
+        };
+        let (initial, mut session) = {
+            let ring = self.prekeys.as_ref().ok_or(None)?.lock().await;
+            crate::pairwise::session::Session::initiate(
+                ring.identity_dh(),
+                &bundle,
+                &ctx.channel_id,
+                ctx.epoch,
+                ctx.suite_id,
+                ctx.floor,
+            )
+            .map_err(|_| None)?
+        };
+        let frame = crate::node::pairwise_stream::rotation_hello_frame(
+            channel_id,
+            &initial,
+            &mut session,
+            key,
+        )
+        .map_err(|_| None)?;
+        // The session existed for this one key: its secrets zeroize here. Only the frame is kept.
+        drop(session);
+        // A one-time prekey is named by one delivery only: a second naming it would be taken as a
+        // replay and graded last-resort (ADR-004). The next delivery to `target` opens against
+        // the next bundle's one-time prekey, or its signed prekey until one arrives (S-5).
+        if let Some(prekey_id) = initial.one_time_prekey_id {
+            self.refused_otps.note(target, prekey_id);
+        }
+        self.deliveries.insert(
+            id,
+            Delivery {
+                frame: frame.clone(),
+                one_time_prekey: initial.one_time_prekey_id,
+            },
+        );
+        Ok(frame)
     }
 
     /// A key watched by [`watch_delivery`] was answered, taken or not: one fewer in flight.
@@ -12694,11 +12781,6 @@ impl Node {
     /// `peer` answered a key delivery that it does not hold the one-time prekey `prekey_id` the
     /// delivery named (ADR-030 P-3): the next delivery fetches its bundle again and never names that
     /// prekey.
-    #[allow(
-        dead_code,
-        reason = "called on a KeyRefusal::UnknownPrekey answer, which the ADR-030 delivery frame \
-                  (v043/adr030-frame) adds"
-    )]
     fn note_refused_otp(&mut self, peer: Digest32, prekey_id: u64) {
         self.refused_otps.note(peer, prekey_id);
     }
@@ -13125,6 +13207,8 @@ impl Node {
         self.held_pairwise.clear();
         // Keys still in flight stay owed, and are sent again after the next unlock (V210-88).
         self.keys_in_flight.clear();
+        // Sealed bytes, no key material; but the ring that opens the next ones is this identity's.
+        self.deliveries.clear();
         // And the watchers still running answer for what is no longer in flight.
         self.delivery_epoch = self.delivery_epoch.wrapping_add(1);
         self.history_in_flight.clear();
