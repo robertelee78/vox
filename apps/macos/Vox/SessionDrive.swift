@@ -106,6 +106,8 @@ struct SessionComposer: View {
                     .accessibilityLabel("Message to \(session.label), as \(model.node)")
                     .textFieldStyle(.plain)
                     .frame(minWidth: Theme.scaled(160), maxWidth: .infinity)
+                    // As tall as what is typed, never a share of the window (as the room's).
+                    .fixedSize(horizontal: false, vertical: true)
                     .layoutPriority(1)
                     .onSubmit(send)
                     // Esc interrupts the turn it is running, as the tooltip says (D13).

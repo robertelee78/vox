@@ -1143,6 +1143,10 @@ private struct RoomView: View {
                 .accessibilityLabel("Message \(model.roomName(room)), as \(model.node)")
                 .textFieldStyle(.plain)
                 .frame(minWidth: Theme.scaled(160), maxWidth: .infinity)
+                // As tall as what is typed (up to 12 lines), never more: without it the field
+                // took a share of the window's height from the timeline, and stood as an empty
+                // band above its one line (the decider, v0.4.3).
+                .fixedSize(horizontal: false, vertical: true)
                 .layoutPriority(1)
                 .onSubmit { send(urgent: urgent) }
                 .accessibilityIdentifier("compose")

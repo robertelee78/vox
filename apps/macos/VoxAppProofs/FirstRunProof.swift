@@ -1072,7 +1072,11 @@ final class FirstRunProof: XCTestCase {
             XCTAssertTrue(abs(line.frame.height - headMeta.frame.height) <= 2 && perChar <= metaPerChar * 1.25,
                           "PRODUCT: \"\(readBy)\" must be a quiet line in the details' face (v0.4.3); it is \(line.frame.height) high and \(perChar) a character, the details \(headMeta.frame.height) and \(metaPerChar)")
         }
-        read.append("header one line; read by \(readBy.debugDescription)")
+        // The composer as tall as its one line (v0.4.3: it stood as an empty band above it).
+        let field = locate(ui, Key.id("compose"))?.frame ?? .null
+        XCTAssertTrue(!field.isNull && field.height <= 3 * max(headMeta.frame.height, 14),
+                      "PRODUCT: the empty composer must be one line high, not a band; its field is \(field.height) high")
+        read.append("header one line; read by \(readBy.debugDescription); composer \(field.height) high")
 
         // Room > Rename…: a sheet on bg.panel, its title SF Pro semibold.
         ui.menuBars.menuBarItems["Room"].click()
