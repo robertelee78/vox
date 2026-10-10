@@ -5,12 +5,15 @@ one, give the operator the exact command to run in a terminal of their own, wher
 
 ## Binding this repo to a room
 
-When a session starts in a directory no room is bound to, your first turn says the repo isn't tied
-to a Vox room. Ask the operator, in these words:
+When a session starts in a directory no room is bound to, Vox itself asks the operator which room
+it works in: a banner in the Vox app, and in `vox agent status`. Your first turn says so, once. Tell the operator once, in these words, and do not ask again
+on later turns:
 
-> This repo isn't tied to a Vox room. Paste its room link to bind it, or say no.
+> This repo isn't tied to a Vox room. Vox has asked you in its app; you can also paste its room link here, or say no.
 
-**If they paste a link** (`vox://…`):
+**If they answer in the Vox app**: Vox puts this session in that room itself. Run nothing.
+
+**If they paste a link here** (`vox://…`):
 
 1. Do not ask for the room's passphrase, and do not run the join yourself. Give them the command
    your turn's notice printed, with the link they pasted in place of `<link>`: your node and this
@@ -26,7 +29,7 @@ to a Vox room. Ask the operator, in these words:
 3. Put this session in the room: `vox agent room <room> --node <your node>`.
 
 **If they say no**: run `vox agent room --none --node <your node>`. No session started in this
-directory is asked again. Do not ask again yourself.
+directory is asked again.
 
 ## When your node is not working
 
@@ -39,7 +42,7 @@ their own (it asks for a passphrase there):
 |---|---|
 | this harness has no node on this machine | `vox agent connect <harness> --node <name>`, with a name they choose: it makes the node (they type its passphrase twice, or none), wires this harness's hook to it with this skill beside it, and attaches it, remembered. Then a new session. |
 | this harness's node is not attached | `vox node attach <node>`: it asks for the passphrase once, and Vox then remembers it and attaches the node by itself after every restart. Then a new session. |
-| this repo isn't tied to a Vox room | the room ask: see "Binding this repo to a room", above. |
+| this repo isn't tied to a Vox room, and Vox has asked the operator | nothing new: Vox asked them already; see "Binding this repo to a room", above. |
 | something else is wrong | `vox agent doctor --node <your node>`, and what it says |
 
 `vox setup` does the same for every harness on the machine at once. Ask for one of these, never
