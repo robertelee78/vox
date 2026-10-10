@@ -314,7 +314,7 @@ impl Member {
         let (ok, out, err) = if root.daemon_running() {
             run()
         } else {
-            root.attached(DEFAULT_NODE, run)
+            root.attached(&layout::the_node(&self.dir), run)
         };
         assert!(
             ok,
@@ -486,7 +486,7 @@ impl Member {
             .build()
             .unwrap_or_else(|e| panic!("APPARATUS: the reader's runtime: {e}"));
         let paths = vox_core::node::paths::Paths::resolve(
-            "default",
+            &layout::the_node(&self.dir),
             Some(&self.dir),
             Some(&self.dir.join("cfg")),
         )

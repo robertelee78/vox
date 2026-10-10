@@ -625,6 +625,14 @@ pub fn worker_as(tmp: &std::path::Path, name: &str, exe: &str) -> Worker {
         panic!("PRODUCT: {name}'s `vox id` printed no fingerprint ({e:?}): {o:?}")
     });
     w.fp = fp;
+    // The node `vox id` just made, whatever setup named it (#666).
+    w.paths = Paths::resolve(&layout::the_node(&w.data), Some(&w.data), Some(&w.cfg))
+        .unwrap_or_else(|e| {
+            panic!(
+                "APPARATUS: no profile paths under {}: {e}",
+                w.data.display()
+            )
+        });
     w
 }
 
