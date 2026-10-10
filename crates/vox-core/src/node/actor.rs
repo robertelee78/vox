@@ -57,6 +57,9 @@ struct Delivery {
     frame: Vec<u8>,
     /// The one-time prekey of the member's the opening named, if any (ADR-030 P-3).
     one_time_prekey: Option<u64>,
+    /// The `skdm_ref` of the key it carries: only that very key is resent in it, so a consent's
+    /// grant always names the key delivered (ADR-007).
+    key: Digest32,
 }
 
 /// A pairwise session this node opened (ADR-004 O2, O3).
@@ -9495,54 +9498,44 @@ impl Node {
                 Err(e) => return Outcome::Failed(fault_of(&e)),
             }
         };
-        // No session need exist yet: one is opened from this member's bundle record
-        // if the join path never made one (ADR-016).
-        let hello = self.ensure_session(channel_id, target).await;
         let Some(conn) = self.reach_member(channel_id, target, asked).await else {
             return Outcome::Failed(Fault::Unreachable);
         };
-        // **No session, because no bundle: said** (#520). A key is sealed to the member's prekey
-        // bundle, read from this node's board; with none there the consent fails on every tick's
-        // retry and wrote nothing, so a person who trusted a member that just joined again saw no
-        // key go and no reason. Said once per member and room, until the key goes.
-        if !self.sessions.contains_key(&(*channel_id, target)) {
-            if self.key_waits_said.insert((*channel_id, target)) {
-                // No bundle, a stale one (ADR-030 D-5, P-2), or one no session opened from: each
-                // said as itself.
-                let why = match self.delivery_bundle(channel_id, target).await {
-                    Err(wait) => wait.why(),
-                    Ok(_) => "no pairwise session with it could be opened from its prekey bundle; \
-                              it is tried again"
-                        .to_owned(),
-                };
-                if let Some(net) = self.net.as_ref() {
-                    net.manager().note(
-                        target,
-                        format!(
-                            "your key for it in room {} waits: {why}",
-                            crate::node::network::short_id(*channel_id)
-                        ),
-                    );
+        // **In a session of its own** (ADR-030 D-1, D-3): retrust, a consent grant and a history
+        // release seal the key as a rotation does, in a session this node opens now against the
+        // member's current bundle, never in the pair's long-lived one.
+        //
+        // **No acceptable bundle: said, and the key waits** (#520, ADR-030 D-5). A key is sealed to
+        // the member's prekey bundle, read from this node's board; with none there, or a stale one
+        // (P-2), the consent fails on every tick's retry and writes nothing. Said once per member
+        // and room, until the key goes, each reason as itself.
+        let frame = match self.delivery_frame(channel_id, target, &skdm).await {
+            Ok(frame) => frame,
+            Err(wait) => {
+                if self.key_waits_said.insert((*channel_id, target)) {
+                    let why = match wait {
+                        Some(wait) => wait.why(),
+                        None => "no pairwise session with it could be opened from its prekey \
+                                 bundle; it is tried again"
+                            .to_owned(),
+                    };
+                    if let Some(net) = self.net.as_ref() {
+                        net.manager().note(
+                            target,
+                            format!(
+                                "your key for it in room {} waits: {why}",
+                                crate::node::network::short_id(*channel_id)
+                            ),
+                        );
+                    }
                 }
+                return Outcome::Failed(Fault::Unreachable);
             }
-            return Outcome::Failed(Fault::Unreachable);
-        }
-        self.key_waits_said.remove(&(*channel_id, target));
-        let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
-            return Outcome::Failed(Fault::Unreachable);
         };
-        // Sealed here, where the session lives; written by this member's writer, off the actor
-        // (V210-71). A write that fails is a key not taken, re-owed like any other.
-        let mut frames = Vec::with_capacity(2);
-        if let Some(initial) = hello.as_ref() {
-            frames.push(crate::node::pairwise_stream::hello_frame(
-                channel_id, initial,
-            ));
-        }
-        match crate::node::pairwise_stream::skdm_frame(channel_id, session, &skdm) {
-            Ok(f) => frames.push(f),
-            Err(e) => return Outcome::Failed(fault_of(&e)),
-        }
+        self.key_waits_said.remove(&(*channel_id, target));
+        // Written by this member's writer, off the actor (V210-71). A write that fails is a key
+        // not taken, re-owed like any other.
+        let frames = vec![frame];
         let (Some(profile), Some(shared)) = (
             self.profile.as_ref(),
             self.channels.get(channel_id).map(Arc::clone),
@@ -9593,8 +9586,9 @@ impl Node {
                 channel_id: *channel_id,
                 after: AfterWrite::Key {
                     chain_id,
-                    hello: hello.is_some(),
-                    session: self.session_serial.get(&(*channel_id, target)).copied(),
+                    hello: false,
+                    // In no long-lived session: a refusal says nothing about the one held.
+                    session: None,
                     history: false,
                     epoch,
                 },
@@ -10357,7 +10351,8 @@ impl Node {
         key: &crate::group::skdm::Skdm,
     ) -> Result<Vec<u8>, Option<prekeys::BundleWait>> {
         let id = (*channel_id, target, key.body.chain_id);
-        if let Some(delivery) = self.deliveries.get(&id) {
+        let key_ref = crate::governance::membership::skdm_ref(key);
+        if let Some(delivery) = self.deliveries.get(&id).filter(|d| d.key == key_ref) {
             return Ok(delivery.frame.clone());
         }
         let bundle = self.delivery_bundle(channel_id, target).await?;
@@ -10398,6 +10393,7 @@ impl Node {
             Delivery {
                 frame: frame.clone(),
                 one_time_prekey: initial.one_time_prekey_id,
+                key: key_ref,
             },
         );
         Ok(frame)
