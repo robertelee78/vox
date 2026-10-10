@@ -122,6 +122,14 @@ type SharedChannel = Arc<tokio::sync::Mutex<ChannelState>>;
 /// connection died and raises the periodic request (D7).
 const TICK: Duration = Duration::from_secs(1);
 
+/// Test-only: while the file this names exists, the node opens none of the key-packages the log
+/// brings it; they stay queued, as between a sync session's entries and its end, so a proof can
+/// show what a member is told while one waits (`drive_given_on_an_idle_session_…`).
+/// **For proofs; nothing in a real deployment sets it.** Not compiled in without the
+/// `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_HOLD_PACKAGES_ENV: &str = "VOX_TEST_HOLD_PACKAGES_FILE";
+
 /// At most one read record per room in this many milliseconds (ADR-028 RR-2): what is read in
 /// between waits, and the next record names all of it.
 const READ_RECORD_EVERY_MS: u64 = 5_000;
@@ -12236,6 +12244,14 @@ impl Node {
     /// each with a one-shot PQXDH against this node's own prekeys and hand the sender key to
     /// the channel, which verifies it against its author and backfills what it opens.
     async fn install_key_packages(&mut self, channel_id: &Digest32) {
+        // Test-only: leave every key-package queued, unopened, while the file the knob names
+        // exists (`TEST_HOLD_PACKAGES_ENV`).
+        #[cfg(feature = "test-knobs")]
+        if std::env::var_os(TEST_HOLD_PACKAGES_ENV)
+            .is_some_and(|f| std::path::Path::new(&f).exists())
+        {
+            return;
+        }
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
         };
@@ -15668,12 +15684,13 @@ impl Node {
     }
 
     /// This node's drive key in one room (ADR-029 SC-2a, SC-2b): **changed first** if a member it
-    /// was released to is no longer in `holders` (downgraded to read, or untrusted), with an entry
-    /// under the new key that says so, so the member reads at once that it no longer holds it;
-    /// **begun** if this node has an open Session here and none yet, so a member given drive holds
-    /// it before the Session's first entry; then released to each member with drive that is owed
-    /// it, as a key-package in the room's log, sealed to that member's prekeys. A member whose
-    /// prekeys this node has not read yet stays owed, and the tick tries again.
+    /// was released to is no longer in `holders` (downgraded to read, or untrusted); **begun** if
+    /// this node has an open Session here and none yet, so a member given drive holds it before
+    /// the Session's first entry; then released to each member with drive that is owed it, as a
+    /// key-package in the room's log, sealed to that member's prekeys; and, after a change, an
+    /// entry under the new key that says so, so the member that lost it reads at once that it no
+    /// longer holds it. A member whose prekeys this node has not read yet stays owed, and the tick
+    /// tries again.
     async fn tend_drive_keys_in(&mut self, channel_id: &Digest32, holders: &BTreeSet<Digest32>) {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
@@ -15692,27 +15709,16 @@ impl Node {
                         .any(|s| s.open && Some(s.node) == me)
                 })
         };
-        let mut changed = false;
         let releases = {
             let Some(profile) = self.profile.as_ref() else {
                 return;
             };
             let mut ch = shared.lock().await;
-            let Ok(lost) = ch.rotate_drive_if_lost(profile.store(), holders, now_ms) else {
+            if ch
+                .rotate_drive_if_lost(profile.store(), holders, now_ms)
+                .is_err()
+            {
                 return;
-            };
-            if !lost.is_empty() {
-                // The member that lost drive still holds the old key: until an entry is sealed
-                // under the new one, nothing tells it the key changed.
-                changed = ch
-                    .append_session(
-                        profile,
-                        crate::node::drive::KEY_CHANGED,
-                        r#"{"kind":"drive-key"}"#,
-                        holders,
-                        now_millis,
-                    )
-                    .is_ok();
             }
             if has_session && ch.ensure_drive(profile.store(), holders, now_ms).is_err() {
                 return;
@@ -15728,9 +15734,6 @@ impl Node {
             }
             releases
         };
-        if changed {
-            self.note_local_append(channel_id);
-        }
         for (member, skdm, generation) in releases {
             if !self.post_key_package(channel_id, member, &skdm).await {
                 continue;
@@ -15742,6 +15745,32 @@ impl Node {
                 .lock()
                 .await
                 .note_drive_delivered(profile.store(), member, generation);
+        }
+        // The member that lost drive still holds the old key: until an entry is sealed under the
+        // new one, nothing tells it the key changed. Written once every member that keeps drive
+        // holds the new key, so none is shown, meanwhile, an entry under a key it lacks; until
+        // then, the tick tries again.
+        let written = {
+            let Some(profile) = self.profile.as_ref() else {
+                return;
+            };
+            let mut ch = shared.lock().await;
+            ch.key_change_unsaid()
+                && ch
+                    .owed_drive(profile.store(), holders)
+                    .is_ok_and(|owed| owed.is_empty())
+                && ch
+                    .append_session(
+                        profile,
+                        crate::node::drive::KEY_CHANGED,
+                        r#"{"kind":"drive-key"}"#,
+                        holders,
+                        now_millis,
+                    )
+                    .is_ok()
+        };
+        if written {
+            self.note_local_append(channel_id);
         }
     }
 
