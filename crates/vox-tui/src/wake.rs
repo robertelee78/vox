@@ -185,6 +185,9 @@ fn interactive_by_default() -> bool {
 /// run (`claude -p`), `sdk-ts` / `sdk-py` for the Agent SDK, `cli` for a person at the terminal
 /// (read from Claude Code 2.1.292: `set("CLAUDE_CODE_ENTRYPOINT", e ? "sdk-cli" : "cli")`).
 ///
+/// **OpenCode**'s run is told by Vox's own plugin, which reads OpenCode's argv from inside it:
+/// `VOX_OPENCODE_HEADLESS=1` for `opencode run` (measured on OpenCode 1.18.35, 2026-10-10).
+///
 /// **Codex** says it nowhere but its own argv: `codex exec …` (or `e`, or `review`), measured
 /// from Codex 0.162.1 (2026-10-10), whose hook input and environment carry no mark of it. The
 /// hook's parent, past at most one shell, is Codex itself; its argv is read from the kernel, and
@@ -195,6 +198,9 @@ pub fn interactive_now() -> bool {
         std::env::var("CLAUDE_CODE_ENTRYPOINT").as_deref(),
         Ok("sdk-cli" | "sdk-ts" | "sdk-py")
     ) {
+        return false;
+    }
+    if std::env::var("VOX_OPENCODE_HEADLESS").as_deref() == Ok("1") {
         return false;
     }
     !harness_parent_args().is_some_and(|argv| codex_headless(&argv))

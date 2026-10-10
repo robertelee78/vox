@@ -41,7 +41,9 @@
 //! **OpenCode** (`an_opencode_session_is_mirrored_and_driven`): one session of `oc-a` through the
 //! hosted plugin: its prompt, a tool call, a question asked and answered by `person` with
 //! `--answer` (the plugin replies to that question on OpenCode's API), the reply and the turn's
-//! end, all in its Session; `--interrupt` reaches it as OpenCode's abort of that session.
+//! end, all in its Session; `--interrupt` reaches it as OpenCode's abort of that session. Then the
+//! same plugin hosted as `opencode run` loads it (OpenCode's own argv as measured, `… run …`) runs
+//! a turn in the room and opens no Session (ADR-029 SE-1).
 //!
 //! **Which side a red is on.** What `vox room session` printed, what the stand-in app-server
 //! received, and the calls the hosted plugin made are `PRODUCT:`. Setup the product refused (`vox
@@ -54,7 +56,8 @@
 //! session instead of the named one (#544) → `turn/start` on S2's thread; a Session not renamed
 //! until its next message (the rename record dropped) → neither reads its new name; the plugin
 //! not reading the session's title when a follow begins → the OpenCode Session never reads the
-//! title it had before.
+//! title it had before; the plugin not telling the hook of `opencode run` → the run's Session is
+//! listed.
 
 #![cfg(unix)]
 
@@ -994,5 +997,79 @@ fn an_opencode_session_is_mirrored_and_driven() {
             .any(|c| c["method"] == "POST" && c["url"] == format!("/session/{OC}/abort")),
         "PRODUCT: an interrupt must reach OpenCode as the abort of session {OC}; the plugin made \
          {calls}"
+    );
+
+    // ---- (5) `opencode run`: headless, so no Session (ADR-029 SE-1) ----
+    // The same shipped plugin, hosted as `opencode run` loads it: OpenCode 1.18.35's own argv
+    // there, as measured (2026-10-10), is ["bun", "/$bunfs/root/src/index.js", "run", "--model",
+    // …, "hello"]; the TUI's worker, where the hosted session above stands, has no "run".
+    let run_id = "ses_headless0000000000000001";
+    let mut run_child = Command::new(&node)
+        .arg(&host_js)
+        .arg(&plugin_path)
+        .arg(run_id)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", w.root.join("home"))
+        .env("TMPDIR", &tmpdir)
+        .env("VOX_BIN", VOX)
+        .env("VOX_DATA_DIR", &w.data)
+        .env("VOX_CONFIG_DIR", &w.cfg)
+        .env("VOX_PROXY", "127.0.0.1:0")
+        .env("VOX_IDENTITY_PASSPHRASE", format!("pass of {OPENCODE}"))
+        .env("VOX_ROOM", &w.room)
+        .env(
+            "STANDIN_ARGV",
+            json!([
+                "bun",
+                "/$bunfs/root/src/index.js",
+                "run",
+                "--model",
+                "standin/stub-model",
+                "hello"
+            ])
+            .to_string(),
+        )
+        .current_dir(w.root.join("work"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("APPARATUS: start node");
+    let run_out = run_child
+        .stdout
+        .take()
+        .expect("APPARATUS: the host's stdout");
+    let (tx, run_lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        for line in std::io::BufReader::new(run_out)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut run_host = Host {
+        child: Killed(run_child),
+        lines: run_lines,
+    };
+    let told = run_host.ask("turn hello", within)["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        told.contains("In a Vox room"),
+        "PRODUCT: the `opencode run` session's hook must reach its room and say so to the model; \
+         its turn was given {told:?}"
+    );
+    let (_, listed, _) = w.vox(OPENCODE, &["room", "sessions", &w.room, "--json"], None);
+    println!("[proof] (5) after an `opencode run` turn, the room's Sessions: {listed}");
+    assert!(
+        listed.contains(OC) && !listed.contains(run_id),
+        "PRODUCT: a headless OpenCode run (`opencode run`) must open no Session (ADR-029 SE-1), \
+         while the TUI's session keeps its own; the room lists:\n{listed}"
     );
 }

@@ -233,6 +233,13 @@ const MAX_RELAYED = 16
 // agent's `vox room …` act as its node too, never as a person's node on the same machine.
 const VOX_NODE = "@VOX_NODE@"
 
+// **A headless run gets no Session** (ADR-029 SE-1): `opencode run` says so only in OpenCode's own
+// argv, which this plugin, loaded inside OpenCode, reads. Measured on OpenCode 1.18.35
+// (2026-10-10): `opencode run …` loads plugins with argv ["bun", "/$bunfs/root/src/index.js",
+// "run", …]; the TUI loads them in its worker, ["bun", "/$bunfs/root/src/cli/tui/worker.js"]. The
+// hook is told with VOX_OPENCODE_HEADLESS=1, as Claude Code tells it with its entrypoint.
+const HEADLESS = process.argv.slice(2).find((a) => !String(a).startsWith("-")) === "run"
+
 /**
  * The connections following a session's Session: session id → the set of `write` functions.
  * A sub-agent's session is followed through its parent (`parents`: child id → parent id).
@@ -563,6 +570,7 @@ export default async function vox({ $, client }) {
         // The wake channel goes to the hook alone, in its environment: the hook
         // registers it, so `vox daemon` can interrupt this session (see above).
         const env = { ...process.env }
+        if (HEADLESS) env.VOX_OPENCODE_HEADLESS = "1"
         if (wake) {
           env.VOX_OPENCODE_WAKE_SOCKET = wake.path
           env.VOX_OPENCODE_WAKE_TOKEN = wake.token
