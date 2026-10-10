@@ -1,6 +1,6 @@
 # Commands and local state
 
-Applies to: v0.4.0. This is a map to the real command help, not a substitute for the parser
+Applies to: v0.4.1. This is a map to the real command help, not a substitute for the parser
 in your installed version.
 
 ## Find the right help

@@ -1,6 +1,6 @@
 # Install and update
 
-Applies to: v0.4.0. The installer may select a later published release; check the resulting
+Applies to: v0.4.1. The installer may select a later published release; check the resulting
 version and its release notes before using version-specific instructions.
 
 ## Install

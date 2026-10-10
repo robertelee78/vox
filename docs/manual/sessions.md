@@ -1,6 +1,6 @@
 # Sessions
 
-Applies to: v0.4.0. You need an agent's node set up with its harness (see
+Applies to: v0.4.1. You need an agent's node set up with its harness (see
 [Agent communications](agents.md)), in a room you are a member of, and its node's trust with
 **read + drive** for your node (see [Identity and keyring](keyring.md#what-a-keyring-entry-grants-read-or-read--drive)).
 

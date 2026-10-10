@@ -1,6 +1,6 @@
 # Send and receive files
 
-Applies to: v0.4.0. Both nodes need to be attached, members of the room, and appropriately
+Applies to: v0.4.1. Both nodes need to be attached, members of the room, and appropriately
 trusted. Examples act as the only attached node; with several, add `--node NAME`.
 
 A file in Vox is never uploaded anywhere. Sharing posts one message to the room that carries the

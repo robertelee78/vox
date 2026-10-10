@@ -1,6 +1,6 @@
 # Your first shared room
 
-Applies to: v0.4.0. Allow a few minutes and keep both machines online. You need another person
+Applies to: v0.4.1. Allow a few minutes and keep both machines online. You need another person
 whose identity you can compare through a way you already trust, such as meeting or a call.
 
 You will each make a node, create and join a room, exchange trust, then confirm that a message

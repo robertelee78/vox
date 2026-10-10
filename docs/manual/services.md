@@ -1,6 +1,6 @@
 # Reach a shared service
 
-Applies to: v0.4.0. This chapter describes named services reached as `service.node.room.vox`.
+Applies to: v0.4.1. This chapter describes named services reached as `service.node.room.vox`.
 Examples act as the only attached node; with several, add `--node NAME`.
 
 You need a running local service on the host, two nodes whose fingerprints have been compared,
