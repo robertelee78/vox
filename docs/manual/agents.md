@@ -63,7 +63,7 @@ vox agent status --harness claude     # codex, opencode
 
 It only reads. It says the first thing this harness needs before the session works in a room,
 and the one command for it, which the session repeats to you to run in a terminal of your own
-(each asks for a passphrase there, never in the session):
+(any passphrase is asked for there, never in the session):
 
 - **No node for this harness**: choose a name, and run `vox agent connect claude --node
   claude-mac`. It says what it is to do, makes the node (you type its passphrase twice, or Enter alone twice for none), wires

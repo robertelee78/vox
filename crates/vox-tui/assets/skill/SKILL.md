@@ -25,10 +25,11 @@ vox agent status --harness claude     # Codex: --harness codex; OpenCode: --harn
 It only reads. It says what this harness needs before this session works in a Vox room, the first
 thing missing, and the one command for it, and gives you the words to say. Say them to the
 operator, with the command exactly as it printed it: `vox agent connect` when this harness has no
-node (they choose the name, and type the node's passphrase in their own terminal), `vox node
-attach` when its node is not attached, or the room ask when this repo is tied to no room (then
+node (they choose the name, and type the node's passphrase, or none, in their own terminal), `vox
+node attach` when its node is not attached, or the room ask when this repo is tied to no room (then
 follow `references/setup.md` → "Binding this repo to a room"). Never run those commands yourself:
-each asks for a passphrase. When it says nothing is missing, go on with the turn.
+they are the operator's, typed in their own terminal, where any passphrase is asked for. When it
+says nothing is missing, go on with the turn.
 
 ## When your turn says…
 
