@@ -2878,14 +2878,21 @@ final class FirstRunProof: XCTestCase {
         XCTAssertNil(locate(ui, Key.showing("Bash: ls")),
                      "PRODUCT: a tool call must not be drawn until asked for (v0.4.3); \"Bash: ls\" shows")
         // Details, a small disclosure, only on the row pointed at or selected (10): bob's reply,
-        // neither, has none showing.
+        // neither (the pointer is on the room's name), has none showing.
+        el(ui, Key.id("room-header-name")).hover()
         let replyRow = ui.windows.firstMatch.descendants(matching: .any)
             .matching(NSPredicate(format: "identifier BEGINSWITH %@", "entry-row-"))
             .allElementsBoundByIndex.first { shown($0).contains("POLISH-REPLY") }
-        if let replyRow, !replyRow.isSelected {
-            let id = replyRow.identifier.replacingOccurrences(of: "entry-row-", with: "")
-            XCTAssertNil(locate(ui, Key.id("entry-details-\(id)")),
-                         "PRODUCT: an entry's Details must show only when it is pointed at or selected (v0.4.3); bob's reply shows it")
+        if let replyRow {
+            if replyRow.isSelected {
+                XCTFail("APPARATUS (staging not achieved): bob's reply is selected, so whether Details shows unselected cannot be read")
+            } else {
+                let id = replyRow.identifier.replacingOccurrences(of: "entry-row-", with: "")
+                XCTAssertNil(locate(ui, Key.id("entry-details-\(id)")),
+                             "PRODUCT: an entry's Details must show only when it is pointed at or selected (v0.4.3); bob's reply, neither, shows it")
+            }
+        } else {
+            XCTFail("PRODUCT: bob's reply must be a row of his Session (entry-row-…) holding POLISH-REPLY; none does")
         }
         print("[proof] Session read: row \(rowWords.debugDescription), header \(headWords.debugDescription), typed \(typed.debugDescription), tools \(folded.debugDescription)")
 
