@@ -64,13 +64,13 @@
 //! - and each of those deliveries names a one-time prekey of its own, none his signed prekey alone
 //!   (ADR-030 P-3: a key waits for the next bundle rather than reuse a one-time prekey).
 //!
-//! Then twice, alice removes and re-trusts dave with a bad bundle of his on her board. One time
-//! its one-time prekey is signed by his root as made eight days ago; the other time, an hour
-//! ahead of her clock. Each time:
+//! Then alice removes and re-trusts dave three times. The first time his bundle on her board is
+//! good: (e) the retrust reaches him in every room, each key in an `OP_ROTATION_HELLO` of its own
+//! (D-3). The second time its one-time prekey is signed by his root as made eight days ago; the
+//! third time, as made an hour ahead of her clock. Each of those:
 //! - (d) she sends him nothing, and her daemon says why, in every room: "its prekey bundle is
 //!   stale: its one-time prekey is 8 days old", or "… was made 60 minutes from now" (P-2, D-5);
-//! - (e) once dave publishes a good bundle, the retrust reaches him in every room, each key in an
-//!   `OP_ROTATION_HELLO` of its own (D-3).
+//! - then dave publishes a good bundle, and (e) holds again.
 //!
 //! ## The mutations that must turn it red
 //! - **Change the lock in one shared room only** (RP-20): `change_the_lock_against` in
@@ -1187,9 +1187,9 @@ fn alice_said_of_dave(tmp: &Path, from: usize, dave_fp: &str) -> Vec<String> {
         .collect()
 }
 
-/// T-1 (d) and (e): a bundle of dave's with a backdated one-time prekey, then one dated ahead of
-/// alice's clock, is refused with its reason, and each time the retrust, once dave publishes a
-/// good bundle, comes in an `OP_ROTATION_HELLO`.
+/// T-1 (e), then (d): a retrust with a good bundle of dave's on alice's board comes in an
+/// `OP_ROTATION_HELLO`; then one with a backdated one-time prekey, and one dated ahead of her
+/// clock, is refused with its reason, and comes the same way once dave publishes a good bundle.
 fn adr030_refused_bundles_and_retrust(
     dave: &Dave,
     alice: &Member,
@@ -1203,20 +1203,26 @@ fn adr030_refused_bundles_and_retrust(
         .to_str()
         .expect("APPARATUS: a UTF-8 temp path")
         .to_owned();
-    let cases: [(&str, u64, &str); 2] = [
-        (
+    // First a retrust with a good bundle on her board, then one with each bad bundle.
+    let cases: [Option<(&str, u64, &str)>; 3] = [
+        None,
+        Some((
             "a one-time prekey made eight days ago",
             wall_ms() - 8 * DAY_MS,
             "waits: its prekey bundle is stale: its one-time prekey is 8 days old",
-        ),
-        (
+        )),
+        Some((
             "a one-time prekey dated an hour ahead",
             wall_ms() + 60 * 60 * 1000,
             "waits: its prekey bundle says its one-time prekey was made",
-        ),
+        )),
     ];
-    for (what, created, reason) in cases {
-        dave.publish(Some(dave.bundle_dated(created)));
+    for case in cases {
+        let what = case.map_or("a good bundle", |(w, _, _)| w);
+        match case {
+            Some((_, created, _)) => dave.publish(Some(dave.bundle_dated(created))),
+            None => dave.publish(None),
+        }
         std::thread::sleep(Duration::from_secs(2));
         let log_at = std::fs::read_to_string(tmp.join("alice.daemon.err"))
             .unwrap_or_default()
@@ -1237,30 +1243,36 @@ fn adr030_refused_bundles_and_retrust(
         );
         let seen = dave.got().len();
         alice.trust(dave_m);
-        // (d) Refused, with its reason, in every room; nothing delivered meanwhile.
-        let said = until(
-            &format!("alice says why her key to dave waits ({what})"),
-            Duration::from_secs(45),
-            || {
-                let lines = alice_said_of_dave(tmp, log_at, &dave_m.fp);
-                ids.iter().all(|_| lines.iter().any(|l| l.contains(reason)))
-            },
-        );
-        let lines = alice_said_of_dave(tmp, log_at, &dave_m.fp);
-        let sent: Vec<Got> = dave.got()[seen..]
-            .iter()
-            .filter(|g| matches!(g.kind, "rotation-hello" | "skdm"))
-            .cloned()
-            .collect();
-        eprintln!("[proof] dave's bundle with {what}: alice said {lines:#?}; sent {sent:#?}");
-        assert!(
-            said && sent.is_empty(),
-            "PRODUCT: dave's bundle on alice's board names {what}; on retrust her node must not \
-             seal his key to it, and must say \"{reason}\" (ADR-030 P-2, D-5). It said \
-             {lines:#?} and sent {sent:#?}"
-        );
-        // (e) A good bundle: the retrust delivers, in a delivery of its own, in every room.
-        dave.publish(None);
+        if let Some((what, _, reason)) = case {
+            // (d) Refused, with its reason, in every room; nothing delivered meanwhile.
+            let said = until(
+                &format!("alice says why her key to dave waits ({what})"),
+                Duration::from_secs(45),
+                || {
+                    alice_said_of_dave(tmp, log_at, &dave_m.fp)
+                        .iter()
+                        .filter(|l| l.contains(reason))
+                        .count()
+                        >= ids.len()
+                },
+            );
+            let lines = alice_said_of_dave(tmp, log_at, &dave_m.fp);
+            let sent: Vec<Got> = dave.got()[seen..]
+                .iter()
+                .filter(|g| matches!(g.kind, "rotation-hello" | "skdm"))
+                .cloned()
+                .collect();
+            eprintln!("[proof] dave's bundle with {what}: alice said {lines:#?}; sent {sent:#?}");
+            assert!(
+                said && sent.is_empty(),
+                "PRODUCT: dave's bundle on alice's board names {what}; on retrust her node must \
+                 not seal his key to it, and must say \"{reason}\" in each of the {} rooms \
+                 (ADR-030 P-2, D-5). It said {lines:#?} and sent {sent:#?}",
+                ids.len()
+            );
+            dave.publish(None);
+        }
+        // (e) With a good bundle the retrust delivers, in a delivery of its own, in every room.
         let ok = until(
             &format!("alice's retrust reaches dave after {what}"),
             Duration::from_secs(60),
