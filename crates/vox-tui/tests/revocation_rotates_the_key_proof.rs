@@ -411,7 +411,14 @@ fn removing_one_member_rotates_the_key_in_every_shared_room_and_keeps_the_others
 
     // ---- the attacker's snapshot of bob's own key state, then a post in each room it must be
     // able to open ----
-    let bob_store = layout::node_dir(&bob.data, layout::DEFAULT_NODE).join("store.redb");
+    // Wherever `vox id` put bob's one node: it is named for the machine, not `default`.
+    let bob_store = match layout::find_named(&bob.data.join("nodes"), "store.redb").as_slice() {
+        [one] => one.clone(),
+        found => panic!(
+            "APPARATUS: bob's data root holds {} stores, not one: {found:?}",
+            found.len()
+        ),
+    };
     let snapshot = tmp.path().join("bob-snapshot.redb");
     let bob_pid = bob
         .daemon
@@ -456,7 +463,7 @@ fn removing_one_member_rotates_the_key_in_every_shared_room_and_keeps_the_others
     let lines: Vec<&str> = o.lines().collect();
     let about = lines
         .iter()
-        .position(|l| l.starts_with("vox: about to stop trusting"));
+        .position(|l| l.starts_with("vox: about to remove "));
     let rooms_named = about.and_then(|b| {
         lines[b..]
             .iter()
@@ -465,7 +472,7 @@ fn removing_one_member_rotates_the_key_in_every_shared_room_and_keeps_the_others
     });
     let done = lines
         .iter()
-        .position(|l| l.starts_with("vox: no longer trusting"));
+        .position(|l| l.starts_with("vox: removed "));
     assert!(
         matches!((rooms_named, done), (Some(r), Some(d)) if r < d),
         "PRODUCT: `vox trust remove` must say, before it acts, that bob is to read nothing new in \
