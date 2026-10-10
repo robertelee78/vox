@@ -1,5 +1,6 @@
 // What the app is doing, and the one node it acts as (ADR-014 M-6, ADR-028 E-4).
 
+import AppKit
 import Foundation
 import ServiceManagement
 @MainActor
@@ -364,6 +365,28 @@ final class AppModel: ObservableObject {
     /// The system opened `url`: a room link goes to the Join sheet, now or once a node is attached.
     func openLink(_ url: URL) {
         guard url.scheme?.lowercased() == "vox" else { return }
+        // **A node on this Mac waits for its passphrase** (#666): `vox` opens
+        // vox://attach-node?node=N where it would have printed "run in a terminal"; the person
+        // gets a notification with Attach…, which opens the Attach sheet for it.
+        if url.host?.lowercased() == "attach-node" {
+            let named = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first { $0.name == "node" }?.value
+            if let named, !named.isEmpty {
+                // In front: the Attach sheet at once. Behind: a notification, whose Attach…
+                // brings Vox forward with it.
+                if NSApp.isActive {
+                    attachNodeAsk = named
+                } else {
+                    Notifier.shared.attachNode = { [weak self] n in
+                        self?.attachNodeAsk = n
+                        NSApp.activate(ignoringOtherApps: true)
+                    }
+                    Notifier.shared.ask()
+                    Notifier.shared.postAttach(node: named)
+                }
+            }
+            return
+        }
         let link = url.absoluteString
         if let node {
             node.offerJoin(link)
@@ -439,6 +462,21 @@ final class AppModel: ObservableObject {
     /// A node on this Mac whose Attach… was chosen under ON THIS MACHINE (#666), its passphrase
     /// asked for; nil when none is asked.
     @Published var attachNodeAsk: String?
+    /// What Forget Passphrase did, or why it could not; nil once read.
+    @Published var forgotSaid: String?
+
+    /// Forget node `node`'s remembered passphrase (#666), as `vox node forget-passphrase` does:
+    /// the daemon stops keeping it, and the Keychain item goes. Attached now, it stays attached.
+    func forgetPassphrase(_ node: String) async {
+        guard let client else { return }
+        do {
+            try await client.unkeep(node: node)
+            forgotSaid = "Node \(node)'s passphrase is forgotten: nothing is stored for it in the "
+                + "Keychain, and Vox no longer attaches it by itself after a restart."
+        } catch {
+            forgotSaid = sentence(error)
+        }
+    }
 
     /// Keep `node` with its passphrase in the Keychain (M-6, ADR-028 K-10): the daemon attaches
     /// it, checks the passphrase against the node's vault and stores it, so the node stays

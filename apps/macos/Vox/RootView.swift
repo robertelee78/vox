@@ -37,6 +37,13 @@ struct RootView: View {
                     .panelSurface()
             }
         }
+        // Forget Passphrase (#666): what it did.
+        .alert("Forget Passphrase", isPresented: Binding(get: { model.forgotSaid != nil },
+                                                         set: { if !$0 { model.forgotSaid = nil } })) {
+            Button("OK") {}
+        } message: {
+            Text(model.forgotSaid ?? "")
+        }
         // ON THIS MACHINE's Attach…: a node that waits for its passphrase (#666).
         .sheet(isPresented: Binding(get: { model.attachNodeAsk != nil },
                                     set: { if !$0 { model.attachNodeAsk = nil } })) {
@@ -238,7 +245,8 @@ private struct AttachNodeSheet: View {
             Text("Type node \(node)'s identity passphrase, or leave it empty for a node made with "
                 + "none. Vox stores it in the Keychain, so node \(node) attaches again by itself "
                 + "after a restart; anyone who can unlock this Mac's login keychain can then attach "
-                + "node \(node). `vox node forget-passphrase \(node)` forgets it.")
+                + "node \(node). Forget Passphrase, on its row under ON THIS MACHINE or in the Node "
+                + "menu, forgets it.")
                 .secondaryText()
                 .accessibilityIdentifier("attach-node-why")
             SecureInput(holder: field) { attach() }
