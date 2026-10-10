@@ -45,6 +45,34 @@ pub fn session_label(node_alias: &str, name: Option<&str>, id: &str) -> String {
     }
 }
 
+/// What a Session's opening or end says as a line of the room (ADR-029, CL-1), in the TUI, the app
+/// and `vox room read` alike (#406): the session by its name, else its short id, then "opened" or
+/// "ended": `gso-cap · 3f0c25bf opened`. None for any other message.
+#[must_use]
+pub fn session_line(envelope: &Envelope) -> Option<String> {
+    if envelope.kind != SESSION && envelope.kind != SESSION_END {
+        return None;
+    }
+    let short: String = envelope.from.chars().take(8).collect();
+    let who = envelope
+        .at
+        .session_name
+        .as_deref()
+        .map_or(short.clone(), |n| format!("{n} \u{b7} {short}"));
+    Some(if envelope.kind == SESSION {
+        format!("{who} opened")
+    } else {
+        format!("{who} ended")
+    })
+}
+
+/// What a message of `kind` with no text says, in every reader alike (#406):
+/// `(status message, no text)`.
+#[must_use]
+pub fn no_text(kind: &str) -> String {
+    format!("({kind} message, no text)")
+}
+
 /// A `to` entry split into the node it names and, for one addressed to a single session of that
 /// node, the session (ADR-029 TA-1): `<whole fingerprint>/<session id>`.
 #[must_use]
