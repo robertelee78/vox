@@ -323,6 +323,7 @@ private struct OnThisMachine: View {
                             Button("Forget Passphrase") {
                                 Task { await AppModel.shared.forgetPassphrase(node.name) }
                             }
+                            .accessibilityIdentifier("machine-forget-\(node.name)")
                         }
                     }
                     .accessibilityIdentifier("machine-\(node.name)")

@@ -2773,6 +2773,8 @@ final class FirstRunProof: XCTestCase {
         // grants it, run as bob on this Mac, with Copy (the app never grants drive, #614).
         try staged(vox, ["trust", "read", "--node", "bob", aliceFp,
                          "--identity-passphrase-file", bobPass], env: voxEnv)
+        // From General, so the tap shows the Session whatever was shown before.
+        tap(ui, Key.id("session-general"), "General in mission's Sessions")
         tap(ui, Key.id("session-\(d7Session.prefix(8))"), "bob's Session in mission's Sessions")
         let grant = "vox trust drive \(aliceFp) --node bob"
         words(ui, Key.id("no-drive-\(d7Session)-command"), timeout: 30,
@@ -2794,31 +2796,33 @@ final class FirstRunProof: XCTestCase {
               "vox://attach-node?node=bob, with Vox in front, must open the Attach sheet for node bob",
               until: { $0.contains("node bob") })
         tap(ui, Key.id("attach-node-cancel"), "Cancel on bob's Attach sheet")
-        // Forget Passphrase in place of `vox node forget-passphrase` (#666): bob, kept by a
-        // passphrase file, is no longer kept once it is chosen on his row under ON THIS MACHINE.
-        try staged(vox, ["node", "attach", "bob", "--keep", "--passphrase-file", bobPass], env: voxEnv)
-        let bobRow = el(ui, Key.id("machine-bob"))
+        // Forget Passphrase in place of `vox node forget-passphrase` (#666): Node > Forget
+        // Passphrase ends the keep of alice, the node this window acts as, kept here by a
+        // passphrase file (never the Keychain, in a proof).
+        try staged(vox, ["node", "attach", "alice", "--keep", "--passphrase-file", alicePass], env: voxEnv)
         let keptUntil = Date().addingTimeInterval(15)
-        while Date() < keptUntil && !(nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "bob")?.contains("(kept)") ?? false) {
+        while Date() < keptUntil && !(nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "alice")?.contains("(kept)") ?? false) {
             Thread.sleep(forTimeInterval: 0.3)
         }
-        Thread.sleep(forTimeInterval: 6) // the sidebar's node list is read every few seconds
-        bobRow.rightClick()
-        let forget = ui.menuItems["Forget Passphrase"].firstMatch
-        if forget.waitForExistence(timeout: 5) { forget.click() } else {
-            XCTFail("PRODUCT: bob's row under ON THIS MACHINE, kept, must offer Forget Passphrase: \(onScreen(ui))")
+        let keptBefore = nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "alice") ?? ""
+        guard keptBefore.contains("(kept)") else {
+            throw Apparatus("alice must be kept before Forget Passphrase is chosen, so that its end can be seen; `vox node list` says \(keptBefore)")
         }
+        ui.menuBars.menuBarItems["Node"].click()
+        tap(ui, Key.menuItem("Forget Passphrase"), "Node > Forget Passphrase")
         let forgotUntil = Date().addingTimeInterval(15)
         var bobLine = ""
         repeat {
-            bobLine = nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "bob") ?? ""
+            bobLine = nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "alice") ?? ""
             if !bobLine.contains("(kept)") { break }
             Thread.sleep(forTimeInterval: 0.3)
         } while Date() < forgotUntil
         XCTAssertFalse(bobLine.contains("(kept)"),
-                       "PRODUCT: Forget Passphrase on bob's row must stop keeping him; `vox node list` says \(bobLine)")
+                       "PRODUCT: Node > Forget Passphrase must stop keeping alice; `vox node list` says \(bobLine)")
         ui.typeKey(.return, modifierFlags: []) // the Forget Passphrase alert's OK
-        print("[proof] #666: drive command \(grant) copied; attach-node opened bob's sheet; Forget Passphrase: \(bobLine)")
+        // Back to General, as 4f expects to find bob's Session not yet shown.
+        tap(ui, Key.id("session-general"), "General in mission's Sessions")
+        print("[proof] #666: drive command \(grant) copied; attach-node opened bob's sheet; Node > Forget Passphrase: \(bobLine)")
 
         // (4f) ↑/↓ reach a Session's entries (P14): bob grants alice drive, so she reads inside his
         // Session; with it shown, View > Focus Timeline selects its newest entry and ↑ the one
