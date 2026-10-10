@@ -1666,7 +1666,7 @@ fn session_room(
     if let Some(r) = named {
         return (Some(r.trim().to_owned()), None);
     }
-    // The room map gives the room of the directory the session started in, exactly (ADR-029
+    // The room map gives the room of the directory the session started in, or of the deepest one above it (ADR-029
     // RB-2), with what joining it takes (RB-3). A map that cannot be read gives none: the session
     // is told why (`room_map::note`).
     match crate::room_map::room_for(&account.data_root, std::path::Path::new(&input.cwd)) {

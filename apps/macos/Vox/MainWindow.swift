@@ -18,6 +18,8 @@ struct MainWindow: View {
                 NodeStopped(model: model)
                 Divider()
             }
+            // A repo with no room (ADR-029 RB-5): one banner across the window.
+            RoomAskBanner(model: model)
             NavigationSplitView {
                 // Dragged wider or narrower, and remembered (Columns).
                 Sidebar(model: model)

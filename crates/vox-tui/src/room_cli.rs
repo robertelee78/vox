@@ -44,7 +44,7 @@ pub(crate) async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
 }
 
 /// Ask the node for its rooms, as `(id, local name, open, over)`.
-async fn rooms_of(
+pub(crate) async fn rooms_of(
     client: &mut IpcClient,
 ) -> Result<Vec<(Digest32, String, bool, String)>, AppError> {
     match client.rooms().await {

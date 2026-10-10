@@ -65,6 +65,28 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
 
     nonisolated static func waitingID(_ sessionKey: String) -> String { "waiting-\(sessionKey)" }
 
+    /// One notification for a directory with no room (ADR-029 RB-5): which harness, which
+    /// directory. Clicking it brings Vox forward, where the ask is a banner across the window.
+    func postRoomAsk(dir: String, sentence: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "Which room is this repo in?"
+        content.body = sentence
+        content.userInfo = ["ask": dir]
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: Notifier.roomAskID(dir), content: content,
+                                            trigger: nil)
+        UNUserNotificationCenter.current().add(request) { _ in }
+    }
+
+    /// A directory answered, or no longer asked about: its notification goes.
+    func withdrawRoomAsk(dir: String) {
+        let id = Notifier.roomAskID(dir)
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [id])
+        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [id])
+    }
+
+    nonisolated static func roomAskID(_ dir: String) -> String { "room-ask-\(dir)" }
+
     /// What a notification says: never the message's text.
     nonisolated static func body(who: String, toYou: Bool, urgent: Bool, file: Bool) -> String {
         let what = file ? "shared a file" : "wrote"
