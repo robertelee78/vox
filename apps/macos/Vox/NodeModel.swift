@@ -72,6 +72,11 @@ final class NodeModel: ObservableObject {
         }
     }
 
+    /// Whether `m` is a Session's opening or end: All says it from the Sessions, General never.
+    nonisolated static func sessionRecord(_ m: RoomMessage) -> Bool {
+        m.kind == "session" || m.kind == "session-end"
+    }
+
     /// A room's newest message as its sidebar row says it: when, and "who: text" (or "new
     /// message" when this node cannot read it yet).
     struct Preview: Equatable {
@@ -474,7 +479,9 @@ final class NodeModel: ObservableObject {
 
     /// `message` counted unread in `room`, once: never this node's own.
     private func count(_ message: RoomMessage, in room: String) {
-        guard message.author != me, counted[room]?[message.id] == nil,
+        // A Session's opening or end is not a line of General (v0.4.3), so it is never drawn and
+        // never read: not counted either, or a room would stay unread for ever.
+        guard !Self.sessionRecord(message), message.author != me, counted[room]?[message.id] == nil,
               let i = rooms.firstIndex(where: { $0.id == room }) else { return }
         counted[room, default: [:]][message.id] = message
         switch message.level {
@@ -638,7 +645,12 @@ final class NodeModel: ObservableObject {
             // draw one room's messages under another.
             // What was unread as the room came on screen, before showing it marks it read: the
             // timeline's unread line goes above the first of it (ADR-028 R-8).
-            let unread = ((try? await client.unread(room: id)) ?? []).filter { $0.author != me }
+            let held = ((try? await client.unread(room: id)) ?? []).filter { $0.author != me }
+            // A Session's opening and end are never drawn in General (v0.4.3), so never read by
+            // being seen: marked read here, and the unread line starts at the first one drawn.
+            let records = held.filter(Self.sessionRecord).map(\.id)
+            if !records.isEmpty { try? await client.markRead(room: id, ids: records) }
+            let unread = held.filter { !Self.sessionRecord($0) }
             let read = try await client.read(room: id, after: "", limit: 0)
             guard case .room(id) = self.selection else { return }
             let unreadIDs = Set(unread.map(\.id))

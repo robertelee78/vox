@@ -234,6 +234,10 @@ struct SessionEntryRow: View {
             }
             // A request is selected by clicking it: what ⌥⌘Y and ⌥⌘N act on (P1).
             .modifier(RequestSelection(model: model, reference: reference))
+            // Never the row's only child: SwiftUI folds a stack's lone child into it, and the
+            // request's own element (request-row-…, what ⌘J selects) went with it once Details
+            // showed only on hover.
+            Color.clear.frame(height: 0).accessibilityHidden(true)
             // A file the session sent, once this node has a verified copy (ADR-029 DR-1, F-11).
             if let file = entry.file, let pulled = file.pulledPath {
                 HStack {

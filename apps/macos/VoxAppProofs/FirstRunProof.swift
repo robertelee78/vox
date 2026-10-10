@@ -1068,7 +1068,24 @@ final class FirstRunProof: XCTestCase {
                       "PRODUCT: the header must not overlap the timeline's first line; the header ends at \(max(headName.frame.maxY, headMeta.frame.maxY)), the first line starts at \(firstRow.minY)")
         // "read by bob": a quiet line, the header details' face and size, not a letter-spaced
         // mono tag: the same height, and per character about as wide.
-        let readBy = words(ui, Key.idPrefix("read-by-"), timeout: 60,
+        // Its premise, logged and checked if it never shows: bob's node holds the message and
+        // counts two members, and alice's node counts bob a member (the first v0.4.3 run's red
+        // showed "on 1 of 1 members' nodes": which side was short could not be told).
+        let readPremise = Premise("bob's node holds LOOK-AT-THIS and both nodes' rosters list both members") {
+            let bobHolds = self.run(vox, ["room", "read", "--node", "bob", room], env: voxEnv).out
+                .contains("LOOK-AT-THIS")
+            let bobRoster = self.run(vox, ["room", "roster", "--node", "bob", room], env: voxEnv).out
+            let aliceRoster = self.run(vox, ["room", "roster", "--node", "alice", room], env: voxEnv).out
+            let count = { (s: String) in s.split(separator: "\n").filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.count }
+            let said = "bob holds it: \(bobHolds); bob's roster (\(count(bobRoster)) lines): \(bobRoster); alice's roster (\(count(aliceRoster)) lines): \(aliceRoster)"
+            print("[proof] read-by premise: \(said)")
+            let aliceSeesBob = aliceRoster.contains(String(bobFp.prefix(12))) || aliceRoster.contains("bob")
+            let bobSeesAlice = bobRoster.contains(String(aliceFp.prefix(12))) || bobRoster.contains("alice")
+            return (bobHolds && aliceSeesBob && bobSeesAlice, said)
+        }
+        present(ui, Key.idPrefix("read-by-"), timeout: 60, "alice's message, read by bob, must say so",
+                premise: readPremise)
+        let readBy = words(ui, Key.idPrefix("read-by-"), timeout: 5,
                            "alice's message, read by bob, must say so") ?? ""
         if let line = locate(ui, Key.idPrefix("read-by-")) {
             let perChar = line.frame.width / CGFloat(max(readBy.count, 1))
@@ -1277,6 +1294,13 @@ final class FirstRunProof: XCTestCase {
         // wide as the three columns need leaves the sidebar nowhere to go. Widen the window first,
         // from its right edge, as a person would.
         let window = ui.windows.firstMatch
+        // Precondition, said up front (APPARATUS): a display wide enough for the window to hold
+        // both drags. The first v0.4.3 run met a 1016-point window on the built-in display alone.
+        let wants = sidebarWidth() + 80 + 400 + 7 + inspectorWidth() + 60
+        let room = (NSScreen.screens.map(\.visibleFrame.width).max() ?? 0)
+        guard room >= wants else {
+            throw Apparatus("precondition unmet: the widest display gives \(room) points, and the two drags need a window \(wants) wide (the timeline keeps 400); run this case on a wider display or a scaled resolution with more space")
+        }
         let edge = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.5))
             .withOffset(CGVector(dx: -1, dy: 0))
         edge.press(forDuration: 0.5, thenDragTo: edge.withOffset(CGVector(dx: 400, dy: 0)),
@@ -2397,6 +2421,9 @@ final class FirstRunProof: XCTestCase {
         // the first run's kept tree, was still not hittable, a false red.)
         func inTimeline(_ key: Key) -> Bool { halfInTimeline(ui, key) }
         tap(ui, sessionRow, "bob's Session")
+        // Its lines are tool output, folded into one line by default (v0.4.3): shown, to follow
+        // them one by one. Off again once the following is proved.
+        tap(ui, Key.id("show-tool-calls"), "Show tool calls on bob's Session")
         let newestLine = Key.showing("P7-LINE-060")
         let openedUntil = Date().addingTimeInterval(20)
         while Date() < openedUntil && !inTimeline(newestLine) { Thread.sleep(forTimeInterval: 0.25) }
@@ -2419,6 +2446,7 @@ final class FirstRunProof: XCTestCase {
             keepTree(ui, "the Session did not follow its new line")
             XCTFail("PRODUCT: a Session watched at its newest line must follow what it prints next; P7-LINE-061 is not on screen 30 s after bob's session made it")
         }
+        tap(ui, Key.id("show-tool-calls"), "Show tool calls on bob's Session, to fold them again")
         // D18: a message to the room while the Session is shown is not seen, so it counts.
         guard let before = newCount() else {
             throw Apparatus("mission's sidebar row could not be read")
@@ -2774,11 +2802,18 @@ final class FirstRunProof: XCTestCase {
         present(ui, openedLine, timeout: 30,
                 "bob's Session's opening must read in All as `vox room read` says it, \"Claude Code · tmp opened\", not as a blank row",
                 premise: openedPremise)
+        // By its own line's identifier: bob's other Session in /tmp (bob-proof, from step 4) has
+        // the same title, and its opening is a line of All too.
         let openedRows = ui.windows.firstMatch.descendants(matching: .any)
-            .matching(NSPredicate(format: "label == %@ OR value == %@", "Claude Code · tmp opened",
-                                  "Claude Code · tmp opened")).count
-        XCTAssertEqual(openedRows, 1,
-                       "PRODUCT: bob's Session's opening must be said once in All (v0.4.3); \"Claude Code · tmp opened\" shows \(openedRows) times")
+            .matching(NSPredicate(format: "identifier BEGINSWITH 'opened-' AND identifier ENDSWITH %@",
+                                  "-\(d7Session)")).count
+        if openedRows == 0 {
+            keepTree(ui, "no opened-…-\(d7Session) line in All")
+            XCTFail("APPARATUS: the proof's lookup found no line identified opened-…-\(d7Session) in All, though \"Claude Code · tmp opened\" shows; the lookup, not the app, is to be fixed")
+        } else {
+            XCTAssertEqual(openedRows, 1,
+                           "PRODUCT: bob's Session \(d7Session)'s opening must be said once in All (v0.4.3); its line shows \(openedRows) times")
+        }
         tap(ui, Key.id("session-general"), "the General tab")
         let generalUntil = Date().addingTimeInterval(3)
         while Date() < generalUntil && locate(ui, openedLine) != nil { Thread.sleep(forTimeInterval: 0.25) }
@@ -2956,9 +2991,12 @@ final class FirstRunProof: XCTestCase {
         // Details, a small disclosure, only on the row pointed at or selected (10): bob's reply,
         // neither (the pointer is on the room's name), has none showing.
         el(ui, Key.id("room-header-name")).hover()
-        let replyRow = ui.windows.firstMatch.descendants(matching: .any)
-            .matching(NSPredicate(format: "identifier BEGINSWITH %@", "entry-row-"))
-            .allElementsBoundByIndex.first { shown($0).contains("POLISH-REPLY") }
+        // The row by the id of its words: a row's own label is empty (its words are its children).
+        let replySaid = ui.windows.firstMatch.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH 'entry-said-' AND (value CONTAINS %@ OR label CONTAINS %@)",
+                                  "POLISH-REPLY", "POLISH-REPLY")).firstMatch
+        let replyId = replySaid.exists ? replySaid.identifier.replacingOccurrences(of: "entry-said-", with: "") : ""
+        let replyRow = replyId.isEmpty ? nil : locate(ui, Key.id("entry-row-\(replyId)"))
         if let replyRow {
             if replyRow.isSelected {
                 XCTFail("APPARATUS (staging not achieved): bob's reply is selected, so whether Details shows unselected cannot be read")
@@ -2968,7 +3006,8 @@ final class FirstRunProof: XCTestCase {
                              "PRODUCT: an entry's Details must show only when it is pointed at or selected (v0.4.3); bob's reply, neither, shows it")
             }
         } else {
-            XCTFail("PRODUCT: bob's reply must be a row of his Session (entry-row-…) holding POLISH-REPLY; none does")
+            keepTree(ui, "bob's reply's row could not be found by its words' id")
+            XCTFail("APPARATUS: the proof's lookup found no entry-said-… holding POLISH-REPLY with an entry-row-… of the same id, though POLISH-REPLY shows; the lookup, not the app, is to be fixed")
         }
         print("[proof] Session read: row \(rowWords.debugDescription), header \(headWords.debugDescription), typed \(typed.debugDescription), tools \(folded.debugDescription)")
 
