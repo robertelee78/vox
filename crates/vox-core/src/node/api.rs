@@ -632,8 +632,9 @@ pub struct ChannelDetail {
 pub struct NodeView {
     /// The profile's identity, or `None` before one is created.
     pub identity: Option<IdentityInfo>,
-    /// `(room, member, why)`: each member this identity's key waits for, and why (ADR-030 D-5,
-    /// W-4), in room and member order.
+    /// `(room, member, said)`: what is said of a member about this identity's key, after its name
+    /// (ADR-030 D-5, W-4): that the key waits, and why, or that it runs an older Vox and reads
+    /// without post-compromise protection. In room and member order.
     pub key_waits: Vec<(Digest32, Digest32, String)>,
     /// Whether the identity is locked (no signer in memory).
     pub locked: bool,

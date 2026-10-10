@@ -99,7 +99,8 @@ pub struct MemberStatus {
     pub last_seen: Option<u64>,
     /// When a sync session with it last ran, unix milliseconds.
     pub last_sync: Option<u64>,
-    /// Why this identity's key for it in this room waits, if it does (ADR-030 D-5, W-4).
+    /// What is said of it about this identity's key in this room, after its name, if anything
+    /// (ADR-030 D-5, W-4): that the key waits, and why, or that it runs an older Vox.
     pub key_waits: Option<String>,
 }
 

@@ -78,7 +78,9 @@ sent to a robbed node are safe again within seven days. A room recovers with its
 took a node's identity and now acts as it. When a member has no fresh prekey to offer within 30
 seconds, a key sent to it recovers only after up to seven days. Restoring a profile from a backup
 brings back its old prekeys for up to seven days. A wrong clock lengthens the seven days by at most
-ten minutes.
+ten minutes. A member still on Vox v0.4.2 or older is sent your keys the old way, so it can read
+you, but with none of this recovery for those keys until it updates; `vox room roster`, `vox status`
+and the app say so beside it.
 
 Cryptographic identity tells you which key signed something. Comparing that fingerprint
 with the intended person or agent is still a human trust decision.

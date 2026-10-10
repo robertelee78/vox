@@ -5941,6 +5941,15 @@ impl ChannelState {
         expired: &mut Vec<(Digest32, Tracked)>,
     ) -> Result<()> {
         let Some(chain) = self.drive.receivers.get_mut(&(author, msg.header.chain_id)) else {
+            // An entry under a key of the author's this node does not hold, from an author whose
+            // key it held: the author changed its key away from this node, and this node's drive
+            // over the author's Sessions is gone (SC-2b). Said once as Session news for the room,
+            // so a client that keeps the room's Sessions reads them again; there is no row.
+            if self.drive.holds_from(&author) && self.drive.told_unheld.insert(entry_hash) {
+                self.drive
+                    .news
+                    .push(crate::node::drive::KEY_CHANGED.to_owned());
+            }
             return Ok(());
         };
         let Ok(plaintext) = chain.decrypt(msg).map(Zeroizing::new) else {

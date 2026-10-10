@@ -106,6 +106,9 @@ pub struct DriveState {
     /// a member that lost drive cannot tell ([`KEY_CHANGED`]); `None` until worked out from the
     /// room's log. Not kept: it is worked out again when the room is opened.
     pub(crate) change_unsaid: Option<bool>,
+    /// Entries under a key of another author's this node does not hold, already said as news
+    /// (a lost drive key, SC-2b). Not kept.
+    pub(crate) told_unheld: std::collections::HashSet<Digest32>,
 }
 
 /// Whether `row` announces a file out of its Session (ADR-029 DR-1.8, #546): what a member with
@@ -296,6 +299,7 @@ impl DriveState {
             pending: Vec::new(),
             news: Vec::new(),
             change_unsaid: None,
+            told_unheld: std::collections::HashSet::new(),
         })
     }
 }

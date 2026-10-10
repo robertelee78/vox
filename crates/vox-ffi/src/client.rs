@@ -468,8 +468,9 @@ pub struct Member {
     pub fingerprint: String,
     /// This node's name for it, from the keyring; empty when it has none.
     pub name: String,
-    /// Why this node's key for it in the room waits, if it does (ADR-030 D-5, W-4): said beside
-    /// it, as `vox room roster` says it.
+    /// What is said of it about this node's key in the room, after its name, if anything (ADR-030
+    /// D-5, W-4): that the key waits, and why, or that it runs an older Vox. As `vox room roster`
+    /// says it.
     pub key_waits: Option<String>,
 }
 
