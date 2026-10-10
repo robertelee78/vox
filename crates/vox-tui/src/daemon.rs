@@ -455,6 +455,9 @@ pub(crate) fn take_account(
             proxy: Some(proxy),
         },
     );
+    // The kept nodes are attaching from before the socket serves (#666): `attach_kept` starts
+    // them once it does.
+    router.mark_kept_attaching();
     // Staged in proofs only: the window in which a daemon holds the lock and serves nothing yet.
     #[cfg(feature = "test-knobs")]
     if let Some(ms) = std::env::var(TEST_SERVE_DELAY_ENV)
