@@ -2152,8 +2152,12 @@ impl NodeNet {
         peer: &crate::nat::service::RecordSet,
     ) -> Vec<Vec<u8>> {
         let now = self.now_ms();
-        let has_bundle: std::collections::BTreeSet<Digest32> =
-            peer.bundles.iter().map(|b| b.author_id).collect();
+        // Per author, the `seq` of the bundle the peer holds. **A newer one is offered too**
+        // (ADR-030 P-3): a member's bundle changes as its one-time prekeys are used, and a sender
+        // never names one twice, so a sender holding the old bundle waits for the new one. Offered
+        // only to a board that lacked the author, it reached the sender at its next own sync.
+        let has_bundle: std::collections::BTreeMap<Digest32, u64> =
+            peer.bundles.iter().map(|b| (b.author_id, b.seq)).collect();
         let has_address: std::collections::BTreeSet<Digest32> =
             peer.members.iter().map(|m| m.author_id).collect();
         let store = self.service.store();
@@ -2162,7 +2166,11 @@ impl NodeNet {
         bundles.sort_by_key(|r| chain_order(r));
         let mut out: Vec<Vec<u8>> = bundles
             .into_iter()
-            .filter(|r| !has_bundle.contains(&r.author_id))
+            .filter(|r| {
+                has_bundle
+                    .get(&r.author_id)
+                    .is_none_or(|held| *held < r.seq)
+            })
             .map(MemberBundleRecord::to_wire)
             .collect();
         out.extend(
