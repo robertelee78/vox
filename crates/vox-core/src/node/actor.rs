@@ -1979,9 +1979,20 @@ async fn read_pairwise_streams(
     tx: mpsc::Sender<NetEvent>,
 ) {
     use crate::node::pairwise_stream::{recv_pairwise, PairwiseFrame};
-    while let Some((send, mut recv)) = streams.recv().await {
-        let Ok(Some(first)) = recv_pairwise(&mut recv).await else {
-            continue;
+    while let Some((mut send, mut recv)) = streams.recv().await {
+        let first = match recv_pairwise(&mut recv).await {
+            Ok(Some(first)) => first,
+            // Nothing was sent: nothing to answer.
+            Ok(None) => continue,
+            // **Refused, never dropped** (ADR-030 W-4): a frame that would not read is answered with
+            // a code. Dropped, the stream ended unanswered, which its sender reads as a node older
+            // than key delivery in a session of its own.
+            Err(_) => {
+                let why = crate::node::pairwise_stream::KeyRefusal::CannotOpen.code();
+                let _ = send.reset(why);
+                let _ = recv.stop(why);
+                continue;
+            }
         };
         // A hello is followed on the same stream by the frame it opens the session for, written
         // without waiting for anything, so it is read now too.
@@ -13256,7 +13267,18 @@ impl Node {
         // An aborted joiner never reports back, so nothing is being joined any more, and what was
         // held for the join goes with the network.
         self.joining.clear();
-        self.held_pairwise.clear();
+        // **Refused, never dropped** (ADR-030 W-4): a stream ended without an answer is what a node
+        // older than key delivery in a session of its own does, and its sender says so to its
+        // person. A held key is refused as not accepted, and its sender sends it again after the
+        // next unlock.
+        for (_, stream) in std::mem::take(&mut self.held_pairwise) {
+            let PairwiseIn {
+                mut send, mut recv, ..
+            } = stream;
+            let why = crate::node::pairwise_stream::KeyRefusal::NotAccepted.code();
+            let _ = send.reset(why);
+            let _ = recv.stop(why);
+        }
         // Keys still in flight stay owed, and are sent again after the next unlock (V210-88).
         self.keys_in_flight.clear();
         // Sealed bytes, no key material; but the ring that opens the next ones is this identity's.
