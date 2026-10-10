@@ -11,6 +11,7 @@
 //! | direction | frame |
 //! |---|---|
 //! | either | `SKDM` — the `channelID` plus one ratchet [`Message`] whose plaintext is an SKDM |
+//! | either | `ROTATION_HELLO` — a key delivery (ADR-030 W-1): the `channelID`, the PQXDH opening of a fresh session, and the key sealed in it |
 //!
 //! The channelID travels **outside** the sealed message because the recipient needs
 //! it to pick the session that decrypts it: an ADR-004 session is bound to a
@@ -55,6 +56,10 @@ const OP_SKDM: u64 = 1;
 const OP_HELLO: u64 = 2;
 /// `3` — an [`PairwiseFrame::Open`]: one ratchet message carrying nothing.
 const OP_OPEN: u64 = 3;
+/// `4` — a [`PairwiseFrame::RotationHello`]: one key delivery in a session of its own (ADR-030
+/// W-1). A node that predates ADR-030 refuses it as an unknown frame, and that refusal is the whole
+/// mixed-version behaviour (W-4): the key waits.
+const OP_ROTATION_HELLO: u64 = 4;
 
 /// One frame on a `pairwise` stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +113,22 @@ pub enum PairwiseFrame {
         /// `Message::to_wire` bytes of a sealed, empty-plaintext ratchet message.
         sealed: Vec<u8>,
     },
+    /// **One key delivery, in a session of its own** (ADR-030 W-1): the PQXDH opening of a session
+    /// the sender opened for this key alone (D-1, D-2), and the key sealed in it, together.
+    ///
+    /// It is not an [`PairwiseFrame::Hello`]. A hello opens the long-lived session a pair keeps, and
+    /// two competing hellos are reconciled (ADR-004 O2–O4). A delivery's session lives only as long
+    /// as it takes to open the key: the receiver builds it, opens the key, answers, and drops it,
+    /// never touching the long-lived session or its replay pin (W-2, W-3).
+    RotationHello {
+        /// The room the key is for, and the session's binding.
+        channel_id: crate::hash::Digest32,
+        /// `InitialMessage::to_wire` bytes: the delivery session's opening.
+        initial: Vec<u8>,
+        /// `Message::to_wire` bytes: the first ratchet message of that session, whose plaintext is
+        /// the [`Skdm`].
+        sealed: Vec<u8>,
+    },
 }
 
 impl PairwiseFrame {
@@ -127,6 +148,17 @@ impl PairwiseFrame {
             }
             Self::Open { channel_id, sealed } => {
                 e.array(3).uint(OP_OPEN).bytes(channel_id).bytes(sealed);
+            }
+            Self::RotationHello {
+                channel_id,
+                initial,
+                sealed,
+            } => {
+                e.array(4)
+                    .uint(OP_ROTATION_HELLO)
+                    .bytes(channel_id)
+                    .bytes(initial)
+                    .bytes(sealed);
             }
         }
         e.finish()
@@ -159,6 +191,14 @@ impl PairwiseFrame {
                     .map_err(|_| Error::MalformedBundle("pairwise room id length"))?,
                 initial: d.bytes()?.to_vec(),
             },
+            (OP_ROTATION_HELLO, 4) => Self::RotationHello {
+                channel_id: d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| Error::MalformedBundle("pairwise room id length"))?,
+                initial: d.bytes()?.to_vec(),
+                sealed: d.bytes()?.to_vec(),
+            },
             _ => return Err(Error::MalformedBundle("pairwise frame op")),
         };
         d.finish()?;
@@ -175,6 +215,27 @@ pub fn hello_frame(channel_id: &crate::hash::Digest32, initial: &InitialMessage)
         initial: initial.to_wire(),
     }
     .to_frame()
+}
+
+/// A key delivery (ADR-030 W-1): `skdm` sealed as the first message of `session`, a session the
+/// sender opened for this key alone with `initial`, in one [`PairwiseFrame::RotationHello`]. The
+/// caller keeps these bytes and resends exactly them until the key is taken (D-4).
+///
+/// # Errors
+/// The session could not seal it.
+pub fn rotation_hello_frame(
+    channel_id: &crate::hash::Digest32,
+    initial: &InitialMessage,
+    session: &mut Session,
+    skdm: &Skdm,
+) -> Result<Vec<u8>> {
+    let sealed = skdm.seal_into(session)?.to_wire();
+    Ok(PairwiseFrame::RotationHello {
+        channel_id: *channel_id,
+        initial: initial.to_wire(),
+        sealed,
+    }
+    .to_frame())
 }
 
 /// Seal `skdm` into `session` as one frame for `channel_id`. Sealing steps the ratchet, so it
@@ -258,6 +319,9 @@ pub enum KeyRefusal {
     /// The key opened, but its owner has not trusted the member it came from, so this node does
     /// not read that member (V210-118). Sent again, and taken, once its owner trusts it.
     NotTrusted = 0x25,
+    /// A key delivery named a one-time prekey this node does not hold (ADR-030 P-3): the sender
+    /// fetches the bundle again and never names that prekey again.
+    UnknownPrekey = 0x26,
 }
 
 impl KeyRefusal {
@@ -276,6 +340,7 @@ impl KeyRefusal {
             0x23 => "the room would not take the key".into(),
             0x24 => "its hello was not accepted".into(),
             0x25 => "its owner has not trusted us, so it does not read us yet".into(),
+            0x26 => "it does not hold the one-time prekey the delivery named".into(),
             0x05 => "refused at accept: it may not take a key from us yet".into(),
             other => format!("reset with code {other}"),
         }

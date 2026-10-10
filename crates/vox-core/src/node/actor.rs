@@ -11963,19 +11963,36 @@ impl Node {
         init: &InitialMessage,
         ctx: &crate::join::session::JoinContext,
     ) -> Option<crate::pairwise::session::Session> {
+        self.respond_to_initial_or_why(init, ctx).await.ok()
+    }
+
+    /// [`Self::respond_to_initial`], saying why not: [`KeyRefusal::UnknownPrekey`] when the message
+    /// names a one-time prekey this ring never issued or no longer holds, which the sender of a key
+    /// delivery must know to fetch the bundle again and never name it again (ADR-030 P-3), and
+    /// [`KeyRefusal::HelloRefused`] for anything else.
+    ///
+    /// [`KeyRefusal::UnknownPrekey`]: crate::node::pairwise_stream::KeyRefusal::UnknownPrekey
+    /// [`KeyRefusal::HelloRefused`]: crate::node::pairwise_stream::KeyRefusal::HelloRefused
+    async fn respond_to_initial_or_why(
+        &mut self,
+        init: &InitialMessage,
+        ctx: &crate::join::session::JoinContext,
+    ) -> Result<crate::pairwise::session::Session, crate::node::pairwise_stream::KeyRefusal> {
+        use crate::node::pairwise_stream::KeyRefusal;
+        let refused = KeyRefusal::HelloRefused;
         let now = self.now_ms().get();
         let mut reuse = crate::pairwise::OtpReuseTracker::new();
-        let profile = self.profile.as_ref()?;
+        let profile = self.profile.as_ref().ok_or(refused)?;
         let store = profile.store();
         let Ok(signer) = profile.signer() else {
-            return None;
+            return Err(refused);
         };
         // The ring is taken under its lock below, so take what the save needs first. The
         // `Send + Sync` bound is load-bearing, not decoration: this function now awaits the
         // ring lock, so the actor's whole future has to stay `Send`, and a bare
         // `&dyn RootSigner` is not.
         let signer: &(dyn crate::identity::composite::RootSigner + Send + Sync) = signer;
-        let ring = self.prekeys.as_ref().map(Arc::clone)?;
+        let ring = self.prekeys.as_ref().map(Arc::clone).ok_or(refused)?;
         let mut ring = ring.lock().await;
         if let Some(id) = init.one_time_prekey_id {
             match ring.use_one_time(id, now) {
@@ -11985,15 +12002,17 @@ impl Node {
                     // the downgrade is graded even after a restart (ADR-004).
                     reuse.observe(id);
                 }
-                prekeys::OneTimeUse::Unknown => return None,
+                prekeys::OneTimeUse::Unknown => return Err(KeyRefusal::UnknownPrekey),
             }
             // Persist the consume before the handshake completes: a crash here must not
             // leave the prekey re-offerable.
             if prekeys::save(store, signer, &ring).is_err() {
-                return None;
+                return Err(refused);
             }
         }
-        let signed_prekey = ring.signed_prekey_for(init.signed_prekey_id)?;
+        let signed_prekey = ring
+            .signed_prekey_for(init.signed_prekey_id)
+            .ok_or(refused)?;
         let one_time_prekey = init
             .one_time_prekey_id
             .and_then(|id| ring.consumed_one_time(id));
@@ -12010,9 +12029,9 @@ impl Node {
             &mut reuse,
             ctx.floor,
         ) else {
-            return None;
+            return Err(refused);
         };
-        Some(session)
+        Ok(session)
     }
 
     /// Accept an inbound [`crate::node::pairwise_stream::PairwiseFrame::Hello`], establishing the responder half of
@@ -12680,7 +12699,8 @@ impl Node {
         let room = match &stream.first {
             PairwiseFrame::Skdm { channel_id, .. }
             | PairwiseFrame::Open { channel_id, .. }
-            | PairwiseFrame::Hello { channel_id, .. } => *channel_id,
+            | PairwiseFrame::Hello { channel_id, .. }
+            | PairwiseFrame::RotationHello { channel_id, .. } => *channel_id,
         };
         // **Held, not dropped, while this node is still joining that room.** The join runs off the
         // actor now, so the responder's key — sent the moment it admits us — can arrive before the
@@ -12802,6 +12822,9 @@ impl Node {
         // the SKDM it precedes.
         let (channel_id, sealed) = match first {
             PairwiseFrame::Skdm { channel_id, sealed } => (channel_id, sealed),
+            // A key delivery in a session of its own (ADR-030 W-1). Not taken yet: refused as a node
+            // that predates it would refuse it (W-4), so the key waits.
+            PairwiseFrame::RotationHello { .. } => return Some(Err(KeyRefusal::HelloRefused)),
             // One ratchet message with an empty plaintext, sent to give *this* node a
             // sending chain (M17.6). Decrypt it so the ratchet steps, then stop: there
             // is nothing behind it and nothing is granted by it.
