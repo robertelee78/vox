@@ -11,7 +11,9 @@ process's: the proof writes a JSON hook event to a file and names it on a line o
 ("hook <path>"); "exit" ends the stand-in. "ask" puts up a permission prompt in the input box's
 place, drawn as Claude Code 2.1.296 draws it (one rule, the command, "Do you want to proceed?",
 the numbered choices, "Esc to cancel · Tab to amend"); while it is up, every key answers it and is
-recorded as {"answered": "<key>"}, and Esc or "unask" takes it down. Nothing here is product.
+recorded as {"answered": "<key>"}, and Esc or "unask" takes it down. "ask-on-key" puts the prompt up
+as the next key arrives, as a tool's permission asked at that moment would, and that key and every
+later one answer it. Nothing here is product.
 """
 import argparse, json, os, select, subprocess, sys, termios, tty
 
@@ -30,6 +32,7 @@ def record(obj):
         f.write(json.dumps(obj) + "\n")
 
 asking = False
+ask_on_key = False
 DASH = "╌" * 60
 
 def draw():
@@ -94,6 +97,9 @@ try:
         if r:
             data = os.read(fd, 4096).decode(errors="replace")
             for ch in data:
+                if ask_on_key:
+                    asking = True
+                    ask_on_key = False
                 if asking:
                     # The prompt takes every key: Esc cancels it, anything else answers it.
                     if ch == "\x1b":
@@ -129,6 +135,8 @@ try:
             if line == "ask":
                 asking = True
                 draw()
+            if line == "ask-on-key":
+                ask_on_key = True
             if line == "unask":
                 asking = False
                 draw()

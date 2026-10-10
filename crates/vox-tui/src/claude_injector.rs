@@ -499,6 +499,15 @@ fn submit(p: &TmuxPane, text: &str) -> Result<(), String> {
     if !wait_until(p, SETTLE, |pane| {
         composer_contains(pane, &marker) == Some(true)
     }) {
+        // A question that came up between the look and the keys (a tool's permission, asked at
+        // that moment) took them: nothing closes that window, so say what may have happened.
+        if capture(p).as_deref().map(screen) == Some(Screen::Asking) {
+            return Err(
+                "a question came up in Claude Code's terminal as Vox typed: the keys may have \
+                 reached it, and nothing was submitted; look at the session's terminal"
+                    .into(),
+            );
+        }
         return Err(
             "the text did not appear in Claude Code's input box, so it was not submitted; look \
              at the session's terminal"

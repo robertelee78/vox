@@ -873,7 +873,8 @@ const S8: &str = "88888888-1111-4000-8000-000000000008";
 ///    run (a `/rename` runs none), renames the Session within 15 s;
 ///    1c. while the session asks for permission in its terminal (its input box replaced by the
 ///    prompt), `--say "1"` and `--slash` are refused, saying it is asking something, and the prompt
-///    gets no key; once the prompt is gone, `--say` reaches the session;
+///    gets no key; once the prompt is gone, `--say` reaches the session; a prompt that comes up as
+///    the keys arrive gets no Enter, and the driver is told the keys may have reached it;
 /// 2. a sub-agent's hook leaves its session's binding as it was;
 /// 3. a session started through a wrapper (a shell script, not exec'd) is still bound;
 /// 4. the pane swapped with another and moved to a new window: input follows the pane;
@@ -1071,6 +1072,19 @@ fn a_driver_reaches_exactly_the_session_it_names_or_is_told_why() {
         ),
         "PRODUCT: arm 1c: once {S1}'s prompt is gone, --say must reach it; vox said {said:?}"
     );
+    // A prompt that comes up as the keys arrive (the window between Vox's look and its keys):
+    // Enter is never pressed into it, and Vox says the keys may have reached it.
+    a.control("ask-on-key");
+    let (ok, said) = drive(&w, &room, S1, &["--say", "raced by a prompt"]);
+    println!("[proof] 1c. --say to {S1} as a prompt comes up: {said}");
+    let enter = a.said().lines().any(|l| l == r#"{"answered": "\r"}"#);
+    assert!(
+        !ok && said.contains("came up in Claude Code's terminal as Vox typed") && !enter,
+        "PRODUCT: arm 1c: a prompt that came up as Vox typed must get no Enter, and the driver \
+         must be told the keys may have reached it; vox said {said:?}, Enter reached the prompt: \
+         {enter}"
+    );
+    a.control("unask");
 
     // ---- 2. a sub-agent's hook keeps its session's binding ----
     a.hook(&event(
