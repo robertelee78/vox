@@ -78,8 +78,8 @@ describe the two as the same assurance.
 
 After an update, `vox update` restarts the vox daemon onto the new version, so update when it is
 safe to interrupt your rooms and services. Every node detaches as the daemon stops; the new daemon
-attaches again each node whose passphrase it keeps (`vox node attach --keep`, or the Keychain from
-the app), and the update names any other node with `vox node attach NAME` to attach it again. A
+attaches again each remembered node (its passphrase in the Keychain, none needed, or `vox node
+attach --keep`), and the update names any other node with `vox node attach NAME` to attach it again. A
 daemon you started yourself in a terminal is left running the old version, and the update says so.
 An open `vox tui` or Vox app keeps running the old version until you restart it. Agent coordination requires
 participants to run the same Vox version; update the group deliberately, not one worker in

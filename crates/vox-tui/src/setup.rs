@@ -97,11 +97,20 @@ pub fn run(args: &NodeArgs) -> Result<(), AppError> {
 
     for (h, program) in &found {
         let suggested = NodeName::parse(&format!("{}-{host}", h.key))?;
+        let wiring = Wiring::of(h.key)?;
+        // **A harness wired already is left as it is** (#666): the node its hook names is the
+        // one it is, whatever its name, and a second node would only split it in two.
+        if let Some(wired) = connected(&account, &wiring) {
+            println!(
+                "vox setup: {} is connected to node {wired}; left as it is",
+                h.name
+            );
+            continue;
+        }
         if account.nodes_on_disk().contains(&suggested) {
             println!("vox setup: node {suggested} exists already; it is left as it is");
             continue;
         }
-        let wiring = Wiring::of(h.key)?;
         println!();
         println!(
             "{} is to get a node of its own, {suggested} unless you name it, with a passphrase \
@@ -129,10 +138,11 @@ pub fn run(args: &NodeArgs) -> Result<(), AppError> {
         if name != suggested {
             println!("  as node {name}, not {suggested}");
         }
-        let fingerprint = create(&account, &name)?;
+        let (fingerprint, passphrase) = create(&account, &name)?;
         for line in wiring.install(&name)? {
             println!("  {line}");
         }
+        attach(args, &name, passphrase);
         if h.key == "codex" {
             match crate::codex_app_server::ensure(program, &wiring.dir) {
                 Ok(_) => println!("  Codex's app-server is running"),
@@ -176,7 +186,8 @@ pub fn run(args: &NodeArgs) -> Result<(), AppError> {
                     Err(e) => println!("  {e}"),
                 }
             };
-            let fingerprint = create(&account, &name)?;
+            let (fingerprint, passphrase) = create(&account, &name)?;
+            attach(args, &name, passphrase);
             made.push(Made {
                 name,
                 fingerprint,
@@ -216,34 +227,63 @@ pub fn run(args: &NodeArgs) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Make node `name` with a passphrase typed twice, which may not be empty (ADR-028 K-11): its
-/// fingerprint, in base32.
+/// The node `wiring`'s harness is connected to here: the one its Vox hook names, when that node
+/// is on this machine (`vox agent status` says the other case).
+pub(crate) fn connected(
+    account: &vox_core::node::paths::Account,
+    wiring: &Wiring,
+) -> Option<NodeName> {
+    wiring
+        .wired_node()
+        .and_then(|n| NodeName::parse(&n).ok())
+        .filter(|n| account.nodes_on_disk().contains(n))
+}
+
+/// Make node `name` with a passphrase typed twice, or none (ADR-028 K-11 as amended): its
+/// fingerprint, in base32, and the passphrase, to attach it with.
 pub(crate) fn create(
     account: &vox_core::node::paths::Account,
     name: &NodeName,
-) -> Result<String, AppError> {
+) -> Result<(String, zeroize::Zeroizing<String>), AppError> {
     let passphrase = ask_new_passphrase(name)?;
     let paths = account.node_paths(name)?;
     let fp = crate::client::create_identity(&paths, &passphrase)?;
     println!("vox setup: created node {name}");
-    Ok(vox_core::node::link::b32_encode(&fp))
+    Ok((vox_core::node::link::b32_encode(&fp), passphrase))
 }
 
-/// A new node's passphrase, typed twice at the terminal, which may not be empty (ADR-028 K-11).
+/// Attach node `name`, just made, and remember it (#666), so it is usable at once and after every
+/// restart with nobody typing. A node made but not attached is said, with the command that
+/// attaches it, and setup goes on.
+fn attach(args: &NodeArgs, name: &NodeName, passphrase: zeroize::Zeroizing<String>) {
+    let attached = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(AppError::Io)
+        .and_then(|rt| rt.block_on(crate::client::attach_with(args, name, passphrase, true)));
+    if let Err(e) = attached {
+        println!(
+            "vox setup: node {name} is made, but not attached: {e}\n  attach it: vox node attach \
+             {name}"
+        );
+    }
+}
+
+/// A new node's passphrase, typed twice at the terminal. Enter alone, twice, gives none (ADR-005
+/// J-2, V030-36), and what that means is said once.
 ///
 /// # Errors
 /// The terminal closed.
 pub(crate) fn ask_new_passphrase(name: &NodeName) -> Result<zeroize::Zeroizing<String>, AppError> {
     loop {
         let first = zeroize::Zeroizing::new(crate::tunnel_cli::prompt_passphrase(&format!(
-            "passphrase for {name}"
+            "passphrase for {name} (Enter alone for none)"
         ))?);
-        if first.is_empty() {
-            println!("  a node must have a passphrase; type one");
-            continue;
-        }
         let again = zeroize::Zeroizing::new(crate::tunnel_cli::prompt_passphrase("again")?);
         if *first == *again {
+            if first.is_empty() {
+                println!("  {}", vox_text::node::NO_PASSPHRASE);
+            }
             return Ok(first);
         }
         println!("  the two differ; type it again");

@@ -16224,7 +16224,6 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::RoomNotSynced => Fault::RoomNotSynced,
         Error::Profile("no identity on this node") => Fault::NoIdentity,
         Error::Profile("identity already exists on this node") => Fault::IdentityExists,
-        Error::Profile(crate::node::profile::EMPTY_PASSPHRASE) => Fault::PassphraseEmpty,
         Error::Profile("locked") => Fault::Locked,
         Error::Profile("no such room on this node") => Fault::UnknownChannel,
         Error::AtRestUnlockFailed => Fault::WrongPassphrase,

@@ -301,14 +301,24 @@ private struct OnThisMachine: View {
                 .padding(.top, Space.s8)
             ForEach(nodes, id: \.name) { node in
                 HStack {
-                    Text(node.name)
-                    Spacer()
-                    Text(node.state).secondaryText()
+                    HStack {
+                        Text(node.name)
+                        Spacer()
+                        Text(node.state).secondaryText()
+                    }
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("\(node.name) \(node.state)")
+                    .copyMenu([("Copy Name", node.name), ("Copy Fingerprint", node.fingerprint)])
+                    .accessibilityIdentifier("machine-\(node.name)")
+                    // A node that waits for its passphrase is attached from here, and remembered
+                    // (#666): it then attaches by itself after every restart.
+                    if node.state != "attached" {
+                        Button("Attach…") { AppModel.shared.attachNodeAsk = node.name }
+                            .buttonStyle(.link)
+                            .accessibilityLabel("Attach node \(node.name)")
+                            .accessibilityIdentifier("machine-attach-\(node.name)")
+                    }
                 }
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel("\(node.name) \(node.state)")
-                .copyMenu([("Copy Name", node.name), ("Copy Fingerprint", node.fingerprint)])
-                .accessibilityIdentifier("machine-\(node.name)")
             }
             Text("Separate identities. One daemon.").secondaryText()
                 .padding(.top, Space.s4)

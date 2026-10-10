@@ -7,7 +7,9 @@
 //!    node `b` still answers.
 //! 2. **Lifecycle races (proof 6, L-3; ADR-028 K-13).** Two hooks of two sessions of one detached
 //!    node, with no daemon running, start at once: both exit 0, telling the agent the node is not
-//!    attached and the command for the operator, `vox node attach agent`; one daemon starts, and
+//!    attached and the command for the operator, `vox node attach agent`; a session's next turn
+//!    says nothing more, and the person is notified once per session (#666; mutant: the
+//!    once-per-session record ignored, red as PRODUCT at the second turn); one daemon starts, and
 //!    the node stays detached (a hook never attaches it). The operator attaches it; then one
 //!    session's `SessionEnd` races the other's next turn, and the node stays attached throughout;
 //!    the last `SessionEnd` leaves it attached too, since the operator attached it. Detached by
@@ -78,6 +80,21 @@ impl Account {
         let data = tmp.path().join("d");
         let cfg = tmp.path().join("c");
         std::fs::create_dir_all(&cfg).unwrap();
+        // Notifications go to a file of this test's, never to the desktop (`VOX_NOTIFY_COMMAND`).
+        let notify = tmp.path().join("notify");
+        std::fs::write(
+            &notify,
+            format!(
+                "#!/bin/sh\nprintf '%s | %s\\n' \"$1\" \"$2\" >> {}\n",
+                tmp.path().join("notified").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &notify,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
         Self {
             _tmp: tmp,
             data,
@@ -96,6 +113,7 @@ impl Account {
             }
         }
         c.args(args)
+            .env("VOX_NOTIFY_COMMAND", self._tmp.path().join("notify"))
             .env("VOX_DATA_DIR", &self.data)
             .env("VOX_CONFIG_DIR", &self.cfg)
             .env("VOX_LISTEN", "127.0.0.1:0")
@@ -144,6 +162,11 @@ impl Account {
 
     fn log(&self) -> String {
         std::fs::read_to_string(self.data.join(".daemon/log")).unwrap_or_default()
+    }
+
+    /// The notifications raised so far, one `title | body` a line.
+    fn notified(&self) -> String {
+        std::fs::read_to_string(self._tmp.path().join("notified")).unwrap_or_default()
     }
 }
 
@@ -352,6 +375,25 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
             a.log()
         );
     }
+    // **Said once per session, not every turn** (#666): session 1's next turn tells the agent
+    // nothing more, and the person was told once per session, with the command.
+    let (ok, out, err) = a.hook("agent", "s-1", "UserPromptSubmit");
+    assert!(
+        ok && !out.contains("not attached") && !out.contains("could not read your rooms"),
+        "PRODUCT: a session's second turn must not say again that its node is not attached \
+         (once per session): {out}{err}"
+    );
+    let notified = a.notified();
+    assert!(
+        notified
+            .lines()
+            .filter(|l| l.contains("node agent needs its passphrase")
+                && l.contains("vox node attach agent"))
+            .count()
+            == 2,
+        "PRODUCT: the person must be notified once per session (two sessions, three turns) that \
+         node agent needs its passphrase, with the command; notified:\n{notified}"
+    );
     let pid = a
         .lock_pid()
         .unwrap_or_else(|| panic!("PRODUCT: no daemon holds the lock\nlog:\n{}", a.log()));

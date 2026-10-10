@@ -1008,14 +1008,10 @@ impl UiState {
                 None => Action::Redraw,
             },
             PromptKind::CreateIdentity => {
-                // **Every node has a passphrase** (ADR-028 K-11): an empty one is asked again.
-                if p.fields[0].is_empty() {
-                    self.status_message = Some(
-                        "every node has an identity passphrase; an empty one is refused — type one"
-                            .into(),
-                    );
-                    self.mode = Mode::Prompt(Prompt::new(PromptKind::CreateIdentity, None));
-                    return Action::Redraw;
+                // **An identity passphrase is optional** (ADR-005 J-2, V030-36): an empty one
+                // is taken, and what it means is said.
+                if p.fields[0].is_empty() && p.fields[1].is_empty() {
+                    self.status_message = Some(vox_text::node::NO_PASSPHRASE.into());
                 }
                 if p.fields[0].as_str() != p.fields[1].as_str() {
                     self.status_message = Some("passphrases do not match — try again".into());
