@@ -3740,6 +3740,65 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         "PRODUCT: `{stop}`, pasted whole into zsh, must stop sharing =eq.txt; zsh said \
          {stopped}, and `vox share list` lists:\n{listed_shares}"
     );
+    // A keyring change run with no terminal (as an agent runs one) is refused with the command
+    // to run at a terminal: pasted whole into zsh, with a name holding `'`, spaces and `&`, it
+    // asks for the passphrase there and trusts the node under that name.
+    let ben_root = tmp.path().join("ben");
+    std::fs::create_dir_all(ben_root.join("cfg")).expect("APPARATUS: a directory");
+    let ben_pass = ben_root.join("identity.pass");
+    std::fs::write(&ben_pass, "identity passphrase").expect("APPARATUS: a passphrase file");
+    let (ok, ben_fp, err) = hook(
+        &ben_root.join("data"),
+        &ben_root.join("cfg"),
+        &[
+            "id",
+            "--identity-passphrase-file",
+            &ben_pass.to_string_lossy(),
+        ],
+        "",
+    );
+    assert!(ok, "PRODUCT (staging): vox id for ben failed: {err}");
+    let ben_fp = ben_fp.trim().to_owned();
+    let ben_name = "Ben's Mac & co";
+    let refused = vox(&data, &cfg)
+        .args([
+            "trust", "add", &ben_fp, "--name", ben_name, "--node", "default",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("APPARATUS: cannot run vox trust add");
+    let said = String::from_utf8_lossy(&refused.stderr).into_owned();
+    let relay = said
+        .split("Run it in a terminal: ")
+        .nth(1)
+        .and_then(|r| r.lines().next())
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        !refused.status.success() && relay.starts_with("vox trust add"),
+        "PRODUCT (staging): `vox trust add` with no terminal and no keyring change typed in this \
+         run must be refused with the command to run at a terminal; it said: {said}"
+    );
+    let trusted_said = in_shell(
+        "zsh",
+        &relay,
+        &data,
+        &cfg,
+        &[("passphrase", "identity passphrase\r")],
+    );
+    let (_, keyring, _) = hook(&data, &cfg, &["trust", "list"], "");
+    eprintln!(
+        "[proof] (5f) pasted `{relay}` into zsh; it said: {trusted_said}; keyring: {keyring}"
+    );
+    assert!(
+        keyring
+            .lines()
+            .any(|l| l.starts_with(&ben_fp) && l.contains(ben_name)),
+        "PRODUCT: the command a refused keyring change gives, `{relay}`, pasted whole into zsh, \
+         must trust ben as {ben_name:?}; zsh said {trusted_said:?}, and `vox trust list` says:\n\
+         {keyring}"
+    );
 
     // (6) A mapped room whose host is gone: the join fails, and the session is told why on a
     // later turn, even though that turn tries the join again.

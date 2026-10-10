@@ -3908,6 +3908,12 @@ final class FirstRunProof: XCTestCase {
         let directions = words(ui, Key.id("card-directions"), timeout: 10,
                                "dave's card must say both directions: he trusts alice, she has not trusted him",
                                until: { $0.contains("trusts you; you haven't trusted") }) ?? ""
+        // The card's Copy puts the fingerprint on the pasteboard whole, as `vox trust add` takes
+        // it, not the grouped form shown for reading (#662).
+        tap(ui, Key.id("card-copy"), "Copy on dave's card")
+        let cardCopied = NSPasteboard.general.string(forType: .string) ?? ""
+        XCTAssertEqual(cardCopied, daveFp,
+                       "PRODUCT: Copy on dave's card must put his fingerprint as `vox trust add` takes it; the pasteboard holds \(cardCopied.debugDescription)")
         // On his card: two groups so far; a wrong third named, with no Remove (he is not in the
         // keyring); the whole of it marked as a match.
         tap(ui, Key.id("card-compare-open"), "Compare… on dave's card")

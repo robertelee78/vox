@@ -4773,7 +4773,8 @@ pub(crate) fn typed_only() -> String {
     format!(
         "it is typed at a terminal, and taken from nothing else (not VOX_IDENTITY_PASSPHRASE, not \
          a file). Run it in a terminal: {}",
-        command.join(" ")
+        // Each argument as one shell word: a name like "Ben's Mac & co" pastes whole.
+        vox_text::shell::command(&command)
     )
 }
 

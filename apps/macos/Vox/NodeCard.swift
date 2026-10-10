@@ -87,7 +87,9 @@ struct NodeCard: View {
                             .accessibilityIdentifier("card-fingerprint")
                         Button("Copy") {
                             NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(card.grouped, forType: .string)
+                            // The raw fingerprint, as `vox trust add` takes it; the grouped
+                            // form above is for reading and comparing.
+                            NSPasteboard.general.setString(node.fingerprint, forType: .string)
                         }
                         .accessibilityIdentifier("card-copy")
                     }
