@@ -545,6 +545,10 @@ private struct RoomView: View {
     @State private var newest: String?
     /// What is shown just changed, and has not been scrolled to its newest line yet.
     @State private var opened = false
+    /// Just opened (or switched), and its newest line not yet measured in view: until it is, each
+    /// change of the lines and each measure of the rows scrolls to it, since a room's lines land
+    /// in steps after it appears (⌘J), each able to leave the newest below the bottom.
+    @State private var pinned = true
     /// Whether the keyboard is on the timeline (WCAG 2.1.1): ↑/↓ move the selection, Return
     /// opens the selected message's first action, Space Quick Looks its pulled file.
     @State private var timelineFocused = false
@@ -732,6 +736,7 @@ private struct RoomView: View {
                                     return !shown.isNull && shown.height * 2 >= frame.height ? id : nil
                                 })
                                 markSeen()
+                                pin(scroller, "rows")
                             }
                             // A room opens at its newest message: loaded before the view
                             // appeared, its count never changed and it stayed at the top, so the
@@ -742,6 +747,7 @@ private struct RoomView: View {
                                 }
                                 newest = model.followItem
                                 opened = model.showsSessionToRead
+                                pinned = true
                                 // Again once the rows are laid out: a scroll asked for in the
                                 // same pass as the rows it scrolls to can do nothing.
                                 DispatchQueue.main.async { openAtNewest(scroller) }
@@ -765,6 +771,7 @@ private struct RoomView: View {
                                 // again at its newest once they land.
                                 opened = model.showsSessionToRead
                                 newest = model.followItem
+                                pinned = true
                                 DispatchQueue.main.async {
                                     openAtNewest(scroller)
                                     newest = model.followItem
@@ -775,6 +782,7 @@ private struct RoomView: View {
                             // end, is not a line to follow), so a Session follows its output
                             // as General follows its messages.
                             .onChange(of: model.followSignature) { _ in
+                                pin(scroller, "lines")
                                 // A request gone to (⌘J, a notification) stays where it was
                                 // centred: new output does not scroll it away (P1, P7).
                                 if model.selectedRequest != nil, !opened {
@@ -786,6 +794,7 @@ private struct RoomView: View {
                                     openAtNewest(scroller)
                                 } else {
                                     let following = newest == nil || inView.contains(newest ?? "")
+                                    readLog.debug("follow in \(room, privacy: .public) on lines: pinned \(pinned), newest \(newest ?? "none", privacy: .public) in view? \(following), rows \(inView.count)")
                                     if following, let last = model.followItem {
                                         scroller.scrollTo(last, anchor: .bottom)
                                         // Again once the new rows are laid out: a room opened
@@ -1174,6 +1183,23 @@ private struct RoomView: View {
         guard looking != nil else { return false }
         looking = nil
         return true
+    }
+
+    /// While pinned, the newest line scrolled to on the next turn of the main loop if it is not in
+    /// view; pinned no longer once it is. A request to centre (P1, P7) is left where it is.
+    private func pin(_ scroller: ScrollViewProxy, _ why: String) {
+        guard pinned else { return }
+        let last = model.followItem
+        let shown = last.map { inView.contains($0) } ?? false
+        readLog.debug("follow in \(room, privacy: .public) on \(why, privacy: .public): pinned \(pinned), newest \(last ?? "none", privacy: .public) in view? \(shown), rows \(inView.count)")
+        guard model.selectedRequest == nil, model.waitingEntry == nil, let last else { return }
+        if shown {
+            pinned = false
+            return
+        }
+        DispatchQueue.main.async {
+            if pinned, model.followItem == last { scroller.scrollTo(last, anchor: .bottom) }
+        }
     }
 
     /// What is shown, at its newest line; or a Session's request waiting for an answer, centred.
