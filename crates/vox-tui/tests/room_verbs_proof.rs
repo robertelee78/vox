@@ -784,19 +784,9 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
     );
     assert!(ok, "PRODUCT: trust remove failed: {err}");
     assert!(
-        said(
-            &out,
-            "vox: about to stop trusting",
-            &[],
-            "vox: no longer trusting",
-            ""
-        ) && said(
-            &out,
-            "vox: no longer trusting",
-            &[],
-            "     cut: none was open",
-            ""
-        ),
+        // "Remove" is the one word for taking a node out of the keyring (ADR-028 E-2, K-6).
+        said(&out, "vox: about to remove", &[], "vox: removed", "")
+            && said(&out, "vox: removed", &[], "     cut: none was open", ""),
         "PRODUCT: `vox trust remove` must say what it is to stop, then what it did, naming the \
          live sessions it cut: {out:?}"
     );
