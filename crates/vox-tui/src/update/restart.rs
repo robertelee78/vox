@@ -51,12 +51,14 @@ enum Started {
 }
 
 /// Restart the account's daemon, if one runs, onto `helper`, the vox now in place, and say what that did: the version it runs, and each node it no longer has attached.
-pub(super) fn restart_daemon(helper: &Path, now: &str) {
+///
+/// The nodes it left detached are returned, for [`say_next`].
+pub(super) fn restart_daemon(helper: &Path, now: &str) -> Vec<NodeName> {
     let account = match Account::of(None, None) {
         Ok(a) => a,
         Err(e) => {
             println!("the vox daemon was not restarted: {e}; restart it to run {now}");
-            return;
+            return Vec::new();
         }
     };
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -66,17 +68,17 @@ pub(super) fn restart_daemon(helper: &Path, now: &str) {
         Ok(rt) => rt,
         Err(e) => {
             println!("the vox daemon was not restarted: {e}; restart it to run {now}");
-            return;
+            return Vec::new();
         }
     };
-    rt.block_on(restart(&account, helper, now));
+    rt.block_on(restart(&account, helper, now))
 }
 
-async fn restart(account: &Account, helper: &Path, now: &str) {
+async fn restart(account: &Account, helper: &Path, now: &str) -> Vec<NodeName> {
     let socket = account.socket();
     // No daemon: the next command that needs one starts the vox now in place.
     let Ok(before) = status(&socket).await else {
-        return;
+        return Vec::new();
     };
     let started = how_started(before.pid);
     if matches!(started, Started::ByHand) {
@@ -85,7 +87,7 @@ async fn restart(account: &Account, helper: &Path, now: &str) {
              stop it and start it again to run {now}",
             before.pid, before.version
         );
-        return;
+        return Vec::new();
     }
     let attached: Vec<NodeName> = before
         .nodes
@@ -118,7 +120,7 @@ async fn restart(account: &Account, helper: &Path, now: &str) {
             STOP_WITHIN.as_secs(),
             before.version
         );
-        return;
+        return Vec::new();
     }
 
     // ---- start the new one ----------------------------------------------------------------
@@ -128,7 +130,7 @@ async fn restart(account: &Account, helper: &Path, now: &str) {
                 "the vox daemon was stopped; the next vox command that needs it starts vox {now}"
             );
             say_detached(&attached);
-            return;
+            return attached;
         }
         Started::ByClient(anchors) => {
             let listen = before
@@ -141,7 +143,7 @@ async fn restart(account: &Account, helper: &Path, now: &str) {
             {
                 println!("the vox daemon was stopped, and vox {now} did not start: {e}");
                 say_detached(&attached);
-                return;
+                return attached;
             }
         }
         #[cfg(target_os = "macos")]
@@ -159,7 +161,7 @@ async fn restart(account: &Account, helper: &Path, now: &str) {
                     )
                 );
                 say_detached(&attached);
-                return;
+                return attached;
             }
         }
         #[cfg(target_os = "linux")]
@@ -176,7 +178,7 @@ async fn restart(account: &Account, helper: &Path, now: &str) {
                         |o| String::from_utf8_lossy(&o.stderr).trim().to_owned()
                     )
                 );
-                return;
+                return Vec::new();
             }
             println!("the systemd user unit {unit} was restarted");
         }
@@ -215,6 +217,7 @@ async fn restart(account: &Account, helper: &Path, now: &str) {
                 })
                 .collect();
             say_detached(&missing);
+            missing
         }
         Err(e) => {
             println!(
@@ -225,6 +228,7 @@ async fn restart(account: &Account, helper: &Path, now: &str) {
             let unkept: Vec<NodeName> =
                 attached.into_iter().filter(|a| !kept.contains(a)).collect();
             say_detached(&unkept);
+            unkept
         }
     }
 }
@@ -233,9 +237,30 @@ async fn restart(account: &Account, helper: &Path, now: &str) {
 fn say_detached(nodes: &[NodeName]) {
     for node in nodes {
         println!(
-            "node {node} is detached: the daemon keeps no passphrase for it. Attach it again: \
-             vox node attach {node}"
+            "node {node} is detached, as the daemon remembers no passphrase for it; attach it \
+             again with `vox node attach {node}`"
         );
+    }
+}
+
+/// The last line of an update or a rollback: what to do next, given the nodes the restart left
+/// `detached` (#666).
+pub(super) fn say_next(detached: &[NodeName]) {
+    match detached {
+        [] => println!("Next: run `vox status` to see your nodes and rooms on this version"),
+        [node] => println!(
+            "Next: run `vox node attach {node}`; it asks for the passphrase once and then \
+             remembers it"
+        ),
+        nodes => println!(
+            "Next: attach {} with `vox node attach <node>`; each asks for its passphrase once \
+             and then remembers it",
+            nodes
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 

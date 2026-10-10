@@ -5001,6 +5001,17 @@ pub async fn trust_add(
                 )
             );
             println!("     `vox trust remove` undoes it and changes the lock everywhere");
+            if drive {
+                println!(
+                    "Next: from node {petname:?}, `vox room sessions <room>` lists this node's \
+                     Sessions in a room you share, and `vox room session` drives one"
+                );
+            } else {
+                println!(
+                    "Next: send {petname:?} this node's fingerprint (`vox id`), so it trusts you \
+                     too and you read what it writes"
+                );
+            }
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),

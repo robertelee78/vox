@@ -47,7 +47,7 @@ attach` or the app), none needed, or `vox node attach --keep`. Any other node co
 names it with the command that attaches it again:
 
 ```text
-node NAME is detached: the daemon keeps no passphrase for it. Attach it again: vox node attach NAME
+node NAME is detached, as the daemon remembers no passphrase for it; attach it again with `vox node attach NAME`
 ```
 
 How the daemon comes back depends on how it was started. The login item's daemon is started again
