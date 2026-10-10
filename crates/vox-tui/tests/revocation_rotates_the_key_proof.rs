@@ -21,10 +21,10 @@
 //! this covers a key that **was** delivered and is in use.
 //!
 //! ## The staging
-//! 1. Alice creates **two** rooms, `team` and `side` — each with its own sender keys, so the
-//!    removal has to change the lock in each of them (RP-20's quantifier); Bob and Carol join both
-//!    with the links, once each (a join that fails is `PRODUCT`); all three trust each other after
-//!    the joins.
+//! 1. Alice creates **three** rooms, `team`, `side` and `third` — each with its own sender keys, so
+//!    the removal has to change the lock in each of them (RP-20's quantifier); Bob, Carol and Dave
+//!    join each with the links, once each (a join that fails is `PRODUCT`); all four trust each
+//!    other after the joins.
 //! 2. Precondition, in every room: Bob and Carol each render a post by Alice, and Bob renders one
 //!    by Carol (`PRODUCT (staging)` otherwise) — Bob really holds Alice's key before she removes him.
 //! 3. In every room Alice posts a `BEFORE-REMOVAL-CONTROL` and Bob renders it.
@@ -33,7 +33,7 @@
 //!    node is still syncing that room, so Bob's silence on Alice's posts below is the lock, not the
 //!    plumbing.
 //!
-//! ## What is asserted, in each of the 2 rooms
+//! ## What is asserted, in each of the 3 rooms
 //! - Carol renders **3 of 3** of Alice's post-removal messages, within 90 s.
 //! - Bob, with the control proved and 10 s more to settle, renders **0 of 3**.
 //! - Bob still renders what Alice said before the removal.
@@ -50,6 +50,28 @@
 //! stop trusting" line, then a line naming both rooms bob is to read nothing new in; after, "vox: no
 //! longer trusting".
 //!
+//! ## ADR-030 T-1: the rotated key travels in a session of its own
+//! Dave, made and joined by the shipped binary, has his daemon stopped once he reads alice in
+//! every room, and the proof takes his place with his own profile (the attacker apparatus, below):
+//! it connects to alice as dave, opens his long-lived session with her in each room (a `Hello`,
+//! then an `Open`) and **freezes** it. That frozen session is the attacker's pre-rotation pairwise
+//! state. It answers each delivery as dave's node does, from his prekey ring, and republishes his
+//! bundle on alice's board after each one it takes. When alice removes bob, in every room:
+//! - (a) the rotated key reaches dave in an `OP_ROTATION_HELLO`, never in the long-lived session;
+//! - (b) the frozen session does not open it;
+//! - (c) the fresh session its own opening names, built from dave's ring, does, and it is alice's
+//!   key (the positive control);
+//! - and each of those deliveries names a one-time prekey of its own, none his signed prekey alone
+//!   (ADR-030 P-3: a key waits for the next bundle rather than reuse a one-time prekey).
+//!
+//! Then twice, alice removes and re-trusts dave with a bad bundle of his on her board. One time
+//! its one-time prekey is signed by his root as made eight days ago; the other time, an hour
+//! ahead of her clock. Each time:
+//! - (d) she sends him nothing, and her daemon says why, in every room: "its prekey bundle is
+//!   stale: its one-time prekey is 8 days old", or "… was made 60 minutes from now" (P-2, D-5);
+//! - (e) once dave publishes a good bundle, the retrust reaches him in every room, each key in an
+//!   `OP_ROTATION_HELLO` of its own (D-3).
+//!
 //! ## The mutations that must turn it red
 //! - **Change the lock in one shared room only** (RP-20): `change_the_lock_against` in
 //!   `crates/vox-core/src/node/actor.rs` stops after the first room it revokes in. The other room
@@ -57,6 +79,12 @@
 //! - Drop `self.change_the_lock_against(fingerprint).await;` from `untrust_identity` in
 //!   `crates/vox-core/src/node/actor.rs`: the ring entry goes but the key is not rotated, so Bob
 //!   keeps opening Alice's new posts with the key he already holds.
+//! - ADR-030 T-2: `deliver_rekeys_for` seals the rotated key in the long-lived session → (a) and
+//!   (b) red; `release_key_to` seals in the long-lived session → (e) red; `delivery_bundle` without
+//!   its cadence check (P-1, P-2 skipped) → (d) red on the backdated bundle; without its check of
+//!   a date ahead → (d) red on the bundle dated ahead; a one-time prekey already named reused (no
+//!   wait for the next bundle) → red: a delivery on the signed prekey alone, or one prekey named
+//!   twice.
 #![cfg(unix)]
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -607,7 +635,7 @@ fn digest(b32: &str) -> Digest32 {
 }
 
 /// One frame alice sent dave, as received, and what dave could do with it.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct Got {
     /// The frame's kind: `rotation-hello`, `skdm`, `hello` or `open`.
     kind: &'static str,
@@ -618,6 +646,29 @@ struct Got {
     frozen_opened: bool,
     /// The author and generation of the key a fresh session opened from dave's ring, if it did.
     fresh_opened: Option<(Digest32, u64)>,
+}
+
+impl std::fmt::Debug for Got {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let short = |d: &Digest32| -> String {
+            vox_core::node::link::b32_encode(d)
+                .chars()
+                .take(12)
+                .collect()
+        };
+        write!(
+            f,
+            "{} in {}: one-time prekey {:?}; opened under the frozen session {}; opened fresh {}",
+            self.kind,
+            short(&self.room),
+            self.one_time,
+            self.frozen_opened,
+            self.fresh_opened.map_or_else(
+                || "no".to_owned(),
+                |(a, c)| format!("as {}'s key, generation {c}", short(&a))
+            )
+        )
+    }
 }
 
 /// A room as dave's apparatus needs it.
