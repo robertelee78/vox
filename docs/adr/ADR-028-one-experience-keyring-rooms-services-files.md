@@ -150,6 +150,10 @@ by any of them (ADR-001: there is no typed agent or human).
 - **K-18. An offer waits.** An offer MUST stay under needs you until it is accepted, dismissed, or
   the offered node leaves the room. Dismissing MUST be local and silent: the offered node is not
   told and stays not in keyring. Trust stays reachable later from the member pane (K-5).
+  Removing a member from the keyring MUST also dismiss what it is offered on now, in the same
+  local, silent way, so a node is not offered back someone its person just removed; it MUST be
+  offered again on a new basis only: the member leaves and joins again, or grants this node
+  consent again (amended 2026-10-10, under the decider's delegation).
 - **K-19. An agent's node is offered in its harness.** For an agent's node, the hook MUST show the
   offer in the harness session, in the agent's per-turn read (ADR-020 6.6), with K-13's command to
   accept it outside the session. An accept MUST pass ADR-020 3.1's passphrase gate whichever

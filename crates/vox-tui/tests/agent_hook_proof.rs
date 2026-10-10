@@ -1735,9 +1735,15 @@ fn drain_as(d: &Daemon, session: &str) -> String {
 ///    offers` on bob's node lists dave all the same, and alice's lists him too, though the join
 ///    came through bob (K-15: every member is offered a newcomer, however the join arrives).
 ///    bob is still offered dave once his daemon has restarted.
+/// 5. bob trusts dave, then removes him: `vox trust offers` does not list dave again (K-18: a
+///    removal dismisses the member's current offer). dave leaves and joins again by bob's link:
+///    a new join, and bob is offered him again.
 ///
 /// **Mutant**: the hook accepts each offer it shows (a trust add with no passphrase, made in the
 /// open window). Red on (3), PRODUCT.
+///
+/// **Mutant** (5): `vox trust remove` dismisses nothing. Red on (5), PRODUCT: dave is offered back
+/// at once.
 ///
 /// **Mutant** (4): a member's join time taken from its first entry again, an unknown time being
 /// the latest. Red on (4), PRODUCT: bob, who never wrote, is offered nobody.
@@ -1884,6 +1890,79 @@ fn an_offer_for_the_agents_node_is_shown_in_its_turn_and_only_the_operator_accep
         after.contains(&dave.fingerprint),
         "PRODUCT: bob's daemon restarted, and within 30 s bob was no longer offered dave, who \
          joined after him (ADR-028 K-15); offered:\n{after}"
+    );
+
+    // (5) bob trusts dave, then removes him: dave is not offered back at once (K-18). dave leaves
+    // and joins again: a new join, so he is offered again.
+    let bob_pass = tmp.path().join("bob").join("identity.pass");
+    let bob_pass = bob_pass.to_str().expect("APPARATUS: a UTF-8 path");
+    for args in [
+        vec![
+            "trust",
+            "add",
+            dave.fingerprint.as_str(),
+            "--name",
+            "dave",
+            "--identity-passphrase-file",
+            bob_pass,
+        ],
+        vec![
+            "trust",
+            "remove",
+            dave.fingerprint.as_str(),
+            "--identity-passphrase-file",
+            bob_pass,
+        ],
+    ] {
+        let (ok, said, err) = hook(&bob.data, &bob.cfg, &args, "");
+        assert!(
+            ok,
+            "PRODUCT (staging): bob's `vox {}` failed: {said}{err}",
+            args[..2].join(" ")
+        );
+    }
+    // Offers are read again from the room every few seconds: watched for 10 s, dave must not come
+    // back.
+    let watch = Instant::now();
+    let mut removed = offered(&bob);
+    while watch.elapsed() < Duration::from_secs(10) && !removed.contains(&dave.fingerprint) {
+        std::thread::sleep(Duration::from_millis(500));
+        removed = offered(&bob);
+    }
+    println!("[proof] (5) offered bob after he removed dave: {removed:?}");
+    assert!(
+        !removed.contains(&dave.fingerprint),
+        "PRODUCT: bob just removed dave from his keyring, and was offered him again at once \
+         (ADR-028 K-18: a removal dismisses the member's current offer); offered:\n{removed}"
+    );
+    let (ok, said, err) = hook(&dave.data, &dave.cfg, &["room", "leave", &label], "y\n");
+    assert!(
+        ok,
+        "PRODUCT (staging): dave's `vox room leave` failed: {said}{err}"
+    );
+    let (ok, _, err) = hook(
+        &dave.data,
+        &dave.cfg,
+        &["room", "join", "--passphrase-file", "-", &bob.link(&label)],
+        "channel passphrase",
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): dave could not join again by bob's link: {err}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let again = loop {
+        let now = offered(&bob);
+        if now.contains(&dave.fingerprint) || Instant::now() >= deadline {
+            break now;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    println!("[proof] (5) offered bob after dave left and joined again: {again:?}");
+    assert!(
+        again.contains(&dave.fingerprint),
+        "PRODUCT: dave left and joined again, a new join, so bob must be offered him again \
+         (ADR-028 K-18); within 60 s bob was offered:\n{again}"
     );
 }
 

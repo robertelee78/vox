@@ -5293,27 +5293,29 @@ impl Node {
             }
             // A dismissal is this node's alone, and changes no keyring: no passphrase (K-11, K-18).
             NodeCommand::DismissOffer { member } => {
-                let Some(profile) = self.profile.as_ref().filter(|p| p.is_unlocked()) else {
+                if self.profile.as_ref().is_none_or(|p| !p.is_unlocked()) {
                     return Outcome::Failed(Fault::Locked);
-                };
-                let rooms = self.view_tx.borrow().open_channels.clone();
-                let mut next = self.dismissed_offers.clone();
-                if !next.dismiss(&member, &rooms) {
-                    return Outcome::Done;
                 }
-                let saved = profile
-                    .signer()
-                    .and_then(|signer| next.save(profile.store(), signer));
-                if let Err(e) = saved {
-                    return Outcome::Failed(crate::node::actor::fault_of(&e));
+                match self.dismiss_offers_of(&member) {
+                    Ok(true) => {
+                        self.publish().await;
+                        Outcome::Done
+                    }
+                    Ok(false) => Outcome::Done,
+                    Err(e) => Outcome::Failed(crate::node::actor::fault_of(&e)),
                 }
-                self.dismissed_offers = next;
-                self.publish().await;
-                Outcome::Done
             }
             NodeCommand::Untrust { fingerprint } => {
                 let alias = self.trust.petname(&fingerprint).map(str::to_owned);
                 let out = self.untrust_identity(&fingerprint).await;
+                // **A member just removed is not offered back at once** (ADR-028 K-18): its offers
+                // now are dismissed, as a dismissal would; a new join or a new grant offers it
+                // again. The removal stands whether or not the dismissal could be kept.
+                if matches!(out, Outcome::Done)
+                    && matches!(self.dismiss_offers_of(&fingerprint), Ok(true))
+                {
+                    self.publish().await;
+                }
                 if matches!(out, Outcome::Done) && alias.is_some() {
                     self.decisions.record(
                         (self.millis_clock)(),
@@ -10019,6 +10021,22 @@ impl Node {
     }
 
     /// [`Self::untrust_identity`], unboxed: see [`Boxed`].
+    /// Dismiss what `member` is offered on now, in every open room, and keep it (ADR-028 K-18).
+    /// `Ok(true)` when anything was added.
+    fn dismiss_offers_of(&mut self, member: &Digest32) -> crate::error::Result<bool> {
+        let Some(profile) = self.profile.as_ref() else {
+            return Err(crate::error::Error::Profile("locked"));
+        };
+        let rooms = self.view_tx.borrow().open_channels.clone();
+        let mut next = self.dismissed_offers.clone();
+        if !next.dismiss(member, &rooms) {
+            return Ok(false);
+        }
+        next.save(profile.store(), profile.signer()?)?;
+        self.dismissed_offers = next;
+        Ok(true)
+    }
+
     async fn untrust_identity_unboxed(&mut self, fingerprint: &Digest32) -> Outcome {
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
@@ -11710,7 +11728,7 @@ impl Node {
         joiner: Digest32,
     ) -> crate::error::Result<SeatsToAsk> {
         let Some(me) = self.profile.as_ref().map(Profile::fingerprint) else {
-            return Err(Error::Profile("locked"));
+            return Err(crate::error::Error::Profile("locked"));
         };
         let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
             return Err(Error::Profile("no such room on this node"));
