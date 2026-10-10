@@ -395,23 +395,17 @@ else
   say "installed: $INSTALL_DIR/vox ($installed)"
 fi
 
-# --- shell integration (PATH first, then tab completion) --------------------------------
+# --- shell integration (PATH first, then tab completion), and the agent skill pack ----------
 # Run through the installed binary so the rc block records the real install path. It appends
 # ONE marker-delimited block at the end of your shell's rc — at the end, so it wins the PATH
 # race against version managers that prepend their shims earlier in the same file — and writes
 # completion scripts into each shell's own autoload directory. Idempotent;
 # `vox shell-setup --remove` undoes it exactly; VOX_NO_SHELL_SETUP=1 skips it.
-if [ -z "${VOX_NO_SHELL_SETUP:-}" ]; then
-  "$INSTALL_DIR/vox" shell-setup </dev/null || say "warning: shell setup reported a problem (vox itself is installed)"
-fi
-
-# --- the agent skill pack ---------------------------------------------------------------------
-# For every harness here (Claude Code, Codex, OpenCode: its program on PATH, or its settings
-# folder), the pack an agent reads goes in that harness's own skills folder, or is refreshed
-# there. Idempotent; a file you changed is kept, and said so. VOX_NO_SKILL_INSTALL=1 skips it.
-if [ -z "${VOX_NO_SKILL_INSTALL:-}" ]; then
-  "$INSTALL_DIR/vox" agent skill --install </dev/null || say "warning: the agent skill reported a problem (vox itself is installed)"
-fi
+# Then, for every harness here (Claude Code, Codex, OpenCode: its program on PATH, or its
+# settings folder), the pack an agent reads goes in that harness's own skills folder, or is
+# refreshed there. Idempotent; a file you changed is kept, and said so. VOX_NO_SKILL_INSTALL=1
+# skips it. `vox update` runs the same command on the vox it puts in place.
+"$INSTALL_DIR/vox" shell-setup </dev/null || say "warning: shell setup or the agent skill reported a problem (vox itself is installed)"
 
 say ""
 say "next:"

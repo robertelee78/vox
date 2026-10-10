@@ -3,7 +3,8 @@
 //! where each harness loads a user-scope skill, `<skills>/vox-agent-comms/`.
 //!
 //! **Installed without the operator doing anything** (v0.4.1): `install.sh` and `vox update` run
-//! `vox agent skill --install`, which installs or refreshes the pack for every harness present here.
+//! `vox shell-setup`, which installs or refreshes the pack for every harness present here, as
+//! `vox agent skill --install` does.
 //! It is idempotent, and it never overwrites a file the operator changed: what it wrote is recorded
 //! in the folder's manifest (`.vox-pack.json`, each file's SHA-256), and a file that no longer
 //! matches what Vox wrote is left alone and named. A `SKILL.md` written before the pack, by `vox
