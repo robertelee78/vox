@@ -7266,12 +7266,14 @@ impl ChannelState {
             .collect()
     }
 
-    /// Where `author`'s current membership starts, and the time claimed for it: its statement that
-    /// it is back after its last leave, else its admission, which is the start of its feed (`seq`
-    /// 0, whatever this node holds of the feed) with the time of the first entry it holds. An author
-    /// that has written nothing this node holds joined no earlier than this node can tell: its
-    /// time is the latest.
-    fn admission(&self, author: &Digest32) -> (u64, u64) {
+    /// Where `author`'s current membership starts, and when: its statement that it is back after its
+    /// last leave, else its admission, the start of its feed (`seq` 0). The time of an admission is
+    /// what admitted it: the genesis for the creator, else the witness of the member that verified
+    /// its join — this node's own, or the notice it keeps of another's — and only failing those the
+    /// first of its entries this node holds. A member that has written nothing still joined when it
+    /// was witnessed: taking its time from its writing made a node that never wrote offered no one
+    /// who joined after it. `None` when nothing here says.
+    fn admission(&self, author: &Digest32) -> (u64, Option<u64>) {
         let back = self
             .gov_entries
             .iter()
@@ -7284,11 +7286,26 @@ impl ChannelState {
         let feed = self.dag.feed(author);
         let ms = |seq: Option<u64>| {
             seq.and_then(|s| feed.and_then(|f| f.get(s)))
-                .map_or(u64::MAX, |e| e.skeleton.claimed_ms)
+                .map(|e| e.skeleton.claimed_ms)
+        };
+        let witnessed = || {
+            if *author == self.me() {
+                match &self.own_admission {
+                    Admission::Creator => Some(self.genesis.body.created_ms),
+                    Admission::Witnessed(w) => Some(w.timestamp_ms),
+                }
+            } else if self.genesis.creator_pubkey().fingerprint() == *author {
+                Some(self.genesis.body.created_ms)
+            } else {
+                self.board_kept.notices.get(author).map(|(at, _)| *at)
+            }
         };
         match back {
-            Some(seq) => (seq, ms(Some(seq))),
-            None => (0, ms(feed.and_then(crate::log::feed::Feed::min_seq))),
+            Some(seq) => (seq, ms(Some(seq)).or_else(witnessed)),
+            None => (
+                0,
+                witnessed().or_else(|| ms(feed.and_then(crate::log::feed::Feed::min_seq))),
+            ),
         }
     }
 
@@ -7308,7 +7325,7 @@ impl ChannelState {
                 continue;
             }
             let (seq, ms) = self.admission(&member);
-            if ms > mine {
+            if ms.zip(mine).is_some_and(|(ms, mine)| ms > mine) {
                 out.push(OfferBasis {
                     member,
                     why: OfferWhy::Joined,
