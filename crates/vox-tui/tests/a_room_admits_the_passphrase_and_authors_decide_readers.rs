@@ -11,6 +11,17 @@
 //! 3. **Two members who trust each other read each other, both ways.**
 //! 4. **A member nobody consented to reads nothing of theirs** — Carol, joined and synced, never
 //!    renders what Alice said, because Alice never trusted her.
+//! 5. **A message's tags make a thread, and only its readers see them** (#636). Alice and Bob tag
+//!    posts with `--task`, `--project`; Bob's `vox room read --tag` shows exactly the messages
+//!    carrying every tag named, `--from` only one member's of them, `--json` carries each row's
+//!    tags and the plain read says them. Carol, whom Alice never trusted, finds none of Alice's
+//!    tags: `--tag` on a tag only Alice used shows nothing, and her whole `--json` read never
+//!    names it, while Bob's tagged message, which she may read, is in her thread.
+//!
+//! **Mutants for claim 5**, each red on its own assertion: the node's `Tagged` answer ignoring the
+//! tags (Bob's thread holds his untagged posts); ignoring `--from` (Alice's thread holds Bob's);
+//! and Alice's node sealing for a member she does not trust, as a tag carried outside what she
+//! seals would be read (Carol's thread holds Alice's tag).
 //!
 //! **Claim 4 carries a positive control, or it would prove nothing.** An absence passes just as
 //! well when Carol's node never synced at all. So Bob *does* trust Carol, and she must render
@@ -387,18 +398,126 @@ fn a_room_admits_the_passphrase_and_each_author_decides_who_reads_them() {
     // ...and only now does Alice's absence mean something. She posts *after* Carol is provably
     // receiving keys, then Bob posts once more: once Carol renders Bob's last post she has synced
     // past Alice's, so Alice's absence is her decision and not an unsynced log.
-    post(&alice, "FROM-ALICE-LATE");
-    post(&bob, "FROM-BOB-FINAL");
+    //
+    // Claim 5 rides on these: each is tagged as an agent tags its work (#636), and Bob adds one
+    // tagged with another task, so a filter that ignored the tag would show it.
+    let tagged = |d: &std::path::Path, text: &str, tags: &[&str]| {
+        let mut args = s(&["room", "post", &room]);
+        args.extend(s(tags));
+        args.push(text.to_owned());
+        let (ok, _, err) = vox(d, &args, None);
+        assert!(ok, "PRODUCT: vox room post {tags:?} {text} failed: {err}");
+    };
+    tagged(
+        &alice,
+        "FROM-ALICE-LATE",
+        &["--task", "#636", "--project", "vox-tags"],
+    );
+    tagged(&bob, "FROM-BOB-OTHER", &["--task", "#999"]);
+    tagged(&bob, "FROM-BOB-FINAL", &["--task", "#636"]);
     let carol_view = until(&carol, "carol to read bob's final post", &read, 90, |o| {
         o.contains("FROM-BOB-FINAL")
     })
     .unwrap_or_else(|e| panic!("PRODUCT: claim 4's control failed after it had passed once: {e}"));
+
+    // ---- claim 5: tags make a thread, by tag and by tag and sender ----
+    until(&bob, "bob to read alice's tagged post", &read, 90, |o| {
+        o.contains("FROM-ALICE-LATE") && o.contains("FROM-BOB-FINAL")
+    })
+    .unwrap_or_else(|e| panic!("PRODUCT (staging): bob never read both tagged posts: {e}"));
+    // The `FROM-…` markers a read shows, in its order.
+    let markers = |out: &str| -> Vec<String> {
+        out.split_whitespace()
+            .filter(|w| w.starts_with("FROM-"))
+            .map(str::to_owned)
+            .collect()
+    };
+    let read_tag = |d: &std::path::Path, extra: &[&str]| {
+        let mut args = s(&["room", "read", &room]);
+        args.extend(s(extra));
+        let (ok, out, err) = vox(d, &args, None);
+        assert!(
+            ok,
+            "PRODUCT: claim 5: vox room read {extra:?} failed: {err}"
+        );
+        out
+    };
+    for (extra, want) in [
+        (
+            &["--tag", "task:#636"][..],
+            &["FROM-ALICE-LATE", "FROM-BOB-FINAL"][..],
+        ),
+        (
+            &["--tag", "task:#636", "--from", "alice"],
+            &["FROM-ALICE-LATE"],
+        ),
+        (
+            &["--tag", "task:#636", "--from", "you"],
+            &["FROM-BOB-FINAL"],
+        ),
+        (
+            &["--tag", "task:#636", "--tag", "project:vox-tags"],
+            &["FROM-ALICE-LATE"],
+        ),
+        (&["--tag", "task:#999"], &["FROM-BOB-OTHER"]),
+    ] {
+        let out = read_tag(&bob, extra);
+        assert_eq!(
+            markers(&out),
+            want,
+            "PRODUCT: claim 5: bob's `vox room read {extra:?}` showed other messages than those \
+             tagged so: {out:?}"
+        );
+    }
+    let out = read_tag(&bob, &["--tag", "task:#636", "--from", "alice"]);
+    assert!(
+        out.contains("tags: project:vox-tags task:#636"),
+        "PRODUCT: claim 5: bob's read does not say the tags alice gave her message: {out:?}"
+    );
+    let out = read_tag(&bob, &["--tag", "task:#636", "--json"]);
+    let rows: Vec<serde_json::Value> = out
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("PRODUCT: bad row ({e}): {l}")))
+        .collect();
+    assert!(
+        rows.len() == 2
+            && rows.iter().all(|r| r["tags"]
+                .as_array()
+                .is_some_and(|t| t.iter().any(|t| t == "task:#636"))),
+        "PRODUCT: claim 5: `--json --tag task:#636` rows do not each carry the tag: {out:?}"
+    );
+    // ...and Carol, whom Alice never trusted, holds none of Alice's tags, while the tagged message
+    // of Bob's, which she may read, is in her thread: the control that her index is built. Watched
+    // as long as claim 4 watches her, and before it each time: a key released late is a tag read
+    // late.
+    let carol_holds_no_tag_of_alice = || {
+        let out = read_tag(&carol, &["--tag", "task:#636"]);
+        assert_eq!(
+            markers(&out),
+            ["FROM-BOB-FINAL"],
+            "PRODUCT: claim 5: carol's thread of task:#636 is not bob's message alone: {out:?}"
+        );
+        let out = read_tag(&carol, &["--tag", "project:vox-tags"]);
+        assert!(
+            markers(&out).is_empty(),
+            "PRODUCT: claim 5: carol found alice's tag, though alice never trusted her: {out:?}"
+        );
+        let out = read_tag(&carol, &["--json"]);
+        assert!(
+            !out.contains("vox-tags"),
+            "PRODUCT: claim 5: carol's read names alice's tag, though alice never trusted her: \
+             {out:?}"
+        );
+    };
+    carol_holds_no_tag_of_alice();
     assert!(
         !carol_view.contains("FROM-ALICE"),
         "PRODUCT: claim 4: Carol rendered Alice, who never trusted her: {carol_view:?}"
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     while std::time::Instant::now() < deadline {
+        carol_holds_no_tag_of_alice();
         let (_, out, _) = vox(&carol, &read, None);
         assert!(
             !out.contains("FROM-ALICE"),

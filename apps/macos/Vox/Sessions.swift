@@ -12,6 +12,8 @@ enum Showing: Hashable {
     case general
     case all
     case session(node: String, id: String)
+    /// The room's messages tagged so (#636): a thread of one task, project or milestone.
+    case tag(String)
 }
 
 extension NodeModel {
@@ -42,8 +44,15 @@ extension NodeModel {
         case .general: shown = "General"
         case .all: shown = "All"
         case .session: shown = shownSession?.label ?? "a Session"
+        case .tag(let tag): shown = "tagged \(tag)"
         }
         return "\(people == 1 ? "1 member" : "\(people) members") · \(shown) · ⏱ \(retention)"
+    }
+
+    /// Every tag the room's messages on hand carry, sorted (#636): what the header's filter offers.
+    /// Only messages this node can read carry any.
+    var roomTags: [String] {
+        Array(Set(messages.flatMap(\.tags))).sorted()
     }
 
     var showingSession: Bool {

@@ -1485,6 +1485,20 @@ private struct MessageRow: View {
             if let card = message.card {
                 LinkCardView(card: card)
             }
+            if !message.tags.isEmpty {
+                // What it relates to, as its sender tagged it (#636): quiet, under it; each opens
+                // the room's thread of that tag.
+                HStack(spacing: Space.s8 * scale) {
+                    ForEach(message.tags, id: \.self) { tag in
+                        Button { model.showing = .tag(tag) } label: {
+                            Text(tag).caption().secondaryText()
+                        }
+                        .buttonStyle(.plain)
+                        .help("Show the room's messages tagged \(tag)")
+                        .accessibilityIdentifier("tag-\(message.id)-\(tag)")
+                    }
+                }
+            }
             if !pulledBy.isEmpty {
                 // No label of its own: a selectable Text with one sends SwiftUI's accessibility
                 // into endless recursion. Its words are what it says.
@@ -1524,6 +1538,7 @@ private struct MessageRow: View {
             said += message.owed ? "not received yet" : message.text
         }
         if let card = message.card, !card.title.isEmpty { said += ", link: \(card.title)" }
+        if !message.tags.isEmpty { said += ", tagged \(message.tags.joined(separator: ", "))" }
         if !pulledBy.isEmpty { said += ", pulled by \(pulledBy.joined(separator: ", "))" }
         if !readBy.isEmpty {
             said += ", read by \(readBy.joined(separator: ", "))"
@@ -1636,6 +1651,39 @@ private struct RoomHeader: View {
     let room: String
 
     var body: some View {
+        HStack(alignment: .center, spacing: 8) {
+            facts
+            // The room by tag (#636): a thread of one task, project or milestone, from the tags of
+            // the messages this node can read.
+            if !model.roomTags.isEmpty || tagShown != nil {
+                Menu {
+                    Button("All messages") { model.showing = .general }
+                        .disabled(tagShown == nil)
+                    Divider()
+                    ForEach(model.roomTags, id: \.self) { tag in
+                        Button(tag) { model.showing = .tag(tag) }
+                    }
+                } label: {
+                    Label(tagShown ?? "Tags", systemImage: "tag")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("Show only the messages carrying a tag")
+                .accessibilityIdentifier("room-tag-filter")
+            }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .navigationTitle(model.roomName(room))
+        .navigationSubtitle(model.roomHeaderMeta)
+    }
+
+    /// The tag whose thread is on screen, if one is.
+    private var tagShown: String? {
+        if case .tag(let tag) = model.showing { return tag }
+        return nil
+    }
+
+    private var facts: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text("ROOM").eyebrow().secondaryText()
             Text(model.roomName(room)).fontWeight(.semibold)
@@ -1649,9 +1697,6 @@ private struct RoomHeader: View {
                 .accessibilityIdentifier("room-header-meta")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 12).padding(.vertical, 8)
-        .navigationTitle(model.roomName(room))
-        .navigationSubtitle(model.roomHeaderMeta)
     }
 }
 

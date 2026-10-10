@@ -107,6 +107,8 @@ pub struct MessageView {
     pub quote: Option<QuoteView>,
     /// An image this message shares (ADR-028 F-9, F-11): drawn inline once verified.
     pub image: Option<ImageView>,
+    /// What it relates to, as its sender tagged it (#636): `task:#636`, `project:vox`.
+    pub tags: Vec<String>,
 }
 
 /// **An image a message shares** (ADR-028 F-11, #502): drawn only once this node's copy is verified.

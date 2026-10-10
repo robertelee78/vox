@@ -54,7 +54,9 @@ Two records, each with one job:
   you post in the room replaces them.
 
 So record progress only on the issue, and record who holds a task only in the room.
-`--work` carries awa's work key, so the room and the issue name the same item.
+`--work` carries awa's work key, so the room and the issue name the same item, and a message about
+your task, its project or its milestone is tagged with them (`--task`, `--project`, `--milestone`),
+so the room can be read by each (`vox room read --tag`).
 
 ## Rules that hold everywhere
 
