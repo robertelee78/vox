@@ -101,6 +101,11 @@ impl World {
             .env("VOX_IDENTITY_PASSPHRASE", format!("pass of {node}"))
             .env("VOX_NODE", node)
             .env("VOX_LISTEN", "127.0.0.1:0")
+            // Test-only (`test-knobs`): while this file exists the daemon opens no key-package.
+            .env(
+                "VOX_TEST_HOLD_PACKAGES_FILE",
+                self.root.join("hold-packages"),
+            )
             .args(args);
         c
     }
@@ -151,8 +156,13 @@ impl World {
     /// Claude Code running its hook for `event`: `vox agent hook --node claude-a --room ROOM`,
     /// with the event's JSON on stdin and Claude Code's environment for an interactive session.
     fn hook(&self, room: &str, event: &serde_json::Value) -> Child {
+        self.hook_as(AGENT, room, event)
+    }
+
+    /// [`Self::hook`] for a harness wired to `node`.
+    fn hook_as(&self, node: &str, room: &str, event: &serde_json::Value) -> Child {
         let mut child = self
-            .command(AGENT, &["agent", "hook", "--node", AGENT, "--room", room])
+            .command(node, &["agent", "hook", "--node", node, "--room", room])
             .env("CLAUDE_CODE_ENTRYPOINT", "cli")
             .current_dir(self.root.join("work"))
             .stdin(Stdio::piped())
@@ -1846,6 +1856,7 @@ fn an_approval_is_answered_from_either_side_and_the_first_answer_wins() {
 }
 
 const S9: &str = "99999999-2222-4000-8000-000000000009";
+const S10: &str = "aaaaaaaa-3333-4000-8000-00000000000a";
 /// A second person's node, which keeps drive while `person` loses it.
 const KEEPER: &str = "keeper";
 
@@ -1897,6 +1908,14 @@ fn can_drive_becomes(
 ///    session --details`) is exactly what each showed before: the entry that says the key
 ///    changed is in no row, Session, message or list.
 /// 4. S9 then calls a tool: `keeper` reads that call; `person` does not.
+/// 5. A key-package waiting for `person` from **another** author does not keep its drive on S9:
+///    `claude-a` gives `person` drive again (held within 10 s); the daemon is made to leave
+///    key-packages unopened (test knob `VOX_TEST_HOLD_PACKAGES_FILE`, as between a sync session's
+///    entries and its end); `keeper`, with Session S10 open in the second room and trusting
+///    `person` to read, gives it drive, so a package from `keeper` waits for `person` (its can_drive on S10 stays false: the
+///    hold took); `claude-a` takes drive back from `person`. Within 10 s `person` reads
+///    `"can_drive":false` on S9 while `keeper`'s package still waits; once the hold ends, `person`
+///    holds drive on S10 (the package was there).
 ///
 /// **Which side a red is on.** What `vox room sessions` or `vox room session` printed is
 /// `PRODUCT:`; staging the product refused is `APPARATUS (staging):`.
@@ -1904,7 +1923,8 @@ fn can_drive_becomes(
 /// **Mutations that must turn it red:** the drive key not begun until the Session's first entry
 /// (arm 2); no entry under the new key when drive is taken back (arm 3, `person`); the new key not
 /// released to a member that keeps drive (arm 3, `keeper`); the key change posted as a room
-/// message rather than an entry no Session has (arm 3, "showed in a room or a Session").
+/// message rather than an entry no Session has (arm 3, "showed in a room or a Session"); any
+/// waiting key-package, from any author, keeping a member's drive (arm 5).
 #[test]
 #[ignore = "real binary; run in release"]
 fn drive_given_on_an_idle_session_is_held_at_once_and_taken_back_at_once() {
@@ -2061,5 +2081,74 @@ fn drive_given_on_an_idle_session_is_held_at_once_and_taken_back_at_once() {
         ok && seen.contains(" · open") && !seen.contains("after-drive-was-taken"),
         "PRODUCT: {PERSON} no longer has drive from {AGENT}, yet reads the call S9 made after it \
          was taken back:\n{seen}"
+    );
+
+    // ---- (5) a package waiting from another author keeps nothing of S9 ----
+    w.staged(
+        PERSON,
+        &["trust", "add", &keeper_fp, "--name", KEEPER],
+        None,
+    );
+    w.staged(
+        KEEPER,
+        &["trust", "add", &person_fp, "--name", PERSON],
+        None,
+    );
+    let opened = wait_within(
+        w.hook_as(KEEPER, &second, &prompt(&w, S10)),
+        Duration::from_secs(15),
+    )
+    .unwrap_or_else(|| panic!("APPARATUS: keeper's prompt hook did not finish within 15 s"));
+    assert!(
+        opened.status.success(),
+        "APPARATUS (staging): keeper's prompt hook failed: {}",
+        String::from_utf8_lossy(&opened.stderr)
+    );
+    session_listed(&w, &second, S10);
+    w.staged(AGENT, &["trust", "drive", &person_fp], None);
+    let again = can_drive_becomes(&w, PERSON, &second, S9, true, Duration::from_secs(10));
+    assert_eq!(
+        again,
+        Some(true),
+        "PRODUCT: {AGENT} gave {PERSON} drive again, yet within 10 s it did not hold it on S9"
+    );
+    let hold = w.root.join("hold-packages");
+    std::fs::write(&hold, "").expect("APPARATUS: the hold file");
+    w.staged(KEEPER, &["trust", "drive", &person_fp], None);
+    std::thread::sleep(Duration::from_secs(4));
+    let held_back = can_drive(&w, PERSON, &second, S10);
+    assert_ne!(
+        held_back,
+        Some(true),
+        "APPARATUS: the daemon opened {KEEPER}'s key-package for {PERSON} while held (it holds \
+         drive on S10): this vox was built without `test-knobs`, so arm 5 cannot be staged"
+    );
+    w.staged(AGENT, &["trust", "read", &person_fp], None);
+    let cut = can_drive_becomes(&w, PERSON, &second, S9, false, Duration::from_secs(10));
+    let still_waiting = can_drive(&w, PERSON, &second, S10);
+    println!(
+        "[proof] (5) with {KEEPER}'s package waiting for {PERSON}: its can_drive on S9 {cut:?}, \
+         on S10 {still_waiting:?}"
+    );
+    std::fs::remove_file(&hold).expect("APPARATUS: the hold file");
+    // A message from keeper starts a sync session, at whose end the waiting package is opened.
+    w.staged(KEEPER, &["room", "post", &second, "the hold is over"], None);
+    assert_eq!(
+        cut,
+        Some(false),
+        "PRODUCT: {AGENT} took drive back from {PERSON}, yet while a key-package from {KEEPER} \
+         (another author) waited for it, within 10 s it still read \"can_drive\":{cut:?} on S9"
+    );
+    let t5 = Instant::now();
+    let landed = can_drive_becomes(&w, PERSON, &second, S10, true, Duration::from_secs(30));
+    println!(
+        "[proof] (5) after the hold, person's can_drive on S10: {landed:?} after {:.1}s",
+        t5.elapsed().as_secs_f64()
+    );
+    assert_eq!(
+        landed,
+        Some(true),
+        "APPARATUS: once the hold ended, {PERSON} still did not hold drive on {KEEPER}'s S10 \
+         within 15 s ({landed:?}): no package from {KEEPER} was waiting, so arm 5 proved nothing"
     );
 }

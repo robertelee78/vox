@@ -122,6 +122,14 @@ type SharedChannel = Arc<tokio::sync::Mutex<ChannelState>>;
 /// connection died and raises the periodic request (D7).
 const TICK: Duration = Duration::from_secs(1);
 
+/// Test-only: while the file this names exists, the node opens none of the key-packages the log
+/// brings it; they stay queued, as between a sync session's entries and its end, so a proof can
+/// show what a member is told while one waits (`drive_given_on_an_idle_session_…`).
+/// **For proofs; nothing in a real deployment sets it.** Not compiled in without the
+/// `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_HOLD_PACKAGES_ENV: &str = "VOX_TEST_HOLD_PACKAGES_FILE";
+
 /// At most one read record per room in this many milliseconds (ADR-028 RR-2): what is read in
 /// between waits, and the next record names all of it.
 const READ_RECORD_EVERY_MS: u64 = 5_000;
@@ -12137,6 +12145,14 @@ impl Node {
     /// each with a one-shot PQXDH against this node's own prekeys and hand the sender key to
     /// the channel, which verifies it against its author and backfills what it opens.
     async fn install_key_packages(&mut self, channel_id: &Digest32) {
+        // Test-only: leave every key-package queued, unopened, while the file the knob names
+        // exists (`TEST_HOLD_PACKAGES_ENV`).
+        #[cfg(feature = "test-knobs")]
+        if std::env::var_os(TEST_HOLD_PACKAGES_ENV)
+            .is_some_and(|f| std::path::Path::new(&f).exists())
+        {
+            return;
+        }
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
         };
