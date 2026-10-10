@@ -882,6 +882,15 @@ private struct RoomView: View {
                                                        pulled: model.pulled[message.id]) { looking = $0 }
                                                 .frame(maxWidth: .infinity, alignment: .leading)
                                                 .voxPadding(Space.s4)
+                                                // A message to this node: a thin accent bar at
+                                                // its left edge (v0.4.3).
+                                                .overlay(alignment: .leading) {
+                                                    if message.to.contains(model.me) {
+                                                        Rectangle().fill(VoxTokens.Colors.accent)
+                                                            .frame(width: 2)
+                                                            .accessibilityIdentifier("to-you-bar-\(message.id)")
+                                                    }
+                                                }
                                                 .selectable(model.selectedMessages.contains(message.id),
                                                             focused: timelineFocused
                                                                 && model.selectedMessage == message.id) {
@@ -1606,11 +1615,11 @@ private struct MessageRow: View {
                 // No label of its own: a selectable Text with one sends SwiftUI's accessibility into
                 // endless recursion (the detail pane is selectable).
                 Text(TimelineTime.short(message.createdMillis))
-                    .font(Theme.mono).secondaryText()
+                    .font(Theme.small).secondaryText()
                     .help(TimelineTime.full(message.createdMillis))
                     .accessibilityIdentifier("time-\(message.id)")
                 if message.urgent { StateMark(kind: .attention, words: "urgent") }
-                if message.to.contains(me) { Text("to you").caption().secondaryText() }
+                if message.to.contains(me) { Text("to you").font(Theme.small).secondaryText() }
                 if message.late {
                     // ADR-023: it took its place above messages already shown.
                     Text("arrived late").eyebrow().secondaryText()
@@ -1751,17 +1760,16 @@ private struct TrustBanner: View {
     @ObservedObject var model: NodeModel
 
     var body: some View {
-        let cut = model.members.filter { $0.trust != .mutual }
+        // A member with a trust offer waiting is shown once, by its offer at the top of General
+        // (the decider, v0.4.3: one place to trust), not here as well.
+        let offered = Set(model.offers.map(\.fingerprint))
+        let cut = model.members.filter { $0.trust != .mutual && !offered.contains($0.id) }
         if !cut.isEmpty {
             HStack(spacing: Space.s8) {
                 StateMark(kind: .attention, words: words(cut))
                     .accessibilityIdentifier("trust-banner")
                 Spacer()
-                if cut.count == 1, let member = cut.first, !member.trust.inKeyring,
-                   model.offers.contains(where: { $0.fingerprint == member.id }) {
-                    Button("Trust \(member.name)…") { Task { await model.show(.offer(member.id)) } }
-                        .accessibilityIdentifier("trust-banner-offer")
-                } else if cut.contains(where: { !$0.trust.inKeyring }) {
+                if cut.contains(where: { !$0.trust.inKeyring }) {
                     Button("Show Keyring") { Task { await model.show(.keyring) } }
                         .accessibilityIdentifier("trust-banner-keyring")
                 }
@@ -2124,9 +2132,16 @@ private struct Inspector: View {
             LazyVStack(alignment: .leading, spacing: Space.s8, pinnedViews: [.sectionHeaders]) {
                 Section {
                     ForEach(model.members) { member in
-                        TrustMark(name: member.name, trust: member.trust)
-                            .nodeCard(model, member.id, name: member.name)
-                            .accessibilityIdentifier("member-\(member.name)")
+                        // A member with a trust offer waiting is plain text here: it is trusted
+                        // from its offer at the top of General, the one place (v0.4.3).
+                        if model.offers.contains(where: { $0.fingerprint == member.id }) {
+                            TrustMark(name: member.name, trust: member.trust)
+                                .accessibilityIdentifier("member-\(member.name)")
+                        } else {
+                            TrustMark(name: member.name, trust: member.trust)
+                                .nodeCard(model, member.id, name: member.name)
+                                .accessibilityIdentifier("member-\(member.name)")
+                        }
                         // What this node's keyring grants it (K-14), once it is in the keyring.
                         if member.trust.inKeyring {
                             Text(Capability.words(member.drive)).secondaryLine()
@@ -2141,7 +2156,7 @@ private struct Inspector: View {
                             // endless recursion, and the app crashed when read.
                             HStack {
                                 Text("says it runs on \(Platform.words(platform))")
-                                    .font(Theme.mono).secondaryText()
+                                    .font(Theme.small).secondaryText()
                             }
                             .padding(.leading, Space.s20)
                             .accessibilityElement(children: .ignore)
@@ -2305,7 +2320,8 @@ private struct StatusBar: View {
                 .accessibilityIdentifier("status-dismiss")
             }
         }
-        .font(Theme.mono)
+        // The body face: nothing here is copied (the decider, v0.4.3: mono only for what is).
+        .font(Theme.small)
         .padding(.horizontal, Space.s12)
         .padding(.vertical, Space.s8)
         // A container, so "notifications-off" keeps its identifier; its label says the whole bar.

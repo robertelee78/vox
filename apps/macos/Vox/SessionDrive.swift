@@ -98,7 +98,8 @@ struct SessionComposer: View {
                     .accessibilityIdentifier("session-compose-as")
                 // Up to 12 lines, so a pasted stack trace or a long prompt is read before it goes;
                 // Return sends, ⇧↩ (or ⌥↩) adds a line (P19).
-                TextField("Composer — to \(session.title)", text: $draft, axis: .vertical)
+                TextField("Message \(session.title.components(separatedBy: " \u{b7} ").first ?? session.title)",
+                          text: $draft, axis: .vertical)
                     .lineLimit(1...12)
                     .focused($composing)
                     .shiftReturnAddsLine(composing)

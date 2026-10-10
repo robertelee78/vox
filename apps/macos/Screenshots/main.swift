@@ -51,6 +51,11 @@ func render<V: View>(_ view: V, _ name: String, size: CGSize = CGSize(width: 128
         throw NSError(domain: "VoxScreens", code: 2, userInfo: [NSLocalizedDescriptionKey: "no PNG for \(name)"])
     }
     try png.write(to: out.appendingPathComponent("\(name).png"))
+    // Torn down at once: a window left alive keeps its sidebar list, whose selection binding put
+    // the room back as soon as the next render chose another view, so the keyring and offer
+    // renders drew the room again.
+    window.contentView = nil
+    window.orderOut(nil)
     print("wrote \(out.appendingPathComponent("\(name).png").path)")
 }
 

@@ -527,7 +527,7 @@ struct TrustMark: View {
         HStack(spacing: Space.s8) {
             Text(trust.glyph).font(Theme.mono)
             Text(name).fontWeight(trust.inKeyring ? .bold : .regular)
-            Text(trust.words).font(Theme.eyebrow)
+            Text(trust.words).font(Theme.small)
         }
         .modifier(TrustStyle(trust: trust))
         .accessibilityElement(children: .ignore)

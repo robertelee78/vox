@@ -84,7 +84,8 @@ struct ComposerAddress: View {
                 .accessibilityIdentifier("compose-urgent")
                 .accessibilityLabel(urgent ? "Urgent, on" : "Urgent, off")
         }
-        .caption()
+        // The body face (v0.4.3): neither is copied.
+        .voxFont(VoxTokens.Fonts.appSmall)
     }
 
     /// A line of the To: list: ticked, it is in `to` as `address`.

@@ -84,8 +84,8 @@
 //     2 members' nodes" (D9). Node > Detach then offers only to attach alice again, never another
 //     node of this Mac's, and attaching again makes the window hers (D17).
 //     Compare goes group by group (#624): four groups of dave's fingerprint on his offer say "So
-//     far matches 4 of 13 groups."; on his card two say 2 of 13, a wrong third is named as group 3
-//     with no Remove (he is not in the keyring), and the whole of it is marked a match.
+//     far matches 4 of 13 groups."; he is trusted from his offer, the one place (v0.4.3): his
+//     member row opens no card while the offer waits.
 //     The keyring's card for dave (G2) heads "dave ⇄ you", says he trusts alice too, names
 //     mission as a shared room, and its disclosure says what removing him would change.
 // 16. What an operation comes to (#608, #611, #615), run after step 5, or alone with
@@ -1901,6 +1901,11 @@ final class FirstRunProof: XCTestCase {
 
         // D12: S1's draft never shows in S2, and comes back in S1.
         let sessionCompose = Key.id("session-compose")
+        // Its placeholder speaks to the Session as a person names it (v0.4.3): "Message Claude
+        // Code", never "Composer — to …".
+        let placeholder = el(ui, sessionCompose).placeholderValue ?? ""
+        XCTAssertTrue(placeholder.hasPrefix("Message ") && !placeholder.contains("Composer"),
+                      "PRODUCT: S1's composer must invite \"Message Claude Code\" (v0.4.3); its placeholder is \(placeholder.debugDescription)")
         type(ui, sessionCompose, "S1-DRAFT", "S1's composer")
         tap(ui, s2Row, "S2 in work's Sessions")
         Thread.sleep(forTimeInterval: 1)
@@ -2284,6 +2289,9 @@ final class FirstRunProof: XCTestCase {
         words(ui, Key.id("room-badge-mission"), timeout: 10, "mission's row must count its one unread message",
               until: { $0 == "1" })
         tap(ui, row, "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
+        // A message to alice has a thin accent bar at its left edge (v0.4.3).
+        present(ui, Key.idPrefix("to-you-bar-"), timeout: 15,
+                "bob's NEEDS-YOU, addressed to alice, must have the accent bar of a message to her")
         let bob = Key.id("member-bob")
         let bobWords = words(ui, bob, timeout: 30, "the inspector must list bob in alice's keyring",
                              until: { $0.hasPrefix("bob, trusted both ways") || $0.hasPrefix("bob, waiting for the other side") }) ?? ""
@@ -3075,8 +3083,10 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(ui.windows.firstMatch.title.hasPrefix("mission"),
                       "PRODUCT: the window must take the room's name as its title; it is \"\(ui.windows.firstMatch.title)\"")
 
-        // Who you can't read yet, and why: erin joins, and neither she nor alice has trusted the
-        // other; then erin trusts alice, and the line says so and offers her offer.
+        // Who you can't read yet, and where to trust them: once, by their offer at the top of
+        // General (the decider, v0.4.3: one place to trust). erin joins: her offer says she
+        // joined; she trusts alice: it says she trusts you. Never also the amber line above the
+        // composer, and her member row has no action. fay joins too: two offers, each its own.
         let erinPass = scratch.appendingPathComponent("erin.pass").path
         try stager.write(Data("erin identity\n".utf8), to: erinPass)
         try staged(vox, ["node", "create", "erin"],
@@ -3088,19 +3098,31 @@ final class FirstRunProof: XCTestCase {
         }
         try staged(vox, ["room", "join", "--node", "erin", "--passphrase-file", roomPass, erinLink],
                    env: voxEnv)
-        let erinShort = String(erinFp.prefix(12))
-        let banner = Key.id("trust-banner")
-        words(ui, banner, timeout: 60,
-              "erin joined and nobody trusted anybody: the room must say \"You and \(erinShort) can't read each other yet\"",
-              until: { $0.contains(erinShort) && $0.contains("can't read each other") })
+        let offeredTo = { (fp: String) in
+            Premise("`vox trust offers` offers \(fp.prefix(12)) to alice") {
+                let o = self.run(vox, ["trust", "offers", "--node", "alice"], env: voxEnv).out
+                return (o.contains(String(fp.prefix(12))), o)
+            }
+        }
+        let erinOffer = Key.id("offer-\(erinFp.prefix(12))")
+        present(ui, erinOffer, timeout: 60, "erin joined mission: her trust offer must show at the top of its General",
+                premise: offeredTo(erinFp))
         try staged(vox, ["trust", "add", "--node", "erin", aliceFp, "--name", "alice",
                          "--identity-passphrase-file", erinPass], env: voxEnv)
-        words(ui, banner, timeout: 60,
-              "erin trusts alice now: the room must say \"\(erinShort) trusts you. Trust \(erinShort) too\"",
-              until: { $0.contains("\(erinShort) trusts you") })
-        present(ui, Key.id("trust-banner-offer"), timeout: 10,
-                "the line must offer erin's trust offer, \"Trust \(erinShort)…\"")
-        // With two members alice can't read, the line names both (D4): fay joins too.
+        words(ui, erinOffer, timeout: 60, "erin trusts alice now: her offer must say she trusts you",
+              until: { $0.contains("trusts you") })
+        if let twice = locate(ui, Key.id("trust-banner")) {
+            XCTFail("PRODUCT: erin, offered at the top of General, must not be offered again above the composer (v0.4.3); it says \"\(shown(twice))\"")
+        }
+        let erinRow = Key.id("member-\(erinFp.prefix(12))")
+        if present(ui, erinRow, timeout: 30, "erin must be listed in mission's members") {
+            tap(ui, erinRow, "erin's member row")
+            Thread.sleep(forTimeInterval: 1)
+            if locate(ui, Key.id("node-card")) != nil {
+                XCTFail("PRODUCT: erin's member row must be plain text while her offer waits (v0.4.3); clicking it opened her card")
+                ui.typeKey(.escape, modifierFlags: [])
+            }
+        }
         let fayPass = scratch.appendingPathComponent("fay.pass").path
         try stager.write(Data("fay identity\n".utf8), to: fayPass)
         try staged(vox, ["node", "create", "fay"],
@@ -3109,10 +3131,9 @@ final class FirstRunProof: XCTestCase {
         let fayFp = try line(staged(vox, ["id", "--node", "fay"], env: voxEnv)) { $0.count == 52 }
         try staged(vox, ["room", "join", "--node", "fay", "--passphrase-file", roomPass, erinLink],
                    env: voxEnv)
-        let fayShort = String(fayFp.prefix(12))
-        words(ui, banner, timeout: 60,
-              "erin and fay can't read alice: the line must name them both, \"… \(erinShort) … \(fayShort) aren't reading each other with you yet\"",
-              until: { $0.contains(erinShort) && $0.contains(fayShort) && $0.contains("aren't reading each other with you yet") })
+        present(ui, Key.id("offer-\(fayFp.prefix(12))"), timeout: 60,
+                "fay joined mission too: her own offer must show beside erin's",
+                premise: offeredTo(fayFp))
 
         // The Dock badge (P17) is not checked here: macOS exposes no Dock badge to lsappinfo or to
         // XCUITest (the Dock's item has an empty label and value with a badge set, 2026-10-09), so
@@ -3976,61 +3997,20 @@ final class FirstRunProof: XCTestCase {
         let offerSoFar = words(ui, Key.id("offer-compare-said"), timeout: 10,
                                "four groups of dave's own fingerprint typed on his offer must say \"So far matches 4 of 13 groups.\"",
                                until: { $0 == "So far matches 4 of 13 groups." }) ?? ""
-        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
-        tap(ui, daveRow, "dave in the member pane")
-        let directions = words(ui, Key.id("card-directions"), timeout: 10,
-                               "dave's card must say both directions: he trusts alice, she has not trusted him",
-                               until: { $0.contains("trusts you; you haven't trusted") }) ?? ""
-        // On his card: two groups so far; a wrong third named, with no Remove (he is not in the
-        // keyring); the whole of it marked as a match.
-        // As tall as what it says (v0.4.3: a fixed height left a large empty area under its
-        // buttons): before anything opens below them, the card ends a padding under Close.
-        if let card = locate(ui, Key.id("node-card")), let close = locate(ui, Key.id("card-close")) {
-            XCTAssertTrue(card.frame.maxY - close.frame.maxY <= 48,
-                          "PRODUCT: the node card must end under its buttons, not leave an empty area; it ends \(card.frame.maxY - close.frame.maxY) points under Close")
-        } else {
-            XCTFail("APPARATUS: dave's card or its Close is not readable to XCTest")
-        }
-        tap(ui, Key.id("card-compare-open"), "Compare… on dave's card")
-        let field = Key.id("card-compare")
-        type(ui, field, String(daveFp.prefix(8)), "the card's compare field")
-        let soFar = words(ui, Key.id("card-compare-said"), timeout: 10,
-                          "two groups of dave's fingerprint typed must say \"So far matches 2 of 13 groups.\"",
-                          until: { $0 == "So far matches 2 of 13 groups." }) ?? ""
-        let third = daveFp.dropFirst(8).prefix(4)
-        el(ui, field).typeText(String(third.map { $0 == "a" ? "b" : "a" }))
-        let wrong = words(ui, Key.id("card-compare-said"), timeout: 10,
-                          "a third group that differs must be named: \"Group 3 does not match: you have …\"",
-                          until: { $0.hasPrefix("Group 3 does not match: you have ") && $0.hasSuffix("do not trust it.") }) ?? ""
-        XCTAssertNil(locate(ui, Key.id("card-compare-remove")),
-                     "PRODUCT: dave is not in alice's keyring, so his compare must offer no Remove")
-        el(ui, field).typeKey("a", modifierFlags: .command)
-        el(ui, field).typeText(daveFp)
-        let whole = words(ui, Key.id("card-compare-said"), timeout: 10,
-                          "dave's whole fingerprint typed must be marked as a match of all 13 groups",
-                          until: { $0.hasSuffix("all 13 groups.") && $0.hasPrefix("Matches ") }) ?? ""
-        print("[proof] compare: offer \(offerSoFar); card \(soFar) → \(wrong) → \(whole)")
-        tap(ui, Key.id("card-trust-open"), "Trust… on dave's card")
-        type(ui, Key.id("card-alias"), "dave", "the card's alias field")
-        // Trusting gives read, with no drive choice (the decider, v0.4.1): the form says read
-        // only and offers no grant to pick.
-        words(ui, Key.id("card-trust-effect"), timeout: 10,
-              "the card's trust form must say what trusting dave gives: read only",
-              until: { $0.contains("With read only, dave sees") })
-        XCTAssertNil(locate(ui, Key.id("card-capability")),
-                     "PRODUCT: the card's trust form must offer no drive choice (the decider, v0.4.1); it shows a Grants control")
-        tap(ui, Key.id("card-trust-confirm"), "Trust")
+        // Trusted from his offer, the one place (v0.4.3): his member row has no card while it waits.
+        type(ui, Key.id("offer-alias"), "dave", "the alias field on dave's offer")
+        tap(ui, Key.id("offer-accept"), "Trust on dave's offer")
         keyringPassphraseIfAsked(ui) {
             self.run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out.contains(daveFp)
         }
-        let cardSaid = words(ui, Key.id("card-trust"), timeout: 60,
-                             "trusted from his card, dave, who trusts alice, must read \"dave, trusted both ways\"",
+        let cardSaid = words(ui, Key.id("member-dave"), timeout: 60,
+                             "trusted from his offer, dave, who trusts alice, must read \"dave, trusted both ways\" in her members",
                              until: { $0 == "dave, trusted both ways" }) ?? ""
         let ring = run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out
         XCTAssertTrue(ring.contains(daveFp),
-                      "PRODUCT: trusted from his card, dave must be in alice's keyring; `vox trust list` said: \(ring)")
-        tap(ui, Key.id("card-close"), "Close on dave's card")
-        print("[proof] dave's row: \(rowSaid); card: \(directions) → \(cardSaid)")
+                      "PRODUCT: trusted from his offer, dave must be in alice's keyring; `vox trust list` said: \(ring)")
+        let directions = "(his offer, no card while it waited)"
+        print("[proof] dave's row: \(rowSaid); compare on his offer: \(offerSoFar); trusted \(directions) → \(cardSaid)")
         // (15f, G2) The keyring's card for dave: each direction, the room it covers, and what
         // removing him would change, behind a disclosure.
         tap(ui, Key.id("keyring"), "Keyring in the sidebar")
