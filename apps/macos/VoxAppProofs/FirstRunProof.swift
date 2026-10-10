@@ -3250,9 +3250,11 @@ final class FirstRunProof: XCTestCase {
         tap(ui, aaa, "aaa in the sidebar", premise: inRoom(vox, voxEnv, "aaa"))
         try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "NEEDS-YOU-9"],
                    env: bobSession)
+        // NEEDS YOU counts the rooms that need alice and the trust offers waiting on her (K-15):
+        // erin's and dave's, from earlier steps. Mission must be the one room.
         words(ui, Key.id("group-needs you"), timeout: 60,
-              "bob's message to alice must put mission under needs you",
-              until: { $0.lowercased() == "needs you (1)" })
+              "bob's message to alice must put mission under needs you, the one room beside \(offerRows(ui)) trust offers",
+              until: { $0.lowercased() == "needs you (\(1 + offerRows(ui)))" })
         ui.typeKey("j", modifierFlags: .command)
         // A message's text is a Text: its words are its accessibility value.
         let landed = Key.showing("NEEDS-YOU-9")
@@ -3504,8 +3506,8 @@ final class FirstRunProof: XCTestCase {
         }
         try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
         let reopened = words(ui, Key.id("group-needs you"), timeout: 30,
-                             "bob's message to alice came while the app was closed; opened again, the app must count it from what her node recorded as read, mission under \"needs you (1)\"",
-                             until: { $0.lowercased() == "needs you (1)" }) ?? ""
+                             "bob's message to alice came while the app was closed; opened again, the app must count it from what her node recorded as read, mission the one room under \"needs you\" beside \(offerRows(ui)) trust offers",
+                             until: { $0.lowercased() == "needs you (\(1 + offerRows(ui)))" }) ?? ""
         print("[proof] opened again: \(reopened)")
 
         // (14) The keyboard. Bob posts KEYS-A and KEYS-B, then shares a file to alice, which her
@@ -4129,6 +4131,11 @@ final class FirstRunProof: XCTestCase {
     /// XCTest reads neither its label nor its value. A `field` is read by what is typed in it
     /// (`typed`), and an empty one is read as empty.
     @discardableResult
+    /// How many trust offers the sidebar lists under NEEDS YOU.
+    private func offerRows(_ ui: XCUIApplication) -> Int {
+        ui.descendants(matching: .any).matching(NSPredicate(format: "identifier BEGINSWITH 'offer-'")).count
+    }
+
     private func words(_ ui: XCUIApplication, _ key: Key, timeout: TimeInterval, _ product: String,
                        until holds: (String) -> Bool = { _ in true }, field: Bool = false,
                        file: StaticString = #filePath, line: UInt = #line) -> String? {
