@@ -875,7 +875,7 @@ final class FirstRunProof: XCTestCase {
     /// channel. Mutations: the inspector without bg.raised → red at "inspector"; the hairline the
     /// system's divider again → red at "line.hair"; a sheet title in Inter Display → red at
     /// "title"; Set the default again → red at "Retention"; Give Drive the default → red at
-    /// "drive". Then Node > Detach: the chooser lists alice, detached, with her fingerprint and
+    /// "drive". Then Node > Sign Out…: the chooser lists alice, detached, with her fingerprint and
     /// "Everything you post, trust and share will be as alice."; `vox node list` shows the same
     /// fingerprint; and with bob's vault copied over hers, it shows none (P8). Before that, the
     /// sidebar opens with "node alice, attached" and ends with ON THIS MACHINE listing bob as
@@ -1073,18 +1073,32 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(!foot.isNull && !lastAbove.isNull && foot.minY > lastAbove.maxY,
                       "PRODUCT: \"ON THIS MACHINE\" must be at the sidebar's foot, below Services (G5); it is at \(foot), Services at \(lastAbove)")
 
-        // P8: Node > Detach, and the chooser lists alice, now detached, with her fingerprint (from
-        // her fingerprint file) and what choosing her means; `vox node list` shows it too. Then a
-        // vault copied over hers, as a restore would: her fingerprint is not known, never stale.
+        // P8: Node > Sign Out… and its confirm, and the chooser lists alice, now detached, with her
+        // fingerprint (from her fingerprint file) and what choosing her means; `vox node list`
+        // shows it too. Then a vault copied over hers, as a restore would: her fingerprint is not
+        // known, never stale. (Node > Detach no longer leads here: since E-4 a detached window
+        // offers only Attach Again, 34289e0ef; Sign Out is the way to the chooser.)
         ui.menuBars.menuBarItems["Node"].click()
-        tap(ui, Key.menuItem("Detach"), "Node > Detach")
+        tap(ui, Key.menuItem("Sign Out…"), "Node > Sign Out…")
+        tap(ui, Key.id("sign-out-confirm"), "Sign Out in its confirm sheet")
         let plain = { (s: String) in s.lowercased().filter { $0.isLetter || $0.isNumber } }
-        let shown = words(ui, Key.id("node-fingerprint-alice"), timeout: 30,
-                          "after Detach, the chooser must list alice with her fingerprint (P8)") ?? ""
-        XCTAssertEqual(plain(shown), plain(aliceFp),
-                       "PRODUCT: the chooser must show detached alice's fingerprint, \(aliceFp) (P8); it shows \(shown.debugDescription)")
-        words(ui, Key.id("node-acting-as-alice"), timeout: 5, "the chooser must say what choosing alice means (P8)",
-              until: { $0 == "Everything you post, trust and share will be as alice." })
+        // The chooser has no status bar, so a missing row is said here, against its heading.
+        present(ui, Key.showing("Which node are you?"), timeout: 30,
+                "after Sign Out, the app must show the node chooser")
+        func chooserWords(_ id: String) -> String? {
+            let end = Date().addingTimeInterval(10)
+            repeat {
+                if let e = locate(ui, Key.id(id)) { return shown(e) }
+                Thread.sleep(forTimeInterval: 0.25)
+            } while Date() < end
+            return nil
+        }
+        let fingerprintShown = chooserWords("node-fingerprint-alice") ?? ""
+        XCTAssertEqual(plain(fingerprintShown), plain(aliceFp),
+                       "PRODUCT: the chooser must show detached alice's fingerprint, \(aliceFp) (P8); \(fingerprintShown.isEmpty ? "it has no fingerprint row for her" : "it shows \(fingerprintShown.debugDescription)")")
+        let actingAs = chooserWords("node-acting-as-alice") ?? ""
+        XCTAssertEqual(actingAs, "Everything you post, trust and share will be as alice.",
+                       "PRODUCT: the chooser must say what choosing alice means (P8); it says \(actingAs.debugDescription)")
         let listed = run(vox, ["node", "list"], env: voxEnv).out
         let aliceLine = nodeLine(listed, "alice") ?? ""
         XCTAssertTrue(aliceLine.contains(" detached ") && plain(aliceLine).contains(plain(aliceFp)),
@@ -1096,7 +1110,7 @@ final class FirstRunProof: XCTestCase {
         let restored = nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "alice") ?? ""
         XCTAssertFalse(plain(restored).contains(plain(aliceFp)) || plain(restored).contains(plain(bobFp)),
                        "PRODUCT: with another vault in alice's place, `vox node list` must not show a fingerprint for her, stale or otherwise; it says \(restored.debugDescription)")
-        print("[proof] look: \(read.joined(separator: "; ")); title \(titleHeight) high; retention kept by Return; bob \(capability.debugDescription) after Return; chooser shows alice \(shown.debugDescription); node list \(aliceLine.debugDescription), then with bob's vault \(restored.debugDescription)")
+        print("[proof] look: \(read.joined(separator: "; ")); title \(titleHeight) high; retention kept by Return; bob \(capability.debugDescription) after Return; chooser shows alice \(fingerprintShown.debugDescription); node list \(aliceLine.debugDescription), then with bob's vault \(restored.debugDescription)")
     }
 
     /// `key` gone within `timeout`: PRODUCT naming what still shows it.
