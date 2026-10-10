@@ -3472,8 +3472,32 @@ async fn follow(
         // to: a Session's opening and end are room messages; its entries are not.
         let mut sessions_in: Vec<Digest32> = Vec::new();
         let rooms: Vec<Digest32> = match stream.next().await {
-            // This node's own post.
-            Ok(Some(Frame::Event(NodeEvent::NewEntry { channel_id, .. }))) => vec![channel_id],
+            // A new entry, with its row: delivered as it came, as `vox room tail` delivers it. Read
+            // back instead, it could come from the room's view before the node published the row in
+            // it, find nothing, and be lost for good with no later event to read it again (the
+            // walkthrough's WHERE-15, posted with every peer offline). The cursor stays where reads
+            // left it: a row rendered late still sits after it, and `delivered` keeps this one from
+            // being told twice when a later read returns it.
+            Ok(Some(Frame::Event(NodeEvent::NewEntry { channel_id, row }))) => {
+                if cursors.contains_key(&channel_id)
+                    && !row.owed
+                    && delivered.insert(row.entry_hash)
+                {
+                    let message = {
+                        let mut slot = held.lock().await;
+                        let Some(h) = slot.as_mut() else {
+                            listener.on_ended("the app released its node".to_owned());
+                            return;
+                        };
+                        let names = names(&mut h.client).await.unwrap_or_default();
+                        let me = h.client.me().map(|f| b32_encode(&f));
+                        rendered(&row, &names, me.as_deref())
+                    };
+                    listener.on_message(b32_encode(&channel_id), message);
+                }
+                sessions_in.push(channel_id);
+                Vec::new()
+            }
             // Others' messages: a sync that rendered rows, or a sender key that made rows already
             // held readable. Said as a notice too, as the TUI says them.
             Ok(Some(Frame::Event(
