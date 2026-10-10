@@ -1369,6 +1369,9 @@ impl Daemon {
             record.harness = "claude".into();
         }
         record.name = session_name(input);
+        if input.claude {
+            record.transcript.clone_from(&input.transcript);
+        }
         let (room, join) = session_room(&self.account, input, room_arg);
         record.room = room;
         record.start = Some(input.cwd.clone()).filter(|c| !c.is_empty());

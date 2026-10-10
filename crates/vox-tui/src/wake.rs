@@ -105,6 +105,10 @@ pub struct Session {
     /// none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Claude Code's transcript for the session (its hooks' `transcript_path`), where a `/rename`
+    /// writes the new name: the daemon reads it there, since no hook runs after a slash command.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub transcript: String,
     /// Whether a person is at the session (ADR-029 SE-1): a headless run (`claude -p`, an SDK,
     /// `codex exec`) gets no Session.
     #[serde(default = "interactive_by_default")]
@@ -419,6 +423,7 @@ impl Session {
                 room: None,
                 start: None,
                 name: None,
+                transcript: String::new(),
                 interactive: interactive_now(),
                 tmux: None,
                 tmux_why: None,
@@ -442,6 +447,7 @@ impl Session {
                 room: None,
                 start: None,
                 name: None,
+                transcript: String::new(),
                 interactive: interactive_now(),
                 tmux: None,
                 tmux_why: None,
@@ -465,6 +471,7 @@ impl Session {
                 room: None,
                 start: None,
                 name: None,
+                transcript: String::new(),
                 interactive: interactive_now(),
                 tmux: None,
                 tmux_why: None,
@@ -485,6 +492,7 @@ impl Session {
                 room: None,
                 start: None,
                 name: None,
+                transcript: String::new(),
                 interactive: interactive_now(),
                 tmux: None,
                 tmux_why: None,

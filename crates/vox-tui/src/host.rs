@@ -102,6 +102,8 @@ struct Inner {
     sink: Arc<crate::session_sink::Sink>,
     /// One queue per (node, session) into its Session, so its entries keep their order.
     posting: Mutex<BTreeMap<(NodeName, String), tokio::sync::mpsc::UnboundedSender<String>>>,
+    /// The Claude Code sessions whose transcript is read for a new name (ADR-029 MD-1).
+    titles: Mutex<BTreeSet<(NodeName, String)>>,
     /// Codex sessions' activity, read from Codex's app-server as a peer client (ADR-029 #541).
     codex: Arc<crate::codex_mirror::CodexMirror>,
     /// OpenCode sessions' activity, read through Vox's OpenCode plugin (ADR-029 #542).
@@ -292,6 +294,7 @@ impl Router {
                     keep_file: tokio::sync::Mutex::new(()),
                     sink,
                     posting: Mutex::default(),
+                    titles: Mutex::default(),
                     joins: Mutex::default(),
                 }
             }),
@@ -671,6 +674,9 @@ impl Router {
         let join = join.filter(|_| asked.is_some() && asked == room);
         if let (Some(handle), Some(reg)) = (handle.as_ref(), stored.as_ref()) {
             joining = self.open_session(node, handle, reg, join).await;
+        }
+        if let Some(reg) = stored.as_ref() {
+            self.watch_title(node, reg);
         }
         // **New** is new to this node: no registration before, and no Session of it in any room
         // its log holds, so a daemon restarted mid-session still knows it (ADR-029 RB-5).
@@ -1273,6 +1279,56 @@ impl Router {
         self.inner.rt.spawn(async move {
             // A Session not open yet is opened under the new name when it is.
             let _ = router.open_session(&node, &handle, &reg, None).await;
+        });
+    }
+
+    /// A Claude Code session's name read from its transcript while it is registered (ADR-029 MD-1):
+    /// its hooks read it each turn, but a `/rename` is a command with no turn, typed in the
+    /// terminal or driven from Vox, so no hook runs after it and the Session kept its old name
+    /// until the session's next prompt. The transcript's new lines are read every
+    /// [`TITLE_EVERY`], from where the last read stopped; a new name renames the Session at once,
+    /// as Codex's and OpenCode's do. One reader per session; it stops when the session's
+    /// registration goes.
+    fn watch_title(&self, node: &NodeName, reg: &crate::wake::Session) {
+        if reg.harness != "claude" || reg.transcript.is_empty() {
+            return;
+        }
+        let key = (node.clone(), reg.session.clone());
+        if !lock(&self.inner.titles).insert(key.clone()) {
+            return;
+        }
+        let weak = Arc::downgrade(&self.inner);
+        let path = std::path::PathBuf::from(&reg.transcript);
+        self.inner.rt.spawn(async move {
+            let (node, session) = key.clone();
+            let mut titles = Titles::default();
+            loop {
+                tokio::time::sleep(TITLE_EVERY).await;
+                let Some(inner) = weak.upgrade() else { return };
+                let router = Router { inner };
+                let Some(reg) = router
+                    .inner
+                    .account
+                    .node_paths(&node)
+                    .ok()
+                    .and_then(|p| crate::wake::registration(&p, &session))
+                else {
+                    break;
+                };
+                let path = path.clone();
+                titles = match tokio::task::spawn_blocking(move || titles.read(&path)).await {
+                    Ok(t) => t,
+                    Err(_) => break,
+                };
+                if let Some(name) = titles.name() {
+                    if reg.name.as_deref() != Some(name.as_str()) {
+                        router.rename_session(&node, &session, &name);
+                    }
+                }
+            }
+            if let Some(inner) = weak.upgrade() {
+                lock(&inner.titles).remove(&key);
+            }
         });
     }
 
@@ -2514,5 +2570,65 @@ impl vox_core::node::ipc::Extension for DaemonExtension {
             }
             _ => crate::lan_cli::LanUp.serve(body, stream, handle),
         }
+    }
+}
+
+/// How often a Claude Code session's transcript is read for a new name.
+const TITLE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The titles a Claude Code transcript holds, read from where the last read stopped: a `/rename`
+/// writes `{"type":"custom-title","customTitle":…}`, and Claude Code's own title is
+/// `{"type":"ai-title","aiTitle":…}`. The last custom title wins, else the last made one, as the
+/// hooks read them (`agent_hook::session_name`).
+#[derive(Default)]
+struct Titles {
+    /// Bytes read so far.
+    offset: u64,
+    /// A line read only in part, finished by the next read.
+    partial: String,
+    custom: Option<String>,
+    made: Option<String>,
+}
+
+impl Titles {
+    fn read(mut self, path: &std::path::Path) -> Self {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return self;
+        };
+        // A transcript that got shorter was written anew: read from its start.
+        if file.metadata().is_ok_and(|m| m.len() < self.offset) {
+            self = Self::default();
+        }
+        if file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return self;
+        }
+        let mut bytes = Vec::new();
+        let Ok(n) = file.read_to_end(&mut bytes) else {
+            return self;
+        };
+        self.offset += n as u64;
+        self.partial.push_str(&String::from_utf8_lossy(&bytes));
+        let done = self.partial.rfind('\n').map_or(0, |i| i + 1);
+        let lines: String = self.partial.drain(..done).collect();
+        for line in lines.lines().filter(|l| l.contains("-title\"")) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            match v["type"].as_str() {
+                Some("custom-title") => self.custom = v["customTitle"].as_str().map(str::to_owned),
+                Some("ai-title") => self.made = v["aiTitle"].as_str().map(str::to_owned),
+                _ => {}
+            }
+        }
+        self
+    }
+
+    fn name(&self) -> Option<String> {
+        self.custom
+            .clone()
+            .or_else(|| self.made.clone())
+            .map(|n| n.trim().to_owned())
+            .filter(|n| !n.is_empty())
     }
 }
