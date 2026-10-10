@@ -2589,6 +2589,15 @@ final class FirstRunProof: XCTestCase {
         guard listed.contains(d7Session.prefix(8)) else {
             throw Apparatus("alice's `vox room sessions` never listed bob's Session \(d7Session) in 30 s: \(listed)")
         }
+        // Its opening is a line of the room, said as every reader says it (#406): "<name · short
+        // id> opened", as `vox room read` prints it, never a blank row under bob's name.
+        let openedLine = Key.showing("\(d7Session.prefix(8)) opened")
+        present(ui, openedLine, timeout: 30,
+                "bob's Session's opening must read in alice's timeline as `vox room read` says it, \"\(d7Session.prefix(8)) opened\", not as a blank row",
+                premise: Premise("alice's `vox room read` says bob's Session \(d7Session) opened") {
+                    let read = self.run(vox, ["room", "read", "--node", "alice", room], env: voxEnv).out
+                    return (read.contains("\(d7Session.prefix(8)) opened"), String(read.suffix(800)))
+                })
         let toBox = Key.id("compose-to")
         tap(ui, toBox, "To:")
         // By its own id: bob has another Session open in mission (bob-proof, his hook's from step 4).
