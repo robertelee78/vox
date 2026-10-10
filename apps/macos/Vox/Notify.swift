@@ -11,8 +11,6 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     var open: ((String) -> Void)?
     /// Opens a Session's waiting request a notification is about: room, node, session, reference.
     var openRequest: ((String, String, String, String) -> Void)?
-    /// Opens a directory's room ask a notification is about.
-    var openAsk: ((String) -> Void)?
     /// Told whether Vox may notify, once macOS says: the status bar says when it may not.
     var allowed: ((Bool) -> Void)?
     private var asked = false
@@ -68,7 +66,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     nonisolated static func waitingID(_ sessionKey: String) -> String { "waiting-\(sessionKey)" }
 
     /// One notification for a directory with no room (ADR-029 RB-5): which harness, which
-    /// directory. Clicking it opens the ask.
+    /// directory. Clicking it brings Vox forward, where the ask is a banner across the window.
     func postRoomAsk(dir: String, sentence: String) {
         let content = UNMutableNotificationContent()
         content.title = "Which room is this repo in?"
@@ -107,11 +105,8 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         let node = info["node"] as? String
         let session = info["session"] as? String
         let reference = info["reference"] as? String
-        let ask = info["ask"] as? String
         Task { @MainActor in
-            if let ask {
-                self.openAsk?(ask)
-            } else if let room, let node, let session, let reference {
+            if let room, let node, let session, let reference {
                 self.openRequest?(room, node, session, reference)
             } else if let room {
                 self.open?(room)

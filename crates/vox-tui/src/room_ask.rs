@@ -81,22 +81,20 @@ pub fn commands(ask: &RoomAsk) -> [String; 2] {
     ]
 }
 
-/// The asks under a "needs you" heading, each with the commands that answer it at a terminal;
-/// nothing when there are none.
+/// One line per ask, as `vox agent status` prints it after its own: "Vox needs you: Claude Code in
+/// /opt/vox has no room. …", with where it is answered. Nothing when there are none.
 #[must_use]
 pub fn needs_you(asks: &[RoomAsk]) -> String {
-    if asks.is_empty() {
-        return String::new();
-    }
-    let mut out = String::from("needs you:\n");
-    for a in asks {
-        let [bind, no] = commands(a);
-        out.push_str(&format!(
-            "  {}: choose a room with `{bind}`, or say no with `{no}`\n",
-            a.sentence()
-        ));
-    }
-    out
+    asks.iter()
+        .map(|a| {
+            let [bind, no] = commands(a);
+            format!(
+                "Vox needs you: {}. Answer in Vox.app, or at a terminal: `{bind}` to bind it, or \
+                 `{no}` to say no.\n",
+                a.sentence()
+            )
+        })
+        .collect()
 }
 
 /// The daemon's asks, as a client reads them. No daemon running is no session registered, so no

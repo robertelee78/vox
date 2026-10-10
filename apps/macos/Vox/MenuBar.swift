@@ -102,7 +102,7 @@ private struct NodeFacts: View {
         Text(model.keyring).font(Theme.mono).secondaryText()
         section("NEEDS YOU") {
             let rooms = model.group(.needsYou)
-            if rooms.isEmpty && model.offers.isEmpty && model.roomAsks.isEmpty {
+            if rooms.isEmpty && model.offers.isEmpty {
                 Text("nothing addressed to you").secondaryText()
             }
             ForEach(rooms) { room in
@@ -116,13 +116,6 @@ private struct NodeFacts: View {
                 Button("offer: \(offer.short)… \(offer.whyWords)") {
                     NSApp.activate(ignoringOtherApps: true)
                     Task { await model.show(.offer(offer.fingerprint)) }
-                }
-            }
-            // A repo with no room (ADR-029 RB-5).
-            ForEach(model.roomAsks, id: \.dir) { ask in
-                Button(ask.sentence) {
-                    NSApp.activate(ignoringOtherApps: true)
-                    Task { await model.show(.roomAsk(ask.dir)) }
                 }
             }
         }

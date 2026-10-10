@@ -29,9 +29,6 @@ final class NodeModel: ObservableObject {
         case services
         /// A trust offer waiting, by the offered node's fingerprint (ADR-028 K-15).
         case offer(String)
-        /// A directory with no room, by its path (ADR-029 RB-5): Vox asks the person which room it
-        /// works in.
-        case roomAsk(String)
     }
 
     /// A room as the sidebar shows it.
@@ -318,7 +315,6 @@ final class NodeModel: ObservableObject {
         notifier.openRequest = { [weak self] room, node, session, reference in
             Task { await self?.openRequest(room: room, node: node, session: session, reference: reference) }
         }
-        notifier.openAsk = { [weak self] dir in Task { await self?.show(.roomAsk(dir)) } }
         notifier.allowed = { [weak self] granted in self?.notifying = granted }
         notifier.ask()
     }
@@ -493,8 +489,6 @@ final class NodeModel: ObservableObject {
             keyringDid = nil
             keyringFailed = nil
         }
-        // An ask's view says what its own answer did, never another's.
-        if case .roomAsk = selection { roomAskSaid = nil }
         guard case .room = selection else { return }
         messages = []
         unreadFrom = nil
@@ -723,6 +717,9 @@ final class NodeModel: ObservableObject {
             return false
         }
     }
+
+    /// Take down what the last answer to an ask said.
+    func clearRoomAskSaid() { roomAskSaid = nil }
 
     /// Say no for `dir` (RB-7): it stays tied to no room, and nothing started there is asked again.
     func declineRoom(_ dir: String) async {
@@ -1145,8 +1142,6 @@ final class NodeModel: ObservableObject {
             }
         } else if let offer = offers.first {
             await show(.offer(offer.fingerprint))
-        } else if let ask = roomAsks.first {
-            await show(.roomAsk(ask.dir))
         }
     }
 

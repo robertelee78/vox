@@ -1684,10 +1684,10 @@ final class FirstRunProof: XCTestCase {
     /// - P1: ⌘J opens S1 with its waiting request selected, and ⌥⌘Y approves it: the hook gets
     ///   "allow" (mutant: ⌘J opening the room only).
     /// - RB-5 (v0.4.3): Vox asks the person, not only the agent. S3, started in a directory the
-    ///   room map does not name, is shown under NEEDS YOU ("Claude Code in … has no room"); Choose
-    ///   a room…, other, the room's passphrase typed here, and Bind write the directory's block to
-    ///   the room map, put S3 in other, and the ask leaves needs you (mutant: the ask never shown
-    ///   in the sidebar).
+    ///   room map does not name, is asked about in a banner across the window ("Claude Code in …
+    ///   has no room"); Choose a room…, other, the room's passphrase typed here, and Bind write the
+    ///   directory's block to the room map, put S3 in other, and the ask leaves the banner (mutant:
+    ///   the banner never shown).
     func testSessionsAreDrivenWhereTheyAreShown() throws {
         let env = ProcessInfo.processInfo.environment
         guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
@@ -1888,14 +1888,13 @@ final class FirstRunProof: XCTestCase {
                                   env: hookEnv).out
             return (status.contains("has no room") && status.contains("/repo"), "`vox agent status` said \(status.debugDescription)")
         }
-        let askRow = Key.id("room-ask-row")
+        let askRow = Key.id("room-ask-sentence")
         present(ui, askRow, timeout: 30,
-                "a session started in a directory with no room must be asked about under NEEDS YOU",
+                "a session started in a directory with no room must be asked about in the window",
                 premise: asked3)
         words(ui, askRow, timeout: 10, "the ask must name the harness and the directory",
               until: { $0.contains("Claude Code in ") && $0.contains("/repo has no room") })
-        tap(ui, askRow, "the ask under NEEDS YOU", premise: asked3)
-        tap(ui, Key.id("room-ask-choose"), "Choose a room…")
+        tap(ui, Key.id("room-ask-choose"), "Choose a room…", premise: asked3)
         let other = ui.radioButtons["other"]
         guard other.waitForExistence(timeout: 10) else {
             keepTree(ui, "no room other to choose")
@@ -1919,9 +1918,9 @@ final class FirstRunProof: XCTestCase {
         while Date() < leaveBy && locate(ui, askRow) != nil { Thread.sleep(forTimeInterval: 0.5) }
         if locate(ui, askRow) != nil {
             keepTree(ui, "the ask stayed after Bind")
-            XCTFail("PRODUCT: once bound, the directory must leave NEEDS YOU; its ask is still shown")
+            XCTFail("PRODUCT: once bound, the directory must no longer be asked about; its ask is still shown")
         }
-        print("[proof] room ask: S3's directory was asked about under NEEDS YOU; bound to other in the app; the map holds its block; S3 is in other; the ask left")
+        print("[proof] room ask: S3's directory was asked about in the window's banner; bound to other in the app; the map holds its block; S3 is in other; the ask left")
     }
 
     /// A keyring change waiting for the passphrase is bound to what it changes (D1). Alice is

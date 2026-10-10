@@ -18,6 +18,8 @@ struct MainWindow: View {
                 NodeStopped(model: model)
                 Divider()
             }
+            // A repo with no room (ADR-029 RB-5): one banner across the window.
+            RoomAskBanner(model: model)
             NavigationSplitView {
                 // Dragged wider or narrower, and remembered (Columns).
                 Sidebar(model: model)
@@ -41,8 +43,6 @@ struct MainWindow: View {
                     ServicesView(model: model)
                 case let .offer(fingerprint):
                     OfferView(model: model, fingerprint: fingerprint).id(fingerprint)
-                case let .roomAsk(dir):
-                    RoomAskView(model: model, dir: dir).id(dir)
                 case nil where model.rooms.isEmpty:
                     // A node in no room yet (its first run, most often): the two ways in, here,
                     // not only in the File menu.
@@ -135,9 +135,7 @@ private struct Sidebar: View {
                 let rooms = model.group(need)
                 // A trust offer waiting needs the person too (ADR-028 K-15, W-2).
                 let offers = need == .needsYou ? model.offers : []
-                // So does a repo with no room (ADR-029 RB-5).
-                let asks = need == .needsYou ? model.roomAsks : []
-                let count = rooms.count + offers.count + asks.count
+                let count = rooms.count + offers.count
                 Section {
                     ForEach(rooms) { room in
                         RoomRow(room: room, selected: model.selection == .room(room.id))
@@ -149,11 +147,6 @@ private struct Sidebar: View {
                         OfferRow(offer: offer).tag(NodeModel.Selection.offer(offer.fingerprint))
                             .sidebarRow(model.selection == .offer(offer.fingerprint))
                             .copyMenu([("Copy Fingerprint", offer.fingerprint)])
-                    }
-                    ForEach(asks, id: \.dir) { ask in
-                        RoomAskRow(ask: ask).tag(NodeModel.Selection.roomAsk(ask.dir))
-                            .sidebarRow(model.selection == .roomAsk(ask.dir))
-                            .copyMenu([("Copy Path", ask.dir)])
                     }
                 } header: {
                     Text("\(need.words) (\(count))")
