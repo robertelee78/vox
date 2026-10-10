@@ -54,6 +54,17 @@ pub fn drive_channel(channel_id: &Digest32) -> Digest32 {
     crate::hash::sha256_concat(&[DRIVE_DOMAIN, channel_id])
 }
 
+/// The session id of the entry a node writes under a new drive generation when it changed its
+/// key because a member lost drive (SC-2b): no harness session has it, so it is no Session's
+/// entry. Members read from it that the key changed, at once rather than at the next entry.
+pub const KEY_CHANGED: &str = "vox:drive-key";
+
+/// Whether `session_id` is [`KEY_CHANGED`]'s: an entry that is no Session's, never shown as one.
+#[must_use]
+pub fn is_key_changed(session_id: &str) -> bool {
+    session_id == KEY_CHANGED
+}
+
 /// One Session entry this node opened, or wrote (ADR-029 SC-1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRow {

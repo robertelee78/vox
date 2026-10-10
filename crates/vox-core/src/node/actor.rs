@@ -7938,7 +7938,7 @@ impl Node {
             }
             NetEvent::SessionRows { channel_id, reply } => {
                 let rows = match self.channels.get(&channel_id).map(Arc::clone) {
-                    Some(shared) => Some(shared.lock().await.session_rows().to_vec()),
+                    Some(shared) => Some(shared.lock().await.session_rows()),
                     None => None,
                 };
                 let _ = reply.send(rows);
@@ -15556,24 +15556,53 @@ impl Node {
     }
 
     /// This node's drive key in one room (ADR-029 SC-2a, SC-2b): **changed first** if a member it
-    /// was released to is no longer in `holders` (downgraded to read, or untrusted), then released
-    /// to each member with drive that is owed it, as a key-package in the room's log, sealed to
-    /// that member's prekeys. A member whose prekeys this node has not read yet stays owed, and the
-    /// tick tries again.
+    /// was released to is no longer in `holders` (downgraded to read, or untrusted), with an entry
+    /// under the new key that says so, so the member reads at once that it no longer holds it;
+    /// **begun** if this node has an open Session here and none yet, so a member given drive holds
+    /// it before the Session's first entry; then released to each member with drive that is owed
+    /// it, as a key-package in the room's log, sealed to that member's prekeys. A member whose
+    /// prekeys this node has not read yet stays owed, and the tick tries again.
     async fn tend_drive_keys_in(&mut self, channel_id: &Digest32, holders: &BTreeSet<Digest32>) {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
         };
         let now_ms = self.now_ms();
+        let now_millis = (self.millis_clock)();
+        let has_session = {
+            let me = self.profile.as_ref().map(Profile::fingerprint);
+            let view = self.view_tx.borrow();
+            view.open_channels
+                .iter()
+                .find(|d| d.channel_id == *channel_id)
+                .is_some_and(|d| {
+                    crate::node::sessions::fold(d)
+                        .iter()
+                        .any(|s| s.open && Some(s.node) == me)
+                })
+        };
+        let mut changed = false;
         let releases = {
             let Some(profile) = self.profile.as_ref() else {
                 return;
             };
             let mut ch = shared.lock().await;
-            if ch
-                .rotate_drive_if_lost(profile.store(), holders, now_ms)
-                .is_err()
-            {
+            let Ok(lost) = ch.rotate_drive_if_lost(profile.store(), holders, now_ms) else {
+                return;
+            };
+            if !lost.is_empty() {
+                // The member that lost drive still holds the old key: until an entry is sealed
+                // under the new one, nothing tells it the key changed.
+                changed = ch
+                    .append_session(
+                        profile,
+                        crate::node::drive::KEY_CHANGED,
+                        r#"{"kind":"drive-key"}"#,
+                        holders,
+                        now_millis,
+                    )
+                    .is_ok();
+            }
+            if has_session && ch.ensure_drive(profile.store(), holders, now_ms).is_err() {
                 return;
             }
             let Ok(owed) = ch.owed_drive(profile.store(), holders) else {
@@ -15587,6 +15616,9 @@ impl Node {
             }
             releases
         };
+        if changed {
+            self.note_local_append(channel_id);
+        }
         for (member, skdm, generation) in releases {
             if !self.post_key_package(channel_id, member, &skdm).await {
                 continue;
