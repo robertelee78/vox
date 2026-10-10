@@ -5,7 +5,8 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 **Status:** accepted and built in `crates/vox-core/src/pairwise/`, `node::prekeys` and
 `node::joinstream`, except: PQ post-compromise security (§"Post-quantum PCS (phased)") is not built;
 the skipped-key bounds (W3) are fixed constants, not channel-policy settings; prekey bundles are
-published only at the rendezvous, not on the log (P1).
+published only at the rendezvous, not on the log (P1). Q1 and O5 are planned for v0.4.2 (ADR-030,
+2026-10-09).
 **Deciders:** Robert E. Lee <robert@agidreams.us>
 
 ## Context
@@ -116,11 +117,19 @@ initiators can consume the same one-time prekey concurrently.
 
 O2–O4 together make every member of a room eventually read every other member it is trusted by.
 
+- **O5. Key delivery sessions are not long-lived sessions.** A key delivery session (ADR-030 W-1) MUST
+  travel as `OP_ROTATION_HELLO`, never as a `Hello`. O1–O4 MUST NOT apply to it: it never replaces,
+  displaces or counts as the long-lived session, and it is dropped once its key is opened. *Status:*
+  planned for v0.4.2 (ADR-030).
+
 ### §"Post-quantum PCS (phased)"
 
-- **Q1.** PQ post-compromise security is not provided today. It MUST be added as a separate
-  capability (a PQ continuous-key-agreement layer, such as Signal SPQR's ML-KEM-768 Triple Ratchet or
-  Apple PQ3's amortized re-KEM), gated by its bandwidth cost (ADR-003 §Scope).
+- **Q1.** PQ post-compromise security MUST be provided at key-delivery granularity, as ADR-030 specifies:
+  every key handed over the pairwise channel travels in a fresh PQXDH session its sender opens, never in
+  the long-lived session, so a key's secrecy rests on a fresh ML-KEM encapsulation. A continuous
+  key-agreement layer inside the ratchet (Signal SPQR, Apple PQ3) was weighed and rejected: on this
+  channel's sparse, one-way traffic it heals only after replies that may never come (ADR-030, Alternatives
+  rejected). *Status:* planned for v0.4.2; not provided today.
 
 ### Security properties provided
 
@@ -134,12 +143,13 @@ O2–O4 together make every member of a room eventually read every other member 
 - Formally verified pairwise confidentiality with forward secrecy, hybrid from the first release.
 - Serverless prekey availability depends on the rendezvous and the log, which can weaken the classic
   asynchronous send to an offline peer.
-- Full post-compromise healing against a quantum adversary is not provided until Q1 is built.
+- Full post-compromise healing against a quantum adversary is not provided until Q1 (ADR-030) is
+  built.
 
 ## Related ADRs
 
-Depends on ADR-002 and ADR-003. Depended on by ADR-005, ADR-006, ADR-007, ADR-011. Cited: ADR-008,
-ADR-012, ADR-016.
+Depends on ADR-002 and ADR-003. Depended on by ADR-005, ADR-006, ADR-007, ADR-011, ADR-030. Cited:
+ADR-008, ADR-012, ADR-016.
 
 ## Engineering Mantra
 

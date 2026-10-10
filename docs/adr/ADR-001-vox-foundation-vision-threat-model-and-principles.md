@@ -88,7 +88,8 @@ Vox MUST NOT claim the following; each is absent unless a later ADR builds it:
 
 - **S1.** Every ADR MUST state which of these it provides and which it does not, and MUST NOT conflate
   them: PQ confidentiality (ADR-003, ADR-004; passive quantum adversary); classical post-compromise
-  security (ADR-004); PQ post-compromise security (ADR-004; not provided today); metadata privacy
+  security (ADR-004); PQ post-compromise security (ADR-030, at key-delivery granularity; planned for
+  v0.4.2, not provided today); metadata privacy
   (member-only confidentiality is provided; pattern privacy against a global passive adversary is
   N1).
 - **S2.** Content deniability is not provided: deniable rooms were removed (PRD-001 R43; ADR-009).

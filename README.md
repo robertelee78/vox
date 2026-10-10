@@ -300,10 +300,6 @@ members, not from the person they work for.
   who later breaks the classical ones; nobody can tell you they hold, which is the reason for the
   hybrid. *(ADR-003, ADR-011)*
 - **Chat, agents and tunnels on one overlay.** *(ADR-013, ADR-017, ADR-020)*
-- **Deniability — specified and built, not enabled.** ADR-009 designs message content with no
-  transferable proof of authorship; `vox-core/src/deniable/` implements it, but no release turns it
-  on until its formal analysis and wire codec are done. Treat it as a commitment, not a property you
-  have today. *(ADR-009)*
 
 ## Threat model
 
@@ -326,7 +322,7 @@ be used by any program running as you. See [ADR-001](docs/adr/ADR-001-vox-founda
 Each layer is a decision record in [`docs/adr/`](docs/adr/) (indexed in
 [`docs/adr/README.md`](docs/adr/README.md)), numbered in build order: identity and keys (002),
 crypto policy (003), pairwise channel (004), addressing and join (005), group messaging (006),
-membership and trust (007), replicated log and sync (008), deniability (009), at-rest storage (010),
+membership and trust (007), replicated log and sync (008), at-rest storage (010),
 transport (011), NAT traversal (012), tunneling (013), clients (014, 015), node runtime (016),
 room-bound services (017), quality bar (018), agent comms (020), and onward.
 

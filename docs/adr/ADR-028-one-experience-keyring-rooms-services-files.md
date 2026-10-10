@@ -418,7 +418,7 @@ structure for both clients; the TUI renders the same regions in text.
 
 ### 12. Out of scope
 
-Calls (v0.5.0) and the iOS app (v0.4.1).
+Calls and the iOS app (both v0.5.0).
 
 ## Superseded and amended lines
 
