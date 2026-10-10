@@ -1610,7 +1610,7 @@ private struct MessageRow: View {
                     .help(TimelineTime.full(message.createdMillis))
                     .accessibilityIdentifier("time-\(message.id)")
                 if message.urgent { StateMark(kind: .attention, words: "urgent") }
-                if message.to.contains(me) { Text("to you").eyebrow() }
+                if message.to.contains(me) { Text("to you").caption().secondaryText() }
                 if message.late {
                     // ADR-023: it took its place above messages already shown.
                     Text("arrived late").eyebrow().secondaryText()
