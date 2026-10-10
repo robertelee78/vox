@@ -96,6 +96,9 @@ struct Inner {
     /// Held while `.daemon/attach` is rewritten and while a Keychain item is stored or removed:
     /// one writer at a time, and a removal never overtakes a later store of the same item.
     keep_file: tokio::sync::Mutex<()>,
+    /// The kept nodes this daemon's start is attaching and has not finished with (#666): listed
+    /// as attaching from the moment the daemon serves, so a hook asking then is told the truth.
+    starting: Mutex<BTreeSet<NodeName>>,
     /// Each node's joins of its sessions' rooms under way (ADR-029 RB-3).
     joins: Mutex<BTreeMap<NodeName, Arc<vox_core::node::room_join::Joins>>>,
     /// Where harness sessions' activity is numbered and posted, and approvals wait (ADR-029).
@@ -292,6 +295,7 @@ impl Router {
                     connections: Arc::default(),
                     proxy,
                     keep_file: tokio::sync::Mutex::new(()),
+                    starting: Mutex::new(BTreeSet::new()),
                     sink,
                     posting: Mutex::default(),
                     titles: Mutex::default(),
@@ -363,6 +367,9 @@ impl Router {
             .into_iter()
             .map(|name| {
                 let mut info = info_of(&name, slots.get(&name));
+                if slots.get(&name).is_none() && lock(&self.inner.starting).contains(&name) {
+                    info.state = NodeState::Attaching;
+                }
                 // A node not attached: its public fingerprint file, for display only (P8).
                 if info.fingerprint.is_none() {
                     info.fingerprint = self
@@ -635,6 +642,64 @@ impl Router {
                 Err(e) => session.tmux_why = Some(format!("the pane could not be proven: {e}")),
             }
         }
+        // **A node still attaching takes the registration now, and applies it once attached**
+        // (#666): the hook, inside a model's turn, is answered at once with the node as attaching,
+        // and the Session exists from this first turn.
+        if let Some(info) = self.attaching(node) {
+            let router = self.clone();
+            let queued = node.clone();
+            let (id, asked) = (id.clone(), asked.clone());
+            self.inner.rt.spawn(async move {
+                router.started(&queued).await;
+                let session_id = id.clone();
+                if let Err(r) = router
+                    .registered(&queued, session, id, asked, known, join)
+                    .await
+                {
+                    eprintln!(
+                        "vox daemon: session {session_id} of node {queued} was not registered \
+                         once the node attached: {r}"
+                    );
+                }
+            });
+            return Ok(DaemonFrame::SessionRegistered {
+                info,
+                room: None,
+                new: !known,
+                joining: None,
+            });
+        }
+        self.registered(node, session, id, asked, known, join).await
+    }
+
+    /// The node's info, as attaching, when the daemon is attaching it (its start's kept nodes, or
+    /// an attach under way); `None` otherwise.
+    fn attaching(&self, node: &NodeName) -> Option<NodeInfo> {
+        self.nodes()
+            .into_iter()
+            .find(|n| &n.name == node && matches!(n.state, NodeState::Attaching))
+    }
+
+    /// Once the daemon's start is done with kept node `node` (attached, or given up), or at
+    /// once for any other node; bounded, as nothing a start does takes minutes.
+    async fn started(&self, node: &NodeName) {
+        let t0 = std::time::Instant::now();
+        while lock(&self.inner.starting).contains(node) && t0.elapsed() < Duration::from_secs(300) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The rest of [`Self::session_register`], for a node attached or about to be: the session
+    /// holds the node, its room is resolved, its Session opened.
+    async fn registered(
+        &self,
+        node: &NodeName,
+        session: crate::wake::Session,
+        id: String,
+        asked: Option<String>,
+        known: bool,
+        join: Option<(String, Zeroizing<String>)>,
+    ) -> Result<DaemonFrame, Refusal> {
         let g = self
             .want(
                 node,
@@ -1512,56 +1577,70 @@ impl Router {
     /// Attach every node the attach file keeps (L-4), each in the background: a client that asks
     /// for one meanwhile waits for it, as for any attach.
     pub fn attach_kept(&self) {
-        for (node, source) in read_attach_file(&self.inner.account.attach_file()) {
+        let kept = self.mark_kept_attaching();
+        for (node, source) in kept {
             let router = self.clone();
             self.inner.rt.spawn(async move {
-                let (passphrase, rooms) = match &source {
-                    KeepSource::None => (None, Vec::new()),
-                    // Off the runtime's workers: a Keychain that asks (locked, or the item made by
-                    // another vox) blocks until someone answers, and two of these would otherwise
-                    // leave the daemon answering no one meanwhile.
-                    KeepSource::Keychain(account) => {
-                        match read_in_keychain(account.clone()).await {
-                            Ok(p) => (Some(p), Vec::new()),
-                            Err(e) => {
-                                eprintln!(
-                                "vox daemon: could not attach kept node {node}: its passphrase in \
-                                 the Keychain: {e}"
-                            );
-                                router.needs_passphrase(&node).await;
-                                return;
-                            }
-                        }
-                    }
-                    KeepSource::File(path) => match crate::tunnel_cli::passphrase_file_text(path) {
-                        Ok(text) => split_passphrases(&text),
-                        Err(e) => {
-                            eprintln!(
-                                "vox daemon: could not attach kept node {node}: its passphrase \
-                                 file {}: {e}",
-                                path.display()
-                            );
-                            return;
-                        }
-                    },
-                };
-                match router
-                    .want(
-                        &node,
-                        Want::Explicit(Some(source)),
-                        passphrase,
-                        rooms,
-                        Vec::new(),
-                    )
-                    .await
-                {
-                    Ok(_) => eprintln!("vox daemon: attached kept node {node}"),
-                    Err(r) => {
-                        eprintln!("vox daemon: could not attach kept node {node}: {r}");
-                        router.needs_passphrase(&node).await;
-                    }
-                }
+                router.attach_one_kept(&node, source).await;
+                lock(&router.inner.starting).remove(&node);
             });
+        }
+    }
+
+    /// List every node the attach file keeps as attaching (#666), and return them with their
+    /// keeps. **Called before the control socket serves**, so no client ever sees a kept node as
+    /// detached in the moment before [`Self::attach_kept`] starts it; idempotent.
+    pub fn mark_kept_attaching(&self) -> Vec<(NodeName, KeepSource)> {
+        let kept = read_attach_file(&self.inner.account.attach_file());
+        lock(&self.inner.starting).extend(kept.iter().map(|(n, _)| n.clone()));
+        kept
+    }
+
+    /// Attach kept node `node` from its keep `source`, as [`Self::attach_kept`] does each.
+    async fn attach_one_kept(&self, node: &NodeName, source: KeepSource) {
+        let (passphrase, rooms) = match &source {
+            KeepSource::None => (None, Vec::new()),
+            // Off the runtime's workers: a Keychain that asks (locked, or the item made by
+            // another vox) blocks until someone answers, and two of these would otherwise leave
+            // the daemon answering no one meanwhile.
+            KeepSource::Keychain(account) => match read_in_keychain(account.clone()).await {
+                Ok(p) => (Some(p), Vec::new()),
+                Err(e) => {
+                    eprintln!(
+                        "vox daemon: could not attach kept node {node}: its passphrase in the \
+                         Keychain: {e}"
+                    );
+                    self.needs_passphrase(node).await;
+                    return;
+                }
+            },
+            KeepSource::File(path) => match crate::tunnel_cli::passphrase_file_text(path) {
+                Ok(text) => split_passphrases(&text),
+                Err(e) => {
+                    eprintln!(
+                        "vox daemon: could not attach kept node {node}: its passphrase file {}: \
+                         {e}",
+                        path.display()
+                    );
+                    return;
+                }
+            },
+        };
+        match self
+            .want(
+                node,
+                Want::Explicit(Some(source)),
+                passphrase,
+                rooms,
+                Vec::new(),
+            )
+            .await
+        {
+            Ok(_) => eprintln!("vox daemon: attached kept node {node}"),
+            Err(r) => {
+                eprintln!("vox daemon: could not attach kept node {node}: {r}");
+                self.needs_passphrase(node).await;
+            }
         }
     }
 

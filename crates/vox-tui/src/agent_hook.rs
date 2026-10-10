@@ -1251,6 +1251,22 @@ pub async fn run(
         input.session_id = s.trim().to_owned();
     }
 
+    // **A node that is not on this machine is said, and nothing is written** (#666): no session
+    // record, no cursor, no node directory; only a turn that shows the agent anything says it,
+    // once per session.
+    if !daemon.account.nodes_on_disk().contains(&daemon.node) {
+        let shown = !matches!(input.event.as_str(), "Stop" | "SessionEnd")
+            && crate::session_mirror::Event::parse(&raw)
+                .filter(|ev| crate::session_mirror::mirrors(&ev.name))
+                .is_none_or(|ev| ev.name == "UserPromptSubmit");
+        let words = Unregistered::NoNode(daemon.node.clone()).said(&input);
+        eprintln!("vox agent hook: {words}");
+        if shown && first_in_session(&daemon.account, daemon.node.as_str(), &input.session_id) {
+            emit(format, &raw, &input.event, &format!("{words}\n"), "");
+        }
+        return Ok(());
+    }
+
     // A Codex session starts: Codex's app-server is kept running (the decider, 2026-10-06), so
     // the next `codex` joins it and can be read and driven from Vox (ADR-029 #541). It is not
     // this session's turn yet, and its drain runs at its prompt, so nothing is read here.
@@ -1336,7 +1352,7 @@ pub async fn run(
             }
             return Ok(());
         }
-        Err(u @ Unregistered::NoDaemon(_)) => {
+        Err(u @ (Unregistered::NoDaemon(_) | Unregistered::Attaching(_))) => {
             let words = u.said(&input);
             eprintln!("vox agent hook: {words}");
             emit(format, &raw, &input.event, &format!("{words}\n"), "");
@@ -1371,6 +1387,8 @@ pub(crate) enum Unregistered {
     NoNode(vox_core::node::paths::NodeName),
     /// No daemon answers, and none could be started: why, in one line.
     NoDaemon(String),
+    /// The hook's node is being attached by the daemon's start (a kept node), not yet done.
+    Attaching(vox_core::node::paths::NodeName),
     /// Anything else, in words.
     Failed(AppError),
 }
@@ -1426,6 +1444,10 @@ impl Unregistered {
                 "{} has no Vox node on this Mac (its hook names node {node}, which is not here); \
                  ask the operator to run `vox setup` in a terminal.",
                 harness_name(input)
+            ),
+            Self::Attaching(node) => format!(
+                "Vox: node {node} is attaching (the vox daemon has just started); this session \
+                 joins it once it is attached, and your rooms show from your next turn."
             ),
             Self::NoDaemon(why) => format!(
                 "Vox could not read your rooms because no vox daemon runs and none could be \
@@ -1512,6 +1534,13 @@ impl Daemon {
         })?
         .map_err(|e| AppError::Usage(e.to_string()))?;
         match asked {
+            // Its node still attaching: the daemon holds the registration until it is, and
+            // this turn says so (#666).
+            DaemonFrame::SessionRegistered { info, .. }
+                if matches!(info.state, vox_core::node::daemonipc::NodeState::Attaching) =>
+            {
+                Err(Unregistered::Attaching(self.node.clone()))
+            }
             DaemonFrame::SessionRegistered {
                 room, new, joining, ..
             } => Ok(Registered { room, new, joining }),

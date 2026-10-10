@@ -5434,7 +5434,16 @@ impl Node {
         let Some(profile) = self.profile.as_mut() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
-        match profile.unlock(passphrase) {
+        // **The unlock's Argon2id (256 MiB) runs off the runtime's workers** (#666): inline, two
+        // nodes unlocking at once (a daemon attaching its kept nodes at start) held every worker
+        // of the daemon's runtime, and its control socket answered no one until they were done.
+        let unlocked = match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+                tokio::task::block_in_place(|| profile.unlock(passphrase))
+            }
+            _ => profile.unlock(passphrase),
+        };
+        match unlocked {
             Ok(()) => {
                 if let Err(e) = self.load_prekeys(self.now_ms().get()) {
                     // The identity is usable but the ring is not: lock again rather
