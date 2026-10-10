@@ -3887,22 +3887,26 @@ pub async fn serve_node(mut stream: UnixStream, lease: Lease) -> Result<()> {
     };
     let wrote = write_frame(&mut stream, &using.to_bytes()).await;
     let mut held = Held::default();
-    if wrote.is_ok() {
-        let _ = serve_requests(
+    // What ended the connection is returned, not dropped (#679): a request it ended without a
+    // reply (a frame past the limit, say) is said in the daemon's log by whoever serves it.
+    let served = if wrote.is_ok() {
+        serve_requests(
             stream,
             &handle,
             &mut held,
             Some((node, detached.clone())),
             extension,
         )
-        .await;
-    }
+        .await
+    } else {
+        Ok(())
+    };
     // A detached node has nothing left to withdraw from: its actor has stopped.
     if !*detached.borrow() {
         held.release(&handle).await;
     }
     drop(hold);
-    wrote
+    wrote.and(served)
 }
 
 /// Apply `command` and answer `Ok`, or the outcome as an error.

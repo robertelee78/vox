@@ -63,9 +63,10 @@
 //! 9. **A request the daemon ends without a reply is in its log** (#666; separate test,
 //!    `a_request_ended_without_a_reply_is_in_the_daemons_log`): a client told "it ended this
 //!    request itself; its log says why" must find a line there. A test-side client (apparatus)
-//!    sends the running daemon a frame longer than it accepts; the daemon closes the connection
-//!    with no reply, and its log says, in one line, that a client's request was ended without a
-//!    reply, and why. Mutant: that line not written (`Dispatch::unanswered` saying nothing) —
+//!    sends the running daemon a frame longer than it accepts, as its opening and again on a
+//!    connection already acting as a node (after `Use`); each time the daemon closes the
+//!    connection with no reply, and its log says, in one line, that a client's request was ended
+//!    without a reply, and why. Mutant: that line not written (`Dispatch::unanswered` saying nothing) —
 //!    red, PRODUCT.
 //!
 //! Each of 7 and 8 says on its own test what it stages, which reds are APPARATUS or PRODUCT (staging), and which
@@ -1569,7 +1570,6 @@ fn a_request_ended_without_a_reply_is_in_the_daemons_log() {
         ok,
         "APPARATUS (staging): vox daemon --detach failed: {said}"
     );
-    let pid = daemon_pid_of(&dir);
     let log = dir.join(".daemon").join("log");
     let before = std::fs::read_to_string(&log).unwrap_or_default().len();
 
@@ -1607,13 +1607,89 @@ fn a_request_ended_without_a_reply_is_in_the_daemons_log() {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    signal("TERM", pid);
-    println!("[proof] (9) the daemon's log: {line:?}");
+    println!("[proof] (9) the daemon's log, for the opening: {line:?}");
     assert!(
         line.starts_with("vox daemon: a client's request was ended without a reply: ")
             && line.contains("ipc frame length"),
         "PRODUCT (9): a request the daemon ended without a reply must be said in its log, with \
          why (a frame longer than it accepts); the log has no such line:\n{}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+
+    // The same past the opening (kimi, #679): on a connection already acting as a node (`Use`
+    // answered `Using`), a frame longer than the daemon accepts is ended with no reply, and said.
+    let (ok, said, _) = must("vox id", vox(&dir, &["id"], "", Duration::from_secs(120)));
+    assert!(ok, "APPARATUS (staging): vox id made no node: {said}");
+    let (ok, said, _) = must(
+        "vox node attach default",
+        vox(
+            &dir,
+            &["node", "attach", "default"],
+            "",
+            Duration::from_secs(120),
+        ),
+    );
+    assert!(ok, "APPARATUS (staging): vox node attach default: {said}");
+    let pid = daemon_pid_of(&dir);
+    let before = std::fs::read_to_string(&log).unwrap_or_default().len();
+    let mut s = UnixStream::connect(dir.join(".daemon").join("vox.sock"))
+        .expect("APPARATUS: connect to the daemon's socket");
+    s.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("APPARATUS: a read timeout");
+    let frame = |s: &mut UnixStream, what: &str| {
+        let mut len = [0u8; 4];
+        s.read_exact(&mut len)
+            .unwrap_or_else(|e| panic!("APPARATUS: {what}'s length: {e}"));
+        let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+        s.read_exact(&mut body)
+            .unwrap_or_else(|e| panic!("APPARATUS: {what}: {e}"));
+        body
+    };
+    frame(&mut s, "the daemon's hello");
+    let using = vox_core::node::daemonipc::Opening::Use(vox_core::node::daemonipc::UseNode {
+        node: vox_core::node::paths::NodeName::parse("default").expect("APPARATUS: a node name"),
+        attach: vox_core::node::daemonipc::AttachMode::No,
+        passphrase: None,
+        anchors: Vec::new(),
+    })
+    .to_bytes();
+    s.write_all(
+        &u32::try_from(using.len())
+            .expect("APPARATUS: a short Use")
+            .to_be_bytes(),
+    )
+    .and_then(|()| s.write_all(&using))
+    .expect("APPARATUS: write the Use");
+    frame(&mut s, "the answer to the Use");
+    s.write_all(&u32::MAX.to_be_bytes())
+        .expect("APPARATUS: write the oversized length");
+    let mut rest = Vec::new();
+    let replied = s.read_to_end(&mut rest).map(|_| rest.len()).unwrap_or(0);
+    assert_eq!(
+        replied, 0,
+        "APPARATUS (staging): the daemon replied ({replied} bytes) to the oversized frame on the \
+         node's connection, so this is not a request ended without a reply"
+    );
+    let t0 = Instant::now();
+    let mut line = String::new();
+    while t0.elapsed() < Duration::from_secs(10) {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        if let Some(l) = text[before.min(text.len())..]
+            .lines()
+            .find(|l| l.contains("a client's request was ended without a reply"))
+        {
+            line = l.to_owned();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    signal("TERM", pid);
+    println!("[proof] (9) the daemon's log, past the opening: {line:?}");
+    assert!(
+        line.starts_with("vox daemon: a client's request was ended without a reply: ")
+            && line.contains("ipc frame length"),
+        "PRODUCT (9): on a connection acting as node default, a request the daemon ended without \
+         a reply must be said in its log, with why; the log has no such line:\n{}",
         std::fs::read_to_string(&log).unwrap_or_default()
     );
 }
