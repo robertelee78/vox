@@ -2350,15 +2350,25 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
     // `<dir>/codex`; each runs the hook as its child with Codex's measured `UserPromptSubmit`.
     let codex_dir = tmp.path().join("codex-standin");
     std::fs::create_dir_all(&codex_dir).expect("APPARATUS: cannot make the stand-in's directory");
-    let standin = "import json, os, subprocess\n\
+    let standin = "import json, os, subprocess, sys\n\
         p = subprocess.run(json.loads(os.environ['STANDIN_HOOK']), \
         input=os.environ['STANDIN_INPUT'].encode(), capture_output=True)\n\
         open(os.environ['STANDIN_OUT'], 'w').write(json.dumps({'exit': p.returncode, \
-        'said': p.stdout.decode(errors='replace') + p.stderr.decode(errors='replace')}))\n";
+        'said': p.stdout.decode(errors='replace') + p.stderr.decode(errors='replace'), \
+        'argv': getattr(sys, 'orig_argv', [])}))\n";
     // As `exec`: the file python runs is the subcommand's own word in argv.
     std::fs::write(codex_dir.join("exec"), standin).expect("APPARATUS: cannot write the stand-in");
     std::fs::write(codex_dir.join("tui.py"), standin)
         .expect("APPARATUS: cannot write the stand-in");
+    // The interpreter itself, not a launcher that execs it (pyenv's shim, macOS's /usr/bin stub):
+    // a launcher's exec replaces the argv the stand-in is made to carry.
+    let python = Command::new("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| panic!("APPARATUS, CANNOT MEASURE: no python3 to stand in for Codex"));
     let as_codex = |id: &str, exec: bool| -> serde_json::Value {
         let payload = format!(
             r#"{{"cwd":"{}","hook_event_name":"UserPromptSubmit","model":"gpt-5","permission_mode":"bypassPermissions","prompt":"hello","session_id":"{id}","transcript_path":null,"turn_id":"turn-{id}"}}"#,
@@ -2369,12 +2379,14 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
         if exec {
             c.args([
                 "-c",
-                r#"exec -a "$0" python3 exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox hello"#,
+                r#"exec -a "$0" "$PY" exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox hello"#,
             ]);
         } else {
-            c.args(["-c", r#"exec -a "$0" python3 < tui.py"#]);
+            c.args(["-c", r#"exec -a "$0" "$PY" < tui.py"#]);
         }
-        c.arg(codex_dir.join("codex")).current_dir(&codex_dir);
+        c.arg(codex_dir.join("codex"))
+            .current_dir(&codex_dir)
+            .env("PY", &python);
         let template = vox(&data, &cfg);
         for (k, v) in template.get_envs() {
             match v {
@@ -2394,6 +2406,24 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_else(|| panic!("APPARATUS: the Codex stand-in ({status}) ran no hook"));
+        // Staging: the stand-in carries exactly the argv measured.
+        let mut want = vec![codex_dir.join("codex").display().to_string()];
+        if exec {
+            want.extend(
+                [
+                    "exec",
+                    "--skip-git-repo-check",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "hello",
+                ]
+                .map(str::to_owned),
+            );
+        }
+        assert!(
+            got["argv"] == serde_json::json!(want),
+            "APPARATUS: staging not achieved: the Codex stand-in's argv is {}, not {want:?}",
+            got["argv"]
+        );
         assert!(
             got["exit"] == 0,
             "PRODUCT: the hook under Codex must exit 0; it said {}",
