@@ -23,6 +23,9 @@ enum Theme {
     static var text: Font { font(VoxTokens.Fonts.appText) }
     /// Fingerprints, addresses and commands: SF Mono (L-7).
     static var mono: Font { font(VoxTokens.Fonts.appMono) }
+    /// A sidebar row's time and preview: SF Pro, one step under the text, never mono or
+    /// letter-spaced.
+    static var small: Font { font(VoxTokens.Fonts.appSmall) }
     /// Uppercase eyebrow labels: SF Mono, tracked (L-7).
     static var eyebrow: Font { font(VoxTokens.Fonts.appEyebrow) }
     /// Pane, sheet and dialog titles: SF Pro semibold (L-7), at a steady size.

@@ -2021,8 +2021,13 @@ final class FirstRunProof: XCTestCase {
               until: { $0.contains("trust bob") })
 
         // Carol's offer: no prompt there, only that bob's change waits.
+        // In the room she joined, pending: its row says what waits, and its General shows her
+        // offer at the top (the decider, v0.4.3: offers are in the room they concern).
+        words(ui, Key.id("room-pending"), timeout: 30, "pending's row must say carol's offer waits: \"… joined — trust?\"",
+              until: { $0.contains("joined — trust?") })
+        tap(ui, Key.id("room-pending"), "pending in the sidebar")
         let offer = Key.id("offer-\(carolFp.prefix(12))")
-        tap(ui, offer, "carol's offer in the sidebar",
+        tap(ui, offer, "carol's offer at the top of pending's General",
             premise: Premise("carol is offered to alice") {
                 (offers.contains(String(carolFp.prefix(12))), "`vox trust offers` said \(offers.debugDescription)")
             })
@@ -2262,12 +2267,18 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("keyring"), "Keyring in the sidebar")
         try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "NEEDS-YOU"],
                    env: bobSession)
-        words(ui, Key.id("group-needs you"), timeout: 60,
-              "a message to alice must list the room under \"needs you (1)\"",
-              until: { $0.lowercased() == "needs you (1)" })
+        // One list of rooms, no headings (the decider, v0.4.3): mission's row says it needs
+        // alice, previews bob's message with its sender, and counts it in a badge.
         let row = Key.id("room-mission")
-        words(ui, row, timeout: 10, "the room's row must say it needs you",
+        words(ui, row, timeout: 60, "a message to alice must mark mission's row as needing her",
               until: { $0.contains("needs you") })
+        XCTAssertNil(locate(ui, Key.id("group-needs you")),
+                     "PRODUCT: the sidebar must list rooms with no NEEDS YOU / ACTIVE / QUIET headings (v0.4.3); \"needs you\" heads a group")
+        words(ui, Key.id("room-preview-mission"), timeout: 10,
+              "mission's row must preview its newest message with its sender: \"bob: NEEDS-YOU\"",
+              until: { $0 == "bob: NEEDS-YOU" })
+        words(ui, Key.id("room-badge-mission"), timeout: 10, "mission's row must count its one unread message",
+              until: { $0 == "1" })
         tap(ui, row, "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         let bob = Key.id("member-bob")
         let bobWords = words(ui, bob, timeout: 30, "the inspector must list bob in alice's keyring",
@@ -2275,10 +2286,13 @@ final class FirstRunProof: XCTestCase {
         let bar = words(ui, Key.id("status"), timeout: 10,
                         "the status bar must say the node, its peers and the keyring window",
                         until: { $0.contains("node alice") && $0.contains("peer") && $0.contains("keyring") }) ?? ""
-        let regrouped = words(ui, Key.id("group-needs you"), timeout: 10,
-                              "the room shown is read, so nothing needs alice: \"needs you (0)\"",
-                              until: { $0.lowercased() == "needs you (0)" }) ?? ""
-        print("[proof] grouped: needs you (1), then \(regrouped); inspector: \(bobWords); status: \(bar)")
+        let regrouped = words(ui, row, timeout: 10,
+                              "the room shown is read, so mission's row no longer needs alice",
+                              until: { !$0.contains("needs you") }) ?? ""
+        if locate(ui, Key.id("room-badge-mission")) != nil {
+            XCTFail("PRODUCT: mission read, its row must show no unread badge (v0.4.3); it still does")
+        }
+        print("[proof] mission's row needed alice, then: \(regrouped); inspector: \(bobWords); status: \(bar)")
 
         // (3b) The platform bob's node says it runs on (ADR-020 §4.9b): a claim of a resource has
         // bob's session announce itself, and Vox fills its hello's os, os_version and arch from
@@ -3479,11 +3493,18 @@ final class FirstRunProof: XCTestCase {
         tap(ui, aaa, "aaa in the sidebar", premise: inRoom(vox, voxEnv, "aaa"))
         try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "NEEDS-YOU-9"],
                    env: bobSession)
-        // NEEDS YOU counts the rooms that need alice and the trust offers waiting on her (K-15):
-        // erin's and dave's, from earlier steps. Mission must be the one room.
-        words(ui, Key.id("group-needs you"), timeout: 60,
-              "bob's message to alice must put mission under needs you, the one room beside \(offerRows(ui)) trust offers",
-              until: { $0.lowercased() == "needs you (\(1 + offerRows(ui)))" })
+        // Mission needs alice, and is listed first, its activity the newest (v0.4.3, a chat
+        // list's order); aaa and bbb need nothing.
+        words(ui, Key.id("room-mission"), timeout: 60, "bob's message to alice must mark mission as needing her",
+              until: { $0.contains("needs you") })
+        for quiet in ["aaa", "bbb"] where shown(el(ui, Key.id("room-\(quiet)"))).contains("needs you") {
+            XCTFail("PRODUCT: \(quiet) has nothing for alice, so its row must not say it needs her; it says \"\(shown(el(ui, Key.id("room-\(quiet)"))))\"")
+        }
+        let roomRows = ui.windows.firstMatch.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH 'room-' AND NOT (identifier BEGINSWITH 'room-preview-' OR identifier BEGINSWITH 'room-badge-' OR identifier BEGINSWITH 'room-time-' OR identifier BEGINSWITH 'room-header' OR identifier BEGINSWITH 'room-form')"))
+            .allElementsBoundByIndex.filter { $0.frame.width > 0 }.sorted { $0.frame.minY < $1.frame.minY }
+        XCTAssertEqual(roomRows.first?.identifier, "room-mission",
+                       "PRODUCT: the room with the newest message, mission, must be listed first (v0.4.3); the rows are \(roomRows.map(\.identifier))")
         ui.typeKey("j", modifierFlags: .command)
         // A message's text is a Text: its words are its accessibility value.
         let landed = Key.showing("NEEDS-YOU-9")
@@ -3774,9 +3795,9 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("alice's node never held bob's WHILE-APP-CLOSED in 60 s: \(held)")
         }
         try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
-        let reopened = words(ui, Key.id("group-needs you"), timeout: 30,
-                             "bob's message to alice came while the app was closed; opened again, the app must count it from what her node recorded as read, mission the one room under \"needs you\" beside \(offerRows(ui)) trust offers",
-                             until: { $0.lowercased() == "needs you (\(1 + offerRows(ui)))" }) ?? ""
+        let reopened = words(ui, Key.id("room-mission"), timeout: 30,
+                             "bob's message to alice came while the app was closed; opened again, the app must count it from what her node recorded as read: mission's row needs her",
+                             until: { $0.contains("needs you") }) ?? ""
         print("[proof] opened again: \(reopened)")
 
         // (14) The keyboard. Bob posts KEYS-A and KEYS-B, then shares a file to alice, which her
@@ -3897,7 +3918,9 @@ final class FirstRunProof: XCTestCase {
                             until: { $0.hasSuffix("not in keyring, trusts you") }) ?? ""
         // (15e, #624) Compare, group by group: on dave's offer, collapsed until asked for, a
         // partial entry says how far it matches.
-        tap(ui, Key.id("offer-\(daveFp.prefix(12))"), "dave's offer under needs you")
+        tap(ui, Key.id("room-mission"), "mission in the sidebar")
+        tap(ui, Key.id("session-general"), "mission's General")
+        tap(ui, Key.id("offer-\(daveFp.prefix(12))"), "dave's offer at the top of mission's General")
         tap(ui, Key.id("offer-compare-open"), "Compare… on dave's offer")
         type(ui, Key.id("offer-compare"), String(daveFp.prefix(16)), "the offer's compare field")
         let offerSoFar = words(ui, Key.id("offer-compare-said"), timeout: 10,
@@ -4460,11 +4483,6 @@ final class FirstRunProof: XCTestCase {
         guard row.exists, timeline.exists else { return false }
         let shown = row.frame.intersection(timeline.frame)
         return !shown.isNull && shown.height * 2 >= row.frame.height
-    }
-
-    /// How many trust offers the sidebar lists under NEEDS YOU.
-    private func offerRows(_ ui: XCUIApplication) -> Int {
-        ui.descendants(matching: .any).matching(NSPredicate(format: "identifier BEGINSWITH 'offer-'")).count
     }
 
     private func words(_ ui: XCUIApplication, _ key: Key, timeout: TimeInterval, _ product: String,
