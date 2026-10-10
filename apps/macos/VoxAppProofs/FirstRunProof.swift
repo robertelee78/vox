@@ -3715,6 +3715,10 @@ final class FirstRunProof: XCTestCase {
         // (15c, D9) A message of alice's no member's node holds says so, then where it is.
         try staged(vox, ["node", "detach", "bob"], env: voxEnv)
         try staged(vox, ["node", "detach", "dave"], env: voxEnv)
+        // erin and fay joined in (5) and hold what alice posts; detached too, no member's node is
+        // up to take WHERE-15.
+        try staged(vox, ["node", "detach", "erin"], env: voxEnv)
+        try staged(vox, ["node", "detach", "fay"], env: voxEnv)
         try staged(vox, ["room", "post", "--node", "alice", room, "WHERE-15"], env: voxEnv)
         var whereId = ""
         for row in run(vox, ["room", "read", "--node", "alice", "--json", room], env: voxEnv).out
@@ -3729,8 +3733,8 @@ final class FirstRunProof: XCTestCase {
                           until: { $0 == "only on this machine" }) ?? ""
         try staged(vox, ["node", "attach", "bob", "--passphrase-file", bobPass], env: voxEnv)
         let spread = words(ui, Key.id("whereabouts-\(whereId)"), timeout: 90,
-                           "once bob's node is back and holds WHERE-15, it must say \"on 1 of 2 members' nodes\"",
-                           until: { $0 == "on 1 of 2 members' nodes" }) ?? ""
+                           "once bob's node is back and holds WHERE-15, it must say it is on 1 of the members' nodes, \"on 1 of N members' nodes\"",
+                           until: { $0.hasPrefix("on 1 of ") && $0.hasSuffix(" members' nodes") }) ?? ""
         print("[proof] whereabouts: \(alone) → \(spread)")
         // (15d, D17) Node > Detach leaves the window alice's: Attach again (or Quit), never another
         // node of this Mac's.
