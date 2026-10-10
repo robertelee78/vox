@@ -3711,6 +3711,11 @@ pub trait Dispatch: Send + Sync + 'static {
     fn connections(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicUsize>> {
         None
     }
+    /// Say, in this process's log (its stderr: a detached daemon's `.daemon/log`), that a
+    /// request was ended with no reply, and why (#666).
+    fn unanswered(&self, why: &str) {
+        eprintln!("vox daemon: {why}");
+    }
 }
 
 /// One counted connection: counted while it lives.
@@ -3768,7 +3773,29 @@ pub fn bind_account<D: Dispatch>(dispatch: std::sync::Arc<D>, path: PathBuf) -> 
             let dispatch = std::sync::Arc::clone(&dispatch);
             let counted = Counted::new(dispatch.connections());
             tokio::spawn(async move {
-                let _ = serve_account(stream, dispatch).await;
+                // **A request ended without a reply is said in the daemon's log** (#666): the
+                // client tells its person "its log says why", so the log must. The client gone
+                // (a cut write) is no request ended by the daemon, and says nothing.
+                let served = tokio::spawn(serve_account(stream, std::sync::Arc::clone(&dispatch)));
+                match served.await {
+                    Ok(Ok(()) | Err(Error::Ipc(IpcHandshake::Cut))) => {}
+                    Ok(Err(e)) => dispatch.unanswered(&format!(
+                        "a client's request was ended without a reply: {e}"
+                    )),
+                    Err(e) if e.is_panic() => {
+                        let payload = e.into_panic();
+                        let why = payload
+                            .downcast_ref::<&str>()
+                            .map(|s| (*s).to_owned())
+                            .or_else(|| payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "a panic with no message".to_owned());
+                        dispatch.unanswered(&format!(
+                            "a client's request was ended without a reply: serving it panicked: \
+                             {why}"
+                        ));
+                    }
+                    Err(_) => {}
+                }
                 drop(counted);
             });
         }
