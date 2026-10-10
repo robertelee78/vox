@@ -1359,9 +1359,17 @@ fn daemon_of(exe: &Path, root: &Path, name: &str, spec: &str) -> Daemon {
 /// exchange, both ways.** The previous release's `vox daemon` (downloaded, its digest checked)
 /// and this build's are members of each other's rooms: the old one joins a room the new one made
 /// (old dials new) and the new one joins a room the old one made (new dials old); each trusts the
-/// other, and each reads the other's post in both rooms. And this build's flights and labels are
-/// the previous release's: a `PROVE` from the old daemon verifies under this build's `resp_input`
-/// and exporter label, and a `CLAIM` this build signs is accepted by the old daemon.
+/// other, and this build reads the old one's post in both rooms. And this build's flights and
+/// labels are the previous release's: a `PROVE` from the old daemon verifies under this build's
+/// `resp_input` and exporter label, and a `CLAIM` this build signs is accepted by the old daemon.
+///
+/// **Key delivery is lockstep** (ADR-030 W-4, D-5). This build delivers every key in a session of
+/// its own (`OP_ROTATION_HELLO`), which the old release cannot read, so the old one reads nothing
+/// new from this build, in either room: its key is never sealed where the old node could open it,
+/// in the pair's long-lived session. This build's daemon says why, in plain words, and resends the
+/// same delivery after a backoff, never every second. Mutants: sealing the key in the long-lived
+/// session again (the old one reads this build); a stream ended without an answer counted as lost
+/// (no plain reason, and a resend each second).
 #[test]
 #[ignore = "downloads the previous release; real daemons of each; run in release"]
 fn the_previous_release_and_this_build_complete_the_exchange_both_ways() {
@@ -1369,7 +1377,7 @@ fn the_previous_release_and_this_build_complete_the_exchange_both_ways() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     watchdog::arm_for(Duration::from_secs(900));
-    let w = world();
+    let mut w = world();
     let (version, old) = previous_release::previous_release(w._tmp.path());
     let new = Path::new(world::VOX);
     let old_d = daemon_of(&old, w._tmp.path(), "old", &w.spec);
@@ -1465,6 +1473,7 @@ fn the_previous_release_and_this_build_complete_the_exchange_both_ways() {
         let (ok, said) = run_as(exe, &d.data, &["trust", "add", &fp, "--name", name], None);
         assert!(ok, "APPARATUS: staging `vox trust add {name}`: {said}");
     }
+    let trusted_at = Instant::now();
     // The room made by new is the one old joined, and the other way round.
     for (room_of, was_joined) in [("new", joined[0]), ("old", joined[1])] {
         if !was_joined {
@@ -1482,8 +1491,11 @@ fn the_previous_release_and_this_build_complete_the_exchange_both_ways() {
         };
         let (r_old, r_new) = (room(&old, &old_d), room(new, new_d));
         let deadline = Instant::now() + Duration::from_secs(90);
+        // Long enough for the old one to read this build if its key had reached it: before ADR-030
+        // both read each other within a few seconds.
+        let fair = Instant::now() + Duration::from_secs(30);
         let (mut new_reads_old, mut old_reads_new) = (false, false);
-        while Instant::now() < deadline && !(new_reads_old && old_reads_new) {
+        while Instant::now() < deadline && !(new_reads_old && Instant::now() >= fair) {
             let _ = run_as(
                 &old,
                 &old_d.data,
@@ -1523,11 +1535,53 @@ fn the_previous_release_and_this_build_complete_the_exchange_both_ways() {
                 "this build never read v{version}'s post in the room made by {room_of}"
             ));
         }
-        if !old_reads_new {
+        if old_reads_new {
             red.push(format!(
-                "v{version} never read this build's post in the room made by {room_of}"
+                "v{version} read this build's post in the room made by {room_of}: this build's key \
+                 reached a node that cannot read a key delivered in a session of its own, so it was \
+                 sealed where that node opens it, in the long-lived session (ADR-030 W-4)"
             ));
         }
+    }
+    // What this build's daemon told its person about the old one's keys.
+    let since = trusted_at.elapsed();
+    let said = w.host._proc.transcript();
+    let old_id: String = b32_encode(&old_d.fp).chars().take(20).collect();
+    let refusals: Vec<&str> = said
+        .lines()
+        .filter(|l| l.contains(&old_id) && l.contains("did not take our key"))
+        .collect();
+    let plain = refusals
+        .iter()
+        .filter(|l| {
+            l.contains(
+                "it closed the stream without an answer, as a node running a Vox older than key \
+                 delivery in a session of its own does; it reads nothing new from you until it is \
+                 updated",
+            )
+        })
+        .count();
+    println!(
+        "[proof] this build's daemon on v{version}'s keys, over {}s: {} refusal(s), {plain} saying \
+         why plainly; first: {:?}",
+        since.as_secs(),
+        refusals.len(),
+        refusals.first()
+    );
+    if joined.iter().any(|j| *j) && plain == 0 {
+        red.push(format!(
+            "this build never said plainly why v{version} took no key of its; it said {refusals:#?}"
+        ));
+    }
+    // A backoff from 2 s doubling: a handful per room a minute. A resend each second is two a
+    // second over the two rooms.
+    if refusals.len() as u64 > since.as_secs() / 2 {
+        red.push(format!(
+            "this build resent its key to v{version} {} times in {}s, about every second, though \
+             that node had answered by closing the stream",
+            refusals.len(),
+            since.as_secs()
+        ));
     }
     assert!(red.is_empty(), "PRODUCT: {red:#?}");
 }
