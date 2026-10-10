@@ -304,7 +304,8 @@ open a confirmation that says the same, and act only once you type the word `lea
 anything else does nothing and says so.
 
 Only the creator or an admin may; anyone else is refused with `cannot end: only the room's
-creator, or an admin it delegated, may do that`. Ending is not a leave: every member's node takes
+creator, or an admin it named, can do that, and this node is neither`. In the app, End for
+Everyone is disabled for them, and says why. Ending is not a leave: every member's node takes
 no new message in the room, passes the end on, and deletes the room, and the services shared in
 it stop. Warn the members first. An ended room cannot be joined again; make a new one. Members
 may still hold copies they made.
