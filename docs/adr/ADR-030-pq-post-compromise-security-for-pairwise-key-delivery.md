@@ -88,7 +88,7 @@ binds PQ freshness to every key delivery, not to the ratchet.
   cadence bound by at most 10 minutes (the decider, 2026-10-10).
 - **P-3. Refused one-time prekeys.** When a recipient answers that it does not know the one-time
   prekey a delivery named, the sender MUST fetch the bundle again and MUST NOT target that prekey id
-  again. Nor MUST it name a one-time prekey that an earlier delivery named. When the bundle it holds
+  again. It MUST NOT name a one-time prekey that an earlier delivery named. When the bundle it holds
   names such a prekey, the key MUST wait for the recipient's next bundle (D-5). A node MUST
   republish its bundle as soon as the prekeys it offers change. If no bundle naming a fresh
   one-time prekey arrives within 30 seconds while the recipient is connected, the sender MAY
