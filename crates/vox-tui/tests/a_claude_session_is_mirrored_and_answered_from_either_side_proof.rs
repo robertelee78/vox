@@ -856,6 +856,9 @@ const S8: &str = "88888888-1111-4000-8000-000000000008";
 ///
 /// 1. two sessions in one server: each one's text, Esc, Ctrl-C and slash command reach only its
 ///    own pane;
+///    1b. a slash command with an argument (`/rename frogs`) reaches the pane whole and the
+///    Session says it whole; the name Claude Code then writes into the transcript, with no hook
+///    run (a `/rename` runs none), renames the Session within 15 s;
 /// 2. a sub-agent's hook leaves its session's binding as it was;
 /// 3. a session started through a wrapper (a shell script, not exec'd) is still bound;
 /// 4. the pane swapped with another and moved to a new window: input follows the pane;
@@ -877,7 +880,8 @@ const S8: &str = "88888888-1111-4000-8000-000000000008";
 ///
 /// **Mutations, one per check that can fail on its own:** the injector types into the first pane
 /// of the server (arm 1); the session's process must be the hook's own parent (arm 3); the
-/// pane is recorded by its position, not its id (arm 4); one session per pane ignores the server
+/// pane is recorded by its position, not its id (arm 4); the slash line said by its command alone,
+/// or the transcript not read for a name (arm 1b, `…--reads2--v043-rename-*` mutants); one session per pane ignores the server
 /// (arm 5); the hook's ancestry not required to reach the pane (arm 6); the session's process not
 /// checked at the send (arm 7); one session per pane not kept (arm 8); a later hook not rebinding
 /// (arm 9); a tool hook not registering (arm 10); the session not told where its file landed
@@ -946,6 +950,74 @@ fn a_driver_reaches_exactly_the_session_it_names_or_is_told_why() {
             "PRODUCT: arm 1: {act:?} must reach {S1}'s pane alone; vox said {said:?}"
         );
     }
+
+    // ---- 1b. a slash command with its argument arrives whole, and is said whole; the name the
+    // harness gives it after (a `/rename`, which runs no hook) renames the Session (v0.4.3) ----
+    let (ok, said) = drive(&w, &room, S1, &["--slash", "/rename frogs"]);
+    println!("[proof] 1b. --slash \"/rename frogs\" to {S1}: {said}");
+    assert!(
+        ok && a.got(
+            &serde_json::json!({ "typed": "/rename frogs" }),
+            Duration::from_secs(10)
+        ),
+        "PRODUCT: arm 1b: \"/rename frogs\" must reach {S1}'s pane whole; vox said {said:?}"
+    );
+    let t0 = Instant::now();
+    let mut read = String::new();
+    while t0.elapsed() < Duration::from_secs(30) && !read.contains("/rename frogs sent by") {
+        read = w.vox(PERSON, &["room", "session", &room, S1], None).1;
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    assert!(
+        read.contains("/rename frogs sent by"),
+        "PRODUCT: arm 1b: {S1}'s Session must say the slash command as sent, \"/rename frogs sent \
+         by …\"; `vox room session` says: {}",
+        read.lines().rev().take(6).collect::<Vec<_>>().join(" | ")
+    );
+    // Claude Code writes the new name into the session's transcript and runs no hook: the stand-in
+    // does the same, appending the line Claude Code 2.1.29x writes.
+    {
+        use std::io::Write as _;
+        let t = w.root.join("work").join(format!("{S1}.jsonl"));
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&t)
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot open {S1}'s transcript: {e}"));
+        // Claude Code's own title first (what an earlier "cc rename frogs" made it, as the
+        // decider's session had), then the name the person set: the person's must win, exactly.
+        for line in [
+            serde_json::json!({ "type": "ai-title", "aiTitle": "Frogs rename", "sessionId": S1 }),
+            serde_json::json!({ "type": "custom-title", "customTitle": "frogs", "sessionId": S1 }),
+        ] {
+            writeln!(f, "{line}")
+                .unwrap_or_else(|e| panic!("APPARATUS: cannot write {S1}'s transcript: {e}"));
+        }
+    }
+    let t0 = Instant::now();
+    let mut named = String::new();
+    let renamed = loop {
+        let (_, out, _) = w.vox(PERSON, &["room", "sessions", &room, "--json"], None);
+        named = out
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["session"].as_str() == Some(S1) || v["id"].as_str() == Some(S1))
+            .map(|v| v["name"].to_string())
+            .unwrap_or(named);
+        if named == "\"frogs\"" {
+            break true;
+        }
+        if t0.elapsed() > Duration::from_secs(15) {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    assert!(
+        renamed,
+        "PRODUCT: arm 1b: renamed \"frogs\" by its person in its transcript, after Claude Code's own \
+         title \"Frogs rename\" and with no hook run, {S1}'s Session must be called exactly \
+         \"frogs\" within 15 s; `vox room sessions --json` says its name is {named}"
+    );
+    println!("[proof] 1b. \"/rename frogs\" arrived whole and is said whole; the transcript's rename named the Session \"frogs\" with no hook run");
 
     // ---- 2. a sub-agent's hook keeps its session's binding ----
     a.hook(&event(

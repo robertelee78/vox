@@ -466,7 +466,16 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                     }
                     "interrupt" => format!("interrupt sent by {by}"),
                     "stop" => format!("stop sent by {by}"),
-                    "slash" => format!("/{} sent by {by}", b.str("cmd").trim_start_matches('/')),
+                    // As typed, with its arguments (`/rename frogs`): the command alone hid what
+                    // was sent. A record written before "text" was kept says its command.
+                    "slash" => {
+                        let typed = match b.str("text").trim() {
+                            "" => format!("/{}", b.str("cmd").trim_start_matches('/')),
+                            t => one_line(t),
+                        };
+                        details.push(("typed".into(), b.str("text").to_owned()));
+                        format!("{typed} sent by {by}")
+                    }
                     "file" => {
                         if !b.str("note").trim().is_empty() {
                             details.push(("note".into(), b.str("note").to_owned()));
