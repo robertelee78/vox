@@ -5224,6 +5224,11 @@ pub(crate) async fn offers_of(
 /// (K-1), why it is offered, which of the nodes in the keyring trust it (K-7), and how to accept
 /// or dismiss it. A read: no passphrase.
 pub async fn trust_offers(paths: &Paths) -> Result<(), AppError> {
+    let node = paths
+        .profile_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let mut client = attach(paths).await?;
     let offers = offers_of(&mut client).await?;
     if offers.is_empty() {
@@ -5244,10 +5249,26 @@ pub async fn trust_offers(paths: &Paths) -> Result<(), AppError> {
         let in_rooms: Vec<String> = o.rooms.iter().map(|r| format!("{:?}", r.name)).collect();
         println!("  {}", o.said);
         println!("  in {}", listed(&in_rooms, ""));
+        // Whole commands, each pasted as it stands: `vox trust add` asks there for a name and the
+        // passphrase. A placeholder (`<name>`, `[--drive]`) is refused by zsh before vox runs.
+        let read = ["vox", "trust", "add", fp.as_str(), "--node", node.as_str()];
+        let mut drive = read.to_vec();
+        drive.push("--drive");
+        println!("  accept (read): {}", vox_text::shell::command(&read));
         println!(
-            "  accept: {} [--drive]   dismiss: {}",
-            vox_text::shell::command(&["vox", "trust", "add", &fp, "--name", "<name>"]),
-            vox_text::shell::command(&["vox", "trust", "dismiss", &short(&o.member)])
+            "  accept (read + drive): {}",
+            vox_text::shell::command(&drive)
+        );
+        println!(
+            "  dismiss: {}",
+            vox_text::shell::command(&[
+                "vox",
+                "trust",
+                "dismiss",
+                &short(&o.member),
+                "--node",
+                node.as_str()
+            ])
         );
     }
     Ok(())

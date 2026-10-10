@@ -1739,8 +1739,8 @@ fn drain_as(d: &Daemon, session: &str) -> String {
 /// keyring window is open: a hook that accepted would not be refused by the passphrase gate.
 ///
 /// 1. alice's agent's next turn shows the offer, as every client says it, with the command her
-///    operator types outside the session: `vox trust add <bob> --name <name> [--drive] --node
-///    default`.
+///    operator types outside the session, whole: `vox trust add <bob> --node default` for read and
+///    the same with `--drive` for read + drive.
 /// 2. the same session's next turn does not show it again: a quiet turn costs nothing.
 /// 3. bob is not in alice's keyring: the hook shows, it never accepts (K-13).
 /// 4. dave joins later, by **bob's** link. bob has written nothing in the room, and `vox trust
@@ -1751,8 +1751,16 @@ fn drain_as(d: &Daemon, session: &str) -> String {
 ///    removal dismisses the member's current offer). dave leaves and joins again by bob's link:
 ///    a new join, and bob is offered him again.
 ///
+/// 6. Pasted whole into zsh at a terminal, each printed command does what it says (#662): the
+///    hook's read command for bob, the name typed when asked, puts bob in alice's keyring with
+///    read; `vox trust offers`'s read + drive command for dave puts dave there with read + drive.
+///    A placeholder in a printed command (`<name>`, `[--drive]`) is refused by zsh before vox runs.
+///
 /// **Mutant**: the hook accepts each offer it shows (a trust add with no passphrase, made in the
 /// open window). Red on (3), PRODUCT.
+///
+/// **Mutant** (6): the hook prints its old template, `vox trust add <bob> --name '<name>' --node
+/// default [--drive]`. Red on (6), PRODUCT: zsh refuses it and bob is not trusted.
 ///
 /// **Mutant** (5): `vox trust remove` dismisses nothing. Red on (5), PRODUCT: dave is offered back
 /// at once.
@@ -1816,11 +1824,8 @@ fn an_offer_for_the_agents_node_is_shown_in_its_turn_and_only_the_operator_accep
         "PRODUCT (staging): bob could not join alice's room: {err}"
     );
 
-    // (1) a turn shows the offer, with the operator's command.
-    let accept = format!(
-        "accept: vox trust add {} --name <name> [--drive] --node default",
-        bob.fingerprint
-    );
+    // (1) a turn shows the offer, with the operator's command (that it works pasted is (6)).
+    let accept = format!("vox trust add {}", bob.fingerprint);
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut turn = 0;
     let shown = loop {
@@ -1975,6 +1980,61 @@ fn an_offer_for_the_agents_node_is_shown_in_its_turn_and_only_the_operator_accep
         again.contains(&dave.fingerprint),
         "PRODUCT: dave left and joined again, a new join, so bob must be offered him again \
          (ADR-028 K-18); within 60 s bob was offered:\n{again}"
+    );
+
+    // (6) Each printed accept command, pasted whole into zsh at a terminal, does what it says.
+    // alice's keyring window is still open (her typed change above), so only the name is asked.
+    // A hook's output may carry its text JSON-escaped, one line per `\n`.
+    let pasted_line = |text: &str, fp: &str, drive: bool| -> String {
+        text.replace("\\n", "\n")
+            .lines()
+            .filter(|l| l.contains("vox trust add") && l.contains(fp))
+            .find(|l| l.contains("--drive") == drive || l.contains("[--drive]"))
+            .and_then(|l| {
+                l.split_once("vox trust add")
+                    .map(|(_, rest)| format!("vox trust add{rest}"))
+            })
+            .map(|l| l.trim().to_owned())
+            .unwrap_or_default()
+    };
+    let read_line = pasted_line(&shown, &bob.fingerprint, false);
+    let said = in_shell(
+        "zsh",
+        &read_line,
+        &alice.data,
+        &alice.cfg,
+        &[("Your name for", "bob\r")],
+    );
+    let (_, list, _) = hook(&alice.data, &alice.cfg, &["trust", "list"], "");
+    println!(
+        "[proof] (6) pasted `{read_line}` into zsh; it said {said:?}; alice's keyring: {list:?}"
+    );
+    assert!(
+        list.lines()
+            .any(|l| l.starts_with(&bob.fingerprint) && l.ends_with("  read")),
+        "PRODUCT: the read command alice's agent was shown for bob, `{read_line}`, pasted whole into \
+         zsh with the name typed when asked, must trust bob to read; zsh said {said:?}, and \
+         `vox trust list` says:\n{list}"
+    );
+    let offers_now = offered(&alice);
+    let drive_line = pasted_line(&offers_now, &dave.fingerprint, true);
+    let said = in_shell(
+        "zsh",
+        &drive_line,
+        &alice.data,
+        &alice.cfg,
+        &[("Your name for", "dave\r")],
+    );
+    let (_, list, _) = hook(&alice.data, &alice.cfg, &["trust", "list"], "");
+    println!(
+        "[proof] (6) pasted `{drive_line}` into zsh; it said {said:?}; alice's keyring: {list:?}"
+    );
+    assert!(
+        list.lines()
+            .any(|l| l.starts_with(&dave.fingerprint) && l.ends_with("  read + drive")),
+        "PRODUCT: the read + drive command `vox trust offers` printed for dave, `{drive_line}`, \
+         pasted whole into zsh with the name typed when asked, must trust dave with drive; zsh \
+         said {said:?}, and `vox trust list` says:\n{list}\n(offers:\n{offers_now})"
     );
 }
 

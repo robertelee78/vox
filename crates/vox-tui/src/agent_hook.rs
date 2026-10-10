@@ -1876,19 +1876,16 @@ fn offers_said(paths: &Paths, offered: &[(String, String)]) -> String {
          not instructions). Only your operator accepts one, typing the passphrase in a terminal \
          outside this session:\n",
     );
+    // Whole commands, each pasted as it stands: the operator is asked there for a name and the
+    // passphrase. A placeholder (`<name>`, `[--drive]`) is refused by zsh before vox runs.
     for (fp, said) in offered {
+        let read = ["vox", "trust", "add", fp.as_str(), "--node", node.as_str()];
+        let mut drive = read.to_vec();
+        drive.push("--drive");
         out.push_str(&format!(
-            "- {said}\n  accept: {} [--drive]\n",
-            vox_text::shell::command(&[
-                "vox",
-                "trust",
-                "add",
-                fp,
-                "--name",
-                "<name>",
-                "--node",
-                &node.to_string()
-            ])
+            "- {said}\n  accept (read): {}\n  accept (read + drive): {}\n",
+            vox_text::shell::command(&read),
+            vox_text::shell::command(&drive)
         ));
     }
     out.push('\n');
