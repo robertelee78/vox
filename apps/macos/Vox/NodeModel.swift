@@ -365,26 +365,6 @@ final class NodeModel: ObservableObject {
         for message in new { arrived(message, in: id) }
     }
 
-    /// Attach `node`, another node on this Mac that waits for its passphrase, with `secret` (empty
-    /// for a node that has none), from its row in ON THIS MACHINE: the daemon holds it attached
-    /// beside this one; this window stays this node's. Nil once attached, else why not.
-    func attachOther(_ node: String, passphrase secret: Secret) async -> String? {
-        let passphrase: Passphrase
-        do {
-            passphrase = try secret.passphrase()
-        } catch {
-            return sentence(error)
-        }
-        defer { passphrase.wipe() }
-        do {
-            _ = try await client.attach(node: node, passphrase: passphrase)
-            if let fresh = try? await client.nodes(), fresh != nodes { nodes = fresh }
-            return nil
-        } catch {
-            return sentence(error)
-        }
-    }
-
     /// The keyring, the nodes on this Mac, the peers and the keyring window, assigned only when
     /// they changed; and who trusts back, while the keyring is on screen.
     private func readFacts() async {

@@ -173,7 +173,7 @@ private struct Sidebar: View {
             return [NSItemProvider(object: room.name as NSString)]
         }
         // The nodes on this Mac, at the sidebar's foot (G5), whatever the rooms above scroll to.
-        .safeAreaInset(edge: .bottom, spacing: 0) { OnThisMachine(model: model) }
+        .safeAreaInset(edge: .bottom, spacing: 0) { OnThisMachine(nodes: model.nodes) }
         // On bg.panel, not the system's sidebar material (L-6), drawn where the sidebar's
         // vibrancy cannot tint it (PanelFill).
         .scrollContentBackground(.hidden)
@@ -294,11 +294,9 @@ private struct NodeIdentity: View {
 }
 
 /// The nodes on this Mac and their state, at the foot of the sidebar (G5): one daemon holds them,
-/// each a separate identity. One waiting for its passphrase offers Attach… (v0.4.3).
+/// each a separate identity.
 private struct OnThisMachine: View {
-    @ObservedObject var model: NodeModel
-    /// The node whose Attach… sheet is open.
-    @State private var attaching: String?
+    let nodes: [NodeSummary]
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s4) {
@@ -307,20 +305,13 @@ private struct OnThisMachine: View {
                 .accessibilityAddTraits(.isHeader)
                 .accessibilityIdentifier("on-this-machine")
                 .padding(.top, Space.s8)
-            ForEach(model.nodes, id: \.name) { node in
+            ForEach(nodes, id: \.name) { node in
                 HStack {
                     Text(node.name)
                     Spacer()
-                    if node.state == "detached" && node.name != model.node {
-                        Button("Attach…") { attaching = node.name }
-                            .buttonStyle(.link)
-                            .help("Attach node \(node.name) with its passphrase")
-                            .accessibilityIdentifier("machine-attach-\(node.name)")
-                    } else {
-                        Text(node.state).secondaryText()
-                    }
+                    Text(node.state).secondaryText()
                 }
-                .accessibilityElement(children: .contain)
+                .accessibilityElement(children: .ignore)
                 .accessibilityLabel("\(node.name) \(node.state)")
                 .copyMenu([("Copy Name", node.name), ("Copy Fingerprint", node.fingerprint)])
                 .accessibilityIdentifier("machine-\(node.name)")
@@ -332,72 +323,6 @@ private struct OnThisMachine: View {
         .padding(.bottom, Space.s12)
         .background(PanelFill())
         .foregroundStyle(VoxTokens.Colors.textPrimary)
-        .sheet(item: Binding(get: { attaching.map(AttachingNode.init) }, set: { attaching = $0?.id })) { node in
-            AttachOtherSheet(model: model, node: node.id) { attaching = nil }
-                .textSelection(.enabled)
-                .panelSurface()
-        }
-    }
-}
-
-private struct AttachingNode: Identifiable {
-    let id: String
-}
-
-/// Attach another node on this Mac with its identity passphrase, typed straight into a secure
-/// field whose bytes go to the daemon and are wiped (M-5). An empty passphrase is a passphrase:
-/// a node made with none attaches with none.
-private struct AttachOtherSheet: View {
-    @ObservedObject var model: NodeModel
-    let node: String
-    let done: () -> Void
-    @State private var field = SecureFieldHolder()
-    @State private var working = false
-    @State private var failed: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: Space.s12) {
-            Text("Attach node \(node)").title()
-            Text("Type node \(node)'s identity passphrase; leave it empty if it has none. It is "
-                + "attached beside \(model.node); this window stays \(model.node)'s.")
-                .secondaryText()
-                .fixedSize(horizontal: false, vertical: true)
-            SecureInput(holder: field) { submit() }
-                .frame(width: Theme.scaled(320))
-                .accessibilityIdentifier("machine-passphrase")
-                .accessibilityLabel("Identity passphrase for node \(node)")
-            if let failed {
-                StateMark(kind: .danger, words: failed)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("machine-attach-failed")
-            }
-            HStack {
-                Button("Cancel") { done() }.keyboardShortcut(.cancelAction)
-                Button("Attach") { submit() }
-                    .keyboardShortcut(.defaultAction)
-                    .buttonStyle(.voxPrimary)
-                    .disabled(working)
-                    .accessibilityIdentifier("machine-attach-confirm")
-            }
-        }
-        .padding(Space.s24)
-        .frame(width: Theme.scaled(440))
-    }
-
-    private func submit() {
-        // Return and the button may both ask: one attach at a time.
-        guard !working else { return }
-        working = true
-        failed = nil
-        let secret = field.take() ?? Secret(Data())
-        Task {
-            if let why = await model.attachOther(node, passphrase: secret) {
-                failed = why
-            } else {
-                done()
-            }
-            working = false
-        }
     }
 }
 

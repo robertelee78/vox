@@ -1921,27 +1921,7 @@ final class FirstRunProof: XCTestCase {
         present(ui, Key.showing("It ends the session."), timeout: 10,
                 "⌃C must ask before stopping the Session")
         ui.typeKey(.escape, modifierFlags: [])
-        // (v0.4.3) claude-a, detached, waits for its passphrase: its row in ON THIS MACHINE
-        // offers Attach…, which attaches it beside alice with the passphrase typed.
-        tap(ui, Key.id("machine-attach-claude-a"), "Attach… on claude-a's row in ON THIS MACHINE",
-            premise: Premise("`vox node list` says claude-a is detached") {
-                let list = self.run(vox, ["node", "list"], env: voxEnv).out
-                return (list.split(separator: "\n").contains { $0.contains("claude-a") && $0.contains("detached") }, list)
-            })
-        type(ui, Key.id("machine-passphrase"), "agent identity", "claude-a's passphrase field")
-        tap(ui, Key.id("machine-attach-confirm"), "Attach, in its sheet")
-        var nodeList = ""
-        let attachedUntil = Date().addingTimeInterval(30)
-        while Date() < attachedUntil {
-            nodeList = run(vox, ["node", "list"], env: voxEnv).out
-            if nodeList.split(separator: "\n").contains(where: { $0.contains("claude-a") && !$0.contains("detached") && $0.contains("attached") }) { break }
-            Thread.sleep(forTimeInterval: 0.5)
-        }
-        XCTAssertTrue(nodeList.split(separator: "\n").contains { $0.contains("claude-a") && !$0.contains("detached") && $0.contains("attached") },
-                      "PRODUCT: Attach… on claude-a's row with its passphrase must attach it (v0.4.3); `vox node list` says: \(nodeList)")
-        words(ui, Key.id("machine-claude-a"), timeout: 15, "claude-a's row must say it is attached once Attach… attached it",
-              until: { $0 == "claude-a attached" })
-        print("[proof] sessions: ⌘J landed on S1's request and ⌥⌘Y approved it; work's draft kept; ⌘↩ in S1 sent nothing; S1's draft stayed in S1; S2 said \(said.debugDescription) and kept the prompt; ⌃C asked; Attach… attached claude-a")
+        print("[proof] sessions: ⌘J landed on S1's request and ⌥⌘Y approved it; work's draft kept; ⌘↩ in S1 sent nothing; S1's draft stayed in S1; S2 said \(said.debugDescription) and kept the prompt; ⌃C asked")
     }
 
     /// A keyring change waiting for the passphrase is bound to what it changes (D1). Alice is
