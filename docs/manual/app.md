@@ -412,9 +412,13 @@ A node that joined a room after yours, or that trusts you, and is not in your ke
 an offer under **needs you** in the sidebar (see [Offers](keyring.md#offers-nodes-waiting-for-your-trust)).
 Select it to see a **Trust offer**: its fingerprint with its art, the same sentence `vox trust
 offers` prints (`ben joined. ann trusts it.`), the rooms you share (`In: family`), and what
-trusting and dismissing do. Give it an alias and choose **Trust**: it is given `read` (drive is a
-separate step in the keyring); the view says what that grant does first, and asks for your identity passphrase if the
-keyring window has closed. You are not asked to compare fingerprints. **Dismiss** removes the offer
+trusting and dismissing do. Give it an alias and choose **Trust**: it is given `read`, and the
+view says what that grant does first. If the keyring window has closed, it asks for your identity
+passphrase in place of the offer's buttons: that form's **Trust** and **Cancel** are then the only
+ones, and **Cancel** brings back **Trust** and **Dismiss**. Leave the field empty only if your
+identity has no passphrase; if it has one, **Trust** says
+`This node's identity has a passphrase: type it to …`. The same holds wherever the app asks for
+the passphrase for a keyring change. You are not asked to compare fingerprints. **Dismiss** removes the offer
 on your node alone: it is not told, and stays out of your keyring.
 
 ## The services view
