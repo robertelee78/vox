@@ -43,6 +43,16 @@ manual.<check> — v<version> candidate <sha> — run by <who> on <date>, macOS 
 
 A `not seen` is a defect in this release. It is fixed before the tag, never carried forward (AGENTS.md, Releases). A check nobody ran is recorded as not run, and the tag waits.
 
+## The fresh-user journey: run before every tag
+
+One optional proof is run before every release tag, as the manual checks are: `fresh_user_journey_proof::a_fresh_user_gets_from_install_to_an_agent_working_in_a_room` (v0.4.3). It blocks no CI run. The person tagging runs it on an Apple silicon Mac with `claude`, `codex`, `opencode` and `tmux` on `PATH`:
+
+```
+cargo test --release -p vox-tui --features optional-proofs,test-knobs --test fresh_user_journey_proof -- --ignored --exact a_fresh_user_gets_from_install_to_an_agent_working_in_a_room --nocapture
+```
+
+It takes a scratch HOME and data root with no node, no keychain item of Vox's and no Vox wiring in any harness, and walks the whole journey with the shipped binaries: `install.sh` from a loopback release of this build, `vox setup` answered at a terminal as a person answers it, Claude Code, Codex and OpenCode started in a stub repo (each confined, offline, against the stand-in model), what each session says is missing and the one command for it, the repo's room asked of the person and bound, trust both ways with drive, an agent's post read by the person, an interactive Claude Code session found, driven and renamed from Vox, a daemon restart and `vox update` that keep every node attached and every skill and hook in place, the next action named at the end of every flow, and every hook path answered in under 1 s with one sentence. It prints every claim with its verdict, `PRODUCT`, `APPARATUS` or `CANNOT MEASURE (precondition unmet)`, and is red until every claim passes. Record the run on the release's tracking issue as a manual check is recorded (`journey.fresh_user — v<version> candidate <sha> — …`); a red is a defect in this release, and the tag waits.
+
 ## Running one
 
 - Run from the repository root, on a machine doing its ordinary work.
@@ -97,6 +107,7 @@ These start the real harness programs, but no model: each turn goes to a stand-i
 | Proof | Helps troubleshoot | Run | Needs | Time |
 |---|---|---|---|---|
 | `skill_cli_proof::each_harness_loads_the_pack_and_is_asked_for_the_repos_room` | An agent never sees the Vox skill (`vox-agent-comms`) although `vox agent skill --install` ran: the harness does not find the pack where it was put, or refuses its front matter. Or a session started in a repo the room map does not name is never asked for the repo's room (ADR-029 RB-5), or is asked without the `vox room join <link> --node <node> --bind <dir>` command filled in. Or a harness with no node never says so: its first session, from the skill alone (there is no hook yet), does not run `vox agent status` and say the harness has no node with the `vox agent connect` command; and once `vox agent connect` has run, the next session's status does not say the node is attached and give the room ask. Two turns each of `claude -p`, `codex exec` and `opencode run`, against a stand-in model that does what the skill's description says. OpenCode runs without its Claude Code compatibility, so Claude Code's copy of the pack cannot stand in for OpenCode's own. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test skill_cli_proof -- --ignored --exact each_harness_loads_the_pack_and_is_asked_for_the_repos_room` | macOS; `claude`, `codex` and `opencode` on `PATH`; `/usr/bin/python3` | about 150 s on a Mac (OpenCode's second turn waits about 130 s on its own npm install of the plugin folder's dependencies, which the offline sandbox refuses); not timed in CI |
+| `fresh_user_journey_proof::a_fresh_user_gets_from_install_to_an_agent_working_in_a_room` | Anything between "I installed Vox" and "my agent works in my room and I can steer it": the skill missing after install or update, setup's names or passphrase, hooks to merge by hand, nodes detached after a restart or an update, the room never asked of the person, a Session not found, a rename not shown, a flow that ends without naming the next step, a hook that is slow or says too much. Run before every tag (see above). | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test fresh_user_journey_proof -- --ignored --exact a_fresh_user_gets_from_install_to_an_agent_working_in_a_room` | Apple silicon Mac; `claude`, `codex`, `opencode`, `tmux` on `PATH`; `/usr/bin/python3` | not timed |
 
 ### Vox.app, on macOS (ADR-014 M-30, M-32)
 

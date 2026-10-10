@@ -5,15 +5,23 @@ It records every request a harness sends, as one JSON line, and answers each tur
 It speaks just enough of Anthropic Messages (Claude Code), OpenAI Responses (Codex) and
 OpenAI Chat Completions (OpenCode), all streamed, for a harness to finish its turn.
 
-argv: <port file> <request log> [--run-status]. It binds 127.0.0.1:0 and writes the
-port it got to the port file once it listens.
+argv: <port file> <request log> [--run-status | --run-file <file>]. It binds 127.0.0.1:0 and
+writes the port it got to the port file once it listens.
 
 With --run-status it plays a model that does what the agent skill's description says at the
 start of a session: when a turn offers a shell tool and the request carries the skill's
 `vox agent status --harness` instruction, it answers with one call of that tool running
 `vox agent status --harness <harness>`, the harness the endpoint names (Anthropic Messages:
 claude, OpenAI Responses: codex, Chat Completions: opencode); when the turn carries that call's result, it answers
-"VOX STATUS SAID:" and the result, word for word, so the harness prints it. Nothing else."""
+"VOX STATUS SAID:" and the result, word for word, so the harness prints it. Nothing else.
+
+With --run-file <file> it plays a model told, by the person, to run one command: while the file
+holds a command, every turn that offers a shell tool answers with one call of it running that
+command, whatever the request carries, and the turn holding its result answers "VOX RUN SAID:"
+and the result, word for word. A file holding "-" runs nothing: every turn answers "ok", so
+anything a harness prints of Vox's then comes from Vox, not from this model. While the file is
+empty or absent it is --run-status. The file is
+read at each turn, so a journey changes what the next session is told to run."""
 import json
 import os
 import sys
@@ -21,10 +29,21 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT_FILE, LOG = sys.argv[1], sys.argv[2]
-RUN_STATUS = len(sys.argv) > 3 and sys.argv[3] == "--run-status"
+RUN_FILE = sys.argv[4] if len(sys.argv) > 4 and sys.argv[3] == "--run-file" else None
+RUN_STATUS = len(sys.argv) > 3 and sys.argv[3] in ("--run-status", "--run-file")
 REPLY = "ok"
 TRIGGER = "vox agent status --harness"
 SAID = "VOX STATUS SAID:\n"
+RAN = "VOX RUN SAID:\n"
+
+
+def told():
+    """The command the person told this model to run, or None."""
+    try:
+        with open(RUN_FILE) as f:
+            return f.read().strip() or None
+    except (TypeError, OSError):
+        return None
 
 
 def text_of(v):
@@ -58,10 +77,10 @@ def tool_result(body, kind):
     return None
 
 
-def shell_tool(body, kind):
-    """The turn's shell tool: (name, arguments for the status command), or None."""
+def shell_tool(body, kind, cmd=None):
+    """The turn's shell tool: (name, arguments for `cmd`, else the status command), or None."""
     harness = {"messages": "claude", "responses": "codex", "chat": "opencode"}[kind]
-    cmd = f"vox agent status --harness {harness}"
+    cmd = cmd or f"vox agent status --harness {harness}"
     names = []
     for t in body.get("tools", []) or []:
         if not isinstance(t, dict):
@@ -85,9 +104,15 @@ def plan(body, kind):
     """What this turn answers: ("text", words) or ("tool", name, arguments)."""
     if not RUN_STATUS or not isinstance(body, dict):
         return ("text", REPLY)
+    cmd = told()
+    if cmd == "-":
+        return ("text", REPLY)
     result = tool_result(body, kind)
     if result is not None:
-        return ("text", SAID + result)
+        return ("text", (RAN if cmd else SAID) + result)
+    if cmd:
+        tool = shell_tool(body, kind, cmd)
+        return ("tool",) + tool if tool else ("text", REPLY)
     tool = shell_tool(body, kind)
     if tool and TRIGGER in json.dumps(body):
         return ("tool",) + tool
