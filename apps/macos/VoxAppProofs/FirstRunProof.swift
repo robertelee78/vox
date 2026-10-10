@@ -4205,7 +4205,12 @@ final class FirstRunProof: XCTestCase {
         // Not offered on bobs's row either: its context menu has no End for Everyone….
         el(ui, Key.id("room-bobs")).rightClick()
         present(ui, Key.menuItem("Copy Room Link"), timeout: 5, "bobs's row's context menu must offer Copy Room Link")
-        if locate(ui, Key.menuItem("End for Everyone…")) != nil {
+        // In the open context menu only: the menu bar's Room menu holds an End for Everyone… of its
+        // own (zero-sized while closed), which a search of every menu finds.
+        let openMenus = ui.menus.allElementsBoundByIndex.filter { $0.frame.width > 0 && $0.frame.height > 0 }
+        if openMenus.isEmpty {
+            XCTFail("APPARATUS: the right-click on bobs's row opened no menu the proof can read, so whether it offers End for Everyone… cannot be told")
+        } else if openMenus.contains(where: { $0.menuItems["End for Everyone…"].exists }) {
             XCTFail("PRODUCT: a room alice may not end must not offer End for Everyone… on its row (v0.4.3)")
         }
         ui.typeKey(.escape, modifierFlags: [])
