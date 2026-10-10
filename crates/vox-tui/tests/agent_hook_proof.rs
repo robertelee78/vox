@@ -50,7 +50,9 @@
 //! **A Session per interactive harness session** (ADR-029 SE-1–SE-5,
 //! [`a_session_opens_with_its_hook_and_ends_only_on_a_real_end`]): the hook of a session a person
 //! is at (Claude Code's `CLAUDE_CODE_ENTRYPOINT=cli`) opens one Session in its room, named by the
-//! harness's own session id; a headless run's (`sdk-cli`) opens none; a sub-agent's event, which
+//! harness's own session id; a headless run's (`sdk-cli`) opens none, and so does a `codex exec`,
+//! told from a `codex` session a person is at by Codex's own argv (a stand-in process with the
+//! measured argv; mutant: Codex taken as interactive whatever its argv); a sub-agent's event, which
 //! carries its parent's session id, opens no other. `Stop` and a `SessionEnd` whose reason is
 //! `resume` leave it open; a real `SessionEnd` ends it, set apart under "ended", and what was said
 //! in the room stays readable. Every message from a session carries its id and the name its harness
@@ -2341,6 +2343,79 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
         "PRODUCT: a hook run by hand must exit 0; it said {out}{err}"
     );
     let after_open = sessions();
+    // (2c) Codex: `codex exec` is headless, a `codex` a person is at is not. Codex's hook input and
+    // environment carry no mark of it (measured on Codex 0.162.1, 2026-10-10); its own argv does.
+    // The stand-in is a process whose argv is what was measured, `<dir>/codex exec
+    // --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox hello`, and, for the TUI,
+    // `<dir>/codex`; each runs the hook as its child with Codex's measured `UserPromptSubmit`.
+    let codex_dir = tmp.path().join("codex-standin");
+    std::fs::create_dir_all(&codex_dir).expect("APPARATUS: cannot make the stand-in's directory");
+    let standin = "import json, os, subprocess\n\
+        p = subprocess.run(json.loads(os.environ['STANDIN_HOOK']), \
+        input=os.environ['STANDIN_INPUT'].encode(), capture_output=True)\n\
+        open(os.environ['STANDIN_OUT'], 'w').write(json.dumps({'exit': p.returncode, \
+        'said': p.stdout.decode(errors='replace') + p.stderr.decode(errors='replace')}))\n";
+    // As `exec`: the file python runs is the subcommand's own word in argv.
+    std::fs::write(codex_dir.join("exec"), standin).expect("APPARATUS: cannot write the stand-in");
+    std::fs::write(codex_dir.join("tui.py"), standin)
+        .expect("APPARATUS: cannot write the stand-in");
+    let as_codex = |id: &str, exec: bool| -> serde_json::Value {
+        let payload = format!(
+            r#"{{"cwd":"{}","hook_event_name":"UserPromptSubmit","model":"gpt-5","permission_mode":"bypassPermissions","prompt":"hello","session_id":"{id}","transcript_path":null,"turn_id":"turn-{id}"}}"#,
+            codex_dir.display()
+        );
+        let out = codex_dir.join(format!("{id}.out"));
+        let mut c = Command::new("/bin/bash");
+        if exec {
+            c.args([
+                "-c",
+                r#"exec -a "$0" python3 exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox hello"#,
+            ]);
+        } else {
+            c.args(["-c", r#"exec -a "$0" python3 < tui.py"#]);
+        }
+        c.arg(codex_dir.join("codex")).current_dir(&codex_dir);
+        let template = vox(&data, &cfg);
+        for (k, v) in template.get_envs() {
+            match v {
+                Some(v) => c.env(k, v),
+                None => c.env_remove(k),
+            };
+        }
+        let mut argv = vec![VOX.to_owned()];
+        argv.extend(hook_args.iter().map(|a| (*a).to_owned()));
+        let status = c
+            .env("STANDIN_HOOK", serde_json::json!(argv).to_string())
+            .env("STANDIN_INPUT", payload)
+            .env("STANDIN_OUT", &out)
+            .status()
+            .expect("APPARATUS: cannot start the Codex stand-in");
+        let got: serde_json::Value = std::fs::read_to_string(&out)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_else(|| panic!("APPARATUS: the Codex stand-in ({status}) ran no hook"));
+        assert!(
+            got["exit"] == 0,
+            "PRODUCT: the hook under Codex must exit 0; it said {}",
+            got["said"]
+        );
+        got
+    };
+    as_codex("codex-exec-0001", true);
+    as_codex("codex-tui-00002", false);
+    let with_codex = sessions();
+    eprintln!("[proof] (2c) after a `codex exec` run and a `codex` session: {with_codex:?}");
+    assert!(
+        of(&with_codex, "codex-tui-00002").len() == 1
+            && of(&with_codex, "codex-tui-00002")[0]["harness"] == "codex",
+        "PRODUCT: a Codex session a person is at (`codex`) must open its Session; the room lists \
+         {with_codex:?}"
+    );
+    assert!(
+        of(&with_codex, "codex-exec-0001").is_empty(),
+        "PRODUCT: a headless Codex run (`codex exec`) must open no Session (ADR-029 SE-1); the room \
+         lists {with_codex:?}"
+    );
     // (7) Every message from a session carries its id and name, whatever verb posts it
     // (ADR-029 MD-1, MD-2): a plain `vox room post` from it, and one from a session with no name.
     let post_as = |session: &str, text: &str| {
