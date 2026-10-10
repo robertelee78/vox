@@ -719,13 +719,39 @@ impl PrekeyRing {
     }
 }
 
-/// Which prekey in a peer's bundle made it stale for a key delivery (ADR-030 P-2).
+/// How far ahead of a sender's clock a prekey's root-signed creation time may be before the
+/// bundle naming it is refused (ADR-030 P-2): ten minutes. A recipient whose clock runs fast makes
+/// its prekeys look newer than they are; this bounds how much longer than a cadence that keeps a
+/// stolen prekey in use.
+pub const PREKEY_FUTURE_TOLERANCE_MS: u64 = 10 * 60 * 1_000;
+
+/// Which prekey in a peer's bundle a key delivery refused (ADR-030 P-2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StalePrekey {
     /// Its signed prekey: its owner rotates it every cadence.
     Signed,
     /// Its one-time prekey: its owner retires an unused one after a cadence (P-1).
     OneTime,
+}
+
+impl StalePrekey {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Signed => "signed",
+            Self::OneTime => "one-time",
+        }
+    }
+}
+
+/// What to do with a bundle whose one-time prekey this node has already named in a delivery, or
+/// the peer refused (ADR-030 P-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpentOneTime {
+    /// Wait for the peer's next bundle, which names a fresh one-time prekey: what a key delivery
+    /// does first.
+    Wait,
+    /// Open against the signed prekey alone, which heals only when it rotates (S-5).
+    SignedPrekey,
 }
 
 /// Why a key delivery to a peer waits for its bundle (ADR-030 D-5): never sealed in an older
@@ -743,12 +769,27 @@ pub enum BundleWait {
         /// How old it is, in milliseconds.
         age_ms: u64,
     },
+    /// The bundle names a prekey whose root-signed creation time is more than
+    /// [`PREKEY_FUTURE_TOLERANCE_MS`] ahead of this node's clock (P-2).
+    FromTheFuture {
+        /// Which prekey.
+        part: StalePrekey,
+        /// How far ahead, in milliseconds.
+        ahead_ms: u64,
+    },
+    /// The bundle's one-time prekey was already named by a delivery to the peer, or refused by it
+    /// (P-3); its next bundle names a fresh one.
+    OneTimeSpent {
+        /// The one-time prekey's id.
+        prekey_id: u64,
+    },
 }
 
 impl BundleWait {
     /// The reason, as a person reads it after "your key for it in room … waits: ".
     #[must_use]
     pub fn why(self) -> String {
+        const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
         match self {
             Self::NoBundle => "this node's board holds no prekey bundle of it yet; it is sent \
                                once one arrives"
@@ -760,12 +801,22 @@ impl BundleWait {
                 "its prekey bundle is stale: its {} prekey is {} days old, and a key sealed to it \
                  could be read by whoever copied that prekey before it was replaced; it is sent \
                  once its next bundle arrives (bundles republish about hourly)",
-                match part {
-                    StalePrekey::Signed => "signed",
-                    StalePrekey::OneTime => "one-time",
-                },
-                age_ms / (24 * 60 * 60 * 1_000)
+                part.word(),
+                age_ms / DAY_MS
             ),
+            Self::FromTheFuture { part, ahead_ms } => format!(
+                "its prekey bundle says its {} prekey was made {} minutes from now: its clock, or \
+                 this node's, is wrong, and a prekey dated ahead would be used longer than seven \
+                 days; it is sent once a bundle dated within {} minutes of this node's clock \
+                 arrives",
+                part.word(),
+                ahead_ms.div_ceil(60_000),
+                PREKEY_FUTURE_TOLERANCE_MS / 60_000
+            ),
+            Self::OneTimeSpent { .. } => "its prekey bundle names a one-time prekey this node has \
+                                           already used; it is sent once its next bundle, naming a \
+                                           fresh one, arrives (about a second when it is online)"
+                .to_owned(),
         }
     }
 }
@@ -775,33 +826,48 @@ impl BundleWait {
 /// The signatures are checked first, so the creation times judged are the root-signed ones, never
 /// the record's own publication fields. A bundle whose signed prekey, or whose one-time prekey, was
 /// created a cadence ([`SIGNED_PREKEY_CADENCE_MS`]) or more before `now_ms` is refused: its owner
-/// has rotated or retired it (P-1), so only a stale or replayed bundle still names it. A one-time
-/// prekey in `refused` — one the peer answered it does not hold — is taken out, so the session
-/// opens against the signed prekey rather than name it again (P-3).
+/// has rotated or retired it (P-1), so only a stale or replayed bundle still names it. So is one
+/// dated more than [`PREKEY_FUTURE_TOLERANCE_MS`] after `now_ms`, which would otherwise stay
+/// acceptable for longer than a cadence. A one-time prekey in `spent` (one a delivery already
+/// named, or the peer answered it does not hold) is never named again (P-3): with
+/// [`SpentOneTime::Wait`] the delivery waits for the next bundle; with
+/// [`SpentOneTime::SignedPrekey`] it is taken out and the session opens against the signed prekey.
 pub fn delivery_bundle(
     bundle: &PrekeyBundlePublic,
     now_ms: u64,
-    refused: &[u64],
+    spent: &[u64],
+    on_spent: SpentOneTime,
 ) -> std::result::Result<PrekeyBundlePublic, BundleWait> {
     bundle.verify().map_err(|_| BundleWait::Unverified)?;
-    let stale = |created: u64| now_ms.saturating_sub(created) >= SIGNED_PREKEY_CADENCE_MS;
-    if stale(bundle.signed_prekey.created) {
-        return Err(BundleWait::Stale {
-            part: StalePrekey::Signed,
-            age_ms: now_ms.saturating_sub(bundle.signed_prekey.created),
-        });
-    }
-    let mut out = bundle.clone();
-    if let Some(otp) = &bundle.one_time_prekey {
-        if stale(otp.created) {
-            return Err(BundleWait::Stale {
-                part: StalePrekey::OneTime,
-                age_ms: now_ms.saturating_sub(otp.created),
+    let judge = |part: StalePrekey, created: u64| {
+        if created > now_ms.saturating_add(PREKEY_FUTURE_TOLERANCE_MS) {
+            return Err(BundleWait::FromTheFuture {
+                part,
+                ahead_ms: created - now_ms,
             });
         }
-        if refused.contains(&otp.prekey_id) {
-            out.one_time_prekey = None;
-            out.one_time_prekey_sig = None;
+        let age_ms = now_ms.saturating_sub(created);
+        if age_ms >= SIGNED_PREKEY_CADENCE_MS {
+            return Err(BundleWait::Stale { part, age_ms });
+        }
+        Ok(())
+    };
+    judge(StalePrekey::Signed, bundle.signed_prekey.created)?;
+    let mut out = bundle.clone();
+    if let Some(otp) = &bundle.one_time_prekey {
+        judge(StalePrekey::OneTime, otp.created)?;
+        if spent.contains(&otp.prekey_id) {
+            match on_spent {
+                SpentOneTime::Wait => {
+                    return Err(BundleWait::OneTimeSpent {
+                        prekey_id: otp.prekey_id,
+                    })
+                }
+                SpentOneTime::SignedPrekey => {
+                    out.one_time_prekey = None;
+                    out.one_time_prekey_sig = None;
+                }
+            }
         }
     }
     Ok(out)
