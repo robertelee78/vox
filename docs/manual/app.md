@@ -373,16 +373,10 @@ your alias for it, with its fingerprint art and its fingerprint in groups, and a
 whether it trusts you back (⇄) or not yet (→), and what its entry grants: `read` or `read +
 drive`. See [Identity and keyring](keyring.md) for what trust grants.
 
-- **Add a node**: paste or type its fingerprint and give it an alias. It is given `read`; drive
-  is a separate step on its row. Before you choose **Trust**, the view says what trusting does: it may read what you write in every room you share, now and later; you read what it
+- **Add a node**: paste or type its fingerprint and give it an alias. It is given `read`: the app
+  gives no node drive (it has no Sessions to drive); `vox trust` does, from the CLI. Before you choose **Trust**, the view says what trusting does: it may read what you write in every room you share, now and later; you read what it
   writes once it trusts you too; and it reaches every service you bind to a room you are both in.
-- **Also let NAME drive my Sessions…**: opens a sheet that says first what drive does: NAME can
-  then answer approvals and type into this node's Sessions, now and later, with their permissions;
-  "With drive, NAME also sees inside your Sessions and may type into them, interrupt or stop them,
-  answer their approvals and questions, and send and receive their files." Return chooses
-  **Cancel**. Only **Give Drive** gives it, and it asks for your identity passphrase if the keyring
-  window has closed.
-- **Make Read Only…** (a node with drive): says "With read only, NAME sees each of your Sessions'
+- **Make Read Only…** (a node given drive from the CLI): says "With read only, NAME sees each of your Sessions'
   name and whether it is open, and nothing inside it." Then **Make Read Only**.
 - **Compare…**: paste or type the fingerprint the person gave you another way. Case, spaces and
   dashes do not count. While you type it says `So far matches N of 13 groups.`; the whole

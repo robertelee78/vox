@@ -869,13 +869,13 @@ final class FirstRunProof: XCTestCase {
     /// sidebar on bg.panel, the timeline on bg.base, the inspector and the status bar on
     /// bg.raised, and between the timeline and the inspector a line of line.hair. Room > Rename's
     /// sheet is on bg.panel, its title SF Pro semibold (one line of about 24 points, not Inter
-    /// Display's 34). Return in Room > Retention sets nothing: the sheet stays. On bob's keyring
-    /// row, "Also let bob drive my Sessions…" opens its confirm sheet, and Return there cancels:
-    /// the sheet goes and bob still has read. Colours are compared in sRGB, within 4 of 255 per
-    /// channel. Mutations: the inspector without bg.raised → red at "inspector"; the hairline the
-    /// system's divider again → red at "line.hair"; a sheet title in Inter Display → red at
-    /// "title"; Set the default again → red at "Retention"; Give Drive the default → red at
-    /// "drive". Then Node > Sign Out…: the chooser lists alice, detached, with her fingerprint and
+    /// Display's 34). Return in Room > Retention sets nothing: the sheet stays. Bob's keyring row
+    /// says he has read and offers no way to give him drive (the decider, v0.4.1: the app has no
+    /// Sessions to drive). Colours are compared in the screenshot's own colour space, within 4 of
+    /// 255 per channel. Mutations: the inspector without bg.raised → red at "inspector"; the
+    /// hairline the system's divider again → red at "line.hair"; a sheet title in Inter Display →
+    /// red at "title"; Set the default again → red at "Retention"; the keyring's drive button back
+    /// → red at "no way to give". Then Node > Sign Out…: the chooser lists alice, detached, with her fingerprint and
     /// "Everything you post, trust and share will be as alice."; `vox node list` shows the same
     /// fingerprint; and with bob's vault copied over hers, it shows none (P8). Before that, the
     /// sidebar opens with "node alice, attached" and ends with ON THIS MACHINE listing bob as
@@ -1051,17 +1051,15 @@ final class FirstRunProof: XCTestCase {
         ui.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
         missingWithin(ui, Key.id("retention-effect"), 5, "Escape must close Retention's sheet")
 
-        // The keyring: drive through its own sheet, whose Return is Cancel (P5).
+        // The keyring: bob's entry says what it grants, and offers no way to give drive (the
+        // decider, v0.4.1: the app has no Sessions to drive; drive is granted from the CLI).
         ui.typeKey("k", modifierFlags: [.command, .shift])
-        tap(ui, Key.id("keyring-give-drive-bob"), "\"Also let bob drive my Sessions…\" on bob's row")
-        present(ui, Key.id("keyring-drive-effect"), timeout: 10, "the drive confirm sheet must open")
-        ui.typeKey(XCUIKeyboardKey.return.rawValue, modifierFlags: [])
-        missingWithin(ui, Key.id("keyring-drive-effect"), 5,
-                      "Return in the drive sheet must be Cancel, closing it (P5)")
         let capability = words(ui, Key.id("keyring-capability-bob"), timeout: 10,
                                "bob's row must say what it grants") ?? ""
         XCTAssertEqual(capability, "read",
-                       "PRODUCT: Return in the drive sheet must give nothing (P5); bob's row says \(capability.debugDescription)")
+                       "PRODUCT: bob was trusted with read; his keyring row says \(capability.debugDescription)")
+        XCTAssertNil(locate(ui, Key.id("keyring-give-drive-bob")),
+                     "PRODUCT: the keyring must offer no way to give bob drive (the decider, v0.4.1); his row has \"Also let bob drive my Sessions…\"")
 
         // G5: the sidebar opens with who you are, and ends with this Mac's nodes and their state.
         words(ui, Key.id("attached"), timeout: 10, "the sidebar must open with the acting node (G5)",
@@ -1110,7 +1108,7 @@ final class FirstRunProof: XCTestCase {
         let restored = nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "alice") ?? ""
         XCTAssertFalse(plain(restored).contains(plain(aliceFp)) || plain(restored).contains(plain(bobFp)),
                        "PRODUCT: with another vault in alice's place, `vox node list` must not show a fingerprint for her, stale or otherwise; it says \(restored.debugDescription)")
-        print("[proof] look: \(read.joined(separator: "; ")); title \(titleHeight) high; retention kept by Return; bob \(capability.debugDescription) after Return; chooser shows alice \(fingerprintShown.debugDescription); node list \(aliceLine.debugDescription), then with bob's vault \(restored.debugDescription)")
+        print("[proof] look: \(read.joined(separator: "; ")); title \(titleHeight) high; retention kept by Return; bob \(capability.debugDescription), no drive control; chooser shows alice \(fingerprintShown.debugDescription); node list \(aliceLine.debugDescription), then with bob's vault \(restored.debugDescription)")
     }
 
     /// `key` gone within `timeout`: PRODUCT naming what still shows it.
