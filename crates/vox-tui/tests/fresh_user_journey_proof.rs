@@ -1881,7 +1881,7 @@ mod journey {
                     });
                 let join = join.replace("<link>", &link);
                 // Its words as a shell reads them: Vox prints arguments in single quotes (v0.4.3).
-                let words = shell_words(&join);
+                let words = super::shell_words(&join);
                 let args: Vec<&str> = words.iter().skip(1).map(String::as_str).collect();
                 let (_, out) = w.follow(&args, node);
                 l.claim(
@@ -2710,6 +2710,7 @@ fn a_fresh_user_gets_from_install_to_an_agent_working_in_a_room() {
 /// `line`'s words as a POSIX shell splits them, for the single quoting Vox prints (v0.4.3): a word
 /// ends at unquoted white space; inside `'…'` every character is itself; `\'` outside quotes is a
 /// `'`. Enough for the commands Vox prints, which use no other quoting.
+#[cfg(feature = "optional-proofs")]
 fn shell_words(line: &str) -> Vec<String> {
     let (mut words, mut word, mut quoted, mut any) = (Vec::new(), String::new(), false, false);
     let mut chars = line.chars();
