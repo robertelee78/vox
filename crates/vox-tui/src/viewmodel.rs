@@ -328,6 +328,16 @@ pub enum SyncStatus {
     Connected(usize),
 }
 
+/// A room ask as the TUI draws it (ADR-029 RB-5a): what it says, and what answers it at a
+/// terminal, each with what it does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoomAskView {
+    /// "Claude Code in /opt/vox has no room".
+    pub sentence: String,
+    /// `(what it does, the command)`.
+    pub answers: Vec<(String, String)>,
+}
+
 /// The latest-wins UI state (core→UI over a `watch`). Cloneable and free of
 /// secrets, so it is safe to broadcast.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -371,7 +381,7 @@ pub struct ViewModel {
     pub offers: Vec<vox_core::node::api::Offer>,
     /// The directories harness sessions started in with no room bound to them (ADR-029 RB-5):
     /// what Vox asks the person, under needs you.
-    pub room_asks: Vec<vox_core::node::daemonipc::RoomAsk>,
+    pub room_asks: Vec<RoomAskView>,
     /// What this node decided, newest first, from its decision record (ADR-028 D-3).
     pub decisions: Vec<vox_core::node::decisions::Event>,
     /// What listens on this machine, for sharing one into a room (ADR-028 S-4), as `vox serve`

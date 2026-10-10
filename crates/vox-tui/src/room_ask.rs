@@ -7,13 +7,17 @@
 //! for it: it is read from the sessions' registrations and the map, so a bind, a no, or the
 //! sessions ending clears it by itself.
 //!
-//! Vox.app shows an ask under needs you with what to do about it; the TUI and `vox agent status`
+//! A session whose directory is bound to a room its node is not in (its join failed, or never
+//! ran) cannot work there either, and is asked about the same way (RB-5a): one bind then serves
+//! every harness's node in that directory.
+//!
+//! Vox.app shows an ask as a banner across its window with what to do about it; the TUI and `vox agent status`
 //! show it with the commands that answer it at a terminal.
 
 use std::collections::BTreeMap;
 
 use vox_core::node::daemonipc::{AskingSession, DaemonClient, DaemonFrame, DaemonRequest, RoomAsk};
-use vox_core::node::paths::Account;
+use vox_core::node::paths::{Account, NodeName};
 
 use crate::app::AppError;
 
@@ -21,77 +25,125 @@ pub use vox_core::node::daemonipc::harness_words;
 
 /// The asks of `account`'s data root, one per directory, ordered by directory; each one's sessions
 /// oldest first. A room map that cannot be read gives none: the hook says why to the session.
+///
+/// `outside(node, room)` says whether `node` is attached, is not in `room` (its id in base32), and
+/// is not joining it now: a session of such a node, started in a directory bound to `room`, cannot
+/// work there, and is asked about too (RB-5a).
 #[must_use]
-pub fn asks(account: &Account) -> Vec<RoomAsk> {
+pub fn asks(account: &Account, outside: &dyn Fn(&NodeName, &str) -> bool) -> Vec<RoomAsk> {
     let Ok(entries) = crate::room_map::read(&account.data_root) else {
         return Vec::new();
     };
-    let mut by_dir: BTreeMap<String, Vec<(u64, AskingSession)>> = BTreeMap::new();
+    let mut by_dir: BTreeMap<(String, String), Vec<(u64, AskingSession)>> = BTreeMap::new();
     for node in account.nodes_on_disk() {
         let Ok(paths) = account.node_paths(&node) else {
             continue;
         };
         for reg in crate::wake::registered(&paths) {
             // A headless run has no person at it to ask, and a hook run by hand no harness.
-            if reg.room.is_some() || !reg.interactive || reg.harness == "unknown" {
+            if !reg.interactive || reg.harness == "unknown" {
                 continue;
             }
             let Some(start) = reg.start.as_deref().filter(|s| !s.is_empty()) else {
                 continue;
             };
             let start = std::path::Path::new(start);
-            if crate::room_map::lookup(&entries, start).is_some() {
-                continue;
-            }
-            // As the map would hold it: the directory itself, a symlink to it resolved.
+            let room = match crate::room_map::lookup(&entries, start) {
+                // No room bound: asked while the session works in none.
+                None if reg.room.is_none() => String::new(),
+                None => continue,
+                Some(e) if e.room == crate::room_map::DECLINED => continue,
+                // Bound: asked while the session's node is not in that room, unless the session
+                // was moved to another.
+                Some(e) => {
+                    let Ok(link) = vox_core::node::link::InviteLink::parse(&e.room) else {
+                        continue;
+                    };
+                    let room = vox_core::node::link::b32_encode(&link.channel_id);
+                    if reg.room.as_deref().is_some_and(|r| r != room) || !outside(&node, &room) {
+                        continue;
+                    }
+                    room
+                }
+            };
+            // As the map holds it: the directory itself, a symlink to it resolved.
             let dir = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
-            by_dir.entry(dir.display().to_string()).or_default().push((
-                reg.first_seen_ms,
-                AskingSession {
-                    node: node.clone(),
-                    session: reg.session.clone(),
-                    harness: reg.harness.clone(),
-                },
-            ));
+            by_dir
+                .entry((dir.display().to_string(), room))
+                .or_default()
+                .push((
+                    reg.first_seen_ms,
+                    AskingSession {
+                        node: node.clone(),
+                        session: reg.session.clone(),
+                        harness: reg.harness.clone(),
+                    },
+                ));
         }
     }
     by_dir
         .into_iter()
-        .map(|(dir, mut sessions)| {
+        .map(|((dir, room), mut sessions)| {
             sessions.sort_by_key(|(first, _)| *first);
             RoomAsk {
                 dir,
+                room,
                 sessions: sessions.into_iter().map(|(_, s)| s).collect(),
             }
         })
         .collect()
 }
 
-/// What answers an ask at a terminal: bind it, or say no.
+/// What answers an ask at a terminal, each with what it does: bind the directory or say no; or,
+/// for a directory bound to a room the node is not in, join that room with the link the room map
+/// holds (it asks for the room's passphrase there).
 #[must_use]
-pub fn commands(ask: &RoomAsk) -> [String; 2] {
+pub fn answers(ask: &RoomAsk, data_root: &std::path::Path) -> Vec<(&'static str, String)> {
     let node = ask.sessions.first().map_or("<node>", |s| s.node.as_str());
+    if !ask.room.is_empty() {
+        let link = crate::room_map::read(data_root)
+            .ok()
+            .and_then(|entries| {
+                crate::room_map::lookup(&entries, std::path::Path::new(&ask.dir))
+                    .map(|e| e.room.clone())
+            })
+            .unwrap_or_else(|| "<link>".to_owned());
+        return vec![("to join it", format!("vox room join {link} --node {node}"))];
+    }
     let session = ask
         .sessions
         .first()
         .map_or("<session>", |s| s.session.as_str());
-    [
-        format!("vox room join <link> --node {node} --bind {}", ask.dir),
-        format!("vox agent room --none --node {node} --session {session}"),
+    vec![
+        (
+            "to bind it",
+            format!("vox room join <link> --node {node} --bind {}", ask.dir),
+        ),
+        (
+            "to say no",
+            format!("vox agent room --none --node {node} --session {session}"),
+        ),
     ]
 }
 
 /// One line per ask, as `vox agent status` prints it after its own: "Vox needs you: Claude Code in
 /// /opt/vox has no room. …", with where it is answered. Nothing when there are none.
 #[must_use]
-pub fn needs_you(asks: &[RoomAsk]) -> String {
+pub fn needs_you(asks: &[RoomAsk], data_root: &std::path::Path) -> String {
     asks.iter()
         .map(|a| {
-            let [bind, no] = commands(a);
+            let ways: Vec<String> = answers(a, data_root)
+                .into_iter()
+                .map(|(what, cmd)| format!("`{cmd}` {what}"))
+                .collect();
+            let sentence = a.sentence();
+            let sentence = sentence
+                .trim_end_matches('?')
+                .trim_end_matches(" Join it")
+                .trim_end_matches('.');
             format!(
-                "Vox needs you: {}. Answer in Vox.app, or at a terminal: `{bind}` to bind it, or \
-                 `{no}` to say no.\n",
-                a.sentence()
+                "Vox needs you: {sentence}. Answer in Vox.app, or at a terminal: {}.\n",
+                ways.join(", or ")
             )
         })
         .collect()

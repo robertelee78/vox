@@ -55,7 +55,7 @@ pub async fn status(args: &NodeArgs, key: &str, dir: &Path) -> Result<String, Ap
     let asks = crate::room_ask::fetch(&args.account()?)
         .await
         .unwrap_or_default();
-    Ok(said + &crate::room_ask::needs_you(&asks))
+    Ok(said + &crate::room_ask::needs_you(&asks, &args.account()?.data_root))
 }
 
 /// The first thing missing, for [`status`].
@@ -116,17 +116,67 @@ async fn first_missing(args: &NodeArgs, key: &str, dir: &Path) -> Result<String,
                 dir.display()
             )
         } else {
-            format!(
-                "Vox: {} is node {node}, attached; this repo ({}) works in room {}.\n",
-                h.name,
-                dir.display(),
-                e.room
-            )
+            in_bound_room(&account, &node, h.name, dir, &e.room).await
         });
     }
     let ask = crate::room_map::note(None, true, None, &account.data_root, dir, node.as_str())
         .unwrap_or_default();
     Ok(format!("Vox: {} is node {node}, attached.\n{ask}", h.name))
+}
+
+/// What status says of a repo the room map binds to the room `link` names: that it works there
+/// when `node` is in that room, and otherwise that `node` is not in it yet, so this harness's
+/// sessions cannot post there, with how it joins (ADR-029 RB-3, RB-5a). A node whose rooms cannot
+/// be read is said as that, never as one in the room.
+async fn in_bound_room(
+    account: &vox_core::node::paths::Account,
+    node: &NodeName,
+    harness: &str,
+    dir: &Path,
+    link: &str,
+) -> String {
+    let room = vox_core::node::link::InviteLink::parse(link)
+        .map(|l| l.channel_id)
+        .ok();
+    let short: String = room
+        .map(|r| vox_core::node::link::b32_encode(&r))
+        .unwrap_or_default()
+        .chars()
+        .take(12)
+        .collect();
+    let held = match account.node_paths(node) {
+        Ok(paths) => match crate::room_cli::attach(&paths).await {
+            Ok(mut client) => crate::room_cli::rooms_of(&mut client)
+                .await
+                .map(|rooms| {
+                    rooms
+                        .iter()
+                        .any(|(id, _, _, over)| Some(*id) == room && over.is_empty())
+                })
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        },
+        Err(e) => Err(e.to_string()),
+    };
+    match held {
+        Ok(true) => format!(
+            "Vox: {harness} is node {node}, attached; this repo ({}) works in room {short}.\n",
+            dir.display()
+        ),
+        Ok(false) => format!(
+            "Vox: {harness} is node {node}, attached; this repo ({}) is bound to room {short}, \
+             and {node} is not in it, so this session cannot post there. {node} joins it by \
+             itself, with the room map's passphrase, when a session starts here; if that failed, \
+             Vox asks the operator (Vox.app banner), or they run at a terminal: vox room join \
+             {link} --node {node}\n",
+            dir.display()
+        ),
+        Err(why) => format!(
+            "Vox: {harness} is node {node}, attached; this repo ({}) is bound to room {short}, \
+             and whether {node} is in it could not be read: {why}\n",
+            dir.display()
+        ),
+    }
 }
 
 /// `vox agent connect <harness> --node <name>`: make node `name` if there is none (its

@@ -76,7 +76,15 @@ private struct RoomAskLine: View {
                     .truncationMode(.middle)
                     .accessibilityIdentifier("room-ask-sentence")
                 Spacer()
-                if !choosing {
+                if !choosing && !ask.room.isEmpty {
+                    // Bound already, to a room the node is not in: joined with the room map's own
+                    // passphrase, nothing typed (RB-5a); or bound to another room instead.
+                    Button("Join It") { Task { _ = await model.joinBoundRoom(dir) } }
+                        .buttonStyle(.voxPrimary)
+                        .accessibilityIdentifier("room-ask-join")
+                    Button("Choose Another Room…") { choosing = true }
+                        .accessibilityIdentifier("room-ask-choose")
+                } else if !choosing {
                     Button("Choose a room…") { choosing = true }
                         .buttonStyle(.voxPrimary)
                         .accessibilityIdentifier("room-ask-choose")

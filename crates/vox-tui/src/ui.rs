@@ -295,18 +295,14 @@ fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
             items.push(ListItem::new(format!("{marker}offer: {short}… {why}")));
         }
         for a in &vm.room_asks {
-            let [bind, no] = crate::room_ask::commands(a);
-            items.push(ListItem::new(Text::from(vec![
-                Line::from(format!("  {}", a.sentence())),
-                Line::from(Span::styled(
-                    format!("    choose a room: {bind}"),
+            let mut lines = vec![Line::from(format!("  {}", a.sentence))];
+            for (what, cmd) in &a.answers {
+                lines.push(Line::from(Span::styled(
+                    format!("    {what}: {cmd}"),
                     Style::default().add_modifier(Modifier::DIM),
-                )),
-                Line::from(Span::styled(
-                    format!("    or say no: {no}"),
-                    Style::default().add_modifier(Modifier::DIM),
-                )),
-            ])));
+                )));
+            }
+            items.push(ListItem::new(Text::from(lines)));
         }
     }
     let mut group = None;

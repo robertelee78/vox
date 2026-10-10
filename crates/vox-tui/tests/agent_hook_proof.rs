@@ -90,7 +90,9 @@
 //! agent status`; the TUI and Vox.app show the same), naming the harness and the directory with the
 //! commands that answer it. It is gone once the session works in a room, once the person says no,
 //! and once the person binds the directory. Mutants: no ask raised; an ask kept for a directory
-//! the map binds.
+//! the map binds. A repo bound to a room the session's node is not in (its join failed) is not said
+//! to work there: status says the node is outside the room, and the person is asked to join it
+//! (RB-5a). Mutant: a bound repo said to work in its room whatever the node holds.
 //! A session started in a mapped directory whose room's host is gone is told the join is under way,
 //! then, on a later turn, why it could not join, though that turn tries again. Mutant: the retry's
 //! "joining" overwrites the failure before the turn reads it.
@@ -2856,25 +2858,26 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     // **What Vox asks the person** (ADR-029 RB-5): `vox agent status`, where a person with no app
     // reads it, under "needs you". Its HOME is scratch: it reads the harnesses' settings there.
     let home_dir = tmp.path().join("home");
-    std::fs::create_dir_all(&home_dir).expect("APPARATUS: cannot make a scratch HOME");
+    std::fs::create_dir_all(home_dir.join(".claude"))
+        .expect("APPARATUS: cannot make a scratch HOME");
+    // Claude Code wired to the agent's node, as `vox setup` wires it: what status reads.
+    std::fs::write(
+        home_dir.join(".claude").join("settings.json"),
+        r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"vox agent hook --node default"}]}]}}"#,
+    )
+    .expect("APPARATUS: cannot wire the scratch Claude Code");
     let status_dir = tmp.path().to_string_lossy().into_owned();
-    let asks = || -> String {
+    let status_in = |dir: &str| -> String {
         let (_, out, err) = hook_env(
             &data,
             &cfg,
-            &[
-                "agent",
-                "status",
-                "--harness",
-                "claude",
-                "--dir",
-                &status_dir,
-            ],
+            &["agent", "status", "--harness", "claude", "--dir", dir],
             "",
             &[("HOME", &home_dir.to_string_lossy())],
         );
         format!("{out}{err}")
     };
+    let asks = || status_in(&status_dir);
     let asked_about = |dir: &Path| -> bool {
         let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         asks().lines().any(|l| {
@@ -3340,6 +3343,26 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         told = turn(stranded, &gone_repo);
     }
     eprintln!("[proof] (6) a turn after the join failed was told: {told:?}");
+    // (6b) Its node is not in the room the map binds the repo to: status must not say the repo
+    // works there, and the person is asked to join it (RB-5a).
+    let gone_dir = std::fs::canonicalize(&gone_repo).unwrap_or(gone_repo.clone());
+    let there = status_in(&gone_dir.to_string_lossy());
+    eprintln!("[proof] (6b) `vox agent status` in gone-repo said:\n{there}");
+    let claims = there.contains(&format!("({}) works in room", gone_dir.display()));
+    let asked = there.lines().any(|l| {
+        l.starts_with("Vox needs you: ")
+            && l.contains(&format!(
+                "Claude Code in {}: its node default isn't in room {ghost_room}",
+                gone_dir.display()
+            ))
+            && l.contains(&format!("vox room join {ghost_link} --node default"))
+    });
+    assert!(
+        !claims && there.contains("and default is not in it") && asked,
+        "PRODUCT: a repo bound to a room its node is not in must not be said to work there; the \
+         node must be said to be outside it, and the person asked to join it; `vox agent status` \
+         said:\n{there}"
+    );
     assert!(
         first_try.contains("joining room")
             && told.contains(&format!("could not join room {ghost_room}")),

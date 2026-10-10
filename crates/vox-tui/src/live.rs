@@ -188,7 +188,7 @@ pub struct DaemonCore {
     /// This node's decision record as last read, and when (ADR-028 D-3).
     decisions: (Option<Instant>, Vec<vox_core::node::decisions::Event>),
     /// What Vox asks the person, and when it was last read (ADR-029 RB-5).
-    room_asks: (Option<Instant>, Vec<vox_core::node::daemonipc::RoomAsk>),
+    room_asks: (Option<Instant>, Vec<crate::viewmodel::RoomAskView>),
     /// What listens on this machine, as the share flow last listed it (ADR-028 S-4).
     listening: Vec<vox_core::node::probe::Listening>,
     /// The service the share flow is about to offer, with what was said of it.
@@ -2158,15 +2158,32 @@ impl DaemonCore {
         self.decisions.1.clone()
     }
 
-    /// What Vox asks the person (ADR-029 RB-5), read as the daemon reads it, from the sessions'
-    /// registrations and the room map, at most once a [`SNAPSHOT_EVERY`].
-    fn room_asks(&mut self) -> Vec<vox_core::node::daemonipc::RoomAsk> {
+    /// What Vox asks the person (ADR-029 RB-5a), as the daemon works it out, at most once a
+    /// [`SNAPSHOT_EVERY`]; what was read last when the daemon does not answer.
+    fn room_asks(&mut self) -> Vec<crate::viewmodel::RoomAskView> {
         if self
             .room_asks
             .0
             .is_none_or(|at| at.elapsed() >= SNAPSHOT_EVERY)
         {
-            self.room_asks = (Some(Instant::now()), crate::room_ask::asks(&self.account));
+            let account = self.account.clone();
+            let read = self
+                .rt
+                .block_on(async move { crate::room_ask::fetch(&account).await });
+            let views = match read {
+                Ok(asks) => asks
+                    .iter()
+                    .map(|a| crate::viewmodel::RoomAskView {
+                        sentence: a.sentence(),
+                        answers: crate::room_ask::answers(a, &self.account.data_root)
+                            .into_iter()
+                            .map(|(what, cmd)| (what.to_owned(), cmd))
+                            .collect(),
+                    })
+                    .collect(),
+                Err(_) => self.room_asks.1.clone(),
+            };
+            self.room_asks = (Some(Instant::now()), views);
         }
         self.room_asks.1.clone()
     }

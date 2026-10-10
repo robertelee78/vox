@@ -718,6 +718,25 @@ final class NodeModel: ObservableObject {
         }
     }
 
+    /// Join the room the room map binds `dir` to already, for every node of a session there that is
+    /// not in it, with the map's own link and passphrase (RB-5a): nothing is typed. Whether it was
+    /// done.
+    func joinBoundRoom(_ dir: String) async -> Bool {
+        begin("bind-room")
+        roomAskSaid = nil
+        do {
+            let none = try Secret(Data()).passphrase()
+            defer { none.wipe() }
+            let answer = try await client.bindRoom(dir: dir, link: "", passphrase: none)
+            roomAskSaid = answer
+            await readRoomAsks()
+            return answer.done
+        } catch {
+            report(error)
+            return false
+        }
+    }
+
     /// Take down what the last answer to an ask said.
     func clearRoomAskSaid() { roomAskSaid = nil }
 

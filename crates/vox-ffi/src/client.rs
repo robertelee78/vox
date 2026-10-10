@@ -535,6 +535,10 @@ pub struct RoomAskInfo {
     pub dir: String,
     /// What it says: "Claude Code in /opt/vox has no room".
     pub sentence: String,
+    /// The room the room map binds it to already, its id in base32, which the sessions' nodes
+    /// are not in (RB-5a); empty when no room is bound to it. Answered by
+    /// [`VoxClient::bind_room`] with an empty link.
+    pub room: String,
     /// The nodes of the sessions waiting, each once, in the order they asked.
     pub nodes: Vec<String>,
     /// How many sessions wait on the answer.
@@ -2334,6 +2338,7 @@ impl VoxClient {
                         sessions: u32::try_from(a.sessions.len()).unwrap_or(u32::MAX),
                         nodes,
                         dir: a.dir,
+                        room: a.room,
                     }
                 })
                 .collect()),
@@ -2347,7 +2352,9 @@ impl VoxClient {
     /// Bind the directory `dir` to the room `link` names (ADR-029 RB-6), the person's answer to
     /// its ask: what `vox room join <link> --node <node> --bind <dir>` does. The room's
     /// `passphrase` is the person's, typed in the app, and never an agent's; empty when it has
-    /// none. Every session waiting there is put in the room.
+    /// none. Every session waiting there is put in the room. With `link` empty, the nodes join
+    /// the room the room map binds `dir` to already, with the map's own link and passphrase
+    /// (RB-5a), and `passphrase` is not used.
     ///
     /// # Errors
     /// The daemon did not answer.

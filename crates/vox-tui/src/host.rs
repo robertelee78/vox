@@ -855,51 +855,106 @@ impl Router {
         })
     }
 
-    /// Bind `dir` to the room `link` names, the person's answer to its ask (ADR-029 RB-6): what
-    /// `vox room join <link> --node <node> --bind <dir>` does, from the app. A node whose session
-    /// asked joins the room, which checks the passphrase, unless it holds the room already; the room
-    /// map then binds `dir`, replacing a no or another room; and every session that asked there is
-    /// put in the room, as `vox agent room` would, each node joining it as the map's block says
-    /// (RB-3).
+    /// The asks of this data root (ADR-029 RB-5a), knowing which rooms each attached node is in,
+    /// or is joining now for the first time.
+    async fn room_asks(&self) -> Vec<vox_core::node::daemonipc::RoomAsk> {
+        let mut held: BTreeMap<NodeName, BTreeSet<String>> = BTreeMap::new();
+        for node in self.inner.account.nodes_on_disk() {
+            if let Some(h) = self.handle_of(&node) {
+                let rooms = h
+                    .view()
+                    .channels
+                    .iter()
+                    .map(|c| vox_core::node::link::b32_encode(&c.channel_id))
+                    .collect();
+                held.insert(node, rooms);
+            }
+        }
+        let joins = lock(&self.inner.joins).clone();
+        let account = self.inner.account.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::room_ask::asks(&account, &|node, room| {
+                // A join running now is waited for, unless one before it failed: a retry that
+                // keeps failing must not hide the ask.
+                held.get(node).is_some_and(|r| !r.contains(room))
+                    && !joins.get(node).is_some_and(|j| {
+                        j.under_way(room)
+                            && !j
+                                .status(room)
+                                .is_some_and(|s| s.starts_with("could not join"))
+                    })
+            })
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// The person's answer to the ask about `dir` (ADR-029 RB-5a, RB-6).
+    ///
+    /// With a `link`: bind `dir` to the room it names, what `vox room join <link> --node <node>
+    /// --bind <dir>` does: each node of a session that asked joins the room, which checks the
+    /// passphrase, unless it is in it already; the room map then binds `dir`, replacing a no or
+    /// another room. With `link` empty: the room map binds `dir` already, to a room the sessions'
+    /// nodes are not in, and they join it with the map's own link and passphrase. Either way every
+    /// session that asked is then put in the room.
     async fn room_bind(&self, dir: &str, link: &str, passphrase: Zeroizing<String>) -> DaemonFrame {
         let no = |why: String| DaemonFrame::RoomAnswer {
             done: false,
             said: vec![why],
         };
-        let parsed = match vox_core::node::link::InviteLink::parse(link) {
-            Ok(p) => p,
-            Err(why) => return no(format!("that is not a room link (vox://…): {why}")),
-        };
-        let account = self.inner.account.clone();
-        let asks = tokio::task::spawn_blocking(move || crate::room_ask::asks(&account))
-            .await
-            .unwrap_or_default();
-        let Some(ask) = asks.into_iter().find(|a| a.dir == dir) else {
+        let Some(ask) = self.room_asks().await.into_iter().find(|a| a.dir == dir) else {
             return no(format!(
                 "no session started in {dir} is waiting for a room now; nothing was changed"
             ));
         };
+        let data_root = self.inner.account.data_root.clone();
+        let (link, passphrase, bind) = if link.is_empty() {
+            let mapped = crate::room_map::read(&data_root).ok().and_then(|entries| {
+                crate::room_map::lookup(&entries, std::path::Path::new(dir))
+                    .filter(|e| e.room != crate::room_map::DECLINED)
+                    .map(|e| (e.room.clone(), e.passphrase.clone()))
+            });
+            let Some((link, passphrase)) = mapped else {
+                return no(format!(
+                    "the room map binds {dir} to no room, so there is no room to join; nothing \
+                     was changed"
+                ));
+            };
+            (link, passphrase, false)
+        } else {
+            (link.to_owned(), passphrase, true)
+        };
+        let parsed = match vox_core::node::link::InviteLink::parse(&link) {
+            Ok(p) => p,
+            Err(why) => return no(format!("that is not a room link (vox://…): {why}")),
+        };
         let room_b32 = vox_core::node::link::b32_encode(&parsed.channel_id);
         let short: String = room_b32.chars().take(12).collect();
-        let Some((node, handle)) = ask
-            .sessions
-            .iter()
-            .find_map(|s| self.handle_of(&s.node).map(|h| (s.node.clone(), h)))
-        else {
-            return no(format!(
-                "no node of the sessions in {dir} is attached, so the passphrase cannot be                  checked; nothing was changed"
-            ));
-        };
+        let mut nodes: Vec<NodeName> = Vec::new();
+        for s in &ask.sessions {
+            if !nodes.contains(&s.node) {
+                nodes.push(s.node.clone());
+            }
+        }
         let mut said = Vec::new();
-        let member = handle
-            .view()
-            .channels
-            .iter()
-            .any(|c| c.channel_id == parsed.channel_id);
-        if !member {
+        for node in &nodes {
+            let Some(handle) = self.handle_of(node) else {
+                return no(format!(
+                    "node {node} is not attached, so it cannot join room {short}; nothing more \
+                     was changed"
+                ));
+            };
+            let member = handle
+                .view()
+                .channels
+                .iter()
+                .any(|c| c.channel_id == parsed.channel_id);
+            if member {
+                continue;
+            }
             match handle
                 .apply(vox_core::node::api::NodeCommand::JoinChannel {
-                    link: link.to_owned(),
+                    link: link.clone(),
                     passphrase: vox_core::node::api::Secret::new(passphrase.as_bytes().to_vec()),
                 })
                 .await
@@ -908,29 +963,32 @@ impl Router {
                     said.push(format!("node {node} joined room {short}"));
                 }
                 other => {
-                    return no(format!(
+                    said.push(format!(
                         "node {node} could not join room {short}, so {dir} was not bound: {other}"
-                    ))
+                    ));
+                    return DaemonFrame::RoomAnswer { done: false, said };
                 }
             }
         }
-        // Said before it is written (ADR-028 E-5): who can read what is saved.
-        let map = crate::room_map::path(&self.inner.account.data_root);
-        said.push(format!(
-            "every agent session started in {dir}, from any harness, is to work in room {short};              every node of this data root can read the room map {}, the passphrase included",
-            map.display()
-        ));
-        match crate::room_map::bind(
-            &self.inner.account.data_root,
-            std::path::Path::new(dir),
-            link,
-            &passphrase,
-        ) {
-            Ok(Some(was)) => said.push(format!(
-                "bound {dir}, replacing what the room map held for it: {was}"
-            )),
-            Ok(None) => said.push(format!("bound {dir}")),
-            Err(e) => return no(format!("{dir} was not bound: {e}")),
+        if bind {
+            // Said before it is written (ADR-028 E-5): who can read what is saved.
+            let map = crate::room_map::path(&data_root);
+            said.push(format!(
+                "every agent session started in {dir}, from any harness, is to work in room \
+                 {short}; every node of this data root can read the room map {}, the passphrase \
+                 included",
+                map.display()
+            ));
+            match crate::room_map::bind(&data_root, std::path::Path::new(dir), &link, &passphrase) {
+                Ok(Some(was)) => said.push(format!(
+                    "bound {dir}, replacing what the room map held for it: {was}"
+                )),
+                Ok(None) => said.push(format!("bound {dir}")),
+                Err(e) => {
+                    said.push(format!("{dir} was not bound: {e}"));
+                    return DaemonFrame::RoomAnswer { done: false, said };
+                }
+            }
         }
         for s in &ask.sessions {
             let label: String = s.session.chars().take(8).collect();
@@ -945,15 +1003,7 @@ impl Router {
                 self.handle_of(&s.node),
                 crate::wake::registration(&paths, &s.session),
             ) {
-                (Some(h), Some(reg)) => {
-                    self.open_session(
-                        &s.node,
-                        &h,
-                        &reg,
-                        Some((link.to_owned(), passphrase.clone())),
-                    )
-                    .await
-                }
+                (Some(h), Some(reg)) => self.open_session(&s.node, &h, &reg, None).await,
                 _ => None,
             };
             said.push(match joining {
@@ -2514,14 +2564,7 @@ impl Dispatch for Router {
                     detached,
                 }
             }
-            DaemonRequest::RoomAsks => {
-                let account = self.inner.account.clone();
-                DaemonFrame::RoomAsks(
-                    tokio::task::spawn_blocking(move || crate::room_ask::asks(&account))
-                        .await
-                        .unwrap_or_default(),
-                )
-            }
+            DaemonRequest::RoomAsks => DaemonFrame::RoomAsks(self.room_asks().await),
             DaemonRequest::RoomBind {
                 dir,
                 link,

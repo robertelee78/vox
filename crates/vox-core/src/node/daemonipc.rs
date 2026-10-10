@@ -249,7 +249,8 @@ pub enum DaemonRequest {
     /// [`DaemonFrame::RoomAsks`].
     RoomAsks,
     /// The person's answer to an ask: bind `dir` to the room `link` names, joined with
-    /// `passphrase` (ADR-029 RB-6). The daemon joins a node whose session asked, which checks the
+    /// `passphrase` (ADR-029 RB-6); or, with `link` empty, join the room the room map binds `dir`
+    /// to already, with the map's own link and passphrase (RB-5a). The daemon joins a node whose session asked, which checks the
     /// passphrase; writes the room map, replacing what it held for `dir`; and puts every session
     /// that asked there in the room. The passphrase is the person's, typed in the client, never
     /// an agent's. Answered [`DaemonFrame::RoomAnswer`].
@@ -467,12 +468,16 @@ pub struct DaemonStatus {
     pub panics: u64,
 }
 
-/// A directory harness sessions started in with no room bound to it (ADR-029 RB-5): what Vox asks
-/// the person, the sessions that wait on the answer.
+/// A directory harness sessions started in that they cannot work in a room from (ADR-029 RB-5a):
+/// no room is bound to it, or one is and their node is not in it. What Vox asks the person, and
+/// the sessions that wait on the answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoomAsk {
     /// The directory, absolute.
     pub dir: String,
+    /// The room the room map binds it to, its id in base32, which the sessions' nodes are not in;
+    /// empty when no room is bound to it.
+    pub room: String,
     /// The sessions started there that work in no room.
     pub sessions: Vec<AskingSession>,
 }
@@ -482,6 +487,12 @@ impl RoomAsk {
     /// "Claude Code in /opt/vox has no room".
     #[must_use]
     pub fn sentence(&self) -> String {
+        let mut nodes: Vec<&str> = Vec::new();
+        for s in &self.sessions {
+            if !nodes.contains(&s.node.as_str()) {
+                nodes.push(s.node.as_str());
+            }
+        }
         let mut who: Vec<&str> = Vec::new();
         for s in &self.sessions {
             let w = harness_words(&s.harness);
@@ -494,7 +505,21 @@ impl RoomAsk {
             [one] => (*one).to_owned(),
             [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
         };
-        format!("{who} in {} has no room", self.dir)
+        if self.room.is_empty() {
+            return format!("{who} in {} has no room", self.dir);
+        }
+        let room: String = self.room.chars().take(12).collect();
+        match nodes.as_slice() {
+            [one] => format!(
+                "{who} in {}: its node {one} isn't in room {room}. Join it?",
+                self.dir
+            ),
+            many => format!(
+                "{who} in {}: their nodes {} aren't in room {room}. Join it?",
+                self.dir,
+                many.join(", ")
+            ),
+        }
     }
 }
 
@@ -1200,7 +1225,10 @@ impl DaemonFrame {
             DaemonFrame::RoomAsks(asks) => {
                 e.array(2).uint(T_ROOM_ASKS).array(asks.len());
                 for a in asks {
-                    e.array(2).text(&a.dir).array(a.sessions.len());
+                    e.array(3)
+                        .text(&a.dir)
+                        .text(&a.room)
+                        .array(a.sessions.len());
                     for s in &a.sessions {
                         e.array(3)
                             .text(s.node.as_str())
@@ -1315,10 +1343,11 @@ impl DaemonFrame {
                 let n = d.array().map_err(malformed("ipc room asks"))?;
                 let mut asks = Vec::with_capacity(n.min(256));
                 for _ in 0..n {
-                    if d.array().map_err(malformed("ipc room ask"))? != 2 {
+                    if d.array().map_err(malformed("ipc room ask"))? != 3 {
                         return Err(Error::MalformedIpc("ipc room ask"));
                     }
                     let dir = text(&mut d, "ipc room ask dir")?;
+                    let room = text(&mut d, "ipc room ask room")?;
                     let m = d.array().map_err(malformed("ipc room ask sessions"))?;
                     let mut sessions = Vec::with_capacity(m.min(256));
                     for _ in 0..m {
@@ -1331,7 +1360,11 @@ impl DaemonFrame {
                             harness: text(&mut d, "ipc room ask harness")?,
                         });
                     }
-                    asks.push(RoomAsk { dir, sessions });
+                    asks.push(RoomAsk {
+                        dir,
+                        room,
+                        sessions,
+                    });
                 }
                 DaemonFrame::RoomAsks(asks)
             }
