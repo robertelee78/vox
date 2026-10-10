@@ -324,7 +324,9 @@ final class NodeModel: ObservableObject {
         await seedUnread()
         do {
             try await client.subscribe(listener: Listener(model: self))
+            readLog.debug("follow: subscribed to the node's events")
         } catch {
+            readLog.debug("follow: subscribing failed: \(sentence(error), privacy: .public)")
             reportBackground(error)
         }
         follow()
@@ -342,8 +344,24 @@ final class NodeModel: ObservableObject {
                 guard let self else { return }
                 await self.readFacts()
                 await self.readWaiting()
+                await self.readNewOnScreen()
             }
         }
+    }
+
+    /// The room on screen read again from its newest message, and anything the node's events did
+    /// not bring added as if it had: a missed or dead event stream hides a message for one turn of
+    /// this loop at most (the walkthrough's WHERE-15, posted while every peer was offline, never
+    /// came as an event to the reopened app).
+    private func readNewOnScreen() async {
+        guard case let .room(id) = selection else { return }
+        let after = messages.last?.id ?? ""
+        guard let rows = try? await client.read(room: id, after: after, limit: 0),
+              case .room(id) = selection else { return }
+        let new = rows.filter { byID[$0.id] == nil && !$0.owed }
+        guard !new.isEmpty else { return }
+        readLog.debug("follow: \(new.count) message(s) in \(id, privacy: .public) found by the read, not by an event")
+        for message in new { arrived(message, in: id) }
     }
 
     /// The keyring, the nodes on this Mac, the peers and the keyring window, assigned only when
@@ -1334,6 +1352,7 @@ private final class Listener: ClientListener, @unchecked Sendable {
     init(model: NodeModel) { self.model = model }
 
     func onMessage(room: String, message: RoomMessage) {
+        readLog.debug("follow: event message \(message.id, privacy: .public) in \(room, privacy: .public)")
         Task { @MainActor [weak model] in model?.arrived(message, in: room) }
     }
 
