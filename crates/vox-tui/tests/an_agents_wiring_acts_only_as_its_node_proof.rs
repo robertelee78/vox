@@ -45,6 +45,13 @@
 //! second node; `vox agent connect claude --node another` says the same and makes no node.
 //! Mutant: the hook's node not looked at (`Wiring::wired_node` ignored); red as PRODUCT.
 //!
+//! And **a node renamed takes everything with it** (#666): `vox node rename my-claude
+//! claude-m5max-work` leaves the node attached under the new name with the same fingerprint, and
+//! no my-claude; Claude Code's settings run its hook as the new name and set VOX_NODE to it; the
+//! hook registers as it and a post as it lands in its room; and on macOS a daemon restart attaches
+//! it again by the new name, its passphrase moved in the Keychain. Mutant: the harnesses' settings
+//! not rewritten; red as PRODUCT.
+//!
 //! And **`vox setup` keeps Codex's app-server running** when it wires Codex (the decider,
 //! 2026-10-06): it says first that it will, and that this runs no model; it asks the `codex` it
 //! found on `PATH` for `app-server daemon start` under the Codex home it wires, waits for the
@@ -114,6 +121,11 @@ impl Dirs {
     }
 
     fn vox(&self, args: &[&str]) -> (bool, String, String) {
+        self.vox_with(args, &[])
+    }
+
+    /// `vox args`, with `extra` set in its environment after the test's own.
+    fn vox_with(&self, args: &[&str], extra: &[(&str, &str)]) -> (bool, String, String) {
         let mut c = Command::new(VOX);
         c.env_clear()
             // A proof's daemon never takes port 1080 (.cargo/config.toml).
@@ -136,6 +148,7 @@ impl Dirs {
             .env("CODEX_HOME", r.join("codex"))
             .env("OPENCODE_CONFIG_DIR", r.join("oc"))
             .env("VOX_TEST_KEYCHAIN", self.keychain())
+            .envs(extra.iter().copied())
             .stdin(Stdio::null())
             .output()
             .unwrap_or_else(|e| panic!("APPARATUS: run vox {args:?}: {e}"));
@@ -671,6 +684,132 @@ fn setup_makes_a_node_for_each_installed_harness() {
          node my-claude and leave it as it is, making no node: {out}{err}\n`vox node list`:\n\
          {listed}"
     );
+
+    // ---- a node renamed: everything this machine holds follows it, and its identity stays
+    // (#666) ----
+    let (_, before, _) = d.vox(&["id", "--node", "my-claude"]);
+    let fp = before.trim().to_owned();
+    // Where there is no Keychain (Linux) my-claude is attached and not remembered, and rename
+    // asks for its passphrase to attach it again: given here as a script gives it.
+    let (ok, out, err) = d.vox_with(
+        &["node", "rename", "my-claude", "claude-m5max-work"],
+        &[("VOX_IDENTITY_PASSPHRASE", "claude passphrase")],
+    );
+    println!("[proof] vox node rename my-claude claude-m5max-work said: {out}{err}");
+    assert!(
+        ok,
+        "PRODUCT: `vox node rename my-claude claude-m5max-work` failed: {out}{err}"
+    );
+    let renamed = d.listed("claude-m5max-work");
+    let (_, after, _) = d.vox(&["id", "--node", "claude-m5max-work"]);
+    assert!(
+        renamed.contains(" attached")
+            && d.listed("my-claude").is_empty()
+            && !fp.is_empty()
+            && after.trim() == fp,
+        "PRODUCT: renamed, the node must be attached as claude-m5max-work with the same \
+         fingerprint ({fp}), and no node my-claude be left: `vox node list` says \
+         {renamed:?}; its fingerprint is now {:?}",
+        after.trim()
+    );
+    let settings = std::fs::read_to_string(d.claude_settings()).unwrap_or_default();
+    assert!(
+        settings.contains("vox agent hook --node claude-m5max-work")
+            && settings
+                .split_whitespace()
+                .collect::<String>()
+                .contains("\"VOX_NODE\":\"claude-m5max-work\"")
+            && !settings.contains("my-claude"),
+        "PRODUCT: renamed, Claude Code's settings must run its hook as claude-m5max-work and \
+         set VOX_NODE to it, naming my-claude nowhere: {settings}"
+    );
+    // The hook the settings now run registers its session as the new name, and a post as it
+    // lands in its room.
+    let pass = d.root.join("room.pass");
+    write(&pass, "\n");
+    let pass = pass.display().to_string();
+    let as_new = [("VOX_NODE", "claude-m5max-work")];
+    let (ok, out, err) = d.vox_with(
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            &pass,
+            "--name",
+            "work",
+        ],
+        &as_new,
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): room create as claude-m5max-work: {out}{err}"
+    );
+    let (_, list, _) = d.vox_with(&["room", "list"], &as_new);
+    let room = list
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let hook = Command::new(VOX)
+        .args(["agent", "hook", "--node", "claude-m5max-work"])
+        .current_dir(&d.root)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", d.root.join("home"))
+        .env("VOX_DATA_DIR", d.root.join("d"))
+        .env("VOX_CONFIG_DIR", d.root.join("c"))
+        .env("VOX_PROXY", "127.0.0.1:0")
+        .env("VOX_TEST_KEYCHAIN", d.keychain())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut c| {
+            c.stdin
+                .take()
+                .expect("APPARATUS: the hook's stdin")
+                .write_all(br#"{"hook_event_name":"UserPromptSubmit","session_id":"s-renamed"}"#)?;
+            c.wait_with_output()
+        })
+        .expect("APPARATUS: run the hook");
+    let hook_said = String::from_utf8_lossy(&hook.stdout).into_owned();
+    let (ok, out, err) = d.vox_with(&["room", "post", &room, "posted as the new name"], &as_new);
+    let (_, read, _) = d.vox_with(&["room", "read", &room], &as_new);
+    println!("[proof] the hook as claude-m5max-work said: {hook_said:?}; the room reads:\n{read}");
+    assert!(
+        hook.status.success()
+            && !hook_said.contains("not attached")
+            && !hook_said.contains("could not read")
+            && ok
+            && read.contains("posted as the new name"),
+        "PRODUCT: renamed, the hook must register as claude-m5max-work and a post as it must land \
+         in its room: the hook said {hook_said:?}; the post said {out}{err}; the room reads:\n\
+         {read}"
+    );
+    // A restart keeps it attached by its new name, with nobody typing, where it is remembered.
+    if cfg!(target_os = "macos") {
+        if let Some(pid) = d.daemon_pid() {
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+            let gone = Instant::now() + Duration::from_secs(30);
+            while d.daemon_pid() == Some(pid) && Instant::now() < gone {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        let (ok, out, err) = d.vox(&["daemon", "--detach"]);
+        assert!(ok, "PRODUCT (staging): vox daemon --detach: {out}{err}");
+        let back = Instant::now() + Duration::from_secs(60);
+        let mut line = d.listed("claude-m5max-work");
+        while !line.contains(" attached") && Instant::now() < back {
+            std::thread::sleep(Duration::from_millis(200));
+            line = d.listed("claude-m5max-work");
+        }
+        assert!(
+            line.contains(" attached"),
+            "PRODUCT: renamed, claude-m5max-work must be attached again by the daemon's own \
+             start, its passphrase in the Keychain under its new name: {line:?}\nlog:\n{}",
+            std::fs::read_to_string(d.root.join("d/.daemon/log")).unwrap_or_default()
+        );
+    }
 }
 
 /// A stand-in `codex`: it records each command it is given in `$CODEX_HOME/asked`, and on

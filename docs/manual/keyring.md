@@ -35,7 +35,12 @@ with none), and the daemon attaches the node again by itself whenever it starts,
 update`, a quit of the app or a reboot too, with nobody typing. Anyone who can unlock this Mac's
 login keychain can then attach the node. `node attach --no-remember` stores nothing, and `node
 forget-passphrase` removes what is stored; the node stays attached until it is detached. `node
-create` attaches and remembers the node it makes at once. Where there is no Keychain Vox can use
+create` attaches and remembers the node it makes at once. `node rename OLD NEW` renames a node on
+this machine in one step: it is detached, its directory, its remembered passphrase and every
+harness wired to it (Claude Code, Codex, OpenCode) and the app's chosen node move to the new name,
+and it is attached again. Its identity stays, so its fingerprint and all that peers see are the
+same; a keyring on this machine that names it by the old name is said, with the `vox trust rename`
+for it. Where there is no Keychain Vox can use
 (Linux), `node attach` says the node is not remembered, and `--keep --passphrase-file PATH` keeps
 it instead. `node list` shows each node as `attached` or `detached`, with its fingerprint once
 it has been attached (a detached node's from a file kept beside its identity, shown only while it

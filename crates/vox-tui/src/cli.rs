@@ -1572,6 +1572,17 @@ pub enum NodeCmd {
         #[command(flatten)]
         account: AccountArgs,
     },
+    /// Rename a node on this machine: detached if attached, its directory, its remembered
+    /// passphrase and every harness wired to it moved to the new name, and attached again. Its
+    /// identity stays: the fingerprint, and all that peers see, are the same.
+    Rename {
+        /// The node's name now.
+        old: String,
+        /// Its new name: letters a-z, digits, '.', '_' and '-'.
+        new: String,
+        #[command(flatten)]
+        account: AccountArgs,
+    },
     /// Forget a node's remembered passphrase: it is removed from the Keychain, and the daemon no
     /// longer attaches the node by itself when it starts. An attached node stays attached.
     ForgetPassphrase {
@@ -1630,6 +1641,9 @@ fn run_node_cmd(cmd: NodeCmd) -> ExitCode {
                 passphrase_file,
             )
             .await
+        }),
+        NodeCmd::Rename { old, new, account } => block_on_client(async move {
+            crate::client::node_rename(&account.as_node_args(), &old, &new).await
         }),
         NodeCmd::ForgetPassphrase { name, account } => block_on_client(async move {
             crate::client::node_forget_passphrase(&account.as_node_args(), &name).await

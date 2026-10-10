@@ -2182,7 +2182,7 @@ fn info_of(name: &NodeName, slot: Option<&Slot>) -> NodeInfo {
 
 /// The identity passphrase (the first line) and the room passphrases (the rest) of a passphrase
 /// file's text, as a piped `vox daemon` reads them. Only line endings are stripped.
-fn split_passphrases(text: &str) -> (Option<Zeroizing<String>>, Vec<Zeroizing<String>>) {
+pub(crate) fn split_passphrases(text: &str) -> (Option<Zeroizing<String>>, Vec<Zeroizing<String>>) {
     let mut lines = text
         .lines()
         .map(|l| Zeroizing::new(l.trim_end_matches('\r').to_owned()));
@@ -2192,7 +2192,7 @@ fn split_passphrases(text: &str) -> (Option<Zeroizing<String>>, Vec<Zeroizing<St
 
 /// `.daemon/attach`: one line per kept node, `<name>\t(none|file:<path>|keychain:<account>)`. A
 /// line that does not parse is skipped.
-fn read_attach_file(path: &std::path::Path) -> Vec<(NodeName, KeepSource)> {
+pub(crate) fn read_attach_file(path: &std::path::Path) -> Vec<(NodeName, KeepSource)> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };

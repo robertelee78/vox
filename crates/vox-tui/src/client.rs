@@ -866,6 +866,192 @@ async fn attach_request(
     }
 }
 
+/// `vox node rename <old> <new>` (#666): the node keeps its identity, so its fingerprint and all
+/// that peers see stay as they were; only its name on this machine changes, everywhere this
+/// machine holds it, in one step: detached if attached, its directory moved, its keep (the
+/// `.daemon/attach` line and the Keychain item) moved with it, every harness wired to it wired to
+/// the new name, the app's chosen node too, and attached again as it was. A keyring on this
+/// machine that names it by the old name is said, with the `vox trust rename` for it: a keyring
+/// change takes that node's passphrase, typed by its owner.
+///
+/// Whatever re-attaching needs is had before anything changes: a passphrase from where it was
+/// kept, else typed here.
+///
+/// # Errors
+/// A bad name, no node `old`, a node `new` already, a passphrase that cannot be had, or a step
+/// that fails, said with what was done by then.
+pub async fn node_rename(args: &NodeArgs, old: &str, new: &str) -> Result<(), AppError> {
+    let old = NodeName::parse(old)?;
+    let new = NodeName::parse(new)?;
+    let account = args.account()?;
+    let on_disk = account.nodes_on_disk();
+    if !on_disk.contains(&old) {
+        return Err(AppError::Usage(format!(
+            "there is no node {old}; `vox node list` lists them"
+        )));
+    }
+    if account.node_dir(&new).exists() {
+        return Err(AppError::Usage(format!(
+            "there is a node {new} already; give another name"
+        )));
+    }
+    let fingerprint = account
+        .node_paths(&old)
+        .ok()
+        .and_then(|p| p.shown_fingerprint());
+    let was_attached = attached(&account, &old).await;
+    let kept = crate::host::read_attach_file(&account.attach_file())
+        .into_iter()
+        .find(|(n, _)| *n == old)
+        .map(|(_, k)| k);
+    // ---- what attaching it again needs, had before anything changes ----
+    let again: Option<(Zeroizing<String>, Option<KeepSource>)> = match (&kept, was_attached) {
+        (Some(KeepSource::Keychain(at)), _) => {
+            let at = at.clone();
+            let read = tokio::task::spawn_blocking(move || crate::keychain::read(&at))
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
+            let passphrase = match read {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: node {old}'s passphrase in the Keychain: {e}; type it here");
+                    tokio::task::spawn_blocking(|| attach_passphrase(None, None))
+                        .await
+                        .map_err(|e| AppError::Usage(format!("asking for a passphrase: {e}")))??
+                }
+            };
+            Some((passphrase, Some(KeepSource::Keychain(String::new()))))
+        }
+        (Some(KeepSource::None), _) => {
+            Some((Zeroizing::new(String::new()), Some(KeepSource::None)))
+        }
+        (Some(KeepSource::File(f)), _) => {
+            let text = crate::tunnel_cli::passphrase_file_text(f)?;
+            let first = crate::host::split_passphrases(&text).0.unwrap_or_default();
+            Some((first, Some(KeepSource::File(f.clone()))))
+        }
+        (None, true) => {
+            println!("vox: node {old} is attached and not remembered; its passphrase attaches it again as {new}");
+            let typed = !given_not_typed(None);
+            let passphrase = tokio::task::spawn_blocking(|| attach_passphrase(None, None))
+                .await
+                .map_err(|e| AppError::Usage(format!("asking for a passphrase: {e}")))??;
+            let keep = remembered(&new, &passphrase, typed);
+            Some((passphrase, keep))
+        }
+        (None, false) => None,
+    };
+    // ---- let go of it: detached, and its keep gone with its Keychain item ----
+    if was_attached {
+        let mut d = daemon(&account).await?;
+        match d.request(DaemonRequest::Detach { node: old.clone() }).await {
+            Ok(DaemonFrame::Ok) => {}
+            Ok(DaemonFrame::Refused(r)) => return Err(AppError::Usage(r.to_string())),
+            Ok(other) => return Err(crate::client::unexpected_daemon(&other)),
+            Err(e) => return Err(AppError::Usage(format!("the daemon did not answer: {e}"))),
+        }
+    }
+    if kept.is_some() {
+        if let Ok(mut d) = DaemonClient::open(&account.socket()).await {
+            let _ = d.request(DaemonRequest::Unkeep { node: old.clone() }).await;
+        } else {
+            forget_kept(&account, &old)?;
+        }
+    }
+    // ---- its name on disk ----
+    std::fs::rename(account.node_dir(&old), account.node_dir(&new)).map_err(|e| {
+        AppError::Usage(format!(
+            "node {old} is detached, but its directory could not be renamed to {new}: {e}; \
+             nothing else was changed, and `vox node attach {old}` attaches it again"
+        ))
+    })?;
+    println!("vox: node {old} is now node {new}; its fingerprint is the same");
+    // ---- every harness wired to it, and the app's choice ----
+    for h in &crate::setup::HARNESSES {
+        let Ok(wiring) = crate::setup::Wiring::of(h.key) else {
+            continue;
+        };
+        if wiring.wired_node().as_deref() == Some(old.as_str()) {
+            for line in wiring.install(&new)? {
+                println!("  {line}");
+            }
+            println!(
+                "vox: {} is connected to node {new} now; a session running now goes on as {old} \
+                 until it is started again",
+                h.name
+            );
+        }
+    }
+    let chosen = account.config_dir.join("app").join("node");
+    if std::fs::read_to_string(&chosen).is_ok_and(|s| s.trim() == old.as_str()) {
+        vox_core::node::paths::write_private_file_unique(&chosen, format!("{new}\n").as_bytes())
+            .map_err(|e| {
+                AppError::Usage(format!("the app's chosen node {}: {e}", chosen.display()))
+            })?;
+        println!("vox: Vox.app opens node {new} now");
+    }
+    // ---- attached again, kept as it was ----
+    if let Some((passphrase, keep)) = again {
+        ensure_daemon(&account, args.listen, &args.anchor_specs()).await?;
+        let mut d = daemon(&account).await?;
+        attach_request(&mut d, &new, passphrase, keep, args.anchor_specs()).await?;
+    }
+    // ---- keyrings on this machine that name it by its old name ----
+    if let Some(fp) = fingerprint {
+        let b32 = vox_core::node::link::b32_encode(&fp);
+        for other in account.nodes_on_disk().into_iter().filter(|n| *n != new) {
+            let Ok(paths) = account.node_paths(&other) else {
+                continue;
+            };
+            if !attached(&account, &other).await {
+                println!(
+                    "vox: node {other} is not attached, so its keyring is not read here; if it \
+                     names {old}: vox trust rename {b32} {new} --node {other}"
+                );
+                continue;
+            }
+            let Ok(mut c) = crate::room_cli::attach(&paths).await else {
+                continue;
+            };
+            if let Ok(Frame::Trusted { entries }) = c.trusted("").await {
+                if entries
+                    .iter()
+                    .any(|(id, name, _)| *id == fp && name.as_str() == old.as_str())
+                {
+                    println!(
+                        "vox: node {other}'s keyring names it {old}; to name it {new} there (it \
+                         asks for {other}'s passphrase): vox trust rename {b32} {new} --node {other}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remove `node`'s line from `.daemon/attach`, and the Keychain item it names, with no daemon
+/// running to do it.
+fn forget_kept(account: &Account, node: &NodeName) -> Result<(), AppError> {
+    let path = account.attach_file();
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut left = String::new();
+    for line in text.lines() {
+        match line.split_once('\t') {
+            Some((name, source)) if name == node.as_str() => {
+                if let Some(at) = source.strip_prefix("keychain:") {
+                    crate::keychain::forget(at);
+                }
+            }
+            _ => {
+                left.push_str(line);
+                left.push('\n');
+            }
+        }
+    }
+    vox_core::node::paths::write_private_file_unique(&path, left.as_bytes())
+        .map_err(|e| AppError::Usage(format!("{}: {e}", path.display())))
+}
+
 /// `vox node forget-passphrase <name>`: the daemon stops keeping the node (ADR-014 M-6's unkeep):
 /// the passphrase stored for it in the Keychain is removed, and the daemon no longer attaches it by
 /// itself when it starts. Attached now, it stays attached.
