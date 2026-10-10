@@ -910,7 +910,7 @@ impl Router {
         let data_root = self.inner.account.data_root.clone();
         let (link, passphrase, bind) = if link.is_empty() {
             let mapped = crate::room_map::read(&data_root).ok().and_then(|entries| {
-                crate::room_map::lookup(&entries, std::path::Path::new(dir))
+                crate::room_map::resolve(&entries, std::path::Path::new(dir))
                     .filter(|e| e.room != crate::room_map::DECLINED)
                     .map(|e| (e.room.clone(), e.passphrase.clone()))
             });

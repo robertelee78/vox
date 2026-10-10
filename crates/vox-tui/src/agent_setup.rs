@@ -107,7 +107,7 @@ async fn first_missing(args: &NodeArgs, key: &str, dir: &Path) -> Result<String,
         ));
     }
     let entries = crate::room_map::read(&account.data_root)?;
-    if let Some(e) = crate::room_map::lookup(&entries, dir) {
+    if let Some(e) = crate::room_map::resolve(&entries, dir) {
         return Ok(if e.room == crate::room_map::DECLINED {
             format!(
                 "Vox: {} is node {node}, attached; the operator said no to a room for this repo \

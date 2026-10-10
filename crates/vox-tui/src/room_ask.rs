@@ -48,7 +48,7 @@ pub fn asks(account: &Account, outside: &dyn Fn(&NodeName, &str) -> bool) -> Vec
                 continue;
             };
             let start = std::path::Path::new(start);
-            let room = match crate::room_map::lookup(&entries, start) {
+            let room = match crate::room_map::resolve(&entries, start) {
                 // No room bound: asked while the session works in none.
                 None if reg.room.is_none() => String::new(),
                 None => continue,
@@ -104,7 +104,7 @@ pub fn answers(ask: &RoomAsk, data_root: &std::path::Path) -> Vec<(&'static str,
         let link = crate::room_map::read(data_root)
             .ok()
             .and_then(|entries| {
-                crate::room_map::lookup(&entries, std::path::Path::new(&ask.dir))
+                crate::room_map::resolve(&entries, std::path::Path::new(&ask.dir))
                     .map(|e| e.room.clone())
             })
             .unwrap_or_else(|| "<link>".to_owned());

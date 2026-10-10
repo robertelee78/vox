@@ -93,6 +93,10 @@
 //! the map binds. A repo bound to a room the session's node is not in (its join failed) is not said
 //! to work there: status says the node is outside the room, and the person is asked to join it
 //! (RB-5a). Mutant: a bound repo said to work in its room whatever the node holds.
+//! **A subfolder or a git worktree of a mapped repository works in its room** (ADR-029 RB-2 as
+//! amended, v0.4.3): sessions started in `repo/sub` and in a worktree of `repo` open their Sessions
+//! in the repository's room and are asked nothing; a block of the subfolder's own (`none`) still
+//! wins. Mutant: exact match only.
 //! A session started in a mapped directory whose room's host is gone is told the join is under way,
 //! then, on a later turn, why it could not join, though that turn tries again. Mutant: the retry's
 //! "joining" overwrites the failure before the turn reads it.
@@ -2806,9 +2810,15 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     // another repository to her second.
     let repo = tmp.path().join("repo");
     let other_repo = tmp.path().join("other-repo");
-    for d in [repo.join("sub"), other_repo.clone()] {
+    for d in [
+        repo.join("sub"),
+        other_repo.clone(),
+        tmp.path().join("loose"),
+    ] {
         std::fs::create_dir_all(&d).expect("APPARATUS: cannot make a repository directory");
     }
+    let loose = std::fs::canonicalize(tmp.path().join("loose"))
+        .expect("APPARATUS: cannot resolve the unmapped directory");
     let map = data.join("rooms");
     std::fs::write(
         &map,
@@ -2971,19 +2981,17 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     };
     eprintln!("[proof] (1) its Session, read once open:\n{read_before}");
 
-    // (2) A session started in a subfolder of the mapped directory: no room.
+    // (2) A session started in a directory the map does not name, at or above it: no room.
     let below = "22222222-aaaa-4bbb-8ccc-000000000002";
-    let told = turn(below, &repo.join("sub"));
-    eprintln!("[proof] (2) a session started in repo/sub was told: {told:?}");
-    let sub = repo.join("sub");
-    let sub = std::fs::canonicalize(&sub).unwrap_or(sub);
+    let told = turn(below, &loose);
+    eprintln!("[proof] (2) a session started in loose was told: {told:?}");
     assert!(
         told.contains("isn't tied to a Vox room")
             && told.contains("Vox has asked the operator which room it works in")
             && told.contains("do not ask again on later turns")
             && told.contains(&format!(
                 "vox room join <link> --node default --bind {}",
-                sub.display()
+                loose.display()
             ))
             && told.contains("vox agent room --none --node default"),
         "PRODUCT: a session started in a directory the room map does not name must be told that \
@@ -2992,17 +3000,116 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     );
     assert!(
         !sessions(&home).iter().any(|r| r["id"] == below),
-        "PRODUCT: a session started below a mapped directory must open no Session in its room: \
+        "PRODUCT: a session started in an unmapped directory must open no Session in any room: \
          {:?}",
         sessions(&home)
     );
     // Vox asks the person too, not only the agent.
     assert!(
-        asked_about(&sub),
+        asked_about(&loose),
         "PRODUCT: a session registered from a directory with no room must raise an ask the person \
          reads under needs you, naming the harness and the directory; `vox agent status` said:\n{}",
         asks()
     );
+
+    // (2b) A subfolder of the mapped repository, and a git worktree of it, work in its room, asked
+    // nothing (RB-2, the deepest block above them); a block of the subfolder's own still wins.
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args([
+                "-c",
+                "user.name=proof",
+                "-c",
+                "user.email=proof@example.invalid",
+            ])
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .expect("APPARATUS: cannot run git");
+        assert!(
+            out.status.success(),
+            "APPARATUS: git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let repo_s = repo.to_string_lossy().into_owned();
+    let worktree = tmp.path().join("repo-worktree");
+    git(&["init", "-q", &repo_s]);
+    git(&[
+        "-C",
+        &repo_s,
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "first",
+    ]);
+    git(&[
+        "-C",
+        &repo_s,
+        "worktree",
+        "add",
+        "-q",
+        &worktree.to_string_lossy(),
+        "-b",
+        "wt",
+    ]);
+    let below_repo = [
+        (
+            "a subfolder",
+            repo.join("sub"),
+            "2b2b2b2b-aaaa-4bbb-8ccc-000000000021",
+        ),
+        (
+            "a git worktree",
+            worktree.clone(),
+            "2b2b2b2b-aaaa-4bbb-8ccc-000000000022",
+        ),
+    ];
+    for (what, dir, id) in &below_repo {
+        let first = turn(id, dir);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !open_in(&home, id) {
+            assert!(
+                Instant::now() < deadline,
+                "PRODUCT: a session started in {what} of a mapped repository ({}) must work in the \
+                 repository's room {home}: its Sessions {:?}; its first turn was told {first:?}",
+                dir.display(),
+                sessions(&home)
+            );
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        assert!(
+            !first.contains("isn't tied to a Vox room") && !asked_about(dir),
+            "PRODUCT: a session started in {what} of a mapped repository must not be asked about \
+             its room: it was told {first:?}; `vox agent status` said:\n{}",
+            asks()
+        );
+        eprintln!("[proof] (2b) {what} of repo works in {home}, asked nothing");
+    }
+    let own_no = repo.join("own-no");
+    std::fs::create_dir_all(&own_no).expect("APPARATUS: cannot make a repository directory");
+    let mut text = std::fs::read_to_string(&map).expect("APPARATUS: cannot read the room map");
+    text.push_str(&format!(
+        "\nrepo {}\n    room       none\n",
+        own_no.display()
+    ));
+    std::fs::write(&map, text).expect("APPARATUS: cannot write the room map");
+    let declined_id = "2b2b2b2b-aaaa-4bbb-8ccc-000000000023";
+    let told = turn(declined_id, &own_no);
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        !open_in(&home, declined_id)
+            && !told.contains("isn't tied to a Vox room")
+            && !asked_about(&own_no),
+        "PRODUCT: a subfolder whose own block says none must work in no room and be asked \
+         nothing, whatever the repository above it is bound to: its Session in {home} {:?}; it \
+         was told {told:?}; `vox agent status` said:\n{}",
+        sessions(&home),
+        asks()
+    );
+    eprintln!("[proof] (2b) a subfolder with its own `none` works in no room, asked nothing");
 
     // (3) The first session, later working in another mapped repository, stays where it was.
     let later = turn(mapped, &other_repo);
@@ -3037,9 +3144,9 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         "PRODUCT: run with no terminal, `vox agent room` must say how the operator can also save \
          the start directory in the room map: {set}"
     );
-    let next = turn(below, &repo.join("sub"));
+    let next = turn(below, &loose);
     assert!(
-        !asked_about(&sub),
+        !asked_about(&loose),
         "PRODUCT: once the only session in a directory works in a room, the person must no longer \
          be asked about it; `vox agent status` said:\n{}",
         asks()
@@ -3051,7 +3158,7 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         sessions(&home)
     );
 
-    // (4b) The operator, at a terminal, saves repo/sub → that room in the room map.
+    // (4b) The operator, at a terminal, saves loose → that room in the room map.
     let saved = in_terminal(
         &data,
         &cfg,
@@ -3077,12 +3184,12 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     );
     // The next session started there works in that room by itself.
     let fresh = "33333333-aaaa-4bbb-8ccc-000000000003";
-    let first_fresh = turn(fresh, &repo.join("sub"));
+    let first_fresh = turn(fresh, &loose);
     let deadline = Instant::now() + Duration::from_secs(30);
     while !open_in(&home, fresh) {
         assert!(
             Instant::now() < deadline,
-            "PRODUCT: after the room map saved repo/sub, a session started there must work in \
+            "PRODUCT: after the room map saved loose, a session started there must work in \
              room {home} by itself: its Sessions {:?}; its first turn was told {first_fresh:?}",
             sessions(&home)
         );

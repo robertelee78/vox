@@ -156,7 +156,7 @@ async fn offer_save(
     };
     let start = std::path::PathBuf::from(start);
     let entries = crate::room_map::read(&account.data_root)?;
-    if crate::room_map::lookup(&entries, &start).is_some() {
+    if crate::room_map::resolve(&entries, &start).is_some() {
         return Ok(());
     }
     let room: String = vox_core::node::link::b32_encode(&channel_id)

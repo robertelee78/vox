@@ -152,8 +152,13 @@ relies on is ADR-028 K-14.
   that directory (RB-7), and holds no passphrase. Every node of the data root can read every passphrase in the map, so any of them can
   join any mapped room; whatever writes the map (setup, `vox agent room`) MUST say so (ADR-028 E-5).
 - **RB-2.** When a harness session starts, its node's hook MUST look up the session's start
-  directory in the room map. The match MUST be exact: `/opt/vox` matches a session started in
-  `/opt/vox` and nothing else.
+  directory in the room map, and the session MUST work by the deepest block whose `repo` is that
+  directory or one above it: a session started in `/opt/vox/crates` works by `/opt/vox`'s block
+  unless `/opt/vox/crates` has its own. A start directory inside a linked git worktree MUST first
+  be looked up within the worktree (a block for the worktree, or for a folder in it, wins), then as
+  the same place in the worktree's main repository, found from the worktree's `.git` file and its
+  `commondir`. A `none` block found this way MUST mean none (RB-7). Writing the map (`--bind`, a
+  no) names exactly the directory given.
 - **RB-3.** On a match, the node MUST join the room if it is not a member (ADR-005 J-1 with the
   map's link and passphrase), and the session MUST work in that room.
 - **RB-4.** A session's room MUST NOT change during the session's life because of where it works
@@ -196,6 +201,9 @@ relies on is ADR-028 K-14.
 (The decider, 2026-10-08: "if I start a session in claude/codex/opencode etc. in a repo, and we
 don't have the configuration set up yet where the repo is tied to a room, ask if there's a room
 url/link for it to bind to"; the passphrase is typed by the operator in another shell.)
+(RB-2's deepest-block and worktree matching: the lead's ruling, 2026-10-10, under the decider's
+delegation, v0.4.3 #671; it replaced the exact match, which asked again in every subfolder and
+worktree of a bound repo.)
 (The decider, 2026-10-10, v0.4.3 #671: an agent that did not relay the ask left the operator never
 knowing, so Vox asks the operator itself, and the operator may still answer in the session: "let
 me specify one if not".)
