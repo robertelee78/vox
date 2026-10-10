@@ -47,7 +47,8 @@ pub const REJECTED_IN_VOX: &str = "rejected in Vox by";
 pub type Poster = Arc<dyn Fn(&NodeName, &str, Vec<String>) + Send + Sync>;
 
 /// Where a session's new name goes (ADR-029 MD-1): its registration, and its Session's record.
-pub type Renamer = Arc<dyn Fn(&NodeName, &str, &str) + Send + Sync>;
+/// `(node, session, name, named)`: `named` when the name is the one the session's person set.
+pub type Renamer = Arc<dyn Fn(&NodeName, &str, &str, bool) + Send + Sync>;
 
 /// The sink. One per daemon.
 pub struct Sink {
@@ -126,10 +127,12 @@ impl Sink {
 
     /// The harness renamed `session` (Codex's thread name, OpenCode's session title): its
     /// Session takes the name now, without waiting for its next message (ADR-029 MD-1).
-    pub fn renamed(&self, node: &NodeName, session: &str, name: &str) {
+    /// `named` when the name is the one its person set (a Codex thread name), not one the
+    /// harness made up (OpenCode's own title).
+    pub fn renamed(&self, node: &NodeName, session: &str, name: &str, named: bool) {
         let name = name.trim();
         if !name.is_empty() {
-            (self.rename)(node, session, name);
+            (self.rename)(node, session, name, named);
         }
     }
 

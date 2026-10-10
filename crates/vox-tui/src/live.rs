@@ -1947,6 +1947,7 @@ impl DaemonCore {
                                     &x.harness,
                                     x.folder.as_deref(),
                                     x.name.as_deref(),
+                                    x.named,
                                     &x.id,
                                 ),
                                 node_alias,

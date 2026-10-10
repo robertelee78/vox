@@ -975,49 +975,66 @@ fn a_driver_reaches_exactly_the_session_it_names_or_is_told_why() {
         read.lines().rev().take(6).collect::<Vec<_>>().join(" | ")
     );
     // Claude Code writes the new name into the session's transcript and runs no hook: the stand-in
-    // does the same, appending the line Claude Code 2.1.29x writes.
-    {
+    // does the same, appending the line Claude Code 2.1.29x writes. Claude Code's own title first
+    // (what an earlier "cc rename frogs" made it, as the decider's session had): it names the
+    // Session, and titles nothing (v0.4.3: the title is "Claude Code · <folder>" until the person
+    // names it). Then the name the person set: it wins, exactly, and is the title.
+    let write = |line: serde_json::Value| {
         use std::io::Write as _;
         let t = w.root.join("work").join(format!("{S1}.jsonl"));
         let mut f = std::fs::OpenOptions::new()
             .append(true)
             .open(&t)
             .unwrap_or_else(|e| panic!("APPARATUS: cannot open {S1}'s transcript: {e}"));
-        // Claude Code's own title first (what an earlier "cc rename frogs" made it, as the
-        // decider's session had), then the name the person set: the person's must win, exactly.
-        for line in [
-            serde_json::json!({ "type": "ai-title", "aiTitle": "Frogs rename", "sessionId": S1 }),
-            serde_json::json!({ "type": "custom-title", "customTitle": "frogs", "sessionId": S1 }),
-        ] {
-            writeln!(f, "{line}")
-                .unwrap_or_else(|e| panic!("APPARATUS: cannot write {S1}'s transcript: {e}"));
-        }
-    }
-    let t0 = Instant::now();
-    let mut named = String::new();
-    let renamed = loop {
-        let (_, out, _) = w.vox(PERSON, &["room", "sessions", &room, "--json"], None);
-        named = out
-            .lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .find(|v| v["session"].as_str() == Some(S1) || v["id"].as_str() == Some(S1))
-            .map(|v| v["name"].to_string())
-            .unwrap_or(named);
-        if named == "\"frogs\"" {
-            break true;
-        }
-        if t0.elapsed() > Duration::from_secs(15) {
-            break false;
-        }
-        std::thread::sleep(Duration::from_millis(300));
+        writeln!(f, "{line}")
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot write {S1}'s transcript: {e}"));
     };
+    // `(name, title)` of S1 as `vox room sessions --json` says them, once `name` is `want` or 15 s
+    // have passed.
+    let named_as = |want: &str| {
+        let t0 = Instant::now();
+        let mut last = (String::new(), String::new());
+        loop {
+            let (_, out, _) = w.vox(PERSON, &["room", "sessions", &room, "--json"], None);
+            if let Some(v) = out
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .find(|v| v["session"].as_str() == Some(S1) || v["id"].as_str() == Some(S1))
+            {
+                last = (v["name"].to_string(), v["title"].as_str().unwrap_or_default().to_owned());
+            }
+            if last.0 == format!("{want:?}") || t0.elapsed() > Duration::from_secs(15) {
+                return last;
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    };
+    write(serde_json::json!({ "type": "ai-title", "aiTitle": "Frogs rename", "sessionId": S1 }));
+    let (own, own_title) = named_as("Frogs rename");
     assert!(
-        renamed,
+        own == "\"Frogs rename\"",
+        "APPARATUS: arm 1b: Claude Code's own title \"Frogs rename\" in {S1}'s transcript never \
+         named its Session in 15 s, so whether it titles it cannot be read; its name is {own}"
+    );
+    assert!(
+        own_title.starts_with("Claude Code \u{b7} ") && !own_title.contains("Frogs"),
+        "PRODUCT: arm 1b: a name Claude Code made up itself must not title the Session (v0.4.3): \
+         the title must be \"Claude Code · <folder>\"; `vox room sessions --json` says {own_title:?}"
+    );
+    write(serde_json::json!({ "type": "custom-title", "customTitle": "frogs", "sessionId": S1 }));
+    let (named, title) = named_as("frogs");
+    assert!(
+        named == "\"frogs\"",
         "PRODUCT: arm 1b: renamed \"frogs\" by its person in its transcript, after Claude Code's own \
          title \"Frogs rename\" and with no hook run, {S1}'s Session must be called exactly \
          \"frogs\" within 15 s; `vox room sessions --json` says its name is {named}"
     );
-    println!("[proof] 1b. \"/rename frogs\" arrived whole and is said whole; the transcript's rename named the Session \"frogs\" with no hook run");
+    assert!(
+        title == "frogs",
+        "PRODUCT: arm 1b: the name its person set must be the Session's title, exactly as set \
+         (v0.4.3); `vox room sessions --json` says its title is {title:?}"
+    );
+    println!("[proof] 1b. \"/rename frogs\" arrived whole and is said whole; the transcript's rename named the Session \"frogs\" with no hook run, its title \"frogs\"; Claude Code's own title titled nothing");
 
     // ---- 2. a sub-agent's hook keeps its session's binding ----
     a.hook(&event(

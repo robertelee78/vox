@@ -57,16 +57,26 @@ pub fn harness_name(harness: &str) -> &str {
     }
 }
 
-/// How a person READS a Session's name, everywhere it is shown (#406, the decider v0.4.3): its
-/// harness and the folder it works in, `Claude Code · vox`; its name in place of the folder when
-/// it gave no folder; its short id only when it gave neither. What a person TYPES to address a
-/// Session stays [`session_label`], as does `--json`.
+/// How a person READS a Session's name, everywhere it is shown (#406, the decider v0.4.3): the
+/// name its person set (`named`), exactly as set, case and all; else its harness and the folder
+/// it works in, `Claude Code · vox`; else its harness and short id, `Claude Code · 3f0c25bf`. A
+/// name the harness made up itself (Claude Code's own title) is not a title: it is in Details
+/// ([`session_label`]). What a person TYPES to address a Session stays [`session_label`], as does
+/// `--json`.
 #[must_use]
-pub fn session_title(harness: &str, folder: Option<&str>, name: Option<&str>, id: &str) -> String {
+pub fn session_title(
+    harness: &str,
+    folder: Option<&str>,
+    name: Option<&str>,
+    named: bool,
+    id: &str,
+) -> String {
+    if let Some(name) = name.filter(|n| named && !n.trim().is_empty()) {
+        return name.to_owned();
+    }
     let what = folder
         .map(str::trim)
         .filter(|f| !f.is_empty())
-        .or_else(|| name.map(str::trim).filter(|n| !n.is_empty()))
         .map_or_else(|| id.chars().take(8).collect::<String>(), str::to_owned);
     format!("{} \u{b7} {what}", harness_name(harness))
 }
@@ -84,6 +94,7 @@ pub fn session_line(envelope: &Envelope) -> Option<String> {
         said["harness"].as_str().unwrap_or_default(),
         said["folder"].as_str(),
         envelope.at.session_name.as_deref(),
+        envelope.at.session_named,
         &envelope.from,
     );
     Some(if envelope.kind == SESSION {
@@ -253,6 +264,11 @@ pub struct Context {
     /// claim, filled by Vox, never by the model. Absent when the harness gives none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_name: Option<String>,
+    /// Whether `session_name` is the name the session's person set (a Claude Code `/rename`, a
+    /// Codex thread name), not one its harness made up (Claude Code's own title): only such a
+    /// name titles the Session (v0.4.3). Absent, from a peer before v0.4.3, it is not.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_named: bool,
 }
 
 /// One agent-comms message, carried as JSON in a log entry's text.

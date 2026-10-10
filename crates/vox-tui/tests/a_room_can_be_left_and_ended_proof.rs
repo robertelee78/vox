@@ -820,7 +820,8 @@ fn the_tui_leaves_and_ends() {
     // `vox room end`, then with `:end` in his TUI. Both say what failed and what to do, in the
     // words vox-core writes for the fault; the TUI words nothing of its own.
     let cli = room.workers[1].vox(None, &["room", "end", &id]);
-    let cause = "only the room's creator, or an admin it named, can do that, and this node is neither";
+    let cause =
+        "only the room's creator, or an admin it named, can do that, and this node is neither";
     let next = "ask the creator to do it, or to make you an admin";
     assert!(
         !cli.ok && cli.stderr.contains(cause) && cli.stderr.contains(next),

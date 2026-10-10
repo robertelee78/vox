@@ -267,11 +267,13 @@ impl Router {
                             Router { inner }.post_session(node, session, bodies);
                         }
                     }),
-                    Arc::new(move |node: &NodeName, session: &str, name: &str| {
-                        if let Some(inner) = weak_rename.upgrade() {
-                            Router { inner }.rename_session(node, session, name);
-                        }
-                    }),
+                    Arc::new(
+                        move |node: &NodeName, session: &str, name: &str, named: bool| {
+                            if let Some(inner) = weak_rename.upgrade() {
+                                Router { inner }.rename_session(node, session, name, named);
+                            }
+                        },
+                    ),
                 );
                 let codex = crate::codex_mirror::CodexMirror::new(Arc::clone(&sink));
                 let opencode = crate::opencode_mirror::OpenCodeMirror::new(Arc::clone(&sink));
@@ -716,6 +718,7 @@ impl Router {
             id: reg.session.clone(),
             harness: reg.harness.clone(),
             name: reg.name.clone(),
+            named: reg.named,
             // Only the folder's own name ("vox"), never the path above it.
             folder: reg
                 .start
@@ -1272,11 +1275,11 @@ impl Router {
     /// `session` of `node` is called `name` now, as its harness says (ADR-029 MD-1): its
     /// registration keeps the name, and its open Session is renamed at once, not at its next
     /// message.
-    fn rename_session(&self, node: &NodeName, session: &str, name: &str) {
+    fn rename_session(&self, node: &NodeName, session: &str, name: &str, named: bool) {
         let Ok(paths) = self.inner.account.node_paths(node) else {
             return;
         };
-        let Some(reg) = crate::wake::store_name(&paths, session, name) else {
+        let Some(reg) = crate::wake::store_name(&paths, session, name, named) else {
             return;
         };
         let Some(handle) = self.handle_of(node) else {
@@ -1331,9 +1334,9 @@ impl Router {
                     Ok(t) => t,
                     Err(_) => break,
                 };
-                if let Some(name) = titles.name() {
-                    if reg.name.as_deref() != Some(name.as_str()) {
-                        router.rename_session(&node, &session, &name);
+                if let Some((name, named)) = titles.name() {
+                    if reg.name.as_deref() != Some(name.as_str()) || reg.named != named {
+                        router.rename_session(&node, &session, &name, named);
                     }
                 }
             }
@@ -2639,11 +2642,20 @@ impl Titles {
         self
     }
 
-    fn name(&self) -> Option<String> {
-        self.custom
-            .clone()
-            .or_else(|| self.made.clone())
-            .map(|n| n.trim().to_owned())
-            .filter(|n| !n.is_empty())
+    /// The name, and whether it is the one the person set (a `/rename`), not Claude Code's own.
+    fn name(&self) -> Option<(String, bool)> {
+        let custom = self
+            .custom
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty());
+        let made = self
+            .made
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty());
+        custom
+            .map(|n| (n.to_owned(), true))
+            .or_else(|| made.map(|n| (n.to_owned(), false)))
     }
 }

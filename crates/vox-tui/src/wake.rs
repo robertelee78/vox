@@ -105,6 +105,10 @@ pub struct Session {
     /// none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Whether `name` is the one the session's person set (a Claude Code `/rename`, a Codex
+    /// thread name), not one the harness made up: only such a name titles the Session (v0.4.3).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub named: bool,
     /// Claude Code's transcript for the session (its hooks' `transcript_path`), where a `/rename`
     /// writes the new name: the daemon reads it there, since no hook runs after a slash command.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -367,9 +371,10 @@ pub fn store(paths: &Paths, reg: &Session) {
 /// Name `session`'s registration `name`, as its harness now calls it (ADR-029 MD-1): what an
 /// adapter that hears a rename (Codex's thread name, OpenCode's session title) records. `None`
 /// when the session is not registered; else the registration as it now is.
-pub fn store_name(paths: &Paths, session: &str, name: &str) -> Option<Session> {
+pub fn store_name(paths: &Paths, session: &str, name: &str, named: bool) -> Option<Session> {
     let mut reg = load(paths, session)?;
     reg.name = Some(name.to_owned());
+    reg.named = named;
     if let Ok(body) = serde_json::to_vec(&reg) {
         let _ =
             vox_core::node::paths::write_private_file_unique(&paths.session_file(session), &body);
@@ -423,6 +428,7 @@ impl Session {
                 room: None,
                 start: None,
                 name: None,
+                named: false,
                 transcript: String::new(),
                 interactive: interactive_now(),
                 tmux: None,
@@ -447,6 +453,7 @@ impl Session {
                 room: None,
                 start: None,
                 name: None,
+                named: false,
                 transcript: String::new(),
                 interactive: interactive_now(),
                 tmux: None,
@@ -471,6 +478,7 @@ impl Session {
                 room: None,
                 start: None,
                 name: None,
+                named: false,
                 transcript: String::new(),
                 interactive: interactive_now(),
                 tmux: None,
@@ -492,6 +500,7 @@ impl Session {
                 room: None,
                 start: None,
                 name: None,
+                named: false,
                 transcript: String::new(),
                 interactive: interactive_now(),
                 tmux: None,

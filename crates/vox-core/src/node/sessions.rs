@@ -26,6 +26,9 @@ pub struct SessionRow {
     pub id: String,
     /// The session's current name, as the node last gave it; `None` for none.
     pub name: Option<String>,
+    /// Whether `name` is the one its person set, as the node claims (`session_named`): only then
+    /// does it title the Session (v0.4.3).
+    pub named: bool,
     /// The harness: `claude`, `codex` or `opencode`, as the node claims it.
     pub harness: String,
     /// The folder it works in, its last component (`vox`), as the node claims it; `None` when its
@@ -79,6 +82,7 @@ pub fn fold(detail: &ChannelDetail) -> Vec<SessionRow> {
             (SESSION, Some(k)) if rows[k].open => {
                 if env.at.session_name.is_some() {
                     rows[k].name.clone_from(&env.at.session_name);
+                    rows[k].named = env.at.session_named;
                     spans[k].0 = i;
                 }
             }
@@ -88,6 +92,7 @@ pub fn fold(detail: &ChannelDetail) -> Vec<SessionRow> {
                     node: r.author,
                     id: env.from.clone(),
                     name: env.at.session_name.clone(),
+                    named: env.at.session_named,
                     harness: env.data["session"]["harness"]
                         .as_str()
                         .unwrap_or_default()
@@ -150,6 +155,7 @@ fn renamed(detail: &ChannelDetail, rows: &mut [SessionRow], spans: &[(u32, Optio
         let Ok(env) = Envelope::parse(&r.text) else {
             continue;
         };
+        let persons = env.at.session_named;
         let (Some(name), false) = (env.at.session_name, env.from.trim().is_empty()) else {
             continue;
         };
@@ -162,6 +168,7 @@ fn renamed(detail: &ChannelDetail, rows: &mut [SessionRow], spans: &[(u32, Optio
                 && end.is_none_or(|e| i < e)
             {
                 s.name = Some(name.clone());
+                s.named = persons;
                 left[k] = false;
                 pending -= 1;
             }
@@ -189,6 +196,8 @@ pub struct Opening {
     pub harness: String,
     /// Its current name, if the harness gives one.
     pub name: Option<String>,
+    /// Whether that name is the one its person set (not one the harness made up).
+    pub named: bool,
     /// The last component of the folder it works in, said with its opening so every member can
     /// title it ("Claude Code · vox"); `None` for none.
     pub folder: Option<String>,
@@ -219,14 +228,19 @@ pub async fn open_when_member(
     // **A rename is said at once** (ADR-029 MD-1): the harness renamed its session, and a Session
     // that posts nothing would otherwise keep its old name until its next message. A Session record
     // for one already open names it again (`fold` reads it as the name from then on).
-    if open.is_some_and(|row| session.name.is_none() || row.name == session.name) {
+    if open.is_some_and(|row| {
+        session.name.is_none() || (row.name == session.name && row.named == session.named)
+    }) {
         return Ok(());
     }
     let mut env = Envelope::new(SESSION, "");
     env.from.clone_from(&session.id);
     env.at.session_name.clone_from(&session.name);
+    env.at.session_named = session.named && session.name.is_some();
     env.data = match &session.folder {
-        Some(folder) => serde_json::json!({ "session": { "harness": session.harness, "folder": folder } }),
+        Some(folder) => {
+            serde_json::json!({ "session": { "harness": session.harness, "folder": folder } })
+        }
         None => serde_json::json!({ "session": { "harness": session.harness } }),
     };
     post(handle, room, env.to_text()).await
@@ -250,11 +264,17 @@ pub async fn end(
         .map(|i| i.fingerprint)
         .ok_or_else(|| "the node is locked".to_owned())?;
     let rows = of_room(handle, &room);
-    let Some(open) = rows.iter().find(|s| s.node == me && s.id == session && s.open) else {
+    let Some(open) = rows
+        .iter()
+        .find(|s| s.node == me && s.id == session && s.open)
+    else {
         return Ok(());
     };
     let mut env = Envelope::new(SESSION_END, "");
     session.clone_into(&mut env.from);
+    // Its name too, so its end line is titled as its opening was.
+    env.at.session_name.clone_from(&open.name);
+    env.at.session_named = open.named;
     // What it was, again, so its end line is titled as its opening was ("Claude Code · vox
     // ended").
     env.data = serde_json::json!({
@@ -294,12 +314,13 @@ async fn post(handle: &NodeHandle, room: Digest32, text: String) -> Result<(), S
 }
 
 /// Write `rows` as CBOR, for the socket ([`crate::node::ipc::Frame::Sessions`]) and the snapshot
-/// alike: an array of 11-element arrays. An absent name or folder is empty text, an absent end `0`
-/// and empty bytes. [`read_rows`] also takes the 10-element rows of a daemon from before `folder`.
+/// alike: an array of 12-element arrays. An absent name or folder is empty text, an absent end `0`
+/// and empty bytes. [`read_rows`] also takes the 10- and 11-element rows of a daemon from before `folder` and
+/// `named`.
 pub(crate) fn put_rows(e: &mut crate::cbor::Encoder, rows: &[SessionRow]) {
     e.array(rows.len());
     for r in rows {
-        e.array(11)
+        e.array(12)
             .bytes(&r.node)
             .text(&r.id)
             .text(r.name.as_deref().unwrap_or_default())
@@ -310,7 +331,8 @@ pub(crate) fn put_rows(e: &mut crate::cbor::Encoder, rows: &[SessionRow]) {
             .uint(r.ended_millis.unwrap_or(0))
             .bytes(&r.opening)
             .bytes(r.ended.as_ref().map_or(&[][..], |d| &d[..]))
-            .uint(u64::from(r.can_drive));
+            .uint(u64::from(r.can_drive))
+            .uint(u64::from(r.named));
     }
 }
 
@@ -328,14 +350,14 @@ pub(crate) fn read_rows(d: &mut crate::cbor::Decoder<'_>) -> crate::error::Resul
     let mut rows = Vec::with_capacity(n.min(1024));
     for _ in 0..n {
         let arity = d.array().map_err(bad("ipc session row"))?;
-        if arity != 10 && arity != 11 {
+        if !(10..=12).contains(&arity) {
             return Err(Error::MalformedIpc("ipc session row arity"));
         }
         let node = digest(d.bytes().map_err(bad("ipc session node"))?)?;
         let id = d.text().map_err(bad("ipc session id"))?.to_owned();
         let name = d.text().map_err(bad("ipc session name"))?.to_owned();
         let harness = d.text().map_err(bad("ipc session harness"))?.to_owned();
-        let folder = if arity == 11 {
+        let folder = if arity >= 11 {
             d.text().map_err(bad("ipc session folder"))?.to_owned()
         } else {
             String::new()
@@ -351,10 +373,12 @@ pub(crate) fn read_rows(d: &mut crate::cbor::Decoder<'_>) -> crate::error::Resul
             Some(digest(ended)?)
         };
         let can_drive = d.uint().map_err(bad("ipc session drive"))? != 0;
+        let named = arity == 12 && d.uint().map_err(bad("ipc session named"))? != 0;
         rows.push(SessionRow {
             node,
             id,
             name: (!name.is_empty()).then_some(name),
+            named,
             harness,
             folder: (!folder.is_empty()).then_some(folder),
             open,
@@ -448,14 +472,17 @@ pub fn fill_name(paths: &crate::node::paths::Paths, text: &str) -> String {
     if env.from.trim().is_empty() || env.at.session_name.is_some() {
         return text.to_owned();
     }
-    let name = std::fs::read(paths.session_file(env.from.trim()))
+    let reg = std::fs::read(paths.session_file(env.from.trim()))
         .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let name = reg
+        .as_ref()
         .and_then(|v| v["name"].as_str().map(str::to_owned))
         .filter(|n| !n.trim().is_empty());
     match name {
         Some(n) => {
             env.at.session_name = Some(n);
+            env.at.session_named = reg.is_some_and(|v| v["named"].as_bool() == Some(true));
             env.to_text()
         }
         None => text.to_owned(),

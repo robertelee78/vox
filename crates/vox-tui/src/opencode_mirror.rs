@@ -479,7 +479,7 @@ impl Follow {
                     if let Some(title) = info.get("title").and_then(Value::as_str) {
                         if self.title.as_deref() != Some(title) {
                             self.title = Some(title.to_owned());
-                            self.sink.renamed(&self.node, &self.session, title);
+                            self.sink.renamed(&self.node, &self.session, title, false);
                         }
                     }
                 }

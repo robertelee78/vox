@@ -1658,7 +1658,7 @@ pub async fn sessions(paths: &Paths, room: &str, json: bool) -> Result<(), AppEr
                     "title": vox_agentcomms::envelope::session_title(
                         &s.harness,
                         s.folder.as_deref(),
-                        s.name.as_deref(),
+                        s.name.as_deref(), s.named,
                         &s.id
                     ),
                     "open": s.open,
@@ -1683,6 +1683,7 @@ pub async fn sessions(paths: &Paths, room: &str, json: bool) -> Result<(), AppEr
                 &s.harness,
                 s.folder.as_deref(),
                 s.name.as_deref(),
+                s.named,
                 &s.id
             )
         )

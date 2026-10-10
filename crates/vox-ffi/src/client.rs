@@ -2650,6 +2650,7 @@ impl VoxClient {
                         &s.harness,
                         s.folder.as_deref(),
                         s.name.as_deref(),
+                        s.named,
                         &s.id,
                     ),
                     session_id: s.id.clone(),
@@ -2714,7 +2715,10 @@ impl VoxClient {
                         said: l
                             .details
                             .iter()
-                            .find(|(k, _)| (k == "typed" && l.kind == "user") || (k == "reply" && l.kind == "reply"))
+                            .find(|(k, _)| {
+                                (k == "typed" && l.kind == "user")
+                                    || (k == "reply" && l.kind == "reply")
+                            })
                             .map_or_else(|| l.text.clone(), |(_, v)| v.clone()),
                         details: details_text(l),
                         file: l.file.as_ref().map(|f| FfiSessionFile {

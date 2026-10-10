@@ -149,6 +149,7 @@ pub fn context() -> Context {
             .map(|d| d.display().to_string()),
         // Filled by the daemon from the session's registration (ADR-029 MD-2).
         session_name: None,
+        session_named: false,
     }
 }
 

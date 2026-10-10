@@ -1368,7 +1368,10 @@ impl Daemon {
         if record.harness == "unknown" && input.claude && !input.codex {
             record.harness = "claude".into();
         }
-        record.name = session_name(input);
+        if let Some((name, named)) = session_name(input) {
+            record.name = Some(name);
+            record.named = named;
+        }
         if input.claude {
             record.transcript.clone_from(&input.transcript);
         }
@@ -1482,7 +1485,7 @@ pub struct Registered {
 /// `{"type":"ai-title","aiTitle":…}` (measured from Claude Code 2.1.29x transcripts). The last
 /// custom title wins, else the last made one. Codex's and OpenCode's names are to be read by their
 /// own hooks (harness2).
-fn session_name(input: &HookInput) -> Option<String> {
+fn session_name(input: &HookInput) -> Option<(String, bool)> {
     use std::io::BufRead as _;
     if !input.claude || input.transcript.is_empty() {
         return None;
@@ -1503,10 +1506,11 @@ fn session_name(input: &HookInput) -> Option<String> {
             _ => {}
         }
     }
-    custom
-        .or(made)
-        .map(|n| n.trim().to_owned())
-        .filter(|n| !n.is_empty())
+    // The person's name, and that it is theirs; else Claude Code's own, which titles nothing.
+    let clean = |n: Option<String>| n.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty());
+    clean(custom)
+        .map(|n| (n, true))
+        .or_else(|| clean(made).map(|n| (n, false)))
 }
 
 /// The room this session works in (ADR-029 §6), and, for a room the node is not a member of, the

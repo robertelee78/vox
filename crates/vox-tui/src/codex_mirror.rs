@@ -620,7 +620,7 @@ impl Conn {
                                 self.threads.get(&thread),
                                 v.pointer("/result/thread/name").and_then(Value::as_str),
                             ) {
-                                self.sink.renamed(&t.node, &thread, name);
+                                self.sink.renamed(&t.node, &thread, name, true);
                             }
                             if let Some(t) = self.threads.get_mut(&thread) {
                                 t.subscribed = true;
@@ -677,12 +677,12 @@ impl Conn {
             // Vox's own `thread/name/set`, is said here, and nothing else carries it.
             "thread/name/updated" => {
                 if let Some(name) = p.get("threadName").and_then(Value::as_str) {
-                    self.sink.renamed(&node, &thread, name);
+                    self.sink.renamed(&node, &thread, name, true);
                 }
             }
             "thread/started" => {
                 if let Some(name) = p.pointer("/thread/name").and_then(Value::as_str) {
-                    self.sink.renamed(&node, &thread, name);
+                    self.sink.renamed(&node, &thread, name, true);
                 }
             }
             "thread/status/changed" => {
