@@ -69,7 +69,7 @@ struct ComposerAddress: View {
                         tick(member.id, member.name, id: "to-\(member.name)")
                         // Its open Sessions, under it: one of them alone can be written to.
                         ForEach(openSessions(of: member.id), id: \.sessionId) { s in
-                            tick("\(member.id)/\(s.sessionId)", s.label,
+                            tick("\(member.id)/\(s.sessionId)", s.title,
                                  id: "to-\(member.name)-\(s.shortId)")
                                 .voxPadding(.leading, Space.s20)
                         }
@@ -107,7 +107,7 @@ struct ComposerAddress: View {
             (to.contains(member.id) ? [member.name] : [])
                 + openSessions(of: member.id)
                 .filter { to.contains("\(member.id)/\($0.sessionId)") }
-                .map(\.label)
+                .map(\.title)
         }
     }
 

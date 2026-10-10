@@ -265,6 +265,11 @@ pub struct SessionView {
     /// `codex@device-2 · gso-cap · 3f0c25bf`: this node's alias for the session's node, the
     /// session's name, and its short id (SE-3).
     pub label: String,
+    /// How a person reads its name (#406, v0.4.3): `Claude Code · vox`, [`session_title`]. The
+    /// label above is what one types to address it, and Details.
+    ///
+    /// [`session_title`]: vox_agentcomms::envelope::session_title
+    pub title: String,
     /// This node's alias for the session's node, as the label begins.
     pub node_alias: String,
     /// When it opened, milliseconds since the Unix epoch.

@@ -716,6 +716,13 @@ impl Router {
             id: reg.session.clone(),
             harness: reg.harness.clone(),
             name: reg.name.clone(),
+            // Only the folder's own name ("vox"), never the path above it.
+            folder: reg
+                .start
+                .as_deref()
+                .and_then(|p| std::path::Path::new(p).file_name())
+                .map(|f| f.to_string_lossy().into_owned())
+                .filter(|f| !f.is_empty()),
         };
         let member = handle.view().channels.iter().any(|c| c.channel_id == room);
         let joins = Arc::clone(lock(&self.inner.joins).entry(node.clone()).or_default());

@@ -586,13 +586,13 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
                 notices.push(NoticeView {
                     timestamp: x.opened,
                     after: None,
-                    text: format!("{} opened", x.label),
+                    text: format!("{} opened", x.title),
                 });
                 if let Some(at) = x.ended {
                     notices.push(NoticeView {
                         timestamp: at,
                         after: None,
-                        text: format!("{} ended", x.label),
+                        text: format!("{} ended", x.title),
                     });
                 }
             }
@@ -605,13 +605,13 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
                 notices.push(NoticeView {
                     timestamp: x.opened,
                     after: None,
-                    text: format!("{} opened", x.label),
+                    text: format!("{} opened", x.title),
                 });
                 if let Some(at) = x.ended {
                     notices.push(NoticeView {
                         timestamp: at,
                         after: None,
-                        text: format!("{} ended", x.label),
+                        text: format!("{} ended", x.title),
                     });
                 }
                 if !x.can_drive {
@@ -630,7 +630,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
                 |x| {
                     format!(
                         " — {}{}",
-                        x.label,
+                        x.title,
                         if x.ended.is_some() {
                             " · ended"
                         } else {
@@ -674,7 +674,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
             (ui.selected_session_line, ui.details_open),
             &format!(
                 "Timeline — {}{}",
-                x.label,
+                x.title,
                 if x.ended.is_some() {
                     " · ended"
                 } else {
@@ -740,7 +740,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
     });
     // In a Session, the composer is to the session (DR-1.2).
     if let Some(x) = session.filter(|_| in_session) {
-        about = vec![format!("to {}", x.label)];
+        about = vec![format!("to {}", x.title)];
     }
     if composing {
         render_composer(
@@ -874,11 +874,11 @@ fn render_sessions(
                     let x = &channel.sessions[*at];
                     let on = ui.showing == Showing::Session(x.node, x.id.clone());
                     if x.ended.is_some() {
-                        (format!("  {} · ended", x.label), on)
+                        (format!("  {} · ended", x.title), on)
                     } else if x.waiting {
-                        (format!("! {} · waiting on you", x.label), on)
+                        (format!("! {} · waiting on you", x.title), on)
                     } else {
-                        (format!("● {}", x.label), on)
+                        (format!("● {}", x.title), on)
                     }
                 }
                 SessionRow::Ended(n) => (format!("Ended ({n})"), false),

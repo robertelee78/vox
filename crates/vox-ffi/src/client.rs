@@ -649,8 +649,11 @@ pub struct FfiSession {
     pub short_id: String,
     /// The session's current name, as its node last gave it.
     pub name: Option<String>,
-    /// How every client labels it (SE-3): `codex@device-2 · gso-cap · 3f0c25bf`.
+    /// How every client labels it (SE-3): `codex@device-2 · gso-cap · 3f0c25bf`: what a person types
+    /// to address it, and its Details.
     pub label: String,
+    /// How a person reads its name (#406, v0.4.3): `Claude Code · vox`.
+    pub title: String,
     /// Open, or ended (SE-5).
     pub open: bool,
     /// When it opened, milliseconds since the Unix epoch.
@@ -684,6 +687,12 @@ pub struct FfiSessionEntry {
     pub at_ms: u64,
     /// The one line, exactly as `vox room session` prints it.
     pub line: String,
+    /// The kind it was drawn from: `user` (typed input), `reply`, `tool`, `approval`, `question`,
+    /// `turn-end`, `file`…, so a client can show what a person reads and fold the rest (v0.4.3).
+    pub kind: String,
+    /// What it says without its line's prefix: the typed text or the reply itself, for `user`
+    /// and `reply`; the line otherwise.
+    pub said: String,
     /// Its full input and output, for Details, as `vox room session --details` prints them under
     /// the line; empty when the line is all there is.
     pub details: String,
@@ -2637,6 +2646,12 @@ impl VoxClient {
                     node_alias: known.names.get(&s.node).cloned().unwrap_or_default(),
                     short_id: s.id.chars().take(8).collect(),
                     label: known.label(s),
+                    title: vox_agentcomms::envelope::session_title(
+                        &s.harness,
+                        s.folder.as_deref(),
+                        s.name.as_deref(),
+                        &s.id,
+                    ),
                     session_id: s.id.clone(),
                     name: s.name.clone(),
                     open: s.open,
@@ -2695,6 +2710,12 @@ impl VoxClient {
                         id: b32_encode(&l.id),
                         at_ms: l.at_millis,
                         line: l.text.clone(),
+                        kind: l.kind.clone(),
+                        said: l
+                            .details
+                            .iter()
+                            .find(|(k, _)| (k == "typed" && l.kind == "user") || (k == "reply" && l.kind == "reply"))
+                            .map_or_else(|| l.text.clone(), |(_, v)| v.clone()),
                         details: details_text(l),
                         file: l.file.as_ref().map(|f| FfiSessionFile {
                             name: shown_name(&f.name),

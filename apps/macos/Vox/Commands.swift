@@ -66,7 +66,7 @@ extension VoxAction {
                 node?.sheet = .joinRoom
             },
             inSession
-                ? VoxAction("File", "Attach File to \(driven?.label ?? "the Session")…", "o",
+                ? VoxAction("File", "Attach File to \(driven?.title ?? "the Session")…", "o",
                             enabled: inRoom && driven != nil) { node?.sessionAttachAsked += 1 }
                 : VoxAction("File", "Attach File to the Room…", "o", enabled: inRoom) {
                     node?.attachAsked += 1

@@ -14,9 +14,17 @@ struct TimelineItem: Identifiable {
     let message: RoomMessage?
     let notice: String?
     let entry: FfiSessionEntry?
+    /// How many tool calls this one line stands for, folded; 0 for any other line.
+    var tools = 0
 
     static func message(_ m: RoomMessage) -> TimelineItem {
         TimelineItem(id: m.id, millis: m.createdMillis, message: m, notice: nil, entry: nil)
+    }
+
+    /// One quiet line for a run of `count` tool calls, folded (v0.4.3).
+    static func folded(_ first: FfiSessionEntry, _ count: Int) -> TimelineItem {
+        TimelineItem(id: "tools-\(first.id)", millis: first.atMs, message: nil, notice: nil,
+                     entry: nil, tools: count)
     }
 
     static func notice(_ id: String, _ text: String, at millis: UInt64) -> TimelineItem {
@@ -29,10 +37,10 @@ struct TimelineItem: Identifiable {
 
     /// "<label> opened" and, once it ended, "<label> ended".
     static func openedAndEnded(_ s: FfiSession) -> [TimelineItem] {
-        var lines = [notice("opened-\(s.nodeFingerprint)-\(s.sessionId)", "\(s.label) opened",
+        var lines = [notice("opened-\(s.nodeFingerprint)-\(s.sessionId)", "\(s.title) opened",
                             at: s.openedAtMs)]
         if let ended = s.endedAtMs {
-            lines.append(notice("ended-\(s.nodeFingerprint)-\(s.sessionId)", "\(s.label) ended",
+            lines.append(notice("ended-\(s.nodeFingerprint)-\(s.sessionId)", "\(s.title) ended",
                                 at: ended))
         }
         return lines
@@ -49,7 +57,7 @@ extension NodeModel {
         // A Session's title has no retention: it is the room's (as the TUI says it).
         case .session:
             guard let s = shownSession else { return "Timeline — a Session this room no longer lists" }
-            return "Timeline — \(s.label)\(s.open ? " · open" : " · ended")"
+            return "Timeline — \(s.title)\(s.open ? " · open" : " · ended")"
         }
     }
 
@@ -99,6 +107,7 @@ extension NodeModel {
                 }
                 lines += sessionEntries.map(TimelineItem.entry)
                 lines.sort { $0.millis < $1.millis }
+                if !showToolCalls { lines = Self.foldingToolCalls(lines) }
                 if let note = sessionNote {
                     lines.append(.notice("note-\(s.sessionId)", note, at: .max))
                 }
@@ -109,6 +118,26 @@ extension NodeModel {
             }
             return lines
         }
+    }
+
+    /// `lines` with each run of tool calls one folded line, saying how many.
+    static func foldingToolCalls(_ lines: [TimelineItem]) -> [TimelineItem] {
+        var out: [TimelineItem] = []
+        var run: [FfiSessionEntry] = []
+        func flush() {
+            if let first = run.first { out.append(.folded(first, run.count)) }
+            run = []
+        }
+        for line in lines {
+            if let e = line.entry, e.kind == "tool" {
+                run.append(e)
+            } else {
+                flush()
+                out.append(line)
+            }
+        }
+        flush()
+        return out
     }
 
     /// The messages selected in the timeline as ⌘C copies them (v0.4.1): one line each, oldest

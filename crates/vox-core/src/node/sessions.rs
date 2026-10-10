@@ -28,6 +28,9 @@ pub struct SessionRow {
     pub name: Option<String>,
     /// The harness: `claude`, `codex` or `opencode`, as the node claims it.
     pub harness: String,
+    /// The folder it works in, its last component (`vox`), as the node claims it; `None` when its
+    /// opening said none. For its title only (`session_title`).
+    pub folder: Option<String>,
     /// Whether it is open: opened, and not ended since.
     pub open: bool,
     /// When it opened, the author's time in milliseconds.
@@ -89,6 +92,10 @@ pub fn fold(detail: &ChannelDetail) -> Vec<SessionRow> {
                         .as_str()
                         .unwrap_or_default()
                         .to_owned(),
+                    folder: env.data["session"]["folder"]
+                        .as_str()
+                        .filter(|f| !f.is_empty())
+                        .map(str::to_owned),
                     open: true,
                     opened_millis: r.created_millis,
                     ended_millis: None,
@@ -182,6 +189,9 @@ pub struct Opening {
     pub harness: String,
     /// Its current name, if the harness gives one.
     pub name: Option<String>,
+    /// The last component of the folder it works in, said with its opening so every member can
+    /// title it ("Claude Code · vox"); `None` for none.
+    pub folder: Option<String>,
 }
 
 /// Open `session`'s Session in `room` if it has none open there (ADR-029 SE-1): idempotent, so a
@@ -215,7 +225,10 @@ pub async fn open_when_member(
     let mut env = Envelope::new(SESSION, "");
     env.from.clone_from(&session.id);
     env.at.session_name.clone_from(&session.name);
-    env.data = serde_json::json!({ "session": { "harness": session.harness } });
+    env.data = match &session.folder {
+        Some(folder) => serde_json::json!({ "session": { "harness": session.harness, "folder": folder } }),
+        None => serde_json::json!({ "session": { "harness": session.harness } }),
+    };
     post(handle, room, env.to_text()).await
 }
 
@@ -236,15 +249,18 @@ pub async fn end(
         .as_ref()
         .map(|i| i.fingerprint)
         .ok_or_else(|| "the node is locked".to_owned())?;
-    let open = of_room(handle, &room)
-        .iter()
-        .any(|s| s.node == me && s.id == session && s.open);
-    if !open {
+    let rows = of_room(handle, &room);
+    let Some(open) = rows.iter().find(|s| s.node == me && s.id == session && s.open) else {
         return Ok(());
-    }
+    };
     let mut env = Envelope::new(SESSION_END, "");
     session.clone_into(&mut env.from);
-    env.data = serde_json::json!({ "reason": reason });
+    // What it was, again, so its end line is titled as its opening was ("Claude Code · vox
+    // ended").
+    env.data = serde_json::json!({
+        "reason": reason,
+        "session": { "harness": open.harness, "folder": open.folder.as_deref().unwrap_or_default() },
+    });
     post(handle, room, env.to_text()).await
 }
 
@@ -278,16 +294,17 @@ async fn post(handle: &NodeHandle, room: Digest32, text: String) -> Result<(), S
 }
 
 /// Write `rows` as CBOR, for the socket ([`crate::node::ipc::Frame::Sessions`]) and the snapshot
-/// alike: an array of 10-element arrays. An absent name is empty text, an absent end `0` and empty
-/// bytes.
+/// alike: an array of 11-element arrays. An absent name or folder is empty text, an absent end `0`
+/// and empty bytes. [`read_rows`] also takes the 10-element rows of a daemon from before `folder`.
 pub(crate) fn put_rows(e: &mut crate::cbor::Encoder, rows: &[SessionRow]) {
     e.array(rows.len());
     for r in rows {
-        e.array(10)
+        e.array(11)
             .bytes(&r.node)
             .text(&r.id)
             .text(r.name.as_deref().unwrap_or_default())
             .text(&r.harness)
+            .text(r.folder.as_deref().unwrap_or_default())
             .uint(u64::from(r.open))
             .uint(r.opened_millis)
             .uint(r.ended_millis.unwrap_or(0))
@@ -310,13 +327,19 @@ pub(crate) fn read_rows(d: &mut crate::cbor::Decoder<'_>) -> crate::error::Resul
     let n = d.array().map_err(bad("ipc sessions"))?;
     let mut rows = Vec::with_capacity(n.min(1024));
     for _ in 0..n {
-        if d.array().map_err(bad("ipc session row"))? != 10 {
+        let arity = d.array().map_err(bad("ipc session row"))?;
+        if arity != 10 && arity != 11 {
             return Err(Error::MalformedIpc("ipc session row arity"));
         }
         let node = digest(d.bytes().map_err(bad("ipc session node"))?)?;
         let id = d.text().map_err(bad("ipc session id"))?.to_owned();
         let name = d.text().map_err(bad("ipc session name"))?.to_owned();
         let harness = d.text().map_err(bad("ipc session harness"))?.to_owned();
+        let folder = if arity == 11 {
+            d.text().map_err(bad("ipc session folder"))?.to_owned()
+        } else {
+            String::new()
+        };
         let open = d.uint().map_err(bad("ipc session open"))? != 0;
         let opened_millis = d.uint().map_err(bad("ipc session opened"))?;
         let ended_millis = d.uint().map_err(bad("ipc session ended at"))?;
@@ -333,6 +356,7 @@ pub(crate) fn read_rows(d: &mut crate::cbor::Decoder<'_>) -> crate::error::Resul
             id,
             name: (!name.is_empty()).then_some(name),
             harness,
+            folder: (!folder.is_empty()).then_some(folder),
             open,
             opened_millis,
             ended_millis: (ended_millis != 0).then_some(ended_millis),

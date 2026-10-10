@@ -1943,6 +1943,12 @@ impl DaemonCore {
                                     x.name.as_deref(),
                                     &x.id,
                                 ),
+                                title: vox_agentcomms::envelope::session_title(
+                                    &x.harness,
+                                    x.folder.as_deref(),
+                                    x.name.as_deref(),
+                                    &x.id,
+                                ),
                                 node_alias,
                                 opened: x.opened_millis,
                                 ended: (!x.open).then(|| x.ended_millis.unwrap_or(x.opened_millis)),

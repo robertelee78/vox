@@ -168,6 +168,9 @@ final class NodeModel: ObservableObject {
     @Published private(set) var sessions: [FfiSession] = []
     /// The Session on screen's entries, oldest first, to a member with drive (SC-1).
     @Published private(set) var sessionEntries: [FfiSessionEntry] = []
+    /// A Session's tool calls drawn one by one; folded, by default, into one quiet line per run
+    /// of them (the decider, v0.4.3: they are noise beside what was typed, replied and asked).
+    @Published var showToolCalls = false
     /// What the node says of the Session on screen besides its entries: "opening not received yet".
     @Published private(set) var sessionNote: String?
     /// What was done to the room on screen (its retention set, its name changed), oldest first.
@@ -1422,7 +1425,7 @@ extension NodeModel {
                                                            sessionId: s.sessionId) else { continue }
             for e in read.entries {
                 if let r = e.request, r.state == nil {
-                    found.append((s.nodeFingerprint, s.sessionId, r.reference, s.label))
+                    found.append((s.nodeFingerprint, s.sessionId, r.reference, s.title))
                 }
             }
         }

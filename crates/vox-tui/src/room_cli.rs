@@ -1668,15 +1668,28 @@ pub async fn sessions(paths: &Paths, room: &str, json: bool) -> Result<(), AppEr
         println!("(no Sessions in this room)");
         return Ok(());
     }
+    // Read by its title (#406, v0.4.3); its short id, what one types to address it, after.
+    let title = |s: &vox_core::node::sessions::SessionRow| {
+        let short: String = s.id.chars().take(8).collect();
+        format!(
+            "{}  (id {short})",
+            vox_agentcomms::envelope::session_title(
+                &s.harness,
+                s.folder.as_deref(),
+                s.name.as_deref(),
+                &s.id
+            )
+        )
+    };
     for s in rows.iter().filter(|s| s.open) {
-        println!("open   {}", label(s));
+        println!("open   {}", title(s));
     }
     // **An ended Session is set apart** (SE-5), kept as long as the room keeps messages.
     let ended: Vec<_> = rows.iter().filter(|s| !s.open).collect();
     if !ended.is_empty() {
         println!("ended:");
         for s in ended {
-            println!("ended  {}", label(s));
+            println!("ended  {}", title(s));
         }
     }
     Ok(())

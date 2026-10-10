@@ -42,7 +42,7 @@ extension NodeModel {
         case .general: shown = "General"
         case .all: shown = "All"
         case .session:
-            shown = shownSession.map { "\($0.label) · \($0.open ? "open" : "ended")" } ?? "a Session"
+            shown = shownSession.map { "\($0.title) · \($0.open ? "open" : "ended")" } ?? "a Session"
         }
         return "\(people == 1 ? "1 member" : "\(people) members") · \(shown) · ⏱ \(retention)"
     }
@@ -84,7 +84,7 @@ struct SessionsList: View {
             row("General", .general, id: "session-general")
             row("All", .all, id: "session-all")
             ForEach(model.openSessions, id: \.self) { s in
-                row(s.pending > 0 ? "! \(s.label) · waiting on you" : "● \(s.label)",
+                row(s.pending > 0 ? "! \(s.title) · waiting on you" : "● \(s.title)",
                     .session(node: s.nodeFingerprint, id: s.sessionId), id: "session-\(s.shortId)")
             }
             let ended = model.endedSessions
@@ -97,7 +97,7 @@ struct SessionsList: View {
                 .accessibilityValue(endedOpen ? "expanded" : "collapsed")
                 if endedOpen {
                     ForEach(ended, id: \.self) { s in
-                        row("\(s.label) · ended", .session(node: s.nodeFingerprint, id: s.sessionId),
+                        row("\(s.title) · ended", .session(node: s.nodeFingerprint, id: s.sessionId),
                             id: "session-\(s.shortId)")
                     }
                 }
@@ -138,16 +138,56 @@ struct SessionEntryRow: View {
     /// Open a pulled copy with Quick Look.
     let look: (URL) -> Void
     @State private var details = false
+    /// The pointer is over the row: its Details appears then, or while it is selected.
+    @State private var hovering = false
 
     var body: some View {
+        if entry.kind == "turn-end" {
+            // The end of a turn is space and a hairline, not words (the decider, v0.4.3).
+            Hairline()
+                .voxPadding(.vertical, Space.s8)
+                .accessibilityElement()
+                .accessibilityLabel("turn ended")
+                .accessibilityIdentifier("entry-line-\(entry.id)")
+        } else {
+            row
+        }
+    }
+
+    /// What a person reads: what was typed and the replies in the text face, a line's words
+    /// otherwise; monospace only in Details, for code and tool output (v0.4.3).
+    @ViewBuilder private var said: some View {
+        switch entry.kind {
+        case "user":
+            VStack(alignment: .leading, spacing: Space.s4 * scale) {
+                Text("typed at the terminal").secondaryLine()
+                Text(entry.said).textSelection(.enabled)
+                    .accessibilityIdentifier("entry-said-\(entry.id)")
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("entry-line-\(entry.id)")
+        case "reply":
+            VStack(alignment: .leading, spacing: 0) {
+                Text(entry.said).textSelection(.enabled)
+                    .accessibilityIdentifier("entry-said-\(entry.id)")
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("entry-line-\(entry.id)")
+        default:
+            Text(entry.line).textSelection(.enabled)
+                .accessibilityIdentifier("entry-line-\(entry.id)")
+        }
+    }
+
+    private var row: some View {
         let reference = entry.request?.reference
-        VStack(alignment: .leading, spacing: Space.s4 * scale) {
+        let selected = model.selectedMessages.contains("entry-\(entry.id)")
+        return VStack(alignment: .leading, spacing: Space.s4 * scale) {
             // The line and its request's answers are the request's own element, inside the row:
             // the row is selected like a message (P14), the request as the one ⌥⌘Y and ⌥⌘N act
             // on (P1), and neither takes the other's place.
             VStack(alignment: .leading, spacing: Space.s4 * scale) {
-                Text(entry.line).voxFont(VoxTokens.Fonts.appMono).textSelection(.enabled)
-                    .accessibilityIdentifier("entry-line-\(entry.id)")
+                said
                 if let request = entry.request {
                     RequestView(model: model, room: room, session: session, request: request,
                                 about: entry.line)
@@ -165,10 +205,15 @@ struct SessionEntryRow: View {
                     }
                 }
             }
-            if !entry.details.isEmpty {
-                Button(details ? "Hide details" : "Details") { details.toggle() }
-                    .buttonStyle(.borderless)
-                    .accessibilityIdentifier("entry-details-\(entry.id)")
+            // A small disclosure, there while the row is pointed at or selected, or open.
+            if !entry.details.isEmpty && (hovering || selected || details) {
+                Button { details.toggle() } label: {
+                    Label(details ? "Hide details" : "Details",
+                          systemImage: details ? "chevron.down" : "chevron.right")
+                }
+                .buttonStyle(.plain)
+                .secondaryLine()
+                .accessibilityIdentifier("entry-details-\(entry.id)")
                 if details {
                     Text(entry.details).voxFont(VoxTokens.Fonts.appMono).secondaryText().textSelection(.enabled)
                         .accessibilityIdentifier("entry-details-text-\(entry.id)")
@@ -176,6 +221,7 @@ struct SessionEntryRow: View {
             }
         }
         .voxPadding(.horizontal, Space.s4)
+        .onHover { hovering = $0 }
     }
 }
 

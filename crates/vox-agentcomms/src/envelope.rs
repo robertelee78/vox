@@ -45,24 +45,51 @@ pub fn session_label(node_alias: &str, name: Option<&str>, id: &str) -> String {
     }
 }
 
+/// A harness as a person names it: `Claude Code`, `Codex`, `OpenCode`; any other as it is.
+#[must_use]
+pub fn harness_name(harness: &str) -> &str {
+    match harness {
+        "claude" => "Claude Code",
+        "codex" => "Codex",
+        "opencode" => "OpenCode",
+        "" | "unknown" => "Session",
+        other => other,
+    }
+}
+
+/// How a person READS a Session's name, everywhere it is shown (#406, the decider v0.4.3): its
+/// harness and the folder it works in, `Claude Code · vox`; its name in place of the folder when
+/// it gave no folder; its short id only when it gave neither. What a person TYPES to address a
+/// Session stays [`session_label`], as does `--json`.
+#[must_use]
+pub fn session_title(harness: &str, folder: Option<&str>, name: Option<&str>, id: &str) -> String {
+    let what = folder
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .or_else(|| name.map(str::trim).filter(|n| !n.is_empty()))
+        .map_or_else(|| id.chars().take(8).collect::<String>(), str::to_owned);
+    format!("{} \u{b7} {what}", harness_name(harness))
+}
+
 /// What a Session's opening or end says as a line of the room (ADR-029, CL-1), in the TUI, the app
-/// and `vox room read` alike (#406): the session by its name, else its short id, then "opened" or
-/// "ended": `gso-cap · 3f0c25bf opened`. None for any other message.
+/// and `vox room read` alike (#406): its title ([`session_title`]), then "opened" or "ended":
+/// `Claude Code · vox opened`. None for any other message.
 #[must_use]
 pub fn session_line(envelope: &Envelope) -> Option<String> {
     if envelope.kind != SESSION && envelope.kind != SESSION_END {
         return None;
     }
-    let short: String = envelope.from.chars().take(8).collect();
-    let who = envelope
-        .at
-        .session_name
-        .as_deref()
-        .map_or(short.clone(), |n| format!("{n} \u{b7} {short}"));
+    let said = &envelope.data["session"];
+    let title = session_title(
+        said["harness"].as_str().unwrap_or_default(),
+        said["folder"].as_str(),
+        envelope.at.session_name.as_deref(),
+        &envelope.from,
+    );
     Some(if envelope.kind == SESSION {
-        format!("{who} opened")
+        format!("{title} opened")
     } else {
-        format!("{who} ended")
+        format!("{title} ended")
     })
 }
 

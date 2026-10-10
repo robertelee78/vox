@@ -711,12 +711,26 @@ private struct RoomView: View {
                 // What the timeline shows is said once, in the room's header (no second title
                 // over the timeline, which also sat on its first line). A Session's own
                 // details, under it.
+                // A Session's name and id as its node gives them are Details, folded; its tool
+                // calls, folded unless asked for (the decider, v0.4.3: the name and id were said
+                // four times).
                 if let header = model.sessionHeader {
-                    Text(header)
+                    HStack(alignment: .firstTextBaseline, spacing: Space.s12) {
+                        DisclosureGroup("Details") {
+                            Text(header)
+                                .secondaryLine()
+                                .textSelection(.enabled)
+                                .accessibilityIdentifier("session-header")
+                        }
                         .secondaryLine()
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .voxPadding(.horizontal, Space.s12).voxPadding(.top, Space.s4)
-                        .accessibilityIdentifier("session-header")
+                        .accessibilityIdentifier("session-details")
+                        Spacer()
+                        Toggle("Show tool calls", isOn: $model.showToolCalls)
+                            .toggleStyle(.checkbox)
+                            .secondaryLine()
+                            .accessibilityIdentifier("show-tool-calls")
+                    }
+                    .voxPadding(.horizontal, Space.s12).voxPadding(.top, Space.s4)
                 }
                 Group {
                     GeometryReader { viewport in
@@ -754,6 +768,19 @@ private struct RoomView: View {
                                                 }
                                                 .reportsFrame(of: message.id)
                                                 .id(message.id)
+                                        } else if item.tools > 0 {
+                                            // A run of tool calls, folded into one quiet line;
+                                            // clicked, every tool call is drawn (v0.4.3).
+                                            Button(item.tools == 1 ? "1 tool call" : "\(item.tools) tool calls") {
+                                                model.showToolCalls = true
+                                            }
+                                            .buttonStyle(.plain)
+                                            .secondaryLine()
+                                            .help("Show every tool call")
+                                            .voxPadding(.horizontal, Space.s4)
+                                            .accessibilityIdentifier(item.id)
+                                            .reportsFrame(of: item.id)
+                                            .id(item.id)
                                         } else if let notice = item.notice {
                                             // What was done to the room: a line among the
                                             // messages, not one of them (ADR-028 R-1, R-7).

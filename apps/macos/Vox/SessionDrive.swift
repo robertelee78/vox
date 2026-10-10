@@ -34,14 +34,14 @@ extension NodeModel {
             let answer = try await drive(room: room, session: s.sessionId, action: action)
             switch answer.delivery {
             case .answered:
-                return answer.ok ? .taken("\(s.label): \(answer.said)")
-                    : .refused("not delivered to \(s.label): \(answer.said)")
+                return answer.ok ? .taken("\(s.title): \(answer.said)")
+                    : .refused("not delivered to \(s.title): \(answer.said)")
             case .unreachable:
                 // A file the node could not serve says "not sent: …" already.
                 let why = answer.said.hasPrefix("not sent: ") ? String(answer.said.dropFirst(10)) : answer.said
-                return .refused("not sent to \(s.label): \(why)")
+                return .refused("not sent to \(s.title): \(why)")
             case .noAnswer:
-                return .unknown("no answer from \(s.label): it may or may not have been delivered")
+                return .unknown("no answer from \(s.title): it may or may not have been delivered")
             }
         } catch {
             return .refused(sentence(error))
@@ -92,13 +92,13 @@ struct SessionComposer: View {
                 .accessibilityIdentifier("session-attach")
                 .disabled(sending)
                 // Who types, into which Session (E-4, CL-1): never read as the room's composer.
-                Text("\(model.node) ▸ \(session.label)").font(Theme.mono).secondaryText()
+                Text("\(model.node) ▸ \(session.title)").font(Theme.mono).secondaryText()
                     .lineLimit(1).truncationMode(.middle)
                     // No label of its own (a selectable Text with one recurses); the field's says it.
                     .accessibilityIdentifier("session-compose-as")
                 // Up to 12 lines, so a pasted stack trace or a long prompt is read before it goes;
                 // Return sends, ⇧↩ (or ⌥↩) adds a line (P19).
-                TextField("Composer — to \(session.label)", text: $draft, axis: .vertical)
+                TextField("Composer — to \(session.title)", text: $draft, axis: .vertical)
                     .lineLimit(1...12)
                     .focused($composing)
                     .shiftReturnAddsLine(composing)
@@ -126,7 +126,7 @@ struct SessionComposer: View {
                     .disabled(stopping)
                     .accessibilityIdentifier("session-stop")
             }
-            .confirmationDialog("Stop \(session.label)? It ends the session.", isPresented: $confirmStop) {
+            .confirmationDialog("Stop \(session.title)? It ends the session.", isPresented: $confirmStop) {
                 Button("Stop the Session", role: .destructive) { stop() }
                     .accessibilityIdentifier("session-stop-confirm")
                 Button("Cancel", role: .cancel) {}
