@@ -138,6 +138,9 @@ final class NodeModel: ObservableObject {
             // afresh in this one (P14), as on opening another room.
             selectedMessage = nil
             selectedMessages = []
+            // A request chosen in another view is not in this one's rows: kept, the timeline
+            // would centre it, not follow its newest line. openRequest chooses it after this.
+            selectedRequest = nil
             selectionAnchor = nil
             Task { await readSession() }
         }
@@ -451,6 +454,8 @@ final class NodeModel: ObservableObject {
             roomDrafts[left, default: RoomDraft()].reply = replyTo
         }
         self.selection = selection
+        // A request chosen in another room is not in this one (P1): openRequest chooses it after.
+        selectedRequest = nil
         // An offer's view says what its own Trust did, never an earlier keyring change.
         if case .offer = selection {
             keyringDid = nil
