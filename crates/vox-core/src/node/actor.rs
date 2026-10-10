@@ -12918,12 +12918,18 @@ impl Node {
         }
         crate::node::status::SyncBook::note_prekeys(
             &self.sync_book,
-            ring.one_time_len(),
-            ring.consumed_len(),
-            ring.signed_prekey_id(),
-            done.rotated,
-            done.one_time_added,
-            ring.previous_used(),
+            crate::node::status::PrekeyNote {
+                one_time: ring.one_time_len(),
+                consumed: ring.consumed_len(),
+                signed_prekey: ring.signed_prekey_id(),
+                rotated: done.rotated,
+                added: done.one_time_added,
+                previous_used: ring.previous_used(),
+                retired: done.retired,
+                retired_held: ring.retired_len(),
+                retired_used: ring.retired_used(),
+                oldest_one_time: ring.oldest_one_time_created(),
+            },
         );
     }
 
