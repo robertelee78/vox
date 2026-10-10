@@ -145,6 +145,32 @@ struct Winding {
 /// dial to one member it cannot currently reach. See `reach_member`.
 const MEMBER_REDIAL_MS: u64 = 30_000;
 
+/// The `timestamp_ms` for records this node signs in `room` naming the prekeys `offered`, given the
+/// clock's `base`. **A changed bundle is never refused as too soon** (ADR-030 P-3): a board takes a
+/// changed record only [`crate::nat::store::MIN_CHANGE_MS`] after the one it holds, and a node's
+/// prekeys can change faster than that (two consumes in a second), while its records go to its own
+/// board and to each anchor, signed apart. A change stamped inside the bound was refused by every
+/// board that held the earlier record, and nothing republished after: the bundle naming a spent
+/// one-time prekey stayed, and a sender's next key waited out its 30 s bound (measured: refusals at
+/// 0, 43, 70, 598, 601 and 644 ms). So a change is stamped at least the bound after the last record,
+/// at most a second ahead of the clock per change, well inside the boards' skew allowance.
+fn spaced_stamp(
+    stamped: &mut BTreeMap<Digest32, (u64, (u64, Option<u64>))>,
+    room: Digest32,
+    base: u64,
+    offered: (u64, Option<u64>),
+) -> u64 {
+    let stamp = match stamped.get(&room) {
+        Some((last, was)) if *was != offered => {
+            base.max(last.saturating_add(crate::nat::store::MIN_CHANGE_MS))
+        }
+        Some((last, _)) => base.max(*last),
+        None => base,
+    };
+    stamped.insert(room, (stamp, offered));
+    stamp
+}
+
 /// How long a key waits, while its member is connected, for a bundle naming a one-time prekey no
 /// delivery has named yet (ADR-030 P-3, S-5). A connected node republishes its bundle within about
 /// a second of a prekey's use; past this the key goes to the member's signed prekey, said once.
@@ -4248,9 +4274,9 @@ pub struct Node {
     /// Rooms whose records are to be renewed because the prekeys this node offers changed: their
     /// renewal pushes them to the members connected now, not only to its own board and the anchors.
     prekeys_changed: BTreeSet<Digest32>,
-    /// Per room: the `timestamp_ms` of the records this node last put on its own board. A board
-    /// takes a changed record only [`crate::nat::store::MIN_CHANGE_MS`] after the one it holds.
-    records_published_at: BTreeMap<Digest32, u64>,
+    /// Per room: the `timestamp_ms` of the last records this node signed there, on any board, and
+    /// the prekeys their bundle named. See [`spaced_stamp`].
+    records_stamped: BTreeMap<Digest32, (u64, (u64, Option<u64>))>,
     /// Per `(room, member)`: the history batch in flight, as the keys not yet answered and
     /// whether the batch fell short (a key refused, or not all of it written). The history is
     /// recorded as delivered only once every key of a whole batch was taken (V210-88).
@@ -4707,7 +4733,7 @@ impl Node {
             signed_said: BTreeSet::new(),
             packages_posted: BTreeSet::new(),
             prekeys_changed: BTreeSet::new(),
-            records_published_at: BTreeMap::new(),
+            records_stamped: BTreeMap::new(),
             history_in_flight: BTreeMap::new(),
             delivery_epoch: 0,
             record_seq: BTreeMap::new(),
@@ -5817,7 +5843,7 @@ impl Node {
             return;
         };
         let seq = self.next_record_seq(channel_id);
-        let stamp = self.record_timestamp(channel_id);
+        let base = self.record_timestamp(channel_id);
         // The admission goes out with the bundle: a node that cannot say how it became
         // a member publishes nothing, rather than publishing an unevidenced key (M17.6).
         let (genesis_wire, epoch, admission) = match self.channels.get(channel_id) {
@@ -5836,6 +5862,7 @@ impl Node {
                 return;
             };
             let ring = ring.lock().await;
+            let stamp = spaced_stamp(&mut self.records_stamped, *channel_id, base, ring.offered());
             net.own_records(signer, channel_id, epoch, &ring, seq, stamp, admission)
         };
         let Ok((address, bundle)) = records else {
@@ -6639,8 +6666,7 @@ impl Node {
         // the renewal off for good, and the own board and every other anchor lapsed.
         self.arm_record_renewal(channel_id);
         let seq = self.next_record_seq(channel_id);
-        let stamp = self.record_timestamp(channel_id);
-        self.records_published_at.insert(*channel_id, stamp);
+        let base = self.record_timestamp(channel_id);
         let Some(profile) = self.profile.as_ref() else {
             return;
         };
@@ -6653,6 +6679,7 @@ impl Node {
             return;
         };
         let ring = ring.lock().await;
+        let stamp = spaced_stamp(&mut self.records_stamped, *channel_id, base, ring.offered());
         let _ = net.publish_local(&channel.genesis().to_wire());
         let admission = channel.own_admission().clone();
         if let Ok((address, bundle)) = net.own_records(
@@ -13422,17 +13449,9 @@ impl Node {
         // to an hour away; the tick coalesces a burst of consumes into one republish.
         if republish {
             drop(ring);
-            // **Not sooner than a board takes it.** A board refuses a changed record less than
-            // `MIN_CHANGE_MS` after the one it holds, and nothing republishes after the refusal
-            // until the prekeys change again: a second consume within a second of the first left
-            // the bundle that names a spent one-time prekey on every board, and a sender's next
-            // key to this node waited out its 30 s bound for one that never came.
+            // Each record is stamped so a board takes the change (`spaced_stamp`).
             for (room, at) in &mut self.records_renew_at {
-                let earliest = self
-                    .records_published_at
-                    .get(room)
-                    .map_or(0, |t| t.saturating_add(crate::nat::store::MIN_CHANGE_MS));
-                *at = now.max(earliest);
+                *at = now;
                 self.prekeys_changed.insert(*room);
             }
         }
