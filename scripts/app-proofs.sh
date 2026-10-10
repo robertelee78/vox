@@ -318,4 +318,17 @@ if grep -q "enabling automation mode" "$SCRATCH/xcodebuild.log"; then
     exit 2
 fi
 [ "$status" -ne 0 ] && exit "$status"
+# A test runner that crashed is restarted by xcodebuild with nothing left to run, and that empty
+# run says "passed" and exits 0 (the look case, 2026-10-09 16:31: a crash in the proof's own pixel
+# reader read as green). A run that ran no test, or restarted after a crash, is never green.
+if grep -q "Restarting after unexpected exit, crash, or test timeout" "$SCRATCH/xcodebuild.log"; then
+    echo "app-proofs: APPARATUS (harness error): the test runner crashed or timed out and" \
+        "xcodebuild restarted it, so the case did not run to its end; see the crash report in" \
+        "~/Library/Logs/DiagnosticReports (VoxAppProofs-Runner-*.ips)." >&2
+    exit 2
+fi
+if ! grep -qE "Executed [1-9][0-9]* tests?," "$SCRATCH/xcodebuild.log"; then
+    echo "app-proofs: APPARATUS (harness error): xcodebuild ran no test, so nothing was proven." >&2
+    exit 2
+fi
 exit "$launch_status"
