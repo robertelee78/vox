@@ -57,6 +57,14 @@
 //! it again by the new name, its passphrase moved in the Keychain. Mutant: the harnesses' settings
 //! not rewritten; red as PRODUCT.
 //!
+//! And **Vox never raises a Keychain window** (#666): on a Mac whose HOME has no keychain, with
+//! no test keychain given, `vox node create` at a terminal attaches the node within 60 s and says
+//! in one line that this Mac has no keychain to remember it in. Mutant: the plain line not said
+//! (the node silently not remembered); red as PRODUCT on the line. The mutant "Keychain
+//! interaction allowed" is deliberately never run: it raises the system's "Keychain Not Found"
+//! window, whose Reset To Defaults resets the person's keychains, and no test may raise a system
+//! prompt (the decider). A store blocked behind any window is caught by the 60 s bound.
+//!
 //! And **`vox setup` keeps Codex's app-server running** when it wires Codex (the decider,
 //! 2026-10-06): it says first that it will, and that this runs no model; it asks the `codex` it
 //! found on `PATH` for `app-server daemon start` under the Codex home it wires, waits for the
@@ -316,6 +324,12 @@ impl Drop for Setup {
 
 impl Setup {
     fn spawn(d: &Dirs, path: &str) -> Self {
+        Self::spawn_args(d, path, &["setup"], true)
+    }
+
+    /// `vox args` on a pseudo-terminal, as `spawn`; with `knob` false, without
+    /// `VOX_TEST_KEYCHAIN`: as on a Mac, with whatever keychain the test's HOME has (none).
+    fn spawn_args(d: &Dirs, path: &str, args: &[&str], knob: bool) -> Self {
         use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem as _};
         let pair = NativePtySystem::default()
             .openpty(PtySize {
@@ -327,7 +341,7 @@ impl Setup {
             .expect("APPARATUS: open a pty");
         let r = &d.root;
         let mut cmd = CommandBuilder::new(VOX);
-        cmd.arg("setup");
+        cmd.args(args);
         cmd.env_clear();
         cmd.cwd(r);
         for (k, v) in [
@@ -341,9 +355,11 @@ impl Setup {
             ("CLAUDE_CONFIG_DIR", r.join("claude").display().to_string()),
             ("CODEX_HOME", r.join("codex").display().to_string()),
             ("OPENCODE_CONFIG_DIR", r.join("oc").display().to_string()),
-            ("VOX_TEST_KEYCHAIN", d.keychain().display().to_string()),
         ] {
             cmd.env(k, v);
+        }
+        if knob {
+            cmd.env("VOX_TEST_KEYCHAIN", d.keychain().display().to_string());
         }
         let child = pair
             .slave
@@ -400,7 +416,12 @@ impl Setup {
 
     /// Wait up to 120 s for setup to exit: its exit status.
     fn finish(&mut self) -> portable_pty::ExitStatus {
-        let deadline = Instant::now() + Duration::from_secs(120);
+        self.finish_within(Duration::from_secs(120))
+    }
+
+    /// Wait up to `within` for the command to exit: its exit status.
+    fn finish_within(&mut self, within: Duration) -> portable_pty::ExitStatus {
+        let deadline = Instant::now() + within;
         loop {
             if let Ok(Some(status)) = self.child.try_wait() {
                 std::thread::sleep(Duration::from_millis(200));
@@ -408,7 +429,8 @@ impl Setup {
             }
             assert!(
                 Instant::now() < deadline,
-                "PRODUCT: `vox setup` did not finish within 120 s of its last answer; it said:\n{}",
+                "PRODUCT: `vox` did not finish within {within:?} of its last answer (blocked, as on \
+                 a window it raised); it said:\n{}",
                 self.said()
             );
             std::thread::sleep(Duration::from_millis(50));
@@ -823,6 +845,26 @@ fn setup_makes_a_node_for_each_installed_harness() {
             "PRODUCT: renamed, claude-m5max-work must be attached again by the daemon's own \
              start, its passphrase in the Keychain under its new name: {line:?}\nlog:\n{}",
             std::fs::read_to_string(d.root.join("d/.daemon/log")).unwrap_or_default()
+        );
+
+        // ---- a Mac with no keychain: Vox raises no Keychain window, and says so (#666) ----
+        // A data root of its own, so its daemon is started here, without the knob, and its HOME
+        // has no keychain at all: the Keychain's own answer would be its "Keychain Not Found"
+        // window, which blocks the store until someone answers it.
+        let bare = Dirs::new();
+        let mut create = Setup::spawn_args(&bare, &path, &["node", "create", "plainmac"], false);
+        create.answer("new identity passphrase", 1, "plain passphrase\r");
+        create.answer("again", 1, "plain passphrase\r");
+        let status = create.finish_within(Duration::from_secs(60));
+        let said = create.said();
+        println!("[proof] vox node create, on a Mac with no keychain, said:\n{said}");
+        assert!(
+            status.success()
+                && said.contains("node plainmac is attached; this Mac has no keychain to remember it in; the node will need its passphrase after a restart")
+                && bare.listed("plainmac").contains(" attached"),
+            "PRODUCT: on a Mac with no keychain, `vox node create` at a terminal must attach the \
+             node and say, in one plain line, that this Mac has no keychain to remember it in \
+             ({status:?}):\n{said}"
         );
     }
 }

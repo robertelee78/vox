@@ -508,10 +508,14 @@ impl Router {
             )));
         }
         if let Err(e) = stored {
-            g.notes.push(format!(
-                "node {node} is attached, but not kept: its passphrase could not be stored in \
-                 the Keychain: {e}"
-            ));
+            g.notes.push(if e == crate::keychain::NO_KEYCHAIN {
+                format!("node {node} is attached; {e}")
+            } else {
+                format!(
+                    "node {node} is attached, but not kept: its passphrase could not be stored \
+                     in the Keychain: {e}"
+                )
+            });
         }
         self.write_attach_file_held(None).await;
         Ok((g.info, g.notes))

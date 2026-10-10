@@ -18,9 +18,38 @@ pub const SERVICE: &str = "us.vox.node";
 #[cfg(all(target_os = "macos", feature = "test-knobs"))]
 const TEST_KEYCHAIN_ENV: &str = "VOX_TEST_KEYCHAIN";
 
+/// What is said when this Mac has no keychain Vox can use without asking (#666): the node is
+/// attached, and not remembered.
+pub const NO_KEYCHAIN: &str = "this Mac has no keychain to remember it in; the node will need its \
+                               passphrase after a restart";
+
 #[cfg(target_os = "macos")]
 mod mac {
     use zeroize::Zeroizing;
+
+    /// **Vox never raises a Keychain window** (#666): no "Keychain Not Found" offering to reset
+    /// the person's keychains, no access prompt behind a daemon with no window. Turned off once,
+    /// for the life of the process, before the first Keychain call: what would ask fails
+    /// instead, and is said in plain words.
+    fn quiet() {
+        static OFF: std::sync::Once = std::sync::Once::new();
+        OFF.call_once(|| {
+            std::mem::forget(
+                security_framework::os::macos::keychain::SecKeychain::disable_user_interaction(),
+            );
+        });
+    }
+
+    /// `e` in words: the plain line when there is no keychain to use without asking.
+    fn said(e: &security_framework::base::Error, what: &str) -> String {
+        // errSecNoDefaultKeychain, errSecNoSuchKeychain, errSecInteractionNotAllowed,
+        // errSecInteractionRequired.
+        if matches!(e.code(), -25307 | -25294 | -25308 | -25315) {
+            super::NO_KEYCHAIN.to_owned()
+        } else {
+            format!("{what}: {e}")
+        }
+    }
 
     /// The proof's keychain file, opened and unlocked, with the Keychain's dialogs off for this
     /// process; `None` without the knob.
@@ -29,8 +58,6 @@ mod mac {
     ) -> Option<Result<security_framework::os::macos::keychain::SecKeychain, String>> {
         use security_framework::os::macos::keychain::SecKeychain;
         let path = std::env::var_os(super::TEST_KEYCHAIN_ENV).filter(|p| !p.is_empty())?;
-        // Kept off for the process's life: a dialog is never the answer in a proof.
-        std::mem::forget(SecKeychain::disable_user_interaction());
         Some(
             SecKeychain::open(&path)
                 .and_then(|mut k| k.unlock(Some("")).map(|()| k))
@@ -40,6 +67,7 @@ mod mac {
 
     /// Store `passphrase` for `account`, replacing what was there.
     pub fn store(account: &str, passphrase: &str) -> Result<(), String> {
+        quiet();
         #[cfg(feature = "test-knobs")]
         if let Some(k) = test_keychain() {
             return k?
@@ -51,11 +79,12 @@ mod mac {
             account,
             passphrase.as_bytes(),
         )
-        .map_err(|e| format!("the Keychain refused to store it: {e}"))
+        .map_err(|e| said(&e, "the Keychain refused to store it"))
     }
 
     /// What is stored for `account`, as bytes.
     fn bytes(account: &str) -> Result<Vec<u8>, String> {
+        quiet();
         #[cfg(feature = "test-knobs")]
         if let Some(k) = test_keychain() {
             return k?
@@ -64,7 +93,7 @@ mod mac {
                 .map_err(|e| format!("the Keychain did not give it: {e}"));
         }
         security_framework::passwords::get_generic_password(super::SERVICE, account)
-            .map_err(|e| format!("the Keychain did not give it: {e}"))
+            .map_err(|e| said(&e, "the Keychain did not give it"))
     }
 
     /// The passphrase stored for `account`.
@@ -81,6 +110,7 @@ mod mac {
 
     /// Remove what is stored for `account`; nothing stored is not an error.
     pub fn forget(account: &str) {
+        quiet();
         #[cfg(feature = "test-knobs")]
         if let Some(k) = test_keychain() {
             if let Ok((_, item)) = k.and_then(|k| {
