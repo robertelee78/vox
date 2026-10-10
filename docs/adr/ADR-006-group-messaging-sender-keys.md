@@ -5,7 +5,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 **Status:** accepted. Built in `crates/vox-core/src/group/` (M4), `node::pairwise_stream` and
 `node::channel` (ADR-016 M14.5b), with rotation enforced (M18.1), except: S-5's shared-root device
 sharing is planned (ADR-002 D2), and the two known gaps below are open. S-4's fresh delivery session
-and S-17's re-carry rule are planned for v0.5.0 (ADR-030, 2026-10-09).
+and S-17's re-carry rule are planned for v0.4.2 (ADR-030, 2026-10-09).
 **Date:** 2026-06-19
 **Deciders:** Robert E. Lee <robert@agidreams.us>
 
@@ -35,7 +35,7 @@ recipient, which is what per-sender trust needs.
 - **S-4.** An SKDM MUST be delivered as a Double Ratchet message in a fresh pairwise session that its
   sender opens with PQXDH for that delivery (ADR-030 D-1), never in the established session, so every
   delivery carries an ML-KEM secret its sender just encapsulated. Any other per-SKDM KEM step MUST NOT be built. *Status:*
-  planned for v0.5.0 (ADR-030); today an SKDM rides the established session, whose ML-KEM secret is the
+  planned for v0.4.2 (ADR-030); today an SKDM rides the established session, whose ML-KEM secret is the
   one PQXDH set up when the session began.
 - **S-5.** An SKDM MUST be addressed to a recipient identity (a node), not to a device. **Planned
   (ADR-002 D2):** under a shared root, the identity's devices share received SKDMs over the self-channel
@@ -89,7 +89,7 @@ recipient, which is what per-sender trust needs.
   sender MUST await that answer on its own task, never on the actor, for `KEY_DELIVERY_PATIENCE` = 30 s.
   Anything but the byte (a reset, no answer, a lost connection) MUST lower the ledger row for exactly that
   generation, and the tick MUST send the key again. Sending a key twice is harmless. A key sent again
-  MUST travel in the same delivery frame as the first time (ADR-030 D-4; planned for v0.5.0). When no direct path
+  MUST travel in the same delivery frame as the first time (ADR-030 D-4; planned for v0.4.2). When no direct path
   reaches the recipient, the key goes through the log as a key-package (ADR-023 decision 4).
 
 ### §History

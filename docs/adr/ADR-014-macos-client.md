@@ -214,7 +214,7 @@ F-9–F-11; RR-1, RR-3, RR-4 (RR-2 is the daemon's); D-3; L-1–L-10; W-1–W-6;
 
 ### 7. Out of scope
 
-The iOS app (v0.4.1), with showing and scanning fingerprint QR codes (ADR-028 K-1, K-5), and calls
+The iOS app (v0.5.0), with showing and scanning fingerprint QR codes (ADR-028 K-1, K-5), and calls
 (v0.5.0).
 
 Dictation of its own (decider, 2026-10-07). The composer is a standard text field, so the
