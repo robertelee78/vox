@@ -243,6 +243,11 @@ mod journey {
         pub took: Duration,
     }
 
+    /// The last line of `said` that holds anything, trimmed.
+    pub fn last_line(said: &str) -> String {
+        last_lines(said, 1).trim().to_owned()
+    }
+
     /// The last `n` lines of `said` that hold anything.
     pub fn last_lines(said: &str, n: usize) -> String {
         let lines: Vec<&str> = said.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -305,6 +310,9 @@ mod journey {
         pub passes: Mutex<BTreeMap<String, String>>,
         /// The update's loopback release, once there is one.
         pub release_base: Mutex<Option<String>>,
+        /// The run's own keychain file (`VOX_TEST_KEYCHAIN`): no `vox` here ever reaches the
+        /// login keychain, nor raises a Keychain window.
+        pub keychain: PathBuf,
     }
 
     impl World {
@@ -326,11 +334,26 @@ mod journey {
                 home,
                 passes: Mutex::new(BTreeMap::new()),
                 release_base: Mutex::new(None),
+                keychain: root.join("k.keychain-db"),
             };
             for d in [&w.home, &w.t, &w.repo, &w.hbin, &w.apps] {
                 std::fs::create_dir_all(d)
                     .unwrap_or_else(|e| panic!("APPARATUS: cannot make {d:?}: {e}"));
             }
+            // `create-keychain` makes the file and changes no search list and no default; with
+            // HOME the run's own, nothing of the person's is read either.
+            let made = Command::new("/usr/bin/security")
+                .args(["create-keychain", "-p", ""])
+                .arg(&w.keychain)
+                .env_clear()
+                .env("HOME", &w.home)
+                .env("PATH", SYSTEM_PATH)
+                .stdin(Stdio::null())
+                .status();
+            assert!(
+                made.is_ok_and(|s| s.success()),
+                "APPARATUS: `security create-keychain` did not make the run's keychain file"
+            );
             w
         }
 
@@ -355,6 +378,7 @@ mod journey {
                 // A proof's daemon never takes port 1080, and listens on loopback alone.
                 ("VOX_PROXY", "127.0.0.1:0".to_owned()),
                 ("VOX_LISTEN", "127.0.0.1:0".to_owned()),
+                ("VOX_TEST_KEYCHAIN", self.keychain.display().to_string()),
             ]
             .into_iter()
             .map(|(k, v)| (k.to_owned(), v))
@@ -363,6 +387,31 @@ mod journey {
                 e.push(("VOX_TEST_RELEASE_BASE".into(), b));
             }
             e
+        }
+
+        /// The installed `vox` as another machine runs it: its own data root and config
+        /// directory, and so its own daemon.
+        pub fn run_as(&self, data: &Path, cfg: &Path, args: &[&str]) -> Out {
+            let t0 = Instant::now();
+            let out = Command::new(self.vox())
+                .args(args)
+                .env_clear()
+                .envs(self.env())
+                .env("VOX_DATA_DIR", data)
+                .env("VOX_CONFIG_DIR", cfg)
+                .current_dir(&self.root)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap_or_else(|e| panic!("APPARATUS: cannot run vox {args:?}: {e}"));
+            Out {
+                ok: out.status.success(),
+                said: format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+                took: t0.elapsed(),
+            }
         }
 
         /// The installed `vox`, run with no terminal: what it said.
@@ -755,7 +804,8 @@ mod journey {
     /// Children this proof started, stopped however it ends; and the daemon, by its own pid.
     pub struct Stop {
         pub children: Vec<Child>,
-        pub data: PathBuf,
+        /// Each data root whose daemon is stopped, by the pid in its lock.
+        pub data: Vec<PathBuf>,
         pub codex: Option<(PathBuf, PathBuf)>,
         pub tmux: Option<(PathBuf, PathBuf)>,
     }
@@ -778,33 +828,23 @@ mod journey {
                     .env("CODEX_HOME", home)
                     .output();
             }
-            if let Some(pid) = std::fs::read_to_string(self.data.join(".daemon/lock"))
-                .ok()
-                .and_then(|t| t.trim().parse::<u32>().ok())
-            {
-                let _ = Command::new("/bin/kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .status();
-                let t0 = Instant::now();
-                while alive(pid) && t0.elapsed() < Duration::from_secs(15) {
-                    std::thread::sleep(Duration::from_millis(100));
+            for data in &self.data {
+                if let Some(pid) = std::fs::read_to_string(data.join(".daemon/lock"))
+                    .ok()
+                    .and_then(|t| t.trim().parse::<u32>().ok())
+                {
+                    let _ = Command::new("/bin/kill")
+                        .args(["-TERM", &pid.to_string()])
+                        .status();
+                    let t0 = Instant::now();
+                    while alive(pid) && t0.elapsed() < Duration::from_secs(15) {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
                 }
             }
             for c in &mut self.children {
                 let _ = c.kill();
                 let _ = c.wait();
-            }
-            // A node kept through the Keychain is kept under its directory, which is this run's:
-            // nothing of the run's stays in the login keychain.
-            if let Ok(nodes) = std::fs::read_dir(self.data.join("nodes")) {
-                for n in nodes.flatten() {
-                    let _ = Command::new("/usr/bin/security")
-                        .args(["delete-generic-password", "-s", "us.vox.node", "-a"])
-                        .arg(n.path())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
-                }
             }
         }
     }
@@ -944,7 +984,7 @@ mod journey {
             .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
         let mut stop = Stop {
             children: vec![],
-            data: w.data.clone(),
+            data: vec![w.data.clone(), w.root.join("m2/vd")],
             codex: Some((programs["codex"].clone(), w.home.join(".codex"))),
             tmux: None,
         };
@@ -1002,16 +1042,13 @@ mod journey {
                 last_lines(&said, 12)
             )
         });
-        l.claim(
-            "J8.install",
-            names_next_action(&said) && last_lines(&said, 4).contains("vox setup"),
-            || {
-                format!(
-                    "install.sh's last lines must name the next step, `vox setup`; they were:\n{}",
-                    last_lines(&said, 4)
-                )
-            },
-        );
+        const INSTALL_NEXT: &str = "Next: run `vox setup`";
+        l.claim("J8.install", last_line(&said) == INSTALL_NEXT, || {
+            format!(
+                "install.sh's last line must be {INSTALL_NEXT:?}; its last lines were:\n{}",
+                last_lines(&said, 3)
+            )
+        });
         *w.release_base.lock().unwrap() = Some(server.base.clone());
 
         // ================================================================ the person's harnesses
@@ -1540,16 +1577,32 @@ mod journey {
                 }
                 let args: Vec<&str> = cmd.split_whitespace().skip(1).collect();
                 let out = w.person(&args, h.node);
+                // `vox node attach N` ends on its one next step; anything else names one.
+                let attach_next = format!(
+                    "Next: start a new session in the harness wired to node {0}, or run `vox \
+                     room list --node {0}` to see its rooms",
+                    h.node
+                );
+                let is_attach = cmd == format!("vox node attach {}", h.node);
                 l.claim(
                     &format!(
                         "J8.{}.{}",
                         h.key,
                         args.iter().take(2).copied().collect::<Vec<_>>().join("-")
                     ),
-                    names_next_action(&out.said),
+                    if is_attach {
+                        last_line(&out.said) == attach_next
+                    } else {
+                        names_next_action(&out.said)
+                    },
                     || {
                         format!(
-                            "`{cmd}`'s last lines name no next action:\n{}",
+                            "`{cmd}` must end naming its next step{}; its last lines were:\n{}",
+                            if is_attach {
+                                format!(" ({attach_next:?})")
+                            } else {
+                                String::new()
+                            },
                             last_lines(&out.said, 3)
                         )
                     },
@@ -1569,27 +1622,39 @@ mod journey {
                 continue;
             };
             l.claim(&id("reaches_room"), true, String::new);
-            // **Vox asks the person** for the repo's room, not only the model. The control: a
-            // session whose model runs nothing and answers "ok", so anything of the ask the
-            // harness shows its person came from Vox (a hook's message to the person, say), not
-            // from a model relaying it or a tool's output echoed. What the model was given (`sent`)
-            // is not shown to the person.
-            let _ = sent;
-            match session(h, "-") {
-                Ok((_, quiet)) => {
-                    let shown = quiet.contains(ASK);
-                    l.claim(&id("person_asked"), shown, || {
-                        format!(
-                            "with a model that relays nothing, {} showed the person no room ask: \
-                             the ask reached only the model (the hook's context, and the status \
-                             a model runs); it printed:\n{}",
-                            h.name,
-                            last_lines(&quiet, 8)
-                        )
-                    });
-                }
-                Err(why) => l.apparatus(&id("person_asked"), &why),
-            }
+            // **Vox asks the person** for the repo's room, not only the model: the daemon's
+            // RoomAsks, which Vox.app shows as its banner, are the "Vox needs you:" lines of
+            // `vox agent status`. What the harness shows is not Vox asking.
+            let _ = (sent, &said);
+            let status = w.run(&[
+                "agent",
+                "status",
+                "--harness",
+                h.key,
+                "--dir",
+                &w.repo.display().to_string(),
+            ]);
+            let line = status
+                .said
+                .lines()
+                .map(str::trim)
+                .find(|l| {
+                    l.starts_with("Vox needs you:")
+                        && l.contains(h.name)
+                        && l.contains(&format!("in {} has no room", w.repo.display()))
+                })
+                .map(str::to_owned);
+            l.claim(&id("person_asked"), line.is_some(), || {
+                format!(
+                    "after {}'s session reached the room ask, `vox agent status` showed the \
+                     person no \"Vox needs you: {} in {} has no room …\" line; it said:\n{}",
+                    h.name,
+                    h.name,
+                    w.repo.display(),
+                    status.said
+                )
+            });
+            let said = line.unwrap_or(said);
             asks.push((h.key, h.node, said));
         }
 
@@ -1597,8 +1662,12 @@ mod journey {
         // harness started in it ----
         let bound_by = match (room_ok, asks.first()) {
             (true, Some((key, node, said))) => {
-                let join = commands_in(said)
-                    .into_iter()
+                let join = said
+                    .split('`')
+                    .skip(1)
+                    .step_by(2)
+                    .map(str::to_owned)
+                    .chain(commands_in(said))
                     .find(|c| c.starts_with("vox room join"))
                     .unwrap_or_else(|| {
                         format!(
@@ -1637,11 +1706,30 @@ mod journey {
             };
             match session(h, "") {
                 Ok((_, said)) => {
-                    // The session says it works in the room, and its node holds the room.
-                    let holds = w.run(&["room", "list", "--node", h.node]);
-                    let ok = said.contains("works in room")
-                        && !said.contains(ASK)
-                        && holds.said.contains(room);
+                    // The session says it works in the room, and its node holds the room. A
+                    // node not in the room joins it by itself when a session starts here (RB-3):
+                    // that join is given 30 s, read from `vox agent status` as the person reads it.
+                    let t0 = Instant::now();
+                    let (said, holds) = loop {
+                        let holds = w.run(&["room", "list", "--node", h.node]);
+                        let now = w.run(&[
+                            "agent",
+                            "status",
+                            "--harness",
+                            h.key,
+                            "--dir",
+                            &w.repo.display().to_string(),
+                        ]);
+                        let done = holds.said.contains(room) && now.said.contains("works in room");
+                        if done || t0.elapsed() > Duration::from_secs(30) {
+                            break (
+                                format!("{said}\n--- `vox agent status` then ---\n{}", now.said),
+                                holds,
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(500));
+                    };
+                    let ok = said.contains("works in room") && holds.said.contains(room);
                     ready.insert(h.key, ok);
                     l.claim(&id("bound"), ok, || {
                         format!(
@@ -1716,16 +1804,141 @@ mod journey {
                     )
                 },
             );
+            let read_next = format!(
+                "Next: send \"{}\" this node's fingerprint (`vox id`), so it trusts you too and \
+                 you read what it writes",
+                h.key
+            );
             l.claim(
                 &format!("J8.{}.trust-add", h.key),
-                names_next_action(&b.said),
+                last_line(&a.said) == read_next,
                 || {
                     format!(
-                        "`vox trust add … --drive`'s last lines name no next action:\n{}",
+                        "`vox trust add` must end {read_next:?}; its last lines were:\n{}",
+                        last_lines(&a.said, 3)
+                    )
+                },
+            );
+            let drive_next = format!(
+                "Next: from node \"{PERSON}\", `vox room sessions <room>` lists this node's \
+                 Sessions in a room you share, and `vox room session` drives one"
+            );
+            l.claim(
+                &format!("J8.{}.trust-add-drive", h.key),
+                last_line(&b.said) == drive_next,
+                || {
+                    format!(
+                        "`vox trust add … --drive` must end {drive_next:?}; its last lines \
+                         were:\n{}",
                         last_lines(&b.said, 3)
                     )
                 },
             );
+        }
+
+        // ---- a second machine: its own daemon and profile, an agent node of its own, joining the
+        // person's room. The person's node, not one of this Mac's agents, is offered it, within a
+        // few seconds, and the person trusts it from that offer ----
+        let (d2, c2) = (w.root.join("m2/vd"), w.root.join("m2/vc"));
+        for d in [&d2, &c2] {
+            std::fs::create_dir_all(d).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+        }
+        let (pass2, room_pass) = (w.root.join("m2.pass"), w.root.join("room.pass"));
+        std::fs::write(&pass2, "remote agent passphrase\n")
+            .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+        std::fs::write(&room_pass, format!("{ROOM_PASS}\n"))
+            .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+        let p2 = pass2.display().to_string();
+        let rp = room_pass.display().to_string();
+        let staged2 = if room_ok {
+            let steps = [
+                w.run_as(
+                    &d2,
+                    &c2,
+                    &["node", "create", "remote-agent", "--passphrase-file", &p2],
+                ),
+                w.run_as(
+                    &d2,
+                    &c2,
+                    &["node", "attach", "remote-agent", "--passphrase-file", &p2],
+                ),
+                w.run_as(
+                    &d2,
+                    &c2,
+                    &[
+                        "room",
+                        "join",
+                        &link,
+                        "--node",
+                        "remote-agent",
+                        "--passphrase-file",
+                        &rp,
+                    ],
+                ),
+            ];
+            match steps.iter().find(|o| !o.ok) {
+                Some(o) => Err(format!(
+                    "the second machine's own setup was refused: {}",
+                    o.said.trim()
+                )),
+                None => Ok(()),
+            }
+        } else {
+            Err("the person has no room for it to join".to_owned())
+        };
+        let fp2 = w
+            .run_as(&d2, &c2, &["id", "--node", "remote-agent"])
+            .said
+            .split_whitespace()
+            .find(|t| t.len() >= 40 && t.chars().all(|c| c.is_ascii_alphanumeric()))
+            .map(str::to_owned);
+        match (staged2, fp2) {
+            (Ok(()), Some(fp2)) => {
+                let t0 = Instant::now();
+                let (offered, seen) = loop {
+                    let o = w.run(&["trust", "offers", "--node", PERSON]);
+                    if o.said.contains(&fp2[..12]) || t0.elapsed() > Duration::from_secs(5) {
+                        break (o.said.contains(&fp2[..12]), o.said);
+                    }
+                    std::thread::sleep(Duration::from_millis(300));
+                };
+                let to_claude = w.run(&["trust", "offers", "--node", "claude-mine"]).said;
+                l.claim("J5.remote.offered", offered, || {
+                    format!(
+                        "a node from another machine (remote-agent, {}) joined the person's room, \
+                         and within 5 s the person's node was not offered it; `vox trust offers \
+                         --node {PERSON}` said:\n{seen}\nclaude-mine's offers name it: {}",
+                        &fp2[..12],
+                        to_claude.contains(&fp2[..12])
+                    )
+                });
+                if offered {
+                    let (_, t) = w.follow(
+                        &["trust", "add", &fp2, "--name", "remote", "--node", PERSON],
+                        PERSON,
+                    );
+                    let list = w.run(&["trust", "list", "--node", PERSON]);
+                    l.claim("J5.remote.trusted", t.ok && list.said.lines().any(|l| l.contains(&fp2) && l.contains("remote")), || {
+                        format!("the person trusting the offered node: `vox trust add` said:\n{}\nthe keyring:\n{}", t.said, list.said)
+                    });
+                } else {
+                    l.cannot(
+                        "J5.remote.trusted",
+                        "the person's node was never offered it",
+                    );
+                }
+            }
+            (Err(why), _) => {
+                l.apparatus("J5.remote.offered", &why);
+                l.cannot("J5.remote.trusted", "the second machine never joined");
+            }
+            (Ok(()), None) => {
+                l.apparatus(
+                    "J5.remote.offered",
+                    "the second machine's node has no fingerprint",
+                );
+                l.cannot("J5.remote.trusted", "the second machine never joined");
+            }
         }
 
         // ================================================================ 6. the agent posts
@@ -1750,7 +1963,7 @@ mod journey {
                     "the harness's session never worked in the room",
                 );
                 l.cannot(
-                    &id("listed"),
+                    &id("headless_unlisted"),
                     "the harness's session never worked in the room",
                 );
                 continue;
@@ -1778,12 +1991,14 @@ mod journey {
                 .lines()
                 .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
                 .any(|v| v["harness"] == h.key);
+            // **A headless run gets no Session** (ADR-029 SE-1): `claude -p`, `codex exec` and
+            // `opencode run` post, and are not listed. The interactive session is (J6.drive.found).
             let plain = w.run(&["room", "sessions", room, "--node", PERSON]);
-            l.claim(&id("listed"), listed, || {
+            l.claim(&id("headless_unlisted"), !listed, || {
                 format!(
-                    "the person found no {} Session in the room; `vox room sessions` said:\n{}\n\
-                     and with --json:\n{}",
-                    h.name, plain.said, s.said
+                    "a headless {} run must get no Session (ADR-029 SE-1); `vox room sessions` \
+                     listed one:\n{}",
+                    h.name, plain.said
                 )
             });
         }
@@ -2133,12 +2348,34 @@ mod journey {
         });
         let wrong = wired("after the update");
         l.claim("J7.update.hooks", wrong.is_empty(), || format!("{wrong:?}"));
-        l.claim("J8.update", names_next_action(&update.said), || {
+        // Every node attached again, so the update's one next step is to look.
+        const UPDATE_NEXT: &str =
+            "Next: run `vox status` to see your nodes and rooms on this version";
+        l.claim("J8.update", last_line(&update.said) == UPDATE_NEXT, || {
             format!(
-                "`vox update`'s last lines name no next action:\n{}",
+                "`vox update` must end {UPDATE_NEXT:?}; its last lines were:\n{}",
                 last_lines(&update.said, 3)
             )
         });
+        // **No Keychain window, and none refused in its place**: the new `vox` reads what the
+        // old one stored. With `VOX_TEST_KEYCHAIN`, what would raise a window is refused and
+        // said in words instead, so a word of the Keychain's here is that case.
+        let said_keychain: Vec<&str> = update
+            .said
+            .lines()
+            .chain(said.lines())
+            .filter(|l| l.to_ascii_lowercase().contains("keychain"))
+            .collect();
+        l.claim(
+            "J7.update.no_keychain_prompt",
+            said_keychain.is_empty() && attached.len() == nodes.len(),
+            || {
+                format!(
+                    "after `vox update`, every node must be attached with nothing asked of the \
+                     Keychain; attached: {attached:?}; Keychain lines: {said_keychain:?}"
+                )
+            },
+        );
         for h in &harnesses {
             let id = format!("J7.{}.ready", h.key);
             if !ready.get(h.key).copied().unwrap_or(false) {
@@ -2169,9 +2406,10 @@ mod journey {
             ("claude", hook_cmd(&w.home.join(".claude/settings.json"))),
             ("codex", hook_cmd(&w.home.join(".codex/hooks.json"))),
         ];
-        let hook = |cmd: &str| -> (Duration, String) {
+        // Each path a session of its own: guidance is said once per session.
+        let hook = |cmd: &str, session: &str| -> (Duration, String) {
             let input = serde_json::json!({
-                "session_id": "0a0a0a0a-1111-4222-8333-944444444444",
+                "session_id": session,
                 "transcript_path": w.root.join("t/transcript.jsonl").display().to_string(),
                 "cwd": w.repo.display().to_string(),
                 "hook_event_name": "UserPromptSubmit",
@@ -2253,7 +2491,11 @@ mod journey {
                 }
                 _ => {}
             }
-            let (took, text) = hook(cmd);
+            let n = paths
+                .iter()
+                .position(|p| p.0 == *path && p.1 == *cmd)
+                .unwrap_or(0);
+            let (took, text) = hook(cmd, &format!("0a0a0a0a-1111-4222-8333-9444444444{n:02}"));
             println!(
                 "[journey] 9. {key} hook, {path}: {:.0} ms: {text:?}",
                 took.as_secs_f64() * 1000.0
@@ -2268,14 +2510,45 @@ mod journey {
                     )
                 },
             );
-            let guides = told_command(&text).is_some() || text.contains("vox ");
-            l.claim(&format!("J9.{key}.{path}.one_sentence"), sentences(&text) == 1 && guides, || {
-                format!(
-                    "the hook must give one sentence of guidance, naming what to do ({path}); it gave \
-                     {} sentence(s){}: {text:?}",
-                    sentences(&text),
-                    if guides { "" } else { " naming nothing to do" }
-                )
+            // The one sentence each path says (v043/setup's wording), and nothing else.
+            let name = if key == "claude" {
+                "Claude Code"
+            } else {
+                "Codex"
+            };
+            let (ok, want) = match *path {
+                "detached" => {
+                    let want = format!(
+                        "Vox could not read your rooms because node {node} is not attached; ask \
+                         the operator to run `vox node attach {node}` in a terminal outside this \
+                         session (it asks for the passphrase once and then remembers it; Vox says \
+                         this once per session)."
+                    );
+                    (text == want, want)
+                }
+                "no-node" => {
+                    let want = format!(
+                        "{name} has no Vox node on this Mac (its hook names node {node}-gone, \
+                         which is not here); ask the operator to run `vox setup` in a terminal."
+                    );
+                    (text == want, want)
+                }
+                // With no daemon, a hook that starts one and reads the rooms has nothing to
+                // guide; one that cannot says so in its one sentence.
+                _ => {
+                    let head = "Vox could not read your rooms because no vox daemon runs and none \
+                                could be started (";
+                    let tail = "); ask the operator to run `vox daemon` in a terminal.";
+                    let ok = if text.starts_with("Vox could not read your rooms") {
+                        text.starts_with(head) && text.ends_with(tail) && sentences(&text) == 1
+                    } else {
+                        true
+                    };
+                    (ok, format!("{head}<reason>{tail}, or the rooms read"))
+                }
+            };
+            l.claim(&format!("J9.{key}.{path}.one_sentence"), ok, || {
+                format!("the hook ({path}) must say {want:?}; it said {text:?}")
             });
         }
         drop(server);
