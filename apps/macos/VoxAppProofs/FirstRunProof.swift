@@ -1987,7 +1987,10 @@ final class FirstRunProof: XCTestCase {
         // passphrase form, and then that form's Trust is the only one on screen; left empty, its
         // Trust says the identity's passphrase is needed (alice's has one); Cancel brings back
         // the offer's Trust and Dismiss.
-        tap(ui, Key.id("offer-\(carolFp.prefix(12))"), "carol's offer in the sidebar",
+        // In the room she joined, at the top of its General (v0.4.3: a trust offer is in the room
+        // it concerns; the sidebar lists rooms only).
+        tap(ui, Key.id("room-pending"), "pending in the sidebar")
+        tap(ui, Key.id("offer-\(carolFp.prefix(12))"), "carol's offer at the top of pending's General",
             premise: Premise("carol is offered to alice") {
                 (offers.contains(String(carolFp.prefix(12))), "`vox trust offers` said \(offers.debugDescription)")
             })
