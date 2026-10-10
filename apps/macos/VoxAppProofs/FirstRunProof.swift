@@ -1491,7 +1491,31 @@ final class FirstRunProof: XCTestCase {
         let read = run(vox, ["room", "read", "--node", "alice", room], env: voxEnv).out
         XCTAssertTrue(!room.isEmpty && read.contains("HELLO-FIRST-RUN"),
                       "PRODUCT: the room made in the app must hold alice's post, as `vox room read` reads it; `vox room list` says \(rooms), and the room reads \(read)")
-        print("[proof] new person: node alice made and attached in the app, room \(room) made from the empty window, HELLO-FIRST-RUN posted; no screen named Terminal or a vox command")
+        // A second room through the sidebar's + (the decider, v0.4.1): New Room… there opens the
+        // same form, and the room shows. New Room… is in the Room menu, and no longer in File.
+        tap(ui, Key.id("sidebar-add"), "the + at the head of the sidebar's rooms")
+        tap(ui, Key.id("sidebar-new-room"), "New Room… in the sidebar's + menu")
+        present(ui, roomName, timeout: 10, "New Room… from the sidebar's + must open the New Room form")
+        type(ui, roomName, "second", "the room's name field")
+        type(ui, Key.id("room-form-passphrase"), "second room", "the room's passphrase field")
+        tap(ui, Key.id("room-form-submit"), "Create")
+        present(ui, Key.id("room-second"), timeout: 30, "the room made from the sidebar's + must show in the sidebar",
+                premise: inRoom(vox, voxEnv, "second"))
+        // Each menu's own items, so one menu's New Room… is never counted as another's.
+        let roomMenu = ui.menuBars.menuBarItems["Room"], fileMenu = ui.menuBars.menuBarItems["File"]
+        roomMenu.click()
+        XCTAssertTrue(roomMenu.menuItems["New Room…"].waitForExistence(timeout: 5)
+                        && roomMenu.menuItems["Join Room…"].exists,
+                      "PRODUCT: the Room menu must hold New Room… and Join Room… (the decider, v0.4.1)")
+        ui.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+        fileMenu.click()
+        guard fileMenu.menuItems["Share Service…"].waitForExistence(timeout: 5) else {
+            throw Apparatus("the File menu did not open, so what it holds cannot be read")
+        }
+        XCTAssertFalse(fileMenu.menuItems["New Room…"].exists || fileMenu.menuItems["Join Room…"].exists,
+                       "PRODUCT: New Room… and Join Room… must be in the Room menu, not File (the decider, v0.4.1); File holds one")
+        ui.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+        print("[proof] new person: node alice made and attached in the app, room \(room) made from the empty window, HELLO-FIRST-RUN posted, room second made from the sidebar's +; New Room… in Room, not File; no screen named Terminal or a vox command")
 
         // **Sign Out, then sign in as a new node (ADR-028 E-4, the decider 2026-10-08).** Alice is
         // kept as Keep Running keeps a node (`--keep`, from a scratch file: the Keychain is the
