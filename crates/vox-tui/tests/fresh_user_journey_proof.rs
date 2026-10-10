@@ -812,7 +812,9 @@ mod journey {
         f.insert("sha256", sha256_hex(&bytes));
         write_record(root, &format!("app-stable-{triple}.json"), &f);
 
-        let bin = std::fs::read(helper).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+        // The vox as signed into the app: what the record names.
+        let bin = std::fs::read(contents.join("Helpers/vox"))
+            .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
         write_asset(root, version, &format!("vox-{triple}"), &bin);
         f.insert("kind", "vox.standalone-release".into());
         f.insert("package", "vox".into());
