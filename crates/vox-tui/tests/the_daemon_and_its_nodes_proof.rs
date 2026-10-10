@@ -8,7 +8,9 @@
 //! 2. **Lifecycle races (proof 6, L-3; ADR-028 K-13).** Two hooks of two sessions of one detached
 //!    node, with no daemon running, start at once: both exit 0, telling the agent the node is not
 //!    attached and the command for the operator, `vox node attach agent`; a session's next turn
-//!    says nothing more, and the person is notified once per session (#666; mutant: the
+//!    says nothing more, and the person is notified once per session; a hook naming a node not
+//!    on this Mac says so with `vox setup` (#666; mutants: the node-on-disk check skipped, red at
+//!    that line; the
 //!    once-per-session record ignored, red as PRODUCT at the second turn); one daemon starts, and
 //!    the node stays detached (a hook never attaches it). The operator attaches it; then one
 //!    session's `SessionEnd` races the other's next turn, and the node stays attached throughout;
@@ -375,6 +377,16 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
             a.log()
         );
     }
+    // **A hook naming a node that is not here says so, with `vox setup`** (#666), in one sentence.
+    let (ok, out, err) = a.hook("ghost", "s-9", "UserPromptSubmit");
+    assert!(
+        ok && out.contains(
+            "Claude Code has no Vox node on this Mac (its hook names node ghost, which is not \
+             here); ask the operator to run `vox setup` in a terminal."
+        ),
+        "PRODUCT: a hook naming a node not on this Mac must say, in one sentence, that Claude \
+         Code has no Vox node here and to run `vox setup`: {out}{err}"
+    );
     // **Said once per session, not every turn** (#666): session 1's next turn tells the agent
     // nothing more, and the person was told once per session, with the command.
     let (ok, out, err) = a.hook("agent", "s-1", "UserPromptSubmit");

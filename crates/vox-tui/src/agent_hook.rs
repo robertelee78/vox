@@ -1269,7 +1269,7 @@ pub async fn run(
             // it proves, is refreshed on each event, so a session first seen by a tool call is
             // known, and a session resumed in another pane is rebound at once.
             if let Err(e) = daemon.register(&input, room_arg).await {
-                eprintln!("vox agent hook: {}", e.said());
+                eprintln!("vox agent hook: {}", e.said(&input));
             }
             if ev.name == "Stop" {
                 crate::wake::record_idle(paths, &input.session_id);
@@ -1315,7 +1315,7 @@ pub async fn run(
             // **Said once per session, not every turn** (#666): the operator was told the
             // command, and a macOS notification tells the person too; each later turn reads
             // nothing until the node is attached, and says so only on stderr.
-            let words = Unregistered::NotAttached(node.clone()).said();
+            let words = Unregistered::NotAttached(node.clone()).said(&input);
             eprintln!("vox agent hook: {words}");
             if crate::wake::first_detached_notice(paths, &input.session_id) {
                 crate::notify::raise_for(
@@ -1323,17 +1323,23 @@ pub async fn run(
                     &format!("Vox: node {node} needs its passphrase"),
                     &format!("Run in a terminal: vox node attach {node}"),
                 );
-                emit(
-                    format,
-                    &raw,
-                    &input.event,
-                    &format!(
-                        "Vox could not read your rooms: {words}. Vox says this once in this \
-                         session.\n"
-                    ),
-                    "",
-                );
+                emit(format, &raw, &input.event, &format!("{words}\n"), "");
             }
+            return Ok(());
+        }
+        Err(Unregistered::NoNode(node)) => {
+            // Said once per session too: nothing changes until the operator runs setup.
+            let words = Unregistered::NoNode(node.clone()).said(&input);
+            eprintln!("vox agent hook: {words}");
+            if first_in_session(&daemon.account, node.as_str(), &input.session_id) {
+                emit(format, &raw, &input.event, &format!("{words}\n"), "");
+            }
+            return Ok(());
+        }
+        Err(u @ Unregistered::NoDaemon(_)) => {
+            let words = u.said(&input);
+            eprintln!("vox agent hook: {words}");
+            emit(format, &raw, &input.event, &format!("{words}\n"), "");
             return Ok(());
         }
         Err(Unregistered::Failed(e)) => Err(e),
@@ -1361,8 +1367,43 @@ pub async fn run(
 pub(crate) enum Unregistered {
     /// The hook's node is not attached, and a hook never attaches it (ADR-028 K-13).
     NotAttached(vox_core::node::paths::NodeName),
+    /// The hook names a node that is not on this machine.
+    NoNode(vox_core::node::paths::NodeName),
+    /// No daemon answers, and none could be started: why, in one line.
+    NoDaemon(String),
     /// Anything else, in words.
     Failed(AppError),
+}
+
+/// The harness that ran this hook, by its name.
+fn harness_name(input: &HookInput) -> &'static str {
+    if input.codex {
+        "Codex"
+    } else if input.claude {
+        "Claude Code"
+    } else {
+        "OpenCode"
+    }
+}
+
+/// Whether this is the first time in `session` that the hook for `node` says a thing it says
+/// once per session (#666), recorded under the account's daemon directory: the node itself may
+/// not be on this machine. A record that cannot be written says it again rather than never.
+fn first_in_session(account: &vox_core::node::paths::Account, node: &str, session: &str) -> bool {
+    let key = vox_core::hash::sha256(format!("{node}\n{session}").as_bytes());
+    let file = account
+        .daemon_dir()
+        .join("said-once")
+        .join(vox_core::node::link::b32_encode(&key));
+    if file.exists() {
+        return false;
+    }
+    if let Some(dir) = file.parent() {
+        let _ = vox_core::node::paths::create_private_dir(&account.daemon_dir());
+        let _ = vox_core::node::paths::create_private_dir(dir);
+    }
+    let _ = vox_core::node::paths::write_private_file_unique(&file, b"");
+    true
 }
 
 impl From<AppError> for Unregistered {
@@ -1372,14 +1413,23 @@ impl From<AppError> for Unregistered {
 }
 
 impl Unregistered {
-    /// In words, with the one command the operator runs for a node not attached.
-    fn said(&self) -> String {
+    /// In one sentence, with the exact command the operator runs (#666).
+    fn said(&self, input: &HookInput) -> String {
         match self {
             Self::NotAttached(node) => format!(
-                "node {node} is not attached, and a hook never attaches it. Ask the operator to \
-                 run, in a terminal outside this session: vox node attach {node} (it asks there \
-                 for the node's passphrase once; Vox then remembers it, and attaches the node by \
-                 itself after every restart)"
+                "Vox could not read your rooms because node {node} is not attached; ask the \
+                 operator to run `vox node attach {node}` in a terminal outside this session (it \
+                 asks for the passphrase once and then remembers it; Vox says this once per \
+                 session)."
+            ),
+            Self::NoNode(node) => format!(
+                "{} has no Vox node on this Mac (its hook names node {node}, which is not here); \
+                 ask the operator to run `vox setup` in a terminal.",
+                harness_name(input)
+            ),
+            Self::NoDaemon(why) => format!(
+                "Vox could not read your rooms because no vox daemon runs and none could be \
+                 started ({why}); ask the operator to run `vox daemon` in a terminal."
             ),
             Self::Failed(e) => e.to_string(),
         }
@@ -1415,7 +1465,12 @@ impl Daemon {
         room_arg: Option<&str>,
     ) -> Result<Registered, Unregistered> {
         use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
-        crate::daemon_client::ensure_daemon(&self.account, self.listen, &self.anchors).await?;
+        if !self.account.nodes_on_disk().contains(&self.node) {
+            return Err(Unregistered::NoNode(self.node.clone()));
+        }
+        crate::daemon_client::ensure_daemon(&self.account, self.listen, &self.anchors)
+            .await
+            .map_err(|e| Unregistered::NoDaemon(one_line_reason(&e)))?;
         let mut record = crate::wake::Session::from_env(&input.session_id, input.codex);
         // **The harness, from its own input** when its environment named no wake channel: Claude
         // Code's payload names its event (ADR-029 SE-3 labels a Session by it).
@@ -1433,7 +1488,9 @@ impl Daemon {
             .map_err(|e| AppError::Usage(format!("the session's record: {e}")))?;
         let mut d = DaemonClient::open(&self.account.socket())
             .await
-            .map_err(|e| AppError::Usage(e.to_string()))?;
+            .map_err(|e| {
+                Unregistered::NoDaemon(e.to_string().lines().next().unwrap_or_default().to_owned())
+            })?;
         // **Never without a bound** (#408): the hook runs inside a model's turn, and a wait with
         // no end hangs the harness. The daemon refuses a node still detaching after
         // DETACHING_PATIENCE; this bounds everything else the registration can wait on.
