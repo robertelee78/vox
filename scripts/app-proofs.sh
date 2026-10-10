@@ -317,7 +317,6 @@ if grep -q "enabling automation mode" "$SCRATCH/xcodebuild.log"; then
         "macOS shows on the next run." >&2
     exit 2
 fi
-[ "$status" -ne 0 ] && exit "$status"
 # A test runner that crashed is restarted by xcodebuild with nothing left to run, and that empty
 # run says "passed" and exits 0 (the look case, 2026-10-09 16:31: a crash in the proof's own pixel
 # reader read as green). A run that ran no test, or restarted after a crash, is never green.
@@ -331,4 +330,5 @@ if ! grep -qE "Executed [1-9][0-9]* tests?," "$SCRATCH/xcodebuild.log"; then
     echo "app-proofs: APPARATUS (harness error): xcodebuild ran no test, so nothing was proven." >&2
     exit 2
 fi
+[ "$status" -ne 0 ] && exit "$status"
 exit "$launch_status"
