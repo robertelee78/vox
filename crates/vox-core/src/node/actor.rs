@@ -145,6 +145,11 @@ struct Winding {
 /// dial to one member it cannot currently reach. See `reach_member`.
 const MEMBER_REDIAL_MS: u64 = 30_000;
 
+/// How long a key waits, while its member is connected, for a bundle naming a one-time prekey no
+/// delivery has named yet (ADR-030 P-3, S-5). A connected node republishes its bundle within about
+/// a second of a prekey's use; past this the key goes to the member's signed prekey, said once.
+const ONE_TIME_WAIT_MS: u64 = 30_000;
+
 /// How many taken key deliveries (ADR-030 W-3) are remembered per peer and room. A sender holds one
 /// delivery per key and drops it on `KEY_TAKEN` or when a later key supersedes it (D-4), so only the
 /// last few can be replayed honestly; an older replay is opened again, and its key is inert
@@ -4230,6 +4235,9 @@ pub struct Node {
     /// Per `(room, member)`: why this identity's key for it waits, until it is taken (ADR-030
     /// D-5, W-4), shown beside the member in the roster, `vox status` and the app.
     key_waiting: BTreeMap<(Digest32, Digest32), String>,
+    /// Per `(room, member)`: since when, connected, its key has waited for a fresh one-time prekey
+    /// ([`ONE_TIME_WAIT_MS`]).
+    one_time_waits: BTreeMap<(Digest32, Digest32), u64>,
     /// Per `(room, member)`: the history batch in flight, as the keys not yet answered and
     /// whether the batch fell short (a key refused, or not all of it written). The history is
     /// recorded as delivered only once every key of a whole batch was taken (V210-88).
@@ -4682,6 +4690,7 @@ impl Node {
             keys_in_flight: BTreeMap::new(),
             deliveries: BTreeMap::new(),
             key_waiting: BTreeMap::new(),
+            one_time_waits: BTreeMap::new(),
             history_in_flight: BTreeMap::new(),
             delivery_epoch: 0,
             record_seq: BTreeMap::new(),
@@ -10370,7 +10379,7 @@ impl Node {
         if let Some(delivery) = self.deliveries.get(&id).filter(|d| d.key == key_ref) {
             return Ok(delivery.frame.clone());
         }
-        let bundle = self.delivery_bundle(channel_id, target).await?;
+        let bundle = self.delivery_bundle_waiting(channel_id, target).await?;
         let ctx = {
             let shared = self.channels.get(channel_id).map(Arc::clone).ok_or(None)?;
             let channel = shared.lock().await;
@@ -10456,6 +10465,59 @@ impl Node {
         {
             self.key_waiting.remove(&pair);
         }
+    }
+
+    /// The bundle a fresh delivery to `target` opens against: [`Self::delivery_bundle`], which waits
+    /// for a one-time prekey no delivery has named (ADR-030 P-3). While `target` is connected that
+    /// wait is bounded by [`ONE_TIME_WAIT_MS`]; past it the delivery opens on the signed prekey
+    /// ([`Self::delivery_bundle_or_signed`]), and the person is told once, with what it costs (S-5).
+    /// A member not connected cannot take the key anyway, and starts no clock.
+    async fn delivery_bundle_waiting(
+        &mut self,
+        channel_id: &Digest32,
+        target: Digest32,
+    ) -> Result<crate::identity::keyagreement::PrekeyBundlePublic, Option<prekeys::BundleWait>>
+    {
+        let pair = (*channel_id, target);
+        let wait = match self.delivery_bundle(channel_id, target).await {
+            Ok(bundle) => {
+                self.one_time_waits.remove(&pair);
+                return Ok(bundle);
+            }
+            Err(wait @ prekeys::BundleWait::OneTimeSpent { .. }) => wait,
+            Err(wait) => return Err(Some(wait)),
+        };
+        let connected = self
+            .net
+            .as_ref()
+            .is_some_and(|n| n.manager().existing(&target).is_some());
+        if !connected {
+            self.one_time_waits.remove(&pair);
+            return Err(Some(wait));
+        }
+        let now = self.now_ms().get();
+        let since = *self.one_time_waits.entry(pair).or_insert(now);
+        if now.saturating_sub(since) < ONE_TIME_WAIT_MS {
+            return Err(Some(wait));
+        }
+        let bundle = self
+            .delivery_bundle_or_signed(channel_id, target)
+            .await
+            .map_err(Some)?;
+        self.one_time_waits.remove(&pair);
+        if let Some(net) = self.net.as_ref() {
+            net.manager().note(
+                target,
+                format!(
+                    "your key for it in room {} went to its signed prekey: no bundle naming a fresh \
+                     one-time prekey arrived within {} s while it was connected, so anyone who \
+                     copied that signed prekey before it rotates could read this key (ADR-030 S-5)",
+                    crate::node::network::short_id(*channel_id),
+                    ONE_TIME_WAIT_MS / 1_000
+                ),
+            );
+        }
+        Ok(bundle)
     }
 
     /// A key watched by [`watch_delivery`] was answered, taken or not: one fewer in flight.
@@ -13322,6 +13384,7 @@ impl Node {
         // Sealed bytes, no key material; but the ring that opens the next ones is this identity's.
         self.deliveries.clear();
         self.key_waiting.clear();
+        self.one_time_waits.clear();
         // And the watchers still running answer for what is no longer in flight.
         self.delivery_epoch = self.delivery_epoch.wrapping_add(1);
         self.history_in_flight.clear();
