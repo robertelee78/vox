@@ -723,7 +723,8 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
     // **With --drive, drive is said before the change is made** (ADR-028 E-5): it is part of what
     // yes changes, so it is in the preview, before the passphrase is asked and before `trusting`.
     // Mutant: the preview's drive line dropped; red here.
-    let driver = "b".repeat(52);
+    // Another fingerprint nobody holds: its last character carries no bits past the 256.
+    let driver = format!("{}a", "b".repeat(51));
     let (ok, out, err) = vox(
         &data,
         &cfg,
