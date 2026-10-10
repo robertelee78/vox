@@ -226,6 +226,22 @@ impl Account {
     /// # Errors
     /// If a directory cannot be created `0700`.
     pub fn node_paths(&self, name: &NodeName) -> Result<Paths> {
+        self.make_node_paths(name)
+    }
+
+    /// Node `name`'s paths, **creating nothing** (#666): for a reader, such as an agent's hook,
+    /// that may be naming a node that is not on this machine. Only making a node (`vox node
+    /// create`, `vox setup`, `vox agent connect`) makes its directory.
+    #[must_use]
+    pub fn node_paths_as_they_are(&self, name: &NodeName) -> Paths {
+        Paths {
+            config_dir: self.config_dir.clone(),
+            profile_dir: self.node_dir(name),
+            data_root: self.data_root.clone(),
+        }
+    }
+
+    fn make_node_paths(&self, name: &NodeName) -> Result<Paths> {
         let profile_dir = self.node_dir(name);
         create_private_dir(&self.data_root)?;
         create_private_dir(&self.nodes_dir())?;
@@ -740,7 +756,12 @@ fn home_dir() -> Result<PathBuf> {
         })
 }
 
-fn default_data_root() -> Result<PathBuf> {
+/// The data root used when neither `--data-dir` nor `VOX_DATA_DIR` names one: the one Vox.app
+/// serves.
+///
+/// # Errors
+/// HOME not set.
+pub fn default_data_root() -> Result<PathBuf> {
     if let Some(v) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(v).join("vox"));
     }

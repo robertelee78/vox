@@ -96,12 +96,17 @@ struct Inner {
     /// Held while `.daemon/attach` is rewritten and while a Keychain item is stored or removed:
     /// one writer at a time, and a removal never overtakes a later store of the same item.
     keep_file: tokio::sync::Mutex<()>,
+    /// The kept nodes this daemon's start is attaching and has not finished with (#666): listed
+    /// as attaching from the moment the daemon serves, so a hook asking then is told the truth.
+    starting: Mutex<BTreeSet<NodeName>>,
     /// Each node's joins of its sessions' rooms under way (ADR-029 RB-3).
     joins: Mutex<BTreeMap<NodeName, Arc<vox_core::node::room_join::Joins>>>,
     /// Where harness sessions' activity is numbered and posted, and approvals wait (ADR-029).
     sink: Arc<crate::session_sink::Sink>,
     /// One queue per (node, session) into its Session, so its entries keep their order.
     posting: Mutex<BTreeMap<(NodeName, String), tokio::sync::mpsc::UnboundedSender<String>>>,
+    /// The Claude Code sessions whose transcript is read for a new name (ADR-029 MD-1).
+    titles: Mutex<BTreeSet<(NodeName, String)>>,
     /// Codex sessions' activity, read from Codex's app-server as a peer client (ADR-029 #541).
     codex: Arc<crate::codex_mirror::CodexMirror>,
     /// OpenCode sessions' activity, read through Vox's OpenCode plugin (ADR-029 #542).
@@ -290,8 +295,10 @@ impl Router {
                     connections: Arc::default(),
                     proxy,
                     keep_file: tokio::sync::Mutex::new(()),
+                    starting: Mutex::new(BTreeSet::new()),
                     sink,
                     posting: Mutex::default(),
+                    titles: Mutex::default(),
                     joins: Mutex::default(),
                 }
             }),
@@ -360,6 +367,9 @@ impl Router {
             .into_iter()
             .map(|name| {
                 let mut info = info_of(&name, slots.get(&name));
+                if slots.get(&name).is_none() && lock(&self.inner.starting).contains(&name) {
+                    info.state = NodeState::Attaching;
+                }
                 // A node not attached: its public fingerprint file, for display only (P8).
                 if info.fingerprint.is_none() {
                     info.fingerprint = self
@@ -505,10 +515,14 @@ impl Router {
             )));
         }
         if let Err(e) = stored {
-            g.notes.push(format!(
-                "node {node} is attached, but not kept: its passphrase could not be stored in \
-                 the Keychain: {e}"
-            ));
+            g.notes.push(if e == crate::keychain::NO_KEYCHAIN {
+                format!("node {node} is attached; {e}")
+            } else {
+                format!(
+                    "node {node} is attached, but not kept: its passphrase could not be stored \
+                     in the Keychain: {e}"
+                )
+            });
         }
         self.write_attach_file_held(None).await;
         Ok((g.info, g.notes))
@@ -628,6 +642,64 @@ impl Router {
                 Err(e) => session.tmux_why = Some(format!("the pane could not be proven: {e}")),
             }
         }
+        // **A node still attaching takes the registration now, and applies it once attached**
+        // (#666): the hook, inside a model's turn, is answered at once with the node as attaching,
+        // and the Session exists from this first turn.
+        if let Some(info) = self.attaching(node) {
+            let router = self.clone();
+            let queued = node.clone();
+            let (id, asked) = (id.clone(), asked.clone());
+            self.inner.rt.spawn(async move {
+                router.started(&queued).await;
+                let session_id = id.clone();
+                if let Err(r) = router
+                    .registered(&queued, session, id, asked, known, join)
+                    .await
+                {
+                    eprintln!(
+                        "vox daemon: session {session_id} of node {queued} was not registered \
+                         once the node attached: {r}"
+                    );
+                }
+            });
+            return Ok(DaemonFrame::SessionRegistered {
+                info,
+                room: None,
+                new: !known,
+                joining: None,
+            });
+        }
+        self.registered(node, session, id, asked, known, join).await
+    }
+
+    /// The node's info, as attaching, when the daemon is attaching it (its start's kept nodes, or
+    /// an attach under way); `None` otherwise.
+    fn attaching(&self, node: &NodeName) -> Option<NodeInfo> {
+        self.nodes()
+            .into_iter()
+            .find(|n| &n.name == node && matches!(n.state, NodeState::Attaching))
+    }
+
+    /// Once the daemon's start is done with kept node `node` (attached, or given up), or at
+    /// once for any other node; bounded, as nothing a start does takes minutes.
+    async fn started(&self, node: &NodeName) {
+        let t0 = std::time::Instant::now();
+        while lock(&self.inner.starting).contains(node) && t0.elapsed() < Duration::from_secs(300) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The rest of [`Self::session_register`], for a node attached or about to be: the session
+    /// holds the node, its room is resolved, its Session opened.
+    async fn registered(
+        &self,
+        node: &NodeName,
+        session: crate::wake::Session,
+        id: String,
+        asked: Option<String>,
+        known: bool,
+        join: Option<(String, Zeroizing<String>)>,
+    ) -> Result<DaemonFrame, Refusal> {
         let g = self
             .want(
                 node,
@@ -672,6 +744,9 @@ impl Router {
         if let (Some(handle), Some(reg)) = (handle.as_ref(), stored.as_ref()) {
             joining = self.open_session(node, handle, reg, join).await;
         }
+        if let Some(reg) = stored.as_ref() {
+            self.watch_title(node, reg);
+        }
         // **New** is new to this node: no registration before, and no Session of it in any room
         // its log holds, so a daemon restarted mid-session still knows it (ADR-029 RB-5).
         let seen = handle.as_ref().is_some_and(|h| {
@@ -691,9 +766,10 @@ impl Router {
     }
 
     /// Open `reg`'s Session in its room (ADR-029 SE-1): at once when the node is a member, or once
-    /// a join from the room map (`join`) makes it one. A headless session gets none, and neither
-    /// does a hook run by hand, with no harness behind it. What a join under way says, for the
-    /// session.
+    /// a join from the room map (`join`) makes it one. A headless session gets none, but its node
+    /// still joins the room the map names (RB-3 has no headless exception: a `claude -p` in a bound
+    /// repo works in that room, though no Session shows it). A hook run by hand, with no harness
+    /// behind it, does neither. What a join under way says, for the session.
     async fn open_session(
         &self,
         node: &NodeName,
@@ -702,19 +778,21 @@ impl Router {
         join: Option<(String, Zeroizing<String>)>,
     ) -> Option<String> {
         let room_b32 = reg.room.as_ref()?;
-        if !reg.interactive || reg.harness == "unknown" {
+        if reg.harness == "unknown" {
             return None;
         }
         let room = vox_core::node::link::b32_decode(room_b32, "room").ok()?;
-        let opening = vox_core::node::sessions::Opening {
+        let opening = reg.interactive.then(|| vox_core::node::sessions::Opening {
             id: reg.session.clone(),
             harness: reg.harness.clone(),
             name: reg.name.clone(),
-        };
+        });
         let member = handle.view().channels.iter().any(|c| c.channel_id == room);
         let joins = Arc::clone(lock(&self.inner.joins).entry(node.clone()).or_default());
         if member {
             joins.set_status(room_b32, None);
+            // A headless run joined and is in: it opens no Session.
+            let opening = opening?;
             if let Err(e) = vox_core::node::sessions::open_when_member(handle, room, &opening).await
             {
                 return Some(format!(
@@ -775,6 +853,191 @@ impl Router {
             new: false,
             joining,
         })
+    }
+
+    /// The asks of this data root (ADR-029 RB-5a), knowing which rooms each attached node is in,
+    /// or is joining now for the first time.
+    async fn room_asks(&self) -> Vec<vox_core::node::daemonipc::RoomAsk> {
+        let mut held: BTreeMap<NodeName, BTreeSet<String>> = BTreeMap::new();
+        for node in self.inner.account.nodes_on_disk() {
+            if let Some(h) = self.handle_of(&node) {
+                let rooms = h
+                    .view()
+                    .channels
+                    .iter()
+                    .map(|c| vox_core::node::link::b32_encode(&c.channel_id))
+                    .collect();
+                held.insert(node, rooms);
+            }
+        }
+        let joins = lock(&self.inner.joins).clone();
+        let account = self.inner.account.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::room_ask::asks(&account, &|node, room| {
+                // A join running now is waited for, unless one before it failed: a retry that
+                // keeps failing must not hide the ask.
+                held.get(node).is_some_and(|r| !r.contains(room))
+                    && !joins.get(node).is_some_and(|j| {
+                        j.under_way(room)
+                            && !j
+                                .status(room)
+                                .is_some_and(|s| s.starts_with("could not join"))
+                    })
+            })
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// The person's answer to the ask about `dir` (ADR-029 RB-5a, RB-6).
+    ///
+    /// With a `link`: bind `dir` to the room it names, what `vox room join <link> --node <node>
+    /// --bind <dir>` does: each node of a session that asked joins the room, which checks the
+    /// passphrase, unless it is in it already; the room map then binds `dir`, replacing a no or
+    /// another room. With `link` empty: the room map binds `dir` already, to a room the sessions'
+    /// nodes are not in, and they join it with the map's own link and passphrase. Either way every
+    /// session that asked is then put in the room.
+    async fn room_bind(&self, dir: &str, link: &str, passphrase: Zeroizing<String>) -> DaemonFrame {
+        let no = |why: String| DaemonFrame::RoomAnswer {
+            done: false,
+            said: vec![why],
+        };
+        let Some(ask) = self.room_asks().await.into_iter().find(|a| a.dir == dir) else {
+            return no(format!(
+                "no session started in {dir} is waiting for a room now; nothing was changed"
+            ));
+        };
+        let data_root = self.inner.account.data_root.clone();
+        let (link, passphrase, bind) = if link.is_empty() {
+            let mapped = crate::room_map::read(&data_root).ok().and_then(|entries| {
+                crate::room_map::resolve(&entries, std::path::Path::new(dir))
+                    .filter(|e| e.room != crate::room_map::DECLINED)
+                    .map(|e| (e.room.clone(), e.passphrase.clone()))
+            });
+            let Some((link, passphrase)) = mapped else {
+                return no(format!(
+                    "the room map binds {dir} to no room, so there is no room to join; nothing \
+                     was changed"
+                ));
+            };
+            (link, passphrase, false)
+        } else {
+            (link.to_owned(), passphrase, true)
+        };
+        let parsed = match vox_core::node::link::InviteLink::parse(&link) {
+            Ok(p) => p,
+            Err(why) => return no(format!("that is not a room link (vox://…): {why}")),
+        };
+        let room_b32 = vox_core::node::link::b32_encode(&parsed.channel_id);
+        let short: String = room_b32.chars().take(12).collect();
+        let mut nodes: Vec<NodeName> = Vec::new();
+        for s in &ask.sessions {
+            if !nodes.contains(&s.node) {
+                nodes.push(s.node.clone());
+            }
+        }
+        let mut said = Vec::new();
+        for node in &nodes {
+            let Some(handle) = self.handle_of(node) else {
+                return no(format!(
+                    "node {node} is not attached, so it cannot join room {short}; nothing more \
+                     was changed"
+                ));
+            };
+            let member = handle
+                .view()
+                .channels
+                .iter()
+                .any(|c| c.channel_id == parsed.channel_id);
+            if member {
+                continue;
+            }
+            match handle
+                .apply(vox_core::node::api::NodeCommand::JoinChannel {
+                    link: link.clone(),
+                    passphrase: vox_core::node::api::Secret::new(passphrase.as_bytes().to_vec()),
+                })
+                .await
+            {
+                vox_core::node::api::Outcome::Done => {
+                    said.push(format!("node {node} joined room {short}"));
+                }
+                other => {
+                    said.push(format!(
+                        "node {node} could not join room {short}, so {dir} was not bound: {other}"
+                    ));
+                    return DaemonFrame::RoomAnswer { done: false, said };
+                }
+            }
+        }
+        if bind {
+            // Said before it is written (ADR-028 E-5): who can read what is saved.
+            let map = crate::room_map::path(&data_root);
+            said.push(format!(
+                "every agent session started in {dir}, from any harness, is to work in room \
+                 {short}; every node of this data root can read the room map {}, the passphrase \
+                 included",
+                map.display()
+            ));
+            match crate::room_map::bind(&data_root, std::path::Path::new(dir), &link, &passphrase) {
+                Ok(Some(was)) => said.push(format!(
+                    "bound {dir}, replacing what the room map held for it: {was}"
+                )),
+                Ok(None) => said.push(format!("bound {dir}")),
+                Err(e) => {
+                    said.push(format!("{dir} was not bound: {e}"));
+                    return DaemonFrame::RoomAnswer { done: false, said };
+                }
+            }
+        }
+        for s in &ask.sessions {
+            let label: String = s.session.chars().take(8).collect();
+            let who = crate::room_ask::harness_words(&s.harness);
+            let Ok(paths) = self.inner.account.node_paths(&s.node) else {
+                continue;
+            };
+            if crate::wake::store_room(&paths, &s.session, &room_b32).is_none() {
+                continue;
+            }
+            let joining = match (
+                self.handle_of(&s.node),
+                crate::wake::registration(&paths, &s.session),
+            ) {
+                (Some(h), Some(reg)) => self.open_session(&s.node, &h, &reg, None).await,
+                _ => None,
+            };
+            said.push(match joining {
+                Some(j) => format!("{who} session {label} now works in room {short}: {j}"),
+                None => format!("{who} session {label} now works in room {short}"),
+            });
+        }
+        DaemonFrame::RoomAnswer { done: true, said }
+    }
+
+    /// Record the person's no for `dir` (ADR-029 RB-7): a block whose room is `none`, so no
+    /// session started there is asked again, by the app or by its hook.
+    fn room_decline(&self, dir: &str) -> DaemonFrame {
+        let data_root = &self.inner.account.data_root;
+        match crate::room_map::decline(data_root, std::path::Path::new(dir)) {
+            Ok(true) => DaemonFrame::RoomAnswer {
+                done: true,
+                said: vec![format!(
+                    "{dir} is to stay tied to no room: no session started there is asked again; \
+                     remove its block from {} to be asked",
+                    crate::room_map::path(data_root).display()
+                )],
+            },
+            Ok(false) => DaemonFrame::RoomAnswer {
+                done: false,
+                said: vec![format!(
+                    "the room map names {dir} already; nothing was changed"
+                )],
+            },
+            Err(e) => DaemonFrame::RoomAnswer {
+                done: false,
+                said: vec![e.to_string()],
+            },
+        }
     }
 
     /// Listen for drive input to `node`'s sessions ([`crate::drive`]) until the node detaches.
@@ -1276,6 +1539,60 @@ impl Router {
         });
     }
 
+    /// A Claude Code session's name read from its transcript while it is registered (ADR-029 MD-1):
+    /// its hooks read it each turn, but a `/rename` is a command with no turn, typed in the
+    /// terminal or driven from Vox, so no hook runs after it and the Session kept its old name
+    /// until the session's next prompt. The transcript's new lines are read every
+    /// [`TITLE_EVERY`], from where the last read stopped; a new name renames the Session at once,
+    /// as Codex's and OpenCode's do. One reader per session; it stops when the session's
+    /// registration goes.
+    ///
+    /// **Only the title lines** (`custom-title`, `ai-title`) are taken from the transcript's new
+    /// bytes: the reader keeps nothing else of it, logs nothing of it, and sends nothing of it
+    /// anywhere. The transcript is the session's whole conversation; Vox needs its name alone.
+    fn watch_title(&self, node: &NodeName, reg: &crate::wake::Session) {
+        if reg.harness != "claude" || reg.transcript.is_empty() {
+            return;
+        }
+        let key = (node.clone(), reg.session.clone());
+        if !lock(&self.inner.titles).insert(key.clone()) {
+            return;
+        }
+        let weak = Arc::downgrade(&self.inner);
+        let path = std::path::PathBuf::from(&reg.transcript);
+        self.inner.rt.spawn(async move {
+            let (node, session) = key.clone();
+            let mut titles = Titles::default();
+            loop {
+                tokio::time::sleep(TITLE_EVERY).await;
+                let Some(inner) = weak.upgrade() else { return };
+                let router = Router { inner };
+                let Some(reg) = router
+                    .inner
+                    .account
+                    .node_paths(&node)
+                    .ok()
+                    .and_then(|p| crate::wake::registration(&p, &session))
+                else {
+                    break;
+                };
+                let path = path.clone();
+                titles = match tokio::task::spawn_blocking(move || titles.read(&path)).await {
+                    Ok(t) => t,
+                    Err(_) => break,
+                };
+                if let Some(name) = titles.name() {
+                    if reg.name.as_deref() != Some(name.as_str()) {
+                        router.rename_session(&node, &session, &name);
+                    }
+                }
+            }
+            if let Some(inner) = weak.upgrade() {
+                lock(&inner.titles).remove(&key);
+            }
+        });
+    }
+
     /// Post `bodies`, numbered, to `session`'s Session: sealed to the members `node` trusts with
     /// drive (ADR-029 SC-2), in the room the session works in. One task per session posts them in
     /// order, so a split entry's parts stay together.
@@ -1448,53 +1765,88 @@ impl Router {
     /// Attach every node the attach file keeps (L-4), each in the background: a client that asks
     /// for one meanwhile waits for it, as for any attach.
     pub fn attach_kept(&self) {
-        for (node, source) in read_attach_file(&self.inner.account.attach_file()) {
+        let kept = self.mark_kept_attaching();
+        for (node, source) in kept {
             let router = self.clone();
             self.inner.rt.spawn(async move {
-                let (passphrase, rooms) = match &source {
-                    KeepSource::None => (None, Vec::new()),
-                    // Off the runtime's workers: a Keychain that asks (locked, or the item made by
-                    // another vox) blocks until someone answers, and two of these would otherwise
-                    // leave the daemon answering no one meanwhile.
-                    KeepSource::Keychain(account) => {
-                        match read_in_keychain(account.clone()).await {
-                            Ok(p) => (Some(p), Vec::new()),
-                            Err(e) => {
-                                eprintln!(
-                                "vox daemon: could not attach kept node {node}: its passphrase in \
-                                 the Keychain: {e}"
-                            );
-                                return;
-                            }
-                        }
-                    }
-                    KeepSource::File(path) => match crate::tunnel_cli::passphrase_file_text(path) {
-                        Ok(text) => split_passphrases(&text),
-                        Err(e) => {
-                            eprintln!(
-                                "vox daemon: could not attach kept node {node}: its passphrase \
-                                 file {}: {e}",
-                                path.display()
-                            );
-                            return;
-                        }
-                    },
-                };
-                match router
-                    .want(
-                        &node,
-                        Want::Explicit(Some(source)),
-                        passphrase,
-                        rooms,
-                        Vec::new(),
-                    )
-                    .await
-                {
-                    Ok(_) => eprintln!("vox daemon: attached kept node {node}"),
-                    Err(r) => eprintln!("vox daemon: could not attach kept node {node}: {r}"),
-                }
+                router.attach_one_kept(&node, source).await;
+                lock(&router.inner.starting).remove(&node);
             });
         }
+    }
+
+    /// List every node the attach file keeps as attaching (#666), and return them with their
+    /// keeps. **Called before the control socket serves**, so no client ever sees a kept node as
+    /// detached in the moment before [`Self::attach_kept`] starts it; idempotent.
+    pub fn mark_kept_attaching(&self) -> Vec<(NodeName, KeepSource)> {
+        let kept = read_attach_file(&self.inner.account.attach_file());
+        lock(&self.inner.starting).extend(kept.iter().map(|(n, _)| n.clone()));
+        kept
+    }
+
+    /// Attach kept node `node` from its keep `source`, as [`Self::attach_kept`] does each.
+    async fn attach_one_kept(&self, node: &NodeName, source: KeepSource) {
+        let (passphrase, rooms) = match &source {
+            KeepSource::None => (None, Vec::new()),
+            // Off the runtime's workers: a Keychain that asks (locked, or the item made by
+            // another vox) blocks until someone answers, and two of these would otherwise leave
+            // the daemon answering no one meanwhile.
+            KeepSource::Keychain(account) => match read_in_keychain(account.clone()).await {
+                Ok(p) => (Some(p), Vec::new()),
+                Err(e) => {
+                    eprintln!(
+                        "vox daemon: could not attach kept node {node}: its passphrase in the \
+                         Keychain: {e}"
+                    );
+                    self.needs_passphrase(node).await;
+                    return;
+                }
+            },
+            KeepSource::File(path) => match crate::tunnel_cli::passphrase_file_text(path) {
+                Ok(text) => split_passphrases(&text),
+                Err(e) => {
+                    eprintln!(
+                        "vox daemon: could not attach kept node {node}: its passphrase file {}: \
+                         {e}",
+                        path.display()
+                    );
+                    return;
+                }
+            },
+        };
+        match self
+            .want(
+                node,
+                Want::Explicit(Some(source)),
+                passphrase,
+                rooms,
+                Vec::new(),
+            )
+            .await
+        {
+            Ok(_) => eprintln!("vox daemon: attached kept node {node}"),
+            Err(r) => {
+                eprintln!("vox daemon: could not attach kept node {node}: {r}");
+                self.needs_passphrase(node).await;
+            }
+        }
+    }
+
+    /// Tell the person that kept node `node` did not attach by itself and waits for them (#666):
+    /// a notification with the command that attaches it, as the node's notifications are raised.
+    async fn needs_passphrase(&self, node: &NodeName) {
+        let Ok(paths) = self.inner.account.node_paths(node) else {
+            return;
+        };
+        let node = node.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::notify::needs_passphrase(
+                &paths,
+                node.as_str(),
+                &format!("It did not attach by itself. Run in a terminal: vox node attach {node}"),
+            );
+        })
+        .await;
     }
 
     /// Find `node` attached, or attach it, as `want` says, waiting out anyone else's attach or
@@ -2101,7 +2453,7 @@ fn info_of(name: &NodeName, slot: Option<&Slot>) -> NodeInfo {
 
 /// The identity passphrase (the first line) and the room passphrases (the rest) of a passphrase
 /// file's text, as a piped `vox daemon` reads them. Only line endings are stripped.
-fn split_passphrases(text: &str) -> (Option<Zeroizing<String>>, Vec<Zeroizing<String>>) {
+pub(crate) fn split_passphrases(text: &str) -> (Option<Zeroizing<String>>, Vec<Zeroizing<String>>) {
     let mut lines = text
         .lines()
         .map(|l| Zeroizing::new(l.trim_end_matches('\r').to_owned()));
@@ -2111,7 +2463,7 @@ fn split_passphrases(text: &str) -> (Option<Zeroizing<String>>, Vec<Zeroizing<St
 
 /// `.daemon/attach`: one line per kept node, `<name>\t(none|file:<path>|keychain:<account>)`. A
 /// line that does not parse is skipped.
-fn read_attach_file(path: &std::path::Path) -> Vec<(NodeName, KeepSource)> {
+pub(crate) fn read_attach_file(path: &std::path::Path) -> Vec<(NodeName, KeepSource)> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -2212,6 +2564,13 @@ impl Dispatch for Router {
                     detached,
                 }
             }
+            DaemonRequest::RoomAsks => DaemonFrame::RoomAsks(self.room_asks().await),
+            DaemonRequest::RoomBind {
+                dir,
+                link,
+                passphrase,
+            } => self.room_bind(&dir, &link, passphrase).await,
+            DaemonRequest::RoomDecline { dir } => self.room_decline(&dir),
             DaemonRequest::Status => DaemonFrame::Status(DaemonStatus {
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 pid: std::process::id(),
@@ -2514,5 +2873,69 @@ impl vox_core::node::ipc::Extension for DaemonExtension {
             }
             _ => crate::lan_cli::LanUp.serve(body, stream, handle),
         }
+    }
+}
+
+/// How often a Claude Code session's transcript is read for a new name.
+const TITLE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The titles a Claude Code transcript holds, read from where the last read stopped: a `/rename`
+/// writes `{"type":"custom-title","customTitle":…}`, and Claude Code's own title is
+/// `{"type":"ai-title","aiTitle":…}`. The name a person set wins, exactly as set, case and all;
+/// Claude Code's own title only while there is none, as the hooks read them
+/// (`agent_hook::session_name`).
+///
+/// Nothing else of the transcript is kept: each read's lines are dropped once their titles are
+/// taken, and only a line not yet ended is held until the next read ends it.
+#[derive(Default)]
+struct Titles {
+    /// Bytes read so far.
+    offset: u64,
+    /// A line read only in part, finished by the next read.
+    partial: String,
+    custom: Option<String>,
+    made: Option<String>,
+}
+
+impl Titles {
+    fn read(mut self, path: &std::path::Path) -> Self {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return self;
+        };
+        // A transcript that got shorter was written anew: read from its start.
+        if file.metadata().is_ok_and(|m| m.len() < self.offset) {
+            self = Self::default();
+        }
+        if file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return self;
+        }
+        let mut bytes = Vec::new();
+        let Ok(n) = file.read_to_end(&mut bytes) else {
+            return self;
+        };
+        self.offset += n as u64;
+        self.partial.push_str(&String::from_utf8_lossy(&bytes));
+        let done = self.partial.rfind('\n').map_or(0, |i| i + 1);
+        let lines: String = self.partial.drain(..done).collect();
+        for line in lines.lines().filter(|l| l.contains("-title\"")) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            match v["type"].as_str() {
+                Some("custom-title") => self.custom = v["customTitle"].as_str().map(str::to_owned),
+                Some("ai-title") => self.made = v["aiTitle"].as_str().map(str::to_owned),
+                _ => {}
+            }
+        }
+        self
+    }
+
+    fn name(&self) -> Option<String> {
+        self.custom
+            .clone()
+            .or_else(|| self.made.clone())
+            .map(|n| n.trim().to_owned())
+            .filter(|n| !n.is_empty())
     }
 }

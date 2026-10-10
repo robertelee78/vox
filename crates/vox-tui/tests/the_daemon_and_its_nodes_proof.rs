@@ -7,7 +7,14 @@
 //!    node `b` still answers.
 //! 2. **Lifecycle races (proof 6, L-3; ADR-028 K-13).** Two hooks of two sessions of one detached
 //!    node, with no daemon running, start at once: both exit 0, telling the agent the node is not
-//!    attached and the command for the operator, `vox node attach agent`; one daemon starts, and
+//!    attached and the command for the operator, `vox node attach agent`; a session's next turn
+//!    says nothing more, and the person is notified once per session; a hook naming a node not
+//!    on this Mac says so with `vox setup` and makes no `nodes/<it>` directory; with no daemon,
+//!    a verb says to open Vox (or run `vox daemon`) on a Mac (#666; mutants: the old `vox
+//!    daemon`-only words, red at that line;
+//!    the node-on-disk check skipped, red at that line; the hook resolving its paths by making
+//!    them, red at the directory; the
+//!    once-per-session record ignored, red as PRODUCT at the second turn); one daemon starts, and
 //!    the node stays detached (a hook never attaches it). The operator attaches it; then one
 //!    session's `SessionEnd` races the other's next turn, and the node stays attached throughout;
 //!    the last `SessionEnd` leaves it attached too, since the operator attached it. Detached by
@@ -78,6 +85,21 @@ impl Account {
         let data = tmp.path().join("d");
         let cfg = tmp.path().join("c");
         std::fs::create_dir_all(&cfg).unwrap();
+        // Notifications go to a file of this test's, never to the desktop (`VOX_NOTIFY_COMMAND`).
+        let notify = tmp.path().join("notify");
+        std::fs::write(
+            &notify,
+            format!(
+                "#!/bin/sh\nprintf '%s | %s\\n' \"$1\" \"$2\" >> {}\n",
+                tmp.path().join("notified").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &notify,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
         Self {
             _tmp: tmp,
             data,
@@ -96,6 +118,7 @@ impl Account {
             }
         }
         c.args(args)
+            .env("VOX_NOTIFY_COMMAND", self._tmp.path().join("notify"))
             .env("VOX_DATA_DIR", &self.data)
             .env("VOX_CONFIG_DIR", &self.cfg)
             .env("VOX_LISTEN", "127.0.0.1:0")
@@ -144,6 +167,11 @@ impl Account {
 
     fn log(&self) -> String {
         std::fs::read_to_string(self.data.join(".daemon/log")).unwrap_or_default()
+    }
+
+    /// The notifications raised so far, one `title | body` a line.
+    fn notified(&self) -> String {
+        std::fs::read_to_string(self._tmp.path().join("notified")).unwrap_or_default()
     }
 }
 
@@ -338,6 +366,19 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
     watchdog::arm();
     let a = Account::new();
     a.make_node("agent");
+    // **No daemon: the way to start one is said, Vox first on a Mac** (#666): a person opens Vox
+    // before they open a terminal.
+    let (ok, out, err) = a.run(&["node", "detach", "agent"], "");
+    let start = if cfg!(target_os = "macos") {
+        "to start one, open Vox (or run `vox daemon` in a terminal)"
+    } else {
+        "to start one, run `vox daemon` in a terminal"
+    };
+    assert!(
+        !ok && format!("{out}{err}").contains(start),
+        "PRODUCT: with no daemon running, `vox node detach` must say how to start one: \
+         \"{start}\"; it said: {out}{err}"
+    );
     let (h1, h2) = std::thread::scope(|s| {
         let one = s.spawn(|| a.hook("agent", "s-1", "UserPromptSubmit"));
         let two = s.spawn(|| a.hook("agent", "s-2", "UserPromptSubmit"));
@@ -352,6 +393,42 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
             a.log()
         );
     }
+    // **A hook naming a node that is not here says so, with `vox setup`** (#666), in one sentence.
+    let (ok, out, err) = a.hook("ghost", "s-9", "UserPromptSubmit");
+    assert!(
+        ok && out.contains(
+            "Claude Code has no Vox node on this Mac (its hook names node ghost, which is not \
+             here); ask the operator to run `vox setup` in a terminal."
+        ),
+        "PRODUCT: a hook naming a node not on this Mac must say, in one sentence, that Claude \
+         Code has no Vox node here and to run `vox setup`: {out}{err}"
+    );
+    // ...and makes nothing: only making a node makes its directory.
+    let ghost = a.data.join("nodes").join("ghost");
+    assert!(
+        !ghost.exists(),
+        "PRODUCT: a hook naming a node not on this Mac must create nothing, but {} exists",
+        ghost.display()
+    );
+    // **Said once per session, not every turn** (#666): session 1's next turn tells the agent
+    // nothing more, and the person was told once per session, with the command.
+    let (ok, out, err) = a.hook("agent", "s-1", "UserPromptSubmit");
+    assert!(
+        ok && !out.contains("not attached") && !out.contains("could not read your rooms"),
+        "PRODUCT: a session's second turn must not say again that its node is not attached \
+         (once per session): {out}{err}"
+    );
+    let notified = a.notified();
+    assert!(
+        notified
+            .lines()
+            .filter(|l| l.contains("node agent needs its passphrase")
+                && l.contains("vox node attach agent"))
+            .count()
+            == 2,
+        "PRODUCT: the person must be notified once per session (two sessions, three turns) that \
+         node agent needs its passphrase, with the command; notified:\n{notified}"
+    );
     let pid = a
         .lock_pid()
         .unwrap_or_else(|| panic!("PRODUCT: no daemon holds the lock\nlog:\n{}", a.log()));
@@ -1065,6 +1142,138 @@ fn hook_read_to_end(a: &Account, session: &str, within: Duration) -> (Option<Str
         }
     }
     (stdout, child)
+}
+
+/// **A hook answers within a second while the daemon it starts attaches its kept nodes** (#666,
+/// the decider's bound for a hook: under 1 s). Eight kept nodes (made with no passphrase, so the
+/// daemon attaches each at its start, each an Argon2id unlock) and one node not attached; no
+/// daemon runs. A hook turn as the node not attached answers within 1 s, saying it is not
+/// attached; a hook turn as a kept node answers within 1 s, saying the node is attaching and the
+/// rooms show from the next turn; the daemon keeps that first turn's registration, and once the
+/// node is attached the session's Session is in its room with no second turn; a later turn says
+/// nothing of attaching. Mutants: the unlock's Argon2id back inline on the daemon's runtime (red:
+/// the not-attached node's hook waits on the unlocks); the daemon waiting for a node still
+/// attaching before it answers (red: the kept node's hook past 1 s); the queued registration
+/// dropped (red: no Session). Timing: run under `timing-lock.sh`.
+#[test]
+#[ignore = "real binaries with production Argon2id; a timing claim: run in release under timing-lock"]
+fn a_hook_answers_within_a_second_while_the_daemon_attaches_its_kept_nodes() {
+    watchdog::arm();
+    let a = Account::new();
+    let empty = a.data.with_extension("empty");
+    std::fs::write(&empty, "\n").unwrap();
+    let empty = empty.to_str().unwrap().to_owned();
+    let kept: Vec<String> = (1..=8).map(|i| format!("kept{i}")).collect();
+    for n in kept.iter().map(String::as_str).chain(["plain"]) {
+        let (ok, out, err) = a.run(&["node", "create", n, "--passphrase-file", &empty], "");
+        assert!(ok, "APPARATUS: vox node create {n}: {out}{err}");
+    }
+    for n in &kept {
+        let (ok, out, err) = a.run(&["node", "attach", n, "--passphrase-file", &empty], "");
+        assert!(
+            ok && out.contains("attaches it again by itself"),
+            "APPARATUS (staging): node {n} must be attached and remembered: {out}{err}"
+        );
+    }
+    // kept1 works in a room, made with no passphrase, so the Session its hook opens is seen.
+    let (ok, out, err) = a.run(
+        &[
+            "room",
+            "create",
+            "--node",
+            "kept1",
+            "--passphrase-file",
+            &empty,
+            "--name",
+            "work",
+        ],
+        "",
+    );
+    assert!(ok, "APPARATUS (staging): kept1's room: {out}{err}");
+    let (_, list, _) = a.run(&["room", "list", "--node", "kept1"], "");
+    let room = list
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let pid = a
+        .lock_pid()
+        .expect("APPARATUS: no daemon after the attaches");
+    stop_pid(pid);
+    assert!(!alive(pid), "APPARATUS: the staging daemon did not stop");
+
+    let timed = |node: &str, session: &str| {
+        let t0 = Instant::now();
+        let (ok, out, err) = a.hook(node, session, "UserPromptSubmit");
+        (t0.elapsed(), ok, format!("{out}{err}"))
+    };
+    let (took, ok, said) = timed("plain", "s-plain");
+    println!("[proof] cold hook as plain (not attached): {took:?}");
+    assert!(
+        ok && took < Duration::from_secs(1) && said.contains("node plain is not attached"),
+        "PRODUCT: with no daemon running and 8 kept nodes to attach, a hook as a node not \
+         attached must answer within 1 s, saying so; it took {took:?} and said: {said}\nlog:\n{}",
+        a.log()
+    );
+    let pid = a.lock_pid().expect("PRODUCT: the hook started no daemon");
+    stop_pid(pid);
+    let t0 = Instant::now();
+    let input = r#"{"hook_event_name":"UserPromptSubmit","session_id":"s-kept"}"#;
+    let (ok, out, err) = a.run(
+        &["agent", "hook", "--node", "kept1", "--room", &room],
+        input,
+    );
+    let (took, said) = (t0.elapsed(), format!("{out}{err}"));
+    println!("[proof] cold hook as kept1 (attaching): {took:?}: {said}");
+    assert!(
+        ok && took < Duration::from_secs(1)
+            && said.contains(
+                "Vox: node kept1 is attaching (the vox daemon has just started); this session \
+                 joins it once it is attached, and your rooms show from your next turn."
+            ),
+        "PRODUCT: with no daemon running, a hook as a kept node must answer within 1 s, saying \
+         the node is attaching and the rooms show from the next turn; it took {took:?} and \
+         said: {said}\nlog:\n{}",
+        a.log()
+    );
+    let attached = wait_until(Duration::from_secs(60), || {
+        a.run(&["node", "list"], "")
+            .1
+            .lines()
+            .any(|l| l.starts_with("kept1 ") && l.contains(" attached"))
+    });
+    assert!(
+        attached,
+        "PRODUCT: kept1 was not attached by the daemon's start\nlog:\n{}",
+        a.log()
+    );
+    // **The first turn's registration is kept** (#666): with no second turn, the Session of
+    // s-kept is in kept1's room once kept1 is attached.
+    let mut sessions = String::new();
+    let opened = wait_until(Duration::from_secs(30), || {
+        sessions = a
+            .run(
+                &["room", "sessions", &room, "--node", "kept1", "--json"],
+                "",
+            )
+            .1;
+        sessions.contains("s-kept")
+    });
+    println!("[proof] kept1's room's Sessions, after its first turn only: {sessions}");
+    assert!(
+        opened,
+        "PRODUCT: the session whose first turn found kept1 attaching must be registered once kept1 \
+         is attached, its Session in kept1's room, with no second turn: `vox room sessions` says \
+         {sessions}\nlog:\n{}",
+        a.log()
+    );
+    let (_, ok, said) = timed("kept1", "s-kept");
+    assert!(
+        ok && !said.contains("attaching") && !said.contains("could not read"),
+        "PRODUCT: once kept1 is attached, the next turn must read its rooms, not say it is \
+         attaching: {said}"
+    );
+    stop_pid(a.lock_pid().expect("PRODUCT: no daemon at the end"));
 }
 
 /// ADR-026 S-2, #405: **a daemon a hook starts keeps none of the hook's descriptors.** Two hooks

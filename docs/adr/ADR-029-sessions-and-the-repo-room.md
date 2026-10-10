@@ -152,19 +152,35 @@ relies on is ADR-028 K-14.
   that directory (RB-7), and holds no passphrase. Every node of the data root can read every passphrase in the map, so any of them can
   join any mapped room; whatever writes the map (setup, `vox agent room`) MUST say so (ADR-028 E-5).
 - **RB-2.** When a harness session starts, its node's hook MUST look up the session's start
-  directory in the room map. The match MUST be exact: `/opt/vox` matches a session started in
-  `/opt/vox` and nothing else.
+  directory in the room map, and the session MUST work by the deepest block whose `repo` is that
+  directory or one above it: a session started in `/opt/vox/crates` works by `/opt/vox`'s block
+  unless `/opt/vox/crates` has its own. A start directory inside a linked git worktree MUST first
+  be looked up within the worktree (a block for the worktree, or for a folder in it, wins), then as
+  the same place in the worktree's main repository, found from the worktree's `.git` file and its
+  `commondir`. A `none` block found this way MUST mean none (RB-7). Writing the map (`--bind`, a
+  no) names exactly the directory given.
 - **RB-3.** On a match, the node MUST join the room if it is not a member (ADR-005 J-1 with the
   map's link and passphrase), and the session MUST work in that room.
 - **RB-4.** A session's room MUST NOT change during the session's life because of where it works
   afterwards: new branches, worktrees, or reading or editing other repositories' files do not move
   it.
-- **RB-5.** With no match, the session MUST work in no room, and on its first turn the hook MUST
-  tell it, once, that its repository is not tied to a Vox room and to ask the operator, in the
-  session, for the room's link or a no: "This repo isn't tied to a Vox room. Paste its room link to
-  bind it, or say no." It MUST also tell the agent what to do with each answer (RB-6, RB-7).
-  `vox agent room <room>`, run later, MUST move the session to that room; a session MUST work in
-  one room at a time.
+- **RB-5.** With no match, the session MUST work in no room. There MUST be one ask, made in two
+  places (RB-5a): Vox asks the operator itself, and on the session's first turn the hook MUST tell
+  the agent, once, that its repository is not tied to a Vox room, that Vox has asked the operator,
+  and to say so to the operator once, in one sentence: "This repo isn't tied to a Vox room. Vox has
+  asked you in its app; you can also paste its room link here, or say no." The agent MUST NOT ask
+  again on later turns. The operator MAY answer in the session; the hook MUST tell the agent what to
+  do with a link or a no given there (RB-6, RB-7). `vox agent room <room>`, run later, MUST move the
+  session to that room; a session MUST work in one room at a time.
+- **RB-5a.** Every registered interactive session that works in no room, started in a directory
+  the room map does not name, MUST raise an ask for the operator, one per directory, naming the
+  harness and the directory ("Claude Code in /opt/vox has no room"). Vox.app MUST show it as a
+  banner across its window, with "Choose a room…" (a room the operator's node holds, or a pasted
+  link, and the room's passphrase typed in the app) and "Not this repo", and post one notification
+  for it; the TUI and `vox agent status` MUST show it with the commands that answer it at a
+  terminal. Choosing a room MUST do what RB-6's `--bind` does, and MUST also put every session
+  waiting in that directory in the room; "Not this repo" MUST record a no as RB-7 does. The ask
+  MUST end when the directory is bound or declined, or when no session there works in no room.
 - **RB-6.** A link is bound by the operator, never by the agent: the agent MUST NOT ask for, and
   the operator MUST NOT be asked to give, the room's passphrase in the session. The agent MUST give
   the operator the command to run in a terminal of their own, `vox room join <link> --node <the
@@ -185,6 +201,12 @@ relies on is ADR-028 K-14.
 (The decider, 2026-10-08: "if I start a session in claude/codex/opencode etc. in a repo, and we
 don't have the configuration set up yet where the repo is tied to a room, ask if there's a room
 url/link for it to bind to"; the passphrase is typed by the operator in another shell.)
+(RB-2's deepest-block and worktree matching: the lead's ruling, 2026-10-10, under the decider's
+delegation, v0.4.3 #671; it replaced the exact match, which asked again in every subfolder and
+worktree of a bound repo.)
+(The decider, 2026-10-10, v0.4.3 #671: an agent that did not relay the ask left the operator never
+knowing, so Vox asks the operator itself, and the operator may still answer in the session: "let
+me specify one if not".)
 
 ### 7. Setting up a machine
 

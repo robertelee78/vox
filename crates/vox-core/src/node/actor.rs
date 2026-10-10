@@ -49,6 +49,19 @@ use crate::node::status::PublishCause;
 use crate::pairwise::init_message::InitialMessage;
 use crate::transport::quic::VoxConnection;
 
+/// One key on its way to one member in a session of its own (ADR-030 D-1, D-4): the frame that
+/// carries it, kept so a re-carry resends exactly these bytes and opens no second session.
+#[derive(Debug, Clone)]
+struct Delivery {
+    /// `PairwiseFrame::RotationHello` bytes: the session's opening and the key sealed in it.
+    frame: Vec<u8>,
+    /// The one-time prekey of the member's the opening named, if any (ADR-030 P-3).
+    one_time_prekey: Option<u64>,
+    /// The `skdm_ref` of the key it carries: only that very key is resent in it, so a consent's
+    /// grant always names the key delivered (ADR-007).
+    key: Digest32,
+}
+
 /// A pairwise session this node opened (ADR-004 O2, O3).
 #[derive(Debug, Clone)]
 struct Initiated {
@@ -109,6 +122,14 @@ type SharedChannel = Arc<tokio::sync::Mutex<ChannelState>>;
 /// connection died and raises the periodic request (D7).
 const TICK: Duration = Duration::from_secs(1);
 
+/// Test-only: while the file this names exists, the node opens none of the key-packages the log
+/// brings it; they stay queued, as between a sync session's entries and its end, so a proof can
+/// show what a member is told while one waits (`drive_given_on_an_idle_session_…`).
+/// **For proofs; nothing in a real deployment sets it.** Not compiled in without the
+/// `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_HOLD_PACKAGES_ENV: &str = "VOX_TEST_HOLD_PACKAGES_FILE";
+
 /// At most one read record per room in this many milliseconds (ADR-028 RR-2): what is read in
 /// between waits, and the next record names all of it.
 const READ_RECORD_EVERY_MS: u64 = 5_000;
@@ -131,6 +152,43 @@ struct Winding {
 /// How often automatic work (a rotation's rekeys, a trusted member's consent) may start a background
 /// dial to one member it cannot currently reach. See `reach_member`.
 const MEMBER_REDIAL_MS: u64 = 30_000;
+
+/// The `timestamp_ms` for records this node signs in `room` naming the prekeys `offered`, given the
+/// clock's `base`. **A changed bundle is never refused as too soon** (ADR-030 P-3): a board takes a
+/// changed record only [`crate::nat::store::MIN_CHANGE_MS`] after the one it holds, and a node's
+/// prekeys can change faster than that (two consumes in a second), while its records go to its own
+/// board and to each anchor, signed apart. A change stamped inside the bound was refused by every
+/// board that held the earlier record, and nothing republished after: the bundle naming a spent
+/// one-time prekey stayed, and a sender's next key waited out its 30 s bound (measured: refusals at
+/// 0, 43, 70, 598, 601 and 644 ms). So a change is stamped at least the bound after the last record,
+/// at most a second ahead of the clock per change, well inside the boards' skew allowance.
+fn spaced_stamp(
+    stamped: &mut BTreeMap<Digest32, (u64, (u64, Option<u64>))>,
+    room: Digest32,
+    base: u64,
+    offered: (u64, Option<u64>),
+) -> u64 {
+    let stamp = match stamped.get(&room) {
+        Some((last, was)) if *was != offered => {
+            base.max(last.saturating_add(crate::nat::store::MIN_CHANGE_MS))
+        }
+        Some((last, _)) => base.max(*last),
+        None => base,
+    };
+    stamped.insert(room, (stamp, offered));
+    stamp
+}
+
+/// How long a key waits, while its member is connected, for a bundle naming a one-time prekey no
+/// delivery has named yet (ADR-030 P-3, S-5). A connected node republishes its bundle within about
+/// a second of a prekey's use; past this the key goes to the member's signed prekey, said once.
+const ONE_TIME_WAIT_MS: u64 = 30_000;
+
+/// How many taken key deliveries (ADR-030 W-3) are remembered per peer and room. A sender holds one
+/// delivery per key and drops it on `KEY_TAKEN` or when a later key supersedes it (D-4), so only the
+/// last few can be replayed honestly; an older replay is opened again, and its key is inert
+/// (ADR-006 S-12).
+const TAKEN_DELIVERIES_KEPT: usize = 64;
 
 /// How often a node holding a room with a member it is not connected to says where it listens on
 /// this computer and the local network (`node::nearby`).
@@ -1960,9 +2018,20 @@ async fn read_pairwise_streams(
     tx: mpsc::Sender<NetEvent>,
 ) {
     use crate::node::pairwise_stream::{recv_pairwise, PairwiseFrame};
-    while let Some((send, mut recv)) = streams.recv().await {
-        let Ok(Some(first)) = recv_pairwise(&mut recv).await else {
-            continue;
+    while let Some((mut send, mut recv)) = streams.recv().await {
+        let first = match recv_pairwise(&mut recv).await {
+            Ok(Some(first)) => first,
+            // Nothing was sent: nothing to answer.
+            Ok(None) => continue,
+            // **Refused, never dropped** (ADR-030 W-4): a frame that would not read is answered with
+            // a code. Dropped, the stream ended unanswered, which its sender reads as a node older
+            // than key delivery in a session of its own, and marks it so.
+            Err(_) => {
+                let why = crate::node::pairwise_stream::KeyRefusal::CannotOpen.code();
+                let _ = send.reset(why);
+                let _ = recv.stop(why);
+                continue;
+            }
         };
         // A hello is followed on the same stream by the frame it opens the session for, written
         // without waiting for anything, so it is read now too.
@@ -4143,6 +4212,12 @@ pub struct Node {
     /// `(room, member)` whose key waits for a prekey bundle of it this node's board does not
     /// hold: said once, not on every tick's retry, until the key goes (see `release_key_to`).
     key_waits_said: BTreeSet<(Digest32, Digest32)>,
+    /// One-time prekey ids of each member a key delivery named, or the member answered it does
+    /// not hold: never targeted again (ADR-030 P-3; see `delivery_bundle`).
+    refused_otps: prekeys::RefusedOneTime,
+    /// The signed and one-time prekey ids this node's ring offered at its last maintenance: a
+    /// change republishes its bundle (ADR-030; see `maintain_prekeys`).
+    prekeys_offered: Option<(u64, Option<u64>)>,
     /// Where this node says it listens on this computer and the local network, and hears others
     /// say so (V210-167; `node::nearby`). `None` for an anchor, or when the group cannot be
     /// joined.
@@ -4188,6 +4263,37 @@ pub struct Node {
     /// Per `(room, member)`: keys written and not yet answered (V210-88). In memory only, so a
     /// key cut off by a crash is owed again after the restart; see [`watch_delivery`].
     keys_in_flight: BTreeMap<(Digest32, Digest32), u32>,
+    /// Per `(room, member, generation)`: the key delivery opened for it (ADR-030 D-4), until the
+    /// member takes it, a later key supersedes it, or the member says its opening cannot work.
+    deliveries: BTreeMap<(Digest32, Digest32, u64), Delivery>,
+    /// Per `(room, member)`: why this identity's key for it waits, until it is taken (ADR-030
+    /// D-5, W-4), shown beside the member in the roster, `vox status` and the app.
+    key_waiting: BTreeMap<(Digest32, Digest32), String>,
+    /// Per `(room, member)`: a member that ended a key delivery's stream without an answer, as a
+    /// Vox older than v0.4.3 does (ADR-030 W-4), so it is sent this node's keys in the pair's
+    /// long-lived session, as it expects them; and whether a probe is due, a delivery in a session
+    /// of its own once per reconnect, so a member that has updated is seen to have. A member
+    /// leaves only by taking such a delivery.
+    older: BTreeMap<(Digest32, Digest32), bool>,
+    /// Members reconnected while marked [`Self::older`], whose current key is to be owed again so
+    /// the probe goes out.
+    older_probes: BTreeSet<Digest32>,
+    /// Per `(room, member)`: since when, connected, its key has waited for a fresh one-time prekey
+    /// ([`ONE_TIME_WAIT_MS`]).
+    one_time_waits: BTreeMap<(Digest32, Digest32), u64>,
+    /// Per `(room, member)`: a key for it went to its signed prekey, and that was said; said again
+    /// only after a key has gone to one of its one-time prekeys since (ADR-030 S-5).
+    signed_said: BTreeSet<(Digest32, Digest32)>,
+    /// `(room, member, skdm_ref)` of every key this node has posted to a room's log as a
+    /// key-package since it unlocked: a batch retried whole posts each such key once, never again
+    /// (a posted package cannot be taken back, and each new one names a fresh one-time prekey).
+    packages_posted: BTreeSet<(Digest32, Digest32, Digest32)>,
+    /// Rooms whose records are to be renewed because the prekeys this node offers changed: their
+    /// renewal pushes them to the members connected now, not only to its own board and the anchors.
+    prekeys_changed: BTreeSet<Digest32>,
+    /// Per room: the `timestamp_ms` of the last records this node signed there, on any board, and
+    /// the prekeys their bundle named. See [`spaced_stamp`].
+    records_stamped: BTreeMap<Digest32, (u64, (u64, Option<u64>))>,
     /// Per `(room, member)`: the history batch in flight, as the keys not yet answered and
     /// whether the batch fell short (a key refused, or not all of it written). The history is
     /// recorded as delivered only once every key of a whole batch was taken (V210-88).
@@ -4222,6 +4328,12 @@ pub struct Node {
     /// re-sending the same hello is recognised and does not re-consume a one-time
     /// prekey or reset a session that is already in use.
     accepted_hello: BTreeMap<(Digest32, Digest32), Digest32>,
+    /// The key deliveries (ADR-030 W-1) each peer has had taken here, by hash of the delivery's
+    /// opening, newest last, at most [`TAKEN_DELIVERIES_KEPT`] a pair. A slot of their own (W-3):
+    /// kept in [`Self::accepted_hello`], a delivery would evict the long-lived session's replay
+    /// pin. A sender resends a delivery's exact bytes until it hears `KEY_TAKEN` (D-4), so a
+    /// replay of one already taken is answered that, with nothing opened.
+    taken_deliveries: BTreeMap<(Digest32, Digest32), std::collections::VecDeque<Digest32>>,
     /// Sessions this node kept against a peer's competing hello, whose peer must now
     /// be sent this node's hello so it adopts the same session; drained on the tick.
     reopen: std::collections::BTreeSet<(Digest32, Digest32)>,
@@ -4616,6 +4728,8 @@ impl Node {
             anchor_owed: BTreeMap::new(),
             member_dialed_at: BTreeMap::new(),
             key_waits_said: BTreeSet::new(),
+            refused_otps: prekeys::RefusedOneTime::default(),
+            prekeys_offered: None,
             nearby: None,
             nearby_task: None,
             nearby_due: 0,
@@ -4630,6 +4744,15 @@ impl Node {
             redeliver_now: false,
             reoffer: BTreeSet::new(),
             keys_in_flight: BTreeMap::new(),
+            deliveries: BTreeMap::new(),
+            key_waiting: BTreeMap::new(),
+            older: BTreeMap::new(),
+            older_probes: BTreeSet::new(),
+            one_time_waits: BTreeMap::new(),
+            signed_said: BTreeSet::new(),
+            packages_posted: BTreeSet::new(),
+            prekeys_changed: BTreeSet::new(),
+            records_stamped: BTreeMap::new(),
             history_in_flight: BTreeMap::new(),
             delivery_epoch: 0,
             record_seq: BTreeMap::new(),
@@ -4637,6 +4760,7 @@ impl Node {
             sessions: BTreeMap::new(),
             initiated: BTreeMap::new(),
             accepted_hello: BTreeMap::new(),
+            taken_deliveries: BTreeMap::new(),
             reopen: std::collections::BTreeSet::new(),
             session_serial: BTreeMap::new(),
             last_session_serial: 0,
@@ -4950,6 +5074,7 @@ impl Node {
                     // A rotation's re-keys go out as the remaining consenters become
                     // reachable, which is why they are retried here and not only at
                     // the moment of rotation (M18.1).
+                    self.owe_older_probes().await;
                     self.deliver_owed_rekeys().await;
                     // Auto-consent for trusted identities, retried here for the
                     // same reason: a trusted member that was unreachable a moment
@@ -5180,27 +5305,29 @@ impl Node {
             }
             // A dismissal is this node's alone, and changes no keyring: no passphrase (K-11, K-18).
             NodeCommand::DismissOffer { member } => {
-                let Some(profile) = self.profile.as_ref().filter(|p| p.is_unlocked()) else {
+                if self.profile.as_ref().is_none_or(|p| !p.is_unlocked()) {
                     return Outcome::Failed(Fault::Locked);
-                };
-                let rooms = self.view_tx.borrow().open_channels.clone();
-                let mut next = self.dismissed_offers.clone();
-                if !next.dismiss(&member, &rooms) {
-                    return Outcome::Done;
                 }
-                let saved = profile
-                    .signer()
-                    .and_then(|signer| next.save(profile.store(), signer));
-                if let Err(e) = saved {
-                    return Outcome::Failed(crate::node::actor::fault_of(&e));
+                match self.dismiss_offers_of(&member) {
+                    Ok(true) => {
+                        self.publish().await;
+                        Outcome::Done
+                    }
+                    Ok(false) => Outcome::Done,
+                    Err(e) => Outcome::Failed(crate::node::actor::fault_of(&e)),
                 }
-                self.dismissed_offers = next;
-                self.publish().await;
-                Outcome::Done
             }
             NodeCommand::Untrust { fingerprint } => {
                 let alias = self.trust.petname(&fingerprint).map(str::to_owned);
                 let out = self.untrust_identity(&fingerprint).await;
+                // **A member just removed is not offered back at once** (ADR-028 K-18): its offers
+                // now are dismissed, as a dismissal would; a new join or a new grant offers it
+                // again. The removal stands whether or not the dismissal could be kept.
+                if matches!(out, Outcome::Done)
+                    && matches!(self.dismiss_offers_of(&fingerprint), Ok(true))
+                {
+                    self.publish().await;
+                }
                 if matches!(out, Outcome::Done) && alias.is_some() {
                     self.decisions.record(
                         (self.millis_clock)(),
@@ -5372,7 +5499,16 @@ impl Node {
         let Some(profile) = self.profile.as_mut() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
-        match profile.unlock(passphrase) {
+        // **The unlock's Argon2id (256 MiB) runs off the runtime's workers** (#666): inline, two
+        // nodes unlocking at once (a daemon attaching its kept nodes at start) held every worker
+        // of the daemon's runtime, and its control socket answered no one until they were done.
+        let unlocked = match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+                tokio::task::block_in_place(|| profile.unlock(passphrase))
+            }
+            _ => profile.unlock(passphrase),
+        };
+        match unlocked {
             Ok(()) => {
                 if let Err(e) = self.load_prekeys(self.now_ms().get()) {
                     // The identity is usable but the ring is not: lock again rather
@@ -5729,7 +5865,7 @@ impl Node {
             return;
         };
         let seq = self.next_record_seq(channel_id);
-        let stamp = self.record_timestamp(channel_id);
+        let base = self.record_timestamp(channel_id);
         // The admission goes out with the bundle: a node that cannot say how it became
         // a member publishes nothing, rather than publishing an unevidenced key (M17.6).
         let (genesis_wire, epoch, admission) = match self.channels.get(channel_id) {
@@ -5748,6 +5884,7 @@ impl Node {
                 return;
             };
             let ring = ring.lock().await;
+            let stamp = spaced_stamp(&mut self.records_stamped, *channel_id, base, ring.offered());
             net.own_records(signer, channel_id, epoch, &ring, seq, stamp, admission)
         };
         let Ok((address, bundle)) = records else {
@@ -6551,7 +6688,7 @@ impl Node {
         // the renewal off for good, and the own board and every other anchor lapsed.
         self.arm_record_renewal(channel_id);
         let seq = self.next_record_seq(channel_id);
-        let stamp = self.record_timestamp(channel_id);
+        let base = self.record_timestamp(channel_id);
         let Some(profile) = self.profile.as_ref() else {
             return;
         };
@@ -6564,6 +6701,7 @@ impl Node {
             return;
         };
         let ring = ring.lock().await;
+        let stamp = spaced_stamp(&mut self.records_stamped, *channel_id, base, ring.offered());
         let _ = net.publish_local(&channel.genesis().to_wire());
         let admission = channel.own_admission().clone();
         if let Ok((address, bundle)) = net.own_records(
@@ -7328,6 +7466,7 @@ impl Node {
                 // with any backoff cleared (ADR-025 D2, D5).
                 self.connected.insert(peer);
                 self.discover_peers.insert(peer);
+                self.probe_older(peer);
             }
             NetEvent::SkdmRefused {
                 channel_id,
@@ -7344,6 +7483,37 @@ impl Node {
                     self.key_landed(channel_id, peer);
                     if history {
                         self.history_landed(channel_id, peer, false);
+                    }
+                }
+                // **A delivery whose opening cannot work is opened afresh** (ADR-030 D-4, P-3): the
+                // member does not hold the one-time prekey it named, or the prekey it was opened
+                // against, or the key did not open under it. Resending its bytes would be refused
+                // the same way for good. A refusal of any other kind resends them exactly.
+                {
+                    use crate::node::pairwise_stream::KeyRefusal;
+                    let refused_as =
+                        |r: KeyRefusal| why == KeyRefusal::describe(r.code().into_inner());
+                    let delivery = (channel_id, peer, chain_id);
+                    // **A member that runs an older Vox** (ADR-030 W-4) is sent this node's keys in
+                    // the pair's long-lived session from now, as it expects them, and that is said
+                    // beside it. Its kept deliveries in sessions of their own are no use to it.
+                    if why == crate::node::pairwise_stream::ENDED_UNANSWERED {
+                        self.older.insert((channel_id, peer), false);
+                        self.deliveries
+                            .retain(|(room, member, _), _| *room != channel_id || *member != peer);
+                    }
+                    if refused_as(KeyRefusal::UnknownPrekey) {
+                        if let Some(prekey_id) = self
+                            .deliveries
+                            .remove(&delivery)
+                            .and_then(|d| d.one_time_prekey)
+                        {
+                            self.note_refused_otp(peer, prekey_id);
+                        }
+                    } else if refused_as(KeyRefusal::HelloRefused)
+                        || refused_as(KeyRefusal::CannotOpen)
+                    {
+                        self.deliveries.remove(&delivery);
                     }
                 }
                 let (Some(profile), Some(shared)) = (
@@ -7436,9 +7606,21 @@ impl Node {
                 // and adopting it resends at once (`accept_hello`). Should that offer be lost
                 // with its connection, the retry here is what brings the next one: it stays at
                 // the first step rather than doubling, so one lost offer costs 2 s, not 2 + 4 + 8.
+                // Refused by a member that runs an older Vox: sent again at once, in the session it
+                // expects (ADR-030 W-4), not after a backoff.
+                if why == crate::node::pairwise_stream::ENDED_UNANSWERED {
+                    self.key_backoff.remove(&(channel_id, peer));
+                    let _ = self.event_tx.send(NodeEvent::KeyNotTaken {
+                        channel_id,
+                        peer,
+                        why,
+                    });
+                    return;
+                }
                 let now = self.now_ms().get();
-                let hello_refused =
-                    why == KeyRefusal::describe(KeyRefusal::HelloRefused.code().into_inner());
+                // A key delivery's opening refused is not a hello race: it backs off as any refusal.
+                let hello_refused = session.is_some()
+                    && why == KeyRefusal::describe(KeyRefusal::HelloRefused.code().into_inner());
                 let entry = self.key_backoff.entry((channel_id, peer)).or_insert((0, 0));
                 entry.0 = if hello_refused {
                     1
@@ -7653,6 +7835,22 @@ impl Node {
                 epoch,
             } => {
                 self.key_backoff.remove(&(channel_id, peer));
+                // Taken: its delivery is done with (ADR-030 D-4), and the member waits no more. A
+                // key of a history batch is kept until the whole batch is taken: a batch that went
+                // out short (a later key waiting for a fresh one-time prekey) is sent again whole,
+                // and this key then goes as these same bytes, which its member answers taken
+                // without opening anything (W-3). Opened afresh each time, it took the fresh
+                // one-time prekey the waiting key was waiting for, and the batch never completed.
+                if !history {
+                    self.deliveries.remove(&(channel_id, peer, chain_id));
+                }
+                // Taken in a session of its own: the member runs v0.4.3 or later, whatever it ran
+                // before (ADR-030 W-4). Taken in the long-lived session, it is still the older Vox
+                // it was, and that stays said.
+                if session.is_none() {
+                    self.older.remove(&(channel_id, peer));
+                }
+                self.key_waiting.remove(&(channel_id, peer));
                 // Taken under the session still held: the peer holds its hello (V210-89).
                 if session.is_some()
                     && self.session_serial.get(&(channel_id, peer)).copied() == session
@@ -7666,6 +7864,10 @@ impl Node {
                     self.key_landed(channel_id, peer);
                 }
                 let whole_history = fresh && history && self.history_landed(channel_id, peer, true);
+                if whole_history {
+                    self.deliveries
+                        .retain(|(room, member, _), _| *room != channel_id || *member != peer);
+                }
                 let (Some(profile), Some(shared)) = (
                     self.profile.as_ref(),
                     self.channels.get(&channel_id).map(Arc::clone),
@@ -7833,7 +8035,7 @@ impl Node {
             }
             NetEvent::SessionRows { channel_id, reply } => {
                 let rows = match self.channels.get(&channel_id).map(Arc::clone) {
-                    Some(shared) => Some(shared.lock().await.session_rows().to_vec()),
+                    Some(shared) => Some(shared.lock().await.session_rows()),
                     None => None,
                 };
                 let _ = reply.send(rows);
@@ -8503,6 +8705,7 @@ impl Node {
         // A new connection syncs at once, then on the interval (ADR-016; ADR-025 D2, D5).
         self.connected.insert(peer);
         self.discover_peers.insert(peer);
+        self.probe_older(peer);
     }
 
     /// Answer a punch session a coordinator relayed here (ADR-012 rung 3), on its own
@@ -9438,57 +9641,25 @@ impl Node {
                 Err(e) => return Outcome::Failed(fault_of(&e)),
             }
         };
-        // No session need exist yet: one is opened from this member's bundle record
-        // if the join path never made one (ADR-016).
-        let hello = self.ensure_session(channel_id, target).await;
         let Some(conn) = self.reach_member(channel_id, target, asked).await else {
             return Outcome::Failed(Fault::Unreachable);
         };
-        // **No session, because no bundle: said** (#520). A key is sealed to the member's prekey
-        // bundle, read from this node's board; with none there the consent fails on every tick's
-        // retry and wrote nothing, so a person who trusted a member that just joined again saw no
-        // key go and no reason. Said once per member and room, until the key goes.
-        if !self.sessions.contains_key(&(*channel_id, target)) {
-            if self.key_waits_said.insert((*channel_id, target)) {
-                let epoch = match self.channels.get(channel_id).map(Arc::clone) {
-                    Some(shared) => shared.lock().await.join_context().ok().map(|c| c.epoch),
-                    None => None,
-                };
-                if let (Some(net), Some(epoch)) = (self.net.as_ref(), epoch) {
-                    let why = if net.board_bundle(channel_id, epoch, &target).is_none() {
-                        "this node's board holds no prekey bundle of it yet; it is sent once one \
-                         arrives"
-                    } else {
-                        "no pairwise session with it could be opened from its prekey bundle; it is \
-                         tried again"
-                    };
-                    net.manager().note(
-                        target,
-                        format!(
-                            "your key for it in room {} waits: {why}",
-                            crate::node::network::short_id(*channel_id)
-                        ),
-                    );
-                }
-            }
-            return Outcome::Failed(Fault::Unreachable);
-        }
-        self.key_waits_said.remove(&(*channel_id, target));
-        let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
+        // **In a session of its own** (ADR-030 D-1, D-3): retrust, a consent grant and a history
+        // release seal the key as a rotation does, in a session this node opens now against the
+        // member's current bundle, never in the pair's long-lived one.
+        //
+        // **No acceptable bundle: said, and the key waits** (#520, ADR-030 D-5). A key is sealed to
+        // the member's prekey bundle, read from this node's board; with none there, or a stale one
+        // (P-2), the consent fails on every tick's retry and writes nothing. Said once per member
+        // and room, until the key goes, each reason as itself.
+        let mut older = self.older_route(channel_id, target).await;
+        let Some((frames, carries_hello, session)) =
+            self.key_frames(channel_id, target, &skdm, &mut older).await
+        else {
             return Outcome::Failed(Fault::Unreachable);
         };
-        // Sealed here, where the session lives; written by this member's writer, off the actor
-        // (V210-71). A write that fails is a key not taken, re-owed like any other.
-        let mut frames = Vec::with_capacity(2);
-        if let Some(initial) = hello.as_ref() {
-            frames.push(crate::node::pairwise_stream::hello_frame(
-                channel_id, initial,
-            ));
-        }
-        match crate::node::pairwise_stream::skdm_frame(channel_id, session, &skdm) {
-            Ok(f) => frames.push(f),
-            Err(e) => return Outcome::Failed(fault_of(&e)),
-        }
+        // Written by this member's writer, off the actor (V210-71). A write that fails is a key
+        // not taken, re-owed like any other.
         let (Some(profile), Some(shared)) = (
             self.profile.as_ref(),
             self.channels.get(channel_id).map(Arc::clone),
@@ -9539,8 +9710,8 @@ impl Node {
                 channel_id: *channel_id,
                 after: AfterWrite::Key {
                     chain_id,
-                    hello: hello.is_some(),
-                    session: self.session_serial.get(&(*channel_id, target)).copied(),
+                    hello: carries_hello,
+                    session,
                     history: false,
                     epoch,
                 },
@@ -9880,6 +10051,22 @@ impl Node {
     }
 
     /// [`Self::untrust_identity`], unboxed: see [`Boxed`].
+    /// Dismiss what `member` is offered on now, in every open room, and keep it (ADR-028 K-18).
+    /// `Ok(true)` when anything was added.
+    fn dismiss_offers_of(&mut self, member: &Digest32) -> crate::error::Result<bool> {
+        let Some(profile) = self.profile.as_ref() else {
+            return Err(crate::error::Error::Profile("locked"));
+        };
+        let rooms = self.view_tx.borrow().open_channels.clone();
+        let mut next = self.dismissed_offers.clone();
+        if !next.dismiss(member, &rooms) {
+            return Ok(false);
+        }
+        next.save(profile.store(), profile.signer()?)?;
+        self.dismissed_offers = next;
+        Ok(true)
+    }
+
     async fn untrust_identity_unboxed(&mut self, fingerprint: &Digest32) -> Outcome {
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
@@ -10224,12 +10411,10 @@ impl Node {
             {
                 continue;
             }
-            // Open a session from the member's bundle record if none exists, and reach
-            // them through the ladder rather than requiring a live connection: a re-key
-            // that only reaches members this process happened to join with is the M15
-            // gap ADR-016 recorded, and it is what made revocation undeliverable after
-            // a restart.
-            let hello = self.ensure_session(channel_id, target).await;
+            // Reach them through the ladder rather than requiring a live connection: a re-key
+            // that only reaches members this process happened to join with is the M15 gap
+            // ADR-016 recorded, and it is what made revocation undeliverable after a restart.
+            // No long-lived session is needed: each key opens its own (ADR-030 D-1).
             let Some(conn) = self.reach_member(channel_id, target, asked).await else {
                 continue;
             };
@@ -10242,32 +10427,22 @@ impl Node {
                     None => continue,
                 },
             };
+            // A delivery opened for a key no longer owed was superseded (ADR-030 D-4).
+            let owed_now: BTreeSet<u64> = keys.iter().map(|k| k.body.chain_id).collect();
+            self.deliveries.retain(|(room, member, generation), _| {
+                room != channel_id || *member != target || owed_now.contains(generation)
+            });
             let mut all_sent = true;
-            let mut hello_left = hello.as_ref();
             let mut jobs = Vec::with_capacity(keys.len());
             let mut watched = 0u32;
+            let mut older = self.older_route(channel_id, target).await;
             for key in keys {
-                let Some(session) = self.sessions.get_mut(&(*channel_id, target)) else {
-                    all_sent = false;
-                    break;
-                };
-                // The hello rides the first key only: the peer holds the session after it.
-                let mut frames = Vec::with_capacity(2);
-                let carries_hello = match hello_left.take() {
-                    Some(initial) => {
-                        frames.push(crate::node::pairwise_stream::hello_frame(
-                            channel_id, initial,
-                        ));
-                        true
-                    }
-                    None => false,
-                };
-                let Ok(frame) = crate::node::pairwise_stream::skdm_frame(channel_id, session, key)
+                let Some((frames, carries_hello, session)) =
+                    self.key_frames(channel_id, target, key, &mut older).await
                 else {
                     all_sent = false;
                     break;
                 };
-                frames.push(frame);
                 // Each key's own generation: a refusal re-owes exactly what was refused, and it is
                 // recorded as delivered only once taken (V210-88).
                 let epoch = self.key_in_flight(*channel_id, target);
@@ -10278,7 +10453,7 @@ impl Node {
                     after: AfterWrite::Key {
                         chain_id: key.body.chain_id,
                         hello: carries_hello,
-                        session: self.session_serial.get(&(*channel_id, target)).copied(),
+                        session,
                         history: owes_history,
                         epoch,
                     },
@@ -10300,6 +10475,286 @@ impl Node {
             }
         }
         delivered
+    }
+
+    /// The frame that delivers `key` to `target` in a session of its own (ADR-030 D-1, D-4): the
+    /// one already opened for this key, resent byte for byte, or else a session opened now with
+    /// `Session::initiate` against `target`'s current bundle, the key sealed as its first message.
+    /// This node is always the initiator (D-2). `Err(Some(why))` when no acceptable bundle is to be
+    /// had (P-2), `Err(None)` when no session could be opened from one; either way the key waits,
+    /// sealed nowhere else (D-5).
+    async fn delivery_frame(
+        &mut self,
+        channel_id: &Digest32,
+        target: Digest32,
+        key: &crate::group::skdm::Skdm,
+    ) -> Result<Vec<u8>, Option<prekeys::BundleWait>> {
+        let id = (*channel_id, target, key.body.chain_id);
+        let key_ref = crate::governance::membership::skdm_ref(key);
+        if let Some(delivery) = self.deliveries.get(&id).filter(|d| d.key == key_ref) {
+            return Ok(delivery.frame.clone());
+        }
+        let bundle = self
+            .delivery_bundle_waiting(channel_id, target, false)
+            .await?;
+        let ctx = {
+            let shared = self.channels.get(channel_id).map(Arc::clone).ok_or(None)?;
+            let channel = shared.lock().await;
+            channel.join_context().map_err(|_| None)?
+        };
+        let (initial, mut session) = {
+            let ring = self.prekeys.as_ref().ok_or(None)?.lock().await;
+            crate::pairwise::session::Session::initiate(
+                ring.identity_dh(),
+                &bundle,
+                &ctx.channel_id,
+                ctx.epoch,
+                ctx.suite_id,
+                ctx.floor,
+            )
+            .map_err(|_| None)?
+        };
+        let frame = crate::node::pairwise_stream::rotation_hello_frame(
+            channel_id,
+            &initial,
+            &mut session,
+            key,
+        )
+        .map_err(|_| None)?;
+        // The session existed for this one key: its secrets zeroize here. Only the frame is kept.
+        drop(session);
+        // A one-time prekey is named by one delivery only: a second naming it would be taken as a
+        // replay and graded last-resort (ADR-004). The next delivery to `target` opens against
+        // the next bundle's one-time prekey, or its signed prekey until one arrives (S-5).
+        if let Some(prekey_id) = initial.one_time_prekey_id {
+            self.refused_otps.note(target, prekey_id);
+        }
+        self.deliveries.insert(
+            id,
+            Delivery {
+                frame: frame.clone(),
+                one_time_prekey: initial.one_time_prekey_id,
+                key: key_ref,
+            },
+        );
+        Ok(frame)
+    }
+
+    /// Say once per member and room, until its key goes, why this identity's key for `target`
+    /// waits (#520, ADR-030 D-5): no bundle, a stale one, or one no session opened from, each as
+    /// itself and with what it costs. A key that waits is sealed nowhere else.
+    fn say_key_waits(
+        &mut self,
+        channel_id: &Digest32,
+        target: Digest32,
+        wait: Option<prekeys::BundleWait>,
+    ) {
+        let why = match wait {
+            Some(wait) => wait.why(),
+            None => "no pairwise session with it could be opened from its prekey bundle; it is \
+                     tried again"
+                .to_owned(),
+        };
+        self.key_waiting.insert(
+            (*channel_id, target),
+            format!("is owed your key in this room, which waits: {why}"),
+        );
+        if !self.key_waits_said.insert((*channel_id, target)) {
+            return;
+        }
+        if let Some(net) = self.net.as_ref() {
+            net.manager().note(
+                target,
+                format!(
+                    "your key for it in room {} waits: {why}",
+                    crate::node::network::short_id(*channel_id)
+                ),
+            );
+        }
+    }
+
+    /// A delivery to `target` opened: what made its key wait for a bundle is over.
+    fn key_left(&mut self, channel_id: &Digest32, target: Digest32) {
+        let pair = (*channel_id, target);
+        self.key_waits_said.remove(&pair);
+        self.key_waiting.remove(&pair);
+    }
+
+    /// The bundle a fresh delivery to `target` opens against: [`Self::delivery_bundle`], which waits
+    /// for a one-time prekey no delivery has named (ADR-030 P-3). While `target` is connected that
+    /// wait is bounded by [`ONE_TIME_WAIT_MS`]; past it the delivery opens on the signed prekey
+    /// ([`Self::delivery_bundle_or_signed`]), and the person is told once, with what it costs (S-5).
+    /// A member not connected starts no clock: a frame cannot reach it anyway, so it waits; a
+    /// key-package (`offline_to_signed`) is for a member the log reaches while it is away, which
+    /// cannot republish meanwhile, so it goes to the signed prekey at once, said once.
+    async fn delivery_bundle_waiting(
+        &mut self,
+        channel_id: &Digest32,
+        target: Digest32,
+        offline_to_signed: bool,
+    ) -> Result<crate::identity::keyagreement::PrekeyBundlePublic, Option<prekeys::BundleWait>>
+    {
+        let pair = (*channel_id, target);
+        let wait = match self.delivery_bundle(channel_id, target).await {
+            Ok(bundle) => {
+                self.one_time_waits.remove(&pair);
+                self.signed_said.remove(&pair);
+                return Ok(bundle);
+            }
+            Err(wait @ prekeys::BundleWait::OneTimeSpent { .. }) => wait,
+            Err(wait) => return Err(Some(wait)),
+        };
+        let connected = self
+            .net
+            .as_ref()
+            .is_some_and(|n| n.manager().existing(&target).is_some());
+        let why = if connected {
+            let now = self.now_ms().get();
+            let since = *self.one_time_waits.entry(pair).or_insert(now);
+            if now.saturating_sub(since) < ONE_TIME_WAIT_MS {
+                return Err(Some(wait));
+            }
+            format!(
+                "no bundle naming a fresh one-time prekey arrived within {} s while it was \
+                 connected",
+                ONE_TIME_WAIT_MS / 1_000
+            )
+        } else {
+            self.one_time_waits.remove(&pair);
+            if !offline_to_signed {
+                return Err(Some(wait));
+            }
+            "it is away, so it cannot publish a fresh one-time prekey before the log carries the \
+             key"
+            .to_owned()
+        };
+        let bundle = self
+            .delivery_bundle_or_signed(channel_id, target)
+            .await
+            .map_err(Some)?;
+        self.one_time_waits.remove(&pair);
+        if self.signed_said.insert(pair) {
+            if let Some(net) = self.net.as_ref() {
+                net.manager().note(
+                    target,
+                    format!(
+                        "your key for it in room {} went to its signed prekey: {why}, so anyone who \
+                         copied that signed prekey before it rotates could read this key (ADR-030 \
+                         S-5)",
+                        crate::node::network::short_id(*channel_id)
+                    ),
+                );
+            }
+        }
+        Ok(bundle)
+    }
+
+    /// How this node's keys go to `target` in `channel_id` this round (ADR-030 W-4): `None` in
+    /// sessions of their own (D-1); `Some(hello)` in the pair's long-lived session, opened now if
+    /// there is none (its hello to ride the first key), for a member marked [`Self::older`] whose
+    /// probe is not due. **A due probe stays due until it is answered for what it asks**: taken,
+    /// the mark goes; closed unanswered, as an older Vox does, the probe is over. Refused for any
+    /// other reason (a node still reopening the room after a restart), it goes again in a session
+    /// of its own. Spent on its first try, a refused probe left the mark for good.
+    async fn older_route(
+        &mut self,
+        channel_id: &Digest32,
+        target: Digest32,
+    ) -> Option<Option<InitialMessage>> {
+        match self.older.get(&(*channel_id, target)) {
+            Some(false) => Some(self.ensure_session(channel_id, target).await),
+            None | Some(true) => None,
+        }
+    }
+
+    /// The frames that carry `key` to `target`, whether they carry a hello, and the serial of the
+    /// long-lived session they are sealed in, if they are: in a session of its own (ADR-030 D-1),
+    /// or, for a member that runs an older Vox (`older` from [`Self::older_route`]), in the pair's
+    /// long-lived session as it expects them (W-4), its hello riding the first key. `None` if the
+    /// key waits, which is said (D-5), or no long-lived session could be had.
+    async fn key_frames(
+        &mut self,
+        channel_id: &Digest32,
+        target: Digest32,
+        key: &crate::group::skdm::Skdm,
+        older: &mut Option<Option<InitialMessage>>,
+    ) -> Option<(Vec<Vec<u8>>, bool, Option<u64>)> {
+        if let Some(hello) = older {
+            let session = self.sessions.get_mut(&(*channel_id, target))?;
+            let mut frames = Vec::with_capacity(2);
+            let carries_hello = match hello.take() {
+                Some(initial) => {
+                    frames.push(crate::node::pairwise_stream::hello_frame(
+                        channel_id, &initial,
+                    ));
+                    true
+                }
+                None => false,
+            };
+            frames.push(crate::node::pairwise_stream::skdm_frame(channel_id, session, key).ok()?);
+            let serial = self.session_serial.get(&(*channel_id, target)).copied();
+            return Some((frames, carries_hello, serial));
+        }
+        // In a session of its own, opened now against the member's current bundle and never sealed
+        // in one that existed before (ADR-030 D-1, D-2).
+        match self.delivery_frame(channel_id, target, key).await {
+            Ok(frame) => {
+                self.key_left(channel_id, target);
+                Some((vec![frame], false, None))
+            }
+            Err(wait) => {
+                // Waits, said why (ADR-030 D-5): never sealed in an older session.
+                self.say_key_waits(channel_id, target, wait);
+                None
+            }
+        }
+    }
+
+    /// What is said of `member` in `room` about this node's key, after its name (ADR-030 D-5,
+    /// W-4): that it runs an older Vox while it is marked [`Self::older`], whatever else is under
+    /// way, so the line leaves only with the mark; else why a key for it waits, if one does.
+    fn said_of(&self, room: &Digest32, member: &Digest32) -> Option<String> {
+        if self.older.contains_key(&(*room, *member)) {
+            return Some(crate::node::pairwise_stream::RUNS_OLDER.to_owned());
+        }
+        self.key_waiting.get(&(*room, *member)).cloned()
+    }
+
+    /// `peer` connected: each room it is marked [`Self::older`] in owes it a probe (ADR-030 W-4).
+    fn probe_older(&mut self, peer: Digest32) {
+        let mut any = false;
+        for ((_, member), probe) in &mut self.older {
+            if *member == peer {
+                *probe = true;
+                any = true;
+            }
+        }
+        if any {
+            self.older_probes.insert(peer);
+        }
+    }
+
+    /// Owe each member due a probe its current key again, in each room it is marked
+    /// [`Self::older`] in, so the re-key round sends it in a session of its own (ADR-030 W-4). Only
+    /// the live key: a probe is one delivery, not the member's history.
+    async fn owe_older_probes(&mut self) {
+        for peer in std::mem::take(&mut self.older_probes) {
+            let rooms: Vec<Digest32> = self
+                .older
+                .keys()
+                .filter(|(_, member)| *member == peer)
+                .map(|(room, _)| *room)
+                .collect();
+            for room in rooms {
+                let (Some(profile), Some(shared)) = (
+                    self.profile.as_ref(),
+                    self.channels.get(&room).map(Arc::clone),
+                ) else {
+                    continue;
+                };
+                let _ = shared.lock().await.forget_delivery(profile.store(), &peer);
+            }
+        }
     }
 
     /// A key watched by [`watch_delivery`] was answered, taken or not: one fewer in flight.
@@ -10418,17 +10873,33 @@ impl Node {
             .filter(|(room, at)| **at <= now && self.channels.contains_key(*room))
             .map(|(room, _)| *room)
             .collect();
+        // **A changed bundle goes to the members connected now** (ADR-030 P-3). A sender reads a
+        // member's bundle off its own board and never names a one-time prekey twice, so until the
+        // new bundle reaches it, the sender's next key to this node waits for it. Published only
+        // here and to the anchors, it reached a connected sender at its next sync, up to 30 s on.
+        // The room's ports are raised, as for a newcomer (`note_new_members`): the outbound setup
+        // offers each peer's board the records it lacks.
         for room in due {
+            let push = self.prekeys_changed.remove(&room);
             self.records_renew_at.remove(&room);
             crate::node::status::SyncBook::note_renewal(&self.sync_book);
             self.publish_channel_locally(&room).await;
             self.publish_channel_to_anchors(&room, PublishCause::Renewal)
                 .await;
+            if push {
+                for ((port_room, _), port) in &mut self.ports {
+                    if *port_room == room {
+                        port.raise();
+                    }
+                }
+                self.note_local_append(&room);
+            }
         }
         // A room closed since it was armed is not renewed.
         let open = &self.channels;
         self.records_renew_at
             .retain(|room, _| open.contains_key(room));
+        self.prekeys_changed.retain(|room| open.contains_key(room));
     }
 
     /// Arm `room`'s next renewal at half its records' lifetime from now.
@@ -11385,7 +11856,7 @@ impl Node {
         joiner: Digest32,
     ) -> crate::error::Result<SeatsToAsk> {
         let Some(me) = self.profile.as_ref().map(Profile::fingerprint) else {
-            return Err(Error::Profile("locked"));
+            return Err(crate::error::Error::Profile("locked"));
         };
         let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
             return Err(Error::Profile("no such room on this node"));
@@ -11848,16 +12319,28 @@ impl Node {
         target: Digest32,
         skdm: &crate::group::skdm::Skdm,
     ) -> bool {
-        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+        if self.net.is_none() {
             return false;
-        };
+        }
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return false;
         };
+        // Posted already: on the log, and taken from there (a batch retried whole).
+        let posted_as = (
+            *channel_id,
+            target,
+            crate::governance::membership::skdm_ref(skdm),
+        );
+        if self.packages_posted.contains(&posted_as) {
+            return true;
+        }
         let Ok(ctx) = shared.lock().await.join_context() else {
             return false;
         };
-        let Some(record) = net.board_bundle(channel_id, ctx.epoch, &target) else {
+        // Never a stale bundle, nor a one-time prekey already named or refused (ADR-030 P-2, P-3).
+        // A burst waits for a fresh one-time prekey as a burst of frames does, at most 30 s while
+        // the member is connected; a member away goes to its signed prekey at once (S-5).
+        let Ok(bundle) = self.delivery_bundle_waiting(channel_id, target, true).await else {
             return false;
         };
         let package = {
@@ -11867,7 +12350,7 @@ impl Node {
             let ring = ring.lock().await;
             match crate::node::keypackage::KeyPackage::seal(
                 ring.identity_dh(),
-                &record.prekey_bundle,
+                &bundle,
                 &ctx,
                 target,
                 skdm,
@@ -11887,6 +12370,16 @@ impl Node {
                 .is_ok()
         };
         if posted {
+            // A one-time prekey is named by one delivery only, frame or package (ADR-030 P-3): a
+            // second naming it would be opened as a replay, last-resort-grade.
+            if let Some(prekey_id) = package
+                .initial_message()
+                .ok()
+                .and_then(|init| init.one_time_prekey_id)
+            {
+                self.refused_otps.note(target, prekey_id);
+            }
+            self.packages_posted.insert(posted_as);
             // An entry like any other: it goes out on the next push.
             self.note_local_append(channel_id);
         }
@@ -11897,6 +12390,14 @@ impl Node {
     /// each with a one-shot PQXDH against this node's own prekeys and hand the sender key to
     /// the channel, which verifies it against its author and backfills what it opens.
     async fn install_key_packages(&mut self, channel_id: &Digest32) {
+        // Test-only: leave every key-package queued, unopened, while the file the knob names
+        // exists (`TEST_HOLD_PACKAGES_ENV`).
+        #[cfg(feature = "test-knobs")]
+        if std::env::var_os(TEST_HOLD_PACKAGES_ENV)
+            .is_some_and(|f| std::path::Path::new(&f).exists())
+        {
+            return;
+        }
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
         };
@@ -11943,11 +12444,23 @@ impl Node {
                     .accept_skdm(profile.store(), &skdm, now_ms)
             };
             if let Ok(backfilled) = installed {
-                let _ = self.event_tx.send(NodeEvent::SenderKeyReceived {
-                    channel_id: *channel_id,
-                    peer: author,
-                    backfilled: backfilled as u64,
-                });
+                // A drive key opens a node's Sessions, not its messages: what changed is what this
+                // node may see of them, said as Session news (no row, nothing shown), so a client
+                // reads the room's Sessions again; "messages can be read now" would be untrue.
+                let _ = self.event_tx.send(
+                    if skdm.body.channel_id == crate::node::drive::drive_channel(channel_id) {
+                        NodeEvent::SessionEntry {
+                            channel_id: *channel_id,
+                            session_id: crate::node::drive::KEY_CHANGED.to_owned(),
+                        }
+                    } else {
+                        NodeEvent::SenderKeyReceived {
+                            channel_id: *channel_id,
+                            peer: author,
+                            backfilled: backfilled as u64,
+                        }
+                    },
+                );
             }
         }
     }
@@ -11961,19 +12474,36 @@ impl Node {
         init: &InitialMessage,
         ctx: &crate::join::session::JoinContext,
     ) -> Option<crate::pairwise::session::Session> {
+        self.respond_to_initial_or_why(init, ctx).await.ok()
+    }
+
+    /// [`Self::respond_to_initial`], saying why not: [`KeyRefusal::UnknownPrekey`] when the message
+    /// names a one-time prekey this ring never issued or no longer holds, which the sender of a key
+    /// delivery must know to fetch the bundle again and never name it again (ADR-030 P-3), and
+    /// [`KeyRefusal::HelloRefused`] for anything else.
+    ///
+    /// [`KeyRefusal::UnknownPrekey`]: crate::node::pairwise_stream::KeyRefusal::UnknownPrekey
+    /// [`KeyRefusal::HelloRefused`]: crate::node::pairwise_stream::KeyRefusal::HelloRefused
+    async fn respond_to_initial_or_why(
+        &mut self,
+        init: &InitialMessage,
+        ctx: &crate::join::session::JoinContext,
+    ) -> Result<crate::pairwise::session::Session, crate::node::pairwise_stream::KeyRefusal> {
+        use crate::node::pairwise_stream::KeyRefusal;
+        let refused = KeyRefusal::HelloRefused;
         let now = self.now_ms().get();
         let mut reuse = crate::pairwise::OtpReuseTracker::new();
-        let profile = self.profile.as_ref()?;
+        let profile = self.profile.as_ref().ok_or(refused)?;
         let store = profile.store();
         let Ok(signer) = profile.signer() else {
-            return None;
+            return Err(refused);
         };
         // The ring is taken under its lock below, so take what the save needs first. The
         // `Send + Sync` bound is load-bearing, not decoration: this function now awaits the
         // ring lock, so the actor's whole future has to stay `Send`, and a bare
         // `&dyn RootSigner` is not.
         let signer: &(dyn crate::identity::composite::RootSigner + Send + Sync) = signer;
-        let ring = self.prekeys.as_ref().map(Arc::clone)?;
+        let ring = self.prekeys.as_ref().map(Arc::clone).ok_or(refused)?;
         let mut ring = ring.lock().await;
         if let Some(id) = init.one_time_prekey_id {
             match ring.use_one_time(id, now) {
@@ -11983,15 +12513,17 @@ impl Node {
                     // the downgrade is graded even after a restart (ADR-004).
                     reuse.observe(id);
                 }
-                prekeys::OneTimeUse::Unknown => return None,
+                prekeys::OneTimeUse::Unknown => return Err(KeyRefusal::UnknownPrekey),
             }
             // Persist the consume before the handshake completes: a crash here must not
             // leave the prekey re-offerable.
             if prekeys::save(store, signer, &ring).is_err() {
-                return None;
+                return Err(refused);
             }
         }
-        let signed_prekey = ring.signed_prekey_for(init.signed_prekey_id)?;
+        let signed_prekey = ring
+            .signed_prekey_for(init.signed_prekey_id)
+            .ok_or(refused)?;
         let one_time_prekey = init
             .one_time_prekey_id
             .and_then(|id| ring.consumed_one_time(id));
@@ -12008,9 +12540,9 @@ impl Node {
             &mut reuse,
             ctx.floor,
         ) else {
-            return None;
+            return Err(refused);
         };
-        Some(session)
+        Ok(session)
     }
 
     /// Accept an inbound [`crate::node::pairwise_stream::PairwiseFrame::Hello`], establishing the responder half of
@@ -12605,14 +13137,17 @@ impl Node {
                 .filter(|i| !i.hello_delivered)
                 .and_then(|i| i.initial.clone());
         }
-        let net = self.net.as_ref().map(Arc::clone)?;
         let shared = self.channels.get(channel_id).map(Arc::clone)?;
         let ctx = { shared.lock().await.join_context().ok()? };
-        let record = net.board_bundle(channel_id, ctx.epoch, &target)?;
+        // Never a stale bundle, nor a one-time prekey already named or refused (ADR-030 P-2, P-3).
+        let bundle = self
+            .delivery_bundle_or_signed(channel_id, target)
+            .await
+            .ok()?;
         let ring = self.prekeys.as_ref()?.lock().await;
         let (initial, session) = crate::pairwise::session::Session::initiate(
             ring.identity_dh(),
-            &record.prekey_bundle,
+            &bundle,
             &ctx.channel_id,
             ctx.epoch,
             ctx.suite_id,
@@ -12633,6 +13168,63 @@ impl Node {
         Some(initial)
     }
 
+    /// The bundle a key delivery to `target` in `channel_id` opens its fresh session against
+    /// (ADR-030 D-1), read from this node's board, or why the key waits (D-5): a bundle whose
+    /// signed or one-time prekey is a cadence old, or dated ahead of this node's clock, by its
+    /// root-signed creation time is refused (P-2), and one whose one-time prekey a delivery already
+    /// named, or `target` refused, waits for `target`'s next bundle (P-3).
+    async fn delivery_bundle(
+        &self,
+        channel_id: &Digest32,
+        target: Digest32,
+    ) -> Result<crate::identity::keyagreement::PrekeyBundlePublic, prekeys::BundleWait> {
+        self.bundle_for(channel_id, target, prekeys::SpentOneTime::Wait)
+            .await
+    }
+
+    /// [`Self::delivery_bundle`], except that a one-time prekey already named or refused is taken
+    /// out and the session opens against the signed prekey, which heals only when it rotates
+    /// (ADR-030 S-5): for a delivery that has waited long enough for a fresh one, a key package to
+    /// a member who is not online to republish, and the long-lived session's opening.
+    async fn delivery_bundle_or_signed(
+        &self,
+        channel_id: &Digest32,
+        target: Digest32,
+    ) -> Result<crate::identity::keyagreement::PrekeyBundlePublic, prekeys::BundleWait> {
+        self.bundle_for(channel_id, target, prekeys::SpentOneTime::SignedPrekey)
+            .await
+    }
+
+    async fn bundle_for(
+        &self,
+        channel_id: &Digest32,
+        target: Digest32,
+        on_spent: prekeys::SpentOneTime,
+    ) -> Result<crate::identity::keyagreement::PrekeyBundlePublic, prekeys::BundleWait> {
+        let epoch = match self.channels.get(channel_id).map(Arc::clone) {
+            Some(shared) => shared.lock().await.join_context().ok().map(|c| c.epoch),
+            None => None,
+        };
+        let record = match (self.net.as_ref(), epoch) {
+            (Some(net), Some(epoch)) => net.board_bundle(channel_id, epoch, &target),
+            _ => None,
+        }
+        .ok_or(prekeys::BundleWait::NoBundle)?;
+        prekeys::delivery_bundle(
+            &record.prekey_bundle,
+            self.now_ms().get(),
+            &self.refused_otps.of(&target),
+            on_spent,
+        )
+    }
+
+    /// `peer` answered a key delivery that it does not hold the one-time prekey `prekey_id` the
+    /// delivery named (ADR-030 P-3): the next delivery fetches its bundle again and never names that
+    /// prekey.
+    fn note_refused_otp(&mut self, peer: Digest32, prekey_id: u64) {
+        self.refused_otps.note(peer, prekey_id);
+    }
+
     /// Take an inbound sealed control message: an ADR-006 SKDM, which makes that
     /// author's messages readable and backfills any already held as ciphertext. Its frames were
     /// read off the actor (see `read_pairwise_streams`); nothing here waits on the peer.
@@ -12641,7 +13233,8 @@ impl Node {
         let room = match &stream.first {
             PairwiseFrame::Skdm { channel_id, .. }
             | PairwiseFrame::Open { channel_id, .. }
-            | PairwiseFrame::Hello { channel_id, .. } => *channel_id,
+            | PairwiseFrame::Hello { channel_id, .. }
+            | PairwiseFrame::RotationHello { channel_id, .. } => *channel_id,
         };
         // **Held, not dropped, while this node is still joining that room.** The join runs off the
         // actor now, so the responder's key — sent the moment it admits us — can arrive before the
@@ -12763,6 +13356,18 @@ impl Node {
         // the SKDM it precedes.
         let (channel_id, sealed) = match first {
             PairwiseFrame::Skdm { channel_id, sealed } => (channel_id, sealed),
+            // A key delivery in a session of its own (ADR-030 W-1), opened under that session alone
+            // and never filed (W-2).
+            PairwiseFrame::RotationHello {
+                channel_id,
+                initial,
+                sealed,
+            } => {
+                return Some(
+                    self.take_delivery(peer, channel_id, &initial, &sealed)
+                        .await,
+                )
+            }
             // One ratchet message with an empty plaintext, sent to give *this* node a
             // sending chain (M17.6). Decrypt it so the ratchet steps, then stop: there
             // is nothing behind it and nothing is granted by it.
@@ -12813,6 +13418,81 @@ impl Node {
         let Ok(skdm) = open_skdm(session, &sealed, now) else {
             return Some(Err(KeyRefusal::CannotOpen));
         };
+        Some(self.take_opened_skdm(channel_id, peer, &skdm, now_ms).await)
+    }
+
+    /// Take a key delivery (ADR-030 W-1): build the session its opening names from this node's own
+    /// prekey ring, open the key under it, and drop it (W-2). The session is never filed: not
+    /// inserted in, checked against or reconciled with the long-lived session table, so a delivery
+    /// can neither replace the pair's session nor be refused because one exists (ADR-004 O2–O4 do
+    /// not apply). A delivery already taken is answered taken at once, with nothing opened (W-3).
+    async fn take_delivery(
+        &mut self,
+        peer: Digest32,
+        channel_id: Digest32,
+        initial: &[u8],
+        sealed: &[u8],
+    ) -> Result<(), crate::node::pairwise_stream::KeyRefusal> {
+        use crate::node::pairwise_stream::{open_skdm, KeyRefusal, PairwiseFrame};
+        let pair = (channel_id, peer);
+        // The whole frame, not its opening alone: a delivery is taken as the bytes that carried it.
+        let delivery = crate::hash::sha256(
+            &PairwiseFrame::RotationHello {
+                channel_id,
+                initial: initial.to_vec(),
+                sealed: sealed.to_vec(),
+            }
+            .to_frame(),
+        );
+        if self
+            .taken_deliveries
+            .get(&pair)
+            .is_some_and(|taken| taken.contains(&delivery))
+        {
+            return Ok(());
+        }
+        let init = InitialMessage::from_wire(initial).map_err(|_| KeyRefusal::HelloRefused)?;
+        let shared = self
+            .channels
+            .get(&channel_id)
+            .map(Arc::clone)
+            .ok_or(KeyRefusal::HelloRefused)?;
+        let ctx = {
+            let channel = shared.lock().await;
+            // Only a member we have admitted may deliver a key, and not one that left (V030-08).
+            if !channel.is_member(&peer) {
+                return Err(KeyRefusal::HelloRefused);
+            }
+            channel
+                .join_context()
+                .map_err(|_| KeyRefusal::HelloRefused)?
+        };
+        let mut session = self.respond_to_initial_or_why(&init, &ctx).await?;
+        let now_ms = self.now_ms();
+        let skdm =
+            open_skdm(&mut session, sealed, now_ms.get()).map_err(|_| KeyRefusal::CannotOpen)?;
+        // Its secrets zeroize here: the session existed for this one key (W-2).
+        drop(session);
+        self.take_opened_skdm(channel_id, peer, &skdm, now_ms)
+            .await?;
+        let taken = self.taken_deliveries.entry(pair).or_default();
+        if taken.len() >= TAKEN_DELIVERIES_KEPT {
+            taken.pop_front();
+        }
+        taken.push_back(delivery);
+        Ok(())
+    }
+
+    /// Take a key that has opened: `Ok` once it is taken, else why not. The same for a key that
+    /// came under the pair's long-lived session and one that came in a delivery of its own.
+    async fn take_opened_skdm(
+        &mut self,
+        channel_id: Digest32,
+        peer: Digest32,
+        skdm: &crate::group::skdm::Skdm,
+        now_ms: crate::time::Ms,
+    ) -> Result<(), crate::node::pairwise_stream::KeyRefusal> {
+        use crate::node::pairwise_stream::KeyRefusal;
         // **A node reads only the members its owner trusts** (V210-118). Trust is decided by each
         // node for itself: the author trusting us releases its key, and that alone must not make
         // it readable here. A key from an author this owner has not trusted is refused, so nothing
@@ -12821,10 +13501,10 @@ impl Node {
         // not accepting rather than read as trusting nobody.
         let author = skdm.body.author_id;
         if !self.profile.as_ref().is_some_and(Profile::is_unlocked) {
-            return Some(Err(KeyRefusal::NotAccepted));
+            return Err(KeyRefusal::NotAccepted);
         }
         if !self.trust.is_trusted(&author) {
-            return Some(Err(KeyRefusal::NotTrusted));
+            return Err(KeyRefusal::NotTrusted);
         }
         let mut fresh = false;
         let backfilled = match (
@@ -12834,12 +13514,12 @@ impl Node {
             (Some(profile), Some(shared)) => {
                 let mut channel = shared.lock().await;
                 fresh = !channel.holds_generation(&author, skdm.body.chain_id);
-                channel.accept_skdm(profile.store(), &skdm, now_ms).ok()
+                channel.accept_skdm(profile.store(), skdm, now_ms).ok()
             }
             _ => None,
         };
         let Some(n) = backfilled else {
-            return Some(Err(KeyRefusal::NotAccepted));
+            return Err(KeyRefusal::NotAccepted);
         };
         // A generation new to us: the author may have refused ours while we were untrusted, or
         // dropped it when its owner stopped trusting us. Ours is offered again once this stream
@@ -12847,12 +13527,21 @@ impl Node {
         if fresh {
             self.reoffer.insert((channel_id, author));
         }
-        let _ = self.event_tx.send(NodeEvent::SenderKeyReceived {
-            channel_id,
-            peer,
-            backfilled: n as u64,
-        });
-        Some(Ok(()))
+        let _ = self.event_tx.send(
+            if skdm.body.channel_id == crate::node::drive::drive_channel(&channel_id) {
+                NodeEvent::SessionEntry {
+                    channel_id,
+                    session_id: crate::node::drive::KEY_CHANGED.to_owned(),
+                }
+            } else {
+                NodeEvent::SenderKeyReceived {
+                    channel_id,
+                    peer,
+                    backfilled: n as u64,
+                }
+            },
+        );
+        Ok(())
     }
 
     /// Load (or, on first use, generate) the prekey ring for the unlocked
@@ -12916,15 +13605,39 @@ impl Node {
             // maintained again at the next unlock.
             let _ = prekeys::save(profile.store(), signer, &ring);
         }
+        // What the bundle names now, against what it named when last looked at.
+        let offered = ring.offered();
+        let republish = self.prekeys_offered.is_some_and(|was| was != offered);
+        self.prekeys_offered = Some(offered);
         crate::node::status::SyncBook::note_prekeys(
             &self.sync_book,
-            ring.one_time_len(),
-            ring.consumed_len(),
-            ring.signed_prekey_id(),
-            done.rotated,
-            done.one_time_added,
-            ring.previous_used(),
+            crate::node::status::PrekeyNote {
+                one_time: ring.one_time_len(),
+                consumed: ring.consumed_len(),
+                signed_prekey: ring.signed_prekey_id(),
+                rotated: done.rotated,
+                added: done.one_time_added,
+                previous_used: ring.previous_used(),
+                retired: done.retired,
+                retired_held: ring.retired_len(),
+                retired_used: ring.retired_used(),
+                oldest_one_time: ring.oldest_one_time_created(),
+            },
         );
+        // A rotated signed prekey, a retired one-time prekey or a consumed one is no longer what
+        // the bundle on the boards should name. Senders refuse a stale one and wait (ADR-030 P-2),
+        // and never name a one-time prekey twice (P-3), so until the next bundle arrives every
+        // delivery to this node would target its signed prekey, which heals only on rotation.
+        // Republished now, in every room whose records renew, rather than at the next renewal, up
+        // to an hour away; the tick coalesces a burst of consumes into one republish.
+        if republish {
+            drop(ring);
+            // Each record is stamped so a board takes the change (`spaced_stamp`).
+            for (room, at) in &mut self.records_renew_at {
+                *at = now;
+                self.prekeys_changed.insert(*room);
+            }
+        }
     }
 
     /// Lock now, and settle off the actor.
@@ -12958,9 +13671,28 @@ impl Node {
         // An aborted joiner never reports back, so nothing is being joined any more, and what was
         // held for the join goes with the network.
         self.joining.clear();
-        self.held_pairwise.clear();
+        // **Refused, never dropped** (ADR-030 W-4): a stream ended without an answer is what a node
+        // older than key delivery in a session of its own does, and its sender would mark this node
+        // older and send it its keys without post-compromise protection. A held key is refused as
+        // not accepted, and its sender sends it again after the next unlock.
+        for (_, stream) in std::mem::take(&mut self.held_pairwise) {
+            let PairwiseIn {
+                mut send, mut recv, ..
+            } = stream;
+            let why = crate::node::pairwise_stream::KeyRefusal::NotAccepted.code();
+            let _ = send.reset(why);
+            let _ = recv.stop(why);
+        }
         // Keys still in flight stay owed, and are sent again after the next unlock (V210-88).
         self.keys_in_flight.clear();
+        // Sealed bytes, no key material; but the ring that opens the next ones is this identity's.
+        self.deliveries.clear();
+        self.key_waiting.clear();
+        self.older.clear();
+        self.older_probes.clear();
+        self.one_time_waits.clear();
+        self.signed_said.clear();
+        self.packages_posted.clear();
         // And the watchers still running answer for what is no longer in flight.
         self.delivery_epoch = self.delivery_epoch.wrapping_add(1);
         self.history_in_flight.clear();
@@ -13001,6 +13733,7 @@ impl Node {
         // Their writers end with their queues; what they hold is sealed bytes, no key material.
         self.pairwise_out.clear();
         self.accepted_hello.clear();
+        self.taken_deliveries.clear();
         self.reopen.clear();
         self.session_serial.clear();
         // The identity and its signer go before the network does (V210-93, V210-94): stopping
@@ -14647,6 +15380,7 @@ impl Node {
                     connected: connected.contains(m),
                     last_seen: self.status.last_seen.get(m).copied(),
                     last_sync: self.status.member_synced.get(m).copied(),
+                    key_waits: self.said_of(&room.channel_id, m),
                 })
                 .collect();
             // From the room as last published, never its lock: a sync session holds that lock
@@ -15119,15 +15853,31 @@ impl Node {
     }
 
     /// This node's drive key in one room (ADR-029 SC-2a, SC-2b): **changed first** if a member it
-    /// was released to is no longer in `holders` (downgraded to read, or untrusted), then released
-    /// to each member with drive that is owed it, as a key-package in the room's log, sealed to
-    /// that member's prekeys. A member whose prekeys this node has not read yet stays owed, and the
-    /// tick tries again.
+    /// was released to is no longer in `holders` (downgraded to read, or untrusted); **begun** if
+    /// this node has an open Session here and none yet, so a member given drive holds it before
+    /// the Session's first entry; then released to each member with drive that is owed it, as a
+    /// key-package in the room's log, sealed to that member's prekeys; and, after a change, an
+    /// entry under the new key that says so, so the member that lost it reads at once that it no
+    /// longer holds it. A member whose prekeys this node has not read yet stays owed, and the tick
+    /// tries again.
     async fn tend_drive_keys_in(&mut self, channel_id: &Digest32, holders: &BTreeSet<Digest32>) {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
         };
         let now_ms = self.now_ms();
+        let now_millis = (self.millis_clock)();
+        let has_session = {
+            let me = self.profile.as_ref().map(Profile::fingerprint);
+            let view = self.view_tx.borrow();
+            view.open_channels
+                .iter()
+                .find(|d| d.channel_id == *channel_id)
+                .is_some_and(|d| {
+                    crate::node::sessions::fold(d)
+                        .iter()
+                        .any(|s| s.open && Some(s.node) == me)
+                })
+        };
         let releases = {
             let Some(profile) = self.profile.as_ref() else {
                 return;
@@ -15137,6 +15887,9 @@ impl Node {
                 .rotate_drive_if_lost(profile.store(), holders, now_ms)
                 .is_err()
             {
+                return;
+            }
+            if has_session && ch.ensure_drive(profile.store(), holders, now_ms).is_err() {
                 return;
             }
             let Ok(owed) = ch.owed_drive(profile.store(), holders) else {
@@ -15161,6 +15914,32 @@ impl Node {
                 .lock()
                 .await
                 .note_drive_delivered(profile.store(), member, generation);
+        }
+        // The member that lost drive still holds the old key: until an entry is sealed under the
+        // new one, nothing tells it the key changed. Written once every member that keeps drive
+        // holds the new key, so none is shown, meanwhile, an entry under a key it lacks; until
+        // then, the tick tries again.
+        let written = {
+            let Some(profile) = self.profile.as_ref() else {
+                return;
+            };
+            let mut ch = shared.lock().await;
+            ch.key_change_unsaid()
+                && ch
+                    .owed_drive(profile.store(), holders)
+                    .is_ok_and(|owed| owed.is_empty())
+                && ch
+                    .append_session(
+                        profile,
+                        crate::node::drive::KEY_CHANGED,
+                        r#"{"kind":"drive-key"}"#,
+                        holders,
+                        now_millis,
+                    )
+                    .is_ok()
+        };
+        if written {
+            self.note_local_append(channel_id);
         }
     }
 
@@ -15274,6 +16053,7 @@ impl Node {
             connected_peers: Vec::new(),
             boards_connected: Vec::new(),
             relaying: 0,
+            key_waits: Vec::new(),
         });
     }
 
@@ -15444,6 +16224,18 @@ impl Node {
             connected: connected_peers.len(),
             connected_peers,
             boards_connected: self.boards_connected(),
+            key_waits: self
+                .older
+                .keys()
+                .chain(self.key_waiting.keys())
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .filter_map(|(room, member)| {
+                    self.said_of(&room, &member)
+                        .map(|said| (room, member, said))
+                })
+                .collect(),
         };
         (view, read)
     }
@@ -16224,7 +17016,6 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::RoomNotSynced => Fault::RoomNotSynced,
         Error::Profile("no identity on this node") => Fault::NoIdentity,
         Error::Profile("identity already exists on this node") => Fault::IdentityExists,
-        Error::Profile(crate::node::profile::EMPTY_PASSPHRASE) => Fault::PassphraseEmpty,
         Error::Profile("locked") => Fault::Locked,
         Error::Profile("no such room on this node") => Fault::UnknownChannel,
         Error::AtRestUnlockFailed => Fault::WrongPassphrase,

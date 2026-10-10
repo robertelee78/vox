@@ -20,6 +20,7 @@
 pub mod agent_hook;
 pub mod agent_room;
 pub mod agent_send;
+pub mod agent_setup;
 pub mod app;
 pub mod app_cli;
 pub mod claude_injector;
@@ -45,6 +46,7 @@ pub mod notify;
 pub mod opencode_mirror;
 pub mod ping;
 pub mod platform;
+pub mod room_ask;
 pub mod room_cli;
 pub mod room_map;
 pub mod session_cli;

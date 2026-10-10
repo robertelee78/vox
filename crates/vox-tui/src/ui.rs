@@ -14,7 +14,7 @@
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 use vox_core::hash::Digest32;
@@ -268,8 +268,13 @@ fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
     ))];
     // **A trust offer waits under needs you** (ADR-028 K-15, K-18), before the rooms there.
     let needs_you = vox_agentcomms::attention::RoomGroup::NeedsYou;
-    if !vm.offers.is_empty() {
-        let n = vm.offers.len() + vm.channels.iter().filter(|c| c.group == needs_you).count();
+    // **So does a repo with no room** (ADR-029 RB-5): Vox asks the person, not only the agent, with
+    // the commands that answer it at a terminal.
+    let headed = !vm.offers.is_empty() || !vm.room_asks.is_empty();
+    if headed {
+        let n = vm.offers.len()
+            + vm.room_asks.len()
+            + vm.channels.iter().filter(|c| c.group == needs_you).count();
         items.push(
             ListItem::new(format!("{} ({n})", needs_you.label()))
                 .style(Style::default().add_modifier(Modifier::BOLD)),
@@ -289,13 +294,23 @@ fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
             };
             items.push(ListItem::new(format!("{marker}offer: {short}… {why}")));
         }
+        for a in &vm.room_asks {
+            let mut lines = vec![Line::from(format!("  {}", a.sentence))];
+            for (what, cmd) in &a.answers {
+                lines.push(Line::from(Span::styled(
+                    format!("    {what}: {cmd}"),
+                    Style::default().add_modifier(Modifier::DIM),
+                )));
+            }
+            items.push(ListItem::new(Text::from(lines)));
+        }
     }
     let mut group = None;
     for (i, c) in vm.channels.iter().enumerate() {
         if group != Some(c.group) {
             group = Some(c.group);
             // Needs you is headed already, with its offers.
-            if c.group != needs_you || vm.offers.is_empty() {
+            if c.group != needs_you || !headed {
                 let n = vm.channels.iter().filter(|o| o.group == c.group).count();
                 items.push(
                     ListItem::new(format!("{} ({n})", c.group.label()))
@@ -574,7 +589,24 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
 
     // What the timeline shows (ADR-029 CL-2): the room's conversation (General); that and each
     // Session's opening and end (All); or one Session, whose activity is never the room's (SC-4).
+    let tagged: Vec<MessageView>;
     let (timeline, notices, shown) = match &ui.showing {
+        Showing::Tag(tag) => {
+            tagged = channel
+                .timeline
+                .iter()
+                .filter(|m| m.tags.iter().any(|t| t == tag))
+                .cloned()
+                .collect();
+            (
+                tagged.as_slice(),
+                Vec::new(),
+                format!(
+                    " — tagged {} (:general for the room)",
+                    vox_agentcomms::envelope::shown(tag, vox_agentcomms::envelope::SHOWN_NAME)
+                ),
+            )
+        }
         Showing::General => (
             channel.timeline.as_slice(),
             channel.notices.clone(),
@@ -1056,6 +1088,14 @@ fn render_timeline(
             ));
             push(&mut rows, Some(m.entry_hash), None, l);
         }
+        // Its tags, quiet, under it (#636): `:tag` shows the room's messages tagged so.
+        if !m.tags.is_empty() {
+            let l = Line::from(Span::styled(
+                format!("  tags: {}", crate::room_cli::shown_tags(&m.tags)),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+            push(&mut rows, Some(m.entry_hash), None, l);
+        }
         // **An image it shares, under it** (ADR-028 F-11): drawn once this node's copy is
         // verified, on a terminal that draws images; otherwise said in words.
         if let Some(img) = &m.image {
@@ -1440,7 +1480,7 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
             " Tab switch pane · ↑/↓ select · Enter show · :general · :all · :session <name> · : command · Esc back"
         }
         Screen::Channel => {
-            " Tab switch pane · ↑/↓ select · Ctrl-R reply · Enter send, or go to the quoted · PgUp/PgDn scroll · :to <name> · :urgent · :share <path> · :link · :general · :all · :session <name> · : command · Esc back"
+            " Tab switch pane · ↑/↓ select · Ctrl-R reply · Enter send, or go to the quoted · PgUp/PgDn scroll · :to <name> · :urgent · :share <path> · :link · :general · :all · :session <name> · :tag <tag> · : command · Esc back"
         }
         Screen::Tunnels => " ↑/↓ select · x close the selected tunnel · : command · Esc back",
         Screen::Serve if vm.serve_preview.is_some() => " Enter share it · Esc back to the list",

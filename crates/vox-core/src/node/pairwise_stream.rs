@@ -11,6 +11,7 @@
 //! | direction | frame |
 //! |---|---|
 //! | either | `SKDM` — the `channelID` plus one ratchet [`Message`] whose plaintext is an SKDM |
+//! | either | `ROTATION_HELLO` — a key delivery (ADR-030 W-1): the `channelID`, the PQXDH opening of a fresh session, and the key sealed in it |
 //!
 //! The channelID travels **outside** the sealed message because the recipient needs
 //! it to pick the session that decrypts it: an ADR-004 session is bound to a
@@ -55,6 +56,10 @@ const OP_SKDM: u64 = 1;
 const OP_HELLO: u64 = 2;
 /// `3` — an [`PairwiseFrame::Open`]: one ratchet message carrying nothing.
 const OP_OPEN: u64 = 3;
+/// `4` — a [`PairwiseFrame::RotationHello`]: one key delivery in a session of its own (ADR-030
+/// W-1). A node that predates ADR-030 ends its stream unanswered, as for any frame it cannot read;
+/// its sender then sends it its keys in the pair's long-lived session, and says so (W-4).
+const OP_ROTATION_HELLO: u64 = 4;
 
 /// One frame on a `pairwise` stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +113,22 @@ pub enum PairwiseFrame {
         /// `Message::to_wire` bytes of a sealed, empty-plaintext ratchet message.
         sealed: Vec<u8>,
     },
+    /// **One key delivery, in a session of its own** (ADR-030 W-1): the PQXDH opening of a session
+    /// the sender opened for this key alone (D-1, D-2), and the key sealed in it, together.
+    ///
+    /// It is not an [`PairwiseFrame::Hello`]. A hello opens the long-lived session a pair keeps, and
+    /// two competing hellos are reconciled (ADR-004 O2–O4). A delivery's session lives only as long
+    /// as it takes to open the key: the receiver builds it, opens the key, answers, and drops it,
+    /// never touching the long-lived session or its replay pin (W-2, W-3).
+    RotationHello {
+        /// The room the key is for, and the session's binding.
+        channel_id: crate::hash::Digest32,
+        /// `InitialMessage::to_wire` bytes: the delivery session's opening.
+        initial: Vec<u8>,
+        /// `Message::to_wire` bytes: the first ratchet message of that session, whose plaintext is
+        /// the [`Skdm`].
+        sealed: Vec<u8>,
+    },
 }
 
 impl PairwiseFrame {
@@ -127,6 +148,17 @@ impl PairwiseFrame {
             }
             Self::Open { channel_id, sealed } => {
                 e.array(3).uint(OP_OPEN).bytes(channel_id).bytes(sealed);
+            }
+            Self::RotationHello {
+                channel_id,
+                initial,
+                sealed,
+            } => {
+                e.array(4)
+                    .uint(OP_ROTATION_HELLO)
+                    .bytes(channel_id)
+                    .bytes(initial)
+                    .bytes(sealed);
             }
         }
         e.finish()
@@ -159,6 +191,14 @@ impl PairwiseFrame {
                     .map_err(|_| Error::MalformedBundle("pairwise room id length"))?,
                 initial: d.bytes()?.to_vec(),
             },
+            (OP_ROTATION_HELLO, 4) => Self::RotationHello {
+                channel_id: d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| Error::MalformedBundle("pairwise room id length"))?,
+                initial: d.bytes()?.to_vec(),
+                sealed: d.bytes()?.to_vec(),
+            },
             _ => return Err(Error::MalformedBundle("pairwise frame op")),
         };
         d.finish()?;
@@ -175,6 +215,27 @@ pub fn hello_frame(channel_id: &crate::hash::Digest32, initial: &InitialMessage)
         initial: initial.to_wire(),
     }
     .to_frame()
+}
+
+/// A key delivery (ADR-030 W-1): `skdm` sealed as the first message of `session`, a session the
+/// sender opened for this key alone with `initial`, in one [`PairwiseFrame::RotationHello`]. The
+/// caller keeps these bytes and resends exactly them until the key is taken (D-4).
+///
+/// # Errors
+/// The session could not seal it.
+pub fn rotation_hello_frame(
+    channel_id: &crate::hash::Digest32,
+    initial: &InitialMessage,
+    session: &mut Session,
+    skdm: &Skdm,
+) -> Result<Vec<u8>> {
+    let sealed = skdm.seal_into(session)?.to_wire();
+    Ok(PairwiseFrame::RotationHello {
+        channel_id: *channel_id,
+        initial: initial.to_wire(),
+        sealed,
+    }
+    .to_frame())
 }
 
 /// Seal `skdm` into `session` as one frame for `channel_id`. Sealing steps the ratchet, so it
@@ -258,6 +319,9 @@ pub enum KeyRefusal {
     /// The key opened, but its owner has not trusted the member it came from, so this node does
     /// not read that member (V210-118). Sent again, and taken, once its owner trusts it.
     NotTrusted = 0x25,
+    /// A key delivery named a one-time prekey this node does not hold (ADR-030 P-3): the sender
+    /// fetches the bundle again and never names that prekey again.
+    UnknownPrekey = 0x26,
 }
 
 impl KeyRefusal {
@@ -276,11 +340,24 @@ impl KeyRefusal {
             0x23 => "the room would not take the key".into(),
             0x24 => "its hello was not accepted".into(),
             0x25 => "its owner has not trusted us, so it does not read us yet".into(),
+            0x26 => "it does not hold the one-time prekey the delivery named".into(),
             0x05 => "refused at accept: it may not take a key from us yet".into(),
             other => format!("reset with code {other}"),
         }
     }
 }
+
+/// What is said when a key's recipient ended the stream without an answer (ADR-030 W-4), and what
+/// that costs.
+pub const ENDED_UNANSWERED: &str = "it runs a Vox older than v0.4.3, which cannot take a key \
+     delivered in a session of its own (it closed the stream without an answer); your key goes to \
+     it in the session it has always used instead, without post-compromise protection, until it \
+     updates";
+
+/// What is said beside a member that runs a Vox older than v0.4.3 (ADR-030 W-4), after its name:
+/// it is sent this node's keys as it expects them, and what that costs.
+pub const RUNS_OLDER: &str = "runs an older Vox: it reads you, but without post-compromise \
+                              protection for your keys, until it updates to v0.4.3";
 
 /// Whether the far side refused a delivered key: `Some(why)` if so, `None` if it took it.
 ///
@@ -309,6 +386,14 @@ pub async fn refusal(
         Ok(Ok(())) => Some((format!("answered {}", byte[0]), true)),
         Ok(Err(quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code)))) => {
             Some((KeyRefusal::describe(code.into_inner()), true))
+        }
+        // **Ended without an answer** (ADR-030 W-4): the recipient read the stream and closed it
+        // without taking or refusing the key, which is what a node that predates key delivery in a
+        // session of its own does with a frame it cannot read. Its decision, so answered: its sender
+        // marks it older and sends it the key in the pair's long-lived session (W-4), never this
+        // frame again every second.
+        Ok(Err(quinn::ReadExactError::FinishedEarly(_))) => {
+            Some((ENDED_UNANSWERED.to_owned(), true))
         }
         Ok(Err(e)) => Some((e.to_string(), false)),
         Err(_) => Some((format!("no answer within {}s", patience.as_secs()), false)),

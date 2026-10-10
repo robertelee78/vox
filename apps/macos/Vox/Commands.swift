@@ -154,6 +154,11 @@ struct VoxCommands: Commands {
                 .disabled(app.node != nil)
             Button("Detach") { Task { await app.detachNode() } }
                 .disabled(app.node == nil)
+            // #666: in place of printing `vox node forget-passphrase`.
+            Button("Forget Passphrase") {
+                if let node = app.signedInAs { Task { await app.forgetPassphrase(node) } }
+            }
+            .disabled(app.signedInAs == nil)
             Hairline()
             // E-4: the one way to act as another node: sign out, then sign in.
             Button("Sign Out…") { app.signingOut = true }

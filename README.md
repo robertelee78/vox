@@ -116,7 +116,7 @@ the nodes that are attached to it. A node is one identity; you can have several,
 yourself and one for each agent working beside you.
 
 ```
-vox node create alice       # make a node (its passphrase is asked twice; every node has one)
+vox node create alice       # make a node (its passphrase is asked twice; Enter alone for none)
 vox node attach alice       # attach it to the daemon, starting the daemon if none runs
 vox node list               # every node here, and whether it is attached
 vox node detach alice       # its connections close and its keys leave memory
@@ -164,7 +164,8 @@ already in it.
 
 ### Passphrases
 
-There are two: every node has an identity passphrase, and a room's passphrase is optional.
+There are two, and both are optional: a node's identity passphrase, and a room's passphrase. A
+node made with none keeps its identity key on that machine unencrypted, and says so.
 
 - **The identity passphrase** protects your keys at rest. You enter it once to unlock your node;
   it then stays unlocked while it runs. Changing who you trust (`vox trust add|remove`) asks for it
@@ -299,6 +300,23 @@ members, not from the person they work for.
   to downgrade to. **If** the lattice halves hold, traffic recorded now stays closed to an adversary
   who later breaks the classical ones; nobody can tell you they hold, which is the reason for the
   hybrid. *(ADR-003, ADR-011)*
+- **Post-quantum recovery after a compromise.** Every key a node hands another member (a room's
+  new sender key after a rotation, a key released by a trust decision) travels in a fresh hybrid
+  handshake opened for it alone, never in an older session. If a node's state is stolen and the
+  thief then only listens, even with a quantum computer, the next key that node hands out is safe
+  again, with no reply needed. If the recipient's state is stolen, keys sent to it are safe again
+  within seven days: a sender refuses a prekey bundle older than that, and a node retires one-time
+  prekeys nobody used in that time. A room recovers with its next sender-key rotation. Weaker cases:
+  a key whose recipient offers no fresh one-time prekey within 30 seconds (its pool used up, or its
+  new prekeys not reaching the sender while it is online) goes to its signed prekey, which heals only
+  when it rotates (up to seven days); restoring a profile brings back its prekeys, and any one-time
+  ones it brings back retire within seven days; a replay of a delivery to a signed prekey re-creates
+  a session whose key the room already holds; and a sender refuses prekeys dated more than ten
+  minutes ahead of its clock, so a wrong clock lengthens the seven days by at most ten minutes. A
+  member still on Vox v0.4.2 or older is sent your keys the old way, so it can read you, but with
+  none of this recovery for those keys until it updates; Vox says so beside it in `vox room roster`,
+  `vox status` and the app. Nothing here holds against someone who stole an identity key and acts as
+  it. *(ADR-030)*
 - **Chat, agents and tunnels on one overlay.** *(ADR-013, ADR-017, ADR-020)*
 
 ## Threat model

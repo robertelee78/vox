@@ -13,6 +13,9 @@
 //!
 //! What it proves:
 //!
+//! - `vox trust add --drive` says, before the change and its passphrase, that the node is to drive
+//!   this node's Sessions (ADR-028 E-5); without `--drive` it says nothing of drive;
+//!
 //! - `room list` names the room, and `room post` puts a message in it that the
 //!   **node's own view** shows — so the post went through the log;
 //! - `room read` prints the entry hash first, and **that hash works as a cursor**
@@ -713,6 +716,60 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
         "PRODUCT: `vox trust add` must say what it is to cover (no room shared yet), then what it \
          did: {out:?}"
     );
+    assert!(
+        !out.contains("to drive"),
+        "PRODUCT: `vox trust add` without --drive must not say it is to drive: {out:?}"
+    );
+    // **With --drive, drive is said before the change is made** (ADR-028 E-5): it is part of what
+    // yes changes, so it is in the preview, before the passphrase is asked and before `trusting`.
+    // Mutant: the preview's drive line dropped; red here.
+    // Another fingerprint nobody holds: its last character carries no bits past the 256.
+    let driver = format!("{}a", "b".repeat(51));
+    let (ok, out, err) = vox(
+        &data,
+        &cfg,
+        &[
+            "trust",
+            "add",
+            &driver,
+            "--name",
+            "driver",
+            "--drive",
+            "--identity-passphrase-file",
+            pass_file,
+        ],
+        None,
+    );
+    assert!(ok, "PRODUCT: trust add --drive failed: {err}");
+    let preview = out.find("vox: about to trust");
+    let drive_said = out
+        .find("and to drive this node's Sessions: type into them, interrupt, approve and answer");
+    let asked = out.find("passphrase");
+    let done = out.find("vox: trusting");
+    assert!(
+        matches!((preview, drive_said, done), (Some(p), Some(d), Some(t)) if p < d && d < t)
+            && asked.is_none_or(|a| drive_said.is_some_and(|d| d < a))
+            && out.contains("read + drive"),
+        "PRODUCT: `vox trust add --drive` must say, in what it is about to do and before the \
+         passphrase is asked, that the node is to drive this node's Sessions, then that it trusts \
+         it read + drive: {out:?}"
+    );
+    let (ok, _, err) = vox(
+        &data,
+        &cfg,
+        &[
+            "trust",
+            "remove",
+            &driver,
+            "--identity-passphrase-file",
+            pass_file,
+        ],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): trust remove of driver failed: {err}"
+    );
     let (ok, out, err) = vox(
         &data,
         &cfg,
@@ -727,19 +784,9 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
     );
     assert!(ok, "PRODUCT: trust remove failed: {err}");
     assert!(
-        said(
-            &out,
-            "vox: about to stop trusting",
-            &[],
-            "vox: no longer trusting",
-            ""
-        ) && said(
-            &out,
-            "vox: no longer trusting",
-            &[],
-            "     cut: none was open",
-            ""
-        ),
+        // "Remove" is the one word for taking a node out of the keyring (ADR-028 E-2, K-6).
+        said(&out, "vox: about to remove", &[], "vox: removed", "")
+            && said(&out, "vox: removed", &[], "     cut: none was open", ""),
         "PRODUCT: `vox trust remove` must say what it is to stop, then what it did, naming the \
          live sessions it cut: {out:?}"
     );

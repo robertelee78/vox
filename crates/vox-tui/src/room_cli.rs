@@ -44,7 +44,7 @@ pub(crate) async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
 }
 
 /// Ask the node for its rooms, as `(id, local name, open, over)`.
-async fn rooms_of(
+pub(crate) async fn rooms_of(
     client: &mut IpcClient,
 ) -> Result<Vec<(Digest32, String, bool, String)>, AppError> {
     match client.rooms().await {
@@ -344,6 +344,7 @@ impl PostOpts {
             || self.data.is_some()
             || self.coord.op.is_some()
             || self.coord.json
+            || self.coord.is_tagged()
     }
 }
 
@@ -530,6 +531,7 @@ pub(crate) async fn post_structured(
             )))
         }
     };
+    let tags = opts.coord.tags(work.as_deref())?;
     if let Some(a) = &opts.attempt {
         data.insert("attempt".into(), a.clone().into());
     }
@@ -618,6 +620,7 @@ pub(crate) async fn post_structured(
         hops: hops_of_reply,
         body: body.trim_end().to_owned(),
         data,
+        tags,
         // A link card for the body's first URL, fetched by this node (ADR-028 F-10).
         card: !opts.no_card,
     };
@@ -1153,6 +1156,8 @@ fn row_value(
         }).unwrap_or_default(),
         "parse_error": parse_error,
         "op": op,
+        // What it relates to, as its sender tagged it (#636): what `--tag` filters by.
+        "tags": vox_core::node::api::message_tags(&r.text),
     })
 }
 
@@ -1316,12 +1321,33 @@ fn plain_row(r: &vox_core::node::api::MessageRow) -> String {
     } else {
         format!("\n  ({to})")
     };
+    // **Its tags, on a line of their own** (#636), after whom it is addressed to, each shown on
+    // one line as the sender wrote it.
+    let tags = vox_core::node::api::message_tags(&r.text);
+    let tags = if tags.is_empty() {
+        String::new()
+    } else {
+        format!("\n  tags: {}", shown_tags(&tags))
+    };
     format!(
-        "{} {} {}{to}",
+        "{} {} {}{to}{tags}",
         id(&r.entry_hash),
         crate::ident::name_of(&r.author),
         text
     )
+}
+
+/// A message's tags as a person reads them (#636): each on one line, cut, separated by spaces.
+pub(crate) fn shown_tags(tags: &[String]) -> String {
+    tags.iter()
+        .map(|t| {
+            vox_agentcomms::envelope::shown(
+                t,
+                vox_agentcomms::envelope::MAX_TAG + "milestone:".len(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// What a post answers and the hop budget it starts with, by the one rule `vox room post` and
@@ -1390,6 +1416,88 @@ pub(crate) async fn answers(
     Ok((re, hops_of_reply))
 }
 
+/// What `vox room read --tag` filters a room by (#636): the tags every message shown carries,
+/// and the member whose messages alone are shown, as typed. No tags, no filter.
+#[derive(Debug, Clone, Default)]
+pub struct Tagged {
+    /// `--tag`, each `task:`, `project:` or `milestone:` and a value.
+    pub tags: Vec<String>,
+    /// `--from`: your name for a member, or its fingerprint.
+    pub from: Option<String>,
+}
+
+/// The rows a read shows: those after `since`, at most `limit` (0 for all), or with `tagged`'s
+/// tags the room's messages carrying them all, from the node's index (#636). `None` when the
+/// cursor is not in the room.
+async fn rows_of(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    since: Option<Digest32>,
+    limit: usize,
+    tagged: &Tagged,
+) -> Result<Option<Vec<vox_core::node::api::MessageRow>>, AppError> {
+    if tagged.tags.is_empty() {
+        return coord::read_upto(client, channel_id, since, limit).await;
+    }
+    if let Some(bad) = tagged
+        .tags
+        .iter()
+        .find(|t| !vox_agentcomms::envelope::is_valid_tag(t))
+    {
+        return Err(AppError::Usage(format!(
+            "--tag {} is not a tag: use task:, project: or milestone: and a value, as \
+             `vox room read --json` shows a message's tags",
+            vox_agentcomms::envelope::shown(bad, vox_agentcomms::envelope::SHOWN_NAME)
+        )));
+    }
+    if tagged.tags.len() > vox_agentcomms::envelope::MAX_TAGS {
+        return Err(AppError::Usage(format!(
+            "at most {} --tag: no message carries more",
+            vox_agentcomms::envelope::MAX_TAGS
+        )));
+    }
+    let from = match &tagged.from {
+        None => None,
+        // `you`, as a read names this node's own messages.
+        Some(w) if w.trim() == crate::ident::YOU => Some(
+            client
+                .me()
+                .ok_or_else(|| AppError::Usage("the node did not say who it is".into()))?,
+        ),
+        Some(w) => {
+            let members = members_of(client, channel_id).await?;
+            Some(
+                crate::ident::resolve_member(w, &members, crate::ident::names())
+                    .map_err(|e| AppError::Usage(format!("refusing --from: {e}")))?,
+            )
+        }
+    };
+    match client
+        .read_tagged(channel_id, &tagged.tags, from)
+        .await
+        .map_err(|e| AppError::Usage(e.to_string()))?
+    {
+        Frame::Rows { mut rows } => {
+            if limit > 0 {
+                rows.truncate(limit);
+            }
+            Ok(Some(rows))
+        }
+        // A node from before tags does not know the request: said as what to do.
+        Frame::Error { reason }
+            if reason == vox_core::error::Error::UnknownIpcRequest.to_string() =>
+        {
+            Err(AppError::Usage(
+                "--tag: this node runs a vox from before tags, which cannot read a room by tag; \
+                 update it (`vox update`) and restart it"
+                    .into(),
+            ))
+        }
+        Frame::Error { reason } => Err(AppError::Usage(format!("--tag: {reason}"))),
+        other => Err(crate::client::unexpected(&other)),
+    }
+}
+
 /// `vox room read` — the room's messages, optionally only what follows a cursor.
 ///
 /// Each line is `<entry-hash> <author> <text>`; with `--json`, one
@@ -1398,6 +1506,7 @@ pub(crate) async fn answers(
 ///
 /// # Errors
 /// If the node cannot be reached, the room is unknown, or the cursor is not in it.
+#[allow(clippy::too_many_arguments)]
 pub async fn read(
     paths: &Paths,
     room: &str,
@@ -1406,6 +1515,7 @@ pub async fn read(
     json: bool,
     only_late: bool,
     with_notices: bool,
+    tagged: &Tagged,
 ) -> Result<(), AppError> {
     let (mut client, channel_id, room_key) = open_room(paths, room).await?;
     let since = match since {
@@ -1417,7 +1527,7 @@ pub async fn read(
         // the cursor had been read. `--late` filters, so it reads on and keeps `--limit` of those.
         let take = usize::try_from(limit).unwrap_or(usize::MAX);
         let read = if only_late { 0 } else { take };
-        let Some(rows) = coord::read_upto(&mut client, channel_id, since, read).await? else {
+        let Some(rows) = rows_of(&mut client, channel_id, since, read, tagged).await? else {
             return Err(AppError::Usage(format!(
                 "cursor {} is not in this room's timeline",
                 since.map(|c| id(&c)).unwrap_or_default()
@@ -1462,7 +1572,7 @@ pub async fn read(
     // those.
     let take = usize::try_from(limit).unwrap_or(usize::MAX);
     let read = if only_late { 0 } else { take };
-    let Some(shown) = coord::read_upto(&mut client, channel_id, since, read).await? else {
+    let Some(shown) = rows_of(&mut client, channel_id, since, read, tagged).await? else {
         return Err(AppError::Usage(format!(
             "cursor {} is not in this room's timeline",
             since.map(|c| id(&c)).unwrap_or_default()
@@ -1612,6 +1722,16 @@ pub async fn roster(paths: &Paths, room: &str) -> Result<(), AppError> {
         Ok(Frame::Members { members }) => {
             for m in members {
                 println!("{}", id(&m));
+            }
+            // What is to be said of a member about this node's key (ADR-030 D-5, W-4): that it
+            // waits, and why, or that the member runs an older Vox. Said beside the list, on
+            // stderr, so the list stays one member a line.
+            if let Ok(Frame::KeyWaits { waits }) =
+                client.request(&Request::KeyWaits { channel_id }).await
+            {
+                for (m, said) in waits {
+                    eprintln!("vox: {} {said}", id(&m));
+                }
             }
             Ok(())
         }
@@ -1961,6 +2081,33 @@ pub struct CoordOpts {
     pub op: Option<String>,
     /// Print one JSON object instead of prose.
     pub json: bool,
+    /// The task the message relates to, tagged `task:` (#636).
+    pub task: Option<String>,
+    /// The project it relates to, tagged `project:`.
+    pub project: Option<String>,
+    /// The milestone it relates to, tagged `milestone:`.
+    pub milestone: Option<String>,
+}
+
+impl CoordOpts {
+    /// The message's tags (#636): what the sender named, the task the work item when it named
+    /// none.
+    ///
+    /// # Errors
+    /// A value that would not make a tag.
+    pub(crate) fn tags(&self, work: Option<&str>) -> Result<Vec<String>, AppError> {
+        vox_agentcomms::envelope::tags_of(
+            self.task.as_deref(),
+            self.project.as_deref(),
+            self.milestone.as_deref(),
+            work,
+        )
+        .map_err(AppError::Usage)
+    }
+
+    fn is_tagged(&self) -> bool {
+        self.task.is_some() || self.project.is_some() || self.milestone.is_some()
+    }
 }
 
 /// Attach to the node and resolve the room: the client, the room's id and its key.
@@ -2025,10 +2172,15 @@ async fn run_op(
         .and_then(|v| v.as_str())
         .and_then(|r| snap.fold.resources.get(r))
         .cloned();
+    let tags = opts.tags(
+        data.get(vox_agentcomms::envelope::WORK_KEY)
+            .and_then(serde_json::Value::as_str),
+    )?;
     let draft = Draft {
         kind: kind.into(),
         body,
         data,
+        tags,
         ..Draft::default()
     };
     let posting = coord::post_once(&mut client, cid, &draft, &session, &op, &snap).await?;
@@ -4817,6 +4969,12 @@ pub async fn trust_add(
             "your services in a room you share, once you offer one"
         )
     );
+    // Drive is part of what yes changes, so it is said with the rest, before the passphrase.
+    if drive {
+        println!(
+            "     and to drive this node's Sessions: type into them, interrupt, approve and answer"
+        );
+    }
     match keyring_change(&mut client, |identity_passphrase| Request::Trust {
         target,
         petname: petname.to_owned(),
@@ -4853,6 +5011,17 @@ pub async fn trust_add(
                 )
             );
             println!("     `vox trust remove` undoes it and changes the lock everywhere");
+            if drive {
+                println!(
+                    "Next: from node {petname:?}, `vox room sessions <room>` lists this node's \
+                     Sessions in a room you share, and `vox room session` drives one"
+                );
+            } else {
+                println!(
+                    "Next: send {petname:?} this node's fingerprint (`vox id`), so it trusts you \
+                     too and you read what it writes"
+                );
+            }
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),

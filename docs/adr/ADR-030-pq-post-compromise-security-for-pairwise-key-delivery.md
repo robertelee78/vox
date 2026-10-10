@@ -2,8 +2,11 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: Accepted for v0.4.2 (the decider, 2026-10-09; first accepted for v0.5.0, moved to v0.4.2 the
-same day). Nothing in this ADR is built.
+**Status**: Accepted (the decider, 2026-10-09; first accepted for v0.5.0, moved to v0.4.2 the same
+day) and built in v0.4.3: key delivery in `node::actor` and `node::pairwise_stream`, the prekey ring
+in `node::prekeys`. W-4 amended 2026-10-10 by the lead, under the decider's delegation ("everything
+else with my recommendations"): an older peer is sent its keys as it expects them, and that is said,
+in place of lockstep.
 **Date**: 2026-10-09
 **Deciders**: Robert E. Lee
 **Tags**: crypto, post-quantum, pairwise, sender-keys, prekeys
@@ -41,7 +44,7 @@ binds PQ freshness to every key delivery, not to the ratchet.
   to a peer over the pairwise channel, MUST be sealed in a session the sender opens with
   `Session::initiate` after deciding to send that key, against the recipient's current bundle. It
   MUST NOT be sealed in the long-lived session (ADR-004 O1–O4) or in any session that existed before
-  the decision.
+  the decision, except to a peer marked older under W-4.
 - **D-2. The sender is always the initiator.** A key delivery session MUST be initiated by the node
   that sends the key. A responder-side compromise heals only when the responder's prekeys roll (§3),
   so the sending side MUST never become the responder through the ADR-004 O2 race.
@@ -70,10 +73,18 @@ binds PQ freshness to every key delivery, not to the ratchet.
   long-lived session's accepted-hello record, so a delivery cannot evict that record's replay pin.
   A replayed delivery frame whose key was already taken MUST be answered `KEY_TAKEN` without opening
   anything; ADR-006 S-12 makes a duplicate SKDM inert.
-- **W-4. Lockstep.** A node that predates this ADR refuses `OP_ROTATION_HELLO` as an unknown frame
-  and resets the stream. That refusal MUST be the whole mixed-version behaviour: the key waits (D-5),
-  and no state is damaged or downgraded. There is no capability bit and no classical mode to fall
-  back to.
+- **W-4. An older peer, said.** A node that predates this ADR ends a key delivery's stream without
+  an answer. The sender MUST then mark that peer older in that room, MUST send it its keys in the
+  pair's long-lived session (ADR-004 O1–O4), as it expects them, and MUST say beside it, in the
+  roster, `vox status` and the app: "<member> runs an older Vox: it reads you, but without
+  post-compromise protection for your keys, until it updates to v0.4.3". On each reconnect the
+  sender MUST probe once, with its current key in a session of its own: a probe taken clears the
+  mark; a probe ended unanswered keeps it; any other answer leaves the probe due. A node of this ADR
+  MUST NOT end a key delivery's stream unanswered (it refuses with a code, even while locking), so
+  no current node is marked. Only the peer's own endpoint can end its stream, since a relay carries
+  QUIC packets it cannot read, so no third party can cause the fallback. There is no capability bit.
+  (Amended 2026-10-10, by the lead under the decider's delegation, in place of lockstep, under which
+  an older peer read nothing new until it updated.)
 
 ### 3. Prekeys
 
@@ -82,10 +93,17 @@ binds PQ freshness to every key delivery, not to the ratchet.
   unadvertised, for a grace of 1 hour, so a delivery already in flight still opens.
 - **P-2. Refuse a stale bundle.** A sender MUST refuse a bundle whose signed prekey's root-signed
   creation time is older than one cadence. It MUST NOT judge staleness by the record's own
-  publication fields. The check MUST sit in the sender's fetch path.
+  publication fields. The check MUST sit in the sender's fetch path. A sender MUST also refuse a
+  bundle whose signed or one-time prekey's root-signed creation time is more than 10 minutes ahead
+  of its own clock, and say so in plain words (D-5), so a recipient clock running fast extends the
+  cadence bound by at most 10 minutes (lead, 2026-10-10; keeps S-2 as stated).
 - **P-3. Refused one-time prekeys.** When a recipient answers that it does not know the one-time
   prekey a delivery named, the sender MUST fetch the bundle again and MUST NOT target that prekey id
-  again.
+  again. It MUST NOT name a one-time prekey that an earlier delivery named. When the bundle it holds
+  names such a prekey, the key MUST wait for the recipient's next bundle (D-5). A node MUST
+  republish its bundle as soon as the prekeys it offers change. If no bundle naming a fresh
+  one-time prekey arrives within 30 seconds while the recipient is connected, the sender MAY
+  deliver to the signed prekey, and MUST say so once (lead, 2026-10-10; keeps S-2 as stated).
 
 ### 4. What this provides
 
@@ -102,12 +120,15 @@ binds PQ freshness to every key delivery, not to the ratchet.
 - **S-4. Out of scope.** This ADR provides nothing against an active adversary holding a stolen
   identity key, or an active quantum adversary during the handshake (ADR-004 S1).
 - **S-5. Stated degradations.** These MUST be stated wherever S-1 to S-3 are claimed:
-  - In a room where one membership change makes more deliveries to a member than its one-time pool
-    holds, the rest target its signed prekey, which heals only on rotation.
+  - A delivery whose recipient published no fresh one-time prekey within 30 seconds of the last one
+    being named (its pool exhausted, or its next bundle not arriving while it is connected) targets
+    its signed prekey, which heals only on rotation.
   - Restoring a profile restores its prekey ring. P-1 bounds the resurrected one-time prekeys to one
     cadence.
   - A replay of a last-resort delivery inside the signed prekey's retention re-derives the same
     session. ADR-006 S-12 makes its key inert.
+  - A peer that runs a Vox older than v0.4.3 is sent its keys in the pair's long-lived session (W-4),
+    so S-1 to S-3 do not hold for keys sent to it until it updates; this is said beside it.
 - **S-6. Precondition.** S-1 to S-3 hold only while D-1 covers every confidential payload on the
   pairwise channel. A change that adds a payload MUST state how it meets D-1, or reopen this ADR.
 
@@ -153,9 +174,12 @@ binds PQ freshness to every key delivery, not to the ratchet.
   recipient's one-time prekeys.
 - `pairwise/ratchet.rs`, `header.rs`, `session.rs`, `init_message.rs` and `suite.rs` are unchanged.
   The work is in the node's delivery paths, the pairwise frames and the prekey ring.
-- v0.4.2 does not interoperate with v0.4.1 or earlier on key delivery (W-4).
-- Recipient-side healing is bounded by prekey hygiene. Today nothing retires an unused one-time
-  prekey, so that bound does not exist until P-1 lands.
+- v0.4.3 sends a peer on v0.4.2 or earlier its keys the old way, in the long-lived session, and says
+  so beside it, so a mixed room keeps reading; those keys have no post-compromise recovery until the
+  peer updates (W-4).
+- Recipient-side healing is bounded by prekey hygiene: P-1 retires unused one-time prekeys and P-2
+  refuses stale bundles and bundles dated more than 10 minutes ahead, so a recipient clock running
+  fast lengthens the bound by at most 10 minutes.
 
 ## Related ADRs
 

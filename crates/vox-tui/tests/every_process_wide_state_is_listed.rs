@@ -40,7 +40,9 @@ mod row {
     pub const COUNTERS: &str =
         "NEXT_TUNNEL, NEXT_SERIAL, paths::NEXT: process-wide unique counters";
     pub const PINNED: &str = "PINNED (atrest/lock.rs): process-wide mlock bookkeeping";
-    pub const CACHED: &str = "SAID (quic.rs), cached strings (api.rs, viewmodel.rs): process-wide";
+    pub const CACHED: &str = "SAID (quic.rs), cached strings (api.rs): process-wide";
+    pub const KEYCHAIN_UI: &str =
+        "OFF (keychain.rs, vox-tui): process-wide, the Keychain's user interaction turned off once";
     pub const SENDING: &str =
         "SENDING (claude_injector.rs): process-wide, one tmux send at a time across nodes";
     pub const TERMINAL: &str =
@@ -68,7 +70,7 @@ const LISTED: &[(&str, &str, usize, &str, Option<&str>)] = &[
     ("vox-core/src/node/paths.rs", "NEXT", 1, row::COUNTERS, None),
     ("vox-core/src/atrest/lock.rs", "PINNED", 1, row::PINNED, None),
     ("vox-core/src/node/api.rs", "TEXT", 1, row::CACHED, None),
-    ("vox-tui/src/viewmodel.rs", "TEXT", 1, row::CACHED, None),
+    ("vox-tui/src/keychain.rs", "OFF", 1, row::KEYCHAIN_UI, None),
     ("vox-tui/src/claude_injector.rs", "SENDING", 1, row::SENDING, None),
     ("vox-tui/src/theme.rs", "ASCII", 1, row::TERMINAL, None),
     ("vox-core/src/transport/mux.rs", "FILE", 1, row::TEST_KNOB_ENV, None),

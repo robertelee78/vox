@@ -82,6 +82,8 @@ final class NodeModel: ObservableObject {
         /// Whether it trusts this node: it has granted this node consent (ADR-007 G-9), whether
         /// or not this node trusts it back.
         var trustsYou = false
+        /// Why this node's key for it here waits, if it does (ADR-030 D-5, W-4).
+        var keyWaits: String?
     }
 
     let node: String
@@ -237,6 +239,13 @@ final class NodeModel: ObservableObject {
     @Published private(set) var trusted: [TrustedNode] = []
     /// Trust offers waiting on this node: newcomers, and nodes that trust it (ADR-028 K-15, K-17).
     @Published private(set) var offers: [OfferInfo] = []
+    /// Directories harness sessions started in with no room bound to them, not said no to
+    /// (ADR-029 RB-5): what Vox asks the person, under needs you.
+    @Published private(set) var roomAsks: [RoomAskInfo] = []
+    /// What the last answer to an ask did, or why it was not done: for the ask's view.
+    @Published private(set) var roomAskSaid: RoomAnswerInfo?
+    /// The directories already notified, so each ask notifies once (M-23).
+    private var roomAsksNotified: Set<String> = []
     /// The trusted nodes that trust this node back, as the rooms shared with them record it (L-4).
     @Published private(set) var trustsBack: Set<String> = []
     /// The members of the room on screen whose trust in this node has reached it, in the keyring
@@ -292,7 +301,7 @@ final class NodeModel: ObservableObject {
     /// Whether this model posts notifications at all.
     private let notifies: Bool
     /// Local notifications for messages in rooms the person is not looking at (M-23).
-    private let notifier = Notifier()
+    private let notifier = Notifier.shared
 
     /// `notify`: whether this model posts notifications; the app's does, and the screenshot
     /// renderer's (apps/macos/Screenshots, never shipped) does not, so it asks nobody anything.
@@ -369,6 +378,7 @@ final class NodeModel: ObservableObject {
     private func readFacts() async {
         if let keyring = try? await client.trustList(), keyring != trusted { trusted = keyring }
         if let waiting = try? await client.pendingOffers(), waiting != offers { offers = waiting }
+        await readRoomAsks()
         if let fresh = try? await client.nodes(), fresh != nodes { nodes = fresh }
         if let view = try? await client.view() {
             if Int(view.peers) != peers { peers = Int(view.peers) }
@@ -636,6 +646,7 @@ final class NodeModel: ObservableObject {
     /// once. Nothing is made unless `pending` is still the change waiting (D1): a prompt drawn for
     /// one change never makes another.
     func retryKeyring(_ pending: KeyringPending, with secret: Secret) async {
+        let empty = secret.isEmpty
         defer { secret.wipe() }
         guard keyringPending?.id == pending.id else { return }
         do {
@@ -646,7 +657,11 @@ final class NodeModel: ObservableObject {
             if keyringPending?.id == pending.id { keyringPending = nil }
             await refresh()
         } catch {
-            keyringFailed = sentence(error)
+            // Left empty for an identity that has a passphrase: one line saying it is needed,
+            // not the daemon's refusal of an empty one.
+            keyringFailed = empty
+                ? "This node's identity has a passphrase: type it to \(pending.words)."
+                : sentence(error)
         }
     }
 
@@ -654,12 +669,87 @@ final class NodeModel: ObservableObject {
     func cancelKeyring() {
         keyringPending = nil
         keyringReplacing = nil
+        // Its failure goes with it (P6): a cancelled change leaves no sentence behind.
+        keyringFailed = nil
     }
 
     /// The person's answer to "Replace the waiting change?" (D1).
     func replaceKeyring(_ yes: Bool) {
         if yes, let next = keyringReplacing { keyringPending = next }
         keyringReplacing = nil
+    }
+
+    // ---- a repo with no room (ADR-029 RB-5 to RB-7) -------------------------------------------
+
+    /// The asks, read again: a new one notifies once, never with more than which harness and
+    /// which directory.
+    func readRoomAsks() async {
+        guard let asks = try? await client.roomAsks() else { return }
+        if asks != roomAsks { roomAsks = asks }
+        let dirs = Set(asks.map(\.dir))
+        if notifies {
+            for ask in asks where !roomAsksNotified.contains(ask.dir) {
+                notifier.postRoomAsk(dir: ask.dir, sentence: ask.sentence)
+            }
+            for gone in roomAsksNotified.subtracting(dirs) { notifier.withdrawRoomAsk(dir: gone) }
+        }
+        roomAsksNotified = dirs
+    }
+
+    /// Bind `dir` to the room this node holds by `room`'s id, or to the room `link` names (one of
+    /// them is given), joined with the passphrase the person typed (RB-6): what `vox room join
+    /// <link> --node <node> --bind <dir>` does. Whether it was done.
+    func bindRoom(_ dir: String, room: String?, link: String?, passphrase secret: Secret) async -> Bool {
+        begin("bind-room")
+        roomAskSaid = nil
+        do {
+            var address = link?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if let room { address = try await client.link(room: room).url }
+            let passphrase = try secret.passphrase()
+            defer { passphrase.wipe() }
+            let answer = try await client.bindRoom(dir: dir, link: address, passphrase: passphrase)
+            roomAskSaid = answer
+            await readRoomAsks()
+            return answer.done
+        } catch {
+            secret.wipe()
+            report(error)
+            return false
+        }
+    }
+
+    /// Join the room the room map binds `dir` to already, for every node of a session there that is
+    /// not in it, with the map's own link and passphrase (RB-5a): nothing is typed. Whether it was
+    /// done.
+    func joinBoundRoom(_ dir: String) async -> Bool {
+        begin("bind-room")
+        roomAskSaid = nil
+        do {
+            let none = try Secret(Data()).passphrase()
+            defer { none.wipe() }
+            let answer = try await client.bindRoom(dir: dir, link: "", passphrase: none)
+            roomAskSaid = answer
+            await readRoomAsks()
+            return answer.done
+        } catch {
+            report(error)
+            return false
+        }
+    }
+
+    /// Take down what the last answer to an ask said.
+    func clearRoomAskSaid() { roomAskSaid = nil }
+
+    /// Say no for `dir` (RB-7): it stays tied to no room, and nothing started there is asked again.
+    func declineRoom(_ dir: String) async {
+        begin("decline-room")
+        roomAskSaid = nil
+        do {
+            roomAskSaid = try await client.declineRoom(dir: dir)
+            await readRoomAsks()
+        } catch {
+            report(error)
+        }
     }
 
     // ---- trust offers (ADR-028 K-15 to K-18) ------------------------------------------------
@@ -1199,7 +1289,8 @@ final class NodeModel: ObservableObject {
             return MemberRow(id: m.fingerprint,
                              name: m.name.isEmpty ? String(m.fingerprint.prefix(12)) : m.name,
                              trust: trust, drive: keyring[m.fingerprint] ?? false,
-                             trustsYou: back.contains(m.fingerprint))
+                             trustsYou: back.contains(m.fingerprint),
+                             keyWaits: m.keyWaits)
         }
     }
 

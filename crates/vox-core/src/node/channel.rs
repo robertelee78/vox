@@ -876,6 +876,9 @@ pub struct ChannelState {
     /// yet, oldest first (ADR-023 decision 4). Installing one needs this identity's prekey
     /// ring, which the actor holds, so the actor drains them ([`Self::take_inbound_packages`]).
     inbound_packages: Vec<crate::node::keypackage::KeyPackage>,
+    /// The authors of [`Self::inbound_packages`] the log brought: who may have released this node
+    /// a drive key it has not opened yet ([`Self::drive_from`]). Cleared with them.
+    packages_from: BTreeSet<Digest32>,
     /// Key-packages opened here from a member this node's owner has not trusted: not installed
     /// (V210-118), and kept so the key is taken the moment the owner trusts its author, as a key
     /// on the pairwise path is when its author offers it again. In memory only: a reopened room
@@ -1750,6 +1753,7 @@ impl ChannelState {
             timeline_generation: 0,
             log_ids: std::collections::HashMap::new(),
             inbound_packages: Vec::new(),
+            packages_from: BTreeSet::new(),
             held_packages: Vec::new(),
             gov_entries: Vec::new(),
             receivers: BTreeMap::new(),
@@ -1874,6 +1878,7 @@ impl ChannelState {
         // twice is harmless (`accept_skdm` keeps the live chain), and one that arrived just
         // before a crash would otherwise never be installed.
         let mut inbound_packages = Vec::new();
+        let mut packages_from = BTreeSet::new();
         let mut set_aside = Vec::new();
         let mut unlinked = Vec::new();
         // Each entry held without its body, `(author, seq, claimed_ms)`: owed again unless it has
@@ -1951,6 +1956,7 @@ impl ChannelState {
                 {
                     if pkg.recipient == me {
                         inbound_packages.push(pkg);
+                        packages_from.insert(entry.skeleton.author_id);
                     }
                 }
             }
@@ -2234,6 +2240,7 @@ impl ChannelState {
             timeline_generation,
             log_ids,
             inbound_packages,
+            packages_from,
             held_packages: Vec::new(),
             gov_entries,
             receivers,
@@ -2476,6 +2483,7 @@ impl ChannelState {
             timeline_generation: 0,
             log_ids: std::collections::HashMap::new(),
             inbound_packages: Vec::new(),
+            packages_from: BTreeSet::new(),
             held_packages: Vec::new(),
             gov_entries: Vec::new(),
             receivers: BTreeMap::new(),
@@ -3092,13 +3100,14 @@ impl ChannelState {
 
     /// If `payload` is a key-package, queue it when it is for this identity and say so; the
     /// caller then neither renders nor retries it as a message.
-    fn queue_if_key_package(&mut self, payload: &[u8]) -> bool {
+    fn queue_if_key_package(&mut self, author: &Digest32, payload: &[u8]) -> bool {
         if !crate::node::keypackage::KeyPackage::is_key_package(payload) {
             return false;
         }
         if let Ok(pkg) = crate::node::keypackage::KeyPackage::from_wire(payload) {
             if pkg.recipient == self.me() {
                 self.inbound_packages.push(pkg);
+                self.packages_from.insert(*author);
             }
         }
         true
@@ -3122,6 +3131,7 @@ impl ChannelState {
     /// Take the key-packages addressed to this identity that the log delivered since the last
     /// call (ADR-023 decision 4). The caller installs them with its prekey ring.
     pub fn take_inbound_packages(&mut self) -> Vec<crate::node::keypackage::KeyPackage> {
+        self.packages_from.clear();
         std::mem::take(&mut self.inbound_packages)
     }
 
@@ -5339,7 +5349,7 @@ impl ChannelState {
                     };
                     // A key-package is queued for the actor to install, never rendered or aged as
                     // a message.
-                    if self.queue_if_key_package(&payload) {
+                    if self.queue_if_key_package(&author, &payload) {
                         return Ok(Ok(rows));
                     }
                     self.track_body_into(&mut batch, entry_hash, id, now_ms)?;
@@ -5546,10 +5556,16 @@ impl ChannelState {
     // ---- Sessions: the drive key (ADR-029 SC-2, SC-2a, SC-2b; #543) ----------------------------
 
     /// The Session entries this node has opened or written here, in the order it did: each
-    /// node's entries only if this node holds its drive key (SC-2), or wrote them.
+    /// node's entries only if this node holds its drive key (SC-2), or wrote them. A
+    /// key-changed entry ([`crate::node::drive::KEY_CHANGED`]) is no Session's, and is left out.
     #[must_use]
-    pub fn session_rows(&self) -> &[SessionRow] {
-        &self.drive.sessions
+    pub fn session_rows(&self) -> Vec<SessionRow> {
+        self.drive
+            .sessions
+            .iter()
+            .filter(|r| !crate::node::drive::is_key_changed(&r.session_id))
+            .cloned()
+            .collect()
     }
 
     /// The files other members' Sessions sent out here that this node opened (ADR-029 DR-1.8).
@@ -5574,9 +5590,11 @@ impl ChannelState {
     /// The nodes whose Sessions this node can read inside here, sorted: itself, and each node
     /// whose **live** drive key it holds (SC-2) — the generation of that node's newest
     /// drive-sealed entry here, or any it released while it has written none. A member whose key
-    /// was rotated away (SC-2b) drops out at the first entry sealed under the new one: before
-    /// that, nothing here can tell the key changed, and the session's node is the authority on
-    /// whom it lets drive (DR-2).
+    /// was rotated away (SC-2b) drops out at the first entry sealed under the new one, which the
+    /// author writes as it changes the key ([`crate::node::drive::KEY_CHANGED`]), unless a
+    /// key-package from that author for this node waits to be opened (until the end of the sync
+    /// session that brought it, when the node opens it): before that, nothing here can tell the key
+    /// changed, and the session's node is the authority on whom it lets drive (DR-2).
     #[must_use]
     pub fn drive_from(&self) -> Vec<Digest32> {
         let ns = drive_channel(&self.channel_id);
@@ -5594,6 +5612,10 @@ impl ChannelState {
                         .map(|m| m.header.chain_id)
                 });
                 newest.is_none_or(|g| self.drive.receivers.contains_key(&(*author, g)))
+                    // A key-package from this author for this node, not yet opened, may hold
+                    // that generation: it is posted before the entry under it, so it arrives
+                    // first, but is opened at the end of the session that brought both.
+                    || self.packages_from.contains(author)
             })
             .collect();
         from.insert(self.me());
@@ -5757,6 +5779,8 @@ impl ChannelState {
             self.poisoned = true;
             return Err(e);
         }
+        // An entry under the live key: a member that lost the one before can tell.
+        self.drive.change_unsaid = Some(false);
         self.log_ids.insert(entry_hash, id);
         self.next_log_id = id.saturating_add(1);
         self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5769,7 +5793,11 @@ impl ChannelState {
                 cache_id: Some(id),
             },
         );
-        self.drive.news.push(row.session_id.clone());
+        // A key-changed entry is kept with the rest, so it is opened once, but it is no
+        // Session's: nothing is said of it.
+        if !crate::node::drive::is_key_changed(&row.session_id) {
+            self.drive.news.push(row.session_id.clone());
+        }
         self.drive.sessions.push(row);
         Ok(entry_hash)
     }
@@ -5781,6 +5809,41 @@ impl ChannelState {
         news.sort_unstable();
         news.dedup();
         news
+    }
+
+    /// Whether this node's drive key here changed and nothing is written under the new one yet
+    /// ([`crate::node::drive::KEY_CHANGED`] is owed): a generation past the first with no entry of
+    /// this node's under it. Worked out from the log once, then kept up to date.
+    pub fn key_change_unsaid(&mut self) -> bool {
+        if let Some(unsaid) = self.drive.change_unsaid {
+            return unsaid;
+        }
+        let live = self.drive.chain.as_ref().map(SenderChain::chain_id);
+        let unsaid = live.is_some_and(|g| g > 0 && self.drive_used().is_none_or(|u| u < g));
+        self.drive.change_unsaid = Some(unsaid);
+        unsaid
+    }
+
+    /// Begin this node's drive key here if it has none yet and a member of the room is in
+    /// `holders` (SC-2a): a member given drive on a Session that has written nothing is owed the
+    /// key at once, not at the Session's first entry. Whether a key was begun.
+    pub fn ensure_drive(
+        &mut self,
+        store: &Store,
+        holders: &BTreeSet<Digest32>,
+        now: crate::time::Ms,
+    ) -> Result<bool> {
+        if self.drive.chain.is_some() || self.poisoned {
+            return Ok(false);
+        }
+        let members = self.drive_members();
+        if !holders.iter().any(|h| members.contains(h)) {
+            return Ok(false);
+        }
+        self.begin_drive(holders, now.get())?;
+        self.persist_drive(store)?;
+        self.drive.change_unsaid = None;
+        Ok(true)
     }
 
     /// Change this node's drive key if a member it was released to is no longer in `holders`
@@ -5800,6 +5863,7 @@ impl ChannelState {
         self.drive.forget(&lost);
         self.begin_drive(holders, now_ms)?;
         self.persist_drive(store)?;
+        self.drive.change_unsaid = Some(true);
         Ok(lost)
     }
 
@@ -5858,7 +5922,11 @@ impl ChannelState {
         self.persist_drive(store)?;
         let before = self.drive.sessions.len();
         self.backfill(store, &skdm.body.author_id, now_ms)?;
-        Ok(self.drive.sessions.len() - before)
+        // What it opened of Sessions: a key-changed entry is none of theirs.
+        Ok(self.drive.sessions[before..]
+            .iter()
+            .filter(|r| !crate::node::drive::is_key_changed(&r.session_id))
+            .count())
     }
 
     /// Open one Session entry with the drive key it names, if this node holds it, queueing its
@@ -5873,6 +5941,15 @@ impl ChannelState {
         expired: &mut Vec<(Digest32, Tracked)>,
     ) -> Result<()> {
         let Some(chain) = self.drive.receivers.get_mut(&(author, msg.header.chain_id)) else {
+            // An entry under a key of the author's this node does not hold, from an author whose
+            // key it held: the author changed its key away from this node, and this node's drive
+            // over the author's Sessions is gone (SC-2b). Said once as Session news for the room,
+            // so a client that keeps the room's Sessions reads them again; there is no row.
+            if self.drive.holds_from(&author) && self.drive.told_unheld.insert(entry_hash) {
+                self.drive
+                    .news
+                    .push(crate::node::drive::KEY_CHANGED.to_owned());
+            }
             return Ok(());
         };
         let Ok(plaintext) = chain.decrypt(msg).map(Zeroizing::new) else {
@@ -6399,7 +6476,9 @@ impl ChannelState {
         for (row, cache_id) in std::mem::take(&mut self.drive.pending) {
             self.retention
                 .rendered(&row.entry_hash, row.created_millis, cache_id);
-            self.drive.news.push(row.session_id.clone());
+            if !crate::node::drive::is_key_changed(&row.session_id) {
+                self.drive.news.push(row.session_id.clone());
+            }
             self.drive.sessions.push(row);
         }
         for (row, cache_id) in std::mem::take(&mut self.pending_reads) {
@@ -6609,14 +6688,14 @@ impl ChannelState {
             // has consented to us; otherwise it stays stored as ciphertext
             // (ADR-007 step 3) until an SKDM arrives and backfills it.
             None => {
-                let Some(payload) = self
+                let Some((author, payload)) = self
                     .dag
                     .get_by_hash(&entry_hash)
-                    .and_then(|e| e.payload.clone())
+                    .and_then(|e| Some((e.skeleton.author_id, e.payload.clone()?)))
                 else {
                     return Ok(Accepted::ContentNotReadable);
                 };
-                if self.queue_if_key_package(&payload) {
+                if self.queue_if_key_package(&author, &payload) {
                     return Ok(Accepted::ContentNotReadable);
                 }
                 self.track_body(store, entry_hash, id, now_ms)?;
@@ -7266,12 +7345,14 @@ impl ChannelState {
             .collect()
     }
 
-    /// Where `author`'s current membership starts, and the time claimed for it: its statement that
-    /// it is back after its last leave, else its admission, which is the start of its feed (`seq`
-    /// 0, whatever this node holds of the feed) with the time of the first entry it holds. An author
-    /// that has written nothing this node holds joined no earlier than this node can tell: its
-    /// time is the latest.
-    fn admission(&self, author: &Digest32) -> (u64, u64) {
+    /// Where `author`'s current membership starts, and when: its statement that it is back after its
+    /// last leave, else its admission, the start of its feed (`seq` 0). The time of an admission is
+    /// what admitted it: the genesis for the creator, else the witness of the member that verified
+    /// its join — this node's own, or the notice it keeps of another's — and only failing those the
+    /// first of its entries this node holds. A member that has written nothing still joined when it
+    /// was witnessed: taking its time from its writing made a node that never wrote offered no one
+    /// who joined after it. `None` when nothing here says.
+    fn admission(&self, author: &Digest32) -> (u64, Option<u64>) {
         let back = self
             .gov_entries
             .iter()
@@ -7284,11 +7365,26 @@ impl ChannelState {
         let feed = self.dag.feed(author);
         let ms = |seq: Option<u64>| {
             seq.and_then(|s| feed.and_then(|f| f.get(s)))
-                .map_or(u64::MAX, |e| e.skeleton.claimed_ms)
+                .map(|e| e.skeleton.claimed_ms)
+        };
+        let witnessed = || {
+            if *author == self.me() {
+                match &self.own_admission {
+                    Admission::Creator => Some(self.genesis.body.created_ms),
+                    Admission::Witnessed(w) => Some(w.timestamp_ms),
+                }
+            } else if self.genesis.creator_pubkey().fingerprint() == *author {
+                Some(self.genesis.body.created_ms)
+            } else {
+                self.board_kept.notices.get(author).map(|(at, _)| *at)
+            }
         };
         match back {
-            Some(seq) => (seq, ms(Some(seq))),
-            None => (0, ms(feed.and_then(crate::log::feed::Feed::min_seq))),
+            Some(seq) => (seq, ms(Some(seq)).or_else(witnessed)),
+            None => (
+                0,
+                witnessed().or_else(|| ms(feed.and_then(crate::log::feed::Feed::min_seq))),
+            ),
         }
     }
 
@@ -7308,7 +7404,7 @@ impl ChannelState {
                 continue;
             }
             let (seq, ms) = self.admission(&member);
-            if ms > mine {
+            if ms.zip(mine).is_some_and(|(ms, mine)| ms > mine) {
                 out.push(OfferBasis {
                     member,
                     why: OfferWhy::Joined,

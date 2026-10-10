@@ -11,7 +11,9 @@
 //! maintained — `prekeys.one_time` (left to offer), `prekeys.consumed` (used, still retained for a
 //! concurrent duplicate), `prekeys.signed_prekey` (the id offered now), what the running node did
 //! itself (`prekeys.rotated`, `prekeys.refilled`), and `prekeys.previous_used`, the sessions it set
-//! up with the signed prekey it had just rotated out.
+//! up with the signed prekey it had just rotated out; and, since ADR-030 P-1, `prekeys.retired`
+//! (unused one-time prekeys it retired), `prekeys.retired_held` (held, unadvertised, in their
+//! grace) and `prekeys.oldest_one_time` (when the oldest one it offers was made).
 //!
 //! Three stagings, each its own test:
 //!
@@ -21,7 +23,19 @@
 //!    v0.3.0 `VOX_TEST_CLOCK_SKEW_MS` moves only the milliseconds); its daemon runs on the true clock. So the signed prekey falls
 //!    due [`LEAD`] seconds after `vox id` — after the daemon's unlock, while it runs. Before:
 //!    signed prekey 1, nothing rotated (anything else is CANNOT MEASURE: the rotation came at
-//!    unlock). Within [`ROTATE_WITHIN`]: signed prekey 2, rotated once.
+//!    unlock). Within [`ROTATE_WITHIN`]: signed prekey 2, rotated once. The one-time prekeys were
+//!    made with the ring and none was used, so the same maintenance retires them all (ADR-030
+//!    P-1): `prekeys.retired` and `prekeys.retired_held` are the whole pool, and the pool offered
+//!    is full again, its oldest (`prekeys.oldest_one_time`) made in this run. Then the daemon is
+//!    started again with its clocks half an hour on: it still holds every retired prekey, so the
+//!    grace survived the restart; and an hour and a minute on: it holds none.
+//!    Deliveries in flight across the retirement (ADR-030 P-1): a guest joins a room on this node
+//!    and on a second node made the same way, each trusts it, and its daemon is stopped. Test-side
+//!    code holding the guest's profile (apparatus) then builds a key delivery to each node, against
+//!    the bundle on its board, before either rotates. Sent to the first node seconds after its
+//!    retirement, the delivery is taken, and `prekeys.retired_used` counts it. Sent to the second
+//!    once it has retired and been started again an hour and a minute on, it is answered "it does
+//!    not hold the one-time prekey the delivery named".
 //! 2. **A session started before a rotation completes after it.** A host made the same way, with
 //!    [`WINDOW_LEAD`] seconds to its rotation, and a guest that starts joining one of its rooms a
 //!    moment before. The guest's daemon is stopped (SIGSTOP, by its PID) mid-join and resumed
@@ -40,7 +54,11 @@
 //!
 //! Mutations that must turn it red: the tick's maintenance leaves the ring as it is (1 never
 //! rotates; 3 consumes exactly [`POOL`]); a rotation drops the signed prekey it replaces at once
-//! (2's join fails).
+//! (2's join fails); unused one-time prekeys never retired (1: `retired` 0, the old pool still
+//! offered); the retired set not saved (1: none held half an hour on); the grace never ending (1:
+//! all still held an hour and a minute on, and first the delivery past the grace taken); a grace
+//! of zero (1: the delivery in its grace answered as naming an unknown prekey); a retired prekey
+//! not looked up when a delivery names it (1: the same).
 
 #![cfg(unix)]
 
@@ -49,6 +67,13 @@ mod watchdog;
 
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
+
+#[path = "support/layout.rs"]
+mod layout;
+#[path = "support/ports.rs"]
+mod ports;
+#[path = "support/typed.rs"]
+mod typed;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -61,12 +86,12 @@ const ROOM_PASS: &str = "room passphrase for the prekey ring proof";
 /// How long after the ring is made its signed prekey falls due, on the skewed clock: long enough
 /// for `vox id` and the daemon's unlock to finish first, short enough to wait for. 45 s was not
 /// enough on a loaded box: a daemon took 45.6 s to answer, and the rotation came at its unlock.
-const LEAD: u64 = 120;
+const LEAD: u64 = 180;
 /// Seven days, the signed prekey's cadence (ADR-002 §2), written out rather than read from the
 /// product so a changed cadence goes red.
 const SEVEN_DAYS: u64 = 7 * 24 * 60 * 60;
 /// How long, from the daemon answering, the rotation may take: the lead, and the tick.
-const ROTATE_WITHIN: Duration = Duration::from_secs(240);
+const ROTATE_WITHIN: Duration = Duration::from_secs(300);
 /// Stage 2's lead: time for the host to start and make a room before its rotation (15 s was
 /// not enough in a debug build).
 const WINDOW_LEAD: u64 = 60;
@@ -78,6 +103,10 @@ const WINDOW_TRIES: u64 = 4;
 const POOL: u64 = 8;
 /// Joins to the host in stage 3: past its whole first pool.
 const JOINS: usize = 12;
+/// Stage 1's restarts, inside and past a retired one-time prekey's one-hour grace (ADR-030 P-1),
+/// written out rather than read from the product.
+const HALF_HOUR_MS: i64 = 30 * 60 * 1000;
+const HOUR_AND_A_MINUTE_MS: i64 = 61 * 60 * 1000;
 
 /// A child killed and reaped by its own handle when dropped, never by a name pattern.
 struct Proc(Child);
@@ -181,6 +210,11 @@ impl Profile {
 
     /// `vox daemon`, answering `vox room list` before this returns.
     fn daemon(&self, anchor: Option<&str>) -> Proc {
+        self.daemon_stepped(anchor, None)
+    }
+
+    /// [`Profile::daemon`], its clocks moved by `step_ms` (`VOX_TEST_CLOCK_STEP_MS`) when given.
+    fn daemon_stepped(&self, anchor: Option<&str>, step_ms: Option<i64>) -> Proc {
         let mut args = vec!["daemon", "--listen", "127.0.0.1:0"];
         if let Some(a) = anchor {
             args.extend(["--anchor", a]);
@@ -193,9 +227,12 @@ impl Profile {
         args.push(pass);
         let err = std::fs::File::create(self.dir.join("daemon.err"))
             .expect("APPARATUS: create a staging file");
+        let mut c = self.command(&args);
+        if let Some(step) = step_ms {
+            c.env("VOX_TEST_CLOCK_STEP_MS", step.to_string());
+        }
         let p = Proc(
-            self.command(&args)
-                .stdin(Stdio::null())
+            c.stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::from(err))
                 .spawn()
@@ -304,6 +341,15 @@ fn anchor(tmp: &Path) -> (Proc, String) {
     }
 }
 
+/// The wall clock, in milliseconds since the epoch.
+fn wall_ms() -> u64 {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("APPARATUS: the clock")
+        .as_millis();
+    u64::try_from(ms).expect("APPARATUS: the clock")
+}
+
 /// Send `sig` to `pid` with `kill(1)`.
 fn signal(pid: u32, sig: &str) {
     let ok = Command::new("kill")
@@ -323,9 +369,14 @@ fn a_running_node_rotates_its_signed_prekey() {
     // on the true clock the daemon keeps.
     let behind_ms = (SEVEN_DAYS - LEAD) * 1000;
     let node = Profile::new(tmp.path(), "node", Some(format!("-{behind_ms}")), None);
+    // A second node made the same way, for the grace's end (below).
+    let node2 = Profile::new(tmp.path(), "node2", Some(format!("-{behind_ms}")), None);
     let made = Instant::now();
+    let made_ms = wall_ms();
     node.id();
-    let _daemon = node.daemon(None);
+    node2.id();
+    let daemon = node.daemon(None);
+    let daemon2 = node2.daemon(None);
     let before = node.prekeys();
     eprintln!(
         "[proof] {:.1}s after the ring was made, before: {before}",
@@ -336,6 +387,54 @@ fn a_running_node_rotates_its_signed_prekey() {
         "APPARATUS, CANNOT MEASURE: the proof's lead was too short; the signed prekey rotated \
          before the daemon ran ({:.1}s after the ring \
          was made, {LEAD}s lead): {before}",
+        made.elapsed().as_secs_f64()
+    );
+    let pool = n(&before, "one_time");
+    assert!(
+        pool > 0 && n(&before, "retired") == 0 && n(&before, "retired_held") == 0,
+        "APPARATUS, CANNOT MEASURE: the one-time prekeys were retired, or there were none to \
+         retire, before the daemon ran: {before}"
+    );
+    // A member of a room on each node, trusted by it, whose deliveries are in flight across the
+    // retirement: each built now, against the node's bundle as its board serves it, and sent
+    // once the one-time prekey it names is retired (ADR-030 P-1).
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("APPARATUS: a runtime");
+    let guest = Profile::new(tmp.path(), "guest", None, None);
+    guest.id();
+    let guest_daemon = guest.daemon(None);
+    let guest_fp = guest.vox(&["id"], None).stdout.trim().to_owned();
+    for host in [&node, &node2] {
+        // One name per room: a node holds one room of a name.
+        let link = host.room(&format!("grace-{}", host.name));
+        let o = guest.vox(
+            &["room", "join", "--passphrase-file", "-", &link],
+            Some(ROOM_PASS),
+        );
+        assert!(
+            o.ok,
+            "PRODUCT (staging): the guest's join of {}'s room: {}{}",
+            host.name, o.stdout, o.stderr
+        );
+        let (ok, shown) =
+            typed::keyring(&host.command(&["trust", "add", &guest_fp, "--name", "guest"]));
+        assert!(
+            ok,
+            "PRODUCT (staging): {} could not trust the guest: {shown}",
+            host.name
+        );
+    }
+    drop(guest_daemon);
+    let member = rt.block_on(Member::of(&guest));
+    let in_grace = rt.block_on(member.delivery_to(&node));
+    let past_grace = rt.block_on(member.delivery_to(&node2));
+    assert!(
+        n(&node.prekeys(), "rotated") == 0 && n(&node2.prekeys(), "rotated") == 0,
+        "APPARATUS, CANNOT MEASURE: the lead was too short; a node rotated before the deliveries \
+         in flight were built ({:.1}s after the rings were made, {LEAD}s lead)",
         made.elapsed().as_secs_f64()
     );
     let deadline = Instant::now() + ROTATE_WITHIN;
@@ -356,6 +455,99 @@ fn a_running_node_rotates_its_signed_prekey() {
         "PRODUCT: the running daemon must rotate its signed prekey once its seven days are up \
          (within {ROTATE_WITHIN:?} of answering): {after}"
     );
+
+    // In its grace, the delivery in flight against a retired one-time prekey still opens: the
+    // node takes the key, or refuses it only after opening it (the room's or its trust's
+    // refusal), never as a prekey it does not hold.
+    let answer = rt.block_on(in_grace.send(&node));
+    // Counted at the node's next maintenance, a tick on.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let used = loop {
+        let u = n(&node.prekeys(), "retired_used");
+        if u > 0 || Instant::now() >= deadline {
+            break u;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    eprintln!(
+        "[proof] a delivery naming a one-time prekey retired seconds ago: {answer:?}; sessions \
+         set up with a retired one-time prekey: {used}"
+    );
+    assert!(
+        answer.as_deref().is_none_or(opened_then_refused) && used == 1,
+        "PRODUCT: a delivery in flight against a one-time prekey the node retired seconds ago \
+         must still open in its one-hour grace, and be counted as one (ADR-030 P-1); the node \
+         answered {answer:?} and counts {used} session(s) set up with a retired one-time prekey"
+    );
+
+    // Past the grace, a delivery in flight against a retired one-time prekey is answered as naming
+    // a prekey the node does not hold (ADR-030 P-1, P-3): the second node, once it has retired its
+    // pool, started again an hour and a minute on.
+    let deadline = Instant::now() + ROTATE_WITHIN;
+    while n(&node2.prekeys(), "retired") == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: the second node never retired its one-time prekeys: {}",
+            node2.prekeys()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    drop(daemon2);
+    let d2 = node2.daemon_stepped(None, Some(HOUR_AND_A_MINUTE_MS));
+    let answer = rt.block_on(past_grace.send(&node2));
+    eprintln!("[proof] a delivery naming a one-time prekey retired 61 min ago: {answer:?}");
+    assert!(
+        answer.as_deref() == Some(UNKNOWN_PREKEY),
+        "PRODUCT: past its one-hour grace, a delivery naming a retired one-time prekey must be \
+         answered \"{UNKNOWN_PREKEY}\" (ADR-030 P-1, P-3); the node answered {answer:?}"
+    );
+    drop(d2);
+
+    // ADR-030 P-1: the one-time prekeys were made with the ring, as old as its signed prekey, and
+    // none was used. The same maintenance retires every one, keeps each for its grace, and offers
+    // a fresh pool, none of it older than this run.
+    // The guest's join used one of them (or more): the rest were unused.
+    let unused = pool - n(&after, "consumed");
+    let oldest = after["oldest_one_time"].as_u64().unwrap_or(0);
+    let ok = n(&after, "retired") == unused
+        && n(&after, "retired_held") == unused
+        && n(&after, "one_time") == pool
+        && oldest >= made_ms;
+    eprintln!(
+        "[proof] unused one-time prekeys retired {}, held in their grace {}, offered {}, the \
+         oldest offered made at {oldest} (this run began at {made_ms})",
+        n(&after, "retired"),
+        n(&after, "retired_held"),
+        n(&after, "one_time")
+    );
+    assert!(
+        ok,
+        "PRODUCT: the running daemon must retire its {unused} unused one-time prekeys once they \
+         are seven days old, hold them for their grace, and offer {pool} made in this run (none \
+         before {made_ms}): {after}"
+    );
+
+    // The grace survives a restart, and ends at an hour: the daemon started again with its clocks
+    // half an hour on still holds every retired prekey but the one just used, and an hour and a
+    // minute on holds none.
+    drop(daemon);
+    for (on_ms, held) in [(HALF_HOUR_MS, unused - 1), (HOUR_AND_A_MINUTE_MS, 0)] {
+        let d = node.daemon_stepped(None, Some(on_ms));
+        let p = node.prekeys();
+        eprintln!(
+            "[proof] started again {} min on: retired held {}",
+            on_ms / 60_000,
+            n(&p, "retired_held")
+        );
+        assert_eq!(
+            n(&p, "retired_held"),
+            held,
+            "PRODUCT: a daemon started again {} min after its one-time prekeys were retired must \
+             hold {held} of them (the grace is one hour, kept across a restart): {p}",
+            on_ms / 60_000
+        );
+        drop(d);
+    }
 }
 
 #[test]
@@ -552,4 +744,212 @@ fn sessions_get_one_time_prekeys_past_the_whole_pool() {
         n(&last, "refilled") > 0,
         "PRODUCT: the running host must have refilled its pool: {last}"
     );
+}
+
+// ---- the member in flight (ADR-030 P-1) ------------------------------------------------------
+//
+// **Apparatus, as AGENTS.md allows.** A real member, made and joined by the shipped binary, whose
+// daemon is then stopped; test-side code holding its profile builds a key delivery to a node the
+// way a sender's node does (a session of its own, `OP_ROTATION_HELLO`), against the node's bundle
+// as the node's own board serves it, and sends it later. What is asserted is the node's answer.
+
+use std::sync::Arc;
+use vox_core::hash::Digest32;
+use vox_core::nat::service::{RecordKinds, RendezvousClient};
+use vox_core::node::pairwise_stream as pw;
+use vox_core::transport::quic::{VoxConnection, VoxEndpoint};
+use vox_core::transport::streams::{open_typed, StreamKind};
+
+/// What a node answers when a delivery names a one-time prekey it does not hold.
+const UNKNOWN_PREKEY: &str = "it does not hold the one-time prekey the delivery named";
+
+/// A refusal a node makes only after the delivery's session opened and its key was read: the
+/// room's or its trust's, not the prekey's nor the hello's.
+fn opened_then_refused(why: &str) -> bool {
+    why == "the room would not take the key"
+        || why == "its owner has not trusted us, so it does not read us yet"
+}
+
+struct Member {
+    signer: Arc<vox_core::atrest::vault::VaultRootSigner>,
+    ring: vox_core::node::prekeys::PrekeyRing,
+    _profile: vox_core::node::profile::Profile,
+}
+
+/// One delivery, built and not yet sent.
+struct InFlight {
+    frame: Vec<u8>,
+    signer: Arc<vox_core::atrest::vault::VaultRootSigner>,
+}
+
+impl Member {
+    async fn of(p: &Profile) -> Self {
+        let node = match layout::find_named(&p.dir.join("nodes"), "store.redb").as_slice() {
+            [one] => one
+                .parent()
+                .and_then(|d| d.file_name())
+                .and_then(|n| n.to_str())
+                .expect("APPARATUS: the member's node name")
+                .to_owned(),
+            found => panic!(
+                "APPARATUS: the member's data root holds {} stores",
+                found.len()
+            ),
+        };
+        let paths =
+            vox_core::node::paths::Paths::resolve(&node, Some(&p.dir), Some(&p.dir.join("cfg")))
+                .expect("APPARATUS: the member's paths");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut profile = loop {
+            match vox_core::node::profile::Profile::open(paths.clone()) {
+                Ok(pr) => break pr,
+                Err(_) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => panic!("APPARATUS: the member's profile did not open: {e:?}"),
+            }
+        };
+        profile
+            .unlock(IDENTITY.as_bytes())
+            .expect("APPARATUS: the member's identity unlocks");
+        let signer = profile
+            .signer_arc()
+            .expect("APPARATUS: the member's signer");
+        let ring = vox_core::node::prekeys::load(profile.store(), signer.as_ref())
+            .expect("APPARATUS: the member's ring opens")
+            .expect("APPARATUS: the member has a ring");
+        Self {
+            signer,
+            ring,
+            _profile: profile,
+        }
+    }
+
+    /// A key delivery to `host` in its room, built now against its bundle on its own board.
+    async fn delivery_to(&self, host: &Profile) -> InFlight {
+        let (_e, conn, room, ctx) = reach(&self.signer, host).await;
+        let host_id = host_fingerprint(host);
+        let mut c = RendezvousClient::open(&conn)
+            .await
+            .expect("APPARATUS: a rendezvous stream");
+        let set = c
+            .get(&room, ctx.epoch, RecordKinds::BUNDLES)
+            .await
+            .expect("APPARATUS: the host's board answers");
+        c.finish();
+        let bundle = set
+            .bundles
+            .into_iter()
+            .find(|b| b.author_id == host_id)
+            .expect("APPARATUS: the host's own bundle is on its board")
+            .prekey_bundle;
+        assert!(
+            bundle.one_time_prekey.is_some(),
+            "APPARATUS: the host's bundle names no one-time prekey"
+        );
+        let (initial, mut session) = vox_core::pairwise::session::Session::initiate(
+            self.ring.identity_dh(),
+            &bundle,
+            &ctx.channel_id,
+            ctx.epoch,
+            ctx.suite_id,
+            ctx.floor,
+        )
+        .expect("APPARATUS: a session opens from the host's bundle");
+        use vox_core::identity::composite::RootSigner as _;
+        let skdm = vox_core::group::skdm::Skdm::build(
+            self.signer.as_ref(),
+            &room,
+            ctx.epoch,
+            1_000_000,
+            0,
+            vox_core::group::senderkey::ChainKey::generate().expect("APPARATUS: a chain key"),
+            self.signer.public_key().to_bytes(),
+        )
+        .expect("APPARATUS: a sender-key distribution message");
+        let frame = pw::rotation_hello_frame(&room, &initial, &mut session, &skdm)
+            .expect("APPARATUS: the delivery's frame");
+        InFlight {
+            frame,
+            signer: Arc::clone(&self.signer),
+        }
+    }
+}
+
+impl InFlight {
+    /// Send it to `host` now: `None` if the host took it, else its refusal in words.
+    async fn send(&self, host: &Profile) -> Option<String> {
+        let (_e, conn, _, _) = reach(&self.signer, host).await;
+        let (mut send, recv) = open_typed(&conn, StreamKind::Pairwise)
+            .await
+            .expect("APPARATUS: a pairwise stream to the host");
+        vox_core::transport::framing::write_frame(&mut send, &self.frame)
+            .await
+            .expect("APPARATUS: write the delivery");
+        let _ = send.finish();
+        pw::refused(recv, Duration::from_secs(20)).await
+    }
+}
+
+fn host_fingerprint(host: &Profile) -> Digest32 {
+    let fp = host.vox(&["id"], None).stdout;
+    vox_core::node::link::b32_decode(fp.trim(), "fingerprint")
+        .unwrap_or_else(|e| panic!("APPARATUS: {}'s id is no fingerprint: {e:?}", host.name))
+}
+
+/// Connect to `host` as the member, and its one room's id and context.
+async fn reach(
+    signer: &Arc<vox_core::atrest::vault::VaultRootSigner>,
+    host: &Profile,
+) -> (
+    VoxEndpoint,
+    Arc<VoxConnection>,
+    Digest32,
+    vox_core::join::session::JoinContext,
+) {
+    let status = host.vox(&["status", "--json"], None).stdout;
+    let addr = ports::loopback_listen(&status).unwrap_or_else(|| {
+        panic!(
+            "APPARATUS: {}'s status names no loopback address",
+            host.name
+        )
+    });
+    let v: serde_json::Value = serde_json::from_str(status.trim()).expect("APPARATUS: status JSON");
+    let r = &v["rooms"][0];
+    let room = vox_core::node::link::b32_decode(r["id"].as_str().unwrap_or_default(), "room")
+        .unwrap_or_else(|e| panic!("APPARATUS: {}'s room id: {e:?}: {status}", host.name));
+    let epoch = r["epoch"].as_u64().unwrap_or(0);
+    let endpoint = VoxEndpoint::bind(
+        Arc::clone(signer) as Arc<_>,
+        "127.0.0.1:0".parse().expect("APPARATUS: an address"),
+    )
+    .expect("APPARATUS: bind the member's endpoint");
+    let host_id = host_fingerprint(host);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let conn = loop {
+        match endpoint.connect(addr, host_id, wall_ms()).await {
+            Ok(c) => break Arc::new(c),
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(500)).await
+            }
+            Err(e) => panic!(
+                "APPARATUS: the member could not connect to {}: {e:?}",
+                host.name
+            ),
+        }
+    };
+    let mut c = RendezvousClient::open(&conn)
+        .await
+        .expect("APPARATUS: a rendezvous stream");
+    let set = c
+        .get(&room, epoch, RecordKinds::GENESIS)
+        .await
+        .expect("APPARATUS: the host's board answers");
+    c.finish();
+    let genesis = set
+        .genesis
+        .expect("APPARATUS: the room's genesis is on its host's board");
+    let ctx = vox_core::node::channel::join_context_from_genesis(&genesis, epoch)
+        .expect("APPARATUS: the room's context");
+    (endpoint, conn, room, ctx)
 }

@@ -105,6 +105,10 @@ pub struct Session {
     /// none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Claude Code's transcript for the session (its hooks' `transcript_path`), where a `/rename`
+    /// writes the new name: the daemon reads it there, since no hook runs after a slash command.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub transcript: String,
     /// Whether a person is at the session (ADR-029 SE-1): a headless run (`claude -p`, an SDK,
     /// `codex exec`) gets no Session.
     #[serde(default = "interactive_by_default")]
@@ -180,13 +184,94 @@ fn interactive_by_default() -> bool {
 /// **Claude Code** sets `CLAUDE_CODE_ENTRYPOINT` for its hooks: `sdk-cli` for a non-interactive
 /// run (`claude -p`), `sdk-ts` / `sdk-py` for the Agent SDK, `cli` for a person at the terminal
 /// (read from Claude Code 2.1.292: `set("CLAUDE_CODE_ENTRYPOINT", e ? "sdk-cli" : "cli")`).
-/// Codex and OpenCode are taken as interactive until their own signals are measured.
+///
+/// **OpenCode**'s run is told by Vox's own plugin, which reads OpenCode's argv from inside it:
+/// `VOX_OPENCODE_HEADLESS=1` for `opencode run` (measured on OpenCode 1.18.35, 2026-10-10).
+///
+/// **Codex** says it nowhere but its own argv: `codex exec …` (or `e`, or `review`), measured
+/// from Codex 0.162.1 (2026-10-10), whose hook input and environment carry no mark of it. The
+/// hook's parent, past at most one shell, is Codex itself; its argv is read from the kernel, and
+/// anything unreadable is taken as interactive, as before.
 #[must_use]
 pub fn interactive_now() -> bool {
-    !matches!(
+    if matches!(
         std::env::var("CLAUDE_CODE_ENTRYPOINT").as_deref(),
         Ok("sdk-cli" | "sdk-ts" | "sdk-py")
-    )
+    ) {
+        return false;
+    }
+    if std::env::var("VOX_OPENCODE_HEADLESS").as_deref() == Ok("1") {
+        return false;
+    }
+    !harness_parent_args().is_some_and(|argv| codex_headless(&argv))
+}
+
+/// The argv of the process that ran this hook: its parent, or that one's parent when the parent
+/// is the shell a harness runs a hook command through.
+fn harness_parent_args() -> Option<Vec<String>> {
+    let parent = std::os::unix::process::parent_id();
+    let pid = if crate::claude_injector::exe_of(parent)
+        .as_deref()
+        .is_some_and(crate::claude_injector::is_shell)
+    {
+        crate::claude_injector::proc_of(parent)?.ppid
+    } else {
+        parent
+    };
+    vox_sockdrops::process_args(pid)
+}
+
+/// Whether `argv` is a headless Codex run: `codex` whose subcommand is `exec` (alias `e`) or
+/// `review`. Options before the subcommand are skipped, with the value of each that takes one.
+#[must_use]
+pub fn codex_headless(argv: &[String]) -> bool {
+    /// Codex 0.162.1's top-level options that take a value as the next argument.
+    const VALUED: &[&str] = &[
+        "-c",
+        "--config",
+        "--enable",
+        "--disable",
+        "--remote",
+        "--remote-auth-token-env",
+        "-i",
+        "--image",
+        "-m",
+        "--model",
+        "--local-provider",
+        "-p",
+        "--profile",
+        "-s",
+        "--sandbox",
+        "-C",
+        "--cd",
+        "--add-dir",
+        "-a",
+        "--ask-for-approval",
+    ];
+    let Some((first, rest)) = argv.split_first() else {
+        return false;
+    };
+    if std::path::Path::new(first)
+        .file_name()
+        .and_then(|n| n.to_str())
+        != Some("codex")
+    {
+        return false;
+    }
+    let mut args = rest.iter();
+    while let Some(a) = args.next() {
+        if a == "--" {
+            return false;
+        }
+        if a.starts_with('-') {
+            if VALUED.contains(&a.as_str()) {
+                args.next();
+            }
+            continue;
+        }
+        return matches!(a.as_str(), "exec" | "e" | "review");
+    }
+    false
 }
 
 /// How a registered session can be reached now (V030-16), as `vox agent doctor` and a pong
@@ -419,6 +504,7 @@ impl Session {
                 room: None,
                 start: None,
                 name: None,
+                transcript: String::new(),
                 interactive: interactive_now(),
                 tmux: None,
                 tmux_why: None,
@@ -442,6 +528,7 @@ impl Session {
                 room: None,
                 start: None,
                 name: None,
+                transcript: String::new(),
                 interactive: interactive_now(),
                 tmux: None,
                 tmux_why: None,
@@ -465,6 +552,7 @@ impl Session {
                 room: None,
                 start: None,
                 name: None,
+                transcript: String::new(),
                 interactive: interactive_now(),
                 tmux: None,
                 tmux_why: None,
@@ -485,6 +573,7 @@ impl Session {
                 room: None,
                 start: None,
                 name: None,
+                transcript: String::new(),
                 interactive: interactive_now(),
                 tmux: None,
                 tmux_why: None,
@@ -660,6 +749,28 @@ pub fn end(paths: &Paths, session: &str) {
     let _ = std::fs::remove_file(paths.session_file(session));
     let _ = std::fs::remove_file(notices_file(paths, session));
     let _ = std::fs::remove_file(woke_file(paths, session));
+    let _ = std::fs::remove_file(said_detached_file(paths, session));
+}
+
+fn said_detached_file(paths: &Paths, session: &str) -> std::path::PathBuf {
+    let reg = paths.session_file(session);
+    let dir = paths.session_dir().with_extension("said-detached");
+    dir.join(reg.file_name().unwrap_or_default())
+}
+
+/// Whether `session` is yet to be told that its node is not attached (#666): `true` the first
+/// time in the session, which is recorded, and `false` after, so the hook says it once per
+/// session, not every turn. A record that cannot be written says it again rather than never.
+pub fn first_detached_notice(paths: &Paths, session: &str) -> bool {
+    let file = said_detached_file(paths, session);
+    if file.exists() {
+        return false;
+    }
+    if let Some(dir) = file.parent() {
+        let _ = vox_core::node::paths::create_private_dir(dir);
+    }
+    let _ = vox_core::node::paths::write_private_file_unique(&file, b"");
+    true
 }
 
 /// The hop budget `envelope` really has left, given the `rows` of its room (ADR-020 §9): see

@@ -42,12 +42,12 @@ updated: /Applications/Vox.app -> Vox VERSION
 ```
 
 Then it restarts the vox daemon onto the new version. Stopping the daemon detaches every node.
-The new daemon attaches again each node whose passphrase it keeps: one kept with the Keychain from
-the app, or with `vox node attach --keep`. Any other node comes back detached, and the update
+The new daemon attaches again each remembered node: its passphrase in the Keychain (from `vox node
+attach` or the app), none needed, or `vox node attach --keep`. Any other node comes back detached, and the update
 names it with the command that attaches it again:
 
 ```text
-node NAME is detached: the daemon keeps no passphrase for it. Attach it again: vox node attach NAME
+node NAME is detached, as the daemon remembers no passphrase for it; attach it again with `vox node attach NAME`
 ```
 
 How the daemon comes back depends on how it was started. The login item's daemon is started again
@@ -75,7 +75,9 @@ version too, until you quit it and open it again.
    `vox node create` does; nothing sends you to Terminal. Type a **Name** (lowercase letters,
    digits, dots, dashes and underscores) and the identity passphrase twice, then choose
    **Make Node**. The passphrase unlocks your node on this Mac, and nobody can recover it for you.
-   The app says, as `vox node create` does, that there is no backup of a node: if this Mac is
+   It may be left empty: while it is, the form says `No identity passphrase: this node's identity
+   key is kept on this machine unencrypted, so anyone who can read its data folder can act as this
+   node; a passphrase is encouraged`, and Make Node makes the node with none. The app says, as `vox node create` does, that there is no backup of a node: if this Mac is
    lost, so is the node. Two passphrases that differ are refused, and nothing is created:
 
    ```text
@@ -412,9 +414,13 @@ A node that joined a room after yours, or that trusts you, and is not in your ke
 an offer under **needs you** in the sidebar (see [Offers](keyring.md#offers-nodes-waiting-for-your-trust)).
 Select it to see a **Trust offer**: its fingerprint with its art, the same sentence `vox trust
 offers` prints (`ben joined. ann trusts it.`), the rooms you share (`In: family`), and what
-trusting and dismissing do. Give it an alias and choose **Trust**: it is given `read` (drive is a
-separate step in the keyring); the view says what that grant does first, and asks for your identity passphrase if the
-keyring window has closed. You are not asked to compare fingerprints. **Dismiss** removes the offer
+trusting and dismissing do. Give it an alias and choose **Trust**: it is given `read`, and the
+view says what that grant does first. If the keyring window has closed, it asks for your identity
+passphrase in place of the offer's buttons: that form's **Trust** and **Cancel** are then the only
+ones, and **Cancel** brings back **Trust** and **Dismiss**. Leave the field empty only if your
+identity has no passphrase; if it has one, **Trust** says
+`This node's identity has a passphrase: type it to …`. The same holds wherever the app asks for
+the passphrase for a keyring change. You are not asked to compare fingerprints. **Dismiss** removes the offer
 on your node alone: it is not told, and stays out of your keyring.
 
 ## The services view

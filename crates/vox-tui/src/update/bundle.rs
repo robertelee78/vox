@@ -135,8 +135,9 @@ pub(super) fn update(
         apps.join(PREVIOUS).display()
     );
     ask_to_restart(current.to_string().as_str(), &vox.version_text);
-    super::restart::restart_daemon(&active.join(HELPER), &vox.version_text);
+    let detached = super::restart::restart_daemon(&active.join(HELPER), &vox.version_text);
     shell_setup_from(apps, exe);
+    super::restart::say_next(&detached);
     Ok(())
 }
 
@@ -166,8 +167,9 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
         previous.display()
     );
     ask_to_restart(&was, &now);
-    super::restart::restart_daemon(&active.join(HELPER), &now);
+    let detached = super::restart::restart_daemon(&active.join(HELPER), &now);
     shell_setup_from(apps, exe);
+    super::restart::say_next(&detached);
     Ok(())
 }
 

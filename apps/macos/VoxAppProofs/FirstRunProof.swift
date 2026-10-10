@@ -95,6 +95,11 @@
 //     bob shares in mission, in the services view, shows its address broken into its parts, each
 //     labelled (service, your node alias, your room alias, Vox address), and Copy Address copies
 //     it whole, canonical.
+// 17. A room by tag (#636), run after step 16, or alone with VOX_PROOF_FROM=17: bob posts one
+//     message tagged task:#636 and one untagged; alice's row for the tagged one shows its tag,
+//     the room header's tag filter set to task:#636 shows it and not the untagged one, and "All
+//     messages" brings the untagged one back. Mutant: the app's `.tag` thread showing the whole
+//     room (timelineItems) turns it red at "must not show the untagged".
 //
 // Mutants for (15), one each: the member rows drop a node's trust in alice unless she trusts it
 // (D4: the row reads "not in keyring"); the timeline drops the whereabouts line (D9); the join
@@ -1678,6 +1683,11 @@ final class FirstRunProof: XCTestCase {
     ///   delivery), and ⌃C asks before stopping.
     /// - P1: ⌘J opens S1 with its waiting request selected, and ⌥⌘Y approves it: the hook gets
     ///   "allow" (mutant: ⌘J opening the room only).
+    /// - RB-5 (v0.4.3): Vox asks the person, not only the agent. S3, started in a directory the
+    ///   room map does not name, is asked about in a banner across the window ("Claude Code in …
+    ///   has no room"); Choose a room…, other, the room's passphrase typed here, and Bind write the
+    ///   directory's block to the room map, put S3 in other, and the ask leaves the banner (mutant:
+    ///   the banner never shown).
     func testSessionsAreDrivenWhereTheyAreShown() throws {
         let env = ProcessInfo.processInfo.environment
         guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
@@ -1859,6 +1869,58 @@ final class FirstRunProof: XCTestCase {
                 "⌃C must ask before stopping the Session")
         ui.typeKey(.escape, modifierFlags: [])
         print("[proof] sessions: ⌘J landed on S1's request and ⌥⌘Y approved it; work's draft kept; ⌘↩ in S1 sent nothing; S1's draft stayed in S1; S2 said \(said.debugDescription) and kept the prompt; ⌃C asked")
+
+        // RB-5: S3 starts in a directory with no room, its hook naming none; Vox asks alice.
+        try staged(vox, ["node", "attach", "claude-a", "--passphrase-file", pass("claude-a")], env: voxEnv)
+        let repo = root.appendingPathComponent("repo").path
+        try stager.write(Data("keep\n".utf8), to: repo + "/.keep")
+        let s3 = "53cccccc-4c0e-4f00-9a1b-0c0ffee54003"
+        try stager.write(Data(), to: work + "/\(s3).jsonl")
+        let unbound = stager.run(["/bin/sh", "-c", "cd \"$1\" && exec \"$2\" agent hook --node claude-a",
+                                  "hook", repo, vox],
+                                 env: hookEnv, input: event(s3, "UserPromptSubmit", ["prompt": "S3", "cwd": repo]))
+        guard unbound.status == 0, unbound.out.contains("isn't tied to a Vox room") else {
+            throw Apparatus("staging not achieved: S3's hook was not told its repo has no room: \(unbound.out)")
+        }
+        let map = data + "/rooms"
+        let asked3 = Premise("S3 works in no room and the room map does not name \(repo)") {
+            let status = self.run(vox, ["agent", "status", "--harness", "claude", "--dir", repo],
+                                  env: hookEnv).out
+            return (status.contains("has no room") && status.contains("/repo"), "`vox agent status` said \(status.debugDescription)")
+        }
+        let askRow = Key.id("room-ask-sentence")
+        present(ui, askRow, timeout: 30,
+                "a session started in a directory with no room must be asked about in the window",
+                premise: asked3)
+        words(ui, askRow, timeout: 10, "the ask must name the harness and the directory",
+              until: { $0.contains("Claude Code in ") && $0.contains("/repo has no room") })
+        tap(ui, Key.id("room-ask-choose"), "Choose a room…", premise: asked3)
+        let other = ui.radioButtons["other"]
+        guard other.waitForExistence(timeout: 10) else {
+            keepTree(ui, "no room other to choose")
+            XCTFail("PRODUCT: Choose a room… must list alice's rooms; other is not among them: \(onScreen(ui))")
+            return
+        }
+        other.click()
+        type(ui, Key.id("room-ask-passphrase"), "work room", "the room's passphrase field")
+        tap(ui, Key.id("room-ask-bind"), "Bind")
+        words(ui, Key.id("room-ask-said"), timeout: 30, "Bind must say the directory was bound",
+              until: { $0.contains("bound ") && $0.contains("/repo") })
+        let otherRoom = rooms["other"] ?? ""
+        let mapText = stager.run(["/bin/cat", map], env: [:]).out
+        XCTAssertTrue(mapText.contains("/repo\n") && mapText.contains("room       vox://")
+                          && mapText.contains("passphrase work room"),
+                      "PRODUCT: Bind must write the directory's block to the room map, with the room's link and passphrase; the map reads \(mapText.debugDescription)")
+        let inOther = run(vox, ["room", "sessions", "--node", "alice", otherRoom, "--json"], env: voxEnv).out
+        XCTAssertTrue(inOther.contains(s3),
+                      "PRODUCT: Bind must put the session that asked in the room chosen; other's Sessions are \(inOther.debugDescription)")
+        let leaveBy = Date().addingTimeInterval(15)
+        while Date() < leaveBy && locate(ui, askRow) != nil { Thread.sleep(forTimeInterval: 0.5) }
+        if locate(ui, askRow) != nil {
+            keepTree(ui, "the ask stayed after Bind")
+            XCTFail("PRODUCT: once bound, the directory must no longer be asked about; its ask is still shown")
+        }
+        print("[proof] room ask: S3's directory was asked about in the window's banner; bound to other in the app; the map holds its block; S3 is in other; the ask left")
     }
 
     /// A keyring change waiting for the passphrase is bound to what it changes (D1). Alice is
@@ -1920,6 +1982,34 @@ final class FirstRunProof: XCTestCase {
         try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
         defer { ui.terminate() }
         present(ui, Key.id("attached"), timeout: 60, "the app must open attached as alice")
+
+        // Carol's offer, first (v0.4.3): its words give read, with no drive; Trust opens the
+        // passphrase form, and then that form's Trust is the only one on screen; left empty, its
+        // Trust says the identity's passphrase is needed (alice's has one); Cancel brings back
+        // the offer's Trust and Dismiss.
+        tap(ui, Key.id("offer-\(carolFp.prefix(12))"), "carol's offer in the sidebar",
+            premise: Premise("carol is offered to alice") {
+                (offers.contains(String(carolFp.prefix(12))), "`vox trust offers` said \(offers.debugDescription)")
+            })
+        let explain = words(ui, Key.id("offer-explain"), timeout: 10,
+                            "carol's offer must say what trusting her gives") ?? ""
+        XCTAssertFalse(explain.lowercased().contains("drive"),
+                       "PRODUCT: the offer must say trusting gives read, with no drive (the app gives none); it says \(explain.debugDescription)")
+        type(ui, Key.id("offer-alias"), "carol", "carol's alias field")
+        tap(ui, Key.id("offer-accept"), "Trust on carol's offer")
+        present(ui, Key.id("keyring-passphrase-continue"), timeout: 15,
+                "Trust on carol's offer, the keyring window closed, must ask for the passphrase")
+        XCTAssertNil(locate(ui, Key.id("offer-accept")),
+                     "PRODUCT: while the passphrase form is open its Trust must be the only one; the offer's own Trust still shows")
+        tap(ui, Key.id("keyring-passphrase-continue"), "Trust with the passphrase field left empty")
+        words(ui, Key.id("offer-failed"), timeout: 15,
+              "Trust with the field empty, alice's identity having a passphrase, must say it is needed",
+              until: { $0.contains("This node's identity has a passphrase") })
+        tap(ui, Key.id("keyring-passphrase-cancel"), "Cancel in the passphrase form")
+        present(ui, Key.id("offer-accept"), timeout: 10, "Cancel must bring back the offer's Trust")
+        el(ui, Key.id("offer-alias")).typeKey("a", modifierFlags: .command)
+        el(ui, Key.id("offer-alias")).typeKey(XCUIKeyboardKey.delete.rawValue, modifierFlags: [])
+        print("[proof] offer: \(explain.debugDescription); one Trust while the form was open; empty passphrase said needed; Cancel brought Trust back")
 
         // Bob's change, waiting for the passphrase, named.
         tap(ui, Key.id("keyring"), "Keyring in the sidebar")
@@ -2055,6 +2145,7 @@ final class FirstRunProof: XCTestCase {
             let field = Key.id("passphrase")
             present(ui, field, timeout: 30, "the app must ask for node alice's passphrase")
             type(ui, field, "alice identity", "the passphrase field")
+            noKeychain(ui)
             tap(ui, Key.id("attach"), "Attach")
             present(ui, Key.id("attached"), timeout: 60, "the app, its first run answered, must open attached as alice")
             listed = run(vox, ["node", "list"], env: voxEnv).out
@@ -2084,6 +2175,7 @@ final class FirstRunProof: XCTestCase {
         present(ui, field, timeout: 30,
                 "with one node on this Mac, the app must ask for node alice's passphrase, not which node")
         type(ui, field, "not the passphrase", "the passphrase field")
+        noKeychain(ui)
         tap(ui, Key.id("attach"), "Attach")
         words(ui, Key.id("said"), timeout: 30,
               "a wrong passphrase must show the daemon's own sentence where it was typed",
@@ -2733,6 +2825,62 @@ final class FirstRunProof: XCTestCase {
         XCTAssertEqual(twoLines, "LINE ONE\nLINE TWO",
                        "PRODUCT: \"LINE ONE\", ⇧↩, \"LINE TWO\", Return in the composer must post one message of two lines; bob's node holds \(twoLines.debugDescription)")
 
+        // (4f0) Fewer trips to a terminal (#666). bob takes alice's drive back: his Session, shown
+        // to her, says only members bob trusts with drive see inside, and gives the command that
+        // grants it, run as bob on this Mac, with Copy (the app never grants drive, #614).
+        try staged(vox, ["trust", "read", "--node", "bob", aliceFp,
+                         "--identity-passphrase-file", bobPass], env: voxEnv)
+        // From General, so the tap shows the Session whatever was shown before.
+        tap(ui, Key.id("session-general"), "General in mission's Sessions")
+        tap(ui, Key.id("session-\(d7Session.prefix(8))"), "bob's Session in mission's Sessions")
+        let grant = "vox trust drive \(aliceFp) --node bob"
+        words(ui, Key.id("no-drive-\(d7Session)-command"), timeout: 30,
+              "bob's Session, shown to alice without drive, must give the command that grants it: \"\(grant)\"",
+              until: { $0 == grant })
+        tap(ui, Key.id("no-drive-\(d7Session)-copy"), "Copy beside the drive command")
+        let copied = NSPasteboard.general.string(forType: .string) ?? ""
+        XCTAssertEqual(copied, grant,
+                       "PRODUCT: Copy beside the drive command must put it on the pasteboard; it holds \(copied.debugDescription)")
+        // A node on this Mac waiting for its passphrase is offered Attach… where `vox` would have
+        // said "run in a terminal": with Vox in front, vox://attach-node opens its Attach sheet.
+        // Opened in the app under proof, by its path, never whichever Vox LaunchServices picks.
+        let opener = Process()
+        opener.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        opener.arguments = ["-a", appPath, "vox://attach-node?node=bob"]
+        try opener.run()
+        opener.waitUntilExit()
+        words(ui, Key.id("attach-node-why"), timeout: 15,
+              "vox://attach-node?node=bob, with Vox in front, must open the Attach sheet for node bob",
+              until: { $0.contains("node bob") })
+        tap(ui, Key.id("attach-node-cancel"), "Cancel on bob's Attach sheet")
+        // Forget Passphrase in place of `vox node forget-passphrase` (#666): Node > Forget
+        // Passphrase ends the keep of alice, the node this window acts as, kept here by a
+        // passphrase file (never the Keychain, in a proof).
+        try staged(vox, ["node", "attach", "alice", "--keep", "--passphrase-file", alicePass], env: voxEnv)
+        let keptUntil = Date().addingTimeInterval(15)
+        while Date() < keptUntil && !(nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "alice")?.contains("(kept)") ?? false) {
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        let keptBefore = nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "alice") ?? ""
+        guard keptBefore.contains("(kept)") else {
+            throw Apparatus("alice must be kept before Forget Passphrase is chosen, so that its end can be seen; `vox node list` says \(keptBefore)")
+        }
+        ui.menuBars.menuBarItems["Node"].click()
+        tap(ui, Key.menuItem("Forget Passphrase"), "Node > Forget Passphrase")
+        let forgotUntil = Date().addingTimeInterval(15)
+        var bobLine = ""
+        repeat {
+            bobLine = nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "alice") ?? ""
+            if !bobLine.contains("(kept)") { break }
+            Thread.sleep(forTimeInterval: 0.3)
+        } while Date() < forgotUntil
+        XCTAssertFalse(bobLine.contains("(kept)"),
+                       "PRODUCT: Node > Forget Passphrase must stop keeping alice; `vox node list` says \(bobLine)")
+        ui.typeKey(.return, modifierFlags: []) // the Forget Passphrase alert's OK
+        // Back to General, as 4f expects to find bob's Session not yet shown.
+        tap(ui, Key.id("session-general"), "General in mission's Sessions")
+        print("[proof] #666: drive command \(grant) copied; attach-node opened bob's sheet; Node > Forget Passphrase: \(bobLine)")
+
         // (4f) ↑/↓ reach a Session's entries (P14): bob grants alice drive, so she reads inside his
         // Session; with it shown, View > Focus Timeline selects its newest entry and ↑ the one
         // before it, as among messages.
@@ -2836,6 +2984,12 @@ final class FirstRunProof: XCTestCase {
         try staged(vox, ["trust", "remove", "--node", "alice", carolFp,
                          "--identity-passphrase-file", alicePass], env: voxEnv)
 
+        }
+
+        if from == 17 {
+            try tagThread(ui, vox: vox, voxEnv: voxEnv, room: room)
+            print("[proof] VOX_PROOF_FROM=17: step 17 run alone; steps 1 to 16 NOT RUN")
+            return
         }
 
         // (5d) Finding your way (v0.4.1). Each part is what a person sees, and stages what it needs
@@ -3097,6 +3251,11 @@ final class FirstRunProof: XCTestCase {
                 print("[proof] VOX_PROOF_FROM=16: step 16 run alone; steps 6 to 15 NOT RUN")
                 return
             }
+        }
+        // (17) A room by tag (#636), on what steps 1 to 5 leave (VOX_PROOF_FROM=17 runs it alone,
+        // before 5d: 5b needs its message unread).
+        if from <= 5 {
+            try tagThread(ui, vox: vox, voxEnv: voxEnv, room: room)
         }
 
         // (6) Attach a file to the room, To: bob, with a note.
@@ -3855,6 +4014,7 @@ final class FirstRunProof: XCTestCase {
         let again = Key.id("passphrase")
         if present(ui, again, timeout: 15, "Attach alice Again must ask for her passphrase") {
             type(ui, again, "alice identity", "the passphrase field")
+            noKeychain(ui)
             tap(ui, Key.id("attach"), "Attach")
         }
         present(ui, Key.id("attached"), timeout: 60, "attached again, the window must be alice's")
@@ -3996,6 +4156,46 @@ final class FirstRunProof: XCTestCase {
             XCTFail("PRODUCT: Copy Address must copy the whole address, canonical (\(canonical)); the pasteboard holds \(pasted.debugDescription)")
         }
         print("[proof] G3: \(readable) shown as \(said); Copy Address copied \(pasted)")
+    }
+
+    /// Step 17 (#636): a message's tags under its row, and the room header's filter by tag.
+    private func tagThread(_ ui: XCUIApplication, vox: String, voxEnv: [String: String],
+                           room: String) throws {
+        try staged(vox, ["room", "post", "--node", "bob", room, "PLAIN-636"], env: voxEnv)
+        try staged(vox, ["room", "post", "--node", "bob", room, "--task", "#636", "TAGGED-636"],
+                   env: voxEnv)
+        var tagged: (id: String, millis: UInt64)?
+        var untagged: (id: String, millis: UInt64)?
+        let until = Date().addingTimeInterval(60)
+        while (tagged == nil || untagged == nil) && Date() < until {
+            tagged = posted(vox, voxEnv, room, "TAGGED-636")
+            untagged = posted(vox, voxEnv, room, "PLAIN-636")
+            if tagged == nil || untagged == nil { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        guard let tagged, let untagged else {
+            throw Apparatus("alice's `vox room read --json` never showed both of bob's PLAIN-636 and TAGGED-636 in 60 s")
+        }
+        let tags = run(vox, ["room", "read", "--node", "alice", "--json", "--tag", "task:#636", room],
+                       env: voxEnv).out
+        guard tags.contains(tagged.id), !tags.contains(untagged.id) else {
+            throw Apparatus("alice's node does not hold TAGGED-636 alone under task:#636 (`vox room read --tag`): \(tags)")
+        }
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
+        present(ui, Key.id("tag-\(tagged.id)-task:#636"), timeout: 30,
+                "bob's TAGGED-636 must show its tag, task:#636, under it")
+        present(ui, Key.id("time-\(untagged.id)"), timeout: 10,
+                "bob's PLAIN-636 must be in the room's timeline before any filter")
+        tap(ui, Key.id("room-tag-filter"), "the room header's tag filter")
+        tap(ui, Key.menuItem("task:#636"), "task:#636 in the tag filter")
+        present(ui, Key.id("time-\(tagged.id)"), timeout: 10,
+                "filtered by task:#636, the room must show TAGGED-636")
+        missingWithin(ui, Key.id("time-\(untagged.id)"), 10,
+                      "filtered by task:#636, the room must not show the untagged PLAIN-636")
+        tap(ui, Key.id("room-tag-filter"), "the room header's tag filter")
+        tap(ui, Key.menuItem("All messages"), "All messages in the tag filter")
+        present(ui, Key.id("time-\(untagged.id)"), timeout: 10,
+                "All messages must show the untagged PLAIN-636 again")
+        print("[proof] tags: TAGGED-636 shows task:#636; the filter shows it alone; All messages brings PLAIN-636 back")
     }
 
     // ---- every check on the window proves its own query first --------------------------------
@@ -4329,6 +4529,25 @@ final class FirstRunProof: XCTestCase {
     /// that as its premise; any other target is a control of the screen the proof has just
     /// reached, which the app must show.
     @discardableResult
+    /// The attach form remembers the passphrase in the Keychain unless told not to (ADR-028 K-10
+    /// as amended, #666). Storing is the person's, never a proof's: the proof's daemon would store
+    /// it in the real login keychain. So the toggle, on by default, is turned off before Attach.
+    private func noKeychain(_ ui: XCUIApplication) {
+        let toggle = ui.descendants(matching: .any)["keep-in-keychain"]
+        guard toggle.waitForExistence(timeout: 10) else {
+            XCTFail("PRODUCT: the attach form must offer to remember the passphrase in the Keychain (keep-in-keychain): \(onScreen(ui))")
+            ui.terminate()
+            return
+        }
+        let on = { (toggle.value as? Int) == 1 || (toggle.value as? String) == "1" }
+        if on() { toggle.click() }
+        if on() {
+            // Stopped here, so the Attach that follows stores nothing in the real login keychain.
+            XCTFail("APPARATUS: the keep-in-keychain toggle did not turn off; the app is stopped before Attach")
+            ui.terminate()
+        }
+    }
+
     private func tap(_ ui: XCUIApplication, _ key: Key, _ what: String, premise: Premise? = nil,
                      file: StaticString = #filePath, line: UInt = #line) -> Bool {
         let end = Date().addingTimeInterval(10)

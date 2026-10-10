@@ -37,6 +37,23 @@ struct RootView: View {
                     .panelSurface()
             }
         }
+        // Forget Passphrase (#666): what it did.
+        .alert("Forget Passphrase", isPresented: Binding(get: { model.forgotSaid != nil },
+                                                         set: { if !$0 { model.forgotSaid = nil } })) {
+            Button("OK") {}
+        } message: {
+            Text(model.forgotSaid ?? "")
+        }
+        // ON THIS MACHINE's Attach…: a node that waits for its passphrase (#666).
+        .sheet(isPresented: Binding(get: { model.attachNodeAsk != nil },
+                                    set: { if !$0 { model.attachNodeAsk = nil } })) {
+            if let node = model.attachNodeAsk {
+                AttachNodeSheet(node: node, model: model)
+                    .padding(Space.s24)
+                    .font(Theme.text)
+                    .panelSurface()
+            }
+        }
         // Turning Keep Running on or off from the Vox menu, refused: macOS's or the daemon's words.
         .alert("Keep Running", isPresented: Binding(get: { model.keepRunningSaid != nil },
                                                     set: { if !$0 { model.keepRunningSaid = nil } })) {
@@ -175,6 +192,8 @@ private struct KeepNodeOffer: View {
     let node: String
     @ObservedObject var model: AppModel
     @State private var field = SecureFieldHolder()
+    /// Set while one Store is being asked: one key press may ask twice.
+    @State private var submitted = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s12) {
@@ -202,7 +221,58 @@ private struct KeepNodeOffer: View {
     }
 
     private func store() {
-        guard let secret = field.take() else { return }
+        // A node may have no passphrase (ADR-005 J-2): an empty field keeps none.
+        guard !submitted else { return }
+        submitted = true
+        DispatchQueue.main.async { submitted = false }
+        let secret = field.takeAllowingEmpty()
+        Task { await model.keepNode(node, passphrase: secret) }
+    }
+}
+
+/// Attach a node on this Mac that waits for its passphrase, and remember it (#666): the passphrase
+/// is stored in the Keychain, so the node attaches again by itself after every restart.
+private struct AttachNodeSheet: View {
+    let node: String
+    @ObservedObject var model: AppModel
+    @State private var field = SecureFieldHolder()
+    /// Set while one Attach is being asked: one key press may ask twice.
+    @State private var submitted = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.s12) {
+            Text("Attach node \(node)").title()
+            Text("Type node \(node)'s identity passphrase, or leave it empty for a node made with "
+                + "none. Vox stores it in the Keychain, so node \(node) attaches again by itself "
+                + "after a restart; anyone who can unlock this Mac's login keychain can then attach "
+                + "node \(node). Forget Passphrase, on its row under ON THIS MACHINE or in the Node "
+                + "menu, forgets it.")
+                .secondaryText()
+                .accessibilityIdentifier("attach-node-why")
+            SecureInput(holder: field) { attach() }
+                .frame(width: Theme.scaled(320))
+                .accessibilityIdentifier("attach-node-passphrase")
+                .accessibilityLabel("Identity passphrase for node \(node)")
+            if let said = model.keepNodeSaid {
+                Said(text: said)
+            }
+            HStack {
+                Button("Attach") { attach() }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.voxPrimary)
+                    .accessibilityIdentifier("attach-node")
+                Button("Cancel") { model.attachNodeAsk = nil }
+                    .keyboardShortcut(.cancelAction)
+                    .accessibilityIdentifier("attach-node-cancel")
+            }
+        }
+    }
+
+    private func attach() {
+        guard !submitted else { return }
+        submitted = true
+        DispatchQueue.main.async { submitted = false }
+        let secret = field.takeAllowingEmpty()
         Task { await model.keepNode(node, passphrase: secret) }
     }
 }
@@ -275,6 +345,11 @@ private struct Welcome: View {
     @State private var name = Welcome.suggestedName
     @State private var first = SecureFieldHolder()
     @State private var again = SecureFieldHolder()
+    /// Whether the passphrase field is empty now: a node may have none (ADR-005 J-2), said here.
+    @State private var noPassphrase = true
+    /// Set while one Make Node is being asked: Return and the button may both ask at one key
+    /// press, and an empty passphrase no longer tells the second from the first.
+    @State private var submitted = false
 
     var body: some View {
         Text("Welcome to Vox").heading()
@@ -287,7 +362,9 @@ private struct Welcome: View {
             .accessibilityIdentifier("new-node-name")
             .accessibilityLabel("Node name")
         Text("Lowercase letters, digits, dots, dashes and underscores.").secondaryText()
-        SecureInput(holder: first) { again.field.becomeFirstResponder() }
+        SecureInput(holder: first, onEmpty: { noPassphrase = $0 }) {
+            again.field.becomeFirstResponder()
+        }
             .frame(width: Theme.scaled(320))
             .accessibilityIdentifier("new-node-passphrase")
             .accessibilityLabel("Identity passphrase")
@@ -299,6 +376,11 @@ private struct Welcome: View {
             + "keep it somewhere safe.")
             .secondaryText()
             .accessibilityIdentifier("new-node-passphrase-why")
+        if noPassphrase {
+            // Allowed, and said (ADR-005 J-2, V030-36): a node with none keeps its key unencrypted.
+            Text(Welcome.capitalized(noPassphraseNotice()))
+                .accessibilityIdentifier("new-node-no-passphrase")
+        }
         Text(Welcome.capitalized(noBackupNotice()))
             .secondaryText()
             .accessibilityIdentifier("new-node-no-backup")
@@ -319,9 +401,13 @@ private struct Welcome: View {
     }
 
     private func submit() {
-        // Return and the button may both ask: the second finds the fields empty.
-        guard let secret = first.take() else { return }
-        let repeated = again.take() ?? Secret(Data())
+        // Return and the button may both ask: the second does nothing.
+        guard !submitted else { return }
+        submitted = true
+        // One key press fires both at once; the next press is a new ask.
+        DispatchQueue.main.async { submitted = false }
+        let secret = first.takeAllowingEmpty()
+        let repeated = again.takeAllowingEmpty()
         let node = name.trimmingCharacters(in: .whitespaces)
         Task { await model.createNode(node, passphrase: secret, again: repeated) }
     }
@@ -426,26 +512,29 @@ private struct PassphraseForm: View {
     let said: String?
     @ObservedObject var model: AppModel
     @State private var field = SecureFieldHolder()
-    /// ADR-028 K-10: off until the person turns it on, for this node.
-    @State private var keepInKeychain = false
+    /// ADR-028 K-10 as amended (#666): on until the person turns it off, for this node.
+    @State private var keepInKeychain = true
+    /// Set while one Attach is being asked: Return and the button may both ask at one key press,
+    /// and an empty passphrase no longer tells the second from the first.
+    @State private var submitted = false
 
     var body: some View {
         Text("Attach node \(node)").heading()
-        Text("Type node \(node)'s identity passphrase.").secondaryText()
+        Text("Type node \(node)'s identity passphrase, or leave it empty for a node made with none.")
+            .secondaryText()
         SecureInput(holder: field) { submit() }
             .frame(width: Theme.scaled(320))
             .accessibilityIdentifier("passphrase")
             .accessibilityLabel("Identity passphrase for node \(node)")
-        if model.keepRunning {
-            Toggle("Store the passphrase in the Keychain, so node \(node) stays attached when "
-                + "Vox quits", isOn: $keepInKeychain)
-                .accessibilityIdentifier("keep-in-keychain")
-            Text(keepInKeychain
-                ? "Anyone who can unlock this Mac's login keychain can then attach node \(node)."
-                : "Without it, your rooms are reachable only while Vox is open.")
-                .secondaryText()
-                .accessibilityIdentifier("keep-in-keychain-why")
-        }
+        Toggle("Remember the passphrase in the Keychain, so node \(node) attaches again by "
+            + "itself after Vox quits or the Mac restarts", isOn: $keepInKeychain)
+            .accessibilityIdentifier("keep-in-keychain")
+        Text(keepInKeychain
+            ? "Anyone who can unlock this Mac's login keychain can then attach node \(node)."
+            : "Without it, your rooms are reachable only while Vox is open, and node \(node) "
+                + "asks for its passphrase again after a restart.")
+            .secondaryText()
+            .accessibilityIdentifier("keep-in-keychain-why")
         if let said {
             Said(text: said)
         }
@@ -456,8 +545,12 @@ private struct PassphraseForm: View {
     }
 
     private func submit() {
-        // Return and the Attach button may both ask: the second finds the field empty.
-        guard let secret = field.take() else { return }
+        // Return and the Attach button may both ask at one key press: the second does nothing.
+        guard !submitted else { return }
+        submitted = true
+        DispatchQueue.main.async { submitted = false }
+        // A node may have no passphrase (ADR-005 J-2): an empty field attaches it with none.
+        let secret = field.takeAllowingEmpty()
         let keep = keepInKeychain
         Task { await model.attach(node, passphrase: secret, keepInKeychain: keep) }
     }
@@ -477,6 +570,9 @@ final class Secret: @unchecked Sendable {
     }
 
     func wipe() { bytes.resetBytes(in: 0..<bytes.count) }
+
+    /// Nothing was typed.
+    var isEmpty: Bool { bytes.isEmpty }
 
     /// Whether `other` holds the same bytes, compared without stopping at the first difference.
     func matches(_ other: Secret) -> Bool {
@@ -502,8 +598,8 @@ final class SecureFieldHolder {
         return Secret(Data(text.utf8))
     }
 
-    /// The typed bytes, the field emptied: empty when nothing was typed. Only for a room's
-    /// passphrase, which a room may go without (ADR-005 J-2 as amended); an identity's never.
+    /// The typed bytes, the field emptied: empty when nothing was typed. For a passphrase a room
+    /// or a node may go without (ADR-005 J-2).
     func takeAllowingEmpty() -> Secret {
         let text = field.stringValue
         field.stringValue = ""

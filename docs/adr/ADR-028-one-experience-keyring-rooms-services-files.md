@@ -87,31 +87,50 @@ decider named: read records, the room's shared name, the decision record and the
 - **K-9.** The keyring window (ADR-026 N-2, 30 minutes) MUST be visible where the person works:
   the TUI status bar and the app's menu bar extra MUST show whether a keyring change will ask for
   the passphrase, for example `keyring open 23m`.
-- **K-10.** The app MAY store a node's identity passphrase in the macOS Keychain, opt-in per node,
-  off by default. The prompt MUST say that anyone who can unlock this Mac's login keychain can then
-  attach the node.
+- **K-10. A node attached with its passphrase is remembered.** *Amended 2026-10-10 (#666):* the
+  decider, 2026-10-09: "vox is unusable"; "if it need a passphrase it should tell me what to do",
+  "not silently fail". Attaching a node with its identity passphrase (`vox node attach`, the app's
+  attach) MUST store that passphrase in the macOS Keychain, keyed per node, once the daemon has
+  proved it, and a node made by `vox node create`, `vox setup` or `vox agent connect` MUST be
+  attached at once and remembered the same way. At its start the daemon MUST attach every node
+  whose passphrase is stored, and every remembered node that has none, with nobody typing: after a
+  daemon restart, `vox update`, the app's quit and a reboot. `vox node attach --no-remember`
+  MUST store nothing, and `vox node forget-passphrase <node>` MUST remove what is stored. Where
+  the passphrase is asked for, Vox MUST say that anyone who can unlock this Mac's login keychain
+  can then attach the node. Where there is no Keychain Vox can use (Linux), Vox MUST say plainly
+  that the node is not remembered and how to keep it (`--keep --passphrase-file`). A remembered
+  node that cannot be attached at the daemon's start MUST be said to the person: a notification
+  with the command, and an Attach… action on its row under ON THIS MACHINE in the app. (Until this
+  amendment the Keychain was opt-in per node in the app only, off by default.)
 
 ### 2a. Passphrases and trust offers (the decider, 2026-10-06)
 
 These rules are the same for every node. A person's node and an agent's node MUST NOT be told apart
 by any of them (ADR-001: there is no typed agent or human).
 
-- **K-11. Every node has a passphrase.** Creating a node (`vox node create`, the TUI's or the app's
-  onboarding, an agent skill pack's setup) MUST require a non-empty identity passphrase. The
-  passphrase MUST be asked for in exactly two cases: attaching the node, and changing its keyring
-  (trust add, remove, rename, a capability change). A retention change MUST NOT ask for it
-  (ADR-010 AR-28 as amended).
+- **K-11. An identity passphrase is optional.** *Amended 2026-10-10:* ADR-005 J-2 (V030-36) is
+  restored, by the decider's ruling of 2026-10-09 ("passphrases are optional"; "we talked about
+  this"). Creating a node (`vox node create`, `vox setup`, `vox agent connect`, the TUI's or the
+  app's onboarding) MUST accept an empty identity passphrase, and MUST say once, where it is given,
+  what it means: the node's identity key is kept on that machine unencrypted, so anyone who can
+  read its data folder can act as the node. Attaching or unlocking a node made with none MUST
+  accept the empty one without asking again. Whatever the node has, the passphrase MUST be asked
+  for in exactly two cases: attaching the node, and changing its keyring (trust add, remove,
+  rename, a capability change). A retention change MUST NOT ask for it (ADR-010 AR-28 as
+  amended). (Between 2026-10-06 and this amendment K-11 required a non-empty passphrase, which
+  v0.4.0 to v0.4.2 enforce.)
 - **K-12. Attaching does not open the keyring window.** A passphrase given to attach a node MUST
   NOT open the keyring window (ADR-026 N-2). Only a passphrase entered for a keyring change MUST
   open it, for 30 minutes. K-9 shows the window.
 - **K-13. A passphrase is typed outside an agent's session.** When an agent's hook finds its node
   not attached, or a keyring change is to be made for its node, the hook MUST show the operator, in
-  the harness session, the command for each step to run in a terminal outside that session, for
-  example
+  the harness session, the command for each step to run in a terminal outside that session, once
+  per session for a node not attached (#666), for example
   `vox node attach claude-code-mbp` or `vox trust add <fingerprint> --node claude-code-mbp`. That
   command MUST read the passphrase from its own terminal. A hook MUST NOT attach a node, and MUST
   NOT take a passphrase from the environment, a file or the session. A keyring change MUST NOT take
   its passphrase from an environment variable, a file or the Keychain (K-10 covers attach only).
+  The daemon attaching a remembered node at its own start (K-10) is not a hook attaching it.
 - **K-14. Capabilities.** A keyring entry MUST carry what it grants: **read** (what trust means
   today, ADR-020 §3), or **read + drive**, stored in the sealed keyring with the entry. Both clients
   and `vox trust list` MUST show it. What drive permits is ADR-029 §3 (Sessions, v0.4.0).
@@ -131,6 +150,10 @@ by any of them (ADR-001: there is no typed agent or human).
 - **K-18. An offer waits.** An offer MUST stay under needs you until it is accepted, dismissed, or
   the offered node leaves the room. Dismissing MUST be local and silent: the offered node is not
   told and stays not in keyring. Trust stays reachable later from the member pane (K-5).
+  Removing a member from the keyring MUST also dismiss what it is offered on now, in the same
+  local, silent way, so a node is not offered back someone its person just removed; it MUST be
+  offered again on a new basis only: the member leaves and joins again, or grants this node
+  consent again (amended 2026-10-10, under the decider's delegation).
 - **K-19. An agent's node is offered in its harness.** For an agent's node, the hook MUST show the
   offer in the harness session, in the agent's per-turn read (ADR-020 6.6), with K-13's command to
   accept it outside the session. An accept MUST pass ADR-020 3.1's passphrase gate whichever
@@ -399,8 +422,9 @@ structure for both clients; the TUI renders the same regions in text.
   messages addressed to it, services shared to it with copy buttons, its own shares with stop, and
   live tunnels.
 - **A-4.** Quitting the app MUST detach its node, as quitting the TUI does (ADR-026 S-4), except
-  when the person chose Keep Running and stored the node's passphrase in the Keychain (K-10), or
-  the node needs none: then the node stays attached (ADR-014 M-6, M-8).
+  when the node is remembered (K-10 as amended 2026-10-10: its passphrase stored in the Keychain,
+  which the app's attach does unless the person turns it off, or none needed): then the node stays
+  attached (ADR-014 M-6, M-8).
 - **A-5.** On macOS the user-level `vox daemon` MUST be registered as a login item with
   `SMAppService`, so it runs before the app opens.
 
@@ -428,7 +452,7 @@ Each line below is amended as stated. Where code already matches, the ADR text i
 |---|---|---|
 | ADR-005 J-1 | "`vox room invite` prints the room's link" | `vox room link` (R-4; already built) |
 | ADR-005 J-6 | "The invite link (`vox://…`)" | "The room link" (E-2) |
-| ADR-014 2.2 | Secure Enclave may hold only the unlock factor | Keychain may also hold the passphrase, opt-in per node (K-10) |
+| ADR-014 2.2 | Secure Enclave may hold only the unlock factor | Keychain also holds the passphrase of a node attached with it, unless declined (K-10 as amended 2026-10-10) |
 | ADR-014 2.5, 2.7 | Required identity backup; restore via self-channel | No backup (K-8) |
 | ADR-014 2.6 | Explicit identity selection; per-channel pseudonymous identity | One node per client (E-4) |
 | ADR-014 3.2–3.5 | Invite QR; consent wording; per-channel local name; nickname bound to a verified key | Room link (R-4); trust wording (E-2); shared room name (R-1); alias (K-3) |
@@ -465,13 +489,13 @@ Each line below is amended as stated. Where code already matches, the ADR text i
 | ADR-020 11.2 | The receiver pulls when asked | Pulled automatically when addressed to this node or to no one, from a keyring member (F-3) |
 | ADR-026 S-6 | `vox daemon install` deferred | On macOS, a login item via `SMAppService` (A-5); Linux unchanged |
 | ADR-005 J-1 | "the two people swap fingerprints … each then runs `vox trust add` for the other" | Swapping fingerprints first is optional; each accepts the other's offer (K-15–K-17) |
-| ADR-005 J-2 | An identity passphrase is OPTIONAL (V030-36) | Required for every node (K-11); a room passphrase stays optional |
-| ADR-020 2.1 | The skill pack's setup creates the agent's node | With a passphrase the operator types (K-11) |
+| ADR-005 J-2 | An identity passphrase is OPTIONAL (V030-36) | Restored (K-11 as amended 2026-10-10): optional, and an empty one says the key is kept unencrypted; a room passphrase stays optional |
+| ADR-020 2.1 | The skill pack's setup creates the agent's node | The operator makes it, at a terminal of their own (`vox setup` or `vox agent connect`), with a passphrase they type or none (K-11 as amended) |
 | ADR-020 3.1 | The keyring window runs from when the passphrase "was last entered" | From when it was last entered for a keyring change; attaching does not open it (K-12) |
 | ADR-020 3.7 | Entry point 2, in-room approval, not built | Specified as offers on join (K-15–K-19) |
 | ADR-020 3.8 | A provision-time import MAY be provided | No import (K-20) |
 | ADR-026 N-2 | The window runs from the passphrase given at attach | Attaching does not open it (K-12) |
-| ADR-026 N-6 | Agent node created "with no passphrase or one from an environment variable" | With a passphrase the operator types (K-11); a hook never supplies one (K-13) |
+| ADR-026 N-6 | Agent node created "with no passphrase or one from an environment variable" | With a passphrase the operator types, or none (K-11 as amended); a hook never supplies one (K-13) |
 | ADR-026 L-2 | A hook may attach a node implicitly | A hook never attaches; it shows the attach command (K-13) |
 | ADR-026 C-6 | Passphrases may come from an environment variable resolved in the client | Never for a keyring change (K-13) |
 | ADR-010 AR-28 | A retention request over the socket is gated on the identity passphrase | Not gated: retention is not one of the passphrase's two cases (K-11) |

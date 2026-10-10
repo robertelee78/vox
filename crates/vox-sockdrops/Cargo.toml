@@ -7,7 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish = false
-description = "The one getsockopt Vox needs that its safe dependencies do not offer: a UDP socket's own drop count (SO_MEMINFO). The only Vox crate that allows unsafe."
+description = "The narrow OS calls Vox needs that no safe crate offers: a UDP socket's own drop count (SO_MEMINFO), and another process's argv on macOS (KERN_PROCARGS2). The only Vox crate that allows unsafe."
 
-[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))'.dependencies]
 libc = "0.2"

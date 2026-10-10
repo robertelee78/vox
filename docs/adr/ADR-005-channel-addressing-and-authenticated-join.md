@@ -28,8 +28,9 @@ readable: who reads whom is decided by trust (ADR-007).
   (ADR-007). *Amended by ADR-028:* the verb is `vox room link` (R-4), swapping fingerprints first is
   optional, and each side trusts the other by accepting its offer (K-15–K-17).
 - **J-2.** A room passphrase is OPTIONAL. The core MUST NOT refuse an empty room passphrase. An identity
-  passphrase is REQUIRED for every node: creating a node MUST refuse an empty one (the decider,
-  2026-10-06, ADR-028 K-11; replaces V030-36's identity half).
+  passphrase is OPTIONAL too (V030-36; restored 2026-10-10 by the decider's ruling of 2026-10-09,
+  "passphrases are optional", ADR-028 K-11 as amended): the core MUST NOT refuse an empty one, and a
+  client MUST say once, where it is given, that the identity key is then kept unencrypted.
 - **J-3.** A join naming a room this node already holds MUST update the room's stored address to the
   new link's addresses, not refuse (V210-167): the members the link names are dialled there, and those
   that answer, with the anchors it names, are kept as the room's address. An address at which no member

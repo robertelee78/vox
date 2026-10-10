@@ -335,8 +335,9 @@ fn seen(w: &room::Worker, room: &str, others: &[String], side: &str) -> Seen {
 /// view is read with that release. Then every process is stopped as a person stops it and started
 /// again from this build on the same data roots, and each member must see the same fingerprint,
 /// the same keyring, the same room, and the same rows in the same order with the same times; the
-/// share must still be listed; a post written after the upgrade must reach the other member; and
-/// `.daemon/format` must say format 1, written by this build.
+/// share must still be listed; `.daemon/format` must say format 1, written by this build; and,
+/// once each member's daemon is started again by this build, so that it reads back what this build
+/// rewrote, a post written after the upgrade must reach the other member.
 ///
 /// Run before every release with the newest published release as the source (`VOX_UPGRADE_FROM`
 /// names another); it needs GitHub.
@@ -347,6 +348,11 @@ fn seen(w: &room::Worker, room: &str, others: &[String], side: &str) -> Seen {
 ///
 /// Mutant: the vault's AEAD label changed in this build (`VAULT_AAD_V2`) → red, `PRODUCT:` this
 /// build cannot unlock the node the previous release made.
+///
+/// Mutants of the prekey ring's upgrade (ADR-030 P-1, ring version 3): the previous release's
+/// version 2 no longer read (`RING_VERSION_NO_RETIRED`'s arm in `PrekeyRing::decode` removed) →
+/// red, `PRODUCT:` this build cannot unlock the node; the retired set left out of the version-3
+/// encoding → red at the restart, `PRODUCT:` the daemon this build started again cannot unlock the node.
 #[test]
 #[ignore = "downloads the previous release; an anchor and two daemons of each; run in release"]
 fn a_data_root_of_the_previous_release_opens_with_nothing_lost() {
@@ -481,6 +487,12 @@ fn a_data_root_of_the_previous_release_opens_with_nothing_lost() {
     println!("[proof] alice's share still listed: {listed}");
     if !listed {
         red.push("alice's `vox share list` no longer lists her share after the upgrade".to_owned());
+    }
+    // Started once more by this build, each node reads back what this build wrote of what the
+    // previous release left: the prekey ring, read at the previous release's at-rest version and
+    // saved at once at this build's (ADR-030 P-1 adds the retired one-time prekeys).
+    for i in 0..r.workers.len() {
+        r.restart(i);
     }
     // And the room still works: a post after the upgrade reaches the other member.
     let after = "written after the upgrade";

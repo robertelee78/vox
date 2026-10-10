@@ -784,6 +784,17 @@ pub struct CoordArgs {
     /// Print one JSON object instead of prose.
     #[arg(long)]
     pub json: bool,
+    /// Tag the message with the task it relates to, as `task:<TASK>`: an issue (`#636`) or awa's
+    /// work key. With `--work` and no `--task`, the work item is its task. Everyone who can read
+    /// the message sees its tags; `vox room read --tag` filters by them.
+    #[arg(long)]
+    pub task: Option<String>,
+    /// Tag the message with the project it relates to, as `project:<PROJECT>`.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Tag the message with the milestone it relates to, as `milestone:<MILESTONE>`.
+    #[arg(long)]
+    pub milestone: Option<String>,
 }
 
 impl CoordArgs {
@@ -792,6 +803,9 @@ impl CoordArgs {
             session: self.session.clone(),
             op: self.op.clone(),
             json: self.json,
+            task: self.task.clone(),
+            project: self.project.clone(),
+            milestone: self.milestone.clone(),
         }
     }
 }
@@ -944,6 +958,30 @@ enum AgentCmd {
     ///
     /// vox agent trust codex
     Trust(AgentTrustArgs),
+    /// Say what this harness on this machine needs before a session works in a Vox room.
+    ///
+    /// Run from a harness session at its start (the agent skill says to), when no hook has
+    /// brought Vox's news: it only reads, and says the first thing missing with the one command
+    /// the operator runs for it in a terminal of their own — `vox agent connect` when no node is
+    /// wired to the harness, `vox node attach` when its node is not attached, the room ask with
+    /// `vox room join … --bind` when the directory is bound to no room — or that nothing is.
+    ///
+    /// For example:
+    ///
+    /// vox agent status --harness claude
+    Status(AgentStatusArgs),
+    /// Make a node for a harness (or take one that exists), wire the harness to it, and attach it.
+    ///
+    /// What `vox setup` does for one harness, by the name you choose: the node is made with a
+    /// passphrase you type twice at this terminal (or `--passphrase-file`), the harness's hook
+    /// goes in its own settings with the agent skill beside it (other Vox hook entries there are
+    /// replaced, nothing else), and the node is attached. It says what it is to do first. Start
+    /// a new session of the harness afterwards.
+    ///
+    /// For example:
+    ///
+    /// vox agent connect claude --node claude-mbp
+    Connect(AgentConnectArgs),
     /// Check that this node's agent sessions are wired up, and say how to fix what is not.
     ///
     /// One line per check, `ok`, `warn` or `fail`, each with a one-line fix: the node answers;
@@ -971,6 +1009,35 @@ enum AgentCmd {
     ///
     /// For example: vox agent send ./report.pdf --note "the numbers you asked for"
     Send(AgentSendArgs),
+}
+
+/// `vox agent status`
+#[derive(Args, Debug, Clone)]
+pub struct AgentStatusArgs {
+    #[command(flatten)]
+    pub profile: AccountArgs,
+    /// The harness this session runs in: `claude`, `codex` or `opencode`.
+    #[arg(long)]
+    pub harness: String,
+    /// The directory the session started in; else the current directory.
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
+}
+
+/// `vox agent connect`
+#[derive(Args, Debug, Clone)]
+pub struct AgentConnectArgs {
+    #[command(flatten)]
+    pub profile: AccountArgs,
+    /// The harness to wire: `claude`, `codex` or `opencode`.
+    pub harness: String,
+    /// The node's name: made if there is none, as `vox node create` makes it.
+    #[arg(long, required = true)]
+    pub node: String,
+    /// Read a new node's passphrase (or an existing one's, to attach it) from this file instead
+    /// of asking at the terminal (first line; `-` reads stdin).
+    #[arg(long)]
+    pub passphrase_file: Option<PathBuf>,
 }
 
 /// `vox agent doctor`
@@ -1338,6 +1405,15 @@ pub struct RoomReadArgs {
     /// been shown, and sit in their true place in history.
     #[arg(long, hide = true, conflicts_with = "hashes")]
     pub late: bool,
+    /// Only the messages tagged TAG (`task:#636`, `project:vox`, `milestone:v0.4.3`), as their
+    /// sender tagged them: a thread of one task, project or milestone. Repeat for messages
+    /// carrying every tag named.
+    #[arg(long, value_name = "TAG", conflicts_with_all = ["since", "late", "notices", "hashes"])]
+    pub tag: Vec<String>,
+    /// With `--tag`, only this member's messages: your name for it (`vox trust list`), its
+    /// fingerprint (`vox room roster`), or `you` for your own.
+    #[arg(long, value_name = "MEMBER", requires = "tag")]
+    pub from: Option<String>,
 }
 
 /// Selecting a room, by the prefix of its channelID as `vox` prints it.
@@ -1482,9 +1558,9 @@ impl AccountArgs {
 #[derive(Subcommand, Debug, Clone)]
 pub enum NodeCmd {
     /// Make a new node: an identity with its own rooms, trust and services. Its files are
-    /// written here; nothing is attached until it is used or `vox node attach`ed. The
+    /// written here, and it is attached and remembered at once, as `vox node attach` does. The
     /// passphrase comes from `--passphrase-file`, `VOX_IDENTITY_PASSPHRASE`, or is asked twice;
-    /// an empty one is refused, and nothing is created.
+    /// an empty one gives the node none, and says that its key is then kept unencrypted.
     Create {
         /// The node's name: letters a-z, digits, '.', '_' and '-'.
         name: String,
@@ -1498,19 +1574,43 @@ pub enum NodeCmd {
         #[command(flatten)]
         account: AccountArgs,
     },
-    /// Attach a node to the daemon by hand (starting the daemon if none runs). It runs in full
-    /// until `vox node detach` or the daemon stops. `--keep` attaches it again whenever the
-    /// daemon starts, with its passphrase from `--passphrase-file`.
+    /// Attach a node to the daemon by hand (starting the daemon if none runs), until `vox node
+    /// detach`. It is remembered: its passphrase is stored in the Keychain (none is needed for a
+    /// node made with none), and the daemon attaches it again by itself whenever it starts, after
+    /// an update or a reboot too. `--no-remember` stores nothing; `vox node forget-passphrase`
+    /// forgets it later. Where there is no Keychain, `--keep --passphrase-file` keeps it.
     Attach {
         /// The node.
         name: String,
-        /// Attach it again whenever the daemon starts.
-        #[arg(long)]
+        /// With `--passphrase-file`: keep it by that file, read by the daemon at each start,
+        /// instead of the Keychain.
+        #[arg(long, requires = "passphrase_file", conflicts_with = "no_remember")]
         keep: bool,
-        /// Read the identity passphrase from this file (first line). With `--keep`, the daemon
-        /// reads it from there at each start.
+        /// Attach it until it is detached or the daemon stops, and store nothing.
+        #[arg(long)]
+        no_remember: bool,
+        /// Read the identity passphrase from this file (first line).
         #[arg(long)]
         passphrase_file: Option<PathBuf>,
+        #[command(flatten)]
+        account: AccountArgs,
+    },
+    /// Rename a node on this machine: detached if attached, its directory, its remembered
+    /// passphrase and every harness wired to it moved to the new name, and attached again. Its
+    /// identity stays: the fingerprint, and all that peers see, are the same.
+    Rename {
+        /// The node's name now.
+        old: String,
+        /// Its new name: letters a-z, digits, '.', '_' and '-'.
+        new: String,
+        #[command(flatten)]
+        account: AccountArgs,
+    },
+    /// Forget a node's remembered passphrase: it is removed from the Keychain, and the daemon no
+    /// longer attaches the node by itself when it starts. An attached node stays attached.
+    ForgetPassphrase {
+        /// The node.
+        name: String,
         #[command(flatten)]
         account: AccountArgs,
     },
@@ -1545,14 +1645,31 @@ fn run_node_cmd(cmd: NodeCmd) -> ExitCode {
             passphrase_file,
             headless,
             account,
-        } => crate::client::node_create(&account.as_node_args(), &name, passphrase_file, headless),
+        } => block_on_client(async move {
+            crate::client::node_create(&account.as_node_args(), &name, passphrase_file, headless)
+                .await
+        }),
         NodeCmd::Attach {
             name,
             keep,
+            no_remember,
             passphrase_file,
             account,
         } => block_on_client(async move {
-            crate::client::node_attach(&account.as_node_args(), &name, keep, passphrase_file).await
+            crate::client::node_attach(
+                &account.as_node_args(),
+                &name,
+                keep,
+                no_remember,
+                passphrase_file,
+            )
+            .await
+        }),
+        NodeCmd::Rename { old, new, account } => block_on_client(async move {
+            crate::client::node_rename(&account.as_node_args(), &old, &new).await
+        }),
+        NodeCmd::ForgetPassphrase { name, account } => block_on_client(async move {
+            crate::client::node_forget_passphrase(&account.as_node_args(), &name).await
         }),
         NodeCmd::Detach { name, account } => block_on_client(async move {
             crate::client::node_detach(&account.as_node_args(), &name).await
@@ -1577,6 +1694,17 @@ fn run_node_cmd(cmd: NodeCmd) -> ExitCode {
 fn block_on_client<Fut>(work: Fut) -> Result<(), AppError>
 where
     Fut: std::future::Future<Output = Result<(), AppError>>,
+{
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(work)
+}
+
+/// Run a client's work that answers with words, on a small runtime of its own.
+fn block_on_said<Fut>(work: Fut) -> Result<String, AppError>
+where
+    Fut: std::future::Future<Output = Result<String, AppError>>,
 {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2125,7 +2253,8 @@ enum Cmd {
     /// Set up this machine: a node for each harness installed here, and one for you.
     ///
     /// Looks for Claude Code, Codex and OpenCode (their programs on `PATH`) and offers each
-    /// a node of its own, `<harness>-<host>`, with a passphrase you type, its hook installed
+    /// a node of its own, `<harness>-<host>` or a name you type (`skip` makes none), with a
+    /// passphrase you type, its hook installed
     /// in the harness's settings and the agent skill beside it. On macOS it also offers a
     /// node for you, which you may skip. It ends by printing every node it made: its
     /// fingerprint, with its art, and its alias, harness, host, OS and Vox version.
@@ -2403,6 +2532,10 @@ pub fn run() -> ExitCode {
                                 a.json,
                                 a.late,
                                 a.notices,
+                                &crate::room_cli::Tagged {
+                                    tags: a.tag.clone(),
+                                    from: a.from.clone(),
+                                },
                             )
                             .await
                         }
@@ -2825,13 +2958,9 @@ pub fn run() -> ExitCode {
                 eprintln!("vox: {e}");
                 return ExitCode::FAILURE;
             }
-            let paths = match account.node_paths(&node) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("vox: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
+            // **A hook makes no node directory** (#666): it may name a node that is not here,
+            // and says so; its paths are resolved as they are.
+            let paths = account.node_paths_as_they_are(&node);
             let daemon = crate::agent_hook::Daemon {
                 account,
                 node,
@@ -2934,6 +3063,41 @@ pub fn run() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Cmd::Agent(AgentCmd::Status(args)) => {
+            let dir = args
+                .dir
+                .clone()
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_default();
+            let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+            match block_on_said(async move {
+                crate::agent_setup::status(&args.profile.as_node_args(), &args.harness, &dir).await
+            }) {
+                Ok(said) => {
+                    print!("{said}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    e.exit_code()
+                }
+            }
+        }
+        Cmd::Agent(AgentCmd::Connect(args)) => match block_on_client(async move {
+            crate::agent_setup::connect(
+                &args.profile.as_node_args(),
+                &args.harness,
+                &args.node,
+                args.passphrase_file.clone(),
+            )
+            .await
+        }) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("vox: {e}");
+                e.exit_code()
+            }
+        },
         Cmd::Agent(AgentCmd::Trust(args)) => match args.harness.to_ascii_lowercase().as_str() {
             "codex" => match crate::codex_trust::trust(&args.codex) {
                 Ok(r) if r.found == 0 => {

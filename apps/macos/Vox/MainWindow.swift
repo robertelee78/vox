@@ -18,6 +18,8 @@ struct MainWindow: View {
                 NodeStopped(model: model)
                 Divider()
             }
+            // A repo with no room (ADR-029 RB-5): one banner across the window.
+            RoomAskBanner(model: model)
             NavigationSplitView {
                 // Dragged wider or narrower, and remembered (Columns).
                 Sidebar(model: model)
@@ -292,6 +294,11 @@ private struct NodeIdentity: View {
 private struct OnThisMachine: View {
     let nodes: [NodeSummary]
 
+    static func copy(_ words: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(words, forType: .string)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s4) {
             Hairline()
@@ -301,14 +308,36 @@ private struct OnThisMachine: View {
                 .padding(.top, Space.s8)
             ForEach(nodes, id: \.name) { node in
                 HStack {
-                    Text(node.name)
-                    Spacer()
-                    Text(node.state).secondaryText()
+                    HStack {
+                        Text(node.name)
+                        Spacer()
+                        Text(node.state).secondaryText()
+                    }
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("\(node.name) \(node.state)")
+                    .contextMenu {
+                        Button("Copy Name") { Self.copy(node.name) }
+                        if !node.fingerprint.isEmpty {
+                            Button("Copy Fingerprint") { Self.copy(node.fingerprint) }
+                        }
+                        // #666: in place of printing `vox node forget-passphrase`.
+                        if node.keep {
+                            Button("Forget Passphrase") {
+                                Task { await AppModel.shared.forgetPassphrase(node.name) }
+                            }
+                            .accessibilityIdentifier("machine-forget-\(node.name)")
+                        }
+                    }
+                    .accessibilityIdentifier("machine-\(node.name)")
+                    // A node that waits for its passphrase is attached from here, and remembered
+                    // (#666): it then attaches by itself after every restart.
+                    if node.state != "attached" {
+                        Button("Attach…") { AppModel.shared.attachNodeAsk = node.name }
+                            .buttonStyle(.link)
+                            .accessibilityLabel("Attach node \(node.name)")
+                            .accessibilityIdentifier("machine-attach-\(node.name)")
+                    }
                 }
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel("\(node.name) \(node.state)")
-                .copyMenu([("Copy Name", node.name), ("Copy Fingerprint", node.fingerprint)])
-                .accessibilityIdentifier("machine-\(node.name)")
             }
             Text("Separate identities. One daemon.").secondaryText()
                 .padding(.top, Space.s4)
@@ -757,11 +786,26 @@ private struct RoomView: View {
                                         } else if let notice = item.notice {
                                             // What was done to the room: a line among the
                                             // messages, not one of them (ADR-028 R-1, R-7).
-                                            Text(notice).secondaryText().italic()
-                                                .voxPadding(.horizontal, Space.s4)
-                                                .accessibilityIdentifier(item.id)
-                                                .reportsFrame(of: item.id)
-                                                .id(item.id)
+                                            VStack(alignment: .leading, spacing: Space.s4) {
+                                                Text(notice).secondaryText().italic()
+                                                    .accessibilityIdentifier(item.id)
+                                                if let command = item.command {
+                                                    HStack(spacing: Space.s8) {
+                                                        Text(command).font(.system(.body, design: .monospaced))
+                                                            .textSelection(.enabled)
+                                                            .accessibilityIdentifier("\(item.id)-command")
+                                                        Button("Copy") {
+                                                            NSPasteboard.general.clearContents()
+                                                            NSPasteboard.general.setString(command, forType: .string)
+                                                        }
+                                                        .accessibilityLabel("Copy the command")
+                                                        .accessibilityIdentifier("\(item.id)-copy")
+                                                    }
+                                                }
+                                            }
+                                            .voxPadding(.horizontal, Space.s4)
+                                            .reportsFrame(of: item.id)
+                                            .id(item.id)
                                         } else if let entry = item.entry, let session = model.shownSession,
                                                   let room = model.roomOnScreen {
                                             SessionEntryRow(model: model, room: room, session: session,
@@ -1485,6 +1529,20 @@ private struct MessageRow: View {
             if let card = message.card {
                 LinkCardView(card: card)
             }
+            if !message.tags.isEmpty {
+                // What it relates to, as its sender tagged it (#636): quiet, under it; each opens
+                // the room's thread of that tag.
+                HStack(spacing: Space.s8 * scale) {
+                    ForEach(message.tags, id: \.self) { tag in
+                        Button { model.showing = .tag(tag) } label: {
+                            Text(tag).caption().secondaryText()
+                        }
+                        .buttonStyle(.plain)
+                        .help("Show the room's messages tagged \(tag)")
+                        .accessibilityIdentifier("tag-\(message.id)-\(tag)")
+                    }
+                }
+            }
             if !pulledBy.isEmpty {
                 // No label of its own: a selectable Text with one sends SwiftUI's accessibility
                 // into endless recursion. Its words are what it says.
@@ -1524,6 +1582,7 @@ private struct MessageRow: View {
             said += message.owed ? "not received yet" : message.text
         }
         if let card = message.card, !card.title.isEmpty { said += ", link: \(card.title)" }
+        if !message.tags.isEmpty { said += ", tagged \(message.tags.joined(separator: ", "))" }
         if !pulledBy.isEmpty { said += ", pulled by \(pulledBy.joined(separator: ", "))" }
         if !readBy.isEmpty {
             said += ", read by \(readBy.joined(separator: ", "))"
@@ -1636,6 +1695,39 @@ private struct RoomHeader: View {
     let room: String
 
     var body: some View {
+        HStack(alignment: .center, spacing: 8) {
+            facts
+            // The room by tag (#636): a thread of one task, project or milestone, from the tags of
+            // the messages this node can read.
+            if !model.roomTags.isEmpty || tagShown != nil {
+                Menu {
+                    Button("All messages") { model.showing = .general }
+                        .disabled(tagShown == nil)
+                    Divider()
+                    ForEach(model.roomTags, id: \.self) { tag in
+                        Button(tag) { model.showing = .tag(tag) }
+                    }
+                } label: {
+                    Label(tagShown ?? "Tags", systemImage: "tag")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("Show only the messages carrying a tag")
+                .accessibilityIdentifier("room-tag-filter")
+            }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .navigationTitle(model.roomName(room))
+        .navigationSubtitle(model.roomHeaderMeta)
+    }
+
+    /// The tag whose thread is on screen, if one is.
+    private var tagShown: String? {
+        if case .tag(let tag) = model.showing { return tag }
+        return nil
+    }
+
+    private var facts: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text("ROOM").eyebrow().secondaryText()
             Text(model.roomName(room)).fontWeight(.semibold)
@@ -1649,9 +1741,6 @@ private struct RoomHeader: View {
                 .accessibilityIdentifier("room-header-meta")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 12).padding(.vertical, 8)
-        .navigationTitle(model.roomName(room))
-        .navigationSubtitle(model.roomHeaderMeta)
     }
 }
 
@@ -1927,6 +2016,15 @@ private struct Inspector: View {
                             Text(Capability.words(member.drive)).eyebrow().secondaryText()
                                 .padding(.leading, Space.s20)
                                 .accessibilityIdentifier("member-capability-\(member.name)")
+                        }
+                        // What is said of it about this node's key (ADR-030 D-5, W-4): that the key
+                        // waits, and why, or that it runs an older Vox and reads without
+                        // post-compromise protection until it updates.
+                        if let said = member.keyWaits {
+                            Text("\(member.name) \(said)").secondaryText()
+                                .fixedSize(horizontal: false, vertical: true)
+                                .padding(.leading, Space.s20)
+                                .accessibilityIdentifier("member-key-waits-\(member.name)")
                         }
                         // The platform its node says it runs on (ADR-020 §4.9b): its claim, said
                         // as one.

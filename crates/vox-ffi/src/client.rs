@@ -141,6 +141,9 @@ pub struct RoomMessage {
     /// The platform its author's node says it runs on, when it is a `hello` that says so (ADR-020
     /// §4.9b): that node's claim, not checked.
     pub platform: Option<NodePlatform>,
+    /// What it relates to, as its sender tagged it (#636): `task:#636`, `project:vox`, each on
+    /// one line and cut, sorted. Shown only to those who can read the message.
+    pub tags: Vec<String>,
 }
 
 /// The OS, OS version and CPU architecture a node says it runs on, from its `hello` (ADR-020
@@ -423,6 +426,14 @@ pub fn no_backup_notice() -> String {
     vox_text::node::NO_BACKUP.to_owned()
 }
 
+/// What a person is told when a node is made with no identity passphrase, as `vox node create`
+/// says it (ADR-005 J-2, V030-36): the key is kept unencrypted.
+#[uniffi::export]
+#[must_use]
+pub fn no_passphrase_notice() -> String {
+    vox_text::node::NO_PASSPHRASE.to_owned()
+}
+
 /// The group a room's unread counts, by [`UnreadLevel`], put it in: the TUI's rule
 /// (`vox_agentcomms::attention::group`).
 #[uniffi::export]
@@ -457,6 +468,10 @@ pub struct Member {
     pub fingerprint: String,
     /// This node's name for it, from the keyring; empty when it has none.
     pub name: String,
+    /// What is said of it about this node's key in the room, after its name, if anything (ADR-030
+    /// D-5, W-4): that the key waits, and why, or that it runs an older Vox. As `vox room roster`
+    /// says it.
+    pub key_waits: Option<String>,
 }
 
 /// An entry of the trust keyring.
@@ -511,6 +526,33 @@ pub struct RoomLink {
     pub url: String,
     /// What it carries, in words; empty when there is nothing to say.
     pub note: String,
+}
+
+/// A directory harness sessions started in with no room bound to it (ADR-029 RB-5): what Vox asks
+/// the person, under needs you.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RoomAskInfo {
+    /// The directory, absolute: what the answer names.
+    pub dir: String,
+    /// What it says: "Claude Code in /opt/vox has no room".
+    pub sentence: String,
+    /// The room the room map binds it to already, its id in base32, which the sessions' nodes
+    /// are not in (RB-5a); empty when no room is bound to it. Answered by
+    /// [`VoxClient::bind_room`] with an empty link.
+    pub room: String,
+    /// The nodes of the sessions waiting, each once, in the order they asked.
+    pub nodes: Vec<String>,
+    /// How many sessions wait on the answer.
+    pub sessions: u32,
+}
+
+/// What binding or declining an ask did: whether it was done, and its lines, said for a person.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RoomAnswerInfo {
+    /// It was done.
+    pub done: bool,
+    /// What was done, or why not.
+    pub said: Vec<String>,
 }
 
 /// What is shared in a room, and what this node offers there, as `vox service list` says it.
@@ -1271,6 +1313,15 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str
         image,
         card,
         platform,
+        tags: vox_core::node::api::message_tags(&row.text)
+            .iter()
+            .map(|t| {
+                vox_agentcomms::envelope::shown(
+                    t,
+                    vox_agentcomms::envelope::MAX_TAG + "milestone:".len(),
+                )
+            })
+            .collect(),
     }
 }
 
@@ -1456,6 +1507,17 @@ impl VoxClient {
         .await
     }
 
+    /// A bind or a no for an ask, and what the daemon said of it.
+    async fn room_answer(&self, req: DaemonRequest) -> Result<RoomAnswerInfo, VoxError> {
+        match self.daemon(req).await? {
+            DaemonFrame::RoomAnswer { done, said } => Ok(RoomAnswerInfo { done, said }),
+            _ => Err(failed(
+                "the vox daemon did not answer for the room map; restart it so it is this vox's \
+                 version",
+            )),
+        }
+    }
+
     /// A room created or joined: the one in `after` that was not in `before`.
     async fn new_room(
         &self,
@@ -1630,12 +1692,12 @@ impl VoxClient {
     }
 
     /// Make node `node` on this machine, as `vox node create` does: its identity sealed under
-    /// `passphrase` (every node has one: an empty one is refused, ADR-028 K-11), with its prekey
+    /// `passphrase` (an empty one gives none, ADR-005 J-2, V030-36), with its prekey
     /// ring, in this client's data root; nothing goes over the socket. Returns its fingerprint,
     /// base32. Attach it next with [`VoxClient::attach`].
     ///
     /// # Errors
-    /// A name a node cannot have, a node by that name already, an empty passphrase, another vox
+    /// A name a node cannot have, a node by that name already, another vox
     /// holding the node's directory, or one that cannot be written.
     pub async fn create_node(
         &self,
@@ -1740,14 +1802,15 @@ impl VoxClient {
         passphrase: Option<Arc<Passphrase>>,
     ) -> Result<(), VoxError> {
         let name = NodeName::parse(&node).map_err(|e| failed(e.to_string()))?;
-        let keep = if passphrase.is_some() {
-            KeepSource::Keychain(String::new())
-        } else {
-            KeepSource::None
+        let passphrase = passphrase.as_ref().map(|p| p.copy());
+        // An empty passphrase is a node made with none (ADR-005 J-2): nothing is stored for it.
+        let keep = match &passphrase {
+            Some(p) if !p.is_empty() => KeepSource::Keychain(String::new()),
+            _ => KeepSource::None,
         };
         let req = DaemonRequest::Attach {
             node: name,
-            passphrase: passphrase.as_ref().map(|p| p.copy()),
+            passphrase,
             keep: Some(keep),
             rooms: Vec::new(),
             anchors: Vec::new(),
@@ -1864,16 +1927,23 @@ impl VoxClient {
         let channel_id = digest(&room, "room id")?;
         on_held!(self, |c| {
             let names = names(c).await?;
-            match ask(c, &Request::Roster { channel_id }).await? {
-                Frame::Members { members } => Ok(members
-                    .into_iter()
-                    .map(|m| Member {
-                        fingerprint: b32_encode(&m),
-                        name: names.get(&m).cloned().unwrap_or_default(),
-                    })
-                    .collect()),
-                other => Err(unexpected(&other)),
-            }
+            let members = match ask(c, &Request::Roster { channel_id }).await? {
+                Frame::Members { members } => members,
+                other => return Err(unexpected(&other)),
+            };
+            let waits: std::collections::HashMap<Digest32, String> =
+                match ask(c, &Request::KeyWaits { channel_id }).await {
+                    Ok(Frame::KeyWaits { waits }) => waits.into_iter().collect(),
+                    _ => std::collections::HashMap::new(),
+                };
+            Ok(members
+                .into_iter()
+                .map(|m| Member {
+                    fingerprint: b32_encode(&m),
+                    name: names.get(&m).cloned().unwrap_or_default(),
+                    key_waits: waits.get(&m).cloned(),
+                })
+                .collect())
         })
     }
 
@@ -1908,6 +1978,43 @@ impl VoxClient {
             )
             .await?
             {
+                Frame::Rows { rows } => Ok(rows
+                    .iter()
+                    .map(|r| rendered(r, &names, me.as_deref()))
+                    .collect()),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
+    /// A room's messages tagged `tag` (#636), in the order they arrived: a thread of one task,
+    /// project or milestone, found through the node's index of the tags of what it can read.
+    ///
+    /// # Errors
+    /// A malformed id or tag, or the node's refusal (a closed room, or a node from before tags).
+    pub async fn read_tagged(
+        &self,
+        room: String,
+        tag: String,
+    ) -> Result<Vec<RoomMessage>, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        if !vox_agentcomms::envelope::is_valid_tag(&tag) {
+            return Err(failed(
+                "not a tag: use task:, project: or milestone: and a value",
+            ));
+        }
+        on_held!(self, |c| {
+            let names = names(c).await?;
+            let me = c.me().map(|f| b32_encode(&f));
+            let frame = c
+                .read_tagged(channel_id, std::slice::from_ref(&tag), None)
+                .await
+                .map_err(|e| VoxError::Unknown {
+                    reason: format!(
+                        "the vox daemon stopped answering before it said whether this was done: {e}"
+                    ),
+                })?;
+            match answered(frame)? {
                 Frame::Rows { rows } => Ok(rows
                     .iter()
                     .map(|r| rendered(r, &names, me.as_deref()))
@@ -2209,6 +2316,70 @@ impl VoxClient {
                 .collect()),
             other => Err(unexpected(&other)),
         })
+    }
+
+    /// The directories harness sessions started in with no room bound to them, which the person
+    /// has not said no for (ADR-029 RB-5): one per directory, as the daemon works them out.
+    ///
+    /// # Errors
+    /// The daemon did not answer.
+    pub async fn room_asks(&self) -> Result<Vec<RoomAskInfo>, VoxError> {
+        match self.daemon(DaemonRequest::RoomAsks).await? {
+            DaemonFrame::RoomAsks(asks) => Ok(asks
+                .into_iter()
+                .map(|a| {
+                    let mut nodes: Vec<String> = Vec::new();
+                    for s in &a.sessions {
+                        if !nodes.iter().any(|n| n == s.node.as_str()) {
+                            nodes.push(s.node.to_string());
+                        }
+                    }
+                    RoomAskInfo {
+                        sentence: a.sentence(),
+                        sessions: u32::try_from(a.sessions.len()).unwrap_or(u32::MAX),
+                        nodes,
+                        dir: a.dir,
+                        room: a.room,
+                    }
+                })
+                .collect()),
+            _ => Err(failed(
+                "the vox daemon did not list what waits for a room; restart it so it is this \
+                 vox's version",
+            )),
+        }
+    }
+
+    /// Bind the directory `dir` to the room `link` names (ADR-029 RB-6), the person's answer to
+    /// its ask: what `vox room join <link> --node <node> --bind <dir>` does. The room's
+    /// `passphrase` is the person's, typed in the app, and never an agent's; empty when it has
+    /// none. Every session waiting there is put in the room. With `link` empty, the nodes join
+    /// the room the room map binds `dir` to already, with the map's own link and passphrase
+    /// (RB-5a), and `passphrase` is not used.
+    ///
+    /// # Errors
+    /// The daemon did not answer.
+    pub async fn bind_room(
+        &self,
+        dir: String,
+        link: String,
+        passphrase: Arc<Passphrase>,
+    ) -> Result<RoomAnswerInfo, VoxError> {
+        let request = DaemonRequest::RoomBind {
+            dir,
+            link: link.trim().to_owned(),
+            passphrase: passphrase.copy(),
+        };
+        self.room_answer(request).await
+    }
+
+    /// Say no for the directory `dir` (ADR-029 RB-7): it stays tied to no room, and no session
+    /// started there is asked again.
+    ///
+    /// # Errors
+    /// The daemon did not answer.
+    pub async fn decline_room(&self, dir: String) -> Result<RoomAnswerInfo, VoxError> {
+        self.room_answer(DaemonRequest::RoomDecline { dir }).await
     }
 
     /// Dismiss the offer of the node `fingerprint` (ADR-028 K-18): kept by the node, on this node

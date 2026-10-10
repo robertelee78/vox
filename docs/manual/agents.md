@@ -14,8 +14,11 @@ vox setup
 ```
 
 `vox setup` looks for Claude Code, Codex and OpenCode on `PATH` and offers each a node of its own,
-`<harness>-<host>`, with a passphrase you type, its hook in the harness's settings and the agent
-skill beside it. It says what it is to do before each one:
+`<harness>-<host>` unless you type another name, with a passphrase you type, its hook in the
+harness's settings and the agent skill beside it. It says what it is to do before each one, then
+asks for the node's name: Enter keeps the suggestion, a name you type is checked as `vox node
+create` checks it (a refused one says why and is asked again), and `skip` makes no node for that
+harness:
 
 ```text
 vox setup: looking for harnesses on this machine (their programs on PATH)
@@ -23,10 +26,10 @@ vox setup: looking for harnesses on this machine (their programs on PATH)
   Codex        not found
   OpenCode     found: /usr/local/bin/opencode
 
-Claude Code is to get a node of its own, claude-mac, with a passphrase you type.
+Claude Code is to get a node of its own, claude-mac unless you name it, with a passphrase you type.
   its hook, `vox agent hook --node claude-mac`, is to go in ~/.claude/settings.json, with VOX_NODE=claude-mac for its sessions; other Vox hook entries there are replaced, nothing else
   the agent skill pack is to be installed in ~/.claude/skills/vox-agent-comms; a file there you changed is kept
-Create claude-mac and wire Claude Code to it? [Y/n]
+a node for Claude Code [claude-mac] (Enter keeps it, or type another name; skip makes none):
 ```
 
 Your settings file keeps the rest of its content in its own order. For Codex, setup also keeps
@@ -49,6 +52,28 @@ attach each in a terminal, `vox node attach claude-mac`, as below. Then map the 
 agent works in to their rooms, so each session it starts works in the right one (see
 [the room a session works in](sessions.md#the-room-a-session-works-in)).
 
+## A session in a harness that has no node yet
+
+You need not run `vox setup` first. Installing or updating Vox puts the agent skill in every
+harness here, and the skill has each session start by checking:
+
+```sh
+vox agent status --harness claude     # codex, opencode
+```
+
+It only reads. It says the first thing this harness needs before the session works in a room,
+and the one command for it, which the session repeats to you to run in a terminal of your own
+(any passphrase is asked for there, never in the session):
+
+- **No node for this harness**: choose a name, and run `vox agent connect claude --node
+  claude-mac`. It says what it is to do, makes the node (you type its passphrase twice, or Enter alone twice for none), wires
+  Claude Code's hook to it in its settings with the skill beside it, and attaches it. For Codex,
+  run `vox agent trust codex` after it. Then start a new session.
+- **Its node is not attached**: `vox node attach claude-mac`. Then start a new session.
+- **This repo is tied to no room**: the session asks for the room's link, and gives you the
+  `vox room join <link> --node claude-mac --bind <this repo>` command to run (see [the room a
+  session works in](sessions.md#the-room-a-session-works-in)).
+
 The rest of this chapter is what setup does for you, done by hand, and what to check after.
 
 ## Give the agent its own node and room
@@ -60,12 +85,14 @@ vox node create claude-mbp
 vox node attach claude-mbp
 ```
 
-Run both in a terminal outside the agent's session: each asks for the node's passphrase, which
-every node has. The agent's hook registers its session with the daemon at each turn, starting the
-daemon if none runs, but it never attaches the node and never takes a passphrase: with the node
-not attached, it tells the agent so, with the command for you to run, `vox node attach
-claude-mbp`. `vox node attach claude-mbp --keep --passphrase-file PATH` also attaches it again
-whenever the daemon starts, reading the passphrase from that private file. A keyring change for
+Run both in a terminal outside the agent's session: each asks for the node's passphrase, or Enter
+for none. The node is attached at once and remembered, so the daemon attaches it again by itself
+whenever it starts, after an update or a reboot too. The agent's hook registers its session with
+the daemon at each turn, starting the daemon if none runs, but it never attaches the node and
+never takes a passphrase: with the node not attached, it tells the agent so once in the session,
+with the command for you to run, `vox node attach claude-mbp`, and a notification tells you too.
+`vox setup` and `vox agent connect` leave a harness that is connected to a node already as it is:
+`Claude Code is connected to node claude-mbp; left as it is`. A keyring change for
 the agent's node, such as `vox trust add FULL_FINGERPRINT --node claude-mbp`, is typed by you in a
 terminal too ([an agent's node](keyring.md#an-agents-node)).
 
@@ -233,6 +260,24 @@ vox room renew ROOM_ID 'gwa:OWNER/REPO:WORK_KEY'
 vox room handoff ROOM_ID 'gwa:OWNER/REPO:WORK_KEY' --to RECIPIENT_FINGERPRINT
 vox room release ROOM_ID 'gwa:OWNER/REPO:WORK_KEY'
 ```
+
+## Tag a message with its task, project and milestone
+
+A message about tracked work can say which: `--task`, `--project` and `--milestone` tag it, and
+`--work` tags it with that item as its task. `post`, `claim`, `release`, `handoff`, `renew` and
+`decline` all take them. Tag only what a message is about.
+
+```sh
+vox room post ROOM_ID --task '#636' --project vox --milestone v0.4.3 "the index is in"
+vox room read ROOM_ID --tag 'task:#636'                     # the task's thread
+vox room read ROOM_ID --tag 'milestone:v0.4.3' --from bob   # bob's messages about it
+```
+
+A tag is part of its message, sealed with it: only the members who can read the message see its
+tags, and a member who cannot read it finds none of them. `--tag` may be repeated, for messages
+carrying every tag named; `--from` takes your name for a member, its fingerprint, or `you`. In the
+TUI, `:tag task:#636` shows the thread and `:general` returns to the room. A node older than
+v0.4.3 reads a tagged message's text and does not show its tags.
 
 Renew extends the holding; a recipient completes a handoff by claiming it. Release means
 “I do not hold it now”, not “the work is done”. A TTL lets abandoned holdings lapse. If the

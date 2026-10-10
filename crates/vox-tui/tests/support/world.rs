@@ -368,7 +368,7 @@ impl Drop for VoxProc {
 /// daemon that attach started gone, so the proof's next `vox serve` or `vox daemon` starts the
 /// data root's daemon with its own `--listen` and `--anchor`.
 pub fn vox_once_attached(data: &Path, args: &[String]) -> (bool, String, String) {
-    attach::Root::at(data, IDENTITY).attached(DEFAULT_NODE, || vox_once(data, args))
+    attach::Root::at(data, IDENTITY).attached(&layout::the_node(data), || vox_once(data, args))
 }
 
 /// The verbs that refuse a node no daemon holds (ADR-026 L-2, ruled): a person attaches the node

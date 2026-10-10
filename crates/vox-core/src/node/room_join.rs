@@ -67,7 +67,7 @@ impl Joins {
 const FAILED: &str = "could not join room";
 
 /// Start joining `room` from `link` with `passphrase`, and open `session`'s Session once the node is
-/// a member. Returns at once: how it goes is told to the session on its next turn
+/// a member; a headless run (`None`) joins and opens none (ADR-029 RB-3, SE-1). Returns at once: how it goes is told to the session on its next turn
 /// ([`Joins::status`]). A join of `room` already running is left to finish; this one is dropped.
 pub fn join_in_background(
     handle: &NodeHandle,
@@ -75,7 +75,7 @@ pub fn join_in_background(
     room: &str,
     link: &str,
     passphrase: Zeroizing<String>,
-    session: Opening,
+    session: Option<Opening>,
 ) {
     if !joins
         .running
@@ -112,15 +112,24 @@ pub fn join_in_background(
             })
             .await;
         let said = match outcome {
-            crate::node::api::Outcome::Done => match crate::node::link::b32_decode(&room, "room") {
-                Ok(id) => crate::node::sessions::open_when_member(&handle, id, &session)
-                    .await
-                    .err()
-                    .map(|e| {
-                        format!("joined room {named}, and could not open this session there: {e}")
-                    }),
-                Err(e) => Some(format!("joined room {named}, and could not name it: {e}")),
-            },
+            crate::node::api::Outcome::Done => {
+                match (crate::node::link::b32_decode(&room, "room"), &session) {
+                    (_, None) => None,
+                    (Ok(id), Some(session)) => {
+                        crate::node::sessions::open_when_member(&handle, id, session)
+                            .await
+                            .err()
+                            .map(|e| {
+                                format!(
+                                "joined room {named}, and could not open this session there: {e}"
+                            )
+                            })
+                    }
+                    (Err(e), Some(_)) => {
+                        Some(format!("joined room {named}, and could not name it: {e}"))
+                    }
+                }
+            }
             other => Some(format!("{FAILED} {named}: {other}")),
         };
         joins.set_status(&room, said);

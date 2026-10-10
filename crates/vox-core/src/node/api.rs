@@ -257,6 +257,10 @@ pub struct StructuredIndex {
     pub by_type: std::collections::BTreeMap<String, Chunks<u32>>,
     /// The posts carrying an operation id, by a hash of the id.
     pub by_op: OpRuns,
+    /// Positions in the timeline, oldest first, of the messages carrying each tag (#636). Built
+    /// from rendered rows, so only from messages this node can read: a tag is part of its
+    /// message, and a node that cannot open the message holds no tag of it.
+    pub by_tag: std::collections::BTreeMap<String, Chunks<u32>>,
 }
 
 impl std::fmt::Debug for StructuredIndex {
@@ -271,6 +275,7 @@ impl std::fmt::Debug for StructuredIndex {
                     .collect::<Vec<_>>(),
             )
             .field("by_op", &self.by_op.len())
+            .field("by_tag", &self.by_tag.len())
             .finish()
     }
 }
@@ -385,18 +390,49 @@ pub fn structured_kind(text: &str) -> Option<(String, Option<String>)> {
     Some((kind, op))
 }
 
+/// The tags a message's text carries (#636): its envelope's `tags`, each a valid tag
+/// ([`vox_agentcomms::envelope::is_valid_tag`]), none for prose or an envelope without them.
+#[must_use]
+pub fn message_tags(text: &str) -> Vec<String> {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with('{') {
+        return Vec::new();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return Vec::new();
+    };
+    let mut tags: Vec<String> = value
+        .get("tags")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .filter(|t| vox_agentcomms::envelope::is_valid_tag(t))
+        .take(vox_agentcomms::envelope::MAX_TAGS)
+        .map(str::to_owned)
+        .collect();
+    tags.sort();
+    tags.dedup();
+    tags
+}
+
 impl StructuredIndex {
     /// This index with the bodies of the rows at `start..` of a timeline added.
     #[must_use]
     pub fn appended<'a>(&self, start: usize, texts: impl IntoIterator<Item = &'a String>) -> Self {
         let mut by_type: std::collections::BTreeMap<String, Vec<u32>> =
             std::collections::BTreeMap::new();
+        let mut by_tag: std::collections::BTreeMap<String, Vec<u32>> =
+            std::collections::BTreeMap::new();
         let mut ops = Vec::new();
         for (i, text) in texts.into_iter().enumerate() {
+            let at = u32::try_from(start + i).unwrap_or(u32::MAX);
+            for tag in message_tags(text) {
+                by_tag.entry(tag).or_default().push(at);
+            }
             let Some((kind, op)) = structured_kind(text) else {
                 continue;
             };
-            let at = u32::try_from(start + i).unwrap_or(u32::MAX);
             by_type.entry(kind).or_default().push(at);
             if let Some(op) = op {
                 ops.push((op_hash(&op), at));
@@ -407,8 +443,31 @@ impl StructuredIndex {
             let entry = next.by_type.entry(kind).or_default();
             *entry = entry.appended(at);
         }
+        for (tag, at) in by_tag {
+            let entry = next.by_tag.entry(tag).or_default();
+            *entry = entry.appended(at);
+        }
         next.by_op = next.by_op.appended(ops);
         next
+    }
+
+    /// The positions of the messages carrying every tag in `tags`, oldest first (#636): read from
+    /// the index, never from the room's history. No tags, no positions.
+    #[must_use]
+    pub fn tagged(&self, tags: &[String]) -> Vec<u32> {
+        let mut lists = tags.iter().map(|t| self.by_tag.get(t));
+        let Some(Some(first)) = lists.next() else {
+            return Vec::new();
+        };
+        let mut out: Vec<u32> = first.iter().copied().collect();
+        for list in lists {
+            let Some(list) = list else {
+                return Vec::new();
+            };
+            let set: std::collections::BTreeSet<u32> = list.iter().copied().collect();
+            out.retain(|p| set.contains(p));
+        }
+        out
     }
 
     /// The positions of the posts of any type in `types`, and of those whose operation id hashes
@@ -573,6 +632,10 @@ pub struct ChannelDetail {
 pub struct NodeView {
     /// The profile's identity, or `None` before one is created.
     pub identity: Option<IdentityInfo>,
+    /// `(room, member, said)`: what is said of a member about this identity's key, after its name
+    /// (ADR-030 D-5, W-4): that the key waits, and why, or that it runs an older Vox and reads
+    /// without post-compromise protection. In room and member order.
+    pub key_waits: Vec<(Digest32, Digest32, String)>,
     /// Whether the identity is locked (no signer in memory).
     pub locked: bool,
     /// Whether a lock is under way: the identity is locked and refuses new work, and the node is
@@ -1018,7 +1081,9 @@ pub enum Fault {
     /// ADR-028 K-12). Not
     /// [`Fault::WrongPassphrase`]: none was given, and the client asks for it and tries again.
     PassphraseNeeded,
-    /// An identity was to be made with an empty passphrase: every node has one (ADR-028 K-11).
+    /// An identity was to be made with an empty passphrase, refused by v0.4.0 to v0.4.2 (ADR-028
+    /// K-11 before its amendment). No longer sent: an empty one is taken (ADR-005 J-2); kept so
+    /// an older daemon's refusal still reads.
     PassphraseEmpty,
     /// The trust keyring already holds its maximum number of identities
     /// (`trust::MAX_TRUSTED`). Not [`Fault::TooLong`]: nothing the person typed was too

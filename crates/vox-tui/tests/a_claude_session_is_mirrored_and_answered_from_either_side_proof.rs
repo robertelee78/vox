@@ -101,6 +101,11 @@ impl World {
             .env("VOX_IDENTITY_PASSPHRASE", format!("pass of {node}"))
             .env("VOX_NODE", node)
             .env("VOX_LISTEN", "127.0.0.1:0")
+            // Test-only (`test-knobs`): while this file exists the daemon opens no key-package.
+            .env(
+                "VOX_TEST_HOLD_PACKAGES_FILE",
+                self.root.join("hold-packages"),
+            )
             .args(args);
         c
     }
@@ -151,8 +156,13 @@ impl World {
     /// Claude Code running its hook for `event`: `vox agent hook --node claude-a --room ROOM`,
     /// with the event's JSON on stdin and Claude Code's environment for an interactive session.
     fn hook(&self, room: &str, event: &serde_json::Value) -> Child {
+        self.hook_as(AGENT, room, event)
+    }
+
+    /// [`Self::hook`] for a harness wired to `node`.
+    fn hook_as(&self, node: &str, room: &str, event: &serde_json::Value) -> Child {
         let mut child = self
-            .command(AGENT, &["agent", "hook", "--node", AGENT, "--room", room])
+            .command(node, &["agent", "hook", "--node", node, "--room", room])
             .env("CLAUDE_CODE_ENTRYPOINT", "cli")
             .current_dir(self.root.join("work"))
             .stdin(Stdio::piped())
@@ -759,6 +769,18 @@ impl StandIn {
         }
     }
 
+    /// Write one line to the stand-in's control: `ask` puts up a permission prompt, `unask` takes
+    /// it down.
+    fn control(&self, line: &str) {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.control)
+            .unwrap_or_else(|e| panic!("APPARATUS: the stand-in's control: {e}"));
+        writeln!(f, "{line}").unwrap_or_else(|e| panic!("APPARATUS: the stand-in's control: {e}"));
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
     fn exit(&self) {
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -856,6 +878,13 @@ const S8: &str = "88888888-1111-4000-8000-000000000008";
 ///
 /// 1. two sessions in one server: each one's text, Esc, Ctrl-C and slash command reach only its
 ///    own pane;
+///    1b. a slash command with an argument (`/rename frogs`) reaches the pane whole and the
+///    Session says it whole; the name Claude Code then writes into the transcript, with no hook
+///    run (a `/rename` runs none), renames the Session within 15 s;
+///    1c. while the session asks for permission in its terminal (its input box replaced by the
+///    prompt), `--say "1"` and `--slash` are refused, saying it is asking something, and the prompt
+///    gets no key; once the prompt is gone, `--say` reaches the session; a prompt that comes up as
+///    the keys arrive gets no Enter, and the driver is told the keys may have reached it;
 /// 2. a sub-agent's hook leaves its session's binding as it was;
 /// 3. a session started through a wrapper (a shell script, not exec'd) is still bound;
 /// 4. the pane swapped with another and moved to a new window: input follows the pane;
@@ -877,7 +906,9 @@ const S8: &str = "88888888-1111-4000-8000-000000000008";
 ///
 /// **Mutations, one per check that can fail on its own:** the injector types into the first pane
 /// of the server (arm 1); the session's process must be the hook's own parent (arm 3); the
-/// pane is recorded by its position, not its id (arm 4); one session per pane ignores the server
+/// pane is recorded by its position, not its id (arm 4); the slash line said by its command alone,
+/// or the transcript not read for a name (arm 1b, `…--reads2--v043-rename-*` mutants); an input box that cannot be found taken
+/// for one that took the text (arm 1c); one session per pane ignores the server
 /// (arm 5); the hook's ancestry not required to reach the pane (arm 6); the session's process not
 /// checked at the send (arm 7); one session per pane not kept (arm 8); a later hook not rebinding
 /// (arm 9); a tool hook not registering (arm 10); the session not told where its file landed
@@ -946,6 +977,124 @@ fn a_driver_reaches_exactly_the_session_it_names_or_is_told_why() {
             "PRODUCT: arm 1: {act:?} must reach {S1}'s pane alone; vox said {said:?}"
         );
     }
+
+    // ---- 1b. a slash command with its argument arrives whole, and is said whole; the name the
+    // harness gives it after (a `/rename`, which runs no hook) renames the Session (v0.4.3) ----
+    let (ok, said) = drive(&w, &room, S1, &["--slash", "/rename frogs"]);
+    println!("[proof] 1b. --slash \"/rename frogs\" to {S1}: {said}");
+    assert!(
+        ok && a.got(
+            &serde_json::json!({ "typed": "/rename frogs" }),
+            Duration::from_secs(10)
+        ),
+        "PRODUCT: arm 1b: \"/rename frogs\" must reach {S1}'s pane whole; vox said {said:?}"
+    );
+    let t0 = Instant::now();
+    let mut read = String::new();
+    while t0.elapsed() < Duration::from_secs(30) && !read.contains("/rename frogs sent by") {
+        read = w.vox(PERSON, &["room", "session", &room, S1], None).1;
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    assert!(
+        read.contains("/rename frogs sent by"),
+        "PRODUCT: arm 1b: {S1}'s Session must say the slash command as sent, \"/rename frogs sent \
+         by …\"; `vox room session` says: {}",
+        read.lines().rev().take(6).collect::<Vec<_>>().join(" | ")
+    );
+    // Claude Code writes the new name into the session's transcript and runs no hook: the stand-in
+    // does the same, appending the line Claude Code 2.1.29x writes.
+    {
+        use std::io::Write as _;
+        let t = w.root.join("work").join(format!("{S1}.jsonl"));
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&t)
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot open {S1}'s transcript: {e}"));
+        // Claude Code's own title first (what an earlier "cc rename frogs" made it, as the
+        // decider's session had), then the name the person set: the person's must win, exactly.
+        for line in [
+            serde_json::json!({ "type": "ai-title", "aiTitle": "Frogs rename", "sessionId": S1 }),
+            serde_json::json!({ "type": "custom-title", "customTitle": "frogs", "sessionId": S1 }),
+        ] {
+            writeln!(f, "{line}")
+                .unwrap_or_else(|e| panic!("APPARATUS: cannot write {S1}'s transcript: {e}"));
+        }
+    }
+    let t0 = Instant::now();
+    let mut named = String::new();
+    let renamed = loop {
+        let (_, out, _) = w.vox(PERSON, &["room", "sessions", &room, "--json"], None);
+        named = out
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["session"].as_str() == Some(S1) || v["id"].as_str() == Some(S1))
+            .map(|v| v["name"].to_string())
+            .unwrap_or(named);
+        if named == "\"frogs\"" {
+            break true;
+        }
+        if t0.elapsed() > Duration::from_secs(15) {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    assert!(
+        renamed,
+        "PRODUCT: arm 1b: renamed \"frogs\" by its person in its transcript, after Claude Code's own \
+         title \"Frogs rename\" and with no hook run, {S1}'s Session must be called exactly \
+         \"frogs\" within 15 s; `vox room sessions --json` says its name is {named}"
+    );
+    println!("[proof] 1b. \"/rename frogs\" arrived whole and is said whole; the transcript's rename named the Session \"frogs\" with no hook run");
+
+    // ---- 1c. Claude Code asking a question in its terminal: nothing typed answers it ----
+    a.control("ask");
+    let asked = Instant::now();
+    while !t.screen(&p1).contains("Do you want to proceed?") {
+        assert!(
+            asked.elapsed() < Duration::from_secs(10),
+            "APPARATUS: arm 1c: the stand-in's permission prompt did not show in {p1}: {}",
+            t.screen(&p1)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for act in [vec!["--say", "1"], vec!["--slash", "/compact"]] {
+        let (ok, said) = drive(&w, &room, S1, &act);
+        println!("[proof] 1c. {act:?} to {S1} while it asks for permission: {said}");
+        let answered = a.said().lines().any(|l| l.contains("\"answered\""));
+        assert!(
+            !ok && said.contains("asking something in its terminal") && !answered,
+            "PRODUCT: arm 1c: while {S1} asks for permission in its terminal, {act:?} must be \
+             refused with why and type nothing (typed keys answer the prompt); vox said {said:?}, \
+             and the prompt got: {:?}",
+            a.said()
+                .lines()
+                .filter(|l| l.contains("\"answered\""))
+                .collect::<Vec<_>>()
+        );
+    }
+    a.control("unask");
+    let (ok, said) = drive(&w, &room, S1, &["--say", "after the question"]);
+    println!("[proof] 1c. --say to {S1} once the prompt is gone: {said}");
+    assert!(
+        ok && a.got(
+            &serde_json::json!({ "typed": "after the question" }),
+            Duration::from_secs(10)
+        ),
+        "PRODUCT: arm 1c: once {S1}'s prompt is gone, --say must reach it; vox said {said:?}"
+    );
+    // A prompt that comes up as the keys arrive (the window between Vox's look and its keys):
+    // Enter is never pressed into it, and Vox says the keys may have reached it.
+    a.control("ask-on-key");
+    let (ok, said) = drive(&w, &room, S1, &["--say", "raced by a prompt"]);
+    println!("[proof] 1c. --say to {S1} as a prompt comes up: {said}");
+    let enter = a.said().lines().any(|l| l == r#"{"answered": "\r"}"#);
+    assert!(
+        !ok && said.contains("came up in Claude Code's terminal as Vox typed") && !enter,
+        "PRODUCT: arm 1c: a prompt that came up as Vox typed must get no Enter, and the driver \
+         must be told the keys may have reached it; vox said {said:?}, Enter reached the prompt: \
+         {enter}"
+    );
+    a.control("unask");
 
     // ---- 2. a sub-agent's hook keeps its session's binding ----
     a.hook(&event(
@@ -1703,5 +1852,303 @@ fn an_approval_is_answered_from_either_side_and_the_first_answer_wins() {
          `vox room sessions` without posting a message; it lists {:?}:\n{}",
         listed.0,
         listed.1
+    );
+}
+
+const S9: &str = "99999999-2222-4000-8000-000000000009";
+const S10: &str = "aaaaaaaa-3333-4000-8000-00000000000a";
+/// A second person's node, which keeps drive while `person` loses it.
+const KEEPER: &str = "keeper";
+
+/// `node`'s `can_drive` for `session` in `room`, as `vox room sessions --json` says it; `None`
+/// while the Session is not listed open.
+fn can_drive(w: &World, node: &str, room: &str, session: &str) -> Option<bool> {
+    let (_, out, _) = w.vox(node, &["room", "sessions", room, "--json"], None);
+    out.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["id"] == session && v["open"] == true)
+        .and_then(|v| v["can_drive"].as_bool())
+}
+
+/// Wait up to `limit` for `node`'s `can_drive` on `session` to be `want`; what it last was.
+fn can_drive_becomes(
+    w: &World,
+    node: &str,
+    room: &str,
+    session: &str,
+    want: bool,
+    limit: Duration,
+) -> Option<bool> {
+    let t0 = Instant::now();
+    loop {
+        let now = can_drive(w, node, room, session);
+        if now == Some(want) || t0.elapsed() >= limit {
+            return now;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// ADR-029 SC-2a, SC-2b; ADR-028 K-14 (#662) — **drive is held as soon as it is given, on a
+/// Session that has written nothing yet, and it is gone as soon as it is taken back, from that
+/// member alone.**
+///
+/// 1. The world above: `claude-a` trusts `person` with drive. Session S9 does one turn in the
+///    room, then is moved with `vox agent room` to a second room, where its Session opens and
+///    writes nothing (as a session Vox moves when the person picks its room). A third node,
+///    `keeper`, is in the second room, and `claude-a` trusts it with drive too.
+/// 2. Within 10 s, with no entry in the second room, `vox room sessions --json` says
+///    `"can_drive":true` for S9 to `person` and to `keeper`: `claude-a` made its drive key there
+///    and released it.
+/// 3. `claude-a`'s operator takes drive back from `person`, `vox trust read person`, typed at a
+///    terminal. Within 10 s, with no entry since, `person` reads `"can_drive":false`; `keeper`,
+///    asked every 0.3 s from before the change until 5 s after `person` lost it, reads `true`
+///    every time. What `claude-a` and `keeper`, which both read under the new key, show of both
+///    rooms and of S9 (`vox room list`, `vox room read`, `vox room sessions --json`, `vox room
+///    session --details`) is exactly what each showed before: the entry that says the key
+///    changed is in no row, Session, message or list.
+/// 4. S9 then calls a tool: `keeper` reads that call; `person` does not.
+/// 5. A key-package waiting for `person` from **another** author does not keep its drive on S9:
+///    `claude-a` gives `person` drive again (held within 10 s); the daemon is made to leave
+///    key-packages unopened (test knob `VOX_TEST_HOLD_PACKAGES_FILE`, as between a sync session's
+///    entries and its end); `keeper`, with Session S10 open in the second room and trusting
+///    `person` to read, gives it drive, so a package from `keeper` waits for `person` (its can_drive on S10 stays false: the
+///    hold took); `claude-a` takes drive back from `person`. Within 10 s `person` reads
+///    `"can_drive":false` on S9 while `keeper`'s package still waits; once the hold ends, `person`
+///    holds drive on S10 (the package was there).
+///
+/// **Which side a red is on.** What `vox room sessions` or `vox room session` printed is
+/// `PRODUCT:`; staging the product refused is `APPARATUS (staging):`.
+///
+/// **Mutations that must turn it red:** the drive key not begun until the Session's first entry
+/// (arm 2); no entry under the new key when drive is taken back (arm 3, `person`); the new key not
+/// released to a member that keeps drive (arm 3, `keeper`); the key change posted as a room
+/// message rather than an entry no Session has (arm 3, "showed in a room or a Session"); any
+/// waiting key-package, from any author, keeping a member's drive (arm 5).
+#[test]
+#[ignore = "real binary; run in release"]
+fn drive_given_on_an_idle_session_is_held_at_once_and_taken_back_at_once() {
+    watchdog::arm_for(Duration::from_secs(600));
+    let (w, _daemon, room) = World::setup();
+
+    // ---- (1) S9 works in the room, then is moved to a second room, where it writes nothing ----
+    w.hook_done(&room, &prompt(&w, S9));
+    session_listed(&w, &room, S9);
+    w.staged(
+        PERSON,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "second",
+        ],
+        Some("second passphrase\n"),
+    );
+    let list = w.staged(PERSON, &["room", "list"], None);
+    let second = list
+        .lines()
+        .find(|l| l.split_whitespace().nth(1) == Some("second"))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_else(|| {
+            panic!("APPARATUS (staging): `vox room list` shows no room `second`: {list}")
+        })
+        .to_owned();
+    let link = w
+        .staged(PERSON, &["room", "link", &second], None)
+        .lines()
+        .find(|l| l.starts_with("vox://"))
+        .unwrap_or_else(|| panic!("APPARATUS (staging): `vox room link` printed no link"))
+        .to_owned();
+    w.staged(KEEPER, &["node", "create", KEEPER], None);
+    w.staged(KEEPER, &["node", "attach", KEEPER], None);
+    for node in [AGENT, KEEPER] {
+        w.staged(
+            node,
+            &["room", "join", "--passphrase-file", "-", &link],
+            Some("second passphrase\n"),
+        );
+    }
+    let agent_fp = w.staged(AGENT, &["id"], None).trim().to_owned();
+    let keeper_fp = w.staged(KEEPER, &["id"], None).trim().to_owned();
+    w.staged(KEEPER, &["trust", "add", &agent_fp, "--name", AGENT], None);
+    w.staged(
+        AGENT,
+        &["trust", "add", &keeper_fp, "--name", KEEPER, "--drive"],
+        None,
+    );
+    w.staged(AGENT, &["agent", "room", &second, "--session", S9], None);
+    session_listed(&w, &second, S9);
+    println!("[proof] (1) S9 moved to room {second}, where it has written nothing");
+
+    // ---- (2) drive held at once, with no entry ----
+    for node in [PERSON, KEEPER] {
+        let held = can_drive_becomes(&w, node, &second, S9, true, Duration::from_secs(10));
+        println!("[proof] (2) {node}'s can_drive on the idle Session: {held:?}");
+        assert_eq!(
+            held,
+            Some(true),
+            "PRODUCT: {AGENT} trusts {node} with drive and S9's Session is open in room \
+             {second}, yet within 10 s `vox room sessions --json` did not say \"can_drive\":true \
+             for it (it said {held:?}): the drive key waits for the Session's first entry"
+        );
+    }
+
+    // ---- (3) drive taken back from person, at a terminal: gone at once, for person alone ----
+    // What a node shows of its rooms and Sessions, before: the key change must add nothing.
+    let shown = |node: &str| -> String {
+        let mut all = w.staged(node, &["room", "list"], None);
+        for r in [&room, &second] {
+            let (_, read, _) = w.vox(node, &["room", "read", r], None);
+            let (_, listed, _) = w.vox(node, &["room", "sessions", r, "--json"], None);
+            let (_, view, _) = w.vox(node, &["room", "session", r, S9, "--details"], None);
+            all += &format!("{read}{listed}{view}");
+        }
+        all
+    };
+    let (own_before, keeper_before) = (shown(AGENT), shown(KEEPER));
+    let person_fp = w.staged(PERSON, &["id"], None).trim().to_owned();
+    w.staged(AGENT, &["trust", "read", &person_fp], None);
+    let t0 = Instant::now();
+    let mut lost_at = None;
+    let mut keeper_seen = Vec::new();
+    while lost_at.map_or(t0.elapsed() < Duration::from_secs(10), |at: Instant| {
+        at.elapsed() < Duration::from_secs(5)
+    }) {
+        keeper_seen.push(can_drive(&w, KEEPER, &second, S9));
+        if lost_at.is_none() && can_drive(&w, PERSON, &second, S9) == Some(false) {
+            lost_at = Some(Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let after = can_drive(&w, PERSON, &second, S9);
+    println!(
+        "[proof] (3) after `vox trust read`, person's can_drive: {after:?}; keeper's, asked {} \
+         times: {keeper_seen:?}",
+        keeper_seen.len()
+    );
+    assert!(
+        lost_at.is_some() && after == Some(false),
+        "PRODUCT: {AGENT} took drive back from {PERSON} (`vox trust read`), yet within 10 s \
+         `vox room sessions --json` still did not say \"can_drive\":false for S9 in room \
+         {second} (it said {after:?})"
+    );
+    assert!(
+        keeper_seen.iter().all(|k| *k == Some(true)),
+        "PRODUCT: {KEEPER} keeps drive from {AGENT}, yet while {PERSON} lost it, its \
+         `vox room sessions --json` said, asked every 0.3 s: {keeper_seen:?}"
+    );
+    // The entry that says the key changed is no Session's, nor a message: the nodes that read
+    // under the new key show their rooms and Sessions exactly as before.
+    let (own_after, keeper_after) = (shown(AGENT), shown(KEEPER));
+    let person_after = shown(PERSON);
+    assert!(
+        own_after == own_before
+            && keeper_after == keeper_before
+            && !format!("{own_after}{keeper_after}{person_after}").contains("drive-key"),
+        "PRODUCT: the key change showed in a room or a Session: {AGENT}'s node showed before\n\
+         {own_before}\nand after\n{own_after}\n{KEEPER}'s showed before\n{keeper_before}\nand \
+         after\n{keeper_after}"
+    );
+
+    // ---- (4) what S9 does next: keeper reads it, person does not ----
+    let call =
+        serde_json::json!({ "command": "echo after-drive-was-taken", "description": "Echo" });
+    w.hook_done(
+        &second,
+        &event(
+            &w,
+            S9,
+            "PreToolUse",
+            serde_json::json!({ "tool_name": "Bash", "tool_input": call, "tool_use_id": "toolu_9" }),
+        ),
+    );
+    let mut kept = String::new();
+    let t0 = Instant::now();
+    while !kept.contains("after-drive-was-taken") && t0.elapsed() < Duration::from_secs(15) {
+        kept = w.vox(KEEPER, &["room", "session", &second, S9], None).1;
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    assert!(
+        kept.contains("after-drive-was-taken"),
+        "PRODUCT: {KEEPER} keeps drive from {AGENT}, yet within 15 s it did not read the call S9 \
+         made after {PERSON} lost drive: {kept}"
+    );
+    let (ok, seen) = drive(&w, &second, S9, &[]);
+    println!("[proof] (4) person's view of S9 after the call (ok {ok}):\n{seen}");
+    assert!(
+        ok && seen.contains(" · open") && !seen.contains("after-drive-was-taken"),
+        "PRODUCT: {PERSON} no longer has drive from {AGENT}, yet reads the call S9 made after it \
+         was taken back:\n{seen}"
+    );
+
+    // ---- (5) a package waiting from another author keeps nothing of S9 ----
+    w.staged(
+        PERSON,
+        &["trust", "add", &keeper_fp, "--name", KEEPER],
+        None,
+    );
+    w.staged(
+        KEEPER,
+        &["trust", "add", &person_fp, "--name", PERSON],
+        None,
+    );
+    let opened = wait_within(
+        w.hook_as(KEEPER, &second, &prompt(&w, S10)),
+        Duration::from_secs(15),
+    )
+    .unwrap_or_else(|| panic!("APPARATUS: keeper's prompt hook did not finish within 15 s"));
+    assert!(
+        opened.status.success(),
+        "APPARATUS (staging): keeper's prompt hook failed: {}",
+        String::from_utf8_lossy(&opened.stderr)
+    );
+    session_listed(&w, &second, S10);
+    w.staged(AGENT, &["trust", "drive", &person_fp], None);
+    let again = can_drive_becomes(&w, PERSON, &second, S9, true, Duration::from_secs(10));
+    assert_eq!(
+        again,
+        Some(true),
+        "PRODUCT: {AGENT} gave {PERSON} drive again, yet within 10 s it did not hold it on S9"
+    );
+    let hold = w.root.join("hold-packages");
+    std::fs::write(&hold, "").expect("APPARATUS: the hold file");
+    w.staged(KEEPER, &["trust", "drive", &person_fp], None);
+    std::thread::sleep(Duration::from_secs(4));
+    let held_back = can_drive(&w, PERSON, &second, S10);
+    assert_ne!(
+        held_back,
+        Some(true),
+        "APPARATUS: the daemon opened {KEEPER}'s key-package for {PERSON} while held (it holds \
+         drive on S10): this vox was built without `test-knobs`, so arm 5 cannot be staged"
+    );
+    w.staged(AGENT, &["trust", "read", &person_fp], None);
+    let cut = can_drive_becomes(&w, PERSON, &second, S9, false, Duration::from_secs(10));
+    let still_waiting = can_drive(&w, PERSON, &second, S10);
+    println!(
+        "[proof] (5) with {KEEPER}'s package waiting for {PERSON}: its can_drive on S9 {cut:?}, \
+         on S10 {still_waiting:?}"
+    );
+    std::fs::remove_file(&hold).expect("APPARATUS: the hold file");
+    // A message from keeper starts a sync session, at whose end the waiting package is opened.
+    w.staged(KEEPER, &["room", "post", &second, "the hold is over"], None);
+    assert_eq!(
+        cut,
+        Some(false),
+        "PRODUCT: {AGENT} took drive back from {PERSON}, yet while a key-package from {KEEPER} \
+         (another author) waited for it, within 10 s it still read \"can_drive\":{cut:?} on S9"
+    );
+    let t5 = Instant::now();
+    let landed = can_drive_becomes(&w, PERSON, &second, S10, true, Duration::from_secs(30));
+    println!(
+        "[proof] (5) after the hold, person's can_drive on S10: {landed:?} after {:.1}s",
+        t5.elapsed().as_secs_f64()
+    );
+    assert_eq!(
+        landed,
+        Some(true),
+        "APPARATUS: once the hold ended, {PERSON} still did not hold drive on {KEEPER}'s S10 \
+         within 15 s ({landed:?}): no package from {KEEPER} was waiting, so arm 5 proved nothing"
     );
 }

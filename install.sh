@@ -408,7 +408,5 @@ fi
 "$INSTALL_DIR/vox" shell-setup </dev/null || say "warning: shell setup or the agent skill reported a problem (vox itself is installed)"
 
 say ""
-say "next:"
-say "  vox                 the interactive client"
-say "  vox serve ssh=22    offer this machine's ssh to a new room, and print the room link"
-say "  vox update          install the next release"
+say "also: \`vox\` opens the interactive client, \`vox serve ssh=22\` offers this machine's ssh in a new room, \`vox update\` installs the next release"
+say "Next: run \`vox setup\`"
