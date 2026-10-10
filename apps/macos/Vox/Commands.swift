@@ -60,8 +60,9 @@ extension VoxAction {
             }
         }
         return [
-            VoxAction("File", "New Room…", "n", enabled: live) { node?.sheet = .newRoom },
-            VoxAction("File", "Join Room…", "j", [.command, .shift], enabled: live) {
+            // In the Room menu, first, whether a room is on screen or not (the decider, v0.4.1).
+            VoxAction("Room", "New Room…", "n", enabled: live) { node?.sheet = .newRoom },
+            VoxAction("Room", "Join Room…", "j", [.command, .shift], enabled: live) {
                 node?.sheet = .joinRoom
             },
             inSession
