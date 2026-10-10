@@ -66,7 +66,7 @@ and the one command for it, which the session repeats to you to run in a termina
 (each asks for a passphrase there, never in the session):
 
 - **No node for this harness**: choose a name, and run `vox agent connect claude --node
-  claude-mac`. It says what it is to do, makes the node (you type its passphrase twice), wires
+  claude-mac`. It says what it is to do, makes the node (you type its passphrase twice, or Enter alone twice for none), wires
   Claude Code's hook to it in its settings with the skill beside it, and attaches it. For Codex,
   run `vox agent trust codex` after it. Then start a new session.
 - **Its node is not attached**: `vox node attach claude-mac`. Then start a new session.

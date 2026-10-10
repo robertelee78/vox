@@ -17,10 +17,13 @@ vox node detach robertgpt
 vox node signout robertgpt
 ```
 
-**Every node has an identity passphrase.** `node create` asks for it twice at the terminal, or
-reads it from `--passphrase-file PATH`. An empty one is refused, and nothing is created: `every
-node has an identity passphrase, and an empty one is refused; nothing was created`. A room's
-passphrase is a separate thing, and it may be empty.
+**A node's identity passphrase is optional.** `node create` asks for it twice at the terminal
+(Enter alone, twice, for none), or reads it from `--passphrase-file PATH`. An empty one makes the
+node with none, and says once what that means: `no identity passphrase: this node's identity key is
+kept on this machine unencrypted, so anyone who can read its data folder can act as this node; a
+passphrase is encouraged`. Attaching such a node takes the empty passphrase (Enter alone, or an
+empty file). There is no command to change a node's passphrase yet. A room's passphrase is a
+separate thing, and it may be empty too.
 
 `node create` writes the identity and prints its fingerprint; it attaches nothing. It also says
 `there is no backup of a node: if this machine is lost, so is this node; make a new one, and ask

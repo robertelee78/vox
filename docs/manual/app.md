@@ -75,7 +75,9 @@ version too, until you quit it and open it again.
    `vox node create` does; nothing sends you to Terminal. Type a **Name** (lowercase letters,
    digits, dots, dashes and underscores) and the identity passphrase twice, then choose
    **Make Node**. The passphrase unlocks your node on this Mac, and nobody can recover it for you.
-   The app says, as `vox node create` does, that there is no backup of a node: if this Mac is
+   It may be left empty: while it is, the form says `No identity passphrase: this node's identity
+   key is kept on this machine unencrypted, so anyone who can read its data folder can act as this
+   node; a passphrase is encouraged`, and Make Node makes the node with none. The app says, as `vox node create` does, that there is no backup of a node: if this Mac is
    lost, so is the node. Two passphrases that differ are refused, and nothing is created:
 
    ```text
