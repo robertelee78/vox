@@ -958,7 +958,10 @@ final class FirstRunProof: XCTestCase {
             context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
             guard let data = context.data else { return { _ in nil } }
             let bytes = data.assumingMemoryBound(to: UInt8.self)
+            // The closure keeps the context, so its bitmap outlives this function: without it the
+            // bytes were freed and a read crashed the runner (SIGSEGV here, 2026-10-09).
             return { p in
+                _ = context
                 let x = Int((p.x - frame.minX) * perPoint), y = Int((p.y - frame.minY) * perPoint)
                 guard x >= 0, y >= 0, x < image.width, y < image.height else { return nil }
                 // A bitmap context's first row is the image's top row, as the window's points run.
