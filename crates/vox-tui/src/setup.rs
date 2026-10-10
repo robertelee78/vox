@@ -1,7 +1,8 @@
 //! `vox setup`: set up this machine (ADR-029 §7).
 //!
 //! It looks for the harnesses installed here (Claude Code, Codex, OpenCode: each one's program on
-//! `PATH`), and offers each a node of its own, `<harness>-<host>` (ADR-026 N-6), with a passphrase
+//! `PATH`), and offers each a node of its own, `<harness>-<host>` (ADR-026 N-6) or a name the
+//! operator types instead (#665; `skip` makes none), with a passphrase
 //! the operator types (ADR-028 K-11), its hook installed in the harness's own settings and the
 //! agent skill beside it. On macOS it then offers a node for the person, which may be skipped. It
 //! ends by printing every node it made: its fingerprint, grouped, with its art (ADR-028 K-1), and
@@ -94,23 +95,38 @@ pub fn run(args: &NodeArgs) -> Result<(), AppError> {
         .collect();
 
     for (h, program) in &found {
-        let name = NodeName::parse(&format!("{}-{host}", h.key))?;
-        if account.nodes_on_disk().contains(&name) {
-            println!("vox setup: node {name} exists already; it is left as it is");
+        let suggested = NodeName::parse(&format!("{}-{host}", h.key))?;
+        if account.nodes_on_disk().contains(&suggested) {
+            println!("vox setup: node {suggested} exists already; it is left as it is");
             continue;
         }
         let wiring = Wiring::of(h.key)?;
         println!();
         println!(
-            "{} is to get a node of its own, {name}, with a passphrase you type.",
+            "{} is to get a node of its own, {suggested} unless you name it, with a passphrase \
+             you type.",
             h.name
         );
-        for line in wiring.effects(&name) {
+        for line in wiring.effects(&suggested) {
             println!("  {line}");
         }
-        if !ask(&format!("Create {name} and wire {} to it?", h.name), true)? {
+        // **The name is the operator's** (#665): Enter keeps the suggestion, a name typed is
+        // taken as `vox node create` takes it, and `skip` makes none.
+        let Some(name) = node_name(
+            &account,
+            &format!(
+                "a node for {} [{suggested}] (Enter keeps it, or type another name; skip makes \
+                 none): ",
+                h.name
+            ),
+            &suggested,
+        )?
+        else {
             println!("vox setup: no node for {}", h.name);
             continue;
+        };
+        if name != suggested {
+            println!("  as node {name}, not {suggested}");
         }
         let fingerprint = create(&account, &name)?;
         for line in wiring.install(&name)? {
@@ -220,6 +236,30 @@ fn create(account: &vox_core::node::paths::Account, name: &NodeName) -> Result<S
     let fp = crate::client::create_identity(&paths, &passphrase)?;
     println!("vox setup: created node {name}");
     Ok(vox_core::node::link::b32_encode(&fp))
+}
+
+/// A node's name, typed after `prompt`: Enter takes `suggested`, `skip` or `n` takes none. A
+/// name is refused as `vox node create` refuses it, with its reason, and asked again.
+fn node_name(
+    account: &vox_core::node::paths::Account,
+    prompt: &str,
+    suggested: &NodeName,
+) -> Result<Option<NodeName>, AppError> {
+    loop {
+        let typed = line(prompt)?;
+        match typed.to_ascii_lowercase().as_str() {
+            "" => return Ok(Some(suggested.clone())),
+            "skip" | "n" | "no" => return Ok(None),
+            _ => {}
+        }
+        match NodeName::parse(&typed) {
+            Ok(n) if account.nodes_on_disk().contains(&n) => {
+                println!("  there is a node {n} already; `vox node list` lists them");
+            }
+            Ok(n) => return Ok(Some(n)),
+            Err(e) => println!("  {e}"),
+        }
+    }
 }
 
 /// A yes/no question, answered at the terminal; Enter takes `default`.

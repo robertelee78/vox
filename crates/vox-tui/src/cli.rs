@@ -2125,7 +2125,8 @@ enum Cmd {
     /// Set up this machine: a node for each harness installed here, and one for you.
     ///
     /// Looks for Claude Code, Codex and OpenCode (their programs on `PATH`) and offers each
-    /// a node of its own, `<harness>-<host>`, with a passphrase you type, its hook installed
+    /// a node of its own, `<harness>-<host>` or a name you type (`skip` makes none), with a
+    /// passphrase you type, its hook installed
     /// in the harness's settings and the agent skill beside it. On macOS it also offers a
     /// node for you, which you may skip. It ends by printing every node it made: its
     /// fingerprint, with its art, and its alias, harness, host, OS and Vox version.

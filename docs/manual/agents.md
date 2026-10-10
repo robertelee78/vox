@@ -14,8 +14,11 @@ vox setup
 ```
 
 `vox setup` looks for Claude Code, Codex and OpenCode on `PATH` and offers each a node of its own,
-`<harness>-<host>`, with a passphrase you type, its hook in the harness's settings and the agent
-skill beside it. It says what it is to do before each one:
+`<harness>-<host>` unless you type another name, with a passphrase you type, its hook in the
+harness's settings and the agent skill beside it. It says what it is to do before each one, then
+asks for the node's name: Enter keeps the suggestion, a name you type is checked as `vox node
+create` checks it (a refused one says why and is asked again), and `skip` makes no node for that
+harness:
 
 ```text
 vox setup: looking for harnesses on this machine (their programs on PATH)
@@ -23,10 +26,10 @@ vox setup: looking for harnesses on this machine (their programs on PATH)
   Codex        not found
   OpenCode     found: /usr/local/bin/opencode
 
-Claude Code is to get a node of its own, claude-mac, with a passphrase you type.
+Claude Code is to get a node of its own, claude-mac unless you name it, with a passphrase you type.
   its hook, `vox agent hook --node claude-mac`, is to go in ~/.claude/settings.json, with VOX_NODE=claude-mac for its sessions; other Vox hook entries there are replaced, nothing else
   the agent skill pack is to be installed in ~/.claude/skills/vox-agent-comms; a file there you changed is kept
-Create claude-mac and wire Claude Code to it? [Y/n]
+a node for Claude Code [claude-mac] (Enter keeps it, or type another name; skip makes none):
 ```
 
 Your settings file keeps the rest of its content in its own order. For Codex, setup also keeps
