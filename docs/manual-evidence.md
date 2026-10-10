@@ -1,7 +1,8 @@
 # User manual evidence map
 
-Updated: 2026-10-04. Scope: ADR-027 M27.1 / work item #421. This is maintainer evidence,
-not a chapter in the public navigation manifest. Source inspection is not an execution test.
+Updated: 2026-10-04; ADR-030's claims added 2026-10-10 (#661). Scope: ADR-027 M27.1 / work item
+#421. This is maintainer evidence, not a chapter in the public navigation manifest. Source
+inspection is not an execution test.
 
 ## Baselines
 
@@ -49,6 +50,34 @@ later parser or implementation may invalidate both an example and its troublesho
 | reference: `gateway` in status, mapping renewal and deletion at stop (v0.3.1) | `crates/vox-tui/src/status_cli.rs` (gateway); `crates/vox-core/src/nat/portmap.rs` (method names); `crates/vox-core/src/node/presence.rs` (deletion at stop) |
 | install: containers, root refusal, receive buffer (v0.3.1) | `crates/vox-core/src/error.rs` (`Root`); `crates/vox-core/src/transport/quic.rs` (`UDP_SOCKET_BUFFER`, `mtu_ceiling_for`, the buffer line) |
 | reference: paths, data root layout, passphrase input, daemon passphrase-file lines | `crates/vox-core/src/node/paths.rs`; ADR-026 F-1; `crates/vox-tui/src/app.rs:870-1020` |
+| concepts: post-quantum recovery after a compromise, and its limits (v0.4.3) | See [ADR-030 post-quantum recovery](#adr-030-post-quantum-recovery-v043) below |
+
+## ADR-030 post-quantum recovery (v0.4.3)
+
+The paragraph in `concepts.md` ("If a node's memory or disk is stolen, …") and the README's
+"Post-quantum recovery after a compromise" bullet, added for #661. Both describe what landed on
+`integrate/v0.4.3`:
+
+- implementation: `v043/adr030-final` at `d059f5fa3fe1cc720d9a9401b09d766ce755fc26`, merged at
+  `75de4aa31`;
+- the claims text: `v043/adr030-claims` at `9d2b5c94a7efde2566c44756f00681b43ca840aa`, merged at
+  `64a34af08`.
+
+| Claim | Source (at `d059f5fa3`) | Proof |
+|---|---|---|
+| Every key handed to a member travels in a fresh handshake of its own (D-1–D-4) | `crates/vox-core/src/node/actor.rs` (`delivery_frame`, `deliver_rekeys_for`, `release_key_to`); `crates/vox-core/src/node/pairwise_stream.rs` (`RotationHello`) | `revocation_rotates_the_key_proof` (T-1 (a)–(c), (e)) |
+| A robbed node's next key is safe again (S-1) | `crates/vox-core/src/pairwise/pqxdh.rs` (`initiate`: fresh ML-KEM encapsulation); ADR-030 S-1 | T-1 (b): the frozen pre-rotation session cannot open the key; the PQ argument is the #660 analysis (issue comments, not committed) |
+| Keys to a robbed node are safe again within seven days; unused one-time prekeys retire, with a one-hour grace (S-2, P-1) | `crates/vox-core/src/node/prekeys.rs` (`PrekeyRing::maintain`, `use_one_time`) | `the_prekey_ring_is_kept_up_while_the_node_runs_proof` stage 1 |
+| A stale prekey, or one dated more than ten minutes ahead, is refused with its reason (P-2) | `crates/vox-core/src/node/prekeys.rs` (`delivery_bundle`, `PREKEY_FUTURE_TOLERANCE_MS`, `BundleWait::why`) | T-1 (d) |
+| Each key waits for a fresh one-time prekey, up to 30 s while its member is online, then uses the signed prekey (P-3, S-5) | `crates/vox-core/src/node/prekeys.rs` (`SpentOneTime`); `crates/vox-core/src/node/actor.rs` (`maintain_prekeys` republish; `ONE_TIME_WAIT_MS`, the 30 s bound) | T-1 (three rooms, three one-time prekeys); the republish path end to end: `a_claude_session_is_mirrored_and_answered_from_either_side_proof` (`drive_given_on_an_idle_session_is_held_at_once_and_taken_back_at_once`, arm (2)) |
+| A restored profile's one-time prekeys retire within seven days (S-5) | as P-1 | as P-1 |
+| A profile from v0.4.2 opens, its prekey ring upgraded (ring version 3) | `crates/vox-core/src/node/prekeys.rs` (`PrekeyRing::decode`, `load_or_create`) | `a_data_root_of_an_earlier_release_is_refused_proof` (`a_data_root_of_the_previous_release_opens_with_nothing_lost`) |
+
+The ADR-030 T-1 and prekey-ring proofs ran once on `8488899eb`, in release with `test-knobs`,
+each with its mutants red; `d059f5fa3` adds only a test-support lookup of the profile's node. The
+upgrade proof ran from the published v0.4.2 on `90a6686cd` (#652), which the merge contains. No
+command check of these claims was run for the manual: they are cryptographic properties, not
+commands a reader types.
 
 ## v0.4.1 command check
 
