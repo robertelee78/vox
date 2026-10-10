@@ -7744,8 +7744,15 @@ impl Node {
                 epoch,
             } => {
                 self.key_backoff.remove(&(channel_id, peer));
-                // Taken: its delivery is done with (ADR-030 D-4), and the member waits no more.
-                self.deliveries.remove(&(channel_id, peer, chain_id));
+                // Taken: its delivery is done with (ADR-030 D-4), and the member waits no more. A
+                // key of a history batch is kept until the whole batch is taken: a batch that went
+                // out short (a later key waiting for a fresh one-time prekey) is sent again whole,
+                // and this key then goes as these same bytes, which its member answers taken
+                // without opening anything (W-3). Opened afresh each time, it took the fresh
+                // one-time prekey the waiting key was waiting for, and the batch never completed.
+                if !history {
+                    self.deliveries.remove(&(channel_id, peer, chain_id));
+                }
                 self.key_waiting.remove(&(channel_id, peer));
                 // Taken under the session still held: the peer holds its hello (V210-89).
                 if session.is_some()
@@ -7760,6 +7767,10 @@ impl Node {
                     self.key_landed(channel_id, peer);
                 }
                 let whole_history = fresh && history && self.history_landed(channel_id, peer, true);
+                if whole_history {
+                    self.deliveries
+                        .retain(|(room, member, _), _| *room != channel_id || *member != peer);
+                }
                 let (Some(profile), Some(shared)) = (
                     self.profile.as_ref(),
                     self.channels.get(&channel_id).map(Arc::clone),
