@@ -1844,3 +1844,181 @@ fn an_approval_is_answered_from_either_side_and_the_first_answer_wins() {
         listed.1
     );
 }
+
+const S9: &str = "99999999-2222-4000-8000-000000000009";
+
+/// `person`'s `can_drive` for `session` in `room`, as `vox room sessions --json` says it; `None`
+/// while the Session is not listed open.
+fn can_drive(w: &World, room: &str, session: &str) -> Option<bool> {
+    let (_, out, _) = w.vox(PERSON, &["room", "sessions", room, "--json"], None);
+    out.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["id"] == session && v["open"] == true)
+        .and_then(|v| v["can_drive"].as_bool())
+}
+
+/// Wait up to `limit` for `person`'s `can_drive` on `session` to be `want`; what it last was.
+fn can_drive_becomes(
+    w: &World,
+    room: &str,
+    session: &str,
+    want: bool,
+    limit: Duration,
+) -> Option<bool> {
+    let t0 = Instant::now();
+    loop {
+        let now = can_drive(w, room, session);
+        if now == Some(want) || t0.elapsed() >= limit {
+            return now;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// ADR-029 SC-2a, SC-2b; ADR-028 K-14 (#662) — **drive is held as soon as it is given, on a
+/// Session that has written nothing yet, and it is gone as soon as it is taken back.**
+///
+/// 1. The world above: `claude-a` trusts `person` with drive. Session S9 does one turn in the
+///    room, then is moved with `vox agent room` to a second room both nodes are in, where its
+///    Session opens and writes nothing (as a session Vox moves when the person picks its room).
+/// 2. Within 10 s, with no entry in the second room, `person`'s `vox room sessions --json` says
+///    `"can_drive":true` for it: `claude-a` made its drive key there and released it.
+/// 3. `claude-a`'s operator takes drive back, `vox trust read person`, typed at a terminal.
+///    Within 10 s, with no entry since, `"can_drive":false`. What `claude-a`'s node shows of
+///    both rooms and of S9 (`vox room read`, `vox room sessions --json`, `vox room session
+///    --details`) is exactly what it showed before: the key change is in no row, Session or
+///    message.
+/// 4. S9 then calls a tool: `person`'s `vox room session` does not show that call.
+///
+/// **Which side a red is on.** What `vox room sessions` or `vox room session` printed is
+/// `PRODUCT:`; staging the product refused is `APPARATUS (staging):`.
+///
+/// **Mutations that must turn it red:** the drive key not begun until the Session's first entry
+/// (arm 2); no entry under the new key when drive is taken back (arm 3); the key change posted
+/// as a room message rather than a drive entry no Session has (arm 3, "showed in a room").
+#[test]
+#[ignore = "real binary; run in release"]
+fn drive_given_on_an_idle_session_is_held_at_once_and_taken_back_at_once() {
+    watchdog::arm_for(Duration::from_secs(600));
+    let (w, _daemon, room) = World::setup();
+
+    // ---- (1) S9 works in the room, then is moved to a second room, where it writes nothing ----
+    w.hook_done(&room, &prompt(&w, S9));
+    session_listed(&w, &room, S9);
+    w.staged(
+        PERSON,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "second",
+        ],
+        Some("second passphrase\n"),
+    );
+    let list = w.staged(PERSON, &["room", "list"], None);
+    let second = list
+        .lines()
+        .find(|l| l.split_whitespace().nth(1) == Some("second"))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_else(|| {
+            panic!("APPARATUS (staging): `vox room list` shows no room `second`: {list}")
+        })
+        .to_owned();
+    let link = w
+        .staged(PERSON, &["room", "link", &second], None)
+        .lines()
+        .find(|l| l.starts_with("vox://"))
+        .unwrap_or_else(|| panic!("APPARATUS (staging): `vox room link` printed no link"))
+        .to_owned();
+    w.staged(
+        AGENT,
+        &["room", "join", "--passphrase-file", "-", &link],
+        Some("second passphrase\n"),
+    );
+    w.staged(AGENT, &["agent", "room", &second, "--session", S9], None);
+    session_listed(&w, &second, S9);
+    println!("[proof] (1) S9 moved to room {second}, where it has written nothing");
+
+    // ---- (2) drive held at once, with no entry ----
+    let held = can_drive_becomes(&w, &second, S9, true, Duration::from_secs(10));
+    println!("[proof] (2) person's can_drive on the idle Session: {held:?}");
+    assert_eq!(
+        held,
+        Some(true),
+        "PRODUCT: {AGENT} trusts {PERSON} with drive and S9's Session is open in room {second}, \
+         yet within 10 s `vox room sessions --json` did not say \"can_drive\":true for it (it said \
+         {held:?}): the drive key waits for the Session's first entry"
+    );
+
+    // ---- (3) drive taken back, at a terminal: gone at once ----
+    // What the agent's own node shows of its Sessions, before: the key change must add nothing.
+    let shown = |node: &str| -> String {
+        [&room, &second]
+            .iter()
+            .map(|r| {
+                w.staged(node, &["room", "read", r], None)
+                    + &w.staged(node, &["room", "sessions", r, "--json"], None)
+                    + &w.staged(node, &["room", "session", r, S9, "--details"], None)
+            })
+            .collect()
+    };
+    let own_before = shown(AGENT);
+    let person_fp = w.staged(PERSON, &["id"], None).trim().to_owned();
+    w.staged(AGENT, &["trust", "read", &person_fp], None);
+    let after = can_drive_becomes(&w, &second, S9, false, Duration::from_secs(10));
+    println!("[proof] (3) after `vox trust read`, person's can_drive: {after:?}");
+    assert_eq!(
+        after,
+        Some(false),
+        "PRODUCT: {AGENT} took drive back from {PERSON} (`vox trust read`), yet within 10 s \
+         `vox room sessions --json` still did not say \"can_drive\":false for S9 in room {second} \
+         (it said {after:?})"
+    );
+
+    // The entry that says the key changed is no Session's, nor a message: the agent's node, which
+    // wrote it and reads it, shows its rooms and Sessions exactly as before, and neither node
+    // shows it anywhere.
+    let own_after = shown(AGENT);
+    let person_after = shown(PERSON);
+    println!("[proof] (3) the agent's own Sessions after the key change:\n{own_after}");
+    assert!(
+        own_after == own_before
+            && !own_after.contains("drive-key")
+            && !person_after.contains("drive-key"),
+        "PRODUCT: the key change showed in a room or a Session: before it {AGENT}'s node showed\n\
+         {own_before}\nand after it\n{own_after}\n({PERSON} shows:\n{person_after})"
+    );
+
+    // ---- (4) what S9 does next is not readable by person ----
+    let call =
+        serde_json::json!({ "command": "echo after-drive-was-taken", "description": "Echo" });
+    w.hook_done(
+        &second,
+        &event(
+            &w,
+            S9,
+            "PreToolUse",
+            serde_json::json!({ "tool_name": "Bash", "tool_input": call, "tool_use_id": "toolu_9" }),
+        ),
+    );
+    let mut own = String::new();
+    let t0 = Instant::now();
+    while !own.contains("after-drive-was-taken") && t0.elapsed() < Duration::from_secs(15) {
+        own = w.staged(AGENT, &["room", "session", &second, S9], None);
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    assert!(
+        own.contains("after-drive-was-taken"),
+        "APPARATUS (staging): S9's tool call never showed in its own node's Session view: {own}"
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    let (ok, seen) = drive(&w, &second, S9, &[]);
+    println!("[proof] (4) person's view of S9 after the call (ok {ok}):\n{seen}");
+    assert!(
+        ok && seen.contains(" · open") && !seen.contains("after-drive-was-taken"),
+        "PRODUCT: {PERSON} no longer has drive from {AGENT}, yet reads the call S9 made after it \
+         was taken back:\n{seen}"
+    );
+}

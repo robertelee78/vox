@@ -5546,10 +5546,16 @@ impl ChannelState {
     // ---- Sessions: the drive key (ADR-029 SC-2, SC-2a, SC-2b; #543) ----------------------------
 
     /// The Session entries this node has opened or written here, in the order it did: each
-    /// node's entries only if this node holds its drive key (SC-2), or wrote them.
+    /// node's entries only if this node holds its drive key (SC-2), or wrote them. A
+    /// key-changed entry ([`crate::node::drive::KEY_CHANGED`]) is no Session's, and is left out.
     #[must_use]
-    pub fn session_rows(&self) -> &[SessionRow] {
-        &self.drive.sessions
+    pub fn session_rows(&self) -> Vec<SessionRow> {
+        self.drive
+            .sessions
+            .iter()
+            .filter(|r| !crate::node::drive::is_key_changed(&r.session_id))
+            .cloned()
+            .collect()
     }
 
     /// The files other members' Sessions sent out here that this node opened (ADR-029 DR-1.8).
@@ -5574,9 +5580,10 @@ impl ChannelState {
     /// The nodes whose Sessions this node can read inside here, sorted: itself, and each node
     /// whose **live** drive key it holds (SC-2) — the generation of that node's newest
     /// drive-sealed entry here, or any it released while it has written none. A member whose key
-    /// was rotated away (SC-2b) drops out at the first entry sealed under the new one: before
-    /// that, nothing here can tell the key changed, and the session's node is the authority on
-    /// whom it lets drive (DR-2).
+    /// was rotated away (SC-2b) drops out at the first entry sealed under the new one, which the
+    /// author writes as it changes the key ([`crate::node::drive::KEY_CHANGED`]): before that,
+    /// nothing here can tell the key changed, and the session's node is the authority on whom it
+    /// lets drive (DR-2).
     #[must_use]
     pub fn drive_from(&self) -> Vec<Digest32> {
         let ns = drive_channel(&self.channel_id);
@@ -5769,7 +5776,11 @@ impl ChannelState {
                 cache_id: Some(id),
             },
         );
-        self.drive.news.push(row.session_id.clone());
+        // A key-changed entry is kept with the rest, so it is opened once, but it is no
+        // Session's: nothing is said of it.
+        if !crate::node::drive::is_key_changed(&row.session_id) {
+            self.drive.news.push(row.session_id.clone());
+        }
         self.drive.sessions.push(row);
         Ok(entry_hash)
     }
@@ -5781,6 +5792,27 @@ impl ChannelState {
         news.sort_unstable();
         news.dedup();
         news
+    }
+
+    /// Begin this node's drive key here if it has none yet and a member of the room is in
+    /// `holders` (SC-2a): a member given drive on a Session that has written nothing is owed the
+    /// key at once, not at the Session's first entry. Whether a key was begun.
+    pub fn ensure_drive(
+        &mut self,
+        store: &Store,
+        holders: &BTreeSet<Digest32>,
+        now: crate::time::Ms,
+    ) -> Result<bool> {
+        if self.drive.chain.is_some() || self.poisoned {
+            return Ok(false);
+        }
+        let members = self.drive_members();
+        if !holders.iter().any(|h| members.contains(h)) {
+            return Ok(false);
+        }
+        self.begin_drive(holders, now.get())?;
+        self.persist_drive(store)?;
+        Ok(true)
     }
 
     /// Change this node's drive key if a member it was released to is no longer in `holders`
@@ -5858,7 +5890,11 @@ impl ChannelState {
         self.persist_drive(store)?;
         let before = self.drive.sessions.len();
         self.backfill(store, &skdm.body.author_id, now_ms)?;
-        Ok(self.drive.sessions.len() - before)
+        // What it opened of Sessions: a key-changed entry is none of theirs.
+        Ok(self.drive.sessions[before..]
+            .iter()
+            .filter(|r| !crate::node::drive::is_key_changed(&r.session_id))
+            .count())
     }
 
     /// Open one Session entry with the drive key it names, if this node holds it, queueing its
@@ -6399,7 +6435,9 @@ impl ChannelState {
         for (row, cache_id) in std::mem::take(&mut self.drive.pending) {
             self.retention
                 .rendered(&row.entry_hash, row.created_millis, cache_id);
-            self.drive.news.push(row.session_id.clone());
+            if !crate::node::drive::is_key_changed(&row.session_id) {
+                self.drive.news.push(row.session_id.clone());
+            }
             self.drive.sessions.push(row);
         }
         for (row, cache_id) in std::mem::take(&mut self.pending_reads) {
