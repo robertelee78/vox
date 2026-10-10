@@ -347,6 +347,13 @@ impl KeyRefusal {
     }
 }
 
+/// Why a key waits when its recipient ended the stream without an answer (ADR-030 W-4, D-5), and
+/// what that costs.
+pub const ENDED_UNANSWERED: &str =
+    "it closed the stream without an answer, as a node running a Vox \
+                                    older than key delivery in a session of its own does; it reads \
+                                    nothing new from you until it is updated";
+
 /// Whether the far side refused a delivered key: `Some(why)` if so, `None` if it took it.
 ///
 /// **Written is not delivered.** QUIC acknowledges the bytes before the recipient has decided
@@ -374,6 +381,13 @@ pub async fn refusal(
         Ok(Ok(())) => Some((format!("answered {}", byte[0]), true)),
         Ok(Err(quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code)))) => {
             Some((KeyRefusal::describe(code.into_inner()), true))
+        }
+        // **Ended without an answer** (ADR-030 W-4): the recipient read the stream and closed it
+        // without taking or refusing the key, which is what a node that predates key delivery in a
+        // session of its own does with a frame it cannot read. Its decision, so answered: resent
+        // after a backoff, never every second, and nothing on either side is changed by it.
+        Ok(Err(quinn::ReadExactError::FinishedEarly(_))) => {
+            Some((ENDED_UNANSWERED.to_owned(), true))
         }
         Ok(Err(e)) => Some((e.to_string(), false)),
         Err(_) => Some((format!("no answer within {}s", patience.as_secs()), false)),

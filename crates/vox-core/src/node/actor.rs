@@ -9512,23 +9512,7 @@ impl Node {
         let frame = match self.delivery_frame(channel_id, target, &skdm).await {
             Ok(frame) => frame,
             Err(wait) => {
-                if self.key_waits_said.insert((*channel_id, target)) {
-                    let why = match wait {
-                        Some(wait) => wait.why(),
-                        None => "no pairwise session with it could be opened from its prekey \
-                                 bundle; it is tried again"
-                            .to_owned(),
-                    };
-                    if let Some(net) = self.net.as_ref() {
-                        net.manager().note(
-                            target,
-                            format!(
-                                "your key for it in room {} waits: {why}",
-                                crate::node::network::short_id(*channel_id)
-                            ),
-                        );
-                    }
-                }
+                self.say_key_waits(channel_id, target, wait);
                 return Outcome::Failed(Fault::Unreachable);
             }
         };
@@ -10299,10 +10283,16 @@ impl Node {
             for key in keys {
                 // Each key in a session of its own, opened now against the member's current bundle
                 // and never sealed in one that existed before (ADR-030 D-1, D-2).
-                let Ok(frame) = self.delivery_frame(channel_id, target, key).await else {
-                    all_sent = false;
-                    break;
+                let frame = match self.delivery_frame(channel_id, target, key).await {
+                    Ok(frame) => frame,
+                    Err(wait) => {
+                        // Waits, said why (ADR-030 D-5): never sealed in an older session.
+                        self.say_key_waits(channel_id, target, wait);
+                        all_sent = false;
+                        break;
+                    }
                 };
+                self.key_waits_said.remove(&(*channel_id, target));
                 // Each key's own generation: a refusal re-owes exactly what was refused, and it is
                 // recorded as delivered only once taken (V210-88).
                 let epoch = self.key_in_flight(*channel_id, target);
@@ -10397,6 +10387,35 @@ impl Node {
             },
         );
         Ok(frame)
+    }
+
+    /// Say once per member and room, until its key goes, why this identity's key for `target`
+    /// waits (#520, ADR-030 D-5): no bundle, a stale one, or one no session opened from, each as
+    /// itself and with what it costs. A key that waits is sealed nowhere else.
+    fn say_key_waits(
+        &mut self,
+        channel_id: &Digest32,
+        target: Digest32,
+        wait: Option<prekeys::BundleWait>,
+    ) {
+        if !self.key_waits_said.insert((*channel_id, target)) {
+            return;
+        }
+        let why = match wait {
+            Some(wait) => wait.why(),
+            None => "no pairwise session with it could be opened from its prekey bundle; it is \
+                     tried again"
+                .to_owned(),
+        };
+        if let Some(net) = self.net.as_ref() {
+            net.manager().note(
+                target,
+                format!(
+                    "your key for it in room {} waits: {why}",
+                    crate::node::network::short_id(*channel_id)
+                ),
+            );
+        }
     }
 
     /// A key watched by [`watch_delivery`] was answered, taken or not: one fewer in flight.
