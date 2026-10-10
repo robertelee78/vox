@@ -1921,6 +1921,34 @@ final class FirstRunProof: XCTestCase {
         defer { ui.terminate() }
         present(ui, Key.id("attached"), timeout: 60, "the app must open attached as alice")
 
+        // Carol's offer, first (v0.4.3): its words give read, with no drive; Trust opens the
+        // passphrase form, and then that form's Trust is the only one on screen; left empty, its
+        // Trust says the identity's passphrase is needed (alice's has one); Cancel brings back
+        // the offer's Trust and Dismiss.
+        tap(ui, Key.id("offer-\(carolFp.prefix(12))"), "carol's offer in the sidebar",
+            premise: Premise("carol is offered to alice") {
+                (offers.contains(String(carolFp.prefix(12))), "`vox trust offers` said \(offers.debugDescription)")
+            })
+        let explain = words(ui, Key.id("offer-explain"), timeout: 10,
+                            "carol's offer must say what trusting her gives") ?? ""
+        XCTAssertFalse(explain.lowercased().contains("drive"),
+                       "PRODUCT: the offer must say trusting gives read, with no drive (the app gives none); it says \(explain.debugDescription)")
+        type(ui, Key.id("offer-alias"), "carol", "carol's alias field")
+        tap(ui, Key.id("offer-accept"), "Trust on carol's offer")
+        present(ui, Key.id("keyring-passphrase-continue"), timeout: 15,
+                "Trust on carol's offer, the keyring window closed, must ask for the passphrase")
+        XCTAssertNil(locate(ui, Key.id("offer-accept")),
+                     "PRODUCT: while the passphrase form is open its Trust must be the only one; the offer's own Trust still shows")
+        tap(ui, Key.id("keyring-passphrase-continue"), "Trust with the passphrase field left empty")
+        words(ui, Key.id("offer-failed"), timeout: 15,
+              "Trust with the field empty, alice's identity having a passphrase, must say it is needed",
+              until: { $0.contains("This node's identity has a passphrase") })
+        tap(ui, Key.id("keyring-passphrase-cancel"), "Cancel in the passphrase form")
+        present(ui, Key.id("offer-accept"), timeout: 10, "Cancel must bring back the offer's Trust")
+        el(ui, Key.id("offer-alias")).typeKey("a", modifierFlags: .command)
+        el(ui, Key.id("offer-alias")).typeKey(XCUIKeyboardKey.delete.rawValue, modifierFlags: [])
+        print("[proof] offer: \(explain.debugDescription); one Trust while the form was open; empty passphrase said needed; Cancel brought Trust back")
+
         // Bob's change, waiting for the passphrase, named.
         tap(ui, Key.id("keyring"), "Keyring in the sidebar")
         type(ui, Key.id("keyring-add-fingerprint"), bobFp, "the fingerprint field")

@@ -478,6 +478,9 @@ final class Secret: @unchecked Sendable {
 
     func wipe() { bytes.resetBytes(in: 0..<bytes.count) }
 
+    /// Nothing was typed.
+    var isEmpty: Bool { bytes.isEmpty }
+
     /// Whether `other` holds the same bytes, compared without stopping at the first difference.
     func matches(_ other: Secret) -> Bool {
         guard bytes.count == other.bytes.count else { return false }

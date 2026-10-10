@@ -79,9 +79,9 @@ struct OfferView: View {
         Text("In: \(offer.rooms.map(\.name).joined(separator: ", "))")
             .accessibilityIdentifier("offer-rooms")
         Text("It is not in your keyring. Trusting it lets it read what you write in every room "
-            + "you share, now and later. You are asked for a name, and it is given read; drive is "
-            + "a separate step in the keyring.")
+            + "you share, now and later. You are asked for a name, and it is given read.")
             .secondaryText()
+            .accessibilityIdentifier("offer-explain")
         Text("Dismissing it is yours alone: it is not told, and stays out of your keyring.")
             .secondaryText()
         Hairline()
@@ -108,15 +108,19 @@ struct OfferView: View {
             StateMark(kind: .danger, words: failed).textSelection(.enabled)
                 .accessibilityIdentifier("offer-failed")
         }
-        HStack {
-            Button("Trust") {
-                let name = alias
-                Task { _ = await model.accept(offer, as: name, drive: false) }
+        // While the passphrase form for this offer is open, its Trust and Cancel are the only
+        // buttons; Cancel brings these back (one Trust on screen, never two).
+        if model.keyringPending?.fingerprint != offer.fingerprint {
+            HStack {
+                Button("Trust") {
+                    let name = alias
+                    Task { _ = await model.accept(offer, as: name, drive: false) }
+                }
+                .disabled(alias.isEmpty)
+                .accessibilityIdentifier("offer-accept")
+                Button("Dismiss") { Task { await model.dismiss(offer) } }
+                    .accessibilityIdentifier("offer-dismiss")
             }
-            .disabled(alias.isEmpty)
-            .accessibilityIdentifier("offer-accept")
-            Button("Dismiss") { Task { await model.dismiss(offer) } }
-                .accessibilityIdentifier("offer-dismiss")
         }
     }
 }
