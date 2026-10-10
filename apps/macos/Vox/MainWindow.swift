@@ -303,7 +303,7 @@ private struct OnThisMachine: View {
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel("\(node.name) \(node.state)")
                 .copyMenu([("Copy Name", node.name), ("Copy Fingerprint", node.fingerprint)])
-                .accessibilityIdentifier("node-\(node.name)")
+                .accessibilityIdentifier("machine-\(node.name)")
             }
             Text("Separate identities. One daemon.").secondaryText()
                 .padding(.top, Space.s4)

@@ -1066,7 +1066,7 @@ final class FirstRunProof: XCTestCase {
         // G5: the sidebar opens with who you are, and ends with this Mac's nodes and their state.
         words(ui, Key.id("attached"), timeout: 10, "the sidebar must open with the acting node (G5)",
               until: { $0 == "node alice, attached" })
-        words(ui, Key.id("node-bob"), timeout: 10, "the sidebar's foot must list bob and his state (G5)",
+        words(ui, Key.id("machine-bob"), timeout: 10, "the sidebar's foot must list bob and his state (G5)",
               until: { $0 == "bob attached" })
         let foot = locate(ui, Key.id("on-this-machine"))?.frame ?? .null
         let lastAbove = locate(ui, Key.id("services"))?.frame ?? .null
