@@ -2972,7 +2972,7 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         asks().lines().any(|l| {
             l.contains(&format!("Claude Code in {} has no room", dir.display()))
                 && l.contains(&format!(
-                    "vox room join <link> --node default --bind {}",
+                    "vox room join '<link>' --node default --bind {}",
                     dir.display()
                 ))
         })
@@ -3069,7 +3069,7 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
             && told.contains("Vox has asked the operator which room it works in")
             && told.contains("do not ask again on later turns")
             && told.contains(&format!(
-                "vox room join <link> --node default --bind {}",
+                "vox room join '<link>' --node default --bind {}",
                 loose.display()
             ))
             && told.contains("vox agent room --none --node default"),
@@ -3501,6 +3501,149 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         asks()
     );
 
+    // (5f) **A printed command, pasted whole, does what it says** (v0.4.3): Vox puts every
+    // argument a shell would act on in single quotes. Each command is taken verbatim from what the
+    // shipped binary printed, and run through `zsh -c` and `bash -c` unedited: first its words, as
+    // each shell reads them (`printf` in place of `vox`), then the command itself at a terminal.
+    // A link holds `?` and `&` (an unquoted `&` sent the rest of the line to the background and
+    // cut the join off); a directory here holds a space, `&` and `!` (which zsh and bash expand
+    // even inside double quotes).
+    let words_in = |shell: &str, line: &str| -> Vec<String> {
+        let as_printf = line.replacen("vox ", "printf '%s\\n' ", 1);
+        let out = Command::new(shell)
+            .args(["-c", &as_printf])
+            .output()
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot run {shell}: {e}"));
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    let make_room = |name: &str, pass: &str| -> (String, String) {
+        let (ok, _, err) = hook(
+            &alice.data,
+            &alice.cfg,
+            &["room", "create", "--passphrase-file", "-", "--name", name],
+            pass,
+        );
+        assert!(
+            ok,
+            "PRODUCT (staging): alice's `vox room create {name}` failed: {err}"
+        );
+        let (_, listed, _) = hook(&alice.data, &alice.cfg, &["room", "list"], "");
+        let label = listed
+            .lines()
+            .find(|l| l.contains(name))
+            .and_then(|l| l.split_whitespace().next())
+            .unwrap_or_default()
+            .to_owned();
+        let link = alice.link(&label);
+        assert!(
+            link.contains('&') && link.contains('?'),
+            "APPARATUS: alice's link for {name} holds no `?` and `&` ({link}), so a pasted `&` cannot be checked"
+        );
+        (label, link)
+    };
+    // A repo bound to a room its node is not in: `vox agent status` prints the join, with the link.
+    let (paste_room, paste_link) = make_room("pasted", "pasted passphrase");
+    let bound_dir = tmp.path().join("bound repo & co!");
+    std::fs::create_dir_all(&bound_dir).expect("APPARATUS: cannot make a repository directory");
+    let bound_dir = std::fs::canonicalize(&bound_dir).unwrap_or(bound_dir);
+    let mut text = std::fs::read_to_string(&map).expect("APPARATUS: cannot read the room map");
+    text.push_str(&format!(
+        "\nrepo {}\n    room       {paste_link}\n    passphrase pasted passphrase\n",
+        bound_dir.display()
+    ));
+    std::fs::write(&map, text).expect("APPARATUS: cannot write the room map");
+    let there = status_in(&bound_dir.to_string_lossy());
+    let printed = there
+        .split("run at a terminal: ")
+        .nth(1)
+        .and_then(|rest| rest.lines().next())
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        printed.starts_with("vox room join "),
+        "PRODUCT: `vox agent status` in a repo bound to a room its node is not in must print the \
+         command that joins it; it said:\n{there}"
+    );
+    for shell in ["zsh", "bash"] {
+        let words = words_in(shell, &printed);
+        assert_eq!(
+            words,
+            ["room", "join", paste_link.as_str(), "--node", "default"],
+            "PRODUCT: the printed `{printed}`, pasted into {shell}, must be read as its words with \
+             the link whole; {shell} read {words:?}"
+        );
+    }
+    let joined = in_shell(
+        "zsh",
+        &printed,
+        &data,
+        &cfg,
+        &[("passphrase", "pasted passphrase\r")],
+    );
+    eprintln!("[proof] (5f) pasted `{printed}` into zsh; it said: {joined}");
+    assert!(
+        rooms().contains(&paste_room),
+        "PRODUCT: `{printed}`, pasted whole into zsh, must join room {paste_room}; it said \
+         {joined}, and `vox room list` lists:\n{}",
+        rooms()
+    );
+    // A directory nobody bound: its ask's bind command, with `--bind` and the directory, the
+    // person putting their link in place of `<link>`, inside its quotes, as the command says.
+    let (bind_room, bind_link) = make_room("bindpaste", "bind passphrase");
+    let ask_dir = tmp.path().join("ask repo & co!");
+    std::fs::create_dir_all(&ask_dir).expect("APPARATUS: cannot make a repository directory");
+    let ask_dir = std::fs::canonicalize(&ask_dir).unwrap_or(ask_dir);
+    turn("5f5f5f5f-aaaa-4bbb-8ccc-0000000005f0", &ask_dir);
+    let listed = asks();
+    let template = listed
+        .lines()
+        .filter(|l| l.contains(&ask_dir.display().to_string()))
+        .flat_map(|l| {
+            l.split('`')
+                .skip(1)
+                .step_by(2)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .find(|c| c.starts_with("vox room join") && c.contains("--bind"))
+        .unwrap_or_default();
+    assert!(
+        template.contains("'<link>'"),
+        "PRODUCT: the ask for {} must give its bind command, with the link's place in single \
+         quotes; `vox agent status` said:\n{listed}",
+        ask_dir.display()
+    );
+    let pasted = template.replace("<link>", &bind_link);
+    for shell in ["zsh", "bash"] {
+        let words = words_in(shell, &pasted);
+        let dir = ask_dir.to_string_lossy();
+        assert_eq!(
+            words,
+            ["room", "join", bind_link.as_str(), "--node", "default", "--bind", &*dir],
+            "PRODUCT: the printed `{template}`, pasted into {shell} with the link in place, must be \
+             read as its words, the directory whole with its space, `&` and `!`; {shell} read {words:?}"
+        );
+    }
+    let bound = in_shell(
+        "bash",
+        &pasted,
+        &data,
+        &cfg,
+        &[("passphrase", "bind passphrase\r")],
+    );
+    eprintln!("[proof] (5f) pasted `{pasted}` into bash; it said: {bound}");
+    assert!(
+        rooms().contains(&bind_room)
+            && bound.contains(&format!("vox: bound {}", ask_dir.display())),
+        "PRODUCT: `{pasted}`, pasted whole into bash, must join room {bind_room} and bind {}; it \
+         said {bound}",
+        ask_dir.display()
+    );
+
     // (6) A mapped room whose host is gone: the join fails, and the session is told why on a
     // later turn, even though that turn tries the join again.
     let ghost = Daemon::start(&tmp.path().join("ghost"));
@@ -3541,7 +3684,7 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
                 "Claude Code in {}: its node default isn't in room {ghost_room}",
                 gone_dir.display()
             ))
-            && l.contains(&format!("vox room join {ghost_link} --node default"))
+            && l.contains(&format!("vox room join '{ghost_link}' --node default"))
     });
     assert!(
         !claims && there.contains("and default is not in it") && asked,
@@ -3632,6 +3775,22 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
 /// Run `vox args` on a pseudo-terminal, as an operator types at one, answering each prompt that
 /// `answers` names (a piece of the question, the keys) in order: everything it printed.
 fn in_terminal(data: &Path, cfg: &Path, args: &[&str], answers: &[(&str, &str)]) -> String {
+    on_pty(VOX, args, data, cfg, answers)
+}
+
+/// Run `line` exactly as pasted into `shell` (`zsh` or `bash`) on a pseudo-terminal, the shipped
+/// `vox` first on its PATH, answering `answers` as [`in_terminal`] does: everything it printed.
+fn in_shell(shell: &str, line: &str, data: &Path, cfg: &Path, answers: &[(&str, &str)]) -> String {
+    on_pty(shell, &["-c", line], data, cfg, answers)
+}
+
+fn on_pty(
+    program: &str,
+    args: &[&str],
+    data: &Path,
+    cfg: &Path,
+    answers: &[(&str, &str)],
+) -> String {
     use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem as _};
     use std::io::Read;
     use std::sync::{Arc, Mutex};
@@ -3643,8 +3802,20 @@ fn in_terminal(data: &Path, cfg: &Path, args: &[&str], answers: &[(&str, &str)])
             pixel_height: 0,
         })
         .expect("APPARATUS: open a pty");
-    let mut cmd = CommandBuilder::new(VOX);
+    let mut cmd = CommandBuilder::new(program);
     cmd.args(args);
+    // A pasted `vox` is the shipped binary under proof, never one installed on this machine.
+    let bin = Path::new(VOX)
+        .parent()
+        .expect("APPARATUS: vox has a directory");
+    cmd.env(
+        "PATH",
+        format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    );
     cmd.env("VOX_DATA_DIR", data);
     cmd.env("VOX_CONFIG_DIR", cfg);
     cmd.env("TERM", "xterm-256color");
@@ -3685,7 +3856,7 @@ fn in_terminal(data: &Path, cfg: &Path, args: &[&str], answers: &[(&str, &str)])
                 let _ = child.kill();
                 let _ = child.wait();
                 panic!(
-                    "PRODUCT: `vox {args:?}` at a terminal never asked {question:?}; it said:\n{}",
+                    "PRODUCT: `{program} {args:?}` at a terminal never asked {question:?}; it said:\n{}",
                     text()
                 );
             }
@@ -3703,7 +3874,7 @@ fn in_terminal(data: &Path, cfg: &Path, args: &[&str], answers: &[(&str, &str)])
             let _ = child.kill();
             let _ = child.wait();
             panic!(
-                "PRODUCT: `vox {args:?}` at a terminal did not finish within 60 s; it said:\n{}",
+                "PRODUCT: `{program} {args:?}` at a terminal did not finish within 60 s; it said:\n{}",
                 text()
             );
         }

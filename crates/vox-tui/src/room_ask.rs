@@ -108,7 +108,10 @@ pub fn answers(ask: &RoomAsk, data_root: &std::path::Path) -> Vec<(&'static str,
                     .map(|e| e.room.clone())
             })
             .unwrap_or_else(|| "<link>".to_owned());
-        return vec![("to join it", format!("vox room join {link} --node {node}"))];
+        return vec![(
+            "to join it",
+            vox_text::shell::command(&["vox", "room", "join", &link, "--node", node]),
+        )];
     }
     let session = ask
         .sessions
@@ -117,11 +120,22 @@ pub fn answers(ask: &RoomAsk, data_root: &std::path::Path) -> Vec<(&'static str,
     vec![
         (
             "to bind it",
-            format!("vox room join <link> --node {node} --bind {}", ask.dir),
+            vox_text::shell::command(&[
+                "vox", "room", "join", "<link>", "--node", node, "--bind", &ask.dir,
+            ]),
         ),
         (
             "to say no",
-            format!("vox agent room --none --node {node} --session {session}"),
+            vox_text::shell::command(&[
+                "vox",
+                "agent",
+                "room",
+                "--none",
+                "--node",
+                node,
+                "--session",
+                session,
+            ]),
         ),
     ]
 }

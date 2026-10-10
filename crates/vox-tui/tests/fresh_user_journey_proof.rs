@@ -1875,12 +1875,14 @@ mod journey {
                     .find(|c| c.starts_with("vox room join"))
                     .unwrap_or_else(|| {
                         format!(
-                            "vox room join <link> --node {node} --bind {}",
+                            "vox room join '<link>' --node {node} --bind {}",
                             w.repo.display()
                         )
                     });
                 let join = join.replace("<link>", &link);
-                let args: Vec<&str> = join.split_whitespace().skip(1).collect();
+                // Its words as a shell reads them: Vox prints arguments in single quotes (v0.4.3).
+                let words = shell_words(&join);
+                let args: Vec<&str> = words.iter().skip(1).map(String::as_str).collect();
                 let (_, out) = w.follow(&args, node);
                 l.claim(
                     &format!("J8.{key}.room-join"),
@@ -2703,4 +2705,36 @@ mod journey {
             with Claude Code, Codex and OpenCode against a stand-in model"]
 fn a_fresh_user_gets_from_install_to_an_agent_working_in_a_room() {
     journey::run();
+}
+
+/// `line`'s words as a POSIX shell splits them, for the single quoting Vox prints (v0.4.3): a word
+/// ends at unquoted white space; inside `'…'` every character is itself; `\'` outside quotes is a
+/// `'`. Enough for the commands Vox prints, which use no other quoting.
+fn shell_words(line: &str) -> Vec<String> {
+    let (mut words, mut word, mut quoted, mut any) = (Vec::new(), String::new(), false, false);
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match (quoted, c) {
+            (true, '\'') => quoted = false,
+            (true, c) => word.push(c),
+            (false, '\'') => (quoted, any) = (true, true),
+            (false, '\\') => {
+                if let Some(n) = chars.next() {
+                    word.push(n);
+                    any = true;
+                }
+            }
+            (false, c) if c.is_whitespace() => {
+                if any || !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+                any = false;
+            }
+            (false, c) => word.push(c),
+        }
+    }
+    if any || !word.is_empty() {
+        words.push(word);
+    }
+    words
 }

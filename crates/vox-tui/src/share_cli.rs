@@ -240,7 +240,10 @@ pub async fn share(
             .collect();
         println!("     for {}", names.join(", "));
     }
-    println!("     collect it with: vox room get {room} {}", s.name);
+    println!(
+        "     collect it with: {}",
+        vox_text::shell::command(&["vox", "room", "get", room, &s.name])
+    );
     if s.files > 0 {
         println!(
             "     or one file through `vox up`: curl --socks5-hostname <proxy> \
@@ -260,9 +263,8 @@ pub async fn share(
         (None, None) => {}
     }
     println!(
-        "     served until its message expires, `vox share stop {room} {}`, you leave the room, \
-         or it ends",
-        s.name
+        "     served until its message expires, `{}`, you leave the room, or it ends",
+        vox_text::shell::command(&["vox", "share", "stop", room, &s.name])
     );
     Ok(())
 }

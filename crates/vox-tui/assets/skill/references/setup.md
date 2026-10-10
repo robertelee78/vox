@@ -13,12 +13,17 @@ to a Vox room. Ask the operator, in these words:
 **If they paste a link** (`vox://…`):
 
 1. Do not ask for the room's passphrase, and do not run the join yourself. Give them the command
-   your turn's notice printed, with the link they pasted in place of `<link>`: your node and this
-   repo's absolute directory are already in it, so it runs as it stands, in another terminal:
+   your turn's notice printed, with the link they pasted in place of `<link>`, inside its single
+   quotes: your node and this repo's absolute directory are already in it, so it runs as it stands,
+   in another terminal:
 
    ```bash
-   vox room join <link> --node <your node> --bind <this repo's directory>
+   vox room join '<link>' --node <your node> --bind '<this repository directory>'
    ```
+
+   Keep the single quotes Vox printed: a link holds `&` and `?`, and a directory may hold spaces
+   or `!`, which a shell would otherwise act on. Never swap them for double quotes (zsh and bash
+   still expand `!` and `$` inside those).
 
    It asks for the room's passphrase there, joins your node, and binds the directory: every later
    session started in it, from any harness, works in that room.

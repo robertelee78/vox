@@ -678,8 +678,9 @@ fn opencode_plugin(node: &vox_core::node::paths::NodeName) -> Check {
             id,
             format!("no Vox plugin in {}", dir.join("plugin").display()),
             format!(
-                "`vox agent plugin opencode --node {node} > {}`",
-                target.display()
+                "`{} > {}`",
+                vox_text::shell::command(&["vox", "agent", "plugin", "opencode", "--node", node.as_str()]),
+                vox_text::shell::arg(&target.display().to_string())
             ),
         ),
         [(path, text)] if *text == this => {
@@ -693,8 +694,9 @@ fn opencode_plugin(node: &vox_core::node::paths::NodeName) -> Check {
                 crate::coord::VERSION
             ),
             format!(
-                "`vox agent plugin opencode --node {node} > {}`",
-                path.display()
+                "`{} > {}`",
+                vox_text::shell::command(&["vox", "agent", "plugin", "opencode", "--node", node.as_str()]),
+                vox_text::shell::arg(&path.display().to_string())
             ),
         ),
         many => fail(

@@ -855,7 +855,7 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
         };
     let bind = |node: &str| {
         format!(
-            "vox room join <link> --node {node} --bind {}",
+            "vox room join '<link>' --node {node} --bind {}",
             repo.display()
         )
     };

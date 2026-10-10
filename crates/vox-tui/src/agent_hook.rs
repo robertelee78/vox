@@ -1878,7 +1878,17 @@ fn offers_said(paths: &Paths, offered: &[(String, String)]) -> String {
     );
     for (fp, said) in offered {
         out.push_str(&format!(
-            "- {said}\n  accept: vox trust add {fp} --name <name> [--drive] --node {node}\n"
+            "- {said}\n  accept: {} [--drive]\n",
+            vox_text::shell::command(&[
+                "vox",
+                "trust",
+                "add",
+                fp,
+                "--name",
+                "<name>",
+                "--node",
+                &node.to_string()
+            ])
         ));
     }
     out.push('\n');

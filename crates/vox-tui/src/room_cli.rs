@@ -3570,8 +3570,8 @@ pub async fn get_file(
         if o.sha256 == newest.sha256 {
             let _ = write!(
                 said,
-                "\n       the same file is also offered by {who}: `vox room get {room} {}`",
-                o.tag
+                "\n       the same file is also offered by {who}: `{}`",
+                vox_text::shell::command(&["vox", "room", "get", room, &o.tag])
             );
         } else {
             let _ = write!(
@@ -5245,8 +5245,9 @@ pub async fn trust_offers(paths: &Paths) -> Result<(), AppError> {
         println!("  {}", o.said);
         println!("  in {}", listed(&in_rooms, ""));
         println!(
-            "  accept: vox trust add {fp} --name <name> [--drive]   dismiss: vox trust dismiss {}",
-            short(&o.member)
+            "  accept: {} [--drive]   dismiss: {}",
+            vox_text::shell::command(&["vox", "trust", "add", &fp, "--name", "<name>"]),
+            vox_text::shell::command(&["vox", "trust", "dismiss", &short(&o.member)])
         );
     }
     Ok(())
