@@ -27,7 +27,11 @@ extension NodeModel {
 
     /// Whether one Session is on screen, rather than the room's conversation or All.
     /// What needs the person, as the sidebar's NEEDS YOU counts it: its rooms and trust offers.
-    var needsYouCount: Int { group(.needsYou).count + offers.count }
+    /// An offer counts in the room it came from (K-15), and alone only when it came from none.
+    var needsYouCount: Int {
+        group(.needsYou).count
+            + offers.filter { o in !rooms.contains { r in o.rooms.contains { $0.id == r.id } } }.count
+    }
 
     /// A room's name as the sidebar says it, else its id's start.
     func roomName(_ room: String) -> String {

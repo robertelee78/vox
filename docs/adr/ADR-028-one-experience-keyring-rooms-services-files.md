@@ -372,11 +372,20 @@ structure for both clients; the TUI renders the same regions in text.
   cards and file offers inline; an inspector with the members and their trust glyphs (L-4); and a
   status bar with the node, its peers and the keyring window (K-9). Keyring and Services MUST be
   views of the same window, not separate windows.
-- **W-2.** The sidebar MUST group rooms by what they need from the person, with counts: **needs
-  you** (a message addressed to this node unread, urgent first, a trust offer waiting, K-15, or a
-  Session waiting on this node, ADR-029 CL-2),
-  **active** (new messages, or a
-  member holding a claim), and **quiet**. A key MUST move to the next room that needs the person.
+- **W-2.** *Amended (the decider, v0.4.3: "we should just list the rooms and they should change
+  color when there's something that I need to respond on to an update of any type but basically
+  anybody talking, And maybe a count of the number of messages I've not read yet But we don't
+  need those three headings those three headings make it really hard to know where to click";
+  and, of a chat list, "should be more like that").* The app's sidebar MUST list the rooms as one
+  list with no group headings, the most recent activity first. Each row MUST show the room's
+  name, the time of its newest message (the time today, "Yesterday", the weekday within the week,
+  else the date), a one-line preview of that message as "sender: text" ("new message" when this
+  node cannot read it), and a badge counting its unread messages. A room that **needs** the
+  person (a message addressed to this node unread, a trust offer from one of its members, K-15,
+  or a Session waiting on this node, ADR-029 CL-2) MUST show it in the stronger accent, and its
+  preview MUST say what waits. A trust offer MUST be shown in the room it came from, at the top of
+  its General. A key MUST move to the next room that needs the person. The TUI keeps its groups
+  (needs you, active, quiet) until it is amended in turn.
 - **W-3.** *Removed (the decider, 2026-10-06):* there MUST be no lanes view. A room shows its own
   conversation and its Sessions (ADR-029 §8): Vox has rooms, nodes and Sessions.
 - **W-4.** The room's composer MUST carry a **To:** selector of members and of their open

@@ -34,15 +34,13 @@ struct OfferRow: View {
 struct OfferView: View {
     @ObservedObject var model: NodeModel
     let fingerprint: String
-    @State private var alias = ""
-    @State private var comparing = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Space.s12) {
                 Text("Trust offer").title()
                 if let offer = model.offers.first(where: { $0.fingerprint == fingerprint }) {
-                    card(offer)
+                    OfferCard(model: model, offer: offer)
                 } else {
                     // Trusted, dismissed, or gone from the room: say what was done, if this did it.
                     if let did = model.keyringDid {
@@ -57,7 +55,17 @@ struct OfferView: View {
         }
     }
 
-    @ViewBuilder private func card(_ offer: OfferInfo) -> some View {
+}
+
+/// An offer's card: its fingerprint, what is said of it, Compare…, and Trust or Dismiss (K-15 –
+/// K-18). In its own view (an offer from no room listed) or in its room's banner (v0.4.3).
+struct OfferCard: View {
+    @ObservedObject var model: NodeModel
+    let offer: OfferInfo
+    @State private var alias = ""
+    @State private var comparing = false
+
+    var body: some View {
         let card = fingerprintCard(fingerprint: offer.fingerprint)
         HStack(alignment: .top, spacing: Space.s16) {
             VStack(spacing: 0) {

@@ -45,11 +45,18 @@ final class NodeModel: ObservableObject {
         /// Approvals and questions waiting on this node in Sessions it may drive here (ADR-029
         /// CL-2).
         var waiting = 0
+        /// Trust offers waiting on this node from members of this room (K-15): shown in the room,
+        /// and they need the person.
+        var offered = 0
+        /// What its first offer's row preview says: "xrsja33… joined — trust?".
+        var offerSaid = ""
+        /// Its newest message, for the row's time and preview (the decider, v0.4.3).
+        var last: Preview?
 
         /// What it needs from the person, by the rule the TUI groups by (W-2): a Session waiting
-        /// on this node needs it too (CL-2).
+        /// on this node needs it too (CL-2), and a trust offer from one of its members (K-15).
         var need: RoomGroup {
-            waiting > 0 ? .needsYou
+            waiting > 0 || offered > 0 ? .needsYou
                 : roomGroup(toYou: UInt32(addressed), new: UInt32(new), coordination: UInt32(coordination))
         }
 
@@ -62,6 +69,28 @@ final class NodeModel: ObservableObject {
             if new > 0 { parts.append("\(new) new") }
             if coordination > 0 { parts.append("\(coordination) coordination") }
             return parts.isEmpty ? "nothing unread" : parts.joined(separator: ", ")
+        }
+    }
+
+    /// A room's newest message as its sidebar row says it: when, and "who: text" (or "new
+    /// message" when this node cannot read it yet).
+    struct Preview: Equatable {
+        let id: String
+        let millis: UInt64
+        let words: String
+
+        @MainActor init(_ m: RoomMessage, me: String) {
+            id = m.id
+            millis = m.createdMillis
+            let said = m.owed ? "" : NodeModel.body(m)
+                .split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
+            words = said.isEmpty ? "new message" : "\(NodeModel.author(m, me: me)): \(said)"
+        }
+
+        /// Whether `m` is a line a row may preview: the room's conversation, not a Session's
+        /// opening or end, nor plumbing.
+        static func shows(_ m: RoomMessage) -> Bool {
+            !["session", "session-end", "ping", "pong"].contains(m.kind)
         }
     }
 
@@ -312,6 +341,31 @@ final class NodeModel: ObservableObject {
     }
 
     /// The rooms in `need`, urgent first, then by name.
+    /// The rooms as the sidebar lists them (the decider, v0.4.3, "more like" a chat list): the
+    /// most recent activity first, a room with none by name.
+    var orderedRooms: [Room] {
+        rooms.sorted {
+            let (a, b) = ($0.last?.millis ?? 0, $1.last?.millis ?? 0)
+            if a != b { return a > b }
+            return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+    }
+
+    /// Each room's newest message read so far, by room: the next read starts after it.
+    private var lastRead: [String: String] = [:]
+
+    /// Read what `room` has after its newest message read so far, for its row's preview.
+    private func readLast(_ room: String) async {
+        guard let rows = try? await client.read(room: room, after: lastRead[room] ?? "", limit: 0),
+              let newest = rows.last else { return }
+        lastRead[room] = newest.id
+        guard let shown = rows.last(where: Preview.shows),
+              let i = rooms.firstIndex(where: { $0.id == room }),
+              shown.createdMillis >= rooms[i].last?.millis ?? 0 else { return }
+        let preview = Preview(shown, me: me)
+        if rooms[i].last != preview { rooms[i].last = preview }
+    }
+
     func group(_ need: RoomGroup) -> [Room] {
         rooms.filter { $0.need == need }.sorted {
             if $0.urgent != $1.urgent { return $0.urgent > $1.urgent }
@@ -370,6 +424,13 @@ final class NodeModel: ObservableObject {
     private func readFacts() async {
         if let keyring = try? await client.trustList(), keyring != trusted { trusted = keyring }
         if let waiting = try? await client.pendingOffers(), waiting != offers { offers = waiting }
+        // Each room counts the offers from its members (K-15), shown in it.
+        for i in rooms.indices {
+            let here = offers.filter { $0.rooms.contains { $0.id == rooms[i].id } }
+            if rooms[i].offered != here.count { rooms[i].offered = here.count }
+            let said = here.first.map { "\($0.short)… \($0.whyWords) — trust?" } ?? ""
+            if rooms[i].offerSaid != said { rooms[i].offerSaid = said }
+        }
         if let fresh = try? await client.nodes(), fresh != nodes { nodes = fresh }
         if let view = try? await client.view() {
             if Int(view.peers) != peers { peers = Int(view.peers) }
@@ -487,10 +548,14 @@ final class NodeModel: ObservableObject {
                     room.new = held.new
                     room.coordination = held.coordination
                     room.waiting = held.waiting
+                    room.offered = held.offered
+                    room.offerSaid = held.offerSaid
+                    room.last = held.last
                 }
                 return room
             }
             if now != rooms { rooms = now }
+            for room in now { await readLast(room.id) }
             // Each room's once, and the room on screen's each time: an admin made elsewhere.
             for room in now where !adminsRead.contains(room.id) || room.id == roomOnScreen {
                 await readEndable(room.id)
@@ -849,7 +914,7 @@ final class NodeModel: ObservableObject {
 
     /// The room at sidebar position `n` (1-based): needs you, then active, then quiet (⌘1–⌘9).
     func showRoom(at n: Int) async {
-        let ordered = group(.needsYou) + group(.active) + group(.quiet)
+        let ordered = orderedRooms
         guard n >= 1 && n <= ordered.count else { return }
         await show(.room(ordered[n - 1].id))
     }
@@ -1107,7 +1172,7 @@ final class NodeModel: ObservableObject {
 
     /// The next room that needs the person, if any (W-2).
     func nextNeedingYou() async {
-        if let room = group(.needsYou).first {
+        if let room = orderedRooms.first(where: { $0.need == .needsYou }) {
             // A request waiting in one of its Sessions: that Session, that request (P1).
             if let waiting = await firstWaiting(in: room.id) {
                 await openRequest(room: room.id, node: waiting.node, session: waiting.session,
@@ -1333,6 +1398,12 @@ final class NodeModel: ObservableObject {
             && !message.owed {
             let name = rooms.first { $0.id == room }?.name ?? String(room.prefix(12))
             notifier.post(message, room: room, roomName: name, me: me)
+        }
+        // The room's row previews it.
+        if Preview.shows(message), let i = rooms.firstIndex(where: { $0.id == room }),
+           message.createdMillis >= rooms[i].last?.millis ?? 0 {
+            let preview = Preview(message, me: me)
+            if rooms[i].last != preview { rooms[i].last = preview }
         }
         if case .room(room) = selection {
             // A message already shown is replaced: one whose body had not arrived ("not received
