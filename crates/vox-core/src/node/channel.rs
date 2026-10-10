@@ -5890,7 +5890,11 @@ impl ChannelState {
         self.persist_drive(store)?;
         let before = self.drive.sessions.len();
         self.backfill(store, &skdm.body.author_id, now_ms)?;
-        Ok(self.drive.sessions.len() - before)
+        // What it opened of Sessions: a key-changed entry is none of theirs.
+        Ok(self.drive.sessions[before..]
+            .iter()
+            .filter(|r| !crate::node::drive::is_key_changed(&r.session_id))
+            .count())
     }
 
     /// Open one Session entry with the drive key it names, if this node holds it, queueing its

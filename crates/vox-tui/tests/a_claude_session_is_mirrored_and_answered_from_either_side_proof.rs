@@ -1846,20 +1846,23 @@ fn an_approval_is_answered_from_either_side_and_the_first_answer_wins() {
 }
 
 const S9: &str = "99999999-2222-4000-8000-000000000009";
+/// A second person's node, which keeps drive while `person` loses it.
+const KEEPER: &str = "keeper";
 
-/// `person`'s `can_drive` for `session` in `room`, as `vox room sessions --json` says it; `None`
+/// `node`'s `can_drive` for `session` in `room`, as `vox room sessions --json` says it; `None`
 /// while the Session is not listed open.
-fn can_drive(w: &World, room: &str, session: &str) -> Option<bool> {
-    let (_, out, _) = w.vox(PERSON, &["room", "sessions", room, "--json"], None);
+fn can_drive(w: &World, node: &str, room: &str, session: &str) -> Option<bool> {
+    let (_, out, _) = w.vox(node, &["room", "sessions", room, "--json"], None);
     out.lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .find(|v| v["id"] == session && v["open"] == true)
         .and_then(|v| v["can_drive"].as_bool())
 }
 
-/// Wait up to `limit` for `person`'s `can_drive` on `session` to be `want`; what it last was.
+/// Wait up to `limit` for `node`'s `can_drive` on `session` to be `want`; what it last was.
 fn can_drive_becomes(
     w: &World,
+    node: &str,
     room: &str,
     session: &str,
     want: bool,
@@ -1867,7 +1870,7 @@ fn can_drive_becomes(
 ) -> Option<bool> {
     let t0 = Instant::now();
     loop {
-        let now = can_drive(w, room, session);
+        let now = can_drive(w, node, room, session);
         if now == Some(want) || t0.elapsed() >= limit {
             return now;
         }
@@ -1876,22 +1879,32 @@ fn can_drive_becomes(
 }
 
 /// ADR-029 SC-2a, SC-2b; ADR-028 K-14 (#662) — **drive is held as soon as it is given, on a
-/// Session that has written nothing yet, and it is gone as soon as it is taken back.**
+/// Session that has written nothing yet, and it is gone as soon as it is taken back, from that
+/// member alone.**
 ///
 /// 1. The world above: `claude-a` trusts `person` with drive. Session S9 does one turn in the
-///    room, then is moved with `vox agent room` to a second room both nodes are in, where its
-///    Session opens and writes nothing (as a session Vox moves when the person picks its room).
-/// 2. Within 10 s, with no entry in the second room, `person`'s `vox room sessions --json` says
-///    `"can_drive":true` for it: `claude-a` made its drive key there and released it.
-/// 3. `claude-a`'s operator takes drive back, `vox trust read person`, typed at a terminal.
-///    Within 10 s, with no entry since, `"can_drive":false`.
-/// 4. S9 then calls a tool: `person`'s `vox room session` does not show that call.
+///    room, then is moved with `vox agent room` to a second room, where its Session opens and
+///    writes nothing (as a session Vox moves when the person picks its room). A third node,
+///    `keeper`, is in the second room, and `claude-a` trusts it with drive too.
+/// 2. Within 10 s, with no entry in the second room, `vox room sessions --json` says
+///    `"can_drive":true` for S9 to `person` and to `keeper`: `claude-a` made its drive key there
+///    and released it.
+/// 3. `claude-a`'s operator takes drive back from `person`, `vox trust read person`, typed at a
+///    terminal. Within 10 s, with no entry since, `person` reads `"can_drive":false`; `keeper`,
+///    asked every 0.3 s from before the change until 5 s after `person` lost it, reads `true`
+///    every time. What `claude-a` and `keeper`, which both read under the new key, show of both
+///    rooms and of S9 (`vox room list`, `vox room read`, `vox room sessions --json`, `vox room
+///    session --details`) is exactly what each showed before: the entry that says the key
+///    changed is in no row, Session, message or list.
+/// 4. S9 then calls a tool: `keeper` reads that call; `person` does not.
 ///
 /// **Which side a red is on.** What `vox room sessions` or `vox room session` printed is
 /// `PRODUCT:`; staging the product refused is `APPARATUS (staging):`.
 ///
 /// **Mutations that must turn it red:** the drive key not begun until the Session's first entry
-/// (arm 2); no entry under the new key when drive is taken back (arm 3).
+/// (arm 2); no entry under the new key when drive is taken back (arm 3, `person`); the new key not
+/// released to a member that keeps drive (arm 3, `keeper`); the key change posted as a room
+/// message rather than an entry no Session has (arm 3, "showed in a room or a Session").
 #[test]
 #[ignore = "real binary; run in release"]
 fn drive_given_on_an_idle_session_is_held_at_once_and_taken_back_at_once() {
@@ -1928,40 +1941,98 @@ fn drive_given_on_an_idle_session_is_held_at_once_and_taken_back_at_once() {
         .find(|l| l.starts_with("vox://"))
         .unwrap_or_else(|| panic!("APPARATUS (staging): `vox room link` printed no link"))
         .to_owned();
+    w.staged(KEEPER, &["node", "create", KEEPER], None);
+    w.staged(KEEPER, &["node", "attach", KEEPER], None);
+    for node in [AGENT, KEEPER] {
+        w.staged(
+            node,
+            &["room", "join", "--passphrase-file", "-", &link],
+            Some("second passphrase\n"),
+        );
+    }
+    let agent_fp = w.staged(AGENT, &["id"], None).trim().to_owned();
+    let keeper_fp = w.staged(KEEPER, &["id"], None).trim().to_owned();
+    w.staged(KEEPER, &["trust", "add", &agent_fp, "--name", AGENT], None);
     w.staged(
         AGENT,
-        &["room", "join", "--passphrase-file", "-", &link],
-        Some("second passphrase\n"),
+        &["trust", "add", &keeper_fp, "--name", KEEPER, "--drive"],
+        None,
     );
     w.staged(AGENT, &["agent", "room", &second, "--session", S9], None);
     session_listed(&w, &second, S9);
     println!("[proof] (1) S9 moved to room {second}, where it has written nothing");
 
     // ---- (2) drive held at once, with no entry ----
-    let held = can_drive_becomes(&w, &second, S9, true, Duration::from_secs(10));
-    println!("[proof] (2) person's can_drive on the idle Session: {held:?}");
-    assert_eq!(
-        held,
-        Some(true),
-        "PRODUCT: {AGENT} trusts {PERSON} with drive and S9's Session is open in room {second}, \
-         yet within 10 s `vox room sessions --json` did not say \"can_drive\":true for it (it said \
-         {held:?}): the drive key waits for the Session's first entry"
-    );
+    for node in [PERSON, KEEPER] {
+        let held = can_drive_becomes(&w, node, &second, S9, true, Duration::from_secs(10));
+        println!("[proof] (2) {node}'s can_drive on the idle Session: {held:?}");
+        assert_eq!(
+            held,
+            Some(true),
+            "PRODUCT: {AGENT} trusts {node} with drive and S9's Session is open in room \
+             {second}, yet within 10 s `vox room sessions --json` did not say \"can_drive\":true \
+             for it (it said {held:?}): the drive key waits for the Session's first entry"
+        );
+    }
 
-    // ---- (3) drive taken back, at a terminal: gone at once ----
+    // ---- (3) drive taken back from person, at a terminal: gone at once, for person alone ----
+    // What a node shows of its rooms and Sessions, before: the key change must add nothing.
+    let shown = |node: &str| -> String {
+        let mut all = w.staged(node, &["room", "list"], None);
+        for r in [&room, &second] {
+            let (_, read, _) = w.vox(node, &["room", "read", r], None);
+            let (_, listed, _) = w.vox(node, &["room", "sessions", r, "--json"], None);
+            let (_, view, _) = w.vox(node, &["room", "session", r, S9, "--details"], None);
+            all += &format!("{read}{listed}{view}");
+        }
+        all
+    };
+    let (own_before, keeper_before) = (shown(AGENT), shown(KEEPER));
     let person_fp = w.staged(PERSON, &["id"], None).trim().to_owned();
     w.staged(AGENT, &["trust", "read", &person_fp], None);
-    let after = can_drive_becomes(&w, &second, S9, false, Duration::from_secs(10));
-    println!("[proof] (3) after `vox trust read`, person's can_drive: {after:?}");
-    assert_eq!(
-        after,
-        Some(false),
+    let t0 = Instant::now();
+    let mut lost_at = None;
+    let mut keeper_seen = Vec::new();
+    while lost_at.map_or(t0.elapsed() < Duration::from_secs(10), |at: Instant| {
+        at.elapsed() < Duration::from_secs(5)
+    }) {
+        keeper_seen.push(can_drive(&w, KEEPER, &second, S9));
+        if lost_at.is_none() && can_drive(&w, PERSON, &second, S9) == Some(false) {
+            lost_at = Some(Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let after = can_drive(&w, PERSON, &second, S9);
+    println!(
+        "[proof] (3) after `vox trust read`, person's can_drive: {after:?}; keeper's, asked {} \
+         times: {keeper_seen:?}",
+        keeper_seen.len()
+    );
+    assert!(
+        lost_at.is_some() && after == Some(false),
         "PRODUCT: {AGENT} took drive back from {PERSON} (`vox trust read`), yet within 10 s \
-         `vox room sessions --json` still did not say \"can_drive\":false for S9 in room {second} \
-         (it said {after:?})"
+         `vox room sessions --json` still did not say \"can_drive\":false for S9 in room \
+         {second} (it said {after:?})"
+    );
+    assert!(
+        keeper_seen.iter().all(|k| *k == Some(true)),
+        "PRODUCT: {KEEPER} keeps drive from {AGENT}, yet while {PERSON} lost it, its \
+         `vox room sessions --json` said, asked every 0.3 s: {keeper_seen:?}"
+    );
+    // The entry that says the key changed is no Session's, nor a message: the nodes that read
+    // under the new key show their rooms and Sessions exactly as before.
+    let (own_after, keeper_after) = (shown(AGENT), shown(KEEPER));
+    let person_after = shown(PERSON);
+    assert!(
+        own_after == own_before
+            && keeper_after == keeper_before
+            && !format!("{own_after}{keeper_after}{person_after}").contains("drive-key"),
+        "PRODUCT: the key change showed in a room or a Session: {AGENT}'s node showed before\n\
+         {own_before}\nand after\n{own_after}\n{KEEPER}'s showed before\n{keeper_before}\nand \
+         after\n{keeper_after}"
     );
 
-    // ---- (4) what S9 does next is not readable by person ----
+    // ---- (4) what S9 does next: keeper reads it, person does not ----
     let call =
         serde_json::json!({ "command": "echo after-drive-was-taken", "description": "Echo" });
     w.hook_done(
@@ -1973,17 +2044,17 @@ fn drive_given_on_an_idle_session_is_held_at_once_and_taken_back_at_once() {
             serde_json::json!({ "tool_name": "Bash", "tool_input": call, "tool_use_id": "toolu_9" }),
         ),
     );
-    let mut own = String::new();
+    let mut kept = String::new();
     let t0 = Instant::now();
-    while !own.contains("after-drive-was-taken") && t0.elapsed() < Duration::from_secs(15) {
-        own = w.staged(AGENT, &["room", "session", &second, S9], None);
+    while !kept.contains("after-drive-was-taken") && t0.elapsed() < Duration::from_secs(15) {
+        kept = w.vox(KEEPER, &["room", "session", &second, S9], None).1;
         std::thread::sleep(Duration::from_millis(300));
     }
     assert!(
-        own.contains("after-drive-was-taken"),
-        "APPARATUS (staging): S9's tool call never showed in its own node's Session view: {own}"
+        kept.contains("after-drive-was-taken"),
+        "PRODUCT: {KEEPER} keeps drive from {AGENT}, yet within 15 s it did not read the call S9 \
+         made after {PERSON} lost drive: {kept}"
     );
-    std::thread::sleep(Duration::from_secs(3));
     let (ok, seen) = drive(&w, &second, S9, &[]);
     println!("[proof] (4) person's view of S9 after the call (ok {ok}):\n{seen}");
     assert!(
