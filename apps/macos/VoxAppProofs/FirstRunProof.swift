@@ -953,6 +953,29 @@ final class FirstRunProof: XCTestCase {
             bobRead = run(vox, ["room", "read", "--node", "bob", room], env: voxEnv).out.contains("LOOK-AT-THIS")
         }
         guard bobRead else { throw Apparatus("staging not achieved: bob never read LOOK-AT-THIS") }
+        // Bob reads it as a person's agent does, by his session's hook, which records the read
+        // (`vox room read` records none: the first v0.4.3 runs' red here was the staging's, as
+        // alice's node never held a read record). Then alice's node must hold it: the premise.
+        let bobHook = run(vox, ["agent", "hook", "--node", "bob", "--room", room, "--format", "text"],
+                          env: voxEnv.merging(["CLAUDE_CODE_ENTRYPOINT": "cli"]) { $1 },
+                          input: "{\"session_id\":\"look-bob\",\"hook_event_name\":\"UserPromptSubmit\",\"cwd\":\"/tmp\",\"transcript_path\":\"/tmp/t.jsonl\",\"prompt\":\"news?\"}")
+        guard bobHook.status == 0 else {
+            throw Apparatus("staging not achieved: bob's hook, to read LOOK-AT-THIS as an agent does, exited \(bobHook.status): \(bobHook.out)")
+        }
+        func aliceHoldsBobsRead() -> (Bool, String) {
+            let rows = run(vox, ["room", "read", "--node", "alice", "--json", room], env: voxEnv).out
+            let row = rows.split(separator: "\n").first { $0.contains("LOOK-AT-THIS") }.map(String.init) ?? ""
+            return (row.contains("\"read_by\"") && row.contains("bob"), row)
+        }
+        var recorded = aliceHoldsBobsRead()
+        let recordUntil = Date().addingTimeInterval(60)
+        while !recorded.0 && Date() < recordUntil {
+            Thread.sleep(forTimeInterval: 1)
+            recorded = aliceHoldsBobsRead()
+        }
+        guard recorded.0 else {
+            throw Apparatus("staging not achieved: 60 s after bob's hook read LOOK-AT-THIS, alice's node holds no read record of bob's for it: \(recorded.1)")
+        }
         try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
         try stager.write(Data("alice\n".utf8), to: config + "/app/node")
 
@@ -1081,7 +1104,10 @@ final class FirstRunProof: XCTestCase {
             print("[proof] read-by premise: \(said)")
             let aliceSeesBob = aliceRoster.contains(String(bobFp.prefix(12))) || aliceRoster.contains("bob")
             let bobSeesAlice = bobRoster.contains(String(aliceFp.prefix(12))) || bobRoster.contains("alice")
-            return (bobHolds && aliceSeesBob && bobSeesAlice, said)
+            let held = self.run(vox, ["room", "read", "--node", "alice", "--json", room], env: voxEnv).out
+                .split(separator: "\n").first { $0.contains("LOOK-AT-THIS") }.map(String.init) ?? ""
+            let read = held.contains("\"read_by\"") && held.contains("bob")
+            return (bobHolds && aliceSeesBob && bobSeesAlice && read, said + "; alice's row: \(held)")
         }
         present(ui, Key.idPrefix("read-by-"), timeout: 60, "alice's message, read by bob, must say so",
                 premise: readPremise)
