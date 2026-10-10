@@ -18,10 +18,12 @@ fn plain(c: char) -> bool {
 }
 
 /// `arg` as one shell word that reads back as `arg` exactly: as it is when every character is
-/// plain, else in single quotes, each `'` in it written `'\''`; an empty argument is `''`.
+/// plain and it does not begin with `=`, else in single quotes, each `'` in it written `'\''`; an
+/// empty argument is `''`. A word beginning with `=` is zsh's `=command` expansion (a share named
+/// `=eq.txt` became "eq.txt not found"), so it is quoted though `=` is plain inside a word.
 #[must_use]
 pub fn arg(arg: &str) -> Cow<'_, str> {
-    if !arg.is_empty() && arg.chars().all(plain) {
+    if !arg.is_empty() && !arg.starts_with('=') && arg.chars().all(plain) {
         return Cow::Borrowed(arg);
     }
     let mut out = String::with_capacity(arg.len() + 2);

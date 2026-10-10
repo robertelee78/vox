@@ -2026,8 +2026,8 @@ mod journey {
                 },
             );
             let drive_next = format!(
-                "Next: from node \"{PERSON}\", `vox room sessions <room>` lists this node's \
-                 Sessions in a room you share, and `vox room session` drives one"
+                "Next: from node \"{PERSON}\", vox room sessions with the id of a room you share \
+                 lists this node's Sessions there, and vox room session drives one"
             );
             l.claim(
                 &format!("J8.{}.trust-add-drive", h.key),

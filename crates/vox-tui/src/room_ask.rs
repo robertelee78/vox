@@ -96,33 +96,41 @@ pub fn asks(account: &Account, outside: &dyn Fn(&NodeName, &str) -> bool) -> Vec
 
 /// What answers an ask at a terminal, each with what it does: bind the directory or say no; or,
 /// for a directory bound to a room the node is not in, join that room with the link the room map
-/// holds (it asks for the room's passphrase there).
+/// holds (it asks for the room's passphrase there). Each is `(what it does, how, whether how is a
+/// whole command to paste)`: a command only when every word of it is known here; else the way is
+/// said in words (the room's link, before the person has it).
 #[must_use]
-pub fn answers(ask: &RoomAsk, data_root: &std::path::Path) -> Vec<(&'static str, String)> {
-    let node = ask.sessions.first().map_or("<node>", |s| s.node.as_str());
+pub fn answers(ask: &RoomAsk, data_root: &std::path::Path) -> Vec<(&'static str, String, bool)> {
+    let Some(first) = ask.sessions.first() else {
+        return Vec::new();
+    };
+    let node = first.node.as_str();
     if !ask.room.is_empty() {
-        let link = crate::room_map::read(data_root)
-            .ok()
-            .and_then(|entries| {
-                crate::room_map::resolve(&entries, std::path::Path::new(&ask.dir))
-                    .map(|e| e.room.clone())
-            })
-            .unwrap_or_else(|| "<link>".to_owned());
-        return vec![(
-            "to join it",
-            vox_text::shell::command(&["vox", "room", "join", &link, "--node", node]),
-        )];
+        let link = crate::room_map::read(data_root).ok().and_then(|entries| {
+            crate::room_map::resolve(&entries, std::path::Path::new(&ask.dir))
+                .map(|e| e.room.clone())
+        });
+        return vec![match link {
+            Some(link) => (
+                "to join it",
+                vox_text::shell::command(&["vox", "room", "join", &link, "--node", node]),
+                true,
+            ),
+            None => (
+                "to join it",
+                format!("run vox room join with the room's link and --node {node}"),
+                false,
+            ),
+        }];
     }
-    let session = ask
-        .sessions
-        .first()
-        .map_or("<session>", |s| s.session.as_str());
     vec![
         (
             "to bind it",
-            vox_text::shell::command(&[
-                "vox", "room", "join", "<link>", "--node", node, "--bind", &ask.dir,
-            ]),
+            format!(
+                "run vox room join with the room's link, --node {node} and --bind {}",
+                ask.dir
+            ),
+            false,
         ),
         (
             "to say no",
@@ -134,8 +142,9 @@ pub fn answers(ask: &RoomAsk, data_root: &std::path::Path) -> Vec<(&'static str,
                 "--node",
                 node,
                 "--session",
-                session,
+                first.session.as_str(),
             ]),
+            true,
         ),
     ]
 }
@@ -148,7 +157,13 @@ pub fn needs_you(asks: &[RoomAsk], data_root: &std::path::Path) -> String {
         .map(|a| {
             let ways: Vec<String> = answers(a, data_root)
                 .into_iter()
-                .map(|(what, cmd)| format!("`{cmd}` {what}"))
+                .map(|(what, how, command)| {
+                    if command {
+                        format!("`{how}` {what}")
+                    } else {
+                        format!("{how} {what}")
+                    }
+                })
                 .collect();
             let sentence = a.sentence();
             let sentence = sentence

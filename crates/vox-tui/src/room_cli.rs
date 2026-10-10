@@ -4506,8 +4506,8 @@ pub async fn create(
     {
         return Err(AppError::Usage(format!(
             "cannot create the room: the room {} on this node is already called {name}, and a \
-             node holds one room of a name\n       rename it (`vox room rename {} <name>`) or \
-             name this one otherwise",
+             node holds one room of a name\n       give that room another name with vox room \
+             rename, its id {} and the new name, or name this one otherwise",
             short(&id),
             short(&id)
         )));
@@ -5012,8 +5012,8 @@ pub async fn trust_add(
             println!("     `vox trust remove` undoes it and changes the lock everywhere");
             if drive {
                 println!(
-                    "Next: from node {petname:?}, `vox room sessions <room>` lists this node's \
-                     Sessions in a room you share, and `vox room session` drives one"
+                    "Next: from node {petname:?}, vox room sessions with the id of a room you share \
+                     lists this node's Sessions there, and vox room session drives one"
                 );
             } else {
                 println!(

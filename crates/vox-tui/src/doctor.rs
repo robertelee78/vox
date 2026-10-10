@@ -111,13 +111,15 @@ pub async fn doctor(paths: &Paths, room: Option<&str>, json: bool) -> Result<(),
             checks.push(fail(
                 "node",
                 e.to_string(),
-                format!(
-                    "attach this node: `vox node attach {}` (it starts the daemon if none runs)",
-                    paths
-                        .profile_dir
-                        .file_name()
-                        .map_or_else(|| "<node>".into(), |n| n.to_string_lossy())
-                ),
+                match paths.profile_dir.file_name() {
+                    Some(n) => format!(
+                        "attach this node: {} (it starts the daemon if none runs)",
+                        vox_text::shell::command(&["vox", "node", "attach", &n.to_string_lossy()])
+                    ),
+                    None => "attach this node with vox node attach and its name (it starts the \
+                             daemon if none runs)"
+                        .to_owned(),
+                },
             ));
             None
         }
@@ -788,7 +790,7 @@ async fn sessions(paths: &Paths) -> Vec<Check> {
         return vec![warn(
             "sessions",
             "no agent session has drained on this node yet: a session registers on its first turn",
-            "open a session with the hook or plugin installed (`vox agent plugin <harness>`)",
+            "open a session in a harness wired to this node (vox agent connect wires one)",
         )];
     }
     let busy_idle = crate::wake::Settings::load(paths).0.busy_idle;
@@ -893,15 +895,22 @@ async fn trust(client: &mut IpcClient, channel_id: Digest32) -> Vec<Check> {
                 (false, _) => warn(
                     id,
                     "you have not trusted it: it cannot read you, and you do not read it",
-                    format!("`vox trust add {full} <name>` (asks for your identity passphrase)"),
+                    format!(
+                        "{} (asks for a name for it and your identity passphrase)",
+                        vox_text::shell::command(&["vox", "trust", "add", &full])
+                    ),
                 ),
                 (true, false) => warn(
                     id,
                     "you trust it, but it has not trusted you: it cannot read you",
-                    format!(
-                        "ask its operator to trust you: `vox trust add {} <name>`",
-                        me.map(|m| b32_encode(&m)).unwrap_or_default()
-                    ),
+                    match me {
+                        Some(m) => format!(
+                            "ask its operator to trust you: {}",
+                            vox_text::shell::command(&["vox", "trust", "add", &b32_encode(&m)])
+                        ),
+                        None => "ask its operator to trust you, with your fingerprint (vox id)"
+                            .to_owned(),
+                    },
                 ),
             }
         })

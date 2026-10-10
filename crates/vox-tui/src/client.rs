@@ -211,11 +211,11 @@ pub fn resolve_node(
         [only] => Ok(only.clone()),
         [] if creates => NodeName::parse(DEFAULT_PROFILE),
         [] => Err(Error::NoNodeChosen(format!(
-            "there is no node in {} yet; make one: vox node create <name>",
+            "there is no node in {} yet; make one with vox node create and a name for it",
             account.data_root.display()
         ))),
         many => Err(Error::NoNodeChosen(format!(
-            "this data root holds several nodes ({}); name one: --node <name> or VOX_NODE",
+            "this data root holds several nodes ({}); name one with --node or VOX_NODE",
             many.iter()
                 .map(NodeName::as_str)
                 .collect::<Vec<_>>()
@@ -811,8 +811,8 @@ fn remembered(name: &NodeName, passphrase: &str, typed: bool) -> Option<KeepSour
     } else {
         eprintln!(
             "vox: node {name}'s passphrase came from a file or VOX_IDENTITY_PASSPHRASE, so it is \
-             not stored in the Keychain; to have the daemon attach it at each start: vox node \
-             attach {name} --keep --passphrase-file <path>"
+             not stored in the Keychain; to have the daemon attach it at each start, attach it \
+             again with --keep and --passphrase-file naming the file that holds it"
         );
         None
     }
@@ -1230,7 +1230,7 @@ pub async fn node_list(args: &NodeArgs) -> Result<(), AppError> {
     }
     names.sort();
     if names.is_empty() {
-        println!("vox: no node yet; make one: vox node create <name>");
+        println!("vox: no node yet; make one with vox node create and a name for it");
         return Ok(());
     }
     for name in names {

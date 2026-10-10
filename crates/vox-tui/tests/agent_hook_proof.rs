@@ -3032,7 +3032,7 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         asks().lines().any(|l| {
             l.contains(&format!("Claude Code in {} has no room", dir.display()))
                 && l.contains(&format!(
-                    "vox room join '<link>' --node default --bind {}",
+                    "run vox room join with the room's link, --node default and --bind {}",
                     dir.display()
                 ))
         })
@@ -3657,24 +3657,20 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     let ask_dir = tmp.path().join("ask repo & co!");
     std::fs::create_dir_all(&ask_dir).expect("APPARATUS: cannot make a repository directory");
     let ask_dir = std::fs::canonicalize(&ask_dir).unwrap_or(ask_dir);
-    turn("5f5f5f5f-aaaa-4bbb-8ccc-0000000005f0", &ask_dir);
-    let listed = asks();
+    // The agent's notice gives it the bind command to fill in once the person pastes a link (the
+    // person is given no command with a placeholder: `vox agent status` says it in words).
+    // Its text is JSON-escaped in the harness's output: one line per `\n`.
+    let listed = turn("5f5f5f5f-aaaa-4bbb-8ccc-0000000005f0", &ask_dir).replace("\\n", "\n");
     let template = listed
         .lines()
-        .filter(|l| l.contains(&ask_dir.display().to_string()))
-        .flat_map(|l| {
-            l.split('`')
-                .skip(1)
-                .step_by(2)
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .find(|c| c.starts_with("vox room join") && c.contains("--bind"))
-        .unwrap_or_default();
+        .map(str::trim)
+        .find(|l| l.starts_with("vox room join") && l.contains("--bind"))
+        .unwrap_or_default()
+        .to_owned();
     assert!(
         template.contains("'<link>'"),
-        "PRODUCT: the ask for {} must give its bind command, with the link's place in single \
-         quotes; `vox agent status` said:\n{listed}",
+        "PRODUCT: the agent's notice for {} must give its bind command, with the link's place in \
+         single quotes; the hook said:\n{listed}",
         ask_dir.display()
     );
     let pasted = template.replace("<link>", &bind_link);
@@ -3702,6 +3698,47 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         "PRODUCT: `{pasted}`, pasted whole into bash, must join room {bind_room} and bind {}; it \
          said {bound}",
         ask_dir.display()
+    );
+    // A word that begins with `=` is zsh's `=command` expansion: a share named `=eq.txt`. The
+    // `vox share stop` its share prints, pasted whole into zsh, stops serving it.
+    let eq_dir = tmp.path().join("eq");
+    std::fs::create_dir_all(&eq_dir).expect("APPARATUS: cannot make a directory");
+    let eq = eq_dir.join("=eq.txt");
+    std::fs::write(&eq, "equals\n").expect("APPARATUS: cannot write =eq.txt");
+    let (ok, out, err) = hook(
+        &data,
+        &cfg,
+        &["share", &paste_room, &eq.to_string_lossy()],
+        "",
+    );
+    let shared = format!("{out}{err}");
+    assert!(
+        ok,
+        "PRODUCT (staging): `vox share` of =eq.txt failed: {shared}"
+    );
+    let stop = shared
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .find(|c| c.starts_with("vox share stop"))
+        .unwrap_or_default()
+        .to_owned();
+    for shell in ["zsh", "bash"] {
+        let words = words_in(shell, &stop);
+        assert_eq!(
+            words,
+            ["share", "stop", paste_room.as_str(), "=eq.txt"],
+            "PRODUCT: the printed `{stop}`, pasted into {shell}, must be read as its words, \
+             `=eq.txt` whole; {shell} read {words:?}"
+        );
+    }
+    let stopped = in_shell("zsh", &stop, &data, &cfg, &[]);
+    let (_, listed_shares, _) = hook(&data, &cfg, &["share", "list", &paste_room], "");
+    eprintln!("[proof] (5f) pasted `{stop}` into zsh; it said: {stopped}; shares: {listed_shares}");
+    assert!(
+        !listed_shares.contains("=eq.txt"),
+        "PRODUCT: `{stop}`, pasted whole into zsh, must stop sharing =eq.txt; zsh said \
+         {stopped}, and `vox share list` lists:\n{listed_shares}"
     );
 
     // (6) A mapped room whose host is gone: the join fails, and the session is told why on a

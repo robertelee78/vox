@@ -1271,7 +1271,7 @@ impl Fault {
                 "this node has no identity yet\n       create one with `vox id` (or start `vox tui`)"
             }
             Fault::IdentityExists => {
-                "this node already has an identity\n       use it: `vox node attach` unlocks it; for another node, `vox node create <name>`"
+                "this node already has an identity\n       use it: `vox node attach` unlocks it; for another node, vox node create and a name for it"
             }
             Fault::Locked => {
                 "the identity is locked\n       unlock it: pipe the identity passphrase to `vox daemon`, or run `vox tui`"
@@ -1289,7 +1289,7 @@ impl Fault {
                 "no such room on this node\n       `vox room list` shows the rooms it holds"
             }
             Fault::ChannelNotOpen => {
-                "that room is not open on this node\n       open it with its passphrase: a line `<room> <passphrase>` to `vox daemon`, or in `vox tui`"
+                "that room is not open on this node\n       open it with its passphrase: a line holding the room's id and its passphrase to `vox daemon`, or in `vox tui`"
             }
             Fault::TooLong => {
                 "that is longer than this field allows\n       shorten it, and try again"
@@ -1300,7 +1300,8 @@ impl Fault {
                 TEXT.get_or_init(|| {
                     format!(
                         "your trust keyring is full ({} identities)\n       remove one with \
-                         `vox trust remove <fingerprint>`, then add again",
+                         vox trust remove and its fingerprint (`vox trust list` shows them), then \
+                         add again",
                         crate::node::trust::trust_cap_words()
                     )
                 })
@@ -1365,10 +1366,10 @@ impl Fault {
                 "that member is not admitted to the room on this node yet\n       it is, once this node syncs their records; then try again"
             }
             Fault::NotConsented => {
-                "that identity is not in your keyring\n       `vox trust list` shows who is; `vox trust add <fingerprint>` adds one"
+                "that identity is not in your keyring\n       `vox trust list` shows who is; vox trust add and its fingerprint adds one"
             }
             Fault::NotTrusted => {
-                "that identity is not in your trust keyring, so it is given no key to read you\n       run `vox trust add <fingerprint>` if you mean it to read you"
+                "that identity is not in your trust keyring, so it is given no key to read you\n       run vox trust add with its fingerprint if you mean it to read you"
             }
             Fault::NotLoopback => {
                 "a local port for Vox must be on loopback (127.0.0.1 or ::1)\n       anything else would hand this room's membership to whoever reaches the port"
@@ -1395,7 +1396,7 @@ impl Fault {
                 "something was written in the room from this node after the leave, so it is in the room again\n       run `vox room leave` again to leave"
             }
             Fault::NotAServiceRoom => {
-                "that room offers no service by name, so it has no .vox name to resolve\n       reach a shared service by its address, `vox forward <service>.<node>.<room>.vox`"
+                "that room offers no service by name, so it has no .vox name to resolve\n       reach a shared service with vox forward and its .vox address, which `vox service list` shows"
             }
             Fault::RoomNameTaken => {
                 "a room this node holds already has that name, and a node holds one room of a name: nothing was made\n       it is the room part of every service address; rename the room it holds (`vox room rename`), or name the new one otherwise"

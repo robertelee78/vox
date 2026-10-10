@@ -121,8 +121,10 @@ extension NodeModel {
                                                 + "node runs on:"),
                                      at: .max,
                                      // Quoted as the CLI quotes what it prints (v0.4.3).
-                                     command: shellCommand(words: ["vox", "trust", "drive", me, "--node",
-                                                                   local ?? "<its node>"])))
+                                     // Whole, to paste: on this Mac with its node named; on the
+                                     // other Mac without, its name there not being known here.
+                                     command: shellCommand(words: ["vox", "trust", "drive", me]
+                                                               + (local.map { ["--node", $0] } ?? []))))
             }
             return lines
         }

@@ -244,19 +244,13 @@ pub async fn share(
         "     collect it with: {}",
         vox_text::shell::command(&["vox", "room", "get", room, &s.name])
     );
-    if s.files > 0 {
-        println!(
-            "     or one file through `vox up`: curl --socks5-hostname <proxy> \
-             http://{}.<your-name-for-this-node>.<room>.vox/<path in {}/>",
-            s.tag, s.name
-        );
-    } else {
-        println!(
-            "     or through `vox up`: curl --socks5-hostname <proxy> \
-             http://{}.<your-name-for-this-node>.<room>.vox/{} -o {}",
-            s.tag, s.name, s.name
-        );
-    }
+    // Each member names this node its own way, so no one address fits all: said in words.
+    println!(
+        "     or a member fetches {} through the proxy `vox up` names, at the service {} of this \
+         node in this room",
+        if s.files > 0 { "one file of it" } else { "it" },
+        s.tag
+    );
     match (opts.count, opts.for_) {
         (Some(n), _) => println!("     the daemon serves it for {n} fetch(es) at most"),
         (None, Some(d)) => println!("     the daemon serves it for {}s at most", d.as_secs()),

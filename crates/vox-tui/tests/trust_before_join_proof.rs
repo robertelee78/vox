@@ -34,8 +34,8 @@
 //! and with bob trusting alice **before** he joins `first`, alice trusting him only after. Bob's
 //! `vox room join` of `first` must list alice as `→ alice — waiting for the other side` with the
 //! `vox trust add` alice runs (bob's fingerprint), and carol, who never trusted bob, by the whole
-//! line `· … — not in keyring: to read each other, you run `vox trust add <carol> --name NAME`; if
-//! they have not trusted you, they run `vox trust add <bob>``: it never says carol trusts him. His
+//! line `· … — not in keyring: to read each other, you run `vox trust add <carol>`; if they have
+//! not trusted you, they run `vox trust add <bob>``: it never says carol trusts him. His
 //! join of `second`, alice's trust in him settled, lists alice as `⇄ alice — trusted both ways`.
 //! Mutations: the waiting state omitted (a member bob trusts that has not trusted him read as
 //! trusted both ways), or a member's trust in bob said when it has not reached him (the
@@ -478,8 +478,8 @@ fn two_people_who_share_a_room_read_each_other_in_a_second_one_with_no_new_trust
             && to_alice.contains(&format!("vox trust add {}", fps[1]))
             && to_carol
                 == format!(
-                    "· {} — not in keyring: to read each other, you run `vox trust add {} --name \
-                     NAME`; if they have not trusted you, they run `vox trust add {}`",
+                    "· {} — not in keyring: to read each other, you run `vox trust add {}`; if \
+                     they have not trusted you, they run `vox trust add {}`",
                     &fps[2][..26],
                     fps[2],
                     fps[1]

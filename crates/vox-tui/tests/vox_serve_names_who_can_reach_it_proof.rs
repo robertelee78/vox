@@ -258,7 +258,7 @@ fn vox_serve_names_who_can_reach_it_and_who_cannot() {
     );
     // Unprivileged, the list cannot show every service: it says so, before the question.
     let unseen = at(&|l: &str| {
-        l.contains("another user's services") && l.contains("vox serve <name>=<port>")
+        l.contains("another user's services") && l.contains("`vox serve ssh=22` names port 22 ssh")
     });
     let asked = at(&|l: &str| l.starts_with("share which?"));
     assert!(
