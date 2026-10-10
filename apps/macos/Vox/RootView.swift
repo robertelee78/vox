@@ -175,6 +175,8 @@ private struct KeepNodeOffer: View {
     let node: String
     @ObservedObject var model: AppModel
     @State private var field = SecureFieldHolder()
+    /// Set while one Store is being asked: one key press may ask twice.
+    @State private var submitted = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s12) {
@@ -202,7 +204,11 @@ private struct KeepNodeOffer: View {
     }
 
     private func store() {
-        guard let secret = field.take() else { return }
+        // A node may have no passphrase (ADR-005 J-2): an empty field keeps none.
+        guard !submitted else { return }
+        submitted = true
+        DispatchQueue.main.async { submitted = false }
+        let secret = field.takeAllowingEmpty()
         Task { await model.keepNode(node, passphrase: secret) }
     }
 }
@@ -444,10 +450,14 @@ private struct PassphraseForm: View {
     @State private var field = SecureFieldHolder()
     /// ADR-028 K-10: off until the person turns it on, for this node.
     @State private var keepInKeychain = false
+    /// Set while one Attach is being asked: Return and the button may both ask at one key press,
+    /// and an empty passphrase no longer tells the second from the first.
+    @State private var submitted = false
 
     var body: some View {
         Text("Attach node \(node)").heading()
-        Text("Type node \(node)'s identity passphrase.").secondaryText()
+        Text("Type node \(node)'s identity passphrase, or leave it empty for a node made with none.")
+            .secondaryText()
         SecureInput(holder: field) { submit() }
             .frame(width: Theme.scaled(320))
             .accessibilityIdentifier("passphrase")
@@ -472,8 +482,12 @@ private struct PassphraseForm: View {
     }
 
     private func submit() {
-        // Return and the Attach button may both ask: the second finds the field empty.
-        guard let secret = field.take() else { return }
+        // Return and the Attach button may both ask at one key press: the second does nothing.
+        guard !submitted else { return }
+        submitted = true
+        DispatchQueue.main.async { submitted = false }
+        // A node may have no passphrase (ADR-005 J-2): an empty field attaches it with none.
+        let secret = field.takeAllowingEmpty()
         let keep = keepInKeychain
         Task { await model.attach(node, passphrase: secret, keepInKeychain: keep) }
     }

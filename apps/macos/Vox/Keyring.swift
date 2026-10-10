@@ -349,6 +349,8 @@ struct KeyringPassphrase: View {
     @ObservedObject var model: NodeModel
     let pending: KeyringPending
     @State private var field = SecureFieldHolder()
+    /// Set while one Continue is being asked: one key press may ask twice.
+    @State private var submitted = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s8) {
@@ -370,7 +372,12 @@ struct KeyringPassphrase: View {
     }
 
     private func submit() {
-        guard let secret = field.take() else { return }
+        // Return and Continue may both ask at one key press: the second does nothing. A node may
+        // have no passphrase (ADR-005 J-2): an empty field gives none.
+        guard !submitted else { return }
+        submitted = true
+        DispatchQueue.main.async { submitted = false }
+        let secret = field.takeAllowingEmpty()
         let change = pending
         Task { await model.retryKeyring(change, with: secret) }
     }
