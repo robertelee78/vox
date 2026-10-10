@@ -3188,6 +3188,11 @@ final class FirstRunProof: XCTestCase {
 
         // (6c) Retention opens at what the room keeps; Return never sets it (D14).
         try staged(vox, ["room", "retention", "--node", "alice", room, String(365 * 86_400)], env: voxEnv)
+        // The sheet opens at what the app knows of the room; set from the CLI a moment ago, it is
+        // known once the header says it (else a red here would be the staging's race, not D14's).
+        words(ui, Key.id("room-header-meta"), timeout: 30,
+              "the room's header must show the retention just set, 365 days",
+              until: { $0.contains("365 days") })
         ui.menuBars.menuBarItems["Room"].click()
         ui.menuBars.menuItems["Retention…"].click()
         let choice = Key.id("retention-choice")
