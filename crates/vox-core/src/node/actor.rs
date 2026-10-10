@@ -4213,6 +4213,9 @@ pub struct Node {
     /// Per `(room, member, generation)`: the key delivery opened for it (ADR-030 D-4), until the
     /// member takes it, a later key supersedes it, or the member says its opening cannot work.
     deliveries: BTreeMap<(Digest32, Digest32, u64), Delivery>,
+    /// Per `(room, member)`: why this identity's key for it waits, until it is taken (ADR-030
+    /// D-5, W-4), shown beside the member in the roster, `vox status` and the app.
+    key_waiting: BTreeMap<(Digest32, Digest32), String>,
     /// Per `(room, member)`: the history batch in flight, as the keys not yet answered and
     /// whether the batch fell short (a key refused, or not all of it written). The history is
     /// recorded as delivered only once every key of a whole batch was taken (V210-88).
@@ -4663,6 +4666,7 @@ impl Node {
             reoffer: BTreeSet::new(),
             keys_in_flight: BTreeMap::new(),
             deliveries: BTreeMap::new(),
+            key_waiting: BTreeMap::new(),
             history_in_flight: BTreeMap::new(),
             delivery_epoch: 0,
             record_seq: BTreeMap::new(),
@@ -7389,6 +7393,11 @@ impl Node {
                     let refused_as =
                         |r: KeyRefusal| why == KeyRefusal::describe(r.code().into_inner());
                     let delivery = (channel_id, peer, chain_id);
+                    // A member that runs an older Vox waits for it to update (ADR-030 W-4): shown
+                    // beside it until it takes the key.
+                    if why == crate::node::pairwise_stream::ENDED_UNANSWERED {
+                        self.key_waiting.insert((channel_id, peer), why.clone());
+                    }
                     if refused_as(KeyRefusal::UnknownPrekey) {
                         if let Some(prekey_id) = self
                             .deliveries
@@ -7711,8 +7720,9 @@ impl Node {
                 epoch,
             } => {
                 self.key_backoff.remove(&(channel_id, peer));
-                // Taken: its delivery is done with (ADR-030 D-4).
+                // Taken: its delivery is done with (ADR-030 D-4), and the member waits no more.
                 self.deliveries.remove(&(channel_id, peer, chain_id));
+                self.key_waiting.remove(&(channel_id, peer));
                 // Taken under the session still held: the peer holds its hello (V210-89).
                 if session.is_some()
                     && self.session_serial.get(&(channel_id, peer)).copied() == session
@@ -9516,7 +9526,7 @@ impl Node {
                 return Outcome::Failed(Fault::Unreachable);
             }
         };
-        self.key_waits_said.remove(&(*channel_id, target));
+        self.key_left(channel_id, target);
         // Written by this member's writer, off the actor (V210-71). A write that fails is a key
         // not taken, re-owed like any other.
         let frames = vec![frame];
@@ -10292,7 +10302,7 @@ impl Node {
                         break;
                     }
                 };
-                self.key_waits_said.remove(&(*channel_id, target));
+                self.key_left(channel_id, target);
                 // Each key's own generation: a refusal re-owes exactly what was refused, and it is
                 // recorded as delivered only once taken (V210-88).
                 let epoch = self.key_in_flight(*channel_id, target);
@@ -10398,15 +10408,16 @@ impl Node {
         target: Digest32,
         wait: Option<prekeys::BundleWait>,
     ) {
-        if !self.key_waits_said.insert((*channel_id, target)) {
-            return;
-        }
         let why = match wait {
             Some(wait) => wait.why(),
             None => "no pairwise session with it could be opened from its prekey bundle; it is \
                      tried again"
                 .to_owned(),
         };
+        self.key_waiting.insert((*channel_id, target), why.clone());
+        if !self.key_waits_said.insert((*channel_id, target)) {
+            return;
+        }
         if let Some(net) = self.net.as_ref() {
             net.manager().note(
                 target,
@@ -10415,6 +10426,20 @@ impl Node {
                     crate::node::network::short_id(*channel_id)
                 ),
             );
+        }
+    }
+
+    /// A delivery to `target` opened: what made its key wait for a bundle is over. A wait for a
+    /// member that runs an older Vox stays until it takes the key.
+    fn key_left(&mut self, channel_id: &Digest32, target: Digest32) {
+        let pair = (*channel_id, target);
+        self.key_waits_said.remove(&pair);
+        if self
+            .key_waiting
+            .get(&pair)
+            .is_some_and(|why| why != crate::node::pairwise_stream::ENDED_UNANSWERED)
+        {
+            self.key_waiting.remove(&pair);
         }
     }
 
@@ -13236,6 +13261,7 @@ impl Node {
         self.keys_in_flight.clear();
         // Sealed bytes, no key material; but the ring that opens the next ones is this identity's.
         self.deliveries.clear();
+        self.key_waiting.clear();
         // And the watchers still running answer for what is no longer in flight.
         self.delivery_epoch = self.delivery_epoch.wrapping_add(1);
         self.history_in_flight.clear();
@@ -14923,6 +14949,7 @@ impl Node {
                     connected: connected.contains(m),
                     last_seen: self.status.last_seen.get(m).copied(),
                     last_sync: self.status.member_synced.get(m).copied(),
+                    key_waits: self.key_waiting.get(&(room.channel_id, *m)).cloned(),
                 })
                 .collect();
             // From the room as last published, never its lock: a sync session holds that lock
@@ -15550,6 +15577,7 @@ impl Node {
             connected_peers: Vec::new(),
             boards_connected: Vec::new(),
             relaying: 0,
+            key_waits: Vec::new(),
         });
     }
 
@@ -15720,6 +15748,11 @@ impl Node {
             connected: connected_peers.len(),
             connected_peers,
             boards_connected: self.boards_connected(),
+            key_waits: self
+                .key_waiting
+                .iter()
+                .map(|((room, member), why)| (*room, *member, why.clone()))
+                .collect(),
         };
         (view, read)
     }

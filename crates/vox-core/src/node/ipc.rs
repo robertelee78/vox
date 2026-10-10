@@ -368,6 +368,10 @@ const T_SESSION_ROWS: u64 = 5432;
 const T_PULL: u64 = 5460;
 /// `[5461, path]` — [`Frame::Pulled`].
 const T_PULLED: u64 = 5461;
+/// `[5464, channel_id]` — [`Request::KeyWaits`].
+const T_KEY_WAITS_REQ: u64 = 5464;
+/// `[5465, [[member, why], …]]` — [`Frame::KeyWaits`].
+const T_KEY_WAITS: u64 = 5465;
 /// `[5462, channel_id]` — [`Request::PullStates`].
 const T_PULL_STATES_REQ: u64 = 5462;
 /// `[5463, [[entry, kind, bytes, of, why], …]]` — [`Frame::PullStates`]; kind 0 pulling,
@@ -451,6 +455,11 @@ pub enum Request {
     },
     /// The members of a room.
     Roster {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// The members of a room this identity's key waits for, and why (ADR-030 D-5, W-4).
+    KeyWaits {
         /// The room.
         channel_id: Digest32,
     },
@@ -940,6 +949,9 @@ impl Request {
             Request::Roster { channel_id } => {
                 e.array(2).uint(T_ROSTER).bytes(channel_id);
             }
+            Request::KeyWaits { channel_id } => {
+                e.array(2).uint(T_KEY_WAITS_REQ).bytes(channel_id);
+            }
             Request::Consents { channel_id } => {
                 e.array(2).uint(T_CONSENTS_REQ).bytes(channel_id);
             }
@@ -1244,6 +1256,12 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Roster { channel_id })
+            }
+            (T_KEY_WAITS_REQ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::KeyWaits { channel_id })
             }
             (T_CONSENTS_REQ, 2) => {
                 let channel_id = digest(&mut d)?;
@@ -1810,6 +1828,11 @@ pub enum Frame {
         /// Member fingerprints, in the order the node holds them.
         members: Vec<Digest32>,
     },
+    /// The answer to a [`Request::KeyWaits`]: `(member, why)`, in member order.
+    KeyWaits {
+        /// Each member the key waits for, and why.
+        waits: Vec<(Digest32, String)>,
+    },
     /// The answer to a [`Request::SetRetention`] from a member who is not the room's creator or
     /// an admin (V030-32): it set **its own node's** retention for the room, `own` seconds, while
     /// the room keeps `room` (`0` = forever). Its own frame, so the CLI says plainly that nothing
@@ -1970,6 +1993,12 @@ impl Frame {
                 e.array(2).uint(T_MEMBERS).array(members.len());
                 for m in members {
                     e.bytes(m);
+                }
+            }
+            Frame::KeyWaits { waits } => {
+                e.array(2).uint(T_KEY_WAITS).array(waits.len());
+                for (m, why) in waits {
+                    e.array(2).bytes(m).text(why);
                 }
             }
             Frame::Consents { outbound, inbound } => {
@@ -2545,6 +2574,20 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 members.push(digest(d)?);
             }
             return Ok(Frame::Members { members });
+        }
+        (T_KEY_WAITS, 2) => {
+            let n = d
+                .array()
+                .map_err(|_| Error::MalformedIpc("ipc key waits"))?;
+            let mut waits = Vec::with_capacity(n.min(1024));
+            for _ in 0..n {
+                if d.array().map_err(|_| Error::MalformedIpc("ipc key wait"))? != 2 {
+                    return Err(Error::MalformedIpc("ipc key wait"));
+                }
+                let m = digest(d)?;
+                waits.push((m, text(d, "ipc key wait why")?));
+            }
+            return Ok(Frame::KeyWaits { waits });
         }
         (T_OWN_RETENTION, 3) => {
             return Ok(Frame::OwnRetention {
@@ -4700,6 +4743,16 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         // (PRD-001's family scale); a member is a 32-byte key, so a roster is ~17 KiB of a
         // 256 KiB frame. A frame would hold ~7,700; paging this is owed only if that scale
         // ever rises past a few thousand (V210-16).
+        // Bounded like the roster: at most one line for each of a room's members.
+        Request::KeyWaits { channel_id } => Frame::KeyWaits {
+            waits: handle
+                .view()
+                .key_waits
+                .iter()
+                .filter(|(room, _, _)| *room == channel_id)
+                .map(|(_, member, why)| (*member, why.clone()))
+                .collect(),
+        },
         Request::Roster { channel_id } => {
             let view = handle.view();
             match view

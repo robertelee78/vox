@@ -468,6 +468,9 @@ pub struct Member {
     pub fingerprint: String,
     /// This node's name for it, from the keyring; empty when it has none.
     pub name: String,
+    /// Why this node's key for it in the room waits, if it does (ADR-030 D-5, W-4): said beside
+    /// it, as `vox room roster` says it.
+    pub key_waits: Option<String>,
 }
 
 /// An entry of the trust keyring.
@@ -1885,16 +1888,23 @@ impl VoxClient {
         let channel_id = digest(&room, "room id")?;
         on_held!(self, |c| {
             let names = names(c).await?;
-            match ask(c, &Request::Roster { channel_id }).await? {
-                Frame::Members { members } => Ok(members
-                    .into_iter()
-                    .map(|m| Member {
-                        fingerprint: b32_encode(&m),
-                        name: names.get(&m).cloned().unwrap_or_default(),
-                    })
-                    .collect()),
-                other => Err(unexpected(&other)),
-            }
+            let members = match ask(c, &Request::Roster { channel_id }).await? {
+                Frame::Members { members } => members,
+                other => return Err(unexpected(&other)),
+            };
+            let waits: std::collections::HashMap<Digest32, String> =
+                match ask(c, &Request::KeyWaits { channel_id }).await {
+                    Ok(Frame::KeyWaits { waits }) => waits.into_iter().collect(),
+                    _ => std::collections::HashMap::new(),
+                };
+            Ok(members
+                .into_iter()
+                .map(|m| Member {
+                    fingerprint: b32_encode(&m),
+                    name: names.get(&m).cloned().unwrap_or_default(),
+                    key_waits: waits.get(&m).cloned(),
+                })
+                .collect())
         })
     }
 

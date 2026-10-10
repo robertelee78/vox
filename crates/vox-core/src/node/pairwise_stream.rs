@@ -349,10 +349,9 @@ impl KeyRefusal {
 
 /// Why a key waits when its recipient ended the stream without an answer (ADR-030 W-4, D-5), and
 /// what that costs.
-pub const ENDED_UNANSWERED: &str =
-    "it closed the stream without an answer, as a node running a Vox \
-                                    older than key delivery in a session of its own does; it reads \
-                                    nothing new from you until it is updated";
+pub const ENDED_UNANSWERED: &str = "it runs a Vox older than v0.4.3, which cannot take a key \
+     delivered in a session of its own (it closed the stream without an answer); it reads nothing \
+     new from you until it updates to v0.4.3 or later, and gets your key then";
 
 /// Whether the far side refused a delivered key: `Some(why)` if so, `None` if it took it.
 ///
