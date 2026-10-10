@@ -1,11 +1,12 @@
 # Troubleshooting by symptom
 
-Applies to: v0.4.1. Check `vox --version` first: the fixes here are for the version they name.
+Find the message or behaviour you see, then follow its steps. Each entry says what the symptom
+means, what to check, how to fix it, and how to confirm the fix.
 
 ## Before changing anything
 
-Keep the **complete error**, including the line before it and any suggested next action.
-Note which machine, binary and node produced it, and what you expected to happen.
+Keep the complete error, including the line before it. Note which machine and node produced it.
+Then gather:
 
 ```sh
 command -v vox
@@ -15,366 +16,268 @@ vox room list
 vox status
 ```
 
-Use the actual affected node, with `--node NAME` when several are attached. If you ran
-`vox daemon` in a terminal, look at that terminal's output. A daemon started in the background
-writes its output to `.daemon/log` in the data root (see [local state](reference.md#local-state)).
-If a service manager started it, use that manager's log for the same process.
+If several nodes are attached, add `--node` and the affected node's name. A daemon started in the
+background writes to `.daemon/log` in the data root ([local state](reference.md#local-state)).
 
-`vox status --json` offers detailed local observations. It can reveal room and peer
-identifiers, addresses and topology; inspect it before sharing. A status from one node is not
-proof of what every other node holds or what a person has read.
-
-Do not delete a node, remove a lock file, trust an unknown node or turn off verification
-as a first diagnostic step. For every entry below, if the stated verification still fails,
-follow [Get help safely](getting-help.md) with the exact symptom and checks already performed.
+Do not delete a node, remove a lock file, trust an unknown node or turn off a check as a first
+step. Each of these destroys the evidence that tells causes apart. If an entry's fix does not
+work, see [Get help safely](getting-help.md).
 
 ## Vox is not found or shows the wrong version
 
-**Meaning:** the shell did not find the intended installation, or found another binary first.
-This does not establish a broken room or identity.
+**Meaning:** the shell found no `vox`, or found another one first. Your rooms and nodes are not
+affected.
 
-**Check:** run `command -v vox`, then inspect the version from that executable. Compare it
-with the installation destination. Open a new shell after installation so its marked PATH
-block is read.
+**Fix:** run `command -v vox` and compare the path with where you installed Vox. Open a new
+terminal so the shell reads the setup block the installer added. Do not install as root to fix
+your `PATH`.
 
-**Fix:** repair the intended installation's shell setup or select its exact path. Do not
-recreate identity data and do not install as root to resolve a user's PATH ordering.
-
-**Verify:** the selected path and `vox --version` agree with the release you intend to use.
-If not, report both paths/versions with personal directory components redacted.
+**Confirm:** `command -v vox` and `vox --version` name the `vox` you meant.
 
 ## The node is not attached
 
-**Exact symptoms:**
+**Symptoms:**
 
-- `no vox daemon is running for this data root, so node robertgpt is not attached.` followed by
-  `Start one: vox daemon (Vox.app starts one when it opens, or vox node attach robertgpt)`. Vox.app
-  shows the same sentence;
-- `node robertgpt is not attached; attach it first: vox node attach robertgpt`;
-- `there is no node in … yet; make one: vox node create <name>`.
+- `no vox daemon is running for this data root, so node robertgpt is not attached.`
+- `node robertgpt is not attached; attach it first: vox node attach robertgpt`
+- `no vox daemon answers at …; to start one, open Vox (or run `vox daemon` in a terminal)`
+- `there is no node in … yet; make one with vox node create and a name for it`
 
-**Meaning:** a one-shot command (`room`, `status`, `trust`, `share`, `service`) asks an attached
-node and found none to ask. It does not mean the node has no rooms on disk, and it is not a
-damaged node.
+**Meaning:** the command asks an attached node and found none. The node and its rooms are still
+on disk.
 
-**Check:** run `vox node list`: each node is `attached` or `detached`. Compare `--node`,
-`VOX_NODE`, the data/config roots and the OS user with the terminal or agent that should hold the
-node. A node attached because a session needed it, such as `vox forward`, detaches again when
-the last of them ends. An agent's hook never attaches its node: the agent says `node NAME is not
-attached, and a hook never attaches it`, once in its session, and you attach it, in a terminal
-outside the agent's session. A remembered node the daemon could not attach at its start is said
-in a notification, and in the app with Attach… beside it under ON THIS MACHINE.
+**Check:** `vox node list` shows each node as `attached` or `detached`. Compare `--node`,
+`VOX_NODE` and `VOX_DATA_DIR` with the terminal or agent that should hold the node. An agent's
+hook never attaches its node. You attach it, in your own terminal.
 
-**Fix:** `vox node attach robertgpt`. Do not create a second node to get past this message: a
-new node is a new identity, with no rooms and no trust. The node is then remembered, and the daemon
-attaches it again after every restart (see [passphrase input](reference.md#passphrase-input)).
+**Fix:** run `vox node attach robertgpt`. Do not make a new node to get past the message: a new
+node is a new identity, with no rooms and no trust.
 
-**Verify:** `vox room list` returns the rooms or `no rooms`, not the attach message. If the
-same message remains, report the selected roots and the exact message.
+**Confirm:** `vox room list` shows your rooms, or `no rooms`.
 
 ## A keyring change asks for the passphrase, or is refused
 
-**Exact symptoms:**
+**Symptoms:**
 
-- `vox: changing who you trust needs your identity passphrase: it was not entered for a keyring
-  change in the last 30 minutes`, then `identity passphrase:` at a terminal;
-- the same line, then `it is typed at a terminal, and taken from nothing else (not
-  VOX_IDENTITY_PASSPHRASE, not a file). Run it in a terminal: vox trust add …`, and the command
-  exits 1;
-- `vox: --identity-passphrase-file is refused: a keyring change's passphrase is typed at a
-  terminal, never read from a file`.
+- `vox: changing who you trust needs your identity passphrase: it was not entered for a keyring change in the last 30 minutes`
+- the same, then `it is typed at a terminal, and taken from nothing else (not VOX_IDENTITY_PASSPHRASE, not a file). Run it in a terminal: …`
+- `vox: --identity-passphrase-file is refused: a keyring change's passphrase is typed at a terminal, never read from a file`
 
-**Meaning:** a keyring change (`vox trust add`, `remove`, `rename`, `drive`, `read`) needs the
-identity passphrase unless one was typed for a keyring change in the last 30 minutes. Attaching
-the node does not count. The passphrase is typed at a terminal; a file, `VOX_IDENTITY_PASSPHRASE`
-and an agent's session are never asked for it. Nothing is changed when the command is refused.
+**Meaning:** a change to the keyring needs the identity passphrase, typed at a terminal, unless
+one was typed for a keyring change in the last 30 minutes. Nothing changed.
 
-**Check:** `vox status` says `keyring asks for the passphrase` or `keyring open Nm` on its second
-line.
+**Fix:** run the command the message names in your own terminal, outside any agent's session, and
+type the passphrase.
 
-**Fix:** run the command the message names in a terminal of your own, outside any agent's session,
-and type the passphrase at the prompt. For an agent's node, you, its operator, run it.
-
-**Verify:** `vox trust list` shows the change, and `vox status` says `keyring open 30m`.
+**Confirm:** `vox trust list` shows the change, and `vox status` says `keyring open 30m`.
 
 ## A daemon is already running
 
-**Exact symptom:** `a daemon is already running for …`.
+**Symptom:** `a daemon is already running for …`
 
-**Meaning:** each data root
-has **one** daemon, and every command, the TUI and agent hooks are its clients. A second
-`vox daemon` for the same data root stops with that message. Attaching a node that is already
-attached simply succeeds.
+**Meaning:** each data root has one daemon, and every command, the terminal interface and the
+agents are its clients. A second `vox daemon` for the same data root stops with this message.
 
-**Check:** you rarely need to start `vox daemon` yourself. If you meant to use another data
-root, compare `VOX_DATA_DIR` in both terminals.
+**Fix:** use the running daemon. To stop a daemon you started in a terminal, press Ctrl-C there.
+That detaches every node it holds. Never delete the lock or the database.
 
-**Fix:** use the running daemon: the TUI, the CLI and agents can all run at once. To stop the
-daemon you started in a terminal, Ctrl-C it; that detaches every node it holds, which stops their
-rooms, services and agent delivery. Do not kill unrelated Vox processes.
+## A pasted command is cut off or refused by the shell
 
-**Verify:** the intended command runs against the one daemon and the existing room data remains
-available. Never delete the lock or database to defeat ownership. If you cannot identify the
-holder, stop here and report the observation before making destructive changes.
+**Symptoms:** zsh says `zsh: no matches found: vox://…`. Or, in bash, `vox room join` says
+`that room link or id will not parse (anchor has no address): check you copied all of it, exactly
+as it was sent`, and the shell reports a job it started in the background.
+
+**Meaning:** the room link was typed without single quotes. zsh reads its `?` as a file pattern,
+and bash ends the command at its first `&`. Nothing was joined, and the link is fine.
+
+**Fix:** type `vox room join '`, paste the link, and type the closing `'`. Commands Vox prints for
+you to paste are already quoted: copy the whole line.
+
+**Confirm:** Vox asks for the room passphrase, then says `vox: joined` and the room's name.
 
 ## The room is closed
 
-**Exact symptom:** `is closed on this node, so there is nothing to read or post`.
+**Symptom:** `is closed on this node, so there is nothing to read or post`
 
-**Meaning:** the node knows the room but has not opened it, for example after `:close` in the
-TUI. This differs from an unknown room ID and from having no rooms at all.
+**Meaning:** the node holds the room but has not opened it, for example after `:close` in the
+terminal interface.
 
-**Check:** inspect the room list and daemon output. Check that you selected the intended node.
+**Fix:** open the terminal interface with `vox`, select the room, press Enter, and give its
+passphrase. Do not leave and join again.
 
-**Fix:** open it in the TUI: `vox` (or `vox tui --node robertgpt`), select the closed room, Enter
-or `:open`, and give its room passphrase. `:back` returns to the room list. Do not leave and
-rejoin just to open a locally closed room. For unattended operation, see the
-[daemon passphrase-file format](reference.md#passphrase-input).
-
-**Verify:** `room read` succeeds for that room. An empty successful read may be legitimate;
-it is not the same error. If opening is refused, retain that new error and ask for help.
+**Confirm:** `vox room read` works for that room.
 
 ## I cannot join a room
 
-**Check first:** retain the entire `cannot join` explanation, confirm the full room link
-with its sender, and ask whether the relevant member is online. A room link and a room
-passphrase have different jobs; do not replace both at random.
+Keep the whole `cannot join` message. Confirm the full link with its sender, and ask whether a
+member is online. The link and the passphrase do different jobs. Do not change both at once.
 
 ### A member answered and refused the join
 
-**Meaning:** a responder was reached. The usual cause is a wrong room passphrase, but a
-refusal can also involve revocation or a different room. It does not prove which one.
+**Meaning:** a member was reached and refused. The usual cause is a wrong room passphrase.
 
-**Fix:** confirm the room passphrase separately with its sender, checking accidental spaces
-or copying mistakes. If it is correct, ask the room's creator about the intended room and your
-membership. Do not bypass admission or change trust merely to get a join accepted.
+**Fix:** confirm the passphrase with the sender by another way, and watch for spaces and typing
+mistakes. If it is right, ask the room's creator whether you have the right room.
 
-**Verify:** join reports `joined` and the room appears in `room list`; then separately verify
-trust and readable messages. If refusal remains, report the exact explanation, not secrets.
+**Confirm:** the join says `vox: joined`, and the room appears in `vox room list`.
 
 ### The room is full or has ended
 
-**Exact symptoms:** after `vox: cannot join:`, one of
+**Symptoms:** after `vox: cannot join:`, one of:
 
 - `the room is full, so you were not admitted`
 - `another newcomer took the room's last place at the same moment, so you were not admitted`
 - `a member of the room did not agree to take you in, so you were not admitted`, with a `said:`
-  line naming the member, for example `member bob did not answer within 5s, and every member
-  online must agree before the room takes a newcomer`
+  line naming the member
 - `that room has ended — a member or its board said so — so it takes nobody in`
 
-**Meaning:** in the first three your passphrase was accepted. A room takes at most 1,024
-members, and every member online must agree before it takes a newcomer (see
-[Create or join](rooms.md#create-or-join)). The first means the room is at its cap. The second
-means you and another newcomer asked for its last place together, and the other got it. The third
-means a member the room could reach did not answer in time or does not yet count the member that
-answered you as part of the room. The last means its creator or an admin ended the room, or it
-ended itself after an idle time its creator chose; your passphrase was never checked.
+**Meaning:** in the first three, your passphrase was accepted. A room holds up to 1,024 members,
+and every member online must agree to a newcomer. An ended room takes no one, and your passphrase
+was never checked.
 
-**Fix:** for a full or ended room, ask the room's creator; an ended room is gone, and they can
-make a new room and share its link. After the second or third, run the join again: a place
-another newcomer did not take is free again, and a member that was busy or still syncing usually
-answers the next time. If the same member is named again, ask its owner whether it is running.
+**Fix:** after the second or third, join again: a member that was busy usually answers next time.
+For a full or ended room, ask the creator for a new room.
 
 ### No board or no member answered
 
-**Meaning:** connectivity failed before a completed passphrase check. “Your passphrase was
-never checked” means exactly that, not that it was correct or incorrect.
+**Symptom:** the message says the room's host did not answer, or no member was reached, and `your
+passphrase was never checked`.
 
-**Check:** distinguish the room host/anchor not answering from a board answering but none of
-its members being reachable. Also distinguish a member that was reached but stopped
-answering during the join exchange. These are different last successful steps.
+**Meaning:** the join reached no one who could check the passphrase. It says nothing about the
+passphrase.
 
-**Fix:** restore the specifically named host/member's availability or route, then retry.
-An anchor matters only if direct reach is unavailable; do not add one to cure a member's
-explicit refusal. A member reached and then silent may have disconnected or become busy.
-If a machine changed network shortly before, see
-[after a network change](#peers-cannot-find-me-after-a-network-change).
-
-**Verify:** the join reaches a responder and completes. If the same step fails, report that
-step, timing and whether the peers share a LAN, without posting their private addresses.
+**Fix:** make sure a member is online and reachable from your network. If both machines are behind
+NAT and cannot reach each other, you need an anchor
+([when an anchor is needed](services.md#when-an-anchor-is-needed)). If a machine just changed
+network, see [after a network change](#peers-cannot-find-me-after-a-network-change).
 
 ### The address is bad or the room is absent from the board
 
-**Meaning:** a parse failure points to the room link. A parsed link whose room is absent
-can mean the host has not published it, or the room portion was mistyped; parsing does not
-prove that the link names the intended room.
+**Meaning:** the link is incomplete or mistyped, or the member who shares the room has not
+published it yet.
 
-**Fix:** compare the full room link with its sender and keep the hosting member online.
-**Verify:** the corrected link joins the intended room. If it still fails, share the
-error category and redacted structure, not the room link and passphrase together.
+**Fix:** copy the whole link again from its sender, inside single quotes.
 
 ## We joined but cannot read each other
 
-**Meaning:** membership is not trust. Trust is directional; a successful join does not
-release every member's message keys. The TUI can show `[locked — not shared with you]` rather
-than readable text.
+**Meaning:** joining is not trust. Each of you reads the other only once each trusts the other.
+The terminal interface shows `[locked — not shared with you]` for a message you cannot read.
 
-**Check:** both people run `vox trust list` and `vox room roster ROOM_ID` as the intended node.
-Compare the actual fingerprints, not just local aliases. Then inspect connectivity with
-`vox status`: each member's line says `trusted`, `connected` and when it was last synced. An
-offline peer cannot immediately deliver a changed key or a message.
+**Check:** both of you run `vox trust list` and `vox room roster family`, and compare whole
+fingerprints, not names. Then run `vox status`: each member's line says whether it is `trusted`
+and `connected`, and when it last synced.
 
-**Fix:** if a trust decision was genuinely missing, compare the full fingerprint and make
-that decision on the correct side. If trust is already correct, restore availability and
-allow sync rather than repeatedly removing and re-adding trust.
+**Fix:** if a trust decision is missing, make it on the right side. If trust is right, get both
+nodes online and let them sync. Do not remove and add trust again.
 
-**Verify:** post a new harmless message and see it on the other node; repeat in reverse.
-Do not infer that an old inaccessible message must become readable. If new messages still
-fail, report each side's trust direction and reachability without posting message bodies.
+**Confirm:** post a new message and see it on the other node, then the other way round.
 
 ## A message says not received yet
 
-**Symptom:** `(not received yet)` occupies a position in the timeline.
+**Symptom:** `(not received yet)` in a room.
 
-**Meaning:** this node holds the signed envelope, but its unexpired message body is still
-owed. It is not a blanket label for a sender not in your keyring and does not expose that sender's
-plaintext. The row has no arrival cursor until the body arrives.
+**Meaning:** your node has the message's signed envelope, and its text is still to come from a
+member. It does not mean missing trust or a bad signature.
 
-**Check:** inspect `vox status`, the affected room and peer connectivity. Compare whether
-another available member actually holds the missing message. Do not infer wrong trust or a
-broken signature from this placeholder alone.
+**Fix:** get the members who hold the message online. If no member holds it, it cannot be
+recovered: there is no server.
 
-**Fix:** restore the relevant peers' availability and let the node request the body. Do not
-reset identity, change trust indiscriminately or use the placeholder as a `--since` cursor.
-If no member holds the body, do not promise a central server can recover it.
-
-**Verify:** the placeholder is replaced by the received message, or the actual retention
-state explains its removal. If it persists despite a reachable holder, report the exact
-versions and sanitized sync observations using [Get help safely](getting-help.md).
+**Confirm:** the message's text replaces the placeholder.
 
 ## The service is unreachable
 
-**Meaning:** joining the room, publishing an offer, local proxy availability and the actual
-service being reachable are separate facts.
+**Meaning:** being in the room, the offer being listed, the proxy running, and the service
+answering are separate facts.
 
 **Check:**
 
-- the host's local service is running;
-- the host trusts the guest fingerprint;
-- both use the intended room;
-- `vox service list ROOM_ID` names the intended offer and shows **your** address for it;
-- the guest has a node attached, so its daemon's proxy runs (`vox up` says where, or why it
-  is not running), or its `vox forward` is still running;
-- the ordinary client uses that loopback proxy or forward.
+- the service runs on the sharer's machine;
+- the sharer trusts your fingerprint;
+- `vox service list family` lists the service, with **your** address for it, and each line `✓`;
+- your node is attached, so the proxy runs (`vox up`), or your `vox forward` still runs;
+- your tool uses that proxy or forward.
 
-A readable address from someone else's screen uses their names for the node and room, which may
-mean nothing on your machine. Use the readable address your own `service list` prints, or the
-canonical address under it, which is the same on every member's machine.
+Use the address your own `vox service list` prints, or the canonical one: another member's
+readable address uses their names.
 
-**Fix:** restore the missing piece. A forward that says `tunnel refused or cut — the host
-refused "ssh" — it has not trusted this identity, or offers nothing there, or its service did not
-answer` names three possible causes; check each with the host. If access was explicitly
-withdrawn, ask the host; retrying does not recreate permission. If the local service refuses
-authentication, investigate that service rather than weakening Vox trust or disabling SSH
-host-key checking.
+**Fix:** fix what the check names. `tunnel refused or cut — the host refused "ssh" — it has not
+trusted this identity, or offers nothing there, or its service did not answer` names three causes.
+Check each with the sharer. If the service itself refuses your login, look at the service, not at
+Vox, and keep SSH's host-key check on.
 
-**Verify:** the expected application answers through Vox using its normal authentication.
-If it still fails, report the last successful step and exact refusal, not a generic “SSH broken”.
+**Confirm:** the service answers through Vox and its own login works.
 
 ## Peers cannot find me after a network change
 
-**What Vox does:** when the machine's addresses or default route change, such as moving from home
-Wi-Fi to a hotspot, the daemon hears it from the operating system and acts within seconds. It
-writes one line to its log (`.daemon/log` in the data root, or the terminal of a `vox daemon` you
-started there), for example:
+When the machine's addresses or default route change, the daemon notices within seconds. It asks
+the router for port mappings again, publishes the node's new addresses, and dials its peers and
+anchors again. Its log says so in one line:
 
 ```text
 vox: the network changed: addresses came: 10.9.1.7; went: 10.9.0.1; IPv4 default route 10.9.0.254 → 10.9.1.254; this node now advertises /ip4/10.9.1.7/udp/55525, /ip4/127.0.0.1/udp/55525, and republished 0 room(s) to its board and its anchors
 ```
 
-It forgets the outside addresses it had seen, asks the router for its port mappings again,
-publishes each attached node's new addresses to its rooms' boards and anchors, and dials its
-peers and anchors again. A connection that does not answer after the change is closed and dialled
-again. `vox status --json` names the last change under `network_changed`, with its time (`at`)
-and the same sentence (`change`); it is `null` when there has been none since the daemon started.
-There is nothing to restart.
-
 **Check:** if a peer still cannot reach you after a minute:
 
-- `vox status --json`: is `network_changed` the change you expected? If it is `null`, the
-  daemon did not count a change: only a change of routable addresses or of the default route
-  counts.
-- `vox status`: under `gateway`, did a router answer (see
-  [reading status](reference.md#output-cursors-and-status))? Behind a new NAT with no mapping
-  answered, a peer that is also behind NAT can reach you only through an anchor; see
-  [when an anchor is needed](services.md#when-an-anchor-is-needed).
-- `vox status` on both sides: is the peer `connected`, and by which path, `direct` or relayed?
-- A VPN, a firewall or a captive portal on the new network can block UDP; check it the way you
-  would for any other program.
+- `vox status --json`: is `network_changed` the change you expect? `null` means the daemon saw no
+  change of routable address or default route.
+- `vox status`, under `gateway`: did a router grant a mapping? Behind NAT with no mapping, a peer
+  also behind NAT reaches you only through an anchor.
+- `vox status` on both sides: is the peer `connected`, and `direct` or relayed?
+- A VPN, a firewall or a captive portal can block UDP.
 
-**Fix:** restore what the checks name: sign in to the captive portal, allow UDP, or give both
-sides an anchor they can reach. Do not delete the node or change trust to cure a network fault.
+**Fix:** sign in to the captive portal, allow UDP, or give both sides an anchor they can reach.
 
-**Verify:** the peer shows `connected` in `vox status` and a new message arrives.
+**Confirm:** the peer shows `connected`, and a new message arrives.
 
 ## The file is unavailable or fails verification
 
-**Meaning:** a share's message can stay in the room after its sharer stops serving it. An
-unreachable share can also mean missing trust; a hash failure means the received bytes do not
-match the signed announcement, not that the check should be disabled.
+**Meaning:** a share's message can outlive its serving. A pull can also fail for missing trust. A
+hash mismatch means the bytes received are not the ones announced.
 
-**Check:** identify the sharer and the exact share. Ask whether it is still shared: the sharer's
-`vox share list ROOM_ID` lists it, and a share given `--count` or `--for` stops by itself. A pull
-from a share that has stopped says `the offer of FILE is gone: NAME no longer serves it`; one
-whose sharer cannot be reached says `the offer of FILE cannot be collected now` and gives the
-reason. Inspect any reported size/hash or stall reason. If `--out` already exists, that is local
-destination protection, not a transfer failure. A share your node did not pull by itself is
-either addressed to someone else or from a node not in your keyring (see
-[where a shared file lands](files.md#where-a-shared-file-lands)).
+**Check:**
 
-**Fix:** have the sharer share the intended unchanged file again if needed, then pull again.
-Use another output path for a collision. Do not salvage or open a failed `.part` as though
-verified; this workflow rejects incomplete/mismatched transfers and removes its partial file.
+- `the offer of report.txt is gone: robertGPT no longer serves it`: the sharer stopped. Their
+  `vox share list family` does not list it.
+- `the offer of report.txt cannot be collected now`, with a reason: the sharer cannot be reached.
+- `already exists; vox room get never overwrites a file`: pick another `--out` path.
+- A share your node did not pull by itself is addressed to someone else, or comes from a node not
+  in your keyring ([where a shared file lands](files.md#where-a-shared-file-lands)).
 
-**Verify:** the command names the saved file and says it `matches its announced SHA-256`. If repeated attempts fail,
-use a harmless reproduction file and record expected/received byte counts, without publishing
-the private file or treating its hash as anonymous.
+**Fix:** ask the sharer to share the file again, then pull again. Never open a `.part` file.
+
+**Confirm:** Vox names the saved file and says it `matches its announced SHA-256`.
 
 ## The agent does not respond
 
-**Meaning:** no answer can mean no session, wrong node, missing hook/plugin, missing trust,
-next-turn delivery, or an agent that has not acted. It is not proof that encryption failed.
+**Meaning:** no answer can mean no running session, the wrong node, a missing hook, missing
+trust, or a message that arrives at the next turn.
 
-**Check:** run `vox agent doctor --node AGENT_NODE --room ROOM_ID` on the agent's machine. It
-checks the node, the room, the installed hook or plugin, the drain, session records, trust in
-each direction and versions, and prints a fix for each problem. From another node,
-`vox room ping ROOM_ID AGENT_ALIAS` asks the agent's daemon which sessions it holds. Then use
-ordinary `vox room read --node AGENT_NODE ROOM_ID`: if the agent's node cannot see the question,
-solve room/trust/connectivity first.
+**Check:** for an agent whose node is `claude-mac`, in the room `family`:
 
-**Fix:** install the generated integration once at user scope with the agent's `--node`. For
-Codex, keep `async: false` and trust the final hook command. Reload the harness after
-configuration changes. Start a normal turn in the existing session and observe a distinctive
-harmless room question. Codex reads at its next turn even when a post is urgent; there is no
-mid-turn interruption to repair. For Claude/OpenCode, urgent wakes still require their live
-endpoint. Do not run the hook manually to simulate a real session's successful receipt.
+```sh
+vox agent doctor --node claude-mac --room family
+vox room read family --node claude-mac
+```
 
-**Verify:** observe the question in the receiving session and its reply in the intended room.
-A clean doctor and a hook's exit 0 are not enough. A ping without an answer cannot distinguish
-an offline node, a node that is not attached and missing trust. If the actual session still
-does not receive, report the harness and Vox versions, event, scope and redacted hook.
+Run them on the agent's machine. From another node, `vox room ping family claude-mac` asks the
+agent's daemon which sessions it holds. If the agent's node cannot read the question, fix trust or
+connectivity first. A session in a repository with no room works in none
+([the room a session works in](sessions.md#the-room-a-session-works-in)).
+
+**Fix:** follow the doctor's `fix:` lines. Reload the harness after any change to its settings.
+Codex reads messages at its next turn, even urgent ones.
+
+**Confirm:** the agent's session shows the question, and its reply appears in the room.
 
 ## A claim is uncertain or coordination is refused
 
-**Meaning:** exit 5 leaves a claim posted but not fully agreed; exit 3 means a version
-mismatch; exit 1 means another holder won. None is exclusive ownership.
+**Meaning:** exit 5 means the claim is posted but not every member agrees yet. Exit 3 means the
+members run different versions of Vox. Exit 1 means another session holds the item.
 
-**Check:** read the named reason and `vox room board ROOM_ID` as the agent's node and session.
-For exit 5, a member may be unreachable, missing the claim, disagreeing, or reporting
-incompatible clocks. Do not reset an identity to clear an ownership result.
+**Check:** read the reason Vox prints, and `vox room board family` as the agent's node.
 
-**Fix:** restore the specific connectivity/trust/time condition, or coordinate with the
-current holder. Align participant versions for exit 3. Retain the same operation ID when
-retrying the same operation. Do not reuse it for different content.
+**Fix:** restore the named member's connectivity, align versions, or coordinate with the holder.
+To retry the same operation, keep its `--op` ID.
 
-**Verify:** obtain an agreed claim or intentionally leave the work with the existing holder.
-Record progress on the GitHub issue, not by manufacturing a successful room outcome. If
-uncertainty persists, report the named reason and sanitized board state.
-
-Sources: [node selection and attach messages](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/client.rs),
-[join diagnostics](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/tunnel_cli.rs),
-[room and file diagnostics](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/room_cli.rs),
-[the daemon](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/daemon.rs),
-[wake behavior](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/wake.rs)
-and [network changes](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/docs/adr/ADR-012-nat-traversal-and-reachability.md).
+**Confirm:** a claim exits 0, or you leave the work to its holder.

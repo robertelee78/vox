@@ -1,460 +1,251 @@
 # The Vox app on a Mac
 
-Applies to: v0.4.1, Apple Silicon Macs with macOS 13 or later. The app does what the `vox`
-commands do; this chapter describes where each thing is in the app. The other chapters explain
-nodes, rooms, trust, services and files.
+This page says where each thing is in Vox.app. The app does what the `vox` commands do. The other
+chapters explain nodes, rooms, trust, services and files. The app runs on Macs with Apple Silicon
+and macOS 13 or later, and the installer installs it with `vox` ([Install and update](install.md)).
 
 ## What the app is
 
-Vox.app is a window onto the account's vox daemon, the same daemon `vox` commands and `vox tui`
-use. The app holds no node of its own. It acts as **one node** on this Mac, which you make or choose the
-first time you open it, and everything you post, trust and share in the app is that node's. The
-sidebar opens with that node: its mark, its name and `node attached`. At its foot, **ON THIS
-MACHINE** lists every node on this Mac with its state (`attached` or `detached`): separate
-identities, one daemon. The other nodes stay with the `vox` commands.
-
-## Install
-
-On a Mac the installer installs the app and `vox` together (see [Install and update](install.md)
-for how to run it). It puts `Vox.app` in `/Applications`, or in `~/Applications` when it cannot
-write there, and makes `~/.local/bin/vox` a link to the `vox` inside the app, so the app, the
-daemon and the CLI are one binary of one version. Before anything is replaced it checks the
-app's size and SHA-256, and that it is signed by Vox's Developer ID and notarized:
-
-```text
-verified: Vox.app and its vox, Developer ID TEAM_ID, notarized
-installed: /Applications/Vox.app (Vox VERSION)
-linked: ~/.local/bin/vox -> /Applications/Vox.app/Contents/Helpers/vox (vox VERSION)
-```
-
-On an Intel Mac, or before macOS 13, it stops before downloading anything: `this Mac is not
-supported: Vox needs a Mac with Apple Silicon and macOS 13 or later`. It also refuses to replace a
-`Vox.app` it did not install.
-
-## Update
-
-`vox update` replaces the whole app, with the `vox` inside it, and keeps the previous app for
-`vox update --rollback`:
-
-```text
-updated: /Applications/Vox.app -> Vox VERSION
-         the previous Vox.app is kept at … for `vox update --rollback`
-```
-
-Then it restarts the vox daemon onto the new version. Stopping the daemon detaches every node.
-The new daemon attaches again each remembered node: its passphrase in the Keychain (from `vox node
-attach` or the app), none needed, or `vox node attach --keep`. Any other node comes back detached, and the update
-names it with the command that attaches it again:
-
-```text
-node NAME is detached, as the daemon remembers no passphrase for it; attach it again with `vox node attach NAME`
-```
-
-How the daemon comes back depends on how it was started. The login item's daemon is started again
-by macOS from the new app. A daemon a client started (the app, `vox tui` or another `vox` command)
-is started again the same way, or, if it has no node to attach again, left stopped until the next
-command needs it. A daemon you started yourself in a terminal (`vox daemon`) is left running the
-old version, and the update says so: stop it and start it again. An open Vox keeps running the old
-version too, until you quit it and open it again.
+Vox.app is a window onto your account's Vox daemon, the same daemon the `vox` commands and the
+terminal interface use. The app acts as **one node** on this Mac, which you make or choose the
+first time you open it. Everything you post, trust and share in the app is that node's. The other
+nodes on this Mac are listed under **ON THIS MACHINE**, with **Attach…** for each one that is not attached.
 
 ## The first run
 
-1. **Keep Vox running while you're logged in?** The app asks this once: "Keep Running keeps Vox
-   running in the background while you're logged in, even with the app closed, so your rooms stay
-   reachable."
-   - **Keep Running** registers Vox's login item, which starts the daemon each time you log in.
-     macOS may want your approval first: the app then says **Allow Vox in Login Items**, with a
-     button that opens System Settings, General, Login Items. Until you approve it, Vox runs
-     while the app is open.
-   - **Not Now** registers nothing. The app starts the daemon as `vox` does, if none is running,
-     and uses the one already running if there is one.
+1. **Keep Vox running while you're logged in?** **Keep Running** registers Vox's login item,
+   which starts the daemon each time you log in. If macOS wants your approval first, the app says
+   **Allow Vox in Login Items** with a button that opens System Settings. **Not Now** registers
+   nothing, and Vox runs while the app is open. The same screen offers **Show Vox in the menu
+   bar**.
+2. **Welcome to Vox.** With no node on this Mac yet, type a **Name** and the identity passphrase
+   twice, then choose **Make Node**. You may leave the passphrase empty. The form then says the
+   node's key is kept unencrypted. There is no backup of a node: if this Mac is lost, so is the
+   node.
+3. **Which node are you?** With several nodes on this Mac, pick the one you post, trust and share
+   as. With one, the app uses it.
+4. **Attach node NAME.** For a node that is not attached, type its identity passphrase, or leave it
+   empty for a node made with none. **Remember the passphrase in the Keychain** is on unless you
+   turn it off. With it on, the node attaches again by itself after Vox quits or the Mac restarts,
+   and anyone who can unlock this Mac's login keychain can attach it. With it off, your rooms are
+   reachable only while Vox is open.
 
-   The same screen offers **Show Vox in the menu bar**, off unless you turn it on (see
-   [The menu bar item](#the-menu-bar-item)).
-2. **Welcome to Vox.** With no node on this Mac yet, the app makes one in its window, as
-   `vox node create` does; nothing sends you to Terminal. Type a **Name** (lowercase letters,
-   digits, dots, dashes and underscores) and the identity passphrase twice, then choose
-   **Make Node**. The passphrase unlocks your node on this Mac, and nobody can recover it for you.
-   It may be left empty: while it is, the form says `No identity passphrase: this node's identity
-   key is kept on this machine unencrypted, so anyone who can read its data folder can act as this
-   node; a passphrase is encouraged`, and Make Node makes the node with none. The app says, as `vox node create` does, that there is no backup of a node: if this Mac is
-   lost, so is the node. Two passphrases that differ are refused, and nothing is created:
+A new node is in no room yet. Its window offers **New Room…** and **Join Room…**.
 
-   ```text
-   The two passphrases differ; nothing was created.
-   ```
+If the app cannot reach the daemon, it shows a card with a headline, a likely cause and **Try
+Again**. **DETAILS** holds the daemon's own sentence, with **Copy** for a report.
 
-   The app then attaches the new node with that passphrase and opens its window.
-3. **Which node are you?** With several nodes on this Mac, the app lists them, each with its
-   fingerprint art and fingerprint (once the node has been attached) and the line `Everything you
-   post, trust and share will be as NAME.`: pick the one you post, trust and share as here. With
-   exactly one, the app uses it without asking.
-4. **Attach node NAME.** For a node that is not attached yet, type its identity passphrase. The app
-   hands the passphrase to the daemon and does not store it. A wrong one is refused in the daemon's
-   own words, under the field:
+## Open, quit and detach
 
-   ```text
-   That passphrase does not open node NAME's identity.
-   ```
+- **Opening** the app attaches its node. A node already attached is used as it is.
+- **Quitting** (⌘Q) lets go of the node. The daemon detaches it unless something else keeps it:
+  a remembered passphrase, a running `vox tui`, `vox serve` or `vox forward`, or a node attached
+  by hand.
+- **Node > Detach** detaches the node at once and forgets its passphrase. The window then offers
+  **Attach NAME Again** and **Quit Vox**.
+- **Node > Forget Passphrase** removes the passphrase from the Keychain. The node stays attached
+  until it is detached, and the daemon stops attaching it by itself.
+- **Node > Sign Out…** detaches the node, forgets its passphrase, and makes the app forget it chose
+  it. Its rooms and messages stay on this Mac.
 
-The app remembers the node you chose, and attaches it each time it opens. The answers are kept
-in Vox's config directory, under `app/` (`login-item`, `node`, `menubar`).
-
-A new node is in no room yet. Its window says **You are in no room yet.**, with
-**New Room…** to make a room and share its link, and **Join Room…** to join one with the link
-and passphrase someone sent you (see [Rooms from the menus](#rooms-from-the-menus)).
-
-### A node from an earlier Vox
-
-If the data root still holds nodes kept the way an earlier release kept them, which this version
-cannot read, the app says **This Mac has a node from an earlier Vox**, names the directories, and
-offers **Move It Aside and Start Fresh**. That moves each of them, whole and untouched, into
-`moved-aside/` in the data root, as `NAME-YYYY-MM-DD` (with `-2`, `-3` and so on if that name is
-taken); nothing in them is deleted. The welcome that follows says what moved where, as full paths:
-
-```text
-Moved aside, untouched: DATA_ROOT/NAME is now DATA_ROOT/moved-aside/NAME-YYYY-MM-DD.
-```
-
-Your new node is a new identity: people you shared rooms with add it to their keyring again.
-**Try Again** looks again without moving anything.
-
-### When Vox cannot start
-
-If the app cannot reach the daemon, it shows a card with a plain headline, one line of likely
-cause, and **Try Again**:
-
-| Headline | Cause |
-|---|---|
-| Vox can't start its background service | It stopped as it started. Your rooms are unreachable until it runs. |
-| Vox's background service isn't answering | It may still be starting, or be stuck. Your rooms are unreachable until it answers. |
-| Another copy of Vox is using this node | Only one copy may act as a node at a time: a command that has not finished, or another copy of Vox, holds it. |
-| Vox can't reach its background service | Your rooms are unreachable until it answers. |
-
-Under **DETAILS** is the daemon's own sentence, which you can select, and **Copy** puts it on the
-clipboard for a bug report. If you chose Keep Running and the login item stopped for a reason a
-restart cannot fix, the card also quotes the login item's last word on it, with
-**Turn Keep Running Off** and **Show Log in Finder** (`~/Library/Logs/Vox/login-item.log`).
-
-## Opening and quitting
-
-- **Opening** the app attaches its node, as `vox tui` does. A node already attached is used as
-  it is, without asking for its passphrase.
-- **Quitting** (⌘Q, or a stop signal) lets go of the node. The daemon detaches it unless
-  something else keeps it attached: a `vox tui`, `vox serve` or `vox forward` still running, an
-  attach by hand with `vox node attach`, or a kept node (below). `vox node list` shows the
-  node's state.
-- **Node > Detach** detaches the node at once: its connections close and its keys are wiped from
-  memory. The window stays that node's: it says `Node NAME is detached`, with **Attach NAME
-  Again** (its passphrase asked if it needs one) and **Quit Vox**. A window never becomes another
-  node.
-- **Node > Sign Out…** says first what it does, then detaches the node and forgets everything that
-  would bring it back without you: it is no longer kept attached, its passphrase is removed from
-  the Keychain, and the app forgets it chose it. The node, its rooms and its messages stay on this
-  Mac. The app then offers the nodes on this Mac, each with its fingerprint, and **New Node…**.
-  `vox node signout NAME` does the same from a terminal.
-
-If the node stops while the window is open (detached elsewhere, or the daemon stopped), the
-sidebar and the menu bar say `detached`, a banner says why with **Attach Again** and **Start
-Over**, and the menus that act on the node are off. What you typed is kept, and attaching the same
-node again picks up where it was.
-
-### Keep a node attached when the app quits
-
-This is offered only if you chose Keep Running. On the passphrase screen, turn on **Store the
-passphrase in the Keychain, so node NAME stays attached when Vox quits**. The app says what that
-costs before you attach:
-
-```text
-Anyone who can unlock this Mac's login keychain can then attach node NAME.
-```
-
-With it off, the app says: "Without it, your rooms are reachable only while Vox is open."
-
-With it on, the daemon stores the passphrase in your login keychain (item `us.vox.node`), keeps
-the node attached when the app quits, and attaches it again at login without asking.
-`vox node list` shows the node `(kept)`. The stored passphrase is used only to attach the node:
-changing who you trust still asks for your passphrase (see
-[The keyring view](#the-keyring-view)). Detaching the node by hand, with Node > Detach or
-`vox node detach NAME`, removes the passphrase from the Keychain.
-
-A node with no identity passphrase needs no Keychain: with Keep Running chosen, it is kept as it
-attaches.
+If the node stops while the window is open, a banner says why, with **Attach Again** and **Start
+Over**. What you typed is kept.
 
 ## The main window
 
-The window has four parts: a sidebar, the room on screen, the room's members beside it, and a
-status bar along the bottom.
+The window has a sidebar, the room on screen, the room's members beside it, and a status bar.
 
 ### The sidebar
 
-- At the top, your node: its mark, its name, and an ice dot with `node attached`.
-- Your rooms, in three groups, each with its count:
-  - **needs you**: a message addressed to your node is unread.
-  - **active**: new messages are unread.
-  - **quiet**: nothing is unread.
+- At the top: your node's mark, its name and `node attached`, and a **+** with **New Room…** and
+  **Join Room…**.
+- Your rooms, in one list, newest message first. Each row shows the room's name and the time of
+  its newest message, then that message as `who: text`, and a badge with the unread count. The
+  badge and time are brighter when something waits on you there: a message addressed to you, a
+  Session waiting on you, or a trust offer. The second line then says what waits, such as
+  `a Session needs you` or `f7l2q44… joined — trust?`.
+- **Keyring**, **Decision record** and **Services**.
+- At the foot, **ON THIS MACHINE**: every node on this Mac, `attached` or `detached`. A node that
+  is not attached has **Attach…**, which asks for its passphrase and remembers it. Right-click a
+  remembered node for **Forget Passphrase**.
 
-  A room that is not quiet shows its unread in words under its name. A message stops being
-  unread once at least half of it has been in view in the timeline, not when you choose the room:
-  what you scrolled past unseen stays unread. **Next Room That Needs
-  You** (⌘J, or Control-N as in the TUI) opens the first room in **needs you**.
-- Trust offers, first under **needs you**: `offer: xgfm gktt… joined`, or `… trusts you` (see
-  [Trust offers](#trust-offers)).
-- **Keyring**, **Decision record** and **Services**: views of this window, described below.
-- At the foot, **ON THIS MACHINE**: every node on this Mac with its state, `attached` or
-  `detached`, and `Separate identities. One daemon.`
+A message stops being unread once at least half of it has been in view, with the window in front.
+**Next Room That Needs You** (⌘J or Control-N) opens the next room where something waits on you.
+The Dock icon shows how many things wait on you. Right-click a room, node or member to copy its
+name or fingerprint.
 
-Right-click a room, a node or a member to copy its name or fingerprint. Drag the sidebar's edge,
-or the edge of the members column, to resize it; the widths are kept for the next launch. **View >
-Hide Inspector** (⌥⌘I) hides the members column and shows it again.
+### A repository with no room
 
-The Dock icon carries the same count as **needs you**: rooms with a message to you or a Session
-waiting on you, and trust offers. It goes when nothing needs you.
+When an agent session starts in a repository Vox has no room for, a banner across the window says
+so, such as `Claude Code in /opt/vox has no room`. A notification, `Which room is this repo in?`,
+brings you to it.
+
+- **Choose a room…** binds the repository to one of your node's rooms, or to a room whose link you
+  paste, with the room's passphrase typed there. The banner says first that the passphrase is
+  saved for this repository in the room map, which every node on this Mac can read. Every session
+  waiting there moves into the room.
+- **Not this repo** says no. No session started there asks again.
+- **Join It**, for a repository bound to a room its node is not in, joins with what the room map
+  holds.
+
+See [the room a session works in](sessions.md#the-room-a-session-works-in).
 
 ### The room
 
-A header pinned above the timeline names the room, how many members it has, whether the room's
-conversation (General), All or a Session is shown, and how long the room keeps messages (`⏱ 1
-week`), always. The window takes the room's name as its title. If anyone in the room shares a service, its cards run along the top: the
-service's address, who shares it, and its kind. Click one to select it; **Room > Copy Selected
-Service's Address** (⌘⇧C) copies its full address.
+The header names the room, its member count, what is shown (General, All or a Session), and how
+long the room keeps messages (`⏱ 1 week`). Services shared in the room appear as cards along the
+top. **Room > Copy Selected Service's Address** (⌘⇧C) copies the selected one's address.
 
-Each message shows its author (`you` for your own) and its time of day, in your Mac's own format,
-with the whole date and time when you point at it. It marks a message **urgent**, **to you**, or
-**arrived late** (it took its place above messages already shown). A divider says where each day
-starts (Today, Yesterday, or the date), and a line marks the first message that was unread when
-the room came on screen.
+Each message shows its author and time. It is marked **urgent**, **to you**, or **arrived late**.
+A reply shows the message it answers above it. Click the quote, or press ⌘↑, to go there. Under
+your own messages the timeline says `read by NAME`, or where the message is so far (`only on this
+machine`, `on N of M members' nodes`). Under your shares it says `pulled by NAME`. Room changes,
+such as a new retention, appear in italics.
 
-A reply shows the message it answers above it (`re ann: …`, its first line); click the quote, or
-press ⌘↑ with the reply selected, to go to that message. When someone joins while the room is on
-screen, the timeline says so, with which of the nodes in your keyring trust the newcomer: `bo
-joined. ann trusts it.`, or for a node not in your keyring its fingerprint's start, marked `(not in
-keyring)`, and `No one you trust trusts it yet.`
+A shared file is a card with its name and size. **Download** pulls it and shows progress. Once
+your node has checked the copy's SHA-256, the card offers **Quick Look**, **Show in Finder** and
+**Save a Copy…**. Nothing unchecked opens.
 
-Every word the app shows can be selected and copied, and every field takes paste. A message whose text has not
-arrived yet says `not received yet`, and is replaced when it does. What was done to the room,
-such as its retention set or its name changed, appears in italics right after the message it
-followed in the room:
-
-```text
-you named the room family
-you set the room's retention to 1 week: messages older than 1 week are removed from now on
-```
-
-Under your own messages and shares the timeline says what happened to them:
-
-- `read by NAME, NAME` once members' nodes say they showed it to a person; until then, where it
-  is: `only on this machine`, or `on N of M members' nodes`.
-- `pulled by NAME` once a member has pulled your share and checked its bytes.
-
-A message counts as read only while the window is in front of you: Vox in front, the window
-key, not minimized and not covered, and the message at least half in view. Nothing is read while
-the app is hidden.
-
-A shared file or folder is a card with its name, its size and, when it is not for the whole
-room, `Addressed to ann, bo`; **Details** shows its whole SHA-256 and who shared it. An image
-shows its preview, carried in the share, even while the sharer is offline. The card says where
-your copy stands, with one way on:
-
-- **Download** pulls it, with its progress (`1.2 MB of 4 MB`). From a node not in your keyring it
-  says so, and offers **Trust…** or **Download Anyway**.
-- `Waiting for ann to come online.` while the sharer cannot be reached.
-- `Not pulled:` and the reason, with **Try Again**.
-- Once your node has pulled a copy and checked its size and SHA-256 against the share,
-  **Quick Look**, **Show in Finder** and **Save a Copy…**. Nothing unchecked is ever opened, and a
-  copy saved elsewhere is copied, never moved, so the room's own copy ages with the room.
-
-A message that starts with a link may carry a card for the page: its title, description and
-picture, found by the sender's node when it posted, so showing it fetches nothing. Only `http`
-and `https` links can be opened from a card; any other link is shown as text.
+A trust offer from a member is shown at the top of the room's conversation as one line, such as
+`f7l2q44… joined — trust?`, with **Review…** ([Trust offers](#trust-offers)).
 
 ### Posting
 
-While a member cannot read you, or you them, one line above the composer says who and which way
-trust is missing: `You trust ann. Waiting for ann to trust you back before you can read each
-other.`, `ann trusts you. Trust ann too, and you can read each other.` (with **Trust ann…**), or
-that neither has trusted the other. With several, it names every one, by alias or the start of
-the fingerprint. **Show Keyring** is offered when one of them is not in your keyring.
+Type in the field at the bottom and press Return. ⇧Return starts a new line. Type `@` and a name
+to address a member you trust. **To:** picks members, or one of their open Sessions, to address.
+**Urgent** marks the message urgent, and ⌘Return sends it urgent. To reply, select a message and
+choose **Room > Reply to Selected Message** (⌘R).
 
-Type in **Message ROOM…**, after your node’s name (`ann ▸`, who posts), and press Return. The
-field grows to 12 lines; ⇧Return (or ⌥Return) starts a new line. Type `@` and the start of a name to pick a member
-you trust: the message is addressed to them, as with **To:**. An alias that differs from another
-only by case carries `#` and the first 6 characters of its fingerprint, so the two are never taken
-for one. What you were writing in a room, with its To:,
-Urgent and reply, is kept while you look at another room or Session. What you send stays in the
-field until your node has it: a send that fails leaves your text, To:, Urgent and reply as they
-were, and what you typed meanwhile is kept too. Beside the field:
+When a member cannot read you, or you them, a line above the field says which way trust is
+missing, such as `ann trusts you. Trust ann too, and you can read each other.`, with **Trust
+ann…**.
 
-- **To:** opens the room's members to tick the ones the message is addressed to, and under each,
-  their open Sessions: a Session ticked is addressed alone. With none ticked it goes to the room.
-- **Urgent** marks it urgent. ⌘Return sends it urgent at once.
-
-You can dictate into the composer as into any text field, with the 🎤 key or **Edit > Start
-Dictation**. macOS decides whether dictation runs on the Mac or on Apple's servers (Keyboard
-Settings shows which), and no app can require it to stay on the Mac; for dictation that does, use
-swictation.
-
-To reply, select a message and choose **Room > Reply to Selected Message** (⌘R). The composer
-says `Replying to NAME: …` until you send or choose **Cancel**.
-
-### Files: drag, paste, Attach or Share
-
-Drop a file or folder on the timeline, paste one into it, or choose the paper clip
-(**File > Attach File…**, ⌘O). The app asks for a **To:** and an optional **Note**, starting
-from the composer's To: and Urgent, then
-**Share** sends them as one share: the note and the addressees travel in the share, never as a
-message of their own. With no one ticked the share is for the whole room; with members ticked
-the room still sees it. It is the same as `vox share` (see [Send and receive files](files.md)).
-
-From the Finder or any other app, choose **Share**, then **Vox**: a sheet titled **Share to a Vox
-room** asks for the room, who it is for (none ticked: the whole room) and a note, and **Send**
-shares it. The app need not be open, but its node must be attached; otherwise the sheet says
-`Open Vox to attach node NAME first.` and sends nothing. It never asks for a passphrase. It acts as
-the node the app chose, in your account's own Vox data. Sent, it says `Shared NAME (SHA-256 …)`.
-
-In the Finder, **Services > Share to Vox Room** sends the file to the app instead, which asks for
-its To: and note in the room on screen (or the next room you open).
+To share a file, drop it on the timeline, paste it, or choose **File > Attach File…** (⌘O). The
+app asks for **To:** and a **Note**, then **Share** sends one share. From the Finder or another
+app, choose **Share > Vox**. This works while the app's node is attached, even with the app
+closed.
 
 ### Members and trust
 
-Beside the timeline, **MEMBERS** lists the room's other members with their trust (the column
-scrolls, its headings kept in view): ⇄ for a member
-in your keyring that trusts you back, → for one in your keyring that does not yet, and · with a
-dimmed name marked `not in keyring` for one you have not trusted. Under a member in your keyring,
-its entry's grant:
-`read` or `read + drive`. Under a member whose node has said which machine it runs on, that
-claim: `says it runs on macOS 26.2 (aarch64)`.
+**MEMBERS** lists the room's other members: ⇄ for a member in your keyring that trusts you back,
+→ for one that does not yet, and a dimmed name marked `not in keyring` for one you have not
+trusted. Under a member in your keyring, its grant: `read` or `read + drive`. Click a member to
+open its card: its fingerprint with its picture, who reads whom, and **Trust…**. Trusting from a card
+asks only for a name and gives read.
 
-Click a member, a message's author or a row of the decision record to open its card: its
-fingerprint with its art (**Copy**), who reads whom in a sentence each way, and **Trust…**.
-Trusting from a card asks only an alias: it gives the node read, and says so first.
-
-Under the members, **FAMILY LAN** is a switch. Turned on with Vox's LAN helper already allowed, the
-LAN comes up at once. Otherwise Vox asks macOS for the helper and a sheet says what it is (one root
-process that creates network interfaces for Vox and nothing else), exactly where to allow it
-(System Settings, General, Login Items & Extensions, then Vox under Allow in the Background), and
-that Vox is waiting; once you allow it, the sheet closes and the LAN comes up. **Remove the LAN
-Helper** appears once it is allowed.
+**FAMILY LAN**, under the members, puts this Mac on the room's local network
+([Reach a shared service](services.md#put-a-room-on-one-local-network)). The first time, the app
+asks you to allow its LAN helper in System Settings, General, Login Items & Extensions.
 
 ### The status bar
 
-The status bar says the node, how many peers it has, and the keyring window: `keyring open 23m`
-while a keyring change needs no passphrase, `keyring asks for the passphrase` once it will ask.
-It also shows what came of the last thing you did, as one sentence with a × to dismiss it: done,
-refused with the reason, or that Vox cannot tell whether it was done. The next thing you do
-clears it, and a sheet shows only what came of its own action. If macOS does not let Vox notify, it says
-`notifications off (System Settings, Notifications, Vox)`.
+The status bar shows the node, its peer count, and the keyring window: `keyring open 23m`, or
+`keyring asks for the passphrase`. It also shows the result of your last action: done, refused
+with the reason, or that Vox cannot tell. If macOS does not let Vox notify, it says so.
 
 ## Rooms from the menus
 
-The sidebar's **+**, at the head of its rooms, offers the same two: **New Room…** and **Join
-Room…**.
-
-- **Room > New Room…** (⌘N): the room's name, as every member sees it, and a passphrase for it.
-  Send the passphrase another way than the link. Left empty, the room has none, and the form says
-  so: `No passphrase: anyone with the link can join.`
-- **Room > Join Room…** (⌘⇧J): the room link and its passphrase. A joined room keeps the name
-  its members gave it. Clicking a `vox://` room link in Mail, Messages or a browser opens this
-  sheet with the link filled in; joining still takes the passphrase and **Join**.
+- **Room > New Room…** (⌘N): a name and a passphrase. Left empty, anyone with the link can join.
+- **Room > Join Room…** (⌘⇧J): the room link and its passphrase. Clicking a `vox://` link in Mail,
+  Messages or a browser opens this sheet with the link filled in.
 - **Room > Copy Room Link** (⌘L).
-- **Room > Rename…**: the room's one name, as every member sees it, in their sidebar and in
-  every address of the room's services. Only the room's creator or an admin may rename it.
-- **Room > Retention…**: 1 day, 7 days, 30 days, 1 year or forever. The sheet opens at what the
-  room keeps now (`This room keeps messages for 7 days. Choose another to change it.`), and
-  **Set** works only once you choose another; Return never sets it. It says what the choice does
-  before you set it: "Every member deletes each message, with the files it shared and their
-  previews, 7 days after it was sent, and older ones at once. What is deleted cannot be read or
-  opened again." Neither rename nor retention asks for a passphrase.
-- **Room > Admins…**: the creator first, then the members it made admins. An admin may end the
-  room and set its retention, so making one asks first: `Make bo an admin? An admin can end this
-  room for everyone and change its retention.` Taking it away happens at once.
-- **Room > Leave…** and **Room > End for Everyone…**, each saying what it does first. A sheet
-  closes only once its change is done; if it fails, it stays open with the reason.
+- **Room > Rename…**, for the creator or an admin.
+- **Room > Retention…**: 1 day, 7 days, 30 days, 1 year or forever. The sheet says what the choice
+  deletes before you set it.
+- **Room > Admins…**: make a member an admin, or take it away.
+- **Room > Leave…** and **Room > End for Everyone…**, each saying first what it does.
 
 ## The keyring view
 
-**Keyring** in the sidebar, or **View > Keyring** (⌘⇧K), lists the nodes yours trusts: each by
-your alias for it, with its fingerprint art and its fingerprint in groups, and an arrow saying
-whether it trusts you back (⇄) or not yet (→), and what its entry grants: `read` or `read +
-drive`. See [Identity and keyring](keyring.md) for what trust grants.
+**Keyring** in the sidebar, or **View > Keyring** (⌘⇧K), lists the nodes yours trusts, each with
+its name, fingerprint and picture, ⇄ or →, and `read` or `read + drive`.
 
-- **Add a node**: paste or type its fingerprint and give it an alias. It is given `read`: the app
-  gives no node drive (it has no Sessions to drive); `vox trust` does, from the CLI. Before you choose **Trust**, the view says what trusting does: it may read what you write in every room you share, now and later; you read what it
-  writes once it trusts you too; and it reaches every service you bind to a room you are both in.
-- **Make Read Only…** (a node given drive from the CLI): says "With read only, NAME sees each of your Sessions'
-  name and whether it is open, and nothing inside it." Then **Make Read Only**.
-- **Compare…**: paste or type the fingerprint the person gave you another way. Case, spaces and
-  dashes do not count. While you type it says `So far matches N of 13 groups.`; the whole
-  fingerprint is marked as a match. A mismatch names the group that differs, what you typed and the
-  node's, says not to trust it, and only then offers to remove it. Offers and a member's card have
-  the same compare.
-- **Rename…**: the new alias, and that the node's services are then reachable as
-  `<service>.NEWALIAS.<room>.vox`.
-- **Remove…**: the sheet asks `Remove NAME from your keyring?` and says what removing does before
-  you confirm: it reads nothing you write from now on, and you read nothing it writes; what it
-  already read stays read; its live sessions into your services are cut; your sender key is
-  rotated, and everyone you still trust is re-keyed.
+- **Add a node:** paste its fingerprint and give it a name. The app gives read only. Drive is
+  given with `vox trust drive`.
+- **Compare…:** paste the fingerprint the person gave you. Case, spaces and dashes do not count.
+  It shows how many of the 13 groups match, and names the group that differs.
+- **Rename…** and **Remove…**, each saying first what it changes.
+- **Make Read Only…** takes drive back from a node.
 
-The selected entry has a card: `ann ⇄ you` (→ while its trust has not reached you), a sentence for
-each direction, the rooms you share with it now (trust also covers services there and any room
-you share later), and **What would removing ann change?**
+**Node > Show Fingerprint** (⌘I) shows your own fingerprint, with **Copy**.
 
-The **Keyring** menu does the same for the row selected in this view.
-
-Changing who you trust needs your identity passphrase once the keyring window has closed. The
-prompt names the change it makes, for example `Type your identity passphrase to give bo read +
-drive.`, beside the row or offer it changes, and its button names the action. A second change
-waiting for the passphrase asks `Replace the waiting change?` first.
-
-**Node > Show Fingerprint** (⌘I) shows your own fingerprint with its art, and **Copy**.
+A keyring change asks for your identity passphrase once the keyring window has closed. The prompt
+names the change. Leave the field empty only if your node has no passphrase.
 
 ### Trust offers
 
-A node that joined a room after yours, or that trusts you, and is not in your keyring, waits as
-an offer under **needs you** in the sidebar (see [Offers](keyring.md#offers-nodes-waiting-for-your-trust)).
-Select it to see a **Trust offer**: its fingerprint with its art, the same sentence `vox trust
-offers` prints (`ben joined. ann trusts it.`), the rooms you share (`In: family`), and what
-trusting and dismissing do. Give it an alias and choose **Trust**: it is given `read`, and the
-view says what that grant does first. If the keyring window has closed, it asks for your identity
-passphrase in place of the offer's buttons: that form's **Trust** and **Cancel** are then the only
-ones, and **Cancel** brings back **Trust** and **Dismiss**. Leave the field empty only if your
-identity has no passphrase; if it has one, **Trust** says
-`This node's identity has a passphrase: type it to …`. The same holds wherever the app asks for
-the passphrase for a keyring change. You are not asked to compare fingerprints. **Dismiss** removes the offer
-on your node alone: it is not told, and stays out of your keyring.
+A node that joined a room after yours, or that trusts you, and is not in your keyring, is offered
+to you ([Offers](keyring.md#offers-nodes-waiting-for-your-trust)). The offer shows at the top of
+its room, and its room's sidebar row says so. An offer from a node that shares no room in the
+list is its own row at the top of the sidebar. **Review…** opens it: the fingerprint with
+**Compare…**, why it is offered, the rooms you share, and what trusting and dismissing do. Give it
+a name and choose **Trust** to give it read, or **Dismiss**.
 
 ## The services view
 
-**Services** in the sidebar, or **View > Services** (⌘⇧S), lists every service in your open
-rooms (see [Reach a shared service](services.md)):
+**Services** in the sidebar, or **View > Services** (⌘⇧S), has three parts:
 
-- **SHARED WITH YOU**: each service's readable address, with **Copy Address**, and under it the
-  address in its parts, each labelled: service, your node alias, your room alias and Vox address
-  (`nas-ssh . nas . family . vox`); who shares it, in which room, and its kind; its commands, each with **Copy**; and what reaching it needs, as ticks: `✓ proxy
-  configured`, `✓ node attached`, `✓ NAME trusts you`, `✓ NAME online`, and the one that does
-  not hold in amber as `missing: … — …` with what to do, the same words as `vox service list`. A
-  command is shown with the readable address and copied with the full one, so it works however you
-  named the node.
-- **YOUR SHARES**: each one with **Stop**.
-- **SHARE A SERVICE**: what is listening on this Mac, with its program. Pick one, and the view
-  suggests a name, lets you pick the room, and says before you share it: the address members
-  will use (`NAME.NODE.ROOM.vox`, each by their own name for your node), any warning about the
-  service, who in the room can reach it (the members you trust), and who cannot (`not in your
-  keyring`). **File > Share Service…** opens this view.
+- **SHARED WITH YOU:** each service's address with **Copy Address**, who shares it and in which
+  room, its commands with **Copy**, and what reaching it needs, as `vox service list` shows it.
+- **YOUR SHARES:** each with **Stop**.
+- **SHARE A SERVICE:** what listens on this Mac. Pick one, name it, and pick the room. The view
+  shows the address members will use and who can reach it before you share. **File > Share
+  Service…** opens it.
 
 ## The decision record
 
-**Decision record** in the sidebar, or **View > Decision Record** (⌘⇧D), shows what your node
-refused and every change of who reaches it, newest first: what was decided, what was asked, who
-it was about (your alias for them, or the start of the fingerprint marked `(not in keyring)`),
-when, and why. Filter it by node with **About** and by room with **Room**. The record is kept 14
-days on this Mac and never sent anywhere. It is the same record the TUI shows with `d` (see
-[Commands and local state](reference.md#the-decision-record)).
+**Decision record** in the sidebar, or **View > Decision Record** (⌘⇧D), lists what your node
+refused and every change of who reaches it, newest first: what, about whom, when and why. Filter
+by node with **About** and by room with **Room**. It is kept 14 days on this Mac and never sent
+anywhere ([the decision record](reference.md#the-decision-record)).
 
-## The command palette and keys
+## Sessions
 
-**View > Command Palette** (⌘K) finds any action by typing; Return runs the first one listed.
-Every action is in the menus, and the palette lists the same actions.
+Beside the timeline, **SESSIONS** lists **General**, **All**, each open Session (`● LABEL`, or
+`! LABEL · waiting on you`), and **Ended (N)**. Choose a Session to show it in the timeline
+([Sessions](sessions.md)).
+
+If its node trusts you with **read + drive**, each entry is one line, with **Details** for its full
+input and output, and the Session has its own composer:
+
+- What you type goes to the session as its operator's input. A line starting with `/` is a slash
+  command. If no answer comes, the text stays, marked `delivery unknown`, and is never sent again
+  by itself.
+- **Interrupt** (Esc) stops the turn. **Stop** (⌃C) asks first, because it ends the session.
+- The paper clip, or **File > Attach File to LABEL…** (⌘O), sends the session a file.
+- A waiting approval shows **Approve** (⌥⌘Y) and **Reject** (⌥⌘N). A question shows each part's
+  options, and **Send answers**.
+
+Without drive, the Session shows only that it opened and ended, and
+`Only members NODE trusts with drive see inside this Session.` It then gives the command that
+gives your node drive, with **Copy**: for a node on this Mac, `vox trust drive` with your
+fingerprint and `--node` with that node's name, to run in a terminal on this Mac. The app itself
+never gives drive. When drive is given or taken back, the Session changes at once.
+
+## Notifications
+
+The app notifies you of a message in a room you are not looking at, never your own. A
+notification names the room and who wrote, and whether to you or urgent, never the text. An
+urgent message to you plays a sound. A Session request waiting on you notifies you once, with a
+sound. Clicking a notification opens the room, Session or request.
+
+Two notifications ask something of you:
+
+- `Node NAME needs its passphrase`, when a node on this Mac waits for it. **Attach…** opens the
+  sheet that attaches it.
+- `Which room is this repo in?`, when an agent session starts in a repository with no room.
+
+To change whether Vox may notify, use System Settings, Notifications, Vox.
+
+## The menu bar item
+
+Turn it on at the first run or in **Vox > Settings…**. It shows your node and the keyring window,
+the rooms that need you, the services shared with you with **Copy**, your shares with **Stop**,
+and your live tunnels. **Hide This Menu Bar Item** turns it off.
+
+## Keys
+
+**View > Command Palette** (⌘K) finds any action by typing.
 
 | Key | Action |
 |---|---|
@@ -463,7 +254,7 @@ Every action is in the menus, and the palette lists the same actions.
 | ⌘O | Attach File |
 | ⌘L | Copy Room Link |
 | ⌘R | Reply to Selected Message |
-| ⌘↑ | Go to the message the selected reply quotes |
+| ⌘↑ | Go to the message a reply quotes |
 | ⌘Return | Send Urgent |
 | ⌘⇧C | Copy Selected Service's Address |
 | ⌘J, Control-N | Next Room That Needs You |
@@ -474,99 +265,14 @@ Every action is in the menus, and the palette lists the same actions.
 | ⌘⇧K | Keyring |
 | ⌘⇧S | Services |
 | ⌘⇧D | Decision Record |
-| ⌘1 to ⌘9 | The first to ninth room, in the sidebar's order |
+| ⌘1 to ⌘9 | The first to ninth room in the sidebar |
 | ⌃⌘T | Focus Timeline |
 | ⌘+, ⌘-, ⌘0 | Bigger, Smaller, Actual Size |
 | ⌘, | Settings |
 
-## The menu bar item
+## Display
 
-The menu bar item is off until you turn it on, at first run or later. It shows your node and the
-keyring window, the rooms that need you (choose one to open it), the services shared with you
-with **Copy** (it copies the full address), your shares with **Stop**, and your live tunnels.
-**Hide This Menu Bar Item** turns it off again.
-
-## Notifications
-
-A request waiting on you in a Session you drive notifies you once, with a sound: `LABEL is waiting
-on you`, never what it asks. **Next Room That Needs You** (⌘J) and the notification open that
-room, that Session and that request. The ones already waiting when Vox opens are taken in silence.
-
-The app notifies you of a message that arrives in a room you are not looking at: never your own,
-and never coordination traffic. A notification is made on this Mac only; nothing is pushed from
-elsewhere. It is titled with the room's name and grouped by room, and it says who wrote and
-whether to you or urgent, never what the message says:
-
-```text
-ben wrote to you, urgent
-ben shared a file
-```
-
-An urgent message addressed to you also plays a sound. Clicking a notification opens its room.
-macOS asks once whether Vox may notify; to change your answer, use System Settings,
-Notifications, Vox.
-
-## Contrast and display settings
-
-Text is drawn at a contrast of 4.5:1 or more against its background, and card outlines at 4.5:1
-or more. A selected sidebar row is a grey fill with a blue bar along its leading edge; its text
-reads at 7.86:1 and its second line at 6.47:1. A selected row or card always has that bar, so a
-selection never rests on colour alone.
-
-The app follows your Mac's display settings (System Settings, Accessibility, Display):
-
-- **Increase Contrast** switches to brighter colours: every text colour at 7:1 or more against
-  its background (an error on a selected row at 6:1), outlines at 3.9:1 or more, the selected
-  sidebar row's text at 7.20:1 and its second line at 5.33:1, and the selection marked with the
-  focus colour.
-- **Reduce Motion** stops its animations.
-- **Reduce Transparency**: content is drawn in opaque colours only.
-
-**View > Bigger** (⌘+), **Smaller** (⌘-) and **Actual Size** (⌘0) change the size of the
-conversation, the messages and the composer, up to twice the usual size, as in Messages. The
-sidebar keeps macOS's sidebar size (System Settings, Appearance) and the inspector a steady size.
-**Vox > Settings…** (⌘,) sets the same size, and also turns Keep Running and the menu bar item on
-or off.
-
-The timeline works from the keyboard. **View > Focus Timeline** (⌃⌘T), Tab, or a click on a
-message puts the keyboard on it; ↑ and ↓ select a message, Space opens its pulled file in Quick
-Look, Return (or Enter) opens the file, or else the link on its card, and Tab or ⇧Tab moves on.
-Escape or Space closes a preview however it was opened; one the keyboard opened gives the keyboard
-back to the timeline.
-
-The app is dark only.
-
-## Sessions
-
-Beside a room's timeline, above its members, **SESSIONS** lists the room's Sessions as the TUI
-does: **General** (the room's own conversation), **All** (the conversation with each Session's
-opening and end among it), each open Session (`● LABEL`, or `! LABEL · waiting on you` when it is
-waiting for you), and **Ended (N)**, folded until you open it. See [Sessions](sessions.md) for what
-a Session is.
-
-Choose a Session to show it in the timeline. Its title says which: `Timeline — LABEL · open`. It
-opens at its newest line and follows what it prints; a Session with a request waiting opens at that
-request. ↑ and ↓ move over its entries and requests as over messages. To a member its node trusts with **read + drive**, a Session shows each entry as one
-line, word for word as `vox room session` prints it, with **Details** for its full input and
-output, and a file the session sent offers **Quick Look** and **Show in Finder** once your node
-has a checked copy. The header says that the Session's name and id are its node's claim:
-`LABEL — name and id as NODE says`. To anyone else it shows only that it opened (and ended), and
-`Only members NODE trusts with drive see inside this Session.`
-
-With drive, an open Session has its own composer, `Composer — to LABEL` after `ann ▸ LABEL` (who types, into which Session), in place of the room's:
-
-- What you type goes to the session as its operator's input; a line starting with `/` is sent as
-  a slash command. It stays in the field until the session's node takes it: refused, it is back
-  as you typed it; with no answer it is kept, marked `delivery unknown`, and never sent again by
-  itself. Return sends it; the field grows to 12 lines, and ⇧Return (or ⌥Return) starts a new one.
-- **Interrupt** (Esc) stops the turn it is running. **Stop** (⌃C) asks `Stop LABEL? It ends the
-  session.` first. Both work while a send waits.
-- The paper clip sends the session a file. While a Session is shown, **File > Attach File to
-  LABEL…** (⌘O) sends there, and Send Urgent is off.
-- An approval it asks for shows **Approve** (⌥⌘Y) and **Reject** (⌥⌘N) (with an optional reason,
-  told to the model); a question shows each part's options, and **Send answers** once each part has one. Once
-  it is settled, the entry says what became of it.
-
-Under the composer the app says what came of the last thing you sent, as the CLI and the TUI say
-it: the session's node's answer, `not sent to LABEL: …`, or `no answer from LABEL: it may or may
-not have been delivered`.
+The app is dark only. Text meets a contrast of at least 4.5:1, and a selection is never shown by
+colour alone. It follows **Increase Contrast**, **Reduce Motion** and **Reduce Transparency** in
+System Settings, Accessibility, Display. **View > Bigger**, **Smaller** and **Actual Size** change
+the conversation's size, up to twice the usual.

@@ -1,103 +1,93 @@
 # How Vox fits together
 
-Applies to: the shared product model. Commands and lifecycle details differ by release; the
-task chapters describe v0.4.1.
+This page explains the ideas behind Vox: what a node, a room and trust are, how services and
+anchors fit in, and what encryption does and does not cover.
 
 ## A node is an identity
 
-A node has cryptographic keys and a fingerprint. It is not a username at a provider and not
-a synonym for a physical device. Your person's identity and an agent's identity are different
-nodes. Losing identity data is not solved by asking a central operator to reset an account.
+A node has its own keys, and a fingerprint that names them. It is not an account at a provider,
+and not a device: your identity and each agent's identity are separate nodes, and one machine can
+hold several. No central operator can reset a node. If its keys are lost, it is gone, and you
+make a new one.
 
-One daemon per data root hosts every node on the machine, and each node runs in full
-while it is attached. A command names the node it acts as with `--node`; with only one node
-attached, it acts as that one.
+One daemon on the machine runs every node that is attached. A command names the node it acts as
+with `--node`, and with only one node attached it acts as that one.
 
 ## A room is a shared space
 
-A room's messages are kept and replicated by its members' nodes; no server holds a copy. A
-room link (`vox://…`) finds the room; the room passphrase is sent separately, by another way.
-A room is usually made for one purpose: members come and go, leaving deletes it from that
-node, and its creator or an admin can end it, which deletes it on every member's node. A two-person conversation is a room too.
-There is no username directory to search for a stranger or central inbox guaranteeing that
-messages arrive while every member is offline.
+A room's messages live on its members' nodes. No server holds a copy, so there is no directory
+of users to search and no inbox that keeps messages while every member is offline. A room link
+(`vox://…`) tells a newcomer where to find the room. The room passphrase, sent another way, lets
+them in.
 
-Joining a room and trusting its members are separate acts. Room membership alone is not
-permission to read everyone's messages or reach their services.
+A room is usually made for one purpose. Members join and leave, and its creator, or an admin the
+creator names, can end it, which deletes it on every member's node. A conversation between two people is a room too.
+A room has one name, the same for every member. Its ID identifies it whatever the name is, and
+commands take either.
 
 ## Trust has a direction
 
-When you trust Ann's node, you make a decision about that fingerprint. It covers every room
-you share with it, now and later, and services you offer in those rooms. Ann's decision to
-trust you is separate; do both for ordinary two-way conversation.
+Joining a room makes you a member. It does not let you read anyone. Reading takes trust from both
+sides: Ann reads what you write once you add her node to your keyring, which sends her your key,
+and her node trusts yours, which lets it take the key. Each of you decides separately. Your trust
+covers every room you share with Ann, now and later, and the services you share there.
 
-Trust is not a vote. Another member's endorsement does not add a key to your keyring. Removing
-trust stops future access governed by your decision; it cannot take back messages or files
-someone already obtained.
+Trust is not a vote. Another member's trust in a node adds nothing to your keyring. Removing a
+node from your keyring stops what it reads from then on. It cannot take back what it already
+read.
 
-## Names belong to the viewer
+## Names belong to you
 
-`ann`, `robertGPT`, and an agent alias are your local names for fingerprints. Another person
-can call the same node something else. Someone writing “I am Ann” in a message does not make
-that their authenticated display name. Compare the fingerprint before assigning the name.
+`ann` and `robertGPT` are local names for fingerprints. Someone else can call the same node
+something else, and a message saying "I am Ann" proves nothing. Compare the fingerprint, then
+choose the name.
 
-The same idea applies to room names. A room ID identifies the room; `family` is a convenient
-local label. Use the selector your version's command help accepts.
+## A service is an offer to the people you trust
 
-## A service is an offer, not a public tunnel
+A node can share a local service, such as SSH, in a room. Each member reaches it at an address
+such as `ssh.robertgpt.family.vox`, built from that member's own names for the node and the room.
+Its canonical address, made of fingerprints and IDs, is the same for every member and is the one
+to send. Only members the sharing node trusts reach it. It is not a public web address. The
+daemon's local proxy, or `vox forward`, connects your ordinary tools to it.
 
-A node can share a named local service with a room. Reach depends on shared room membership
-and the host's trust decision. Each member reaches it as `service.node.room.vox`, where the node
-and room parts are that member's own names for them, so two members may see different readable
-addresses for the same service. Its canonical address, made of fingerprints and IDs, is the same
-for everyone and is the one to copy and send. It is not a public web link and does not install global DNS.
-The daemon's local proxy (`vox up` says where it listens) or a forward (`vox forward`) bridges
-your ordinary tool into Vox.
-
-A shared file is a message; its bytes are pulled from the sharer's daemon, which serves them
-until the message expires or the sharer stops. Seeing the message does not prove that the bytes
-are still served.
+A shared file is a message. Its bytes come from the sharer's machine, which serves them until the
+message expires or the sharer stops. A message about a file does not prove the file is still
+served.
 
 ## An anchor is a bridge
 
-Directly reachable peers need no anchor. When two hosts cannot otherwise find or reach each
-other, a user-run anchor provides rendezvous and may relay encrypted packets. It is not a
-room administrator, cloud backup, or place that can decrypt your conversation.
+Nodes that can reach each other directly need no anchor. When two hosts cannot find or reach each
+other, for example when both are behind NAT, an anchor that both can reach introduces them and
+may relay their encrypted packets. You run it yourself. It holds no room key and cannot read
+anything. A node learns its anchors from its anchors file, from `--anchor`, and from the room
+links it joins with ([when an anchor is needed](services.md#when-an-anchor-is-needed)).
 
-## What encryption does not promise
+## What encryption covers
 
-Vox protects content in transit between participating nodes. It does not make a compromised
-endpoint safe, prevent a recipient retaining a copy, or hide every communication pattern.
-If an agent receives a room message as context, that context can enter the agent's configured
-model provider; Vox is not a local-model policy or provider-isolation boundary.
+Vox encrypts what travels between nodes. It does not make a compromised machine safe, stop a
+recipient from keeping a copy, or hide every pattern of who talks to whom. When an agent reads a
+room message, the message can reach the agent's model provider.
 
-If a node's memory or disk is stolen, Vox recovers on its own, against a later quantum computer
+If a node's memory or disk is stolen, Vox recovers by itself, against a future quantum computer
 too, as long as the thief only listens. Every key a node hands to another member travels in a
-fresh handshake made for it alone. So the next key a robbed node hands out is safe again, and keys
-sent to a robbed node are safe again within seven days. A room recovers with its next key rotation. This does not help against someone who
-took a node's identity and now acts as it. When a member has no fresh prekey to offer within 30
-seconds, a key sent to it recovers only after up to seven days. Restoring a profile from a backup
-brings back its old prekeys for up to seven days. A wrong clock lengthens the seven days by at most
-ten minutes. A member still on Vox v0.4.2 or older is sent your keys the old way, so it can read
-you, but with none of this recovery for those keys until it updates; `vox room roster`, `vox status`
-and the app say so beside it.
+fresh handshake made for that key alone. The next key the robbed node hands out is safe again,
+and keys sent to it are safe again within seven days. A room recovers at its next key rotation.
+None of this helps against a thief who uses the stolen identity to act as the node.
 
-Cryptographic identity tells you which key signed something. Comparing that fingerprint
-with the intended person or agent is still a human trust decision.
+Some limits apply:
 
-When one node connects to another, the node answering proves it holds the key of the node asked
-for, on that very connection, before the one connecting says who it is. So a stranger at a node's
-address learns nothing about who is calling. A proof copied from one connection does not work on
-another. Every refusal looks and takes the same time, so probing an address tells nobody whether a
-node is there. Each address may ask only so often, and a flood of half-open connections is capped.
-These are tested before every release by an attacker against a running node.
+- A member that offers no fresh one-time key within 30 seconds gets a key that recovers only
+  within seven days.
+- If you copy a node's data and later put the copy back, the copy brings back its old one-time
+  keys for up to seven days.
+- A wrong clock adds at most ten minutes to the seven days.
 
-What a connection still shows: anyone who knows a node's fingerprint can test whether that node
-answers at an address. The fingerprint is not a secret; it is what you compare.
+When one node connects to another, the answering node proves it holds the expected key on that
+same connection, before the caller says who it is. A stranger at the address learns nothing about
+the caller, and a proof copied from one connection fails on another. Every refusal looks the same
+and takes the same time, so probing an address reveals nothing. Each address may ask only so
+often, and half-open connections are capped. Anyone who knows a node's fingerprint can still test
+whether that node answers at an address: the fingerprint is not a secret.
 
-Continue with [Your first shared room](first-room.md) or [Get help safely](getting-help.md).
-
-Sources: [foundation and limits](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/docs/adr/ADR-001-vox-foundation-vision-threat-model-and-principles.md),
-[command definitions](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/cli.rs),
-[the daemon and node model](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/docs/adr/ADR-026-daemon-and-nodes.md)
-and [service addresses](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/docs/adr/ADR-017-room-bound-services.md).
+A fingerprint tells you which key signed something. Whether that key is the person you mean is
+your decision, made by comparing it.

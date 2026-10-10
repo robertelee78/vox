@@ -1,191 +1,161 @@
 # Commands and local state
 
-Applies to: v0.4.1. This is a map to the real command help, not a substitute for the parser
-in your installed version.
+This page lists the terms this manual uses, Vox's commands, how a command picks its node, the files Vox keeps, how
+passphrases are given, and the terminal interface's keys. `vox --help`, and `--help` on any
+command, give the exact arguments of the `vox` you run. `vox man` prints the same as a man page.
 
-## Find the right help
+## Terms
 
-```sh
-vox --version
-vox --help
-vox node --help
-vox room --help
-vox room join --help
-vox trust --help
-vox service --help
-vox agent --help
-vox man
-```
+| Term | Meaning |
+|---|---|
+| node | one identity: its own keys, fingerprint, rooms, keyring and services |
+| fingerprint | the 52-character public name of a node's keys |
+| daemon | the background program that runs the attached nodes of one data root |
+| attached | running in the daemon; a detached node is on disk but does nothing |
+| kept | attached again by the daemon by itself whenever it starts |
+| keyring | the nodes a node trusts, each with your name for it |
+| room link | the `vox://…` address that tells a newcomer where to find a room |
+| entry hash | the ID of one message, the first column of `vox room read` |
+| data root | the directory that holds the nodes and the daemon's files |
+| harness | the program an agent runs in: Claude Code, Codex or OpenCode |
+| hook | the command a harness runs at each turn, which hands the agent its room messages |
+| operator | the person who runs an agent |
+| session, Session | a harness session, and the record of it that Vox keeps in its room |
+| drive | the right to type into, interrupt, approve and answer another node's Sessions |
+| canonical address | a service's address made of IDs, the same for every member |
+| anchor | a node you run on a reachable host, which introduces nodes that cannot reach each other |
+| headless node | an anchor's node: a key file with no passphrase, which holds no room |
 
-`vox man` prints a man page generated from the same command definitions as the CLI. Use a
-subcommand's `--help` when checking a particular argument; an example from a different release
-is not an alias for your parser.
+## Commands
 
-| Intent | Entry point | Prerequisite |
+| Task | Command | Needs |
 |---|---|---|
-| Make, attach, list, detach or sign out a node | `vox node create`, `attach`, `list`, `detach`, `signout` | Node passphrase, if it has one |
-| Interactive client | `vox` or `vox tui` | Terminal; a client of the daemon |
-| Run the daemon in a terminal | `vox daemon` | Optional: attaching a node starts one |
-| Run an anchor | `vox node` with no subcommand | A headless node; reachable infrastructure |
-| Ask a node about rooms | `vox room list`, `read`, `roster` | The node attached |
-| Inspect runtime | `vox status`, `vox status --json` | The node attached |
-| Change peer trust | `vox trust add`, `rename`, `remove` | Compared fingerprint; passphrase after 30 minutes (`vox status` shows the minutes left) |
-| List peer trust | `vox trust list` | The node attached |
-| Room lifecycle | `vox room retention`, `admin`, `leave`, `end` | Creator or admin for the room-wide ones |
-| Share a port in a new room | `vox serve NAME=PORT` | Existing local service |
-| Join a service room | `vox connect ROOM_LINK` | Room link and passphrase |
-| Reach services | the daemon's proxy (`vox up` says where), `vox forward SERVICE.NODE.ROOM.vox` | Host's trust; a node attached, or the forward running |
-| Close live tunnels | `vox tunnel close` | `vox status` lists them |
-| Share and pull files | `vox share`, `vox share list`, `vox share stop`, `vox room get` | Attached node; the sharer's daemon serving it |
-| A room's family LAN | `vox lan up` | `sudo vox lan helper` running |
-| Wire a harness | `vox agent plugin`, `skill`, `trust`, `doctor` | `--node` for plugin and hook |
+| Set up this machine for its harnesses | `vox setup` | a terminal |
+| Make, attach, list, detach, sign out a node | `vox node create`, `attach`, `list`, `detach`, `signout` | the node's passphrase, if it has one |
+| Rename a node, or forget its passphrase | `vox node rename`, `forget-passphrase` | the node on this machine |
+| Open the terminal interface | `vox` or `vox tui` | a terminal |
+| Run the daemon in a terminal | `vox daemon` | nothing: attaching a node starts one |
+| Run an anchor | `vox node`, with no subcommand | a headless node |
+| Rooms and messages | `vox room list`, `create`, `link`, `join`, `roster`, `post`, `read`, `tail`, `rename`, `retention`, `admin`, `leave`, `end` | an attached node |
+| What the node is doing | `vox status`, `vox status --json` | an attached node |
+| Your fingerprint | `vox id` | |
+| Trust | `vox trust add`, `list`, `offers`, `dismiss`, `rename`, `remove`, `drive`, `read` | a compared fingerprint; the passphrase, typed at a terminal, for a change |
+| Share a service | `vox serve`, `vox service add`, `list`, `remove` | a running local service |
+| Join a room for its services | `vox connect` | the room link and passphrase |
+| Reach a service | `vox up`, `vox forward` | the sharer's trust |
+| Close tunnels | `vox tunnel close` | `vox status` lists them |
+| Share and pull files | `vox share`, `vox share list`, `vox share stop`, `vox room get` | an attached node |
+| A room's local network | `vox lan up` | the LAN helper |
+| Wire a harness | `vox agent connect`, `plugin`, `skill`, `trust`, `doctor`, `status` | `--node` |
+| Sessions | `vox room sessions`, `vox room session`, `vox agent room`, `vox agent send` | read + drive, to drive |
+| Install, update, remove | `vox update`, `vox uninstall`, `vox shell-setup` | |
 
-## Select the node
+## How a command picks its node
 
-A node is chosen per command, in this order: `--node NAME`, then `VOX_NODE`, then the only
-attached node, then the only node on disk. When none of these settles it, the command refuses
-and lists the nodes; that is not a corrupt node. Name the node explicitly in scripts and agent
-integrations, so nothing acts as your person's node by accident.
+A command acts as the first of these that names a node: `--node`, then `VOX_NODE`, then the only
+attached node, then the only node on disk. If none settles it, the command refuses and lists the
+nodes. Name the node explicitly in scripts and agent setups.
 
-Session-holding commands (`serve`, `connect`, `up`, `forward`, `lan up`) and `vox node attach`
-start the daemon in the background when none runs and attach their node. One-shot commands
-(`room`, `status`, `trust`, `share`, `service`) only ask an attached node, and say so when it is
-not: `vox node attach NAME` first.
+`vox node attach`, `serve`, `connect`, `up`, `forward` and `lan up` start the daemon if none runs,
+and attach their node. Other commands only ask an attached node, and say so if it is not attached,
+with the `vox node attach` that attaches it.
 
-A `vox daemon` started while the daemon holding the data root is stopping says so, waits until it
-has stopped, and then serves its node itself. `vox tui` exits when its terminal goes away, and
-SIGHUP or SIGTERM stop it cleanly.
+The data root is chosen by `--data-dir`, then `VOX_DATA_DIR`, then the platform default. The
+config directory by `--config-dir`, then `VOX_CONFIG_DIR`, then `XDG_CONFIG_HOME`, then the
+platform default. Each data root has its own daemon and nodes.
 
-Data/config selection follows explicit flags, then `VOX_DATA_DIR` / `VOX_CONFIG_DIR`, then
-XDG/platform defaults. Each data root has its own daemon and nodes, so two shells with different
-roots see different nodes even when both say `--node robertgpt`. A command may create
-directories while resolving paths; do not treat a guessed node name as a harmless diagnostic
-probe.
+`vox tui` exits when its terminal goes away. SIGHUP or SIGTERM stops it cleanly.
 
 ## Local state
 
-On Linux the usual data root is `~/.local/share/vox/`, unless XDG or Vox overrides select
-another. On macOS the default root is `~/Library/Application Support/vox/`. Config uses the
-corresponding XDG/platform config location; it is not necessarily the same root as data on Linux.
+The data root is `~/Library/Application Support/vox/` on a Mac and `~/.local/share/vox/` on
+Linux. It holds:
 
-Inside the data root:
+- `nodes/NAME/`, one node: its identity (`vault.cbor`), its room store (`store.redb`), its own
+  `config/`, cursors, agent sessions, `files/ROOM_ID/` for the shares it pulled, and `decisions/`
+  for its decision record.
+- `.daemon/`, the daemon's: its lock, control socket, port, the list of nodes it attaches by
+  itself (`attach`), its `log`, and `format`, which records the data's format and the version of
+  `vox` that last served it.
+- `rooms`, the room map: which room an agent session works in, by its start directory
+  ([Sessions](sessions.md#the-room-a-session-works-in)). It holds room passphrases.
 
-- `nodes/NAME/` holds one node: identity material such as `vault.cbor`, the room store
-  `store.redb`, and that node's own `config/`, cursors and agent sessions. `files/ROOM_ID/` holds
-  the shares it pulled (see [Send and receive files](files.md)), and `decisions/` its decision
-  record (below).
-- `.daemon/` holds the daemon's lock, its control socket `vox.sock`, the port it reuses, the list
-  of nodes kept attached (`attach`), its `config`, and `log`, where a daemon started in the
-  background writes its output. `format` says the data root's format and the version of vox that
-  last served it, two lines such as `format 1` and `written-by vox 0.4.1`, so a later release knows
-  what to upgrade (see [Install and update](install.md#update-deliberately)).
+The config directory is `~/Library/Application Support/vox/` on a Mac and `~/.config/vox/` on
+Linux. A node reads each setting file from its own `nodes/NAME/config/` first, and from the config
+directory otherwise. The files include:
 
-A data root an earlier release left with a node's files directly in it, outside `nodes/` (any
-release before v0.3.0), is refused by every command, and nothing in it is changed: `… is not a Vox
-data directory this version reads: …/default is not a node (a node lives under …/nodes)`. Move it
-aside, or use another data root (`--data-dir` or `VOX_DATA_DIR`).
+- `anchors`, one `FINGERPRINT@ADDRESS` per line
+  ([How a node gets its anchors](services.md#how-a-node-gets-its-anchors));
+- `config`, `key = value` lines, such as `notify-command = PROGRAM`.
+
+Vox creates these files readable by your account only. They are not caches: never delete them to
+get past an error, and never attach them to a report.
 
 ### The decision record
 
-`vox status` lists the most recent refusals near its top, newest first:
+Each node records every refusal and every change of who reaches it: a refused join or tunnel, a
+cut session, a node added to or removed from the keyring, a stopped share. Each entry says what,
+about whom, when and why, such as `join proof-of-possession failed` for a wrong room passphrase.
+It never holds message text, file names, passphrases or keys. A refusal that repeats is recorded
+once, then counted.
+
+The record is sealed under the node's identity in `nodes/NAME/decisions/`, one file per UTC day,
+and deleted after 14 days. It is read only through the node: `d` in the terminal interface, the
+app's Decision record view, and the most recent refusals near the top of `vox status`:
 
 ```text
 recent refusals
   4s ago  refused 34rtzgeq333h to join a room: answering 34rtzgeq333h: join proof-of-possession failed
 ```
 
-In the TUI, `d` on the room list, or `:decisions`, shows the whole record, newest first, titled
-`Decisions (newest first · kept 14 days · Esc: back)`. (`vox status` also begins with this node's
-own fingerprint, in groups beside its art.)
-
-Each node writes down every refusal and every change of access it decides: a join or a tunnel it
-refused, a session it cut, a node added to or removed from its keyring, a share it stopped. Each
-decision says what was decided, what was asked, who it was about (your name for them, or the
-start of their fingerprint), when, and why, in the node's own words, for example `join
-proof-of-possession failed` for a wrong room passphrase. It never holds message text, a file's
-name or contents, a passphrase or a key. A refusal that can repeat many times a minute, such as a
-refused stream, is written the first time; its repeats in the next hour are counted and written
-as one.
-
-The record is sealed at rest under the node's identity, in
-`nodes/NAME/decisions/YYYY-MM-DD.sealed`, one file per UTC day, readable by your account only, and
-it is read only through the node: in the TUI with `d`, in the app's Decision record view, and its
-latest refusals in `vox status`. Files older than 14 days are deleted, and the record is never
-sent anywhere. A record an earlier build wrote in plain text (`.jsonl`) is sealed into its day's
-file, and the plain file removed, the next time the node is attached.
-
-These are not caches to remove when a join is refused. The source creates private
-directories/files on supported Unix systems; still protect the account and machine that can use
-them. Never attach a state directory, vault, passphrase file or unreviewed config to a bug
-report.
-
 ## Passphrase input
 
-The identity passphrase protects a node's key material. Every node has one: `node create` refuses
-an empty one and creates nothing. A room passphrase is a separate join factor, and it may be
-empty. At a terminal, use the masked prompt. For an unattended
-command, use its supported passphrase-file option and restrict the file to the intended OS user.
+A node's identity passphrase protects its keys. A room's passphrase admits newcomers. Either may
+be empty. An empty identity passphrase leaves the node's key unencrypted on disk, and an empty room
+passphrase lets anyone with the link join.
 
-`node create` and `node attach` read the identity passphrase from `--passphrase-file`; `room
-create` and `room join` read the room passphrase from `--passphrase-file`, where `-` selects
-stdin. Without a terminal or that explicit input, they fail rather than wait on an unattended
-prompt. A keyring change (`vox trust add`, `remove`, `rename`, `drive`, `read`) takes the identity
-passphrase only typed at a terminal, never from a file or the environment; a room's retention or
-name asks for none (see [when the passphrase is asked for](keyring.md#when-the-passphrase-is-asked-for)).
+At a terminal, Vox asks with a hidden prompt. Without one:
 
-`vox node attach robertgpt` remembers the node: its passphrase is stored in the Keychain, and the
-daemon attaches it again whenever it starts. `--no-remember` stores nothing; `vox node
-forget-passphrase robertgpt` removes what is stored. Where there is no Keychain (Linux), keep a
-node by a file instead:
+- `vox node create` and `vox node attach` read the identity passphrase from `--passphrase-file`,
+  or from `VOX_IDENTITY_PASSPHRASE`.
+- `vox room create` and `vox room join` read the room passphrase from `--passphrase-file`. `-`
+  reads standard input.
+- A keyring change (`vox trust add`, `remove`, `rename`, `drive`, `read`) takes the passphrase only
+  at a terminal ([when the passphrase is asked for](keyring.md#when-the-passphrase-is-asked-for)).
+
+Vox refuses a passphrase on the command line, because other processes can read it. It refuses
+`VOX_ROOM_PASSPHRASE` too. `VOX_IDENTITY_PASSPHRASE` works for attaching, but other processes of
+your user can read it.
+
+On a Mac, `vox node attach` remembers the passphrase in the Keychain. On Linux, keep a node with a
+file instead, readable only by you:
 
 ```sh
-vox node attach robertgpt --keep --passphrase-file PATH_TO_PRIVATE_FILE
+vox node attach robertgpt --keep --passphrase-file ~/.vox-robertgpt-passphrase
 ```
 
-The daemon then reads that file at each start. A foreground daemon also takes a passphrase file
-with the identity passphrase on its first line. For explicit room selection, each additional
-room line can be the room ID, one space, and that room's passphrase. The named-room form splits
-at the first space; later spaces belong to the room passphrase. The parser also tries a whole
-line as a passphrase for closed rooms before the named form. A schematic file, not literal
-secrets:
+The daemon reads that file at each start. `vox daemon --node robertgpt --passphrase-file
+~/.vox-robertgpt-passphrase` takes a file whose first line is the identity passphrase. Each
+further line can be a room ID, a space, and that room's passphrase, for rooms to open at start:
 
 ```text
 IDENTITY_PASSPHRASE
 ROOM_ID ROOM_PASSPHRASE
-ANOTHER_ROOM_ID ANOTHER_ROOM_PASSPHRASE
 ```
 
-Use `vox daemon --node robertgpt --passphrase-file PATH_TO_PRIVATE_FILE` with the intended file,
-owned by your user and readable only by that user. Store it outside shared repositories; do not
-create it by typing secrets into a shell command that remains in history. This format is
-source-reviewed in the daemon parser, not exercised by the manual's command check.
-
-`--identity-passphrase` and room `--passphrase` are intentionally refused: process arguments
-and shell history expose secrets. `VOX_ROOM_PASSPHRASE` is also refused.
-`VOX_IDENTITY_PASSPHRASE` is supported for attaching a node, never for a keyring change, but an
-environment can be read by same-user processes and inherited by children. A supported mechanism is not a promise that it is equally private.
-
-Do not write a real passphrase into a documentation example, paste it to a model, or capture
-it in a screenshot. An empty room passphrase leaves the room's link as its only join factor; an
-example should not silently opt you into that choice.
+Never put a real passphrase in a shell command, a model's context or a screenshot.
 
 ## Output, cursors and status
 
-Room/member selectors can accept unambiguous prefixes where help says so. A `--since` cursor
-uses the full entry hash returned by a successful read; do not shorten it. `--json` selects
-structured output for commands that advertise it; it is not a universal top-level switch.
+`--json` gives structured output on the commands that list it in their help. A `--since` cursor is
+the whole entry hash from an earlier read. A nonzero exit status means read the command's
+message. Claims have their own [exit codes](agents.md#coordinate-ownership-not-a-second-progress-tracker).
 
-A nonzero exit status means inspect the command's explanation. Coordination commands have
-the specific [claim status meanings](agents.md#coordinate-ownership-not-a-second-progress-tracker).
-A hook's zero exit is deliberately not a delivery assertion.
-
-`vox status` shows the node's rooms with each member's trust, connection and last sync, its
-peers with their path (`direct` or relayed) and round-trip time, its tunnels, and anything that
-needs attention.
-
-Its `gateway` section says, for IPv4 and IPv6, which router the machine's default route names,
-which routers the daemon asked for a port mapping, and which method answered: PCP, NAT-PMP,
-UPnP-IGD or an IPv6 pinhole. For example:
+`vox status` shows the node's fingerprint, the keyring window, what needs attention, each room
+with each member's trust, connection and last sync, each peer with its path (`direct` or relayed)
+and round-trip time, and the live tunnels. Its `gateway` section shows, for IPv4 and IPv6, the
+router the default route names, which routers the daemon asked for a port mapping, and which
+method answered:
 
 ```text
 gateway
@@ -195,19 +165,53 @@ gateway
         no gateway asked
 ```
 
-`asked …: none answered` means no router granted a mapping; `no gateway asked` means there was
-none to ask. `vox status --json` carries the same under `gateway.ipv4` and `gateway.ipv6`
-(`next_hop`, `asked`, and `answered` with the method as `rung`, the outside address as
-`external` and the mapping's `lifetime` in seconds), and the machine's last network change under
-`network_changed`. The daemon renews a mapping before it lapses and deletes every mapping it holds
-when it stops; its log names each one, for example `vox daemon: deleted the port mapping UDP 53277
-at 192.168.1.1:5351 (PCP)`. When gathering support evidence, use the smallest relevant status excerpt.
-Paths, aliases, peer addresses, session IDs and even public fingerprints can expose private
-relationships.
+`asked …: none answered` means no router granted a mapping. The daemon renews a mapping before it
+lapses and deletes each one when it stops. `vox status --json` carries the same, and the last
+network change under `network_changed`.
 
-Source: [CLI parser](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/cli.rs),
-[node selection](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/client.rs),
-[path resolution](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-core/src/node/paths.rs)
-and [the daemon and its files](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/docs/adr/ADR-026-daemon-and-nodes.md).
-The [daemon parser](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/app.rs)
-defines the passphrase-file lines.
+Status output can reveal rooms, peers, addresses and paths. Share the smallest excerpt that shows
+the problem.
+
+## The terminal interface
+
+`vox`, or `vox tui`, opens the terminal interface. It is another client of the same daemon, so it
+runs beside the command line and agents. It acts as one node. `vox tui --node spare` opens one as
+another. `:attach` attaches its node. `:quit` exits.
+
+On the room list:
+
+| Key or command | Action |
+|---|---|
+| Enter, `:open` | open the selected room |
+| `:new` | create a room |
+| `:join` | join a room by its link |
+| Ctrl-N | open the next room with a message to you |
+| `t`, `:tunnels` | list live tunnels |
+| `k`, `:keyring` | show your keyring |
+| `d`, `:decisions` | show the decision record |
+
+The list groups rooms under `needs you`, `active` and `quiet`. Trust offers and repositories
+waiting for a room come first under `needs you`.
+
+In a room, Tab moves between the timeline, the composer, the members pane and the Shared pane.
+
+| Key or command | Action |
+|---|---|
+| Enter, in the composer | send; `@alice` in the text addresses alice |
+| Up, Down, in the timeline | select a message |
+| Ctrl-R | reply to the selected message |
+| Enter, on a reply's quote | go to the message it answers |
+| `t`, on a member | trust it ([Trust from the TUI](keyring.md#trust-from-the-tui)) |
+| `y`, in the Shared pane | copy the selected service's command |
+| `:serve` | share a service of yours in this room |
+| `:link` | print the room link |
+| `:rename home` | rename the room, for the creator or an admin |
+| `:close` | close the room on this node |
+| `:leave`, `:end` | leave, or end for everyone; each asks you to type its word |
+| `:tag task:#636`, `:general` | show a tag's messages, then the whole room |
+| `:back`, Esc | return to the room list |
+
+While the interface runs, a message in a room you are not looking at raises one notification for
+that room, naming who wrote, never the text. It goes to your terminal as a desktop notification,
+or as a bell over SSH. To send it elsewhere, set `notify-command = PROGRAM` in the `config` file,
+or `VOX_NOTIFY_COMMAND`. Vox runs it as `PROGRAM TITLE BODY`.

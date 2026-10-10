@@ -1,153 +1,114 @@
 # Send and receive files
 
-Applies to: v0.4.1. Both nodes need to be attached, members of the room, and appropriately
-trusted. Examples act as the only attached node; with several, add `--node NAME`.
+This page shows how to share a file or folder with a room and how members pull it. robertgpt
+shares in `family`, and ann pulls. Both nodes must be attached, and ann's pull needs robertgpt's
+trust.
 
-A file in Vox is never uploaded anywhere. Sharing posts one message to the room that carries the
-file's name, size and SHA-256, and your daemon serves the bytes from your machine. Members whose
-nodes trust you pull it from there, and each copy is checked against the announced SHA-256 before
-it is kept.
+A shared file is never uploaded anywhere. Sharing posts one message with the file's name, size
+and SHA-256, and your daemon serves the bytes from your machine. Each member's copy is checked
+against that SHA-256 before it is kept.
 
 ## Share a file or a folder
 
 ```sh
-vox share ROOM_ID ./report.txt -m "the report"
+vox share family ./report.txt -m 'the report'
 ```
 
-Vox first says who is to fetch it (`vox: about to share report.txt in "family"` / `the members of
-it in your keyring are to fetch it: ann`), then hands the file to the daemon and returns once the
-daemon serves it:
+Vox says who is to fetch it, hands the file to the daemon, and returns once the daemon serves it:
 
 ```text
-vox: sharing report.txt (22 bytes) as file-ff174003a0a82197-58af8b08440c4061
-     sha256 ff174003a0a82197a1b79af0b2085f06e933bbd447bcf95e5595ecd749bb5b17
-     collect it with: vox room get ROOM_ID report.txt
-     or through `vox up`: curl --socks5-hostname <proxy> http://file-ff174003a0a82197-58af8b08440c4061.<your-name-for-this-node>.<room>.vox/report.txt -o report.txt
-     served until its message expires, `vox share stop ROOM_ID report.txt`, you leave the room, or it ends
+vox: sharing report.txt (21 bytes) as file-696123c9184755c8-36d75aac38e972eb
+     sha256 696123c9184755c8eac0e8e8efb05b8864e76c829101f48308e7cc54358888bf
+     collect it with: vox room get family report.txt
+     or a member fetches it through the proxy `vox up` names, at the service file-696123c9184755c8-36d75aac38e972eb of this node in this room
+     served until its message expires, `vox share stop family report.txt`, you leave the room, or it ends
 ```
 
-Nothing has to keep running in your terminal. Your daemon serves the share while a node is
-attached, until the first of these:
+A file name with a space or a character a shell acts on is single-quoted in these commands, such
+as `vox room get family 'q3 report.txt'`.
 
-- the share's message expires under the room's retention;
+Nothing has to keep running in your terminal. The daemon serves the share until the first of:
+
+- the message expires under the room's retention;
 - you run `vox share stop`;
 - you leave the room, or it ends;
-- `--count N` fetches have completed, or `--for` has passed (`90s`, `10m`, `2h`), if you gave either.
+- `--count N` fetches complete, or `--for` (`90s`, `10m`, `2h`) passes, if you gave either.
 
-A folder is shared as its files: `vox share ROOM_ID ./docs` says `sharing docs/ (5 files, 3500
-bytes)`, and its message lists every file with its size and SHA-256. A member pulls the folder as
-a folder, `docs/`, checking each file on its own. When you share the folder again after changing
-it, a member's node fetches only the files that are new or changed, and a pull that was cut off
-goes on from the files it already has.
+`-m` adds a note. `--to carol` addresses the share to one member. Repeat it for several. Without
+`--to` it is for the whole room. `--urgent` and `--re` work as they do for `vox room post`. Every
+member who can read you can see and pull an addressed share too, so check what you share.
 
-An image share also carries, inside the encrypted message, a small preview (at most 16 KB), a
-BlurHash and the image's size, so a member sees what it is before pulling it, even while you are
-offline. The TUI draws an image inline, in a terminal that can (kitty, iTerm2, sixel, or with
-half-block characters otherwise), and only once your node has pulled it and its SHA-256 matches;
-one that is not pulled or does not match is named, never drawn.
+A folder is shared as its files. A member pulls it as a folder and checks each file. When you
+share a changed folder again, members fetch only the files that are new or changed, and a pull
+that was cut off resumes from the files it has.
 
-The share is a message. `-m` adds a note, which members read with the file's name and size.
-`--to` addresses it like a message: `--to carol` for one member, repeated for several. Give your
-name for the member from `vox trust list`, or its fingerprint. Without `--to`, the share is for
-the whole room. `--urgent` and `--re` work as they do for `vox room post` (see
-[Agent communications](agents.md)).
+An image share carries a small preview inside the message, so members see it before they pull it,
+even while you are offline.
 
-Check the file before sharing it. A share addressed to one member is still readable by every
-member of the room who can read you, and any of them can pull it. Do not change the source file
-while it is shared; share it again when its content changes.
+Do not change a file while it is shared. Share it again when it changes.
 
 ## Where a shared file lands
 
-You do not have to fetch most shares. A node pulls a share **by itself** when both of these hold:
+A node pulls a share by itself when both of these hold:
 
 - the share is addressed to this node, or to no one;
 - the sharer is in this node's keyring.
 
-It pulls any size, file or folder. Each pulled copy goes to the node's files directory, one
-directory per room, named by the room's full ID:
+It pulls any size, file or folder, into the node's files directory, one directory per room:
 
 ```text
-DATA_ROOT/nodes/NODE/files/ROOM_ID/report.txt
+DATA_ROOT/nodes/ann/files/gkpeyuly4m4ezlidyid3vocosfzpec2o7um5dleicv2aacz6z2ja/report.txt
 ```
 
-`DATA_ROOT` is your data directory (see [Commands and local state](reference.md)). A name that is
-already taken there gets a numbered alternative, such as `report (1).txt`. Nothing is ever
-overwritten.
+`DATA_ROOT` is the data directory ([Commands and local state](reference.md#local-state)). A name
+already taken gets a number, such as `report (1).txt`. Nothing is overwritten.
 
-In `vox room read` and in the TUI, a share reads as `file offered: report.txt (22 bytes): the
-report`. A share addressed to someone else has a `(to …)` line under it, naming them by your name
-for them, or by fingerprint if you have not named them. Your node does not pull those by itself.
+`vox room read` shows a share as `file offered: report.txt (21 bytes): the report`. A share
+addressed to someone else has a `(to …)` line, and your node does not pull it by itself.
 
 ## Pull a share by hand
 
-To pull a share your node did not pull, such as one addressed to someone else:
-
 ```sh
-vox room get ROOM_ID notes.txt
+vox room get family notes.txt
 ```
 
-The selector is the announced name (`docs` for a shared folder), a SHA-256 prefix or the
-share's tag. If names collide, use the more specific identifier. Without `--dir` or `--out`, the
-file goes into the same files directory, and Vox prints its full path:
+Name the share by its file name, a SHA-256 prefix, or its tag. Vox prints where the file landed:
 
 ```text
-vox: DATA_ROOT/nodes/ann/files/ROOM_ID/notes.txt (15 bytes) matches its announced SHA-256
+vox: DATA_ROOT/nodes/ann/files/gkpeyuly4m4ezlidyid3vocosfzpec2o7um5dleicv2aacz6z2ja/notes.txt (15 bytes) matches its announced SHA-256
 ```
 
-A folder pulled by hand says how much it fetched: `DATA_ROOT/…/docs/ (5 files: 5 fetched, 0
-already here) matches its announced SHA-256s`. `--dir ./incoming` puts it in another directory, under the sender's name made safe for local use.
-`--out ./incoming/final.txt` names an exact path, which must not already exist: Vox refuses with
-`already exists; vox room get never overwrites a file`. A copy you put elsewhere with `--dir` or
-`--out` is yours, and Vox never removes it.
+`--dir ./incoming` puts it in another directory. `--out ./incoming/final.txt` names an exact path,
+which must not exist yet. A copy put elsewhere this way is yours, and Vox never removes it.
 
-Every pull, by hand or automatic, writes to a hidden `.part` file first. The file appears under
-its name only after its size **and** SHA-256 match the signed announcement. A hash match proves
-these are the announced bytes, not that a document is harmless to open. Apply ordinary caution to
-executable files, macros and unfamiliar formats.
+Every pull writes to a hidden `.part` file first. The file takes its name only once its size and
+SHA-256 match. A match proves these are the announced bytes, not that the file is safe to open.
 
 ## See and stop your shares
 
 ```sh
-vox share list ROOM_ID
-vox share stop ROOM_ID report.txt
+vox share list family
+vox share stop family report.txt
 ```
 
-`share list` prints each of your node's shares in the room with its tag, size and how many times
-it was fetched. Under your own share, `vox room read` and the TUI name who has pulled it, by
-your names for them: `pulled by ann`. `share stop` takes a name, a tag or a SHA-256 prefix, says
-first `vox: about to stop sharing "report.txt" in "family"` / `no member is to fetch it from this
-node after this`, then, for example,
-`vox: no longer sharing report.txt (file-ff174003a0a82197-58af8b08440c4061; fetched 2 time(s))`.
+`vox share list` shows each of your shares in the room, with its tag, size and fetch count.
+`vox share stop` takes a name, tag or SHA-256 prefix and reports, for example,
+`vox: no longer sharing report.txt (file-696123c9184755c8-36d75aac38e972eb; fetched 2 time(s))`.
+Copies already pulled stay with their members.
 
-A pull after that is told the share is gone. Copies already pulled stay where they are until the
-message expires: stopping is not remote erasure.
+When a share's message expires under a node's retention, that node deletes its pulled copy, and
+the sharer stops serving it. Copies put elsewhere with `--dir` or `--out` stay.
 
-## When a share's message expires
+## When a pull fails
 
-When a share's message expires under the retention a node applies to the room, that node deletes
-its pulled copy from its files directory, and the sharer stops serving it. A copy put elsewhere
-with `--dir` or `--out` is not touched. Retention is set per room (see
-[Rooms and messages](rooms.md)); a modified node can keep everything, so this is housekeeping, not
-a security property.
+- `the offer of report.txt is gone: robertGPT no longer serves it`: the sharer stopped. Ask them to
+  share it again.
+- `the offer of report.txt cannot be collected now`, with a reason: the sharer cannot be reached
+  now.
+- A share from a node not in your keyring is not pulled by itself. Trust the node, or pull the one
+  file by hand.
+- A stalled, cut, oversized or mismatched transfer is refused and its `.part` file removed. An
+  automatic pull tries again, waiting longer each time. A pull by hand starts again from the
+  beginning.
 
-## Recover from an unavailable or bad transfer
-
-- A share's message can outlive its serving. Pulling it then fails with
-  `the offer of report.txt is gone: robertGPT no longer serves it`. When the sharer cannot be
-  reached at all, it says `the offer of report.txt cannot be collected now` and why. Ask the sharer
-  to share it again if appropriate.
-- A share from a node your keyring does not hold is not pulled by itself. Decide whether to trust
-  that node, or pull the one file by hand.
-- Missing trust and unavailable serving can both prevent a pull. Check the named nodes and the
-  room before deciding it is a network fault.
-- A stalled, truncated, oversized or mismatched transfer is refused. Do not use a partial file
-  or disable verification. An automatic pull that fails is tried again on its own, waiting longer
-  each time; a pull by hand starts again from the beginning.
-
-If it repeats, use [file troubleshooting](troubleshooting.md#the-file-is-unavailable-or-fails-verification)
-and [safe reporting](getting-help.md). Keep file contents out of a public report unless you
-have deliberately made a harmless reproduction file.
-
-Source: [share](https://github.com/robertelee78/vox/blob/36649d812f2b19fe8c9bc35cad49e3c0d56bfe3a/crates/vox-tui/src/share_cli.rs),
-[pulling a share by hand](https://github.com/robertelee78/vox/blob/36649d812f2b19fe8c9bc35cad49e3c0d56bfe3a/crates/vox-tui/src/room_cli.rs)
-and [pulling a share by itself, and expiry](https://github.com/robertelee78/vox/blob/36649d812f2b19fe8c9bc35cad49e3c0d56bfe3a/crates/vox-core/src/node/pulls.rs).
+More in [the file is unavailable or fails verification](troubleshooting.md#the-file-is-unavailable-or-fails-verification).
