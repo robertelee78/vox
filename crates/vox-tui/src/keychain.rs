@@ -58,6 +58,14 @@ mod mac {
     ) -> Option<Result<security_framework::os::macos::keychain::SecKeychain, String>> {
         use security_framework::os::macos::keychain::SecKeychain;
         let path = std::env::var_os(super::TEST_KEYCHAIN_ENV).filter(|p| !p.is_empty())?;
+        // A file that is gone (a proof's directory removed under a daemon still stopping) is
+        // refused here: the Keychain, handed a keychain that is not there, offers its own window.
+        if !std::path::Path::new(&path).is_file() {
+            return Some(Err(format!(
+                "the test keychain {} is not there",
+                path.to_string_lossy()
+            )));
+        }
         Some(
             SecKeychain::open(&path)
                 .and_then(|mut k| k.unlock(Some("")).map(|()| k))

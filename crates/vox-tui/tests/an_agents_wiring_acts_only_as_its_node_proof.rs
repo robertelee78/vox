@@ -196,10 +196,22 @@ impl Dirs {
 }
 
 impl Drop for Dirs {
-    /// The daemon setup started is this test's to stop, by its own pid.
+    /// The daemon setup started is this test's to stop, by its own pid, and it is waited for
+    /// (up to 30 s) before the directory goes: a daemon still stopping must never find its test
+    /// keychain file removed under it.
     fn drop(&mut self) {
         if let Some(pid) = self.daemon_pid() {
             let _ = Command::new("kill").arg(pid.to_string()).status();
+            let gone = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < gone
+                && Command::new("kill")
+                    .args(["-0", &pid.to_string()])
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success())
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
     }
 }
