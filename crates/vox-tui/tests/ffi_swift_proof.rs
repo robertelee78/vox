@@ -71,7 +71,17 @@
 //! Mutants for (7), one per claim, each red PRODUCT: `RoomMessage.card` always nil;
 //! `RoomMessage.image` always nil; `renameRoom` answers without asking the node; `pulledBy`
 //! always empty.
+//! 8b. **Drive over another node's Session, as the app keeps it** (#662): the peer opens a
+//!    Session through its hook and gives the app's node drive, typed at a terminal; the app holds
+//!    drive with the entry. The peer takes drive back: within 30 s the listener hears the room's
+//!    Sessions change, and `sessions` says the app may no longer drive. The peer gives drive again
+//!    and writes a second entry: within 30 s the listener hears the change again, `sessions` says
+//!    it may drive, and `sessionRead` gives both entries. An app reads a room's Sessions again only
+//!    when its listener says so, so an unheard change leaves it showing a stale capability.
+//!
 //! Mutant for (8): `sessionRead` gives each entry's kind for its line: red PRODUCT.
+//! Mutant for (8b): no Session news when another node's key moves away from this one: the revoke
+//! is not heard, red PRODUCT.
 //! Mutant for (9): the node answers `get` without pulling: red PRODUCT.
 //! Mutant for (10): `retentionSecs` gives 30 days whatever the room keeps: red PRODUCT.
 //!
@@ -1160,6 +1170,89 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
         counts.len() == 2 && counts[0] >= 1 && counts[1] >= 1,
         "PRODUCT: the listener must hear of the Session's entries and of the room's Sessions \
          changing: {heard}"
+    );
+
+    // (8b) Drive over a Session of the peer's, as the app keeps it: given, taken back, given
+    // again (#662). The peer's Session, through its own hook; the peer's operator gives the app's
+    // node drive, takes it back, and gives it again, typed at a terminal.
+    let peer_node = peer
+        .run(&["node", "list"], "")
+        .split_whitespace()
+        .next()
+        .expect("APPARATUS (staging): the peer's `vox node list` names no node")
+        .to_owned();
+    let peer_session = "d7d7d7d7-0000-4aaa-8bbb-5e55fe55d7d7";
+    let peer_work = tmp.path().join("peer-work");
+    std::fs::create_dir_all(&peer_work).expect("APPARATUS: the peer session's directory");
+    let peer_prompt = |prompt: &str| {
+        let payload = serde_json::json!({
+            "session_id": peer_session,
+            "transcript_path": peer_work.join("t.jsonl").display().to_string(),
+            "cwd": peer_work.display().to_string(),
+            "permission_mode": "default",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": prompt,
+        });
+        let mut c = peer.command(&["agent", "hook", "--node", &peer_node, "--room", &room]);
+        for v in [
+            "CLAUDE_CODE_SESSION_ID",
+            "CODEX_THREAD_ID",
+            "VOX_SESSION",
+            "VOX_HARNESS",
+        ] {
+            c.env_remove(v);
+        }
+        let out = c
+            .env("CLAUDE_CODE_ENTRYPOINT", "cli")
+            .current_dir(&peer_work)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(payload.to_string().as_bytes())?;
+                child.wait_with_output()
+            })
+            .expect("APPARATUS: could not run the peer's hook");
+        assert!(
+            out.status.success(),
+            "PRODUCT (staging): the peer's hook failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    peer.run(&["trust", "drive", &app_fp], "");
+    peer_prompt("first, with drive given");
+    writeln!(to_app, "{peer_session}").unwrap();
+    let held = expect(&from_app, &seen, "PEER ");
+    peer.run(&["trust", "read", &app_fp], "");
+    writeln!(to_app).unwrap();
+    let revoked = expect(&from_app, &seen, "REVOKED ");
+    peer.run(&["trust", "drive", &app_fp], "");
+    peer_prompt("second, with drive given again");
+    writeln!(to_app).unwrap();
+    let regranted = expect(&from_app, &seen, "REGRANTED ");
+    eprintln!("(8b) {held}\n{revoked}\n{regranted}");
+    assert!(
+        held.starts_with("PEER DRIVE true ENTRIES ") && !held.ends_with(" 0"),
+        "APPARATUS (staging): the peer gave the app's node drive and wrote an entry, yet the app \
+         never held drive on its Session with the entry in 90 s: {held}"
+    );
+    assert_eq!(
+        revoked, "REVOKED HEARD true DRIVE false",
+        "PRODUCT: when the peer took drive back, the app's listener must hear the room's Sessions \
+         change (an app keeps them and reads them again only then), and `sessions` must say it \
+         may no longer drive: {revoked}"
+    );
+    assert!(
+        regranted.starts_with("REGRANTED HEARD true DRIVE true ENTRIES ")
+            && regranted[40..].trim().parse::<u32>().is_ok_and(|n| n >= 2),
+        "PRODUCT: when the peer gave drive again and wrote a second entry, the app's listener must \
+         hear the room's Sessions change, `sessions` must say it may drive, and `sessionRead` must \
+         give both entries: {regranted}"
     );
 
     // (9) The app closes; the daemon lets the node go.

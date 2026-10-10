@@ -69,6 +69,16 @@
 //   NOTE <note>             what `sessionRead` says besides; empty for nothing
 //   HEARD <n> <m>           how many times the listener heard of an entry in that Session, and of
 //                           the room's Sessions changing
+//   (waits for a line on stdin: the id of a Session of the peer's, which gives this node drive)
+//   PEER DRIVE <bool> ENTRIES <n>
+//                           `sessions` and `sessionRead` of it, once drive shows (up to 90 s)
+//   (waits for a line on stdin: the peer took drive back)
+//   REVOKED HEARD <bool> DRIVE <bool>
+//                           whether the listener heard the room's Sessions change (up to 30 s), and
+//                           what `sessions` says then
+//   (waits for a line on stdin: the peer gave drive again, and wrote a second entry)
+//   REGRANTED HEARD <bool> DRIVE <bool> ENTRIES <n>
+//                           the same, then `sessionRead`'s entries once there are two (up to 30 s)
 //   (waits for a line on stdin)
 //   CLOSED                  the client has closed, letting go of the node
 //
@@ -296,6 +306,52 @@ do {
     say("NOTE \(session.note ?? "")")
     let (heardEntries, heardRooms) = listener.heard(session: sid, room: room)
     say("HEARD \(heardEntries) \(heardRooms)")
+
+    // Drive over a Session of the peer's: given, taken back, given again (#662). An app keeps a
+    // room's Sessions and reads them again when the listener says they changed: each change must
+    // be heard.
+    let psid = (readLine() ?? "").trimmingCharacters(in: .whitespaces)
+    func peerRow() async -> FfiSession? {
+        try? await client.sessions(room: room).first { $0.sessionId == psid }
+    }
+    func peerEntries(_ s: FfiSession?) async -> Int {
+        guard let s else { return 0 }
+        return (try? await client.sessionRead(room: room, node: s.nodeFingerprint, sessionId: psid))?
+            .entries.count ?? 0
+    }
+    var held: FfiSession? = nil
+    let heldUntil = Date().addingTimeInterval(90)
+    while Date() < heldUntil {
+        held = await peerRow()
+        if held?.canDrive == true, await peerEntries(held) >= 1 { break }
+        try await Task.sleep(nanoseconds: 250_000_000)
+    }
+    say("PEER DRIVE \(held?.canDrive ?? false) ENTRIES \(await peerEntries(held))")
+    func heardChange(after before: Int) async -> Bool {
+        let until = Date().addingTimeInterval(30)
+        while Date() < until {
+            if listener.heard(session: psid, room: room).1 > before { return true }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        return false
+    }
+    var before = listener.heard(session: psid, room: room).1
+    _ = readLine()
+    let revokeHeard = await heardChange(after: before)
+    say("REVOKED HEARD \(revokeHeard) DRIVE \(await peerRow()?.canDrive ?? false)")
+    before = listener.heard(session: psid, room: room).1
+    _ = readLine()
+    let regrantHeard = await heardChange(after: before)
+    var regained: FfiSession? = nil
+    var count = 0
+    let regainedUntil = Date().addingTimeInterval(30)
+    while Date() < regainedUntil {
+        regained = await peerRow()
+        count = await peerEntries(regained)
+        if regained?.canDrive == true && count >= 2 { break }
+        try await Task.sleep(nanoseconds: 250_000_000)
+    }
+    say("REGRANTED HEARD \(regrantHeard) DRIVE \(regained?.canDrive ?? false) ENTRIES \(count)")
     _ = readLine()
     await client.close()
     say("CLOSED")
