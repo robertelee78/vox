@@ -1722,16 +1722,23 @@ fn drain_as(d: &Daemon, session: &str) -> String {
 ///    default`.
 /// 2. the same session's next turn does not show it again: a quiet turn costs nothing.
 /// 3. bob is not in alice's keyring: the hook shows, it never accepts (K-13).
+/// 4. dave joins later, by **bob's** link. bob has written nothing in the room, and `vox trust
+///    offers` on bob's node lists dave all the same, and alice's lists him too, though the join
+///    came through bob (K-15: every member is offered a newcomer, however the join arrives).
+///    bob is still offered dave once his daemon has restarted.
 ///
 /// **Mutant**: the hook accepts each offer it shows (a trust add with no passphrase, made in the
 /// open window). Red on (3), PRODUCT.
+///
+/// **Mutant** (4): a member's join time taken from its first entry again, an unknown time being
+/// the latest. Red on (4), PRODUCT: bob, who never wrote, is offered nobody.
 #[test]
 #[ignore = "two daemons with production Argon2id; drives the real binary; CI runs it in release"]
 fn an_offer_for_the_agents_node_is_shown_in_its_turn_and_only_the_operator_accepts_it() {
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let alice = Daemon::start(&tmp.path().join("alice"));
-    let bob = Daemon::start_bare(&tmp.path().join("bob"));
+    let mut bob = Daemon::start_bare(&tmp.path().join("bob"));
     let alice_pass = alice
         .data
         .parent()
@@ -1820,6 +1827,54 @@ fn an_offer_for_the_agents_node_is_shown_in_its_turn_and_only_the_operator_accep
         "PRODUCT: the hook accepted the offer of bob: only the operator, typing the passphrase \
          outside the session, accepts one (ADR-028 K-13, K-19); `vox trust list` says \
          {list}{err}"
+    );
+
+    // (4) dave joins by bob's link; bob, who has written nothing in the room, is offered him.
+    let dave = Daemon::start_bare(&tmp.path().join("dave"));
+    let (ok, _, err) = hook(
+        &dave.data,
+        &dave.cfg,
+        &["room", "join", "--passphrase-file", "-", &bob.link(&label)],
+        "channel passphrase",
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): dave could not join by bob's link: {err}"
+    );
+    let offered = |d: &Daemon| hook(&d.data, &d.cfg, &["trust", "offers"], "").1;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let (to_bob, to_alice) = loop {
+        let both = (offered(&bob), offered(&alice));
+        if (both.0.contains(&dave.fingerprint) && both.1.contains(&dave.fingerprint))
+            || Instant::now() >= deadline
+        {
+            break both;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let (_, roster, _) = hook(&bob.data, &bob.cfg, &["room", "roster", &label], "");
+    println!("[proof] (4) bob's roster: {roster:?}; offered bob: {to_bob:?}; alice: {to_alice:?}");
+    assert!(
+        to_bob.contains(&dave.fingerprint) && to_alice.contains(&dave.fingerprint),
+        "PRODUCT: dave joined after bob and alice, by bob's link, so each must be offered him \
+         (ADR-028 K-15), whether or not it ever wrote in the room; within 60 s bob's roster was \
+         {roster:?}, bob was offered:\n{to_bob}\nalice was offered:\n{to_alice}"
+    );
+    // And still, once bob's daemon is back from a restart: the offer rests on what the node keeps.
+    restart(&mut bob, &tmp.path().join("bob"));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let after = loop {
+        let now = offered(&bob);
+        if now.contains(&dave.fingerprint) || Instant::now() >= deadline {
+            break now;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    println!("[proof] (4) offered bob after his daemon restarted: {after:?}");
+    assert!(
+        after.contains(&dave.fingerprint),
+        "PRODUCT: bob's daemon restarted, and within 30 s bob was no longer offered dave, who \
+         joined after him (ADR-028 K-15); offered:\n{after}"
     );
 }
 
