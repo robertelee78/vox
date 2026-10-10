@@ -1425,6 +1425,15 @@ final class FirstRunProof: XCTestCase {
         guard before.status == 0, nodeLine(before.out, "alice") == nil else {
             throw Apparatus("staging not achieved: the data root is to hold no node; `vox node list` said \(before.out)")
         }
+        // Claude Code is here: its settings folder, in the HOME a proof build gives the launch's
+        // `vox agent skill --install` (`<config dir>/app/home`, never the person's own).
+        let skillHome = URL(fileURLWithPath: config).appendingPathComponent("app/home")
+        do {
+            try FileManager.default.createDirectory(at: skillHome.appendingPathComponent(".claude"),
+                                                    withIntermediateDirectories: true)
+        } catch {
+            throw Apparatus("staging not achieved: Claude Code's settings folder under \(skillHome.path): \(error)")
+        }
 
         let ui = voxApp(appPath)
         ui.launchEnvironment = voxEnv
@@ -1433,6 +1442,16 @@ final class FirstRunProof: XCTestCase {
             ui.terminate()
             _ = run(vox, ["node", "detach", "alice"], env: voxEnv)
         }
+        // **Vox.app installs the agent skill pack at launch** (#586): its first run and every
+        // update of the app, not only install.sh and `vox update`. Mutant: AppModel.start without
+        // `Daemon.refreshSkillPack()`; red as PRODUCT here.
+        let skill = skillHome.appendingPathComponent(".claude/skills/vox-agent-comms/SKILL.md").path
+        let skillBy = Date().addingTimeInterval(10)
+        while !FileManager.default.fileExists(atPath: skill) && Date() < skillBy {
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: skill),
+                      "PRODUCT: Vox.app must install the agent skill at launch: 10 s after its window, \(skill) is not there")
         present(ui, Key.id("login-item-why"), timeout: 30, "at first run the app must ask about Keep Running")
         tap(ui, Key.id("login-item-not-now"), "Not Now")
 

@@ -99,6 +99,44 @@ enum Daemon {
     /// How long the login item's daemon, or one started here, is waited for (ADR-026 S-2).
     static let patience: TimeInterval = 15
 
+    /// **The agent skill pack, installed or refreshed for every harness here** (#586): once per
+    /// build of Vox.app, at launch, so a first run and every update of the app put the pack the
+    /// bundle's `vox` carries in each harness's skills folder, as `install.sh` and `vox update` do.
+    /// A file the operator changed is kept. `vox agent skill --install` does it, in the background;
+    /// a launch where it fails tries again. In a proof build its HOME is
+    /// `<config dir>/app/home` and no harness variable reaches it, so no proof touches the
+    /// person's own harness folders, and it runs at every launch.
+    static func refreshSkillPack() {
+        let build = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "")
+            + " " + (Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "")
+        let key = "skillPackInstalledFor"
+        var env = ProcessInfo.processInfo.environment
+        #if VOX_PROOF_STUB_SERVICES
+        guard let dir = try? configDir(dataRoot: "") else { return }
+        env["HOME"] = URL(fileURLWithPath: dir).appendingPathComponent("app/home").path
+        for name in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME"] {
+            env[name] = nil
+        }
+        #else
+        if UserDefaults.standard.string(forKey: key) == build { return }
+        #endif
+        let environment = env
+        Task.detached {
+            let p = Process()
+            p.executableURL = vox
+            p.arguments = ["agent", "skill", "--install"]
+            p.environment = environment
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            p.standardInput = FileHandle.nullDevice
+            guard (try? p.run()) != nil else { return }
+            p.waitUntilExit()
+            if p.terminationStatus == 0 {
+                UserDefaults.standard.set(build, forKey: key)
+            }
+        }
+    }
+
     /// A client of the account's daemon. When none answers, the bundle's `vox` starts one as
     /// `vox` does (`vox daemon --detach`, ADR-026 S-2), which starts none if one runs: also with
     /// the login item on, whose daemon may not be running (stopped, refused, or not loaded yet),
