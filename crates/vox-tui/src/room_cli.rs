@@ -1655,6 +1655,12 @@ pub async fn sessions(paths: &Paths, room: &str, json: bool) -> Result<(), AppEr
                     "name": s.name,
                     "harness": s.harness,
                     "label": label(s),
+                    "title": vox_agentcomms::envelope::session_title(
+                        &s.harness,
+                        s.folder.as_deref(),
+                        s.name.as_deref(),
+                        &s.id
+                    ),
                     "open": s.open,
                     "opened_millis": s.opened_millis,
                     "ended_millis": s.ended_millis,

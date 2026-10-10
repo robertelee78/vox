@@ -103,8 +103,8 @@
 //!   one path `vox room post --to … --urgent` takes, reaches Alice with `to` naming her and
 //!   `urgent` (W-4, #513);
 //! - `sessions`: Alice's node, through Claude Code's hook in a session a person is at, opens two
-//!   Sessions and ends one: Bob's Sessions pane lists the open one by the label `vox room sessions`
-//!   gives it and the ended one apart under "Ended (1)"; `:all` shows each opening and end among
+//!   Sessions and ends one: Bob's Sessions pane lists the open one by the title `vox room sessions`
+//!   gives it (harness and folder) and the ended one apart under "Ended (1)"; `:all` shows each opening and end among
 //!   the room's messages; `:session <short id>`, without drive, shows only that it exists, that
 //!   its name and id are alice's node's claim ("<label> — name and id as alice says", MD-3) and
 //!   "Only members alice trusts with drive see inside this Session.", with no composer, and

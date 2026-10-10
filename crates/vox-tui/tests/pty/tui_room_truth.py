@@ -110,7 +110,7 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             message Bob then sends reaches Alice with `to` naming her and `urgent` (W-4, #513);
   sessions  Alice's node, through Claude Code's hook in a session a person is at, opens two
             Sessions and ends one: Bob's Sessions pane lists the open one by `vox room sessions`'s
-            label and the ended one apart under "Ended (1)"; `:all` shows each opening and end
+            title and the ended one apart under "Ended (1)"; `:all` shows each opening and end
             among the room's messages; `:session <short id>`, without drive, shows only that it
             exists, "<label> — name and id as alice says" (MD-3) and "Only members alice trusts
             with drive see inside this Session.", with no
@@ -1292,7 +1292,7 @@ try:
     stage("sessions")
     # A room's Sessions (ADR-029 CL-2, CL-3, #553): Alice's node, as Claude Code's hook runs it in a
     # session a person is at, opens two Sessions in the room and ends one with a real `SessionEnd`.
-    # Bob's TUI lists the open one by the label `vox room sessions` gives it, the ended one apart
+    # Bob's TUI lists the open one by the title `vox room sessions` gives it, the ended one apart
     # under "Ended (1)"; All merges each Session's opening and end among the room's messages; a
     # Session opened without drive (Alice gives Bob none) shows only that it exists and why
     # nothing more, and offers no composer: `:send` there is refused.
@@ -1319,21 +1319,24 @@ try:
                 f"{cli_labels()!r}")
     labels = cli_labels()
     open_label, ended_label = labels[OPEN_ID]["label"], labels[ENDED_ID]["label"]
+    # How a person reads them (#406, v0.4.3): the title; the label stays what one types, and the
+    # Details line.
+    open_title, ended_title = labels[OPEN_ID]["title"], labels[ENDED_ID]["title"]
     sessions_pane = lambda: [r.strip().strip("│").strip() for r in pane(tui.display(), "Sessions")]
-    listed = tui.until(lambda: any(r.endswith("● " + open_label) for r in sessions_pane())
+    listed = tui.until(lambda: any(r.endswith("● " + open_title) for r in sessions_pane())
                        and "Ended (1)" in " ".join(sessions_pane()), 60, 1)
     listed_rows = sessions_pane()
-    apart = not any(ended_label in r for r in listed_rows)
+    apart = not any(ended_title in r for r in listed_rows)
     tui.key(":all\r", 2)
     all_rows = pane(tui.display(), "Timeline")
     all_text = " ".join(" ".join(r.split()) for r in all_rows)
-    merged = (f"{open_label} opened" in all_text and f"{ended_label} opened" in all_text
-              and f"{ended_label} ended" in all_text and "TO-ALICE-513" in all_text
+    merged = (f"{open_title} opened" in all_text and f"{ended_title} opened" in all_text
+              and f"{ended_title} ended" in all_text and "TO-ALICE-513" in all_text
               and any("Timeline — All" in r for r in tui.display()))
     tui.key(f":session {OPEN_ID[:8]}\r", 2)
     screen = tui.display()
     inside = " ".join(" ".join(r.split()) for r in pane(screen, "Timeline"))
-    titled = any(f"Timeline — {open_label} · open" in r for r in screen)
+    titled = any(f"Timeline — {open_title} · open" in r for r in screen)
     # The Session's name and id are alice's node's claim, and the TUI says so (ADR-029 MD-3).
     claimed = any(f"{open_label} — name and id as alice says" in r for r in screen)
     # The pane wraps its lines: read it as one text without the spaces a wrap took.
@@ -1383,7 +1386,7 @@ try:
     attempt, sid, t0, t1 = order_staged
     if not until(lambda: sid in cli_labels(), 60):
         product(f"bob's `vox room sessions` never listed the Session {sid} within 60 s")
-    opened_mark = f"{cli_labels()[sid]['label']} opened".replace(" ", "")
+    opened_mark = f"{cli_labels()[sid]['title']} opened".replace(" ", "")
     post_mark = f"SESSION-ORDER-{attempt}"
     tui.key(":all\r", 2)
     all_text = lambda: "".join(bare(r) for r in pane(tui.display(), "Timeline")).replace(" ", "")
@@ -1476,8 +1479,8 @@ try:
                                    "tool_name": "Bash", "tool_input": touch, "permission_suggestions": []}))
     asking.stdin.close()
     side_rows = lambda: [bare(r) for r in pane(tui.display(), "Rooms")]
-    flagged = tui.until(lambda: any(r.startswith(f"! {open_label} · waiting on you") or
-                                    f"! {open_label} · waiting on you" in r for r in sessions_pane())
+    flagged = tui.until(lambda: any(r.startswith(f"! {open_title} · waiting on you") or
+                                    f"! {open_title} · waiting on you" in r for r in sessions_pane())
                         and any("waiting 1" in r for r in side_rows()), 60, 1)
     flags = (sessions_pane(), side_rows())
     tui.key(f":session {OPEN_ID[:8]}\r", 2)

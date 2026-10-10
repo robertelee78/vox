@@ -2705,14 +2705,15 @@ final class FirstRunProof: XCTestCase {
         guard listed.contains(d7Session.prefix(8)) else {
             throw Apparatus("alice's `vox room sessions` never listed bob's Session \(d7Session) in 30 s: \(listed)")
         }
-        // Its opening is a line of the room, said as every reader says it (#406): "<name · short
-        // id> opened", as `vox room read` prints it, never a blank row under bob's name.
-        let openedLine = Key.showing("\(d7Session.prefix(8)) opened")
+        // Its opening is a line of the room, said as every reader says it (#406): "<title> opened",
+        // its harness and folder ("Claude Code · tmp opened"), as `vox room read` prints it, never
+        // a blank row under bob's name.
+        let openedLine = Key.showing("Claude Code · tmp opened")
         present(ui, openedLine, timeout: 30,
-                "bob's Session's opening must read in alice's timeline as `vox room read` says it, \"\(d7Session.prefix(8)) opened\", not as a blank row",
+                "bob's Session's opening must read in alice's timeline as `vox room read` says it, \"Claude Code · tmp opened\", not as a blank row",
                 premise: Premise("alice's `vox room read` says bob's Session \(d7Session) opened") {
                     let read = self.run(vox, ["room", "read", "--node", "alice", room], env: voxEnv).out
-                    return (read.contains("\(d7Session.prefix(8)) opened"), String(read.suffix(800)))
+                    return (read.contains("Claude Code · tmp opened"), String(read.suffix(800)))
                 })
         let toBox = Key.id("compose-to")
         tap(ui, toBox, "To:")
@@ -2838,6 +2839,55 @@ final class FirstRunProof: XCTestCase {
         onlySelected(rows[rows.count - 1], "View > Focus Timeline on bob's Session")
         ui.typeKey(.upArrow, modifierFlags: [])
         onlySelected(rows[rows.count - 2], "↑ from the newest entry")
+
+        // (4g) The Session as a person reads it (v0.4.3): one tool call, then the turn's reply
+        // and its end, as bob's Claude Code's hook gives them.
+        func bobHook(_ json: String) {
+            let r = run(vox, ["agent", "hook", "--node", "bob", "--room", room, "--format", "text"],
+                        env: voxEnv.merging(["CLAUDE_CODE_ENTRYPOINT": "cli"]) { $1 }, input: json)
+            if r.status != 0 { XCTFail("APPARATUS: bob's hook exited \(r.status): \(r.out)") }
+        }
+        let common = "\"session_id\":\"\(d7Session)\",\"cwd\":\"/tmp\",\"transcript_path\":\"/tmp/t.jsonl\""
+        bobHook("{\(common),\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"tool_use_id\":\"t-polish\",\"tool_input\":{\"command\":\"ls\"}}")
+        bobHook("{\(common),\"hook_event_name\":\"PostToolUse\",\"tool_name\":\"Bash\",\"tool_use_id\":\"t-polish\",\"tool_input\":{\"command\":\"ls\"},\"tool_response\":{\"stdout\":\"a b\"}}")
+        bobHook("{\(common),\"hook_event_name\":\"Stop\",\"last_assistant_message\":\"POLISH-REPLY\"}")
+        let reply = Key.showing("POLISH-REPLY")
+        present(ui, reply, timeout: 30, "bob's reply must show in his Session")
+        // Its name, read: harness and folder, no id (3, 9).
+        let shortSession = String(d7Session.prefix(8))
+        let rowWords = words(ui, Key.id("session-\(shortSession)"), timeout: 10,
+                             "bob's Session must be listed under SESSIONS") ?? ""
+        XCTAssertTrue(rowWords.contains("Claude Code · tmp") && !rowWords.contains(shortSession),
+                      "PRODUCT: a Session must be listed by its harness and folder, without its id (v0.4.3); its row says \(rowWords.debugDescription)")
+        let headWords = words(ui, Key.id("room-header-meta"), timeout: 10, "the room's header") ?? ""
+        XCTAssertTrue(headWords.contains("Claude Code · tmp · open") && !headWords.contains(shortSession),
+                      "PRODUCT: the header must name the Session once, by harness and folder, without its id (v0.4.3); it says \(headWords.debugDescription)")
+        XCTAssertNil(locate(ui, Key.id("session-header")),
+                     "PRODUCT: the Session's name and id as its node says them must be folded in Details (v0.4.3); they show")
+        // What was typed in the text face, its words alone (13); the turn's end no words (12);
+        // the tool call one quiet folded line (11).
+        let typed = words(ui, Key.idPrefix("entry-said-"), timeout: 10, "what bob typed must show") ?? ""
+        XCTAssertFalse(typed.hasPrefix("typed at the terminal:"),
+                       "PRODUCT: what was typed must show as its own words, not the line \"typed at the terminal: …\" (v0.4.3); it says \(typed.debugDescription)")
+        XCTAssertNil(locate(ui, Key.showing("— turn ended —")),
+                     "PRODUCT: a turn's end must be a hairline, not the words \"— turn ended —\" (v0.4.3)")
+        let folded = words(ui, Key.idPrefix("tools-"), timeout: 10,
+                           "bob's tool call must be folded into one line") ?? ""
+        XCTAssertEqual(folded, "1 tool call",
+                       "PRODUCT: a run of tool calls must be one quiet line saying how many (v0.4.3); it says \(folded.debugDescription)")
+        XCTAssertNil(locate(ui, Key.showing("Bash: ls")),
+                     "PRODUCT: a tool call must not be drawn until asked for (v0.4.3); \"Bash: ls\" shows")
+        // Details, a small disclosure, only on the row pointed at or selected (10): bob's reply,
+        // neither, has none showing.
+        let replyRow = ui.windows.firstMatch.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH %@", "entry-row-"))
+            .allElementsBoundByIndex.first { shown($0).contains("POLISH-REPLY") }
+        if let replyRow, !replyRow.isSelected {
+            let id = replyRow.identifier.replacingOccurrences(of: "entry-row-", with: "")
+            XCTAssertNil(locate(ui, Key.id("entry-details-\(id)")),
+                         "PRODUCT: an entry's Details must show only when it is pointed at or selected (v0.4.3); bob's reply shows it")
+        }
+        print("[proof] Session read: row \(rowWords.debugDescription), header \(headWords.debugDescription), typed \(typed.debugDescription), tools \(folded.debugDescription)")
 
         // (5) The keyring: carol, a node made here, added by her pasted fingerprint, then removed.
         try staged(vox, ["node", "create", "carol"],
