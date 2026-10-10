@@ -512,6 +512,11 @@ private enum TimelineKey {
     case up, down, extendUp, extendDown, open, look, close, quoted
 }
 
+/// The bottom of the timeline, below its last line: what "the newest line" is scrolled to.
+private enum TimelineEnd {
+    static let id = "timeline-end"
+}
+
 /// The room on screen: its timeline and a field to post, with its members beside it.
 private struct RoomView: View {
     /// The conversation's text size, for its spacing (L-1a): this view sets it on the timeline and
@@ -676,6 +681,11 @@ private struct RoomView: View {
                                                                                 object: nil)
                                             }
                                         })
+                                // The end of the timeline, after the lazy rows: always laid out,
+                                // so a scroll to it reaches the bottom however the rows above were
+                                // estimated (a scroll to the newest lazy row could stop short of
+                                // it, the newest line never in view, never read).
+                                Color.clear.frame(height: 1).id(TimelineEnd.id)
                             }
                             .coordinateSpace(name: "timeline")
                             // A scroll view of its own for each destination (General, All, each
@@ -735,6 +745,13 @@ private struct RoomView: View {
                                     let shown = frame.intersection(bounds)
                                     return !shown.isNull && shown.height * 2 >= frame.height ? id : nil
                                 })
+                                // The last three rows' frames and the viewport, for reading a row
+                                // never counted in view (debug: kept only when asked for).
+                                let tail = model.timelineItems.suffix(3).map { item in
+                                    frames[item.id].map { "\(item.id.prefix(10)) \(Int($0.minY))..\(Int($0.maxY))" }
+                                        ?? "\(item.id.prefix(10)) unmeasured"
+                                }
+                                readLog.debug("frames in \(room, privacy: .public): viewport \(Int(viewport.size.width))x\(Int(viewport.size.height)), \(frames.count) measured, last: \(tail.joined(separator: "; "), privacy: .public)")
                                 markSeen()
                                 pin(scroller, "rows")
                             }
@@ -742,8 +759,8 @@ private struct RoomView: View {
                             // appeared, its count never changed and it stayed at the top, so the
                             // newest rows were never in view, and never read.
                             .onAppear {
-                                if let last = model.followItem {
-                                    scroller.scrollTo(last, anchor: .bottom)
+                                if model.followItem != nil {
+                                    scroller.scrollTo(TimelineEnd.id, anchor: .bottom)
                                 }
                                 newest = model.followItem
                                 opened = model.showsSessionToRead
@@ -796,14 +813,14 @@ private struct RoomView: View {
                                     let following = newest == nil || inView.contains(newest ?? "")
                                     readLog.debug("follow in \(room, privacy: .public) on lines: pinned \(pinned), newest \(newest ?? "none", privacy: .public) in view? \(following), rows \(inView.count)")
                                     if following, let last = model.followItem {
-                                        scroller.scrollTo(last, anchor: .bottom)
+                                        scroller.scrollTo(TimelineEnd.id, anchor: .bottom)
                                         // Again once the new rows are laid out: a room opened
                                         // with ⌘J gets its messages after it appears, and a
                                         // scroll asked for in the pass that brings them can
                                         // do nothing (as on a change of what is shown).
                                         DispatchQueue.main.async {
                                             if model.followItem == last {
-                                                scroller.scrollTo(last, anchor: .bottom)
+                                                scroller.scrollTo(TimelineEnd.id, anchor: .bottom)
                                             }
                                         }
                                     }
@@ -1198,7 +1215,7 @@ private struct RoomView: View {
             return
         }
         DispatchQueue.main.async {
-            if pinned, model.followItem == last { scroller.scrollTo(last, anchor: .bottom) }
+            if pinned, model.followItem == last { scroller.scrollTo(TimelineEnd.id, anchor: .bottom) }
         }
     }
 
@@ -1208,8 +1225,8 @@ private struct RoomView: View {
             centre(model.selectedRequest, scroller)
         } else if let waiting = model.waitingEntry {
             scroller.scrollTo(waiting, anchor: .center)
-        } else if let last = model.followItem {
-            scroller.scrollTo(last, anchor: .bottom)
+        } else if model.followItem != nil {
+            scroller.scrollTo(TimelineEnd.id, anchor: .bottom)
         }
     }
 
