@@ -3270,6 +3270,11 @@ final class FirstRunProof: XCTestCase {
         present(ui, Key.id("room-bbb"), timeout: 30,
                 "room bbb must show in the sidebar",
                 premise: inRoom(vox, voxEnv, "bbb"))
+        // Mission taller than its timeline, so it can be scrolled up from its newest line below:
+        // lines of alice's own, which are never unread.
+        for n in 1...16 {
+            try staged(vox, ["room", "post", "--node", "alice", room, "FILL-\(n)"], env: voxEnv)
+        }
         tap(ui, aaa, "aaa in the sidebar", premise: inRoom(vox, voxEnv, "aaa"))
         try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "NEEDS-YOU-9"],
                    env: bobSession)
@@ -3292,6 +3297,29 @@ final class FirstRunProof: XCTestCase {
         if !halfInTimeline(ui, landed) {
             keepTree(ui, "NEEDS-YOU-9 was not in view")
             XCTFail("PRODUCT: ⌘J must open mission with its newest message, NEEDS-YOU-9, in view; it is in the timeline but not on screen")
+        }
+        // Scrolled up by the person with a mouse wheel, the timeline stays where they put it: the
+        // newest line is not pulled back into view. Premise: mission is taller than its timeline
+        // (its first filler line is out of view at its newest line).
+        let timelineView = el(ui, Key.id("timeline"))
+        if halfInTimeline(ui, Key.showing("FILL-1")) {
+            keepTree(ui, "mission fit its timeline")
+            XCTFail("APPARATUS: mission's lines all fit in its timeline (FILL-1 in view with NEEDS-YOU-9), so scrolling up cannot be told from not scrolling")
+        } else {
+            timelineView.scroll(byDeltaX: 0, deltaY: 600)
+            Thread.sleep(forTimeInterval: 2)
+            if halfInTimeline(ui, landed) {
+                keepTree(ui, "NEEDS-YOU-9 came back after a wheel scroll up")
+                XCTFail("PRODUCT: scrolled up with the mouse wheel, mission's timeline must stay up; 2 s later its newest line, NEEDS-YOU-9, is back in view, so it was pulled back down")
+            }
+            // Down again to the newest line, so the steps after find mission as ⌘J left it.
+            timelineView.scroll(byDeltaX: 0, deltaY: -6000)
+            let backUntil = Date().addingTimeInterval(10)
+            while Date() < backUntil && !halfInTimeline(ui, landed) { Thread.sleep(forTimeInterval: 0.2) }
+            if !halfInTimeline(ui, landed) {
+                keepTree(ui, "NEEDS-YOU-9 not back after a wheel scroll down")
+                XCTFail("PRODUCT: scrolled down with the mouse wheel to the end, mission's timeline must show its newest line, NEEDS-YOU-9")
+            }
         }
         // To: is the room's own: bob ticked in mission is not carried into aaa.
         let to = Key.id("compose-to")
