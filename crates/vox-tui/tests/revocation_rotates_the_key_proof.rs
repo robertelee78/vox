@@ -621,6 +621,12 @@ use vox_core::pairwise::{InitialMessage, OtpReuseTracker};
 use vox_core::transport::quic::{VoxConnection, VoxEndpoint};
 use vox_core::transport::streams::{accept_typed, open_typed, StreamKind};
 
+/// How long after taking a delivery dave's apparatus republishes his bundle: no sooner than his
+/// own node would. A node republishes at its next one-second tick, and the record then travels to
+/// the sender's board; an apparatus that republished at once would hide a sender that does not
+/// wait for the next bundle.
+const REPUBLISH_AFTER: Duration = Duration::from_millis(1500);
+
 fn wall_ms() -> u64 {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -925,6 +931,9 @@ impl Dave {
                     if took {
                         let _ = send.write_all(&[pw::KEY_TAKEN]).await;
                         let _ = send.finish();
+                        // As dave's node does: at its next tick, and no sooner (see
+                        // [`REPUBLISH_AFTER`]).
+                        tokio::time::sleep(REPUBLISH_AFTER).await;
                         if republish.load(std::sync::atomic::Ordering::SeqCst) {
                             publish_bundle(&conn, &signer, &ring, &rooms, &seq, None).await;
                         }
@@ -1007,6 +1016,25 @@ impl Dave {
             bundle.one_time_prekey_sig = Some(otp.signature().to_bytes());
             bundle
         })
+    }
+
+    /// Wait until alice has sent dave nothing for a few seconds, and his last republish is done.
+    fn quiesce(&self) {
+        let mut last = self.got().len();
+        let mut still = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while still.elapsed() < Duration::from_secs(4) {
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS: alice kept sending dave frames for 60 s; the next staging cannot start"
+            );
+            std::thread::sleep(Duration::from_millis(250));
+            let n = self.got().len();
+            if n != last {
+                last = n;
+                still = Instant::now();
+            }
+        }
     }
 
     fn got(&self) -> Vec<Got> {
@@ -1219,8 +1247,15 @@ fn adr030_refused_bundles_and_retrust(
     ];
     for case in cases {
         let what = case.map_or("a good bundle", |(w, _, _)| w);
+        // Nothing of the last retrust still in flight: no late republish of a good bundle may
+        // overwrite the bad one this case stages.
+        dave.quiesce();
         match case {
-            Some((_, created, _)) => dave.publish(Some(dave.bundle_dated(created))),
+            Some((_, created, _)) => {
+                dave.republish
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                dave.publish(Some(dave.bundle_dated(created)));
+            }
             None => dave.publish(None),
         }
         std::thread::sleep(Duration::from_secs(2));
@@ -1270,6 +1305,8 @@ fn adr030_refused_bundles_and_retrust(
                  (ADR-030 P-2, D-5). It said {lines:#?} and sent {sent:#?}",
                 ids.len()
             );
+            dave.republish
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             dave.publish(None);
         }
         // (e) With a good bundle the retrust delivers, in a delivery of its own, in every room.
