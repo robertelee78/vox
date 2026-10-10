@@ -512,6 +512,50 @@ private enum TimelineKey {
     case up, down, extendUp, extendDown, open, look, close, quoted
 }
 
+/// Says when the person starts and ends scrolling the timeline by hand (wheel, trackpad, the
+/// scroller): a live scroll of the scroll view it is drawn in. A scroll the app asks for is not one.
+private struct LiveScroll: NSViewRepresentable {
+    let began: () -> Void
+    let ended: () -> Void
+
+    func makeNSView(context: Context) -> Probe {
+        let probe = Probe()
+        probe.began = began
+        probe.ended = ended
+        return probe
+    }
+
+    func updateNSView(_ probe: Probe, context: Context) {
+        probe.began = began
+        probe.ended = ended
+    }
+
+    final class Probe: NSView {
+        var began: (() -> Void)?
+        var ended: (() -> Void)?
+        private var watched: [NSObjectProtocol] = []
+
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            watched.forEach(NotificationCenter.default.removeObserver)
+            watched = []
+            guard window != nil, let scroll = enclosingScrollView else { return }
+            let center = NotificationCenter.default
+            watched.append(center.addObserver(forName: NSScrollView.willStartLiveScrollNotification,
+                                              object: scroll, queue: .main) { [weak self] _ in
+                self?.began?()
+            })
+            watched.append(center.addObserver(forName: NSScrollView.didEndLiveScrollNotification,
+                                              object: scroll, queue: .main) { [weak self] _ in
+                self?.ended?()
+            })
+            setAccessibilityElement(false)
+        }
+    }
+}
+
 /// The bottom of the timeline, below its last line: what "the newest line" is scrolled to.
 private enum TimelineEnd {
     static let id = "timeline-end"
@@ -550,10 +594,14 @@ private struct RoomView: View {
     @State private var newest: String?
     /// What is shown just changed, and has not been scrolled to its newest line yet.
     @State private var opened = false
-    /// Just opened (or switched), and its newest line not yet measured in view: until it is, each
-    /// change of the lines and each measure of the rows scrolls to it, since a room's lines land
-    /// in steps after it appears (⌘J), each able to leave the newest below the bottom.
-    @State private var pinned = true
+    /// Whether the timeline keeps its newest line in view: from when it opens until the person
+    /// scrolls away by hand, or moves the selection off the newest line with ↑/↓ or a quote; again
+    /// once they are back at it. A state, not judged from the last measure: the newest line also
+    /// leaves the view when nobody scrolled, as the room's lines land in steps after it appears
+    /// (⌘J), rows above it grow, or the composer grows and the timeline shrinks (To:, a draft).
+    @State private var following = true
+    /// A scroll back to the newest line asked for and not yet made.
+    @State private var keeping = false
     /// Whether the keyboard is on the timeline (WCAG 2.1.1): ↑/↓ move the selection, Return
     /// opens the selected message's first action, Space Quick Looks its pulled file.
     @State private var timelineFocused = false
@@ -686,6 +734,15 @@ private struct RoomView: View {
                                 // estimated (a scroll to the newest lazy row could stop short of
                                 // it, the newest line never in view, never read).
                                 Color.clear.frame(height: 1).id(TimelineEnd.id)
+                                    // The person scrolling by hand: the timeline follows again
+                                    // only if they end at its newest line.
+                                    .background(LiveScroll(began: {
+                                        following = false
+                                        readLog.debug("follow in \(room, privacy: .public): following false, why: scrolled by hand")
+                                    }, ended: {
+                                        following = model.followItem.map { inView.contains($0) } ?? true
+                                        readLog.debug("follow in \(room, privacy: .public): following \(following), why: scroll by hand ended")
+                                    }))
                             }
                             .coordinateSpace(name: "timeline")
                             // A scroll view of its own for each destination (General, All, each
@@ -723,6 +780,7 @@ private struct RoomView: View {
                                 model.jumpTo = nil
                                 guard model.byID[id] != nil else { return }
                                 select(id)
+                                following = id == model.followItem
                                 withAnimation(Theme.motion(reduced: reduceMotion)) {
                                     scroller.scrollTo(id, anchor: .center)
                                 }
@@ -753,8 +811,11 @@ private struct RoomView: View {
                                 }
                                 readLog.debug("frames in \(room, privacy: .public): viewport \(Int(viewport.size.width))x\(Int(viewport.size.height)), \(frames.count) measured, last: \(tail.joined(separator: "; "), privacy: .public)")
                                 markSeen()
-                                pin(scroller, "rows")
+                                keepNewest(scroller, viewport.size.height, "rows")
                             }
+                            // The timeline shrank or grew (the composer grows with To:, a draft
+                            // or a reply): the newest line kept in view.
+                            .onChange(of: viewport.size) { _ in keepNewest(scroller, viewport.size.height, "viewport") }
                             // A room opens at its newest message: loaded before the view
                             // appeared, its count never changed and it stayed at the top, so the
                             // newest rows were never in view, and never read.
@@ -764,7 +825,7 @@ private struct RoomView: View {
                                 }
                                 newest = model.followItem
                                 opened = model.showsSessionToRead
-                                pinned = true
+                                following = true
                                 // Again once the rows are laid out: a scroll asked for in the
                                 // same pass as the rows it scrolls to can do nothing.
                                 DispatchQueue.main.async { openAtNewest(scroller) }
@@ -788,7 +849,7 @@ private struct RoomView: View {
                                 // again at its newest once they land.
                                 opened = model.showsSessionToRead
                                 newest = model.followItem
-                                pinned = true
+                                following = true
                                 DispatchQueue.main.async {
                                     openAtNewest(scroller)
                                     newest = model.followItem
@@ -799,7 +860,7 @@ private struct RoomView: View {
                             // end, is not a line to follow), so a Session follows its output
                             // as General follows its messages.
                             .onChange(of: model.followSignature) { _ in
-                                pin(scroller, "lines")
+                                keepNewest(scroller, viewport.size.height, "lines")
                                 // A request gone to (⌘J, a notification) stays where it was
                                 // centred: new output does not scroll it away (P1, P7).
                                 if model.selectedRequest != nil, !opened {
@@ -810,9 +871,9 @@ private struct RoomView: View {
                                     opened = false
                                     openAtNewest(scroller)
                                 } else {
-                                    let following = newest == nil || inView.contains(newest ?? "")
-                                    readLog.debug("follow in \(room, privacy: .public) on lines: pinned \(pinned), newest \(newest ?? "none", privacy: .public) in view? \(following), rows \(inView.count)")
-                                    if following, let last = model.followItem {
+                                    let follows = following || newest == nil
+                                    readLog.debug("follow in \(room, privacy: .public) on lines: following \(follows), newest \(newest ?? "none", privacy: .public) in view? \(inView.contains(newest ?? "")), rows \(inView.count)")
+                                    if follows, let last = model.followItem {
                                         scroller.scrollTo(TimelineEnd.id, anchor: .bottom)
                                         // Again once the new rows are laid out: a room opened
                                         // with ⌘J gets its messages after it appears, and a
@@ -1085,6 +1146,7 @@ private struct RoomView: View {
         default: return false
         }
         if extending { extend(to: ids[next]) } else { select(ids[next]) }
+        following = ids[next] == model.followItem
         withAnimation(Theme.motion(reduced: reduceMotion)) {
             scroller.scrollTo(ids[next])
         }
@@ -1202,20 +1264,19 @@ private struct RoomView: View {
         return true
     }
 
-    /// While pinned, the newest line scrolled to on the next turn of the main loop if it is not in
-    /// view; pinned no longer once it is. A request to centre (P1, P7) is left where it is.
-    private func pin(_ scroller: ScrollViewProxy, _ why: String) {
-        guard pinned else { return }
-        let last = model.followItem
-        let shown = last.map { inView.contains($0) } ?? false
-        readLog.debug("follow in \(room, privacy: .public) on \(why, privacy: .public): pinned \(pinned), newest \(last ?? "none", privacy: .public) in view? \(shown), rows \(inView.count)")
-        guard model.selectedRequest == nil, model.waitingEntry == nil, let last else { return }
-        if shown {
-            pinned = false
-            return
-        }
+    /// While following, the newest line kept in view: on any change of the lines, the rows' frames
+    /// or the timeline's size that leaves it out of view or undrawn, a scroll to the timeline's
+    /// end on the next turn of the main loop. A request centred (P1, P7) is left where it is.
+    private func keepNewest(_ scroller: ScrollViewProxy, _ height: CGFloat, _ why: String) {
+        guard following, model.selectedRequest == nil, model.waitingEntry == nil,
+              let last = model.followItem else { return }
+        let shown = rowFrames[last].map { $0.maxY <= height + 1 } ?? false
+        readLog.debug("follow in \(room, privacy: .public) on \(why, privacy: .public): following \(following), newest \(last, privacy: .public) at its end in view? \(shown), rows \(inView.count)")
+        guard !shown, !keeping else { return }
+        keeping = true
         DispatchQueue.main.async {
-            if pinned, model.followItem == last { scroller.scrollTo(TimelineEnd.id, anchor: .bottom) }
+            keeping = false
+            if following { scroller.scrollTo(TimelineEnd.id, anchor: .bottom) }
         }
     }
 
