@@ -59,6 +59,12 @@ A drive you do not hold is refused, and says so: `<node> does not trust you with
 you to read only, or not at all`. Which nodes **your** node lets drive, `vox trust list` shows:
 each entry ends `read` or `read + drive`.
 
+When drive you held is taken back (`vox trust read`), what you already read inside the Session
+stays readable, but nothing written after: `vox room session` shows the lines you read before, and
+no newer ones, and `"can_drive"` is `false`. Only a Session you never read inside shows the "Only
+members … see inside" line. So read `"can_drive"`, not whether lines show, to know if you hold
+drive.
+
 ## What you may do
 
 ```bash

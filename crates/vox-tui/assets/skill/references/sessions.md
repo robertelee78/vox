@@ -8,7 +8,8 @@ at it has none: `claude -p` (or the Agent SDK), `codex exec`, `opencode run`. No
 follow or drive.
 
 Only the members a session's node trusts with **drive** see inside its Session; anyone else is told
-so. Your own Session is seen by the members your node trusts with drive, and they may steer you
+so. A member whose drive is taken back keeps what it already read there, and sees nothing written
+afterwards. Your own Session is seen by the members your node trusts with drive, and they may steer you
 from it: text typed into your session from Vox reaches you as typed input, and your turn shows who
 typed it. Drive is granted only by the operator, with `vox trust drive` at a terminal; whether you
 hold it over a Session, and how to ask for it, is in `trust.md`.

@@ -1305,39 +1305,41 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
     // harness), in the repo the room map binds: Codex's node holds drive over it, Claude Code's
     // does not.
     let opencode_session = "0c0c0c0c-5e55-4000-8000-00000000c0de".to_owned();
-    let mut c = Command::new(&vox_bin);
-    env(&mut c);
-    let mut hook = c
-        .args(["agent", "hook", "--node", "opencode-proof"])
-        .env("CLAUDE_CODE_ENTRYPOINT", "cli")
-        .current_dir(&repo)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("APPARATUS: cannot start vox agent hook");
-    {
+    // One prompt of that session, through its hook, as Claude Code runs it.
+    let stand_in_prompt = |prompt: &str| {
         use std::io::Write as _;
+        let mut c = Command::new(&vox_bin);
+        env(&mut c);
+        let mut hook = c
+            .args(["agent", "hook", "--node", "opencode-proof"])
+            .env("CLAUDE_CODE_ENTRYPOINT", "cli")
+            .current_dir(&repo)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("APPARATUS: cannot start vox agent hook");
         let event = serde_json::json!({
             "hook_event_name": "UserPromptSubmit",
             "session_id": opencode_session,
             "cwd": repo.display().to_string(),
             "transcript_path": root.join("standin.jsonl").display().to_string(),
             "permission_mode": "default",
-            "prompt": "carry on",
+            "prompt": prompt,
         });
         hook.stdin
             .take()
             .expect("APPARATUS: the hook's stdin")
             .write_all(event.to_string().as_bytes())
             .expect("APPARATUS: cannot give the hook its event");
-    }
-    let hooked = hook.wait_with_output().expect("APPARATUS: the hook");
-    assert!(
-        hooked.status.success(),
-        "APPARATUS (staging): the stand-in's hook failed: {}",
-        String::from_utf8_lossy(&hooked.stderr)
-    );
+        let hooked = hook.wait_with_output().expect("APPARATUS: the hook");
+        assert!(
+            hooked.status.success(),
+            "APPARATUS (staging): the stand-in's hook failed: {}",
+            String::from_utf8_lossy(&hooked.stderr)
+        );
+    };
+    stand_in_prompt("carry on");
     let deadline = Instant::now() + Duration::from_secs(60);
     while !sessions_of("opencode-proof")
         .iter()
@@ -1540,6 +1542,72 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
             &["typed at a terminal, never read from a file"],
         );
     }
+    // trust.md: drive taken back. OpenCode's operator takes Codex's drive back, typed; the stand-in
+    // session then writes a line. Codex's node keeps what it already read inside the Session and
+    // sees nothing newer, and its `"can_drive"` is false.
+    let (ok, shown) = typed_vox(&[
+        "trust",
+        "read",
+        &fp["codex-proof"],
+        "--node",
+        "opencode-proof",
+    ]);
+    assert!(
+        ok,
+        "APPARATUS (staging): `vox trust read <codex-proof>`, typed, failed: {shown}"
+    );
+    let as_codex = |args: &[&str]| -> String {
+        let mut all = args.to_vec();
+        all.extend_from_slice(&["--node", "codex-proof"]);
+        let (_, out, err) = vox(&all);
+        out + &err
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut listed = String::new();
+    while Instant::now() < deadline {
+        listed = as_codex(&["room", "sessions", &room, "--json"]);
+        if listed.lines().any(|l| {
+            l.contains(&format!("\"id\":\"{opencode_session}\""))
+                && l.contains("\"can_drive\":false")
+        }) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    stand_in_prompt("written after drive was taken back");
+    std::thread::sleep(Duration::from_secs(3));
+    let kept = as_codex(&["room", "session", &room, &opencode_session]);
+    let own = {
+        let (_, out, err) = vox(&[
+            "room",
+            "session",
+            &room,
+            &opencode_session,
+            "--node",
+            "opencode-proof",
+        ]);
+        out + &err
+    };
+    println!(
+        "[proof] after `vox trust read`, Codex's node lists:\n{listed}\nand reads:\n{kept}\n(the \
+         Session's own node reads:\n{own})"
+    );
+    assert!(
+        own.contains("written after drive was taken back"),
+        "APPARATUS (staging): the stand-in's new line never showed in its own node's view: {own}"
+    );
+    assert!(
+        listed
+            .lines()
+            .any(|l| l.contains(&format!("\"id\":\"{opencode_session}\""))
+                && l.contains("\"can_drive\":false"))
+            && kept.contains("carry on")
+            && !kept.contains("written after drive was taken back"),
+        "PRODUCT: trust.md says that when drive is taken back, `\"can_drive\"` is false, what was \
+         already read stays readable and nothing written after shows; Codex's node listed:\n\
+         {listed}\nand read:\n{kept}"
+    );
+
     // files.md: `vox room get`. It reaches the daemon's forward on an ephemeral loopback port,
     // which the harness's sandbox keeps closed (it opens no loopback port but the stand-in's), so
     // it runs here as Claude Code's node, in the repo, as the agent would run it.
