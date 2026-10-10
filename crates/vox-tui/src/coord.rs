@@ -599,6 +599,8 @@ pub struct Draft {
     pub body: String,
     /// Payload, without `op` or `vox`.
     pub data: serde_json::Map<String, serde_json::Value>,
+    /// What it relates to, as its sender tags it (#636).
+    pub tags: Vec<String>,
     /// Whether the node fetches a link card for the body's first URL (ADR-028 F-10).
     pub card: bool,
 }
@@ -636,6 +638,7 @@ fn envelope(draft: &Draft, session: &str, op: &str) -> Envelope {
     env.urgent = draft.urgent;
     env.re.clone_from(&draft.re);
     env.thread.clone_from(&draft.thread);
+    env.tags.clone_from(&draft.tags);
     if let Some(h) = draft.hops {
         env.hops = h;
     }

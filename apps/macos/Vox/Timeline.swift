@@ -89,6 +89,11 @@ extension NodeModel {
                 items.insert(line, at: items.firstIndex { $0.millis > line.millis } ?? items.count)
             }
             return items
+        case .tag(let tag):
+            // A thread (#636): the room's messages carrying the tag, in the room's order.
+            return messages
+                .filter { $0.kind != "session" && $0.kind != "session-end" && $0.tags.contains(tag) }
+                .map(TimelineItem.message)
         case .session:
             guard let s = shownSession else { return [] }
             // Its opening and end are said in All only (the decider, v0.4.3).

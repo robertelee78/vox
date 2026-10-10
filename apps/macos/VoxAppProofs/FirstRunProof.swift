@@ -95,6 +95,11 @@
 //     bob shares in mission, in the services view, shows its address broken into its parts, each
 //     labelled (service, your node alias, your room alias, Vox address), and Copy Address copies
 //     it whole, canonical.
+// 17. A room by tag (#636), run after step 16, or alone with VOX_PROOF_FROM=17: bob posts one
+//     message tagged task:#636 and one untagged; alice's row for the tagged one shows its tag,
+//     the room header's tag filter set to task:#636 shows it and not the untagged one, and "All
+//     messages" brings the untagged one back. Mutant: the app's `.tag` thread showing the whole
+//     room (timelineItems) turns it red at "must not show the untagged".
 //
 // Mutants for (15), one each: the member rows drop a node's trust in alice unless she trusts it
 // (D4: the row reads "not in keyring"); the timeline drops the whereabouts line (D9); the join
@@ -1984,6 +1989,34 @@ final class FirstRunProof: XCTestCase {
         defer { ui.terminate() }
         present(ui, Key.id("attached"), timeout: 60, "the app must open attached as alice")
 
+        // Carol's offer, first (v0.4.3): its words give read, with no drive; Trust opens the
+        // passphrase form, and then that form's Trust is the only one on screen; left empty, its
+        // Trust says the identity's passphrase is needed (alice's has one); Cancel brings back
+        // the offer's Trust and Dismiss.
+        tap(ui, Key.id("offer-\(carolFp.prefix(12))"), "carol's offer in the sidebar",
+            premise: Premise("carol is offered to alice") {
+                (offers.contains(String(carolFp.prefix(12))), "`vox trust offers` said \(offers.debugDescription)")
+            })
+        let explain = words(ui, Key.id("offer-explain"), timeout: 10,
+                            "carol's offer must say what trusting her gives") ?? ""
+        XCTAssertFalse(explain.lowercased().contains("drive"),
+                       "PRODUCT: the offer must say trusting gives read, with no drive (the app gives none); it says \(explain.debugDescription)")
+        type(ui, Key.id("offer-alias"), "carol", "carol's alias field")
+        tap(ui, Key.id("offer-accept"), "Trust on carol's offer")
+        present(ui, Key.id("keyring-passphrase-continue"), timeout: 15,
+                "Trust on carol's offer, the keyring window closed, must ask for the passphrase")
+        XCTAssertNil(locate(ui, Key.id("offer-accept")),
+                     "PRODUCT: while the passphrase form is open its Trust must be the only one; the offer's own Trust still shows")
+        tap(ui, Key.id("keyring-passphrase-continue"), "Trust with the passphrase field left empty")
+        words(ui, Key.id("offer-failed"), timeout: 15,
+              "Trust with the field empty, alice's identity having a passphrase, must say it is needed",
+              until: { $0.contains("This node's identity has a passphrase") })
+        tap(ui, Key.id("keyring-passphrase-cancel"), "Cancel in the passphrase form")
+        present(ui, Key.id("offer-accept"), timeout: 10, "Cancel must bring back the offer's Trust")
+        el(ui, Key.id("offer-alias")).typeKey("a", modifierFlags: .command)
+        el(ui, Key.id("offer-alias")).typeKey(XCUIKeyboardKey.delete.rawValue, modifierFlags: [])
+        print("[proof] offer: \(explain.debugDescription); one Trust while the form was open; empty passphrase said needed; Cancel brought Trust back")
+
         // Bob's change, waiting for the passphrase, named.
         tap(ui, Key.id("keyring"), "Keyring in the sidebar")
         type(ui, Key.id("keyring-add-fingerprint"), bobFp, "the fingerprint field")
@@ -3002,6 +3035,12 @@ final class FirstRunProof: XCTestCase {
 
         }
 
+        if from == 17 {
+            try tagThread(ui, vox: vox, voxEnv: voxEnv, room: room)
+            print("[proof] VOX_PROOF_FROM=17: step 17 run alone; steps 1 to 16 NOT RUN")
+            return
+        }
+
         // (5d) Finding your way (v0.4.1). Each part is what a person sees, and stages what it needs
         // itself, so it runs from step 6 too (VOX_PROOF_FROM=6).
         //
@@ -3276,6 +3315,11 @@ final class FirstRunProof: XCTestCase {
                 print("[proof] VOX_PROOF_FROM=16: step 16 run alone; steps 6 to 15 NOT RUN")
                 return
             }
+        }
+        // (17) A room by tag (#636), on what steps 1 to 5 leave (VOX_PROOF_FROM=17 runs it alone,
+        // before 5d: 5b needs its message unread).
+        if from <= 5 {
+            try tagThread(ui, vox: vox, voxEnv: voxEnv, room: room)
         }
 
         // (6) Attach a file to the room, To: bob, with a note.
@@ -4253,6 +4297,46 @@ final class FirstRunProof: XCTestCase {
             XCTFail("PRODUCT: Copy Address must copy the whole address, canonical (\(canonical)); the pasteboard holds \(pasted.debugDescription)")
         }
         print("[proof] G3: \(readable) shown as \(said); Copy Address copied \(pasted)")
+    }
+
+    /// Step 17 (#636): a message's tags under its row, and the room header's filter by tag.
+    private func tagThread(_ ui: XCUIApplication, vox: String, voxEnv: [String: String],
+                           room: String) throws {
+        try staged(vox, ["room", "post", "--node", "bob", room, "PLAIN-636"], env: voxEnv)
+        try staged(vox, ["room", "post", "--node", "bob", room, "--task", "#636", "TAGGED-636"],
+                   env: voxEnv)
+        var tagged: (id: String, millis: UInt64)?
+        var untagged: (id: String, millis: UInt64)?
+        let until = Date().addingTimeInterval(60)
+        while (tagged == nil || untagged == nil) && Date() < until {
+            tagged = posted(vox, voxEnv, room, "TAGGED-636")
+            untagged = posted(vox, voxEnv, room, "PLAIN-636")
+            if tagged == nil || untagged == nil { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        guard let tagged, let untagged else {
+            throw Apparatus("alice's `vox room read --json` never showed both of bob's PLAIN-636 and TAGGED-636 in 60 s")
+        }
+        let tags = run(vox, ["room", "read", "--node", "alice", "--json", "--tag", "task:#636", room],
+                       env: voxEnv).out
+        guard tags.contains(tagged.id), !tags.contains(untagged.id) else {
+            throw Apparatus("alice's node does not hold TAGGED-636 alone under task:#636 (`vox room read --tag`): \(tags)")
+        }
+        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
+        present(ui, Key.id("tag-\(tagged.id)-task:#636"), timeout: 30,
+                "bob's TAGGED-636 must show its tag, task:#636, under it")
+        present(ui, Key.id("time-\(untagged.id)"), timeout: 10,
+                "bob's PLAIN-636 must be in the room's timeline before any filter")
+        tap(ui, Key.id("room-tag-filter"), "the room header's tag filter")
+        tap(ui, Key.menuItem("task:#636"), "task:#636 in the tag filter")
+        present(ui, Key.id("time-\(tagged.id)"), timeout: 10,
+                "filtered by task:#636, the room must show TAGGED-636")
+        missingWithin(ui, Key.id("time-\(untagged.id)"), 10,
+                      "filtered by task:#636, the room must not show the untagged PLAIN-636")
+        tap(ui, Key.id("room-tag-filter"), "the room header's tag filter")
+        tap(ui, Key.menuItem("All messages"), "All messages in the tag filter")
+        present(ui, Key.id("time-\(untagged.id)"), timeout: 10,
+                "All messages must show the untagged PLAIN-636 again")
+        print("[proof] tags: TAGGED-636 shows task:#636; the filter shows it alone; All messages brings PLAIN-636 back")
     }
 
     // ---- every check on the window proves its own query first --------------------------------

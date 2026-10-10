@@ -574,7 +574,24 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
 
     // What the timeline shows (ADR-029 CL-2): the room's conversation (General); that and each
     // Session's opening and end (All); or one Session, whose activity is never the room's (SC-4).
+    let tagged: Vec<MessageView>;
     let (timeline, notices, shown) = match &ui.showing {
+        Showing::Tag(tag) => {
+            tagged = channel
+                .timeline
+                .iter()
+                .filter(|m| m.tags.iter().any(|t| t == tag))
+                .cloned()
+                .collect();
+            (
+                tagged.as_slice(),
+                Vec::new(),
+                format!(
+                    " — tagged {} (:general for the room)",
+                    vox_agentcomms::envelope::shown(tag, vox_agentcomms::envelope::SHOWN_NAME)
+                ),
+            )
+        }
         Showing::General => (
             channel.timeline.as_slice(),
             channel.notices.clone(),
@@ -1056,6 +1073,14 @@ fn render_timeline(
             ));
             push(&mut rows, Some(m.entry_hash), None, l);
         }
+        // Its tags, quiet, under it (#636): `:tag` shows the room's messages tagged so.
+        if !m.tags.is_empty() {
+            let l = Line::from(Span::styled(
+                format!("  tags: {}", crate::room_cli::shown_tags(&m.tags)),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+            push(&mut rows, Some(m.entry_hash), None, l);
+        }
         // **An image it shares, under it** (ADR-028 F-11): drawn once this node's copy is
         // verified, on a terminal that draws images; otherwise said in words.
         if let Some(img) = &m.image {
@@ -1440,7 +1465,7 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
             " Tab switch pane · ↑/↓ select · Enter show · :general · :all · :session <name> · : command · Esc back"
         }
         Screen::Channel => {
-            " Tab switch pane · ↑/↓ select · Ctrl-R reply · Enter send, or go to the quoted · PgUp/PgDn scroll · :to <name> · :urgent · :share <path> · :link · :general · :all · :session <name> · : command · Esc back"
+            " Tab switch pane · ↑/↓ select · Ctrl-R reply · Enter send, or go to the quoted · PgUp/PgDn scroll · :to <name> · :urgent · :share <path> · :link · :general · :all · :session <name> · :tag <tag> · : command · Esc back"
         }
         Screen::Tunnels => " ↑/↓ select · x close the selected tunnel · : command · Esc back",
         Screen::Serve if vm.serve_preview.is_some() => " Enter share it · Esc back to the list",

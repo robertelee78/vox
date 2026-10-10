@@ -746,6 +746,7 @@ final class NodeModel: ObservableObject {
     /// once. Nothing is made unless `pending` is still the change waiting (D1): a prompt drawn for
     /// one change never makes another.
     func retryKeyring(_ pending: KeyringPending, with secret: Secret) async {
+        let empty = secret.isEmpty
         defer { secret.wipe() }
         guard keyringPending?.id == pending.id else { return }
         do {
@@ -756,7 +757,11 @@ final class NodeModel: ObservableObject {
             if keyringPending?.id == pending.id { keyringPending = nil }
             await refresh()
         } catch {
-            keyringFailed = sentence(error)
+            // Left empty for an identity that has a passphrase: one line saying it is needed,
+            // not the daemon's refusal of an empty one.
+            keyringFailed = empty
+                ? "This node's identity has a passphrase: type it to \(pending.words)."
+                : sentence(error)
         }
     }
 
@@ -764,6 +769,8 @@ final class NodeModel: ObservableObject {
     func cancelKeyring() {
         keyringPending = nil
         keyringReplacing = nil
+        // Its failure goes with it (P6): a cancelled change leaves no sentence behind.
+        keyringFailed = nil
     }
 
     /// The person's answer to "Replace the waiting change?" (D1).

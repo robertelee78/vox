@@ -349,6 +349,8 @@ struct KeyringPassphrase: View {
     @ObservedObject var model: NodeModel
     let pending: KeyringPending
     @State private var field = SecureFieldHolder()
+    /// A try is under way: Return and the button both ask, and only one goes.
+    @State private var busy = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s8) {
@@ -369,10 +371,17 @@ struct KeyringPassphrase: View {
         }
     }
 
+    /// The field as typed, empty included: an identity may have no passphrase (V030-36), and one
+    /// that has one says so when the field is left empty, rather than nothing happening.
     private func submit() {
-        guard let secret = field.take() else { return }
+        guard !busy else { return }
+        busy = true
+        let secret = field.takeAllowingEmpty()
         let change = pending
-        Task { await model.retryKeyring(change, with: secret) }
+        Task {
+            await model.retryKeyring(change, with: secret)
+            busy = false
+        }
     }
 }
 

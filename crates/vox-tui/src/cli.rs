@@ -784,6 +784,17 @@ pub struct CoordArgs {
     /// Print one JSON object instead of prose.
     #[arg(long)]
     pub json: bool,
+    /// Tag the message with the task it relates to, as `task:<TASK>`: an issue (`#636`) or awa's
+    /// work key. With `--work` and no `--task`, the work item is its task. Everyone who can read
+    /// the message sees its tags; `vox room read --tag` filters by them.
+    #[arg(long)]
+    pub task: Option<String>,
+    /// Tag the message with the project it relates to, as `project:<PROJECT>`.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Tag the message with the milestone it relates to, as `milestone:<MILESTONE>`.
+    #[arg(long)]
+    pub milestone: Option<String>,
 }
 
 impl CoordArgs {
@@ -792,6 +803,9 @@ impl CoordArgs {
             session: self.session.clone(),
             op: self.op.clone(),
             json: self.json,
+            task: self.task.clone(),
+            project: self.project.clone(),
+            milestone: self.milestone.clone(),
         }
     }
 }
@@ -1391,6 +1405,15 @@ pub struct RoomReadArgs {
     /// been shown, and sit in their true place in history.
     #[arg(long, hide = true, conflicts_with = "hashes")]
     pub late: bool,
+    /// Only the messages tagged TAG (`task:#636`, `project:vox`, `milestone:v0.4.3`), as their
+    /// sender tagged them: a thread of one task, project or milestone. Repeat for messages
+    /// carrying every tag named.
+    #[arg(long, value_name = "TAG", conflicts_with_all = ["since", "late", "notices", "hashes"])]
+    pub tag: Vec<String>,
+    /// With `--tag`, only this member's messages: your name for it (`vox trust list`), its
+    /// fingerprint (`vox room roster`), or `you` for your own.
+    #[arg(long, value_name = "MEMBER", requires = "tag")]
+    pub from: Option<String>,
 }
 
 /// Selecting a room, by the prefix of its channelID as `vox` prints it.
@@ -2468,6 +2491,10 @@ pub fn run() -> ExitCode {
                                 a.json,
                                 a.late,
                                 a.notices,
+                                &crate::room_cli::Tagged {
+                                    tags: a.tag.clone(),
+                                    from: a.from.clone(),
+                                },
                             )
                             .await
                         }

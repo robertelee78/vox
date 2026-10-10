@@ -205,6 +205,64 @@ pub fn is_valid_work(s: &str) -> bool {
     scheme_ok && id_ok
 }
 
+/// The kinds of tag a message may carry (#636): what it relates to.
+pub const TAG_KINDS: &[&str] = &["task", "project", "milestone"];
+
+/// Most tags one message carries.
+pub const MAX_TAGS: usize = 8;
+
+/// Longest tag value, after its kind and `:`, in bytes.
+pub const MAX_TAG: usize = 128;
+
+/// Whether `s` is a tag (#636): `<kind>:<value>`, the kind one of [`TAG_KINDS`], the value
+/// non-empty, at most [`MAX_TAG`] bytes, with nothing around it to trim, and the whole on one
+/// line. `task:` takes an issue (`#636`) or a work reference (`gwa:OWNER/REPO:…`), as a sender
+/// names it; nothing here looks it up.
+#[must_use]
+pub fn is_valid_tag(s: &str) -> bool {
+    let Some((kind, value)) = s.split_once(':') else {
+        return false;
+    };
+    TAG_KINDS.contains(&kind)
+        && value.trim() == value
+        && is_valid_name(value, MAX_TAG)
+        && !s.chars().any(breaks_lines)
+}
+
+/// The tags a sender gives a message (#636): `task:`, `project:` and `milestone:` from what it
+/// named, the task the work item when it named none, sorted and each once. A value that would
+/// not make a tag ([`is_valid_tag`]) is refused, saying which.
+///
+/// # Errors
+/// The value that is not a tag, and why, in words a person reads.
+pub fn tags_of(
+    task: Option<&str>,
+    project: Option<&str>,
+    milestone: Option<&str>,
+    work: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut tags = Vec::new();
+    for (kind, value) in [
+        ("task", task.or(work)),
+        ("project", project),
+        ("milestone", milestone),
+    ] {
+        let Some(value) = value else { continue };
+        let tag = format!("{kind}:{value}");
+        if !is_valid_tag(&tag) {
+            return Err(format!(
+                "--{kind} {} is refused: a tag's value is 1–{MAX_TAG} bytes on one line, with \
+                 nothing to trim around it, because everyone who reads the message is shown it",
+                shown(value, SHOWN_NAME)
+            ));
+        }
+        tags.push(tag);
+    }
+    tags.sort();
+    tags.dedup();
+    Ok(tags)
+}
+
 /// The suggested work vocabulary, shipped as convention rather than enforced.
 ///
 /// Shaped to map onto A2A's `TaskState` so a bridge is mechanical later. Nothing
@@ -310,6 +368,12 @@ pub struct Envelope {
     /// Application payload, opaque here.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub data: serde_json::Value,
+    /// What the message relates to, as its sender tags it (#636, the decider 2026-10-08): its
+    /// task, project and milestone ([`is_valid_tag`]), only when it relates to one. Part of the
+    /// message, so sealed with it and read by exactly those who read it; a reader filters a room
+    /// by them into a thread. An older reader ignores the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 fn default_hops() -> u32 {
@@ -366,6 +430,7 @@ impl Envelope {
             hops: DEFAULT_HOPS,
             body: body.to_owned(),
             data: serde_json::Value::Null,
+            tags: Vec::new(),
         }
     }
 
@@ -447,6 +512,13 @@ impl Envelope {
                 "`from` is too long or not on one line",
             ));
         }
+        // Tags are printed and filtered by (#636): never empty, made of nothing, or off one line.
+        if self.tags.len() > MAX_TAGS || !self.tags.iter().all(|t| is_valid_tag(t)) {
+            return Err(ParseError::Malformed(
+                "a tag is not task:, project: or milestone: and a value on one line, or there are \
+                 more than eight",
+            ));
+        }
         Ok(())
     }
 
@@ -470,6 +542,7 @@ impl Envelope {
             && self.re.is_none()
             && self.thread.is_none()
             && self.data.is_null()
+            && self.tags.is_empty()
             && self.from.is_empty()
             && self.at == Context::default()
             && !self.body.trim_start().starts_with('{')
