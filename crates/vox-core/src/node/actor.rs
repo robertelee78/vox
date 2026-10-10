@@ -12641,7 +12641,8 @@ impl Node {
         let room = match &stream.first {
             PairwiseFrame::Skdm { channel_id, .. }
             | PairwiseFrame::Open { channel_id, .. }
-            | PairwiseFrame::Hello { channel_id, .. } => *channel_id,
+            | PairwiseFrame::Hello { channel_id, .. }
+            | PairwiseFrame::RotationHello { channel_id, .. } => *channel_id,
         };
         // **Held, not dropped, while this node is still joining that room.** The join runs off the
         // actor now, so the responder's key — sent the moment it admits us — can arrive before the
@@ -12763,6 +12764,9 @@ impl Node {
         // the SKDM it precedes.
         let (channel_id, sealed) = match first {
             PairwiseFrame::Skdm { channel_id, sealed } => (channel_id, sealed),
+            // A key delivery in a session of its own (ADR-030 W-1). Not taken yet: refused as a node
+            // that predates it would refuse it (W-4), so the key waits.
+            PairwiseFrame::RotationHello { .. } => return Some(Err(KeyRefusal::HelloRefused)),
             // One ratchet message with an empty plaintext, sent to give *this* node a
             // sending chain (M17.6). Decrypt it so the ratchet steps, then stop: there
             // is nothing behind it and nothing is granted by it.
