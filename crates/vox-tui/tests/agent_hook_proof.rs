@@ -3393,7 +3393,7 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     let ask_repo = tmp.path().join("ask-repo");
     std::fs::create_dir_all(&ask_repo).expect("APPARATUS: cannot make a repository directory");
     let ask_repo = std::fs::canonicalize(&ask_repo).unwrap_or(ask_repo);
-    turn("99999999-aaaa-4bbb-8ccc-000000000009", &ask_repo);
+    turn("5e5e5e5e-aaaa-4bbb-8ccc-0000000005e0", &ask_repo);
     assert!(
         asked_about(&ask_repo),
         "PRODUCT: a session in an unbound directory must raise an ask for the person; `vox agent \
