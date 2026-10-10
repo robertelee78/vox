@@ -1294,22 +1294,30 @@ final class FirstRunProof: XCTestCase {
         // wide as the three columns need leaves the sidebar nowhere to go. Widen the window first,
         // from its right edge, as a person would.
         let window = ui.windows.firstMatch
-        // Precondition, said up front (APPARATUS): a display wide enough for the window to hold
-        // both drags. The first v0.4.3 run met a 1016-point window on the built-in display alone.
+        // Where it can grow: the first v0.4.3 run's window sat at x 1032 and stopped at 1016 points
+        // wide, its right edge on the display's (2048 points across at its "looks like" scale), so
+        // a drag of its right edge had nowhere to go. Said in the log, then, when the right edge
+        // has no room, the window takes the whole display with Window › Zoom, as a person would.
         let wants = sidebarWidth() + 80 + 400 + 7 + inspectorWidth() + 60
-        let room = (NSScreen.screens.map(\.visibleFrame.width).max() ?? 0)
-        guard room >= wants else {
-            throw Apparatus("precondition unmet: the widest display gives \(room) points, and the two drags need a window \(wants) wide (the timeline keeps 400); run this case on a wider display or a scaled resolution with more space")
+        let screens = NSScreen.screens.map { "\($0.frame) visible \($0.visibleFrame) scale \($0.backingScaleFactor)" }
+        print("[proof] columns: displays \(screens); window \(window.frame); needs \(wants) wide")
+        let screenRight = NSScreen.screens.map(\.frame.maxX).max() ?? 0
+        if window.frame.maxX + (wants - window.frame.width) > screenRight {
+            ui.menuBars.menuBarItems["Window"].click()
+            tap(ui, Key.menuItem("Zoom"), "Window › Zoom")
+            Thread.sleep(forTimeInterval: 1)
         }
-        let edge = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.5))
-            .withOffset(CGVector(dx: -1, dy: 0))
-        edge.press(forDuration: 0.5, thenDragTo: edge.withOffset(CGVector(dx: 400, dy: 0)),
-                   withVelocity: .slow, thenHoldForDuration: 0.5)
-        Thread.sleep(forTimeInterval: 1)
+        if window.frame.width < wants {
+            let edge = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.5))
+                .withOffset(CGVector(dx: -1, dy: 0))
+            edge.press(forDuration: 0.5, thenDragTo: edge.withOffset(CGVector(dx: 400, dy: 0)),
+                       withVelocity: .slow, thenHoldForDuration: 0.5)
+            Thread.sleep(forTimeInterval: 1)
+        }
         let sidebar0 = sidebarWidth(), inspector0 = inspectorWidth()
         let needed = sidebar0 + 80 + 400 + 7 + inspector0 + 60
         guard window.frame.width >= needed else {
-            throw Apparatus("staging not achieved: the window is \(window.frame.width) wide after widening, and both drags need \(needed) (the timeline keeps 400)")
+            throw Apparatus("staging not achieved: the window is \(window.frame) after Zoom or widening, and both drags need \(needed) wide (the timeline keeps 400); displays \(screens)")
         }
         // The sidebar's own resize is not driven here: XCTest's drag does not reach the split
         // view's resize area (the sidebar-resize spike, 2026-10-09: 13 grips around the separator,
