@@ -86,25 +86,21 @@ struct RoomAskView: View {
         Text("One of your rooms").eyebrow()
         let open = model.rooms.filter(\.open)
         if open.isEmpty { Text("You hold no open room.").secondaryText() }
-        ForEach(open) { r in
-            Toggle(r.name, isOn: Binding(
-                get: { room == r.id },
-                set: { on in
-                    room = on ? r.id : nil
-                    if on { link = "" }
-                }))
-                .toggleStyle(.radioButton)
-                .accessibilityIdentifier("room-ask-room-\(r.id.prefix(12))")
+        if !open.isEmpty {
+            Picker("Room", selection: $room) {
+                ForEach(open) { r in Text(r.name).tag(Optional(r.id)) }
+            }
+            .pickerStyle(.radioGroup)
+            .labelsHidden()
+            .accessibilityIdentifier("room-ask-rooms")
+            .onChange(of: room) { if $0 != nil { link = "" } }
         }
         Text("Or its link").eyebrow()
         TextField("Room link (vox://…)", text: $link).font(Theme.mono)
             .accessibilityLabel("Room link")
             .accessibilityIdentifier("room-ask-link")
             .onChange(of: link) { if !$0.isEmpty { room = nil } }
-        Text("The room's passphrase. It is saved for this repo in the room map, which every node "
-            + "on this Mac can read, so \(ask.nodes.joined(separator: ", ")) can join the room "
-            + "with it. No agent is asked for it.")
-            .secondaryText()
+        Text(passphraseWords(ask)).secondaryText()
         SecureInput(holder: field, onEmpty: { noPassphrase = $0 }) { submit() }
             .frame(width: Theme.scaled(320))
             .accessibilityLabel("Room passphrase")
@@ -120,6 +116,14 @@ struct RoomAskView: View {
                 .disabled(submitting || (room == nil && link.isEmpty))
                 .accessibilityIdentifier("room-ask-bind")
         }
+    }
+
+    /// What is said of the passphrase before it is typed (ADR-028 E-5): who can read it once saved.
+    private func passphraseWords(_ ask: RoomAskInfo) -> String {
+        let nodes = ask.nodes.joined(separator: ", ")
+        return "The room's passphrase. It is saved for this repo in the room map, which every "
+            + "node on this Mac can read, so \(nodes) can join the room with it. No agent is "
+            + "asked for it."
     }
 
     private func submit() {

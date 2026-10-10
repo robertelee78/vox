@@ -1683,6 +1683,11 @@ final class FirstRunProof: XCTestCase {
     ///   delivery), and ⌃C asks before stopping.
     /// - P1: ⌘J opens S1 with its waiting request selected, and ⌥⌘Y approves it: the hook gets
     ///   "allow" (mutant: ⌘J opening the room only).
+    /// - RB-5 (v0.4.3): Vox asks the person, not only the agent. S3, started in a directory the
+    ///   room map does not name, is shown under NEEDS YOU ("Claude Code in … has no room"); Choose
+    ///   a room…, other, the room's passphrase typed here, and Bind write the directory's block to
+    ///   the room map, put S3 in other, and the ask leaves needs you (mutant: the ask never shown
+    ///   in the sidebar).
     func testSessionsAreDrivenWhereTheyAreShown() throws {
         let env = ProcessInfo.processInfo.environment
         guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
@@ -1864,6 +1869,59 @@ final class FirstRunProof: XCTestCase {
                 "⌃C must ask before stopping the Session")
         ui.typeKey(.escape, modifierFlags: [])
         print("[proof] sessions: ⌘J landed on S1's request and ⌥⌘Y approved it; work's draft kept; ⌘↩ in S1 sent nothing; S1's draft stayed in S1; S2 said \(said.debugDescription) and kept the prompt; ⌃C asked")
+
+        // RB-5: S3 starts in a directory with no room, its hook naming none; Vox asks alice.
+        try staged(vox, ["node", "attach", "claude-a", "--passphrase-file", pass("claude-a")], env: voxEnv)
+        let repo = root.appendingPathComponent("repo").path
+        try stager.write(Data("keep\n".utf8), to: repo + "/.keep")
+        let s3 = "53cccccc-4c0e-4f00-9a1b-0c0ffee54003"
+        try stager.write(Data(), to: work + "/\(s3).jsonl")
+        let unbound = stager.run(["/bin/sh", "-c", "cd \"$1\" && exec \"$2\" agent hook --node claude-a",
+                                  "hook", repo, vox],
+                                 env: hookEnv, input: event(s3, "UserPromptSubmit", ["prompt": "S3", "cwd": repo]))
+        guard unbound.status == 0, unbound.out.contains("isn't tied to a Vox room") else {
+            throw Apparatus("staging not achieved: S3's hook was not told its repo has no room: \(unbound.out)")
+        }
+        let map = data + "/rooms"
+        let asked3 = Premise("S3 works in no room and the room map does not name \(repo)") {
+            let status = self.run(vox, ["agent", "status", "--harness", "claude", "--dir", repo],
+                                  env: hookEnv).out
+            return (status.contains("has no room") && status.contains("/repo"), "`vox agent status` said \(status.debugDescription)")
+        }
+        let askRow = Key.id("room-ask-row")
+        present(ui, askRow, timeout: 30,
+                "a session started in a directory with no room must be asked about under NEEDS YOU",
+                premise: asked3)
+        words(ui, askRow, timeout: 10, "the ask must name the harness and the directory",
+              until: { $0.contains("Claude Code in ") && $0.contains("/repo has no room") })
+        tap(ui, askRow, "the ask under NEEDS YOU", premise: asked3)
+        tap(ui, Key.id("room-ask-choose"), "Choose a room…")
+        let other = ui.radioButtons["other"]
+        guard other.waitForExistence(timeout: 10) else {
+            keepTree(ui, "no room other to choose")
+            XCTFail("PRODUCT: Choose a room… must list alice's rooms; other is not among them: \(onScreen(ui))")
+            return
+        }
+        other.click()
+        type(ui, Key.id("room-ask-passphrase"), "work room", "the room's passphrase field")
+        tap(ui, Key.id("room-ask-bind"), "Bind")
+        words(ui, Key.id("room-ask-said"), timeout: 30, "Bind must say the directory was bound",
+              until: { $0.contains("bound ") && $0.contains("/repo") })
+        let otherRoom = rooms["other"] ?? ""
+        let mapText = stager.run(["/bin/cat", map], env: [:]).out
+        XCTAssertTrue(mapText.contains("/repo\n") && mapText.contains("room       vox://")
+                          && mapText.contains("passphrase work room"),
+                      "PRODUCT: Bind must write the directory's block to the room map, with the room's link and passphrase; the map reads \(mapText.debugDescription)")
+        let inOther = run(vox, ["room", "sessions", "--node", "alice", otherRoom, "--json"], env: voxEnv).out
+        XCTAssertTrue(inOther.contains(s3),
+                      "PRODUCT: Bind must put the session that asked in the room chosen; other's Sessions are \(inOther.debugDescription)")
+        let leaveBy = Date().addingTimeInterval(15)
+        while Date() < leaveBy && locate(ui, askRow) != nil { Thread.sleep(forTimeInterval: 0.5) }
+        if locate(ui, askRow) != nil {
+            keepTree(ui, "the ask stayed after Bind")
+            XCTFail("PRODUCT: once bound, the directory must leave NEEDS YOU; its ask is still shown")
+        }
+        print("[proof] room ask: S3's directory was asked about under NEEDS YOU; bound to other in the app; the map holds its block; S3 is in other; the ask left")
     }
 
     /// A keyring change waiting for the passphrase is bound to what it changes (D1). Alice is
