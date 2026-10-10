@@ -347,7 +347,10 @@ fn a_hook_never_attaches_its_node_and_says_how_to() {
     println!("[proof] (7) the hook told the agent: {told:?}; `vox node list`: {listed:?}");
     assert!(
         ok && told.contains("node default is not attached")
-            && told.contains("in a terminal outside this session: vox node attach default")
+            && told.contains(
+                "ask the operator to run `vox node attach default` in a terminal outside this \
+                 session"
+            )
             && listed.lines().any(|l| l.starts_with("default detached")),
         "PRODUCT: with node default detached, the hook must leave it detached and tell the agent \
          the command for the operator, `vox node attach default` (ADR-028 K-13); it exited ok \
@@ -381,8 +384,8 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
     let data = tmp.path().join("data");
     let cfg = tmp.path().join("cfg");
 
-    // (6) with nothing running at all, the hook still exits 0. It starts the daemon (ADR-020
-    // 6.10), which has no node `default` here.
+    // (6) with nothing running at all, the hook still exits 0; it names no node that is here,
+    // and says so with `vox setup` (#666).
     let (ok, out, _) = hook(
         &data,
         &cfg,
@@ -404,11 +407,12 @@ fn the_hook_feeds_an_agent_its_room_in_either_harness_shape() {
         .as_str()
         .unwrap_or_default();
     assert!(
-        context.starts_with("Vox could not read your rooms this turn: ")
-            && context.contains("there is no node default")
-            && context.trim_end().lines().count() == 1,
-        "PRODUCT: when it cannot read, it must say so to the agent in one line naming why; it \
-         printed {out:?}"
+        context.starts_with(
+            "Claude Code has no Vox node on this Mac (its hook names node default, which is not \
+             here); ask the operator to run `vox setup` in a terminal."
+        ) && context.trim_end().lines().count() == 1,
+        "PRODUCT: when it cannot read because its node is not here, it must say so to the agent \
+         in one sentence with `vox setup` (#666); it printed {out:?}"
     );
 
     // ---- a daemon, a room, and one message waiting ----
