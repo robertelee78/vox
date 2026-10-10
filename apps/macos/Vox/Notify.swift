@@ -7,6 +7,13 @@ import UserNotifications
 
 @MainActor
 final class Notifier: NSObject, UNUserNotificationCenterDelegate {
+    /// The app's one notifier: the node's model and the app's own asks (#666) post through it, and
+    /// it is the notification center's one delegate.
+    static let shared = Notifier()
+    /// Opens the Attach sheet for a node on this Mac that waits for its passphrase (#666).
+    var attachNode: ((String) -> Void)?
+    /// A node that waits for its passphrase: its notification's category, with Attach….
+    nonisolated static let attachCategory = "attach-node"
     /// Opens the room a notification is about.
     var open: ((String) -> Void)?
     /// Opens a Session's waiting request a notification is about: room, node, session, reference.
@@ -21,6 +28,12 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         asked = true
         let center = UNUserNotificationCenter.current()
         center.delegate = self
+        center.setNotificationCategories([
+            UNNotificationCategory(identifier: Notifier.attachCategory,
+                                   actions: [UNNotificationAction(identifier: "attach", title: "Attach…",
+                                                                  options: [.foreground])],
+                                   intentIdentifiers: [], options: []),
+        ])
         center.requestAuthorization(options: [.alert, .sound]) { [weak self] granted, _ in
             Task { @MainActor in self?.allowed?(granted) }
         }
@@ -56,6 +69,19 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         UNUserNotificationCenter.current().add(request) { _ in }
     }
 
+    /// Node `node` on this Mac waits for its passphrase (#666): one notification, with Attach…,
+    /// which opens the Attach sheet for it. Replaces an earlier one for the same node.
+    func postAttach(node: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "Node \(node) needs its passphrase"
+        content.body = "It is not attached, so nothing reaches it. Attach it in Vox."
+        content.categoryIdentifier = Notifier.attachCategory
+        content.userInfo = ["attachNode": node]
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: "attach-\(node)", content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request) { _ in }
+    }
+
     /// A Session no longer waiting: its notification goes.
     func withdrawWaiting(sessionKey: String) {
         let id = Notifier.waitingID(sessionKey)
@@ -83,8 +109,11 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         let node = info["node"] as? String
         let session = info["session"] as? String
         let reference = info["reference"] as? String
+        let attach = info["attachNode"] as? String
         Task { @MainActor in
-            if let room, let node, let session, let reference {
+            if let attach {
+                self.attachNode?(attach)
+            } else if let room, let node, let session, let reference {
                 self.openRequest?(room, node, session, reference)
             } else if let room {
                 self.open?(room)

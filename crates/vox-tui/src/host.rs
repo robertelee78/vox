@@ -1655,9 +1655,9 @@ impl Router {
         };
         let node = node.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            crate::notify::raise_for(
+            crate::notify::needs_passphrase(
                 &paths,
-                &format!("Vox: node {node} needs its passphrase"),
+                node.as_str(),
                 &format!("It did not attach by itself. Run in a terminal: vox node attach {node}"),
             );
         })

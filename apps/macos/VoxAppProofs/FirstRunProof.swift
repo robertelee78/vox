@@ -2768,6 +2768,58 @@ final class FirstRunProof: XCTestCase {
         XCTAssertEqual(twoLines, "LINE ONE\nLINE TWO",
                        "PRODUCT: \"LINE ONE\", ⇧↩, \"LINE TWO\", Return in the composer must post one message of two lines; bob's node holds \(twoLines.debugDescription)")
 
+        // (4f0) Fewer trips to a terminal (#666). bob takes alice's drive back: his Session, shown
+        // to her, says only members bob trusts with drive see inside, and gives the command that
+        // grants it, run as bob on this Mac, with Copy (the app never grants drive, #614).
+        try staged(vox, ["trust", "read", "--node", "bob", aliceFp,
+                         "--identity-passphrase-file", bobPass], env: voxEnv)
+        tap(ui, Key.id("session-\(d7Session.prefix(8))"), "bob's Session in mission's Sessions")
+        let grant = "vox trust drive \(aliceFp) --node bob"
+        words(ui, Key.id("no-drive-\(d7Session)-command"), timeout: 30,
+              "bob's Session, shown to alice without drive, must give the command that grants it: \"\(grant)\"",
+              until: { $0 == grant })
+        tap(ui, Key.id("no-drive-\(d7Session)-copy"), "Copy beside the drive command")
+        let copied = NSPasteboard.general.string(forType: .string) ?? ""
+        XCTAssertEqual(copied, grant,
+                       "PRODUCT: Copy beside the drive command must put it on the pasteboard; it holds \(copied.debugDescription)")
+        // A node on this Mac waiting for its passphrase is offered Attach… where `vox` would have
+        // said "run in a terminal": with Vox in front, vox://attach-node opens its Attach sheet.
+        // Opened in the app under proof, by its path, never whichever Vox LaunchServices picks.
+        let opener = Process()
+        opener.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        opener.arguments = ["-a", appPath, "vox://attach-node?node=bob"]
+        try opener.run()
+        opener.waitUntilExit()
+        words(ui, Key.id("attach-node-why"), timeout: 15,
+              "vox://attach-node?node=bob, with Vox in front, must open the Attach sheet for node bob",
+              until: { $0.contains("node bob") })
+        tap(ui, Key.id("attach-node-cancel"), "Cancel on bob's Attach sheet")
+        // Forget Passphrase in place of `vox node forget-passphrase` (#666): bob, kept by a
+        // passphrase file, is no longer kept once it is chosen on his row under ON THIS MACHINE.
+        try staged(vox, ["node", "attach", "bob", "--keep", "--passphrase-file", bobPass], env: voxEnv)
+        let bobRow = el(ui, Key.id("machine-bob"))
+        let keptUntil = Date().addingTimeInterval(15)
+        while Date() < keptUntil && !(nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "bob")?.contains("(kept)") ?? false) {
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        Thread.sleep(forTimeInterval: 6) // the sidebar's node list is read every few seconds
+        bobRow.rightClick()
+        let forget = ui.menuItems["Forget Passphrase"].firstMatch
+        if forget.waitForExistence(timeout: 5) { forget.click() } else {
+            XCTFail("PRODUCT: bob's row under ON THIS MACHINE, kept, must offer Forget Passphrase: \(onScreen(ui))")
+        }
+        let forgotUntil = Date().addingTimeInterval(15)
+        var bobLine = ""
+        repeat {
+            bobLine = nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "bob") ?? ""
+            if !bobLine.contains("(kept)") { break }
+            Thread.sleep(forTimeInterval: 0.3)
+        } while Date() < forgotUntil
+        XCTAssertFalse(bobLine.contains("(kept)"),
+                       "PRODUCT: Forget Passphrase on bob's row must stop keeping him; `vox node list` says \(bobLine)")
+        ui.typeKey(.return, modifierFlags: []) // the Forget Passphrase alert's OK
+        print("[proof] #666: drive command \(grant) copied; attach-node opened bob's sheet; Forget Passphrase: \(bobLine)")
+
         // (4f) ↑/↓ reach a Session's entries (P14): bob grants alice drive, so she reads inside his
         // Session; with it shown, View > Focus Timeline selects its newest entry and ↑ the one
         // before it, as among messages.

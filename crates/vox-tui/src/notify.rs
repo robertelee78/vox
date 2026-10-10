@@ -174,6 +174,43 @@ pub fn raise_for(paths: &Paths, title: &str, body: &str) {
     raise(&note, command(paths).as_deref());
 }
 
+/// Tell the person that node `node` waits for its passphrase (#666). On a Mac with Vox.app, for the
+/// data root the app serves, and with no notification program set, Vox raises it, with an Attach… that opens its Attach sheet for the
+/// node (`vox://attach-node?node=<node>`, opened in the background); elsewhere, or when Vox cannot
+/// be asked, the plain notification, whose `body` says the command.
+pub fn needs_passphrase(paths: &Paths, node: &str, body: &str) {
+    if disabled(paths) {
+        return;
+    }
+    let title = format!("Vox: node {node} needs its passphrase");
+    let command = command(paths);
+    // Only for the data root Vox.app serves, the default one: a `vox` run on another (a proof's
+    // scratch root, a second account) names a node the app cannot see.
+    #[cfg(target_os = "macos")]
+    if command.is_none()
+        && vox_core::node::paths::default_data_root().is_ok_and(|root| root == paths.data_root)
+    {
+        // A node's name is a-z, digits, '.', '_' and '-': nothing in it needs escaping.
+        let asked = std::process::Command::new("/usr/bin/open")
+            .args(["-g", "-b", "us.vox.app"])
+            .arg(format!("vox://attach-node?node={node}"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if asked {
+            eprintln!("vox daemon: {title} — asked Vox.app to offer Attach…");
+            return;
+        }
+    }
+    let note = Note {
+        title,
+        body: body.to_owned(),
+    };
+    raise(&note, command.as_deref());
+}
+
 /// Raise `note` from the TUI (ADR-028 R-10): to the node's notification program when it has one
 /// (`notify-command`, `VOX_NOTIFY_COMMAND`), run off the TUI's thread; else to the terminal the TUI
 /// draws in, as an OSC 9 desktop notification, or as a bell over SSH, where a terminal's OSC 9

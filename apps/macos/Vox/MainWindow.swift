@@ -292,6 +292,11 @@ private struct NodeIdentity: View {
 private struct OnThisMachine: View {
     let nodes: [NodeSummary]
 
+    static func copy(_ words: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(words, forType: .string)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s4) {
             Hairline()
@@ -308,7 +313,18 @@ private struct OnThisMachine: View {
                     }
                     .accessibilityElement(children: .ignore)
                     .accessibilityLabel("\(node.name) \(node.state)")
-                    .copyMenu([("Copy Name", node.name), ("Copy Fingerprint", node.fingerprint)])
+                    .contextMenu {
+                        Button("Copy Name") { Self.copy(node.name) }
+                        if !node.fingerprint.isEmpty {
+                            Button("Copy Fingerprint") { Self.copy(node.fingerprint) }
+                        }
+                        // #666: in place of printing `vox node forget-passphrase`.
+                        if node.keep {
+                            Button("Forget Passphrase") {
+                                Task { await AppModel.shared.forgetPassphrase(node.name) }
+                            }
+                        }
+                    }
                     .accessibilityIdentifier("machine-\(node.name)")
                     // A node that waits for its passphrase is attached from here, and remembered
                     // (#666): it then attaches by itself after every restart.
@@ -767,11 +783,26 @@ private struct RoomView: View {
                                         } else if let notice = item.notice {
                                             // What was done to the room: a line among the
                                             // messages, not one of them (ADR-028 R-1, R-7).
-                                            Text(notice).secondaryText().italic()
-                                                .voxPadding(.horizontal, Space.s4)
-                                                .accessibilityIdentifier(item.id)
-                                                .reportsFrame(of: item.id)
-                                                .id(item.id)
+                                            VStack(alignment: .leading, spacing: Space.s4) {
+                                                Text(notice).secondaryText().italic()
+                                                    .accessibilityIdentifier(item.id)
+                                                if let command = item.command {
+                                                    HStack(spacing: Space.s8) {
+                                                        Text(command).font(.system(.body, design: .monospaced))
+                                                            .textSelection(.enabled)
+                                                            .accessibilityIdentifier("\(item.id)-command")
+                                                        Button("Copy") {
+                                                            NSPasteboard.general.clearContents()
+                                                            NSPasteboard.general.setString(command, forType: .string)
+                                                        }
+                                                        .accessibilityLabel("Copy the command")
+                                                        .accessibilityIdentifier("\(item.id)-copy")
+                                                    }
+                                                }
+                                            }
+                                            .voxPadding(.horizontal, Space.s4)
+                                            .reportsFrame(of: item.id)
+                                            .id(item.id)
                                         } else if let entry = item.entry, let session = model.shownSession,
                                                   let room = model.roomOnScreen {
                                             SessionEntryRow(model: model, room: room, session: session,

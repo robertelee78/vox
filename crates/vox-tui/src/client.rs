@@ -1251,11 +1251,19 @@ pub async fn node_list(args: &NodeArgs) -> Result<(), AppError> {
     Ok(())
 }
 
+/// How a person starts the daemon, said where none answers (#666): on macOS, Vox.app starts it
+/// when it opens, so opening Vox comes first; `vox daemon` everywhere.
+pub(crate) const START_DAEMON: &str = if cfg!(target_os = "macos") {
+    "open Vox (or run `vox daemon` in a terminal)"
+} else {
+    "run `vox daemon` in a terminal"
+};
+
 /// The daemon, or why there is none.
 async fn daemon(account: &Account) -> Result<DaemonClient, AppError> {
     DaemonClient::open(&account.socket()).await.map_err(|e| {
         AppError::Usage(format!(
-            "no vox daemon answers at {} ({e}); start one: vox daemon",
+            "no vox daemon answers at {} ({e}); to start one, {START_DAEMON}",
             account.socket().display()
         ))
     })

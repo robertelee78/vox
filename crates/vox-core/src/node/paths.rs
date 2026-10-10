@@ -756,7 +756,12 @@ fn home_dir() -> Result<PathBuf> {
         })
 }
 
-fn default_data_root() -> Result<PathBuf> {
+/// The data root used when neither `--data-dir` nor `VOX_DATA_DIR` names one: the one Vox.app
+/// serves.
+///
+/// # Errors
+/// HOME not set.
+pub fn default_data_root() -> Result<PathBuf> {
     if let Some(v) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(v).join("vox"));
     }
