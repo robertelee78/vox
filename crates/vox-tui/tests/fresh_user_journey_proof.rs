@@ -94,6 +94,9 @@
 //!   the skill refresh when nothing is newer (the v0.4.2 defect) → `J7.update.pack` red;
 //!   `vox update` not re-wiring hooks → `J7.update.hooks` red.
 //! - `J8.*`: a command's closing "next" line removed → red.
+//! - `J9.*.no-node.leaves_nothing`: red today (`Account::node_paths` makes the missing node's
+//!   directory); once fixed, its mutant is that `create_private_dir(&profile_dir)` put back on
+//!   the hook's path.
 //! - `J9.*.fast`: a hook that waits on the daemon's start → red; `J9.*.one_sentence`: the
 //!   detached-node guidance as two sentences → red (today).
 
@@ -2659,6 +2662,21 @@ mod journey {
             l.claim(&format!("J9.{key}.{path}.one_sentence"), ok, || {
                 format!("the hook ({path}) must say {want:?}; it said {text:?}")
             });
+            // **A hook naming a missing node leaves nothing behind** in the data root: no
+            // directory for a node that is not there.
+            if *path == "no-node" {
+                let ghost = w.data.join("nodes").join(format!("{node}-gone"));
+                l.claim(
+                    &format!("J9.{key}.no-node.leaves_nothing"),
+                    !ghost.exists(),
+                    || {
+                        format!(
+                            "the hook naming node {node}-gone, which is not here, left {} behind",
+                            ghost.display()
+                        )
+                    },
+                );
+            }
         }
         drop(server);
         drop(server2);
