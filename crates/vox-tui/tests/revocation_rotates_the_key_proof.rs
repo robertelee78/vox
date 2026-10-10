@@ -470,9 +470,7 @@ fn removing_one_member_rotates_the_key_in_every_shared_room_and_keeps_the_others
             .position(|l| ROOMS.iter().all(|r| l.contains(&format!("{r:?}"))))
             .map(|i| b + i)
     });
-    let done = lines
-        .iter()
-        .position(|l| l.starts_with("vox: removed "));
+    let done = lines.iter().position(|l| l.starts_with("vox: removed "));
     assert!(
         matches!((rooms_named, done), (Some(r), Some(d)) if r < d),
         "PRODUCT: `vox trust remove` must say, before it acts, that bob is to read nothing new in \
