@@ -1428,11 +1428,10 @@ final class FirstRunProof: XCTestCase {
         // Claude Code is here: its settings folder, in the HOME a proof build gives the launch's
         // `vox agent skill --install` (`<config dir>/app/home`, never the person's own).
         let skillHome = URL(fileURLWithPath: config).appendingPathComponent("app/home")
-        do {
-            try FileManager.default.createDirectory(at: skillHome.appendingPathComponent(".claude"),
-                                                    withIntermediateDirectories: true)
-        } catch {
-            throw Apparatus("staging not achieved: Claude Code's settings folder under \(skillHome.path): \(error)")
+        // Made by the stager: the test runner's sandbox may not write in the scratch (513).
+        let made = stager.run(["/bin/mkdir", "-p", skillHome.appendingPathComponent(".claude").path], env: [:])
+        guard made.status == 0 else {
+            throw Apparatus("staging not achieved: Claude Code's settings folder under \(skillHome.path): \(made.out)")
         }
 
         let ui = voxApp(appPath)
@@ -1447,10 +1446,12 @@ final class FirstRunProof: XCTestCase {
         // `Daemon.refreshSkillPack()`; red as PRODUCT here.
         let skill = skillHome.appendingPathComponent(".claude/skills/vox-agent-comms/SKILL.md").path
         let skillBy = Date().addingTimeInterval(10)
-        while !FileManager.default.fileExists(atPath: skill) && Date() < skillBy {
+        // Looked for by the stager too, outside the test runner's sandbox.
+        func installed() -> Bool { stager.run(["/bin/test", "-f", skill], env: [:]).status == 0 }
+        while !installed() && Date() < skillBy {
             Thread.sleep(forTimeInterval: 0.25)
         }
-        XCTAssertTrue(FileManager.default.fileExists(atPath: skill),
+        XCTAssertTrue(installed(),
                       "PRODUCT: Vox.app must install the agent skill at launch: 10 s after its window, \(skill) is not there")
         present(ui, Key.id("login-item-why"), timeout: 30, "at first run the app must ask about Keep Running")
         tap(ui, Key.id("login-item-not-now"), "Not Now")

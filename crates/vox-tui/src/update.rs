@@ -1214,6 +1214,7 @@ fn run_shell_setup(active: &Path) {
 /// The agent skill pack alone, where `vox shell-setup` is not run (a Vox.app update run from
 /// inside the bundle): the binary now in place installs or refreshes it for every harness here,
 /// keeping any file the operator changed. `VOX_NO_SKILL_INSTALL` skips it.
+#[cfg(target_os = "macos")]
 fn run_skill_install(active: &Path) {
     if std::env::var_os("VOX_NO_SKILL_INSTALL").is_some() {
         return;
