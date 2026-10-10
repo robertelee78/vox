@@ -4146,6 +4146,9 @@ pub struct Node {
     /// One-time prekey ids of each member a key delivery named, or the member answered it does
     /// not hold: never targeted again (ADR-030 P-3; see `delivery_bundle`).
     refused_otps: prekeys::RefusedOneTime,
+    /// The signed and one-time prekey ids this node's ring offered at its last maintenance: a
+    /// change republishes its bundle (ADR-030; see `maintain_prekeys`).
+    prekeys_offered: Option<(u64, Option<u64>)>,
     /// Where this node says it listens on this computer and the local network, and hears others
     /// say so (V210-167; `node::nearby`). `None` for an anchor, or when the group cannot be
     /// joined.
@@ -4620,6 +4623,7 @@ impl Node {
             member_dialed_at: BTreeMap::new(),
             key_waits_said: BTreeSet::new(),
             refused_otps: prekeys::RefusedOneTime::default(),
+            prekeys_offered: None,
             nearby: None,
             nearby_task: None,
             nearby_due: 0,
@@ -12955,7 +12959,10 @@ impl Node {
             // maintained again at the next unlock.
             let _ = prekeys::save(profile.store(), signer, &ring);
         }
-        let republish = done.rotated || done.retired > 0;
+        // What the bundle names now, against what it named when last looked at.
+        let offered = ring.offered();
+        let republish = self.prekeys_offered.is_some_and(|was| was != offered);
+        self.prekeys_offered = Some(offered);
         crate::node::status::SyncBook::note_prekeys(
             &self.sync_book,
             crate::node::status::PrekeyNote {
@@ -12971,10 +12978,12 @@ impl Node {
                 oldest_one_time: ring.oldest_one_time_created(),
             },
         );
-        // A rotated signed prekey, or a retired one-time prekey, is no longer what the bundle on
-        // the boards should name: senders refuse it as stale (ADR-030 P-2) and wait. Republished
-        // now, in every room whose records renew, rather than at the next renewal, up to an hour
-        // away.
+        // A rotated signed prekey, a retired one-time prekey or a consumed one is no longer what
+        // the bundle on the boards should name. Senders refuse a stale one and wait (ADR-030 P-2),
+        // and never name a one-time prekey twice (P-3), so until the next bundle arrives every
+        // delivery to this node would target its signed prekey, which heals only on rotation.
+        // Republished now, in every room whose records renew, rather than at the next renewal, up
+        // to an hour away; the tick coalesces a burst of consumes into one republish.
         if republish {
             drop(ring);
             for at in self.records_renew_at.values_mut() {

@@ -453,6 +453,16 @@ impl PrekeyRing {
         self.retired_used.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// What [`PrekeyRing::bundle`] names now: the signed prekey's id and the one-time prekey's, if
+    /// any. When it changes, the bundle on the boards is out of date.
+    #[must_use]
+    pub fn offered(&self) -> (u64, Option<u64>) {
+        (
+            self.current.public().prekey_id,
+            self.pool.first().map(|o| o.public().prekey_id),
+        )
+    }
+
     /// The root-signed creation time of the oldest one-time prekey offered, or `None` with none to
     /// offer. After [`PrekeyRing::maintain`], never older than one cadence (ADR-030 P-1).
     #[must_use]
