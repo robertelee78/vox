@@ -67,6 +67,8 @@ impl Proc {
             .env("VOX_DATA_DIR", dir)
             .env("VOX_CONFIG_DIR", dir.join("cfg"))
             .env_remove("VOX_ROOM")
+            // A harness session running this proof names its own node here; never this run's.
+            .env_remove("VOX_NODE")
             .env_remove("VOX_IDENTITY_PASSPHRASE")
             .stdin(if stdin.is_some() {
                 Stdio::piped()
@@ -185,6 +187,8 @@ fn vox_as(
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env("VOX_IDENTITY_PASSPHRASE", identity)
         .env_remove("VOX_ROOM")
+        // A harness session running this proof names its own node here; never this run's.
+        .env_remove("VOX_NODE")
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
@@ -301,6 +305,8 @@ sys.stdout.write("\nPROMPTED %s EXIT %d\n" % (sent, os.waitstatus_to_exitcode(st
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env_remove("VOX_IDENTITY_PASSPHRASE")
         .env_remove("VOX_ROOM")
+        // A harness session running this proof names its own node here; never this run's.
+        .env_remove("VOX_NODE")
         .output()
         .unwrap_or_else(|e| panic!("APPARATUS: cannot run the pty driver: {e}"));
     assert!(
