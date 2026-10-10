@@ -4245,9 +4245,12 @@ pub struct Node {
     /// key-package since it unlocked: a batch retried whole posts each such key once, never again
     /// (a posted package cannot be taken back, and each new one names a fresh one-time prekey).
     packages_posted: BTreeSet<(Digest32, Digest32, Digest32)>,
-    /// The prekeys this node offers changed since its records were last renewed: the renewal
-    /// pushes them to the members connected now, not only to its own board and the anchors.
-    prekeys_changed: bool,
+    /// Rooms whose records are to be renewed because the prekeys this node offers changed: their
+    /// renewal pushes them to the members connected now, not only to its own board and the anchors.
+    prekeys_changed: BTreeSet<Digest32>,
+    /// Per room: the `timestamp_ms` of the records this node last put on its own board. A board
+    /// takes a changed record only [`crate::nat::store::MIN_CHANGE_MS`] after the one it holds.
+    records_published_at: BTreeMap<Digest32, u64>,
     /// Per `(room, member)`: the history batch in flight, as the keys not yet answered and
     /// whether the batch fell short (a key refused, or not all of it written). The history is
     /// recorded as delivered only once every key of a whole batch was taken (V210-88).
@@ -4703,7 +4706,8 @@ impl Node {
             one_time_waits: BTreeMap::new(),
             signed_said: BTreeSet::new(),
             packages_posted: BTreeSet::new(),
-            prekeys_changed: false,
+            prekeys_changed: BTreeSet::new(),
+            records_published_at: BTreeMap::new(),
             history_in_flight: BTreeMap::new(),
             delivery_epoch: 0,
             record_seq: BTreeMap::new(),
@@ -6636,6 +6640,7 @@ impl Node {
         self.arm_record_renewal(channel_id);
         let seq = self.next_record_seq(channel_id);
         let stamp = self.record_timestamp(channel_id);
+        self.records_published_at.insert(*channel_id, stamp);
         let Some(profile) = self.profile.as_ref() else {
             return;
         };
@@ -10693,8 +10698,8 @@ impl Node {
         // here and to the anchors, it reached a connected sender at its next sync, up to 30 s on.
         // The room's ports are raised, as for a newcomer (`note_new_members`): the outbound setup
         // offers each peer's board the records it lacks.
-        let push = std::mem::take(&mut self.prekeys_changed);
         for room in due {
+            let push = self.prekeys_changed.remove(&room);
             self.records_renew_at.remove(&room);
             crate::node::status::SyncBook::note_renewal(&self.sync_book);
             self.publish_channel_locally(&room).await;
@@ -10713,6 +10718,7 @@ impl Node {
         let open = &self.channels;
         self.records_renew_at
             .retain(|room, _| open.contains_key(room));
+        self.prekeys_changed.retain(|room| open.contains_key(room));
     }
 
     /// Arm `room`'s next renewal at half its records' lifetime from now.
@@ -13416,10 +13422,19 @@ impl Node {
         // to an hour away; the tick coalesces a burst of consumes into one republish.
         if republish {
             drop(ring);
-            for at in self.records_renew_at.values_mut() {
-                *at = now;
+            // **Not sooner than a board takes it.** A board refuses a changed record less than
+            // `MIN_CHANGE_MS` after the one it holds, and nothing republishes after the refusal
+            // until the prekeys change again: a second consume within a second of the first left
+            // the bundle that names a spent one-time prekey on every board, and a sender's next
+            // key to this node waited out its 30 s bound for one that never came.
+            for (room, at) in &mut self.records_renew_at {
+                let earliest = self
+                    .records_published_at
+                    .get(room)
+                    .map_or(0, |t| t.saturating_add(crate::nat::store::MIN_CHANGE_MS));
+                *at = now.max(earliest);
+                self.prekeys_changed.insert(*room);
             }
-            self.prekeys_changed = true;
         }
     }
 
