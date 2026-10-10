@@ -86,6 +86,9 @@
 //! A session started in a mapped directory whose room's host is gone is told the join is under way,
 //! then, on a later turn, why it could not join, though that turn tries again. Mutant: the retry's
 //! "joining" overwrites the failure before the turn reads it.
+//! A headless run (`claude -p`) started in a mapped directory has its node join the room (RB-3 has
+//! no headless exception) and opens no Session there (SE-1). Mutant: a headless run skips the join
+//! with its Session (the node never joins).
 //!
 //! Not proved here, and stated rather than implied: that a harness actually
 //! *shows* the model what it injects. The probe could not confirm it because this
@@ -3111,6 +3114,78 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
             && told.contains(&format!("could not join room {ghost_room}")),
         "PRODUCT: the session must be told the join is under way, then why it failed: first \
          {first_try:?}, later {told:?}"
+    );
+
+    // (7) A headless run (`claude -p`) started in a mapped directory: its node joins the room
+    // (RB-3 has no headless exception), and the run opens no Session there (SE-1).
+    let (ok, _, err) = hook(
+        &alice.data,
+        &alice.cfg,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "headless",
+        ],
+        "headless passphrase",
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's fourth `vox room create` failed: {err}"
+    );
+    let (_, listed, _) = hook(&alice.data, &alice.cfg, &["room", "list"], "");
+    let fourth = listed
+        .lines()
+        .find(|l| l.contains("headless"))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_default()
+        .to_owned();
+    let headless_repo = tmp.path().join("headless-repo");
+    std::fs::create_dir_all(&headless_repo).expect("APPARATUS: cannot make a repository directory");
+    let mut text = std::fs::read_to_string(&map).expect("APPARATUS: cannot read the room map");
+    text.push_str(&format!(
+        "\nrepo {}\n    room       {}\n    passphrase headless passphrase\n",
+        headless_repo.display(),
+        alice.link(&fourth)
+    ));
+    std::fs::write(&map, text).expect("APPARATUS: cannot write the room map");
+    let run = "99999999-aaaa-4bbb-8ccc-000000000009";
+    let payload = format!(
+        r#"{{"session_id":"{run}","hook_event_name":"UserPromptSubmit","cwd":"{}","prompt":"hi","transcript_path":"/tmp/t.jsonl"}}"#,
+        headless_repo.display()
+    );
+    let headless = [("CLAUDE_CODE_ENTRYPOINT", "sdk-cli")];
+    let (ok, told, err) = hook_env(
+        &data,
+        &cfg,
+        &["agent", "hook", "--node", "default"],
+        &payload,
+        &headless,
+    );
+    assert!(
+        ok,
+        "PRODUCT: the headless run's hook must exit 0; it said {told}{err}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(540);
+    while !rooms().contains(&fourth) {
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: a headless run started in a directory mapped to room {fourth} must have its \
+             node join that room (ADR-029 RB-3); within 540 s `vox room list` said {:?}; the run's \
+             hook was told {told:?}",
+            rooms()
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    std::thread::sleep(Duration::from_secs(3));
+    let listed = sessions(&fourth);
+    eprintln!("[proof] (7) the headless run's node joined {fourth}; its Sessions: {listed:?}");
+    assert!(
+        !listed.iter().any(|r| r["id"] == run),
+        "PRODUCT: a headless run must get no Session (ADR-029 SE-1); room {fourth} lists \
+         {listed:?}"
     );
 }
 

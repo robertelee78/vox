@@ -701,9 +701,10 @@ impl Router {
     }
 
     /// Open `reg`'s Session in its room (ADR-029 SE-1): at once when the node is a member, or once
-    /// a join from the room map (`join`) makes it one. A headless session gets none, and neither
-    /// does a hook run by hand, with no harness behind it. What a join under way says, for the
-    /// session.
+    /// a join from the room map (`join`) makes it one. A headless session gets none, but its node
+    /// still joins the room the map names (RB-3 has no headless exception: a `claude -p` in a bound
+    /// repo works in that room, though no Session shows it). A hook run by hand, with no harness
+    /// behind it, does neither. What a join under way says, for the session.
     async fn open_session(
         &self,
         node: &NodeName,
@@ -712,19 +713,21 @@ impl Router {
         join: Option<(String, Zeroizing<String>)>,
     ) -> Option<String> {
         let room_b32 = reg.room.as_ref()?;
-        if !reg.interactive || reg.harness == "unknown" {
+        if reg.harness == "unknown" {
             return None;
         }
         let room = vox_core::node::link::b32_decode(room_b32, "room").ok()?;
-        let opening = vox_core::node::sessions::Opening {
+        let opening = reg.interactive.then(|| vox_core::node::sessions::Opening {
             id: reg.session.clone(),
             harness: reg.harness.clone(),
             name: reg.name.clone(),
-        };
+        });
         let member = handle.view().channels.iter().any(|c| c.channel_id == room);
         let joins = Arc::clone(lock(&self.inner.joins).entry(node.clone()).or_default());
         if member {
             joins.set_status(room_b32, None);
+            // A headless run joined and is in: it opens no Session.
+            let opening = opening?;
             if let Err(e) = vox_core::node::sessions::open_when_member(handle, room, &opening).await
             {
                 return Some(format!(
