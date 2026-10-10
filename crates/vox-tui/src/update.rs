@@ -928,6 +928,15 @@ pub fn run(check_only: bool, rollback: bool) -> Result<(), AppError> {
             "vox {current} is current (the newest {channel} release is {})",
             release.version_text
         );
+        // **An update still updates** (decider, v0.4.2): with nothing newer, what an update
+        // refreshes is refreshed on the vox in place: completions and the agent skill pack.
+        // `--check` changes nothing.
+        if !check_only {
+            if let Ok((install_dir, _)) = owned(installed, "") {
+                run_shell_setup(&install_dir.join(ACTIVE_NAME));
+                println!("vox {current} is current; {}", skill_said());
+            }
+        }
         return Ok(());
     }
     println!(
@@ -1208,6 +1217,27 @@ fn run_shell_setup(active: &Path) {
         Err(_) => println!(
             "         note: run `vox shell-setup` to refresh completions and the agent skill"
         ),
+    }
+}
+
+/// Where the agent skill pack is now, as a person reads it: the harnesses here whose skills
+/// folder holds it, read from disk after the refresh.
+fn skill_said() -> String {
+    if std::env::var_os("VOX_NO_SKILL_INSTALL").is_some_and(|v| !v.is_empty()) {
+        return "the agent skill was left as it is (VOX_NO_SKILL_INSTALL is set)".to_owned();
+    }
+    let have: Vec<&str> = crate::skill_pack::HARNESSES
+        .iter()
+        .filter(|h| {
+            crate::skill_pack::pack_dir(h.key).is_some_and(|d| d.join("SKILL.md").is_file())
+        })
+        .map(|h| h.name)
+        .collect();
+    if have.is_empty() {
+        "no harness here has the agent skill: Claude Code, Codex and OpenCode were not found"
+            .to_owned()
+    } else {
+        format!("the agent skill is installed for {}", have.join(", "))
     }
 }
 

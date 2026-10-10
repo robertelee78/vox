@@ -877,6 +877,64 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
         ));
     }
 
+    // ---- an update with nothing newer still updates (decider, v0.4.2) ---------------------
+    // The release serves this very version: `vox update --check` changes nothing, and `vox
+    // update` refreshes what an update refreshes on the vox in place, here the agent skill pack
+    // for Claude Code (its settings folder, no pack yet), and says so. Mutant: bundle::update's
+    // "is current" branch without its refresh; red as PRODUCT, no pack.
+    {
+        let id = "bundle.a_current_update_refreshes_the_agent_skill_pack";
+        let current_tree = tmpdir();
+        bundle_release_of(
+            current_tree.path(),
+            VERSION,
+            Path::new(VOX),
+            &[("stable", None)],
+        );
+        match release_server::serve(current_tree.path()) {
+            Err(why) => claims.push(blocked(id, format!("APPARATUS: the release server: {why}"))),
+            Ok(current_server) => {
+                let tmp = tmpdir();
+                let home = tmp.path();
+                let link = bundle_install(home, Some("stable"));
+                std::fs::create_dir_all(home.join(".claude"))
+                    .unwrap_or_else(|e| panic!("APPARATUS: a harness folder: {e}"));
+                let mut env = base;
+                env[0] = ("VOX_TEST_RELEASE_BASE", current_server.base.as_str());
+                let pack = home.join(".claude/skills/vox-agent-comms/SKILL.md");
+                let check = vox(&link, home, &["update", "--check"], &env);
+                let after_check = pack.is_file();
+                let out = vox(&link, home, &["update"], &env);
+                let text = said(&out);
+                let current = format!("Vox {VERSION} is current");
+                let refreshed = format!(
+                    "Vox {VERSION} is current; the agent skill is installed for Claude Code"
+                );
+                claims.push(claim(
+                    id,
+                    check.status.success()
+                        && !after_check
+                        && out.status.success()
+                        && text.contains(&current)
+                        && text.contains(&refreshed)
+                        && pack.is_file()
+                        && reports(&link) == format!("vox {VERSION}"),
+                    format!(
+                        "with Vox {VERSION} current: `vox update --check` (exit_ok={}) left a pack: \
+                         {after_check}, saying {:?}; `vox update` (exit_ok={}) left {} there: {}, \
+                         saying {text:?}; wanted {refreshed:?}",
+                        check.status.success(),
+                        said(&check),
+                        out.status.success(),
+                        pack.display(),
+                        pack.is_file()
+                    ),
+                ));
+                receipts.insert(id.into(), text);
+            }
+        }
+    }
+
     // ---- refusals: nothing in the install changes -----------------------------------------
     for (id, channel, extra, want) in [
         (
