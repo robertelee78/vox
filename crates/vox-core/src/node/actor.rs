@@ -4245,6 +4245,9 @@ pub struct Node {
     /// key-package since it unlocked: a batch retried whole posts each such key once, never again
     /// (a posted package cannot be taken back, and each new one names a fresh one-time prekey).
     packages_posted: BTreeSet<(Digest32, Digest32, Digest32)>,
+    /// The prekeys this node offers changed since its records were last renewed: the renewal
+    /// pushes them to the members connected now, not only to its own board and the anchors.
+    prekeys_changed: bool,
     /// Per `(room, member)`: the history batch in flight, as the keys not yet answered and
     /// whether the batch fell short (a key refused, or not all of it written). The history is
     /// recorded as delivered only once every key of a whole batch was taken (V210-88).
@@ -4700,6 +4703,7 @@ impl Node {
             one_time_waits: BTreeMap::new(),
             signed_said: BTreeSet::new(),
             packages_posted: BTreeSet::new(),
+            prekeys_changed: false,
             history_in_flight: BTreeMap::new(),
             delivery_epoch: 0,
             record_seq: BTreeMap::new(),
@@ -10683,12 +10687,27 @@ impl Node {
             .filter(|(room, at)| **at <= now && self.channels.contains_key(*room))
             .map(|(room, _)| *room)
             .collect();
+        // **A changed bundle goes to the members connected now** (ADR-030 P-3). A sender reads a
+        // member's bundle off its own board and never names a one-time prekey twice, so until the
+        // new bundle reaches it, the sender's next key to this node waits for it. Published only
+        // here and to the anchors, it reached a connected sender at its next sync, up to 30 s on.
+        // The room's ports are raised, as for a newcomer (`note_new_members`): the outbound setup
+        // offers each peer's board the records it lacks.
+        let push = std::mem::take(&mut self.prekeys_changed);
         for room in due {
             self.records_renew_at.remove(&room);
             crate::node::status::SyncBook::note_renewal(&self.sync_book);
             self.publish_channel_locally(&room).await;
             self.publish_channel_to_anchors(&room, PublishCause::Renewal)
                 .await;
+            if push {
+                for ((port_room, _), port) in &mut self.ports {
+                    if *port_room == room {
+                        port.raise();
+                    }
+                }
+                self.note_local_append(&room);
+            }
         }
         // A room closed since it was armed is not renewed.
         let open = &self.channels;
@@ -13400,6 +13419,7 @@ impl Node {
             for at in self.records_renew_at.values_mut() {
                 *at = now;
             }
+            self.prekeys_changed = true;
         }
     }
 

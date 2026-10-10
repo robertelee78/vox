@@ -33,7 +33,9 @@
 //!    Session of alice's in two rooms, alice gives carol drive (`vox trust drive`): carol is owed
 //!    alice's drive key in both rooms at once, each as a key-package in that room's log. Carol's
 //!    own `vox status` says how many one-time prekeys her node has used: exactly two more. Two
-//!    packages naming one prekey use one, and the second is opened as a replay, last-resort.
+//!    packages naming one prekey use one, and the second is opened as a replay, last-resort. And
+//!    within 15 s of the grant: the second package waits only for carol's next bundle, which her
+//!    node pushes to the members connected to it as soon as its prekeys change.
 //!
 //! ## The staging
 //! - Every `vox` is the shipped binary in a scratch `VOX_DATA_DIR`/`VOX_CONFIG_DIR`; every step a
@@ -64,7 +66,9 @@
 //!   file arm in `crates/vox-tui/src/host.rs`. The petabyte is accepted: red PRODUCT.
 //! - **A package's one-time prekey not noted** (claim 5): the `refused_otps.note` after the seal
 //!   in `post_key_package` in `crates/vox-core/src/node/actor.rs` removed. Both packages name one
-//!   prekey, and carol's node uses one: red PRODUCT.
+//!   prekey, and carol's node uses one: red PRODUCT. **A changed bundle not pushed** (claim 5):
+//!   the port raise in `renew_records_if_due` removed. The second package waits out the 30 s
+//!   bound: red PRODUCT.
 //! - **No rotation on losing drive** (claim 2): `rotate_drive_if_lost` in
 //!   `crates/vox-core/src/node/channel.rs` returns the lost members without changing the key. Bob's
 //!   node opens the entries written after his downgrade: red PRODUCT.
@@ -937,9 +941,11 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     );
     assert!(ok, "PRODUCT: `vox trust drive` of carol failed: {o}{e}");
     // Both packages taken; then ten seconds more for any further use to show.
+    let granted = Instant::now();
     let _ = until(Duration::from_secs(90), || {
         consumed(&carol).is_some_and(|n| n >= base + 2)
     });
+    let took = granted.elapsed();
     std::thread::sleep(Duration::from_secs(10));
     let used = consumed(&carol).unwrap_or(base).saturating_sub(base);
     let alice_said =
@@ -950,7 +956,7 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         .collect();
     eprintln!(
         "[proof] claim 5: carol's node used {used} one-time prekeys for alice's drive keys in two \
-         rooms; alice's node said carol was away: {away:?}"
+         rooms, the second {took:?} after the grant; alice's node said carol was away: {away:?}"
     );
     assert!(
         used == 2 || !away.is_empty(),
@@ -961,5 +967,12 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         away.is_empty(),
         "APPARATUS (precondition unmet): carol was not connected to alice when her keys went, so \
          they went to her signed prekey as a member away's do: {away:?}"
+    );
+    // Drive shows within a few seconds: the second key waited only for carol's next bundle,
+    // which her node pushes to alice's at once, never the 30 s bound.
+    assert!(
+        took < Duration::from_secs(15),
+        "PRODUCT: carol's node took alice's second drive key {took:?} after the grant: it waited \
+         for carol's next bundle to reach alice, which should take seconds, not the 30 s bound"
     );
 }
