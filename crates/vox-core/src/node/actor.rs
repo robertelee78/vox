@@ -4238,6 +4238,13 @@ pub struct Node {
     /// Per `(room, member)`: since when, connected, its key has waited for a fresh one-time prekey
     /// ([`ONE_TIME_WAIT_MS`]).
     one_time_waits: BTreeMap<(Digest32, Digest32), u64>,
+    /// Per `(room, member)`: a key for it went to its signed prekey, and that was said; said again
+    /// only after a key has gone to one of its one-time prekeys since (ADR-030 S-5).
+    signed_said: BTreeSet<(Digest32, Digest32)>,
+    /// `(room, member, skdm_ref)` of every key this node has posted to a room's log as a
+    /// key-package since it unlocked: a batch retried whole posts each such key once, never again
+    /// (a posted package cannot be taken back, and each new one names a fresh one-time prekey).
+    packages_posted: BTreeSet<(Digest32, Digest32, Digest32)>,
     /// Per `(room, member)`: the history batch in flight, as the keys not yet answered and
     /// whether the batch fell short (a key refused, or not all of it written). The history is
     /// recorded as delivered only once every key of a whole batch was taken (V210-88).
@@ -4691,6 +4698,8 @@ impl Node {
             deliveries: BTreeMap::new(),
             key_waiting: BTreeMap::new(),
             one_time_waits: BTreeMap::new(),
+            signed_said: BTreeSet::new(),
+            packages_posted: BTreeSet::new(),
             history_in_flight: BTreeMap::new(),
             delivery_epoch: 0,
             record_seq: BTreeMap::new(),
@@ -10399,7 +10408,9 @@ impl Node {
         if let Some(delivery) = self.deliveries.get(&id).filter(|d| d.key == key_ref) {
             return Ok(delivery.frame.clone());
         }
-        let bundle = self.delivery_bundle_waiting(channel_id, target).await?;
+        let bundle = self
+            .delivery_bundle_waiting(channel_id, target, false)
+            .await?;
         let ctx = {
             let shared = self.channels.get(channel_id).map(Arc::clone).ok_or(None)?;
             let channel = shared.lock().await;
@@ -10491,17 +10502,21 @@ impl Node {
     /// for a one-time prekey no delivery has named (ADR-030 P-3). While `target` is connected that
     /// wait is bounded by [`ONE_TIME_WAIT_MS`]; past it the delivery opens on the signed prekey
     /// ([`Self::delivery_bundle_or_signed`]), and the person is told once, with what it costs (S-5).
-    /// A member not connected cannot take the key anyway, and starts no clock.
+    /// A member not connected starts no clock: a frame cannot reach it anyway, so it waits; a
+    /// key-package (`offline_to_signed`) is for a member the log reaches while it is away, which
+    /// cannot republish meanwhile, so it goes to the signed prekey at once, said once.
     async fn delivery_bundle_waiting(
         &mut self,
         channel_id: &Digest32,
         target: Digest32,
+        offline_to_signed: bool,
     ) -> Result<crate::identity::keyagreement::PrekeyBundlePublic, Option<prekeys::BundleWait>>
     {
         let pair = (*channel_id, target);
         let wait = match self.delivery_bundle(channel_id, target).await {
             Ok(bundle) => {
                 self.one_time_waits.remove(&pair);
+                self.signed_said.remove(&pair);
                 return Ok(bundle);
             }
             Err(wait @ prekeys::BundleWait::OneTimeSpent { .. }) => wait,
@@ -10511,31 +10526,43 @@ impl Node {
             .net
             .as_ref()
             .is_some_and(|n| n.manager().existing(&target).is_some());
-        if !connected {
+        let why = if connected {
+            let now = self.now_ms().get();
+            let since = *self.one_time_waits.entry(pair).or_insert(now);
+            if now.saturating_sub(since) < ONE_TIME_WAIT_MS {
+                return Err(Some(wait));
+            }
+            format!(
+                "no bundle naming a fresh one-time prekey arrived within {} s while it was \
+                 connected",
+                ONE_TIME_WAIT_MS / 1_000
+            )
+        } else {
             self.one_time_waits.remove(&pair);
-            return Err(Some(wait));
-        }
-        let now = self.now_ms().get();
-        let since = *self.one_time_waits.entry(pair).or_insert(now);
-        if now.saturating_sub(since) < ONE_TIME_WAIT_MS {
-            return Err(Some(wait));
-        }
+            if !offline_to_signed {
+                return Err(Some(wait));
+            }
+            "it is away, so it cannot publish a fresh one-time prekey before the log carries the \
+             key"
+            .to_owned()
+        };
         let bundle = self
             .delivery_bundle_or_signed(channel_id, target)
             .await
             .map_err(Some)?;
         self.one_time_waits.remove(&pair);
-        if let Some(net) = self.net.as_ref() {
-            net.manager().note(
-                target,
-                format!(
-                    "your key for it in room {} went to its signed prekey: no bundle naming a fresh \
-                     one-time prekey arrived within {} s while it was connected, so anyone who \
-                     copied that signed prekey before it rotates could read this key (ADR-030 S-5)",
-                    crate::node::network::short_id(*channel_id),
-                    ONE_TIME_WAIT_MS / 1_000
-                ),
-            );
+        if self.signed_said.insert(pair) {
+            if let Some(net) = self.net.as_ref() {
+                net.manager().note(
+                    target,
+                    format!(
+                        "your key for it in room {} went to its signed prekey: {why}, so anyone who \
+                         copied that signed prekey before it rotates could read this key (ADR-030 \
+                         S-5)",
+                        crate::node::network::short_id(*channel_id)
+                    ),
+                );
+            }
         }
         Ok(bundle)
     }
@@ -12092,12 +12119,22 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return false;
         };
+        // Posted already: on the log, and taken from there (a batch retried whole).
+        let posted_as = (
+            *channel_id,
+            target,
+            crate::governance::membership::skdm_ref(skdm),
+        );
+        if self.packages_posted.contains(&posted_as) {
+            return true;
+        }
         let Ok(ctx) = shared.lock().await.join_context() else {
             return false;
         };
         // Never a stale bundle, nor a one-time prekey already named or refused (ADR-030 P-2, P-3).
-        // A member reached through the log is not online to republish, so it does not wait.
-        let Ok(bundle) = self.delivery_bundle_or_signed(channel_id, target).await else {
+        // A burst waits for a fresh one-time prekey as a burst of frames does, at most 30 s while
+        // the member is connected; a member away goes to its signed prekey at once (S-5).
+        let Ok(bundle) = self.delivery_bundle_waiting(channel_id, target, true).await else {
             return false;
         };
         let package = {
@@ -12127,6 +12164,16 @@ impl Node {
                 .is_ok()
         };
         if posted {
+            // A one-time prekey is named by one delivery only, frame or package (ADR-030 P-3): a
+            // second naming it would be opened as a replay, last-resort-grade.
+            if let Some(prekey_id) = package
+                .initial_message()
+                .ok()
+                .and_then(|init| init.one_time_prekey_id)
+            {
+                self.refused_otps.note(target, prekey_id);
+            }
+            self.packages_posted.insert(posted_as);
             // An entry like any other: it goes out on the next push.
             self.note_local_append(channel_id);
         }
@@ -13405,6 +13452,8 @@ impl Node {
         self.deliveries.clear();
         self.key_waiting.clear();
         self.one_time_waits.clear();
+        self.signed_said.clear();
+        self.packages_posted.clear();
         // And the watchers still running answer for what is no longer in flight.
         self.delivery_epoch = self.delivery_epoch.wrapping_add(1);
         self.history_in_flight.clear();
