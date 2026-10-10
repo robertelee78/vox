@@ -5,15 +5,23 @@ It records every request a harness sends, as one JSON line, and answers each tur
 It speaks just enough of Anthropic Messages (Claude Code), OpenAI Responses (Codex) and
 OpenAI Chat Completions (OpenCode), all streamed, for a harness to finish its turn.
 
-argv: <port file> <request log> [--run-status]. It binds 127.0.0.1:0 and writes the
-port it got to the port file once it listens.
+argv: <port file> <request log> [--run-status] [--script <dir>]. It binds 127.0.0.1:0 and
+writes the port it got to the port file once it listens.
 
 With --run-status it plays a model that does what the agent skill's description says at the
 start of a session: when a turn offers a shell tool and the request carries the skill's
 `vox agent status --harness` instruction, it answers with one call of that tool running
 `vox agent status --harness <harness>`, the harness the endpoint names (Anthropic Messages:
 claude, OpenAI Responses: codex, Chat Completions: opencode); when the turn carries that call's result, it answers
-"VOX STATUS SAID:" and the result, word for word, so the harness prints it. Nothing else."""
+"VOX STATUS SAID:" and the result, word for word, so the harness prints it. Nothing else.
+
+With --script <dir> it plays a model following the skill's instructions one command at a time:
+when `<dir>/<harness>.cmds` holds lines and the turn offers a shell tool, it answers with one
+call of that tool per line, in order (each followed by `echo "[exit $?]"`), one call per
+request, the line chosen by how many results the turn already carries; once every line has a
+result, it answers "VOX RAN:" and each line with its result, under `### <n> $ <line>`, so the
+harness prints them, and writes the same to `<dir>/<harness>.ran`. The proof writes the
+`.cmds` file before the turn and removes it after."""
 import json
 import os
 import sys
@@ -21,10 +29,13 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT_FILE, LOG = sys.argv[1], sys.argv[2]
-RUN_STATUS = len(sys.argv) > 3 and sys.argv[3] == "--run-status"
+RUN_STATUS = "--run-status" in sys.argv[3:]
+SCRIPT = sys.argv[sys.argv.index("--script") + 1] if "--script" in sys.argv[3:] else None
 REPLY = "ok"
 TRIGGER = "vox agent status --harness"
 SAID = "VOX STATUS SAID:\n"
+RAN = "VOX RAN:\n"
+HARNESS = {"messages": "claude", "responses": "codex", "chat": "opencode"}
 
 
 def text_of(v):
@@ -38,30 +49,44 @@ def text_of(v):
     return ""
 
 
-def tool_result(body, kind):
-    """The text of the status call's result in this turn, or None."""
+def tool_results(body, kind):
+    """The text of every tool call's result this turn carries, in order."""
+    out = []
     if kind == "messages":
         for m in body.get("messages", []):
             c = m.get("content")
             if isinstance(c, list):
                 for part in c:
                     if isinstance(part, dict) and part.get("type") == "tool_result":
-                        return text_of(part.get("content"))
+                        out.append(text_of(part.get("content")))
     elif kind == "responses":
         for item in body.get("input", []) if isinstance(body.get("input"), list) else []:
             if isinstance(item, dict) and item.get("type", "").endswith("_call_output"):
-                return text_of(item.get("output"))
+                out.append(text_of(item.get("output")))
     else:
         for m in body.get("messages", []):
             if m.get("role") == "tool":
-                return text_of(m.get("content"))
-    return None
+                out.append(text_of(m.get("content")))
+    return out
 
 
-def shell_tool(body, kind):
-    """The turn's shell tool: (name, arguments for the status command), or None."""
-    harness = {"messages": "claude", "responses": "codex", "chat": "opencode"}[kind]
-    cmd = f"vox agent status --harness {harness}"
+def script_of(kind):
+    """The lines the proof gave this harness to run, or None."""
+    if SCRIPT is None:
+        return None
+    try:
+        with open(os.path.join(SCRIPT, HARNESS[kind] + ".cmds")) as f:
+            lines = [l.rstrip("\n") for l in f if l.strip()]
+    except OSError:
+        return None
+    return lines or None
+
+
+def shell_tool(body, kind, cmd=None):
+    """The turn's shell tool: (name, arguments running cmd, by default the status command), or
+    None."""
+    if cmd is None:
+        cmd = f"vox agent status --harness {HARNESS[kind]}"
     names = []
     for t in body.get("tools", []) or []:
         if not isinstance(t, dict):
@@ -77,20 +102,36 @@ def shell_tool(body, kind):
         if "shell" in names:
             return "shell", {"command": ["bash", "-lc", cmd]}
     if kind == "chat" and "bash" in names:
-        return "bash", {"command": cmd, "description": "Vox status"}
+        # A command may wait on the proof (up to ten minutes), past the tool's two-minute default.
+        return "bash", {"command": cmd, "description": "Vox status", "timeout": 600000}
     return None
 
 
 def plan(body, kind):
     """What this turn answers: ("text", words) or ("tool", name, arguments)."""
-    if not RUN_STATUS or not isinstance(body, dict):
+    if not isinstance(body, dict):
         return ("text", REPLY)
-    result = tool_result(body, kind)
-    if result is not None:
-        return ("text", SAID + result)
+    script = script_of(kind)
+    if script is not None:
+        results = tool_results(body, kind)
+        if len(results) < len(script):
+            tool = shell_tool(body, kind, script[len(results)] + '; echo "[exit $?]"')
+            if tool:
+                return ("tool",) + tool + (len(results),)
+            return ("text", REPLY)
+        ran = RAN + "".join(f"### {i} $ {c}\n{r}\n" for i, (c, r) in
+                            enumerate(zip(script, results)))
+        with open(os.path.join(SCRIPT, HARNESS[kind] + ".ran"), "w") as f:
+            f.write(ran)
+        return ("text", ran)
+    if not RUN_STATUS:
+        return ("text", REPLY)
+    results = tool_results(body, kind)
+    if results:
+        return ("text", SAID + results[0])
     tool = shell_tool(body, kind)
     if tool and TRIGGER in json.dumps(body):
-        return ("tool",) + tool
+        return ("tool",) + tool + (0,)
     return ("text", REPLY)
 
 
@@ -161,7 +202,7 @@ class H(BaseHTTPRequestHandler):
             if act[0] == "tool":
                 sse(self, "content_block_start", {"type": "content_block_start", "index": 0,
                                                   "content_block": {"type": "tool_use",
-                                                                    "id": "toolu_status",
+                                                                    "id": f"toolu_{act[3]}",
                                                                     "name": act[1], "input": {}}})
                 sse(self, "content_block_delta", {"type": "content_block_delta", "index": 0,
                                                   "delta": {"type": "input_json_delta",
@@ -182,7 +223,7 @@ class H(BaseHTTPRequestHandler):
         elif p.endswith("/responses"):
             act = plan(body, "responses")
             if act[0] == "tool":
-                item = {"type": "function_call", "id": "fc_status", "call_id": "call_status",
+                item = {"type": "function_call", "id": f"fc_{act[3]}", "call_id": f"call_{act[3]}",
                         "name": act[1], "arguments": json.dumps(act[2]), "status": "completed"}
             else:
                 item = {"type": "message", "id": "m1", "role": "assistant",
@@ -201,7 +242,7 @@ class H(BaseHTTPRequestHandler):
             act = plan(body, "chat")
             if act[0] == "tool":
                 delta = {"role": "assistant", "tool_calls": [{
-                    "index": 0, "id": "call_status", "type": "function",
+                    "index": 0, "id": f"call_{act[3]}", "type": "function",
                     "function": {"name": act[1], "arguments": json.dumps(act[2])}}]}
                 finish = "tool_calls"
             else:
