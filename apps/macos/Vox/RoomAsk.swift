@@ -28,7 +28,8 @@ struct RoomAskBanner: View {
                                 }
                             }
                         }
-                        .accessibilityElement(children: .combine)
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel(said.said.joined(separator: " "))
                         .accessibilityIdentifier(said.done ? "room-ask-said" : "room-ask-failed")
                         Spacer()
                         Button("Dismiss") { model.clearRoomAskSaid() }
