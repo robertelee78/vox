@@ -45,6 +45,8 @@ const T_METRICS: u64 = 4008;
 const T_DAEMON_STATUS: u64 = 4009;
 const T_SESSION_ENDED: u64 = 4010;
 const T_SESSION_REGISTERED: u64 = 4011;
+const T_ROOM_ASKS: u64 = 4012;
+const T_ROOM_ANSWER: u64 = 4013;
 /// 4020–4029: the Session activity sink (ADR-029 §2, §3).
 const T_SESSION_ANSWER: u64 = 4020;
 
@@ -61,6 +63,9 @@ const T_REQ_STOP: u64 = 4108;
 const T_REQ_SESSION_REGISTER: u64 = 4109;
 const T_REQ_SESSION_ROOM: u64 = 4110;
 const T_REQ_UNKEEP: u64 = 4111;
+const T_REQ_ROOM_ASKS: u64 = 4112;
+const T_REQ_ROOM_BIND: u64 = 4113;
+const T_REQ_ROOM_DECLINE: u64 = 4114;
 /// 4120–4129: the Session activity sink (ADR-029 §2, §3).
 const T_REQ_SESSION_ACTIVITY: u64 = 4120;
 const T_REQ_SESSION_ASK: u64 = 4121;
@@ -238,6 +243,29 @@ pub enum DaemonRequest {
         session: String,
         /// The room, its id in base32.
         room: String,
+    },
+    /// The directories harness sessions started in that no room is bound to, and that the operator
+    /// has not said no for (ADR-029 RB-5): what Vox asks the person. Answered
+    /// [`DaemonFrame::RoomAsks`].
+    RoomAsks,
+    /// The person's answer to an ask: bind `dir` to the room `link` names, joined with
+    /// `passphrase` (ADR-029 RB-6). The daemon joins a node whose session asked, which checks the
+    /// passphrase; writes the room map, replacing what it held for `dir`; and puts every session
+    /// that asked there in the room. The passphrase is the person's, typed in the client, never
+    /// an agent's. Answered [`DaemonFrame::RoomAnswer`].
+    RoomBind {
+        /// The directory, absolute.
+        dir: String,
+        /// The room's link (`vox://…`).
+        link: String,
+        /// The room's passphrase; empty when it has none.
+        passphrase: Zeroizing<String>,
+    },
+    /// The person's no to an ask: `dir` is recorded in the room map as bound to no room (ADR-029
+    /// RB-7), and no session started there is asked again. Answered [`DaemonFrame::RoomAnswer`].
+    RoomDecline {
+        /// The directory, absolute.
+        dir: String,
     },
     /// The daemon's own status: answered [`DaemonFrame::Status`].
     Status,
@@ -439,6 +467,59 @@ pub struct DaemonStatus {
     pub panics: u64,
 }
 
+/// A directory harness sessions started in with no room bound to it (ADR-029 RB-5): what Vox asks
+/// the person, the sessions that wait on the answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomAsk {
+    /// The directory, absolute.
+    pub dir: String,
+    /// The sessions started there that work in no room.
+    pub sessions: Vec<AskingSession>,
+}
+
+impl RoomAsk {
+    /// What the ask says, the same in the app, the TUI and `vox agent status` (ADR-028 E-1):
+    /// "Claude Code in /opt/vox has no room".
+    #[must_use]
+    pub fn sentence(&self) -> String {
+        let mut who: Vec<&str> = Vec::new();
+        for s in &self.sessions {
+            let w = harness_words(&s.harness);
+            if !who.contains(&w) {
+                who.push(w);
+            }
+        }
+        let who = match who.as_slice() {
+            [] => "A session".to_owned(),
+            [one] => (*one).to_owned(),
+            [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        };
+        format!("{who} in {} has no room", self.dir)
+    }
+}
+
+/// A harness as a person names it: `claude` is Claude Code.
+#[must_use]
+pub fn harness_words(harness: &str) -> &str {
+    match harness {
+        "claude" => "Claude Code",
+        "codex" => "Codex",
+        "opencode" => "OpenCode",
+        other => other,
+    }
+}
+
+/// A session waiting on a [`RoomAsk`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskingSession {
+    /// Its node.
+    pub node: NodeName,
+    /// The harness's session id.
+    pub session: String,
+    /// `claude`, `codex` or `opencode`.
+    pub harness: String,
+}
+
 /// What the daemon sends on a connection before a `Use` takes it to the node level, and in answer to
 /// a [`DaemonRequest`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -499,6 +580,16 @@ pub enum DaemonFrame {
     /// The answer to a [`DaemonRequest::SessionAsk`]: what the hook gives its harness, or
     /// nothing when the harness settled the request without Vox.
     SessionAnswer(Option<String>),
+    /// What a [`DaemonRequest::RoomAsks`] asked for: one per directory, oldest session first.
+    RoomAsks(Vec<RoomAsk>),
+    /// What a [`DaemonRequest::RoomBind`] or [`DaemonRequest::RoomDecline`] did: whether it was
+    /// done, and what to tell the person (what was done, or why not).
+    RoomAnswer {
+        /// It was done.
+        done: bool,
+        /// One line per thing said.
+        said: Vec<String>,
+    },
     /// The daemon's status.
     Status(DaemonStatus),
     /// Prometheus text (answering [`DaemonRequest::Metrics`]).
@@ -839,6 +930,20 @@ impl Opening {
                     e.text(join.as_ref().map_or("", |(link, _)| link.as_str()));
                     put_secret(&mut e, join.as_ref().map(|(_, p)| p));
                 }
+                DaemonRequest::RoomAsks => {
+                    e.array(1).uint(T_REQ_ROOM_ASKS);
+                }
+                DaemonRequest::RoomBind {
+                    dir,
+                    link,
+                    passphrase,
+                } => {
+                    e.array(4).uint(T_REQ_ROOM_BIND).text(dir).text(link);
+                    put_secret(&mut e, Some(passphrase));
+                }
+                DaemonRequest::RoomDecline { dir } => {
+                    e.array(2).uint(T_REQ_ROOM_DECLINE).text(dir);
+                }
                 DaemonRequest::Status => {
                     e.array(1).uint(T_REQ_STATUS);
                 }
@@ -982,6 +1087,15 @@ impl Opening {
                     join: (!link.is_empty()).then(|| (link, pass.unwrap_or_default())),
                 })
             }
+            (T_REQ_ROOM_ASKS, 1) => Opening::Daemon(DaemonRequest::RoomAsks),
+            (T_REQ_ROOM_BIND, 4) => Opening::Daemon(DaemonRequest::RoomBind {
+                dir: text(&mut d, "ipc room bind dir")?,
+                link: text(&mut d, "ipc room bind link")?,
+                passphrase: secret(&mut d, "ipc room bind passphrase")?.unwrap_or_default(),
+            }),
+            (T_REQ_ROOM_DECLINE, 2) => Opening::Daemon(DaemonRequest::RoomDecline {
+                dir: text(&mut d, "ipc room decline dir")?,
+            }),
             (T_REQ_STATUS, 1) => Opening::Daemon(DaemonRequest::Status),
             (T_REQ_METRICS, 1) => Opening::Daemon(DaemonRequest::Metrics),
             (T_REQ_SUBSCRIBE, 1) => Opening::Daemon(DaemonRequest::Subscribe),
@@ -1083,6 +1197,22 @@ impl DaemonFrame {
                     .uint(T_SESSION_ANSWER)
                     .text(a.as_deref().unwrap_or(""));
             }
+            DaemonFrame::RoomAsks(asks) => {
+                e.array(2).uint(T_ROOM_ASKS).array(asks.len());
+                for a in asks {
+                    e.array(2).text(&a.dir).array(a.sessions.len());
+                    for s in &a.sessions {
+                        e.array(3)
+                            .text(s.node.as_str())
+                            .text(&s.session)
+                            .text(&s.harness);
+                    }
+                }
+            }
+            DaemonFrame::RoomAnswer { done, said } => {
+                e.array(3).uint(T_ROOM_ANSWER).uint(u64::from(*done));
+                put_texts(&mut e, said);
+            }
             DaemonFrame::Status(s) => {
                 e.array(6)
                     .uint(T_DAEMON_STATUS)
@@ -1181,6 +1311,34 @@ impl DaemonFrame {
                     panics,
                 })
             }
+            (T_ROOM_ASKS, 2) => {
+                let n = d.array().map_err(malformed("ipc room asks"))?;
+                let mut asks = Vec::with_capacity(n.min(256));
+                for _ in 0..n {
+                    if d.array().map_err(malformed("ipc room ask"))? != 2 {
+                        return Err(Error::MalformedIpc("ipc room ask"));
+                    }
+                    let dir = text(&mut d, "ipc room ask dir")?;
+                    let m = d.array().map_err(malformed("ipc room ask sessions"))?;
+                    let mut sessions = Vec::with_capacity(m.min(256));
+                    for _ in 0..m {
+                        if d.array().map_err(malformed("ipc room ask session"))? != 3 {
+                            return Err(Error::MalformedIpc("ipc room ask session"));
+                        }
+                        sessions.push(AskingSession {
+                            node: name(&mut d, "ipc room ask node")?,
+                            session: text(&mut d, "ipc room ask session")?,
+                            harness: text(&mut d, "ipc room ask harness")?,
+                        });
+                    }
+                    asks.push(RoomAsk { dir, sessions });
+                }
+                DaemonFrame::RoomAsks(asks)
+            }
+            (T_ROOM_ANSWER, 3) => DaemonFrame::RoomAnswer {
+                done: flag(&mut d, "ipc room answer done")?,
+                said: texts(&mut d, "ipc room answer said")?,
+            },
             (T_METRICS, 2) => DaemonFrame::Metrics(text(&mut d, "ipc metrics")?),
             (T_DAEMON_EVENT, 2) => {
                 let n = d.array().map_err(malformed("ipc daemon event"))?;

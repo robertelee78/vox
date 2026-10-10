@@ -855,6 +855,141 @@ impl Router {
         })
     }
 
+    /// Bind `dir` to the room `link` names, the person's answer to its ask (ADR-029 RB-6): what
+    /// `vox room join <link> --node <node> --bind <dir>` does, from the app. A node whose session
+    /// asked joins the room, which checks the passphrase, unless it holds the room already; the room
+    /// map then binds `dir`, replacing a no or another room; and every session that asked there is
+    /// put in the room, as `vox agent room` would, each node joining it as the map's block says
+    /// (RB-3).
+    async fn room_bind(&self, dir: &str, link: &str, passphrase: Zeroizing<String>) -> DaemonFrame {
+        let no = |why: String| DaemonFrame::RoomAnswer {
+            done: false,
+            said: vec![why],
+        };
+        let parsed = match vox_core::node::link::InviteLink::parse(link) {
+            Ok(p) => p,
+            Err(why) => return no(format!("that is not a room link (vox://…): {why}")),
+        };
+        let account = self.inner.account.clone();
+        let asks = tokio::task::spawn_blocking(move || crate::room_ask::asks(&account))
+            .await
+            .unwrap_or_default();
+        let Some(ask) = asks.into_iter().find(|a| a.dir == dir) else {
+            return no(format!(
+                "no session started in {dir} is waiting for a room now; nothing was changed"
+            ));
+        };
+        let room_b32 = vox_core::node::link::b32_encode(&parsed.channel_id);
+        let short: String = room_b32.chars().take(12).collect();
+        let Some((node, handle)) = ask
+            .sessions
+            .iter()
+            .find_map(|s| self.handle_of(&s.node).map(|h| (s.node.clone(), h)))
+        else {
+            return no(format!(
+                "no node of the sessions in {dir} is attached, so the passphrase cannot be                  checked; nothing was changed"
+            ));
+        };
+        let mut said = Vec::new();
+        let member = handle
+            .view()
+            .channels
+            .iter()
+            .any(|c| c.channel_id == parsed.channel_id);
+        if !member {
+            match handle
+                .apply(vox_core::node::api::NodeCommand::JoinChannel {
+                    link: link.to_owned(),
+                    passphrase: vox_core::node::api::Secret::new(passphrase.as_bytes().to_vec()),
+                })
+                .await
+            {
+                vox_core::node::api::Outcome::Done => {
+                    said.push(format!("node {node} joined room {short}"));
+                }
+                other => {
+                    return no(format!(
+                        "node {node} could not join room {short}, so {dir} was not bound: {other}"
+                    ))
+                }
+            }
+        }
+        // Said before it is written (ADR-028 E-5): who can read what is saved.
+        let map = crate::room_map::path(&self.inner.account.data_root);
+        said.push(format!(
+            "every agent session started in {dir}, from any harness, is to work in room {short};              every node of this data root can read the room map {}, the passphrase included",
+            map.display()
+        ));
+        match crate::room_map::bind(
+            &self.inner.account.data_root,
+            std::path::Path::new(dir),
+            link,
+            &passphrase,
+        ) {
+            Ok(Some(was)) => said.push(format!(
+                "bound {dir}, replacing what the room map held for it: {was}"
+            )),
+            Ok(None) => said.push(format!("bound {dir}")),
+            Err(e) => return no(format!("{dir} was not bound: {e}")),
+        }
+        for s in &ask.sessions {
+            let label: String = s.session.chars().take(8).collect();
+            let who = crate::room_ask::harness_words(&s.harness);
+            let Ok(paths) = self.inner.account.node_paths(&s.node) else {
+                continue;
+            };
+            if crate::wake::store_room(&paths, &s.session, &room_b32).is_none() {
+                continue;
+            }
+            let joining = match (
+                self.handle_of(&s.node),
+                crate::wake::registration(&paths, &s.session),
+            ) {
+                (Some(h), Some(reg)) => {
+                    self.open_session(
+                        &s.node,
+                        &h,
+                        &reg,
+                        Some((link.to_owned(), passphrase.clone())),
+                    )
+                    .await
+                }
+                _ => None,
+            };
+            said.push(match joining {
+                Some(j) => format!("{who} session {label} now works in room {short}: {j}"),
+                None => format!("{who} session {label} now works in room {short}"),
+            });
+        }
+        DaemonFrame::RoomAnswer { done: true, said }
+    }
+
+    /// Record the person's no for `dir` (ADR-029 RB-7): a block whose room is `none`, so no
+    /// session started there is asked again, by the app or by its hook.
+    fn room_decline(&self, dir: &str) -> DaemonFrame {
+        let data_root = &self.inner.account.data_root;
+        match crate::room_map::decline(data_root, std::path::Path::new(dir)) {
+            Ok(true) => DaemonFrame::RoomAnswer {
+                done: true,
+                said: vec![format!(
+                    "{dir} is to stay tied to no room: no session started there is asked again; \
+                     remove its block from {} to be asked",
+                    crate::room_map::path(data_root).display()
+                )],
+            },
+            Ok(false) => DaemonFrame::RoomAnswer {
+                done: false,
+                said: vec![format!(
+                    "the room map names {dir} already; nothing was changed"
+                )],
+            },
+            Err(e) => DaemonFrame::RoomAnswer {
+                done: false,
+                said: vec![e.to_string()],
+            },
+        }
+    }
+
     /// Listen for drive input to `node`'s sessions ([`crate::drive`]) until the node detaches.
     fn serve_drive(
         &self,
@@ -2379,6 +2514,20 @@ impl Dispatch for Router {
                     detached,
                 }
             }
+            DaemonRequest::RoomAsks => {
+                let account = self.inner.account.clone();
+                DaemonFrame::RoomAsks(
+                    tokio::task::spawn_blocking(move || crate::room_ask::asks(&account))
+                        .await
+                        .unwrap_or_default(),
+                )
+            }
+            DaemonRequest::RoomBind {
+                dir,
+                link,
+                passphrase,
+            } => self.room_bind(&dir, &link, passphrase).await,
+            DaemonRequest::RoomDecline { dir } => self.room_decline(&dir),
             DaemonRequest::Status => DaemonFrame::Status(DaemonStatus {
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 pid: std::process::id(),

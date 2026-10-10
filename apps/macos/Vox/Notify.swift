@@ -11,6 +11,8 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     var open: ((String) -> Void)?
     /// Opens a Session's waiting request a notification is about: room, node, session, reference.
     var openRequest: ((String, String, String, String) -> Void)?
+    /// Opens a directory's room ask a notification is about.
+    var openAsk: ((String) -> Void)?
     /// Told whether Vox may notify, once macOS says: the status bar says when it may not.
     var allowed: ((Bool) -> Void)?
     private var asked = false
@@ -65,6 +67,28 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
 
     nonisolated static func waitingID(_ sessionKey: String) -> String { "waiting-\(sessionKey)" }
 
+    /// One notification for a directory with no room (ADR-029 RB-5): which harness, which
+    /// directory. Clicking it opens the ask.
+    func postRoomAsk(dir: String, sentence: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "Which room is this repo in?"
+        content.body = sentence
+        content.userInfo = ["ask": dir]
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: Notifier.roomAskID(dir), content: content,
+                                            trigger: nil)
+        UNUserNotificationCenter.current().add(request) { _ in }
+    }
+
+    /// A directory answered, or no longer asked about: its notification goes.
+    func withdrawRoomAsk(dir: String) {
+        let id = Notifier.roomAskID(dir)
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [id])
+        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [id])
+    }
+
+    nonisolated static func roomAskID(_ dir: String) -> String { "room-ask-\(dir)" }
+
     /// What a notification says: never the message's text.
     nonisolated static func body(who: String, toYou: Bool, urgent: Bool, file: Bool) -> String {
         let what = file ? "shared a file" : "wrote"
@@ -83,8 +107,11 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         let node = info["node"] as? String
         let session = info["session"] as? String
         let reference = info["reference"] as? String
+        let ask = info["ask"] as? String
         Task { @MainActor in
-            if let room, let node, let session, let reference {
+            if let ask {
+                self.openAsk?(ask)
+            } else if let room, let node, let session, let reference {
                 self.openRequest?(room, node, session, reference)
             } else if let room {
                 self.open?(room)

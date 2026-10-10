@@ -14,7 +14,7 @@
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 use vox_core::hash::Digest32;
@@ -268,8 +268,13 @@ fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
     ))];
     // **A trust offer waits under needs you** (ADR-028 K-15, K-18), before the rooms there.
     let needs_you = vox_agentcomms::attention::RoomGroup::NeedsYou;
-    if !vm.offers.is_empty() {
-        let n = vm.offers.len() + vm.channels.iter().filter(|c| c.group == needs_you).count();
+    // **So does a repo with no room** (ADR-029 RB-5): Vox asks the person, not only the agent, with
+    // the commands that answer it at a terminal.
+    let headed = !vm.offers.is_empty() || !vm.room_asks.is_empty();
+    if headed {
+        let n = vm.offers.len()
+            + vm.room_asks.len()
+            + vm.channels.iter().filter(|c| c.group == needs_you).count();
         items.push(
             ListItem::new(format!("{} ({n})", needs_you.label()))
                 .style(Style::default().add_modifier(Modifier::BOLD)),
@@ -289,13 +294,27 @@ fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
             };
             items.push(ListItem::new(format!("{marker}offer: {short}… {why}")));
         }
+        for a in &vm.room_asks {
+            let [bind, no] = crate::room_ask::commands(a);
+            items.push(ListItem::new(Text::from(vec![
+                Line::from(format!("  {}", a.sentence())),
+                Line::from(Span::styled(
+                    format!("    choose a room: {bind}"),
+                    Style::default().add_modifier(Modifier::DIM),
+                )),
+                Line::from(Span::styled(
+                    format!("    or say no: {no}"),
+                    Style::default().add_modifier(Modifier::DIM),
+                )),
+            ])));
+        }
     }
     let mut group = None;
     for (i, c) in vm.channels.iter().enumerate() {
         if group != Some(c.group) {
             group = Some(c.group);
             // Needs you is headed already, with its offers.
-            if c.group != needs_you || vm.offers.is_empty() {
+            if c.group != needs_you || !headed {
                 let n = vm.channels.iter().filter(|o| o.group == c.group).count();
                 items.push(
                     ListItem::new(format!("{} ({n})", c.group.label()))

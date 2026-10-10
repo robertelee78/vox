@@ -527,6 +527,29 @@ pub struct RoomLink {
     pub note: String,
 }
 
+/// A directory harness sessions started in with no room bound to it (ADR-029 RB-5): what Vox asks
+/// the person, under needs you.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RoomAskInfo {
+    /// The directory, absolute: what the answer names.
+    pub dir: String,
+    /// What it says: "Claude Code in /opt/vox has no room".
+    pub sentence: String,
+    /// The nodes of the sessions waiting, each once, in the order they asked.
+    pub nodes: Vec<String>,
+    /// How many sessions wait on the answer.
+    pub sessions: u32,
+}
+
+/// What binding or declining an ask did: whether it was done, and its lines, said for a person.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RoomAnswerInfo {
+    /// It was done.
+    pub done: bool,
+    /// What was done, or why not.
+    pub said: Vec<String>,
+}
+
 /// What is shared in a room, and what this node offers there, as `vox service list` says it.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct RoomServices {
@@ -1479,6 +1502,17 @@ impl VoxClient {
         .await
     }
 
+    /// A bind or a no for an ask, and what the daemon said of it.
+    async fn room_answer(&self, req: DaemonRequest) -> Result<RoomAnswerInfo, VoxError> {
+        match self.daemon(req).await? {
+            DaemonFrame::RoomAnswer { done, said } => Ok(RoomAnswerInfo { done, said }),
+            _ => Err(failed(
+                "the vox daemon did not answer for the room map; restart it so it is this vox's \
+                 version",
+            )),
+        }
+    }
+
     /// A room created or joined: the one in `after` that was not in `before`.
     async fn new_room(
         &self,
@@ -2277,6 +2311,67 @@ impl VoxClient {
                 .collect()),
             other => Err(unexpected(&other)),
         })
+    }
+
+    /// The directories harness sessions started in with no room bound to them, which the person
+    /// has not said no for (ADR-029 RB-5): one per directory, as the daemon works them out.
+    ///
+    /// # Errors
+    /// The daemon did not answer.
+    pub async fn room_asks(&self) -> Result<Vec<RoomAskInfo>, VoxError> {
+        match self.daemon(DaemonRequest::RoomAsks).await? {
+            DaemonFrame::RoomAsks(asks) => Ok(asks
+                .into_iter()
+                .map(|a| {
+                    let mut nodes: Vec<String> = Vec::new();
+                    for s in &a.sessions {
+                        if !nodes.iter().any(|n| n == s.node.as_str()) {
+                            nodes.push(s.node.to_string());
+                        }
+                    }
+                    RoomAskInfo {
+                        sentence: a.sentence(),
+                        sessions: u32::try_from(a.sessions.len()).unwrap_or(u32::MAX),
+                        nodes,
+                        dir: a.dir,
+                    }
+                })
+                .collect()),
+            _ => Err(failed(
+                "the vox daemon did not list what waits for a room; restart it so it is this \
+                 vox's version",
+            )),
+        }
+    }
+
+    /// Bind the directory `dir` to the room `link` names (ADR-029 RB-6), the person's answer to
+    /// its ask: what `vox room join <link> --node <node> --bind <dir>` does. The room's
+    /// `passphrase` is the person's, typed in the app, and never an agent's; empty when it has
+    /// none. Every session waiting there is put in the room.
+    ///
+    /// # Errors
+    /// The daemon did not answer.
+    pub async fn bind_room(
+        &self,
+        dir: String,
+        link: String,
+        passphrase: Arc<Passphrase>,
+    ) -> Result<RoomAnswerInfo, VoxError> {
+        let request = DaemonRequest::RoomBind {
+            dir,
+            link: link.trim().to_owned(),
+            passphrase: passphrase.copy(),
+        };
+        self.room_answer(request).await
+    }
+
+    /// Say no for the directory `dir` (ADR-029 RB-7): it stays tied to no room, and no session
+    /// started there is asked again.
+    ///
+    /// # Errors
+    /// The daemon did not answer.
+    pub async fn decline_room(&self, dir: String) -> Result<RoomAnswerInfo, VoxError> {
+        self.room_answer(DaemonRequest::RoomDecline { dir }).await
     }
 
     /// Dismiss the offer of the node `fingerprint` (ADR-028 K-18): kept by the node, on this node

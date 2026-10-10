@@ -369,6 +369,9 @@ pub struct ViewModel {
     pub keyring: Vec<(vox_core::hash::Digest32, String)>,
     /// The members offered to the keyring (ADR-028 K-15 – K-18), in fingerprint order.
     pub offers: Vec<vox_core::node::api::Offer>,
+    /// The directories harness sessions started in with no room bound to them (ADR-029 RB-5):
+    /// what Vox asks the person, under needs you.
+    pub room_asks: Vec<vox_core::node::daemonipc::RoomAsk>,
     /// What this node decided, newest first, from its decision record (ADR-028 D-3).
     pub decisions: Vec<vox_core::node::decisions::Event>,
     /// What listens on this machine, for sharing one into a room (ADR-028 S-4), as `vox serve`

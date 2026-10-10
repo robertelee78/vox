@@ -49,6 +49,17 @@ fn harness(key: &str) -> Result<&'static Harness, AppError> {
 /// # Errors
 /// An unknown harness, or a data root that cannot be used.
 pub async fn status(args: &NodeArgs, key: &str, dir: &Path) -> Result<String, AppError> {
+    let said = first_missing(args, key, dir).await?;
+    // **What Vox asks the person, here too** (ADR-029 RB-5): on a machine with no app, this and
+    // the TUI are where a person reads that a repo waits for a room.
+    let asks = crate::room_ask::fetch(&args.account()?)
+        .await
+        .unwrap_or_default();
+    Ok(said + &crate::room_ask::needs_you(&asks))
+}
+
+/// The first thing missing, for [`status`].
+async fn first_missing(args: &NodeArgs, key: &str, dir: &Path) -> Result<String, AppError> {
     let h = harness(key)?;
     let account = args.account()?;
     let wiring = Wiring::of(h.key)?;

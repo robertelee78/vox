@@ -1,0 +1,138 @@
+// A repo with no room (ADR-029 RB-5 to RB-7): a harness session started in a directory the room
+// map does not name works in no room, and Vox asks the person, here, under needs you, not only the
+// agent in its session. The words are the TUI's and `vox agent status`'s (CL-1); the sentence is
+// the daemon's own. The room's passphrase is typed here, never given to an agent (RB-6).
+
+import SwiftUI
+
+/// An ask in the sidebar, under needs you: "Claude Code in /opt/vox has no room".
+struct RoomAskRow: View {
+    let ask: RoomAskInfo
+
+    var body: some View {
+        Text(ask.sentence)
+            .lineLimit(2)
+            .truncationMode(.middle)
+            .accessibilityIdentifier("room-ask-row")
+            .accessibilityLabel("needs a room: \(ask.sentence)")
+    }
+}
+
+/// The ask selected: what it is, and the two answers. Choose a room… binds the directory to a room
+/// this node holds, or to one by its pasted link, with the room's passphrase typed here: what `vox
+/// room join <link> --node <node> --bind <dir>` does, and every session waiting there is put in
+/// that room. Not this repo records a no, as `vox agent room --none` does.
+struct RoomAskView: View {
+    @ObservedObject var model: NodeModel
+    let dir: String
+    @State private var choosing = false
+    /// The room chosen from this node's, by id; nil when a link is pasted instead.
+    @State private var room: String?
+    @State private var link = ""
+    @State private var field = SecureFieldHolder()
+    @State private var noPassphrase = true
+    @State private var submitting = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: Space.s12) {
+                Text("Which room is this repo in?").title()
+                if let ask = model.roomAsks.first(where: { $0.dir == dir }) {
+                    card(ask)
+                } else {
+                    Text("This repo is no longer waiting for a room.").secondaryText()
+                }
+                if let said = model.roomAskSaid {
+                    ForEach(Array(said.said.enumerated()), id: \.offset) { _, line in
+                        if said.done {
+                            Text(line)
+                        } else {
+                            StateMark(kind: .danger, words: line)
+                        }
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier(said.done ? "room-ask-said" : "room-ask-failed")
+                }
+                OutcomeMark(outcome: model.failure(of: "bind-room")
+                    ?? model.failure(of: "decline-room"))
+            }
+            .padding(Space.s24)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder private func card(_ ask: RoomAskInfo) -> some View {
+        Text(ask.sentence).accessibilityIdentifier("room-ask-sentence")
+        Text(ask.sessions == 1
+            ? "Its session works in no Vox room until you choose one."
+            : "Its \(ask.sessions) sessions work in no Vox room until you choose one.")
+            .secondaryText()
+        if !choosing {
+            HStack {
+                Button("Choose a room…") { choosing = true }
+                    .buttonStyle(.voxPrimary)
+                    .accessibilityIdentifier("room-ask-choose")
+                Button("Not this repo") { Task { await model.declineRoom(dir) } }
+                    .accessibilityIdentifier("room-ask-decline")
+            }
+            Text("Not this repo: no session started here is asked again.").secondaryText()
+        } else {
+            chooser(ask)
+        }
+    }
+
+    @ViewBuilder private func chooser(_ ask: RoomAskInfo) -> some View {
+        Hairline()
+        Text("One of your rooms").eyebrow()
+        let open = model.rooms.filter(\.open)
+        if open.isEmpty { Text("You hold no open room.").secondaryText() }
+        ForEach(open) { r in
+            Toggle(r.name, isOn: Binding(
+                get: { room == r.id },
+                set: { on in
+                    room = on ? r.id : nil
+                    if on { link = "" }
+                }))
+                .toggleStyle(.radioButton)
+                .accessibilityIdentifier("room-ask-room-\(r.id.prefix(12))")
+        }
+        Text("Or its link").eyebrow()
+        TextField("Room link (vox://…)", text: $link).font(Theme.mono)
+            .accessibilityLabel("Room link")
+            .accessibilityIdentifier("room-ask-link")
+            .onChange(of: link) { if !$0.isEmpty { room = nil } }
+        Text("The room's passphrase. It is saved for this repo in the room map, which every node "
+            + "on this Mac can read, so \(ask.nodes.joined(separator: ", ")) can join the room "
+            + "with it. No agent is asked for it.")
+            .secondaryText()
+        SecureInput(holder: field, onEmpty: { noPassphrase = $0 }) { submit() }
+            .frame(width: Theme.scaled(320))
+            .accessibilityLabel("Room passphrase")
+            .accessibilityIdentifier("room-ask-passphrase")
+        if noPassphrase {
+            Text("No passphrase: for a room that has none.").secondaryText()
+        }
+        HStack {
+            Button("Cancel") { choosing = false }
+            Button("Bind") { submit() }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.voxPrimary)
+                .disabled(submitting || (room == nil && link.isEmpty))
+                .accessibilityIdentifier("room-ask-bind")
+        }
+    }
+
+    private func submit() {
+        guard !submitting, room != nil || !link.isEmpty else { return }
+        submitting = true
+        let secret = field.takeAllowingEmpty()
+        noPassphrase = true
+        let (r, l) = (room, link)
+        Task {
+            if await model.bindRoom(dir, room: r, link: r == nil ? l : nil, passphrase: secret) {
+                choosing = false
+            }
+            submitting = false
+        }
+    }
+}
