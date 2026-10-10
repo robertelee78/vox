@@ -68,6 +68,15 @@
 //!   TTL (7 days) would extend the documented forward-secrecy residual by a week to
 //!   serve a stale-bundle initiator that can simply refetch.
 //!
+//! ## Retiring unused one-time prekeys (ADR-030 P-1)
+//! A one-time prekey nobody used within one signed-prekey cadence ([`SIGNED_PREKEY_CADENCE_MS`],
+//! by its root-signed creation time) is **retired** by [`PrekeyRing::maintain`]: taken out of the
+//! pool, so it is never advertised again, and its secret kept, unadvertised, for
+//! [`ONE_TIME_RETIRED_GRACE_MS`], so a delivery already in flight against it still opens
+//! ([`PrekeyRing::use_one_time`] takes it as [`OneTimeUse::Fresh`]). Then it is dropped. Without
+//! this a one-time prekey a thief copied stayed usable until some initiator happened to consume
+//! it, which bounded nothing: a recipient's compromise healed only as fast as its pool turned over.
+//!
 //! The prekey material stays owned by the ring ([`PrekeyRing::consumed_one_time`]
 //! hands out a borrow), the ring is deliberately not `Clone` so no consumed secret
 //! survives in a copy, and [`save`] **must** be called after a consume: until it
@@ -97,8 +106,12 @@ pub const PREKEY_RING_SEK_INFO: &[u8] = b"vox/prekey-ring-sek/v2";
 /// The ring's segment id within its pseudo-channel (one segment, latest-wins).
 pub const SEG_PREKEY_RING: u64 = 1;
 
-/// At-rest encoding version of the ring: 2, every time in it in milliseconds.
-const RING_VERSION: u64 = 2;
+/// At-rest encoding version of the ring: 3, which adds the retired one-time prekeys (ADR-030
+/// P-1); every time in it in milliseconds.
+const RING_VERSION: u64 = 3;
+
+/// The ring's version 2: no retired one-time prekeys. Still read (see [`PrekeyRing::decode`]).
+const RING_VERSION_NO_RETIRED: u64 = 2;
 
 /// The ring's version 1, its times in seconds: still read (see [`PrekeyRing::decode`]).
 const RING_VERSION_SECONDS: u64 = 1;
@@ -149,6 +162,14 @@ const fn one_time_pool() -> (usize, usize) {
 /// covers a genuine race; see the module docs for why it is not the bundle TTL.
 pub const ONE_TIME_CONSUMED_RETAIN_MS: u64 = 60 * 60 * 1_000;
 
+/// How long a **retired** one-time prekey's secret is kept, unadvertised, so a delivery already in
+/// flight against it still opens (ADR-030 P-1: one hour).
+pub const ONE_TIME_RETIRED_GRACE_MS: u64 = 60 * 60 * 1_000;
+
+/// Hard cap on retired one-time prekeys held in their grace (oldest dropped first): one cadence
+/// retires at most the pool, and a stored ring holding more is refused as malformed.
+pub const ONE_TIME_RETIRED_MAX: usize = 4 * ONE_TIME_PREKEY_TARGET;
+
 /// Hard cap on retained consumed one-time prekeys (oldest dropped first), so a
 /// drain attack cannot grow the ring without bound.
 pub const ONE_TIME_CONSUMED_MAX: usize = 256;
@@ -174,13 +195,22 @@ pub struct Maintenance {
     /// How many consumed one-time prekeys were dropped (retention elapsed or the
     /// cap was exceeded) — their secrets are gone, restoring forward secrecy.
     pub consumed_pruned: usize,
+    /// How many unused one-time prekeys were retired: older than one cadence, no longer
+    /// advertised (ADR-030 P-1).
+    pub retired: usize,
+    /// How many retired one-time prekeys were dropped, their grace over: their secrets are gone.
+    pub retired_pruned: usize,
 }
 
 impl Maintenance {
     /// Whether anything changed (so the caller knows it must [`save`]).
     #[must_use]
     pub fn changed(self) -> bool {
-        self.rotated || self.one_time_added > 0 || self.consumed_pruned > 0
+        self.rotated
+            || self.one_time_added > 0
+            || self.consumed_pruned > 0
+            || self.retired > 0
+            || self.retired_pruned > 0
     }
 }
 
@@ -204,6 +234,13 @@ struct ConsumedOneTime {
     consumed_at: u64,
 }
 
+/// A one-time prekey retired unused (ADR-030 P-1), kept unadvertised for its grace so a delivery
+/// already in flight against it still opens. Its secrets zeroize on drop with the prekey.
+struct RetiredOneTime {
+    prekey: OneTimePrekey,
+    retired_at: u64,
+}
+
 /// The identity's key-agreement keys. Not `Clone` (see the module docs); every
 /// component zeroizes its secrets on drop.
 pub struct PrekeyRing {
@@ -214,6 +251,12 @@ pub struct PrekeyRing {
     pool: OneTimePrekeyPool,
     /// Recently consumed one-time prekeys, oldest first.
     consumed: Vec<ConsumedOneTime>,
+    /// One-time prekeys retired unused, in their grace, oldest first (ADR-030 P-1).
+    retired: Vec<RetiredOneTime>,
+    /// Initial messages this process answered with a retired one-time prekey, in its grace: a
+    /// delivery in flight when the prekey was retired. Not persisted; `vox status --json` reports
+    /// it.
+    retired_used: std::sync::atomic::AtomicU64,
     /// Initial messages this process answered with the **previous** signed prekey: sessions
     /// started just before a rotation. Not persisted; `vox status --json` reports it.
     previous_used: std::sync::atomic::AtomicU64,
@@ -233,6 +276,7 @@ impl std::fmt::Debug for PrekeyRing {
             )
             .field("one_time_prekeys", &self.pool.len())
             .field("consumed_retained", &self.consumed.len())
+            .field("retired_retained", &self.retired.len())
             .finish_non_exhaustive()
     }
 }
@@ -279,6 +323,8 @@ impl PrekeyRing {
             next_signed_prekey_id: 2,
             pool,
             consumed: Vec::new(),
+            retired: Vec::new(),
+            retired_used: std::sync::atomic::AtomicU64::new(0),
             previous_used: std::sync::atomic::AtomicU64::new(0),
             rotate_now: false,
         })
@@ -351,6 +397,23 @@ impl PrekeyRing {
             self.enforce_consumed_cap();
             return OneTimeUse::Fresh;
         }
+        // Retired unused, and still in its grace: a delivery in flight when it was retired (ADR-030
+        // P-1). It was never consumed, so this is its first use.
+        if let Some(at) = self
+            .retired
+            .iter()
+            .position(|r| r.prekey.public().prekey_id == prekey_id)
+        {
+            let RetiredOneTime { prekey, .. } = self.retired.remove(at);
+            self.consumed.push(ConsumedOneTime {
+                prekey,
+                consumed_at: now_ms,
+            });
+            self.enforce_consumed_cap();
+            self.retired_used
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return OneTimeUse::Fresh;
+        }
         if self.consumed_one_time(prekey_id).is_some() {
             return OneTimeUse::Reused;
         }
@@ -371,6 +434,26 @@ impl PrekeyRing {
     #[must_use]
     pub fn consumed_len(&self) -> usize {
         self.consumed.len()
+    }
+
+    /// How many retired one-time prekeys are held in their grace (ADR-030 P-1).
+    #[must_use]
+    pub fn retired_len(&self) -> usize {
+        self.retired.len()
+    }
+
+    /// How many initial messages this process answered with a retired one-time prekey in its
+    /// grace (ADR-030 P-1).
+    #[must_use]
+    pub fn retired_used(&self) -> u64 {
+        self.retired_used.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The root-signed creation time of the oldest one-time prekey offered, or `None` with none to
+    /// offer. After [`PrekeyRing::maintain`], never older than one cadence (ADR-030 P-1).
+    #[must_use]
+    pub fn oldest_one_time_created(&self) -> Option<u64> {
+        self.pool.iter().map(|o| o.public().created).min()
     }
 
     /// Drop the oldest consumed entries beyond [`ONE_TIME_CONSUMED_MAX`].
@@ -411,9 +494,35 @@ impl PrekeyRing {
             self.rotate_now = false;
             out.rotated = true;
         }
+        // Unused for a whole cadence: retired, never advertised again, its secret kept for the grace
+        // (ADR-030 P-1). Before the refill, so the pool is refilled with fresh ones.
+        let stale: Vec<u64> = self
+            .pool
+            .iter()
+            .filter(|o| now_ms >= o.public().created.saturating_add(SIGNED_PREKEY_CADENCE_MS))
+            .map(|o| o.public().prekey_id)
+            .collect();
+        for id in stale {
+            if let Some(prekey) = self.pool.take_by_id(id) {
+                self.retired.push(RetiredOneTime {
+                    prekey,
+                    retired_at: now_ms,
+                });
+                out.retired += 1;
+            }
+        }
         out.one_time_added =
             self.pool
                 .refill_to(signer, one_time_pool().0, one_time_pool().1, now_ms)?;
+        // Grace over: the retired secrets go.
+        let held = self.retired.len();
+        self.retired
+            .retain(|r| now_ms < r.retired_at.saturating_add(ONE_TIME_RETIRED_GRACE_MS));
+        if self.retired.len() > ONE_TIME_RETIRED_MAX {
+            let excess = self.retired.len() - ONE_TIME_RETIRED_MAX;
+            self.retired.drain(..excess);
+        }
+        out.retired_pruned = held - self.retired.len();
         // Retention elapsed: drop the consumed secrets (forward secrecy restored).
         let before = self.consumed.len();
         self.consumed
@@ -424,14 +533,14 @@ impl PrekeyRing {
 
     /// Encode the ring (**secrets included**) for sealing:
     /// `[version, idk, current, previous(0|1), next_signed_prekey_id,
-    ///  pool_next_id, pool, consumed]`, where a signed/one-time prekey is
+    ///  pool_next_id, pool, consumed, retired]`, where a signed/one-time prekey is
     /// `[canonical_body, signature, x25519_secret, ml_kem_seed]` and the identity
     /// DH key is `[canonical_body, signature, x25519_secret]`. Reusing the ADR-002
     /// canonical bodies means the at-rest form pins exactly the bytes the root
     /// signature covers.
     fn encode(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::for_secrets();
-        e.array(8).uint(RING_VERSION);
+        e.array(9).uint(RING_VERSION);
         // Identity DH key.
         e.array(3)
             .bytes(&self.identity_dh.public().canonical_body())
@@ -460,6 +569,13 @@ impl PrekeyRing {
             encode_one_time_fields(&mut e, &c.prekey);
             e.uint(c.consumed_at);
         }
+        // Retired entries carry their retire time (arity 5) so the grace survives a restart.
+        e.array(self.retired.len());
+        for r in &self.retired {
+            e.array(5);
+            encode_one_time_fields(&mut e, &r.prekey);
+            e.uint(r.retired_at);
+        }
         Zeroizing::new(e.finish())
     }
 
@@ -468,15 +584,19 @@ impl PrekeyRing {
     /// segment is refused, not silently adopted).
     fn decode(root: &CompositePublicKey, buf: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(buf);
-        if d.array()? != 8 {
-            return Err(Error::MalformedAtRest("prekey ring arity"));
-        }
+        let arity = d.array()?;
         // A version-1 ring's times are seconds. Its consume times convert; a prekey's creation
         // time is under its root signature, and only the current signed prekey's is ever read,
         // so that one is rotated at once instead (the others' are never compared with anything).
-        let seconds = match d.uint()? {
-            RING_VERSION => false,
-            RING_VERSION_SECONDS => true,
+        // Versions 1 and 2 hold no retired one-time prekeys (ADR-030 P-1): an empty set, and the
+        // next save writes version 3.
+        let (seconds, has_retired) = match (d.uint()?, arity) {
+            (RING_VERSION, 9) => (false, true),
+            (RING_VERSION_NO_RETIRED, 8) => (false, false),
+            (RING_VERSION_SECONDS, 8) => (true, false),
+            (RING_VERSION | RING_VERSION_NO_RETIRED | RING_VERSION_SECONDS, _) => {
+                return Err(Error::MalformedAtRest("prekey ring arity"))
+            }
             _ => return Err(Error::MalformedAtRest("prekey ring version")),
         };
         if d.array()? != 3 {
@@ -531,6 +651,22 @@ impl PrekeyRing {
                 consumed_at,
             });
         }
+        let mut retired = Vec::new();
+        if has_retired {
+            let r = d.array()?;
+            if r > ONE_TIME_RETIRED_MAX {
+                return Err(Error::MalformedAtRest("prekey ring retired set too large"));
+            }
+            retired.reserve(r);
+            for _ in 0..r {
+                if d.array()? != 5 {
+                    return Err(Error::MalformedAtRest("prekey ring retired arity"));
+                }
+                let prekey = decode_one_time(root, &mut d)?;
+                let retired_at = d.uint()?;
+                retired.push(RetiredOneTime { prekey, retired_at });
+            }
+        }
         d.finish()?;
         let pool = OneTimePrekeyPool::from_parts(pool_next_id, prekeys)?;
         if next_signed_prekey_id <= current.public().prekey_id {
@@ -546,6 +682,13 @@ impl PrekeyRing {
                 return Err(Error::MalformedAtRest("prekey ring consumed ids"));
             }
         }
+        // Nor a retired one (it would be advertised again, or opened twice).
+        for r in &retired {
+            let id = r.prekey.public().prekey_id;
+            if id >= pool_next_id || !ids.insert(id) {
+                return Err(Error::MalformedAtRest("prekey ring retired ids"));
+            }
+        }
         Ok(Self {
             identity_dh,
             current,
@@ -553,9 +696,130 @@ impl PrekeyRing {
             next_signed_prekey_id,
             pool,
             consumed,
+            retired,
+            retired_used: std::sync::atomic::AtomicU64::new(0),
             previous_used: std::sync::atomic::AtomicU64::new(0),
             rotate_now: seconds,
         })
+    }
+}
+
+/// Which prekey in a peer's bundle made it stale for a key delivery (ADR-030 P-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StalePrekey {
+    /// Its signed prekey: its owner rotates it every cadence.
+    Signed,
+    /// Its one-time prekey: its owner retires an unused one after a cadence (P-1).
+    OneTime,
+}
+
+/// Why a key delivery to a peer waits for its bundle (ADR-030 D-5): never sealed in an older
+/// session instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleWait {
+    /// This node's board holds no bundle of the peer.
+    NoBundle,
+    /// The bundle's signatures do not verify against its own root.
+    Unverified,
+    /// The bundle names a prekey created, by its root-signed time, a cadence or more ago (P-2).
+    Stale {
+        /// Which prekey.
+        part: StalePrekey,
+        /// How old it is, in milliseconds.
+        age_ms: u64,
+    },
+}
+
+impl BundleWait {
+    /// The reason, as a person reads it after "your key for it in room … waits: ".
+    #[must_use]
+    pub fn why(self) -> String {
+        match self {
+            Self::NoBundle => "this node's board holds no prekey bundle of it yet; it is sent \
+                               once one arrives"
+                .to_owned(),
+            Self::Unverified => "its prekey bundle on this node's board does not verify; it is \
+                                 sent once a valid one arrives"
+                .to_owned(),
+            Self::Stale { part, age_ms } => format!(
+                "its prekey bundle is stale: its {} prekey is {} days old, and a key sealed to it \
+                 could be read by whoever copied that prekey before it was replaced; it is sent \
+                 once its next bundle arrives (bundles republish about hourly)",
+                match part {
+                    StalePrekey::Signed => "signed",
+                    StalePrekey::OneTime => "one-time",
+                },
+                age_ms / (24 * 60 * 60 * 1_000)
+            ),
+        }
+    }
+}
+
+/// The bundle a key delivery opens its session against (ADR-030 P-2, P-3), or why it waits.
+///
+/// The signatures are checked first, so the creation times judged are the root-signed ones, never
+/// the record's own publication fields. A bundle whose signed prekey, or whose one-time prekey, was
+/// created a cadence ([`SIGNED_PREKEY_CADENCE_MS`]) or more before `now_ms` is refused: its owner
+/// has rotated or retired it (P-1), so only a stale or replayed bundle still names it. A one-time
+/// prekey in `refused` — one the peer answered it does not hold — is taken out, so the session
+/// opens against the signed prekey rather than name it again (P-3).
+pub fn delivery_bundle(
+    bundle: &PrekeyBundlePublic,
+    now_ms: u64,
+    refused: &[u64],
+) -> std::result::Result<PrekeyBundlePublic, BundleWait> {
+    bundle.verify().map_err(|_| BundleWait::Unverified)?;
+    let stale = |created: u64| now_ms.saturating_sub(created) >= SIGNED_PREKEY_CADENCE_MS;
+    if stale(bundle.signed_prekey.created) {
+        return Err(BundleWait::Stale {
+            part: StalePrekey::Signed,
+            age_ms: now_ms.saturating_sub(bundle.signed_prekey.created),
+        });
+    }
+    let mut out = bundle.clone();
+    if let Some(otp) = &bundle.one_time_prekey {
+        if stale(otp.created) {
+            return Err(BundleWait::Stale {
+                part: StalePrekey::OneTime,
+                age_ms: now_ms.saturating_sub(otp.created),
+            });
+        }
+        if refused.contains(&otp.prekey_id) {
+            out.one_time_prekey = None;
+            out.one_time_prekey_sig = None;
+        }
+    }
+    Ok(out)
+}
+
+/// One-time prekey ids a peer answered it does not hold (ADR-030 P-3), never targeted again; at
+/// most [`ONE_TIME_PREKEY_TARGET`] per peer, oldest dropped first. A ring issues ids in increasing
+/// order and never reissues one, so a dropped entry can only be one its owner no longer offers.
+#[derive(Debug, Default)]
+pub struct RefusedOneTime {
+    by_peer: std::collections::BTreeMap<Digest32, std::collections::VecDeque<u64>>,
+}
+
+impl RefusedOneTime {
+    /// Record that `peer` refused `prekey_id`.
+    pub fn note(&mut self, peer: Digest32, prekey_id: u64) {
+        let ids = self.by_peer.entry(peer).or_default();
+        if ids.contains(&prekey_id) {
+            return;
+        }
+        ids.push_back(prekey_id);
+        while ids.len() > ONE_TIME_PREKEY_TARGET {
+            ids.pop_front();
+        }
+    }
+
+    /// The ids `peer` refused.
+    #[must_use]
+    pub fn of(&self, peer: &Digest32) -> Vec<u64> {
+        self.by_peer
+            .get(peer)
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default()
     }
 }
 

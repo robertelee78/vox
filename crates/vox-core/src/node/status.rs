@@ -1239,6 +1239,40 @@ pub struct PrekeyCounts {
     /// Sessions the running node set up with its previous signed prekey: started just before a
     /// rotation, completed after it.
     pub previous_used: u64,
+    /// Unused one-time prekeys the running node retired, a cadence old (ADR-030 P-1).
+    pub retired: u64,
+    /// Retired one-time prekeys held, unadvertised, in their one-hour grace.
+    pub retired_held: usize,
+    /// Sessions the running node set up with a retired one-time prekey in its grace: a delivery in
+    /// flight when the prekey was retired.
+    pub retired_used: u64,
+    /// The root-signed creation time (ms) of the oldest one-time prekey it offers, or `None`.
+    pub oldest_one_time: Option<u64>,
+}
+
+/// What [`SyncBook::note_prekeys`] records about the ring, read from it after its maintenance.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PrekeyNote {
+    /// One-time prekeys left to offer.
+    pub one_time: usize,
+    /// Consumed one-time prekeys retained.
+    pub consumed: usize,
+    /// The signed prekey offered now.
+    pub signed_prekey: u64,
+    /// This maintenance rotated the signed prekey.
+    pub rotated: bool,
+    /// One-time prekeys this maintenance added.
+    pub added: usize,
+    /// Sessions set up with the previous signed prekey.
+    pub previous_used: u64,
+    /// One-time prekeys this maintenance retired.
+    pub retired: usize,
+    /// Retired one-time prekeys in their grace.
+    pub retired_held: usize,
+    /// Sessions set up with a retired one-time prekey in its grace.
+    pub retired_used: u64,
+    /// The oldest offered one-time prekey's creation time.
+    pub oldest_one_time: Option<u64>,
 }
 
 /// The book as the actor and the handles share it.
@@ -1315,23 +1349,19 @@ impl SyncBook {
 
     /// Record the ring as it stands after a maintenance that `rotated` and added `added`, and
     /// how many sessions it has set up with its previous signed prekey.
-    pub fn note_prekeys(
-        book: &SharedSyncBook,
-        one_time: usize,
-        consumed: usize,
-        signed_prekey: u64,
-        rotated: bool,
-        added: usize,
-        previous_used: u64,
-    ) {
+    pub fn note_prekeys(book: &SharedSyncBook, n: PrekeyNote) {
         let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
         let c = b.prekeys.get_or_insert_with(PrekeyCounts::default);
-        c.one_time = one_time;
-        c.consumed = consumed;
-        c.signed_prekey = signed_prekey;
-        c.rotated += u64::from(rotated);
-        c.refilled += u64::try_from(added).unwrap_or(u64::MAX);
-        c.previous_used = previous_used;
+        c.one_time = n.one_time;
+        c.consumed = n.consumed;
+        c.signed_prekey = n.signed_prekey;
+        c.rotated += u64::from(n.rotated);
+        c.refilled += u64::try_from(n.added).unwrap_or(u64::MAX);
+        c.previous_used = n.previous_used;
+        c.retired += u64::try_from(n.retired).unwrap_or(u64::MAX);
+        c.retired_held = n.retired_held;
+        c.retired_used = n.retired_used;
+        c.oldest_one_time = n.oldest_one_time;
     }
 
     /// Count one reachability ladder run to `peer`.
@@ -1504,8 +1534,19 @@ impl SyncBook {
                 let _ = write!(
                     s,
                     "{{\"one_time\":{},\"consumed\":{},\"signed_prekey\":{},\"rotated\":{},\
-                     \"refilled\":{},\"previous_used\":{}}}",
-                    p.one_time, p.consumed, p.signed_prekey, p.rotated, p.refilled, p.previous_used
+                     \"refilled\":{},\"previous_used\":{},\"retired\":{},\"retired_held\":{},\
+                     \"retired_used\":{},\"oldest_one_time\":{}}}",
+                    p.one_time,
+                    p.consumed,
+                    p.signed_prekey,
+                    p.rotated,
+                    p.refilled,
+                    p.previous_used,
+                    p.retired,
+                    p.retired_held,
+                    p.retired_used,
+                    p.oldest_one_time
+                        .map_or_else(|| "null".to_owned(), |t| t.to_string())
                 );
             }
             None => s.push_str("null"),
