@@ -2233,12 +2233,7 @@ final class FirstRunProof: XCTestCase {
         // In view: at least half of it inside the timeline's frame, as Seen counts a row seen.
         // (Hit-testing is not this: the line at the bottom of the timeline, drawn and in view in
         // the first run's kept tree, was still not hittable, a false red.)
-        func inTimeline(_ key: Key) -> Bool {
-            let e = el(ui, key), t = el(ui, Key.id("timeline"))
-            guard e.exists, t.exists else { return false }
-            let shown = e.frame.intersection(t.frame)
-            return !shown.isNull && shown.height * 2 >= e.frame.height
-        }
+        func inTimeline(_ key: Key) -> Bool { halfInTimeline(ui, key) }
         tap(ui, sessionRow, "bob's Session")
         let newestLine = Key.showing("P7-LINE-060")
         let openedUntil = Date().addingTimeInterval(20)
@@ -3279,11 +3274,13 @@ final class FirstRunProof: XCTestCase {
         let landed = Key.showing("NEEDS-YOU-9")
         present(ui, landed, timeout: 15,
                 "⌘J from room aaa must open mission, the room that needs alice, with its message NEEDS-YOU-9")
-        // Shown means on screen (hittable), not only built: a lazy timeline builds rows beyond
-        // its visible part too.
+        // Shown means in the timeline's visible part by the app's own rule (half the row or more
+        // inside the timeline), not hittable: a lazy timeline builds rows past its visible edge,
+        // and one there is hittable while the app has not seen it (93b123e6f: L3288 green, L3313
+        // red, the row never in the app's view).
         let inViewUntil = Date().addingTimeInterval(10)
-        while Date() < inViewUntil && !el(ui, landed).isHittable { Thread.sleep(forTimeInterval: 0.2) }
-        if !el(ui, landed).isHittable {
+        while Date() < inViewUntil && !halfInTimeline(ui, landed) { Thread.sleep(forTimeInterval: 0.2) }
+        if !halfInTimeline(ui, landed) {
             keepTree(ui, "NEEDS-YOU-9 was not in view")
             XCTFail("PRODUCT: ⌘J must open mission with its newest message, NEEDS-YOU-9, in view; it is in the timeline but not on screen")
         }
@@ -4154,6 +4151,16 @@ final class FirstRunProof: XCTestCase {
     /// XCTest reads neither its label nor its value. A `field` is read by what is typed in it
     /// (`typed`), and an empty one is read as empty.
     @discardableResult
+    /// Whether half or more of `key`'s element lies inside the timeline's frame: what the app
+    /// counts as seen (R-6), so the proof and the app agree on "on screen".
+    private func halfInTimeline(_ ui: XCUIApplication, _ key: Key) -> Bool {
+        let row = el(ui, key)
+        let timeline = el(ui, Key.id("timeline"))
+        guard row.exists, timeline.exists else { return false }
+        let shown = row.frame.intersection(timeline.frame)
+        return !shown.isNull && shown.height * 2 >= row.frame.height
+    }
+
     /// How many trust offers the sidebar lists under NEEDS YOU.
     private func offerRows(_ ui: XCUIApplication) -> Int {
         ui.descendants(matching: .any).matching(NSPredicate(format: "identifier BEGINSWITH 'offer-'")).count
