@@ -141,8 +141,8 @@ fn tmux(p: &TmuxPane, args: &[&str]) -> Result<String, String> {
 
 /// One process, as the kernel says: its parent, when it started, and what it is called.
 #[derive(Debug, Clone)]
-struct Proc {
-    ppid: u32,
+pub(crate) struct Proc {
+    pub(crate) ppid: u32,
     start: String,
     name: String,
 }
@@ -150,7 +150,7 @@ struct Proc {
 /// `pid`, read from the kernel itself (no program is run: a sandbox may refuse to start `ps`):
 /// `proc_pidinfo` on macOS, `/proc/<pid>/stat` on Linux. `None` when it is gone.
 #[cfg(target_os = "macos")]
-fn proc_of(pid: u32) -> Option<Proc> {
+pub(crate) fn proc_of(pid: u32) -> Option<Proc> {
     use libproc::bsd_info::BSDInfo;
     let info = libproc::proc_pid::pidinfo::<BSDInfo>(i32::try_from(pid).ok()?, 0).ok()?;
     let name: String = info
@@ -167,7 +167,7 @@ fn proc_of(pid: u32) -> Option<Proc> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn proc_of(pid: u32) -> Option<Proc> {
+pub(crate) fn proc_of(pid: u32) -> Option<Proc> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // `pid (comm) state ppid …`: the name may hold spaces and parentheses, so it ends at the
     // last ')'. After it, the fields from `state` on; `starttime` is the 22nd field of the line.
@@ -323,7 +323,7 @@ pub fn prove(
 
 /// A process's executable, as the kernel has it: `proc_pidpath` on macOS, `/proc/<pid>/exe` on
 /// Linux. `None` when it cannot be read.
-fn exe_of(pid: u32) -> Option<std::path::PathBuf> {
+pub(crate) fn exe_of(pid: u32) -> Option<std::path::PathBuf> {
     if pid <= 1 {
         return None;
     }
@@ -337,7 +337,7 @@ fn exe_of(pid: u32) -> Option<std::path::PathBuf> {
 }
 
 /// Whether `exe` is a POSIX shell a harness runs its hook command through (`sh -c`).
-fn is_shell(exe: &std::path::Path) -> bool {
+pub(crate) fn is_shell(exe: &std::path::Path) -> bool {
     exe.file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| matches!(n, "sh" | "bash" | "zsh" | "dash" | "ksh"))

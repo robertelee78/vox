@@ -3627,6 +3627,7 @@ dependencies = [
  "tokio-util",
  "vox-agentcomms",
  "vox-core",
+ "vox-sockdrops",
  "vox-text",
  "vox-theme",
  "vt100",

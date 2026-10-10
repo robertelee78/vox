@@ -50,7 +50,9 @@
 //! **A Session per interactive harness session** (ADR-029 SE-1–SE-5,
 //! [`a_session_opens_with_its_hook_and_ends_only_on_a_real_end`]): the hook of a session a person
 //! is at (Claude Code's `CLAUDE_CODE_ENTRYPOINT=cli`) opens one Session in its room, named by the
-//! harness's own session id; a headless run's (`sdk-cli`) opens none; a sub-agent's event, which
+//! harness's own session id; a headless run's (`sdk-cli`) opens none, and so does a `codex exec`,
+//! told from a `codex` session a person is at by Codex's own argv (a stand-in process with the
+//! measured argv; mutant: Codex taken as interactive whatever its argv); a sub-agent's event, which
 //! carries its parent's session id, opens no other. `Stop` and a `SessionEnd` whose reason is
 //! `resume` leave it open; a real `SessionEnd` ends it, set apart under "ended", and what was said
 //! in the room stays readable. Every message from a session carries its id and the name its harness
@@ -86,6 +88,9 @@
 //! A session started in a mapped directory whose room's host is gone is told the join is under way,
 //! then, on a later turn, why it could not join, though that turn tries again. Mutant: the retry's
 //! "joining" overwrites the failure before the turn reads it.
+//! A headless run (`claude -p`) started in a mapped directory has its node join the room (RB-3 has
+//! no headless exception) and opens no Session there (SE-1). Mutant: a headless run skips the join
+//! with its Session (the node never joins).
 //!
 //! Not proved here, and stated rather than implied: that a harness actually
 //! *shows* the model what it injects. The probe could not confirm it because this
@@ -2342,6 +2347,109 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
         "PRODUCT: a hook run by hand must exit 0; it said {out}{err}"
     );
     let after_open = sessions();
+    // (2c) Codex: `codex exec` is headless, a `codex` a person is at is not. Codex's hook input and
+    // environment carry no mark of it (measured on Codex 0.162.1, 2026-10-10); its own argv does.
+    // The stand-in is a process whose argv is what was measured, `<dir>/codex exec
+    // --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox hello`, and, for the TUI,
+    // `<dir>/codex`; each runs the hook as its child with Codex's measured `UserPromptSubmit`.
+    let codex_dir = tmp.path().join("codex-standin");
+    std::fs::create_dir_all(&codex_dir).expect("APPARATUS: cannot make the stand-in's directory");
+    let standin = "import json, os, subprocess, sys\n\
+        p = subprocess.run(json.loads(os.environ['STANDIN_HOOK']), \
+        input=os.environ['STANDIN_INPUT'].encode(), capture_output=True)\n\
+        open(os.environ['STANDIN_OUT'], 'w').write(json.dumps({'exit': p.returncode, \
+        'said': p.stdout.decode(errors='replace') + p.stderr.decode(errors='replace'), \
+        'argv': getattr(sys, 'orig_argv', [])}))\n";
+    // As `exec`: the file python runs is the subcommand's own word in argv.
+    std::fs::write(codex_dir.join("exec"), standin).expect("APPARATUS: cannot write the stand-in");
+    std::fs::write(codex_dir.join("tui.py"), standin)
+        .expect("APPARATUS: cannot write the stand-in");
+    // The interpreter itself, not a launcher that execs it (pyenv's shim, macOS's /usr/bin stub):
+    // a launcher's exec replaces the argv the stand-in is made to carry.
+    let python = Command::new("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| panic!("APPARATUS, CANNOT MEASURE: no python3 to stand in for Codex"));
+    let as_codex = |id: &str, exec: bool| -> serde_json::Value {
+        let payload = format!(
+            r#"{{"cwd":"{}","hook_event_name":"UserPromptSubmit","model":"gpt-5","permission_mode":"bypassPermissions","prompt":"hello","session_id":"{id}","transcript_path":null,"turn_id":"turn-{id}"}}"#,
+            codex_dir.display()
+        );
+        let out = codex_dir.join(format!("{id}.out"));
+        let mut c = Command::new("/bin/bash");
+        if exec {
+            c.args([
+                "-c",
+                r#"exec -a "$0" "$PY" exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox hello"#,
+            ]);
+        } else {
+            c.args(["-c", r#"exec -a "$0" "$PY" < tui.py"#]);
+        }
+        c.arg(codex_dir.join("codex"))
+            .current_dir(&codex_dir)
+            .env("PY", &python);
+        let template = vox(&data, &cfg);
+        for (k, v) in template.get_envs() {
+            match v {
+                Some(v) => c.env(k, v),
+                None => c.env_remove(k),
+            };
+        }
+        let mut argv = vec![VOX.to_owned()];
+        argv.extend(hook_args.iter().map(|a| (*a).to_owned()));
+        let status = c
+            .env("STANDIN_HOOK", serde_json::json!(argv).to_string())
+            .env("STANDIN_INPUT", payload)
+            .env("STANDIN_OUT", &out)
+            .status()
+            .expect("APPARATUS: cannot start the Codex stand-in");
+        let got: serde_json::Value = std::fs::read_to_string(&out)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_else(|| panic!("APPARATUS: the Codex stand-in ({status}) ran no hook"));
+        // Staging: the stand-in carries exactly the argv measured.
+        let mut want = vec![codex_dir.join("codex").display().to_string()];
+        if exec {
+            want.extend(
+                [
+                    "exec",
+                    "--skip-git-repo-check",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "hello",
+                ]
+                .map(str::to_owned),
+            );
+        }
+        assert!(
+            got["argv"] == serde_json::json!(want),
+            "APPARATUS: staging not achieved: the Codex stand-in's argv is {}, not {want:?}",
+            got["argv"]
+        );
+        assert!(
+            got["exit"] == 0,
+            "PRODUCT: the hook under Codex must exit 0; it said {}",
+            got["said"]
+        );
+        got
+    };
+    as_codex("codex-exec-0001", true);
+    as_codex("codex-tui-00002", false);
+    let with_codex = sessions();
+    eprintln!("[proof] (2c) after a `codex exec` run and a `codex` session: {with_codex:?}");
+    assert!(
+        of(&with_codex, "codex-tui-00002").len() == 1
+            && of(&with_codex, "codex-tui-00002")[0]["harness"] == "codex",
+        "PRODUCT: a Codex session a person is at (`codex`) must open its Session; the room lists \
+         {with_codex:?}"
+    );
+    assert!(
+        of(&with_codex, "codex-exec-0001").is_empty(),
+        "PRODUCT: a headless Codex run (`codex exec`) must open no Session (ADR-029 SE-1); the room \
+         lists {with_codex:?}"
+    );
     // (7) Every message from a session carries its id and name, whatever verb posts it
     // (ADR-029 MD-1, MD-2): a plain `vox room post` from it, and one from a session with no name.
     let post_as = |session: &str, text: &str| {
@@ -3115,6 +3223,78 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
             && told.contains(&format!("could not join room {ghost_room}")),
         "PRODUCT: the session must be told the join is under way, then why it failed: first \
          {first_try:?}, later {told:?}"
+    );
+
+    // (7) A headless run (`claude -p`) started in a mapped directory: its node joins the room
+    // (RB-3 has no headless exception), and the run opens no Session there (SE-1).
+    let (ok, _, err) = hook(
+        &alice.data,
+        &alice.cfg,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "headless",
+        ],
+        "headless passphrase",
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's fourth `vox room create` failed: {err}"
+    );
+    let (_, listed, _) = hook(&alice.data, &alice.cfg, &["room", "list"], "");
+    let fourth = listed
+        .lines()
+        .find(|l| l.contains("headless"))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_default()
+        .to_owned();
+    let headless_repo = tmp.path().join("headless-repo");
+    std::fs::create_dir_all(&headless_repo).expect("APPARATUS: cannot make a repository directory");
+    let mut text = std::fs::read_to_string(&map).expect("APPARATUS: cannot read the room map");
+    text.push_str(&format!(
+        "\nrepo {}\n    room       {}\n    passphrase headless passphrase\n",
+        headless_repo.display(),
+        alice.link(&fourth)
+    ));
+    std::fs::write(&map, text).expect("APPARATUS: cannot write the room map");
+    let run = "99999999-aaaa-4bbb-8ccc-000000000009";
+    let payload = format!(
+        r#"{{"session_id":"{run}","hook_event_name":"UserPromptSubmit","cwd":"{}","prompt":"hi","transcript_path":"/tmp/t.jsonl"}}"#,
+        headless_repo.display()
+    );
+    let headless = [("CLAUDE_CODE_ENTRYPOINT", "sdk-cli")];
+    let (ok, told, err) = hook_env(
+        &data,
+        &cfg,
+        &["agent", "hook", "--node", "default"],
+        &payload,
+        &headless,
+    );
+    assert!(
+        ok,
+        "PRODUCT: the headless run's hook must exit 0; it said {told}{err}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(540);
+    while !rooms().contains(&fourth) {
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: a headless run started in a directory mapped to room {fourth} must have its \
+             node join that room (ADR-029 RB-3); within 540 s `vox room list` said {:?}; the run's \
+             hook was told {told:?}",
+            rooms()
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    std::thread::sleep(Duration::from_secs(3));
+    let listed = sessions(&fourth);
+    eprintln!("[proof] (7) the headless run's node joined {fourth}; its Sessions: {listed:?}");
+    assert!(
+        !listed.iter().any(|r| r["id"] == run),
+        "PRODUCT: a headless run must get no Session (ADR-029 SE-1); room {fourth} lists \
+         {listed:?}"
     );
 }
 

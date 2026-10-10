@@ -30,6 +30,9 @@ import { createInterface } from "node:readline"
 import { pathToFileURL } from "node:url"
 
 const [pluginPath, session] = process.argv.slice(2)
+// OpenCode's own argv, as the plugin sees it inside OpenCode, when the proof names one
+// (`STANDIN_ARGV`, JSON): the host is then that OpenCode process to the plugin.
+if (process.env.STANDIN_ARGV) process.argv = JSON.parse(process.env.STANDIN_ARGV)
 
 function say(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n")

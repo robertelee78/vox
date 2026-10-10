@@ -46,6 +46,8 @@ vox-theme = { path = "../vox-theme" }
 
 [dependencies]
 vox-core = { path = "../vox-core" }
+# The one crate allowed `unsafe` (#218): another process's argv, to tell a headless harness run.
+vox-sockdrops = { path = "../vox-sockdrops" }
 # The app tier (ADR-020 §1). `vox room claim|release|handoff|board` are this crate's
 # vocabulary and claim resolver made reachable from the product; without this
 # dependency the model exists and nothing can use it.
