@@ -132,6 +132,12 @@ struct Winding {
 /// dial to one member it cannot currently reach. See `reach_member`.
 const MEMBER_REDIAL_MS: u64 = 30_000;
 
+/// How many taken key deliveries (ADR-030 W-3) are remembered per peer and room. A sender holds one
+/// delivery per key and drops it on `KEY_TAKEN` or when a later key supersedes it (D-4), so only the
+/// last few can be replayed honestly; an older replay is opened again, and its key is inert
+/// (ADR-006 S-12).
+const TAKEN_DELIVERIES_KEPT: usize = 64;
+
 /// How often a node holding a room with a member it is not connected to says where it listens on
 /// this computer and the local network (`node::nearby`).
 const NEARBY_EVERY_MS: u64 = 30_000;
@@ -4222,6 +4228,12 @@ pub struct Node {
     /// re-sending the same hello is recognised and does not re-consume a one-time
     /// prekey or reset a session that is already in use.
     accepted_hello: BTreeMap<(Digest32, Digest32), Digest32>,
+    /// The key deliveries (ADR-030 W-1) each peer has had taken here, by hash of the delivery's
+    /// opening, newest last, at most [`TAKEN_DELIVERIES_KEPT`] a pair. A slot of their own (W-3):
+    /// kept in [`Self::accepted_hello`], a delivery would evict the long-lived session's replay
+    /// pin. A sender resends a delivery's exact bytes until it hears `KEY_TAKEN` (D-4), so a
+    /// replay of one already taken is answered that, with nothing opened.
+    taken_deliveries: BTreeMap<(Digest32, Digest32), std::collections::VecDeque<Digest32>>,
     /// Sessions this node kept against a peer's competing hello, whose peer must now
     /// be sent this node's hello so it adopts the same session; drained on the tick.
     reopen: std::collections::BTreeSet<(Digest32, Digest32)>,
@@ -4637,6 +4649,7 @@ impl Node {
             sessions: BTreeMap::new(),
             initiated: BTreeMap::new(),
             accepted_hello: BTreeMap::new(),
+            taken_deliveries: BTreeMap::new(),
             reopen: std::collections::BTreeSet::new(),
             session_serial: BTreeMap::new(),
             last_session_serial: 0,
@@ -12783,9 +12796,18 @@ impl Node {
         // the SKDM it precedes.
         let (channel_id, sealed) = match first {
             PairwiseFrame::Skdm { channel_id, sealed } => (channel_id, sealed),
-            // A key delivery in a session of its own (ADR-030 W-1). Not taken yet: refused as a node
-            // that predates it would refuse it (W-4), so the key waits.
-            PairwiseFrame::RotationHello { .. } => return Some(Err(KeyRefusal::HelloRefused)),
+            // A key delivery in a session of its own (ADR-030 W-1), opened under that session alone
+            // and never filed (W-2).
+            PairwiseFrame::RotationHello {
+                channel_id,
+                initial,
+                sealed,
+            } => {
+                return Some(
+                    self.take_delivery(peer, channel_id, &initial, &sealed)
+                        .await,
+                )
+            }
             // One ratchet message with an empty plaintext, sent to give *this* node a
             // sending chain (M17.6). Decrypt it so the ratchet steps, then stop: there
             // is nothing behind it and nothing is granted by it.
@@ -12836,6 +12858,81 @@ impl Node {
         let Ok(skdm) = open_skdm(session, &sealed, now) else {
             return Some(Err(KeyRefusal::CannotOpen));
         };
+        Some(self.take_opened_skdm(channel_id, peer, &skdm, now_ms).await)
+    }
+
+    /// Take a key delivery (ADR-030 W-1): build the session its opening names from this node's own
+    /// prekey ring, open the key under it, and drop it (W-2). The session is never filed: not
+    /// inserted in, checked against or reconciled with the long-lived session table, so a delivery
+    /// can neither replace the pair's session nor be refused because one exists (ADR-004 O2–O4 do
+    /// not apply). A delivery already taken is answered taken at once, with nothing opened (W-3).
+    async fn take_delivery(
+        &mut self,
+        peer: Digest32,
+        channel_id: Digest32,
+        initial: &[u8],
+        sealed: &[u8],
+    ) -> Result<(), crate::node::pairwise_stream::KeyRefusal> {
+        use crate::node::pairwise_stream::{open_skdm, KeyRefusal, PairwiseFrame};
+        let pair = (channel_id, peer);
+        // The whole frame, not its opening alone: a delivery is taken as the bytes that carried it.
+        let delivery = crate::hash::sha256(
+            &PairwiseFrame::RotationHello {
+                channel_id,
+                initial: initial.to_vec(),
+                sealed: sealed.to_vec(),
+            }
+            .to_frame(),
+        );
+        if self
+            .taken_deliveries
+            .get(&pair)
+            .is_some_and(|taken| taken.contains(&delivery))
+        {
+            return Ok(());
+        }
+        let init = InitialMessage::from_wire(initial).map_err(|_| KeyRefusal::HelloRefused)?;
+        let shared = self
+            .channels
+            .get(&channel_id)
+            .map(Arc::clone)
+            .ok_or(KeyRefusal::HelloRefused)?;
+        let ctx = {
+            let channel = shared.lock().await;
+            // Only a member we have admitted may deliver a key, and not one that left (V030-08).
+            if !channel.is_member(&peer) {
+                return Err(KeyRefusal::HelloRefused);
+            }
+            channel
+                .join_context()
+                .map_err(|_| KeyRefusal::HelloRefused)?
+        };
+        let mut session = self.respond_to_initial_or_why(&init, &ctx).await?;
+        let now_ms = self.now_ms();
+        let skdm =
+            open_skdm(&mut session, sealed, now_ms.get()).map_err(|_| KeyRefusal::CannotOpen)?;
+        // Its secrets zeroize here: the session existed for this one key (W-2).
+        drop(session);
+        self.take_opened_skdm(channel_id, peer, &skdm, now_ms)
+            .await?;
+        let taken = self.taken_deliveries.entry(pair).or_default();
+        if taken.len() >= TAKEN_DELIVERIES_KEPT {
+            taken.pop_front();
+        }
+        taken.push_back(delivery);
+        Ok(())
+    }
+
+    /// Take a key that has opened: `Ok` once it is taken, else why not. The same for a key that
+    /// came under the pair's long-lived session and one that came in a delivery of its own.
+    async fn take_opened_skdm(
+        &mut self,
+        channel_id: Digest32,
+        peer: Digest32,
+        skdm: &crate::group::skdm::Skdm,
+        now_ms: crate::time::Ms,
+    ) -> Result<(), crate::node::pairwise_stream::KeyRefusal> {
+        use crate::node::pairwise_stream::KeyRefusal;
         // **A node reads only the members its owner trusts** (V210-118). Trust is decided by each
         // node for itself: the author trusting us releases its key, and that alone must not make
         // it readable here. A key from an author this owner has not trusted is refused, so nothing
@@ -12844,10 +12941,10 @@ impl Node {
         // not accepting rather than read as trusting nobody.
         let author = skdm.body.author_id;
         if !self.profile.as_ref().is_some_and(Profile::is_unlocked) {
-            return Some(Err(KeyRefusal::NotAccepted));
+            return Err(KeyRefusal::NotAccepted);
         }
         if !self.trust.is_trusted(&author) {
-            return Some(Err(KeyRefusal::NotTrusted));
+            return Err(KeyRefusal::NotTrusted);
         }
         let mut fresh = false;
         let backfilled = match (
@@ -12857,12 +12954,12 @@ impl Node {
             (Some(profile), Some(shared)) => {
                 let mut channel = shared.lock().await;
                 fresh = !channel.holds_generation(&author, skdm.body.chain_id);
-                channel.accept_skdm(profile.store(), &skdm, now_ms).ok()
+                channel.accept_skdm(profile.store(), skdm, now_ms).ok()
             }
             _ => None,
         };
         let Some(n) = backfilled else {
-            return Some(Err(KeyRefusal::NotAccepted));
+            return Err(KeyRefusal::NotAccepted);
         };
         // A generation new to us: the author may have refused ours while we were untrusted, or
         // dropped it when its owner stopped trusting us. Ours is offered again once this stream
@@ -12875,7 +12972,7 @@ impl Node {
             peer,
             backfilled: n as u64,
         });
-        Some(Ok(()))
+        Ok(())
     }
 
     /// Load (or, on first use, generate) the prekey ring for the unlocked
@@ -13024,6 +13121,7 @@ impl Node {
         // Their writers end with their queues; what they hold is sealed bytes, no key material.
         self.pairwise_out.clear();
         self.accepted_hello.clear();
+        self.taken_deliveries.clear();
         self.reopen.clear();
         self.session_serial.clear();
         // The identity and its signer go before the network does (V210-93, V210-94): stopping
