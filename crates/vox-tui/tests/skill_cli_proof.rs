@@ -68,8 +68,9 @@
 //! `vox trust add … --drive`, and OpenCode's node gives Codex's drive with `vox trust drive`. Then
 //! the stand-in plays an agent following the pack (`model_standin.py --script`): each command is
 //! one call of the harness's own shell tool, and what the harness gave back is what is asserted.
-//! OpenCode's session holds its last command until the other two are done, so its Session is open
-//! while Codex's (with drive) and Claude Code's (read only) reach it. Asserted, as PRODUCT:
+//! A `codex exec`, `opencode run` or `claude -p` has no person at it and opens no Session, so the
+//! Session Codex's node (with drive) and Claude Code's (read only) reach is an interactive one of
+//! OpenCode's node, opened through `vox agent hook` as a stand-in harness runs it. Asserted, as PRODUCT:
 //! Claude Code and OpenCode name no node (`VOX_NODE`) with four nodes attached, Codex names it on
 //! every command but `vox agent status`; `vox trust list` says `read` or `read + drive` per
 //! entry; posts (plain, `--re`, typed from stdin, `--type ask|blocked`, `--urgent`), and a post
@@ -575,17 +576,6 @@ fn strings_of(v: &serde_json::Value, out: &mut String) {
 #[cfg(feature = "optional-proofs")]
 struct Stop(Vec<std::process::Child>);
 
-/// Writes its file when dropped: what lets a harness's waiting command go.
-#[cfg(feature = "optional-proofs")]
-struct Release(std::path::PathBuf);
-
-#[cfg(feature = "optional-proofs")]
-impl Drop for Release {
-    fn drop(&mut self) {
-        let _ = std::fs::write(&self.0, "");
-    }
-}
-
 #[cfg(feature = "optional-proofs")]
 impl Drop for Stop {
     fn drop(&mut self) {
@@ -613,8 +603,8 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
              runs on macOS only"
         );
     }
-    const ASK: &str =
-        "This repo isn't tied to a Vox room. Paste its room link to bind it, or say no.";
+    const ASK: &str = "This repo isn't tied to a Vox room. Vox has asked you in its app; you can \
+                       also paste its room link here, or say no.";
 
     // ---- the three harnesses, as installed here; the sandbox reads each one's install ----
     let find = |bin: &str| -> PathBuf {
@@ -1045,6 +1035,7 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
     let xdg = |d: &str| root.join("xdg").join(d).display().to_string();
     let config = home.join(".config").display().to_string();
     let (xdg_data, xdg_state, xdg_cache) = (xdg("data"), xdg("state"), xdg("cache"));
+    let plugin_log = root.join("opencode-plugin.log").display().to_string();
     let opencode_env = [
         ("XDG_CONFIG_HOME", config.as_str()),
         ("XDG_DATA_HOME", xdg_data.as_str()),
@@ -1056,6 +1047,8 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
         // Its Claude Code compatibility would read ~/.claude/skills, where Claude Code's
         // copy of the pack could stand in for OpenCode's own.
         ("OPENCODE_DISABLE_CLAUDE_CODE", "1"),
+        // What Vox's plugin did, for a red to be read by.
+        ("VOX_PLUGIN_LOG", plugin_log.as_str()),
     ];
     let opencode_args = ["run", "--model", "standin/stub-model", "hello"];
     let opencode_listed = [
@@ -1087,11 +1080,26 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
     let rpass = root.join("room.pass");
     std::fs::write(&rpass, "room passphrase\n").expect("APPARATUS: the room passphrase file");
     let rpass_arg = rpass.to_str().expect("APPARATUS: a UTF-8 path");
-    staged("alice", &["node", "create", "alice", "--passphrase-file", pass_arg]);
-    staged("alice", &["node", "attach", "alice", "--passphrase-file", pass_arg]);
+    staged(
+        "alice",
+        &["node", "create", "alice", "--passphrase-file", pass_arg],
+    );
+    staged(
+        "alice",
+        &["node", "attach", "alice", "--passphrase-file", pass_arg],
+    );
     staged(
         "the room",
-        &["room", "create", "--node", "alice", "--name", "work", "--passphrase-file", rpass_arg],
+        &[
+            "room",
+            "create",
+            "--node",
+            "alice",
+            "--name",
+            "work",
+            "--passphrase-file",
+            rpass_arg,
+        ],
     );
     let room = staged("the room", &["room", "list", "--node", "alice"])
         .split_whitespace()
@@ -1107,8 +1115,15 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
     // setup.md: `vox room join <link> --node <your node> --bind <this repo's directory>`, its
     // passphrase from a file here where the operator types it.
     let (ok, out, err) = vox(&[
-        "room", "join", &link, "--node", "claude-proof", "--bind", repo_arg,
-        "--passphrase-file", rpass_arg,
+        "room",
+        "join",
+        &link,
+        "--node",
+        "claude-proof",
+        "--bind",
+        repo_arg,
+        "--passphrase-file",
+        rpass_arg,
     ]);
     println!("[proof] the operator's join, as the pack gives it:\n{out}{err}");
     assert!(
@@ -1117,8 +1132,15 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
          claude-proof --bind <repo>`) failed: {out}{err}"
     );
     for node in ["codex-proof", "opencode-proof"] {
-        let (ok, out, err) =
-            vox(&["room", "join", &link, "--node", node, "--passphrase-file", rpass_arg]);
+        let (ok, out, err) = vox(&[
+            "room",
+            "join",
+            &link,
+            "--node",
+            node,
+            "--passphrase-file",
+            rpass_arg,
+        ]);
         assert!(
             ok,
             "PRODUCT: the join the pack gives the operator (`vox room join <link> --node \
@@ -1152,7 +1174,13 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
         }
     }
     // trust.md: `vox trust drive <fingerprint>`, the operator's, at a terminal.
-    let (ok, shown) = typed_vox(&["trust", "drive", &fp["codex-proof"], "--node", "opencode-proof"]);
+    let (ok, shown) = typed_vox(&[
+        "trust",
+        "drive",
+        &fp["codex-proof"],
+        "--node",
+        "opencode-proof",
+    ]);
     println!("[proof] the operator's `vox trust drive`, typed:\n{shown}");
     assert!(
         ok,
@@ -1162,7 +1190,16 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
     // A message for Claude Code's node to answer, and a file for every member.
     staged(
         "alice's ask",
-        &["room", "post", &room, "--node", "alice", "--to", "claude-proof", "how is the codec going?"],
+        &[
+            "room",
+            "post",
+            &room,
+            "--node",
+            "alice",
+            "--to",
+            "claude-proof",
+            "how is the codec going?",
+        ],
     );
     let read = staged("alice's read", &["room", "read", &room, "--node", "alice"]);
     let asked = read
@@ -1176,8 +1213,15 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
     let notes = root.join("notes.txt");
     staged(
         "alice's share",
-        &["share", &room, notes.to_str().expect("APPARATUS: a UTF-8 path"), "-m", "notes for all",
-          "--node", "alice"],
+        &[
+            "share",
+            &room,
+            notes.to_str().expect("APPARATUS: a UTF-8 path"),
+            "-m",
+            "notes for all",
+            "--node",
+            "alice",
+        ],
     );
     std::fs::write(repo.join("report.json"), "{\"codec\": \"on track\"}\n")
         .expect("APPARATUS: the report");
@@ -1187,13 +1231,16 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
     // ---- (6) each harness runs the pack's commands, as written, through its own shell ----
     // What each turn ran: the stand-in writes each command with what the harness gave back.
     let script = |key: &str, lines: &[String]| {
-        std::fs::write(script_dir.join(format!("{key}.cmds")), lines.join("\n") + "\n")
-            .expect("APPARATUS: the stand-in's script");
+        std::fs::write(
+            script_dir.join(format!("{key}.cmds")),
+            lines.join("\n") + "\n",
+        )
+        .expect("APPARATUS: the stand-in's script");
     };
     let ran = |name: &str, key: &str, lines: &[String]| -> Vec<String> {
         let _ = std::fs::remove_file(script_dir.join(format!("{key}.cmds")));
-        let text = std::fs::read_to_string(script_dir.join(format!("{key}.ran")))
-            .unwrap_or_else(|e| {
+        let text =
+            std::fs::read_to_string(script_dir.join(format!("{key}.ran"))).unwrap_or_else(|e| {
                 panic!("APPARATUS: {name} did not run the script through its shell tool ({e})")
             });
         let outs: Vec<String> = text
@@ -1235,11 +1282,14 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
     let wire = "gwa:acme/widgets:prd-1:wire";
 
     let sessions_of = |node: &str| -> Vec<serde_json::Value> {
-        staged("the Sessions", &["room", "sessions", &room, "--json", "--node", "alice"])
-            .lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .filter(|v| v["node"].as_str() == Some(fp[node].as_str()))
-            .collect()
+        staged(
+            "the Sessions",
+            &["room", "sessions", &room, "--json", "--node", "alice"],
+        )
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["node"].as_str() == Some(fp[node].as_str()))
+        .collect()
     };
 
     let claude_ran = [
@@ -1249,38 +1299,78 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
         "--allowedTools=Bash",
         "hello",
     ];
-    // OpenCode: `VOX_NODE` set for it. Its session stays open, its last command waiting on the
-    // proof, so the other two find its Session open: Codex's node holds drive over it, Claude
-    // Code's does not.
-    let release = root.join("release");
+    // A `codex exec`, an `opencode run` and a `claude -p` have no person at them, so none opens a
+    // Session (sessions.md). The Session the other two reach is an interactive one of OpenCode's
+    // node, opened through `vox agent hook` as Claude Code's hook runs it (apparatus: a stand-in
+    // harness), in the repo the room map binds: Codex's node holds drive over it, Claude Code's
+    // does not.
+    let opencode_session = "0c0c0c0c-5e55-4000-8000-00000000c0de".to_owned();
+    let mut c = Command::new(&vox_bin);
+    env(&mut c);
+    let mut hook = c
+        .args(["agent", "hook", "--node", "opencode-proof"])
+        .env("CLAUDE_CODE_ENTRYPOINT", "cli")
+        .current_dir(&repo)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: cannot start vox agent hook");
+    {
+        use std::io::Write as _;
+        let event = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": opencode_session,
+            "cwd": repo.display().to_string(),
+            "transcript_path": root.join("standin.jsonl").display().to_string(),
+            "permission_mode": "default",
+            "prompt": "carry on",
+        });
+        hook.stdin
+            .take()
+            .expect("APPARATUS: the hook's stdin")
+            .write_all(event.to_string().as_bytes())
+            .expect("APPARATUS: cannot give the hook its event");
+    }
+    let hooked = hook.wait_with_output().expect("APPARATUS: the hook");
+    assert!(
+        hooked.status.success(),
+        "APPARATUS (staging): the stand-in's hook failed: {}",
+        String::from_utf8_lossy(&hooked.stderr)
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !sessions_of("opencode-proof")
+        .iter()
+        .any(|v| v["id"] == opencode_session.as_str() && v["open"] == true)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: an interactive session of node opencode-proof, started in the repo the room \
+             map binds, opened no Session in the room within 60 s"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // OpenCode: `VOX_NODE` set for it.
     let opencode_lines: Vec<String> = vec![
         "vox agent status --harness opencode".to_owned(),
         "vox trust list".to_owned(),
         format!("vox room sessions {room}"),
-        format!("until [ -e {} ]; do sleep 1; done", release.display()),
     ];
     script("opencode", &opencode_lines);
-    let opencode_session = std::thread::scope(|scope| {
-        // However this scope ends, a red included, OpenCode's last command is let go, so its
-        // turn ends and the scope can join it.
-        let let_go = Release(release.clone());
-        let held = scope.spawn(|| turn("OpenCode", &opencode, &opencode_args, &opencode_env));
-        let deadline = Instant::now() + Duration::from_secs(300);
-        let opencode_session = loop {
-            if let Some(id) = sessions_of("opencode-proof")
-                .iter()
-                .find(|v| v["open"] == serde_json::Value::Bool(true))
-                .and_then(|v| v["id"].as_str().map(str::to_owned))
-            {
-                break id;
-            }
-            assert!(
-                Instant::now() < deadline && !held.is_finished(),
-                "PRODUCT: OpenCode's session worked in the room and no open Session of node \
-                 opencode-proof showed there in 300 s (alice's `vox room sessions --json`)"
-            );
-            std::thread::sleep(Duration::from_millis(500));
-        };
+    let (_, _) = turn("OpenCode", &opencode, &opencode_args, &opencode_env);
+    let outs = ran("OpenCode", "opencode", &opencode_lines);
+    let n = "OpenCode";
+    let lines = &opencode_lines;
+    said_ok(
+        n,
+        lines,
+        &outs,
+        1,
+        &["codex-proof  read + drive", "claude-proof  read\n"],
+    );
+    said_ok(n, lines, &outs, 2, &[&opencode_session[..8]]);
+    {
         let s = &opencode_session;
 
         // Codex: no `VOX_NODE`, so each command names the node, as SKILL.md says, but for `vox
@@ -1312,13 +1402,25 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
         let outs = ran("Codex", "codex", &lines);
         let n = "Codex";
         said_ok(n, &lines, &outs, 1, &[&room]);
-        said_ok(n, &lines, &outs, 2, &["opencode-proof  read\n", "claude-proof  read\n"]);
+        said_ok(
+            n,
+            &lines,
+            &outs,
+            2,
+            &["opencode-proof  read\n", "claude-proof  read\n"],
+        );
         for i in 3..=10 {
             said_ok(n, &lines, &outs, i, &[]);
         }
         said_ok(n, &lines, &outs, 10, &[codec, wire]);
         // rooms.md: a post says, for each node it addresses, what to expect.
-        said_ok(n, &lines, &outs, 7, &["to alice: ", "you trust it; it trusts you"]);
+        said_ok(
+            n,
+            &lines,
+            &outs,
+            7,
+            &["to alice: ", "you trust it; it trusts you"],
+        );
         let open_with_drive = format!("\"id\":\"{s}\"");
         assert!(
             outs[11].lines().any(|l| l.contains(&open_with_drive)
@@ -1397,7 +1499,11 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
             &lines,
             &outs,
             3,
-            &["codex-proof  read\n", "opencode-proof  read\n", "alice  read + drive"],
+            &[
+                "codex-proof  read\n",
+                "opencode-proof  read\n",
+                "alice  read + drive",
+            ],
         );
         for i in [4, 5, 7, 8, 9, 10, 11, 13, 14] {
             said_ok(n, &lines, &outs, i, &[]);
@@ -1405,8 +1511,9 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
         said_ok(n, &lines, &outs, 6, &["how is the codec going?"]);
         said_ok(n, &lines, &outs, 12, &[wire]);
         assert!(
-            outs[15].lines().any(|l| l.contains(&open_with_drive)
-                && l.contains("\"can_drive\":false")),
+            outs[15]
+                .lines()
+                .any(|l| l.contains(&open_with_drive) && l.contains("\"can_drive\":false")),
             "PRODUCT: Claude Code's node holds no drive from OpenCode's, and `vox room sessions \
              --json` did not say `\"can_drive\":false` for OpenCode's Session {s}:\n{}",
             outs[15]
@@ -1432,17 +1539,7 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
             lines.len() - 1,
             &["typed at a terminal, never read from a file"],
         );
-
-        drop(let_go);
-        held.join().expect("APPARATUS: OpenCode's turn panicked");
-        opencode_session
-    });
-    let outs = ran("OpenCode", "opencode", &opencode_lines);
-    let n = "OpenCode";
-    let lines = &opencode_lines;
-    said_ok(n, lines, &outs, 1, &["codex-proof  read + drive", "claude-proof  read\n"]);
-    said_ok(n, lines, &outs, 2, &[&opencode_session[..8]]);
-    said_ok(n, lines, &outs, 3, &[]);
+    }
     // files.md: `vox room get`. It reaches the daemon's forward on an ephemeral loopback port,
     // which the harness's sandbox keeps closed (it opens no loopback port but the stand-in's), so
     // it runs here as Claude Code's node, in the repo, as the agent would run it.
@@ -1455,8 +1552,8 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
         .stdin(Stdio::null())
         .output()
         .unwrap_or_else(|e| panic!("APPARATUS: cannot run vox room get: {e}"));
-    let said = String::from_utf8_lossy(&got.stdout).into_owned()
-        + &String::from_utf8_lossy(&got.stderr);
+    let said =
+        String::from_utf8_lossy(&got.stdout).into_owned() + &String::from_utf8_lossy(&got.stderr);
     println!("[proof] Claude Code's node $ vox room get {room} notes.txt --dir ./incoming\n{said}");
     assert!(
         got.status.success()

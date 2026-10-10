@@ -3,8 +3,9 @@
 Every harness session working in a room (yours included) has a **Session** there: what it did,
 one line per activity — tool calls with what they returned, its replies, the end of each turn,
 what was typed at its terminal or in Vox, approvals and questions with who answered them, and
-files either way. Vox writes it from the harness itself, not from the model. A Claude Code run
-with no person at it (`claude -p`, or the Agent SDK) has none: nobody is there to follow or drive.
+files either way. Vox writes it from the harness itself, not from the model. A run with no person
+at it has none: `claude -p` (or the Agent SDK), `codex exec`, `opencode run`. Nobody is there to
+follow or drive.
 
 Only the members a session's node trusts with **drive** see inside its Session; anyone else is told
 so. Your own Session is seen by the members your node trusts with drive, and they may steer you
