@@ -1367,7 +1367,8 @@ fn daemon_of(exe: &Path, root: &Path, name: &str, spec: &str) -> Daemon {
 /// its own (`OP_ROTATION_HELLO`), which the old release cannot read, so the old one reads nothing
 /// new from this build, in either room: its key is never sealed where the old node could open it,
 /// in the pair's long-lived session. This build's daemon says why, in plain words, and resends the
-/// same delivery after a backoff, never every second. Mutants: sealing the key in the long-lived
+/// same delivery after a backoff, never every second; its `vox room roster` of each shared room
+/// and its `vox status` say beside the old member that its key waits until it updates to v0.4.3. Mutants: sealing the key in the long-lived
 /// session again (the old one reads this build); a stream ended without an answer counted as lost
 /// (no plain reason, and a resend each second).
 #[test]
@@ -1444,6 +1445,8 @@ fn the_previous_release_and_this_build_complete_the_exchange_both_ways() {
     let to_old = make_room(&old, &old_d, "made-by-old");
     let mut red = Vec::new();
     let mut joined = Vec::new();
+    // This build's id of each shared room, for its roster below.
+    let mut rooms_here = Vec::new();
     for (who, exe, d, link) in [
         (
             format!("v{version} (old dials new)"),
@@ -1490,6 +1493,7 @@ fn the_previous_release_and_this_build_complete_the_exchange_both_ways() {
                 .to_owned()
         };
         let (r_old, r_new) = (room(&old, &old_d), room(new, new_d));
+        rooms_here.push(r_new.clone());
         let deadline = Instant::now() + Duration::from_secs(90);
         // Long enough for the old one to read this build if its key had reached it: before ADR-030
         // both read each other within a few seconds.
@@ -1543,6 +1547,39 @@ fn the_previous_release_and_this_build_complete_the_exchange_both_ways() {
             ));
         }
     }
+    // Beside the member, where a person looks: the roster of each shared room, and `vox status`.
+    let old_full = b32_encode(&old_d.fp);
+    let waits_line = "waits: it runs a Vox older than v0.4.3";
+    for r in &rooms_here {
+        let (_, roster) = run_as(new, &new_d.data, &["room", "roster", r], None);
+        let said = roster.lines().any(|l| {
+            l.contains(&format!(
+                "your key for {old_full} in this room {waits_line}"
+            ))
+        });
+        println!("[proof] this build's roster of {r} says v{version}'s member waits: {said}");
+        if !said {
+            red.push(format!(
+                "this build's `vox room roster {r}` did not say its key waits for v{version}'s \
+                 member until it updates: {roster}"
+            ));
+        }
+    }
+    let (_, status) = run_as(new, &new_d.data, &["status"], None);
+    let in_status = status
+        .lines()
+        .filter(|l| l.contains("your key for it waits: it runs a Vox older than v0.4.3"))
+        .count();
+    println!(
+        "[proof] this build's `vox status` says v{version}'s member waits in {in_status} room(s)"
+    );
+    if !rooms_here.is_empty() && in_status != rooms_here.len() {
+        red.push(format!(
+            "this build's `vox status` said v{version}'s member waits in {in_status} of {} \
+             shared rooms: {status}",
+            rooms_here.len()
+        ));
+    }
     // What this build's daemon told its person about the old one's keys.
     let since = trusted_at.elapsed();
     let said = w.host._proc.transcript();
@@ -1555,9 +1592,9 @@ fn the_previous_release_and_this_build_complete_the_exchange_both_ways() {
         .iter()
         .filter(|l| {
             l.contains(
-                "it closed the stream without an answer, as a node running a Vox older than key \
-                 delivery in a session of its own does; it reads nothing new from you until it is \
-                 updated",
+                "it runs a Vox older than v0.4.3, which cannot take a key delivered in a session \
+                 of its own (it closed the stream without an answer); it reads nothing new from \
+                 you until it updates to v0.4.3 or later, and gets your key then",
             )
         })
         .count();

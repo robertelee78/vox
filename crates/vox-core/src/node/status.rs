@@ -99,6 +99,8 @@ pub struct MemberStatus {
     pub last_seen: Option<u64>,
     /// When a sync session with it last ran, unix milliseconds.
     pub last_sync: Option<u64>,
+    /// Why this identity's key for it in this room waits, if it does (ADR-030 D-5, W-4).
+    pub key_waits: Option<String>,
 }
 
 /// One open room.
@@ -425,13 +427,14 @@ impl StatusReport {
         let rooms = self.rooms.iter().map(|r| {
             let members = r.members.iter().map(|m| {
                 format!(
-                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"last_seen_ms\":{},\"last_sync_ms\":{}}}",
+                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"last_seen_ms\":{},\"last_sync_ms\":{},\"key_waits\":{}}}",
                     q(&b32_encode(&m.id)),
                     m.me,
                     m.trusted,
                     m.connected,
                     opt(m.last_seen),
-                    opt(m.last_sync)
+                    opt(m.last_sync),
+                    m.key_waits.as_deref().map_or_else(|| "null".to_owned(), q)
                 )
             });
             let frozen = list(r.frozen.iter().map(|d| q(&b32_encode(d))));

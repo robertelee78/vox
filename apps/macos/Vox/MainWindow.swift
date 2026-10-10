@@ -1928,6 +1928,14 @@ private struct Inspector: View {
                                 .padding(.leading, Space.s20)
                                 .accessibilityIdentifier("member-capability-\(member.name)")
                         }
+                        // Why this node's key for it waits (ADR-030 D-5, W-4): a member on an
+                        // older Vox reads nothing new from this node until it updates.
+                        if let why = member.keyWaits {
+                            Text("Your key for it waits: \(why)").secondaryText()
+                                .fixedSize(horizontal: false, vertical: true)
+                                .padding(.leading, Space.s20)
+                                .accessibilityIdentifier("member-key-waits-\(member.name)")
+                        }
                         // The platform its node says it runs on (ADR-020 §4.9b): its claim, said
                         // as one.
                         if let platform = model.platforms[member.id] {
