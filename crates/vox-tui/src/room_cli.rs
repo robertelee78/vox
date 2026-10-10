@@ -4817,6 +4817,12 @@ pub async fn trust_add(
             "your services in a room you share, once you offer one"
         )
     );
+    // Drive is part of what yes changes, so it is said with the rest, before the passphrase.
+    if drive {
+        println!(
+            "     and to drive this node's Sessions: type into them, interrupt, approve and answer"
+        );
+    }
     match keyring_change(&mut client, |identity_passphrase| Request::Trust {
         target,
         petname: petname.to_owned(),
