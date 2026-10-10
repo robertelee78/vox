@@ -236,10 +236,24 @@ pub fn needs(data: &Path, argv: &[&str]) -> Option<String> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let node = argv
-        .windows(2)
-        .find(|w| w[0] == "--node")
-        .map_or("default", |w| w[1])
-        .to_owned();
+    // Without `--node`, the profile's one node: setup names it after the machine (#666), so it
+    // is no longer always `default`.
+    let named = argv.windows(2).find(|w| w[0] == "--node").map(|w| w[1]);
+    let node = match named {
+        Some(n) => n.to_owned(),
+        None => {
+            let mut nodes: Vec<String> = std::fs::read_dir(data.join("nodes"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect();
+            match nodes.len() {
+                1 => nodes.remove(0),
+                _ => "default".to_owned(),
+            }
+        }
+    };
     data.join("nodes").join(&node).exists().then_some(node)
 }
