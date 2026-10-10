@@ -80,6 +80,8 @@
 //!   `first.is_empty()` refusal in `ask_new_passphrase` kept → red (today). `J2.wired`:
 //!   `Wiring::install` writing no hook → red. `J2.attached`: setup making nodes without attaching
 //!   them → red (today).
+//! - `J4.<harness>.person_asked` (an interactive Claude Code, `codex --no-daemon` and the OpenCode
+//!   TUI, each in a confined tmux pane): `room_ask::asks` skipping that harness's sessions → red.
 //! - `J4.*.one_command`: `vox agent status` printing two commands → red. `J4.*.reaches_room`:
 //!   status naming `vox node attach` for an attached node → red (loops). `J4.*.person_asked`: the
 //!   ask given to the model only → red (today). `J4.*.bound`: `--bind` not writing the room map → red.
@@ -1609,6 +1611,9 @@ mod journey {
             ),
             ("DISABLE_AUTOUPDATER".to_owned(), "1".to_owned()),
         ]);
+        // Codex's and OpenCode's own, for their TUIs in the same server.
+        env.extend(harnesses[1].env.iter().cloned());
+        env.extend(harnesses[2].env.iter().cloned());
         let tm = |args: &[&str]| -> String {
             let o = Command::new(&tmux)
                 .env_clear()
@@ -1633,8 +1638,27 @@ mod journey {
             .iter()
             .any(|b| s.contains(b))
         };
-        // A fresh tmux server with Claude Code started in its pane: whether it came up.
-        let start_claude = || -> bool {
+        // A fresh tmux server with harness `key`'s interactive client started in its pane, as a
+        // person starts it, on the stand-in model: whether it came up. Codex runs with
+        // `--no-daemon`: its app-server cannot run `ps` in the sandbox.
+        let start_tui = |key: &str| -> bool {
+            let h = harnesses
+                .iter()
+                .find(|h| h.key == key)
+                .expect("APPARATUS: a harness of the journey's");
+            let line = match key {
+                "claude" => format!("{} --model claude-sonnet-4-5", h.program.display()),
+                "codex" => format!("{} --no-daemon", h.program.display()),
+                _ => format!("{} --model standin/stub-model", h.program.display()),
+            };
+            let ready = |s: &str| match key {
+                "claude" => {
+                    s.contains("Claude Code v")
+                        && s.lines().filter(|l| l.matches('─').count() >= 20).count() >= 2
+                }
+                "codex" => s.contains("Ask Codex to do anything"),
+                _ => s.contains("Ask anything"),
+            };
             let _ = tm(&["kill-server"]);
             let started = Command::new("/usr/bin/sandbox-exec")
                 .env_clear()
@@ -1660,16 +1684,7 @@ mod journey {
                 .output()
                 .is_ok_and(|o| o.status.success());
             if started {
-                let _ = tm(&[
-                    "send-keys",
-                    "-t",
-                    ":0.0",
-                    "-l",
-                    &format!(
-                        "{} --model claude-sonnet-4-5",
-                        harnesses[0].program.display()
-                    ),
-                ]);
+                let _ = tm(&["send-keys", "-t", ":0.0", "-l", &line]);
                 let _ = tm(&["send-keys", "-t", ":0.0", "Enter"]);
             }
             let t0 = Instant::now();
@@ -1679,9 +1694,7 @@ mod journey {
                 if !guard_ok(&s) {
                     break;
                 }
-                if s.contains("Claude Code v")
-                    && s.lines().filter(|l| l.matches('─').count() >= 20).count() >= 2
-                {
+                if ready(&s) {
                     up = true;
                     break;
                 }
@@ -1787,25 +1800,18 @@ mod journey {
             // **Vox asks the person** for the repo's room, not only the model: the daemon's
             // RoomAsks, which Vox.app shows as its banner, are the "Vox needs you:" lines of
             // `vox agent status`. A headless run is asked nothing (it gets no Session, ADR-029
-            // SE-1), so the ask is for an interactive session: Claude Code at its own terminal.
+            // SE-1), so the ask is for an interactive session: each harness's own client at a
+            // terminal of its own.
             let _ = sent;
             let mut line: Option<String> = None;
-            if h.key != "claude" {
-                l.cannot(
-                    &id("person_asked"),
-                    &format!(
-                        "the ask is raised for an interactive session, and this proof runs {} \
-                         headless only",
-                        h.name
-                    ),
-                );
-            } else {
+            {
                 std::fs::write(&run_file, "-").unwrap_or_else(|e| panic!("APPARATUS: {e}"));
-                if !start_claude() {
+                if !start_tui(h.key) {
                     l.apparatus(
                         &id("person_asked"),
                         &format!(
-                            "an interactive Claude Code did not come up in tmux; the pane:\n{}",
+                            "an interactive {} did not come up in tmux; the pane:\n{}",
+                            h.name,
                             screen()
                         ),
                     );
@@ -1813,7 +1819,8 @@ mod journey {
                     let _ = tm(&["send-keys", "-t", ":0.0", "-l", "hello from the terminal"]);
                     std::thread::sleep(Duration::from_millis(600));
                     let _ = tm(&["send-keys", "-t", ":0.0", "Enter"]);
-                    let want = format!("Claude Code in {} has no room", w.repo.display());
+                    // Several harnesses read "Claude Code and Codex in <dir> has no room".
+                    let want = format!("in {} has no room", w.repo.display());
                     let t0 = Instant::now();
                     let status = loop {
                         let st = w.run(&[
@@ -1828,7 +1835,11 @@ mod journey {
                             .said
                             .lines()
                             .map(str::trim)
-                            .find(|l| l.starts_with("Vox needs you:") && l.contains(&want))
+                            .find(|l| {
+                                l.starts_with("Vox needs you:")
+                                    && l.contains(h.name)
+                                    && l.contains(&want)
+                            })
                             .map(str::to_owned);
                         if line.is_some() || t0.elapsed() > Duration::from_secs(30) {
                             break st.said;
@@ -1837,9 +1848,10 @@ mod journey {
                     };
                     l.claim(&id("person_asked"), line.is_some(), || {
                         format!(
-                            "within 30 s of an interactive Claude Code started in the repo, \
-                             `vox agent status` showed the person no \"Vox needs you: {want} …\" \
-                             line; it said:\n{status}"
+                            "within 30 s of an interactive {} started in the repo, `vox agent \
+                             status` showed the person no \"Vox needs you: {} {want} …\" line; it \
+                             said:\n{status}",
+                            h.name, h.name
                         )
                     });
                 }
@@ -2201,7 +2213,7 @@ mod journey {
             // Its model answers "ok" and runs nothing, so no approval is pending when the person
             // drives: what is measured is driving an idle session.
             std::fs::write(&run_file, "-").unwrap_or_else(|e| panic!("APPARATUS: {e}"));
-            let up = start_claude();
+            let up = start_tui("claude");
             if !up {
                 for c in ["found", "said", "renamed", "while_waiting"] {
                     l.apparatus(
