@@ -11849,16 +11849,17 @@ impl Node {
         target: Digest32,
         skdm: &crate::group::skdm::Skdm,
     ) -> bool {
-        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+        if self.net.is_none() {
             return false;
-        };
+        }
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return false;
         };
         let Ok(ctx) = shared.lock().await.join_context() else {
             return false;
         };
-        let Some(record) = net.board_bundle(channel_id, ctx.epoch, &target) else {
+        // Never a stale bundle, nor a one-time prekey it refused (ADR-030 P-2, P-3).
+        let Ok(bundle) = self.delivery_bundle(channel_id, target).await else {
             return false;
         };
         let package = {
@@ -11868,7 +11869,7 @@ impl Node {
             let ring = ring.lock().await;
             match crate::node::keypackage::KeyPackage::seal(
                 ring.identity_dh(),
-                &record.prekey_bundle,
+                &bundle,
                 &ctx,
                 target,
                 skdm,
@@ -12954,6 +12955,7 @@ impl Node {
             // maintained again at the next unlock.
             let _ = prekeys::save(profile.store(), signer, &ring);
         }
+        let republish = done.rotated || done.retired > 0;
         crate::node::status::SyncBook::note_prekeys(
             &self.sync_book,
             crate::node::status::PrekeyNote {
@@ -12969,6 +12971,16 @@ impl Node {
                 oldest_one_time: ring.oldest_one_time_created(),
             },
         );
+        // A rotated signed prekey, or a retired one-time prekey, is no longer what the bundle on
+        // the boards should name: senders refuse it as stale (ADR-030 P-2) and wait. Republished
+        // now, in every room whose records renew, rather than at the next renewal, up to an hour
+        // away.
+        if republish {
+            drop(ring);
+            for at in self.records_renew_at.values_mut() {
+                *at = now;
+            }
+        }
     }
 
     /// Lock now, and settle off the actor.

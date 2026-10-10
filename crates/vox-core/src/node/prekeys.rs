@@ -260,6 +260,9 @@ pub struct PrekeyRing {
     /// Initial messages this process answered with the **previous** signed prekey: sessions
     /// started just before a rotation. Not persisted; `vox status --json` reports it.
     previous_used: std::sync::atomic::AtomicU64,
+    /// Read from an earlier at-rest version: [`load_or_create`] saves it at once in this one, so
+    /// no ring of an earlier release lingers on disk.
+    older_version: bool,
     /// The current signed prekey was read from a version-1 ring, its creation time in seconds
     /// under its signature: it is rotated at the next [`PrekeyRing::maintain`] rather than read in
     /// the wrong unit.
@@ -327,6 +330,7 @@ impl PrekeyRing {
             retired_used: std::sync::atomic::AtomicU64::new(0),
             previous_used: std::sync::atomic::AtomicU64::new(0),
             rotate_now: false,
+            older_version: false,
         })
     }
 
@@ -588,8 +592,8 @@ impl PrekeyRing {
         // A version-1 ring's times are seconds. Its consume times convert; a prekey's creation
         // time is under its root signature, and only the current signed prekey's is ever read,
         // so that one is rotated at once instead (the others' are never compared with anything).
-        // Versions 1 and 2 hold no retired one-time prekeys (ADR-030 P-1): an empty set, and the
-        // next save writes version 3.
+        // Versions 1 and 2 hold no retired one-time prekeys (ADR-030 P-1): an empty set, and
+        // `load_or_create` saves the ring as version 3 at once.
         let (seconds, has_retired) = match (d.uint()?, arity) {
             (RING_VERSION, 9) => (false, true),
             (RING_VERSION_NO_RETIRED, 8) => (false, false),
@@ -700,6 +704,7 @@ impl PrekeyRing {
             retired_used: std::sync::atomic::AtomicU64::new(0),
             previous_used: std::sync::atomic::AtomicU64::new(0),
             rotate_now: seconds,
+            older_version: !has_retired,
         })
     }
 }
@@ -931,8 +936,9 @@ pub fn load_or_create(
 ) -> Result<(PrekeyRing, bool)> {
     match load(store, signer)? {
         Some(mut ring) => {
-            if ring.maintain(signer, now_ms)?.changed() {
+            if ring.maintain(signer, now_ms)?.changed() || ring.older_version {
                 save(store, signer, &ring)?;
+                ring.older_version = false;
             }
             Ok((ring, false))
         }
