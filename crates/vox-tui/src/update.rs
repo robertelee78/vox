@@ -983,7 +983,6 @@ pub fn run(check_only: bool, rollback: bool) -> Result<(), AppError> {
     );
     restart::restart_daemon(&active, &release.version_text);
     run_shell_setup(&active);
-    run_skill_install(&active);
     Ok(())
 }
 
@@ -1059,7 +1058,6 @@ fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
             // brings its own completions.
             restart_onto(&active);
             run_shell_setup(&active);
-            run_skill_install(&active);
             return Ok(());
         }
         fs::remove_file(&scratch).map_err(AppError::Io)?;
@@ -1086,7 +1084,6 @@ fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
     );
     restart_onto(&active);
     run_shell_setup(&active);
-    run_skill_install(&active);
     Ok(())
 }
 
@@ -1195,22 +1192,28 @@ fn binary_version(path: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Completions are generated from the CLI model, so they are refreshed with the CLI. This runs
-/// the binary that is now in place — the new model is the one that matters — and honours the
-/// same opt-out `vox shell-setup` itself honours.
+/// Completions are generated from the CLI model, and the agent skill pack is the CLI's, so both
+/// are refreshed with the CLI: this runs the binary that is now in place — the new one is the one
+/// that matters — as every earlier release's update runs it. It honours `VOX_NO_SHELL_SETUP` and
+/// `VOX_NO_SKILL_INSTALL` itself, each for its own part.
 fn run_shell_setup(active: &Path) {
-    if std::env::var_os("VOX_NO_SHELL_SETUP").is_some() {
-        return;
-    }
     match Command::new(active).arg("shell-setup").output() {
         Ok(o) if o.status.success() => print!("{}", String::from_utf8_lossy(&o.stdout)),
-        _ => println!("         note: run `vox shell-setup` to refresh completions"),
+        Ok(o) => {
+            print!("{}", String::from_utf8_lossy(&o.stdout));
+            println!(
+                "         note: run `vox shell-setup` to refresh completions and the agent skill"
+            );
+        }
+        Err(_) => println!(
+            "         note: run `vox shell-setup` to refresh completions and the agent skill"
+        ),
     }
 }
 
-/// The agent skill pack is the CLI's, so it is refreshed with the CLI (v0.4.1): the binary now in
-/// place installs or refreshes it for every harness here, keeping any file the operator changed.
-/// `VOX_NO_SKILL_INSTALL` skips it, as `install.sh` honours it.
+/// The agent skill pack alone, where `vox shell-setup` is not run (a Vox.app update run from
+/// inside the bundle): the binary now in place installs or refreshes it for every harness here,
+/// keeping any file the operator changed. `VOX_NO_SKILL_INSTALL` skips it.
 fn run_skill_install(active: &Path) {
     if std::env::var_os("VOX_NO_SKILL_INSTALL").is_some() {
         return;

@@ -29,6 +29,14 @@
 //! never grows a fish config. Every step is best-effort and reported rather than fatal: a
 //! failure here must not fail an install of a binary that is already in place.
 //! `VOX_NO_SHELL_SETUP=1` skips all of it.
+//!
+//! ## The agent skill pack
+//! It then installs or refreshes the agent skill pack for every harness here
+//! ([`crate::skill_pack::install_all`]), keeping any file the operator changed;
+//! `VOX_NO_SKILL_INSTALL=1` skips that. It lives here because `vox shell-setup` is the one
+//! command every release's `vox update` runs on the vox it has just put in place: a release's
+//! update is the previous release's code, and v0.4.0's runs this and nothing else, so only the
+//! new vox's `shell-setup` reaches a machine updated from it.
 
 use std::fs;
 use std::io::Write;
@@ -39,6 +47,7 @@ use clap::CommandFactory;
 const BEGIN: &str = "# >>> vox >>>";
 const END: &str = "# <<< vox <<<";
 const OPT_OUT_VAR: &str = "VOX_NO_SHELL_SETUP";
+const SKILL_OPT_OUT_VAR: &str = "VOX_NO_SKILL_INSTALL";
 
 /// The shells this provisions for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,11 +431,19 @@ pub fn install_dir() -> PathBuf {
 
 /// `vox shell-setup [--remove]`.
 pub fn run(remove: bool) -> std::process::ExitCode {
-    let report = if remove {
+    let mut report = if remove {
         deprovision()
     } else {
         provision(&install_dir())
     };
+    if !remove
+        && std::env::var_os(SKILL_OPT_OUT_VAR).is_none_or(|v| v.is_empty())
+        && !crate::skill_pack::install_all()
+    {
+        report
+            .errors
+            .push("the agent skill pack was not installed for every harness here".into());
+    }
     for line in &report.lines {
         println!("vox shell-setup: {line}");
     }

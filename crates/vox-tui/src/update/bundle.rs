@@ -131,7 +131,6 @@ pub(super) fn update(
     ask_to_restart(current.to_string().as_str(), &vox.version_text);
     super::restart::restart_daemon(&active.join(HELPER), &vox.version_text);
     shell_setup_from(apps, exe);
-    super::run_skill_install(exe);
     Ok(())
 }
 
@@ -163,7 +162,6 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
     ask_to_restart(&was, &now);
     super::restart::restart_daemon(&active.join(HELPER), &now);
     shell_setup_from(apps, exe);
-    super::run_skill_install(exe);
     Ok(())
 }
 
@@ -524,14 +522,17 @@ fn ask_to_restart(was: &str, now: &str) {
     println!("restart Vox to run {now}: an open Vox keeps running {was} until it is restarted");
 }
 
-/// Refresh completions through the path the person ran, when that is the link outside the
-/// bundle; the rc block records that directory, never one inside the bundle.
+/// Refresh completions and the agent skill pack through the path the person ran, when that is
+/// the link outside the bundle; the rc block records that directory, never one inside the bundle.
+/// Run from inside the bundle, only the skill pack is refreshed.
 fn shell_setup_from(apps: &Path, exe: &Path) {
     let inside = exe
         .parent()
         .and_then(|dir| fs::canonicalize(dir).ok())
         .is_some_and(|dir| dir.starts_with(apps));
-    if !inside {
+    if inside {
+        super::run_skill_install(exe);
+    } else {
         run_shell_setup(exe);
     }
 }

@@ -2130,13 +2130,15 @@ enum Cmd {
     /// node for you, which you may skip. It ends by printing every node it made: its
     /// fingerprint, with its art, and its alias, harness, host, OS and Vox version.
     Setup(AccountArgs),
-    /// Put `vox` on PATH and install tab completion for your shell.
+    /// Put `vox` on PATH, install tab completion for your shell, and install or refresh the agent
+    /// skill pack for every harness here.
     ///
     /// `install.sh` and `vox update` run this for you. It writes the completion script into
     /// your shell's own autoload directory and maintains one marked section at the end of your
     /// shell's startup file — at the end, so it wins the PATH race against version managers
     /// that prepend their shims earlier in the same file. Idempotent; `--remove` undoes it
-    /// exactly; `VOX_NO_SHELL_SETUP=1` skips it.
+    /// exactly; `VOX_NO_SHELL_SETUP=1` skips it. The skill pack keeps any file you changed, as
+    /// `vox agent skill --install` does; `VOX_NO_SKILL_INSTALL=1` skips it.
     ShellSetup {
         /// Remove everything `vox shell-setup` installed.
         #[arg(long)]

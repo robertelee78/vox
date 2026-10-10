@@ -98,6 +98,7 @@ final class AppModel: ObservableObject {
     /// Ask about the login item at first run; then reach the daemon, and attach the node chosen at
     /// first run, or ask which.
     func start() async {
+        Daemon.refreshSkillPack()
         if Daemon.kept() == nil {
             phase = .askingLoginItem
             return

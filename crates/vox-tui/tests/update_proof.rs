@@ -777,6 +777,7 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
             for id in [
                 "bundle.update_replaces_the_whole_bundle",
                 "bundle.update_installs_the_agent_skill_pack",
+                "bundle.an_earlier_releases_update_installs_the_agent_skill_pack",
                 "bundle.update_refuses_a_vox_that_is_not_the_records",
                 "bundle.apple_gate_refuses_an_unsigned_app",
             ] {
@@ -847,6 +848,33 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
             ),
         ));
         receipts.insert("bundle.update".into(), text);
+
+        // **An update by an earlier release installs it too** (#586): a release's `vox update`
+        // is that release's code, and v0.4.0's runs only `<new vox> shell-setup` on the vox it
+        // put in place (v0.4.1's also ran `agent skill --install`). So the new vox's own
+        // `shell-setup`, run as v0.4.0 ran it (VOX_NO_SHELL_SETUP set, as here), must install the
+        // pack, here for Codex (its settings folder only). Mutant: `shell::run` without its
+        // `skill_pack::install_all` call; red as PRODUCT, no pack.
+        let earlier = tmpdir();
+        let home = earlier.path();
+        std::fs::create_dir_all(home.join(".codex"))
+            .unwrap_or_else(|e| panic!("APPARATUS: a harness folder: {e}"));
+        let new_vox = apps.join("Vox.app/Contents/Helpers/vox");
+        let out = vox(&new_vox, home, &["shell-setup"], &base);
+        let text = said(&out);
+        let pack = home.join(".codex/skills/vox-agent-comms");
+        let entry =
+            pack.join("SKILL.md").is_file() && pack.join("references/sessions.md").is_file();
+        claims.push(claim(
+            "bundle.an_earlier_releases_update_installs_the_agent_skill_pack",
+            out.status.success() && entry && text.contains("Codex: installed"),
+            format!(
+                "the new release's `vox shell-setup`, as v0.4.0's `vox update` runs it (exit_ok={}): \
+                 {} holds SKILL.md and references/sessions.md: {entry}; it said {text:?}",
+                out.status.success(),
+                pack.display()
+            ),
+        ));
     }
 
     // ---- refusals: nothing in the install changes -----------------------------------------
