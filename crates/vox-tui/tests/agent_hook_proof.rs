@@ -2976,14 +2976,16 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     let sub = std::fs::canonicalize(&sub).unwrap_or(sub);
     assert!(
         told.contains("isn't tied to a Vox room")
-            && told.contains("Paste its room link to bind it, or say no.")
+            && told.contains("Vox has asked the operator which room it works in")
+            && told.contains("do not ask again on later turns")
             && told.contains(&format!(
                 "vox room join <link> --node default --bind {}",
                 sub.display()
             ))
             && told.contains("vox agent room --none --node default"),
-        "PRODUCT: a session started in a directory the room map does not name must be told to ask \
-         the operator for its room link or a no, with what to do with each; it was told {told:?}"
+        "PRODUCT: a session started in a directory the room map does not name must be told that \
+         Vox has asked the operator, to say so once, and what to do with a link or a no given in \
+         the session; it was told {told:?}"
     );
     assert!(
         !sessions(&home).iter().any(|r| r["id"] == below),

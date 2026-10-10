@@ -186,8 +186,9 @@ pub fn declined(data_root: &Path, start: &Path) -> bool {
 /// What the hook tells a session about its room this turn, before its rooms' news (ADR-029
 /// RB-5), or `None` when there is nothing to tell:
 /// - a session new to its node that works in no room is told, once, that its repo is not tied to a
-///   room, and to ask the operator for the room's link or a no, with what to do with each (RB-5,
-///   RB-6); unless the operator said no for that directory already (RB-7);
+///   room and that Vox has asked the operator (Vox.app, `vox agent status`, [`crate::room_ask`]):
+///   it tells them so once, and acts on a link or a no given in the session (RB-5, RB-6); unless
+///   the operator said no for that directory already (RB-7);
 /// - a session whose room is being joined is told that, or why the join failed;
 /// - a room map that cannot be read is named, with why, so a person can fix it.
 #[must_use]
@@ -212,12 +213,16 @@ pub fn note(
     let dir = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
     let dir = dir.display();
     Some(format!(
-        "Vox: this repo ({dir}) isn't tied to a Vox room. Ask the operator now, in these words: \
-         \"This repo isn't tied to a Vox room. Paste its room link to bind it, or say no.\"\n\
-         - If they paste a link: never ask for the room's passphrase here. Give them this command \
-         exactly, with the link they pasted in place of <link>, to run in a terminal of their own \
-         (it asks for the passphrase there, and saves the link for this repo so every later \
-         session started here works in that room):\n    \
+        "Vox: this repo ({dir}) isn't tied to a Vox room, and Vox has asked the operator which \
+         room it works in (a banner in Vox.app, and `vox agent status`). Tell them once, in one \
+         sentence, in these words, and do not ask again on later turns: \"This repo isn't tied to \
+         a Vox room. Vox has asked you in its app; you can also paste its room link here, or say \
+         no.\"\n\
+         - If they answer in Vox.app: Vox puts this session in that room itself; run nothing.\n\
+         - If they paste a link here: never ask for the room's passphrase here. Give them this \
+         command exactly, with the link they pasted in place of <link>, to run in a terminal of \
+         their own (it asks for the passphrase there, and saves the link for this repo so every \
+         later session started here works in that room):\n    \
          vox room join <link> --node {node} --bind {dir}\n  \
          Once it says joined, put this session in the room: vox agent room <room> --node {node}\n\
          - If they say no: run vox agent room --none --node {node}, and no session started here is \

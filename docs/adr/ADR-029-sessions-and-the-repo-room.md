@@ -159,12 +159,23 @@ relies on is ADR-028 K-14.
 - **RB-4.** A session's room MUST NOT change during the session's life because of where it works
   afterwards: new branches, worktrees, or reading or editing other repositories' files do not move
   it.
-- **RB-5.** With no match, the session MUST work in no room, and on its first turn the hook MUST
-  tell it, once, that its repository is not tied to a Vox room and to ask the operator, in the
-  session, for the room's link or a no: "This repo isn't tied to a Vox room. Paste its room link to
-  bind it, or say no." It MUST also tell the agent what to do with each answer (RB-6, RB-7).
-  `vox agent room <room>`, run later, MUST move the session to that room; a session MUST work in
-  one room at a time.
+- **RB-5.** With no match, the session MUST work in no room. There MUST be one ask, made in two
+  places (RB-5a): Vox asks the operator itself, and on the session's first turn the hook MUST tell
+  the agent, once, that its repository is not tied to a Vox room, that Vox has asked the operator,
+  and to say so to the operator once, in one sentence: "This repo isn't tied to a Vox room. Vox has
+  asked you in its app; you can also paste its room link here, or say no." The agent MUST NOT ask
+  again on later turns. The operator MAY answer in the session; the hook MUST tell the agent what to
+  do with a link or a no given there (RB-6, RB-7). `vox agent room <room>`, run later, MUST move the
+  session to that room; a session MUST work in one room at a time.
+- **RB-5a.** Every registered interactive session that works in no room, started in a directory
+  the room map does not name, MUST raise an ask for the operator, one per directory, naming the
+  harness and the directory ("Claude Code in /opt/vox has no room"). Vox.app MUST show it as a
+  banner across its window, with "Choose a room…" (a room the operator's node holds, or a pasted
+  link, and the room's passphrase typed in the app) and "Not this repo", and post one notification
+  for it; the TUI and `vox agent status` MUST show it with the commands that answer it at a
+  terminal. Choosing a room MUST do what RB-6's `--bind` does, and MUST also put every session
+  waiting in that directory in the room; "Not this repo" MUST record a no as RB-7 does. The ask
+  MUST end when the directory is bound or declined, or when no session there works in no room.
 - **RB-6.** A link is bound by the operator, never by the agent: the agent MUST NOT ask for, and
   the operator MUST NOT be asked to give, the room's passphrase in the session. The agent MUST give
   the operator the command to run in a terminal of their own, `vox room join <link> --node <the
@@ -185,6 +196,9 @@ relies on is ADR-028 K-14.
 (The decider, 2026-10-08: "if I start a session in claude/codex/opencode etc. in a repo, and we
 don't have the configuration set up yet where the repo is tied to a room, ask if there's a room
 url/link for it to bind to"; the passphrase is typed by the operator in another shell.)
+(The decider, 2026-10-10, v0.4.3 #671: an agent that did not relay the ask left the operator never
+knowing, so Vox asks the operator itself, and the operator may still answer in the session: "let
+me specify one if not".)
 
 ### 7. Setting up a machine
 
