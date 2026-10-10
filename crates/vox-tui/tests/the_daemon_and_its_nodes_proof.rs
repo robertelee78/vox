@@ -9,7 +9,9 @@
 //!    node, with no daemon running, start at once: both exit 0, telling the agent the node is not
 //!    attached and the command for the operator, `vox node attach agent`; a session's next turn
 //!    says nothing more, and the person is notified once per session; a hook naming a node not
-//!    on this Mac says so with `vox setup` and makes no `nodes/<it>` directory (#666; mutants:
+//!    on this Mac says so with `vox setup` and makes no `nodes/<it>` directory; with no daemon,
+//!    a verb says to open Vox (or run `vox daemon`) on a Mac (#666; mutants: the old `vox
+//!    daemon`-only words, red at that line;
 //!    the node-on-disk check skipped, red at that line; the hook resolving its paths by making
 //!    them, red at the directory; the
 //!    once-per-session record ignored, red as PRODUCT at the second turn); one daemon starts, and
@@ -364,6 +366,19 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
     watchdog::arm();
     let a = Account::new();
     a.make_node("agent");
+    // **No daemon: the way to start one is said, Vox first on a Mac** (#666): a person opens Vox
+    // before they open a terminal.
+    let (ok, out, err) = a.run(&["node", "detach", "agent"], "");
+    let start = if cfg!(target_os = "macos") {
+        "to start one, open Vox (or run `vox daemon` in a terminal)"
+    } else {
+        "to start one, run `vox daemon` in a terminal"
+    };
+    assert!(
+        !ok && format!("{out}{err}").contains(start),
+        "PRODUCT: with no daemon running, `vox node detach` must say how to start one: \
+         \"{start}\"; it said: {out}{err}"
+    );
     let (h1, h2) = std::thread::scope(|s| {
         let one = s.spawn(|| a.hook("agent", "s-1", "UserPromptSubmit"));
         let two = s.spawn(|| a.hook("agent", "s-2", "UserPromptSubmit"));

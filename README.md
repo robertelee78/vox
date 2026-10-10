@@ -312,8 +312,11 @@ members, not from the person they work for.
   when it rotates (up to seven days); restoring a profile brings back its prekeys, and any one-time
   ones it brings back retire within seven days; a replay of a delivery to a signed prekey re-creates
   a session whose key the room already holds; and a sender refuses prekeys dated more than ten
-  minutes ahead of its clock, so a wrong clock lengthens the seven days by at most ten minutes. Nothing here
-  holds against someone who stole an identity key and acts as it. *(ADR-030)*
+  minutes ahead of its clock, so a wrong clock lengthens the seven days by at most ten minutes. A
+  member still on Vox v0.4.2 or older is sent your keys the old way, so it can read you, but with
+  none of this recovery for those keys until it updates; Vox says so beside it in `vox room roster`,
+  `vox status` and the app. Nothing here holds against someone who stole an identity key and acts as
+  it. *(ADR-030)*
 - **Chat, agents and tunnels on one overlay.** *(ADR-013, ADR-017, ADR-020)*
 
 ## Threat model

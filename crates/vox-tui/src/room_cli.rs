@@ -1723,13 +1723,14 @@ pub async fn roster(paths: &Paths, room: &str) -> Result<(), AppError> {
             for m in members {
                 println!("{}", id(&m));
             }
-            // Which members this node's key waits for, and why (ADR-030 D-5, W-4): said beside
-            // the list, on stderr, so the list stays one member a line.
+            // What is to be said of a member about this node's key (ADR-030 D-5, W-4): that it
+            // waits, and why, or that the member runs an older Vox. Said beside the list, on
+            // stderr, so the list stays one member a line.
             if let Ok(Frame::KeyWaits { waits }) =
                 client.request(&Request::KeyWaits { channel_id }).await
             {
-                for (m, why) in waits {
-                    eprintln!("vox: your key for {} in this room waits: {why}", id(&m));
+                for (m, said) in waits {
+                    eprintln!("vox: {} {said}", id(&m));
                 }
             }
             Ok(())

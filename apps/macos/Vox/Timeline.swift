@@ -14,13 +14,16 @@ struct TimelineItem: Identifiable {
     let message: RoomMessage?
     let notice: String?
     let entry: FfiSessionEntry?
+    /// A command the notice gives the person to run, shown with Copy (#666); nil for most.
+    var command: String? = nil
 
     static func message(_ m: RoomMessage) -> TimelineItem {
         TimelineItem(id: m.id, millis: m.createdMillis, message: m, notice: nil, entry: nil)
     }
 
-    static func notice(_ id: String, _ text: String, at millis: UInt64) -> TimelineItem {
-        TimelineItem(id: id, millis: millis, message: nil, notice: text, entry: nil)
+    static func notice(_ id: String, _ text: String, at millis: UInt64,
+                       command: String? = nil) -> TimelineItem {
+        TimelineItem(id: id, millis: millis, message: nil, notice: text, entry: nil, command: command)
     }
 
     static func entry(_ e: FfiSessionEntry) -> TimelineItem {
@@ -107,9 +110,17 @@ extension NodeModel {
                     lines.append(.notice("note-\(s.sessionId)", note, at: .max))
                 }
             } else {
+                // The way in, for the person (#666): the app never grants drive (#614), so the
+                // command for the node's own Mac, run as that node, with Copy.
+                let local = nodes.first { $0.fingerprint == s.nodeFingerprint }?.name
                 lines.append(.notice("no-drive-\(s.sessionId)",
-                                     "Only members \(s.nodeAlias) trusts with drive see inside this Session.",
-                                     at: .max))
+                                     "Only members \(s.nodeAlias) trusts with drive see inside this Session. "
+                                         + (local != nil
+                                            ? "To see inside, run this in a terminal on this Mac:"
+                                            : "To see inside, run this in a terminal on the Mac that "
+                                                + "node runs on:"),
+                                     at: .max,
+                                     command: "vox trust drive \(me) --node \(local ?? "<its node>")"))
             }
             return lines
         }

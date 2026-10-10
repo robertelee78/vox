@@ -301,7 +301,7 @@ final class NodeModel: ObservableObject {
     /// Whether this model posts notifications at all.
     private let notifies: Bool
     /// Local notifications for messages in rooms the person is not looking at (M-23).
-    private let notifier = Notifier()
+    private let notifier = Notifier.shared
 
     /// `notify`: whether this model posts notifications; the app's does, and the screenshot
     /// renderer's (apps/macos/Screenshots, never shipped) does not, so it asks nobody anything.

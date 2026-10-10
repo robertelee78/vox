@@ -1334,9 +1334,9 @@ pub async fn run(
             let words = Unregistered::NotAttached(node.clone()).said(&input);
             eprintln!("vox agent hook: {words}");
             if crate::wake::first_detached_notice(paths, &input.session_id) {
-                crate::notify::raise_for(
+                crate::notify::needs_passphrase(
                     paths,
-                    &format!("Vox: node {node} needs its passphrase"),
+                    node.as_str(),
                     &format!("Run in a terminal: vox node attach {node}"),
                 );
                 emit(format, &raw, &input.event, &format!("{words}\n"), "");
@@ -1451,7 +1451,8 @@ impl Unregistered {
             ),
             Self::NoDaemon(why) => format!(
                 "Vox could not read your rooms because no vox daemon runs and none could be \
-                 started ({why}); ask the operator to run `vox daemon` in a terminal."
+                 started ({why}); ask the operator to {}.",
+                crate::client::START_DAEMON
             ),
             Self::Failed(e) => e.to_string(),
         }
