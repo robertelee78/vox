@@ -10,7 +10,8 @@
 //! Before `main` runs, while the process has one thread, this module makes a fresh directory
 //! under the system temp dir and points this process's `HOME` and `XDG_*_HOME` there, and
 //! unsets `CODEX_HOME`, `CLAUDE_CONFIG_DIR` and `OPENCODE_CONFIG_DIR` (which name an agent's
-//! config outside HOME) and the variables naming the agent session that runs the proof. A
+//! config outside HOME), the variables naming the agent session that runs the proof, and every
+//! `VOX_*` but the run's own settings (`VOX_NODE` above all). A
 //! child inherits its parent's environment, so every child of every proof gets the temporary
 //! HOME by default, through every helper, with no call site to remember. The same constructor
 //! gives every child `VOX_PROXY=127.0.0.1:0` unless the run set its own, so no proof's daemon takes
@@ -75,6 +76,17 @@ const UNSET: [&str; 11] = [
     "VOX_HARNESS",
     "VOX_OPENCODE_WAKE_SOCKET",
     "VOX_OPENCODE_WAKE_TOKEN",
+];
+
+/// The `VOX_*` a run of proofs may set on purpose, kept: each configures the proof process, never
+/// the product (`VOX_PROXY` is set below when the run gives none).
+const RUN_SETTINGS: [&str; 6] = [
+    "VOX_PROXY",
+    "VOX_PROOF_",
+    "VOX_MUTANT_",
+    "VOX_UPGRADE_FROM",
+    "VOX_PERF_",
+    "VOX_TEST_WATCHDOG_SECS",
 ];
 
 /// Where a `vox` daemon listens for its `.vox` proxy, and the value every proof's child gets unless
@@ -153,6 +165,21 @@ extern "C" fn init() {
         })
         .collect();
     for var in harness {
+        std::env::remove_var(var);
+    }
+    // **No `VOX_*` of the shell that runs the proof** (#666): run from an agent's shell, a proof
+    // inherited its `VOX_NODE` (room_verbs went red twice acting as `claude-work-laptop`), and any
+    // other would steer the `vox` it runs the same way. Every `VOX_*` is taken out, walked from
+    // the environment, except what configures the run itself and is read by the proof process
+    // ([`RUN_SETTINGS`]); a proof that wants one on a child sets it there.
+    let vox: Vec<std::ffi::OsString> = std::env::vars_os()
+        .map(|(k, _)| k)
+        .filter(|k| {
+            let k = k.to_string_lossy();
+            k.starts_with("VOX_") && !RUN_SETTINGS.iter().any(|keep| k.starts_with(keep))
+        })
+        .collect();
+    for var in vox {
         std::env::remove_var(var);
     }
     // A daemon a proof starts binds its `.vox` proxy on a free port, never 127.0.0.1:1080 (ADR-028

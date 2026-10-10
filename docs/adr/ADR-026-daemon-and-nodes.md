@@ -286,8 +286,9 @@ network presence from the start: there is no interim design with one socket per 
   | test-knob environment `OnceLock`s (`prekeys.rs`, `channel.rs`, `log/sync.rs`, `nat/store.rs`, `ipc.rs`, `transport/mux.rs`) | process-wide, test builds only |
   | `NEXT_TUNNEL`, `NEXT_SERIAL`, `paths::NEXT` | process-wide unique counters |
   | `PINNED` (`atrest/lock.rs`) | process-wide mlock bookkeeping; every node shares `RLIMIT_MEMLOCK` |
-  | `SAID` (`quic.rs`), cached strings (`api.rs`, `viewmodel.rs`) | process-wide |
+  | `SAID` (`quic.rs`), cached strings (`api.rs`) | process-wide |
   | `SENDING` (`claude_injector.rs`) | process-wide: one tmux send at a time, whichever node's Session it types into (ctm's lock), so two drives never interleave their keys; it holds no node's state |
+  | `OFF` (`keychain.rs`, `vox-tui`) | process-wide: the Keychain's user interaction turned off once, before this process's first Keychain call, so Vox never raises a Keychain window (#666); the same for every node's call |
   | `ASCII`, `DEPTH` (`theme.rs`, `vox-tui`) | process-wide: what this process's terminal can show, read once from its environment; a TUI runs in one terminal |
   | signals, metrics (labelled `node=`), runtime size | daemon-level |
 
