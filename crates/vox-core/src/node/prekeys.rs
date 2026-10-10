@@ -797,16 +797,18 @@ pub fn delivery_bundle(
     Ok(out)
 }
 
-/// One-time prekey ids a peer answered it does not hold (ADR-030 P-3), never targeted again; at
-/// most [`ONE_TIME_PREKEY_TARGET`] per peer, oldest dropped first. A ring issues ids in increasing
-/// order and never reissues one, so a dropped entry can only be one its owner no longer offers.
+/// One-time prekey ids of a peer never targeted again (ADR-030 P-3): each one a key delivery named,
+/// which the peer consumes on receipt, and each one the peer answered it does not hold. At most
+/// [`ONE_TIME_PREKEY_TARGET`] per peer, oldest dropped first. A ring issues ids in increasing order
+/// and never reissues one, so a dropped id is targeted again only if its owner still offers it: the
+/// delivery naming it never arrived, and the prekey is still unused.
 #[derive(Debug, Default)]
 pub struct RefusedOneTime {
     by_peer: std::collections::BTreeMap<Digest32, std::collections::VecDeque<u64>>,
 }
 
 impl RefusedOneTime {
-    /// Record that `peer` refused `prekey_id`.
+    /// Record that a delivery named `peer`'s `prekey_id`, or that `peer` refused it.
     pub fn note(&mut self, peer: Digest32, prekey_id: u64) {
         let ids = self.by_peer.entry(peer).or_default();
         if ids.contains(&prekey_id) {
