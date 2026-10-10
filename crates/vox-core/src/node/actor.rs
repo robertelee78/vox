@@ -4173,8 +4173,8 @@ pub struct Node {
     /// `(room, member)` whose key waits for a prekey bundle of it this node's board does not
     /// hold: said once, not on every tick's retry, until the key goes (see `release_key_to`).
     key_waits_said: BTreeSet<(Digest32, Digest32)>,
-    /// One-time prekey ids each member answered it does not hold: never targeted again by a key
-    /// delivery (ADR-030 P-3; see `delivery_bundle`).
+    /// One-time prekey ids of each member a key delivery named, or the member answered it does
+    /// not hold: never targeted again (ADR-030 P-3; see `delivery_bundle`).
     refused_otps: prekeys::RefusedOneTime,
     /// Where this node says it listens on this computer and the local network, and hears others
     /// say so (V210-167; `node::nearby`). `None` for an anchor, or when the group cannot be
