@@ -2025,7 +2025,7 @@ async fn read_pairwise_streams(
             Ok(None) => continue,
             // **Refused, never dropped** (ADR-030 W-4): a frame that would not read is answered with
             // a code. Dropped, the stream ended unanswered, which its sender reads as a node older
-            // than key delivery in a session of its own.
+            // than key delivery in a session of its own, and marks it so.
             Err(_) => {
                 let why = crate::node::pairwise_stream::KeyRefusal::CannotOpen.code();
                 let _ = send.reset(why);
@@ -4269,6 +4269,15 @@ pub struct Node {
     /// Per `(room, member)`: why this identity's key for it waits, until it is taken (ADR-030
     /// D-5, W-4), shown beside the member in the roster, `vox status` and the app.
     key_waiting: BTreeMap<(Digest32, Digest32), String>,
+    /// Per `(room, member)`: a member that ended a key delivery's stream without an answer, as a
+    /// Vox older than v0.4.3 does (ADR-030 W-4), so it is sent this node's keys in the pair's
+    /// long-lived session, as it expects them; and whether a probe is due, a delivery in a session
+    /// of its own once per reconnect, so a member that has updated is seen to have. A member
+    /// leaves only by taking such a delivery.
+    older: BTreeMap<(Digest32, Digest32), bool>,
+    /// Members reconnected while marked [`Self::older`], whose current key is to be owed again so
+    /// the probe goes out.
+    older_probes: BTreeSet<Digest32>,
     /// Per `(room, member)`: since when, connected, its key has waited for a fresh one-time prekey
     /// ([`ONE_TIME_WAIT_MS`]).
     one_time_waits: BTreeMap<(Digest32, Digest32), u64>,
@@ -4737,6 +4746,8 @@ impl Node {
             keys_in_flight: BTreeMap::new(),
             deliveries: BTreeMap::new(),
             key_waiting: BTreeMap::new(),
+            older: BTreeMap::new(),
+            older_probes: BTreeSet::new(),
             one_time_waits: BTreeMap::new(),
             signed_said: BTreeSet::new(),
             packages_posted: BTreeSet::new(),
@@ -5063,6 +5074,7 @@ impl Node {
                     // A rotation's re-keys go out as the remaining consenters become
                     // reachable, which is why they are retried here and not only at
                     // the moment of rotation (M18.1).
+                    self.owe_older_probes().await;
                     self.deliver_owed_rekeys().await;
                     // Auto-consent for trusted identities, retried here for the
                     // same reason: a trusted member that was unreachable a moment
@@ -7454,6 +7466,7 @@ impl Node {
                 // with any backoff cleared (ADR-025 D2, D5).
                 self.connected.insert(peer);
                 self.discover_peers.insert(peer);
+                self.probe_older(peer);
             }
             NetEvent::SkdmRefused {
                 channel_id,
@@ -7481,10 +7494,13 @@ impl Node {
                     let refused_as =
                         |r: KeyRefusal| why == KeyRefusal::describe(r.code().into_inner());
                     let delivery = (channel_id, peer, chain_id);
-                    // A member that runs an older Vox waits for it to update (ADR-030 W-4): shown
-                    // beside it until it takes the key.
+                    // **A member that runs an older Vox** (ADR-030 W-4) is sent this node's keys in
+                    // the pair's long-lived session from now, as it expects them, and that is said
+                    // beside it. Its kept deliveries in sessions of their own are no use to it.
                     if why == crate::node::pairwise_stream::ENDED_UNANSWERED {
-                        self.key_waiting.insert((channel_id, peer), why.clone());
+                        self.older.insert((channel_id, peer), false);
+                        self.deliveries
+                            .retain(|(room, member, _), _| *room != channel_id || *member != peer);
                     }
                     if refused_as(KeyRefusal::UnknownPrekey) {
                         if let Some(prekey_id) = self
@@ -7590,6 +7606,17 @@ impl Node {
                 // and adopting it resends at once (`accept_hello`). Should that offer be lost
                 // with its connection, the retry here is what brings the next one: it stays at
                 // the first step rather than doubling, so one lost offer costs 2 s, not 2 + 4 + 8.
+                // Refused by a member that runs an older Vox: sent again at once, in the session it
+                // expects (ADR-030 W-4), not after a backoff.
+                if why == crate::node::pairwise_stream::ENDED_UNANSWERED {
+                    self.key_backoff.remove(&(channel_id, peer));
+                    let _ = self.event_tx.send(NodeEvent::KeyNotTaken {
+                        channel_id,
+                        peer,
+                        why,
+                    });
+                    return;
+                }
                 let now = self.now_ms().get();
                 // A key delivery's opening refused is not a hello race: it backs off as any refusal.
                 let hello_refused = session.is_some()
@@ -7816,6 +7843,12 @@ impl Node {
                 // one-time prekey the waiting key was waiting for, and the batch never completed.
                 if !history {
                     self.deliveries.remove(&(channel_id, peer, chain_id));
+                }
+                // Taken in a session of its own: the member runs v0.4.3 or later, whatever it ran
+                // before (ADR-030 W-4). Taken in the long-lived session, it is still the older Vox
+                // it was, and that stays said.
+                if session.is_none() {
+                    self.older.remove(&(channel_id, peer));
                 }
                 self.key_waiting.remove(&(channel_id, peer));
                 // Taken under the session still held: the peer holds its hello (V210-89).
@@ -8672,6 +8705,7 @@ impl Node {
         // A new connection syncs at once, then on the interval (ADR-016; ADR-025 D2, D5).
         self.connected.insert(peer);
         self.discover_peers.insert(peer);
+        self.probe_older(peer);
     }
 
     /// Answer a punch session a coordinator relayed here (ADR-012 rung 3), on its own
@@ -9618,17 +9652,14 @@ impl Node {
         // the member's prekey bundle, read from this node's board; with none there, or a stale one
         // (P-2), the consent fails on every tick's retry and writes nothing. Said once per member
         // and room, until the key goes, each reason as itself.
-        let frame = match self.delivery_frame(channel_id, target, &skdm).await {
-            Ok(frame) => frame,
-            Err(wait) => {
-                self.say_key_waits(channel_id, target, wait);
-                return Outcome::Failed(Fault::Unreachable);
-            }
+        let mut older = self.older_route(channel_id, target).await;
+        let Some((frames, carries_hello, session)) =
+            self.key_frames(channel_id, target, &skdm, &mut older).await
+        else {
+            return Outcome::Failed(Fault::Unreachable);
         };
-        self.key_left(channel_id, target);
         // Written by this member's writer, off the actor (V210-71). A write that fails is a key
         // not taken, re-owed like any other.
-        let frames = vec![frame];
         let (Some(profile), Some(shared)) = (
             self.profile.as_ref(),
             self.channels.get(channel_id).map(Arc::clone),
@@ -9679,9 +9710,8 @@ impl Node {
                 channel_id: *channel_id,
                 after: AfterWrite::Key {
                     chain_id,
-                    hello: false,
-                    // In no long-lived session: a refusal says nothing about the one held.
-                    session: None,
+                    hello: carries_hello,
+                    session,
                     history: false,
                     epoch,
                 },
@@ -10405,31 +10435,25 @@ impl Node {
             let mut all_sent = true;
             let mut jobs = Vec::with_capacity(keys.len());
             let mut watched = 0u32;
+            let mut older = self.older_route(channel_id, target).await;
             for key in keys {
-                // Each key in a session of its own, opened now against the member's current bundle
-                // and never sealed in one that existed before (ADR-030 D-1, D-2).
-                let frame = match self.delivery_frame(channel_id, target, key).await {
-                    Ok(frame) => frame,
-                    Err(wait) => {
-                        // Waits, said why (ADR-030 D-5): never sealed in an older session.
-                        self.say_key_waits(channel_id, target, wait);
-                        all_sent = false;
-                        break;
-                    }
+                let Some((frames, carries_hello, session)) =
+                    self.key_frames(channel_id, target, key, &mut older).await
+                else {
+                    all_sent = false;
+                    break;
                 };
-                self.key_left(channel_id, target);
                 // Each key's own generation: a refusal re-owes exactly what was refused, and it is
                 // recorded as delivered only once taken (V210-88).
                 let epoch = self.key_in_flight(*channel_id, target);
                 jobs.push(PairwiseJob {
                     conn: Arc::clone(&conn),
-                    frames: vec![frame],
+                    frames,
                     channel_id: *channel_id,
                     after: AfterWrite::Key {
                         chain_id: key.body.chain_id,
-                        hello: false,
-                        // In no long-lived session: a refusal says nothing about the one held.
-                        session: None,
+                        hello: carries_hello,
+                        session,
                         history: owes_history,
                         epoch,
                     },
@@ -10531,7 +10555,10 @@ impl Node {
                      tried again"
                 .to_owned(),
         };
-        self.key_waiting.insert((*channel_id, target), why.clone());
+        self.key_waiting.insert(
+            (*channel_id, target),
+            format!("is owed your key in this room, which waits: {why}"),
+        );
         if !self.key_waits_said.insert((*channel_id, target)) {
             return;
         }
@@ -10546,18 +10573,11 @@ impl Node {
         }
     }
 
-    /// A delivery to `target` opened: what made its key wait for a bundle is over. A wait for a
-    /// member that runs an older Vox stays until it takes the key.
+    /// A delivery to `target` opened: what made its key wait for a bundle is over.
     fn key_left(&mut self, channel_id: &Digest32, target: Digest32) {
         let pair = (*channel_id, target);
         self.key_waits_said.remove(&pair);
-        if self
-            .key_waiting
-            .get(&pair)
-            .is_some_and(|why| why != crate::node::pairwise_stream::ENDED_UNANSWERED)
-        {
-            self.key_waiting.remove(&pair);
-        }
+        self.key_waiting.remove(&pair);
     }
 
     /// The bundle a fresh delivery to `target` opens against: [`Self::delivery_bundle`], which waits
@@ -10627,6 +10647,114 @@ impl Node {
             }
         }
         Ok(bundle)
+    }
+
+    /// How this node's keys go to `target` in `channel_id` this round (ADR-030 W-4): `None` in
+    /// sessions of their own (D-1); `Some(hello)` in the pair's long-lived session, opened now if
+    /// there is none (its hello to ride the first key), for a member marked [`Self::older`] whose
+    /// probe is not due. **A due probe stays due until it is answered for what it asks**: taken,
+    /// the mark goes; closed unanswered, as an older Vox does, the probe is over. Refused for any
+    /// other reason (a node still reopening the room after a restart), it goes again in a session
+    /// of its own. Spent on its first try, a refused probe left the mark for good.
+    async fn older_route(
+        &mut self,
+        channel_id: &Digest32,
+        target: Digest32,
+    ) -> Option<Option<InitialMessage>> {
+        match self.older.get(&(*channel_id, target)) {
+            Some(false) => Some(self.ensure_session(channel_id, target).await),
+            None | Some(true) => None,
+        }
+    }
+
+    /// The frames that carry `key` to `target`, whether they carry a hello, and the serial of the
+    /// long-lived session they are sealed in, if they are: in a session of its own (ADR-030 D-1),
+    /// or, for a member that runs an older Vox (`older` from [`Self::older_route`]), in the pair's
+    /// long-lived session as it expects them (W-4), its hello riding the first key. `None` if the
+    /// key waits, which is said (D-5), or no long-lived session could be had.
+    async fn key_frames(
+        &mut self,
+        channel_id: &Digest32,
+        target: Digest32,
+        key: &crate::group::skdm::Skdm,
+        older: &mut Option<Option<InitialMessage>>,
+    ) -> Option<(Vec<Vec<u8>>, bool, Option<u64>)> {
+        if let Some(hello) = older {
+            let session = self.sessions.get_mut(&(*channel_id, target))?;
+            let mut frames = Vec::with_capacity(2);
+            let carries_hello = match hello.take() {
+                Some(initial) => {
+                    frames.push(crate::node::pairwise_stream::hello_frame(
+                        channel_id, &initial,
+                    ));
+                    true
+                }
+                None => false,
+            };
+            frames.push(crate::node::pairwise_stream::skdm_frame(channel_id, session, key).ok()?);
+            let serial = self.session_serial.get(&(*channel_id, target)).copied();
+            return Some((frames, carries_hello, serial));
+        }
+        // In a session of its own, opened now against the member's current bundle and never sealed
+        // in one that existed before (ADR-030 D-1, D-2).
+        match self.delivery_frame(channel_id, target, key).await {
+            Ok(frame) => {
+                self.key_left(channel_id, target);
+                Some((vec![frame], false, None))
+            }
+            Err(wait) => {
+                // Waits, said why (ADR-030 D-5): never sealed in an older session.
+                self.say_key_waits(channel_id, target, wait);
+                None
+            }
+        }
+    }
+
+    /// What is said of `member` in `room` about this node's key, after its name (ADR-030 D-5,
+    /// W-4): that it runs an older Vox while it is marked [`Self::older`], whatever else is under
+    /// way, so the line leaves only with the mark; else why a key for it waits, if one does.
+    fn said_of(&self, room: &Digest32, member: &Digest32) -> Option<String> {
+        if self.older.contains_key(&(*room, *member)) {
+            return Some(crate::node::pairwise_stream::RUNS_OLDER.to_owned());
+        }
+        self.key_waiting.get(&(*room, *member)).cloned()
+    }
+
+    /// `peer` connected: each room it is marked [`Self::older`] in owes it a probe (ADR-030 W-4).
+    fn probe_older(&mut self, peer: Digest32) {
+        let mut any = false;
+        for ((_, member), probe) in &mut self.older {
+            if *member == peer {
+                *probe = true;
+                any = true;
+            }
+        }
+        if any {
+            self.older_probes.insert(peer);
+        }
+    }
+
+    /// Owe each member due a probe its current key again, in each room it is marked
+    /// [`Self::older`] in, so the re-key round sends it in a session of its own (ADR-030 W-4). Only
+    /// the live key: a probe is one delivery, not the member's history.
+    async fn owe_older_probes(&mut self) {
+        for peer in std::mem::take(&mut self.older_probes) {
+            let rooms: Vec<Digest32> = self
+                .older
+                .keys()
+                .filter(|(_, member)| *member == peer)
+                .map(|(room, _)| *room)
+                .collect();
+            for room in rooms {
+                let (Some(profile), Some(shared)) = (
+                    self.profile.as_ref(),
+                    self.channels.get(&room).map(Arc::clone),
+                ) else {
+                    continue;
+                };
+                let _ = shared.lock().await.forget_delivery(profile.store(), &peer);
+            }
+        }
     }
 
     /// A key watched by [`watch_delivery`] was answered, taken or not: one fewer in flight.
@@ -13523,9 +13651,9 @@ impl Node {
         // held for the join goes with the network.
         self.joining.clear();
         // **Refused, never dropped** (ADR-030 W-4): a stream ended without an answer is what a node
-        // older than key delivery in a session of its own does, and its sender says so to its
-        // person. A held key is refused as not accepted, and its sender sends it again after the
-        // next unlock.
+        // older than key delivery in a session of its own does, and its sender would mark this node
+        // older and send it its keys without post-compromise protection. A held key is refused as
+        // not accepted, and its sender sends it again after the next unlock.
         for (_, stream) in std::mem::take(&mut self.held_pairwise) {
             let PairwiseIn {
                 mut send, mut recv, ..
@@ -13539,6 +13667,8 @@ impl Node {
         // Sealed bytes, no key material; but the ring that opens the next ones is this identity's.
         self.deliveries.clear();
         self.key_waiting.clear();
+        self.older.clear();
+        self.older_probes.clear();
         self.one_time_waits.clear();
         self.signed_said.clear();
         self.packages_posted.clear();
@@ -15229,7 +15359,7 @@ impl Node {
                     connected: connected.contains(m),
                     last_seen: self.status.last_seen.get(m).copied(),
                     last_sync: self.status.member_synced.get(m).copied(),
-                    key_waits: self.key_waiting.get(&(room.channel_id, *m)).cloned(),
+                    key_waits: self.said_of(&room.channel_id, m),
                 })
                 .collect();
             // From the room as last published, never its lock: a sync session holds that lock
@@ -16074,9 +16204,16 @@ impl Node {
             connected_peers,
             boards_connected: self.boards_connected(),
             key_waits: self
-                .key_waiting
-                .iter()
-                .map(|((room, member), why)| (*room, *member, why.clone()))
+                .older
+                .keys()
+                .chain(self.key_waiting.keys())
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .filter_map(|(room, member)| {
+                    self.said_of(&room, &member)
+                        .map(|said| (room, member, said))
+                })
                 .collect(),
         };
         (view, read)

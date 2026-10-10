@@ -1363,14 +1363,18 @@ fn daemon_of(exe: &Path, root: &Path, name: &str, spec: &str) -> Daemon {
 /// labels are the previous release's: a `PROVE` from the old daemon verifies under this build's
 /// `resp_input` and exporter label, and a `CLAIM` this build signs is accepted by the old daemon.
 ///
-/// **Key delivery is lockstep** (ADR-030 W-4, D-5). This build delivers every key in a session of
-/// its own (`OP_ROTATION_HELLO`), which the old release cannot read, so the old one reads nothing
-/// new from this build, in either room: its key is never sealed where the old node could open it,
-/// in the pair's long-lived session. This build's daemon says why, in plain words, and resends the
-/// same delivery after a backoff, never every second; its `vox room roster` of each shared room
-/// and its `vox status` say beside the old member that its key waits until it updates to v0.4.3. Mutants: sealing the key in the long-lived
-/// session again (the old one reads this build); a stream ended without an answer counted as lost
-/// (no plain reason, and a resend each second).
+/// **An older member is sent its keys as it expects them, and that is said** (ADR-030 W-4). This
+/// build delivers every key in a session of its own (`OP_ROTATION_HELLO`), which the old release
+/// cannot read: it ends the stream unanswered. From then this build sends that member its keys in
+/// the pair's long-lived session, so the old one reads this build in both rooms; its daemon says
+/// why in plain words, once per probe, never every second; and its `vox room roster` of each
+/// shared room and its `vox status` say beside the old member that it runs an older Vox and reads
+/// without post-compromise protection until it updates to v0.4.3. **The mark leaves with the old
+/// release**: the old member's node is then run by this build, on the same data root, and within
+/// 120 s neither roster says it any more: the reconnect's probe, a key in a session of its own, was
+/// taken. Mutants: no fallback (the old one reads nothing of this build); the mark never cleared
+/// (the line stays after the update); a stream ended without an answer counted as lost (no plain
+/// reason, and a resend each second).
 #[test]
 #[ignore = "downloads the previous release; real daemons of each; run in release"]
 fn the_previous_release_and_this_build_complete_the_exchange_both_ways() {
@@ -1497,9 +1501,8 @@ fn the_previous_release_and_this_build_complete_the_exchange_both_ways() {
         let deadline = Instant::now() + Duration::from_secs(90);
         // Long enough for the old one to read this build if its key had reached it: before ADR-030
         // both read each other within a few seconds.
-        let fair = Instant::now() + Duration::from_secs(30);
         let (mut new_reads_old, mut old_reads_new) = (false, false);
-        while Instant::now() < deadline && !(new_reads_old && Instant::now() >= fair) {
+        while Instant::now() < deadline && !(new_reads_old && old_reads_new) {
             let _ = run_as(
                 &old,
                 &old_d.data,
@@ -1539,44 +1542,45 @@ fn the_previous_release_and_this_build_complete_the_exchange_both_ways() {
                 "this build never read v{version}'s post in the room made by {room_of}"
             ));
         }
-        if old_reads_new {
+        if !old_reads_new {
             red.push(format!(
-                "v{version} read this build's post in the room made by {room_of}: this build's key \
-                 reached a node that cannot read a key delivered in a session of its own, so it was \
-                 sealed where that node opens it, in the long-lived session (ADR-030 W-4)"
+                "v{version} never read this build's post in the room made by {room_of}: this build \
+                 did not send a node that runs an older Vox its key in the session it expects \
+                 (ADR-030 W-4)"
             ));
         }
     }
     // Beside the member, where a person looks: the roster of each shared room, and `vox status`.
     let old_full = b32_encode(&old_d.fp);
-    let waits_line = "waits: it runs a Vox older than v0.4.3";
-    for r in &rooms_here {
+    let older = "runs an older Vox: it reads you, but without post-compromise protection for your \
+                 keys, until it updates to v0.4.3";
+    let older_line = format!("vox: {old_full} {older}");
+    let roster_says = |r: &str| -> (bool, String) {
         let (_, roster) = run_as(new, &new_d.data, &["room", "roster", r], None);
-        let said = roster.lines().any(|l| {
-            l.contains(&format!(
-                "your key for {old_full} in this room {waits_line}"
-            ))
-        });
-        println!("[proof] this build's roster of {r} says v{version}'s member waits: {said}");
+        (roster.lines().any(|l| l.contains(&older_line)), roster)
+    };
+    for r in &rooms_here {
+        let (said, roster) = roster_says(r);
+        println!(
+            "[proof] this build's roster of {r} says v{version}'s member runs an older Vox: {said}"
+        );
         if !said {
             red.push(format!(
-                "this build's `vox room roster {r}` did not say its key waits for v{version}'s \
-                 member until it updates: {roster}"
+                "this build's `vox room roster {r}` did not say v{version}'s member runs an older \
+                 Vox and reads without post-compromise protection: {roster}"
             ));
         }
     }
     let (_, status) = run_as(new, &new_d.data, &["status"], None);
-    let in_status = status
-        .lines()
-        .filter(|l| l.contains("your key for it waits: it runs a Vox older than v0.4.3"))
-        .count();
+    let in_status = status.lines().filter(|l| l.contains(older)).count();
     println!(
-        "[proof] this build's `vox status` says v{version}'s member waits in {in_status} room(s)"
+        "[proof] this build's `vox status` says v{version}'s member runs an older Vox in \
+         {in_status} room(s)"
     );
     if !rooms_here.is_empty() && in_status != rooms_here.len() {
         red.push(format!(
-            "this build's `vox status` said v{version}'s member waits in {in_status} of {} \
-             shared rooms: {status}",
+            "this build's `vox status` said v{version}'s member runs an older Vox in {in_status} of \
+             {} shared rooms: {status}",
             rooms_here.len()
         ));
     }
@@ -1593,8 +1597,9 @@ fn the_previous_release_and_this_build_complete_the_exchange_both_ways() {
         .filter(|l| {
             l.contains(
                 "it runs a Vox older than v0.4.3, which cannot take a key delivered in a session \
-                 of its own (it closed the stream without an answer); it reads nothing new from \
-                 you until it updates to v0.4.3 or later, and gets your key then",
+                 of its own (it closed the stream without an answer); your key goes to it in the \
+                 session it has always used instead, without post-compromise protection, until it \
+                 updates",
             )
         })
         .count();
@@ -1611,14 +1616,78 @@ fn the_previous_release_and_this_build_complete_the_exchange_both_ways() {
             &refusals[..refusals.len().min(3)]
         ));
     }
-    // A backoff from 2 s doubling: a handful per room a minute. A resend each second is two a
-    // second over the two rooms.
-    if refusals.len() as u64 > since.as_secs() / 2 {
+    // One refusal per room for the probe, then the long-lived session: never a resend each
+    // second, which is two a second over the two rooms.
+    if refusals.len() as u64 > rooms_here.len() as u64 + since.as_secs() / 2 {
         red.push(format!(
             "this build resent its key to v{version} {} times in {}s, about every second, though \
              that node had answered by closing the stream",
             refusals.len(),
             since.as_secs()
+        ));
+    }
+
+    // ---- the old member updates: its node is run by this build, on the same data root ----
+    let host_data = w.host.data.clone();
+    let rosters_say = |exe: &Path| -> Vec<bool> {
+        rooms_here
+            .iter()
+            .map(|r| {
+                run_as(exe, &host_data, &["room", "roster", r], None)
+                    .1
+                    .lines()
+                    .any(|l| l.contains(&older_line))
+            })
+            .collect()
+    };
+    let old_pass = w._tmp.path().join("old.pass");
+    let Daemon {
+        _proc: old_proc,
+        data: old_data,
+        ..
+    } = old_d;
+    drop(old_proc);
+    let _updated = VoxProc::spawn_exe(
+        new,
+        "old-updated",
+        &old_data,
+        &args(&[
+            "daemon",
+            "--listen",
+            "127.0.0.1:0",
+            "--anchor",
+            &w.spec,
+            "--passphrase-file",
+            old_pass.to_str().expect("APPARATUS: a UTF-8 path"),
+        ]),
+        &[],
+    );
+    let up = Instant::now() + Duration::from_secs(120);
+    while !run_as(new, &old_data, &["room", "list"], None).0 {
+        assert!(
+            Instant::now() < up,
+            "APPARATUS (staging not achieved): this build's daemon never answered on the old \
+             member's data root"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let updated_at = Instant::now();
+    let clear_by = updated_at + Duration::from_secs(120);
+    let mut still = rosters_say(new);
+    while still.iter().any(|s| *s) && Instant::now() < clear_by {
+        std::thread::sleep(Duration::from_secs(1));
+        still = rosters_say(new);
+    }
+    println!(
+        "[proof] after the old member's node runs this build: rosters still say it runs an older \
+         Vox: {still:?}, {}s after it came up",
+        updated_at.elapsed().as_secs()
+    );
+    if !rooms_here.is_empty() && still.iter().any(|s| *s) {
+        red.push(format!(
+            "the old member's node runs this build now, yet 120 s on this build's roster still says \
+             it runs an older Vox (rooms {rooms_here:?}: {still:?}): the mark did not leave with \
+             the old release"
         ));
     }
     assert!(red.is_empty(), "PRODUCT: {red:#?}");
