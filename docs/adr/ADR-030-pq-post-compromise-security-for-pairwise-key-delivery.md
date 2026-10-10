@@ -156,8 +156,8 @@ binds PQ freshness to every key delivery, not to the ratchet.
   The work is in the node's delivery paths, the pairwise frames and the prekey ring.
 - v0.4.3 does not interoperate with v0.4.2 or earlier on key delivery (W-4).
 - Recipient-side healing is bounded by prekey hygiene: P-1 retires unused one-time prekeys and P-2
-  refuses stale bundles, and the bound is measured on the recipient's clock (a prekey's root-signed
-  creation time) against the sender's, so clock skew between them lengthens it by the skew.
+  refuses stale bundles and bundles dated more than 10 minutes ahead, so a recipient clock running
+  fast lengthens the bound by at most 10 minutes.
 
 ## Related ADRs
 

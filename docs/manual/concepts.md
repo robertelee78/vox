@@ -75,10 +75,10 @@ If a node's memory or disk is stolen, Vox recovers on its own, against a later q
 too, as long as the thief only listens. Every key a node hands to another member travels in a
 fresh handshake made for it alone. So the next key a robbed node hands out is safe again, and keys
 sent to a robbed node are safe again within seven days. A room recovers with its next key rotation. This does not help against someone who
-took a node's identity and now acts as it. When one change hands a member more keys at once than
-it has spare prekeys, some of them recover only after up to seven days. Restoring a profile from a
-backup brings back its old prekeys for up to seven days. A node whose clock is wrong lengthens the
-seven days by that much.
+took a node's identity and now acts as it. When a member has no fresh prekey to offer within 30
+seconds, a key sent to it recovers only after up to seven days. Restoring a profile from a backup
+brings back its old prekeys for up to seven days. A wrong clock lengthens the seven days by at most
+ten minutes.
 
 Cryptographic identity tells you which key signed something. Comparing that fingerprint
 with the intended person or agent is still a human trust decision.

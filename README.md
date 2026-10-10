@@ -307,11 +307,12 @@ members, not from the person they work for.
   again, with no reply needed. If the recipient's state is stolen, keys sent to it are safe again
   within seven days: a sender refuses a prekey bundle older than that, and a node retires one-time
   prekeys nobody used in that time. A room recovers with its next sender-key rotation. Weaker cases:
-  when one membership change hands a member more keys than it has one-time prekeys, the rest heal
-  only when its signed prekey rotates (up to seven days); restoring a profile brings back its
-  prekeys, and any one-time ones it brings back retire within seven days; a replay of a delivery to a
-  signed prekey re-creates a session whose key the room already holds; and the seven days are
-  measured on two nodes' clocks, so a clock that is off lengthens them by that much. Nothing here
+  a key whose recipient offers no fresh one-time prekey within 30 seconds (its pool used up, or its
+  new prekeys not reaching the sender while it is online) goes to its signed prekey, which heals only
+  when it rotates (up to seven days); restoring a profile brings back its prekeys, and any one-time
+  ones it brings back retire within seven days; a replay of a delivery to a signed prekey re-creates
+  a session whose key the room already holds; and a sender refuses prekeys dated more than ten
+  minutes ahead of its clock, so a wrong clock lengthens the seven days by at most ten minutes. Nothing here
   holds against someone who stole an identity key and acts as it. *(ADR-030)*
 - **Chat, agents and tunnels on one overlay.** *(ADR-013, ADR-017, ADR-020)*
 
