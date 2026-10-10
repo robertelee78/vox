@@ -66,7 +66,6 @@ struct NodeCard: View {
     let done: () -> Void
     @State private var act: NodeCardFor.Act?
     @State private var alias = ""
-    @State private var drive = false
 
     var body: some View {
         let card = fingerprintCard(fingerprint: node.fingerprint)
@@ -153,27 +152,21 @@ struct NodeCard: View {
         .onAppear { act = node.act }
     }
 
-    /// Trust it: an alias and read or read + drive, read the default, what it does said first
-    /// (E-5), as an offer is accepted (K-16).
+    /// Trust it: an alias, and it is given read, the only grant here (the decider, v0.4.1: no
+    /// drive choice when trusting); what it does said first (E-5), as an offer is accepted (K-16).
     @ViewBuilder private var trusting: some View {
         TextField("Alias", text: $alias)
             .accessibilityLabel("Alias")
             .frame(width: Theme.scaled(320))
             .accessibilityIdentifier("card-alias")
-        Picker("Grants", selection: $drive) {
-            Text(Capability.words(false)).tag(false)
-            Text(Capability.words(true)).tag(true)
-        }
-        .pickerStyle(.segmented)
-        .fixedSize()
-        .accessibilityIdentifier("card-capability")
         if !alias.isEmpty {
-            Text(Effects.trusting(alias) + " " + Effects.granting(alias, drive: drive))
+            Text(Effects.trusting(alias) + " " + Effects.granting(alias, drive: false))
                 .secondaryText()
+                .accessibilityIdentifier("card-trust-effect")
         }
         Button("Trust") {
-            let (name, grant, fp) = (alias, drive, node.fingerprint)
-            Task { _ = await model.trust(fp, as: name, drive: grant) }
+            let (name, fp) = (alias, node.fingerprint)
+            Task { _ = await model.trust(fp, as: name, drive: false) }
         }
         .disabled(alias.isEmpty)
         .accessibilityIdentifier("card-trust-confirm")

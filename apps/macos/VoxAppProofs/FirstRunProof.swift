@@ -3730,6 +3730,13 @@ final class FirstRunProof: XCTestCase {
         print("[proof] compare: offer \(offerSoFar); card \(soFar) → \(wrong) → \(whole)")
         tap(ui, Key.id("card-trust-open"), "Trust… on dave's card")
         type(ui, Key.id("card-alias"), "dave", "the card's alias field")
+        // Trusting gives read, with no drive choice (the decider, v0.4.1): the form says read
+        // only and offers no grant to pick.
+        words(ui, Key.id("card-trust-effect"), timeout: 10,
+              "the card's trust form must say what trusting dave gives: read only",
+              until: { $0.contains("With read only, dave sees") })
+        XCTAssertNil(locate(ui, Key.id("card-capability")),
+                     "PRODUCT: the card's trust form must offer no drive choice (the decider, v0.4.1); it shows a Grants control")
         tap(ui, Key.id("card-trust-confirm"), "Trust")
         keyringPassphraseIfAsked(ui) {
             self.run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out.contains(daveFp)

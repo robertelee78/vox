@@ -325,6 +325,7 @@ claim: `says it runs on macOS 26.2 (aarch64)`.
 
 Click a member, a message's author or a row of the decision record to open its card: its
 fingerprint with its art (**Copy**), who reads whom in a sentence each way, and **Trust…**.
+Trusting from a card asks only an alias: it gives the node read, and says so first.
 
 Under the members, **FAMILY LAN** is a switch. Turned on with Vox's LAN helper already allowed, the
 LAN comes up at once. Otherwise Vox asks macOS for the helper and a sheet says what it is (one root
