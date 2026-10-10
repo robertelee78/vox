@@ -1537,7 +1537,7 @@ pub enum NodeCmd {
     /// Make a new node: an identity with its own rooms, trust and services. Its files are
     /// written here; nothing is attached until it is used or `vox node attach`ed. The
     /// passphrase comes from `--passphrase-file`, `VOX_IDENTITY_PASSPHRASE`, or is asked twice;
-    /// an empty one is refused, and nothing is created.
+    /// an empty one gives the node none, and says that its key is then kept unencrypted.
     Create {
         /// The node's name: letters a-z, digits, '.', '_' and '-'.
         name: String,

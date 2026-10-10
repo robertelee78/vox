@@ -147,19 +147,20 @@ pub fn identity_passphrase_for(
     made
 }
 
-/// The passphrase for an identity about to be made: given, or asked twice at the terminal, and
-/// refused when empty. It touches no file, so a refusal leaves nothing behind. `how` says how
+/// The passphrase for an identity about to be made: given, or asked twice at the terminal. An
+/// empty one is taken (ADR-005 J-2, V030-36), and what it means is said once. It touches no file,
+/// so a refusal leaves nothing behind. `how` says how
 /// to give it when there is no terminal to ask at, in the words of the verb that asks.
 ///
 /// # Errors
-/// An empty passphrase, two that differ, no terminal to ask at, or a file that cannot be read.
+/// Two that differ, no terminal to ask at, or a file that cannot be read.
 pub fn new_identity_passphrase(
     given: Option<String>,
     file: Option<std::path::PathBuf>,
     how: &str,
 ) -> Result<String, AppError> {
     if let Some(p) = identity_passphrase_given(given, file)? {
-        return not_empty(p);
+        return Ok(said_if_empty(p));
     }
     // **Without a terminal there is nobody to ask twice.**
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
@@ -169,27 +170,24 @@ pub fn new_identity_passphrase(
         )));
     }
     println!("vox: this node has no identity yet; creating one.");
-    let first = not_empty(prompt_passphrase("new identity passphrase")?)?;
+    let first = prompt_passphrase("new identity passphrase (Enter alone for none)")?;
     let again = prompt_passphrase("again")?;
     if first != again {
         return Err(AppError::Usage(
             "the two passphrases differ; nothing was created".into(),
         ));
     }
-    Ok(first)
+    Ok(said_if_empty(first))
 }
 
-/// A new identity's passphrase, refused when empty: **every node has one** (ADR-028 K-11),
-/// whichever way it was given.
-fn not_empty(passphrase: String) -> Result<String, AppError> {
+/// A new identity's passphrase, whichever way it was given: **an empty one is taken** (ADR-005
+/// J-2, V030-36, the decider 2026-10-09: "passphrases are optional"), after saying once, on
+/// stderr, what it means.
+fn said_if_empty(passphrase: String) -> String {
     if passphrase.is_empty() {
-        return Err(AppError::Usage(
-            "every node has an identity passphrase, and an empty one is refused; nothing was \
-             created"
-                .into(),
-        ));
+        eprintln!("vox: {}", vox_text::node::NO_PASSPHRASE);
     }
-    Ok(passphrase)
+    passphrase
 }
 
 /// What a CLI verb says on stderr when creating or unlocking the identity waits for another vox

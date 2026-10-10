@@ -275,6 +275,11 @@ private struct Welcome: View {
     @State private var name = Welcome.suggestedName
     @State private var first = SecureFieldHolder()
     @State private var again = SecureFieldHolder()
+    /// Whether the passphrase field is empty now: a node may have none (ADR-005 J-2), said here.
+    @State private var noPassphrase = true
+    /// Set while one Make Node is being asked: Return and the button may both ask at one key
+    /// press, and an empty passphrase no longer tells the second from the first.
+    @State private var submitted = false
 
     var body: some View {
         Text("Welcome to Vox").heading()
@@ -287,7 +292,9 @@ private struct Welcome: View {
             .accessibilityIdentifier("new-node-name")
             .accessibilityLabel("Node name")
         Text("Lowercase letters, digits, dots, dashes and underscores.").secondaryText()
-        SecureInput(holder: first) { again.field.becomeFirstResponder() }
+        SecureInput(holder: first, onEmpty: { noPassphrase = $0 }) {
+            again.field.becomeFirstResponder()
+        }
             .frame(width: Theme.scaled(320))
             .accessibilityIdentifier("new-node-passphrase")
             .accessibilityLabel("Identity passphrase")
@@ -299,6 +306,11 @@ private struct Welcome: View {
             + "keep it somewhere safe.")
             .secondaryText()
             .accessibilityIdentifier("new-node-passphrase-why")
+        if noPassphrase {
+            // Allowed, and said (ADR-005 J-2, V030-36): a node with none keeps its key unencrypted.
+            Text(Welcome.capitalized(noPassphraseNotice()))
+                .accessibilityIdentifier("new-node-no-passphrase")
+        }
         Text(Welcome.capitalized(noBackupNotice()))
             .secondaryText()
             .accessibilityIdentifier("new-node-no-backup")
@@ -319,9 +331,13 @@ private struct Welcome: View {
     }
 
     private func submit() {
-        // Return and the button may both ask: the second finds the fields empty.
-        guard let secret = first.take() else { return }
-        let repeated = again.take() ?? Secret(Data())
+        // Return and the button may both ask: the second does nothing.
+        guard !submitted else { return }
+        submitted = true
+        // One key press fires both at once; the next press is a new ask.
+        DispatchQueue.main.async { submitted = false }
+        let secret = first.takeAllowingEmpty()
+        let repeated = again.takeAllowingEmpty()
         let node = name.trimmingCharacters(in: .whitespaces)
         Task { await model.createNode(node, passphrase: secret, again: repeated) }
     }
@@ -502,8 +518,8 @@ final class SecureFieldHolder {
         return Secret(Data(text.utf8))
     }
 
-    /// The typed bytes, the field emptied: empty when nothing was typed. Only for a room's
-    /// passphrase, which a room may go without (ADR-005 J-2 as amended); an identity's never.
+    /// The typed bytes, the field emptied: empty when nothing was typed. For a passphrase a room
+    /// or a node may go without (ADR-005 J-2).
     func takeAllowingEmpty() -> Secret {
         let text = field.stringValue
         field.stringValue = ""

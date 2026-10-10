@@ -229,21 +229,21 @@ pub(crate) fn create(
     Ok(vox_core::node::link::b32_encode(&fp))
 }
 
-/// A new node's passphrase, typed twice at the terminal, which may not be empty (ADR-028 K-11).
+/// A new node's passphrase, typed twice at the terminal. Enter alone, twice, gives none (ADR-005
+/// J-2, V030-36), and what that means is said once.
 ///
 /// # Errors
 /// The terminal closed.
 pub(crate) fn ask_new_passphrase(name: &NodeName) -> Result<zeroize::Zeroizing<String>, AppError> {
     loop {
         let first = zeroize::Zeroizing::new(crate::tunnel_cli::prompt_passphrase(&format!(
-            "passphrase for {name}"
+            "passphrase for {name} (Enter alone for none)"
         ))?);
-        if first.is_empty() {
-            println!("  a node must have a passphrase; type one");
-            continue;
-        }
         let again = zeroize::Zeroizing::new(crate::tunnel_cli::prompt_passphrase("again")?);
         if *first == *again {
+            if first.is_empty() {
+                println!("  {}", vox_text::node::NO_PASSPHRASE);
+            }
             return Ok(first);
         }
         println!("  the two differ; type it again");

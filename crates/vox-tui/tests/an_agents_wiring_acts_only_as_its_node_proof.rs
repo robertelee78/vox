@@ -28,6 +28,11 @@
 //! is refused with its reason and asked again. Mutant: the typed name ignored, the suggestion
 //! always taken; red as PRODUCT (no node `my-claude`).
 //!
+//! And **a harness's node may have no passphrase** (ADR-005 J-2, V030-36): OpenCode's is typed as
+//! Enter alone, twice; setup says once that its key is then kept unencrypted, makes it, and wires
+//! its plugin, which `vox agent doctor` passes. Mutant: an empty identity passphrase refused again;
+//! red as PRODUCT.
+//!
 //! And **`vox setup` keeps Codex's app-server running** when it wires Codex (the decider,
 //! 2026-10-06): it says first that it will, and that this runs no model; it asks the `codex` it
 //! found on `PATH` for `app-server daemon start` under the Codex home it wires, waits for the
@@ -381,8 +386,9 @@ fn setup_makes_a_node_for_each_installed_harness() {
     setup.answer("again:", 1, "claude passphrase\r");
     // Enter keeps the suggestion.
     setup.answer("a node for OpenCode [opencode-", 1, "\r");
-    setup.answer("passphrase for opencode-", 1, "opencode passphrase\r");
-    setup.answer("again:", 2, "opencode passphrase\r");
+    // No passphrase, Enter alone twice (ADR-005 J-2): taken, and what it means said.
+    setup.answer("passphrase for opencode-", 1, "\r");
+    setup.answer("again:", 2, "\r");
     if cfg!(target_os = "macos") {
         // The person's node is offered, and skipped.
         setup.answer("Create a node for you?", 1, "\r");
@@ -404,6 +410,15 @@ fn setup_makes_a_node_for_each_installed_harness() {
         matches!((refused, asked_again), (Some(r), Some(a)) if r < a),
         "PRODUCT: `vox setup` must refuse the name `Bad Name!` as `vox node create` does, saying \
          why, then ask for Claude Code's node again:\n{said}"
+    );
+    let none_said = said.find(
+        "no identity passphrase: this node's identity key is kept on this machine unencrypted",
+    );
+    let opencode_made = said.find("created node opencode-");
+    assert!(
+        matches!((none_said, opencode_made), (Some(n), Some(m)) if n < m),
+        "PRODUCT: `vox setup` must make OpenCode's node with no passphrase (Enter alone, twice), \
+         saying first that its key is then kept unencrypted:\n{said}"
     );
     assert!(
         !said.contains("a node for Codex"),

@@ -96,11 +96,17 @@ decider named: read records, the room's shared name, the decision record and the
 These rules are the same for every node. A person's node and an agent's node MUST NOT be told apart
 by any of them (ADR-001: there is no typed agent or human).
 
-- **K-11. Every node has a passphrase.** Creating a node (`vox node create`, the TUI's or the app's
-  onboarding, an agent skill pack's setup) MUST require a non-empty identity passphrase. The
-  passphrase MUST be asked for in exactly two cases: attaching the node, and changing its keyring
-  (trust add, remove, rename, a capability change). A retention change MUST NOT ask for it
-  (ADR-010 AR-28 as amended).
+- **K-11. An identity passphrase is optional.** *Amended 2026-10-10:* ADR-005 J-2 (V030-36) is
+  restored, by the decider's ruling of 2026-10-09 ("passphrases are optional"; "we talked about
+  this"). Creating a node (`vox node create`, `vox setup`, `vox agent connect`, the TUI's or the
+  app's onboarding) MUST accept an empty identity passphrase, and MUST say once, where it is given,
+  what it means: the node's identity key is kept on that machine unencrypted, so anyone who can
+  read its data folder can act as the node. Attaching or unlocking a node made with none MUST
+  accept the empty one without asking again. Whatever the node has, the passphrase MUST be asked
+  for in exactly two cases: attaching the node, and changing its keyring (trust add, remove,
+  rename, a capability change). A retention change MUST NOT ask for it (ADR-010 AR-28 as
+  amended). (Between 2026-10-06 and this amendment K-11 required a non-empty passphrase, which
+  v0.4.0 to v0.4.2 enforce.)
 - **K-12. Attaching does not open the keyring window.** A passphrase given to attach a node MUST
   NOT open the keyring window (ADR-026 N-2). Only a passphrase entered for a keyring change MUST
   open it, for 30 minutes. K-9 shows the window.
@@ -465,13 +471,13 @@ Each line below is amended as stated. Where code already matches, the ADR text i
 | ADR-020 11.2 | The receiver pulls when asked | Pulled automatically when addressed to this node or to no one, from a keyring member (F-3) |
 | ADR-026 S-6 | `vox daemon install` deferred | On macOS, a login item via `SMAppService` (A-5); Linux unchanged |
 | ADR-005 J-1 | "the two people swap fingerprints … each then runs `vox trust add` for the other" | Swapping fingerprints first is optional; each accepts the other's offer (K-15–K-17) |
-| ADR-005 J-2 | An identity passphrase is OPTIONAL (V030-36) | Required for every node (K-11); a room passphrase stays optional |
-| ADR-020 2.1 | The skill pack's setup creates the agent's node | With a passphrase the operator types (K-11) |
+| ADR-005 J-2 | An identity passphrase is OPTIONAL (V030-36) | Restored (K-11 as amended 2026-10-10): optional, and an empty one says the key is kept unencrypted; a room passphrase stays optional |
+| ADR-020 2.1 | The skill pack's setup creates the agent's node | The operator makes it, at a terminal of their own (`vox setup` or `vox agent connect`), with a passphrase they type or none (K-11 as amended) |
 | ADR-020 3.1 | The keyring window runs from when the passphrase "was last entered" | From when it was last entered for a keyring change; attaching does not open it (K-12) |
 | ADR-020 3.7 | Entry point 2, in-room approval, not built | Specified as offers on join (K-15–K-19) |
 | ADR-020 3.8 | A provision-time import MAY be provided | No import (K-20) |
 | ADR-026 N-2 | The window runs from the passphrase given at attach | Attaching does not open it (K-12) |
-| ADR-026 N-6 | Agent node created "with no passphrase or one from an environment variable" | With a passphrase the operator types (K-11); a hook never supplies one (K-13) |
+| ADR-026 N-6 | Agent node created "with no passphrase or one from an environment variable" | With a passphrase the operator types, or none (K-11 as amended); a hook never supplies one (K-13) |
 | ADR-026 L-2 | A hook may attach a node implicitly | A hook never attaches; it shows the attach command (K-13) |
 | ADR-026 C-6 | Passphrases may come from an environment variable resolved in the client | Never for a keyring change (K-13) |
 | ADR-010 AR-28 | A retention request over the socket is gated on the identity passphrase | Not gated: retention is not one of the passphrase's two cases (K-11) |

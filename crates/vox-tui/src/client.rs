@@ -663,7 +663,7 @@ pub async fn events(at: &NodeSocket) -> Result<IpcClient, AppError> {
 /// `vox node create <name> [--headless]`: write the node's files here (C-5), sending nothing over
 /// the socket.
 /// Its passphrase comes from `--passphrase-file`, `VOX_IDENTITY_PASSPHRASE`, or the terminal
-/// (asked twice); an empty one is refused, before anything is written.
+/// (asked twice); an empty one gives none, which is said (ADR-005 J-2).
 ///
 /// # Errors
 /// A bad name, a node that exists, or a passphrase that cannot be had.
