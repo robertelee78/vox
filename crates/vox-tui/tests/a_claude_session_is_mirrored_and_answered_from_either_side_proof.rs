@@ -759,6 +759,18 @@ impl StandIn {
         }
     }
 
+    /// Write one line to the stand-in's control: `ask` puts up a permission prompt, `unask` takes
+    /// it down.
+    fn control(&self, line: &str) {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.control)
+            .unwrap_or_else(|e| panic!("APPARATUS: the stand-in's control: {e}"));
+        writeln!(f, "{line}").unwrap_or_else(|e| panic!("APPARATUS: the stand-in's control: {e}"));
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
     fn exit(&self) {
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -859,6 +871,10 @@ const S8: &str = "88888888-1111-4000-8000-000000000008";
 ///    1b. a slash command with an argument (`/rename frogs`) reaches the pane whole and the
 ///    Session says it whole; the name Claude Code then writes into the transcript, with no hook
 ///    run (a `/rename` runs none), renames the Session within 15 s;
+///    1c. while the session asks for permission in its terminal (its input box replaced by the
+///    prompt), `--say "1"` and `--slash` are refused, saying it is asking something, and the prompt
+///    gets no key; once the prompt is gone, `--say` reaches the session; a prompt that comes up as
+///    the keys arrive gets no Enter, and the driver is told the keys may have reached it;
 /// 2. a sub-agent's hook leaves its session's binding as it was;
 /// 3. a session started through a wrapper (a shell script, not exec'd) is still bound;
 /// 4. the pane swapped with another and moved to a new window: input follows the pane;
@@ -881,7 +897,8 @@ const S8: &str = "88888888-1111-4000-8000-000000000008";
 /// **Mutations, one per check that can fail on its own:** the injector types into the first pane
 /// of the server (arm 1); the session's process must be the hook's own parent (arm 3); the
 /// pane is recorded by its position, not its id (arm 4); the slash line said by its command alone,
-/// or the transcript not read for a name (arm 1b, `…--reads2--v043-rename-*` mutants); one session per pane ignores the server
+/// or the transcript not read for a name (arm 1b, `…--reads2--v043-rename-*` mutants); an input box that cannot be found taken
+/// for one that took the text (arm 1c); one session per pane ignores the server
 /// (arm 5); the hook's ancestry not required to reach the pane (arm 6); the session's process not
 /// checked at the send (arm 7); one session per pane not kept (arm 8); a later hook not rebinding
 /// (arm 9); a tool hook not registering (arm 10); the session not told where its file landed
@@ -1018,6 +1035,56 @@ fn a_driver_reaches_exactly_the_session_it_names_or_is_told_why() {
          \"frogs\" within 15 s; `vox room sessions --json` says its name is {named}"
     );
     println!("[proof] 1b. \"/rename frogs\" arrived whole and is said whole; the transcript's rename named the Session \"frogs\" with no hook run");
+
+    // ---- 1c. Claude Code asking a question in its terminal: nothing typed answers it ----
+    a.control("ask");
+    let asked = Instant::now();
+    while !t.screen(&p1).contains("Do you want to proceed?") {
+        assert!(
+            asked.elapsed() < Duration::from_secs(10),
+            "APPARATUS: arm 1c: the stand-in's permission prompt did not show in {p1}: {}",
+            t.screen(&p1)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for act in [vec!["--say", "1"], vec!["--slash", "/compact"]] {
+        let (ok, said) = drive(&w, &room, S1, &act);
+        println!("[proof] 1c. {act:?} to {S1} while it asks for permission: {said}");
+        let answered = a.said().lines().any(|l| l.contains("\"answered\""));
+        assert!(
+            !ok && said.contains("asking something in its terminal") && !answered,
+            "PRODUCT: arm 1c: while {S1} asks for permission in its terminal, {act:?} must be \
+             refused with why and type nothing (typed keys answer the prompt); vox said {said:?}, \
+             and the prompt got: {:?}",
+            a.said()
+                .lines()
+                .filter(|l| l.contains("\"answered\""))
+                .collect::<Vec<_>>()
+        );
+    }
+    a.control("unask");
+    let (ok, said) = drive(&w, &room, S1, &["--say", "after the question"]);
+    println!("[proof] 1c. --say to {S1} once the prompt is gone: {said}");
+    assert!(
+        ok && a.got(
+            &serde_json::json!({ "typed": "after the question" }),
+            Duration::from_secs(10)
+        ),
+        "PRODUCT: arm 1c: once {S1}'s prompt is gone, --say must reach it; vox said {said:?}"
+    );
+    // A prompt that comes up as the keys arrive (the window between Vox's look and its keys):
+    // Enter is never pressed into it, and Vox says the keys may have reached it.
+    a.control("ask-on-key");
+    let (ok, said) = drive(&w, &room, S1, &["--say", "raced by a prompt"]);
+    println!("[proof] 1c. --say to {S1} as a prompt comes up: {said}");
+    let enter = a.said().lines().any(|l| l == r#"{"answered": "\r"}"#);
+    assert!(
+        !ok && said.contains("came up in Claude Code's terminal as Vox typed") && !enter,
+        "PRODUCT: arm 1c: a prompt that came up as Vox typed must get no Enter, and the driver \
+         must be told the keys may have reached it; vox said {said:?}, Enter reached the prompt: \
+         {enter}"
+    );
+    a.control("unask");
 
     // ---- 2. a sub-agent's hook keeps its session's binding ----
     a.hook(&event(

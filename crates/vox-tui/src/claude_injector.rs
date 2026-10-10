@@ -20,6 +20,11 @@
 //!   input box; the box must then empty, with Enter tried up to three times, or the driver is told
 //!   the text would not submit (DR-6). Reading the box is what ctm learned after a long message's
 //!   Enter was swallowed.
+//! - **Nothing is typed unless the input box is on screen.** While Claude Code asks something in
+//!   its terminal (a permission prompt, a question), the box is gone and the keys would answer the
+//!   question instead: a "1" and Enter approve a command. Text and slash commands are then refused,
+//!   saying why, and nothing is typed. "Delivered" is said only once the text was seen in the box
+//!   and then seen leaving it; a box that cannot be found is never taken for a submit.
 //! - **Esc** interrupts, **Ctrl-C** stops: one key each, as ctm sends them.
 //! - **A slash command** is checked against ctm's characters (letters, digits, `_ - / space`),
 //!   typed and submitted.
@@ -101,8 +106,7 @@ pub fn drive(reg: &crate::wake::Session, act: &Act) -> Result<(), String> {
                      `-`, `/` and spaces"
                 ));
             }
-            literal(p, &cmd)?;
-            key(p, "Enter")
+            submit(p, &cmd)
         }
         Act::Text(text) => {
             if text.trim().is_empty() {
@@ -465,35 +469,111 @@ fn wait_until(p: &TmuxPane, budget: Duration, pred: impl Fn(&str) -> bool) -> bo
     }
 }
 
-/// Type `text` and submit it, confirming it left the input box (ctm's `inject`).
+/// Type `text` and submit it, confirming it left the input box (ctm's `inject`): only into an input
+/// box on screen, and said done only once the text was seen there and then seen leaving it.
 fn submit(p: &TmuxPane, text: &str) -> Result<(), String> {
+    match capture(p).as_deref().map(screen) {
+        Some(Screen::Composer) => {}
+        Some(Screen::Asking) => {
+            return Err(
+                "Claude Code is asking something in its terminal (a permission prompt or a \
+                 question), so nothing was typed: what Vox typed would answer it. Answer it there, \
+                 or from the Session, then send again"
+                    .into(),
+            )
+        }
+        Some(Screen::Unknown) => {
+            return Err(
+                "Vox cannot find Claude Code's input box in its terminal, so nothing was typed"
+                    .into(),
+            )
+        }
+        None => {
+            return Err("Vox could not read the session's terminal, so nothing was typed".into())
+        }
+    }
     literal(p, text)?;
     let marker = submit_marker(text);
-    if !marker.is_empty() {
-        // An input box that cannot be found is nothing to wait for.
-        wait_until(p, SETTLE, |pane| {
-            composer_contains(pane, &marker).unwrap_or(true)
-        });
+    // **Seen in the box, or not submitted**: Enter on anything else answers whatever took the
+    // keys.
+    if !wait_until(p, SETTLE, |pane| {
+        composer_contains(pane, &marker) == Some(true)
+    }) {
+        // A question that came up between the look and the keys (a tool's permission, asked at
+        // that moment) took them: nothing closes that window, so say what may have happened.
+        if capture(p).as_deref().map(screen) == Some(Screen::Asking) {
+            return Err(
+                "a question came up in Claude Code's terminal as Vox typed: the keys may have \
+                 reached it, and nothing was submitted; look at the session's terminal"
+                    .into(),
+            );
+        }
+        return Err(
+            "the text did not appear in Claude Code's input box, so it was not submitted; look \
+             at the session's terminal"
+                .into(),
+        );
     }
     for attempt in 0..=SUBMIT_RETRIES {
         key(p, "Enter")?;
-        if marker.is_empty() {
-            return Ok(());
-        }
-        // Submitted: the text has left the box. A box that cannot be found is not a failure.
+        // Submitted: the box is on screen without the text, or Claude Code took it and asks
+        // something in the box's place (a command's own question, a tool's permission).
         if wait_until(p, SUBMIT, |pane| {
-            composer_contains(pane, &marker) != Some(true)
+            composer_contains(pane, &marker) == Some(false) || screen(pane) == Screen::Asking
         }) {
             return Ok(());
         }
-        if attempt == SUBMIT_RETRIES {
+        // Enter again only while the text is still seen in the box: never into a question.
+        let still = capture(p).is_some_and(|pane| composer_contains(&pane, &marker) == Some(true));
+        if attempt == SUBMIT_RETRIES || !still {
             break;
         }
     }
     Err(format!(
-        "the text is in Claude Code's input box but would not submit after {} Enters",
+        "the text was typed into Claude Code's input box, but Vox did not see it submitted after \
+         Enter (tried up to {} times); look at the session's terminal",
         SUBMIT_RETRIES + 1
     ))
+}
+
+/// What Claude Code's terminal shows, for typing into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    /// Its input box, taking the operator's input.
+    Composer,
+    /// A question in place of the box: a permission prompt, a choice.
+    Asking,
+    /// Neither can be told.
+    Unknown,
+}
+
+/// What `pane` shows. A question is told by its own words below the last rule ("Esc to cancel",
+/// a numbered choice under the cursor `❯ 1.`); the input box by a pair of rules with the prompt
+/// `❯` (or `>`) between them.
+#[must_use]
+pub fn screen(pane: &str) -> Screen {
+    let lines: Vec<&str> = pane.lines().collect();
+    let last_rule = lines
+        .iter()
+        .rposition(|l| l.chars().filter(|c| *c == '─').count() >= RULE_MIN_DASHES);
+    let below = last_rule.map_or(&lines[..], |r| &lines[r + 1..]);
+    let asking = below.iter().any(|l| {
+        let t = l.trim_start();
+        t.contains("Esc to cancel")
+            || t.strip_prefix('❯').is_some_and(|r| {
+                let r = r.trim_start();
+                r.chars().next().is_some_and(|c| c.is_ascii_digit())
+                    && r.trim_start_matches(|c: char| c.is_ascii_digit())
+                        .starts_with('.')
+            })
+    });
+    if asking {
+        return Screen::Asking;
+    }
+    match composer_region(pane) {
+        Some(r) if matches!(r.trim_start().chars().next(), Some('❯' | '>')) => Screen::Composer,
+        _ => Screen::Unknown,
+    }
 }
 
 /// A short tail of `text`, to recognise it on screen: the end, because a long message scrolls,
