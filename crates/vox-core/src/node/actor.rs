@@ -12013,8 +12013,9 @@ impl Node {
         let Ok(ctx) = shared.lock().await.join_context() else {
             return false;
         };
-        // Never a stale bundle, nor a one-time prekey it refused (ADR-030 P-2, P-3).
-        let Ok(bundle) = self.delivery_bundle(channel_id, target).await else {
+        // Never a stale bundle, nor a one-time prekey already named or refused (ADR-030 P-2, P-3).
+        // A member reached through the log is not online to republish, so it does not wait.
+        let Ok(bundle) = self.delivery_bundle_or_signed(channel_id, target).await else {
             return false;
         };
         let package = {
@@ -12783,8 +12784,11 @@ impl Node {
         }
         let shared = self.channels.get(channel_id).map(Arc::clone)?;
         let ctx = { shared.lock().await.join_context().ok()? };
-        // Never a stale bundle, nor a one-time prekey it refused (ADR-030 P-2, P-3).
-        let bundle = self.delivery_bundle(channel_id, target).await.ok()?;
+        // Never a stale bundle, nor a one-time prekey already named or refused (ADR-030 P-2, P-3).
+        let bundle = self
+            .delivery_bundle_or_signed(channel_id, target)
+            .await
+            .ok()?;
         let ring = self.prekeys.as_ref()?.lock().await;
         let (initial, session) = crate::pairwise::session::Session::initiate(
             ring.identity_dh(),
@@ -12811,12 +12815,36 @@ impl Node {
 
     /// The bundle a key delivery to `target` in `channel_id` opens its fresh session against
     /// (ADR-030 D-1), read from this node's board, or why the key waits (D-5): a bundle whose
-    /// signed or one-time prekey is a cadence old by its root-signed creation time is refused (P-2),
-    /// and a one-time prekey `target` refused is never named again (P-3).
+    /// signed or one-time prekey is a cadence old, or dated ahead of this node's clock, by its
+    /// root-signed creation time is refused (P-2), and one whose one-time prekey a delivery already
+    /// named, or `target` refused, waits for `target`'s next bundle (P-3).
     async fn delivery_bundle(
         &self,
         channel_id: &Digest32,
         target: Digest32,
+    ) -> Result<crate::identity::keyagreement::PrekeyBundlePublic, prekeys::BundleWait> {
+        self.bundle_for(channel_id, target, prekeys::SpentOneTime::Wait)
+            .await
+    }
+
+    /// [`Self::delivery_bundle`], except that a one-time prekey already named or refused is taken
+    /// out and the session opens against the signed prekey, which heals only when it rotates
+    /// (ADR-030 S-5): for a delivery that has waited long enough for a fresh one, a key package to
+    /// a member who is not online to republish, and the long-lived session's opening.
+    async fn delivery_bundle_or_signed(
+        &self,
+        channel_id: &Digest32,
+        target: Digest32,
+    ) -> Result<crate::identity::keyagreement::PrekeyBundlePublic, prekeys::BundleWait> {
+        self.bundle_for(channel_id, target, prekeys::SpentOneTime::SignedPrekey)
+            .await
+    }
+
+    async fn bundle_for(
+        &self,
+        channel_id: &Digest32,
+        target: Digest32,
+        on_spent: prekeys::SpentOneTime,
     ) -> Result<crate::identity::keyagreement::PrekeyBundlePublic, prekeys::BundleWait> {
         let epoch = match self.channels.get(channel_id).map(Arc::clone) {
             Some(shared) => shared.lock().await.join_context().ok().map(|c| c.epoch),
@@ -12831,6 +12859,7 @@ impl Node {
             &record.prekey_bundle,
             self.now_ms().get(),
             &self.refused_otps.of(&target),
+            on_spent,
         )
     }
 
