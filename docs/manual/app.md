@@ -345,10 +345,13 @@ clears it, and a sheet shows only what came of its own action. If macOS does not
 
 ## Rooms from the menus
 
-- **File > New Room…** (⌘N): the room's name, as every member sees it, and a passphrase for it.
+The sidebar's **+**, at the head of its rooms, offers the same two: **New Room…** and **Join
+Room…**.
+
+- **Room > New Room…** (⌘N): the room's name, as every member sees it, and a passphrase for it.
   Send the passphrase another way than the link. Left empty, the room has none, and the form says
   so: `No passphrase: anyone with the link can join.`
-- **File > Join Room…** (⌘⇧J): the room link and its passphrase. A joined room keeps the name
+- **Room > Join Room…** (⌘⇧J): the room link and its passphrase. A joined room keeps the name
   its members gave it. Clicking a `vox://` room link in Mail, Messages or a browser opens this
   sheet with the link filled in; joining still takes the passphrase and **Join**.
 - **Room > Copy Room Link** (⌘L).

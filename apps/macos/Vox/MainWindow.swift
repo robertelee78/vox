@@ -124,6 +124,11 @@ private struct Sidebar: View {
                     .accessibilityIdentifier(model.ended == nil ? "attached" : "detached")
                     .background(SidebarHighlightOff())
             }
+            // The rooms' head: a + that makes a room or joins one, as Room > New Room… and
+            // Join Room… do (the decider, v0.4.1).
+            Section {
+                RoomsHead(model: model)
+            }
             ForEach([RoomGroup.needsYou, .active, .quiet], id: \.self) { need in
                 let rooms = model.group(need)
                 // A trust offer waiting needs the person too (ADR-028 K-15, W-2).
@@ -312,6 +317,32 @@ private struct OnThisMachine: View {
         .padding(.bottom, Space.s12)
         .background(PanelFill())
         .foregroundStyle(VoxTokens.Colors.textPrimary)
+    }
+}
+
+/// ROOMS, and a + offering New Room… and Join Room…, the same sheets as the Room menu's.
+private struct RoomsHead: View {
+    @ObservedObject var model: NodeModel
+
+    var body: some View {
+        HStack {
+            Text("ROOMS").eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
+            Spacer()
+            Menu {
+                Button("New Room…") { model.sheet = .newRoom }
+                    .accessibilityIdentifier("sidebar-new-room")
+                Button("Join Room…") { model.sheet = .joinRoom }
+                    .accessibilityIdentifier("sidebar-join-room")
+            } label: {
+                Image(systemName: "plus")
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("New Room or Join Room")
+            .accessibilityLabel("Add a room: New Room or Join Room")
+            .accessibilityIdentifier("sidebar-add")
+        }
     }
 }
 
