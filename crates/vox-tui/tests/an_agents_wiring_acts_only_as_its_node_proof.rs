@@ -45,6 +45,11 @@
 //! second node; `vox agent connect claude --node another` says the same and makes no node.
 //! Mutant: the hook's node not looked at (`Wiring::wired_node` ignored); red as PRODUCT.
 //!
+//! And **the doctor judges each harness against its own node** (#666): `vox agent doctor --node
+//! opencode-<host>` says Claude Code is wired to its own node my-claude and passes it, rather than
+//! failing it and telling the operator to rewire it onto OpenCode's node. Mutant: every harness
+//! judged against the asking node; red as PRODUCT.
+//!
 //! And **a node renamed takes everything with it** (#666): `vox node rename my-claude
 //! claude-m5max-work` leaves the node attached under the new name with the same fingerprint, and
 //! no my-claude; Claude Code's settings run its hook as the new name and set VOX_NODE to it; the
@@ -569,6 +574,16 @@ fn setup_makes_a_node_for_each_installed_harness() {
              said:\n{line}\nall:\n{out}{err}"
         );
     }
+    // ---- each harness is judged against its own node (#666): OpenCode's node's doctor leaves
+    // Claude Code, wired to my-claude, as my-claude's ----
+    let (ok, out, err) = d.vox(&["agent", "doctor", "--node", &format!("opencode-{host}")]);
+    let line = doctor_line(&format!("{out}{err}"), "claude-hook");
+    println!("[proof] doctor --node opencode-{host}, on Claude Code: {line}");
+    assert!(
+        line.starts_with("ok") && line.contains("wired to node my-claude") && !out.contains("fail  claude-hook"),
+        "PRODUCT: `vox agent doctor --node opencode-{host}` must leave Claude Code, wired to its own \
+         node my-claude, as that node's, not fail it ({ok}): {line}\nall:\n{out}{err}"
+    );
     let kept = std::fs::read_to_string(d.claude_settings()).unwrap_or_default();
     // In the order the person had it: `theme` was first, then `hooks`.
     let in_order = matches!(
