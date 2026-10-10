@@ -85,14 +85,14 @@ binds PQ freshness to every key delivery, not to the ratchet.
   publication fields. The check MUST sit in the sender's fetch path. A sender MUST also refuse a
   bundle whose signed or one-time prekey's root-signed creation time is more than 10 minutes ahead
   of its own clock, and say so in plain words (D-5), so a recipient clock running fast extends the
-  cadence bound by at most 10 minutes (the decider, 2026-10-10).
+  cadence bound by at most 10 minutes (lead, 2026-10-10; keeps S-2 as stated).
 - **P-3. Refused one-time prekeys.** When a recipient answers that it does not know the one-time
   prekey a delivery named, the sender MUST fetch the bundle again and MUST NOT target that prekey id
   again. It MUST NOT name a one-time prekey that an earlier delivery named. When the bundle it holds
   names such a prekey, the key MUST wait for the recipient's next bundle (D-5). A node MUST
   republish its bundle as soon as the prekeys it offers change. If no bundle naming a fresh
   one-time prekey arrives within 30 seconds while the recipient is connected, the sender MAY
-  deliver to the signed prekey, and MUST say so once (the decider, 2026-10-10).
+  deliver to the signed prekey, and MUST say so once (lead, 2026-10-10; keeps S-2 as stated).
 
 ### 4. What this provides
 
