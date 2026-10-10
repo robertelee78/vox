@@ -56,8 +56,9 @@
 //! rotates; 3 consumes exactly [`POOL`]); a rotation drops the signed prekey it replaces at once
 //! (2's join fails); unused one-time prekeys never retired (1: `retired` 0, the old pool still
 //! offered); the retired set not saved (1: none held half an hour on); the grace never ending (1:
-//! all still held an hour and a minute on); a retired prekey not looked up when a delivery names it
-//! (1: the delivery in its grace answered as naming an unknown prekey).
+//! all still held an hour and a minute on, and first the delivery past the grace taken); a grace
+//! of zero (1: the delivery in its grace answered as naming an unknown prekey); a retired prekey
+//! not looked up when a delivery names it (1: the same).
 
 #![cfg(unix)]
 
@@ -455,30 +456,6 @@ fn a_running_node_rotates_its_signed_prekey() {
          (within {ROTATE_WITHIN:?} of answering): {after}"
     );
 
-    // ADR-030 P-1: the one-time prekeys were made with the ring, as old as its signed prekey, and
-    // none was used. The same maintenance retires every one, keeps each for its grace, and offers
-    // a fresh pool, none of it older than this run.
-    // The guest's join used one of them (or more): the rest were unused.
-    let unused = pool - n(&after, "consumed");
-    let oldest = after["oldest_one_time"].as_u64().unwrap_or(0);
-    let ok = n(&after, "retired") == unused
-        && n(&after, "retired_held") == unused
-        && n(&after, "one_time") == pool
-        && oldest >= made_ms;
-    eprintln!(
-        "[proof] unused one-time prekeys retired {}, held in their grace {}, offered {}, the \
-         oldest offered made at {oldest} (this run began at {made_ms})",
-        n(&after, "retired"),
-        n(&after, "retired_held"),
-        n(&after, "one_time")
-    );
-    assert!(
-        ok,
-        "PRODUCT: the running daemon must retire its {unused} unused one-time prekeys once they \
-         are seven days old, hold them for their grace, and offer {pool} made in this run (none \
-         before {made_ms}): {after}"
-    );
-
     // In its grace, the delivery in flight against a retired one-time prekey still opens: the
     // node takes the key, or refuses it only after opening it (the room's or its trust's
     // refusal), never as a prekey it does not hold.
@@ -503,28 +480,6 @@ fn a_running_node_rotates_its_signed_prekey() {
          answered {answer:?} and counts {used} session(s) set up with a retired one-time prekey"
     );
 
-    // The grace survives a restart, and ends at an hour: the daemon started again with its clocks
-    // half an hour on still holds every retired prekey but the one just used, and an hour and a
-    // minute on holds none.
-    drop(daemon);
-    for (on_ms, held) in [(HALF_HOUR_MS, unused - 1), (HOUR_AND_A_MINUTE_MS, 0)] {
-        let d = node.daemon_stepped(None, Some(on_ms));
-        let p = node.prekeys();
-        eprintln!(
-            "[proof] started again {} min on: retired held {}",
-            on_ms / 60_000,
-            n(&p, "retired_held")
-        );
-        assert_eq!(
-            n(&p, "retired_held"),
-            held,
-            "PRODUCT: a daemon started again {} min after its one-time prekeys were retired must \
-             hold {held} of them (the grace is one hour, kept across a restart): {p}",
-            on_ms / 60_000
-        );
-        drop(d);
-    }
-
     // Past the grace, a delivery in flight against a retired one-time prekey is answered as naming
     // a prekey the node does not hold (ADR-030 P-1, P-3): the second node, once it has retired its
     // pool, started again an hour and a minute on.
@@ -547,6 +502,52 @@ fn a_running_node_rotates_its_signed_prekey() {
          answered \"{UNKNOWN_PREKEY}\" (ADR-030 P-1, P-3); the node answered {answer:?}"
     );
     drop(d2);
+
+    // ADR-030 P-1: the one-time prekeys were made with the ring, as old as its signed prekey, and
+    // none was used. The same maintenance retires every one, keeps each for its grace, and offers
+    // a fresh pool, none of it older than this run.
+    // The guest's join used one of them (or more): the rest were unused.
+    let unused = pool - n(&after, "consumed");
+    let oldest = after["oldest_one_time"].as_u64().unwrap_or(0);
+    let ok = n(&after, "retired") == unused
+        && n(&after, "retired_held") == unused
+        && n(&after, "one_time") == pool
+        && oldest >= made_ms;
+    eprintln!(
+        "[proof] unused one-time prekeys retired {}, held in their grace {}, offered {}, the \
+         oldest offered made at {oldest} (this run began at {made_ms})",
+        n(&after, "retired"),
+        n(&after, "retired_held"),
+        n(&after, "one_time")
+    );
+    assert!(
+        ok,
+        "PRODUCT: the running daemon must retire its {unused} unused one-time prekeys once they \
+         are seven days old, hold them for their grace, and offer {pool} made in this run (none \
+         before {made_ms}): {after}"
+    );
+
+    // The grace survives a restart, and ends at an hour: the daemon started again with its clocks
+    // half an hour on still holds every retired prekey but the one just used, and an hour and a
+    // minute on holds none.
+    drop(daemon);
+    for (on_ms, held) in [(HALF_HOUR_MS, unused - 1), (HOUR_AND_A_MINUTE_MS, 0)] {
+        let d = node.daemon_stepped(None, Some(on_ms));
+        let p = node.prekeys();
+        eprintln!(
+            "[proof] started again {} min on: retired held {}",
+            on_ms / 60_000,
+            n(&p, "retired_held")
+        );
+        assert_eq!(
+            n(&p, "retired_held"),
+            held,
+            "PRODUCT: a daemon started again {} min after its one-time prekeys were retired must \
+             hold {held} of them (the grace is one hour, kept across a restart): {p}",
+            on_ms / 60_000
+        );
+        drop(d);
+    }
 }
 
 #[test]
