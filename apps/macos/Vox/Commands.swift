@@ -532,7 +532,7 @@ private struct AdminsSheet: View {
                                                                : "\(member.name), not an admin")
             }
             if let member = asking {
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: Space.s8) {
                     StateMark(kind: .attention,
                               words: "Make \(member.name) an admin? An admin can end this room for "
                                   + "everyone and change its retention.")

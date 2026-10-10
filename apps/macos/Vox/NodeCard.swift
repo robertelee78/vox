@@ -73,8 +73,9 @@ struct NodeCard: View {
         let entry = model.trusted.first { $0.fingerprint == node.fingerprint }
         // Its alias once the keyring holds it, else as the room named it.
         let name = entry?.name ?? node.name
-        ScrollView {
-            VStack(alignment: .leading, spacing: Space.s12) {
+        // As tall as what it says (the decider, v0.4.3: a fixed 520 left a large empty area under
+        // its buttons); its sheet grows when Trust…, Compare… or Remove… opens below them.
+        VStack(alignment: .leading, spacing: Space.s12) {
                 Text(name).title()
                 HStack(alignment: .top, spacing: Space.s16) {
                     VStack(spacing: 0) {
@@ -115,7 +116,7 @@ struct NodeCard: View {
                     Button("Close", action: done).keyboardShortcut(.cancelAction)
                         .accessibilityIdentifier("card-close")
                 }
-                Hairline()
+                if act != nil { Hairline() }
                 switch act {
                 case .trust? where !trust.inKeyring:
                     trusting
@@ -143,10 +144,9 @@ struct NodeCard: View {
                     Text(did).accessibilityIdentifier("card-did")
                 }
             }
-            .padding(Space.s24)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .frame(width: Theme.scaled(520), height: Theme.scaled(520))
+        .padding(Space.s24)
+        .frame(width: Theme.scaled(520), alignment: .leading)
+        .fixedSize(horizontal: false, vertical: true)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("node-card")
         .onAppear { act = node.act }

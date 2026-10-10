@@ -16,7 +16,7 @@ struct MainWindow: View {
         VStack(spacing: 0) {
             if model.ended != nil {
                 NodeStopped(model: model)
-                Divider()
+                Hairline()
             }
             NavigationSplitView {
                 // Dragged wider or narrower, and remembered (Columns).
@@ -681,8 +681,10 @@ private struct RoomView: View {
         // kept from last time.
         HStack(spacing: 0) {
             VStack(spacing: 0) {
-                RoomHeader(model: model, room: room)
-                Divider()
+            // The room's one header, at a steady size (L-1b: only the conversation scales).
+            RoomHeader(model: model, room: room)
+            Hairline()
+            VStack(spacing: 0) {
                 if !model.roomServices.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: Space.s8 * scale) {
@@ -706,14 +708,12 @@ private struct RoomView: View {
                     }
                     Hairline()
                 }
-                Text(model.timelineTitle)
-                    .secondaryText()
-                    .lineLimit(1).truncationMode(.middle)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .voxPadding(.horizontal, Space.s12).voxPadding(.top, Space.s8)
-                    .accessibilityIdentifier("timeline-title")
+                // What the timeline shows is said once, in the room's header (no second title
+                // over the timeline, which also sat on its first line). A Session's own
+                // details, under it.
                 if let header = model.sessionHeader {
                     Text(header)
+                        .secondaryLine()
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .voxPadding(.horizontal, Space.s12).voxPadding(.top, Space.s4)
                         .accessibilityIdentifier("session-header")
@@ -1031,8 +1031,10 @@ private struct RoomView: View {
                 }
             }
             // The conversation, the timeline and the composer, at the text size View > Bigger and
-            // Smaller set (the decider, v0.4.1); the inspector beside it keeps a steady size.
+            // Smaller set (the decider, v0.4.1); the header above and the inspector beside it
+            // keep a steady size.
             .conversationScale(Theme.scale)
+            }
             // At least wide enough for the composer's field beside its To: and Urgent.
             .frame(minWidth: Theme.scaled(400), maxWidth: .infinity)
             if model.inspectorShown {
@@ -1489,17 +1491,17 @@ private struct MessageRow: View {
                 // No label of its own: a selectable Text with one sends SwiftUI's accessibility
                 // into endless recursion. Its words are what it says.
                 Text("pulled by \(pulledBy.joined(separator: ", "))")
-                    .caption().secondaryText()
+                    .secondaryLine()
                     .accessibilityIdentifier("pulled-by-\(message.id)")
             }
             if !readBy.isEmpty {
                 Text("read by \(readBy.joined(separator: ", "))")
-                    .caption().secondaryText()
+                    .secondaryLine()
                     .accessibilityIdentifier("read-by-\(message.id)")
             } else if let whereabouts, message.author == me {
                 // No label of its own, as above: its words are what it says.
                 Text(whereabouts)
-                    .caption().secondaryText()
+                    .secondaryLine()
                     .accessibilityIdentifier("whereabouts-\(message.id)")
             }
         }
@@ -1547,7 +1549,7 @@ private struct NodeStopped: View {
     @State private var field = SecureFieldHolder()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: Space.s8) {
             StateMark(kind: .danger, words: "Node \(model.node) is detached: \(model.ended ?? "")")
                 .textSelection(.enabled)
                 .accessibilityIdentifier("node-stopped")
@@ -1566,7 +1568,7 @@ private struct NodeStopped: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
+        .padding(Space.s12)
     }
 
     private func again() {
@@ -1584,7 +1586,7 @@ private struct TrustBanner: View {
     var body: some View {
         let cut = model.members.filter { $0.trust != .mutual }
         if !cut.isEmpty {
-            HStack(spacing: 8) {
+            HStack(spacing: Space.s8) {
                 StateMark(kind: .attention, words: words(cut))
                     .accessibilityIdentifier("trust-banner")
                 Spacer()
@@ -1597,7 +1599,7 @@ private struct TrustBanner: View {
                         .accessibilityIdentifier("trust-banner-keyring")
                 }
             }
-            .padding(.horizontal, 12).padding(.vertical, 6)
+            .padding(.horizontal, Space.s12).padding(.vertical, Space.s8)
         }
     }
 
@@ -1621,6 +1623,18 @@ private struct TrustBanner: View {
     }
 }
 
+extension View {
+    /// The title bar draws no title (macOS 15 and later); the window keeps its title for the
+    /// Window menu.
+    @ViewBuilder func hidesTitleBarTitle() -> some View {
+        if #available(macOS 15, *) {
+            toolbar(removing: .title)
+        } else {
+            self
+        }
+    }
+}
+
 /// The Dock icon's badge.
 enum DockBadge {
     static func show(_ count: Int) {
@@ -1636,22 +1650,26 @@ private struct RoomHeader: View {
     let room: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text("ROOM").eyebrow().secondaryText()
-            Text(model.roomName(room)).fontWeight(.semibold)
+        // One line: the name, then its details, quieter (the decider, v0.4.3: the room was named
+        // three times, in the title bar, a large header and the timeline's title).
+        HStack(alignment: .firstTextBaseline, spacing: Space.s8) {
+            Text(model.roomName(room)).font(Theme.text).fontWeight(.semibold)
                 .lineLimit(1).truncationMode(.middle)
                 .textSelection(.enabled)
                 .accessibilityIdentifier("room-header-name")
                 .accessibilityAddTraits(.isHeader)
             Text(model.roomHeaderMeta)
-                .secondaryText()
+                .font(Theme.small).secondaryText()
                 .lineLimit(1).truncationMode(.middle)
                 .accessibilityIdentifier("room-header-meta")
+            Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 12).padding(.vertical, 8)
+        .padding(.horizontal, Space.s12).padding(.vertical, Space.s8)
+        // The window keeps the room's name for the Window menu and ⌘` (P10); the title bar does
+        // not draw it again where macOS lets the app say so.
         .navigationTitle(model.roomName(room))
-        .navigationSubtitle(model.roomHeaderMeta)
+        .hidesTitleBarTitle()
     }
 }
 
@@ -1662,12 +1680,12 @@ private struct DayDivider: View {
     let words: String
 
     var body: some View {
-        HStack(spacing: 8) {
-            VStack { Divider() }
+        HStack(spacing: Space.s8) {
+            VStack { Hairline() }
             Text(words).caption().secondaryText()
-            VStack { Divider() }
+            VStack { Hairline() }
         }
-        .padding(.vertical, 4)
+        .voxPadding(.vertical, Space.s4)
         .accessibilityElement(children: .ignore)
         .accessibilityAddTraits(.isHeader)
         .accessibilityLabel(words)
@@ -1681,12 +1699,12 @@ private struct UnreadDivider: View {
 
     var body: some View {
         let words = count == 1 ? "1 unread" : "\(count) unread"
-        HStack(spacing: 8) {
-            VStack { Divider() }
+        HStack(spacing: Space.s8) {
+            VStack { Hairline() }
             Text(words).caption()
-            VStack { Divider() }
+            VStack { Hairline() }
         }
-        .padding(.vertical, 4)
+        .voxPadding(.vertical, Space.s4)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(words)
         .accessibilityIdentifier("unread-divider")
@@ -1751,7 +1769,7 @@ private struct FileCard: View {
                 }
                 state
                 DisclosureGroup("Details", isExpanded: $details) {
-                    VStack(alignment: .leading, spacing: 2) {
+                    VStack(alignment: .leading, spacing: Space.s4 * scale) {
                         Text("SHA-256 \(file.sha256)").font(Theme.mono).textSelection(.enabled)
                         Text("Shared by \(sharer) (\(message.author))").font(Theme.mono)
                             .textSelection(.enabled)
@@ -1894,7 +1912,7 @@ private struct ServiceCard: View {
             VStack(alignment: .leading, spacing: Space.s4 * scale) {
                 Text(service.address).voxFont(VoxTokens.Fonts.appMono).textSelection(.enabled)
                 Text("by \(service.by)  ·  \(service.kind)\(service.udp && service.kind != "udp" ? "/udp" : "")")
-                    .caption().secondaryText()
+                    .secondaryLine()
             }
         }
         .voxPadding(Space.s8)
@@ -1924,7 +1942,7 @@ private struct Inspector: View {
                             .accessibilityIdentifier("member-\(member.name)")
                         // What this node's keyring grants it (K-14), once it is in the keyring.
                         if member.trust.inKeyring {
-                            Text(Capability.words(member.drive)).eyebrow().secondaryText()
+                            Text(Capability.words(member.drive)).secondaryLine()
                                 .padding(.leading, Space.s20)
                                 .accessibilityIdentifier("member-capability-\(member.name)")
                         }

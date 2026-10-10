@@ -23,6 +23,9 @@ enum Theme {
     static var text: Font { font(VoxTokens.Fonts.appText) }
     /// Fingerprints, addresses and commands: SF Mono (L-7).
     static var mono: Font { font(VoxTokens.Fonts.appMono) }
+    /// Secondary lines (who read a message, a header's details, what an entry grants): SF Pro,
+    /// one step under the text, never mono or letter-spaced.
+    static var small: Font { font(VoxTokens.Fonts.appSmall) }
     /// Uppercase eyebrow labels: SF Mono, tracked (L-7).
     static var eyebrow: Font { font(VoxTokens.Fonts.appEyebrow) }
     /// Pane, sheet and dialog titles: SF Pro semibold (L-7), at a steady size.
@@ -334,6 +337,10 @@ struct AliasClash: View {
 }
 
 extension View {
+    /// A quiet secondary line: the small face, in secondary text, at the text size of where it
+    /// is drawn (inside the conversation, its scale).
+    func secondaryLine() -> some View { voxFont(VoxTokens.Fonts.appSmall).secondaryText() }
+
     /// Draw as secondary text.
     func secondaryText() -> some View { modifier(SecondaryText()) }
 

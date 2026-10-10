@@ -41,7 +41,8 @@ extension NodeModel {
         switch showing {
         case .general: shown = "General"
         case .all: shown = "All"
-        case .session: shown = shownSession?.label ?? "a Session"
+        case .session:
+            shown = shownSession.map { "\($0.label) · \($0.open ? "open" : "ended")" } ?? "a Session"
         }
         return "\(people == 1 ? "1 member" : "\(people) members") · \(shown) · ⏱ \(retention)"
     }
