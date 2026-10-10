@@ -845,15 +845,21 @@ final class FirstRunProof: XCTestCase {
         }
         present(ui, next, timeout: 20, "alice's second message must show in the timeline")
         Thread.sleep(forTimeInterval: 1)
+        let header = Key.id("room-header-name")
         let m0 = height(message), s0 = height(sidebarRow), i0 = height(members), g0 = gap()
+        let h0 = height(header)
         ui.typeKey("+", modifierFlags: .command)
         ui.typeKey("+", modifierFlags: .command)
         Thread.sleep(forTimeInterval: 2)
         present(ui, message, timeout: 10, "after View > Bigger, the message must still show")
         let m1 = height(message), s1 = height(sidebarRow), i1 = height(members), g1 = gap()
+        let h1 = height(header)
         ui.typeKey("0", modifierFlags: .command)
         XCTAssertTrue(m0 > 0 && m1 > m0 * 1.15,
                       "PRODUCT: View > Bigger twice must grow the conversation's text; the message was \(m0) high and is \(m1)")
+        // The room's header too keeps its size (v0.4.3: it grew with the conversation).
+        XCTAssertTrue(h0 > 0 && abs(h1 - h0) <= 1,
+                      "PRODUCT: View > Bigger must leave the room's header its size; its name went from \(h0) to \(h1)")
         XCTAssertTrue(s0 > 0 && i0 > 0 && abs(s1 - s0) <= 1 && abs(i1 - i0) <= 1,
                       "PRODUCT: View > Bigger must leave the sidebar and the inspector unchanged; a sidebar row went from \(s0) to \(s1), the inspector's MEMBERS line from \(i0) to \(i1)")
         // Two steps are 1.3 times Actual Size: spacing taken at the text size grows the gap by
@@ -914,7 +920,34 @@ final class FirstRunProof: XCTestCase {
         let room = try line(staged(vox, ["room", "list", "--node", "alice"], env: voxEnv)) {
             $0.contains(" talk")
         }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        // Bob in the room, each trusting the other, so alice's message can be read by him and
+        // say so ("read by bob", v0.4.3's quiet line).
+        try staged(vox, ["trust", "add", "--node", "bob", aliceFp, "--name", "alice",
+                         "--identity-passphrase-file", pass("bob")], env: voxEnv)
+        let link = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        try staged(vox, ["room", "join", "--node", "bob", "--passphrase-file", pass("room"), link],
+                   env: voxEnv)
+        // Forward-only keys: alice posts until bob reads one of hers, then the message itself.
+        var warm = false
+        let warming = Date().addingTimeInterval(120)
+        var n = 0
+        while !warm && Date() < warming {
+            n += 1
+            try staged(vox, ["room", "post", "--node", "alice", room, "WARM-\(n)"], env: voxEnv)
+            Thread.sleep(forTimeInterval: 1)
+            warm = run(vox, ["room", "read", "--node", "bob", room], env: voxEnv).out.contains("WARM-")
+        }
+        guard warm else { throw Apparatus("staging not achieved: bob never read alice's posts in talk") }
         try staged(vox, ["room", "post", "--node", "alice", room, "LOOK-AT-THIS"], env: voxEnv)
+        var bobRead = false
+        let reading = Date().addingTimeInterval(60)
+        while !bobRead && Date() < reading {
+            Thread.sleep(forTimeInterval: 1)
+            bobRead = run(vox, ["room", "read", "--node", "bob", room], env: voxEnv).out.contains("LOOK-AT-THIS")
+        }
+        guard bobRead else { throw Apparatus("staging not achieved: bob never read LOOK-AT-THIS") }
         try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
         try stager.write(Data("alice\n".utf8), to: config + "/app/node")
 
@@ -1014,6 +1047,32 @@ final class FirstRunProof: XCTestCase {
         }
         XCTAssertNotNil(hair, "PRODUCT: the timeline and the inspector must be separated by line.hair #303137 (L-2, L-6); no pixel of it in the 40 points left of the inspector, at height \(y)")
         read.append("line.hair at x \(hair.map { "\($0)" } ?? "none")")
+
+        // One header (v0.4.3): the room's name and its details on one line, above the timeline's
+        // first line, and no second title over the timeline.
+        guard let headName = locate(ui, Key.id("room-header-name")),
+              let headMeta = locate(ui, Key.id("room-header-meta")) else {
+            throw Apparatus("the room's header is not readable to XCTest")
+        }
+        XCTAssertTrue(abs(headName.frame.midY - headMeta.frame.midY) <= 4,
+                      "PRODUCT: the room's header must be one line, its name and details side by side; the name is at \(headName.frame), the details at \(headMeta.frame)")
+        XCTAssertNil(locate(ui, Key.id("timeline-title")),
+                     "PRODUCT: the room must be named once over its timeline: a second title (\"Timeline · …\") shows")
+        let firstRow = locate(ui, Key.idPrefix("day-"))?.frame ?? message.frame
+        XCTAssertTrue(firstRow.minY >= max(headName.frame.maxY, headMeta.frame.maxY),
+                      "PRODUCT: the header must not overlap the timeline's first line; the header ends at \(max(headName.frame.maxY, headMeta.frame.maxY)), the first line starts at \(firstRow.minY)")
+        // "read by bob": a quiet line, the header details' face and size, not a letter-spaced
+        // mono tag: the same height, and per character about as wide.
+        let readBy = words(ui, Key.idPrefix("read-by-"), timeout: 60,
+                           "alice's message, read by bob, must say so") ?? ""
+        if let line = locate(ui, Key.idPrefix("read-by-")) {
+            let perChar = line.frame.width / CGFloat(max(readBy.count, 1))
+            let metaChars = CGFloat(max(shown(headMeta).count, 1))
+            let metaPerChar = headMeta.frame.width / metaChars
+            XCTAssertTrue(abs(line.frame.height - headMeta.frame.height) <= 2 && perChar <= metaPerChar * 1.25,
+                          "PRODUCT: \"\(readBy)\" must be a quiet line in the details' face (v0.4.3); it is \(line.frame.height) high and \(perChar) a character, the details \(headMeta.frame.height) and \(metaPerChar)")
+        }
+        read.append("header one line; read by \(readBy.debugDescription)")
 
         // Room > Rename…: a sheet on bg.panel, its title SF Pro semibold.
         ui.menuBars.menuBarItems["Room"].click()
@@ -2609,7 +2668,18 @@ final class FirstRunProof: XCTestCase {
         }
         reaches("clicking the reply's quote") { tap(ui, quote, "the reply's quote") }
         reaches("⌘↑ with the reply selected") { ui.typeKey(.upArrow, modifierFlags: .command) }
-        print("[proof] bob's reply quotes \"re you: FROM-ALICE\", and its quote and ⌘↑ go to it")
+        // A reply naming FROM-ALICE by the start of its id, as `vox` and agents print ids, quotes
+        // it as well (the decider, v0.4.3: such a reply said "re a message this room does not hold
+        // yet" under the message it answered).
+        try staged(vox, ["room", "post", "--node", "bob", "--re", String(fromAlice.prefix(12)), room,
+                         "REPLY-BY-SHORT-ID"], env: voxEnv)
+        guard let shortReply = entry("REPLY-BY-SHORT-ID") else {
+            throw Apparatus("alice's `vox room read --json` holds no REPLY-BY-SHORT-ID")
+        }
+        let shortQuote = words(ui, Key.id("quote-\(shortReply)"), timeout: 30,
+                               "a reply naming FROM-ALICE by the start of its id must quote it",
+                               until: { $0 == "re you: FROM-ALICE" }) ?? ""
+        print("[proof] bob's reply quotes \"re you: FROM-ALICE\", and its quote and ⌘↑ go to it; by a short id, \(shortQuote.debugDescription)")
 
         // (4d) To: offers bob's open Session under him, and a message to it alone is addressed to
         // that Session (MADR W-4, ADR-029 TA-1, D7): bob's Claude Code session opens a Session in
@@ -3751,6 +3821,14 @@ final class FirstRunProof: XCTestCase {
                                until: { $0.contains("trusts you; you haven't trusted") }) ?? ""
         // On his card: two groups so far; a wrong third named, with no Remove (he is not in the
         // keyring); the whole of it marked as a match.
+        // As tall as what it says (v0.4.3: a fixed height left a large empty area under its
+        // buttons): before anything opens below them, the card ends a padding under Close.
+        if let card = locate(ui, Key.id("node-card")), let close = locate(ui, Key.id("card-close")) {
+            XCTAssertTrue(card.frame.maxY - close.frame.maxY <= 48,
+                          "PRODUCT: the node card must end under its buttons, not leave an empty area; it ends \(card.frame.maxY - close.frame.maxY) points under Close")
+        } else {
+            XCTFail("APPARATUS: dave's card or its Close is not readable to XCTest")
+        }
         tap(ui, Key.id("card-compare-open"), "Compare… on dave's card")
         let field = Key.id("card-compare")
         type(ui, field, String(daveFp.prefix(8)), "the card's compare field")

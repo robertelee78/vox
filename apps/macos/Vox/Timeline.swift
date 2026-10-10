@@ -148,8 +148,16 @@ extension NodeModel {
     /// 80 characters, or nil while this room does not hold that message. Nil for a message that
     /// replies to nothing.
     func quote(of m: RoomMessage) -> (id: String, words: String?)? {
-        let re = m.re.trimmingCharacters(in: .whitespaces).lowercased()
-        guard !re.isEmpty else { return nil }
+        let given = m.re.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !given.isEmpty else { return nil }
+        // A reply may name its message by the start of its id, as `vox` and agents print it
+        // (the decider, v0.4.3: "re a message this room does not hold yet" on a reply to a
+        // message on screen): the one message whose id starts so, when only one does.
+        var re = given
+        if byID[given] == nil {
+            let starting = byID.keys.filter { $0.hasPrefix(given) }
+            if starting.count == 1, let whole = starting.first { re = whole }
+        }
         guard let held = byID[re], !held.owed else { return (re, nil) }
         let said = held.file.map { $0.note.isEmpty ? $0.name : $0.note } ?? held.text
         let first = said.split(separator: "\n", omittingEmptySubsequences: false).first.map(String.init) ?? ""
