@@ -60,7 +60,7 @@ to bind it, or say no."
   there, joins the agent's node, and saves the directory in the room map:
 
   ```sh
-  vox room join vox://… --node claude-mac --bind /path/to/repo
+  vox room join 'vox://…' --node claude-mac --bind /path/to/repo
   ```
 
   Every later session started in that directory, from any harness, works in that room; if the map

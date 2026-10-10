@@ -120,7 +120,11 @@ extension NodeModel {
                                             : "To see inside, run this in a terminal on the Mac that "
                                                 + "node runs on:"),
                                      at: .max,
-                                     command: "vox trust drive \(me) --node \(local ?? "<its node>")"))
+                                     // Quoted as the CLI quotes what it prints (v0.4.3).
+                                     // Whole, to paste: on this Mac with its node named; on the
+                                     // other Mac without, its name there not being known here.
+                                     command: shellCommand(words: ["vox", "trust", "drive", me]
+                                                               + (local.map { ["--node", $0] } ?? []))))
             }
             return lines
         }

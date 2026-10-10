@@ -165,8 +165,8 @@ pub fn helper_answers(socket: &Path) -> Result<(), String> {
     let not_one = |why: String| {
         format!(
             "{} answers, but not as a vox LAN helper ({why}). Is another program using that \
-             path? Start the helper on a path of its own with\n\n    sudo vox lan helper \
-             --socket <path>\n\nand give `vox lan up` the same --helper-socket.",
+             path? Start the helper with sudo vox lan helper and --socket naming a path of its \
+             own, and give `vox lan up` the same path with --helper-socket.",
             socket.display()
         )
     };
@@ -226,7 +226,10 @@ pub fn no_helper(socket: &Path) -> String {
         }
         String::new()
     } else {
-        format!(" --socket {}", socket.display())
+        format!(
+            " {}",
+            vox_text::shell::command(&["--socket", &socket.to_string_lossy()])
+        )
     };
     format!(
         "no LAN helper is answering on {}. Creating a network interface needs root, and \
@@ -1074,8 +1077,8 @@ pub async fn up_held(
 ) -> Result<(), AppError> {
     if args.metrics.is_some() {
         eprintln!(
-            "vox lan: --metrics is served by the vox daemon for every node: vox daemon --metrics \
-             <addr>"
+            "vox lan: --metrics is served by the vox daemon for every node: give the daemon \
+             --metrics and the address to serve them on"
         );
     }
     let room = &args.room;

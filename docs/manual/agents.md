@@ -71,7 +71,7 @@ and the one command for it, which the session repeats to you to run in a termina
   run `vox agent trust codex` after it. Then start a new session.
 - **Its node is not attached**: `vox node attach claude-mac`. Then start a new session.
 - **This repo is tied to no room**: the session asks for the room's link, and gives you the
-  `vox room join <link> --node claude-mac --bind <this repo>` command to run (see [the room a
+  `vox room join '<link>' --node claude-mac --bind '<this repo>'` command to run (see [the room a
   session works in](sessions.md#the-room-a-session-works-in)).
 
 The rest of this chapter is what setup does for you, done by hand, and what to check after.

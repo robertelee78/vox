@@ -399,17 +399,21 @@ impl Reading {
             Reading::Waiting => format!(
                 "waiting for the other side: you trust {name}; {name}'s trust in you has not \
                  reached this node yet. Until it does neither reads the other; if they have not \
-                 trusted you, they run `vox trust add {me}`"
+                 trusted you, they run `{}`",
+                vox_text::shell::command(&["vox", "trust", "add", me])
             ),
             // Their trust in this node, when it has reached it, is said; when it has not, only what
             // each still runs, never that they have or have not given it.
+            // Whole commands, to paste: `vox trust add` asks there for a name.
             Reading::NotInKeyring { trusts_you: true } => format!(
-                "not in keyring, trusts you: to read each other, you run `vox trust add {fp} \
-                 --name NAME`"
+                "not in keyring, trusts you: to read each other, you run `{}`",
+                vox_text::shell::command(&["vox", "trust", "add", fp])
             ),
             Reading::NotInKeyring { trusts_you: false } => format!(
-                "not in keyring: to read each other, you run `vox trust add {fp} --name NAME`; \
-                 if they have not trusted you, they run `vox trust add {me}`"
+                "not in keyring: to read each other, you run `{}`; if they have not trusted you, \
+                 they run `{}`",
+                vox_text::shell::command(&["vox", "trust", "add", fp]),
+                vox_text::shell::command(&["vox", "trust", "add", me])
             ),
         }
     }

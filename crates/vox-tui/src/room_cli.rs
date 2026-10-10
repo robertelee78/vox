@@ -3571,8 +3571,8 @@ pub async fn get_file(
         if o.sha256 == newest.sha256 {
             let _ = write!(
                 said,
-                "\n       the same file is also offered by {who}: `vox room get {room} {}`",
-                o.tag
+                "\n       the same file is also offered by {who}: `{}`",
+                vox_text::shell::command(&["vox", "room", "get", room, &o.tag])
             );
         } else {
             let _ = write!(
@@ -4507,8 +4507,8 @@ pub async fn create(
     {
         return Err(AppError::Usage(format!(
             "cannot create the room: the room {} on this node is already called {name}, and a \
-             node holds one room of a name\n       rename it (`vox room rename {} <name>`) or \
-             name this one otherwise",
+             node holds one room of a name\n       give that room another name with vox room \
+             rename, its id {} and the new name, or name this one otherwise",
             short(&id),
             short(&id)
         )));
@@ -4774,7 +4774,8 @@ pub(crate) fn typed_only() -> String {
     format!(
         "it is typed at a terminal, and taken from nothing else (not VOX_IDENTITY_PASSPHRASE, not \
          a file). Run it in a terminal: {}",
-        command.join(" ")
+        // Each argument as one shell word: a name like "Ben's Mac & co" pastes whole.
+        vox_text::shell::command(&command)
     )
 }
 
@@ -5013,8 +5014,8 @@ pub async fn trust_add(
             println!("     `vox trust remove` undoes it and changes the lock everywhere");
             if drive {
                 println!(
-                    "Next: from node {petname:?}, `vox room sessions <room>` lists this node's \
-                     Sessions in a room you share, and `vox room session` drives one"
+                    "Next: from node {petname:?}, vox room sessions with the id of a room you share \
+                     lists this node's Sessions there, and vox room session drives one"
                 );
             } else {
                 println!(
@@ -5225,6 +5226,11 @@ pub(crate) async fn offers_of(
 /// (K-1), why it is offered, which of the nodes in the keyring trust it (K-7), and how to accept
 /// or dismiss it. A read: no passphrase.
 pub async fn trust_offers(paths: &Paths) -> Result<(), AppError> {
+    let node = paths
+        .profile_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let mut client = attach(paths).await?;
     let offers = offers_of(&mut client).await?;
     if offers.is_empty() {
@@ -5245,9 +5251,26 @@ pub async fn trust_offers(paths: &Paths) -> Result<(), AppError> {
         let in_rooms: Vec<String> = o.rooms.iter().map(|r| format!("{:?}", r.name)).collect();
         println!("  {}", o.said);
         println!("  in {}", listed(&in_rooms, ""));
+        // Whole commands, each pasted as it stands: `vox trust add` asks there for a name and the
+        // passphrase. A placeholder (`<name>`, `[--drive]`) is refused by zsh before vox runs.
+        let read = ["vox", "trust", "add", fp.as_str(), "--node", node.as_str()];
+        let mut drive = read.to_vec();
+        drive.push("--drive");
+        println!("  accept (read): {}", vox_text::shell::command(&read));
         println!(
-            "  accept: vox trust add {fp} --name <name> [--drive]   dismiss: vox trust dismiss {}",
-            short(&o.member)
+            "  accept (read + drive): {}",
+            vox_text::shell::command(&drive)
+        );
+        println!(
+            "  dismiss: {}",
+            vox_text::shell::command(&[
+                "vox",
+                "trust",
+                "dismiss",
+                &short(&o.member),
+                "--node",
+                node.as_str()
+            ])
         );
     }
     Ok(())

@@ -1210,7 +1210,7 @@ fn read_piped_stdin(
                         "vox daemon: waiting for stdin to close: the identity passphrase, then \
                          any room lines.\n\
                          \x20      No terminal to ask at. Or set VOX_IDENTITY_PASSPHRASE, or \
-                         pass --passphrase-file <path>."
+                         pass --passphrase-file naming the file that holds it."
                     );
                 }
             }

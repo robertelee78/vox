@@ -36,7 +36,7 @@ pub async fn run(
         .ok_or_else(|| {
             AppError::Usage(format!(
                 "session {label} of node {node} works in no room, so its Session has nowhere to \
-                 send a file: `vox agent room ROOM` sets it"
+                 send a file: vox agent room and a room's id sets it (vox room list shows them)"
             ))
         })?;
     let channel_id = vox_core::node::link::b32_decode(&room, "the session's room")

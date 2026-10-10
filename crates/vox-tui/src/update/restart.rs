@@ -253,11 +253,10 @@ pub(super) fn say_next(detached: &[NodeName]) {
              remembers it"
         ),
         nodes => println!(
-            "Next: attach {} with `vox node attach <node>`; each asks for its passphrase once \
-             and then remembers it",
+            "Next: attach each: {}; each asks for its passphrase once and then remembers it",
             nodes
                 .iter()
-                .map(ToString::to_string)
+                .map(|n| vox_text::shell::command(&["vox", "node", "attach", n.as_str()]))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),

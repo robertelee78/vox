@@ -136,7 +136,9 @@ fn trust_name(a: &TrustAddArgs) -> Result<String, crate::app::AppError> {
     }
     if !std::io::stdin().is_terminal() {
         return Err(crate::app::AppError::Usage(
-            "name it: vox trust add <fingerprint> --name <your name for it>".into(),
+            "name it: run it again with --name and your name for it, or at a terminal, where \
+             it asks"
+                .into(),
         ));
     }
     let mut err = std::io::stderr();
@@ -1803,7 +1805,8 @@ impl AnchorArgs {
         if !vox_core::node::profile::Profile::exists(paths) {
             return Err(refuse(format!(
                 "this node has no identity, so no `vox trust` list to read; make one with \
-                 `vox id` and `vox trust add <fingerprint>` in the node at {}",
+                 `vox id`, then trust others with vox trust add and their fingerprint, in the \
+                 node at {}",
                 paths.profile_dir.display()
             )));
         }
@@ -3328,8 +3331,8 @@ pub fn run() -> ExitCode {
             let name = args.address.trim().to_ascii_lowercase();
             if !name.ends_with(".vox") {
                 eprintln!(
-                    "vox: forward a service by its address: vox forward \
-                     <service>.<node>.<room>.vox [<local>]  (`vox service list <room>` shows each)"
+                    "vox: forward a service by its .vox address, which vox service list and a \
+                     room's id shows for each one"
                 );
                 return ExitCode::FAILURE;
             }

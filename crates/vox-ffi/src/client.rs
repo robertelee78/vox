@@ -418,6 +418,14 @@ pub fn move_old_layout_aside(data_root: String, date: String) -> Result<Vec<Move
         .map_err(|e| failed(e.to_string()))
 }
 
+/// `words` as one command line a person pastes into a shell, each word quoted as the CLI quotes it
+/// (`vox_text::shell`, v0.4.3): the app's Copy buttons give what the CLI prints.
+#[uniffi::export]
+#[must_use]
+pub fn shell_command(words: Vec<String>) -> String {
+    vox_text::shell::command(&words)
+}
+
 /// What a person is told wherever a node is made, as `vox node create` says it (ADR-028 K-8): a
 /// node has no backup.
 #[uniffi::export]

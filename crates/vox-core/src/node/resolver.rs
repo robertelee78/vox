@@ -486,7 +486,7 @@ impl VoxResolver {
             }
             return Err(format!(
                 "no node you trust is called `{label}` — only trusted nodes have names here \
-                 (`vox trust add <fingerprint> --name {label}`)"
+                 (vox trust add, with its fingerprint and --name {label}, names one)"
             ));
         }
         let hits: Vec<Digest32> = named
@@ -499,8 +499,8 @@ impl VoxResolver {
                 "`{label}` is a node you trust, but not a member of `{room_label}`"
             )),
             many => Err(format!(
-                "`{label}` names {} nodes you trust in `{room_label}`; rename one \
-                 (`vox trust rename <fingerprint> <name>`): {}",
+                "`{label}` names {} nodes you trust in `{room_label}`; rename one with vox trust \
+                 rename, its fingerprint and a new name: {}",
                 many.len(),
                 many.iter()
                     .map(|fp| b32_encode(fp).chars().take(12).collect::<String>())

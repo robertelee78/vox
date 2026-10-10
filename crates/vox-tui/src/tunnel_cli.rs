@@ -136,8 +136,8 @@ pub fn identity_passphrase_for(
     let made = new_identity_passphrase(
         given,
         file,
-        "Make one at a terminal with `vox id`, or give its new passphrase with \
-         --identity-passphrase-file <path> (`-` reads stdin) or VOX_IDENTITY_PASSPHRASE.",
+        "Make one at a terminal with `vox id`, or give its new passphrase in a file named by \
+         --identity-passphrase-file (`-` reads stdin) or in VOX_IDENTITY_PASSPHRASE.",
     );
     // **A refusal leaves no node behind**: resolving the paths made the node's directory, and
     // "nothing was created" must be true on disk. Only an empty directory is removed.
@@ -347,7 +347,8 @@ pub fn named_spec(spec: &str) -> Result<(u16, String), AppError> {
     let Some((name, port_spec)) = spec.split_once('=') else {
         return Err(AppError::Usage(format!(
             "{spec:?} has no name: every shared service is named, and reached as \
-             <name>.<node>.<room>.vox\n       name it as <name>=<port>, e.g. `vox serve ssh=22`"
+             <name>.<node>.<room>.vox\n       put its name before its port, as `vox serve ssh=22` \
+             names port 22 ssh"
         )));
     };
     let label = vox_core::tunnel::udp::service_label(port_spec).ok_or_else(|| {
@@ -1424,8 +1425,8 @@ async fn pick_service() -> Result<(u16, String, SocketAddr), AppError> {
         .unwrap_or_default();
     if found.is_empty() {
         return Err(AppError::Usage(
-            "nothing listening on this machine can be seen from here: name the service, \
-             vox serve <name>=<port>, e.g. vox serve ssh=22"
+            "nothing listening on this machine can be seen from here: name the service and its \
+             port, as `vox serve ssh=22` names port 22 ssh"
                 .into(),
         ));
     }
@@ -1435,7 +1436,7 @@ async fn pick_service() -> Result<(u16, String, SocketAddr), AppError> {
     }
     // Unprivileged, `lsof` sees only this user's sockets and `ss` hides another user's program:
     // a service missing here may still be listening.
-    println!("  {MAY_BE_MISSING}; name one with vox serve <name>=<port>");
+    println!("  {MAY_BE_MISSING}; name one with its port, as `vox serve ssh=22` names port 22 ssh");
     let answer = ask("share which? (its number, or its port)").await?;
     let chosen = answer
         .parse::<usize>()
@@ -1661,7 +1662,7 @@ pub async fn up(
     }
     println!();
     println!(
-        "then:  ssh user@<service>.<node>.<room>.vox   (`vox service list <room>` shows each one)"
+        "then:  ssh to a service by its .vox address (vox service list and a room's id shows each one)"
     );
     println!("other tools:  ALL_PROXY=socks5h://{bound}");
     if !watch {

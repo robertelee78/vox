@@ -2177,7 +2177,7 @@ impl DaemonCore {
                         sentence: a.sentence(),
                         answers: crate::room_ask::answers(a, &self.account.data_root)
                             .into_iter()
-                            .map(|(what, cmd)| (what.to_owned(), cmd))
+                            .map(|(what, how, _)| (what.to_owned(), how))
                             .collect(),
                     })
                     .collect(),
