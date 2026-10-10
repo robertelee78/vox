@@ -4,7 +4,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 **Status:** accepted and built. The registry is `crates/vox-core/src/suite.rs`; the floor is in the
 signed genesis policy (`ChannelPolicy::min_suite`) and enforced in `pairwise::pqxdh` and the ADR-005
-join. PQ post-compromise security (§Scope) is not built.
+join. PQ post-compromise security (§Scope, ADR-030) is not built; it is planned for v0.5.0.
 **Deciders:** Robert E. Lee <robert@agidreams.us>
 
 ## Context
@@ -93,8 +93,10 @@ stay non-goals (ADR-001).
 
 - **S1.** PQ confidentiality (hybrid PQXDH) and PQ authentication (composite signatures) MUST be
   present everywhere from the first release.
-- **S2.** PQ post-compromise security in the ratchet (ADR-004) is a separate capability with its own
-  ADR, built complete when built. It MUST NOT be described as a deferred part of confidentiality.
+- **S2.** PQ post-compromise security is a separate capability with its own ADR (ADR-030), built
+  complete when built. It MUST NOT be described as a deferred part of confidentiality. It is provided at
+  key delivery, by a fresh PQXDH per delivered key, not in the ratchet, and it needs no new suite: each
+  delivery costs one PQXDH initial message (about 1.2 KB) under `VOX_SUITE_1`.
 
 ## Consequences
 
