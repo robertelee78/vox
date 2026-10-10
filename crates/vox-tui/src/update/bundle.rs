@@ -83,6 +83,12 @@ pub(super) fn update(
             "Vox {current} is current (the newest {channel} release is {})",
             vox.version_text
         );
+        // **An update still updates** (decider, v0.4.2): with nothing newer, completions and the
+        // agent skill pack are refreshed on the Vox.app in place. `--check` changes nothing.
+        if !check_only {
+            shell_setup_from(apps, exe);
+            println!("Vox {current} is current; {}", super::skill_said());
+        }
         return Ok(());
     }
     println!(
