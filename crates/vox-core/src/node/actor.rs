@@ -4143,6 +4143,9 @@ pub struct Node {
     /// `(room, member)` whose key waits for a prekey bundle of it this node's board does not
     /// hold: said once, not on every tick's retry, until the key goes (see `release_key_to`).
     key_waits_said: BTreeSet<(Digest32, Digest32)>,
+    /// One-time prekey ids each member answered it does not hold: never targeted again by a key
+    /// delivery (ADR-030 P-3; see `delivery_bundle`).
+    refused_otps: prekeys::RefusedOneTime,
     /// Where this node says it listens on this computer and the local network, and hears others
     /// say so (V210-167; `node::nearby`). `None` for an anchor, or when the group cannot be
     /// joined.
@@ -4616,6 +4619,7 @@ impl Node {
             anchor_owed: BTreeMap::new(),
             member_dialed_at: BTreeMap::new(),
             key_waits_said: BTreeSet::new(),
+            refused_otps: prekeys::RefusedOneTime::default(),
             nearby: None,
             nearby_task: None,
             nearby_due: 0,
@@ -9450,18 +9454,15 @@ impl Node {
         // key go and no reason. Said once per member and room, until the key goes.
         if !self.sessions.contains_key(&(*channel_id, target)) {
             if self.key_waits_said.insert((*channel_id, target)) {
-                let epoch = match self.channels.get(channel_id).map(Arc::clone) {
-                    Some(shared) => shared.lock().await.join_context().ok().map(|c| c.epoch),
-                    None => None,
+                // No bundle, a stale one (ADR-030 D-5, P-2), or one no session opened from: each
+                // said as itself.
+                let why = match self.delivery_bundle(channel_id, target).await {
+                    Err(wait) => wait.why(),
+                    Ok(_) => "no pairwise session with it could be opened from its prekey bundle; \
+                              it is tried again"
+                        .to_owned(),
                 };
-                if let (Some(net), Some(epoch)) = (self.net.as_ref(), epoch) {
-                    let why = if net.board_bundle(channel_id, epoch, &target).is_none() {
-                        "this node's board holds no prekey bundle of it yet; it is sent once one \
-                         arrives"
-                    } else {
-                        "no pairwise session with it could be opened from its prekey bundle; it is \
-                         tried again"
-                    };
+                if let Some(net) = self.net.as_ref() {
                     net.manager().note(
                         target,
                         format!(
@@ -12605,14 +12606,14 @@ impl Node {
                 .filter(|i| !i.hello_delivered)
                 .and_then(|i| i.initial.clone());
         }
-        let net = self.net.as_ref().map(Arc::clone)?;
         let shared = self.channels.get(channel_id).map(Arc::clone)?;
         let ctx = { shared.lock().await.join_context().ok()? };
-        let record = net.board_bundle(channel_id, ctx.epoch, &target)?;
+        // Never a stale bundle, nor a one-time prekey it refused (ADR-030 P-2, P-3).
+        let bundle = self.delivery_bundle(channel_id, target).await.ok()?;
         let ring = self.prekeys.as_ref()?.lock().await;
         let (initial, session) = crate::pairwise::session::Session::initiate(
             ring.identity_dh(),
-            &record.prekey_bundle,
+            &bundle,
             &ctx.channel_id,
             ctx.epoch,
             ctx.suite_id,
@@ -12631,6 +12632,43 @@ impl Node {
             },
         );
         Some(initial)
+    }
+
+    /// The bundle a key delivery to `target` in `channel_id` opens its fresh session against
+    /// (ADR-030 D-1), read from this node's board, or why the key waits (D-5): a bundle whose
+    /// signed or one-time prekey is a cadence old by its root-signed creation time is refused (P-2),
+    /// and a one-time prekey `target` refused is never named again (P-3).
+    async fn delivery_bundle(
+        &self,
+        channel_id: &Digest32,
+        target: Digest32,
+    ) -> Result<crate::identity::keyagreement::PrekeyBundlePublic, prekeys::BundleWait> {
+        let epoch = match self.channels.get(channel_id).map(Arc::clone) {
+            Some(shared) => shared.lock().await.join_context().ok().map(|c| c.epoch),
+            None => None,
+        };
+        let record = match (self.net.as_ref(), epoch) {
+            (Some(net), Some(epoch)) => net.board_bundle(channel_id, epoch, &target),
+            _ => None,
+        }
+        .ok_or(prekeys::BundleWait::NoBundle)?;
+        prekeys::delivery_bundle(
+            &record.prekey_bundle,
+            self.now_ms().get(),
+            &self.refused_otps.of(&target),
+        )
+    }
+
+    /// `peer` answered a key delivery that it does not hold the one-time prekey `prekey_id` the
+    /// delivery named (ADR-030 P-3): the next delivery fetches its bundle again and never names that
+    /// prekey.
+    #[allow(
+        dead_code,
+        reason = "called on a KeyRefusal::UnknownPrekey answer, which the ADR-030 delivery frame \
+                  (v043/adr030-frame) adds"
+    )]
+    fn note_refused_otp(&mut self, peer: Digest32, prekey_id: u64) {
+        self.refused_otps.note(peer, prekey_id);
     }
 
     /// Take an inbound sealed control message: an ADR-006 SKDM, which makes that

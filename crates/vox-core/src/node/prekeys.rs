@@ -704,6 +704,125 @@ impl PrekeyRing {
     }
 }
 
+/// Which prekey in a peer's bundle made it stale for a key delivery (ADR-030 P-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StalePrekey {
+    /// Its signed prekey: its owner rotates it every cadence.
+    Signed,
+    /// Its one-time prekey: its owner retires an unused one after a cadence (P-1).
+    OneTime,
+}
+
+/// Why a key delivery to a peer waits for its bundle (ADR-030 D-5): never sealed in an older
+/// session instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleWait {
+    /// This node's board holds no bundle of the peer.
+    NoBundle,
+    /// The bundle's signatures do not verify against its own root.
+    Unverified,
+    /// The bundle names a prekey created, by its root-signed time, a cadence or more ago (P-2).
+    Stale {
+        /// Which prekey.
+        part: StalePrekey,
+        /// How old it is, in milliseconds.
+        age_ms: u64,
+    },
+}
+
+impl BundleWait {
+    /// The reason, as a person reads it after "your key for it in room … waits: ".
+    #[must_use]
+    pub fn why(self) -> String {
+        match self {
+            Self::NoBundle => "this node's board holds no prekey bundle of it yet; it is sent \
+                               once one arrives"
+                .to_owned(),
+            Self::Unverified => "its prekey bundle on this node's board does not verify; it is \
+                                 sent once a valid one arrives"
+                .to_owned(),
+            Self::Stale { part, age_ms } => format!(
+                "its prekey bundle is stale: its {} prekey is {} days old, and a key sealed to it \
+                 could be read by whoever copied that prekey before it was replaced; it is sent \
+                 once its next bundle arrives (bundles republish about hourly)",
+                match part {
+                    StalePrekey::Signed => "signed",
+                    StalePrekey::OneTime => "one-time",
+                },
+                age_ms / (24 * 60 * 60 * 1_000)
+            ),
+        }
+    }
+}
+
+/// The bundle a key delivery opens its session against (ADR-030 P-2, P-3), or why it waits.
+///
+/// The signatures are checked first, so the creation times judged are the root-signed ones, never
+/// the record's own publication fields. A bundle whose signed prekey, or whose one-time prekey, was
+/// created a cadence ([`SIGNED_PREKEY_CADENCE_MS`]) or more before `now_ms` is refused: its owner
+/// has rotated or retired it (P-1), so only a stale or replayed bundle still names it. A one-time
+/// prekey in `refused` — one the peer answered it does not hold — is taken out, so the session
+/// opens against the signed prekey rather than name it again (P-3).
+pub fn delivery_bundle(
+    bundle: &PrekeyBundlePublic,
+    now_ms: u64,
+    refused: &[u64],
+) -> std::result::Result<PrekeyBundlePublic, BundleWait> {
+    bundle.verify().map_err(|_| BundleWait::Unverified)?;
+    let stale = |created: u64| now_ms.saturating_sub(created) >= SIGNED_PREKEY_CADENCE_MS;
+    if stale(bundle.signed_prekey.created) {
+        return Err(BundleWait::Stale {
+            part: StalePrekey::Signed,
+            age_ms: now_ms.saturating_sub(bundle.signed_prekey.created),
+        });
+    }
+    let mut out = bundle.clone();
+    if let Some(otp) = &bundle.one_time_prekey {
+        if stale(otp.created) {
+            return Err(BundleWait::Stale {
+                part: StalePrekey::OneTime,
+                age_ms: now_ms.saturating_sub(otp.created),
+            });
+        }
+        if refused.contains(&otp.prekey_id) {
+            out.one_time_prekey = None;
+            out.one_time_prekey_sig = None;
+        }
+    }
+    Ok(out)
+}
+
+/// One-time prekey ids a peer answered it does not hold (ADR-030 P-3), never targeted again; at
+/// most [`ONE_TIME_PREKEY_TARGET`] per peer, oldest dropped first. A ring issues ids in increasing
+/// order and never reissues one, so a dropped entry can only be one its owner no longer offers.
+#[derive(Debug, Default)]
+pub struct RefusedOneTime {
+    by_peer: std::collections::BTreeMap<Digest32, std::collections::VecDeque<u64>>,
+}
+
+impl RefusedOneTime {
+    /// Record that `peer` refused `prekey_id`.
+    pub fn note(&mut self, peer: Digest32, prekey_id: u64) {
+        let ids = self.by_peer.entry(peer).or_default();
+        if ids.contains(&prekey_id) {
+            return;
+        }
+        ids.push_back(prekey_id);
+        while ids.len() > ONE_TIME_PREKEY_TARGET {
+            ids.pop_front();
+        }
+    }
+
+    /// The ids `peer` refused.
+    #[must_use]
+    pub fn of(&self, peer: &Digest32) -> Vec<u64> {
+        self.by_peer
+            .get(peer)
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default()
+    }
+}
+
 fn encode_one_time_fields(e: &mut Encoder, otp: &OneTimePrekey) {
     e.bytes(&otp.public().canonical_body())
         .bytes(&otp.signature().to_bytes())
