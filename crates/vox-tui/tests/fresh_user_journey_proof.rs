@@ -845,6 +845,8 @@ mod journey {
         pub data: Vec<PathBuf>,
         pub codex: Option<(PathBuf, PathBuf)>,
         pub tmux: Option<(PathBuf, PathBuf)>,
+        /// The run's root: any process still running a program under it is the run's own.
+        pub root: PathBuf,
     }
 
     impl Drop for Stop {
@@ -882,6 +884,27 @@ mod journey {
             for c in &mut self.children {
                 let _ = c.kill();
                 let _ = c.wait();
+            }
+            // What outlived its own stop: Codex's app-server keeps a pid-update loop running from
+            // its package under the run's CODEX_HOME. Each such process is stopped by its pid.
+            let root = self.root.display().to_string();
+            if let Ok(o) = Command::new("/bin/ps")
+                .args(["-axo", "pid=,command="])
+                .output()
+            {
+                for line in String::from_utf8_lossy(&o.stdout).lines() {
+                    let line = line.trim_start();
+                    let Some((pid, command)) = line.split_once(' ') else {
+                        continue;
+                    };
+                    if command.starts_with(&root) || command.contains(&format!(" {root}/")) {
+                        if let Ok(pid) = pid.parse::<u32>() {
+                            let _ = Command::new("/bin/kill")
+                                .args(["-TERM", &pid.to_string()])
+                                .status();
+                        }
+                    }
+                }
             }
         }
     }
@@ -1024,6 +1047,7 @@ mod journey {
             data: vec![w.data.clone(), w.root.join("m2/vd")],
             codex: Some((programs["codex"].clone(), w.home.join(".codex"))),
             tmux: None,
+            root: w.root.clone(),
         };
 
         // ================================================================ 1. install
@@ -2473,18 +2497,24 @@ mod journey {
             ("codex", hook_cmd(&w.home.join(".codex/hooks.json"))),
         ];
         // Each path a session of its own: guidance is said once per session.
-        // Claude Code's hook JSON names its event; Codex's does not.
+        // Each harness's own hook JSON for a prompt, as measured: Codex 0.162 sends its model,
+        // permission mode and turn id beside what Claude Code sends.
         let hook = |cmd: &str, session: &str, codex: bool| -> (Duration, String) {
             let mut input = serde_json::json!({
                 "session_id": session,
                 "transcript_path": w.root.join("t/transcript.jsonl").display().to_string(),
                 "cwd": w.repo.display().to_string(),
                 "hook_event_name": "UserPromptSubmit",
+                "permission_mode": "default",
                 "prompt": "hello",
             });
             if codex {
                 if let Some(o) = input.as_object_mut() {
-                    o.remove("hook_event_name");
+                    o.insert("model".into(), "stub-model".into());
+                    o.insert(
+                        "turn_id".into(),
+                        "0199d0a0-0000-7000-8000-000000000001".into(),
+                    );
                 }
             }
             let input = input.to_string();
