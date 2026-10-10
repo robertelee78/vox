@@ -602,6 +602,15 @@ private struct RoomView: View {
     @State private var following = true
     /// A scroll back to the newest line asked for and not yet made.
     @State private var keeping = false
+    /// Until when a move of the rows is the app's own scroll (one it asked for, animated or not),
+    /// not the person's.
+    @State private var appScrollUntil = Date.distantPast
+    /// The last measure: the timeline's height, its lines' count and each drawn row's frame, to
+    /// tell a scroll by the person that AppKit posts no live scroll for (a classic mouse wheel's
+    /// steps) from rows moved by the layout.
+    @State private var lastHeight: CGFloat = 0
+    @State private var lastCount = 0
+    @State private var lastFrames: [String: CGRect] = [:]
     /// Whether the keyboard is on the timeline (WCAG 2.1.1): ↑/↓ move the selection, Return
     /// opens the selected message's first action, Space Quick Looks its pulled file.
     @State private var timelineFocused = false
@@ -782,6 +791,7 @@ private struct RoomView: View {
                                 select(id)
                                 following = id == model.followItem
                                 withAnimation(Theme.motion(reduced: reduceMotion)) {
+                                    appScrolled()
                                     scroller.scrollTo(id, anchor: .center)
                                 }
                                 NotificationCenter.default.post(name: .voxFocusTimeline, object: nil)
@@ -792,6 +802,7 @@ private struct RoomView: View {
                                 if model.selectedMessage == nil,
                                    let last = model.timelineItems.last(where: { $0.message != nil || $0.entry != nil }) {
                                     select(last.id)
+                                    appScrolled()
                                     scroller.scrollTo(last.id)
                                 }
                             }
@@ -811,6 +822,7 @@ private struct RoomView: View {
                                 }
                                 readLog.debug("frames in \(room, privacy: .public): viewport \(Int(viewport.size.width))x\(Int(viewport.size.height)), \(frames.count) measured, last: \(tail.joined(separator: "; "), privacy: .public)")
                                 markSeen()
+                                scrolledByWheel(frames, viewport.size.height)
                                 keepNewest(scroller, viewport.size.height, "rows")
                             }
                             // The timeline shrank or grew (the composer grows with To:, a draft
@@ -821,6 +833,7 @@ private struct RoomView: View {
                             // newest rows were never in view, and never read.
                             .onAppear {
                                 if model.followItem != nil {
+                                    appScrolled()
                                     scroller.scrollTo(TimelineEnd.id, anchor: .bottom)
                                 }
                                 newest = model.followItem
@@ -874,6 +887,7 @@ private struct RoomView: View {
                                     let follows = following || newest == nil
                                     readLog.debug("follow in \(room, privacy: .public) on lines: following \(follows), newest \(newest ?? "none", privacy: .public) in view? \(inView.contains(newest ?? "")), rows \(inView.count)")
                                     if follows, let last = model.followItem {
+                                        appScrolled()
                                         scroller.scrollTo(TimelineEnd.id, anchor: .bottom)
                                         // Again once the new rows are laid out: a room opened
                                         // with ⌘J gets its messages after it appears, and a
@@ -881,6 +895,7 @@ private struct RoomView: View {
                                         // do nothing (as on a change of what is shown).
                                         DispatchQueue.main.async {
                                             if model.followItem == last {
+                                                appScrolled()
                                                 scroller.scrollTo(TimelineEnd.id, anchor: .bottom)
                                             }
                                         }
@@ -1148,6 +1163,7 @@ private struct RoomView: View {
         if extending { extend(to: ids[next]) } else { select(ids[next]) }
         following = ids[next] == model.followItem
         withAnimation(Theme.motion(reduced: reduceMotion)) {
+            appScrolled()
             scroller.scrollTo(ids[next])
         }
         return true
@@ -1213,6 +1229,7 @@ private struct RoomView: View {
         guard let reference,
               let entry = model.sessionEntries.first(where: { $0.request?.reference == reference }) else { return }
         withAnimation(Theme.motion(reduced: reduceMotion)) {
+            appScrolled()
             scroller.scrollTo("entry-\(entry.id)", anchor: .center)
         }
     }
@@ -1264,6 +1281,35 @@ private struct RoomView: View {
         return true
     }
 
+    /// A scroll the app asks for: the rows' moves for a moment after are its own.
+    private func appScrolled() {
+        appScrollUntil = Date().addingTimeInterval(1)
+    }
+
+    /// The rows moved with nothing resized, no line come or gone, and no scroll of the app's: the
+    /// person scrolled, by a mouse wheel's steps (no live scroll is posted for them). The timeline
+    /// follows after it only if the newest line is at its end in view.
+    private func scrolledByWheel(_ frames: [String: CGRect], _ height: CGFloat) {
+        defer {
+            lastHeight = height
+            lastCount = model.timelineItems.count
+            lastFrames = frames
+        }
+        guard Date() >= appScrollUntil, height == lastHeight,
+              model.timelineItems.count == lastCount else { return }
+        var moved = false
+        for (id, frame) in frames {
+            guard let before = lastFrames[id] else { continue }
+            if before.height != frame.height { return }
+            if before.minY != frame.minY { moved = true }
+        }
+        guard moved else { return }
+        let atEnd = model.followItem.flatMap { frames[$0] }.map { $0.maxY <= height + 1 } ?? false
+        guard atEnd != following else { return }
+        following = atEnd
+        readLog.debug("follow in \(room, privacy: .public): following \(atEnd), why: rows moved, no size change")
+    }
+
     /// While following, the newest line kept in view: on any change of the lines, the rows' frames
     /// or the timeline's size that leaves it out of view or undrawn, a scroll to the timeline's
     /// end on the next turn of the main loop. A request centred (P1, P7) is left where it is.
@@ -1276,7 +1322,10 @@ private struct RoomView: View {
         keeping = true
         DispatchQueue.main.async {
             keeping = false
-            if following { scroller.scrollTo(TimelineEnd.id, anchor: .bottom) }
+            if following {
+                appScrolled()
+                scroller.scrollTo(TimelineEnd.id, anchor: .bottom)
+            }
         }
     }
 
@@ -1285,8 +1334,10 @@ private struct RoomView: View {
         if model.selectedRequest != nil {
             centre(model.selectedRequest, scroller)
         } else if let waiting = model.waitingEntry {
+            appScrolled()
             scroller.scrollTo(waiting, anchor: .center)
         } else if model.followItem != nil {
+            appScrolled()
             scroller.scrollTo(TimelineEnd.id, anchor: .bottom)
         }
     }
