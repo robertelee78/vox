@@ -1570,7 +1570,8 @@ fn the_previous_release_and_this_build_complete_the_exchange_both_ways() {
     );
     if joined.iter().any(|j| *j) && plain == 0 {
         red.push(format!(
-            "this build never said plainly why v{version} took no key of its; it said {refusals:#?}"
+            "this build never said plainly why v{version} took no key of its; it said, first: {:#?}",
+            &refusals[..refusals.len().min(3)]
         ));
     }
     // A backoff from 2 s doubling: a handful per room a minute. A resend each second is two a
