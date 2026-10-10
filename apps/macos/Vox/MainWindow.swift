@@ -119,40 +119,34 @@ private struct Sidebar: View {
                                     model.select(s)
                                     Task { await model.show(s) }
                                 })) {
-            // Who you are, first (G5): the node's mark, its name, and that it is attached.
+            // Who you are, first (G5): the node's mark, its name, and that it is attached; and a
+            // + that makes a room or joins one, as Room > New Room… and Join Room… do.
             Section {
-                NodeIdentity(name: model.node, attached: model.ended == nil)
-                    .copyMenu([("Copy Name", model.node)])
-                    .accessibilityIdentifier(model.ended == nil ? "attached" : "detached")
-                    .background(SidebarHighlightOff())
+                HStack {
+                    NodeIdentity(name: model.node, attached: model.ended == nil)
+                        .copyMenu([("Copy Name", model.node)])
+                        .accessibilityIdentifier(model.ended == nil ? "attached" : "detached")
+                    Spacer()
+                    RoomsAdd(model: model)
+                }
+                .background(SidebarHighlightOff())
             }
-            // The rooms' head: a + that makes a room or joins one, as Room > New Room… and
-            // Join Room… do (the decider, v0.4.1).
+            // The rooms, one list, the most recent first, as a chat list is (the decider, v0.4.3:
+            // the three headings made it "really hard to know where to click"). A trust offer is
+            // in the room it came from; one from no room listed here is a row of its own.
             Section {
-                RoomsHead(model: model)
-            }
-            ForEach([RoomGroup.needsYou, .active, .quiet], id: \.self) { need in
-                let rooms = model.group(need)
-                // A trust offer waiting needs the person too (ADR-028 K-15, W-2).
-                let offers = need == .needsYou ? model.offers : []
-                let count = rooms.count + offers.count
-                Section {
-                    ForEach(rooms) { room in
-                        RoomRow(room: room, selected: model.selection == .room(room.id))
-                            .tag(NodeModel.Selection.room(room.id))
-                            .sidebarRow(model.selection == .room(room.id))
-                            .copyMenu([("Copy Name", room.name)])
-                    }
-                    ForEach(offers, id: \.fingerprint) { offer in
-                        OfferRow(offer: offer).tag(NodeModel.Selection.offer(offer.fingerprint))
-                            .sidebarRow(model.selection == .offer(offer.fingerprint))
-                            .copyMenu([("Copy Fingerprint", offer.fingerprint)])
-                    }
-                } header: {
-                    Text("\(need.words) (\(count))")
-                        .eyebrow()
-                        .accessibilityIdentifier("group-\(need.words)")
-                        .accessibilityLabel("\(need.words) (\(count))")
+                ForEach(model.offers.filter { o in
+                    !model.rooms.contains { r in o.rooms.contains { $0.id == r.id } }
+                }, id: \.fingerprint) { offer in
+                    OfferRow(offer: offer).tag(NodeModel.Selection.offer(offer.fingerprint))
+                        .sidebarRow(model.selection == .offer(offer.fingerprint))
+                        .copyMenu([("Copy Fingerprint", offer.fingerprint)])
+                }
+                ForEach(model.orderedRooms) { room in
+                    RoomRow(room: room, selected: model.selection == .room(room.id))
+                        .tag(NodeModel.Selection.room(room.id))
+                        .sidebarRow(model.selection == .room(room.id))
+                        .copyMenu([("Copy Name", room.name)])
                 }
             }
             Section {
@@ -349,29 +343,25 @@ private struct OnThisMachine: View {
     }
 }
 
-/// ROOMS, and a + offering New Room… and Join Room…, the same sheets as the Room menu's.
-private struct RoomsHead: View {
+/// A + offering New Room… and Join Room…, the same sheets as the Room menu's.
+private struct RoomsAdd: View {
     @ObservedObject var model: NodeModel
 
     var body: some View {
-        HStack {
-            Text("ROOMS").eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
-            Spacer()
-            Menu {
-                Button("New Room…") { model.sheet = .newRoom }
-                    .accessibilityIdentifier("sidebar-new-room")
-                Button("Join Room…") { model.sheet = .joinRoom }
-                    .accessibilityIdentifier("sidebar-join-room")
-            } label: {
-                Image(systemName: "plus")
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .fixedSize()
-            .help("New Room or Join Room")
-            .accessibilityLabel("Add a room: New Room or Join Room")
-            .accessibilityIdentifier("sidebar-add")
+        Menu {
+            Button("New Room…") { model.sheet = .newRoom }
+                .accessibilityIdentifier("sidebar-new-room")
+            Button("Join Room…") { model.sheet = .joinRoom }
+                .accessibilityIdentifier("sidebar-join-room")
+        } label: {
+            Image(systemName: "plus")
         }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("New Room or Join Room")
+        .accessibilityLabel("Add a room: New Room or Join Room")
+        .accessibilityIdentifier("sidebar-add")
     }
 }
 
@@ -393,27 +383,79 @@ private struct SidebarHighlightOff: NSViewRepresentable {
     }
 }
 
-/// A room in the sidebar: its name, and its unread in words.
+/// A room in the sidebar, as a chat list draws one (the decider, v0.4.3): its name and the time
+/// of its newest message, then that message ("who: text") and how many are unread, a badge in
+/// the accent; brighter when something waits on the person (a message to them, a Session
+/// needing them, a trust offer), and its preview then says what waits.
 private struct RoomRow: View {
     let room: NodeModel.Room
     /// Whether it is the row selected: its second line then takes selection.secondary, which
     /// reads on the selection's fill (text.secondary would not: 3.66:1).
     var selected = false
 
+    private var unread: Int { room.addressed + room.new }
+    private var waits: Bool { room.need == .needsYou }
+    /// The badge's number: what is unread, else what waits.
+    private var count: Int { unread > 0 ? unread : room.waiting + room.offered }
+
+    private var preview: String {
+        if room.offered > 0 { return room.offerSaid }
+        if room.waiting > 0 { return room.waiting == 1 ? "a Session needs you" : "\(room.waiting) Session requests need you" }
+        return room.last?.words ?? ""
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s4) {
-            Text(room.name).fontWeight(room.need == .quiet ? .regular : .bold)
-            if room.need != .quiet {
-                if selected {
-                    Text(room.words).eyebrow().foregroundStyle(VoxTokens.Colors.selectionSecondary)
-                } else {
-                    Text(room.words).eyebrow().secondaryText()
+            HStack(alignment: .firstTextBaseline, spacing: Space.s8) {
+                Text(room.name).fontWeight(.semibold).lineLimit(1).truncationMode(.tail)
+                Spacer(minLength: Space.s4)
+                if let last = room.last {
+                    Text(RoomTime.words(last.millis))
+                        .font(Theme.small)
+                        .foregroundStyle(count > 0 ? VoxTokens.Colors.accent : secondary)
+                        .accessibilityIdentifier("room-time-\(room.name)")
+                }
+            }
+            HStack(alignment: .center, spacing: Space.s8) {
+                Text(preview.isEmpty ? " " : preview)
+                    .font(Theme.small).foregroundStyle(secondary)
+                    .lineLimit(1).truncationMode(.tail)
+                    .accessibilityIdentifier("room-preview-\(room.name)")
+                Spacer(minLength: Space.s4)
+                if count > 0 {
+                    Text("\(count)")
+                        .font(Theme.small).fontWeight(.semibold).monospacedDigit()
+                        .foregroundStyle(waits ? VoxTokens.Colors.bgBase : VoxTokens.Colors.textPrimary)
+                        .padding(.horizontal, 6).frame(minWidth: 18, minHeight: 18)
+                        .background(Capsule().fill(waits ? VoxTokens.Colors.accent : VoxTokens.Colors.accentDeep))
+                        .accessibilityIdentifier("room-badge-\(room.name)")
                 }
             }
         }
-        .accessibilityElement(children: .ignore)
+        .padding(.vertical, Space.s4)
+        .overlay(alignment: .bottom) { Hairline().offset(y: Space.s4 + 1) }
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("room-\(room.name)")
-        .accessibilityLabel("\(room.name), \(room.need.words), \(room.words)")
+        .accessibilityLabel("\(room.name), \(room.need.words), \(room.words)\(preview.isEmpty ? "" : ", \(preview)")")
+    }
+
+    private var secondary: Color {
+        selected ? VoxTokens.Colors.selectionSecondary : VoxTokens.Colors.textSecondary
+    }
+}
+
+/// When a room's newest message came, as its row says it, as a chat list does: the time today,
+/// "Yesterday", the weekday within the week, else the date.
+enum RoomTime {
+    static func words(_ millis: UInt64, now: Date = Date()) -> String {
+        let when = TimelineTime.date(millis)
+        let calendar = Calendar.current
+        if calendar.isDate(when, inSameDayAs: now) { return TimelineTime.short(millis) }
+        if let yesterday = calendar.date(byAdding: .day, value: -1, to: now),
+           calendar.isDate(when, inSameDayAs: yesterday) { return "Yesterday" }
+        if let week = calendar.date(byAdding: .day, value: -6, to: calendar.startOfDay(for: now)),
+           when >= week { return when.formatted(.dateTime.weekday(.wide)) }
+        return when.formatted(date: .numeric, time: .omitted)
     }
 }
 
@@ -648,6 +690,39 @@ private struct LiveScroll: NSViewRepresentable {
     }
 }
 
+/// A trust offer in its room's General (v0.4.3): one line, "<fingerprint>… joined — trust?",
+/// and its card, Trust or Dismiss, opened from it.
+private struct OfferBanner: View {
+    @ObservedObject var model: NodeModel
+    let offer: OfferInfo
+    @State private var open = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.s12) {
+            Button { open.toggle() } label: {
+                HStack(spacing: Space.s8) {
+                    Circle().fill(VoxTokens.Colors.accent).frame(width: 6, height: 6)
+                        .accessibilityHidden(true)
+                    Text("\(offer.short)… \(offer.whyWords) — trust?")
+                    Spacer()
+                    Text(open ? "Hide" : "Review…").foregroundStyle(VoxTokens.Colors.accent)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("offer-\(offer.fingerprint.prefix(12))")
+            .accessibilityLabel("trust offer: \(offer.short)… \(offer.whyWords)")
+            if open {
+                VStack(alignment: .leading, spacing: Space.s12) {
+                    OfferCard(model: model, offer: offer)
+                }
+            }
+        }
+        .padding(.horizontal, Space.s12).padding(.vertical, Space.s8)
+        .background(VoxTokens.Colors.bgRaised)
+    }
+}
+
 /// The bottom of the timeline, below its last line: what "the newest line" is scrolled to.
 private enum TimelineEnd {
     static let id = "timeline-end"
@@ -712,6 +787,14 @@ private struct RoomView: View {
             VStack(spacing: 0) {
                 RoomHeader(model: model, room: room)
                 Divider()
+                // A trust offer from one of its members, at the top of its conversation (the
+                // decider, v0.4.3: offers are in the room they concern, not a sidebar section).
+                if model.showing == .general {
+                    ForEach(model.offers.filter { $0.rooms.contains { $0.id == room } }, id: \.fingerprint) { offer in
+                        OfferBanner(model: model, offer: offer)
+                        Divider()
+                    }
+                }
                 if !model.roomServices.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: Space.s8 * scale) {

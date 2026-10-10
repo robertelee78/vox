@@ -21,6 +21,7 @@
   "type": {
     "app.text":    { "family": "SF Pro",        "system": "body",       "weight": 400 },
     "app.mono":    { "family": "SF Mono",       "system": "monospaced", "weight": 400 },
+    "app.small":   { "family": "SF Pro",        "system": "footnote",   "weight": 400, "size": 11 },
     "app.eyebrow": { "family": "SF Mono",       "system": "monospaced", "weight": 600, "tracking": 0.12, "uppercase": true, "size": 11 },
     "app.heading": { "family": "Inter Display", "bundled": "InterDisplay-ExtraBold.otf", "weight": 800, "tracking": -0.02 },
     "app.title":   { "family": "SF Pro",        "system": "title",      "weight": 600, "size": 20 },
