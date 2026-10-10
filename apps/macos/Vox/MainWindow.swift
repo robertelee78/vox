@@ -745,6 +745,13 @@ private struct RoomView: View {
                                     let shown = frame.intersection(bounds)
                                     return !shown.isNull && shown.height * 2 >= frame.height ? id : nil
                                 })
+                                // The last three rows' frames and the viewport, for reading a row
+                                // never counted in view (debug: kept only when asked for).
+                                let tail = model.timelineItems.suffix(3).map { item in
+                                    frames[item.id].map { "\(item.id.prefix(10)) \(Int($0.minY))..\(Int($0.maxY))" }
+                                        ?? "\(item.id.prefix(10)) unmeasured"
+                                }
+                                readLog.debug("frames in \(room, privacy: .public): viewport \(Int(viewport.size.width))x\(Int(viewport.size.height)), \(frames.count) measured, last: \(tail.joined(separator: "; "), privacy: .public)")
                                 markSeen()
                                 pin(scroller, "rows")
                             }
