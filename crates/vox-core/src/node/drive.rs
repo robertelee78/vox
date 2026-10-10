@@ -102,6 +102,10 @@ pub struct DriveState {
     /// The sessions with an entry placed here since the node last said so
     /// ([`crate::node::api::NodeEvent::SessionEntry`]).
     pub(crate) news: Vec<String>,
+    /// Whether this node changed its key here and has written nothing under the new one yet, so
+    /// a member that lost drive cannot tell ([`KEY_CHANGED`]); `None` until worked out from the
+    /// room's log. Not kept: it is worked out again when the room is opened.
+    pub(crate) change_unsaid: Option<bool>,
 }
 
 /// Whether `row` announces a file out of its Session (ADR-029 DR-1.8, #546): what a member with
@@ -291,6 +295,7 @@ impl DriveState {
             sessions: Vec::new(),
             pending: Vec::new(),
             news: Vec::new(),
+            change_unsaid: None,
         })
     }
 }

@@ -15590,15 +15590,17 @@ impl Node {
                         .any(|s| s.open && Some(s.node) == me)
                 })
         };
-        let (changed, releases) = {
+        let releases = {
             let Some(profile) = self.profile.as_ref() else {
                 return;
             };
             let mut ch = shared.lock().await;
-            let Ok(lost) = ch.rotate_drive_if_lost(profile.store(), holders, now_ms) else {
+            if ch
+                .rotate_drive_if_lost(profile.store(), holders, now_ms)
+                .is_err()
+            {
                 return;
-            };
-            let changed = !lost.is_empty();
+            }
             if has_session && ch.ensure_drive(profile.store(), holders, now_ms).is_err() {
                 return;
             }
@@ -15611,7 +15613,7 @@ impl Node {
                     releases.push((member, skdm, generation));
                 }
             }
-            (changed, releases)
+            releases
         };
         for (member, skdm, generation) in releases {
             if !self.post_key_package(channel_id, member, &skdm).await {
@@ -15626,26 +15628,30 @@ impl Node {
                 .note_drive_delivered(profile.store(), member, generation);
         }
         // The member that lost drive still holds the old key: until an entry is sealed under the
-        // new one, nothing tells it the key changed. Written after the new key is released, so a
-        // member that keeps drive is not shown, meanwhile, an entry under a key it lacks.
-        if changed {
+        // new one, nothing tells it the key changed. Written once every member that keeps drive
+        // holds the new key, so none is shown, meanwhile, an entry under a key it lacks; until
+        // then, the tick tries again.
+        let written = {
             let Some(profile) = self.profile.as_ref() else {
                 return;
             };
-            let written = shared
-                .lock()
-                .await
-                .append_session(
-                    profile,
-                    crate::node::drive::KEY_CHANGED,
-                    r#"{"kind":"drive-key"}"#,
-                    holders,
-                    now_millis,
-                )
-                .is_ok();
-            if written {
-                self.note_local_append(channel_id);
-            }
+            let mut ch = shared.lock().await;
+            ch.key_change_unsaid()
+                && ch
+                    .owed_drive(profile.store(), holders)
+                    .is_ok_and(|owed| owed.is_empty())
+                && ch
+                    .append_session(
+                        profile,
+                        crate::node::drive::KEY_CHANGED,
+                        r#"{"kind":"drive-key"}"#,
+                        holders,
+                        now_millis,
+                    )
+                    .is_ok()
+        };
+        if written {
+            self.note_local_append(channel_id);
         }
     }
 

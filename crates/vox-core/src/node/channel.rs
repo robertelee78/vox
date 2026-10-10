@@ -5764,6 +5764,8 @@ impl ChannelState {
             self.poisoned = true;
             return Err(e);
         }
+        // An entry under the live key: a member that lost the one before can tell.
+        self.drive.change_unsaid = Some(false);
         self.log_ids.insert(entry_hash, id);
         self.next_log_id = id.saturating_add(1);
         self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5794,6 +5796,19 @@ impl ChannelState {
         news
     }
 
+    /// Whether this node's drive key here changed and nothing is written under the new one yet
+    /// ([`crate::node::drive::KEY_CHANGED`] is owed): a generation past the first with no entry of
+    /// this node's under it. Worked out from the log once, then kept up to date.
+    pub fn key_change_unsaid(&mut self) -> bool {
+        if let Some(unsaid) = self.drive.change_unsaid {
+            return unsaid;
+        }
+        let live = self.drive.chain.as_ref().map(SenderChain::chain_id);
+        let unsaid = live.is_some_and(|g| g > 0 && self.drive_used().is_none_or(|u| u < g));
+        self.drive.change_unsaid = Some(unsaid);
+        unsaid
+    }
+
     /// Begin this node's drive key here if it has none yet and a member of the room is in
     /// `holders` (SC-2a): a member given drive on a Session that has written nothing is owed the
     /// key at once, not at the Session's first entry. Whether a key was begun.
@@ -5812,6 +5827,7 @@ impl ChannelState {
         }
         self.begin_drive(holders, now.get())?;
         self.persist_drive(store)?;
+        self.drive.change_unsaid = None;
         Ok(true)
     }
 
@@ -5832,6 +5848,7 @@ impl ChannelState {
         self.drive.forget(&lost);
         self.begin_drive(holders, now_ms)?;
         self.persist_drive(store)?;
+        self.drive.change_unsaid = Some(true);
         Ok(lost)
     }
 
