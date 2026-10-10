@@ -785,6 +785,56 @@ pub async fn node_attach(
     }
 }
 
+/// Attach node `name` with `passphrase`, already had (`vox agent connect`, right after the node
+/// was made with it): the daemon started if none answers, as `vox node attach` does, and not kept.
+///
+/// # Errors
+/// No daemon, or the daemon's refusal.
+pub async fn attach_with(
+    args: &NodeArgs,
+    name: &NodeName,
+    passphrase: Zeroizing<String>,
+) -> Result<(), AppError> {
+    let account = args.account()?;
+    ensure_daemon(&account, args.listen, &args.anchor_specs()).await?;
+    let mut d = daemon(&account).await?;
+    match d
+        .request(DaemonRequest::Attach {
+            node: name.clone(),
+            passphrase: Some(passphrase),
+            keep: None,
+            rooms: Vec::new(),
+            anchors: args.anchor_specs(),
+        })
+        .await
+    {
+        Ok(DaemonFrame::Attached(info, notes)) => {
+            for note in &notes {
+                eprintln!("vox: {note}");
+            }
+            println!("vox: node {} attached{}", info.name, kept(&info));
+            Ok(())
+        }
+        Ok(DaemonFrame::Refused(r)) => Err(AppError::Usage(r.to_string())),
+        Ok(other) => Err(crate::client::unexpected_daemon(&other)),
+        Err(e) => Err(AppError::Usage(format!("the daemon did not answer: {e}"))),
+    }
+}
+
+/// Whether node `name` is attached to the account's running daemon now: `false` with no daemon.
+pub async fn attached(account: &Account, name: &NodeName) -> bool {
+    let Ok(mut d) = DaemonClient::open(&account.socket()).await else {
+        return false;
+    };
+    let nodes = match d.request(DaemonRequest::Nodes).await {
+        Ok(DaemonFrame::Nodes(n)) => n,
+        _ => d.attached.clone(),
+    };
+    nodes
+        .iter()
+        .any(|n| &n.name == name && matches!(n.state, NodeState::Attached))
+}
+
 /// `vox node detach <name>`: detach it (L-3); its connections close and its keys are wiped.
 ///
 /// # Errors

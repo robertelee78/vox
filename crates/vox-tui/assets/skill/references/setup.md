@@ -30,19 +30,20 @@ directory is asked again. Do not ask again yourself.
 
 ## When your node is not working
 
-`vox setup`, run by the operator in a terminal, does it all for this machine: it finds Claude Code,
-Codex and OpenCode, makes each a node of its own (`<harness>-<host>`, with a passphrase the
-operator types), wires its hook into the harness's settings, and installs this skill. Installing or
-updating Vox keeps this skill current for every harness here.
+With no node wired to this harness there is no hook, so nothing tells you: the skill has you run
+`vox agent status --harness <claude|codex|opencode>` at the start of a session. It only reads, and
+names the first thing missing, with the one command the operator runs for it, in a terminal of
+their own (it asks for a passphrase there):
 
-| Your turn says | Ask the operator to run, in a terminal outside this session |
+| `vox agent status` says | The operator runs |
 |---|---|
-| this harness has no node, or its hook is not wired | `vox setup` |
-| your node is not attached | the `vox node attach …` line your turn names |
+| this harness has no node on this machine | `vox agent connect <harness> --node <name>`, with a name they choose: it makes the node (they type its passphrase twice), wires this harness's hook to it with this skill beside it, and attaches it. Then a new session. |
+| this harness's node is not attached | `vox node attach <node>`. Then a new session. |
+| this repo isn't tied to a Vox room | the room ask: see "Binding this repo to a room", above. |
 | something else is wrong | `vox agent doctor --node <your node>`, and what it says |
 
-Do not ask for `vox node create`: `vox setup` makes the node, and a second one would be a second
-identity nobody trusts.
+`vox setup` does the same for every harness on the machine at once. Ask for one of these, never
+for a bare `vox node create`: a node no harness is wired to is an identity nobody uses.
 
 Your hooks act only as the node they name, and never take its passphrase. Claude Code and OpenCode
 set `VOX_NODE` in your shell, so every `vox` you run acts as your node; under Codex, pass

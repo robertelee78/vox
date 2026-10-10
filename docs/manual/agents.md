@@ -14,8 +14,11 @@ vox setup
 ```
 
 `vox setup` looks for Claude Code, Codex and OpenCode on `PATH` and offers each a node of its own,
-`<harness>-<host>`, with a passphrase you type, its hook in the harness's settings and the agent
-skill beside it. It says what it is to do before each one:
+`<harness>-<host>` unless you type another name, with a passphrase you type, its hook in the
+harness's settings and the agent skill beside it. It says what it is to do before each one, then
+asks for the node's name: Enter keeps the suggestion, a name you type is checked as `vox node
+create` checks it (a refused one says why and is asked again), and `skip` makes no node for that
+harness:
 
 ```text
 vox setup: looking for harnesses on this machine (their programs on PATH)
@@ -23,10 +26,10 @@ vox setup: looking for harnesses on this machine (their programs on PATH)
   Codex        not found
   OpenCode     found: /usr/local/bin/opencode
 
-Claude Code is to get a node of its own, claude-mac, with a passphrase you type.
+Claude Code is to get a node of its own, claude-mac unless you name it, with a passphrase you type.
   its hook, `vox agent hook --node claude-mac`, is to go in ~/.claude/settings.json, with VOX_NODE=claude-mac for its sessions; other Vox hook entries there are replaced, nothing else
   the agent skill pack is to be installed in ~/.claude/skills/vox-agent-comms; a file there you changed is kept
-Create claude-mac and wire Claude Code to it? [Y/n]
+a node for Claude Code [claude-mac] (Enter keeps it, or type another name; skip makes none):
 ```
 
 Your settings file keeps the rest of its content in its own order. For Codex, setup also keeps
@@ -48,6 +51,28 @@ Give that fingerprint to whoever is to trust the node. The nodes setup makes are
 attach each in a terminal, `vox node attach claude-mac`, as below. Then map the repositories the
 agent works in to their rooms, so each session it starts works in the right one (see
 [the room a session works in](sessions.md#the-room-a-session-works-in)).
+
+## A session in a harness that has no node yet
+
+You need not run `vox setup` first. Installing or updating Vox puts the agent skill in every
+harness here, and the skill has each session start by checking:
+
+```sh
+vox agent status --harness claude     # codex, opencode
+```
+
+It only reads. It says the first thing this harness needs before the session works in a room,
+and the one command for it, which the session repeats to you to run in a terminal of your own
+(each asks for a passphrase there, never in the session):
+
+- **No node for this harness**: choose a name, and run `vox agent connect claude --node
+  claude-mac`. It says what it is to do, makes the node (you type its passphrase twice), wires
+  Claude Code's hook to it in its settings with the skill beside it, and attaches it. For Codex,
+  run `vox agent trust codex` after it. Then start a new session.
+- **Its node is not attached**: `vox node attach claude-mac`. Then start a new session.
+- **This repo is tied to no room**: the session asks for the room's link, and gives you the
+  `vox room join <link> --node claude-mac --bind <this repo>` command to run (see [the room a
+  session works in](sessions.md#the-room-a-session-works-in)).
 
 The rest of this chapter is what setup does for you, done by hand, and what to check after.
 

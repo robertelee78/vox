@@ -944,6 +944,30 @@ enum AgentCmd {
     ///
     /// vox agent trust codex
     Trust(AgentTrustArgs),
+    /// Say what this harness on this machine needs before a session works in a Vox room.
+    ///
+    /// Run from a harness session at its start (the agent skill says to), when no hook has
+    /// brought Vox's news: it only reads, and says the first thing missing with the one command
+    /// the operator runs for it in a terminal of their own — `vox agent connect` when no node is
+    /// wired to the harness, `vox node attach` when its node is not attached, the room ask with
+    /// `vox room join … --bind` when the directory is bound to no room — or that nothing is.
+    ///
+    /// For example:
+    ///
+    /// vox agent status --harness claude
+    Status(AgentStatusArgs),
+    /// Make a node for a harness (or take one that exists), wire the harness to it, and attach it.
+    ///
+    /// What `vox setup` does for one harness, by the name you choose: the node is made with a
+    /// passphrase you type twice at this terminal (or `--passphrase-file`), the harness's hook
+    /// goes in its own settings with the agent skill beside it (other Vox hook entries there are
+    /// replaced, nothing else), and the node is attached. It says what it is to do first. Start
+    /// a new session of the harness afterwards.
+    ///
+    /// For example:
+    ///
+    /// vox agent connect claude --node claude-mbp
+    Connect(AgentConnectArgs),
     /// Check that this node's agent sessions are wired up, and say how to fix what is not.
     ///
     /// One line per check, `ok`, `warn` or `fail`, each with a one-line fix: the node answers;
@@ -971,6 +995,35 @@ enum AgentCmd {
     ///
     /// For example: vox agent send ./report.pdf --note "the numbers you asked for"
     Send(AgentSendArgs),
+}
+
+/// `vox agent status`
+#[derive(Args, Debug, Clone)]
+pub struct AgentStatusArgs {
+    #[command(flatten)]
+    pub profile: AccountArgs,
+    /// The harness this session runs in: `claude`, `codex` or `opencode`.
+    #[arg(long)]
+    pub harness: String,
+    /// The directory the session started in; else the current directory.
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
+}
+
+/// `vox agent connect`
+#[derive(Args, Debug, Clone)]
+pub struct AgentConnectArgs {
+    #[command(flatten)]
+    pub profile: AccountArgs,
+    /// The harness to wire: `claude`, `codex` or `opencode`.
+    pub harness: String,
+    /// The node's name: made if there is none, as `vox node create` makes it.
+    #[arg(long, required = true)]
+    pub node: String,
+    /// Read a new node's passphrase (or an existing one's, to attach it) from this file instead
+    /// of asking at the terminal (first line; `-` reads stdin).
+    #[arg(long)]
+    pub passphrase_file: Option<PathBuf>,
 }
 
 /// `vox agent doctor`
@@ -1584,6 +1637,17 @@ where
         .block_on(work)
 }
 
+/// Run a client's work that answers with words, on a small runtime of its own.
+fn block_on_said<Fut>(work: Fut) -> Result<String, AppError>
+where
+    Fut: std::future::Future<Output = Result<String, AppError>>,
+{
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(work)
+}
+
 /// `vox node` (the anchor) and its subcommands.
 #[derive(Args, Debug, Clone)]
 #[command(args_conflicts_with_subcommands = true)]
@@ -2125,7 +2189,8 @@ enum Cmd {
     /// Set up this machine: a node for each harness installed here, and one for you.
     ///
     /// Looks for Claude Code, Codex and OpenCode (their programs on `PATH`) and offers each
-    /// a node of its own, `<harness>-<host>`, with a passphrase you type, its hook installed
+    /// a node of its own, `<harness>-<host>` or a name you type (`skip` makes none), with a
+    /// passphrase you type, its hook installed
     /// in the harness's settings and the agent skill beside it. On macOS it also offers a
     /// node for you, which you may skip. It ends by printing every node it made: its
     /// fingerprint, with its art, and its alias, harness, host, OS and Vox version.
@@ -2934,6 +2999,41 @@ pub fn run() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Cmd::Agent(AgentCmd::Status(args)) => {
+            let dir = args
+                .dir
+                .clone()
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_default();
+            let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+            match block_on_said(async move {
+                crate::agent_setup::status(&args.profile.as_node_args(), &args.harness, &dir).await
+            }) {
+                Ok(said) => {
+                    print!("{said}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    e.exit_code()
+                }
+            }
+        }
+        Cmd::Agent(AgentCmd::Connect(args)) => match block_on_client(async move {
+            crate::agent_setup::connect(
+                &args.profile.as_node_args(),
+                &args.harness,
+                &args.node,
+                args.passphrase_file.clone(),
+            )
+            .await
+        }) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("vox: {e}");
+                e.exit_code()
+            }
+        },
         Cmd::Agent(AgentCmd::Trust(args)) => match args.harness.to_ascii_lowercase().as_str() {
             "codex" => match crate::codex_trust::trust(&args.codex) {
                 Ok(r) if r.found == 0 => {

@@ -22,6 +22,12 @@
 //! fingerprint, grouped with its art, as `vox id` has it, with its alias, harness, host, OS and
 //! Vox version. Mutant: a harness not on `PATH` taken as found (a node made for Codex).
 //!
+//! And **the operator names each harness's node** (#665): setup suggests `<harness>-<host>`, and
+//! Enter keeps it (OpenCode here); a name typed instead is the node made and the one its hook
+//! names (Claude Code here, `my-claude`), and a name `vox node create` would refuse (`Bad Name!`)
+//! is refused with its reason and asked again. Mutant: the typed name ignored, the suggestion
+//! always taken; red as PRODUCT (no node `my-claude`).
+//!
 //! And **`vox setup` keeps Codex's app-server running** when it wires Codex (the decider,
 //! 2026-10-06): it says first that it will, and that this runs no model; it asks the `codex` it
 //! found on `PATH` for `app-server daemon start` under the Codex home it wires, waits for the
@@ -359,7 +365,7 @@ fn setup_makes_a_node_for_each_installed_harness() {
     // ---- Codex is said not found, and offered nothing ----
     // Read before anything is answered: what it found is said first, and a question for Codex
     // would come before OpenCode's.
-    setup.answer("wire Claude Code to it?", 1, "");
+    setup.answer("a node for Claude Code [claude-", 1, "");
     let found = setup.said();
     assert!(
         found
@@ -367,10 +373,14 @@ fn setup_makes_a_node_for_each_installed_harness() {
             .any(|l| l.trim_start().starts_with("Codex") && l.contains("not found")),
         "PRODUCT: `vox setup` must say Codex, which is not on PATH, is not found:\n{found}"
     );
-    setup.answer("wire Claude Code to it?", 1, "\r");
-    setup.answer("passphrase for claude-", 1, "claude passphrase\r");
+    // A name `vox node create` refuses is refused, with its reason, and asked again; then a name
+    // of the operator's own is taken.
+    setup.answer("a node for Claude Code [claude-", 1, "Bad Name!\r");
+    setup.answer("a node for Claude Code [claude-", 2, "my-claude\r");
+    setup.answer("passphrase for my-claude", 1, "claude passphrase\r");
     setup.answer("again:", 1, "claude passphrase\r");
-    setup.answer("wire OpenCode to it?", 1, "\r");
+    // Enter keeps the suggestion.
+    setup.answer("a node for OpenCode [opencode-", 1, "\r");
     setup.answer("passphrase for opencode-", 1, "opencode passphrase\r");
     setup.answer("again:", 2, "opencode passphrase\r");
     if cfg!(target_os = "macos") {
@@ -385,8 +395,18 @@ fn setup_makes_a_node_for_each_installed_harness() {
         "PRODUCT: `vox setup` failed ({status:?}):\n{said}"
     );
 
+    let refused = said.find("\"Bad Name!\" holds ' '");
+    let asked_again = said
+        .match_indices("a node for Claude Code [claude-")
+        .nth(1)
+        .map(|(i, _)| i);
     assert!(
-        !said.contains("wire Codex"),
+        matches!((refused, asked_again), (Some(r), Some(a)) if r < a),
+        "PRODUCT: `vox setup` must refuse the name `Bad Name!` as `vox node create` does, saying \
+         why, then ask for Claude Code's node again:\n{said}"
+    );
+    assert!(
+        !said.contains("a node for Codex"),
         "PRODUCT: `vox setup` must offer Codex, which is not installed, nothing:\n{said}"
     );
 
@@ -400,21 +420,22 @@ fn setup_makes_a_node_for_each_installed_harness() {
         .collect();
     let host = nodes
         .iter()
-        .find_map(|n| n.strip_prefix("claude-"))
+        .find_map(|n| n.strip_prefix("opencode-"))
         .unwrap_or_default()
         .to_owned();
     println!("[proof] vox node list:\n{listed}");
     assert!(
-        !host.is_empty()
-            && nodes.contains(&format!("opencode-{host}").as_str())
-            && nodes.len() == 2,
-        "PRODUCT: `vox setup` must make claude-<host> and opencode-<host> and nothing else (no \
-         node for Codex, none for the person who skipped it): `vox node list` says:\n{listed}"
+        !host.is_empty() && nodes.contains(&"my-claude") && nodes.len() == 2,
+        "PRODUCT: `vox setup` must make my-claude (the name typed for Claude Code) and \
+         opencode-<host> (the suggestion kept) and nothing else (no node for Codex, none for the \
+         person who skipped it): `vox node list` says:\n{listed}"
     );
 
     // ---- each node's card: its fingerprint, grouped, with art, and its facts ----
-    for (harness, name) in [("Claude Code", "claude"), ("OpenCode", "opencode")] {
-        let node = format!("{name}-{host}");
+    for (harness, node) in [
+        ("Claude Code", "my-claude".to_owned()),
+        ("OpenCode", format!("opencode-{host}")),
+    ] {
         let (ok, id, err) = d.vox(&["id", "--node", &node]);
         assert!(ok, "PRODUCT (staging): vox id --node {node}: {err}");
         let fp = id.trim();
@@ -439,7 +460,7 @@ fn setup_makes_a_node_for_each_installed_harness() {
 
     // ---- each hook installed where its harness reads it, acting as its node ----
     for (check, node) in [
-        ("claude-hook UserPromptSubmit", format!("claude-{host}")),
+        ("claude-hook UserPromptSubmit", "my-claude".to_owned()),
         ("opencode-plugin", format!("opencode-{host}")),
     ] {
         let (_, out, err) = d.vox(&["agent", "doctor", "--node", &node]);
@@ -507,7 +528,7 @@ fn setup_keeps_codex_app_server_running() {
     let codex_home = d.root.join("codex");
 
     let mut setup = Setup::spawn(&d, &path);
-    setup.answer("wire Codex to it?", 1, "\r");
+    setup.answer("a node for Codex [codex-", 1, "\r");
     setup.answer("passphrase for codex-", 1, "codex passphrase\r");
     setup.answer("again:", 1, "codex passphrase\r");
     if cfg!(target_os = "macos") {
