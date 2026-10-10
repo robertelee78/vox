@@ -706,8 +706,8 @@ mod journey {
         format!("{{{body}}}\n")
     }
 
-    fn write_asset(root: &Path, name: &str, bytes: &[u8]) {
-        let dir = root.join("releases/download").join(format!("v{VERSION}"));
+    fn write_asset(root: &Path, version: &str, name: &str, bytes: &[u8]) {
+        let dir = root.join("releases/download").join(format!("v{version}"));
         std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
         std::fs::write(dir.join(name), bytes).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
     }
@@ -721,6 +721,36 @@ mod journey {
     /// A release of this build, laid out as GitHub serves one: on macOS Vox.app carrying it (ad-hoc
     /// signed, as `install_sh_proof` makes it), and the standalone `vox`, each with its record.
     pub fn release_tree(root: &Path) {
+        release_tree_of(root, VERSION, Path::new(VOX));
+    }
+
+    /// The version a newer release is said to be: what `vox update` moves to.
+    pub const NEWER: &str = "99.0.0";
+
+    /// A release newer than this build: its vox answers `--version` as [`NEWER`] and is this
+    /// build for everything else (a copy would be indistinguishable; tampered bytes would not
+    /// run), as `update_proof` makes one.
+    pub fn newer_release(root: &Path) {
+        let stub = root.join("stub/vox");
+        std::fs::create_dir_all(stub.parent().unwrap_or(root))
+            .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo \"vox {NEWER}\"; exit 0; fi\nexec \"{VOX}\" \"$@\"\n"
+            ),
+        )
+        .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+        }
+        release_tree_of(root, NEWER, &stub);
+    }
+
+    /// A release of `version` whose vox is `helper`.
+    fn release_tree_of(root: &Path, version: &str, helper: &Path) {
         let triple = "aarch64-apple-darwin";
         let work = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: {e}"));
         let contents = work.path().join("Vox.app/Contents");
@@ -728,7 +758,7 @@ mod journey {
             std::fs::create_dir_all(contents.join(d)).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
         }
         std::fs::copy(VOX, contents.join("MacOS/Vox")).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
-        std::fs::copy(VOX, contents.join("Helpers/vox"))
+        std::fs::copy(helper, contents.join("Helpers/vox"))
             .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
         std::fs::write(
             contents.join("Info.plist"),
@@ -737,22 +767,27 @@ mod journey {
                  \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
                  <plist version=\"1.0\"><dict><key>CFBundleIdentifier</key><string>us.vox.app</string>\
                  <key>CFBundleExecutable</key><string>Vox</string><key>CFBundlePackageType</key>\
-                 <string>APPL</string><key>CFBundleShortVersionString</key><string>{VERSION}</string>\
+                 <string>APPL</string><key>CFBundleShortVersionString</key><string>{version}</string>\
                  <key>LSMinimumSystemVersion</key><string>13.0</string></dict></plist>\n"
             ),
         )
         .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
         let app = work.path().join("Vox.app");
-        let signed = Command::new("/usr/bin/codesign")
-            .args(["--force", "--sign", "-"])
-            .arg(&app)
-            .output()
-            .unwrap_or_else(|e| panic!("APPARATUS: codesign: {e}"));
-        assert!(
-            signed.status.success(),
-            "APPARATUS: ad-hoc signing the fixture app"
-        );
-        let zip_name = format!("Vox-{VERSION}-{triple}.zip");
+        // Nested code first: a script helper carries its signature in an extended attribute.
+        for code in [contents.join("Helpers/vox"), app.clone()] {
+            let signed = Command::new("/usr/bin/codesign")
+                .args(["--force", "--sign", "-"])
+                .arg(&code)
+                .output()
+                .unwrap_or_else(|e| panic!("APPARATUS: codesign: {e}"));
+            assert!(
+                signed.status.success(),
+                "APPARATUS: ad-hoc signing the fixture's {}: {}",
+                code.display(),
+                String::from_utf8_lossy(&signed.stderr)
+            );
+        }
+        let zip_name = format!("Vox-{version}-{triple}.zip");
         let zip = work.path().join(&zip_name);
         let zipped = Command::new("/usr/bin/ditto")
             .args(["-c", "-k", "--keepParent"])
@@ -765,20 +800,20 @@ mod journey {
             "APPARATUS: zipping the fixture app"
         );
         let bytes = std::fs::read(&zip).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
-        write_asset(root, &zip_name, &bytes);
+        write_asset(root, version, &zip_name, &bytes);
         let mut f: BTreeMap<&str, String> = BTreeMap::new();
         f.insert("kind", "vox.app-release".into());
         f.insert("schema_version", "1".into());
         f.insert("package", "Vox.app".into());
         f.insert("channel", "stable".into());
         f.insert("target", triple.into());
-        f.insert("version", VERSION.into());
+        f.insert("version", version.into());
         f.insert("size", bytes.len().to_string());
         f.insert("sha256", sha256_hex(&bytes));
         write_record(root, &format!("app-stable-{triple}.json"), &f);
 
-        let bin = std::fs::read(VOX).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
-        write_asset(root, &format!("vox-{triple}"), &bin);
+        let bin = std::fs::read(helper).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+        write_asset(root, version, &format!("vox-{triple}"), &bin);
         f.insert("kind", "vox.standalone-release".into());
         f.insert("package", "vox".into());
         f.insert("size", bin.len().to_string());
@@ -1508,7 +1543,7 @@ mod journey {
         // agent status` run in the same sandbox printed its three lines): smoke, so the session
         // is run once more, and a second empty answer is the apparatus's.
         let session = |h: &Harness, told: &str| -> Result<(String, String), String> {
-            let empty = |said: &str| said.contains("SAID:\n(no output)");
+            let empty = |said: &str| said.contains("VOX STATUS SAID:\n(no output)");
             match once(h, told)? {
                 (_, said) if empty(&said) => {
                     println!(
@@ -1527,6 +1562,104 @@ mod journey {
             }
         };
         const ASK: &str = "isn't tied to a Vox room";
+
+        // ---- an interactive Claude Code in a confined tmux, as a person runs it ----
+        let socket = w.root.join("t.sock");
+        stop.tmux = Some((tmux.clone(), socket.clone()));
+        let mut env = w.env();
+        env.extend([
+            ("ANTHROPIC_BASE_URL".to_owned(), url.clone()),
+            (
+                "ANTHROPIC_AUTH_TOKEN".to_owned(),
+                "made-up-token-for-a-stand-in".to_owned(),
+            ),
+            ("CLAUDE_CODE_TMPDIR".to_owned(), w.t.display().to_string()),
+            (
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_owned(),
+                "1".to_owned(),
+            ),
+            ("DISABLE_AUTOUPDATER".to_owned(), "1".to_owned()),
+        ]);
+        let tm = |args: &[&str]| -> String {
+            let o = Command::new(&tmux)
+                .env_clear()
+                .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .arg("-S")
+                .arg(&socket)
+                .args(["-f", "/dev/null"])
+                .args(args)
+                .output();
+            o.map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default()
+        };
+        let screen = || tm(&["capture-pane", "-p", "-t", ":0.0"]);
+        let guard_ok = |s: &str| {
+            ![
+                "Select login method",
+                "API key",
+                "Paste code",
+                "Log in to",
+                "trust this folder",
+            ]
+            .iter()
+            .any(|b| s.contains(b))
+        };
+        // A fresh tmux server with Claude Code started in its pane: whether it came up.
+        let start_claude = || -> bool {
+            let _ = tm(&["kill-server"]);
+            let started = Command::new("/usr/bin/sandbox-exec")
+                .env_clear()
+                .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .arg("-f")
+                .arg(&profile)
+                .arg(&tmux)
+                .arg("-S")
+                .arg(&socket)
+                .args([
+                    "-f",
+                    "/dev/null",
+                    "new-session",
+                    "-d",
+                    "-x",
+                    "160",
+                    "-y",
+                    "50",
+                    "-c",
+                ])
+                .arg(&w.repo)
+                .arg("/bin/sh")
+                .output()
+                .is_ok_and(|o| o.status.success());
+            if started {
+                let _ = tm(&[
+                    "send-keys",
+                    "-t",
+                    ":0.0",
+                    "-l",
+                    &format!(
+                        "{} --model claude-sonnet-4-5",
+                        harnesses[0].program.display()
+                    ),
+                ]);
+                let _ = tm(&["send-keys", "-t", ":0.0", "Enter"]);
+            }
+            let t0 = Instant::now();
+            let mut up = false;
+            while started && t0.elapsed() < Duration::from_secs(90) {
+                let s = screen();
+                if !guard_ok(&s) {
+                    break;
+                }
+                if s.contains("Claude Code v")
+                    && s.lines().filter(|l| l.matches('─').count() >= 20).count() >= 2
+                {
+                    up = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            up
+        };
 
         // A person's OpenCode has run before: its first start fetches its plugin folder's
         // dependencies, which the offline sandbox refuses, and its shell tool has then come back
@@ -1624,36 +1757,66 @@ mod journey {
             l.claim(&id("reaches_room"), true, String::new);
             // **Vox asks the person** for the repo's room, not only the model: the daemon's
             // RoomAsks, which Vox.app shows as its banner, are the "Vox needs you:" lines of
-            // `vox agent status`. What the harness shows is not Vox asking.
-            let _ = (sent, &said);
-            let status = w.run(&[
-                "agent",
-                "status",
-                "--harness",
-                h.key,
-                "--dir",
-                &w.repo.display().to_string(),
-            ]);
-            let line = status
-                .said
-                .lines()
-                .map(str::trim)
-                .find(|l| {
-                    l.starts_with("Vox needs you:")
-                        && l.contains(h.name)
-                        && l.contains(&format!("in {} has no room", w.repo.display()))
-                })
-                .map(str::to_owned);
-            l.claim(&id("person_asked"), line.is_some(), || {
-                format!(
-                    "after {}'s session reached the room ask, `vox agent status` showed the \
-                     person no \"Vox needs you: {} in {} has no room …\" line; it said:\n{}",
-                    h.name,
-                    h.name,
-                    w.repo.display(),
-                    status.said
-                )
-            });
+            // `vox agent status`. A headless run is asked nothing (it gets no Session, ADR-029
+            // SE-1), so the ask is for an interactive session: Claude Code at its own terminal.
+            let _ = sent;
+            let mut line: Option<String> = None;
+            if h.key != "claude" {
+                l.cannot(
+                    &id("person_asked"),
+                    &format!(
+                        "the ask is raised for an interactive session, and this proof runs {} \
+                         headless only",
+                        h.name
+                    ),
+                );
+            } else {
+                std::fs::write(&run_file, "-").unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+                if !start_claude() {
+                    l.apparatus(
+                        &id("person_asked"),
+                        &format!(
+                            "an interactive Claude Code did not come up in tmux; the pane:\n{}",
+                            screen()
+                        ),
+                    );
+                } else {
+                    let _ = tm(&["send-keys", "-t", ":0.0", "-l", "hello from the terminal"]);
+                    std::thread::sleep(Duration::from_millis(600));
+                    let _ = tm(&["send-keys", "-t", ":0.0", "Enter"]);
+                    let want = format!("Claude Code in {} has no room", w.repo.display());
+                    let t0 = Instant::now();
+                    let status = loop {
+                        let st = w.run(&[
+                            "agent",
+                            "status",
+                            "--harness",
+                            h.key,
+                            "--dir",
+                            &w.repo.display().to_string(),
+                        ]);
+                        line = st
+                            .said
+                            .lines()
+                            .map(str::trim)
+                            .find(|l| l.starts_with("Vox needs you:") && l.contains(&want))
+                            .map(str::to_owned);
+                        if line.is_some() || t0.elapsed() > Duration::from_secs(30) {
+                            break st.said;
+                        }
+                        std::thread::sleep(Duration::from_millis(500));
+                    };
+                    l.claim(&id("person_asked"), line.is_some(), || {
+                        format!(
+                            "within 30 s of an interactive Claude Code started in the repo, \
+                             `vox agent status` showed the person no \"Vox needs you: {want} …\" \
+                             line; it said:\n{status}"
+                        )
+                    });
+                }
+                let _ = tm(&["kill-server"]);
+                std::fs::write(&run_file, "").unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+            }
             let said = line.unwrap_or(said);
             asks.push((h.key, h.node, said));
         }
@@ -2006,98 +2169,10 @@ mod journey {
 
         // ---- an interactive Claude Code, found, driven and renamed from Vox ----
         if ready.get("claude").copied().unwrap_or(false) && l.passed("J5.trust.claude") {
-            let claude = &harnesses[0];
             // Its model answers "ok" and runs nothing, so no approval is pending when the person
             // drives: what is measured is driving an idle session.
             std::fs::write(&run_file, "-").unwrap_or_else(|e| panic!("APPARATUS: {e}"));
-            let socket = w.root.join("t.sock");
-            stop.tmux = Some((tmux.clone(), socket.clone()));
-            let mut env = w.env();
-            env.extend([
-                ("ANTHROPIC_BASE_URL".to_owned(), url.clone()),
-                (
-                    "ANTHROPIC_AUTH_TOKEN".to_owned(),
-                    "made-up-token-for-a-stand-in".to_owned(),
-                ),
-                ("CLAUDE_CODE_TMPDIR".to_owned(), w.t.display().to_string()),
-                (
-                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_owned(),
-                    "1".to_owned(),
-                ),
-                ("DISABLE_AUTOUPDATER".to_owned(), "1".to_owned()),
-            ]);
-            let tm = |args: &[&str]| -> String {
-                let o = Command::new(&tmux)
-                    .env_clear()
-                    .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-                    .arg("-S")
-                    .arg(&socket)
-                    .args(["-f", "/dev/null"])
-                    .args(args)
-                    .output();
-                o.map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-                    .unwrap_or_default()
-            };
-            let started = Command::new("/usr/bin/sandbox-exec")
-                .env_clear()
-                .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-                .arg("-f")
-                .arg(&profile)
-                .arg(&tmux)
-                .arg("-S")
-                .arg(&socket)
-                .args([
-                    "-f",
-                    "/dev/null",
-                    "new-session",
-                    "-d",
-                    "-x",
-                    "160",
-                    "-y",
-                    "50",
-                    "-c",
-                ])
-                .arg(&w.repo)
-                .arg("/bin/sh")
-                .output()
-                .is_ok_and(|o| o.status.success());
-            if started {
-                let _ = tm(&[
-                    "send-keys",
-                    "-t",
-                    ":0.0",
-                    "-l",
-                    &format!("{} --model claude-sonnet-4-5", claude.program.display()),
-                ]);
-                let _ = tm(&["send-keys", "-t", ":0.0", "Enter"]);
-            }
-            let screen = || tm(&["capture-pane", "-p", "-t", ":0.0"]);
-            let guard_ok = |s: &str| {
-                ![
-                    "Select login method",
-                    "API key",
-                    "Paste code",
-                    "Log in to",
-                    "trust this folder",
-                ]
-                .iter()
-                .any(|b| s.contains(b))
-            };
-            let t0 = Instant::now();
-            let mut up = false;
-            while started && t0.elapsed() < Duration::from_secs(90) {
-                let s = screen();
-                if !guard_ok(&s) {
-                    break;
-                }
-                if s.contains("Claude Code v")
-                    && s.lines().filter(|l| l.matches('─').count() >= 20).count() >= 2
-                {
-                    up = true;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(400));
-            }
+            let up = start_claude();
             if !up {
                 for c in ["found", "said", "renamed", "while_waiting"] {
                     l.apparatus(
@@ -2275,27 +2350,10 @@ mod journey {
                 "the daemon did not stop within 30 s of SIGTERM",
             );
         } else {
-            // The machine comes back: `vox daemon` starts as the app's login item starts it, and
-            // nothing is typed.
-            let log = std::fs::File::create(w.root.join("daemon.log"))
-                .unwrap_or_else(|e| panic!("APPARATUS: the daemon's log: {e}"));
-            let daemon = Command::new(w.vox())
-                .arg("daemon")
-                .env_clear()
-                .envs(w.env())
-                .stdin(Stdio::null())
-                .stdout(Stdio::from(
-                    log.try_clone().unwrap_or_else(|e| panic!("APPARATUS: {e}")),
-                ))
-                .stderr(Stdio::from(log))
-                .spawn()
-                .unwrap_or_else(|e| panic!("APPARATUS: cannot start vox daemon: {e}"));
-            stop.children.push(daemon);
-            let up = Out {
-                ok: true,
-                said: "vox daemon started, as the app's login item starts it".into(),
-                took: Duration::ZERO,
-            };
+            // The machine comes back, and nothing is typed.
+            // The person's next command starts the daemon again, as a client does; it is given
+            // no passphrase, and no terminal to type one at.
+            let up = w.run(&["up", "--node", PERSON]);
             let t0 = Instant::now();
             let (attached, said) = loop {
                 let (a, s) = w.attached(&nodes);
@@ -2308,6 +2366,12 @@ mod journey {
                 format!("after the daemon restarted (`vox up` said {:?}), attached: {attached:?} of {nodes:?}:\n{said}", last_lines(&up.said, 2))
             });
         }
+        // A newer release, so the update installs and restarts, as a real one does.
+        let rel2 = w.root.join("rel2");
+        newer_release(&rel2);
+        let server2 = release_server::serve(&rel2)
+            .unwrap_or_else(|e| panic!("APPARATUS: the newer loopback release did not start: {e}"));
+        *w.release_base.lock().unwrap() = Some(server2.base.clone());
         let update = w.run(&["update"]);
         println!("[journey] 7. vox update said:\n{}", indent(&update.said));
         l.claim(
@@ -2407,15 +2471,21 @@ mod journey {
             ("codex", hook_cmd(&w.home.join(".codex/hooks.json"))),
         ];
         // Each path a session of its own: guidance is said once per session.
-        let hook = |cmd: &str, session: &str| -> (Duration, String) {
-            let input = serde_json::json!({
+        // Claude Code's hook JSON names its event; Codex's does not.
+        let hook = |cmd: &str, session: &str, codex: bool| -> (Duration, String) {
+            let mut input = serde_json::json!({
                 "session_id": session,
                 "transcript_path": w.root.join("t/transcript.jsonl").display().to_string(),
                 "cwd": w.repo.display().to_string(),
                 "hook_event_name": "UserPromptSubmit",
                 "prompt": "hello",
-            })
-            .to_string();
+            });
+            if codex {
+                if let Some(o) = input.as_object_mut() {
+                    o.remove("hook_event_name");
+                }
+            }
+            let input = input.to_string();
             let t0 = Instant::now();
             let mut c = Command::new("/bin/sh")
                 .args(["-c", cmd])
@@ -2487,6 +2557,9 @@ mod journey {
                     let _ = w.run(&["node", "detach", node]);
                 }
                 "no-daemon" => {
+                    // The node attached and remembered (typed, as a person attaches it), then no
+                    // daemon.
+                    let _ = w.person(&["node", "attach", node], node);
                     w.stop_daemon();
                 }
                 _ => {}
@@ -2495,7 +2568,11 @@ mod journey {
                 .iter()
                 .position(|p| p.0 == *path && p.1 == *cmd)
                 .unwrap_or(0);
-            let (took, text) = hook(cmd, &format!("0a0a0a0a-1111-4222-8333-9444444444{n:02}"));
+            let (took, text) = hook(
+                cmd,
+                &format!("0a0a0a0a-1111-4222-8333-9444444444{n:02}"),
+                key == "codex",
+            );
             println!(
                 "[journey] 9. {key} hook, {path}: {:.0} ms: {text:?}",
                 took.as_secs_f64() * 1000.0
@@ -2552,6 +2629,7 @@ mod journey {
             });
         }
         drop(server);
+        drop(server2);
         drop(stop);
         l.finish();
     }
