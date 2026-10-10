@@ -64,7 +64,7 @@ pub fn semantic(env: &Envelope) -> String {
     if let serde_json::Value::Object(m) = &mut data {
         m.remove(OP_KEY);
     }
-    let v = serde_json::json!({
+    let mut v = serde_json::json!({
         "type": env.kind,
         "to": to,
         "urgent": env.urgent,
@@ -73,6 +73,13 @@ pub fn semantic(env: &Envelope) -> String {
         "from": env.from,
         "data": data,
     });
+    // Tags are part of what was said (#636), named only when there are some, so an untagged post
+    // compares as it did before tags existed.
+    if !env.tags.is_empty() {
+        let mut tags = env.tags.clone();
+        tags.sort();
+        v["tags"] = tags.into();
+    }
     canonical(&v)
 }
 

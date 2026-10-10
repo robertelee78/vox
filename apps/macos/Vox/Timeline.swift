@@ -50,6 +50,7 @@ extension NodeModel {
         case .session:
             guard let s = shownSession else { return "Timeline — a Session this room no longer lists" }
             return "Timeline — \(s.label)\(s.open ? " · open" : " · ended")"
+        case .tag(let tag): return "Timeline — tagged \(tag) · ⏱ \(retention)"
         }
     }
 
@@ -90,6 +91,9 @@ extension NodeModel {
                 items.insert(line, at: items.firstIndex { $0.millis > line.millis } ?? items.count)
             }
             return items
+        case .tag(let tag):
+            // A thread (#636): the room's messages carrying the tag, in the room's order.
+            return messages.filter { $0.tags.contains(tag) }.map(TimelineItem.message)
         case .session:
             guard let s = shownSession else { return [] }
             var lines = TimelineItem.openedAndEnded(s)

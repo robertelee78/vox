@@ -141,6 +141,9 @@ pub struct RoomMessage {
     /// The platform its author's node says it runs on, when it is a `hello` that says so (ADR-020
     /// §4.9b): that node's claim, not checked.
     pub platform: Option<NodePlatform>,
+    /// What it relates to, as its sender tagged it (#636): `task:#636`, `project:vox`, each on
+    /// one line and cut, sorted. Shown only to those who can read the message.
+    pub tags: Vec<String>,
 }
 
 /// The OS, OS version and CPU architecture a node says it runs on, from its `hello` (ADR-020
@@ -1271,6 +1274,15 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str
         image,
         card,
         platform,
+        tags: vox_core::node::api::message_tags(&row.text)
+            .iter()
+            .map(|t| {
+                vox_agentcomms::envelope::shown(
+                    t,
+                    vox_agentcomms::envelope::MAX_TAG + "milestone:".len(),
+                )
+            })
+            .collect(),
     }
 }
 
@@ -1908,6 +1920,43 @@ impl VoxClient {
             )
             .await?
             {
+                Frame::Rows { rows } => Ok(rows
+                    .iter()
+                    .map(|r| rendered(r, &names, me.as_deref()))
+                    .collect()),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
+    /// A room's messages tagged `tag` (#636), in the order they arrived: a thread of one task,
+    /// project or milestone, found through the node's index of the tags of what it can read.
+    ///
+    /// # Errors
+    /// A malformed id or tag, or the node's refusal (a closed room, or a node from before tags).
+    pub async fn read_tagged(
+        &self,
+        room: String,
+        tag: String,
+    ) -> Result<Vec<RoomMessage>, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        if !vox_agentcomms::envelope::is_valid_tag(&tag) {
+            return Err(failed(
+                "not a tag: use task:, project: or milestone: and a value",
+            ));
+        }
+        on_held!(self, |c| {
+            let names = names(c).await?;
+            let me = c.me().map(|f| b32_encode(&f));
+            let frame = c
+                .read_tagged(channel_id, std::slice::from_ref(&tag), None)
+                .await
+                .map_err(|e| VoxError::Unknown {
+                    reason: format!(
+                        "the vox daemon stopped answering before it said whether this was done: {e}"
+                    ),
+                })?;
+            match answered(frame)? {
                 Frame::Rows { rows } => Ok(rows
                     .iter()
                     .map(|r| rendered(r, &names, me.as_deref()))

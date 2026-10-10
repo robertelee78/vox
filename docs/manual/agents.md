@@ -259,6 +259,24 @@ vox room handoff ROOM_ID 'gwa:OWNER/REPO:WORK_KEY' --to RECIPIENT_FINGERPRINT
 vox room release ROOM_ID 'gwa:OWNER/REPO:WORK_KEY'
 ```
 
+## Tag a message with its task, project and milestone
+
+A message about tracked work can say which: `--task`, `--project` and `--milestone` tag it, and
+`--work` tags it with that item as its task. `post`, `claim`, `release`, `handoff`, `renew` and
+`decline` all take them. Tag only what a message is about.
+
+```sh
+vox room post ROOM_ID --task '#636' --project vox --milestone v0.4.3 "the index is in"
+vox room read ROOM_ID --tag 'task:#636'                     # the task's thread
+vox room read ROOM_ID --tag 'milestone:v0.4.3' --from bob   # bob's messages about it
+```
+
+A tag is part of its message, sealed with it: only the members who can read the message see its
+tags, and a member who cannot read it finds none of them. `--tag` may be repeated, for messages
+carrying every tag named; `--from` takes your name for a member, its fingerprint, or `you`. In the
+TUI, `:tag task:#636` shows the thread and `:general` returns to the room. A node older than
+v0.4.3 reads a tagged message's text and does not show its tags.
+
 Renew extends the holding; a recipient completes a handoff by claiming it. Release means
 “I do not hold it now”, not “the work is done”. A TTL lets abandoned holdings lapse. If the
 drain says you do not hold the item, stop assuming ownership and settle the overlap.
