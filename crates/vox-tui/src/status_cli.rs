@@ -161,6 +161,9 @@ fn render(v: &Value) -> String {
                 ago(now, &m["last_seen_ms"]),
                 ago(now, &m["last_sync_ms"])
             );
+            if let Some(why) = m.get("key_waits").and_then(Value::as_str) {
+                let _ = writeln!(o, "      your key for it waits: {why}");
+            }
         }
     }
     let _ = writeln!(o, "  always-on member: {}", s(v, "always_on_member"));

@@ -82,10 +82,17 @@ binds PQ freshness to every key delivery, not to the ratchet.
   unadvertised, for a grace of 1 hour, so a delivery already in flight still opens.
 - **P-2. Refuse a stale bundle.** A sender MUST refuse a bundle whose signed prekey's root-signed
   creation time is older than one cadence. It MUST NOT judge staleness by the record's own
-  publication fields. The check MUST sit in the sender's fetch path.
+  publication fields. The check MUST sit in the sender's fetch path. A sender MUST also refuse a
+  bundle whose signed or one-time prekey's root-signed creation time is more than 10 minutes ahead
+  of its own clock, and say so in plain words (D-5), so a recipient clock running fast extends the
+  cadence bound by at most 10 minutes (lead, 2026-10-10; keeps S-2 as stated).
 - **P-3. Refused one-time prekeys.** When a recipient answers that it does not know the one-time
   prekey a delivery named, the sender MUST fetch the bundle again and MUST NOT target that prekey id
-  again.
+  again. It MUST NOT name a one-time prekey that an earlier delivery named. When the bundle it holds
+  names such a prekey, the key MUST wait for the recipient's next bundle (D-5). A node MUST
+  republish its bundle as soon as the prekeys it offers change. If no bundle naming a fresh
+  one-time prekey arrives within 30 seconds while the recipient is connected, the sender MAY
+  deliver to the signed prekey, and MUST say so once (lead, 2026-10-10; keeps S-2 as stated).
 
 ### 4. What this provides
 
@@ -102,8 +109,9 @@ binds PQ freshness to every key delivery, not to the ratchet.
 - **S-4. Out of scope.** This ADR provides nothing against an active adversary holding a stolen
   identity key, or an active quantum adversary during the handshake (ADR-004 S1).
 - **S-5. Stated degradations.** These MUST be stated wherever S-1 to S-3 are claimed:
-  - In a room where one membership change makes more deliveries to a member than its one-time pool
-    holds, the rest target its signed prekey, which heals only on rotation.
+  - A delivery whose recipient published no fresh one-time prekey within 30 seconds of the last one
+    being named (its pool exhausted, or its next bundle not arriving while it is connected) targets
+    its signed prekey, which heals only on rotation.
   - Restoring a profile restores its prekey ring. P-1 bounds the resurrected one-time prekeys to one
     cadence.
   - A replay of a last-resort delivery inside the signed prekey's retention re-derives the same

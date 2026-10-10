@@ -1031,6 +1031,10 @@ async fn serves_member(conn: &VoxConnection, room: &Digest32, who: &Digest32) ->
 ///    carol's board; spy, connected, stays a member. carol's operator trusts spy at a terminal, and
 ///    over the next 30 s carol's node says exactly once that her key to spy waits for a bundle. It
 ///    failed on every tick's retry and said nothing.
+/// 6. *A stream is refused, never left unanswered* (ADR-030 W-4): spy sends carol, on a `pairwise`
+///    stream, a frame she cannot read. She resets it with a code (`CannotOpen`). A stream ended
+///    without an answer is what a node older than v0.4.3 does, and its sender tells its person
+///    that member runs an older Vox: from a current node that would be a lie.
 ///
 /// **Mutations**, one each: (1) the admitting member keeps no notice — red PRODUCT (no notice on
 /// the host's board). (2) `nat::store::accept_notice` ignores withdraws — red PRODUCT (2: the
@@ -1038,7 +1042,8 @@ async fn serves_member(conn: &VoxConnection, room: &Digest32, who: &Digest32) ->
 /// withdraws on after notices — red PRODUCT (3: carol lists x). (4) `RendezvousStore::withdraw_member`
 /// takes every record of the member, whenever signed — red PRODUCT (4: x's records gone). (5)
 /// `release_key_to` says nothing when it has no session — red PRODUCT (5: said 0 times); (5b) it
-/// says it on every retry — red PRODUCT (5: said many times).
+/// says it on every retry — red PRODUCT (5: said many times). (6) `read_pairwise_streams` drops a
+/// stream whose frame will not read — red PRODUCT (6: ended unanswered).
 #[test]
 #[ignore = "real vox processes with production Argon2id and three real joins; run in release"]
 fn an_admission_reaches_every_member_and_never_outlives_a_leave() {
@@ -1276,4 +1281,30 @@ fn an_admission_reaches_every_member_and_never_outlives_a_leave() {
          say once that her key waits for one, and said {} time(s): {said:#?}",
         said.len()
     );
+
+    // ---- 6. a stream is refused, never left unanswered ---------------------------------------
+    // `[99]`: a CBOR array holding an op no Vox defines, framed as a pairwise frame.
+    let unreadable = vec![0x81, 0x18, 0x63];
+    let cannot_open = vox_core::node::pairwise_stream::KeyRefusal::CannotOpen
+        .code()
+        .into_inner();
+    let answer = rt.block_on(async {
+        let mut recv = write_pairwise(&spy_carol, &[unreadable])
+            .await
+            .expect("APPARATUS (staging not achieved): spy's pairwise stream to carol");
+        tokio::time::timeout(Duration::from_secs(10), recv.read_to_end(8)).await
+    });
+    eprintln!("[proof] carol's answer to a frame she cannot read: {answer:?}");
+    match answer {
+        Ok(Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(code))))
+            if code.into_inner() == cannot_open => {}
+        Ok(Ok(bytes)) => panic!(
+            "PRODUCT: carol ended spy's stream without an answer ({bytes:?}) when its frame would \
+             not read; its sender reads that as a node older than v0.4.3"
+        ),
+        other => panic!(
+            "APPARATUS (precondition unmet): carol's answer was not a read of spy's frame: \
+             {other:?}"
+        ),
+    }
 }

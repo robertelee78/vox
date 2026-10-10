@@ -82,6 +82,8 @@ final class NodeModel: ObservableObject {
         /// Whether it trusts this node: it has granted this node consent (ADR-007 G-9), whether
         /// or not this node trusts it back.
         var trustsYou = false
+        /// Why this node's key for it here waits, if it does (ADR-030 D-5, W-4).
+        var keyWaits: String?
     }
 
     let node: String
@@ -1206,7 +1208,8 @@ final class NodeModel: ObservableObject {
             return MemberRow(id: m.fingerprint,
                              name: m.name.isEmpty ? String(m.fingerprint.prefix(12)) : m.name,
                              trust: trust, drive: keyring[m.fingerprint] ?? false,
-                             trustsYou: back.contains(m.fingerprint))
+                             trustsYou: back.contains(m.fingerprint),
+                             keyWaits: m.keyWaits)
         }
     }
 

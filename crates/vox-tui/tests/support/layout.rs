@@ -21,6 +21,28 @@ pub fn node_dir(data: &Path, name: &str) -> PathBuf {
     data.join("nodes").join(name)
 }
 
+/// The profile's one node under data root `data`: setup names it after the machine (#666), so it
+/// is no longer always [`DEFAULT_NODE`]. A node is a directory holding a vault or a headless key,
+/// as `vox` counts them: a harness that resolved paths for `default` before `vox id` left an empty
+/// `nodes/default` beside the real one. `DEFAULT_NODE` when the data root holds none, or more than
+/// one, as `attach::needs` takes it.
+pub fn the_node(data: &Path) -> String {
+    let mut nodes: Vec<String> = std::fs::read_dir(data.join("nodes"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            let p = e.path();
+            p.join("vault.cbor").is_file() || p.join("node-identity.key").is_file()
+        })
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    match nodes.len() {
+        1 => nodes.remove(0),
+        _ => DEFAULT_NODE.to_owned(),
+    }
+}
+
 /// `<data>/.daemon`: the daemon's directory under data root `data`.
 pub fn daemon_dir(data: &Path) -> PathBuf {
     data.join(".daemon")
