@@ -1,20 +1,51 @@
 //! A kept node's identity passphrase in the macOS login keychain (ADR-028 K-10, ADR-014 M-6).
 //!
-//! Only the daemon touches it: it stores the passphrase when Vox.app asks it to keep a node it has
-//! just attached with that passphrase, reads it to attach the node again when it starts, and
-//! removes it when the node is detached by hand. One generic-password item per node, under the
+//! Only the daemon touches it: it stores the passphrase when a client (`vox node attach`, `vox
+//! node create`, `vox setup`, `vox agent connect`, Vox.app) asks it to keep a node it has just
+//! attached with that passphrase (#666), reads it to attach the node again when it starts, and
+//! removes it when the node is detached by hand or its passphrase is forgotten. One generic-password item per node, under the
 //! service [`SERVICE`] and the node's directory as its account; the item's access is the daemon's
 //! own, so reading it back at login asks nothing.
 
 /// The keychain service every kept node's passphrase is stored under.
 pub const SERVICE: &str = "us.vox.node";
 
+/// **Test-only** (V210-105, #666): the keychain file a proof's daemon keeps passphrases in, made
+/// by the proof with `security create-keychain -p '' <path>`, which changes no preference. Read
+/// only in a build with the `test-knobs` feature; no shipped build reads it. With it, every call
+/// here goes to that file, unlocked with the empty password, and the Keychain may show nothing:
+/// what would ask is refused instead, so no proof can raise a dialog on the machine it runs on.
+#[cfg(all(target_os = "macos", feature = "test-knobs"))]
+const TEST_KEYCHAIN_ENV: &str = "VOX_TEST_KEYCHAIN";
+
 #[cfg(target_os = "macos")]
 mod mac {
     use zeroize::Zeroizing;
 
+    /// The proof's keychain file, opened and unlocked, with the Keychain's dialogs off for this
+    /// process; `None` without the knob.
+    #[cfg(feature = "test-knobs")]
+    fn test_keychain(
+    ) -> Option<Result<security_framework::os::macos::keychain::SecKeychain, String>> {
+        use security_framework::os::macos::keychain::SecKeychain;
+        let path = std::env::var_os(super::TEST_KEYCHAIN_ENV).filter(|p| !p.is_empty())?;
+        // Kept off for the process's life: a dialog is never the answer in a proof.
+        std::mem::forget(SecKeychain::disable_user_interaction());
+        Some(
+            SecKeychain::open(&path)
+                .and_then(|mut k| k.unlock(Some("")).map(|()| k))
+                .map_err(|e| format!("the test keychain {}: {e}", path.to_string_lossy())),
+        )
+    }
+
     /// Store `passphrase` for `account`, replacing what was there.
     pub fn store(account: &str, passphrase: &str) -> Result<(), String> {
+        #[cfg(feature = "test-knobs")]
+        if let Some(k) = test_keychain() {
+            return k?
+                .set_generic_password(super::SERVICE, account, passphrase.as_bytes())
+                .map_err(|e| format!("the Keychain refused to store it: {e}"));
+        }
         security_framework::passwords::set_generic_password(
             super::SERVICE,
             account,
@@ -23,12 +54,22 @@ mod mac {
         .map_err(|e| format!("the Keychain refused to store it: {e}"))
     }
 
+    /// What is stored for `account`, as bytes.
+    fn bytes(account: &str) -> Result<Vec<u8>, String> {
+        #[cfg(feature = "test-knobs")]
+        if let Some(k) = test_keychain() {
+            return k?
+                .find_generic_password(super::SERVICE, account)
+                .map(|(p, _)| p.to_vec())
+                .map_err(|e| format!("the Keychain did not give it: {e}"));
+        }
+        security_framework::passwords::get_generic_password(super::SERVICE, account)
+            .map_err(|e| format!("the Keychain did not give it: {e}"))
+    }
+
     /// The passphrase stored for `account`.
     pub fn read(account: &str) -> Result<Zeroizing<String>, String> {
-        let bytes = Zeroizing::new(
-            security_framework::passwords::get_generic_password(super::SERVICE, account)
-                .map_err(|e| format!("the Keychain did not give it: {e}"))?,
-        );
+        let bytes = Zeroizing::new(bytes(account)?);
         String::from_utf8(bytes.to_vec())
             .map(Zeroizing::new)
             .map_err(|e| {
@@ -40,6 +81,16 @@ mod mac {
 
     /// Remove what is stored for `account`; nothing stored is not an error.
     pub fn forget(account: &str) {
+        #[cfg(feature = "test-knobs")]
+        if let Some(k) = test_keychain() {
+            if let Ok((_, item)) = k.and_then(|k| {
+                k.find_generic_password(super::SERVICE, account)
+                    .map_err(|e| e.to_string())
+            }) {
+                item.delete();
+            }
+            return;
+        }
         let _ = security_framework::passwords::delete_generic_password(super::SERVICE, account);
     }
 }
@@ -48,7 +99,9 @@ mod mac {
 pub use mac::{forget, read, store};
 
 #[cfg(not(target_os = "macos"))]
-const NOT_HERE: &str = "the Keychain is macOS's; keep a node with --keep --passphrase-file here";
+const NOT_HERE: &str = "this system has no Keychain Vox can store it in, so after the daemon \
+                        restarts the node is to be attached again by hand; or keep it with `vox \
+                        node attach <node> --keep --passphrase-file <path>`";
 
 /// Store `passphrase` for `account`. Not on this platform.
 ///

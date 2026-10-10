@@ -1,25 +1,27 @@
-//! **Every node has a passphrase; a room may have none** (ADR-028 K-11, and V030-36's room half)
-//! — proved with nothing but the shipped `vox`: a `vox node` anchor and three `vox daemon`s, every
-//! step as an operator types it.
+//! **A passphrase is optional, for a node and for a room** (ADR-005 J-2, V030-36, restored by the
+//! decider 2026-10-09: "passphrases are optional"; ADR-028 K-11 as amended) — proved with nothing
+//! but the shipped `vox`: a `vox node` anchor and three `vox daemon`s, every step as an operator
+//! types it.
 //!
-//! 1. A node is never made with an empty identity passphrase, however it is given: `vox id` with
+//! 1. A node is made with an empty identity passphrase, however it is given: `vox id` with
 //!    `VOX_IDENTITY_PASSPHRASE` set to nothing, `vox node create` with an empty
-//!    `--passphrase-file`, and `vox node create` at a terminal with Enter alone each refuse,
-//!    saying every node has an identity passphrase, and leave no identity behind; a refused
-//!    `vox node create` leaves no `nodes/<name>/` either. With no terminal and no passphrase given,
-//!    `vox node create` says how to give one in its own words (`--passphrase-file`), and leaves
-//!    nothing. `vox node create --help` says what it does: an empty passphrase is refused.
+//!    `--passphrase-file`, and `vox node create` at a terminal with Enter alone, twice. Each makes
+//!    the identity and says once what it means: the key is kept on this machine unencrypted. With
+//!    no terminal and no passphrase given, `vox node create` refuses, says how to give one in its
+//!    own words (`--passphrase-file`), and leaves no `nodes/<name>/`. `vox node --help` says an
+//!    empty one gives the node none. Bob's node has none: his daemon attaches it from an empty
+//!    `--passphrase-file`, his trust change is typed as Enter alone, and he posts and reads in
+//!    claim 4.
 //! 2. `vox room create` makes a room with no passphrase (an empty line on `--passphrase-file -`),
 //!    saying the line that encourages one.
 //! 3. A join to that room with a wrong, non-empty passphrase is refused, naming the passphrase.
 //! 4. A join with no passphrase (an empty `--passphrase-file`) gets in, and the two members read
 //!    each other's posts both ways.
 //!
-//! Mutations: an empty identity passphrase accepted again (the node's and the CLI's checks) — red,
-//! PRODUCT (claim 1); `node_create` resolving its paths before it has the passphrase — red,
-//! PRODUCT (claim 1: `nodes/e/` left behind); the help saying "an empty one is allowed" again —
-//! red, PRODUCT (claim 1); the room's empty passphrase read as locked again (`join_passphrase` refusing
-//! an empty one) — red, PRODUCT (claim 4: the join is refused).
+//! Mutations: an empty identity passphrase refused again (`Profile::create_noting`) — red, PRODUCT
+//! (claim 1); `node_create` resolving its paths before it has the passphrase (no terminal) — red,
+//! PRODUCT (claim 1: `nodes/n/` left behind); the room's empty passphrase read as locked again
+//! (`join_passphrase` refusing an empty one) — red, PRODUCT (claim 4: the join is refused).
 
 #![cfg(unix)]
 
@@ -65,6 +67,8 @@ impl Proc {
             .env("VOX_DATA_DIR", dir)
             .env("VOX_CONFIG_DIR", dir.join("cfg"))
             .env_remove("VOX_ROOM")
+            // A harness session running this proof names its own node here; never this run's.
+            .env_remove("VOX_NODE")
             .env_remove("VOX_IDENTITY_PASSPHRASE")
             .stdin(if stdin.is_some() {
                 Stdio::piped()
@@ -148,11 +152,22 @@ impl Proc {
 /// daemon holds the data root, runs with the node attached by `vox node attach` and let go after.
 fn vox(dir: &std::path::Path, args: &[String], stdin: Option<&str>) -> (bool, String, String) {
     let verb: Vec<&str> = args.iter().map(String::as_str).collect();
+    let pass = identity_of(dir);
     match attach::needs(dir, &verb) {
         Some(node) => {
-            attach::Root::at(dir, PASS).attached(&node, || vox_as(dir, args, stdin, PASS))
+            attach::Root::at(dir, pass).attached(&node, || vox_as(dir, args, stdin, pass))
         }
-        None => vox_as(dir, args, stdin, PASS),
+        None => vox_as(dir, args, stdin, pass),
+    }
+}
+
+/// The identity passphrase of the node in `dir`: Bob's node has none (claim 1), every other one
+/// [`PASS`].
+fn identity_of(dir: &std::path::Path) -> &'static str {
+    if dir.ends_with("bob") {
+        ""
+    } else {
+        PASS
     }
 }
 
@@ -172,6 +187,8 @@ fn vox_as(
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env("VOX_IDENTITY_PASSPHRASE", identity)
         .env_remove("VOX_ROOM")
+        // A harness session running this proof names its own node here; never this run's.
+        .env_remove("VOX_NODE")
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
@@ -230,8 +247,9 @@ fn until(
 /// The line the CLI says when a room passphrase is left empty.
 const ENCOURAGED: &str = "A passphrase is encouraged.";
 
-/// What refusing an empty identity passphrase says.
-const EVERY_NODE: &str = "every node has an identity passphrase";
+/// What a node made with no identity passphrase is told, once (`vox_text::node::NO_PASSPHRASE`).
+const NO_PASSPHRASE: &str = "no identity passphrase: this node's identity key is kept on this \
+                             machine unencrypted";
 
 /// Every identity vault under `dir`: an identity left behind.
 fn vaults(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -250,8 +268,8 @@ fn vaults(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     found
 }
 
-/// `vox node create <name>` at a terminal (a pty), answering its first passphrase prompt with
-/// Enter alone: what the terminal showed, and how `vox` exited.
+/// `vox node create <name>` at a terminal (a pty), answering both passphrase prompts with Enter
+/// alone: what the terminal showed, and how `vox` exited.
 fn create_at_a_terminal(dir: &std::path::Path, name: &str) -> String {
     const DRIVER: &str = r#"
 import os, select, sys, time
@@ -259,7 +277,7 @@ vox, name = sys.argv[1], sys.argv[2]
 pid, fd = os.forkpty()
 if pid == 0:
     os.execv(vox, [vox, "node", "create", name])
-out, sent, deadline = b"", False, time.time() + 60
+out, sent, again, deadline = b"", False, False, time.time() + 60
 while time.time() < deadline:
     r, _, _ = select.select([fd], [], [], 0.5)
     if not r:
@@ -274,6 +292,9 @@ while time.time() < deadline:
     if not sent and b"new identity passphrase" in out:
         os.write(fd, b"\r")
         sent = True
+    elif sent and not again and b"again" in out:
+        os.write(fd, b"\r")
+        again = True
 _, st = os.waitpid(pid, 0)
 sys.stdout.write(out.decode("utf-8", "replace"))
 sys.stdout.write("\nPROMPTED %s EXIT %d\n" % (sent, os.waitstatus_to_exitcode(st)))
@@ -284,6 +305,8 @@ sys.stdout.write("\nPROMPTED %s EXIT %d\n" % (sent, os.waitstatus_to_exitcode(st
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env_remove("VOX_IDENTITY_PASSPHRASE")
         .env_remove("VOX_ROOM")
+        // A harness session running this proof names its own node here; never this run's.
+        .env_remove("VOX_NODE")
         .output()
         .unwrap_or_else(|e| panic!("APPARATUS: cannot run the pty driver: {e}"));
     assert!(
@@ -300,7 +323,7 @@ fn s(v: &[&str]) -> Vec<String> {
 
 #[test]
 #[ignore = "four real vox processes, a real anchor and production Argon2id; run on demand"]
-fn every_node_has_a_passphrase_and_a_room_may_have_none() {
+fn a_passphrase_is_optional_for_a_node_and_a_room() {
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
@@ -331,26 +354,19 @@ fn every_node_has_a_passphrase_and_a_room_may_have_none() {
         .trim()
         .to_owned();
 
-    // ---- claim 1: no node is made with an empty identity passphrase ----
-    let refused = |how: &str, d: &std::path::Path, ok: bool, said: &str| {
-        let mut left = vaults(d);
-        left.extend(
-            std::fs::read_dir(d.join("nodes"))
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|e| e.path()),
-        );
+    // ---- claim 1: a node is made with an empty identity passphrase, and told what it means ----
+    let made = |how: &str, d: &std::path::Path, ok: bool, said: &str| {
+        let left = vaults(d);
         assert!(
-            !ok && said.contains(EVERY_NODE) && left.is_empty(),
-            "PRODUCT: {how} must refuse, saying {EVERY_NODE:?}, and make nothing (ADR-028 K-11); \
-             it {} and left {left:?}, saying:\n{said}",
+            ok && said.contains(NO_PASSPHRASE) && left.len() == 1,
+            "PRODUCT: {how} must make the node, saying once {NO_PASSPHRASE:?} (ADR-005 J-2); it \
+             {} and left {left:?}, saying:\n{said}",
             if ok { "succeeded" } else { "failed" }
         );
     };
     let by_variable = dir("by-variable");
     let (ok, out, err) = vox_as(&by_variable, &s(&["id"]), None, "");
-    refused(
+    made(
         "`vox id` with VOX_IDENTITY_PASSPHRASE set to nothing",
         &by_variable,
         ok,
@@ -363,7 +379,7 @@ fn every_node_has_a_passphrase_and_a_room_may_have_none() {
         None,
         PASS,
     );
-    refused(
+    made(
         "`vox node create` with an empty --passphrase-file",
         &by_file,
         ok,
@@ -375,8 +391,8 @@ fn every_node_has_a_passphrase_and_a_room_may_have_none() {
         shown.contains("PROMPTED True"),
         "APPARATUS: `vox node create` at a pty never showed its passphrase prompt:\n{shown}"
     );
-    refused(
-        "`vox node create` at a terminal with Enter alone",
+    made(
+        "`vox node create` at a terminal with Enter alone, twice",
         &at_terminal,
         shown.contains("EXIT 0\n"),
         &shown,
@@ -407,11 +423,14 @@ fn every_node_has_a_passphrase_and_a_room_may_have_none() {
         .skip_while(|l| !l.trim_start().starts_with("create "))
         .take_while(|l| !l.trim_start().starts_with("attach "))
         .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
         .join(" ");
     assert!(
-        create.contains("an empty") && create.contains("refused") && !create.contains("allowed"),
-        "PRODUCT: `vox node --help` must say an empty passphrase is refused, as `vox node create` \
-         does; it says of create: {create:?}"
+        create.contains("an empty one gives the node none") && !create.contains("refused"),
+        "PRODUCT: `vox node --help` must say an empty passphrase gives the node none, as `vox \
+         node create` does; it says of create: {create:?}"
     );
     let fp = |d: &std::path::Path| {
         let (ok, out, err) = vox(d, &s(&["id"]), None);
@@ -430,14 +449,7 @@ fn every_node_has_a_passphrase_and_a_room_may_have_none() {
             "PRODUCT (staging): `vox trust add {name}` failed: {err}"
         );
     }
-    // Alice and Carol give it as a line on stdin, Bob in a file.
-    let pass_file = tmp.path().join("identity-passphrase");
-    std::fs::write(&pass_file, format!("{PASS}\n"))
-        .expect("APPARATUS: cannot write the passphrase file");
-    let pass_file = pass_file
-        .to_str()
-        .expect("APPARATUS: the temp path is not UTF-8")
-        .to_owned();
+    // Alice and Carol give it as a line on stdin; Bob gives none, in an empty file.
     let mut daemons = Vec::new();
     for (name, d, file) in [
         ("alice", &alice, false),
@@ -446,7 +458,8 @@ fn every_node_has_a_passphrase_and_a_room_may_have_none() {
     ] {
         let mut args = s(&["daemon", "--listen", "127.0.0.1:0", "--anchor", &spec]);
         if file {
-            args.extend(s(&["--passphrase-file", &pass_file]));
+            // Bob's node has no passphrase: an empty file attaches it (claim 1).
+            args.extend(s(&["--passphrase-file", &empty_file]));
         }
         let line = format!("{PASS}\n");
         let mut p = Proc::spawn(name, d, &args, (!file).then_some(line.as_str()));

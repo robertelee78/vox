@@ -17,23 +17,33 @@ vox node detach robertgpt
 vox node signout robertgpt
 ```
 
-**Every node has an identity passphrase.** `node create` asks for it twice at the terminal, or
-reads it from `--passphrase-file PATH`. An empty one is refused, and nothing is created: `every
-node has an identity passphrase, and an empty one is refused; nothing was created`. A room's
-passphrase is a separate thing, and it may be empty.
+**A node's identity passphrase is optional.** `node create` asks for it twice at the terminal
+(Enter alone, twice, for none), or reads it from `--passphrase-file PATH`. An empty one makes the
+node with none, and says once what that means: `no identity passphrase: this node's identity key is
+kept on this machine unencrypted, so anyone who can read its data folder can act as this node; a
+passphrase is encouraged`. Attaching such a node takes the empty passphrase (Enter alone, or an
+empty file). There is no command to change a node's passphrase yet. A room's passphrase is a
+separate thing, and it may be empty too.
 
 `node create` writes the identity and prints its fingerprint; it attaches nothing. It also says
 `there is no backup of a node: if this machine is lost, so is this node; make a new one, and ask
 everyone who trusts this one to remove it from their keyring and trust the new one`. That is the
 whole recovery plan: a node's keys never leave its machine, so no copy of them exists to restore.
-`node attach` takes the identity passphrase once and runs the node in full until `node detach` or
-until the daemon stops. `node list` shows each node as `attached` or `detached`, with its fingerprint once
+`node attach` takes the identity passphrase once and runs the node in full until `node detach`. It
+remembers the node: the passphrase is stored in the Keychain (nothing is stored for a node made
+with none), and the daemon attaches the node again by itself whenever it starts, after `vox
+update`, a quit of the app or a reboot too, with nobody typing. Anyone who can unlock this Mac's
+login keychain can then attach the node. `node attach --no-remember` stores nothing, and `node
+forget-passphrase` removes what is stored; the node stays attached until it is detached. `node
+create` attaches and remembers the node it makes at once. Where there is no Keychain Vox can use
+(Linux), `node attach` says the node is not remembered, and `--keep --passphrase-file PATH` keeps
+it instead. `node list` shows each node as `attached` or `detached`, with its fingerprint once
 it has been attached (a detached node's from a file kept beside its identity, shown only while it
 matches that identity). `node detach` closes that
 node's connections, stops its services and wipes its keys from memory; other attached nodes keep
 running. Detaching is not deleting: the node, its rooms and its keyring stay on disk. `node signout` detaches the
-node and forgets what would bring it back without you: it is no longer kept attached (`node attach
---keep`), its passphrase leaves the Keychain, and the app no longer opens it by itself. It says
+node and forgets what would bring it back without you: it is no longer remembered (`node attach`), its
+passphrase leaves the Keychain, and the app no longer opens it by itself. It says
 so: ``node robertgpt signed out: detached, no longer kept, its Keychain passphrase forgotten; its
 rooms and messages stay here, and `vox node attach robertgpt` uses it again``.
 

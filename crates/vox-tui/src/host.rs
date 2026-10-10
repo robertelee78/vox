@@ -1524,6 +1524,7 @@ impl Router {
                                 "vox daemon: could not attach kept node {node}: its passphrase in \
                                  the Keychain: {e}"
                             );
+                                router.needs_passphrase(&node).await;
                                 return;
                             }
                         }
@@ -1551,10 +1552,30 @@ impl Router {
                     .await
                 {
                     Ok(_) => eprintln!("vox daemon: attached kept node {node}"),
-                    Err(r) => eprintln!("vox daemon: could not attach kept node {node}: {r}"),
+                    Err(r) => {
+                        eprintln!("vox daemon: could not attach kept node {node}: {r}");
+                        router.needs_passphrase(&node).await;
+                    }
                 }
             });
         }
+    }
+
+    /// Tell the person that kept node `node` did not attach by itself and waits for them (#666):
+    /// a notification with the command that attaches it, as the node's notifications are raised.
+    async fn needs_passphrase(&self, node: &NodeName) {
+        let Ok(paths) = self.inner.account.node_paths(node) else {
+            return;
+        };
+        let node = node.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::notify::raise_for(
+                &paths,
+                &format!("Vox: node {node} needs its passphrase"),
+                &format!("It did not attach by itself. Run in a terminal: vox node attach {node}"),
+            );
+        })
+        .await;
     }
 
     /// Find `node` attached, or attach it, as `want` says, waiting out anyone else's attach or

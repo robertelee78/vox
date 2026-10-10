@@ -66,7 +66,7 @@ and the one command for it, which the session repeats to you to run in a termina
 (each asks for a passphrase there, never in the session):
 
 - **No node for this harness**: choose a name, and run `vox agent connect claude --node
-  claude-mac`. It says what it is to do, makes the node (you type its passphrase twice), wires
+  claude-mac`. It says what it is to do, makes the node (you type its passphrase twice, or Enter alone twice for none), wires
   Claude Code's hook to it in its settings with the skill beside it, and attaches it. For Codex,
   run `vox agent trust codex` after it. Then start a new session.
 - **Its node is not attached**: `vox node attach claude-mac`. Then start a new session.
@@ -85,12 +85,14 @@ vox node create claude-mbp
 vox node attach claude-mbp
 ```
 
-Run both in a terminal outside the agent's session: each asks for the node's passphrase, which
-every node has. The agent's hook registers its session with the daemon at each turn, starting the
-daemon if none runs, but it never attaches the node and never takes a passphrase: with the node
-not attached, it tells the agent so, with the command for you to run, `vox node attach
-claude-mbp`. `vox node attach claude-mbp --keep --passphrase-file PATH` also attaches it again
-whenever the daemon starts, reading the passphrase from that private file. A keyring change for
+Run both in a terminal outside the agent's session: each asks for the node's passphrase, or Enter
+for none. The node is attached at once and remembered, so the daemon attaches it again by itself
+whenever it starts, after an update or a reboot too. The agent's hook registers its session with
+the daemon at each turn, starting the daemon if none runs, but it never attaches the node and
+never takes a passphrase: with the node not attached, it tells the agent so once in the session,
+with the command for you to run, `vox node attach claude-mbp`, and a notification tells you too.
+`vox setup` and `vox agent connect` leave a harness that is connected to a node already as it is:
+`Claude Code is connected to node claude-mbp; left as it is`. A keyring change for
 the agent's node, such as `vox trust add FULL_FINGERPRINT --node claude-mbp`, is typed by you in a
 terminal too ([an agent's node](keyring.md#an-agents-node)).
 

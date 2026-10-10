@@ -28,6 +28,23 @@
 //! is refused with its reason and asked again. Mutant: the typed name ignored, the suggestion
 //! always taken; red as PRODUCT (no node `my-claude`).
 //!
+//! And **a harness's node may have no passphrase** (ADR-005 J-2, V030-36): OpenCode's is typed as
+//! Enter alone, twice; setup says once that its key is then kept unencrypted, makes it, and wires
+//! its plugin, which `vox agent doctor` passes. Mutant: an empty identity passphrase refused again;
+//! red as PRODUCT.
+//!
+//! And **each node setup makes is attached at once, and remembered** (#666): setup's daemon is
+//! stopped, a new one started, and with nobody typing `vox node list` says OpenCode's node (made
+//! with no passphrase) is attached, and on macOS Claude Code's too, its typed passphrase read
+//! from the Keychain. The Keychain is a keychain file of this test's own (`VOX_TEST_KEYCHAIN`,
+//! the `test-knobs` feature), never the person's. Mutant: the daemon's Keychain lookup off; red
+//! as PRODUCT on my-claude.
+//!
+//! And **a harness connected already is left as it is** (#666): `vox setup` run again says Claude
+//! Code is connected to node my-claude and OpenCode to its node, each left as it is, and offers no
+//! second node; `vox agent connect claude --node another` says the same and makes no node.
+//! Mutant: the hook's node not looked at (`Wiring::wired_node` ignored); red as PRODUCT.
+//!
 //! And **`vox setup` keeps Codex's app-server running** when it wires Codex (the decider,
 //! 2026-10-06): it says first that it will, and that this runs no model; it asks the `codex` it
 //! found on `PATH` for `app-server daemon start` under the Codex home it wires, waits for the
@@ -39,6 +56,9 @@
 //! and the harnesses' programs on `PATH` are stand-ins that only exist.
 
 #![cfg(unix)]
+
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -68,7 +88,29 @@ impl Dirs {
         for d in ["claude", "codex", "oc", "c", "home"] {
             std::fs::create_dir_all(root.join(d)).expect("APPARATUS: a directory");
         }
+        // **Never the person's login keychain** (#666): a passphrase typed to setup is stored in
+        // the Keychain, so this test's `vox` keeps it in a keychain file of its own
+        // (VOX_TEST_KEYCHAIN), made here unlocked with an empty password. `create-keychain`
+        // makes the file and changes no search list and no default; with HOME the test's own,
+        // nothing of the person's is read either.
+        if cfg!(target_os = "macos") {
+            let made = Command::new("/usr/bin/security")
+                .args(["create-keychain", "-p", ""])
+                .arg(root.join("k.keychain-db"))
+                .env("HOME", root.join("home"))
+                .stdin(Stdio::null())
+                .status();
+            assert!(
+                made.is_ok_and(|s| s.success()),
+                "APPARATUS: `security create-keychain` did not make the test's keychain file"
+            );
+        }
         Self { _tmp: tmp, root }
+    }
+
+    /// The test's keychain file (macOS), as `VOX_TEST_KEYCHAIN` names it.
+    fn keychain(&self) -> PathBuf {
+        self.root.join("k.keychain-db")
     }
 
     fn vox(&self, args: &[&str]) -> (bool, String, String) {
@@ -93,6 +135,7 @@ impl Dirs {
             .env("CLAUDE_CONFIG_DIR", r.join("claude"))
             .env("CODEX_HOME", r.join("codex"))
             .env("OPENCODE_CONFIG_DIR", r.join("oc"))
+            .env("VOX_TEST_KEYCHAIN", self.keychain())
             .stdin(Stdio::null())
             .output()
             .unwrap_or_else(|e| panic!("APPARATUS: run vox {args:?}: {e}"));
@@ -105,6 +148,33 @@ impl Dirs {
 
     fn claude_settings(&self) -> PathBuf {
         self.root.join("claude").join("settings.json")
+    }
+
+    /// The pid of the daemon serving this test's data root, if one runs.
+    fn daemon_pid(&self) -> Option<u32> {
+        std::fs::read_to_string(self.root.join("d/.daemon/lock"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// `vox node list`'s line for `node`.
+    fn listed(&self, node: &str) -> String {
+        let (_, out, _) = self.vox(&["node", "list"]);
+        out.lines()
+            .find(|l| l.split_whitespace().next() == Some(node))
+            .unwrap_or_default()
+            .to_owned()
+    }
+}
+
+impl Drop for Dirs {
+    /// The daemon setup started is this test's to stop, by its own pid.
+    fn drop(&mut self) {
+        if let Some(pid) = self.daemon_pid() {
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+        }
     }
 }
 
@@ -253,6 +323,7 @@ impl Setup {
             ("CLAUDE_CONFIG_DIR", r.join("claude").display().to_string()),
             ("CODEX_HOME", r.join("codex").display().to_string()),
             ("OPENCODE_CONFIG_DIR", r.join("oc").display().to_string()),
+            ("VOX_TEST_KEYCHAIN", d.keychain().display().to_string()),
         ] {
             cmd.env(k, v);
         }
@@ -330,6 +401,9 @@ impl Setup {
 #[test]
 #[ignore = "real binary, production Argon2id, a pty; run in release"]
 fn setup_makes_a_node_for_each_installed_harness() {
+    if cfg!(target_os = "macos") {
+        test_knobs::require(&["VOX_TEST_KEYCHAIN"]);
+    }
     let d = Dirs::new();
     // Claude Code and OpenCode are installed; Codex is not. Stand-ins that only exist.
     let bin = d.root.join("bin");
@@ -381,8 +455,9 @@ fn setup_makes_a_node_for_each_installed_harness() {
     setup.answer("again:", 1, "claude passphrase\r");
     // Enter keeps the suggestion.
     setup.answer("a node for OpenCode [opencode-", 1, "\r");
-    setup.answer("passphrase for opencode-", 1, "opencode passphrase\r");
-    setup.answer("again:", 2, "opencode passphrase\r");
+    // No passphrase, Enter alone twice (ADR-005 J-2): taken, and what it means said.
+    setup.answer("passphrase for opencode-", 1, "\r");
+    setup.answer("again:", 2, "\r");
     if cfg!(target_os = "macos") {
         // The person's node is offered, and skipped.
         setup.answer("Create a node for you?", 1, "\r");
@@ -404,6 +479,15 @@ fn setup_makes_a_node_for_each_installed_harness() {
         matches!((refused, asked_again), (Some(r), Some(a)) if r < a),
         "PRODUCT: `vox setup` must refuse the name `Bad Name!` as `vox node create` does, saying \
          why, then ask for Claude Code's node again:\n{said}"
+    );
+    let none_said = said.find(
+        "no identity passphrase: this node's identity key is kept on this machine unencrypted",
+    );
+    let opencode_made = said.find("created node opencode-");
+    assert!(
+        matches!((none_said, opencode_made), (Some(n), Some(m)) if n < m),
+        "PRODUCT: `vox setup` must make OpenCode's node with no passphrase (Enter alone, twice), \
+         saying first that its key is then kept unencrypted:\n{said}"
     );
     assert!(
         !said.contains("a node for Codex"),
@@ -483,6 +567,110 @@ fn setup_makes_a_node_for_each_installed_harness() {
         "PRODUCT: `vox setup` must keep what Claude's settings held, in its order, and replace \
          the Vox hook for another node: {kept}"
     );
+
+    // ---- each node made is attached at once, and one with no passphrase comes back by itself
+    // after the daemon restarts (#666) ----
+    let opencode = format!("opencode-{host}");
+    for node in ["my-claude", opencode.as_str()] {
+        let line = d.listed(node);
+        assert!(
+            line.contains(" attached"),
+            "PRODUCT: `vox setup` must attach node {node} at once: `vox node list` says {line:?}"
+        );
+    }
+    let pid = d
+        .daemon_pid()
+        .expect("PRODUCT: `vox setup` attached its nodes, but no daemon holds the lock");
+    let _ = Command::new("kill").arg(pid.to_string()).status();
+    let gone = Instant::now() + Duration::from_secs(30);
+    while d.daemon_pid() == Some(pid)
+        && Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    {
+        assert!(
+            Instant::now() < gone,
+            "APPARATUS: the daemon did not stop within 30 s"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (ok, out, err) = d.vox(&["daemon", "--detach"]);
+    assert!(ok, "PRODUCT (staging): vox daemon --detach: {out}{err}");
+    // OpenCode's, made with none, everywhere; Claude Code's, its typed passphrase in the
+    // Keychain, where there is one (macOS).
+    let mut back_by_itself = vec![(opencode.clone(), "made with no passphrase")];
+    if cfg!(target_os = "macos") {
+        back_by_itself.push((
+            "my-claude".to_owned(),
+            "its typed passphrase in the Keychain",
+        ));
+    }
+    for (node, how) in back_by_itself {
+        let back = Instant::now() + Duration::from_secs(60);
+        let mut line = d.listed(&node);
+        while !line.contains(" attached") && Instant::now() < back {
+            std::thread::sleep(Duration::from_millis(200));
+            line = d.listed(&node);
+        }
+        println!("[proof] after a restart, with nobody typing ({how}): {line:?}");
+        assert!(
+            line.contains(" attached"),
+            "PRODUCT: node {node}, {how}, must be attached again by the daemon's own start, \
+             with nobody typing: `vox node list` says {line:?}\nlog:\n{}",
+            std::fs::read_to_string(d.root.join("d/.daemon/log")).unwrap_or_default()
+        );
+    }
+
+    // ---- a harness connected already is left as it is (#666) ----
+    let mut again = Setup::spawn(&d, &path);
+    // A node offered for a harness connected already is the defect, said as that, not as a
+    // question setup never reached.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !again.said().contains("Create a node for you?") && Instant::now() < deadline {
+        let said = again.said();
+        assert!(
+            !said.contains("a node for Claude Code") && !said.contains("a node for OpenCode"),
+            "PRODUCT: `vox setup` run again offered a second node for a harness connected \
+             already:\n{said}"
+        );
+        if again.child.try_wait().ok().flatten().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if cfg!(target_os = "macos") {
+        again.answer("Create a node for you?", 1, "\r");
+    }
+    let status = again.finish();
+    let second = again.said();
+    println!("[proof] vox setup, run again, said:\n{second}");
+    let (_, listed, _) = d.vox(&["node", "list"]);
+    assert!(
+        status.success()
+            && second.contains("Claude Code is connected to node my-claude; left as it is")
+            && second.contains(&format!(
+                "OpenCode is connected to node {opencode}; left as it is"
+            ))
+            && !second.contains("a node for Claude Code")
+            && listed.lines().filter(|l| l.contains('-')).count() == 2,
+        "PRODUCT: `vox setup` run again must say each harness is connected to its node and leave \
+         it as it is, offering no second node ({status:?}):\n{second}\n`vox node list`:\n{listed}"
+    );
+    let (ok, out, err) = d.vox(&["agent", "connect", "claude", "--node", "another"]);
+    let (_, listed, _) = d.vox(&["node", "list"]);
+    println!("[proof] vox agent connect claude --node another said: {out}{err}");
+    assert!(
+        ok && out.contains("Claude Code is connected to node my-claude; left as it is")
+            && !listed.contains("another")
+            && std::fs::read_to_string(d.claude_settings())
+                .unwrap_or_default()
+                .contains("--node my-claude"),
+        "PRODUCT: `vox agent connect claude --node another` must say Claude Code is connected to \
+         node my-claude and leave it as it is, making no node: {out}{err}\n`vox node list`:\n\
+         {listed}"
+    );
 }
 
 /// A stand-in `codex`: it records each command it is given in `$CODEX_HOME/asked`, and on
@@ -514,6 +702,9 @@ if sys.argv[1:4] == ["app-server", "daemon", "start"]:
 #[test]
 #[ignore = "real binary, production Argon2id, a pty; run in release"]
 fn setup_keeps_codex_app_server_running() {
+    if cfg!(target_os = "macos") {
+        test_knobs::require(&["VOX_TEST_KEYCHAIN"]);
+    }
     let d = Dirs::new();
     let bin = d.root.join("bin");
     std::fs::create_dir_all(&bin).expect("APPARATUS: a bin directory");

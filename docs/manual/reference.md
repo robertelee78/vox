@@ -133,7 +133,10 @@ prompt. A keyring change (`vox trust add`, `remove`, `rename`, `drive`, `read`) 
 passphrase only typed at a terminal, never from a file or the environment; a room's retention or
 name asks for none (see [when the passphrase is asked for](keyring.md#when-the-passphrase-is-asked-for)).
 
-To keep a node attached across daemon restarts:
+`vox node attach robertgpt` remembers the node: its passphrase is stored in the Keychain, and the
+daemon attaches it again whenever it starts. `--no-remember` stores nothing; `vox node
+forget-passphrase robertgpt` removes what is stored. Where there is no Keychain (Linux), keep a
+node by a file instead:
 
 ```sh
 vox node attach robertgpt --keep --passphrase-file PATH_TO_PRIVATE_FILE
