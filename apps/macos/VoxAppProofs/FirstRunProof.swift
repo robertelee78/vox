@@ -1425,6 +1425,14 @@ final class FirstRunProof: XCTestCase {
         guard before.status == 0, nodeLine(before.out, "alice") == nil else {
             throw Apparatus("staging not achieved: the data root is to hold no node; `vox node list` said \(before.out)")
         }
+        // Claude Code is here: its settings folder, in the HOME a proof build gives the launch's
+        // `vox agent skill --install` (`<config dir>/app/home`, never the person's own).
+        let skillHome = URL(fileURLWithPath: config).appendingPathComponent("app/home")
+        // Made by the stager: the test runner's sandbox may not write in the scratch (513).
+        let made = stager.run(["/bin/mkdir", "-p", skillHome.appendingPathComponent(".claude").path], env: [:])
+        guard made.status == 0 else {
+            throw Apparatus("staging not achieved: Claude Code's settings folder under \(skillHome.path): \(made.out)")
+        }
 
         let ui = voxApp(appPath)
         ui.launchEnvironment = voxEnv
@@ -1433,6 +1441,18 @@ final class FirstRunProof: XCTestCase {
             ui.terminate()
             _ = run(vox, ["node", "detach", "alice"], env: voxEnv)
         }
+        // **Vox.app installs the agent skill pack at launch** (#586): its first run and every
+        // update of the app, not only install.sh and `vox update`. Mutant: AppModel.start without
+        // `Daemon.refreshSkillPack()`; red as PRODUCT here.
+        let skill = skillHome.appendingPathComponent(".claude/skills/vox-agent-comms/SKILL.md").path
+        let skillBy = Date().addingTimeInterval(10)
+        // Looked for by the stager too, outside the test runner's sandbox.
+        func installed() -> Bool { stager.run(["/bin/test", "-f", skill], env: [:]).status == 0 }
+        while !installed() && Date() < skillBy {
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        XCTAssertTrue(installed(),
+                      "PRODUCT: Vox.app must install the agent skill at launch: 10 s after its window, \(skill) is not there")
         present(ui, Key.id("login-item-why"), timeout: 30, "at first run the app must ask about Keep Running")
         tap(ui, Key.id("login-item-not-now"), "Not Now")
 
