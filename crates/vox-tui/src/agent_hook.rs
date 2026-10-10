@@ -658,21 +658,10 @@ pub(crate) fn words(text: &str) -> String {
     }
     // **A Session's opening and end** (ADR-029), said as what they are: the session by its name,
     // else its short id.
-    if e.kind == vox_agentcomms::envelope::SESSION
-        || e.kind == vox_agentcomms::envelope::SESSION_END
-    {
-        let short: String = e.from.chars().take(8).collect();
-        let who =
-            e.at.session_name
-                .as_deref()
-                .map_or(short.clone(), |n| format!("{n} \u{b7} {short}"));
-        // After its author's name, as a reader's line starts, this reads as the label does:
-        // `codex@device-2 gso-cap · 3f0c25bf opened` (CL-1).
-        return if e.kind == vox_agentcomms::envelope::SESSION {
-            format!("{who} opened")
-        } else {
-            format!("{who} ended")
-        };
+    // After its author's name, as a reader's line starts, this reads as the label does:
+    // `codex@device-2 gso-cap · 3f0c25bf opened` (CL-1).
+    if let Some(line) = vox_agentcomms::envelope::session_line(&e) {
+        return line;
     }
     let work = e.data.get(WORK_KEY).and_then(serde_json::Value::as_str);
     let head = match (e.kind == SAY, work) {
@@ -681,7 +670,7 @@ pub(crate) fn words(text: &str) -> String {
         (false, Some(w)) => format!("{} {w}: ", e.kind),
     };
     let said = if e.body.trim().is_empty() {
-        format!("{head}({} message, no text)", e.kind)
+        format!("{head}{}", vox_agentcomms::envelope::no_text(&e.kind))
     } else {
         format!("{head}{}", e.body)
     };

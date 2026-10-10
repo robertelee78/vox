@@ -1218,7 +1218,18 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str
         match vox_agentcomms::envelope::Envelope::parse(&row.text) {
             Ok(env) => (
                 shown_name(&env.kind),
-                reveal(&env.body),
+                // What it says as every reader says it (#406): a Session's opening or end as
+                // "<name · short id> opened", any other envelope with no text as "(<kind>
+                // message, no text)", never a blank row. A share says its file in its card.
+                match vox_agentcomms::envelope::session_line(&env) {
+                    Some(line) => reveal(&line),
+                    None if env.body.trim().is_empty()
+                        && env.kind != vox_core::node::shares::FILE =>
+                    {
+                        vox_agentcomms::envelope::no_text(&shown_name(&env.kind))
+                    }
+                    None => reveal(&env.body),
+                },
                 env.to.iter().map(|t| shown_name(t)).collect(),
                 env.re.as_deref().map(shown_name).unwrap_or_default(),
                 env.urgent,
