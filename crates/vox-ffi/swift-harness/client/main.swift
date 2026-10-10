@@ -69,6 +69,19 @@
 //   NOTE <note>             what `sessionRead` says besides; empty for nothing
 //   HEARD <n> <m>           how many times the listener heard of an entry in that Session, and of
 //                           the room's Sessions changing
+//   (waits for a line on stdin: the id of a Session of the peer's, which gives this node drive)
+//   PEER DRIVE <bool> ENTRIES <n>
+//                           `sessions` and `sessionRead` of it, once drive shows (up to 90 s)
+//   (waits for a line on stdin: the peer took drive back)
+//   REVOKED HEARD <bool> DRIVE <bool>
+//                           whether the listener heard the room's Sessions change (up to 30 s), and
+//                           what `sessions` says then
+//   (waits for a line on stdin: the peer gave drive again, and wrote a second entry)
+//   REGRANTED HEARD <bool> DRIVE <bool> ENTRIES <n>
+//                           the same, then `sessionRead`'s entries once there are two (up to 30 s)
+//   COUNTS BEFORE <counts>  before the peer took drive back: `unread`'s messages, what `sessions`
+//                           says waits on this node, and the messages and notices the listener got
+//   COUNTS AFTER <counts>   the same, after the re-grant
 //   (waits for a line on stdin)
 //   CLOSED                  the client has closed, letting go of the node
 //
@@ -96,12 +109,36 @@ final class Listener: ClientListener, @unchecked Sendable {
     private let lock = NSLock()
     private var entries: [String: Int] = [:]
     private var rooms: [String: Int] = [:]
+    private var told = (messages: 0, notices: 0)
+    private var notices: [String] = []
 
     func onMessage(room: String, message: RoomMessage) {
+        lock.lock()
+        told.messages += 1
+        lock.unlock()
         say("GOT \(message.text)")
     }
 
-    func onNotice(text: String) {}
+    func onNotice(text: String) {
+        lock.lock()
+        told.notices += 1
+        notices.append(text)
+        lock.unlock()
+    }
+
+    /// The notices given from the `from`th on.
+    func noticesSince(_ from: Int) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return Array(notices.dropFirst(from))
+    }
+
+    /// How many messages and notices the listener was given, all told.
+    func toldCounts() -> (Int, Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return told
+    }
 
     func onEnded(text: String) {
         say("ENDED \(text)")
@@ -296,6 +333,65 @@ do {
     say("NOTE \(session.note ?? "")")
     let (heardEntries, heardRooms) = listener.heard(session: sid, room: room)
     say("HEARD \(heardEntries) \(heardRooms)")
+
+    // Drive over a Session of the peer's: given, taken back, given again (#662). An app keeps a
+    // room's Sessions and reads them again when the listener says they changed: each change must
+    // be heard.
+    let psid = (readLine() ?? "").trimmingCharacters(in: .whitespaces)
+    func peerRow() async -> FfiSession? {
+        try? await client.sessions(room: room).first { $0.sessionId == psid }
+    }
+    func peerEntries(_ s: FfiSession?) async -> Int {
+        guard let s else { return 0 }
+        return (try? await client.sessionRead(room: room, node: s.nodeFingerprint, sessionId: psid))?
+            .entries.count ?? 0
+    }
+    var held: FfiSession? = nil
+    let heldUntil = Date().addingTimeInterval(90)
+    while Date() < heldUntil {
+        held = await peerRow()
+        if held?.canDrive == true, await peerEntries(held) >= 1 { break }
+        try await Task.sleep(nanoseconds: 250_000_000)
+    }
+    say("PEER DRIVE \(held?.canDrive ?? false) ENTRIES \(await peerEntries(held))")
+    func heardChange(after before: Int) async -> Bool {
+        let until = Date().addingTimeInterval(30)
+        while Date() < until {
+            if listener.heard(session: psid, room: room).1 > before { return true }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        return false
+    }
+    // What a person would see counted: the room's unread, what waits on them (needs you), and
+    // what the listener was told as messages or notices.
+    func seenCounts() async -> String {
+        let unread = (try? await client.unread(room: room).count) ?? -1
+        let pending = (try? await client.sessions(room: room).reduce(0) { $0 + Int($1.pending) }) ?? -1
+        let (messages, notices) = listener.toldCounts()
+        return "UNREAD \(unread) WAITING \(pending) MESSAGES \(messages) NOTICES \(notices)"
+    }
+    let countsBefore = await seenCounts()
+    let noticesBefore = listener.toldCounts().1
+    var before = listener.heard(session: psid, room: room).1
+    _ = readLine()
+    let revokeHeard = await heardChange(after: before)
+    say("REVOKED HEARD \(revokeHeard) DRIVE \(await peerRow()?.canDrive ?? false)")
+    before = listener.heard(session: psid, room: room).1
+    _ = readLine()
+    let regrantHeard = await heardChange(after: before)
+    var regained: FfiSession? = nil
+    var count = 0
+    let regainedUntil = Date().addingTimeInterval(30)
+    while Date() < regainedUntil {
+        regained = await peerRow()
+        count = await peerEntries(regained)
+        if regained?.canDrive == true && count >= 2 { break }
+        try await Task.sleep(nanoseconds: 250_000_000)
+    }
+    say("REGRANTED HEARD \(regrantHeard) DRIVE \(regained?.canDrive ?? false) ENTRIES \(count)")
+    say("COUNTS BEFORE \(countsBefore)")
+    say("COUNTS AFTER \(await seenCounts())")
+    say("NEW NOTICES \(listener.noticesSince(noticesBefore))")
     _ = readLine()
     await client.close()
     say("CLOSED")

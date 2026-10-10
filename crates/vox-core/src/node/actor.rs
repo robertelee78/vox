@@ -12444,11 +12444,23 @@ impl Node {
                     .accept_skdm(profile.store(), &skdm, now_ms)
             };
             if let Ok(backfilled) = installed {
-                let _ = self.event_tx.send(NodeEvent::SenderKeyReceived {
-                    channel_id: *channel_id,
-                    peer: author,
-                    backfilled: backfilled as u64,
-                });
+                // A drive key opens a node's Sessions, not its messages: what changed is what this
+                // node may see of them, said as Session news (no row, nothing shown), so a client
+                // reads the room's Sessions again; "messages can be read now" would be untrue.
+                let _ = self.event_tx.send(
+                    if skdm.body.channel_id == crate::node::drive::drive_channel(channel_id) {
+                        NodeEvent::SessionEntry {
+                            channel_id: *channel_id,
+                            session_id: crate::node::drive::KEY_CHANGED.to_owned(),
+                        }
+                    } else {
+                        NodeEvent::SenderKeyReceived {
+                            channel_id: *channel_id,
+                            peer: author,
+                            backfilled: backfilled as u64,
+                        }
+                    },
+                );
             }
         }
     }
@@ -13515,11 +13527,20 @@ impl Node {
         if fresh {
             self.reoffer.insert((channel_id, author));
         }
-        let _ = self.event_tx.send(NodeEvent::SenderKeyReceived {
-            channel_id,
-            peer,
-            backfilled: n as u64,
-        });
+        let _ = self.event_tx.send(
+            if skdm.body.channel_id == crate::node::drive::drive_channel(&channel_id) {
+                NodeEvent::SessionEntry {
+                    channel_id,
+                    session_id: crate::node::drive::KEY_CHANGED.to_owned(),
+                }
+            } else {
+                NodeEvent::SenderKeyReceived {
+                    channel_id,
+                    peer,
+                    backfilled: n as u64,
+                }
+            },
+        );
         Ok(())
     }
 
