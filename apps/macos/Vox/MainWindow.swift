@@ -609,7 +609,7 @@ private struct RoomView: View {
     /// tell a scroll by the person that AppKit posts no live scroll for (a classic mouse wheel's
     /// steps) from rows moved by the layout.
     @State private var lastHeight: CGFloat = 0
-    @State private var lastCount = 0
+    @State private var lastLayout = ""
     @State private var lastFrames: [String: CGRect] = [:]
     /// Whether the keyboard is on the timeline (WCAG 2.1.1): ↑/↓ move the selection, Return
     /// opens the selected message's first action, Space Quick Looks its pulled file.
@@ -1290,13 +1290,19 @@ private struct RoomView: View {
     /// person scrolled, by a mouse wheel's steps (no live scroll is posted for them). The timeline
     /// follows after it only if the newest line is at its end in view.
     private func scrolledByWheel(_ frames: [String: CGRect], _ height: CGFloat) {
+        // What moves rows with no row resized and no line come or gone: the unread line above the
+        // first unread message (it goes once that is read), a day's divider, and a row first
+        // drawn above the others (its estimated height replaced by its own).
+        let items = model.timelineItems
+        let top = frames.min { $0.value.minY < $1.value.minY }?.key ?? ""
+        let layout = "\(items.count)#\(model.unreadFrom ?? "")#\(model.unreadCount)"
+            + "#\(TimelineTime.dividers(items).count)#\(top)"
         defer {
             lastHeight = height
-            lastCount = model.timelineItems.count
+            lastLayout = layout
             lastFrames = frames
         }
-        guard Date() >= appScrollUntil, height == lastHeight,
-              model.timelineItems.count == lastCount else { return }
+        guard Date() >= appScrollUntil, height == lastHeight, layout == lastLayout else { return }
         var moved = false
         for (id, frame) in frames {
             guard let before = lastFrames[id] else { continue }
