@@ -51,9 +51,6 @@ func render<V: View>(_ view: V, _ name: String, size: CGSize = CGSize(width: 128
         throw NSError(domain: "VoxScreens", code: 2, userInfo: [NSLocalizedDescriptionKey: "no PNG for \(name)"])
     }
     try png.write(to: out.appendingPathComponent("\(name).png"))
-    // Torn down at once: a window left alive keeps its sidebar list, whose selection binding put
-    // the room back as soon as the next render chose another view, so the keyring and offer
-    // renders drew the room again.
     window.contentView = nil
     window.orderOut(nil)
     print("wrote \(out.appendingPathComponent("\(name).png").path)")
@@ -73,11 +70,16 @@ Task { @MainActor in
         await model.show(.room(room.id))
         await wait(3)
         try render(MainWindow(model: model), "main-window")
+        // A render's sidebar list sets the selection it shows as it comes up, and the show that
+        // starts runs later: let it run before choosing another view, or it puts the room back
+        // (the keyring and offer renders drew the room).
+        await wait(2)
         // A trust offer waiting on ann: cam joined and trusts her (ADR-028 K-15).
         if let offer = model.offers.first {
             await model.show(.offer(offer.fingerprint))
             await wait(1)
             try render(MainWindow(model: model), "offer")
+            await wait(2)
         }
         // A Session of ann's own, staged by the script, waiting on her (ADR-029 §8): in the room,
         // which the offer above left.
@@ -87,11 +89,13 @@ Task { @MainActor in
             model.showing = .session(node: s.nodeFingerprint, id: s.sessionId)
             await wait(3)
             try render(MainWindow(model: model), "room-session")
+            await wait(2)
             model.showing = .general
         }
         await model.show(.keyring)
         await wait(1)
         try render(MainWindow(model: model), "keyring")
+        await wait(2)
         await model.show(.decisions)
         await wait(4)
         try render(MainWindow(model: model), "decision-record")
