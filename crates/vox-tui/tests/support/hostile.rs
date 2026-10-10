@@ -360,9 +360,21 @@ pub fn create_room(data: &Path, name: &str, pass: &str) -> (Digest32, String) {
 /// these peers send. The profile is opened only after that member's own vox has stopped, and
 /// nothing the proof asserts is read from it.
 pub fn member_signer(data: &Path) -> Arc<vox_core::atrest::vault::VaultRootSigner> {
-    let paths =
-        vox_core::node::paths::Paths::resolve("default", Some(data), Some(&data.join("cfg")))
-            .expect("APPARATUS: the member's paths");
+    // The one node `vox id` made here: it is named for the machine, not `default`.
+    let nodes: Vec<String> = std::fs::read_dir(data.join("nodes"))
+        .expect("APPARATUS: the member's nodes directory")
+        .filter_map(Result::ok)
+        .filter(|e| e.path().join("vault.cbor").is_file())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    let [node] = nodes.as_slice() else {
+        panic!(
+            "APPARATUS: the member's data root holds {} nodes, not one: {nodes:?}",
+            nodes.len()
+        )
+    };
+    let paths = vox_core::node::paths::Paths::resolve(node, Some(data), Some(&data.join("cfg")))
+        .expect("APPARATUS: the member's paths");
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut profile = loop {
         match vox_core::node::profile::Profile::open(paths.clone()) {

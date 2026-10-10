@@ -54,6 +54,17 @@ pub fn drive_channel(channel_id: &Digest32) -> Digest32 {
     crate::hash::sha256_concat(&[DRIVE_DOMAIN, channel_id])
 }
 
+/// The session id of the entry a node writes under a new drive generation when it changed its
+/// key because a member lost drive (SC-2b): no harness session has it, so it is no Session's
+/// entry. Members read from it that the key changed, at once rather than at the next entry.
+pub const KEY_CHANGED: &str = "vox:drive-key";
+
+/// Whether `session_id` is [`KEY_CHANGED`]'s: an entry that is no Session's, never shown as one.
+#[must_use]
+pub fn is_key_changed(session_id: &str) -> bool {
+    session_id == KEY_CHANGED
+}
+
 /// One Session entry this node opened, or wrote (ADR-029 SC-1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRow {
@@ -91,6 +102,10 @@ pub struct DriveState {
     /// The sessions with an entry placed here since the node last said so
     /// ([`crate::node::api::NodeEvent::SessionEntry`]).
     pub(crate) news: Vec<String>,
+    /// Whether this node changed its key here and has written nothing under the new one yet, so
+    /// a member that lost drive cannot tell ([`KEY_CHANGED`]); `None` until worked out from the
+    /// room's log. Not kept: it is worked out again when the room is opened.
+    pub(crate) change_unsaid: Option<bool>,
 }
 
 /// Whether `row` announces a file out of its Session (ADR-029 DR-1.8, #546): what a member with
@@ -280,6 +295,7 @@ impl DriveState {
             sessions: Vec::new(),
             pending: Vec::new(),
             news: Vec::new(),
+            change_unsaid: None,
         })
     }
 }

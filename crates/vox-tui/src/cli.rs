@@ -2958,13 +2958,9 @@ pub fn run() -> ExitCode {
                 eprintln!("vox: {e}");
                 return ExitCode::FAILURE;
             }
-            let paths = match account.node_paths(&node) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("vox: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
+            // **A hook makes no node directory** (#666): it may name a node that is not here,
+            // and says so; its paths are resolved as they are.
+            let paths = account.node_paths_as_they_are(&node);
             let daemon = crate::agent_hook::Daemon {
                 account,
                 node,

@@ -785,7 +785,12 @@ pub async fn node_attach(
             _ => remembered(&name, &passphrase, typed),
         }
     };
-    attach_request(&mut d, &name, passphrase, keep, args.anchor_specs()).await
+    attach_request(&mut d, &name, passphrase, keep, args.anchor_specs()).await?;
+    println!(
+        "Next: start a new session in the harness wired to node {name}, or run `vox room list \
+         --node {name}` to see its rooms"
+    );
+    Ok(())
 }
 
 /// Whether the identity passphrase is to come from `file` or `VOX_IDENTITY_PASSPHRASE`, not typed.

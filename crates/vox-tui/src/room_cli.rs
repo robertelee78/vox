@@ -44,7 +44,7 @@ pub(crate) async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
 }
 
 /// Ask the node for its rooms, as `(id, local name, open, over)`.
-async fn rooms_of(
+pub(crate) async fn rooms_of(
     client: &mut IpcClient,
 ) -> Result<Vec<(Digest32, String, bool, String)>, AppError> {
     match client.rooms().await {
@@ -1722,6 +1722,15 @@ pub async fn roster(paths: &Paths, room: &str) -> Result<(), AppError> {
         Ok(Frame::Members { members }) => {
             for m in members {
                 println!("{}", id(&m));
+            }
+            // Which members this node's key waits for, and why (ADR-030 D-5, W-4): said beside
+            // the list, on stderr, so the list stays one member a line.
+            if let Ok(Frame::KeyWaits { waits }) =
+                client.request(&Request::KeyWaits { channel_id }).await
+            {
+                for (m, why) in waits {
+                    eprintln!("vox: your key for {} in this room waits: {why}", id(&m));
+                }
             }
             Ok(())
         }
@@ -5021,6 +5030,17 @@ pub async fn trust_add(
                 )
             );
             println!("     `vox trust remove` undoes it and changes the lock everywhere");
+            if drive {
+                println!(
+                    "Next: from node {petname:?}, `vox room sessions <room>` lists this node's \
+                     Sessions in a room you share, and `vox room session` drives one"
+                );
+            } else {
+                println!(
+                    "Next: send {petname:?} this node's fingerprint (`vox id`), so it trusts you \
+                     too and you read what it writes"
+                );
+            }
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),

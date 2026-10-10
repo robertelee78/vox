@@ -8,7 +8,12 @@ records every key it receives, one JSON line each, in --log:
 
 It runs the session's hook as Claude Code does, as its own child, so the hook's ancestry is this
 process's: the proof writes a JSON hook event to a file and names it on a line of --control
-("hook <path>"); "exit" ends the stand-in. Nothing here is product.
+("hook <path>"); "exit" ends the stand-in. "ask" puts up a permission prompt in the input box's
+place, drawn as Claude Code 2.1.296 draws it (one rule, the command, "Do you want to proceed?",
+the numbered choices, "Esc to cancel · Tab to amend"); while it is up, every key answers it and is
+recorded as {"answered": "<key>"}, and Esc or "unask" takes it down. "ask-on-key" puts the prompt up
+as the next key arrives, as a tool's permission asked at that moment would, and that key and every
+later one answer it. Nothing here is product.
 """
 import argparse, json, os, select, subprocess, sys, termios, tty
 
@@ -26,10 +31,20 @@ def record(obj):
     with open(args.log, "a") as f:
         f.write(json.dumps(obj) + "\n")
 
+asking = False
+ask_on_key = False
+DASH = "╌" * 60
+
 def draw():
     sys.stdout.write("\x1b[2J\x1b[H")
     # Raw mode: a line feed alone does not return the cursor.
-    sys.stdout.write("stand-in Claude Code\r\n\r\n" + RULE + "\r\n❯ " + buf + "\r\n" + RULE + "\r\n")
+    if asking:
+        sys.stdout.write("stand-in Claude Code\r\n\r\n" + RULE + "\r\n Bash command\r\n" + DASH
+                         + "\r\n echo hi\r\n" + DASH + "\r\n This command requires approval\r\n\r\n"
+                         + " Do you want to proceed?\r\n ❯ 1. Yes\r\n   2. Yes, and don’t ask again for: echo *\r\n"
+                         + "   3. No\r\n\r\n Esc to cancel · Tab to amend\r\n")
+    else:
+        sys.stdout.write("stand-in Claude Code\r\n\r\n" + RULE + "\r\n❯ " + buf + "\r\n" + RULE + "\r\n")
     sys.stdout.flush()
 
 def run_hook(path, via=None):
@@ -82,6 +97,17 @@ try:
         if r:
             data = os.read(fd, 4096).decode(errors="replace")
             for ch in data:
+                if ask_on_key:
+                    asking = True
+                    ask_on_key = False
+                if asking:
+                    # The prompt takes every key: Esc cancels it, anything else answers it.
+                    if ch == "\x1b":
+                        record({"key": "Escape"})
+                        asking = False
+                    else:
+                        record({"answered": ch})
+                    continue
                 if ch == "\r":
                     record({"typed": buf})
                     buf = ""
@@ -106,6 +132,14 @@ try:
                     t.kill()
                 record({"exited": os.getpid()})
                 sys.exit(0)
+            if line == "ask":
+                asking = True
+                draw()
+            if line == "ask-on-key":
+                ask_on_key = True
+            if line == "unask":
+                asking = False
+                draw()
             if line.startswith("hook "):
                 run_hook(line[5:])
             if line.startswith("hookvia "):

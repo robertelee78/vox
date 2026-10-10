@@ -990,8 +990,9 @@ pub fn run(check_only: bool, rollback: bool) -> Result<(), AppError> {
         "         previous kept at {}",
         install_dir.join(PREVIOUS_NAME).display()
     );
-    restart::restart_daemon(&active, &release.version_text);
+    let detached = restart::restart_daemon(&active, &release.version_text);
     run_shell_setup(&active);
+    restart::say_next(&detached);
     Ok(())
 }
 
@@ -1065,8 +1066,9 @@ fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
             );
             // As any rollback does: the daemon is restarted onto the binary now in place, which
             // brings its own completions.
-            restart_onto(&active);
+            let detached = restart_onto(&active);
             run_shell_setup(&active);
+            restart::say_next(&detached);
             return Ok(());
         }
         fs::remove_file(&scratch).map_err(AppError::Io)?;
@@ -1091,15 +1093,16 @@ fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
         active.display(),
         binary_version(&active).unwrap_or_else(|| "unknown".to_owned())
     );
-    restart_onto(&active);
+    let detached = restart_onto(&active);
     run_shell_setup(&active);
+    restart::say_next(&detached);
     Ok(())
 }
 
 /// Restart the daemon onto the binary a rollback put in place, as the version it says it is.
-fn restart_onto(active: &Path) {
+fn restart_onto(active: &Path) -> Vec<vox_core::node::paths::NodeName> {
     let now = binary_version(active).unwrap_or_else(|| "unknown".to_owned());
-    restart::restart_daemon(active, &now);
+    restart::restart_daemon(active, &now)
 }
 
 /// How long [`runs_as_vox`] waits for `--version` before it counts a binary as not running.

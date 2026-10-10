@@ -29,6 +29,12 @@
 //!    the ones it read before and still reads alice's messages to the room; and its
 //!    `vox room sessions --json` lists alice's Session with `can_drive` false.
 //!
+//! 5. **A burst of key-packages names a fresh one-time prekey each** (ADR-030 P-3). With a
+//!    Session of alice's in two rooms, alice gives carol drive (`vox trust drive`): carol is owed
+//!    alice's drive key in both rooms at once, each as a key-package in that room's log. Carol's
+//!    own `vox status` says how many one-time prekeys her node has used: exactly two more. Two
+//!    packages naming one prekey use one, and the second is opened as a replay, last-resort.
+//!
 //! ## The staging
 //! - Every `vox` is the shipped binary in a scratch `VOX_DATA_DIR`/`VOX_CONFIG_DIR`; every step a
 //!   person takes is typed as one types it (`vox id`, `vox room create|link|join|post|read`,
@@ -56,6 +62,9 @@
 //!   `crates/vox-tui/src/host.rs` is removed. Carol's file lands on alice's node: red PRODUCT.
 //! - **A driven file's size not checked** (claim 4): `short_of_space` is not asked in `drive`'s
 //!   file arm in `crates/vox-tui/src/host.rs`. The petabyte is accepted: red PRODUCT.
+//! - **A package's one-time prekey not noted** (claim 5): the `refused_otps.note` after the seal
+//!   in `post_key_package` in `crates/vox-core/src/node/actor.rs` removed. Both packages name one
+//!   prekey, and carol's node uses one: red PRODUCT.
 //! - **No rotation on losing drive** (claim 2): `rotate_drive_if_lost` in
 //!   `crates/vox-core/src/node/channel.rs` returns the lost members without changing the key. Bob's
 //!   node opens the entries written after his downgrade: red PRODUCT.
@@ -402,6 +411,26 @@ fn can_drive(m: &Member, room: &str) -> Option<bool> {
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .find(|v| v["id"] == SESSION)
         .and_then(|v| v["can_drive"].as_bool())
+}
+
+/// How many one-time prekeys `m`'s node has used, as its `vox status --json` says (`prekeys`
+/// `consumed`); `None` if it does not say.
+fn consumed(m: &Member) -> Option<u64> {
+    fn find(v: &serde_json::Value) -> Option<u64> {
+        match v {
+            serde_json::Value::Object(o) => o
+                .get("prekeys")
+                .and_then(|p| p["consumed"].as_u64())
+                .or_else(|| o.values().find_map(find)),
+            serde_json::Value::Array(a) => a.iter().find_map(find),
+            _ => None,
+        }
+    }
+    let (_, out, _) = m.vox(&["status", "--json"], None);
+    serde_json::from_str::<serde_json::Value>(out.trim())
+        .ok()
+        .as_ref()
+        .and_then(find)
 }
 
 /// One reply of alice's Session, in the harnesses' activity format.
@@ -827,5 +856,112 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     assert!(
         before.iter().all(|b| bob_now.contains(b)),
         "PRODUCT: bob keeps the Session entries he read before the downgrade: he has {bob_now:?}"
+    );
+
+    // ---- claim 5: a burst of key-packages to one member names a fresh one-time prekey each ----
+    let (ok, _, e) = alice.vox(
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "second",
+        ],
+        Some(&format!("{ROOM_PASS}\n")),
+    );
+    assert!(
+        ok,
+        "APPARATUS (staging): the second vox room create failed: {e}"
+    );
+    let room2 = room_id(&alice, "second");
+    let (ok, link2, e) = alice.vox(&["room", "link", &room2], None);
+    assert!(
+        ok,
+        "APPARATUS (staging): vox room link of the second room failed: {e}"
+    );
+    let (ok, o, e) = carol.vox(
+        &["room", "join", "--passphrase-file", "-", link2.trim()],
+        Some(&format!("{ROOM_PASS}\n")),
+    );
+    assert!(
+        ok,
+        "PRODUCT: carol's `vox room join` of the second room failed: {o}{e}"
+    );
+    assert!(
+        posts_until_read(&alice, &carol, &room2, "READY-CAROL-SECOND"),
+        "APPARATUS (staging): carol never read alice's messages in the second room"
+    );
+    // A Session of alice's in the second room too, with an entry: her drive key there.
+    let session2 = format!("{SESSION}-second");
+    let id2 = channel_id(&rt, &alice, &room2);
+    let (ok, o, e) = alice.vox_with(
+        &["agent", "hook", "--node", "default", "--room", &room2],
+        Some(&format!(
+            r#"{{"session_id":"{session2}","hook_event_name":"UserPromptSubmit","cwd":"/tmp","transcript_path":"/tmp/t.jsonl","prompt":"go"}}"#
+        )),
+        &[("CLAUDE_CODE_ENTRYPOINT", "cli")],
+    );
+    assert!(
+        ok,
+        "APPARATUS (staging): alice's hook in the second room failed: {o}{e}"
+    );
+    let body = serde_json::json!({
+        "v": 1, "session": session2, "kind": "reply", "seq": 1, "text": "SECOND-ROOM 1"
+    })
+    .to_string();
+    match rt.block_on(alice.socket(&rt).request(&Request::AppendSession {
+        channel_id: id2,
+        session_id: session2.clone(),
+        body,
+    })) {
+        Ok(Frame::Appended { .. }) => {}
+        other => {
+            panic!("PRODUCT: alice's node refused a Session entry in the second room: {other:?}")
+        }
+    }
+    // Quiet first: every key of the join and the trust above has gone.
+    std::thread::sleep(Duration::from_secs(10));
+    let base = consumed(&carol).unwrap_or_else(|| {
+        panic!("APPARATUS (precondition unmet): carol's `vox status --json` says no prekey counts")
+    });
+    let (ok, o, e) = alice.vox(
+        &[
+            "trust",
+            "drive",
+            &carol.fp,
+            "--identity-passphrase-file",
+            alice.pass(),
+        ],
+        None,
+    );
+    assert!(ok, "PRODUCT: `vox trust drive` of carol failed: {o}{e}");
+    // Both packages taken; then ten seconds more for any further use to show.
+    let granted = Instant::now();
+    let _ = until(Duration::from_secs(90), || {
+        consumed(&carol).is_some_and(|n| n >= base + 2)
+    });
+    let took = granted.elapsed();
+    std::thread::sleep(Duration::from_secs(10));
+    let used = consumed(&carol).unwrap_or(base).saturating_sub(base);
+    let alice_said =
+        std::fs::read_to_string(tmp.path().join("alice.daemon.err")).unwrap_or_default();
+    let away: Vec<&str> = alice_said
+        .lines()
+        .filter(|l| l.contains(&carol.fp[..20]) && l.contains("it is away"))
+        .collect();
+    eprintln!(
+        "[proof] claim 5: carol's node used {used} one-time prekeys for alice's drive keys in two \
+         rooms, the second {took:?} after the grant; alice's node said carol was away: {away:?}"
+    );
+    assert!(
+        used == 2 || !away.is_empty(),
+        "PRODUCT: alice's drive keys to carol in two rooms, released at once, must each name a \
+         one-time prekey of its own: carol's node used {used}"
+    );
+    assert!(
+        away.is_empty(),
+        "APPARATUS (precondition unmet): carol was not connected to alice when her keys went, so \
+         they went to her signed prekey as a member away's do: {away:?}"
     );
 }

@@ -49,6 +49,17 @@ fn harness(key: &str) -> Result<&'static Harness, AppError> {
 /// # Errors
 /// An unknown harness, or a data root that cannot be used.
 pub async fn status(args: &NodeArgs, key: &str, dir: &Path) -> Result<String, AppError> {
+    let said = first_missing(args, key, dir).await?;
+    // **What Vox asks the person, here too** (ADR-029 RB-5): on a machine with no app, this and
+    // the TUI are where a person reads that a repo waits for a room.
+    let asks = crate::room_ask::fetch(&args.account()?)
+        .await
+        .unwrap_or_default();
+    Ok(said + &crate::room_ask::needs_you(&asks, &args.account()?.data_root))
+}
+
+/// The first thing missing, for [`status`].
+async fn first_missing(args: &NodeArgs, key: &str, dir: &Path) -> Result<String, AppError> {
     let h = harness(key)?;
     let account = args.account()?;
     let wiring = Wiring::of(h.key)?;
@@ -96,7 +107,7 @@ pub async fn status(args: &NodeArgs, key: &str, dir: &Path) -> Result<String, Ap
         ));
     }
     let entries = crate::room_map::read(&account.data_root)?;
-    if let Some(e) = crate::room_map::lookup(&entries, dir) {
+    if let Some(e) = crate::room_map::resolve(&entries, dir) {
         return Ok(if e.room == crate::room_map::DECLINED {
             format!(
                 "Vox: {} is node {node}, attached; the operator said no to a room for this repo \
@@ -105,17 +116,67 @@ pub async fn status(args: &NodeArgs, key: &str, dir: &Path) -> Result<String, Ap
                 dir.display()
             )
         } else {
-            format!(
-                "Vox: {} is node {node}, attached; this repo ({}) works in room {}.\n",
-                h.name,
-                dir.display(),
-                e.room
-            )
+            in_bound_room(&account, &node, h.name, dir, &e.room).await
         });
     }
     let ask = crate::room_map::note(None, true, None, &account.data_root, dir, node.as_str())
         .unwrap_or_default();
     Ok(format!("Vox: {} is node {node}, attached.\n{ask}", h.name))
+}
+
+/// What status says of a repo the room map binds to the room `link` names: that it works there
+/// when `node` is in that room, and otherwise that `node` is not in it yet, so this harness's
+/// sessions cannot post there, with how it joins (ADR-029 RB-3, RB-5a). A node whose rooms cannot
+/// be read is said as that, never as one in the room.
+async fn in_bound_room(
+    account: &vox_core::node::paths::Account,
+    node: &NodeName,
+    harness: &str,
+    dir: &Path,
+    link: &str,
+) -> String {
+    let room = vox_core::node::link::InviteLink::parse(link)
+        .map(|l| l.channel_id)
+        .ok();
+    let short: String = room
+        .map(|r| vox_core::node::link::b32_encode(&r))
+        .unwrap_or_default()
+        .chars()
+        .take(12)
+        .collect();
+    let held = match account.node_paths(node) {
+        Ok(paths) => match crate::room_cli::attach(&paths).await {
+            Ok(mut client) => crate::room_cli::rooms_of(&mut client)
+                .await
+                .map(|rooms| {
+                    rooms
+                        .iter()
+                        .any(|(id, _, _, over)| Some(*id) == room && over.is_empty())
+                })
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        },
+        Err(e) => Err(e.to_string()),
+    };
+    match held {
+        Ok(true) => format!(
+            "Vox: {harness} is node {node}, attached; this repo ({}) works in room {short}.\n",
+            dir.display()
+        ),
+        Ok(false) => format!(
+            "Vox: {harness} is node {node}, attached; this repo ({}) is bound to room {short}, \
+             and {node} is not in it, so this session cannot post there. {node} joins it by \
+             itself, with the room map's passphrase, when a session starts here; if that failed, \
+             Vox asks the operator (Vox.app banner), or they run at a terminal: vox room join \
+             {link} --node {node}\n",
+            dir.display()
+        ),
+        Err(why) => format!(
+            "Vox: {harness} is node {node}, attached; this repo ({}) is bound to room {short}, \
+             and whether {node} is in it could not be read: {why}\n",
+            dir.display()
+        ),
+    }
 }
 
 /// `vox agent connect <harness> --node <name>`: make node `name` if there is none (its

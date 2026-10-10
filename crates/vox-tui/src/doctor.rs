@@ -151,9 +151,37 @@ pub async fn doctor(paths: &Paths, room: Option<&str>, json: bool) -> Result<(),
         .and_then(|n| vox_core::node::paths::NodeName::parse(n).ok());
     match &node {
         Some(node) => {
-            checks.extend(claude_hooks(node));
-            checks.push(codex_hook(node));
-            checks.push(opencode_plugin(node));
+            // **Each harness is checked against its own node** (#666): one wired to another node
+            // on this machine is that node's, and left as it is; its fix would rewire it onto
+            // this one.
+            let account = paths.account();
+            let elsewhere = |key: &'static str| {
+                crate::setup::Wiring::of(key)
+                    .ok()
+                    .and_then(|w| crate::setup::connected(&account, &w))
+                    .filter(|wired| wired != node)
+            };
+            let theirs = |id: &str, name: &str, wired: &vox_core::node::paths::NodeName| {
+                ok(
+                    id,
+                    format!(
+                        "{name} is wired to node {wired}, its own node here, not this one \
+                         ({node}); `vox agent doctor --node {wired}` checks it"
+                    ),
+                )
+            };
+            match elsewhere("claude") {
+                Some(w) => checks.push(theirs("claude-hook", "Claude Code", &w)),
+                None => checks.extend(claude_hooks(node)),
+            }
+            match elsewhere("codex") {
+                Some(w) => checks.push(theirs("codex-hook", "Codex", &w)),
+                None => checks.push(codex_hook(node)),
+            }
+            match elsewhere("opencode") {
+                Some(w) => checks.push(theirs("opencode-plugin", "OpenCode", &w)),
+                None => checks.push(opencode_plugin(node)),
+            }
         }
         None => checks.push(fail(
             "node-name",

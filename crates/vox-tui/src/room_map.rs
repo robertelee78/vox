@@ -9,9 +9,11 @@
 //!     passphrase the room's passphrase
 //! ```
 //!
-//! A session started in a mapped directory works in that room for its life (RB-2 – RB-4). The match
-//! is exact: `/opt/vox` matches a session started in `/opt/vox`, and not one started in
-//! `/opt/vox/crates` or in a worktree beside it. The link and the passphrase are separate fields;
+//! A session started in a mapped directory works in that room for its life (RB-2 – RB-4). It is
+//! matched to the deepest block at or above its start directory: a session started in
+//! `/opt/vox/crates` works in `/opt/vox`'s room, unless `/opt/vox/crates` has a block of its own. A
+//! git worktree is matched through to its main repository's directory, unless a block names the
+//! worktree or a folder in it ([`resolve`]). The link and the passphrase are separate fields;
 //! the passphrase is never part of the link (ADR-005). Every node of the data root can read every
 //! passphrase here, which whatever writes the map says (ADR-028 E-5).
 //!
@@ -142,13 +144,71 @@ fn parse(text: &str) -> Result<Vec<Entry>, (usize, String)> {
     Ok(entries)
 }
 
-/// The block whose `repo` is exactly `start`: the same directory, not one above or below it (RB-2).
-/// A symlink and the directory it names are the same directory.
+/// The block whose `repo` is exactly `dir`: the same directory, not one above or below it. What
+/// writing the map asks (does it name `dir` already?). A symlink and the directory it names are the
+/// same directory.
 #[must_use]
-pub fn lookup<'a>(entries: &'a [Entry], start: &Path) -> Option<&'a Entry> {
+pub fn lookup<'a>(entries: &'a [Entry], dir: &Path) -> Option<&'a Entry> {
+    let same = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let dir = same(dir);
+    entries.iter().find(|e| same(&e.repo) == dir)
+}
+
+/// The block a session started in `start` works by (ADR-029 RB-2): the deepest block whose `repo`
+/// is `start` or a directory above it, so a subfolder of a bound repo works in the repo's room.
+/// A start inside a git worktree is first looked up within that worktree (a block for the worktree
+/// or a folder in it wins), then as the same place in the worktree's main repository, read from its
+/// `.git` file and `commondir`.
+#[must_use]
+pub fn resolve<'a>(entries: &'a [Entry], start: &Path) -> Option<&'a Entry> {
     let same = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let start = same(start);
-    entries.iter().find(|e| same(&e.repo) == start)
+    let repos: Vec<(PathBuf, &Entry)> = entries.iter().map(|e| (same(&e.repo), e)).collect();
+    // The deepest block at `from` or above it, stopping above `floor` when one is given.
+    let deepest = |from: &Path, floor: Option<&Path>| -> Option<&'a Entry> {
+        for dir in from.ancestors() {
+            if let Some((_, e)) = repos.iter().find(|(r, _)| r == dir) {
+                return Some(*e);
+            }
+            if floor.is_some_and(|f| f == dir) {
+                return None;
+            }
+        }
+        None
+    };
+    match worktree_of(&start) {
+        Some((top, main)) => deepest(&start, Some(&top)).or_else(|| {
+            let inside = start.strip_prefix(&top).unwrap_or(Path::new(""));
+            deepest(&main.join(inside), None)
+        }),
+        None => deepest(&start, None),
+    }
+}
+
+/// When `dir` is inside a linked git worktree: the worktree's top directory, and its main
+/// repository's directory. A worktree's `.git` is a file, `gitdir: <its git dir>`, and that git dir
+/// holds `commondir`, the main repository's `.git`. A submodule's `.git` file names a git dir with
+/// no `commondir`, and is not a worktree.
+fn worktree_of(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let top = dir.ancestors().find(|d| d.join(".git").exists())?;
+    let text = std::fs::read_to_string(top.join(".git")).ok()?;
+    let gitdir = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
+    let gitdir = if gitdir.is_absolute() {
+        gitdir
+    } else {
+        top.join(gitdir)
+    };
+    let common = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
+    let common = PathBuf::from(common.trim());
+    let common = if common.is_absolute() {
+        common
+    } else {
+        gitdir.join(common)
+    };
+    let common = std::fs::canonicalize(&common).ok()?;
+    // The main repository's directory holds its `.git`.
+    let main = common.parent()?.to_path_buf();
+    Some((top.to_path_buf(), main))
 }
 
 /// The room the map gives a session started in `start`, as `(room id in base32, link,
@@ -162,7 +222,7 @@ pub fn room_for(
     start: &Path,
 ) -> Result<Option<(String, String, Zeroizing<String>)>, AppError> {
     let entries = read(data_root)?;
-    Ok(lookup(&entries, start).and_then(|e| {
+    Ok(resolve(&entries, start).and_then(|e| {
         if e.room == DECLINED {
             return None;
         }
@@ -180,14 +240,15 @@ pub fn room_for(
 pub fn declined(data_root: &Path, start: &Path) -> bool {
     read(data_root)
         .ok()
-        .is_some_and(|entries| lookup(&entries, start).is_some_and(|e| e.room == DECLINED))
+        .is_some_and(|entries| resolve(&entries, start).is_some_and(|e| e.room == DECLINED))
 }
 
 /// What the hook tells a session about its room this turn, before its rooms' news (ADR-029
 /// RB-5), or `None` when there is nothing to tell:
 /// - a session new to its node that works in no room is told, once, that its repo is not tied to a
-///   room, and to ask the operator for the room's link or a no, with what to do with each (RB-5,
-///   RB-6); unless the operator said no for that directory already (RB-7);
+///   room and that Vox has asked the operator (Vox.app, `vox agent status`, [`crate::room_ask`]):
+///   it tells them so once, and acts on a link or a no given in the session (RB-5, RB-6); unless
+///   the operator said no for that directory already (RB-7);
 /// - a session whose room is being joined is told that, or why the join failed;
 /// - a room map that cannot be read is named, with why, so a person can fix it.
 #[must_use]
@@ -212,12 +273,16 @@ pub fn note(
     let dir = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
     let dir = dir.display();
     Some(format!(
-        "Vox: this repo ({dir}) isn't tied to a Vox room. Ask the operator now, in these words: \
-         \"This repo isn't tied to a Vox room. Paste its room link to bind it, or say no.\"\n\
-         - If they paste a link: never ask for the room's passphrase here. Give them this command \
-         exactly, with the link they pasted in place of <link>, to run in a terminal of their own \
-         (it asks for the passphrase there, and saves the link for this repo so every later \
-         session started here works in that room):\n    \
+        "Vox: this repo ({dir}) isn't tied to a Vox room, and Vox has asked the operator which \
+         room it works in (a banner in Vox.app, and `vox agent status`). Tell them once, in one \
+         sentence, in these words, and do not ask again on later turns: \"This repo isn't tied to \
+         a Vox room. Vox has asked you in its app; you can also paste its room link here, or say \
+         no.\"\n\
+         - If they answer in Vox.app: Vox puts this session in that room itself; run nothing.\n\
+         - If they paste a link here: never ask for the room's passphrase here. Give them this \
+         command exactly, with the link they pasted in place of <link>, to run in a terminal of \
+         their own (it asks for the passphrase there, and saves the link for this repo so every \
+         later session started here works in that room):\n    \
          vox room join <link> --node {node} --bind {dir}\n  \
          Once it says joined, put this session in the room: vox agent room <room> --node {node}\n\
          - If they say no: run vox agent room --none --node {node}, and no session started here is \
