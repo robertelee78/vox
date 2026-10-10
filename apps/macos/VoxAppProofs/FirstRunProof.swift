@@ -3306,11 +3306,26 @@ final class FirstRunProof: XCTestCase {
             keepTree(ui, "mission fit its timeline")
             XCTFail("APPARATUS: mission's lines all fit in its timeline (FILL-1 in view with NEEDS-YOU-9), so scrolling up cannot be told from not scrolling")
         } else {
+            // Premise: the scroll moved the timeline: within 0.5 s NEEDS-YOU-9 has gone down by
+            // more than 20 pt, or out of the lazy timeline altogether.
+            let before = el(ui, landed).frame.minY
             timelineView.scroll(byDeltaX: 0, deltaY: 600)
-            Thread.sleep(forTimeInterval: 2)
-            if halfInTimeline(ui, landed) {
-                keepTree(ui, "NEEDS-YOU-9 came back after a wheel scroll up")
-                XCTFail("PRODUCT: scrolled up with the mouse wheel, mission's timeline must stay up; 2 s later its newest line, NEEDS-YOU-9, is back in view, so it was pulled back down")
+            var moved = false
+            let movedUntil = Date().addingTimeInterval(0.5)
+            repeat {
+                let row = el(ui, landed)
+                moved = !row.exists || row.frame.minY - before > 20
+                if !moved { Thread.sleep(forTimeInterval: 0.05) }
+            } while !moved && Date() < movedUntil
+            if !moved {
+                keepTree(ui, "the wheel scroll moved nothing")
+                XCTFail("APPARATUS: the scroll moved nothing (sign or target): NEEDS-YOU-9 was at y \(Int(before)) and is at y \(Int(el(ui, landed).frame.minY)) 0.5 s after scroll(byDeltaX: 0, deltaY: 600) on the timeline")
+            } else {
+                Thread.sleep(forTimeInterval: 2)
+                if halfInTimeline(ui, landed) {
+                    keepTree(ui, "NEEDS-YOU-9 came back after a wheel scroll up")
+                    XCTFail("PRODUCT: scrolled up with the mouse wheel, mission's timeline must stay up; 2 s later its newest line, NEEDS-YOU-9, is back in view, so it was pulled back down")
+                }
             }
             // Down again to the newest line, so the steps after find mission as ⌘J left it.
             timelineView.scroll(byDeltaX: 0, deltaY: -6000)
