@@ -2,8 +2,9 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: Accepted for v0.4.2 (the decider, 2026-10-09; first accepted for v0.5.0, moved to v0.4.2 the
-same day). Nothing in this ADR is built.
+**Status**: Accepted (the decider, 2026-10-09; first accepted for v0.5.0, moved to v0.4.2 the same
+day) and built in v0.4.3: key delivery in `node::actor` and `node::pairwise_stream`, the prekey ring
+in `node::prekeys`.
 **Date**: 2026-10-09
 **Deciders**: Robert E. Lee
 **Tags**: crypto, post-quantum, pairwise, sender-keys, prekeys
@@ -161,9 +162,10 @@ binds PQ freshness to every key delivery, not to the ratchet.
   recipient's one-time prekeys.
 - `pairwise/ratchet.rs`, `header.rs`, `session.rs`, `init_message.rs` and `suite.rs` are unchanged.
   The work is in the node's delivery paths, the pairwise frames and the prekey ring.
-- v0.4.2 does not interoperate with v0.4.1 or earlier on key delivery (W-4).
-- Recipient-side healing is bounded by prekey hygiene. Today nothing retires an unused one-time
-  prekey, so that bound does not exist until P-1 lands.
+- v0.4.3 does not interoperate with v0.4.2 or earlier on key delivery (W-4).
+- Recipient-side healing is bounded by prekey hygiene: P-1 retires unused one-time prekeys and P-2
+  refuses stale bundles and bundles dated more than 10 minutes ahead, so a recipient clock running
+  fast lengthens the bound by at most 10 minutes.
 
 ## Related ADRs
 
