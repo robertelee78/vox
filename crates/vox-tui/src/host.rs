@@ -1289,6 +1289,10 @@ impl Router {
     /// [`TITLE_EVERY`], from where the last read stopped; a new name renames the Session at once,
     /// as Codex's and OpenCode's do. One reader per session; it stops when the session's
     /// registration goes.
+    ///
+    /// **Only the title lines** (`custom-title`, `ai-title`) are taken from the transcript's new
+    /// bytes: the reader keeps nothing else of it, logs nothing of it, and sends nothing of it
+    /// anywhere. The transcript is the session's whole conversation; Vox needs its name alone.
     fn watch_title(&self, node: &NodeName, reg: &crate::wake::Session) {
         if reg.harness != "claude" || reg.transcript.is_empty() {
             return;
@@ -2578,8 +2582,12 @@ const TITLE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The titles a Claude Code transcript holds, read from where the last read stopped: a `/rename`
 /// writes `{"type":"custom-title","customTitle":…}`, and Claude Code's own title is
-/// `{"type":"ai-title","aiTitle":…}`. The last custom title wins, else the last made one, as the
-/// hooks read them (`agent_hook::session_name`).
+/// `{"type":"ai-title","aiTitle":…}`. The name a person set wins, exactly as set, case and all;
+/// Claude Code's own title only while there is none, as the hooks read them
+/// (`agent_hook::session_name`).
+///
+/// Nothing else of the transcript is kept: each read's lines are dropped once their titles are
+/// taken, and only a line not yet ended is held until the next read ends it.
 #[derive(Default)]
 struct Titles {
     /// Bytes read so far.

@@ -983,12 +983,15 @@ fn a_driver_reaches_exactly_the_session_it_names_or_is_told_why() {
             .append(true)
             .open(&t)
             .unwrap_or_else(|e| panic!("APPARATUS: cannot open {S1}'s transcript: {e}"));
-        writeln!(
-            f,
-            "{}",
-            serde_json::json!({ "type": "custom-title", "customTitle": "frogs", "sessionId": S1 })
-        )
-        .unwrap_or_else(|e| panic!("APPARATUS: cannot write {S1}'s transcript: {e}"));
+        // Claude Code's own title first (what an earlier "cc rename frogs" made it, as the
+        // decider's session had), then the name the person set: the person's must win, exactly.
+        for line in [
+            serde_json::json!({ "type": "ai-title", "aiTitle": "Frogs rename", "sessionId": S1 }),
+            serde_json::json!({ "type": "custom-title", "customTitle": "frogs", "sessionId": S1 }),
+        ] {
+            writeln!(f, "{line}")
+                .unwrap_or_else(|e| panic!("APPARATUS: cannot write {S1}'s transcript: {e}"));
+        }
     }
     let t0 = Instant::now();
     let mut named = String::new();
@@ -1010,7 +1013,8 @@ fn a_driver_reaches_exactly_the_session_it_names_or_is_told_why() {
     };
     assert!(
         renamed,
-        "PRODUCT: arm 1b: renamed in its transcript with no hook run, {S1}'s Session must be called \
+        "PRODUCT: arm 1b: renamed \"frogs\" by its person in its transcript, after Claude Code's own \
+         title \"Frogs rename\" and with no hook run, {S1}'s Session must be called exactly \
          \"frogs\" within 15 s; `vox room sessions --json` says its name is {named}"
     );
     println!("[proof] 1b. \"/rename frogs\" arrived whole and is said whole; the transcript's rename named the Session \"frogs\" with no hook run");
