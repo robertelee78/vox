@@ -3,10 +3,9 @@
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
 **Status:** accepted and built in `crates/vox-core/src/pairwise/`, `node::prekeys` and
-`node::joinstream`, except: PQ post-compromise security (§"Post-quantum PCS (phased)") is not built;
-the skipped-key bounds (W3) are fixed constants, not channel-policy settings; prekey bundles are
-published only at the rendezvous, not on the log (P1). Q1 and O5 are planned for v0.4.2 (ADR-030,
-2026-10-09).
+`node::joinstream`, except: the skipped-key bounds (W3) are fixed constants, not channel-policy
+settings; prekey bundles are published only at the rendezvous, not on the log (P1). Q1 and O5
+(ADR-030) are built in v0.4.3.
 **Deciders:** Robert E. Lee <robert@agidreams.us>
 
 ## Context
@@ -120,7 +119,7 @@ O2–O4 together make every member of a room eventually read every other member 
 - **O5. Key delivery sessions are not long-lived sessions.** A key delivery session (ADR-030 W-1) MUST
   travel as `OP_ROTATION_HELLO`, never as a `Hello`. O1–O4 MUST NOT apply to it: it never replaces,
   displaces or counts as the long-lived session, and it is dropped once its key is opened. *Status:*
-  planned for v0.4.2 (ADR-030).
+  built in v0.4.3 (ADR-030).
 
 ### §"Post-quantum PCS (phased)"
 
@@ -129,22 +128,25 @@ O2–O4 together make every member of a room eventually read every other member 
   the long-lived session, so a key's secrecy rests on a fresh ML-KEM encapsulation. A continuous
   key-agreement layer inside the ratchet (Signal SPQR, Apple PQ3) was weighed and rejected: on this
   channel's sparse, one-way traffic it heals only after replies that may never come (ADR-030, Alternatives
-  rejected). *Status:* planned for v0.4.2; not provided today.
+  rejected). *Status:* built in v0.4.3.
 
 ### Security properties provided
 
 - **S1.** This layer provides: forward secrecy (the KDF-chain ratchet); classical post-compromise
   security (the DH ratchet); PQ confidentiality against a passive quantum adversary (PQXDH's ML-KEM
-  leg). It MUST NOT be described as providing PQ post-compromise security (Q1) or security against an
-  active quantum adversary (out of scope per the PQXDH specification).
+  leg); and, for every key delivered over it (Q1, ADR-030), PQ post-compromise security: a compromised
+  sender heals with its next delivery, a compromised recipient within one signed-prekey cadence, with
+  the degradations ADR-030 S-5 states. The long-lived session itself MUST NOT be described as providing
+  PQ post-compromise security, nor this layer as secure against an active quantum adversary (out of
+  scope per the PQXDH specification).
 
 ## Consequences
 
 - Formally verified pairwise confidentiality with forward secrecy, hybrid from the first release.
 - Serverless prekey availability depends on the rendezvous and the log, which can weaken the classic
   asynchronous send to an offline peer.
-- Full post-compromise healing against a quantum adversary is not provided until Q1 (ADR-030) is
-  built.
+- Post-compromise healing against a quantum adversary is provided per delivered key (Q1, ADR-030),
+  not for the long-lived session's own traffic.
 
 ## Related ADRs
 

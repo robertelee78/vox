@@ -41,7 +41,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [026](ADR-026-daemon-and-nodes.md) | The Daemon and the Nodes That Use It (one presence per account, nodes attach and detach) | 002, 010, 011, 012, 016 |
 | [028](ADR-028-one-experience-keyring-rooms-services-files.md) | One Experience (keyring, rooms, services and files in the TUI and the app; look; install) — accepted for v0.4.0 | 005, 007, 014, 015, 016, 017, 020, 023, 026, 029 |
 | [029](ADR-029-sessions-and-the-repo-room.md) | Sessions, and the Room a Session Works In (a Session per harness session; drive; talking to one session; the room map; setup) — accepted for v0.4.0 | 020, 021, 026, 028 |
-| [030](ADR-030-pq-post-compromise-security-for-pairwise-key-delivery.md) | Post-Quantum Post-Compromise Security for Pairwise Key Delivery (a fresh PQXDH per delivered key) — accepted for v0.4.2 | 002, 003, 004, 006 |
+| [030](ADR-030-pq-post-compromise-security-for-pairwise-key-delivery.md) | Post-Quantum Post-Compromise Security for Pairwise Key Delivery (a fresh PQXDH per delivered key) — accepted; built in v0.4.3 | 002, 003, 004, 006 |
 
 ## Tiers
 
@@ -74,7 +74,7 @@ planned. This is the roll-up.
 | 001 | accepted; governs every later ADR |
 | 002 | accepted; built (`identity/`, `node::prekeys`) except where marked |
 | 003 | accepted; built (`suite.rs`, the floor in genesis policy) |
-| 004 | accepted; built (`pairwise/`) except Q1 and O5 (ADR-030, planned for v0.4.2) |
+| 004 | accepted; built (`pairwise/`), Q1 and O5 (ADR-030) since v0.4.3 |
 | 005 | accepted; built (`join/`, `node::joinstream`) except where marked |
 | 006 | accepted; built (`group/`) except the known gaps it lists |
 | 007 | accepted; governance is only the creator or an admin setting the room's retention and ending the room, built; the strict member cap (G-22), built |
@@ -97,7 +97,7 @@ planned. This is the roll-up.
 | 024 | accepted, speed only; M24.1–M24.5 built, the taper is the default controller |
 | 025 | accepted; built as V210-34 (#209) |
 | 026 | accepted 2026-10-03, **not built** (#397); amends 005, 008, 010, 011, 012, 013, 014, 015, 016, 017, 020, 021 |
-| 030 | accepted for v0.4.2 (2026-10-09), **not built**; amends 004 (Q1, O5) and 006 (S-4, S-17) |
+| 030 | accepted (2026-10-09); built in v0.4.3; amends 004 (Q1, O5) and 006 (S-4, S-17) |
 
 ## Conformance-vector obligations
 

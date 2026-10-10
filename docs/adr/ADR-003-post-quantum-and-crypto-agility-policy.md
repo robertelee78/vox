@@ -4,7 +4,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 **Status:** accepted and built. The registry is `crates/vox-core/src/suite.rs`; the floor is in the
 signed genesis policy (`ChannelPolicy::min_suite`) and enforced in `pairwise::pqxdh` and the ADR-005
-join. PQ post-compromise security (§Scope, ADR-030) is not built; it is planned for v0.4.2.
+join. PQ post-compromise security (§Scope, ADR-030) is built in v0.4.3.
 **Deciders:** Robert E. Lee <robert@agidreams.us>
 
 ## Context

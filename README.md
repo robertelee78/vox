@@ -300,6 +300,19 @@ members, not from the person they work for.
   to downgrade to. **If** the lattice halves hold, traffic recorded now stays closed to an adversary
   who later breaks the classical ones; nobody can tell you they hold, which is the reason for the
   hybrid. *(ADR-003, ADR-011)*
+- **Post-quantum recovery after a compromise.** Every key a node hands another member (a room's
+  new sender key after a rotation, a key released by a trust decision) travels in a fresh hybrid
+  handshake opened for it alone, never in an older session. If a node's state is stolen and the
+  thief then only listens, even with a quantum computer, the next key that node hands out is safe
+  again, with no reply needed. If the recipient's state is stolen, keys sent to it are safe again
+  within seven days: a sender refuses a prekey bundle older than that, and a node retires one-time
+  prekeys nobody used in that time. A room recovers with its next sender-key rotation. Weaker cases:
+  when one membership change hands a member more keys than it has one-time prekeys, the rest heal
+  only when its signed prekey rotates (up to seven days); restoring a profile brings back its
+  prekeys, and any one-time ones it brings back retire within seven days; a replay of a delivery to a
+  signed prekey re-creates a session whose key the room already holds; and the seven days are
+  measured on two nodes' clocks, so a clock that is off lengthens them by that much. Nothing here
+  holds against someone who stole an identity key and acts as it. *(ADR-030)*
 - **Chat, agents and tunnels on one overlay.** *(ADR-013, ADR-017, ADR-020)*
 
 ## Threat model
