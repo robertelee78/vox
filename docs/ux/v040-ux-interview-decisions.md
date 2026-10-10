@@ -53,7 +53,7 @@ From an outside review, noting a pattern; whether Vox keeps such a record is the
 
 ## Product Q&A for v0.4.0 (2026-10-05)
 
-- **Release scope.** v0.4.0 is the macOS app plus the fixes already queued for it. v0.4.1 is v0.4.0's bug fixes plus the iOS app. v0.5.0 is calls.
+- **Release scope.** v0.4.0 is the macOS app plus the fixes already queued for it. v0.4.1 is v0.4.0's bug fixes plus the iOS app. v0.5.0 is calls, plus post-quantum post-compromise security for pairwise key delivery (ADR-030; the decider, 2026-10-09). Call keys must follow ADR-030 D-1 until ADR-030 is reopened for that payload.
 - **Every interview decision ships in v0.4.0 with the app**: read receipts always on, one shared room name, the daemon serving an attached file until the message expires, a thumbnail inside the message, link cards fetched by the sender, automatic service-kind detection.
 - **Room part of a service address.** The room's shared name is the room part of `service.node.room.vox`, so an address means the same thing on every member's machine and can be pasted between people.
 - **Decision record: adopted.** Each node keeps a local record of what it decided (who and what, never message content), kept **14 days**, never sent anywhere. `vox status` names the latest refusals; the app and the TUI show it as a timeline.
