@@ -1,7 +1,8 @@
 # Send and receive files
 
-Applies to: v0.4.1. Both nodes need to be attached, members of the room, and appropriately
-trusted. Examples act as the only attached node; with several, add `--node NAME`.
+Applies to: v0.4.3. Both nodes need to be attached, members of the room, and appropriately
+trusted. Examples act as the only attached node; with several, add `--node robertgpt`. robertgpt
+shares in the room `family`; ann pulls.
 
 A file in Vox is never uploaded anywhere. Sharing posts one message to the room that carries the
 file's name, size and SHA-256, and your daemon serves the bytes from your machine. Members whose
@@ -11,7 +12,7 @@ it is kept.
 ## Share a file or a folder
 
 ```sh
-vox share ROOM_ID ./report.txt -m "the report"
+vox share family ./report.txt -m 'the report'
 ```
 
 Vox first says who is to fetch it (`vox: about to share report.txt in "family"` / `the members of
@@ -19,12 +20,15 @@ it in your keyring are to fetch it: ann`), then hands the file to the daemon and
 daemon serves it:
 
 ```text
-vox: sharing report.txt (22 bytes) as file-ff174003a0a82197-58af8b08440c4061
-     sha256 ff174003a0a82197a1b79af0b2085f06e933bbd447bcf95e5595ecd749bb5b17
-     collect it with: vox room get ROOM_ID report.txt
-     or through `vox up`: curl --socks5-hostname <proxy> http://file-ff174003a0a82197-58af8b08440c4061.<your-name-for-this-node>.<room>.vox/report.txt -o report.txt
-     served until its message expires, `vox share stop ROOM_ID report.txt`, you leave the room, or it ends
+vox: sharing report.txt (21 bytes) as file-696123c9184755c8-36d75aac38e972eb
+     sha256 696123c9184755c8eac0e8e8efb05b8864e76c829101f48308e7cc54358888bf
+     collect it with: vox room get family report.txt
+     or a member fetches it through the proxy `vox up` names, at the service file-696123c9184755c8-36d75aac38e972eb of this node in this room
+     served until its message expires, `vox share stop family report.txt`, you leave the room, or it ends
 ```
+
+A file name with a space or a character a shell acts on is put in single quotes in the commands
+Vox prints, so each pastes as it stands: `vox room get family 'q3 report.txt'`.
 
 Nothing has to keep running in your terminal. Your daemon serves the share while a node is
 attached, until the first of these:
@@ -34,7 +38,7 @@ attached, until the first of these:
 - you leave the room, or it ends;
 - `--count N` fetches have completed, or `--for` has passed (`90s`, `10m`, `2h`), if you gave either.
 
-A folder is shared as its files: `vox share ROOM_ID ./docs` says `sharing docs/ (5 files, 3500
+A folder is shared as its files: `vox share family ./docs` says `sharing docs/ (5 files, 3500
 bytes)`, and its message lists every file with its size and SHA-256. A member pulls the folder as
 a folder, `docs/`, checking each file on its own. When you share the folder again after changing
 it, a member's node fetches only the files that are new or changed, and a pull that was cut off
@@ -67,14 +71,14 @@ It pulls any size, file or folder. Each pulled copy goes to the node's files dir
 directory per room, named by the room's full ID:
 
 ```text
-DATA_ROOT/nodes/NODE/files/ROOM_ID/report.txt
+DATA_ROOT/nodes/ann/files/gkpeyuly4m4ezlidyid3vocosfzpec2o7um5dleicv2aacz6z2ja/report.txt
 ```
 
 `DATA_ROOT` is your data directory (see [Commands and local state](reference.md)). A name that is
 already taken there gets a numbered alternative, such as `report (1).txt`. Nothing is ever
 overwritten.
 
-In `vox room read` and in the TUI, a share reads as `file offered: report.txt (22 bytes): the
+In `vox room read` and in the TUI, a share reads as `file offered: report.txt (21 bytes): the
 report`. A share addressed to someone else has a `(to …)` line under it, naming them by your name
 for them, or by fingerprint if you have not named them. Your node does not pull those by itself.
 
@@ -83,7 +87,7 @@ for them, or by fingerprint if you have not named them. Your node does not pull 
 To pull a share your node did not pull, such as one addressed to someone else:
 
 ```sh
-vox room get ROOM_ID notes.txt
+vox room get family notes.txt
 ```
 
 The selector is the announced name (`docs` for a shared folder), a SHA-256 prefix or the
@@ -91,7 +95,7 @@ share's tag. If names collide, use the more specific identifier. Without `--dir`
 file goes into the same files directory, and Vox prints its full path:
 
 ```text
-vox: DATA_ROOT/nodes/ann/files/ROOM_ID/notes.txt (15 bytes) matches its announced SHA-256
+vox: DATA_ROOT/nodes/ann/files/gkpeyuly4m4ezlidyid3vocosfzpec2o7um5dleicv2aacz6z2ja/notes.txt (15 bytes) matches its announced SHA-256
 ```
 
 A folder pulled by hand says how much it fetched: `DATA_ROOT/…/docs/ (5 files: 5 fetched, 0
@@ -108,8 +112,8 @@ executable files, macros and unfamiliar formats.
 ## See and stop your shares
 
 ```sh
-vox share list ROOM_ID
-vox share stop ROOM_ID report.txt
+vox share list family
+vox share stop family report.txt
 ```
 
 `share list` prints each of your node's shares in the room with its tag, size and how many times
@@ -117,7 +121,7 @@ it was fetched. Under your own share, `vox room read` and the TUI name who has p
 your names for them: `pulled by ann`. `share stop` takes a name, a tag or a SHA-256 prefix, says
 first `vox: about to stop sharing "report.txt" in "family"` / `no member is to fetch it from this
 node after this`, then, for example,
-`vox: no longer sharing report.txt (file-ff174003a0a82197-58af8b08440c4061; fetched 2 time(s))`.
+`vox: no longer sharing report.txt (file-696123c9184755c8-36d75aac38e972eb; fetched 2 time(s))`.
 
 A pull after that is told the share is gone. Copies already pulled stay where they are until the
 message expires: stopping is not remote erasure.

@@ -1,6 +1,6 @@
 # Commands and local state
 
-Applies to: v0.4.1. This is a map to the real command help, not a substitute for the parser
+Applies to: v0.4.3. This is a map to the real command help, not a substitute for the parser
 in your installed version.
 
 ## Find the right help
@@ -23,22 +23,24 @@ is not an alias for your parser.
 
 | Intent | Entry point | Prerequisite |
 |---|---|---|
+| Set up this machine for its harnesses | `vox setup` | A terminal |
 | Make, attach, list, detach or sign out a node | `vox node create`, `attach`, `list`, `detach`, `signout` | Node passphrase, if it has one |
+| Rename a node, or forget its remembered passphrase | `vox node rename`, `forget-passphrase` | The node on this machine |
 | Interactive client | `vox` or `vox tui` | Terminal; a client of the daemon |
 | Run the daemon in a terminal | `vox daemon` | Optional: attaching a node starts one |
 | Run an anchor | `vox node` with no subcommand | A headless node; reachable infrastructure |
 | Ask a node about rooms | `vox room list`, `read`, `roster` | The node attached |
 | Inspect runtime | `vox status`, `vox status --json` | The node attached |
-| Change peer trust | `vox trust add`, `rename`, `remove` | Compared fingerprint; passphrase after 30 minutes (`vox status` shows the minutes left) |
-| List peer trust | `vox trust list` | The node attached |
+| Change peer trust | `vox trust add`, `rename`, `remove`, `drive`, `read` | Compared fingerprint; passphrase after 30 minutes (`vox status` shows the minutes left) |
+| List peer trust, or the offers waiting | `vox trust list`, `vox trust offers` | The node attached |
 | Room lifecycle | `vox room retention`, `admin`, `leave`, `end` | Creator or admin for the room-wide ones |
-| Share a port in a new room | `vox serve NAME=PORT` | Existing local service |
-| Join a service room | `vox connect ROOM_LINK` | Room link and passphrase |
-| Reach services | the daemon's proxy (`vox up` says where), `vox forward SERVICE.NODE.ROOM.vox` | Host's trust; a node attached, or the forward running |
+| Share a port in a new room | `vox serve`, such as `vox serve ssh=22` | Existing local service |
+| Join a service room | `vox connect`, with the room link in single quotes | Room link and passphrase |
+| Reach services | the daemon's proxy (`vox up` says where), `vox forward`, such as `vox forward ssh.robertgpt.family.vox 127.0.0.1:2222` | Host's trust; a node attached, or the forward running |
 | Close live tunnels | `vox tunnel close` | `vox status` lists them |
 | Share and pull files | `vox share`, `vox share list`, `vox share stop`, `vox room get` | Attached node; the sharer's daemon serving it |
 | A room's family LAN | `vox lan up` | `sudo vox lan helper` running |
-| Wire a harness | `vox agent plugin`, `skill`, `trust`, `doctor` | `--node` for plugin and hook |
+| Wire a harness | `vox agent connect`, `plugin`, `skill`, `trust`, `doctor`, `status` | `--node` for plugin and hook |
 
 ## Select the node
 
@@ -50,7 +52,7 @@ integrations, so nothing acts as your person's node by accident.
 Session-holding commands (`serve`, `connect`, `up`, `forward`, `lan up`) and `vox node attach`
 start the daemon in the background when none runs and attach their node. One-shot commands
 (`room`, `status`, `trust`, `share`, `service`) only ask an attached node, and say so when it is
-not: `vox node attach NAME` first.
+not, with the `vox node attach` that attaches it.
 
 A `vox daemon` started while the daemon holding the data root is stopping says so, waits until it
 has stopped, and then serves its node itself. `vox tui` exits when its terminal goes away, and
@@ -77,8 +79,17 @@ Inside the data root:
 - `.daemon/` holds the daemon's lock, its control socket `vox.sock`, the port it reuses, the list
   of nodes kept attached (`attach`), its `config`, and `log`, where a daemon started in the
   background writes its output. `format` says the data root's format and the version of vox that
-  last served it, two lines such as `format 1` and `written-by vox 0.4.1`, so a later release knows
+  last served it, two lines such as `format 1` and `written-by vox 0.4.3`, so a later release knows
   what to upgrade (see [Install and update](install.md#update-deliberately)).
+- `rooms` is the room map: which room an agent session started in a repository works in (see
+  [the room a session works in](sessions.md#the-room-a-session-works-in)). It holds room
+  passphrases, and is readable by your account only.
+
+The config directory holds the account's settings, read for any node that has no file of its own
+in `nodes/NAME/config/`. Among them is `anchors`, the anchors every node uses unless it has its
+own (see [How a node gets its anchors](services.md#how-a-node-gets-its-anchors)). On macOS the
+config directory and the data root are the same directory unless `VOX_CONFIG_DIR` or
+`VOX_DATA_DIR` moves one.
 
 A data root an earlier release left with a node's files directly in it, outside `nodes/` (any
 release before v0.3.0), is refused by every command, and nothing in it is changed: `… is not a Vox
@@ -121,9 +132,10 @@ report.
 
 ## Passphrase input
 
-The identity passphrase protects a node's key material. Every node has one: `node create` refuses
-an empty one and creates nothing. A room passphrase is a separate join factor, and it may be
-empty. At a terminal, use the masked prompt. For an unattended
+The identity passphrase protects a node's key material. It may be empty: `node create` then makes
+the node with none, and says that its key is kept on this machine unencrypted, so anyone who can
+read its data folder can act as it. A room passphrase is a separate join factor, and it may be
+empty too. At a terminal, use the masked prompt. For an unattended
 command, use its supported passphrase-file option and restrict the file to the intended OS user.
 
 `node create` and `node attach` read the identity passphrase from `--passphrase-file`; `room
@@ -139,7 +151,7 @@ forget-passphrase robertgpt` removes what is stored. Where there is no Keychain 
 node by a file instead:
 
 ```sh
-vox node attach robertgpt --keep --passphrase-file PATH_TO_PRIVATE_FILE
+vox node attach robertgpt --keep --passphrase-file ~/.vox-robertgpt-passphrase
 ```
 
 The daemon then reads that file at each start. A foreground daemon also takes a passphrase file
@@ -155,7 +167,7 @@ ROOM_ID ROOM_PASSPHRASE
 ANOTHER_ROOM_ID ANOTHER_ROOM_PASSPHRASE
 ```
 
-Use `vox daemon --node robertgpt --passphrase-file PATH_TO_PRIVATE_FILE` with the intended file,
+Use `vox daemon --node robertgpt --passphrase-file ~/.vox-robertgpt-passphrase` with the intended file,
 owned by your user and readable only by that user. Store it outside shared repositories; do not
 create it by typing secrets into a shell command that remains in history. This format is
 source-reviewed in the daemon parser, not exercised by the manual's command check.

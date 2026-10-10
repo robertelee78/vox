@@ -1,6 +1,6 @@
 # Troubleshooting by symptom
 
-Applies to: v0.4.1. Check `vox --version` first: the fixes here are for the version they name.
+Applies to: v0.4.3. Check `vox --version` first: the fixes here are for the version they name.
 
 ## Before changing anything
 
@@ -15,7 +15,7 @@ vox room list
 vox status
 ```
 
-Use the actual affected node, with `--node NAME` when several are attached. If you ran
+Use the actual affected node, with `--node` and its name when several are attached. If you ran
 `vox daemon` in a terminal, look at that terminal's output. A daemon started in the background
 writes its output to `.daemon/log` in the data root (see [local state](reference.md#local-state)).
 If a service manager started it, use that manager's log for the same process.
@@ -51,7 +51,8 @@ If not, report both paths/versions with personal directory components redacted.
   `Start one: vox daemon (Vox.app starts one when it opens, or vox node attach robertgpt)`. Vox.app
   shows the same sentence;
 - `node robertgpt is not attached; attach it first: vox node attach robertgpt`;
-- `there is no node in … yet; make one: vox node create <name>`.
+- `no vox daemon answers at …; to start one, open Vox (or run `vox daemon` in a terminal)`;
+- `there is no node in … yet; make one with vox node create and a name for it`.
 
 **Meaning:** a one-shot command (`room`, `status`, `trust`, `share`, `service`) asks an attached
 node and found none to ask. It does not mean the node has no rooms on disk, and it is not a
@@ -134,6 +135,23 @@ rejoin just to open a locally closed room. For unattended operation, see the
 **Verify:** `room read` succeeds for that room. An empty successful read may be legitimate;
 it is not the same error. If opening is refused, retain that new error and ask for help.
 
+## A pasted command is cut off or refused by the shell
+
+**Exact symptoms:** zsh says `zsh: no matches found: vox://…`; or, in bash, `vox room join` says
+`that room link or id will not parse (anchor has no address): check you copied all of it, exactly
+as it was sent`, and the shell also reports a job it started in the background.
+
+**Meaning:** the room link was typed without single quotes around it. A link holds `?` and `&`:
+zsh takes `?` as a file pattern and stops, and bash ends the command at the first `&`, so Vox is
+given only the start of the link. Nothing was joined, and nothing is wrong with the link or the
+room.
+
+**Fix:** run the command again with the whole link inside single quotes:
+`vox room join '` then the pasted link, then `'`. Every command Vox prints for you to paste
+already quotes what needs it; copy the whole line.
+
+**Verify:** the join asks for the room passphrase and says `vox: joined` and the room's name.
+
 ## I cannot join a room
 
 **Check first:** retain the entire `cannot join` explanation, confirm the full room link
@@ -210,7 +228,7 @@ error category and redacted structure, not the room link and passphrase together
 release every member's message keys. The TUI can show `[locked — not shared with you]` rather
 than readable text.
 
-**Check:** both people run `vox trust list` and `vox room roster ROOM_ID` as the intended node.
+**Check:** both people run `vox trust list` and `vox room roster family` as the intended node.
 Compare the actual fingerprints, not just local aliases. Then inspect connectivity with
 `vox status`: each member's line says `trusted`, `connected` and when it was last synced. An
 offline peer cannot immediately deliver a changed key or a message.
@@ -253,7 +271,7 @@ service being reachable are separate facts.
 - the host's local service is running;
 - the host trusts the guest fingerprint;
 - both use the intended room;
-- `vox service list ROOM_ID` names the intended offer and shows **your** address for it;
+- `vox service list family` names the intended offer and shows **your** address for it;
 - the guest has a node attached, so its daemon's proxy runs (`vox up` says where, or why it
   is not running), or its `vox forward` is still running;
 - the ordinary client uses that loopback proxy or forward.
@@ -315,7 +333,7 @@ unreachable share can also mean missing trust; a hash failure means the received
 match the signed announcement, not that the check should be disabled.
 
 **Check:** identify the sharer and the exact share. Ask whether it is still shared: the sharer's
-`vox share list ROOM_ID` lists it, and a share given `--count` or `--for` stops by itself. A pull
+`vox share list family` lists it, and a share given `--count` or `--for` stops by itself. A pull
 from a share that has stopped says `the offer of FILE is gone: NAME no longer serves it`; one
 whose sharer cannot be reached says `the offer of FILE cannot be collected now` and gives the
 reason. Inspect any reported size/hash or stall reason. If `--out` already exists, that is local
@@ -336,12 +354,14 @@ the private file or treating its hash as anonymous.
 **Meaning:** no answer can mean no session, wrong node, missing hook/plugin, missing trust,
 next-turn delivery, or an agent that has not acted. It is not proof that encryption failed.
 
-**Check:** run `vox agent doctor --node AGENT_NODE --room ROOM_ID` on the agent's machine. It
-checks the node, the room, the installed hook or plugin, the drain, session records, trust in
-each direction and versions, and prints a fix for each problem. From another node,
-`vox room ping ROOM_ID AGENT_ALIAS` asks the agent's daemon which sessions it holds. Then use
-ordinary `vox room read --node AGENT_NODE ROOM_ID`: if the agent's node cannot see the question,
-solve room/trust/connectivity first.
+**Check:** for an agent whose node is `claude-mbp` in the room `family`, run `vox agent doctor
+--node claude-mbp --room family` on the agent's machine. It checks the node, the room, the
+installed hook or plugin, the drain, session records, trust in each direction and versions, and
+prints a fix for each problem. From another node, `vox room ping family claude-mbp` (your name for
+the agent's node) asks the agent's daemon which sessions it holds. Then use ordinary `vox room
+read family --node claude-mbp`: if the agent's node cannot see the question, solve
+room/trust/connectivity first. A session in a repository with no room works in none: Vox asks you
+which room it works in (see [the room a session works in](sessions.md#the-room-a-session-works-in)).
 
 **Fix:** install the generated integration once at user scope with the agent's `--node`. For
 Codex, keep `async: false` and trust the final hook command. Reload the harness after
@@ -360,7 +380,7 @@ does not receive, report the harness and Vox versions, event, scope and redacted
 **Meaning:** exit 5 leaves a claim posted but not fully agreed; exit 3 means a version
 mismatch; exit 1 means another holder won. None is exclusive ownership.
 
-**Check:** read the named reason and `vox room board ROOM_ID` as the agent's node and session.
+**Check:** read the named reason and `vox room board family` as the agent's node and session.
 For exit 5, a member may be unreachable, missing the claim, disagreeing, or reporting
 incompatible clocks. Do not reset an identity to clear an ownership result.
 

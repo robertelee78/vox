@@ -1,7 +1,7 @@
 # How Vox fits together
 
 Applies to: the shared product model. Commands and lifecycle details differ by release; the
-task chapters describe v0.4.1.
+task chapters describe v0.4.3.
 
 ## A node is an identity
 
@@ -41,8 +41,9 @@ someone already obtained.
 can call the same node something else. Someone writing “I am Ann” in a message does not make
 that their authenticated display name. Compare the fingerprint before assigning the name.
 
-The same idea applies to room names. A room ID identifies the room; `family` is a convenient
-local label. Use the selector your version's command help accepts.
+Room names are different: a room has one name, `family`, the same on every member's node, which
+its creator or an admin can change. A room ID identifies the room whatever its name. Commands take
+either.
 
 ## A service is an offer, not a public tunnel
 
@@ -62,7 +63,9 @@ are still served.
 
 Directly reachable peers need no anchor. When two hosts cannot otherwise find or reach each
 other, a user-run anchor provides rendezvous and may relay encrypted packets. It is not a
-room administrator, cloud backup, or place that can decrypt your conversation.
+room administrator, cloud backup, or place that can decrypt your conversation. A node learns its
+anchors from its anchors file, from `--anchor`, and from the room links it joins with; see
+[when an anchor is needed](services.md#when-an-anchor-is-needed).
 
 ## What encryption does not promise
 

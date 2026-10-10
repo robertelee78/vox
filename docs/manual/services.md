@@ -1,7 +1,8 @@
 # Reach a shared service
 
-Applies to: v0.4.1. This chapter describes named services reached as `service.node.room.vox`.
-Examples act as the only attached node; with several, add `--node NAME`.
+Applies to: v0.4.3. This chapter describes named services reached as `service.node.room.vox`.
+Examples act as the only attached node; with several, add `--node robertgpt`. robertgpt shares;
+ann, whose name for robertgpt is `robertgpt` too, reaches.
 
 You need a running local service on the host, two nodes whose fingerprints have been compared,
 and the host's trust in the guest. Vox does not start an SSH server or replace that server's own
@@ -49,9 +50,9 @@ to copy, with its canonical address in them, and what reaching it needs, each `�
 
 ```text
   ssh.robertgpt.family.vox  by robertgpt  ssh
-    SERVICE_ID.NODE_FINGERPRINT.ROOM_ID.vox
-      ssh     ssh $USER@SERVICE_ID.NODE_FINGERPRINT.ROOM_ID.vox
-      forward vox forward SERVICE_ID.NODE_FINGERPRINT.ROOM_ID.vox 127.0.0.1:2222
+    mffm4sohl2j7kaefpvwk3jwrwc3xoynh3q2w5xesjcoteicf26ua.ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a.gkpeyuly4m4ezlidyid3vocosfzpec2o7um5dleicv2aacz6z2ja.vox
+      ssh     ssh $USER@mffm4sohl2j7kaefpvwk3jwrwc3xoynh3q2w5xesjcoteicf26ua.ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a.gkpeyuly4m4ezlidyid3vocosfzpec2o7um5dleicv2aacz6z2ja.vox
+      forward vox forward mffm4sohl2j7kaefpvwk3jwrwc3xoynh3q2w5xesjcoteicf26ua.ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a.gkpeyuly4m4ezlidyid3vocosfzpec2o7um5dleicv2aacz6z2ja.vox 127.0.0.1:2222
       then    ssh -p 2222 $USER@127.0.0.1
       ✓ proxy configured
       ✓ node attached
@@ -80,8 +81,8 @@ vox serve ssh=22
 `serve` creates a room, shares `127.0.0.1:22` in it as `ssh`, and keeps running. It prints the
 room ID, the room link, a generated room passphrase (`^ send this another way than the address (in
 person, a call, a different app)`) and the service's [canonical address](#how-a-service-is-named),
-followed by the [kind](#what-kind-of-service-it-is) Vox detected:
-`sharing 127.0.0.1:22 as ssh — SERVICE_ID.FINGERPRINT.ROOM_ID.vox (ssh)`.
+followed by the [kind](#what-kind-of-service-it-is) Vox detected, as `sharing 127.0.0.1:22 as
+ssh —`, the canonical address, and `(ssh)`.
 Send the link and the passphrase separately. Protect this output: it includes the room passphrase.
 Several shares can be named at once, such as `vox serve ssh=22 dns=53/udp`; `--at` names a local
 endpoint other than `127.0.0.1:PORT`, and `--name` sets the new room's name, which every member sees (default
@@ -115,7 +116,7 @@ name, and asks which to share:
 ```text
 vox: services listening on this machine
    3  sshd                 127.0.0.1:22  tcp
-  another user's services, root's among them, may be missing here or listed without their program; name one with vox serve <name>=<port>
+  another user's services, root's among them, may be missing here or listed without their program; name one with vox serve and its name=port, such as vox serve ssh=22
 share which? (its number, or its port)
 ```
 
@@ -125,7 +126,7 @@ take it or type another. Before anything is created it shows the address members
 who can reach it, with any warning, and asks `share it? [y/N]`:
 
 ```text
-members will reach it as ssh.FINGERPRINT.<the new room>.vox
+members will reach it as ssh.ek46r5zf3r7m.<the new room>.vox
 who can reach it: each node you trust, once it joins the room: carol, ann
 who cannot: anyone else who joins with the room link and passphrase
 share it? [y/N]
@@ -143,9 +144,11 @@ among them; name such a service as `NAME=PORT`.
 On the guest:
 
 ```sh
-vox connect 'ROOM_LINK'
-vox service list ROOM_ID
+vox connect 'vox://gkpeyuly4m4ezlidyid3vocosfzpec2o7um5dleicv2aacz6z2ja?a=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a&b=/ip4/203.0.113.7/udp/53213&m=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a&r=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a'
+vox service list family
 ```
+
+As with `vox room join`, the whole link goes inside single quotes.
 
 `connect` asks for the room passphrase at the terminal, or reads it from `--passphrase-file`, where
 `-` reads stdin; a pipe is read only with `--passphrase-file -`, so input meant for something else
@@ -159,13 +162,13 @@ trust the guest's fingerprint before the guest can reach its service.
 With the node attached and the room on it:
 
 ```sh
-vox service add ROOM_ID ssh 127.0.0.1:22
-vox service list ROOM_ID
+vox service add family ssh 127.0.0.1:22
+vox service list family
 ```
 
 Vox first says who is to reach it (`vox: about to offer "ssh" at 127.0.0.1:22 in "family"` / `the
 members of it in your keyring are to reach it: ann`), then `offering "ssh" at 127.0.0.1:22 in room
-ROOM_ID` and who can reach it now; with nobody in your keyring in the room yet it says `it is dark
+gkpeyuly4m4e` and who can reach it now (`ann can reach it now`); with nobody in your keyring in the room yet it says `it is dark
 until you vox trust add someone — and they join this room`. On the host, `service list` prints the readable address, `by you` and the kind
 under `shared in`, the canonical address under it, and the endpoint under `services offered`. On a
 guest it prints the readable address, who shares it and the kind, for example
@@ -217,15 +220,16 @@ Host *.vox
 
 Vox prints this block rather than editing your SSH configuration. Copy the one your `vox up`
 printed: it names the port the proxy really listens on. To use another loopback port, start the
-daemon with `vox daemon --proxy 127.0.0.1:PORT`, or set `VOX_PROXY`; the proxy listens on loopback
+daemon with `vox daemon --proxy 127.0.0.1:1081`, or set `VOX_PROXY`; the proxy listens on loopback
 only. If the port is taken, `vox up` says `the .vox proxy could not listen on 127.0.0.1:1080:
 Address already in use` and names both settings. `vox up --watch` stays in the foreground and
 prints what the proxy refuses or cuts, until stopped; the proxy runs on without it.
 
-Use the **real SSH account on the host** and your service address:
+Use the **real SSH account on the host** and your service address. For an account `robert` on
+robertgpt's machine:
 
 ```sh
-ssh SSH_USER@ssh.robertgpt.family.vox
+ssh robert@ssh.robertgpt.family.vox
 ```
 
 A Vox alias is not an SSH login name. Other tools use the proxy through
@@ -244,21 +248,24 @@ For a tool without SOCKS support, the guest forwards a local port to the address
 vox forward ssh.robertgpt.family.vox 127.0.0.1:2222
 ```
 
-It prints `forwarding 127.0.0.1:2222 to ssh on ssh.robertgpt.family.vox` and runs until Ctrl-C.
+It prints `vox: forwarding 127.0.0.1:2222 to ssh on ssh.robertgpt.family.vox (ek46r5zf3r7m)` and
+runs until Ctrl-C.
 It is a client of the daemon, so nothing else needs stopping. Point the tool at loopback port
-2222; for SSH, `ssh -p 2222 SSH_USER@127.0.0.1`. Do not bind a forward publicly unless you
+2222; for SSH, `ssh -p 2222 robert@127.0.0.1`. Do not bind a forward publicly unless you
 explicitly intend other local-network users to access it.
 
-`vox status` lists live tunnels under `tunnels`. `vox tunnel close MEMBER [SERVICE]`, or
-`vox tunnel close --id NUMBER`, closes them.
+`vox status` lists live tunnels under `tunnels`, each with its number. `vox tunnel close` closes
+them: all of one member's (`vox tunnel close f7l2q44g56mz`, its fingerprint's start as `vox status`
+prints it), those to one service (`vox tunnel close f7l2q44g56mz ssh`), or one by its number
+(`vox tunnel close --id 1`).
 
 ## Stop sharing
 
 For a service registered in a room:
 
 ```sh
-vox service remove ROOM_ID ssh
-vox service list ROOM_ID
+vox service remove family ssh
+vox service list family
 ```
 
 Removal withdraws the offer and cuts its live sessions; warn affected users first. Vox says
@@ -271,7 +278,7 @@ shared in it.
 
 ## A family LAN
 
-`vox lan up ROOM_ID` puts this machine on a network interface on which the room's trusted
+`vox lan up family` puts this machine on a network interface on which the room's trusted
 members are one subnet, so local-network discovery works across Vox. Creating an interface needs
 root, and only a separate helper has it: run `sudo vox lan helper` in another terminal, then run
 `vox lan up` as yourself, not with sudo. On a Mac with Vox.app the helper is the app's instead:
@@ -288,13 +295,43 @@ always-on host they can reach can run an anchor. On that host, per `vox node --h
 
 ```sh
 vox node create anchor --headless
-vox node --node anchor --listen 0.0.0.0:PORT
+vox node --node anchor --listen 0.0.0.0:4433
 ```
 
-The anchor prints a `FINGERPRINT@ADDRESS` specification. Verify it through a way you already
-trust and supply it with `--anchor` to the commands that attach or start nodes, such as
-`vox node attach`, `serve` and `up`; a room link also carries the anchors its sharer uses. The
-manual's command check did not run an anchor; these two commands come from the command help.
+The anchor prints its `FINGERPRINT@ADDRESS` specifications, one per address, and writes them to
+the anchors file of its own machine, so a node there needs nothing more. Choose a port the other
+hosts can reach, and verify the anchor's fingerprint through a way you already trust before
+anyone uses it. The manual's command check did not run an anchor; these two commands come from the
+command help.
+
+### How a node gets its anchors
+
+A node uses every anchor it learns from these three, together; one never replaces another:
+
+- **Its anchors file.** One `FINGERPRINT@ADDRESS` per line, where the address is a multiaddr
+  such as `/ip4/203.0.113.7/udp/4433` or a `host:port`; blank lines and lines starting with `#`
+  are skipped. A node reads `config/anchors` in its own node directory
+  (`nodes/robertgpt/config/anchors` in the data root) if it has one, and otherwise the account's,
+  `anchors` in the config directory: `~/Library/Application Support/vox/anchors` on macOS,
+  `~/.config/vox/anchors` on Linux; `VOX_CONFIG_DIR`, or else `XDG_CONFIG_HOME` with `/vox`, moves
+it when set (see
+  [local state](reference.md#local-state)). The file holds no secret. Edit it by hand to add an
+  anchor on another machine; the daemon reads it when the node attaches and again every 30
+  seconds. A line it cannot use is skipped and said, with its line number, by the command that
+  attaches the node and in the daemon's log, and the other lines still count.
+- **`--anchor`.** `vox node create`, `vox node attach`, `vox setup`, `vox serve`, `vox connect`,
+  `vox up`, `vox forward`, `vox daemon` and the other commands that start the daemon or attach a
+  node take `--anchor FINGERPRINT@ADDRESS`, repeatable; `VOX_ANCHORS` takes a comma-separated
+  list. It adds to the file.
+- **The room link.** A room link names the anchors its sharer uses. Joining with it keeps them
+  for that room, so a member who joins needs no anchor of its own to reach that room's members.
+
+For example, an anchors file naming one anchor on another machine:
+
+```text
+# the family's anchor on the NAS
+ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a@/ip4/203.0.113.7/udp/4433
+```
 
 An anchor is infrastructure you operate, not an account with a central provider. It holds
 no room key and stores nothing for rooms it is not in. Running it does not make an arbitrary

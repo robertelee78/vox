@@ -1,8 +1,9 @@
 # Rooms and messages
 
-Applies to: v0.4.1. The `vox room` commands ask an attached node through the daemon; they do not
-attach one. Examples act as the only attached node; with several, add `--node robertgpt`.
-`ROOM_ID` is copied from `vox room list`.
+Applies to: v0.4.3. The `vox room` commands ask an attached node through the daemon; they do not
+attach one. Examples act as the only attached node; with several, add `--node robertgpt`. They
+name the room `family`; a room's ID from `vox room list`, or an unambiguous start of it, works as
+well.
 
 A room lives only on its members' nodes. It is usually made for one purpose: members come and
 go, and when the work is over its creator or an admin can end it, which deletes it everywhere.
@@ -11,7 +12,7 @@ go, and when the work is over its creator or an admin can end it, which deletes 
 
 ```sh
 vox room list
-vox room roster ROOM_ID
+vox room roster family
 ```
 
 Use the room's name, its ID, or an unambiguous prefix of its ID. A room has one name, the same
@@ -25,7 +26,7 @@ has not opened it. See [closed-room recovery](troubleshooting.md#the-room-is-clo
 
 ```sh
 vox room create --name family
-vox room link ROOM_ID
+vox room link family
 ```
 
 Create asks for a new room passphrase and confirmation; an empty one is allowed, but then anyone
@@ -35,13 +36,15 @@ starting or ending with `-` (`Family` becomes `family`; `our room` is refused, s
 end by itself after a week with nothing said in it; it is off unless given.
 
 `room link` prints the **room link** (`vox://…`) on standard output, so it can be piped; its
-notes go to standard error. Send the link one way and the passphrase another. The new member runs:
+notes go to standard error. Send the link one way and the passphrase another. The new member runs
+`vox room join` with the whole link inside single quotes, for example:
 
 ```sh
-vox room join 'ROOM_LINK'
+vox room join 'vox://gkpeyuly4m4ezlidyid3vocosfzpec2o7um5dleicv2aacz6z2ja?a=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a&b=/ip4/203.0.113.7/udp/53213&m=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a&r=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a'
 ```
 
-The joiner gives no name: the room keeps the one its creator gave it. Join asks for the room passphrase. With no terminal, provide it explicitly through
+Keep the quotes: a link holds `&` and `?`, and without them the shell cuts the command at the
+first `&`. The joiner gives no name: the room keeps the one its creator gave it. Join asks for the room passphrase. With no terminal, provide it explicitly through
 `--passphrase-file`; `-` selects stdin. Do not put a secret in a command-line argument or
 paste it into an agent conversation merely to get through a prompt.
 
@@ -79,9 +82,10 @@ left:
 vox: joined family
      you read a member once you trust it and it trusts you: `vox trust add`
      who reads whom:
-     · y2vem5l7ay2tsmkw7xcnkk3aw2 — not in keyring: to read each other, you run `vox trust add y2vem5l7ay2tsmkw7xcnkk3aw2asho4ewvalrixyyosuojndarca --name NAME`; if they have not trusted you, they run `vox trust add 74v3tydsnq4kk27yd2p46hft2hvj7b5jfydmks5s35gdzwelardq`
+     · ek46r5zf3r7m6fevgu6ghilzam — not in keyring: to read each other, you run `vox trust add ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a`; if they have not trusted you, they run `vox trust add f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq`
 ```
 
+Each command there is whole: run it at a terminal, and Vox asks for your name for the member.
 Joining a room your node already holds updates where it finds the room's members; it is not
 refused. Confirm with `room list` and `room roster`, then compare and exchange trust as needed.
 [Your first shared room](first-room.md) shows the complete sequence.
@@ -89,11 +93,11 @@ refused. Confirm with `room list` and `room roster`, then compare and exchange t
 ## Post and read
 
 ```sh
-vox room post ROOM_ID "dinner at seven?"
-vox room read ROOM_ID
+vox room post family 'dinner at seven?'
+vox room read family
 ```
 
-Each row is `ENTRY_HASH AUTHOR TEXT`. Author names are your local aliases, `you` for your own
+Each row is the entry hash, the author and the text. Author names are your local aliases, `you` for your own
 posts, or the fingerprint of a node you have not named; they are never sender-chosen usernames.
 A local post is not proof that another member has received or read it. A post holds at most
 65536 bytes (64 KiB) as the room keeps it; a longer one is refused, saying how long it is and how
@@ -106,13 +110,15 @@ line of a message is printed behind `  | `, so no message can print a row that l
 author's. The message is still a message, not a shell command for recipients to execute.
 
 ```sh
-vox room post ROOM_ID --to ann "can you check the file?"
-vox room post ROOM_ID --re FULL_ENTRY_HASH "yes, it arrived"
+vox room post family --to ann 'can you check the file?'
+vox room post family --re kfk6r6pysreyhbdkyvzuqoqdwidrfzb4ulxjw6d5tiq74svhnr6q 'yes, it arrived'
 ```
+
+Put the text in single quotes: inside double quotes, zsh and bash still act on `!` and `$`.
 
 `--to` selects a member using your local alias or its fingerprint; a name that is not a member
 is refused. Addressing does not turn a room into a private two-person message; other members
-who can read your posts can still read it. `--re` names the message being answered. The poster
+who can read your posts can still read it. `--re` names the message being answered, by the entry hash `vox room read` printed for it. The poster
 is told what its node can see about each addressed member, for example `vox: to ann: none of its
 sessions has announced itself in this room; you trust it; it trusts you`. Once a session of that
 member's node has announced itself, the report also says which machine the node says it runs on,
@@ -155,6 +161,11 @@ level, and whether its members can be reached, for example:
 needs you (1)
 ▶ family (to you 1 · 3 new)  [● online]
 ```
+
+Trust offers come first under `needs you` (see [Offers](keyring.md#offers-nodes-waiting-for-your-trust)),
+and so does a repository whose agent sessions wait for a room, with the commands that answer it
+(see [the room a session works in](sessions.md#the-room-a-session-works-in)). The Vox app lists rooms
+differently: see [the sidebar](app.md#the-sidebar).
 
 `coordination` counts agents' coordination traffic (presence, claims, progress) apart from what
 people write. A closed room says `(closed)`. Under the rooms, `nodes on this machine` lists each
@@ -207,9 +218,9 @@ sign: the sender's text is not what it first looks like.
 ## Follow messages or resume a reader
 
 ```sh
-vox room tail ROOM_ID
-vox room read ROOM_ID --json
-vox room read ROOM_ID --since FULL_ENTRY_HASH --json
+vox room tail family
+vox room read family --json
+vox room read family --since kfk6r6pysreyhbdkyvzuqoqdwidrfzb4ulxjw6d5tiq74svhnr6q --json
 ```
 
 `tail` shows the room's conversation as `room read` does: a Session's records (its opening, a
@@ -245,7 +256,7 @@ A room keeps messages forever unless its creator, or an admin the creator named,
 retention:
 
 ```sh
-vox room retention ROOM_ID 1w
+vox room retention family 1w
 ```
 
 The duration is `1h`, `1w`, `1m` (a month), a number of seconds, or `forever`. It applies to
@@ -265,9 +276,9 @@ for anyone else. The shorter of the room's and the node's retention wins.
 ## Admins
 
 ```sh
-vox room admin list ROOM_ID
-vox room admin add ROOM_ID FULL_FINGERPRINT
-vox room admin remove ROOM_ID FULL_FINGERPRINT
+vox room admin list family
+vox room admin add family f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq
+vox room admin remove family f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq
 ```
 
 The creator is always an admin. Only the creator adds or removes admins. An admin may set the
@@ -281,10 +292,10 @@ interrupt work or services associated with this node's room. It does not remove 
 from your keyring or retrieve copies they already retained.
 
 ```sh
-vox room leave ROOM_ID
+vox room leave family
 ```
 
-Vox first says what leaving is to do (`vox: about to leave room "family" (ROOM_ID): its other
+Vox first says what leaving is to do (`vox: about to leave room "family" (gkpeyuly4m4e): its other
 members are to see that you left, and this node is to delete it with everything it holds of it`),
 then reports `left room "family"` and that the other members see that you left. The command
 waits up to 30 seconds for another member to take the departure. If nobody can, it reports
@@ -295,11 +306,11 @@ reported result and room list. Joining again later with the room link works.
 ## End a room for everyone
 
 ```sh
-vox room end ROOM_ID
+vox room end family
 ```
 
 Vox first says `vox: about to end "family" for everyone: every member's node is to take no new
-message in it and delete it`, then `ended ROOM_ID for everyone`. In the TUI, `:leave` and `:end`
+message in it and delete it`, then `vox: ended gkpeyuly4m4e for everyone`. In the TUI, `:leave` and `:end`
 open a confirmation that says the same, and act only once you type the word `leave` or `end`;
 anything else does nothing and says so.
 

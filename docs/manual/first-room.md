@@ -1,34 +1,49 @@
 # Your first shared room
 
-Applies to: v0.4.1. Allow a few minutes and keep both machines online. You need another person
+Applies to: v0.4.3. Allow a few minutes and keep both machines online. You need another person
 whose identity you can compare through a way you already trust, such as meeting or a call.
 
-You will each make a node, create and join a room, exchange trust, then confirm that a message
-arrives **in each direction**. The first time takes these six steps; every later room you share
-with the same person needs only steps 3 and 4, because trust carries over.
+You will each make a node, one of you makes a room and the other joins it, you trust each other,
+then you confirm that a message arrives **in each direction**. The first time takes these six
+steps; every later room you share with the same person needs only steps 3 and 4, because trust
+carries over. The examples are robertgpt's machine and ann's; use your own names.
 
 ## 1. Each person creates an identity
 
-On each person's machine:
+On each person's machine, in a terminal:
 
 ```sh
 vox --version
 vox node create robertgpt
-vox node attach robertgpt
 ```
 
 Choose your own node name: lower-case letters, digits, `.`, `_` and `-`. `node create` asks for
-the node's identity passphrase twice. Every node has one, so it may not be empty; this is not the
-room passphrase. It prints the node's 52-character fingerprint and says `there is no backup
-of a node`: if this machine is lost, you make a new node and the other person trusts that one
-instead ([Identity and keyring](keyring.md#your-nodes)). `node attach` asks for the
-passphrase once, starts the machine's daemon in the background if none runs, and keeps the
-node running: `vox: node robertgpt attached`. `vox node list` then shows it as `attached`.
+the node's **identity passphrase** twice. It unlocks this node on this machine; it is not the room
+passphrase, which comes later. You may leave it empty (Enter twice): Vox then says that the node's
+key is kept unencrypted, so anyone who can read its data folder can act as it, and encourages a
+passphrase.
 
-From now on, commands act as this node. With more than one node attached, name the node with
+It prints the node's 52-character fingerprint and says `there is no backup of a node`: if this
+machine is lost, you make a new node and the other person trusts that one instead
+([Identity and keyring](keyring.md#your-nodes)). Run at a terminal, it also attaches the node at
+once, starting the machine's daemon in the background if none runs, and remembers it, so the node
+is attached again by itself after a restart: `vox: node robertgpt attached (kept)`. `vox node
+list` shows it as `attached`. (Made by a script, with no terminal, the node is only made; `vox node
+attach robertgpt` then attaches it.)
+
+From now on, commands act as this node. With more than one node attached, name it with
 `--node robertgpt`. If you would rather see the daemon in a terminal, `vox daemon --node
-robertgpt` runs it in the foreground instead of `node attach`; Ctrl-C stops it and detaches the
-node.
+robertgpt` runs it in the foreground; Ctrl-C stops it and detaches the node.
+
+Confirm the node answers:
+
+```sh
+vox room list
+```
+
+A new node prints `no rooms`. If you see `no
+vox daemon is running for this data root, so node robertgpt is not attached`, run `vox node attach
+robertgpt`; see [the node is not attached](troubleshooting.md#the-node-is-not-attached).
 
 ## 2. Exchange and compare fingerprints
 
@@ -41,37 +56,24 @@ theirs. Compare them through a way you already trust, such as in person or a cal
 you know. Do not accept a replacement fingerprint solely because an unknown sender says “it's
 me”. A fingerprint is public, but deciding whose fingerprint it is is your decision.
 
-Confirm the node answers:
-
-```sh
-vox room list
-```
-
-A new node prints `no rooms`. If you see `no vox daemon is running for this data root, so node
-robertgpt is not attached`, run `vox node attach robertgpt` again; see
-[the node is not attached](troubleshooting.md#the-node-is-not-attached).
-
 ## 3. One person creates the room and shares its link
 
-The person creating the room runs:
+The person creating the room, here robertgpt, runs:
 
 ```sh
 vox room create --name family
-vox room list
+vox room link family
 ```
 
-Vox asks for the new room's passphrase and confirmation. This is a separate secret from either
-person's identity passphrase. `room create` prints `vox: created family`. Copy the room ID from
-`vox room list`, for example `bmbkjywlgzar  family`. In examples below, replace `ROOM_ID` with it:
-
-```sh
-vox room link ROOM_ID
-```
+Vox asks for the new **room passphrase** and its confirmation. This is a separate secret from
+either person's identity passphrase. `room create` prints `vox: created family`, and `vox room
+list` then shows the room with its ID, for example `gkpeyuly4m4e  family`. A command takes the
+room's name or its ID.
 
 `room link` prints the **room link**, a `vox://…` address, on standard output. Its other lines
 go to standard error: they describe how the link names this host, say `send the passphrase
-another way than this address (in person, a call, a different app)`, and remind you that the
-link grants nothing by itself.
+another way than this address (in person, a call, a different app)`, and remind you that joining
+grants nothing by itself.
 
 Send the complete link to the other person. Send or say the room passphrase by a different way.
 Keep a room member online for the join. If both hosts cannot reach each other directly, read
@@ -79,22 +81,33 @@ Keep a room member online for the join. If both hosts cannot reach each other di
 
 ## 4. The other person joins
 
-The other person runs this, replacing `ROOM_LINK` with the complete link received, in quotes:
+The other person, here ann, runs `vox room join` with the complete link received, inside single
+quotes. With the link from step 3 it reads:
 
 ```sh
-vox room join 'ROOM_LINK'
-vox room list
+vox room join 'vox://gkpeyuly4m4ezlidyid3vocosfzpec2o7um5dleicv2aacz6z2ja?a=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a&b=/ip4/203.0.113.7/udp/53213&m=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a&r=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a'
 ```
 
-Enter the **room** passphrase at its prompt. Success prints `vox: joined family`. Joining keeps
-the room on this node; it does not give either person permission to read the other's messages.
-The name `family` is the room's own, the same for both people: the joiner does not choose one.
-The room's creator, or an admin it named, can change it with `vox room rename`.
+Type `vox room join '`, paste the link, and type the closing `'`. The quotes matter: without
+them, the shell takes the link's `&` as the end of the command, and the join is cut off. Enter the
+**room** passphrase at its prompt. Success prints `vox: joined family`, then who reads whom, with
+the command that trusts each member:
+
+```text
+vox: joined family
+     you read a member once you trust it and it trusts you: `vox trust add`
+     who reads whom:
+     · ek46r5zf3r7m6fevgu6ghilzam — not in keyring: to read each other, you run `vox trust add ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a`; if they have not trusted you, they run `vox trust add f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq`
+```
+
+Joining keeps the room on this node; it does not give either person permission to read the
+other's messages. The name `family` is the room's own, the same for both people: the joiner does
+not choose one. The room's creator, or an admin it named, can change it with `vox room rename`.
 
 Both people can inspect membership:
 
 ```sh
-vox room roster ROOM_ID
+vox room roster family
 ```
 
 The two expected fingerprints should be present. A refused join and a timeout mean different
@@ -103,48 +116,71 @@ instead of repeatedly changing the passphrase.
 
 ## 5. Each person trusts the other
 
-The first person substitutes the full fingerprint of the other person, already compared:
+Once a member joins, Vox offers it to the other members to trust. Each person lists what waits:
 
 ```sh
-vox trust add FULL_FINGERPRINT --name ann
-vox trust list
+vox trust offers
 ```
 
-The other person substitutes the first person's fingerprint and chooses their local alias:
+On robertgpt's machine, ann's offer reads:
+
+```text
+  f7l2q44g56mzd62nsvck7mofib (not in keyring) joined. No one you trust trusts it yet.
+  in "family"
+  accept (read): vox trust add f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq --node robertgpt
+  accept (read + drive): vox trust add f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq --node robertgpt --drive
+  dismiss: vox trust dismiss f7l2q44g56mz --node robertgpt
+```
+
+First check that the fingerprint is the one ann gave you in step 2. Then copy the `accept (read)`
+command and run it:
 
 ```sh
-vox trust add FULL_FINGERPRINT --name robertGPT
+vox trust add f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq --node robertgpt
+```
+
+Vox asks `Your name for` the fingerprint: a name that is yours alone; type `ann`. Then it asks for
+your identity passphrase, unless one was typed for a keyring change in the last 30 minutes or the
+node has none. On ann's machine, robertgpt's offer says `trusts you`, and ann accepts it the same
+way, naming it `robertGPT`. Check with:
+
+```sh
 vox trust list
 ```
 
 These are two independent decisions. Vox says what each one grants: the node `may now read what
-you write in every room you share — now and later`, you read it `once it trusts you too`, and it
-may `reach every service you bind to a room you are both in`. It is not restricted to this
-room. A keyring change asks for your identity passphrase again once 30 minutes have passed since
-you last gave it; `vox status` says how long is left (`keyring open 30m`).
+you write in "family" — now and later`, you read it `once it trusts you too`, and it may `reach
+every service you bind to a room you are both in`. It is not restricted to this room. `read +
+drive` is for an agent's node, and is described in [Sessions](sessions.md).
 
 ## 6. Prove receipt both ways
 
 The first person posts:
 
 ```sh
-vox room post ROOM_ID "hello from robertGPT"
+vox room post family 'hello from robertGPT'
 ```
 
 The second person reads, confirms that exact message appeared, and replies:
 
 ```sh
-vox room read ROOM_ID
-vox room post ROOM_ID "hello back from ann"
+vox room read family
+vox room post family 'hello back from ann'
 ```
 
 The first person then runs:
 
 ```sh
-vox room read ROOM_ID
+vox room read family
 ```
 
-Each row is the entry hash, the author as you named them (`you` for your own), and the text.
+Each row is the entry hash, the author as you named them (`you` for your own), and the text:
+
+```text
+kfk6r6pysreyhbdkyvzuqoqdwidrfzb4ulxjw6d5tiq74svhnr6q you hello from robertGPT
+wlei7fi2n6hidyekawhh73t5b2q7vonu5ib6sozpgfs4rzhn6zqq ann hello back from ann
+```
+
 You are done when each person sees the other's text. Local post success means the local node
 accepted a post, not that someone else read it. If one side cannot read, check both keyrings,
 membership and connectivity using [Troubleshooting](troubleshooting.md#we-joined-but-cannot-read-each-other).

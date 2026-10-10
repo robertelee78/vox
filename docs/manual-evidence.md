@@ -1,6 +1,6 @@
 # User manual evidence map
 
-Updated: 2026-10-04; ADR-030's claims added 2026-10-10 (#661). Scope: ADR-027 M27.1 / work item
+Updated: 2026-10-04; ADR-030's claims added 2026-10-10 (#661); the v0.4.3 pass 2026-10-10. Scope: ADR-027 M27.1 / work item
 #421. This is maintainer evidence, not a chapter in the public navigation manifest. Source
 inspection is not an execution test.
 
@@ -8,6 +8,7 @@ inspection is not an execution test.
 
 | Label | Exact source revision | Use |
 |---|---|---|
+| v0.4.3 | `c942c4564` (the v0.4.3 tag, on main) | Task chapters from v0.4.3, the v0.4.3 command check |
 | v0.4.0 | `5c564791` (`v040/version-bump`, on integrate `a0787063`) | Task chapters from v0.4.0 (#516), the v0.4.0 command check; each row names the integrate commit it was checked at |
 | v0.3.1 | `bf6dfcdbee65e82a4683400baa94dd62fc8532d6` (built on macOS and on Linux) | Task chapters from v0.3.1 (#425), the v0.3.1 command check |
 | v0.3.0 | `82523cebc870a29e0947b0cb7c20b4563d233966` (built); manual merged at `c24a260dee708a340df5544f80a4518823e261a8`; review fixes at `c142ddd3293bfd1273cfd5737a673bcceb93dfc9` and `vox room link` at `d01c2c767c9ae295d1ed9aabdf66b73838c8f266` (each built, rechecked) | Task chapters, troubleshooting, the v0.3.0 command check |
@@ -78,6 +79,40 @@ each with its mutants red; `d059f5fa3` adds only a test-support lookup of the pr
 upgrade proof ran from the published v0.4.2 on `90a6686cd` (#652), which the merge contains. No
 command check of these claims was run for the manual: they are cryptographic properties, not
 commands a reader types.
+
+## v0.4.3 command check
+
+Checked on 2026-10-10 against `c942c45649398cb99fdc85f4e2a982fde367b781`, the v0.4.3 tag, with a
+release `vox` built there (`cargo build --release -p vox-tui --bin vox`, no features; `vox 0.4.3`).
+Every process had a scratch `VOX_DATA_DIR`, `VOX_CONFIG_DIR` and `HOME` and an otherwise empty
+environment (`env -i`), and none used `sudo`. Nodes were made with no identity passphrase, so
+nothing was stored in a Keychain. Two data roots on one Mac (robertgpt, ann) and a third (spare);
+same-host, so no NAT or anchor path was exercised.
+
+**Every command in a `sh` block is whole, parses and is valid zsh.** Each block was given to
+`zsh -f -n -c` (syntax only) and searched for a placeholder (`<…>`, `ROOM_ID`, `FULL_FINGERPRINT`,
+`ROOM_LINK`, `[--…`); each `vox …` line in one was run as `vox <its words> --help`. Result: 128
+commands, 0 refused, no syntax error, no placeholder. Mutant: `vox room roster family` in rooms.md
+changed to `vox room rooster family` was caught: `REJECTED rooms.md: vox room rooster family`,
+`error: unrecognized subcommand 'rooster'`. The inline `` `vox …` `` spans were checked the same
+way: 223, the 3 refused each an output quote or an option named alone (`vox setup: Claude Code is
+connected…`, `vox daemon: deleted the port mapping…`, `vox room post --to`). The check is a
+spike, run and reported here, not committed.
+
+| Manual claim | Where and how | Observed |
+|---|---|---|
+| `node create` at a terminal attaches and remembers; by a script only makes | `vox node create robertgpt --passphrase-file EMPTY`, stdin not a terminal; `crates/vox-tui/src/client.rs` (`node_create`) | the no-passphrase sentence, `vox: created node robertgpt`, the fingerprint, the no-backup line, `vox: node robertgpt is not attached; attach it: vox node attach robertgpt`; the terminal branch is source-read |
+| An empty identity passphrase is allowed (reverses the v0.4.1 row above) | the same | `vox: no identity passphrase: this node's identity key is kept on this machine unencrypted, …; a passphrase is encouraged`, exit 0 |
+| first-room steps 3 to 6 by the room's name | `room create --name family`, `room link family`, `room join 'LINK'` on ann, `trust offers` and `trust add` (on a pty) both ways, `room post family …` and `room read family` both ways | `vox: joined family` with the who-reads-whom lines quoted in first-room.md; the offer's `accept (read)`, `accept (read + drive)` and `dismiss` lines with `--node`; `Your name for …:`; each side read the other's message |
+| A link without quotes | `zsh -f -c` with an unquoted link; `vox room join` with a link cut at its first `&` | `zsh:1: no matches found: vox://…?a=…`; `vox: cannot join: that room link or id will not parse (anchor has no address): check you copied all of it, exactly as it was sent`, exit 1 |
+| The example room link parses | the link in first-room.md (documentation address 203.0.113.7), joined from spare | `cannot join: the room's host did not answer, so no member was asked` after 30 s: parsed, as expected unreachable |
+| `trust drive`, `read`, `remove`, `add --drive` | on robertgpt for ann, on a pty | `now has read + drive`; `now has read`; the remove lines quoted in keyring.md, then `vox trust offers` listed no offer of ann (#678); `add --drive` said `and to drive this node's Sessions: type into them, interrupt, approve and answer` |
+| `node detach` forgets the keep | `vox node detach spare` with `spare	none` in `.daemon/attach` | the line gone, `vox node list` without `(kept)`; `crates/vox-tui/src/host.rs` (`forget_keep`) |
+| A service by room name, its list and a forward | a banner-only TCP server on 127.0.0.1:2022 shared as `ssh` in `family`; `service list family` on ann; `vox forward ssh.robertgpt.family.vox 127.0.0.1:2223` | the canonical address, commands and ticks quoted in services.md (the proxy tick read `missing`: port 1080 was taken on this Mac); `vox: forwarding 127.0.0.1:2223 to ssh on ssh.robertgpt.family.vox (ek46r5zf3r7m)`, and the banner through it |
+| Shares print whole commands | `vox share family ./report.txt -m 'the report'`; a file `q3 report.txt` | the lines quoted in files.md; `vox room get family 'q3 report.txt'` |
+| The anchors file | `config/anchors` holding a bad line, then `vox node attach spare`; `crates/vox-core/src/node/paths.rs` (`ANCHORS_FILE`, `config_path`), `crates/vox-core/src/node/link.rs` (`merge_anchors_file`), `crates/vox-tui/src/node_tasks.rs` (`ANCHOR_REFRESH` 30 s), `crates/vox-tui/src/app.rs` (`write_anchors_file`), `crates/vox-core/src/node/actor.rs` (a link's anchors kept for its room) | `… anchors line 2 is skipped: bad anchor: expected <fingerprint>@<host:port>, or @ followed by a multiaddr`, then `names no usable anchor (1 skipped, each said above); a peer this machine can reach directly needs none; carrying on with no anchor`; the anchor itself was not run |
+| The room map: subfolders and worktrees; Vox asks the person | `crates/vox-tui/src/room_map.rs` (`resolve`, `note`), `crates/vox-tui/src/room_ask.rs`, `apps/macos/Vox/RoomAsk.swift`, `Notify.swift` | source-read; proved by the merged room-ask proofs, not run again here |
+| The app (app.md): flat room list, offers in their room, Attach… and Forget Passphrase, the drive command with Copy, the repo banner | read against `apps/macos/Vox` at `c942c4564`: `MainWindow.swift` (`Sidebar`, `RoomRow`, `OfferBanner`, `OnThisMachine`), `Offers.swift`, `RootView.swift` (`PassphraseForm`), `Timeline.swift`, `Notify.swift` | not driven here: the app's own walkthrough proves the app, as merged |
 
 ## v0.4.1 command check
 

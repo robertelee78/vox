@@ -1,6 +1,6 @@
 # The Vox app on a Mac
 
-Applies to: v0.4.1, Apple Silicon Macs with macOS 13 or later. The app does what the `vox`
+Applies to: v0.4.3, Apple Silicon Macs with macOS 13 or later. The app does what the `vox`
 commands do; this chapter describes where each thing is in the app. The other chapters explain
 nodes, rooms, trust, services and files.
 
@@ -11,7 +11,8 @@ use. The app holds no node of its own. It acts as **one node** on this Mac, whic
 first time you open it, and everything you post, trust and share in the app is that node's. The
 sidebar opens with that node: its mark, its name and `node attached`. At its foot, **ON THIS
 MACHINE** lists every node on this Mac with its state (`attached` or `detached`): separate
-identities, one daemon. The other nodes stay with the `vox` commands.
+identities, one daemon. The app posts, trusts and shares only as its own node; it attaches the
+others, and forgets their passphrases, from that list (see [The sidebar](#the-sidebar)).
 
 ## Install
 
@@ -47,7 +48,7 @@ attach` or the app), none needed, or `vox node attach --keep`. Any other node co
 names it with the command that attaches it again:
 
 ```text
-node NAME is detached, as the daemon remembers no passphrase for it; attach it again with `vox node attach NAME`
+node robertgpt is detached, as the daemon remembers no passphrase for it; attach it again with `vox node attach robertgpt`
 ```
 
 How the daemon comes back depends on how it was started. The login item's daemon is started again
@@ -152,7 +153,7 @@ restart cannot fix, the card also quotes the login item's last word on it, with
   would bring it back without you: it is no longer kept attached, its passphrase is removed from
   the Keychain, and the app forgets it chose it. The node, its rooms and its messages stay on this
   Mac. The app then offers the nodes on this Mac, each with its fingerprint, and **New Node…**.
-  `vox node signout NAME` does the same from a terminal.
+  `vox node signout robertgpt` does the same from a terminal.
 
 If the node stops while the window is open (detached elsewhere, or the daemon stopped), the
 sidebar and the menu bar say `detached`, a banner says why with **Attach Again** and **Start
@@ -161,25 +162,27 @@ node again picks up where it was.
 
 ### Keep a node attached when the app quits
 
-This is offered only if you chose Keep Running. On the passphrase screen, turn on **Store the
-passphrase in the Keychain, so node NAME stays attached when Vox quits**. The app says what that
+The passphrase screen has **Remember the passphrase in the Keychain, so node NAME attaches again
+by itself after Vox quits or the Mac restarts**, on unless you turn it off. The app says what that
 costs before you attach:
 
 ```text
 Anyone who can unlock this Mac's login keychain can then attach node NAME.
 ```
 
-With it off, the app says: "Without it, your rooms are reachable only while Vox is open."
+With it off, the app says: "Without it, your rooms are reachable only while Vox is open, and node
+NAME asks for its passphrase again after a restart."
 
 With it on, the daemon stores the passphrase in your login keychain (item `us.vox.node`), keeps
-the node attached when the app quits, and attaches it again at login without asking.
-`vox node list` shows the node `(kept)`. The stored passphrase is used only to attach the node:
+the node attached when the app quits, and attaches it again when it starts, without asking.
+`vox node list` shows the node `(kept)`. **Node > Forget Passphrase** removes it from the Keychain,
+and the daemon no longer attaches the node by itself; the node stays attached until it is
+detached. The stored passphrase is used only to attach the node:
 changing who you trust still asks for your passphrase (see
 [The keyring view](#the-keyring-view)). Detaching the node by hand, with Node > Detach or
-`vox node detach NAME`, removes the passphrase from the Keychain.
+`vox node detach robertgpt`, removes the passphrase from the Keychain.
 
-A node with no identity passphrase needs no Keychain: with Keep Running chosen, it is kept as it
-attaches.
+A node with no identity passphrase needs no Keychain: it is kept as it attaches.
 
 ## The main window
 
@@ -188,28 +191,46 @@ status bar along the bottom.
 
 ### The sidebar
 
-- At the top, your node: its mark, its name, and an ice dot with `node attached`.
-- Your rooms, in three groups, each with its count:
-  - **needs you**: a message addressed to your node is unread.
-  - **active**: new messages are unread.
-  - **quiet**: nothing is unread.
-
-  A room that is not quiet shows its unread in words under its name. A message stops being
-  unread once at least half of it has been in view in the timeline, not when you choose the room:
-  what you scrolled past unseen stays unread. **Next Room That Needs
-  You** (⌘J, or Control-N as in the TUI) opens the first room in **needs you**.
-- Trust offers, first under **needs you**: `offer: xgfm gktt… joined`, or `… trusts you` (see
-  [Trust offers](#trust-offers)).
+- At the top, your node: its mark, its name, and an ice dot with `node attached`; and a **+** that
+  offers **New Room…** and **Join Room…**.
+- Your rooms, in one list, as a chat app lists conversations: the room with the newest message
+  first. Each row shows the room's name and when its newest message came (the time today,
+  Yesterday, the weekday within the week, else the date), then that message as `who: text`, and a
+  badge with how many are unread. The badge and the time are brighter when something waits on you
+  there: a message addressed to you, a Session waiting on you, or a trust offer from one of its
+  members; the row's second line then says what waits, such as `a Session needs you` or
+  `f7l2q44… joined — trust?`. A message stops being unread once at least half of it has been in
+  view in the timeline, not when you choose the room: what you scrolled past unseen stays unread.
+  **Next Room That Needs You** (⌘J, or Control-N as in the TUI) opens the next room where
+  something waits on you.
+- A trust offer is shown in the room it came from (see [Trust offers](#trust-offers)). An offer
+  from a node that shares no room listed here, such as one that trusts you, is a row of its own
+  at the top of the list.
 - **Keyring**, **Decision record** and **Services**: views of this window, described below.
 - At the foot, **ON THIS MACHINE**: every node on this Mac with its state, `attached` or
-  `detached`, and `Separate identities. One daemon.`
+  `detached`, and `Separate identities. One daemon.` A node that is not attached has **Attach…**,
+  which asks for its identity passphrase (empty for a node made with none) and remembers it in the
+  Keychain, so the node attaches again by itself after a restart. Right-click a kept node for
+  **Forget Passphrase**.
 
 Right-click a room, a node or a member to copy its name or fingerprint. Drag the sidebar's edge,
 or the edge of the members column, to resize it; the widths are kept for the next launch. **View >
 Hide Inspector** (⌥⌘I) hides the members column and shows it again.
 
-The Dock icon carries the same count as **needs you**: rooms with a message to you or a Session
-waiting on you, and trust offers. It goes when nothing needs you.
+The Dock icon carries the count of what waits on you: rooms with a message to you or a Session
+waiting on you, and trust offers. It goes when nothing does.
+
+### A repository with no room
+
+When an agent session starts in a repository Vox has no room for, a banner across the top of the
+window says so, for example `Claude Code in /opt/vox has no room`, and a notification, `Which room
+is this repo in?`, brings you to it. **Choose a room…** binds the repository to one of your
+node's rooms, or to the room whose link you paste, with the room's passphrase typed there; the
+banner says first that the passphrase is saved for this repo in the room map, which every node on
+this Mac can read, and that no agent is asked for it. Every session waiting there is put in that
+room. **Not this repo** says no: no session started there asks again. For a repository bound to a
+room its node is not in, **Join It** joins with what the room map holds. See [the room a session
+works in](sessions.md#the-room-a-session-works-in).
 
 ### The room
 
@@ -411,17 +432,20 @@ waiting for the passphrase asks `Replace the waiting change?` first.
 ### Trust offers
 
 A node that joined a room after yours, or that trusts you, and is not in your keyring, waits as
-an offer under **needs you** in the sidebar (see [Offers](keyring.md#offers-nodes-waiting-for-your-trust)).
-Select it to see a **Trust offer**: its fingerprint with its art, the same sentence `vox trust
-offers` prints (`ben joined. ann trusts it.`), the rooms you share (`In: family`), and what
-trusting and dismissing do. Give it an alias and choose **Trust**: it is given `read`, and the
-view says what that grant does first. If the keyring window has closed, it asks for your identity
-passphrase in place of the offer's buttons: that form's **Trust** and **Cancel** are then the only
-ones, and **Cancel** brings back **Trust** and **Dismiss**. Leave the field empty only if your
-identity has no passphrase; if it has one, **Trust** says
-`This node's identity has a passphrase: type it to …`. The same holds wherever the app asks for
-the passphrase for a keyring change. You are not asked to compare fingerprints. **Dismiss** removes the offer
-on your node alone: it is not told, and stays out of your keyring.
+an offer (see [Offers](keyring.md#offers-nodes-waiting-for-your-trust)). It is shown at the top
+of the room it came from, in its conversation, as one line: `f7l2q44… joined — trust?`, with
+**Review…**. The room's row in the sidebar says the same, brighter. An offer from a node that
+shares no room listed is a row of its own at the top of the sidebar. **Review…** opens the **Trust
+offer**: its fingerprint with its art and **Compare…**, the same sentence `vox trust offers` prints
+(`ben joined. ann trusts it.`), the rooms you share (`In: family`), and what trusting and
+dismissing do. Give it an alias and choose **Trust**: it is given `read`, and the view says so
+first. If the keyring window has closed, it asks for your identity passphrase in place of the
+offer's buttons: that form's **Trust** and **Cancel** are then the only ones, and **Cancel** brings
+back **Trust** and **Dismiss**. Leave the field empty only if your identity has no passphrase; if
+it has one, **Trust** says `This node's identity has a passphrase: type it to …`. The same holds
+wherever the app asks for the passphrase for a keyring change. You are not asked to compare
+fingerprints. **Dismiss** removes the offer on your node alone: it is not told, and stays out of
+your keyring.
 
 ## The services view
 
@@ -503,6 +527,12 @@ ben shared a file
 ```
 
 An urgent message addressed to you also plays a sound. Clicking a notification opens its room.
+
+Two more ask something of you. `Node NAME needs its passphrase` (`It is not attached, so nothing
+reaches it. Attach it in Vox.`) comes when a node on this Mac waits for its passphrase, for
+example an agent's node whose session found it detached; its **Attach…** opens the sheet that
+attaches it. `Which room is this repo in?` comes when an agent session starts in a repository with
+no room (see [A repository with no room](#a-repository-with-no-room)).
 macOS asks once whether Vox may notify; to change your answer, use System Settings,
 Notifications, Vox.
 
@@ -551,7 +581,13 @@ line, word for word as `vox room session` prints it, with **Details** for its fu
 output, and a file the session sent offers **Quick Look** and **Show in Finder** once your node
 has a checked copy. The header says that the Session's name and id are its node's claim:
 `LABEL — name and id as NODE says`. To anyone else it shows only that it opened (and ended), and
-`Only members NODE trusts with drive see inside this Session.`
+`Only members NODE trusts with drive see inside this Session.` It then gives the command that gives
+your node drive, with **Copy**: for a node on this Mac, `To see inside, run this in a terminal on
+this Mac:` and, for example, `vox trust drive f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq
+--node claude-mac`; for a node elsewhere, the same without `--node`, to run on the Mac that node
+runs on. The app itself never gives drive. When drive is given or taken back, the Session
+shows it at once: taken back, you keep what you already read in it, and see nothing written
+afterwards.
 
 With drive, an open Session has its own composer, `Composer — to LABEL` after `ann ▸ LABEL` (who types, into which Session), in place of the room's:
 
