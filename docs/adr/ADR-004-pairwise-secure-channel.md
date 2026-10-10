@@ -5,7 +5,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 **Status:** accepted and built in `crates/vox-core/src/pairwise/`, `node::prekeys` and
 `node::joinstream`, except: PQ post-compromise security (§"Post-quantum PCS (phased)") is not built;
 the skipped-key bounds (W3) are fixed constants, not channel-policy settings; prekey bundles are
-published only at the rendezvous, not on the log (P1). Q1 and O5 are planned for v0.5.0 (ADR-030,
+published only at the rendezvous, not on the log (P1). Q1 and O5 are planned for v0.4.2 (ADR-030,
 2026-10-09).
 **Deciders:** Robert E. Lee <robert@agidreams.us>
 
@@ -120,7 +120,7 @@ O2–O4 together make every member of a room eventually read every other member 
 - **O5. Key delivery sessions are not long-lived sessions.** A key delivery session (ADR-030 W-1) MUST
   travel as `OP_ROTATION_HELLO`, never as a `Hello`. O1–O4 MUST NOT apply to it: it never replaces,
   displaces or counts as the long-lived session, and it is dropped once its key is opened. *Status:*
-  planned for v0.5.0 (ADR-030).
+  planned for v0.4.2 (ADR-030).
 
 ### §"Post-quantum PCS (phased)"
 
@@ -129,7 +129,7 @@ O2–O4 together make every member of a room eventually read every other member 
   the long-lived session, so a key's secrecy rests on a fresh ML-KEM encapsulation. A continuous
   key-agreement layer inside the ratchet (Signal SPQR, Apple PQ3) was weighed and rejected: on this
   channel's sparse, one-way traffic it heals only after replies that may never come (ADR-030, Alternatives
-  rejected). *Status:* planned for v0.5.0; not provided today.
+  rejected). *Status:* planned for v0.4.2; not provided today.
 
 ### Security properties provided
 

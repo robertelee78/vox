@@ -2,7 +2,8 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: Accepted for v0.5.0 (the decider, 2026-10-09). Nothing in this ADR is built.
+**Status**: Accepted for v0.4.2 (the decider, 2026-10-09; first accepted for v0.5.0, moved to v0.4.2 the
+same day). Nothing in this ADR is built.
 **Date**: 2026-10-09
 **Deciders**: Robert E. Lee
 **Tags**: crypto, post-quantum, pairwise, sender-keys, prekeys
@@ -152,7 +153,7 @@ binds PQ freshness to every key delivery, not to the ratchet.
   recipient's one-time prekeys.
 - `pairwise/ratchet.rs`, `header.rs`, `session.rs`, `init_message.rs` and `suite.rs` are unchanged.
   The work is in the node's delivery paths, the pairwise frames and the prekey ring.
-- v0.5.0 does not interoperate with v0.4.x on key delivery (W-4).
+- v0.4.2 does not interoperate with v0.4.1 or earlier on key delivery (W-4).
 - Recipient-side healing is bounded by prekey hygiene. Today nothing retires an unused one-time
   prekey, so that bound does not exist until P-1 lands.
 

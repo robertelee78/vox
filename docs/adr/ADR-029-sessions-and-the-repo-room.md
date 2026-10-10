@@ -168,7 +168,7 @@ relies on is ADR-028 K-14.
   OpenCode) and offer to create one node per harness (`<harness>-<host>`, ADR-026 N-6), each with a
   passphrase the operator types (ADR-028 K-11), and to install its hooks.
 - **ST-2.** On macOS, setup MUST offer to create a node for the person, and it MUST be optional
-  (on iOS, with its app, v0.4.1).
+  (on iOS, with its app, v0.5.0).
 - **ST-3.** Setup MUST end by printing, for every node it created, its fingerprint (grouped, with
   its art, ADR-028 K-1) with the facts a person needs to recognise it: alias, harness, host, OS and
   Vox version.
