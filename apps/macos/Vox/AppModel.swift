@@ -154,6 +154,37 @@ final class AppModel: ObservableObject {
         }
     }
 
+    @Published private(set) var updating = false
+    @Published private(set) var updateSaid: String?
+    @Published private(set) var updated = false
+
+    /// The app uses the same verified bundle replacement and daemon restart as `vox update`.
+    func updateVox() async {
+        guard !updating else { return }
+        updating = true
+        updateSaid = nil
+        updated = false
+        defer { updating = false }
+        do {
+            updateSaid = try await Daemon.command(["update"], patience: 300)
+            updated = true
+        } catch {
+            updateSaid = sentence(error)
+        }
+    }
+
+    /// Open the installed bundle after updating; the current process keeps its old code until quit.
+    func reopenUpdatedApp() {
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.createsNewApplicationInstance = true
+        NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: configuration) { _, error in
+            Task { @MainActor in
+                if let error { self.updateSaid = sentence(error) }
+                else { NSApp.terminate(nil) }
+            }
+        }
+    }
+
     /// Restart the same account's daemon using this app's bundled version (ADR-034 UP-2).
     func restartDaemon() async {
         phase = .starting
