@@ -58,6 +58,18 @@ mod support;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+#[cfg(feature = "optional-proofs")]
+#[path = "support/pty_driver.rs"]
+mod pty_driver;
+optional_proof::not_run!(
+    every_large_collection_reaches_the_cli_and_app,
+    a_six_thousand_entry_room_opens_in_the_tui_in_order,
+    a_seventy_member_room_opens_with_every_read_mark_and_trust,
+    a_hundred_thousand_entry_session_opens_in_one_second_with_bounded_memory
+);
+
 use std::io::{BufRead as _, BufReader};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -1290,10 +1302,6 @@ fn same_rows(verb: &str, got: &[String], sent: &[String]) {
     }
 }
 
-#[path = "support/optional_proof.rs"]
-mod optional_proof;
-optional_proof::not_run!(a_hundred_thousand_entry_session_opens_in_one_second_with_bounded_memory);
-
 /// ADR-034 FR-6: a separate app-client process measures its own RSS, without counting the
 /// staging apparatus. This optional proof blocks nothing and is never a release gate.
 #[cfg(feature = "optional-proofs")]
@@ -1458,4 +1466,537 @@ fn a_hundred_thousand_entry_session_opens_in_one_second_with_bounded_memory() {
         panic!("APPARATUS: app-client proof process ended without a verdict: {report}");
     }
     eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// The collection verbs and the app client deliver every row, beyond one transport frame.
+/// Mutants: return each collection unpaged, or truncate that collection to 200 rows. Each
+/// variant must fail its own every-row assertion below; a later successful call is also checked.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "OPTIONAL: 64 MiB of unread messages and 1000 real service/decision operations"]
+fn every_large_collection_reaches_the_cli_and_app() {
+    watchdog::arm_for(Duration::from_secs(1200));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("APPARATUS: runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: scratch profiles");
+    let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
+    let (alice, bob) = (&room.workers[0], &room.workers[1]);
+    let tags: Vec<String> = (0..1000)
+        .map(|n| format!("paging-{n:04}-{}", "s".repeat(40)))
+        .collect();
+    let bodies: Vec<String> = (0..1000)
+        .map(|n| {
+            let head = format!("UNREAD-PAGE-{n:04} ");
+            format!("{head}{}", "u".repeat(MAX_TEXT - head.len()))
+        })
+        .collect();
+    let (app_alice, app_bob) = rt.block_on(async {
+        let a = collection_app(alice).await;
+        let b = collection_app(bob).await;
+        (a, b)
+    });
+    rt.block_on(async {
+        let mut client = collection_socket(alice).await;
+        for (n, text) in bodies.iter().enumerate() {
+            let reply = client
+                .request(&Request::Post {
+                    channel_id: room.cid,
+                    text: text.clone(),
+                    card: false,
+                })
+                .await;
+            assert!(
+                matches!(reply, Ok(Frame::Appended { .. })),
+                "PRODUCT: posting unread row {n}: {reply:?}"
+            );
+        }
+    });
+    until(
+        bob,
+        None,
+        "the last unread row arrives",
+        &["room", "read", &room.id, "--json"],
+        |out| out.ok && out.stdout.contains("UNREAD-PAGE-0999"),
+    );
+    let cli = bob.vox(None, &["room", "read", &room.id, "--unread", "--json"]);
+    assert!(cli.ok, "PRODUCT: CLI unread collection failed: {cli:?}");
+    let rows = cli.ndjson();
+    let texts: Vec<_> = rows
+        .iter()
+        .filter_map(|r| r["text"].as_str())
+        .filter(|t| t.starts_with("UNREAD-PAGE-"))
+        .collect();
+    assert!(
+        texts == bodies.iter().map(String::as_str).collect::<Vec<_>>(),
+        "PRODUCT: CLI unread lost, duplicated, reordered or cut a 64 KiB row ({} matching rows)",
+        texts.len()
+    );
+    let app_rows = rt
+        .block_on(app_bob.unread(room.id.clone()))
+        .expect("PRODUCT: app unread failed");
+    let texts: Vec<_> = app_rows
+        .iter()
+        .map(|r| r.text.as_str())
+        .filter(|t| t.starts_with("UNREAD-PAGE-"))
+        .collect();
+    assert!(
+        texts == bodies.iter().map(String::as_str).collect::<Vec<_>>(),
+        "PRODUCT: app unread lost, duplicated, reordered or cut a 64 KiB row ({} matching rows)",
+        texts.len()
+    );
+    bob.vox(None, &["status", "--json"])
+        .expect_ok("CLI works after unread pages");
+    rt.block_on(app_bob.rooms())
+        .expect("PRODUCT: app next call failed after unread pages");
+    eprintln!("[proof] CLI and app read all1000 unread64KiB rows");
+
+    // A real endpoint supplies its SSH greeting immediately, so each service is detected by
+    // the shipped daemon without slow probe timeouts or a service-kind test knob.
+    rt.block_on(async {
+        use tokio::io::AsyncWriteExt as _;
+        let endpoint = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("APPARATUS: service listener");
+        let local = endpoint
+            .local_addr()
+            .expect("APPARATUS: endpoint address")
+            .to_string();
+        let greet = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = endpoint.accept().await {
+                let _ = socket.write_all(b"SSH-2.0-vox-proof\r\n").await;
+            }
+        });
+        let mut client = collection_socket(alice).await;
+        for tag in &tags {
+            let reply = client
+                .request(&Request::AddService {
+                    channel_id: room.cid,
+                    service_tag: tag.clone(),
+                    local: local.clone(),
+                    persist: true,
+                })
+                .await;
+            assert!(
+                matches!(reply, Ok(Frame::Ok)),
+                "PRODUCT: share {tag}: {reply:?}"
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let listed = app_bob
+                .services(room.id.clone())
+                .await
+                .expect("PRODUCT: app service collection failed");
+            if listed.shared.len() >= tags.len() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PRODUCT: only{} of1000 services reached the app",
+                listed.shared.len()
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let cli = bob.vox(None, &["service", "list", &room.id, "--json"]);
+        assert!(cli.ok, "PRODUCT: CLI services failed: {cli:?}");
+        let v = cli.json();
+        let shared = v["shared"]
+            .as_array()
+            .expect("PRODUCT: CLI did not list shared services");
+        for tag in &tags {
+            assert_eq!(
+                shared
+                    .iter()
+                    .filter(|s| s["address"]
+                        .as_str()
+                        .is_some_and(|a| a.starts_with(&format!("{tag}."))))
+                    .count(),
+                1,
+                "PRODUCT: CLI lost or repeated service {tag}"
+            );
+        }
+        let shared = app_bob
+            .services(room.id.clone())
+            .await
+            .expect("PRODUCT: app services failed")
+            .shared;
+        for tag in &tags {
+            assert_eq!(
+                shared
+                    .iter()
+                    .filter(|s| s.canonical.starts_with(&format!("{tag}.")))
+                    .count(),
+                1,
+                "PRODUCT: app lost or repeated service {tag}"
+            );
+        }
+        app_bob
+            .rooms()
+            .await
+            .expect("PRODUCT: app next call failed after service pages");
+        bob.vox(None, &["status", "--json"])
+            .expect_ok("CLI works after service pages");
+        eprintln!("[proof] CLI and app read all1000 services");
+        // Stopping each real service writes one genuine decision event in the shipped node.
+        for tag in &tags {
+            let reply = client
+                .request(&Request::RemoveService {
+                    channel_id: room.cid,
+                    service_tag: tag.clone(),
+                })
+                .await;
+            assert!(
+                matches!(reply, Ok(Frame::Ok)),
+                "PRODUCT: stop shared service {tag}: {reply:?}"
+            );
+        }
+        greet.abort();
+    });
+    let cli = alice.vox(None, &["decisions", "--json"]);
+    assert!(cli.ok, "PRODUCT: CLI decisions failed: {cli:?}");
+    let events = cli.ndjson();
+    let app_events = rt
+        .block_on(app_alice.decisions())
+        .expect("PRODUCT: app decision collection failed");
+    for tag in &tags {
+        let needle = format!("stopped sharing {tag} in room");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["why"].as_str().is_some_and(|w| w.contains(&needle)))
+                .count(),
+            1,
+            "PRODUCT: CLI lost or repeated decision for {tag}"
+        );
+        assert_eq!(
+            app_events
+                .iter()
+                .filter(|e| e.why.contains(&needle))
+                .count(),
+            1,
+            "PRODUCT: app lost or repeated decision for {tag}"
+        );
+    }
+    assert!(
+        events
+            .windows(2)
+            .all(|w| w[0]["at_ms"].as_u64() >= w[1]["at_ms"].as_u64()),
+        "PRODUCT: CLI decision record is not newest first"
+    );
+    assert!(
+        app_events
+            .windows(2)
+            .all(|w| w[0].at_millis >= w[1].at_millis),
+        "PRODUCT: app decision record is not newest first"
+    );
+    alice
+        .vox(None, &["status", "--json"])
+        .expect_ok("CLI works after decision pages");
+    rt.block_on(app_alice.rooms())
+        .expect("PRODUCT: app next call failed after decision pages");
+    eprintln!("[proof] CLI and app read all1000 decisions; following calls work");
+}
+
+#[cfg(feature = "optional-proofs")]
+async fn collection_socket(worker: &support::Worker) -> IpcClient {
+    let node = worker.paths.account().nodes_on_disk()[0].clone();
+    IpcClient::open_at(&NodeSocket::one_shot(worker.paths.account().socket(), node))
+        .await
+        .expect("PRODUCT: the running node did not answer its client")
+}
+
+#[cfg(feature = "optional-proofs")]
+async fn collection_app(worker: &support::Worker) -> std::sync::Arc<vox_ffi::VoxClient> {
+    let client = vox_ffi::VoxClient::open(worker.data.to_string_lossy().into_owned())
+        .await
+        .expect("PRODUCT: app could not open its daemon");
+    let node = worker.paths.account().nodes_on_disk()[0].clone();
+    let pass = vox_ffi::Passphrase::new(support::ID_PASS.as_bytes().to_vec())
+        .expect("APPARATUS: passphrase");
+    client
+        .attach(node.as_str().to_owned(), Some(pass))
+        .await
+        .expect("PRODUCT: app could not attach");
+    client
+}
+
+/// The TUI opens a room past one frame of Order and exposes every row in sequence.
+/// Mutant: write Order with write_frame instead of write_reply; the PRODUCT assertion on
+/// opening/reading every timeline row must fail, not a frame-length counter in the apparatus.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "OPTIONAL: real 6000-entry room and its terminal timeline"]
+fn a_six_thousand_entry_room_opens_in_the_tui_in_order() {
+    watchdog::arm_for(Duration::from_secs(1200));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("APPARATUS: runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: scratch profiles");
+    let room = rt.block_on(support::room(tmp.path(), &["alice"]));
+    let alice = &room.workers[0];
+    rt.block_on(async {
+        let mut client = collection_socket(alice).await;
+        for n in 0..6000 {
+            let reply = client
+                .request(&Request::Post {
+                    channel_id: room.cid,
+                    text: format!("ORDER-PAGE-{n:04}"),
+                    card: false,
+                })
+                .await;
+            assert!(
+                matches!(reply, Ok(Frame::Appended { .. })),
+                "PRODUCT: post Order row {n}: {reply:?}"
+            );
+        }
+    });
+    let node = alice.paths.account().nodes_on_disk()[0].clone();
+    let out = pty_driver::run(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_long_room.py"),
+        &[
+            VOX,
+            "PAGED-ORDER",
+            alice.data.to_str().unwrap(),
+            alice.cfg.to_str().unwrap(),
+            "mission",
+            "0",
+            support::ID_PASS,
+            support::ROOM_PASS,
+            "order",
+            node.as_str(),
+        ],
+    );
+    assert!(
+        out.has_verdict("PAGED-ORDER"),
+        "APPARATUS: Order driver gave no verdict: {}",
+        out.stderr
+    );
+    assert!(
+        !out.stdout.contains("APPARATUS") && !out.stdout.contains("HUNG at"),
+        "APPARATUS: Order driver could not finish: {}",
+        out.stdout
+    );
+    assert!(
+        out.code == Some(0) && out.stdout.contains("PAGED-ORDER PASS"),
+        "PRODUCT: the real TUI did not show every Order row: {}",
+        out.stdout
+    );
+}
+
+/// Seventy real members fill the snapshot's quadratic read/trust lists. Their app client and
+/// terminal must still show every member's read marks and trust. Mutant: send snapshot bytes
+/// with write_frame rather than write_reply; the user-facing room/read/trust assertions fail.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "OPTIONAL: 70 shipped nodes, their full trust graph, read marks and terminal"]
+fn a_seventy_member_room_opens_with_every_read_mark_and_trust() {
+    watchdog::arm_for(Duration::from_secs(2400));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("APPARATUS: runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: scratch profiles");
+    let data = tmp.path().join("data");
+    let cfg = tmp.path().join("cfg");
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            support::reap_daemon(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(data.clone());
+    let account =
+        vox_core::node::paths::Account::of(Some(&data), Some(&cfg)).expect("APPARATUS: account");
+    let names: Vec<String> = (0..70).map(|n| format!("member-{n:02}")).collect();
+    let mut fingerprints = Vec::new();
+    for name in &names {
+        many_vox(&data, &cfg, name, &["node", "create", name], None)
+            .expect_ok("create one of70 members");
+        many_vox(
+            &data,
+            &cfg,
+            name,
+            &["node", "attach", name, "--listen", "127.0.0.1:0"],
+            None,
+        )
+        .expect_ok("attach one of70 members");
+        let id = many_vox(&data, &cfg, name, &["id"], None);
+        id.expect_ok("read member fingerprint");
+        fingerprints.push(
+            vox_core::node::link::b32_decode(id.stdout.trim(), "member fingerprint")
+                .expect("PRODUCT: member fingerprint was malformed"),
+        );
+    }
+    many_vox(
+        &data,
+        &cfg,
+        &names[0],
+        &[
+            "room",
+            "create",
+            "--name",
+            "paging-members",
+            "--passphrase-file",
+            "-",
+        ],
+        Some(support::ROOM_PASS),
+    )
+    .expect_ok("create70-member room");
+    let listed = many_vox(&data, &cfg, &names[0], &["room", "list"], None);
+    listed.expect_ok("list70-member room");
+    let room = listed
+        .stdout
+        .split_whitespace()
+        .next()
+        .expect("PRODUCT: created room not listed")
+        .to_owned();
+    let linked = many_vox(&data, &cfg, &names[0], &["room", "link", &room], None);
+    linked.expect_ok("link70-member room");
+    let link = linked.stdout.trim();
+    for name in &names[1..] {
+        many_vox(
+            &data,
+            &cfg,
+            name,
+            &["room", "join", link, "--passphrase-file", "-"],
+            Some(support::ROOM_PASS),
+        )
+        .expect_ok("join one of70 members");
+    }
+    rt.block_on(async {
+        let mut clients = Vec::new();
+        for name in &names {
+            clients.push(IpcClient::open_at(&NodeSocket::one_shot(account.socket(),
+                vox_core::node::paths::NodeName::parse(name).expect("APPARATUS: node name"))).await
+                .expect("PRODUCT: attached member did not answer"));
+        }
+        for (i,client) in clients.iter_mut().enumerate() {
+            for (j,target) in fingerprints.iter().enumerate().filter(|(j,_)|*j!=i) {
+                let reply = client.request(&Request::Trust { target:*target,petname:names[j].clone(),
+                    identity_passphrase:zeroize::Zeroizing::new(String::new()),full_history:true,drive:false }).await;
+                assert!(matches!(reply,Ok(Frame::Ok)), "PRODUCT: {} could not trust{}: {reply:?}",names[i],names[j]);
+            }
+        }
+        let rooms = clients[0].rooms().await.expect("PRODUCT: creator's room list failed");
+        let Frame::Rooms { rooms } = rooms else { panic!("PRODUCT: creator did not return rooms"); };
+        let cid = rooms.first().expect("PRODUCT: creator lost its room").0;
+        let room_id = vox_core::node::link::b32_encode(&cid);
+        let mut posted = Vec::new();
+        for n in 0..70 {
+            let reply = clients[0].request(&Request::Post { channel_id:cid,text:format!("READ-MARK-{n:02}"),card:false }).await;
+            let Ok(Frame::Appended { entry }) = reply else { panic!("PRODUCT: post read-mark row{n}: {reply:?}"); };
+            posted.push(entry);
+        }
+        for (i,client) in clients.iter_mut().enumerate().skip(1) {
+            let deadline = Instant::now()+Duration::from_secs(180);
+            loop {
+                let reply = client.request(&Request::RoomPage { channel_id:cid,before:None,limit:0 }).await;
+                if matches!(&reply,Ok(Frame::RoomPage { rows,.. }) if rows.iter().any(|r|r.text=="READ-MARK-69")) { break; }
+                assert!(Instant::now()<deadline,"PRODUCT: member{} never read the last row: {reply:?}",names[i]);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            let reply = client.request(&Request::MarkRead { channel_id:cid,entries:posted.clone() }).await;
+            assert!(matches!(reply,Ok(Frame::Ok)), "PRODUCT: member{} could not mark rows read: {reply:?}",names[i]);
+        }
+        let app = vox_ffi::VoxClient::open(data.to_string_lossy().into_owned()).await.expect("PRODUCT: app could not open70-member daemon");
+        app.attach(names[0].clone(),Some(vox_ffi::Passphrase::new(Vec::new()).expect("APPARATUS: empty passphrase")))
+            .await.expect("PRODUCT: app could not attach creator");
+        let wanted: std::collections::BTreeSet<_> = names[1..].iter().cloned().collect();
+        let deadline = Instant::now()+Duration::from_secs(180);
+        loop {
+            let marks = app.read_by(room_id.clone()).await.expect("PRODUCT: app could not open70-member room read marks");
+            let complete = posted.iter().all(|id|marks.iter().any(|m|m.id==vox_core::node::link::b32_encode(id)
+                && m.names.iter().cloned().collect::<std::collections::BTreeSet<_>>()==wanted));
+            if complete { break; }
+            assert!(Instant::now()<deadline,"PRODUCT: app lost one of70 rows'69 read marks ({} rows answered)",marks.len());
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let roster = app.roster(room_id.clone()).await.expect("PRODUCT: app roster failed");
+        assert_eq!(roster.len(),70,"PRODUCT: app lost a member in the70-member room");
+        for (j,member) in fingerprints.iter().enumerate() {
+            let said = app.join_said(room_id.clone(),vox_core::node::link::b32_encode(member)).await
+                .expect("PRODUCT: app could not read who trusts a member");
+            for (k,name) in names.iter().enumerate().skip(1).filter(|(k,_)|*k!=j) {
+                assert!(said.contains(name),"PRODUCT: app lost member{k}'s trust of member{j}: {said}");
+            }
+        }
+        app.rooms().await.expect("PRODUCT: app next call failed after large member snapshot");
+        eprintln!("[proof] app showed70 members, every read mark and full trusted-by lists");
+    });
+    let out = pty_driver::run(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_long_room.py"),
+        &[
+            VOX,
+            "PAGED-MEMBERS",
+            data.to_str().unwrap(),
+            cfg.to_str().unwrap(),
+            "paging-members",
+            "0",
+            "",
+            support::ROOM_PASS,
+            "members",
+            &names[0],
+        ],
+    );
+    assert!(
+        out.has_verdict("PAGED-MEMBERS"),
+        "APPARATUS: member driver gave no verdict: {}",
+        out.stderr
+    );
+    assert!(
+        !out.stdout.contains("APPARATUS") && !out.stdout.contains("HUNG at"),
+        "APPARATUS: member driver did not finish: {}",
+        out.stdout
+    );
+    assert!(
+        out.code == Some(0) && out.stdout.contains("PAGED-MEMBERS PASS"),
+        "PRODUCT: TUI70-member view failed: {}",
+        out.stdout
+    );
+}
+
+#[cfg(feature = "optional-proofs")]
+fn many_vox(
+    data: &std::path::Path,
+    cfg: &std::path::Path,
+    node: &str,
+    args: &[&str],
+    input: Option<&str>,
+) -> Out {
+    use std::io::Write as _;
+    let mut command = Command::new(VOX);
+    support::strip_harness_env(&mut command);
+    command
+        .args(args)
+        .env("VOX_DATA_DIR", data)
+        .env("VOX_CONFIG_DIR", cfg)
+        .env("VOX_NODE", node)
+        .env("VOX_IDENTITY_PASSPHRASE", "")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("APPARATUS: start vox");
+    if let Some(input) = input {
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .expect("APPARATUS: write input");
+    }
+    drop(child.stdin.take());
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
+    Out {
+        ok: out.status.success(),
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        argv: format!("vox {} --node {node}", args.join(" ")),
+    }
 }

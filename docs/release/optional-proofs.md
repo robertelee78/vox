@@ -208,3 +208,25 @@ The `a_room_takes_every_joiner_proof` row came with #299 (V210-104), which made 
 | Proof | Helps troubleshoot | Run | Needs | Time |
 |---|---|---|---|---|
 | `a_member_that_just_joined_is_not_refused_proof::a_member_that_just_joined_is_not_refused_by_its_anchor` | A member who just joined is told of an integrity failure that isn't real. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_member_that_just_joined_is_not_refused_proof -- --ignored --exact a_member_that_just_joined_is_not_refused_by_its_anchor` | it makes its own CPU load; run it alone | 88 s / 102 s |
+
+### Large collection paging (ADR-034 #791)
+
+`cargo test --release -p vox-tui --features test-knobs,optional-proofs --test a_large_room_reads_whole_proof every_large_collection_reaches_the_cli_and_app -- --exact --ignored --nocapture`
+
+Two shipped nodes exchange 1000 unread 64 KiB messages and 1000 real service shares. Stopping
+the shares produces 1000 real decision events. The CLI and app client must read every row
+whole, in order where ordered, and remain usable afterwards. This expensive proof is optional
+and blocks neither CI nor a release. Without the feature it says OPTIONAL PROOF NOT RUN.
+
+`cargo test --release -p vox-tui --features test-knobs,optional-proofs --test a_large_room_reads_whole_proof a_six_thousand_entry_room_opens_in_the_tui_in_order -- --exact --ignored --nocapture`
+
+A real room receives 6000 posts. Its shipped TUI must open at the newest rows, show every
+row in order as PageUp walks the timeline, and return to the newest row with End (#793).
+This expensive proof is optional and blocks neither CI nor release.
+
+`cargo test --release -p vox-tui --features test-knobs,optional-proofs --test a_large_room_reads_whole_proof a_seventy_member_room_opens_with_every_read_mark_and_trust -- --exact --ignored --nocapture`
+
+Seventy shipped nodes share one scratch daemon, join a room, trust each other and mark70
+messages read. The app client must expose all69 readers on every message and every trust
+relationship. The terminal must open the room and show every reader and peer's trust (#792).
+This expensive proof is optional and blocks neither CI nor release.

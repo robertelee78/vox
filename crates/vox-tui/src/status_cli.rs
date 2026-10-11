@@ -424,3 +424,41 @@ fn tunnels(v: &serde_json::Value, out: &mut String) {
         );
     }
 }
+
+/// `vox decisions`: the complete retained record, carried by the same paged reader as the app.
+pub async fn decisions(paths: &Paths, json: bool) -> Result<(), AppError> {
+    use vox_core::node::ipc::{Frame, IpcClient, Request};
+    let at = crate::client::one_shot(paths)?;
+    let mut client = IpcClient::open_at(&at)
+        .await
+        .map_err(|e| crate::client::said(&at, e))?;
+    let reply = client
+        .request(&Request::Decisions { limit: 0 })
+        .await
+        .map_err(|e| crate::client::said(&at, e))?;
+    let Frame::Decisions { events } = reply else {
+        return Err(AppError::Usage(format!(
+            "the node did not return its decisions: {reply:?}"
+        )));
+    };
+    if events.is_empty() && !json {
+        println!("No decisions in the retained record.");
+    }
+    for event in events {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"at_ms":event.at_ms,"asked":event.asked,
+                "by":event.by,"alias":event.alias,"decided":event.decided,
+                "why":event.why,"room":event.room})
+            );
+        } else {
+            let who = event.alias.as_deref().unwrap_or(&event.by);
+            println!(
+                "{}  {}  {}: {} — {}",
+                event.at_ms, event.decided, who, event.asked, event.why
+            );
+        }
+    }
+    Ok(())
+}
