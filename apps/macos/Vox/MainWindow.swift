@@ -780,6 +780,7 @@ private struct RoomView: View {
     @State private var sending = false
     /// The rows inside the visible part of the timeline, as last measured.
     @State private var inView: Set<String> = []
+    @State private var olderVisible = false
     /// The newest message when the messages last changed: if it was in view, the timeline follows
     /// the next one; scrolled up to read, it stays (as the TUI does, V210-82).
     @State private var newest: String?
@@ -909,6 +910,16 @@ private struct RoomView: View {
                                                         .accessibilityIdentifier("\(item.id)-copy")
                                                     }
                                                 }
+                                                if item.loadsOlder {
+                                                    if model.readingOlderTimeline {
+                                                        ProgressView("Loading earlier entries…").controlSize(.small)
+                                                    }
+                                                    Button("Show older entries") {
+                                                        Task { await model.readOlderTimeline() }
+                                                    }
+                                                    .disabled(model.readingOlderTimeline)
+                                                    .accessibilityIdentifier("\(item.id)-load")
+                                                }
                                             }
                                             .voxPadding(.horizontal, Space.s4)
                                             .reportsFrame(of: item.id)
@@ -1031,6 +1042,14 @@ private struct RoomView: View {
                                         ?? "\(item.id.prefix(10)) unmeasured"
                                 }
                                 readLog.debug("frames in \(room, privacy: .public): viewport \(Int(viewport.size.width))x\(Int(viewport.size.height)), \(frames.count) measured, last: \(tail.joined(separator: "; "), privacy: .public)")
+                                // Lazy rows may appear before they are on screen. Read older
+                                // entries only when the person has scrolled to their marker.
+                                let olderShown = !following && model.timelineItems
+                                    .first(where: \.loadsOlder).map { inView.contains($0.id) } == true
+                                if olderShown && !olderVisible {
+                                    Task { await model.readOlderTimeline() }
+                                }
+                                olderVisible = olderShown
                                 markSeen()
                                 keepNewest(scroller, viewport.size.height, "rows")
                             }
@@ -1057,10 +1076,14 @@ private struct RoomView: View {
                             .onChange(of: model.sessionEntries.count) { _ in
                                 centre(model.selectedRequest, scroller)
                             }
+                            .onChange(of: model.selectedEarlierRequest) { _ in
+                                centre(model.selectedRequest, scroller)
+                            }
                             // What is shown changed (General, All, a Session): it opens at its
                             // newest line, or, a Session with a request waiting, at that request,
                             // centred, so going to an approval shows it (P7).
                             .onChange(of: model.showing) { _ in
+                                olderVisible = false
                                 // The rows of what is now shown are laid out after this change,
                                 // so the scroll waits for the next turn of the main loop: asked
                                 // for at once, it could land before them and do nothing, leaving
@@ -1463,7 +1486,8 @@ private struct RoomView: View {
     /// Scroll the request `reference`'s entry to the middle of the timeline, once it is drawn.
     private func centre(_ reference: String?, _ scroller: ScrollViewProxy) {
         guard let reference,
-              let entry = model.sessionEntries.first(where: { $0.request?.reference == reference }) else { return }
+              let entry = (model.sessionEntries + [model.selectedEarlierRequest].compactMap { $0 })
+                .first(where: { $0.request?.reference == reference }) else { return }
         withAnimation(Theme.motion(reduced: reduceMotion)) {
             scroller.scrollTo("entry-\(entry.id)", anchor: .center)
         }

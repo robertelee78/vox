@@ -137,6 +137,13 @@ pub struct DaemonCore {
     shown_session: Option<(Digest32, Digest32, String)>,
     /// Its lines, as last read, for a member with drive (SC-1).
     session_lines: Vec<crate::viewmodel::SessionLineView>,
+    /// Its entries held here, oldest first: the newest page, and the older pages the person went
+    /// up to (ADR-034 FR-4). Never its whole history.
+    session_rows: Vec<vox_core::node::drive::SessionRow>,
+    /// How many of its entries are older than the first held.
+    session_older: u64,
+    /// The person went up past the oldest line shown: the page before it is to be read.
+    session_want_older: bool,
     /// Its entries are to be read again on the next frame: it was just shown or driven, or the
     /// node said it has news (`NodeEvent::SessionEntry`).
     session_stale: bool,
@@ -231,6 +238,10 @@ struct RoomUnread {
 struct Timeline {
     channel_id: Digest32,
     rows: Vec<MessageRow>,
+    /// Messages before the first page loaded by the person.
+    older: u64,
+    /// The person scrolled above the oldest shown message.
+    want_older: bool,
     /// The row that arrived last, the feed's cursor.
     cursor: Option<Digest32>,
     /// Rows have arrived since the last read.
@@ -432,6 +443,9 @@ impl DaemonCore {
             seeded: BTreeSet::new(),
             shown_session: None,
             session_lines: Vec::new(),
+            session_rows: Vec::new(),
+            session_older: 0,
+            session_want_older: false,
             session_stale: true,
             waiting: BTreeMap::new(),
             waiting_sessions: BTreeSet::new(),
@@ -626,6 +640,32 @@ impl DaemonCore {
         let Some(answer) = until_stopped(&self.rt, &self.stop, conn.client.request(request)) else {
             return Err(Lost::Gone("stopping".into()));
         };
+        self.answered(answer)
+    }
+
+    /// One page of a room's Session entries (ADR-034 FR-4): `which`'s newest before `before`, or
+    /// the newest when `None`, and how many are older; `None` when the node did not answer with
+    /// a page.
+    fn session_page(
+        &mut self,
+        room: Digest32,
+        which: vox_core::node::drive::SessionFilter,
+        before: Option<Digest32>,
+    ) -> Option<(Vec<vox_core::node::drive::SessionRow>, u64)> {
+        let conn = self.conn.as_mut()?;
+        let answer = until_stopped(
+            &self.rt,
+            &self.stop,
+            conn.client.session_page(room, which, before),
+        )?;
+        match self.answered(answer) {
+            Ok(Frame::SessionPage { rows, older }) => Some((rows, older)),
+            _ => None,
+        }
+    }
+
+    /// What the daemon's `answer` means here: a detach and a lost daemon said once.
+    fn answered(&mut self, answer: vox_core::error::Result<Frame>) -> Result<Frame, Lost> {
         match answer {
             Ok(Frame::NodeDetached { .. }) => {
                 self.detached();
@@ -694,9 +734,11 @@ impl DaemonCore {
             let Some(conn) = self.conn.as_mut() else {
                 return;
             };
-            let Some(Ok(Frame::Rows { mut rows })) =
-                until_stopped(&self.rt, &self.stop, conn.client.read_rows(cid, None))
-            else {
+            let Some(Ok(Frame::Rows { mut rows })) = until_stopped(
+                &self.rt,
+                &self.stop,
+                conn.client.request(&Request::Unread { channel_id: cid }),
+            ) else {
                 continue;
             };
             // The rows that arrived: the newest `n` by arrival, from a member other than this node.
@@ -1119,7 +1161,16 @@ impl DaemonCore {
             let Some(conn) = self.conn.as_mut() else {
                 return;
             };
-            let read = until_stopped(&self.rt, &self.stop, conn.client.read_rows(cid, cursor));
+            let request = match cursor {
+                Some(_) => Request::Read {
+                    channel_id: cid,
+                    since: cursor,
+                    after: None,
+                    limit: 200,
+                },
+                None => Request::Unread { channel_id: cid },
+            };
+            let read = until_stopped(&self.rt, &self.stop, conn.client.request(&request));
             let Some(u) = self.unread.get_mut(&cid) else {
                 continue;
             };
@@ -1154,7 +1205,11 @@ impl DaemonCore {
             {
                 u.cursor = Some(newest);
             }
-            u.pending = 0;
+            u.pending = if cursor.is_none() || rows.is_empty() {
+                0
+            } else {
+                u.pending.saturating_sub(rows.len())
+            };
         }
     }
 
@@ -1305,26 +1360,33 @@ impl DaemonCore {
             if drivable.is_empty() {
                 continue;
             }
-            let Ok(Frame::SessionEntries { rows }) =
-                self.request(&Request::SessionEntries { channel_id: room })
+            // What the daemon's index says waits in each Session (ADR-034 FR-5): no entry is
+            // read for the count.
+            let Some(conn) = self.conn.as_mut() else {
+                break;
+            };
+            let Some(answer) = until_stopped(&self.rt, &self.stop, conn.client.sessions(room))
+            else {
+                break;
+            };
+            let Ok(Frame::SessionsPage {
+                sessions: listed,
+                summaries,
+                ..
+            }) = self.answered(answer)
             else {
                 continue;
             };
-            let names = SessionNames {
-                trusted: &self.snapshot.trusted,
-                me: self.snapshot.me,
-            };
             let mut n = 0;
-            for (node, id) in &drivable {
-                let mine = crate::session_cli::of_session(rows.clone(), id, node);
-                let here = crate::session_cli::lines(&mine, "", &names)
-                    .iter()
-                    .filter(|l| l.waiting.is_some())
-                    .count();
-                if here > 0 {
-                    sessions.insert((room, *node, id.clone()));
+            for (s, t) in listed.iter().zip(&summaries) {
+                if t.waiting > 0
+                    && drivable
+                        .iter()
+                        .any(|(node, id)| *node == s.node && *id == s.id)
+                {
+                    sessions.insert((room, s.node, s.id.clone()));
+                    n += t.waiting as usize;
                 }
-                n += here;
             }
             waiting.insert(room, n);
         }
@@ -1342,18 +1404,40 @@ impl DaemonCore {
         if Some(room) != self.active {
             return;
         }
-        if !self.session_stale {
+        if !self.session_stale && !self.session_want_older {
             return;
         }
-        self.session_stale = false;
-        let Ok(Frame::SessionEntries { rows }) =
-            self.request(&Request::SessionEntries { channel_id: room })
-        else {
-            return;
-        };
+        let which = vox_core::node::drive::SessionFilter::Session(id.clone());
+        if std::mem::take(&mut self.session_want_older) && self.session_older > 0 {
+            // The page before the oldest held (ADR-034 FR-4), put before it.
+            if let Some(first) = self.session_rows.first().map(|r| r.entry_hash) {
+                if let Some((mut rows, older)) = self.session_page(room, which.clone(), Some(first))
+                {
+                    rows.extend(std::mem::take(&mut self.session_rows));
+                    self.session_rows = rows;
+                    self.session_older = older;
+                }
+            }
+        }
+        if std::mem::take(&mut self.session_stale) {
+            // The newest page (FR-4): what arrived since the last read is at its end, after what
+            // is held. More than a page since, or nothing held: the newest page alone.
+            let Some((rows, older)) = self.session_page(room, which, None) else {
+                return;
+            };
+            let held: std::collections::HashSet<Digest32> =
+                self.session_rows.iter().map(|r| r.entry_hash).collect();
+            if held.is_empty() || !rows.iter().any(|r| held.contains(&r.entry_hash)) {
+                self.session_rows = rows;
+                self.session_older = older;
+            } else {
+                self.session_rows
+                    .extend(rows.into_iter().filter(|r| !held.contains(&r.entry_hash)));
+            }
+        }
         // The Session's own entries and the drive entries naming it, in written order: as
         // `vox room session` takes them.
-        let mine = crate::session_cli::of_session(rows, &id, &node);
+        let mine = crate::session_cli::of_session(self.session_rows.clone(), &id, &node);
         let me = self.snapshot.me;
         let names = SessionNames {
             trusted: &self.snapshot.trusted,
@@ -1407,6 +1491,27 @@ impl DaemonCore {
         if !self.snapshot.open.iter().any(|o| o.channel_id == cid) {
             return;
         }
+        if let Some(t) = self.timeline.as_mut().filter(|t| t.channel_id == cid) {
+            if std::mem::take(&mut t.want_older) && t.older > 0 {
+                let before = t.rows.first().map(|r| r.entry_hash);
+                if let Some(conn) = self.conn.as_mut() {
+                    if let Some(Ok(Frame::RoomPage { mut rows, older })) = until_stopped(
+                        &self.rt,
+                        &self.stop,
+                        conn.client.request(&Request::RoomPage {
+                            channel_id: cid,
+                            before,
+                            limit: 0,
+                        }),
+                    ) {
+                        rows.append(&mut t.rows);
+                        t.rows = rows;
+                        t.older = older;
+                        t.projected = None;
+                    }
+                }
+            }
+        }
         let fresh = !matches!(&self.timeline, Some(t) if t.channel_id == cid);
         if !fresh && !self.timeline.as_ref().is_some_and(|t| t.stale) {
             return;
@@ -1419,14 +1524,27 @@ impl DaemonCore {
         let Some(conn) = self.conn.as_mut() else {
             return;
         };
-        let Some(read) = until_stopped(&self.rt, &self.stop, conn.client.read_rows(cid, since))
-        else {
+        let request = match since {
+            None => Request::RoomPage {
+                channel_id: cid,
+                before: None,
+                limit: 0,
+            },
+            Some(since) => Request::Read {
+                channel_id: cid,
+                since: Some(since),
+                after: None,
+                limit: vox_core::node::ipc::SESSION_PAGE_ROWS as u64,
+            },
+        };
+        let Some(read) = until_stopped(&self.rt, &self.stop, conn.client.request(&request)) else {
             return;
         };
-        let rows = match read {
-            Ok(Frame::Rows { rows }) => rows,
+        let (rows, older) = match read {
+            Ok(Frame::Rows { rows }) => (rows, 0),
+            Ok(Frame::RoomPage { rows, older }) => (rows, older),
             Ok(Frame::NodeDetached { .. }) => return self.detached(),
-            // A cursor the node no longer knows (the row expired): read it whole.
+            // A cursor the node no longer knows (the row expired): reopen at the newest page.
             Ok(_) if since.is_some() => {
                 self.timeline = None;
                 return self.read_timeline();
@@ -1444,6 +1562,7 @@ impl DaemonCore {
                 .max_by_key(|r| r.arrival)
                 .map(|r| r.entry_hash)
         };
+        let rows_full = !rows.is_empty();
         match self.timeline.as_mut() {
             Some(t) if !fresh => {
                 if rows.iter().any(|r| r.late) {
@@ -1465,7 +1584,8 @@ impl DaemonCore {
                         None => t.rows.push(row),
                     }
                 }
-                t.stale = false;
+                // A full feed page may have a following page; fetch it on the next frame.
+                t.stale = rows_full;
             }
             _ => {
                 let mut machines = std::collections::HashMap::new();
@@ -1476,6 +1596,8 @@ impl DaemonCore {
                     channel_id: cid,
                     cursor: newest(&rows),
                     rows,
+                    older,
+                    want_older: false,
                     stale: false,
                     projected: None,
                     machines,
@@ -1907,6 +2029,11 @@ impl DaemonCore {
                         })
                         .collect(),
                     timeline: timeline.clone().unwrap_or_default(),
+                    room_older: self
+                        .timeline
+                        .as_ref()
+                        .filter(|t| t.channel_id == d.channel_id)
+                        .map_or(0, |t| t.older),
                     // What is shared here, in this operator's own words (V030-25): the same
                     // addresses `vox service list` prints.
                     shared: {
@@ -1982,6 +2109,15 @@ impl DaemonCore {
                         self.session_lines.clone()
                     } else {
                         Vec::new()
+                    },
+                    session_older: if self
+                        .shown_session
+                        .as_ref()
+                        .is_some_and(|(room, _, _)| *room == d.channel_id)
+                    {
+                        self.session_older
+                    } else {
+                        0
                     },
                     // The room's Sessions (ADR-029 CL-2), newest opening first, each labelled as
                     // `vox room sessions` labels it (SE-3).
@@ -2542,7 +2678,29 @@ impl CoreHandle for DaemonCore {
             } => {
                 self.shown_session = session.map(|(node, id)| (channel_id, node, id));
                 self.session_lines.clear();
+                self.session_rows.clear();
+                self.session_older = 0;
+                self.session_want_older = false;
                 self.session_stale = true;
+                CommandStatus::Done
+            }
+            Command::OlderSession {
+                channel_id,
+                session: (node, id),
+            } => {
+                if self.shown_session.as_ref() == Some(&(channel_id, node, id)) {
+                    self.session_want_older = true;
+                }
+                CommandStatus::Done
+            }
+            Command::OlderRoom { channel_id } => {
+                if let Some(t) = self
+                    .timeline
+                    .as_mut()
+                    .filter(|t| t.channel_id == channel_id)
+                {
+                    t.want_older = true;
+                }
                 CommandStatus::Done
             }
             Command::SelectChannel { channel_id } => {

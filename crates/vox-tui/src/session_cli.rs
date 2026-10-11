@@ -47,7 +47,9 @@ impl Names for ByIdent {
     }
 }
 
-/// `vox room session ROOM SESSION [--details] [--json]`.
+/// `vox room session ROOM SESSION [--details] [--json] [--before ENTRY]`: one page of the
+/// Session, the newest or the one before ENTRY, and under it how to print the page before it
+/// (ADR-034 FR-4): never the whole history.
 ///
 /// # Errors
 /// If the node cannot be reached, the room is unknown or closed, or no one Session answers to
@@ -58,13 +60,14 @@ pub async fn show(
     session: &str,
     details: bool,
     json: bool,
+    before: Option<&str>,
 ) -> Result<(), crate::app::AppError> {
     use crate::app::AppError;
-    use vox_core::node::ipc::{Frame, Request};
+    use vox_core::node::ipc::Frame;
     let mut client = crate::room_cli::attach(paths).await?;
     let channel_id = crate::room_cli::room_of(&mut client, room).await?;
-    let sessions = match client.request(&Request::Sessions { channel_id }).await {
-        Ok(Frame::Sessions { sessions }) => sessions,
+    let sessions = match client.sessions(channel_id).await {
+        Ok(Frame::SessionsPage { sessions, .. }) => sessions,
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
         Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
@@ -76,18 +79,36 @@ pub async fn show(
             &s.id,
         )
     };
-    let rows = match client
-        .request(&Request::SessionEntries { channel_id })
-        .await
-    {
-        Ok(Frame::SessionEntries { rows }) => rows,
+    // The Session the room's Sessions name; else the daemon looks among its entries for the one
+    // `session` names, whose opening has not arrived yet.
+    let named = vox_core::node::sessions::resolve(&sessions, session, true, label_of)
+        .map_or_else(|_| session.trim().to_owned(), |s| s.id.clone());
+    let before = before
+        .map(|b| vox_core::node::link::b32_decode(b.trim(), "entry"))
+        .transpose()
+        .map_err(|_| AppError::Usage(format!("--before {}: not an entry", before.unwrap_or(""))))?;
+    let which = vox_core::node::drive::SessionFilter::Session(named);
+    let (rows, older) = match client.session_page(channel_id, which, before).await {
+        Ok(Frame::SessionPage { rows, older }) => (rows, older),
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
         Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
+    let first = rows
+        .first()
+        .map(|r| vox_core::node::link::b32_encode(&r.entry_hash));
     let read =
         vox_core::node::session_view::read(&sessions, rows, session, None, &label_of, &ByIdent)
             .map_err(AppError::Usage)?;
+    // What is not shown, and how to show it, on stderr: stdout stays the page.
+    if let (Some(first), true) = (&first, older > 0 && read.hidden.is_none()) {
+        eprintln!(
+            "{older} older {} not shown: vox room session {} {} --before {first}",
+            if older == 1 { "entry" } else { "entries" },
+            room.trim(),
+            read.id
+        );
+    }
     use std::io::Write as _;
     let mut out = std::io::stdout().lock();
     if let Some(hidden) = &read.hidden {

@@ -1826,6 +1826,19 @@ pub async fn serve(stream: &mut UnixStream, handle: &NodeHandle) -> Result<()> {
         }
         .to_bytes(),
     };
+    // **Never over the frame limit** (ADR-034 FR-2): said instead, as the snapshot says it.
+    let body = if body.len() > crate::node::ipc::frame_limit() {
+        Frame::Error {
+            reason: format!(
+                "this node's status takes {} bytes, more than one control frame carries ({})",
+                body.len(),
+                crate::node::ipc::frame_limit()
+            ),
+        }
+        .to_bytes()
+    } else {
+        body
+    };
     write_frame(stream, &body).await
 }
 
