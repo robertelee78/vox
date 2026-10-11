@@ -89,6 +89,12 @@ fn said(out: &Output) -> String {
 /// Run a `vox` with a private `$HOME`, so nothing here can touch the developer's own dotfiles
 /// — `vox update` runs `vox shell-setup` on success, and that edits a startup file.
 fn vox(bin: &Path, home: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+    vox_command(bin, home, args, extra_env)
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not run {}: {e}", bin.display()))
+}
+
+fn vox_command(bin: &Path, home: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Command {
     let mut cmd = Command::new(bin);
     cmd.args(args)
         .env_clear()
@@ -102,8 +108,7 @@ fn vox(bin: &Path, home: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Ou
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    cmd.output()
-        .unwrap_or_else(|e| panic!("APPARATUS: could not run {}: {e}", bin.display()))
+    cmd
 }
 
 /// A temporary directory, or an apparatus failure.
@@ -1472,6 +1477,7 @@ fn daemon_restart_claim(
         vec!["daemon", "--node", "kept"],
         vec!["node", "detach", "kept"],
         vec!["node", "rename", "kept", "renamed-by-mismatch"],
+        vec!["agent", "status", "--harness", "claude"],
     ] {
         let refusal = said(&vox(Path::new(VOX), home, &args, &env));
         claims.push(claim(
@@ -1484,6 +1490,37 @@ fn daemon_restart_claim(
             format!("the current release's {} said {refusal:?}", args.join(" ")),
         ));
     }
+    let mut ending = vox_command(
+        Path::new(VOX),
+        home,
+        &["agent", "hook", "--node", "kept", "--format", "text"],
+        &env,
+    );
+    let mut ending = ending
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: SessionEnd hook");
+    {
+        use std::io::Write as _;
+        ending
+            .stdin
+            .take()
+            .expect("APPARATUS: hook input")
+            .write_all(
+                br#"{"hook_event_name":"SessionEnd","session_id":"version-ended","reason":"exit"}"#,
+            )
+            .expect("APPARATUS: write SessionEnd");
+    }
+    let refusal = said(&ending.wait_with_output().expect("APPARATUS: hook output"));
+    claims.push(claim(
+        "daemon.session_end_preserves_version_refusal",
+        refusal.contains(VERSION)
+            && refusal.contains(&next)
+            && refusal.contains("vox daemon --restart"),
+        format!("SessionEnd hook against another release said {refusal:?}"),
+    ));
     let (_, _, after_refusals) = listed(&link);
     claims.push(claim(
         "daemon.mismatched_rename_preserves_attached_node",
