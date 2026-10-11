@@ -284,7 +284,7 @@ fn assert_upgrade_steps(w: &room::Worker, room: &str, present: bool) {
 }
 
 /// The user's status, rather than a private policy or store value, reports effective retention.
-fn assert_retention(w: &room::Worker, room: &str, messages: u64, steps: u64) {
+fn assert_retention(w: &room::Worker, room: &str, messages: u64, steps: u64) -> String {
     let o = w.vox(None, &["status", "--json"]);
     assert!(o.ok, "PRODUCT: {} could not read status: {o:?}", w.name);
     let status: serde_json::Value = serde_json::from_str(&o.stdout)
@@ -302,6 +302,10 @@ fn assert_retention(w: &room::Worker, room: &str, messages: u64, steps: u64) {
         "PRODUCT: {}'s status does not show the effective message and step retention: {row}",
         w.name
     );
+    row["id"]
+        .as_str()
+        .expect("PRODUCT: room status omitted its id")
+        .to_owned()
 }
 
 fn await_upgrade_post(w: &room::Worker, room: &str, text: &str) {
@@ -700,12 +704,31 @@ fn a_data_root_of_the_previous_release_opens_with_nothing_lost() {
         created.ok,
         "PRODUCT: could not create a new room after upgrade: {created:?}"
     );
-    assert_retention(&r.workers[0], "fresh-retention-default", 0, 7 * 86400);
+    let fresh = assert_retention(&r.workers[0], "fresh-retention-default", 0, 7 * 86400);
+    // The admin's separate step policy still cannot outlive the room's message cap.
+    for args in [
+        vec!["room", "retention", &fresh, "1h"],
+        vec!["room", "retention", &fresh, "--steps", "7d"],
+    ] {
+        let o = r.workers[0].vox(None, &args);
+        assert!(o.ok, "PRODUCT: setting the admin's retention failed: {o:?}");
+    }
+    assert_retention(&r.workers[0], &fresh, 3600, 3600);
+    let help = r.workers[0].vox(None, &["room", "retention", "--help"]);
+    let meaning = help.stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        help.ok
+            && meaning.contains("A step is one thing an agent did in its Session: a message, a command it ran, or a file it edited.")
+            && meaning.contains("Retention is housekeeping: a modified node can keep everything."),
+        "PRODUCT: retention help does not explain a step and what retention means: {help:?}"
+    );
     let bob = &r.workers[1];
     for ttl in ["8d", "forever"] {
         let o = bob.vox(None, &["room", "retention", &r.id, "--steps", ttl]);
-        assert!(!o.ok && o.stderr.contains("room"),
-            "PRODUCT: a member could extend steps beyond the room's seven-day cap, or got no reason: {o:?}");
+        assert!(
+            !o.ok && o.stderr.contains("room"),
+            "PRODUCT: a member could extend steps beyond the room's seven-day cap, or got no reason: {o:?}"
+        );
     }
     // What status shows must include the message cap, even when the member asks for more steps.
     for args in [
@@ -756,6 +779,8 @@ fn a_data_root_of_the_previous_release_opens_with_nothing_lost() {
                 w.name
             );
         }
-        println!("[proof] day {days}, restart={restart}: step expiry is visible on first read; forever messages remain");
+        println!(
+            "[proof] day {days}, restart={restart}: step expiry is visible on first read; forever messages remain"
+        );
     }
 }

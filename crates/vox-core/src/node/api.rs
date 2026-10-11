@@ -1019,8 +1019,6 @@ pub enum NodeCommand {
         /// The local address the forward is listening on.
         local: std::net::SocketAddr,
     },
-    /// Set a room's retention (PRD-001 R7, ADR-023 decision 2): `ttl` seconds, `0` for
-    /// forever, as an ADR-007 policy-update. Only the room's admin may; it applies to what is
     /// Set the room's Session retention, or this member's shorter local rule.
     SetStepRetention {
         /// The room to change.
@@ -1028,6 +1026,8 @@ pub enum NodeCommand {
         /// Seconds to retain Session entries; zero means forever.
         seconds: u64,
     },
+    /// Set a room's retention (PRD-001 R7, ADR-023 decision 2): `ttl` seconds, `0` for
+    /// forever, as an ADR-007 policy-update. Only the room's admin may; it applies to what is
     /// already stored.
     SetRetention {
         /// The channel.
