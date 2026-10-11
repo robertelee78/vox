@@ -6929,8 +6929,15 @@ impl Node {
                     // unlock is the same room, and a restart is exactly when its members have to
                     // be dialled from where they were last reached (`node::peer_book`).
                     let mut channel = *channel;
-                    channel.set_node_retention(self.node_retention_for(&channel_id));
-                    channel.set_node_step_retention(self.node_step_retention.for_room(&channel_id));
+                    if let Err(e) = self.retention_before_publication(&mut channel) {
+                        let _ = self.event_tx.send(NodeEvent::NodeNote {
+                            note: format!(
+                                "room {} did not reopen: {e}; it stays closed",
+                                crate::node::link::b32_encode(&channel_id)
+                            ),
+                        });
+                        return;
+                    }
                     crate::node::status::SyncBook::note_set_aside(
                         &self.sync_book,
                         channel_id,
@@ -14352,13 +14359,37 @@ impl Node {
         Box::pin(self.finish_open_channel_unboxed(ch))
     }
 
+    /// Apply this node's shorter limits after opening under the room policy, before a cached
+    /// row can be read or relayed. Failure follows the caller's ordinary open/recovery error path.
+    fn retention_before_publication(&mut self, ch: &mut ChannelState) -> crate::error::Result<()> {
+        let id = ch.channel_id();
+        ch.set_node_retention(self.node_retention_for(&id));
+        ch.set_node_step_retention(self.node_step_retention.for_room(&id));
+        let profile = self
+            .profile
+            .as_ref()
+            .ok_or(crate::error::Error::AtRestLocked)?;
+        ch.sweep_retention(profile.store(), self.now_ms())?;
+        Ok(())
+    }
+
     /// [`Self::finish_open_channel`], unboxed: see [`Boxed`].
     async fn finish_open_channel_unboxed(&mut self, mut ch: ChannelState) -> Outcome {
+        if let Err(e) = self.retention_before_publication(&mut ch) {
+            let _ = self.event_tx.send(NodeEvent::NodeNote {
+                note: format!(
+                    "room {} could not apply retention before opening: {e}",
+                    crate::node::link::b32_encode(&ch.channel_id())
+                ),
+            });
+            return Outcome::Failed(fault_of(&e));
+        }
+        self.publish_open_channel(ch).await
+    }
+
+    /// Publish a room only after both shared and local retention have been applied durably.
+    async fn publish_open_channel(&mut self, ch: ChannelState) -> Outcome {
         let channel_id = ch.channel_id();
-        // The node's own retention before the room is visible to anything that can start a
-        // session on it (the retention fix, e2a74b9).
-        ch.set_node_retention(self.node_retention_for(&channel_id));
-        ch.set_node_step_retention(self.node_step_retention.for_room(&channel_id));
         // What the open set aside is reported (V210-74), as a reopen reports it.
         crate::node::status::SyncBook::note_set_aside(&self.sync_book, channel_id, ch.set_aside());
         self.remember_or_say(&ch);

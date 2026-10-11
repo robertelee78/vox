@@ -700,12 +700,7 @@ fn a_data_root_of_the_previous_release_opens_with_nothing_lost() {
         created.ok,
         "PRODUCT: could not create a new room after upgrade: {created:?}"
     );
-    assert_retention(
-        &r.workers[0],
-        "fresh-retention-default",
-        7 * 86400,
-        7 * 86400,
-    );
+    assert_retention(&r.workers[0], "fresh-retention-default", 0, 7 * 86400);
     let bob = &r.workers[1];
     for ttl in ["8d", "forever"] {
         let o = bob.vox(None, &["room", "retention", &r.id, "--steps", ttl]);
