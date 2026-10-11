@@ -2734,6 +2734,7 @@ fn a_sessions_steps_start_at_the_later_of_join_and_drive() {
             .env("VOX_NODE", "published")
             .env("VOX_LISTEN", "127.0.0.1:0")
             .env("VOX_PROXY", "127.0.0.1:0")
+            .env("CLAUDE_CODE_ENTRYPOINT", "cli")
             .args(args);
         command
     };
@@ -2831,5 +2832,62 @@ fn a_sessions_steps_start_at_the_later_of_join_and_drive() {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
-    println!("[proof] join and drive boundaries hold at author and relay; published {old_version} exchanges ordinary messages across floor controls");
+    // Staggered upgrades include the other direction: the published peer is a live Session
+    // author. Its authenticated drive release authorizes only this receiver's later steps;
+    // absence of a new public floor must not silently stop that existing collaboration.
+    const OLD_SESSION: &str = "published-session-forward-only";
+    let mut old_prompt = base_for(
+        OLD_SESSION,
+        "UserPromptSubmit",
+        &w.root.join("work"),
+        &transcript,
+    );
+    old_prompt["prompt"] = "published author step before drive grant".into();
+    old_run(
+        &["agent", "hook", "--node", "published", "--room", &room],
+        Some(&old_prompt.to_string()),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let text = old_run(&["room", "session", &room, OLD_SESSION], None);
+        if text.contains("published author step before drive grant") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: published author's first step was not written: {text}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    old_run(
+        &["trust", "add", &agent_fp, "--name", AGENT, "--drive"],
+        None,
+    );
+    let read_old = |wanted: &str| {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let (_, shown, err) = w.vox(AGENT, &["room", "session", &room, OLD_SESSION], None);
+            if shown.contains(wanted) {
+                assert!(!shown.contains("published author step before drive grant"), "PRODUCT: current receiver backfilled the published author's pre-grant step: {shown}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "PRODUCT: current receiver lost the published author's eligible Session step {wanted:?}: {shown}{err}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    old_prompt["prompt"] = "published author step after drive grant".into();
+    old_run(
+        &["agent", "hook", "--node", "published", "--room", &room],
+        Some(&old_prompt.to_string()),
+    );
+    read_old("published author step after drive grant");
+    w.staged(AGENT, &["node", "detach", AGENT], None);
+    w.staged(AGENT, &["node", "attach", AGENT], None);
+    old_prompt["prompt"] = "published author step after receiver reopened".into();
+    old_run(
+        &["agent", "hook", "--node", "published", "--room", &room],
+        Some(&old_prompt.to_string()),
+    );
+    read_old("published author step after receiver reopened");
+    println!("[proof] join/drive boundaries hold at author and relay; published {old_version} exchanges ordinary messages and eligible live Session steps, including after receiver reopen");
 }
