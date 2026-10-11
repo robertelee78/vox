@@ -1177,16 +1177,21 @@ impl Held {
         }
         let mut again = self.at.clone();
         again.using.attach = AttachMode::Hold;
-        self.client = IpcClient::open_at(&again).await.map_err(|e| {
-            failed(format!(
-                "the app's connection to node {} broke, and a new one could not be opened: {}",
-                self.node,
-                said(&self.at.path, e)
-            ))
-        })?;
+        self.client = IpcClient::open_at(&again)
+            .await
+            .map_err(|e| {
+                failed(format!(
+                    "the app's connection to node {} broke, and a new one could not be opened: {}",
+                    self.node,
+                    said(&self.at.path, e)
+                ))
+            })?
+            .with_answer_bound(REQUEST_WITHIN);
         Ok(())
     }
 }
+
+const REQUEST_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
 
 type Slot = Arc<tokio::sync::Mutex<Option<Held>>>;
 
@@ -1560,7 +1565,7 @@ impl VoxClient {
         // the next call opens a fresh connection while retaining the node's hold (WT-2, WT-5).
         self.rt
             .spawn(async move {
-                tokio::time::timeout(std::time::Duration::from_secs(60), fut)
+                tokio::time::timeout(REQUEST_WITHIN, fut)
                     .await
                     .unwrap_or_else(|_| Err(VoxError::Unknown {
                         reason: "vox did not finish this request within 60 seconds; its outcome is unknown. Try again to reconnect.".into(),
@@ -1851,7 +1856,8 @@ impl VoxClient {
             *slot = None;
             let client = IpcClient::open_at(&at)
                 .await
-                .map_err(|e| attach_said(&socket, &name, e))?;
+                .map_err(|e| attach_said(&socket, &name, e))?
+                .with_answer_bound(REQUEST_WITHIN);
             let me = client.me().map(|f| b32_encode(&f)).unwrap_or_default();
             *slot = Some(Held {
                 node: name,
@@ -3742,7 +3748,13 @@ async fn follow(
                             listener.on_ended("the app released its node".to_owned());
                             return;
                         };
-                        let names = names(&mut h.client).await.unwrap_or_default();
+                        let names = match names(&mut h.client).await {
+                            Ok(names) => names,
+                            Err(e) => {
+                                listener.on_ended(e.to_string());
+                                return;
+                            }
+                        };
                         let me = h.client.me().map(|f| b32_encode(&f));
                         rendered(&row, &names, me.as_deref())
                     };
@@ -3832,7 +3844,13 @@ async fn follow(
                         return;
                     }
                 };
-                let names = names(&mut h.client).await.unwrap_or_default();
+                let names = match names(&mut h.client).await {
+                            Ok(names) => names,
+                            Err(e) => {
+                                listener.on_ended(e.to_string());
+                                return;
+                            }
+                        };
                 let me = h.client.me().map(|f| b32_encode(&f));
                 rows.iter()
                     .map(|r| (r.clone(), rendered(r, &names, me.as_deref())))

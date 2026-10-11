@@ -82,9 +82,21 @@ const SESSION: &str = "5b1d0c6e-7a2f-4e3b-8c9d-large-room-session";
 #[test]
 #[ignore = "real daemon and the app's 60-second request deadline; run in release on demand"]
 fn an_app_request_times_out_and_reconnects_without_losing_its_node() {
+    delayed_app_reply(false);
+}
+
+/// The listener shares the app's held connection: its request must release that mutex at the
+/// same bound, so a subsequent button action can reconnect (ADR-034 WT-1/WT-2).
+#[test]
+#[ignore = "real daemon and the app listener's 60-second request deadline; run in release on demand"]
+fn an_app_listener_times_out_and_releases_its_connection() {
+    delayed_app_reply(true);
+}
+
+fn delayed_app_reply(background: bool) {
     use std::io::{Read as _, Write as _};
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     watchdog::arm();
@@ -105,6 +117,8 @@ fn an_app_request_times_out_and_reconnects_without_losing_its_node() {
     let armed = Arc::new(AtomicBool::new(false));
     let delayed = Arc::new(AtomicBool::new(false));
     let release = Arc::new(AtomicBool::new(false));
+    let connections = Arc::new(AtomicUsize::new(0));
+    let proxy_connections = Arc::clone(&connections);
     // Let the one held reply go on panic too; no paused worker or daemon survives this proof.
     struct Release(Arc<AtomicBool>);
     impl Drop for Release {
@@ -121,6 +135,7 @@ fn an_app_request_times_out_and_reconnects_without_losing_its_node() {
     std::thread::spawn(move || {
         for accepted in listener.incoming() {
             let Ok(mut down) = accepted else { break };
+            let connection = proxy_connections.fetch_add(1, Ordering::SeqCst) + 1;
             let Ok(mut up) = UnixStream::connect(&upstream) else {
                 break;
             };
@@ -145,7 +160,9 @@ fn an_app_request_times_out_and_reconnects_without_losing_its_node() {
                     if n == 0 {
                         break;
                     }
-                    if armed.swap(false, Ordering::SeqCst) {
+                    // The first connection holds the daemon; the second holds the app's node.
+                    // A subscribed event stream must keep delivering while its lookup is delayed.
+                    if (!background || connection == 2) && armed.swap(false, Ordering::SeqCst) {
                         delayed.store(true, Ordering::SeqCst);
                         while !release.load(Ordering::SeqCst) {
                             std::thread::sleep(Duration::from_millis(20));
@@ -167,19 +184,54 @@ fn an_app_request_times_out_and_reconnects_without_losing_its_node() {
         .expect("APPARATUS: passphrase");
     rt.block_on(client.attach(node.as_str().to_owned(), Some(pass)))
         .expect("PRODUCT: the app could not attach its node");
+    let (ended, from_listener) = std::sync::mpsc::channel();
+    struct Listener(std::sync::mpsc::Sender<String>);
+    impl vox_ffi::ClientListener for Listener {
+        fn on_message(&self, _: String, _: vox_ffi::RoomMessage) {}
+        fn on_notice(&self, _: String) {}
+        fn on_ended(&self, said: String) {
+            let _ = self.0.send(said);
+        }
+        fn on_sessions(&self, _: String) {}
+        fn on_session_entry(&self, _: String, _: String, _: String) {}
+    }
+    if background {
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            2,
+            "APPARATUS: held connection was not the second connection"
+        );
+        rt.block_on(client.subscribe(Arc::new(Listener(ended))))
+            .expect("PRODUCT: the app could not subscribe");
+    }
     armed.store(true, Ordering::SeqCst);
     let began = Instant::now();
-    let answer = rt.block_on(async {
-        tokio::time::timeout(Duration::from_secs(65), client.sessions(room.id.clone())).await
-    });
+    let reason = if background {
+        let posted = alice.vox(
+            None,
+            &["room", "post", &room.id, "an app listener receives this"],
+        );
+        assert!(
+            posted.ok,
+            "PRODUCT: the post for the app listener failed: {posted:?}"
+        );
+        from_listener.recv_timeout(Duration::from_secs(65)).expect(
+            "PRODUCT: the app listener kept its shared connection beyond its 60-second bound",
+        )
+    } else {
+        let answer = rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(65), client.sessions(room.id.clone())).await
+        });
+        let answer =
+            answer.expect("PRODUCT: the app's request still waits after its 60-second bound");
+        answer
+            .expect_err("PRODUCT: the app answered before the delayed reply arrived")
+            .to_string()
+    };
     assert!(
         delayed.load(Ordering::SeqCst),
         "APPARATUS: no app reply was delayed"
     );
-    let answer = answer.expect("PRODUCT: the app's request still waits after its 60-second bound");
-    let reason = answer
-        .expect_err("PRODUCT: the app answered before the delayed reply arrived")
-        .to_string();
     assert!(
         reason.contains("60 seconds"),
         "PRODUCT: the app's deadline said: {reason}"
