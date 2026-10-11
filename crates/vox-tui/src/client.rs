@@ -960,7 +960,10 @@ pub async fn node_rename(args: &NodeArgs, old: &str, new: &str) -> Result<(), Ap
     // ---- let go of it; `again` keeps the passphrase for restoring any failed move ----
     if was_attached {
         let mut d = daemon(&account).await?;
-        match d.request(DaemonRequest::Detach { node: old.clone() }).await {
+        match d
+            .request(DaemonRequest::DetachForRename { node: old.clone() })
+            .await
+        {
             Ok(DaemonFrame::Ok) => {}
             Ok(DaemonFrame::Refused(r)) => return Err(AppError::Usage(r.to_string())),
             Ok(other) => return Err(crate::client::unexpected_daemon(&other)),
@@ -1135,7 +1138,7 @@ pub async fn node_rename(args: &NodeArgs, old: &str, new: &str) -> Result<(), Ap
 }
 
 /// Restore the old node after a failed rename, including a keep already removed by Unkeep.
-/// A previously detached kept node is detached again after its credentials are remembered.
+/// A previously detached kept node is suspended again without forgetting its credentials.
 async fn restore_rename_source(
     account: &Account,
     args: &NodeArgs,
@@ -1156,8 +1159,10 @@ async fn restore_rename_source(
     )
     .await?;
     if !was_attached {
+        // Daemon requests are one opening per connection; Attach has completed on `d`.
+        let mut d = daemon(account).await?;
         match d
-            .request(DaemonRequest::Detach { node: name.clone() })
+            .request(DaemonRequest::DetachForRename { node: name.clone() })
             .await
         {
             Ok(DaemonFrame::Ok) => {}

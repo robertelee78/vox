@@ -58,7 +58,9 @@
 //! not rewritten; red as PRODUCT. RN-1 (#742) extends that journey to Codex, the app's chosen
 //! node and LT aliases: a read-only OpenCode hook is named with its fix line, while the other
 //! hooks, remembered node and old-name alias still change. Custom aliases stay. Mutant: skip
-//! the Codex hook rewrite; PRODUCT on its new --node assertion.
+//! the Codex hook rewrite; PRODUCT on its new --node assertion. A denied directory move also
+//! leaves a detached remembered node detached and remembered; restarting attaches it without
+//! typing. Mutant: rollback uses ordinary Detach and forgets its keep; PRODUCT on node list.
 //!
 //! And **Vox never raises a Keychain window** (#666): on a Mac whose HOME has no keychain, with
 //! no test keychain given, `vox node create` at a terminal attaches the node within 60 s and says
@@ -782,6 +784,112 @@ fn setup_makes_a_node_for_each_installed_harness() {
          node my-claude and leave it as it is, making no node: {out}{err}\n`vox node list`:\n\
          {listed}"
     );
+
+    // RN-1 rollback: a directory move denied by the OS must leave a remembered but detached
+    // node remembered and detached. The daemon protocol stages that state; the verdict is
+    // the shipped CLI's node list and its ability to restart without a passphrase.
+    #[cfg(target_os = "macos")]
+    {
+        let rollback_node = "my-claude";
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("APPARATUS: rollback protocol runtime");
+        rt.block_on(async {
+            use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest, NodeName};
+            let account = vox_core::node::paths::Account::of(
+                Some(&d.root.join("d")),
+                Some(&d.root.join("c")),
+            )
+            .expect("APPARATUS: scratch account");
+            let mut daemon = DaemonClient::open(&account.socket())
+                .await
+                .expect("APPARATUS: daemon for remembered detached node");
+            let reply = daemon
+                .request(DaemonRequest::DetachForRename {
+                    node: NodeName::parse(rollback_node).expect("APPARATUS: node name"),
+                })
+                .await
+                .expect("APPARATUS: detach preserving remembered credentials");
+            assert!(
+                matches!(reply, DaemonFrame::Ok),
+                "APPARATUS: staging a detached kept node: {reply:?}"
+            );
+        });
+        let staged = d.listed(rollback_node);
+        assert!(
+            staged.contains(" detached") && staged.contains("(kept)"),
+            "APPARATUS: remembered detached node not staged: {staged}"
+        );
+        // A macOS delete ACL blocks moving this directory while allowing the store inside to
+        // reopen. chmod on its parent would be undone by Vox restoring private permissions.
+        let source = d.root.join("d/nodes").join(rollback_node);
+        let protected = Command::new("chmod")
+            .args(["+a", "everyone deny delete"])
+            .arg(&source)
+            .status()
+            .expect("APPARATUS: protect the source directory from a move");
+        assert!(
+            protected.success(),
+            "APPARATUS: source directory ACL was not installed"
+        );
+        let (renamed, out, err) = d.vox(&["node", "rename", rollback_node, "rename-cannot-land"]);
+        let source_now = if source.exists() {
+            source
+        } else {
+            d.root.join("d/nodes/rename-cannot-land")
+        };
+        let restored_acl = Command::new("chmod")
+            .arg("-N")
+            .arg(source_now)
+            .status()
+            .expect("APPARATUS: remove scratch directory ACL");
+        assert!(
+            restored_acl.success(),
+            "APPARATUS: scratch directory ACL was not removed"
+        );
+        let refused = format!("{out}{err}");
+        let retained = d.listed(rollback_node);
+        println!("[proof] failed rename: {refused}; node list: {retained}");
+        assert!(
+            !renamed && refused.contains("could not be renamed"),
+            "APPARATUS: the source-directory ACL did not stage an OS rename failure: {refused}"
+        );
+        assert!(refused.contains("its previous attachment and remembered state were restored")
+        && retained.contains(" detached") && retained.contains("(kept)")
+        && d.listed("rename-cannot-land").is_empty(),
+        "PRODUCT: a denied rename must restore the old detached, remembered node: {refused}; node list: {retained}");
+        let pid = d
+            .daemon_pid()
+            .expect("APPARATUS: daemon to restart after failed rename");
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+        let gone = Instant::now() + Duration::from_secs(30);
+        while d.daemon_pid() == Some(pid)
+            && Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        {
+            assert!(
+                Instant::now() < gone,
+                "APPARATUS: rollback daemon did not stop within 30 s"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let (ok, out, err) = d.vox(&["daemon", "--detach"]);
+        assert!(ok, "PRODUCT: restart after refused rename: {out}{err}");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut restored = d.listed(rollback_node);
+        while !restored.contains(" attached") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+            restored = d.listed(rollback_node);
+        }
+        assert!(restored.contains(" attached") && restored.contains("(kept)"),
+        "PRODUCT: after a failed rename the original remembered node must attach on restart without typing: {restored}");
+        drop(rt);
+    }
 
     // ---- a node renamed: everything this machine holds follows it, and its identity stays
     // (#666) ----

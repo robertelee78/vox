@@ -359,6 +359,10 @@ impl Router {
     /// Every node: each on disk, and any slot besides, with its state.
     #[must_use]
     pub fn nodes(&self) -> Vec<NodeInfo> {
+        let remembered: BTreeSet<NodeName> = read_attach_file(&self.inner.account.attach_file())
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
         let slots = lock(&self.inner.slots);
         let mut names: BTreeSet<NodeName> =
             self.inner.account.nodes_on_disk().into_iter().collect();
@@ -367,6 +371,9 @@ impl Router {
             .into_iter()
             .map(|name| {
                 let mut info = info_of(&name, slots.get(&name));
+                if !matches!(slots.get(&name), Some(Slot::Attached(_))) {
+                    info.keep = remembered.contains(&name);
+                }
                 if slots.get(&name).is_none() && lock(&self.inner.starting).contains(&name) {
                     info.state = NodeState::Attaching;
                 }
@@ -2417,6 +2424,7 @@ async fn stop_actor(
 fn cause_words(cause: &DetachCause) -> String {
     match cause {
         DetachCause::Requested => "asked to".into(),
+        DetachCause::Rename => "its node is being renamed".into(),
         DetachCause::LastHolder => "its last holder went".into(),
         DetachCause::DaemonStopping => "the daemon is stopping".into(),
         DetachCause::Panicked(m) => format!("its actor panicked: {m}"),
@@ -2516,6 +2524,12 @@ impl Dispatch for Router {
             },
             DaemonRequest::Detach { node } => {
                 match self.detach(&node, DetachCause::Requested).await {
+                    Ok(()) => DaemonFrame::Ok,
+                    Err(r) => refused(r),
+                }
+            }
+            DaemonRequest::DetachForRename { node } => {
+                match self.detach(&node, DetachCause::Rename).await {
                     Ok(()) => DaemonFrame::Ok,
                     Err(r) => refused(r),
                 }
