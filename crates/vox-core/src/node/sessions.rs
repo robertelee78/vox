@@ -54,21 +54,83 @@ pub fn fold(detail: &ChannelDetail) -> Vec<SessionRow> {
     let mut rows: Vec<SessionRow> = Vec::new();
     // Per row: the position that last named it, and the one that ended it.
     let mut spans: Vec<(u32, Option<u32>)> = Vec::new();
+    // Large metadata is ordinary retained Session records, split without changing the store
+    // encoding. Only a complete, hash-matching bundle supplies a Session's fields.
+    let mut parts: std::collections::HashMap<(Digest32, String), (u32, u64, String)> =
+        std::collections::HashMap::new();
     let mut positions = detail.structured.positions(&types, &[]);
     positions.sort_unstable();
-    for i in positions {
-        let Some(r) = detail.timeline.get(i as usize) else {
+    let mut records = Vec::new();
+    for mut i in positions {
+        let Some(mut r) = detail.timeline.get(i as usize) else {
             continue;
         };
         if r.owed {
             continue;
         }
-        let Ok(env) = Envelope::parse(&r.text) else {
+        let Ok(mut env) = Envelope::parse(&r.text) else {
             continue;
         };
+        if let Some(tag) = env.data["session_parts"].as_str() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&r.text) else {
+                continue;
+            };
+            let Some(part) = value["part"].as_array() else {
+                continue;
+            };
+            let (Some(number), Some(count)) = (
+                part.first().and_then(serde_json::Value::as_u64),
+                part.get(1).and_then(serde_json::Value::as_u64),
+            ) else {
+                continue;
+            };
+            if number == 0 || count == 0 || number > count {
+                continue;
+            }
+            let key = (r.author, tag.to_owned());
+            if number == 1 {
+                parts.insert(key.clone(), (i, 1, String::new()));
+            }
+            let Some((_, next, text)) = parts.get_mut(&key) else {
+                continue;
+            };
+            if *next != number {
+                parts.remove(&key);
+                continue;
+            }
+            text.push_str(&env.body);
+            *next = number.saturating_add(1);
+            if number != count {
+                continue;
+            }
+            let Some((first, _, text)) = parts.remove(&key) else {
+                continue;
+            };
+            if crate::node::link::b32_encode(&crate::hash::sha256(text.as_bytes())) != tag {
+                continue;
+            }
+            let Ok(joined) = Envelope::parse(&text) else {
+                continue;
+            };
+            if joined.kind != SESSION {
+                continue;
+            }
+            let Some(origin) = detail.timeline.get(first as usize) else {
+                continue;
+            };
+            i = first;
+            r = origin;
+            env = joined;
+        }
         if env.from.trim().is_empty() {
             continue;
         }
+        records.push((i, r, env));
+    }
+    // Other openings or an end can arrive between a bundle's parts. Interpret complete
+    // metadata at its first record's position, not where its final part happened to land.
+    records.sort_unstable_by_key(|(position, _, _)| *position);
+    for (i, r, env) in records {
         let at = rows
             .iter()
             .rposition(|s| s.node == r.author && s.id == env.from);
@@ -216,7 +278,27 @@ pub async fn open_when_member(
     env.from.clone_from(&session.id);
     env.at.session_name.clone_from(&session.name);
     env.data = serde_json::json!({ "session": { "harness": session.harness } });
-    post(handle, room, env.to_text()).await
+    for part in metadata_parts(env.to_text()) {
+        post(handle, room, part).await?;
+    }
+    Ok(())
+}
+
+/// A Session's metadata has no field-size limit. Each retained room record still fits the
+/// content bound, and the reader joins the complete metadata before exposing any field.
+fn metadata_parts(text: String) -> Vec<String> {
+    use serde_json::{json, Map, Value};
+    let limit = crate::node::content::MAX_TEXT_LEN;
+    if text.len() <= limit {
+        return vec![text];
+    }
+    let tag = crate::node::link::b32_encode(&crate::hash::sha256(text.as_bytes()));
+    let mut envelope = Map::new();
+    envelope.insert("v".into(), json!(1));
+    envelope.insert("type".into(), json!(SESSION));
+    envelope.insert("body".into(), Value::String(text));
+    envelope.insert("data".into(), json!({"session_parts": tag}));
+    vox_agentcomms::activity::split(envelope, "body", limit)
 }
 
 /// End `session`'s Session in `room`, if it is open there (ADR-029 SE-4): on the harness's real end,
@@ -432,7 +514,16 @@ pub fn fill_name(paths: &crate::node::paths::Paths, text: &str) -> String {
     match name {
         Some(n) => {
             env.at.session_name = Some(n);
-            env.to_text()
+            let mut metadata = Envelope::new(SESSION, "");
+            metadata.from.clone_from(&env.from);
+            metadata.at.session_name.clone_from(&env.at.session_name);
+            if metadata.to_text().len() <= crate::node::content::MAX_TEXT_LEN {
+                env.to_text()
+            } else {
+                // The complete name is in the Session's authoritative metadata record. Do not
+                // make an otherwise valid message fail merely by repeating that metadata.
+                text.to_owned()
+            }
         }
         None => text.to_owned(),
     }

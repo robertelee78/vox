@@ -276,6 +276,189 @@ fn session_pages_show_complete_activities_after_late_results() {
     eprintln!("[proof] newest CLI page showed completed tools; app Details joined 7 parts across the real frame bound and all 220 older tools retained their later results");
 }
 
+/// A complete Sessions list can cross many frames; one Session name can itself cross a frame.
+/// The large name comes from the real hook's transcript, through daemon registration and retained
+/// room metadata, then is read through both shipped clients. Mutants: unpage Sessions, or cut a
+/// metadata field to one record (red PRODUCT on the complete-list/name assertion).
+#[test]
+#[ignore = "real daemon, 2000 Sessions and a hook with a 300 KiB name; CI runs in release"]
+fn a_large_sessions_list_and_a_hook_name_arrive_whole() {
+    watchdog::arm();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("APPARATUS: runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: scratch profile");
+    let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
+    let alice = &room.workers[0];
+    let node = alice.paths.account().nodes_on_disk()[0].clone();
+    rt.block_on(async {
+        let mut c = IpcClient::open_at(&NodeSocket::one_shot(
+            alice.paths.account().socket(),
+            node.clone(),
+        ))
+        .await
+        .expect("PRODUCT: the running daemon did not answer");
+        for n in 0..2000 {
+            let text = serde_json::json!({"v":1,"type":"session","from":format!("session-{n:04}"),
+                "body":"","at":{"session_name":format!("Session {n:04} {}","n".repeat(200))},
+                "data":{"session":{"harness":"proof harness"}}})
+            .to_string();
+            assert!(
+                matches!(
+                    c.request(&Request::Post {
+                        channel_id: room.cid,
+                        text,
+                        card: false
+                    })
+                    .await,
+                    Ok(Frame::Ok)
+                ),
+                "PRODUCT: the daemon refused Session {n}"
+            );
+        }
+        // A peer can send another opening between the parts of a large one. The list must
+        // keep both at their opening positions, regardless of which metadata finishes first.
+        let first = serde_json::json!({"v":1,"type":"session","from":"interleaved-a",
+            "at":{"session_name":"whole interleaved name"},"data":{"session":{"harness":"proof"}}})
+        .to_string();
+        let hash = vox_core::node::link::b32_encode(&vox_core::hash::sha256(first.as_bytes()));
+        let middle = first.len() / 2;
+        let part = |n, text: &str| {
+            serde_json::json!({"v":1,"type":"session","body":text,
+            "part":[n,2],"data":{"session_parts":hash}})
+            .to_string()
+        };
+        let other = serde_json::json!({"v":1,"type":"session","from":"interleaved-b",
+            "data":{"session":{"harness":"proof"}}})
+        .to_string();
+        for text in [part(1, &first[..middle]), other, part(2, &first[middle..])] {
+            assert!(
+                matches!(
+                    c.request(&Request::Post {
+                        channel_id: room.cid,
+                        text,
+                        card: false
+                    })
+                    .await,
+                    Ok(Frame::Ok)
+                ),
+                "PRODUCT: the daemon refused interleaved Session metadata"
+            );
+        }
+    });
+    let name = format!("LONG-NAME-{}", "n".repeat(300 * 1024));
+    let transcript = tmp.path().join("large-name.jsonl");
+    std::fs::write(
+        &transcript,
+        serde_json::json!({"type":"custom-title","customTitle":name}).to_string(),
+    )
+    .expect("APPARATUS: transcript title");
+    let payload = serde_json::json!({"session_id":SESSION,"hook_event_name":"UserPromptSubmit",
+        "cwd":"/tmp","transcript_path":transcript,"prompt":"go"})
+    .to_string();
+    let hooked = alice.vox_env(
+        None,
+        &[("CLAUDE_CODE_ENTRYPOINT", "cli")],
+        &["agent", "hook", "--node", node.as_str(), "--room", &room.id],
+        Some(&payload),
+    );
+    assert!(
+        hooked.ok && hooked.stderr.trim().is_empty(),
+        "PRODUCT: the hook could not register its 300 KiB Session name: {hooked:?}"
+    );
+    let cli = alice.vox(None, &["room", "sessions", &room.id, "--json"]);
+    let sessions = cli.ndjson();
+    assert!(
+        cli.ok && sessions.len() == 2003,
+        "PRODUCT: the CLI listed {} of 2003 Sessions: {}",
+        sessions.len(),
+        cli.stderr
+    );
+    let wanted: std::collections::BTreeSet<String> = (0..2000)
+        .map(|n| format!("session-{n:04}"))
+        .chain(
+            ["interleaved-a", "interleaved-b", SESSION]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .collect();
+    let ids: std::collections::BTreeSet<String> = sessions
+        .iter()
+        .filter_map(|s| s["id"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(ids, wanted, "PRODUCT: the CLI duplicated or lost a Session");
+    let order: Vec<_> = sessions.iter().filter_map(|s| s["id"].as_str()).collect();
+    assert_eq!(
+        &order[2000..],
+        &["interleaved-a", "interleaved-b", SESSION],
+        "PRODUCT: the CLI ordered fragmented metadata by completion instead of opening"
+    );
+    assert!(
+        sessions
+            .iter()
+            .any(|s| s["id"] == SESSION && s["name"] == name),
+        "PRODUCT: the CLI cut or omitted the hook's 300 KiB name"
+    );
+    let client = rt
+        .block_on(vox_ffi::VoxClient::open(
+            alice.data.to_string_lossy().into_owned(),
+        ))
+        .expect("PRODUCT: the app could not open its daemon");
+    let pass = vox_ffi::Passphrase::new(support::ID_PASS.as_bytes().to_vec())
+        .expect("APPARATUS: passphrase");
+    rt.block_on(client.attach(node.as_str().to_owned(), Some(pass)))
+        .expect("PRODUCT: the app could not attach");
+    let listed = rt
+        .block_on(client.sessions(room.id.clone()))
+        .expect("PRODUCT: the app could not list the Sessions");
+    assert_eq!(
+        listed.len(),
+        2003,
+        "PRODUCT: the app did not receive all Sessions"
+    );
+    let app_ids: std::collections::BTreeSet<_> =
+        listed.iter().map(|s| s.session_id.clone()).collect();
+    assert_eq!(
+        app_ids, wanted,
+        "PRODUCT: the app duplicated or lost a Session"
+    );
+    let order: Vec<_> = listed.iter().map(|s| s.session_id.as_str()).collect();
+    assert_eq!(
+        &order[2000..],
+        &["interleaved-a", "interleaved-b", SESSION],
+        "PRODUCT: the app ordered fragmented metadata by completion instead of opening"
+    );
+    assert!(
+        listed
+            .iter()
+            .any(|s| s.session_id == SESSION && s.name.as_deref() == Some(name.as_str())),
+        "PRODUCT: the app cut or omitted the hook's 300 KiB name"
+    );
+    assert!(
+        rt.block_on(
+            client.create_room(
+                "after-large-sessions".into(),
+                vox_ffi::Passphrase::new(b"room passphrase".to_vec())
+                    .expect("APPARATUS: room passphrase")
+            )
+        )
+        .is_ok(),
+        "PRODUCT: the app's next call failed after listing Sessions"
+    );
+    let posted = alice.vox(
+        Some(SESSION),
+        &["room", "post", &room.id, "message after large name"],
+    );
+    assert!(
+        posted.ok,
+        "PRODUCT: repeating the large Session name made an ordinary message fail: {posted:?}"
+    );
+    rt.block_on(client.close());
+    eprintln!("[proof] CLI and app listed all 2003 Sessions; the real hook's {}-byte name arrived whole and subsequent room creation/post succeeded",name.len());
+}
+
 fn delayed_app_reply(fault: AppReplyFault) {
     let background = matches!(fault, AppReplyFault::BackgroundTimeout);
     let timeout = matches!(

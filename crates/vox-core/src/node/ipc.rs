@@ -3513,7 +3513,7 @@ const T_REPLY_NEXT: u64 = 5491;
 
 /// Carry a complete collection reply across frame-sized pages. The next byte offset is its
 /// cursor; the client must ask for that cursor before the daemon sends more (ADR-034 FR-7/8).
-async fn write_reply(s: &mut UnixStream, body: &[u8]) -> Result<()> {
+pub(crate) async fn write_reply(s: &mut UnixStream, body: &[u8]) -> Result<()> {
     if body.len() <= rows_budget() {
         return write_frame(s, body).await;
     }
@@ -3543,7 +3543,7 @@ async fn write_reply(s: &mut UnixStream, body: &[u8]) -> Result<()> {
 }
 
 /// Read a collection's pages, joining a row that crosses a frame without dropping any bytes.
-async fn read_reply(s: &mut UnixStream) -> Result<Option<Vec<u8>>> {
+pub(crate) async fn read_reply(s: &mut UnixStream) -> Result<Option<Vec<u8>>> {
     let Some(mut body) = read_frame(s).await? else {
         return Ok(None);
     };
@@ -4244,7 +4244,7 @@ async fn serve_account<D: Dispatch>(
 ) -> Result<()> {
     use crate::node::daemonipc::{DaemonFrame, DaemonRequest, Opening};
     write_frame(&mut stream, &dispatch.hello().to_bytes()).await?;
-    let Some(body) = read_frame(&mut stream).await? else {
+    let Some(body) = read_reply(&mut stream).await? else {
         return Ok(());
     };
     // Wiped once decoded: an opening can carry passphrases (C-6).
@@ -4492,7 +4492,8 @@ pub struct SessionSummary {
 }
 
 /// One page of a room's Sessions (ADR-034 FR-1): oldest opening first, after the Session `after`
-/// opened, at most [`rows_budget`] bytes and at least one while any remain; and whether more follow.
+/// opened, filling [`rows_budget`] bytes and carrying at least one while any remain; and whether
+/// more follow. A larger individual row is carried whole across transport pages.
 ///
 /// The order is the room's log's, where a late arrival can land before the cursor: such a Session
 /// is in the next listing, not this one.
@@ -4506,8 +4507,8 @@ fn sessions_page(
             return Err("cursor not among this room's Sessions".into());
         }
     }
-    // Its id, name and harness, and the rest of a row. A name and a harness come from one
-    // message's text, so one row is never much past `MAX_TEXT_LEN`, and fits a page by itself.
+    // Its id, name and harness, and the rest of a row. Member-written fields have no length
+    // cap: a row larger than this budget goes alone, across as many transport pages as needed.
     let cost = |s: &crate::node::sessions::SessionRow| {
         s.id.len() + s.name.as_ref().map_or(0, String::len) + s.harness.len() + ROW_OVERHEAD
     };

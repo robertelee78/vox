@@ -1536,7 +1536,7 @@ impl DaemonClient {
     /// # Errors
     /// If the connection fails or closes before an answer, or the answer is malformed.
     pub async fn request(&mut self, request: DaemonRequest) -> Result<DaemonFrame> {
-        crate::node::ipc::write_frame(&mut self.stream, &Opening::Daemon(request).to_bytes())
+        crate::node::ipc::write_reply(&mut self.stream, &Opening::Daemon(request).to_bytes())
             .await?;
         self.next()
             .await?
