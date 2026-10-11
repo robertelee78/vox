@@ -363,6 +363,27 @@ const T_SESSION_APPEND: u64 = 5430;
 const T_SESSION_ENTRIES: u64 = 5431;
 /// [`Frame::SessionEntries`].
 const T_SESSION_ROWS: u64 = 5432;
+/// `[5435, channel_id, before, which, session_id]` — [`Request::SessionPage`]; an empty `before`
+/// is the newest page; `which` is 0 every Session, 1 the Session `session_id`, 2 files out
+/// (ADR-034 FR-4, FR-5).
+const T_SESSION_PAGE_REQ: u64 = 5435;
+/// `[5436, [row, …], older]` — [`Frame::SessionPage`].
+const T_SESSION_PAGE: u64 = 5436;
+/// `[5437, channel_id, after]` — [`Request::SessionsPage`]; an empty `after` is the start
+/// (ADR-034 FR-1).
+const T_SESSIONS_PAGE_REQ: u64 = 5437;
+/// `[5438, [session, …], [[entries, newest, waiting], …], more]` — [`Frame::SessionsPage`].
+const T_SESSIONS_PAGE: u64 = 5438;
+const T_ROOM_PAGE_REQ: u64 = 5492;
+const T_ROOM_PAGE: u64 = 5493;
+
+/// At most this many entries in one page of a Session (ADR-034 FR-7): bytes bound a page too.
+pub const SESSION_PAGE_ROWS: usize = 200;
+
+/// At most this many Sessions in one page of a room's Sessions list: each costs the daemon a look
+/// at its newest entries ([`SessionSummary`]).
+pub const SESSIONS_PAGE_ROWS: usize = 64;
+
 // Pulling one offer on request, and where pulls stand (ADR-028 F-3; D5). Additive.
 /// `[5460, channel_id, entry]` — [`Request::Pull`].
 const T_PULL: u64 = 5460;
@@ -410,6 +431,15 @@ const T_OFFERS: u64 = 4952;
 /// is accident prevention on top of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
+    /// A room's newest bounded history page, or the page before an entry (ADR-034 FR-4/5).
+    RoomPage {
+        /// The room.
+        channel_id: Digest32,
+        /// The first entry of the page already shown, or none for newest.
+        before: Option<Digest32>,
+        /// The most rows requested; zero uses the daemon's bounded page size.
+        limit: u64,
+    },
     /// Begin streaming events. Everything emitted from this point reaches this
     /// client; nothing before it does. **Terminal** — the connection becomes a
     /// stream and serves no further requests.
@@ -550,15 +580,45 @@ pub enum Request {
         to: SessionTo,
     },
     /// The Session entries this node can read in a room (ADR-029 SC-2): its own, and those of
-    /// each node that released it its drive key. Answered with [`Frame::SessionEntries`].
+    /// each node that released it its drive key. Answered with [`Frame::SessionEntries`], all in
+    /// one frame, or with a plain error when they do not fit one (ADR-034 FR-2).
+    ///
+    /// The previous release's read, served for its clients only, and only while the room's
+    /// entries fit one reply: this build reads them a page at a time ([`Request::SessionPage`]).
     SessionEntries {
         /// The room.
         channel_id: Digest32,
     },
-    /// A room's Sessions (ADR-029), as its log says, answered with [`Frame::Sessions`].
+    /// One page of the Session entries this node can read in a room (ADR-034 FR-4, FR-5),
+    /// answered with [`Frame::SessionPage`]: the newest of `which`'s entries before `before`, in
+    /// the order this node opened or wrote them, at most [`SESSION_PAGE_ROWS`] and
+    /// [`rows_budget`] bytes, and at least one while any are older. The daemon finds them by
+    /// index: a page costs what it carries, however long the history.
+    SessionPage {
+        /// The room.
+        channel_id: Digest32,
+        /// Whose entries.
+        which: crate::node::drive::SessionFilter,
+        /// The first entry of the page after this one; `None` for the newest page.
+        before: Option<Digest32>,
+    },
+    /// A room's Sessions (ADR-029), as its log says, answered with [`Frame::Sessions`], all in one
+    /// frame, or with a plain error when they do not fit one (ADR-034 FR-2).
+    ///
+    /// The previous release's read, served for its clients only: this build reads them in pages
+    /// ([`Request::SessionsPage`], [`IpcClient::sessions`]).
     Sessions {
         /// The room.
         channel_id: Digest32,
+    },
+    /// One page of a room's Sessions (ADR-034 FR-1), answered with [`Frame::SessionsPage`]: oldest
+    /// opening first, after the Session `after` opened, at most [`rows_budget`] bytes and at least
+    /// one while any remain.
+    SessionsPage {
+        /// The room.
+        channel_id: Digest32,
+        /// The opening entry of the last Session of the page before; `None` from the start.
+        after: Option<Digest32>,
     },
     /// Pull the file the message `entry` of a room offers, now, as `vox room get` does (ADR-028
     /// F-3; D5): whoever it is addressed to, verified before it is kept. Answered
@@ -578,7 +638,7 @@ pub enum Request {
     /// This node's decision record, newest first (ADR-028 D-3), answered with
     /// [`Frame::Decisions`]: read by the node, which alone opens it (#563).
     Decisions {
-        /// The most events to answer with.
+        /// The most events to answer with, or zero for the complete retained record.
         limit: u64,
     },
     /// The members offered to this node's keyring (ADR-028 K-15 – K-18), answered with
@@ -833,6 +893,17 @@ impl Request {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         match self {
+            Request::RoomPage {
+                channel_id,
+                before,
+                limit,
+            } => {
+                e.array(4)
+                    .uint(T_ROOM_PAGE_REQ)
+                    .bytes(channel_id)
+                    .bytes(before.as_ref().map_or(&[][..], |d| &d[..]))
+                    .uint(*limit);
+            }
             Request::Subscribe => {
                 e.array(1).uint(T_SUBSCRIBE);
             }
@@ -989,6 +1060,12 @@ impl Request {
             Request::Sessions { channel_id } => {
                 e.array(2).uint(T_SESSIONS_REQ).bytes(channel_id);
             }
+            Request::SessionsPage { channel_id, after } => {
+                e.array(3)
+                    .uint(T_SESSIONS_PAGE_REQ)
+                    .bytes(channel_id)
+                    .bytes(after.as_ref().map_or(&[][..], |d| &d[..]));
+            }
             Request::Decisions { limit } => {
                 e.array(2).uint(T_DECISIONS_REQ).uint(*limit);
             }
@@ -1014,6 +1091,30 @@ impl Request {
             }
             Request::SessionEntries { channel_id } => {
                 e.array(2).uint(T_SESSION_ENTRIES).bytes(channel_id);
+            }
+            Request::SessionPage {
+                channel_id,
+                which,
+                before,
+            } => {
+                use crate::node::drive::SessionFilter;
+                let (kind, id) = match which {
+                    SessionFilter::All => (0, ""),
+                    SessionFilter::Session(id) => (1, id.as_str()),
+                    SessionFilter::FilesOut => (2, ""),
+                    SessionFilter::SessionRaw(id) => (5, id.as_str()),
+                    SessionFilter::Pending(id) => (3, id.as_str()),
+                    SessionFilter::Request { session_id, .. } => (4, session_id.as_str()),
+                };
+                e.array(if kind == 4 { 6 } else { 5 })
+                    .uint(T_SESSION_PAGE_REQ)
+                    .bytes(channel_id)
+                    .bytes(before.as_ref().map_or(&[][..], |d| &d[..]))
+                    .uint(kind)
+                    .text(id);
+                if let SessionFilter::Request { reference, .. } = which {
+                    e.text(reference);
+                }
             }
             Request::Pull { channel_id, entry } => {
                 e.array(3).uint(T_PULL).bytes(channel_id).bytes(entry);
@@ -1249,6 +1350,20 @@ impl Request {
                     channel_id,
                     since,
                     after,
+                    limit,
+                })
+            }
+            (T_ROOM_PAGE_REQ, 4) => {
+                let channel_id = digest(&mut d)?;
+                let before = optional_digest(&mut d)?;
+                let limit = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc room page limit"))?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc room page trailing"))?;
+                Ok(Request::RoomPage {
+                    channel_id,
+                    before,
                     limit,
                 })
             }
@@ -1575,6 +1690,41 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::SessionEntries { channel_id })
             }
+            (T_SESSIONS_PAGE_REQ, 3) => {
+                let channel_id = digest(&mut d)?;
+                let after = optional_digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::SessionsPage { channel_id, after })
+            }
+            (T_SESSION_PAGE_REQ, 5 | 6) => {
+                use crate::node::drive::SessionFilter;
+                let channel_id = digest(&mut d)?;
+                let before = optional_digest(&mut d)?;
+                let kind = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc session page kind"))?;
+                let id = text(&mut d, "ipc session page id")?;
+                let which = match kind {
+                    0 => SessionFilter::All,
+                    1 => SessionFilter::Session(id),
+                    2 => SessionFilter::FilesOut,
+                    3 => SessionFilter::Pending(id),
+                    5 => SessionFilter::SessionRaw(id),
+                    4 => SessionFilter::Request {
+                        session_id: id,
+                        reference: text(&mut d, "ipc request reference")?,
+                    },
+                    _ => return Err(Error::MalformedIpc("ipc session page kind")),
+                };
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::SessionPage {
+                    channel_id,
+                    which,
+                    before,
+                })
+            }
             (T_PULL, 3) => {
                 let channel_id = digest(&mut d)?;
                 let entry = digest(&mut d)?;
@@ -1764,6 +1914,13 @@ pub struct SharedService {
 /// how a `Lagged` report comes to be silently swallowed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
+    /// One bounded history page, oldest row first, and the number of older rows (FR-4).
+    RoomPage {
+        /// The selected messages.
+        rows: Vec<MessageRow>,
+        /// How many rows precede the first selected message.
+        older: u64,
+    },
     /// Sent once on connect, before anything else.
     Hello {
         /// The [`PROTOCOL_VERSION`] this node speaks.
@@ -1906,10 +2063,26 @@ pub enum Frame {
         /// Each entry.
         rows: Vec<crate::node::drive::SessionRow>,
     },
+    /// One page of Session entries, as a [`Request::SessionPage`] asked for.
+    SessionPage {
+        /// Each entry, in the order this node opened or wrote them.
+        rows: Vec<crate::node::drive::SessionRow>,
+        /// How many older entries there are: ask again with the first as `before` for them.
+        older: u64,
+    },
     /// A room's Sessions, oldest opening first, as a [`Request::Sessions`] asked for.
     Sessions {
         /// Each Session.
         sessions: Vec<crate::node::sessions::SessionRow>,
+    },
+    /// One page of a room's Sessions, as a [`Request::SessionsPage`] asked for.
+    SessionsPage {
+        /// Each Session, oldest opening first.
+        sessions: Vec<crate::node::sessions::SessionRow>,
+        /// What the daemon's index says of each, in the same order.
+        summaries: Vec<SessionSummary>,
+        /// Whether more follow the last: ask again with its opening as `after`.
+        more: bool,
     },
     /// Where a [`Request::Pull`] put the verified copy.
     Pulled {
@@ -1939,6 +2112,12 @@ impl Frame {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         match self {
+            Frame::RoomPage { rows, older } => {
+                e.array(3)
+                    .uint(T_ROOM_PAGE)
+                    .bytes(&Frame::Rows { rows: rows.clone() }.to_bytes())
+                    .uint(*older);
+            }
             Frame::Hello { protocol, me } => {
                 // An absent identity is the empty byte string, so the arity stays
                 // fixed — ADR-008's canonical encoding has no optionals.
@@ -2087,15 +2266,13 @@ impl Frame {
                 e.array(2).uint(T_APPENDED).bytes(entry);
             }
             Frame::SessionEntries { rows } => {
-                e.array(2).uint(T_SESSION_ROWS).array(rows.len());
-                for r in rows {
-                    e.array(5)
-                        .bytes(&r.entry_hash)
-                        .bytes(&r.author)
-                        .uint(r.created_millis)
-                        .text(&r.session_id)
-                        .text(&r.body);
-                }
+                e.array(2).uint(T_SESSION_ROWS);
+                encode_session_rows(&mut e, rows);
+            }
+            Frame::SessionPage { rows, older } => {
+                e.array(3).uint(T_SESSION_PAGE);
+                encode_session_rows(&mut e, rows);
+                e.uint(*older);
             }
             Frame::Pulled { path } => {
                 e.array(2).uint(T_PULLED).text(path);
@@ -2120,6 +2297,22 @@ impl Frame {
             Frame::Sessions { sessions } => {
                 e.array(2).uint(T_SESSIONS);
                 crate::node::sessions::put_rows(&mut e, sessions);
+            }
+            Frame::SessionsPage {
+                sessions,
+                summaries,
+                more,
+            } => {
+                e.array(4).uint(T_SESSIONS_PAGE);
+                crate::node::sessions::put_rows(&mut e, sessions);
+                e.array(summaries.len());
+                for s in summaries {
+                    e.array(3)
+                        .uint(s.entries)
+                        .bytes(s.newest.as_ref().map_or(&[][..], |d| &d[..]))
+                        .uint(u64::from(s.waiting));
+                }
+                e.uint(u64::from(*more));
             }
             Frame::Decisions { events } => {
                 e.array(2).uint(T_DECISIONS).array(events.len());
@@ -2206,6 +2399,50 @@ fn addr(d: &mut Decoder<'_>) -> Result<std::net::SocketAddr> {
         .map_err(|_| Error::MalformedIpc("ipc addr"))?
         .parse()
         .map_err(|_| Error::MalformedIpc("ipc addr syntax"))
+}
+
+/// Session entries as [`Frame::SessionEntries`] and [`Frame::SessionPage`] carry them.
+fn encode_session_rows(e: &mut Encoder, rows: &[crate::node::drive::SessionRow]) {
+    e.array(rows.len());
+    for r in rows {
+        e.array(5)
+            .bytes(&r.entry_hash)
+            .bytes(&r.author)
+            .uint(r.created_millis)
+            .text(&r.session_id)
+            .text(&r.body);
+    }
+}
+
+/// The Session entries [`encode_session_rows`] wrote.
+fn decode_session_rows(d: &mut Decoder<'_>) -> Result<Vec<crate::node::drive::SessionRow>> {
+    let count = d
+        .array()
+        .map_err(|_| Error::MalformedIpc("ipc session entries array"))?;
+    let mut rows = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        if d.array()
+            .map_err(|_| Error::MalformedIpc("ipc session entry row"))?
+            != 5
+        {
+            return Err(Error::MalformedIpc("ipc session entry arity"));
+        }
+        let entry_hash = digest(d)?;
+        let author = digest(d)?;
+        let created_millis = d
+            .uint()
+            .map_err(|_| Error::MalformedIpc("ipc session entry time"))?;
+        let session_id = text(d, "ipc session id")?;
+        let body = text(d, "ipc session entry body")?;
+        rows.push(crate::node::drive::SessionRow {
+            entry_hash,
+            author,
+            created_millis,
+            session_id,
+            body,
+        });
+    }
+    Ok(rows)
 }
 
 fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
@@ -2526,6 +2763,22 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let last = optional_digest(d)?;
             return Ok(Frame::Count { n, last });
         }
+        (T_ROOM_PAGE, 3) => {
+            let body = d
+                .bytes()
+                .map_err(|_| Error::MalformedIpc("ipc room page rows"))?;
+            let mut inner = Decoder::new(body);
+            if inner.array().ok() != Some(2) || inner.uint().ok() != Some(T_ROWS) {
+                return Err(Error::MalformedIpc("ipc room page rows"));
+            }
+            let Frame::Rows { rows } = Frame::from_bytes(body)? else {
+                return Err(Error::MalformedIpc("ipc room page rows"));
+            };
+            let older = d
+                .uint()
+                .map_err(|_| Error::MalformedIpc("ipc room page older"))?;
+            return Ok(Frame::RoomPage { rows, older });
+        }
         (T_ROWS, 2) => {
             let n = d.array().map_err(|_| Error::MalformedIpc("ipc rows"))?;
             let mut rows = Vec::with_capacity(n.min(1024));
@@ -2756,33 +3009,15 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             return Ok(Frame::Appended { entry });
         }
         (T_SESSION_ROWS, 2) => {
-            let count = d
-                .array()
-                .map_err(|_| Error::MalformedIpc("ipc session entries array"))?;
-            let mut rows = Vec::with_capacity(count.min(1024));
-            for _ in 0..count {
-                if d.array()
-                    .map_err(|_| Error::MalformedIpc("ipc session entry row"))?
-                    != 5
-                {
-                    return Err(Error::MalformedIpc("ipc session entry arity"));
-                }
-                let entry_hash = digest(d)?;
-                let author = digest(d)?;
-                let created_millis = d
-                    .uint()
-                    .map_err(|_| Error::MalformedIpc("ipc session entry time"))?;
-                let session_id = text(d, "ipc session id")?;
-                let body = text(d, "ipc session entry body")?;
-                rows.push(crate::node::drive::SessionRow {
-                    entry_hash,
-                    author,
-                    created_millis,
-                    session_id,
-                    body,
-                });
-            }
+            let rows = decode_session_rows(d)?;
             return Ok(Frame::SessionEntries { rows });
+        }
+        (T_SESSION_PAGE, 3) => {
+            let rows = decode_session_rows(d)?;
+            let older = d
+                .uint()
+                .map_err(|_| Error::MalformedIpc("ipc session page older"))?;
+            return Ok(Frame::SessionPage { rows, older });
         }
         (T_PULLED, 2) => {
             let path = text(d, "ipc pulled path")?;
@@ -2825,6 +3060,34 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
         (T_SESSIONS, 2) => {
             let sessions = crate::node::sessions::read_rows(d)?;
             return Ok(Frame::Sessions { sessions });
+        }
+        (T_SESSIONS_PAGE, 4) => {
+            let bad = || Error::MalformedIpc("ipc session summary");
+            let sessions = crate::node::sessions::read_rows(d)?;
+            let n = d.array().map_err(|_| bad())?;
+            if n != sessions.len() {
+                return Err(bad());
+            }
+            let mut summaries = Vec::with_capacity(n);
+            for _ in 0..n {
+                if d.array().map_err(|_| bad())? != 3 {
+                    return Err(bad());
+                }
+                let entries = d.uint().map_err(|_| bad())?;
+                let newest = optional_digest(d)?;
+                let waiting = u32::try_from(d.uint().map_err(|_| bad())?).map_err(|_| bad())?;
+                summaries.push(SessionSummary {
+                    entries,
+                    newest,
+                    waiting,
+                });
+            }
+            let more = flag(d, "ipc sessions page more")?;
+            return Ok(Frame::SessionsPage {
+                sessions,
+                summaries,
+                more,
+            });
         }
         (T_DECISIONS, 2) => {
             let bad = || Error::MalformedIpc("ipc decisions");
@@ -3177,11 +3440,24 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
 
 // ---- transport -------------------------------------------------------------
 
+/// The largest frame body [`read_frame`] reads past when it is over the limit: a length larger is
+/// not a frame anyone sent.
+const DRAIN_AT_MOST: usize = 64 * MAX_FRAME;
+
+/// How long [`read_frame`] reads past a frame over the limit.
+const DRAIN_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Write one length-prefixed frame, mirroring [`crate::transport::framing`].
 ///
 /// A write that fails is the connection ending under it ([`IpcHandshake::Cut`]), never a
 /// malformed message (V210-101): nothing was received to be malformed.
+///
+/// **Never over the frame limit** (ADR-034 FR-2): a body larger than [`frame_limit`] is refused
+/// here, unwritten, since the reader would refuse it and its frames would no longer line up.
 pub async fn write_frame(s: &mut UnixStream, body: &[u8]) -> Result<()> {
+    if body.len() > frame_limit() {
+        return Err(Error::SizeLimitExceeded("ipc frame length"));
+    }
     let len =
         u32::try_from(body.len()).map_err(|_| Error::SizeLimitExceeded("ipc frame length"))?;
     s.write_all(&len.to_be_bytes())
@@ -3207,6 +3483,17 @@ pub async fn read_frame(s: &mut UnixStream) -> Result<Option<Vec<u8>>> {
     }
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > frame_limit() {
+        // **Read past it before saying so** (ADR-034 FR-3): what is left of the body would be read
+        // as the next frame's length. Bounded in bytes and in time, since a length read out of
+        // step may be any number; the connection is to be dropped either way.
+        if len <= DRAIN_AT_MOST {
+            let mut rest = tokio::io::AsyncReadExt::take(&mut *s, len as u64);
+            let _ = tokio::time::timeout(
+                DRAIN_WITHIN,
+                tokio::io::copy(&mut rest, &mut tokio::io::sink()),
+            )
+            .await;
+        }
         return Err(Error::SizeLimitExceeded("ipc frame length"));
     }
     let mut body = vec![0u8; len];
@@ -3216,6 +3503,81 @@ pub async fn read_frame(s: &mut UnixStream) -> Result<Option<Vec<u8>>> {
         return Ok(None);
     }
     Ok(Some(body))
+}
+
+// A collection is carried in byte pages so even a single member-written field can cross a
+// frame without being cut. Logical history pages remain separately bounded by SessionPage and
+// Read; this envelope only carries the selected reply, and does not fetch another history page.
+const T_REPLY_PAGE: u64 = 5490;
+const T_REPLY_NEXT: u64 = 5491;
+
+/// Carry a complete collection reply across frame-sized pages. The next byte offset is its
+/// cursor; the client must ask for that cursor before the daemon sends more (ADR-034 FR-7/8).
+async fn write_reply(s: &mut UnixStream, body: &[u8]) -> Result<()> {
+    if body.len() <= rows_budget() {
+        return write_frame(s, body).await;
+    }
+    let mut start = 0;
+    while start < body.len() {
+        let end = start.saturating_add(rows_budget()).min(body.len());
+        let more = end < body.len();
+        let mut e = Encoder::new();
+        e.array(4)
+            .uint(T_REPLY_PAGE)
+            .uint(start as u64)
+            .uint(u64::from(more))
+            .bytes(&body[start..end]);
+        write_frame(s, &e.finish()).await?;
+        if more {
+            let next = read_frame(s).await?.ok_or(Error::Ipc(IpcHandshake::Cut))?;
+            let mut d = Decoder::new(&next);
+            if !matches!((d.array(), d.uint(), d.uint()), (Ok(2), Ok(T_REPLY_NEXT), Ok(cursor)) if cursor == end as u64)
+                || d.finish().is_err()
+            {
+                return Err(Error::MalformedIpc("ipc reply page cursor"));
+            }
+        }
+        start = end;
+    }
+    Ok(())
+}
+
+/// Read a collection's pages, joining a row that crosses a frame without dropping any bytes.
+async fn read_reply(s: &mut UnixStream) -> Result<Option<Vec<u8>>> {
+    let Some(mut body) = read_frame(s).await? else {
+        return Ok(None);
+    };
+    let mut joined = Vec::new();
+    loop {
+        let mut d = Decoder::new(&body);
+        if !matches!((d.array(), d.uint()), (Ok(4), Ok(T_REPLY_PAGE))) {
+            return if joined.is_empty() {
+                Ok(Some(body))
+            } else {
+                Err(Error::MalformedIpc("ipc reply page missing"))
+            };
+        }
+        let bad = || Error::MalformedIpc("ipc reply page");
+        let cursor = d.uint().map_err(|_| bad())?;
+        let more = match d.uint().map_err(|_| bad())? {
+            0 => false,
+            1 => true,
+            _ => return Err(bad()),
+        };
+        let part = d.bytes().map_err(|_| bad())?;
+        if cursor != joined.len() as u64 || (more && part.is_empty()) {
+            return Err(bad());
+        }
+        joined.extend_from_slice(part);
+        d.finish().map_err(|_| bad())?;
+        if !more {
+            return Ok(Some(joined));
+        }
+        let mut next = Encoder::new();
+        next.array(2).uint(T_REPLY_NEXT).uint(joined.len() as u64);
+        write_frame(s, &next.finish()).await?;
+        body = read_frame(s).await?.ok_or(Error::Ipc(IpcHandshake::Cut))?;
+    }
 }
 
 /// A failed exchange with the node at `path`, with the connection ending under a write named as
@@ -3561,7 +3923,7 @@ async fn serve_requests(
         // ADR-026 C-7: what a client that draws the node's rooms needs, the TUI first. Answered,
         // and the connection serves on.
         if crate::node::snapshot::is_request(&body) {
-            write_frame(&mut stream, &crate::node::snapshot::answer(handle)).await?;
+            write_reply(&mut stream, &crate::node::snapshot::answer(handle)).await?;
             continue;
         }
         // V030-11: `vox tunnel close`. The live tunnels are kept in this process, so it is
@@ -3633,6 +3995,7 @@ async fn serve_requests(
             };
         }
         let intent = Held::intent(&request);
+        let what = request_name(&request);
         let reply = tokio::select! {
             reply = serve_request(handle, request) => reply,
             // **A client that hangs up mid-request is noticed then, not when the request ends**
@@ -3650,8 +4013,70 @@ async fn serve_requests(
             }
         };
         held.note(intent, &reply);
-        write_frame(&mut stream, &reply.to_bytes()).await?;
+        if matches!(
+            reply,
+            Frame::Rows { .. }
+                | Frame::RoomPage { .. }
+                | Frame::Order { .. }
+                | Frame::Members { .. }
+                | Frame::KeyWaits { .. }
+                | Frame::Consents { .. }
+                | Frame::Trusted { .. }
+                | Frame::Rooms { .. }
+                | Frame::Services { .. }
+                | Frame::Shares { .. }
+                | Frame::SessionPage { .. }
+                | Frame::Sessions { .. }
+                | Frame::SessionsPage { .. }
+                | Frame::PullStates { .. }
+                | Frame::Decisions { .. }
+                | Frame::Offers { .. }
+        ) {
+            write_reply(&mut stream, &reply.to_bytes()).await?;
+        } else {
+            write_frame(&mut stream, &fitted(&reply, &what)).await?;
+        }
     }
+}
+
+/// `reply`'s bytes, or, when they would not fit one frame, a plain error saying so in their place
+/// (ADR-034 FR-2): the daemon never writes a frame its client would refuse.
+fn fitted(reply: &Frame, what: &str) -> Vec<u8> {
+    let bytes = reply.to_bytes();
+    if bytes.len() <= frame_limit() {
+        return bytes;
+    }
+    Frame::Error {
+        reason: format!(
+            "the answer to {what} was too large to send: {} bytes, and one reply holds at most {}",
+            bytes.len(),
+            frame_limit()
+        ),
+    }
+    .to_bytes()
+}
+
+/// The name of `request`'s kind (`SessionEntries`), for a sentence about it: the start of its
+/// `Debug`, which stops there, so no field (a passphrase) is ever formatted.
+fn request_name(request: &Request) -> String {
+    struct Head(String);
+    impl std::fmt::Write for Head {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            match s.find([' ', '{', '(']) {
+                Some(end) => {
+                    self.0.push_str(&s[..end]);
+                    Err(std::fmt::Error)
+                }
+                None => {
+                    self.0.push_str(s);
+                    Ok(())
+                }
+            }
+        }
+    }
+    let mut head = Head(String::new());
+    let _ = std::fmt::write(&mut head, format_args!("{request:?}"));
+    head.0
 }
 
 // ---- the account socket (ADR-026 §4) ---------------------------------------------------------
@@ -4001,6 +4426,111 @@ async fn proved_if(
     }
 }
 
+/// What one page of a Session may carry of body and id: the row budget, less each row's overhead.
+fn session_page_bytes() -> usize {
+    rows_budget().saturating_sub(SESSION_PAGE_ROWS * ROW_OVERHEAD)
+}
+
+/// What the daemon's index says of a room's Session `s` (ADR-034 FR-5): how many entries it holds
+/// of it, its newest, and its indexed pending requests when this node may drive it and it is
+/// open. Transcript length never changes the work.
+async fn session_summary(
+    handle: &NodeHandle,
+    channel_id: Digest32,
+    s: &crate::node::sessions::SessionRow,
+) -> SessionSummary {
+    let page = handle
+        .session_page(
+            channel_id,
+            crate::node::drive::SessionFilter::SessionRaw(s.id.clone()),
+            None,
+            1,
+            session_page_bytes(),
+        )
+        .await
+        .and_then(std::result::Result::ok);
+    let Some(page) = page else {
+        return SessionSummary::default();
+    };
+    let newest = page.rows.last().map(|r| r.entry_hash);
+    let entries = page.older + page.rows.len() as u64;
+    let waiting = if s.can_drive && s.open {
+        let pending = handle
+            .session_page(
+                channel_id,
+                crate::node::drive::SessionFilter::Pending(s.id.clone()),
+                None,
+                usize::MAX,
+                usize::MAX,
+            )
+            .await
+            .and_then(std::result::Result::ok)
+            .map(|p| p.rows)
+            .unwrap_or_default();
+        let mine = crate::node::session_view::of_session(pending, &s.id, &s.node);
+        u32::try_from(crate::node::session_view::waiting(&mine).len()).unwrap_or(u32::MAX)
+    } else {
+        0
+    };
+    SessionSummary {
+        entries,
+        newest,
+        waiting,
+    }
+}
+
+/// What the daemon's index says of one Session (ADR-034 FR-5), so a client lists Sessions and
+/// counts what waits in them without reading their entries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionSummary {
+    /// How many entries this node holds of it, the drive entries naming it among them.
+    pub entries: u64,
+    /// Its newest entry, if it has one here.
+    pub newest: Option<Digest32>,
+    /// The requests waiting in it that this node may answer: none without drive, or once it ended.
+    pub waiting: u32,
+}
+
+/// One page of a room's Sessions (ADR-034 FR-1): oldest opening first, after the Session `after`
+/// opened, at most [`rows_budget`] bytes and at least one while any remain; and whether more follow.
+///
+/// The order is the room's log's, where a late arrival can land before the cursor: such a Session
+/// is in the next listing, not this one.
+fn sessions_page(
+    sessions: Vec<crate::node::sessions::SessionRow>,
+    after: Option<Digest32>,
+) -> std::result::Result<(Vec<crate::node::sessions::SessionRow>, bool), String> {
+    let mut rest = sessions.into_iter().peekable();
+    if let Some(after) = after {
+        if !rest.by_ref().any(|s| s.opening == after) {
+            return Err("cursor not among this room's Sessions".into());
+        }
+    }
+    // Its id, name and harness, and the rest of a row. A name and a harness come from one
+    // message's text, so one row is never much past `MAX_TEXT_LEN`, and fits a page by itself.
+    let cost = |s: &crate::node::sessions::SessionRow| {
+        s.id.len() + s.name.as_ref().map_or(0, String::len) + s.harness.len() + ROW_OVERHEAD
+    };
+    let mut page = Vec::new();
+    let mut bytes = 0usize;
+    while let Some(s) = rest.peek() {
+        if !page.is_empty() && (page.len() >= SESSIONS_PAGE_ROWS || bytes + cost(s) > rows_budget())
+        {
+            break;
+        }
+        bytes += cost(s);
+        page.extend(rest.next());
+    }
+    let more = rest.peek().is_some();
+    Ok((page, more))
+}
+
+// A page always carries at least one Session entry, so the largest must fit by itself.
+const _: () = assert!(
+    crate::node::content::MAX_TEXT_LEN + crate::node::content::MAX_SESSION_ID_LEN + ROW_OVERHEAD
+        <= ROWS_BUDGET
+);
+
 /// One page of a collection reply: entries in id order, strictly after `after`, at most
 /// [`PAGE_ENTRIES`] of them and at most [`ROWS_BUDGET`] bytes, and at least one while any
 /// remain.
@@ -4048,6 +4578,66 @@ fn one_line(text: &str) -> String {
 /// and be able to ask something else.
 async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
     match request {
+        Request::RoomPage {
+            channel_id,
+            before,
+            limit,
+        } => {
+            let view = handle.view();
+            let Some(detail) = view
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == channel_id)
+            else {
+                return Frame::Error {
+                    reason: "room not open".into(),
+                };
+            };
+            let end = match before {
+                None => detail.timeline.len(),
+                Some(hash) => {
+                    let prefix = u64::from_be_bytes([hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7]]);
+                    let Some(at) = detail.row_index.find(prefix).into_iter().find(|at| {
+                        detail
+                            .timeline
+                            .get(*at as usize)
+                            .is_some_and(|r| r.entry_hash == hash)
+                    }) else {
+                        return Frame::Error {
+                            reason: "cursor not in this room's timeline".into(),
+                        };
+                    };
+                    at as usize
+                }
+            };
+            let max_rows = if limit == 0 {
+                SESSION_PAGE_ROWS
+            } else {
+                usize::try_from(limit)
+                    .unwrap_or(usize::MAX)
+                    .min(SESSION_PAGE_ROWS)
+            };
+            let mut rows = Vec::new();
+            let mut bytes = 0;
+            let mut start = end;
+            while start > 0 && rows.len() < max_rows {
+                let Some(row) = detail.timeline.get(start - 1) else {
+                    break;
+                };
+                let cost = row.text.len() + ROW_OVERHEAD;
+                if !rows.is_empty() && bytes + cost > rows_budget() {
+                    break;
+                }
+                bytes += cost;
+                rows.push(row.clone());
+                start -= 1;
+            }
+            rows.reverse();
+            Frame::RoomPage {
+                rows,
+                older: start as u64,
+            }
+        }
         // Handled by the caller; the connection becomes a stream.
         Request::Subscribe => Frame::Ok,
         Request::Ping => match handle.apply(crate::node::api::NodeCommand::Ping).await {
@@ -4576,6 +5166,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     rows.push(r.clone());
                 }
             }
+            // Every unread row, carried across reply pages, oldest first (ADR-034 FR-7).
             rows.reverse();
             Frame::Rows { rows }
         }
@@ -4603,6 +5194,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     rows.push(r.clone());
                 }
             }
+            // Every named row is returned; byte pages carry long bodies whole.
             rows.reverse();
             Frame::Rows { rows }
         }
@@ -4690,16 +5282,63 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         Request::PullStates { channel_id } => Frame::PullStates {
             states: handle.pulls().states(&channel_id).await,
         },
-        Request::SessionEntries { channel_id } => match handle.session_rows(channel_id).await {
-            Some(rows) => Frame::SessionEntries { rows },
+        // The previous release's whole read, while the whole fits one reply; never a whole
+        // history past it (ADR-034 FR-4).
+        Request::SessionEntries { channel_id } => match handle
+            .session_page(
+                channel_id,
+                crate::node::drive::SessionFilter::All,
+                None,
+                SESSION_PAGE_ROWS,
+                session_page_bytes(),
+            )
+            .await
+        {
+            Some(Ok(page)) if page.older == 0 => Frame::SessionEntries { rows: page.rows },
+            Some(Ok(_)) => Frame::Error {
+                reason:
+                    "SessionEntries: this room's Session entries are more than one reply holds, and this vox \
+                         reads them a page at a time: update this app or verb to this vox's version"
+                        .into(),
+            },
+            Some(Err(reason)) => Frame::Error { reason },
             None => Frame::Error {
                 reason: "room not open".into(),
             },
         },
+        Request::SessionPage {
+            channel_id,
+            which,
+            before,
+        } => match handle
+            .session_page(
+                channel_id,
+                which,
+                before,
+                SESSION_PAGE_ROWS,
+                session_page_bytes(),
+            )
+            .await
+        {
+            Some(Ok(page)) => Frame::SessionPage {
+                rows: page.rows,
+                older: page.older,
+            },
+            Some(Err(reason)) => Frame::Error { reason },
+            None => Frame::Error {
+                reason: "room not open".into(),
+            },
+        },
+        // Newest first. The reply envelope carries every event across pages, without a byte cap.
         Request::Decisions { limit } => Frame::Decisions {
-            events: handle
-                .decisions()
-                .recent(usize::try_from(limit).unwrap_or(usize::MAX), None),
+            events: handle.decisions().recent(
+                if limit == 0 {
+                    usize::MAX
+                } else {
+                    usize::try_from(limit).unwrap_or(usize::MAX)
+                },
+                None,
+            ),
         },
         Request::Offers => Frame::Offers {
             offers: handle.view().offers.clone(),
@@ -4726,6 +5365,33 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             }
             Frame::Sessions {
                 sessions: crate::node::sessions::of_room(handle, &channel_id),
+            }
+        }
+        Request::SessionsPage { channel_id, after } => {
+            if !handle
+                .view()
+                .open_channels
+                .iter()
+                .any(|d| d.channel_id == channel_id)
+            {
+                return Frame::Error {
+                    reason: "room not open".into(),
+                };
+            }
+            let all = crate::node::sessions::of_room(handle, &channel_id);
+            match sessions_page(all, after) {
+                Ok((sessions, more)) => {
+                    let mut summaries = Vec::with_capacity(sessions.len());
+                    for s in &sessions {
+                        summaries.push(session_summary(handle, channel_id, s).await);
+                    }
+                    Frame::SessionsPage {
+                        sessions,
+                        summaries,
+                        more,
+                    }
+                }
+                Err(reason) => Frame::Error { reason },
             }
         }
         Request::Services { channel_id } => match handle.open_detail(channel_id).await {
@@ -4772,10 +5438,9 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 },
             }
         }
-        // **Not paged, and bounded by the product's scale.** A room is at most 500 members
-        // (PRD-001's family scale); a member is a 32-byte key, so a roster is ~17 KiB of a
-        // 256 KiB frame. A frame would hold ~7,700; paging this is owed only if that scale
-        // ever rises past a few thousand (V210-16).
+        // **Not paged, and bounded by the room's member cap** (ADR-034 FR-1): a room holds at
+        // most `AUTHORS_HARD_LIMIT` (2,048) members, and a member is a 32-byte key, so a roster is
+        // at most ~68 KiB of a 256 KiB frame (V210-16).
         // Bounded like the roster: at most one line for each of a room's members.
         Request::KeyWaits { channel_id } => Frame::KeyWaits {
             waits: handle
@@ -5228,8 +5893,11 @@ pub struct IpcClient {
     node: Option<crate::node::paths::NodeName>,
     /// What attaching the node said, when this connection's `Use` attached it.
     notes: Vec<String>,
-    /// A failed or cancelled exchange leaves frames misaligned: reconnect before reuse.
+    /// Whether an exchange on it failed (ADR-034 WT-2, FR-3): its frames may no longer line up,
+    /// so its next reply might be an earlier request's. It must not be used again.
     broken: bool,
+    /// App-owned connections also bound background requests, which bypass the exported FFI
+    /// call wrapper. A stalled listener must not hold the app's mutex forever (WT-1).
     answer_within: Option<std::time::Duration>,
 }
 
@@ -5534,6 +6202,8 @@ impl IpcClient {
     /// fits every request; instead, while one waits, the node is asked every [`ANSWER_WITHIN`]
     /// whether it is still greeting and its actor still taking commands ([`ACTOR_WITHIN`]), and
     /// the request fails, naming which, once it is not.
+    ///
+    /// Any failure leaves the connection [broken](Self::is_broken).
     pub async fn request(&mut self, req: &Request) -> Result<Frame> {
         let answer_within = self.answer_within;
         if self.broken {
@@ -5552,7 +6222,7 @@ impl IpcClient {
             if let Err(e) = write_frame(stream, &zeroize::Zeroizing::new(req.to_bytes())).await {
                 return Err(named(path, e).await);
             }
-            let Some(body) = read_frame(stream).await? else {
+            let Some(body) = read_reply(stream).await? else {
                 return Err(hung_up(path).await);
             };
             Frame::from_bytes(&body)
@@ -5601,7 +6271,7 @@ impl IpcClient {
             if let Err(e) = write_frame(stream, body).await {
                 return Err(named(path, e).await);
             }
-            match read_frame(stream).await? {
+            match read_reply(stream).await? {
                 Some(reply) => Ok(reply),
                 None => Err(hung_up(path).await),
             }
@@ -5771,6 +6441,88 @@ impl IpcClient {
                 }
                 other => return Ok(other),
             }
+        }
+    }
+
+    /// One page of a room's Session entries (ADR-034 FR-4): `which`'s newest before `before`, or
+    /// the newest when `None`, as one [`Frame::SessionPage`], or the reply that was not a page (an
+    /// error). Never more: a client shows the newest page and asks for an older one only when the
+    /// person goes to it. A daemon older than this client is said as
+    /// [`IpcClient::older_daemon`] says it.
+    ///
+    /// # Errors
+    /// If the node cannot be reached or answers with a malformed frame.
+    pub async fn session_page(
+        &mut self,
+        channel_id: Digest32,
+        which: crate::node::drive::SessionFilter,
+        before: Option<Digest32>,
+    ) -> Result<Frame> {
+        let reply = self
+            .request(&Request::SessionPage {
+                channel_id,
+                which,
+                before,
+            })
+            .await?;
+        Ok(self.older_daemon(reply))
+    }
+
+    /// A room's Sessions, however many pages that takes (ADR-034 FR-1) — as one
+    /// [`Frame::SessionsPage`] with no more to follow, or the first reply that was not a page (an
+    /// error). A daemon older than this client is said as [`IpcClient::older_daemon`] says it.
+    ///
+    /// # Errors
+    /// If the node cannot be reached or answers with a malformed frame.
+    pub async fn sessions(&mut self, channel_id: Digest32) -> Result<Frame> {
+        let (mut all, mut told) = (Vec::new(), Vec::new());
+        let mut after = None;
+        loop {
+            match self
+                .request(&Request::SessionsPage { channel_id, after })
+                .await?
+            {
+                Frame::SessionsPage {
+                    sessions,
+                    summaries,
+                    more,
+                } => {
+                    let last = sessions.last().map(|s| s.opening);
+                    all.extend(sessions);
+                    told.extend(summaries);
+                    match (more, last) {
+                        (false, _) => {
+                            return Ok(Frame::SessionsPage {
+                                sessions: all,
+                                summaries: told,
+                                more: false,
+                            })
+                        }
+                        (true, Some(last)) if after != Some(last) => after = Some(last),
+                        (true, _) => {
+                            return Err(Error::MalformedIpc("ipc sessions page did not advance"))
+                        }
+                    }
+                }
+                other => return Ok(self.older_daemon(other)),
+            }
+        }
+    }
+
+    /// `reply` as this client says it: a daemon that does not know a request this build makes is
+    /// older than it, and needs restarting on this version. Such a daemon ends the connection after
+    /// saying so, so this one is [broken](Self::is_broken).
+    fn older_daemon(&mut self, reply: Frame) -> Frame {
+        match reply {
+            Frame::Error { reason } if reason == Error::UnknownIpcRequest.to_string() => {
+                self.broken = true;
+                Frame::Error {
+                    reason: "the vox daemon is older than this vox and cannot read this in pages: \
+                             restart the daemon so it is this vox's version"
+                        .into(),
+                }
+            }
+            other => other,
         }
     }
 

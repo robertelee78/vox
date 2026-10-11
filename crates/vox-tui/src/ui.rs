@@ -610,7 +610,11 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         Showing::General => (
             channel.timeline.as_slice(),
             channel.notices.clone(),
-            String::new(),
+            if channel.room_older > 0 {
+                format!(" — {} older · ↑ at top to load", channel.room_older)
+            } else {
+                String::new()
+            },
         ),
         Showing::All => {
             let mut notices = channel.notices.clone();
@@ -702,7 +706,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         render_session(
             frame,
             area,
-            &channel.session_lines,
+            (&channel.session_lines, channel.session_older),
             (ui.selected_session_line, ui.details_open),
             &format!(
                 "Timeline — {}{}",
@@ -836,7 +840,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
 fn render_session(
     frame: &mut Frame,
     area: Rect,
-    lines: &[crate::viewmodel::SessionLineView],
+    (lines, older): (&[crate::viewmodel::SessionLineView], u64),
     (selected, details): (Option<usize>, bool),
     title: &str,
     focus: bool,
@@ -844,6 +848,16 @@ fn render_session(
     let width = usize::from(area.width.saturating_sub(2)).max(1);
     let height = usize::from(area.height.saturating_sub(2));
     let mut rows: Vec<Line> = Vec::new();
+    // What is older than the page shown, and how to see it (ADR-034 FR-4).
+    if older > 0 {
+        rows.push(Line::from(Span::styled(
+            format!(
+                "· {older} older {} not shown: Up past the first line loads the page before it",
+                if older == 1 { "entry" } else { "entries" }
+            ),
+            Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
+        )));
+    }
     let mut at = None;
     for (i, l) in lines.iter().enumerate() {
         let chosen = selected == Some(i);

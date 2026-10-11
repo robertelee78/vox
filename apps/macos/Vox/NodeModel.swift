@@ -134,6 +134,10 @@ final class NodeModel: ObservableObject {
             if said != platforms { platforms = said }
         }
     }
+    @Published private(set) var roomOlder: UInt64 = 0
+    private var roomBefore: String?
+    @Published private var roomReadingOlder = false
+
     /// The room on screen's messages by id, for what is in view.
     private(set) var byID: [String: RoomMessage] = [:]
     /// The platform each member's node says it runs on, from its latest `hello` that says so in
@@ -162,7 +166,8 @@ final class NodeModel: ObservableObject {
             guard showing != oldValue else { return }
             // Another Session's entries are never drawn, nor acted on, under this one's header
             // while it loads (D3): cleared, and said to be loading.
-            sessionEntries = []
+            sessionPages.clear()
+            selectedEarlierRequest = nil
             sessionNote = nil
             sessionLoading = showingSession
             // What was selected was in the other view's rows: Focus Timeline and ↑/↓ start
@@ -197,8 +202,19 @@ final class NodeModel: ObservableObject {
     private var waitingSeen = false
     /// The room on screen's Sessions, open and ended (ADR-029 CL-2).
     @Published private(set) var sessions: [FfiSession] = []
-    /// The Session on screen's entries, oldest first, to a member with drive (SC-1).
-    @Published private(set) var sessionEntries: [FfiSessionEntry] = []
+    /// The Session on screen's entries, oldest first, to a member with drive (SC-1): its newest
+    /// page, and the older pages the person scrolled up to (ADR-034 FR-4); never its whole
+    /// history.
+    @Published private var sessionPages = SessionPages()
+    var sessionEntries: [FfiSessionEntry] { sessionPages.entries }
+    /// A notification may point to a request before the newest page. It is shown separately,
+    /// without reading every transcript entry between it and the newest page.
+    @Published private(set) var selectedEarlierRequest: FfiSessionEntry?
+    var sessionOlder: UInt64 { sessionPages.older }
+    private var sessionBefore: String? { sessionPages.before }
+    /// An older page is being read: one at a time.
+    @Published private var sessionReadingOlder = false
+    var readingOlderTimeline: Bool { showingSession ? sessionReadingOlder : roomReadingOlder }
     /// What the node says of the Session on screen besides its entries: "opening not received yet".
     @Published private(set) var sessionNote: String?
     /// What was done to the room on screen (its retention set, its name changed), oldest first.
@@ -392,14 +408,23 @@ final class NodeModel: ObservableObject {
 
     /// Read what `room` has after its newest message read so far, for its row's preview.
     private func readLast(_ room: String) async {
-        guard let rows = try? await client.read(room: room, after: lastRead[room] ?? "", limit: 0),
-              let newest = rows.last else { return }
-        lastRead[room] = newest.id
-        guard let shown = rows.last(where: Preview.shows),
-              let i = rooms.firstIndex(where: { $0.id == room }),
-              shown.createdMillis >= rooms[i].last?.millis ?? 0 else { return }
-        let preview = Preview(shown, me: me)
-        if rooms[i].last != preview { rooms[i].last = preview }
+        do {
+            let rows: [RoomMessage]
+            if let after = lastRead[room] {
+                rows = try await client.read(room: room, after: after, limit: 0)
+            } else {
+                rows = try await client.roomRead(room: room).messages
+            }
+            guard let newest = rows.last else { return }
+            lastRead[room] = newest.id
+            guard let shown = rows.last(where: Preview.shows),
+                  let i = rooms.firstIndex(where: { $0.id == room }),
+                  shown.createdMillis >= rooms[i].last?.millis ?? 0 else { return }
+            let preview = Preview(shown, me: me)
+            if rooms[i].last != preview { rooms[i].last = preview }
+        } catch {
+            reportBackground(error)
+        }
     }
 
     func group(_ need: RoomGroup) -> [Room] {
@@ -447,13 +472,44 @@ final class NodeModel: ObservableObject {
     /// came as an event to the reopened app).
     private func readNewOnScreen() async {
         guard case let .room(id) = selection else { return }
-        let after = messages.last?.id ?? ""
-        guard let rows = try? await client.read(room: id, after: after, limit: 0),
-              case .room(id) = selection else { return }
-        let new = rows.filter { byID[$0.id] == nil && !$0.owed }
-        guard !new.isEmpty else { return }
-        readLog.debug("follow: \(new.count) message(s) in \(id, privacy: .public) found by the read, not by an event")
-        for message in new { arrived(message, in: id) }
+        do {
+            let rows: [RoomMessage]
+            if let after = messages.last?.id {
+                rows = try await client.read(room: id, after: after, limit: 0)
+            } else {
+                let page = try await client.roomRead(room: id)
+                guard case .room(id) = selection else { return }
+                rows = page.messages
+                roomOlder = page.older
+                roomBefore = page.before
+            }
+            guard case .room(id) = selection else { return }
+            let new = rows.filter { byID[$0.id] == nil && !$0.owed }
+            for message in new { arrived(message, in: id) }
+        } catch {
+            reportBackground(error)
+        }
+    }
+
+    /// The timeline's previous page is fetched only at the person's scroll position or request.
+    func readOlderTimeline() async {
+        if showingSession {
+            await readOlderSession()
+            return
+        }
+        guard let room = roomOnScreen, let before = roomBefore, !roomReadingOlder else { return }
+        roomReadingOlder = true
+        defer { roomReadingOlder = false }
+        do {
+            let page = try await client.roomReadOlder(room: room, before: before)
+            guard roomOnScreen == room, roomBefore == before else { return }
+            let held = Set(messages.map(\.id))
+            messages = page.messages.filter { !held.contains($0.id) } + messages
+            roomOlder = page.older
+            roomBefore = page.before
+        } catch {
+            reportBackground(error)
+        }
     }
 
     /// The keyring, the nodes on this Mac, the peers and the keyring window, assigned only when
@@ -481,6 +537,9 @@ final class NodeModel: ObservableObject {
             if recovering {
                 if outcome?.operation == "" { outcome = nil }
                 try await client.subscribe(listener: Listener(model: self))
+                lastRead.removeAll()
+                await refresh()
+                await reconcileUnread()
             }
         } catch {
             daemonReachable = false
@@ -526,6 +585,21 @@ final class NodeModel: ObservableObject {
             guard let rows = try? await client.unread(room: room.id) else { continue }
             seeded.insert(room.id)
             for message in rows { count(message, in: room.id) }
+        }
+    }
+
+    /// Events missed while the daemon was away are reconciled with its current read state.
+    /// This also removes messages another client marked read during the outage.
+    private func reconcileUnread() async {
+        for room in rooms where room.open {
+            do {
+                let rows = try await client.unread(room: room.id)
+                let ids = Set(rows.map(\.id))
+                for id in Array(counted[room.id]?.keys ?? Dictionary<String, RoomMessage>().keys)
+                    where !ids.contains(id) { uncount(id, in: room.id) }
+                for message in rows { count(message, in: room.id) }
+                seeded.insert(room.id)
+            } catch { reportBackground(error) }
         }
     }
 
@@ -609,6 +683,8 @@ final class NodeModel: ObservableObject {
         }
         guard case .room = selection else { return }
         messages = []
+        roomOlder = 0
+        roomBefore = nil
         unreadFrom = nil
         unreadCount = 0
         readBy = [:]
@@ -621,7 +697,8 @@ final class NodeModel: ObservableObject {
         retentionSecs = nil
         notices = []
         sessions = []
-        sessionEntries = []
+        sessionPages.clear()
+        selectedEarlierRequest = nil
         sessionNote = nil
         members = []
         roomServices = []
@@ -657,8 +734,11 @@ final class NodeModel: ObservableObject {
             // What was unread as the room came on screen, before showing it marks it read: the
             // timeline's unread line goes above the first of it (ADR-028 R-8).
             let unread = ((try? await client.unread(room: id)) ?? []).filter { $0.author != me }
-            let read = try await client.read(room: id, after: "", limit: 0)
+            let page = try await client.roomRead(room: id)
+            let read = page.messages
             guard case .room(id) = self.selection else { return }
+            roomOlder = page.older
+            roomBefore = page.before
             let unreadIDs = Set(unread.map(\.id))
             unreadFrom = read.first { unreadIDs.contains($0.id) }?.id
             unreadCount = unread.count
@@ -1664,24 +1744,73 @@ extension NodeModel {
     /// The Session on screen's entries, to a member with drive; nothing to one without (SC-3).
     func readSession() async {
         guard let room = roomOnScreen, let s = shownSession, s.canDrive else {
-            if !sessionEntries.isEmpty { sessionEntries = [] }
+            sessionPages.clear()
+            selectedEarlierRequest = nil
             if sessionNote != nil { sessionNote = nil }
             sessionLoading = false
             return
         }
         do {
+            // Its newest page (ADR-034 FR-4): an older page is read only when the person scrolls
+            // up to it (readOlderSession).
             let read = try await client.sessionRead(room: room, node: s.nodeFingerprint,
                                                     sessionId: s.sessionId)
             // Drawn only for the destination it was read for, still on screen and still driven
             // (D3): the room, the Session's node and its id, and drive held.
             guard roomOnScreen == room, let now = shownSession, now.nodeFingerprint == s.nodeFingerprint,
                   now.sessionId == s.sessionId, now.canDrive else { return }
-            if read.entries != sessionEntries { sessionEntries = read.entries }
+            var pages = sessionPages
+            pages.newest(read)
+            if pages != sessionPages { sessionPages = pages }
             if read.note != sessionNote { sessionNote = read.note }
             sessionLoading = false
+            await refreshSessionRequests(room: room, session: now)
         } catch {
             reportBackground(error)
             sessionLoading = false
+        }
+    }
+
+    /// The page of the Session on screen's entries before those held (ADR-034 FR-4): read when
+    /// the person scrolls up to the top, or asks, and put before them. One page at a time.
+    func readOlderSession() async {
+        guard let room = roomOnScreen, let s = shownSession, s.canDrive,
+              let before = sessionBefore, !sessionReadingOlder else { return }
+        sessionReadingOlder = true
+        defer { sessionReadingOlder = false }
+        do {
+            let read = try await client.sessionReadOlder(room: room, node: s.nodeFingerprint,
+                                                         sessionId: s.sessionId, before: before)
+            guard roomOnScreen == room, let now = shownSession, now.nodeFingerprint == s.nodeFingerprint,
+                  now.sessionId == s.sessionId, now.canDrive, sessionBefore == before else { return }
+            sessionPages.older(read, asked: before)
+            await refreshSessionRequests(room: room, session: now)
+        } catch {
+            reportBackground(error)
+        }
+    }
+
+    /// Current state for the loaded requests and any request selected from a notification.
+    /// The daemon uses its request index; no transcript history is walked to find them.
+    private func refreshSessionRequests(room: String, session s: FfiSession) async {
+        let selected = selectedRequest
+        var references = Set(sessionEntries.compactMap { $0.request?.reference })
+        if let selected { references.insert(selected) }
+        guard !references.isEmpty else {
+            selectedEarlierRequest = nil
+            return
+        }
+        do {
+            let current = try await client.sessionRequests(room: room, node: s.nodeFingerprint,
+                sessionId: s.sessionId, references: references.sorted())
+            guard roomOnScreen == room, let now = shownSession, now.nodeFingerprint == s.nodeFingerprint,
+                  now.sessionId == s.sessionId, now.canDrive, selectedRequest == selected else { return }
+            sessionPages.refreshRequests(current)
+            selectedEarlierRequest = current.first { entry in
+                entry.request?.reference == selected && !sessionEntries.contains(where: { $0.id == entry.id })
+            }
+        } catch {
+            reportBackground(error)
         }
     }
 
@@ -1704,9 +1833,9 @@ extension NodeModel {
         guard let listed = try? await client.sessions(room: room) else { return [] }
         var found: [(node: String, session: String, reference: String, label: String)] = []
         for s in listed where s.pending > 0 && s.canDrive && s.open {
-            guard let read = try? await client.sessionRead(room: room, node: s.nodeFingerprint,
-                                                           sessionId: s.sessionId) else { continue }
-            for e in read.entries {
+            guard let requests = try? await client.sessionRequests(room: room, node: s.nodeFingerprint,
+                sessionId: s.sessionId, references: []) else { continue }
+            for e in requests {
                 if let r = e.request, r.state == nil {
                     found.append((s.nodeFingerprint, s.sessionId, r.reference, s.label))
                 }
@@ -1756,6 +1885,7 @@ extension NodeModel {
         await show(.room(room))
         showing = .session(node: node, id: session)
         selectedRequest = reference
+        if let s = shownSession, s.canDrive { await refreshSessionRequests(room: room, session: s) }
     }
 
     /// The approval selected in the Session on screen, open and this node's to answer: what
@@ -1763,7 +1893,8 @@ extension NodeModel {
     var selectedApproval: (session: FfiSession, room: String, reference: String)? {
         guard let reference = selectedRequest, let s = shownSession, s.canDrive, s.open,
               let room = roomOnScreen,
-              let r = sessionEntries.compactMap(\.request).first(where: { $0.reference == reference }),
+              let r = (sessionEntries + [selectedEarlierRequest].compactMap { $0 })
+                .compactMap(\.request).first(where: { $0.reference == reference }),
               r.state == nil, !r.isQuestion else { return nil }
         return (s, room, reference)
     }

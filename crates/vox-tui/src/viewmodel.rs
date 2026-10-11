@@ -226,6 +226,8 @@ pub struct ChannelView {
     /// message's row to it rather than projecting the whole room again on every frame
     /// (V210-120).
     pub timeline: std::sync::Arc<Vec<MessageView>>,
+    /// Messages before the oldest room page on screen; Up at the first loads another page.
+    pub room_older: u64,
     /// One notice per member this node holds back for equivocating here (V210-63, V210-66), by
     /// the name this operator gave them; drawn above the timeline, **each on its own line**.
     pub held_back: Vec<String>,
@@ -236,6 +238,9 @@ pub struct ChannelView {
     /// The lines of the Session on screen, for a member with drive (ADR-029 SC-1): one per
     /// activity, in the words `vox room session` prints. Empty while none is shown.
     pub session_lines: Vec<SessionLineView>,
+    /// How many older entries the Session on screen has before its lines (ADR-034 FR-4): a page
+    /// of them loads when the person goes up past the oldest line shown.
+    pub session_older: u64,
     /// This channel's reachability.
     pub reachability: Reachability,
 }
@@ -557,6 +562,19 @@ pub enum Command {
         channel_id: Digest32,
         /// The Session's node and the harness's session id.
         session: Option<(Digest32, String)>,
+    },
+    /// Load the page of the shown Session's entries before the oldest it shows (ADR-034 FR-4):
+    /// the person went up past it.
+    OlderSession {
+        /// The room.
+        channel_id: Digest32,
+        /// The Session's node and the harness's session id.
+        session: (Digest32, String),
+    },
+    /// Load the room page before its oldest shown message.
+    OlderRoom {
+        /// The room on screen.
+        channel_id: Digest32,
     },
     /// Create a room under its shared name (ADR-028 R-1) with an out-of-band passphrase.
     CreateChannel {

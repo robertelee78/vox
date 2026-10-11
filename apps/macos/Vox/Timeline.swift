@@ -16,6 +16,9 @@ struct TimelineItem: Identifiable {
     let entry: FfiSessionEntry?
     /// A command the notice gives the person to run, shown with Copy (#666); nil for most.
     var command: String? = nil
+    /// The notice stands for the Session's older entries (ADR-034 FR-4): scrolling up to it, or
+    /// its button, loads the page before those shown.
+    var loadsOlder: Bool = false
 
     static func message(_ m: RoomMessage) -> TimelineItem {
         TimelineItem(id: m.id, millis: m.createdMillis, message: m, notice: nil, entry: nil)
@@ -79,7 +82,14 @@ extension NodeModel {
             let line = TimelineItem.notice("join-\(j.fingerprint)", j.said, at: j.at)
             items.insert(line, at: items.firstIndex { $0.millis > j.at } ?? items.count)
         }
-        return items
+        return withEarlierRoomEntries(items)
+    }
+
+    private func withEarlierRoomEntries(_ items: [TimelineItem]) -> [TimelineItem] {
+        guard roomOlder > 0, let room = roomOnScreen else { return items }
+        var earlier = TimelineItem.notice("older-room-\(room)", "Earlier messages", at: 0)
+        earlier.loadsOlder = true
+        return [earlier] + items
     }
 
     /// What the timeline draws.
@@ -96,7 +106,7 @@ extension NodeModel {
             return items
         case .tag(let tag):
             // A thread (#636): the room's messages carrying the tag, in the room's order.
-            return messages.filter { $0.tags.contains(tag) }.map(TimelineItem.message)
+            return withEarlierRoomEntries(messages.filter { $0.tags.contains(tag) }.map(TimelineItem.message))
         case .session:
             guard let s = shownSession else { return [] }
             var lines = TimelineItem.openedAndEnded(s)
@@ -106,6 +116,24 @@ extension NodeModel {
                 }
                 lines += sessionEntries.map(TimelineItem.entry)
                 lines.sort { $0.millis < $1.millis }
+                // What is older than the pages held, under "opened" and above the entries
+                // (ADR-034 FR-4): the newest page is shown, an older one loads on scroll.
+                if sessionOlder > 0 {
+                    var older = TimelineItem.notice(
+                        "older-\(s.sessionId)",
+                        "Earlier entries",
+                        at: 0)
+                    older.loadsOlder = true
+                    let under = lines.first?.id.hasPrefix("opened-") == true ? 1 : 0
+                    lines.insert(older, at: under)
+                }
+                if let request = selectedEarlierRequest {
+                    lines.insert(contentsOf: [
+                        .notice("selected-earlier-\(s.sessionId)", "Selected request from earlier in this Session", at: 0),
+                        .entry(request),
+                        .notice("latest-\(s.sessionId)", "Latest entries", at: 0)
+                    ], at: 0)
+                }
                 if let note = sessionNote {
                     lines.append(.notice("note-\(s.sessionId)", note, at: .max))
                 }

@@ -1230,6 +1230,10 @@ pub struct RoomSessionArgs {
     /// Print one JSON object per line instead.
     #[arg(long)]
     pub json: bool,
+    /// Print the page of entries older than ENTRY, as the line under a page names it. Without
+    /// it, the newest page.
+    #[arg(long, value_name = "ENTRY")]
+    pub before: Option<String>,
     /// Drive the session instead of reading it, as a member its node trusts with
     /// drive. Each input reaches that session alone, or is refused with the reason.
     #[command(flatten)]
@@ -1389,7 +1393,10 @@ pub struct RoomReadArgs {
     /// a prefix that matched the wrong entry would silently skip or repeat messages.
     #[arg(long)]
     pub since: Option<String>,
-    /// At most this many messages. 0 means no limit.
+    /// Read the bounded page before this entry; otherwise open at the newest page.
+    #[arg(long, conflicts_with_all = ["since", "tag", "late", "hashes"])]
+    pub before: Option<String>,
+    /// At most this many messages in the page. 0 uses the page's row and byte bound.
     #[arg(long, default_value_t = 0)]
     pub limit: u64,
     /// One `vox.room.row/1` JSON object per line.
@@ -2534,6 +2541,7 @@ pub fn run() -> ExitCode {
                                 &paths,
                                 &a.room,
                                 a.since.as_deref(),
+                                a.before.as_deref(),
                                 a.limit,
                                 a.json,
                                 a.late,
@@ -2566,7 +2574,12 @@ pub fn run() -> ExitCode {
                             }
                             Ok(None) => {
                                 crate::session_cli::show(
-                                    &paths, &a.room, &a.session, a.details, a.json,
+                                    &paths,
+                                    &a.room,
+                                    &a.session,
+                                    a.details,
+                                    a.json,
+                                    a.before.as_deref(),
                                 )
                                 .await
                             }
