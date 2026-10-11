@@ -586,6 +586,12 @@ fn hung_up_why(still_running: bool) -> &'static str {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum IpcHandshake {
+    /// A client with a fixed request deadline did not receive the complete answer in time.
+    #[error("the request did not finish within {secs} seconds; its outcome is unknown; open a new connection")]
+    RequestTimedOut {
+        /// The request's total deadline, including every page of its reply.
+        secs: u64,
+    },
     /// The connect itself failed: nothing is listening on the socket.
     #[error("nothing is listening on the control socket ({reason})")]
     Unreachable {

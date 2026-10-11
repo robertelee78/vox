@@ -107,6 +107,8 @@ nix = { version = "0.31", default-features = false, features = ["fs"] }
 
 # `tempfile` is a normal dependency above and is in scope for the integration proofs too.
 [dev-dependencies]
+# The app's actual FFI client drives a running shipped daemon in the timeout journey.
+vox-ffi = { path = "../vox-ffi" }
 # The share proof reads the thumbnail an announcement carries (ADR-028 F-9); `image`, a
 # dependency of the TUI, makes the photo it shares.
 base64.workspace = true

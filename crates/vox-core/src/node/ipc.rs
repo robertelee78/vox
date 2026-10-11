@@ -5228,6 +5228,9 @@ pub struct IpcClient {
     node: Option<crate::node::paths::NodeName>,
     /// What attaching the node said, when this connection's `Use` attached it.
     notes: Vec<String>,
+    /// A failed or cancelled exchange leaves frames misaligned: reconnect before reuse.
+    broken: bool,
+    answer_within: Option<std::time::Duration>,
 }
 
 /// Where a client of the daemon reaches its node (ADR-026 C-2): the account's one socket, and the
@@ -5430,6 +5433,8 @@ impl IpcClient {
                 path: path.to_owned(),
                 node: Some(node),
                 notes,
+                broken: false,
+                answer_within: None,
             })),
             DaemonFrame::Refused(r) => Ok(Err(r)),
             _ => Err(Error::Ipc(IpcHandshake::NotHello)),
@@ -5481,6 +5486,8 @@ impl IpcClient {
             path: path.to_owned(),
             node: None,
             notes: Vec::new(),
+            broken: false,
+            answer_within: None,
         })
     }
 
@@ -5496,6 +5503,8 @@ impl IpcClient {
             path: at.path.clone(),
             node: Some(at.using.node.clone()),
             notes,
+            broken: false,
+            answer_within: None,
         })
     }
 
@@ -5504,6 +5513,13 @@ impl IpcClient {
     #[must_use]
     pub fn attach_notes(&self) -> &[String] {
         &self.notes
+    }
+
+    /// Apply a fixed total deadline to every exchange, including background requests.
+    #[must_use]
+    pub fn with_answer_bound(mut self, within: std::time::Duration) -> Self {
+        self.answer_within = Some(within);
+        self
     }
 
     /// Send one request and read its answer.
@@ -5519,6 +5535,15 @@ impl IpcClient {
     /// whether it is still greeting and its actor still taking commands ([`ACTOR_WITHIN`]), and
     /// the request fails, naming which, once it is not.
     pub async fn request(&mut self, req: &Request) -> Result<Frame> {
+        let answer_within = self.answer_within;
+        if self.broken {
+            return Err(Error::MalformedIpc(
+                "the connection broke; open a new connection",
+            ));
+        }
+        // A caller may cancel this future at any await, including a half-written frame. Leave
+        // it broken in that case too; only a complete exchange makes it reusable (WT-2).
+        self.broken = true;
         let Self {
             stream, path, node, ..
         } = self;
@@ -5532,7 +5557,27 @@ impl IpcClient {
             };
             Frame::from_bytes(&body)
         };
-        while_answering(path, node.as_ref(), exchange).await
+        let answering = while_answering(path, node.as_ref(), exchange);
+        let out = match answer_within {
+            Some(within) => tokio::time::timeout(within, answering)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Error::Ipc(IpcHandshake::RequestTimedOut {
+                        secs: within.as_secs(),
+                    }))
+                }),
+            None => answering.await,
+        };
+        self.broken = out.is_err();
+        out
+    }
+
+    /// Whether an exchange on this connection failed (ADR-034 WT-2, FR-3): a reply that did not
+    /// arrive whole, could not be read, or did not come at all. Its frames may no longer line up
+    /// with its requests, so a client that holds it drops it and opens another.
+    #[must_use]
+    pub fn is_broken(&self) -> bool {
+        self.broken
     }
 
     /// Send one request body this module has no [`Request`] for — a status, a tunnel close, a
@@ -5542,6 +5587,13 @@ impl IpcClient {
     /// # Errors
     /// If the node cannot be reached, or hangs up before it answers.
     pub async fn exchange(&mut self, body: &[u8]) -> Result<Vec<u8>> {
+        let answer_within = self.answer_within;
+        if self.broken {
+            return Err(Error::MalformedIpc(
+                "the connection broke; open a new connection",
+            ));
+        }
+        self.broken = true;
         let Self {
             stream, path, node, ..
         } = self;
@@ -5554,7 +5606,19 @@ impl IpcClient {
                 None => Err(hung_up(path).await),
             }
         };
-        while_answering(path, node.as_ref(), exchange).await
+        let answering = while_answering(path, node.as_ref(), exchange);
+        let out = match answer_within {
+            Some(within) => tokio::time::timeout(within, answering)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Error::Ipc(IpcHandshake::RequestTimedOut {
+                        secs: within.as_secs(),
+                    }))
+                }),
+            None => answering.await,
+        };
+        self.broken = out.is_err();
+        out
     }
 
     /// Every row after `since`, however many replies that takes — as one

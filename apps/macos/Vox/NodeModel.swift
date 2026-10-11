@@ -1279,8 +1279,8 @@ final class NodeModel: ObservableObject {
     }
 
     /// What listens on this Mac, as one-step sharing lists it (S-4).
-    func listeningHere() async -> ListeningServices {
-        await client.listening()
+    func listeningHere() async throws -> ListeningServices {
+        try await client.listening()
     }
 
     /// What sharing the service on `port` would do, said before it is shared (S-4).
