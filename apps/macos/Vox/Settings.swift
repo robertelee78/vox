@@ -3,6 +3,7 @@
 // run, and the menu bar item could be hidden with nothing to bring it back; the text size was only
 // in the View menu. Each is one control whose words say what it does.
 
+import AppKit
 import ServiceManagement
 import SwiftUI
 
@@ -55,6 +56,7 @@ struct SettingsView: View {
                         .accessibilityIdentifier("settings-update-said")
                 }
             }
+            if let node = app.node { DaemonLogSetting(node: node) }
             setting {
                 Picker("Conversation text size", selection: Binding(
                     get: { app.textScale },
@@ -119,4 +121,22 @@ enum KeepRunningState: Equatable {
     /// System Settings' Login Items, through the one Keep Running implementation (#571): a proof
     /// build only records the request.
     static func openLoginItems() { Daemon.openLoginItems() }
+}
+
+/// Observe the node directly: the first status report may arrive while Settings is open.
+private struct DaemonLogSetting: View {
+    @ObservedObject var node: NodeModel
+    var body: some View {
+        if let path = node.logPath {
+            VStack(alignment: .leading, spacing: Space.s8) {
+                Button("Show Daemon Log in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+                }
+                .accessibilityIdentifier("settings-daemon-log")
+                Text("Daemon log: \(path)").secondaryText().textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("settings-daemon-log-path")
+            }
+        }
+    }
 }
