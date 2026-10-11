@@ -2891,3 +2891,141 @@ fn a_sessions_steps_start_at_the_later_of_join_and_drive() {
     read_old("published author step after receiver reopened");
     println!("[proof] join/drive boundaries hold at author and relay; published {old_version} exchanges ordinary messages and eligible live Session steps, including after receiver reopen");
 }
+
+/// Leaving deletes the node's room. Rejoining gives even its author only later Session steps.
+#[test]
+#[ignore = "real binary, production Argon2id; run in release"]
+fn a_rejoined_author_is_not_sent_its_old_session_steps() {
+    watchdog::arm_for(Duration::from_secs(240));
+    let (w, _daemon, room) = World::setup();
+    let transcript = w.root.join("author-rejoin.jsonl");
+    std::fs::write(&transcript, "").expect("APPARATUS: author transcript");
+    let mut prompt = base("UserPromptSubmit", &w.root.join("work"), &transcript);
+    prompt["prompt"] = "own step before leaving the room".into();
+    w.hook_done(&room, &prompt);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (_, text, err) = w.vox(PERSON, &["room", "session", &room, SESSION], None);
+        if text.contains("own step before leaving the room") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: relay did not receive the old author step: {text}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    w.staged(AGENT, &["node", "detach", AGENT], None);
+    let before = served_to_member(&w, AGENT, PERSON, &room);
+    let cid = complete_room_id(&w, PERSON, &room);
+    let drive_namespace = vox_core::node::drive::drive_channel(&cid);
+    let old_steps: Vec<_> = before
+        .iter()
+        .filter(|entry| {
+            entry
+                .payload
+                .as_deref()
+                .and_then(|body| vox_core::group::message::GroupMessage::from_wire(body).ok())
+                .is_some_and(|message| message.header.channel_id == drive_namespace)
+        })
+        .map(|entry| (entry.skeleton.author_id, entry.skeleton.seq))
+        .collect();
+    assert!(
+        !old_steps.is_empty(),
+        "APPARATUS: relay did not serve the still-joined author's old step"
+    );
+    w.staged(AGENT, &["node", "attach", AGENT], None);
+    let link = w
+        .staged(PERSON, &["room", "link", &room], None)
+        .trim()
+        .to_owned();
+    w.staged(AGENT, &["room", "leave", &room], None);
+    w.staged(
+        AGENT,
+        &["room", "join", "--passphrase-file", "-", &link],
+        Some("room passphrase\n"),
+    );
+    w.staged(
+        AGENT,
+        &["room", "post", &room, "author returned after leaving"],
+        None,
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let text = w.staged(PERSON, &["room", "read", &room], None);
+        if text.contains("author returned after leaving") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: relay did not learn the author's new membership: {text}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    w.staged(AGENT, &["node", "detach", AGENT], None);
+    let after = served_to_member(&w, AGENT, PERSON, &room);
+    for (author, seq) in old_steps {
+        let entry = after
+            .iter()
+            .find(|entry| entry.skeleton.author_id == author && entry.skeleton.seq == seq)
+            .unwrap_or_else(|| {
+                panic!("PRODUCT: relay lost the authenticated old-step skeleton at {seq}")
+            });
+        assert!(entry.payload.is_none(), "PRODUCT: a rejoined author was served its own pre-rejoin Session step body at sequence {seq}");
+    }
+    // Privacy must not break the next turn: its generation differs from the one other members
+    // already hold, even though the returned author no longer retains any older step bodies.
+    w.staged(AGENT, &["node", "attach", AGENT], None);
+    prompt["prompt"] = "new step after author rejoined".into();
+    w.hook_done(&room, &prompt);
+    let read_new = |wanted: &str| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let (_, text, err) = w.vox(PERSON, &["room", "session", &room, SESSION], None);
+            if text.contains(wanted) {
+                break text;
+            }
+            assert!(Instant::now() < deadline, "PRODUCT: the rejoined Session did not deliver its new step {wanted:?}: {text}{err}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    read_new("new step after author rejoined");
+    // The other direction: a returned reader needs a fresh release at its new membership,
+    // while its old delivery record must not backfill the previous membership's steps.
+    let link = w
+        .staged(AGENT, &["room", "link", &room], None)
+        .trim()
+        .to_owned();
+    w.staged(PERSON, &["room", "leave", &room], None);
+    w.staged(
+        PERSON,
+        &["room", "join", "--passphrase-file", "-", &link],
+        Some("room passphrase\n"),
+    );
+    w.staged(
+        PERSON,
+        &["room", "post", &room, "reader returned after leaving"],
+        None,
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let text = w.staged(AGENT, &["room", "read", &room], None);
+        if text.contains("reader returned after leaving") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: author did not learn its reader's new membership: {text}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    prompt["prompt"] = "new step after reader rejoined".into();
+    w.hook_done(&room, &prompt);
+    let text = read_new("new step after reader rejoined");
+    assert!(
+        !text.contains("new step after author rejoined")
+            && !text.contains("own step before leaving the room"),
+        "PRODUCT: rejoined reader backfilled its prior membership's Session steps: {text}"
+    );
+    println!("[proof] author and reader rejoin receive new Session steps without backfilling the prior membership");
+}

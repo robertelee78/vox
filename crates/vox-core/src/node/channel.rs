@@ -5680,6 +5680,15 @@ impl ChannelState {
     /// A new drive generation for this node here: past every one it used, owed whole to
     /// `holders`.
     fn begin_drive(&mut self, holders: &BTreeSet<Digest32>, now_ms: u64) -> Result<()> {
+        self.index_session_floors();
+        let me = self.me();
+        let published = self
+            .drive
+            .floors
+            .keys()
+            .filter(|(author, _, epoch, _)| *author == me && *epoch <= self.epoch)
+            .map(|(_, _, _, generation)| *generation)
+            .max();
         let floor = self
             .drive
             .chain
@@ -5687,8 +5696,17 @@ impl ChannelState {
             .map(SenderChain::chain_id)
             .into_iter()
             .chain(self.drive_used())
+            .chain(published)
             .max();
-        let next = floor.map_or(Ok(0), |f| {
+        // A pre-upgrade departure has no public generation marker. Legacy generations began
+        // at zero and incremented; start its replacement in the upper half of the namespace
+        // rather than reusing the erased generation. Current departures use their signed floor.
+        let first = if self.admission(&me).0 == 0 {
+            0
+        } else {
+            1u64 << 63
+        };
+        let next = floor.map_or(Ok(first), |f| {
             f.checked_add(1)
                 .ok_or(Error::MalformedBundle("drive chain_id overflow"))
         })?;
@@ -5901,12 +5919,12 @@ impl ChannelState {
         holders: &BTreeSet<Digest32>,
         now: crate::time::Ms,
     ) -> Result<Vec<Digest32>> {
+        self.ensure_session_floors(profile, holders, now.get())?;
         let members = self.drive_members();
         let owed = self.drive.take_owed(&members, holders);
         if !owed.is_empty() {
             self.persist_drive(profile.store())?;
         }
-        self.ensure_session_floors(profile, holders, now.get())?;
         Ok(owed)
     }
 
