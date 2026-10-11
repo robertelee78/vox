@@ -1608,7 +1608,9 @@ final class NodeModel: ObservableObject {
     /// Attach this node again after it stopped, with `secret` if it needs its passphrase, and
     /// follow it as before: the window and its drafts stay.
     func attachAgain(_ secret: Secret?) async {
-        begin("attach")
+        let operation = "attach"
+        let attempt = begin(operation)
+        defer { end(attempt) }
         do {
             let passphrase = try secret?.passphrase()
             defer { passphrase?.wipe() }
