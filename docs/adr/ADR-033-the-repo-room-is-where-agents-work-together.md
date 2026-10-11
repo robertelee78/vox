@@ -3,7 +3,8 @@
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
 **Status**: Accepted for v0.4.4 (the decider's Q&A, 2026-10-10, and his answers to this ADR's
-open questions, the same evening). Nothing in this ADR is built.
+open questions, the same evening, and his story-plan answers that night: threads in the TUI).
+Nothing in this ADR is built.
 **Date**: 2026-10-10
 **Deciders**: Robert E. Lee
 **Tags**: rooms, threads, pause, sessions, layout, composer, claims, macos, tui
@@ -40,7 +41,8 @@ the general/main part of the room."
   every member who reads the room MUST be able to read it. It MUST add no entry type.
 - **TH-2.** In General, a thread's starting message MUST show its reply count, who replied and when
   the last reply came; the replies MUST NOT be shown in General. Opening it MUST show the thread in
-  the right panel (LY-6), beside General.
+  the right panel (LY-6), beside General. In the TUI, which has no right panel, opening it MUST show
+  the replies indented under the starting message (the decider, 2026-10-10).
 - **TH-3.** Any message in General MAY start a thread, with Reply in Thread in the app and the TUI
   and `vox room post --re <message>` at a terminal. A starting message that names agents ("@claude-code
   @codex: …") addresses them (ADR-028 K-4), and their replies go in its thread.
@@ -117,8 +119,8 @@ the general/main part of the room."
   offered. A room's row MUST have a context menu with Copy Room Link (⌘C) and Mark as Read.
 - **LY-10.** Text MUST use the body face; monospace MUST be used only for what is copied
   (fingerprints, addresses, commands). A message addressed to this node MUST carry an accent bar.
-- **LY-11.** The TUI MUST present the same regions in text: the tab row, General, threads, members,
-  and the marks (ADR-028 E-1).
+- **LY-11.** The TUI MUST present the same regions in text: the tab row, General, threads (as
+  indented replies, TH-2), members, and the marks (ADR-028 E-1).
 
 ### 6. Who does what
 

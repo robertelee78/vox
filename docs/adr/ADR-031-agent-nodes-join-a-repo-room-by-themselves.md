@@ -3,7 +3,8 @@
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
 **Status**: Accepted for v0.4.4 (the decider's Q&A, 2026-10-10, and his answers to this ADR's
-open questions, the same evening). Nothing in this ADR is built.
+open questions, the same evening, and his story-plan answers that night: LT-8, a Mac over ssh,
+one format step). Nothing in this ADR is built.
 **Date**: 2026-10-10
 **Deciders**: Robert E. Lee
 **Tags**: agents, onboarding, hooks, keyring, trust, drive, sessions, macos
@@ -33,7 +34,10 @@ nodes of one machine, and amends the trust, setup, hook and Session lines it ove
 
 **Terms.** *This machine's nodes* are the nodes of one daemon, that is, of one data root
 (ADR-026 D-1). *The person's node* is the node Vox.app acts as (ADR-028 E-4). *News* is what an
-agent's hook puts into the agent's next turn (ADR-020 6.6).
+agent's hook puts into the agent's next turn (ADR-020 6.6). *A Mac with Vox.app* is a Mac where
+Vox.app is installed and the agent's session runs at that Mac; a session reached over ssh is on a
+machine with no Vox.app, and is told the terminal way (NC-4, RM-4, CW-6). The decider, 2026-10-10:
+a Mac reached over ssh is treated as a box with no app.
 
 ## Requirements
 
@@ -113,10 +117,16 @@ allow drive access for the node I'm using from the macOS app."
   the normal way. A newcomer from another machine MUST appear in the room's members panel as a new
   member with **Trust** and **Dismiss** (the decider, Q18: "as a new member, not pending"); the
   offer MUST NOT be shown in General.
-- **LT-8. With #677.** Every widening of trust or drive other than LT-1 (`vox trust add`,
-  `vox trust drive`, the app's Trust) MUST be confirmed by the person as #677 requires, whatever
-  the passphrase and the keyring window say. LT-1 is not such a widening by a process: it is the
-  person's standing rule, applied by the daemon, and grants drive only to the person's own node.
+- **LT-8. With #677: no widening from an agent's session.** Every widening of trust or drive other
+  than LT-1 (`vox trust add`, `vox trust drive` and any other verb that adds a trust or a
+  capability) MUST be refused when it runs inside an agent's session, as that session's Vox hook
+  marks it, whatever the passphrase and the keyring window say. The refusal MUST be one sentence
+  saying that the person must run it in a terminal of their own or in Vox.app. The identity
+  passphrase and its 30-minute window (ADR-028 K-12, KP-1) stay as they are for a person's own
+  terminal and the app. No operating-system account check (Touch ID, the account password) is
+  used: the decider, 2026-10-10, "nodes are tied to pub/priv keys which is orthogonal to host level
+  account auth". LT-1 is not such a widening: it is the person's standing rule, applied by the
+  daemon, and grants drive only to the person's own node.
 - **LT-9. Existing pairs.** LT-1 MUST apply to pairs of this machine's nodes that already share a
   room with the person's node when a release with this ADR first starts, not only to new joins.
   The daemon MUST write their entries at that start (or when each node is next Ready). A pair whose removal by hand is in either node's decision record
@@ -209,7 +219,8 @@ allow drive access for the node I'm using from the macOS app."
   nothing MAY be lost. Records an earlier release wrote unsealed stay as they were written in every
   member's copy of the log; from the upgrade on, the daemon MUST NOT serve them to a member without
   drive (SA-2), and the release's notes MUST say that earlier opening and end records stay readable
-  in a copy a member already holds.
+  in a copy a member already holds. This is one format step with ADR-032 AN-14: v0.4.4 MUST raise
+  the format once, with one upgrade and one proof (SA-6) for both.
 - **SA-6. Proof of the upgrade.** The upgrade MUST be proved by real use, on a data root and rooms
   the shipped v0.4.3 binary wrote, with Sessions open and ended, opened by the v0.4.4 binary
   (extending `a_data_root_of_the_previous_release_opens_with_nothing_lost`, ADR-026 F-3), with a
@@ -255,6 +266,7 @@ allow drive access for the node I'm using from the macOS app."
 | ADR-014 M-6, M-21 | Keep Running decides whether the node stays attached; Node menu Attach, Detach | Every remembered node returns Ready (CW-3); Node menu Unlock…, Forget (CW-2, CW-4) |
 | #681 | Drive stays at the terminal | The person's node gets drive over this machine's agent nodes automatically (LT-1.3) |
 | ADR-028 K-12 | Every keyring change asks for the identity passphrase, with the 30-minute window | Except LT-1's entries, the person's standing rule applied by the daemon (LT-3) |
+| #677 | A widening is confirmed by the person (a Touch ID or password check was considered) | Refused inside an agent's session as its hook marks it; the passphrase and its window stay; no OS account check (LT-8) |
 | ADR-026 L-2; ADR-028 K-13 | `vox node attach <name> [--keep]`, `vox node detach <name>`; the hook shows the attach command | `vox node unlock <name>`, `vox node lock <name>`; the old verbs work and print the new ones (CW-7) |
 | ADR-026 F-3 | Format as of v0.4.3 | Sealed Session opening and end records raise the format, with an upgrade from every release since v0.4.0 (SA-5, SA-6) |
 
@@ -267,6 +279,9 @@ allow drive access for the node I'm using from the macOS app."
   already the boundary for the daemon's socket (ADR-026 C-6); this rule widens what a process
   inside it gains without a person, and with no keyring passphrase. The decider accepted this
   cost (2026-10-10); each automatic trust is in each node's decision record (LT-5).
+- A trust-widening verb run inside an agent's session is refused by the mark its hook sets (LT-8).
+  An agent's process that drops that mark is not refused: LT-8 stops an agent's ordinary use of
+  the verbs, and the OS account stays the boundary (ADR-026 C-6).
 - On upgrade, this machine's nodes that already share a room with the person's node trust each
   other, and the person's node gains drive over them (LT-9).
 - A member with read only no longer learns that a node has Sessions, or their names.
@@ -279,9 +294,10 @@ allow drive access for the node I'm using from the macOS app."
 
 - **A member of an earlier release in the room.** What a v0.4.3 node does when it receives a sealed
   opening or end record (skips it, refuses the entry, or poisons the room) is not known. It is to be
-  measured with the shipped v0.4.3 binary before SA-3 is built, and the answer decides whether
-  sealing needs ADR-034 UP-2's capability negotiation between peers as well as between a client and
-  its daemon.
+  measured with the shipped v0.4.3 binary before SA-3 is built. Under ADR-034 UP-2 a v0.4.4 node
+  does not sync with a peer of another version, so the measurement is to confirm that a v0.4.3
+  member is never sent a sealed record and is not harmed. Measuring compatibility between versions,
+  so that peers of different releases can share a room, is planned for v0.4.5 (ADR-034 UP-2).
 
 ## Related ADRs
 
