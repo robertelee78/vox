@@ -463,24 +463,11 @@ pub fn is_request(body: &[u8]) -> bool {
     matches!((d.array(), d.uint()), (Ok(1), Ok(T_SNAPSHOT)))
 }
 
-/// The answer to a snapshot request for the node behind `handle`: the snapshot, or an error frame
-/// saying it does not fit one frame (a client then says so; it never draws part of the node as
-/// if it were all of it).
+/// The complete snapshot body. IPC carries it across cursor pages, including member read and
+/// trust lists whose individual rows can cross a frame (ADR-034 FR-7).
 #[must_use]
 pub fn answer(handle: &NodeHandle) -> Vec<u8> {
-    let body = NodeSnapshot::of(handle).to_bytes();
-    if body.len() > crate::node::ipc::frame_limit() {
-        return crate::node::ipc::Frame::Error {
-            reason: format!(
-                "this node's rooms, members and tunnels take {} bytes, more than one control \
-                 frame carries ({})",
-                body.len(),
-                crate::node::ipc::frame_limit()
-            ),
-        }
-        .to_bytes();
-    }
-    body
+    NodeSnapshot::of(handle).to_bytes()
 }
 
 fn digests(e: &mut Encoder, ds: &[Digest32]) {

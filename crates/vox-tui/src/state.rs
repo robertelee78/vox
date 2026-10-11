@@ -821,6 +821,26 @@ impl UiState {
             }
             KeyCode::Enter if self.screen == Screen::ChannelList => self.open_selected(vm),
             KeyCode::Up => {
+                // At the oldest line of a Session that has older entries, Up loads the page
+                // before it (ADR-034 FR-4).
+                if let Some(cmd) = self.older_session(vm) {
+                    return Action::Dispatch(cmd);
+                }
+                if self.screen == Screen::Channel
+                    && self.focus == Focus::Timeline
+                    && !matches!(self.showing, Showing::Session(..))
+                {
+                    if let Some(active) = vm.active.as_ref().filter(|c| c.room_older > 0) {
+                        if self.selected_message.is_some()
+                            && self.selected_message
+                                == active.timeline.first().map(|r| r.entry_hash)
+                        {
+                            if let Some(channel_id) = self.active_channel_id(vm) {
+                                return Action::Dispatch(Command::OlderRoom { channel_id });
+                            }
+                        }
+                    }
+                }
                 self.move_selection(vm, -1);
                 Action::Redraw
             }
@@ -1422,6 +1442,25 @@ impl UiState {
             }
             _ => Action::Redraw,
         }
+    }
+
+    /// The command that loads the shown Session's page of older entries: Up is pressed at its
+    /// oldest line, and it has older ones (ADR-034 FR-4).
+    fn older_session(&self, vm: &ViewModel) -> Option<Command> {
+        if self.screen != Screen::Channel || self.focus != Focus::Timeline {
+            return None;
+        }
+        let Showing::Session(node, id) = &self.showing else {
+            return None;
+        };
+        let active = vm.active.as_ref()?;
+        if active.session_older == 0 || self.selected_session_line != Some(0) {
+            return None;
+        }
+        Some(Command::OlderSession {
+            channel_id: self.active_channel_id(vm)?,
+            session: (*node, id.clone()),
+        })
     }
 
     /// Show General, All or one Session; the composer is not a Session's (ADR-029 DR-1).

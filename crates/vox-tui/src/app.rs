@@ -1638,7 +1638,9 @@ fn event_loop(io: &mut impl TerminalIo, core: &mut impl CoreHandle) -> Result<()
                 // the screen's own key hints.
                 let moving = matches!(
                     cmd,
-                    Command::SelectChannel { .. } | Command::ShowSession { .. }
+                    Command::SelectChannel { .. }
+                        | Command::ShowSession { .. }
+                        | Command::OlderSession { .. }
                 );
                 // **Waiting is said in the status line** (V210-100), never on stderr: stderr is
                 // this terminal, and a line written there lands inside the screen.

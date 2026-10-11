@@ -92,6 +92,7 @@ pub const NOT_RECEIVED_YET: &str = "(not received yet)";
 #[derive(Clone)]
 pub struct Chunks<T> {
     chunks: Vec<std::sync::Arc<[T]>>,
+    ends: Vec<usize>,
     len: usize,
 }
 
@@ -102,6 +103,7 @@ impl<T> Default for Chunks<T> {
     fn default() -> Self {
         Self {
             chunks: Vec::new(),
+            ends: Vec::new(),
             len: 0,
         }
     }
@@ -140,14 +142,10 @@ impl<T: Clone> Chunks<T> {
 
     /// The row at position `i`, oldest first.
     #[must_use]
-    pub fn get(&self, mut i: usize) -> Option<&T> {
-        for c in &self.chunks {
-            if i < c.len() {
-                return c.get(i);
-            }
-            i -= c.len();
-        }
-        None
+    pub fn get(&self, i: usize) -> Option<&T> {
+        let chunk = self.ends.partition_point(|end| *end <= i);
+        let start = chunk.checked_sub(1).map_or(0, |p| self.ends[p]);
+        self.chunks.get(chunk)?.get(i - start)
     }
 
     /// The oldest row.
@@ -173,6 +171,7 @@ impl<T: Clone> Chunks<T> {
         let mut next = self.clone();
         next.len += added.len();
         next.chunks.push(added);
+        next.ends.push(next.len);
         // Merge the newest chunks while the older of the two is no larger than the newer, as a
         // binary counter carries, and never into a chunk past `CHUNK`: chunks stay few, and an
         // append copies a bounded number of rows.
@@ -184,6 +183,9 @@ impl<T: Clone> Chunks<T> {
             next.chunks.pop();
             next.chunks.pop();
             next.chunks.push(merged);
+            next.ends.pop();
+            next.ends.pop();
+            next.ends.push(next.len);
         }
         next
     }
@@ -209,11 +211,13 @@ impl<T: Clone> FromIterator<T> for Chunks<T> {
             if chunk.len() == Self::CHUNK {
                 t.len += chunk.len();
                 t.chunks.push(std::mem::take(&mut chunk).into());
+                t.ends.push(t.len);
             }
         }
         if !chunk.is_empty() {
             t.len += chunk.len();
             t.chunks.push(chunk.into());
+            t.ends.push(t.len);
         }
         t
     }
@@ -553,6 +557,9 @@ pub struct ChannelDetail {
     /// IPC read page takes one — used to copy every room's whole timeline (V210-71); and a new
     /// message adds its row without rebuilding the rest (V210-120).
     pub timeline: Timeline,
+    /// Entry-hash prefixes to timeline positions. Collisions are checked against the row's full
+    /// hash. Shared sorted runs let history pages locate their cursor without scanning history.
+    pub row_index: OpRuns,
     /// Every entry this node holds for the channel, readable or not, in the room's one
     /// order (PRD-001 R13), each with the clock that placed it (ms). `timeline` is this
     /// sequence restricted to rendered rows.

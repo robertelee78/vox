@@ -2187,7 +2187,7 @@ impl ChannelState {
             }
             None => DriveState::default(),
         };
-        drive.sessions = sessions;
+        drive.sessions = crate::node::drive::SessionLog::of(sessions);
         let board_kept =
             match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_BOARD_KEPT)? {
                 Some(seg) => {
@@ -5555,17 +5555,27 @@ impl ChannelState {
 
     // ---- Sessions: the drive key (ADR-029 SC-2, SC-2a, SC-2b; #543) ----------------------------
 
-    /// The Session entries this node has opened or written here, in the order it did: each
-    /// node's entries only if this node holds its drive key (SC-2), or wrote them. A
-    /// key-changed entry ([`crate::node::drive::KEY_CHANGED`]) is no Session's, and is left out.
+    /// How many Session entries this node holds here, key-changed entries among them.
     #[must_use]
-    pub fn session_rows(&self) -> Vec<SessionRow> {
-        self.drive
-            .sessions
-            .iter()
-            .filter(|r| !crate::node::drive::is_key_changed(&r.session_id))
-            .cloned()
-            .collect()
+    pub fn session_count(&self) -> usize {
+        self.drive.sessions.len()
+    }
+
+    /// One page of the Session entries this node has opened or written here (ADR-034 FR-5): each
+    /// node's entries only if this node holds its drive key (SC-2), or wrote them; a key-changed
+    /// entry ([`crate::node::drive::KEY_CHANGED`]) is no Session's, and is left out. As
+    /// [`crate::node::drive::SessionLog::page`] gives it.
+    ///
+    /// # Errors
+    /// `before` is not among the filter's entries.
+    pub fn session_page(
+        &self,
+        which: &crate::node::drive::SessionFilter,
+        before: Option<Digest32>,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> std::result::Result<crate::node::drive::SessionPage, String> {
+        self.drive.sessions.page(which, before, max_rows, max_bytes)
     }
 
     /// The files other members' Sessions sent out here that this node opened (ADR-029 DR-1.8).
@@ -5574,8 +5584,8 @@ impl ChannelState {
         let me = self.me();
         self.drive
             .sessions
-            .iter()
-            .filter(|r| r.author != me && crate::node::drive::is_file_out(r))
+            .files_out()
+            .filter(|r| r.author != me)
             .cloned()
             .collect()
     }
@@ -5923,7 +5933,7 @@ impl ChannelState {
         let before = self.drive.sessions.len();
         self.backfill(store, &skdm.body.author_id, now_ms)?;
         // What it opened of Sessions: a key-changed entry is none of theirs.
-        Ok(self.drive.sessions[before..]
+        Ok(self.drive.sessions.rows()[before..]
             .iter()
             .filter(|r| !crate::node::drive::is_key_changed(&r.session_id))
             .count())
@@ -6261,7 +6271,7 @@ impl ChannelState {
             .iter()
             .map(|r| r.entry_hash)
             .chain(self.read_records.keys().copied())
-            .chain(self.drive.sessions.iter().map(|r| r.entry_hash))
+            .chain(self.drive.sessions.rows().iter().map(|r| r.entry_hash))
             .collect();
         let pending: Vec<(Digest32, Vec<u8>)> = match self.dag.feed(author) {
             None => Vec::new(),

@@ -33,13 +33,19 @@
 //! a Session through its real hook, and its node is handed 2,400 entries of about 300 bytes through
 //! its own control socket, as the hook hands them; then
 //!
-//! 5. `vox room session --json` prints every one of them, in order;
+//! 5. `vox room session --json` prints its newest page and says under it how to print the page
+//!    before (`--before <entry>`), and followed to the first those pages are every entry, in
+//!    order; never the whole history in one call (ADR-034 FR-4);
 //! 6. the app's client (`VoxClient`, the library Vox.app links), attached to alice's node on her
-//!    daemon, lists the Session in `sessions` and reads every entry in `session_read`;
+//!    daemon, lists the Session in `sessions` and reads its newest page in `session_read`, with
+//!    how many are older and where they end; `session_read_older` followed to the first gives
+//!    every entry, and no call gives the whole history (FR-4);
 //! 7. and `create_room` on that same client then makes a room.
 //!
-//! At the real 256 KiB frame: no frame knob may be set. Mutant: the daemon answers a page with
-//! every entry (`session_page` without its budget): red PRODUCT at 5, the reply too large to send.
+//! At the real 256 KiB frame: no frame knob may be set. Mutants: the daemon answers a page with
+//! every entry (`session_page` without its budget): red PRODUCT at 5, the reply too large to send;
+//! the verb or the app's client fetches every page itself and gives the whole history at once:
+//! red PRODUCT at 5 or 6 on the one-page assertion.
 //!
 //! **Every red names its side** (V210-106). `PRODUCT:` quotes what a `vox` command did: a row
 //! missing, shown twice, out of order or cut short is the product's. `APPARATUS:` is this harness
@@ -82,7 +88,7 @@ const SESSION: &str = "5b1d0c6e-7a2f-4e3b-8c9d-large-room-session";
 #[test]
 #[ignore = "real daemon and the app's 60-second request deadline; run in release on demand"]
 fn an_app_request_times_out_and_reconnects_without_losing_its_node() {
-    delayed_app_reply(false);
+    delayed_app_reply(AppReplyFault::ForegroundTimeout);
 }
 
 /// The listener shares the app's held connection: its request must release that mutex at the
@@ -90,10 +96,30 @@ fn an_app_request_times_out_and_reconnects_without_losing_its_node() {
 #[test]
 #[ignore = "real daemon and the app listener's 60-second request deadline; run in release on demand"]
 fn an_app_listener_times_out_and_releases_its_connection() {
-    delayed_app_reply(true);
+    delayed_app_reply(AppReplyFault::BackgroundTimeout);
 }
 
-fn delayed_app_reply(background: bool) {
+#[derive(Clone, Copy)]
+enum AppReplyFault {
+    ForegroundTimeout,
+    BackgroundTimeout,
+    Oversize,
+    Unparseable,
+}
+
+#[test]
+#[ignore = "real daemons and the app client; CI runs in release"]
+fn an_app_drops_unreadable_replies_and_the_daemon_refuses_an_oversize_history() {
+    delayed_app_reply(AppReplyFault::Oversize);
+    delayed_app_reply(AppReplyFault::Unparseable);
+}
+
+fn delayed_app_reply(fault: AppReplyFault) {
+    let background = matches!(fault, AppReplyFault::BackgroundTimeout);
+    let timeout = matches!(
+        fault,
+        AppReplyFault::ForegroundTimeout | AppReplyFault::BackgroundTimeout
+    );
     use std::io::{Read as _, Write as _};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -110,6 +136,22 @@ fn delayed_app_reply(background: bool) {
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let alice = &room.workers[0];
     let node = alice.paths.account().nodes_on_disk()[0].clone();
+    if matches!(fault, AppReplyFault::Oversize) {
+        rt.block_on(async {
+            let mut c = IpcClient::open_at(&NodeSocket::one_shot(alice.paths.account().socket(),node.clone())).await
+                .expect("PRODUCT: the running daemon did not answer");
+            for n in 0..400 {
+                let body=serde_json::json!({"kind":"reply","seq":n,"text":"x".repeat(1024)}).to_string();
+                assert!(matches!(c.request(&Request::AppendSession {channel_id:room.cid,session_id:SESSION.to_owned(),body}).await,Ok(Frame::Appended{..})),
+                    "PRODUCT: the daemon refused a Session entry");
+            }
+            let answer=c.request(&Request::SessionEntries {channel_id:room.cid}).await;
+            assert!(matches!(&answer,Ok(Frame::Error{reason}) if reason.contains("SessionEntries")),
+                "PRODUCT: a legacy whole-history reply did not name the oversized request: {answer:?}");
+            assert!(matches!(c.request(&Request::Ping).await,Ok(Frame::Ok)),
+                "PRODUCT: the same connection failed after the oversized history was refused");
+        });
+    }
     let socket = alice.paths.account().socket();
     let upstream = socket.with_extension("upstream");
     std::fs::rename(&socket, &upstream).expect("APPARATUS: move scratch daemon socket");
@@ -164,6 +206,18 @@ fn delayed_app_reply(background: bool) {
                     // A subscribed event stream must keep delivering while its lookup is delayed.
                     if (!background || connection == 2) && armed.swap(false, Ordering::SeqCst) {
                         delayed.store(true, Ordering::SeqCst);
+                        if !timeout {
+                            let body = if matches!(fault, AppReplyFault::Oversize) {
+                                vec![0; vox_core::node::ipc::MAX_FRAME + 1]
+                            } else {
+                                vec![0xff]
+                            };
+                            down.write_all(&(body.len() as u32).to_be_bytes())
+                                .expect("APPARATUS: write bad reply header");
+                            down.write_all(&body)
+                                .expect("APPARATUS: write bad reply body");
+                            break;
+                        }
                         while !release.load(Ordering::SeqCst) {
                             std::thread::sleep(Duration::from_millis(20));
                         }
@@ -233,7 +287,7 @@ fn delayed_app_reply(background: bool) {
         "APPARATUS: no app reply was delayed"
     );
     assert!(
-        reason.contains("60 seconds"),
+        !timeout || reason.contains("60 seconds"),
         "PRODUCT: the app's deadline said: {reason}"
     );
     release.store(true, Ordering::SeqCst);
@@ -355,13 +409,39 @@ fn a_room_past_one_frame_of_history_reads_whole() {
         &["room", "read", r, "--json"],
         |o: &Out| o.ok && o.stdout.contains(&format!("LARGE-ROOM-{ROWS:03} ")),
     );
-    let got: Vec<String> = read
+    let mut got: Vec<String> = read
         .ndjson()
         .iter()
         .filter_map(|x| x["envelope"]["body"].as_str().map(str::to_owned))
         .filter(|b| b.starts_with("LARGE-ROOM-"))
         .collect();
+    assert!(
+        got.len() < sent.len(),
+        "PRODUCT: room read fetched the whole history on opening"
+    );
+    let mut shown = read.clone();
+    let mut room_pages = 1;
+    while let Some(before) = shown
+        .stderr
+        .lines()
+        .find_map(|l| l.split_once("--before ").map(|(_, e)| e.trim().to_owned()))
+    {
+        shown = bob.vox(None, &["room", "read", r, "--json", "--before", &before]);
+        assert!(
+            shown.ok && !shown.stdout.trim().is_empty(),
+            "PRODUCT: the older room page failed: {shown:?}"
+        );
+        let page: Vec<String> = shown
+            .ndjson()
+            .iter()
+            .filter_map(|x| x["envelope"]["body"].as_str().map(str::to_owned))
+            .filter(|b| b.starts_with("LARGE-ROOM-"))
+            .collect();
+        got.splice(0..0, page);
+        room_pages += 1;
+    }
     same_rows("read --json", &got, &sent);
+    eprintln!("[proof] the room opened newest-first and its {} large rows arrived over {room_pages} CLI pages", got.len());
     let max_row = read
         .ndjson()
         .iter()
@@ -382,6 +462,52 @@ fn a_room_past_one_frame_of_history_reads_whole() {
         max_row, MAX_TEXT,
         "PRODUCT: the largest row must carry exactly MAX_TEXT_LEN and read back whole"
     );
+
+    // The app uses the same newest-first history, asking for older pages only on scroll.
+    let app = rt
+        .block_on(vox_ffi::VoxClient::open(
+            bob.data.to_string_lossy().into_owned(),
+        ))
+        .expect("PRODUCT: the app could not open bob's daemon");
+    let node = bob.paths.account().nodes_on_disk()[0].clone();
+    let pass = vox_ffi::Passphrase::new(support::ID_PASS.as_bytes().to_vec())
+        .expect("APPARATUS: passphrase");
+    rt.block_on(app.attach(node.as_str().into(), Some(pass)))
+        .expect("PRODUCT: the app could not attach bob");
+    let mut page = rt
+        .block_on(app.room_read(room.id.clone()))
+        .expect("PRODUCT: the app could not open the newest room page");
+    assert!(
+        page.older > 0
+            && page
+                .messages
+                .iter()
+                .any(|m| m.text.starts_with(&format!("LARGE-ROOM-{ROWS:03} "))),
+        "PRODUCT: the app opened a large room at its oldest history"
+    );
+    let mut messages = Vec::new();
+    let mut app_room_pages = 0;
+    loop {
+        app_room_pages += 1;
+        messages.splice(
+            0..0,
+            page.messages
+                .into_iter()
+                .map(|m| m.text)
+                .filter(|t| t.starts_with("LARGE-ROOM-")),
+        );
+        let Some(before) = page.before else { break };
+        page = rt
+            .block_on(app.room_read_older(room.id.clone(), before))
+            .expect("PRODUCT: the app could not read an older room page");
+    }
+    same_rows("the app's room_read", &messages, &sent);
+    assert!(
+        rt.block_on(app.rooms()).is_ok(),
+        "PRODUCT: the app's request after paging the room failed"
+    );
+    rt.block_on(app.close());
+    eprintln!("[proof] every large room message arrived whole over {app_room_pages} app pages");
 
     // 2. `tail --since`, which pages the same history before it follows.
     let mut cmd = Command::new(VOX);
@@ -490,6 +616,22 @@ fn a_room_past_one_frame_of_history_reads_whole() {
         let mut c = IpcClient::open_at(&at)
             .await
             .unwrap_or_else(|e| panic!("PRODUCT (staging): alice's node did not answer: {e}"));
+        let request = serde_json::json!({"v":1,"session":SESSION,"kind":"approval",
+            "ref":"approval-before-pages","tool":"Read","summary":"read an older file",
+            "input":"older-request-input","answerable":true})
+        .to_string();
+        assert!(
+            matches!(
+                c.request(&Request::AppendSession {
+                    channel_id: room.cid,
+                    session_id: SESSION.to_owned(),
+                    body: request
+                })
+                .await,
+                Ok(Frame::Appended { .. })
+            ),
+            "PRODUCT: the older request could not be recorded"
+        );
         for (_, body) in &entries {
             let req = Request::AppendSession {
                 channel_id: room.cid,
@@ -507,19 +649,51 @@ fn a_room_past_one_frame_of_history_reads_whole() {
     let wanted: Vec<String> = entries.iter().map(|(t, _)| format!("reply: {t}")).collect();
     eprintln!("[proof] {SESSION_ENTRIES} Session entries staged, {staged} bytes of body");
 
-    // 5. `vox room session --json`.
-    let shown = alice.vox(None, &["room", "session", r, SESSION, "--json"]);
+    // 5. `vox room session --json`: the newest page, and under it how to print the page before
+    // it (ADR-034 FR-4), followed to the first.
+    let mut lines: Vec<String> = Vec::new();
+    let mut before: Option<String> = None;
+    let mut pages = 0usize;
+    loop {
+        let mut args = vec!["room", "session", r, SESSION, "--json"];
+        if let Some(b) = &before {
+            args.extend(["--before", b.as_str()]);
+        }
+        let shown = alice.vox(None, &args);
+        assert!(
+            shown.ok,
+            "PRODUCT: `vox room session --json` (page {}, before {before:?}) over {SESSION_ENTRIES} \
+             Session entries failed: {}",
+            pages + 1,
+            shown.stderr.trim()
+        );
+        let page: Vec<String> = shown
+            .ndjson()
+            .iter()
+            .filter(|v| v["kind"] == "reply")
+            .filter_map(|v| v["line"].as_str().map(str::to_owned))
+            .collect();
+        assert!(
+            !shown.stdout.trim().is_empty(),
+            "PRODUCT: `vox room session --json` printed an empty page (before {before:?})"
+        );
+        pages += 1;
+        lines.splice(0..0, page);
+        // The line under the page names the page before it, or there is none left.
+        let older = shown
+            .stderr
+            .lines()
+            .find_map(|l| l.split_once("--before ").map(|(_, e)| e.trim().to_owned()));
+        match older {
+            Some(e) => before = Some(e),
+            None => break,
+        }
+    }
     assert!(
-        shown.ok,
-        "PRODUCT: `vox room session --json` over {SESSION_ENTRIES} Session entries failed: {}",
-        shown.stderr.trim()
+        pages > 1,
+        "PRODUCT: `vox room session --json` printed every one of {SESSION_ENTRIES} entries in one \
+         call: a verb prints one bounded page and says how to get the older ones (ADR-034 FR-4)"
     );
-    let lines: Vec<String> = shown
-        .ndjson()
-        .iter()
-        .filter(|v| v["kind"] == "reply")
-        .filter_map(|v| v["line"].as_str().map(str::to_owned))
-        .collect();
     same_entries("vox room session --json", &lines, &wanted);
 
     // 6. The app's client, attached to alice's node on her daemon.
@@ -545,18 +719,118 @@ fn a_room_past_one_frame_of_history_reads_whole() {
         listed.iter().any(|s| s.session_id == SESSION),
         "PRODUCT: the app's `sessions` does not list alice's Session: {listed:?}"
     );
-    let read = rt
+    assert_eq!(
+        listed
+            .iter()
+            .find(|s| s.session_id == SESSION)
+            .unwrap()
+            .pending,
+        1,
+        "PRODUCT: a pending request before the newest page disappeared from the Session count"
+    );
+    let pending = rt
+        .block_on(client.session_requests(room.id.clone(), alice.b32(), SESSION.to_owned(), vec![]))
+        .expect("PRODUCT: the app could not find an older pending request");
+    assert!(
+        pending.iter().any(|e| e
+            .request
+            .as_ref()
+            .is_some_and(|q| q.reference == "approval-before-pages" && q.state.is_none())
+            && e.details.contains("older-request-input")),
+        "PRODUCT: the app lost the off-page request's actionable details: {pending:?}"
+    );
+    // Its newest page, and how many are older; then each older page, to the first (FR-4).
+    let mut read = rt
         .block_on(client.session_read(room.id.clone(), alice.b32(), SESSION.to_owned()))
         .unwrap_or_else(|e| {
             panic!("PRODUCT: the app's `session_read` over {SESSION_ENTRIES} Session entries failed: {e}")
         });
-    let app_lines: Vec<String> = read
-        .entries
-        .iter()
-        .map(|e| e.line.clone())
-        .filter(|l| l.starts_with("reply: "))
-        .collect();
+    let mut app_lines: Vec<String> = Vec::new();
+    let mut app_pages = 0usize;
+    loop {
+        app_pages += 1;
+        let page: Vec<String> = read
+            .entries
+            .iter()
+            .map(|e| e.line.clone())
+            .filter(|l| l.starts_with("reply: "))
+            .collect();
+        app_lines.splice(0..0, page);
+        let Some(b) = read.before.clone() else {
+            assert_eq!(
+                read.older, 0,
+                "PRODUCT: the app's `session_read` says {} older entries but names no page before",
+                read.older
+            );
+            break;
+        };
+        assert!(
+            read.older > 0,
+            "PRODUCT: the app's `session_read` names a page before ({b}) but says none are older"
+        );
+        read = rt
+            .block_on(client.session_read_older(
+                room.id.clone(),
+                alice.b32(),
+                SESSION.to_owned(),
+                b,
+            ))
+            .unwrap_or_else(|e| {
+                panic!("PRODUCT: the app's `session_read_older` over {SESSION_ENTRIES} Session entries failed: {e}")
+            });
+    }
+    assert!(
+        app_pages > 1,
+        "PRODUCT: the app's `session_read` gave every one of {SESSION_ENTRIES} entries at once: \
+         the app shows the newest page and loads an older one only on scroll (ADR-034 FR-4)"
+    );
     same_entries("the app's session_read", &app_lines, &wanted);
+
+    rt.block_on(async {
+        let mut c = IpcClient::open_at(&NodeSocket::one_shot(
+            alice.paths.account().socket(),
+            node.clone(),
+        ))
+        .await
+        .unwrap();
+        let body = serde_json::json!({"v":1,"session":SESSION,"kind":"resolved",
+            "ref":"approval-before-pages","outcome":"allowed","by":"terminal"})
+        .to_string();
+        assert!(
+            matches!(
+                c.request(&Request::AppendSession {
+                    channel_id: room.cid,
+                    session_id: SESSION.to_owned(),
+                    body
+                })
+                .await,
+                Ok(Frame::Appended { .. })
+            ),
+            "PRODUCT: resolving the older request failed"
+        );
+    });
+    let resolved = rt
+        .block_on(client.session_requests(
+            room.id.clone(),
+            alice.b32(),
+            SESSION.to_owned(),
+            vec!["approval-before-pages".to_owned()],
+        ))
+        .expect("PRODUCT: the app could not refresh a loaded older request");
+    assert!(
+        resolved.iter().any(|e| e
+            .request
+            .as_ref()
+            .is_some_and(|q| q.state.as_deref() == Some("answered in the terminal: approved"))),
+        "PRODUCT: the app's loaded older request remained unresolved: {resolved:?}"
+    );
+    let pending = rt
+        .block_on(client.session_requests(room.id.clone(), alice.b32(), SESSION.to_owned(), vec![]))
+        .expect("PRODUCT: the app could not refresh pending requests");
+    assert!(
+        pending.is_empty(),
+        "PRODUCT: the resolved older request still asks for an answer: {pending:?}"
+    );
 
     // 7. And the client still works: a room is made on it.
     let made =
@@ -568,7 +842,8 @@ fn a_room_past_one_frame_of_history_reads_whole() {
         )
     });
     eprintln!(
-        "[proof] the CLI printed {} entries, the app read {}, and made room {made}",
+        "[proof] the CLI printed {} entries over {pages} pages, the app read {} over {app_pages}, \
+         and made room {made}",
         lines.len(),
         app_lines.len()
     );
@@ -640,4 +915,169 @@ fn same_rows(verb: &str, got: &[String], sent: &[String]) {
             s.len()
         );
     }
+}
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_hundred_thousand_entry_session_opens_in_one_second_with_bounded_memory);
+
+/// ADR-034 FR-6: a separate app-client process measures its own RSS, without counting the
+/// staging apparatus. This optional proof blocks nothing and is never a release gate.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "OPTIONAL: 100000 signed Session entries; run only on demand"]
+fn a_hundred_thousand_entry_session_opens_in_one_second_with_bounded_memory() {
+    watchdog::arm();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("APPARATUS: runtime");
+    let rss = |pid: u32| -> u64 {
+        let out = Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid.to_string()])
+            .output()
+            .expect("APPARATUS: cannot measure resident memory with ps");
+        assert!(
+            out.status.success(),
+            "APPARATUS: ps could not read process {pid}"
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<u64>()
+            .expect("APPARATUS: ps did not print resident KiB")
+    };
+    if let Ok(data) = std::env::var("VOX_PROOF_SCALE_CLIENT_DATA") {
+        let room = std::env::var("VOX_PROOF_SCALE_ROOM").expect("APPARATUS: room");
+        let node = std::env::var("VOX_PROOF_SCALE_NODE").expect("APPARATUS: node");
+        let fingerprint =
+            std::env::var("VOX_PROOF_SCALE_FINGERPRINT").expect("APPARATUS: fingerprint");
+        let daemon = std::env::var("VOX_PROOF_SCALE_DAEMON")
+            .expect("APPARATUS: daemon pid")
+            .parse()
+            .unwrap();
+        let client = rt
+            .block_on(vox_ffi::VoxClient::open(data))
+            .expect("PRODUCT: app could not connect");
+        let pass = vox_ffi::Passphrase::new(support::ID_PASS.as_bytes().to_vec()).unwrap();
+        rt.block_on(client.attach(node, Some(pass)))
+            .expect("PRODUCT: app could not attach");
+        let began = Instant::now();
+        let mut page = rt
+            .block_on(client.session_read(room.clone(), fingerprint.clone(), SESSION.to_owned()))
+            .expect("PRODUCT: the 100000-entry Session did not open");
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "PRODUCT: the newest Session page took {:?}",
+            began.elapsed()
+        );
+        assert!(
+            page.entries
+                .last()
+                .is_some_and(|e| e.line.contains("SCALE-099999")),
+            "PRODUCT: the Session did not open at its newest entry"
+        );
+        let mut shown = std::collections::VecDeque::new();
+        let mut pages = 0;
+        loop {
+            let before = page.before.clone();
+            shown.push_back(page);
+            // A four-page viewport: each newly requested page replaces the farthest one.
+            if shown.len() > 4 {
+                shown.pop_front();
+            }
+            pages += 1;
+            for (who, pid) in [("daemon", daemon), ("app client", std::process::id())] {
+                let resident = rss(pid);
+                assert!(
+                    resident < 50 * 1024,
+                    "PRODUCT: {who} used {resident} KiB resident at page {pages}, bound 50 MiB"
+                );
+            }
+            let Some(before) = before else { break };
+            let began = Instant::now();
+            page = rt
+                .block_on(client.session_read_older(
+                    room.clone(),
+                    fingerprint.clone(),
+                    SESSION.to_owned(),
+                    before,
+                ))
+                .expect("PRODUCT: an older Session page did not arrive");
+            assert!(
+                began.elapsed() < Duration::from_secs(1),
+                "PRODUCT: older page {} took {:?}",
+                pages + 1,
+                began.elapsed()
+            );
+        }
+        assert!(
+            pages >= 500,
+            "PRODUCT: the client loaded more than one bounded page at a time"
+        );
+        rt.block_on(client.close());
+        eprintln!("[proof] 100000 entries: {pages} pages each under one second; daemon and app client each under 50 MiB resident");
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("APPARATUS: scratch profiles");
+    let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
+    let alice = &room.workers[0];
+    let node = alice.paths.account().nodes_on_disk()[0].clone();
+    rt.block_on(async {
+        let mut c = IpcClient::open_at(&NodeSocket::one_shot(
+            alice.paths.account().socket(),
+            node.clone(),
+        ))
+        .await
+        .expect("PRODUCT: the running daemon did not answer");
+        for seq in 0..100000 {
+            let body =
+                serde_json::json!({"kind":"reply","seq":seq,"text":format!("SCALE-{seq:06}")})
+                    .to_string();
+            assert!(
+                matches!(
+                    c.request(&Request::AppendSession {
+                        channel_id: room.cid,
+                        session_id: SESSION.to_owned(),
+                        body
+                    })
+                    .await,
+                    Ok(Frame::Appended { .. })
+                ),
+                "PRODUCT: entry {seq} could not be recorded"
+            );
+        }
+    });
+    let mut command = Command::new(std::env::current_exe().expect("APPARATUS: proof executable"));
+    command
+        .args([
+            "--ignored",
+            "--exact",
+            "a_hundred_thousand_entry_session_opens_in_one_second_with_bounded_memory",
+            "--nocapture",
+        ])
+        .env("VOX_PROOF_SCALE_CLIENT_DATA", &alice.data)
+        .env("VOX_PROOF_SCALE_ROOM", &room.id)
+        .env("VOX_PROOF_SCALE_NODE", node.as_str())
+        .env("VOX_PROOF_SCALE_FINGERPRINT", alice.b32())
+        .env(
+            "VOX_PROOF_SCALE_DAEMON",
+            alice
+                .daemon_pid()
+                .expect("APPARATUS: daemon pid")
+                .to_string(),
+        )
+        .env("VOX_DATA_DIR", &alice.data)
+        .env("VOX_CONFIG_DIR", &alice.cfg);
+    support::strip_harness_env(&mut command);
+    let output = command
+        .output()
+        .expect("APPARATUS: start app-client process");
+    assert!(
+        output.status.success(),
+        "the app-client process reported:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    eprintln!("{}", String::from_utf8_lossy(&output.stderr));
 }

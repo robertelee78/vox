@@ -65,6 +65,18 @@ It takes a scratch HOME and data root with no node, no keychain item of Vox's an
 
 "Time" is the release run's `finished in` from CI run 36830124620 (2026-10-01, ubuntu and macOS runners), the last run before these proofs left CI. The two figures are ubuntu / macOS. It is a guide, not a bound. A row says "not timed" when CI never ran that proof for real: CI had no model account.
 
+## Session paging at scale (ADR-034 FR-6)
+
+`a_large_room_reads_whole_proof::a_hundred_thousand_entry_session_opens_in_one_second_with_bounded_memory`
+records 100,000 entries through a real daemon, then opens the Session from a separate app-client
+process. It reads every page with a four-page viewport: newest and each older page must arrive in
+under one second, and both processes must stay under 50 MiB resident. It is optional, was **not
+run** for the paging change, and blocks neither CI nor release. CI compiles it. Run on demand:
+
+```sh
+CARGO_BUILD_JOBS=2 cargo test --release -p vox-tui --features optional-proofs --test a_large_room_reads_whole_proof a_hundred_thousand_entry_session_opens_in_one_second_with_bounded_memory -- --ignored --exact --nocapture
+```
+
 ## The proofs
 
 ### Live model (needs `opencode` on PATH, logged in: `~/.local/share/opencode/auth.json`)

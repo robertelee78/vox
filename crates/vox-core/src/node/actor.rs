@@ -341,6 +341,22 @@ fn detail_of(
             crate::node::api::StructuredIndex::default().appended(0, rows.iter().map(|r| &r.text)),
         ),
     };
+    let (base, from) = prev.filter(prefix).map_or_else(
+        || (crate::node::api::OpRuns::default(), 0),
+        |p| (p.row_index.clone(), p.timeline.len()),
+    );
+    let row_index = base.appended(
+        rows[from..]
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                Some((
+                    u64::from_be_bytes(r.entry_hash[..8].try_into().ok()?),
+                    u32::try_from(from + i).ok()?,
+                ))
+            })
+            .collect(),
+    );
     // Who trusts each member (ADR-028 K-7), once: this identity's own entry is `consenting`.
     let trusted_by = ch.trusted_by();
     let consenting = trusted_by.get(&ch.me()).cloned().unwrap_or_default();
@@ -351,6 +367,7 @@ fn detail_of(
         epoch: ch.epoch(),
         members: ch.members(),
         timeline,
+        row_index,
         order: ch.order_keys(),
         structured,
         services: ch
@@ -589,7 +606,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::AppDial(_) => "reaching a peer for an app stream",
         NetEvent::Status(_) => "reporting status",
         NetEvent::Names(_) => "resolving a .vox name",
-        NetEvent::SessionRows { .. } => "reading a room's Session entries",
+        NetEvent::SessionPage { .. } => "reading a page of a room's Session entries",
         NetEvent::MemberDialer(_) => "lending the proxy its dialer",
     }
 }
@@ -952,13 +969,22 @@ enum NetEvent {
     /// A `.vox` name is being resolved (PRD-001 R20): answer with a snapshot of this
     /// node's rooms and keyring names.
     Names(oneshot::Sender<crate::node::resolver::VoxResolver>),
-    /// The Session entries this node can read in a room (ADR-029 SC-2), or `None` if the room
-    /// is not open.
-    SessionRows {
+    /// One page of the Session entries this node can read in a room (ADR-029 SC-2; ADR-034
+    /// FR-5), or `None` if the room is not open.
+    SessionPage {
         /// The room.
         channel_id: Digest32,
+        /// Whose entries.
+        which: crate::node::drive::SessionFilter,
+        /// The page ends before this entry; the newest when `None`.
+        before: Option<Digest32>,
+        /// At most this many rows.
+        max_rows: usize,
+        /// At most this many bytes of body and id.
+        max_bytes: usize,
         /// Where the answer goes.
-        reply: oneshot::Sender<Option<Vec<crate::node::drive::SessionRow>>>,
+        reply:
+            oneshot::Sender<Option<std::result::Result<crate::node::drive::SessionPage, String>>>,
     },
     /// The daemon's proxy (ADR-028 S-5) wants this node's way of reaching a member, to carry a
     /// name that resolved to one of this node's rooms.
@@ -3694,15 +3720,27 @@ impl NodeHandle {
             .map_err(|_| crate::error::Error::Unreachable("the node has stopped"))
     }
 
-    /// The Session entries this node can read in a room (ADR-029 SC-2): its own, and each node's
-    /// that released it its drive key; `None` if the room is not open.
-    pub async fn session_rows(
+    /// One page of the Session entries this node can read in a room (ADR-029 SC-2: its own, and
+    /// each node's that released it its drive key), as
+    /// [`crate::node::drive::SessionLog::page`] gives it; `None` if the room is not open.
+    pub async fn session_page(
         &self,
         channel_id: Digest32,
-    ) -> Option<Vec<crate::node::drive::SessionRow>> {
+        which: crate::node::drive::SessionFilter,
+        before: Option<Digest32>,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Option<std::result::Result<crate::node::drive::SessionPage, String>> {
         let (reply, rx) = oneshot::channel();
         self.net_tx
-            .send(NetEvent::SessionRows { channel_id, reply })
+            .send(NetEvent::SessionPage {
+                channel_id,
+                which,
+                before,
+                max_rows,
+                max_bytes,
+                reply,
+            })
             .await
             .ok()?;
         rx.await.ok()?
@@ -8033,12 +8071,24 @@ impl Node {
             NetEvent::Status(reply) => {
                 let _ = reply.send(self.status_report());
             }
-            NetEvent::SessionRows { channel_id, reply } => {
-                let rows = match self.channels.get(&channel_id).map(Arc::clone) {
-                    Some(shared) => Some(shared.lock().await.session_rows()),
+            NetEvent::SessionPage {
+                channel_id,
+                which,
+                before,
+                max_rows,
+                max_bytes,
+                reply,
+            } => {
+                let page = match self.channels.get(&channel_id).map(Arc::clone) {
+                    Some(shared) => Some(
+                        shared
+                            .lock()
+                            .await
+                            .session_page(&which, before, max_rows, max_bytes),
+                    ),
                     None => None,
                 };
-                let _ = reply.send(rows);
+                let _ = reply.send(page);
             }
             NetEvent::Names(reply) => {
                 let _ = reply.send(self.resolver_snapshot().await);
