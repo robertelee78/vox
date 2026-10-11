@@ -52,9 +52,7 @@ pub async fn status(args: &NodeArgs, key: &str, dir: &Path) -> Result<String, Ap
     let said = first_missing(args, key, dir).await?;
     // **What Vox asks the person, here too** (ADR-029 RB-5): on a machine with no app, this and
     // the TUI are where a person reads that a repo waits for a room.
-    let asks = crate::room_ask::fetch(&args.account()?)
-        .await
-        .unwrap_or_default();
+    let asks = crate::room_ask::fetch(&args.account()?).await?;
     Ok(said + &crate::room_ask::needs_you(&asks, &args.account()?.data_root))
 }
 
