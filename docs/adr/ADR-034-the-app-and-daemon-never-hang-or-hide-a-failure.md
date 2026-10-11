@@ -3,8 +3,9 @@
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
 **Status**: Accepted for v0.4.4 (the decider's Q&A, 2026-10-10, and his answers to this ADR's
-open questions, the same evening; UP-2 and UP-3 revised with his story-plan answers that night).
-Nothing in this ADR is built.
+open questions, the same evening; UP-2 and UP-3 revised with his story-plan answers that night;
+FR-4–FR-6 from his ruling on the frame-length root cause that night). Nothing in this ADR is
+built.
 **Date**: 2026-10-10
 **Deciders**: Robert E. Lee
 **Tags**: daemon, app, ffi, ipc, update, storage, health, logs, progress
@@ -86,6 +87,26 @@ each of these broke.
 - **FR-3.** A client that reads a frame over the limit, or one it cannot parse, MUST drop the
   connection (WT-2); it MUST NOT read the next reply from it.
 
+The decider on the frame-length root cause (2026-10-10): "this feels like a footgun", "this isn't
+even a long session wtf", "agents will often have MUCH MUCH MUCH longer sessions". Paging that only
+fits a frame is not enough: a history may be any length.
+
+- **FR-4. Never a whole history.** No client (the app, the TUI, any verb or hook) MAY fetch a whole
+  Session or a whole room history. The app and the TUI MUST show the newest page and load an older
+  page only when the person scrolls up to it. A verb that prints a history (`vox room session`
+  and the like) MUST print one bounded page by default and say how to get the older ones.
+- **FR-5. Pages from an index.** The daemon MUST serve each page from an index, by Session and by
+  position, at a cost that does not grow with the history's length: it MUST NOT read, decrypt or
+  decode a whole history to answer for one page. The memory the daemon uses to answer a page, and
+  the memory the app uses to show a Session or a room, MUST be bounded by the pages shown, not by
+  the history's length.
+- **FR-6. Proof at scale.** FR-4 and FR-5 MUST be proved by real use of the shipped binary and the
+  app's client on a Session of 100,000 entries: opening it MUST show the newest page within a
+  stated time bound, each older page down to the first MUST load within a stated time bound, and
+  the daemon's and the app's resident memory MUST stay under a stated bound throughout. The bounds MUST be written in the proof. Its mutant MUST make the
+  client fetch the whole history and MUST turn the proof red on its own assertion, labelled
+  PRODUCT.
+
 ### 4. A room that cannot save
 
 - **SR-1.** A room whose store write failed MUST recover by itself once writes succeed again: it MUST
@@ -152,13 +173,15 @@ each of these broke.
 | ADR-014 M-29 | The update asks the person to restart the app and the daemon | The update restarts the daemon itself (UP-1); a client refuses a daemon of another version (UP-2) |
 | ADR-014 M-21 | The menus as listed, with no Quit named | The Vox menu holds Quit Vox ⌘Q (QT-1) |
 | ADR-028 A-4 | Quitting detaches the node, with no bound | Letting go of the node is bounded and never blocks quitting (QT-2) |
+| ADR-034 FR-1 (as first written) | Lists are paged so a reply fits one frame | Also: no client fetches a whole history; the newest page first, older on scroll; pages from an index; proven at 100,000 entries (FR-4–FR-6) |
 | ADR-026 C-4 | `Hello` reports the daemon's version | A client refuses its daemon when their versions differ and attempts nothing else (UP-2); both versions are named (UP-3); peers are unchanged |
 
 ## Consequences
 
 - An update ends the held sessions (`vox serve`, `vox forward` and the like) running on the old
   daemon, and says so.
-- Readers of long lists make more round trips.
+- Readers of long lists make more round trips, and a history opens at its newest page whatever its
+  length (FR-4, FR-5).
 - Quitting never waits on the daemon; a node the app could not let go of in time is reported at the
   next start.
 - A client and a daemon of different versions do not work together until the daemon is restarted
@@ -167,6 +190,13 @@ each of these broke.
   version. Measuring compatibility between versions is planned for v0.4.5.
 - A room that ran out of disk loses nothing written after space returns, and the person is told
   what happened.
+
+## Open questions
+
+- **FR-6's bounds and weight.** The time and memory bounds are not yet stated by the decider, and a
+  100,000-entry proof is heavy: whether it blocks the release or is an optional proof (the cargo
+  feature `optional-proofs`, ADR-018) is the decider's call. Whether a room of 100,000 messages is
+  proved the same way as a Session of 100,000 entries is also his.
 
 ## Related ADRs
 

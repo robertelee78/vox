@@ -4,11 +4,12 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 **Status**: Accepted for v0.4.4 (the decider's Q&A, 2026-10-10, and his answers to this ADR's
 open questions, the same evening, and his story-plan answers that night: LT-8, a Mac over ssh,
-one format step). Nothing in this ADR is built.
+one format step; and his Session history decisions that night: SA-7–SA-12). Nothing in this
+ADR is built.
 **Date**: 2026-10-10
 **Deciders**: Robert E. Lee
 **Tags**: agents, onboarding, hooks, keyring, trust, drive, sessions, macos
-**Related**: ADR-001, ADR-005, ADR-014, ADR-020, ADR-026, ADR-028, ADR-029, ADR-033, ADR-034
+**Related**: ADR-001, ADR-005, ADR-007, ADR-010, ADR-014, ADR-020, ADR-026, ADR-028, ADR-029, ADR-033, ADR-034
 **Inputs**: the decider's product Q&A of 2026-10-10 (Q1–Q8, Q16a, Q18) and his answers to the
 open questions (local trust without the keyring passphrase, its cost, existing pairs, the CLI
 verbs, sealing Session records now; every other first choice "ok"); the onboarding
@@ -228,6 +229,59 @@ allow drive access for the node I'm using from the macOS app."
 - **SA-4.** A member without drive addresses the node (ADR-029 TA-4); the composer MUST NOT offer
   that node's Sessions.
 
+The decider's Session history decisions (2026-10-10, night), after the frame-length root cause
+(ADR-034 Context): "agents will often have MUCH MUCH MUCH longer sessions". A Session's steps are
+the entries ADR-029 SC-1 lists: tool calls, replies, turn ends, approvals, questions and answers,
+and file records.
+
+- **SA-7. Session steps live only with drive.** A Session's steps MUST be sent, synced, relayed and
+  stored only to and on the session's own node and the members that node trusts with drive. A
+  member without drive MUST NOT receive them, not even sealed, and no member MAY relay them to one.
+  The decider: "Session steps are kept only on members with drive (the only ones who can read
+  them)." The room's own messages are not affected: a member without drive MUST be able to hold,
+  verify and sync the room's log complete without any Session step, so nothing a member without
+  drive holds MAY need a Session step to verify or to sync.
+- **SA-8. Forward from the join.** A node that joins a room MUST get a Session's steps only from
+  the later of its join and its gaining drive, going forward. No node MAY send it, and it MUST NOT
+  fetch, a step written before then, whatever its trust. The decider: "A node that joins syncs a
+  Session only from the point it joined, going forward — no backfill of Session history."
+- **SA-9. A retention for Session steps.** A room MUST have a retention for its Session steps,
+  apart from its message retention (ADR-010 AR-28). Its default MUST be 7 days or the room's message
+  retention, whichever is shorter, where forever is longer than any duration. The decider: "a room
+  has its own retention for Session steps; default = 7 days or the room's message retention,
+  whichever is shorter; the creator/admin may set it." Only the room's creator, or an admin it
+  delegated with `vox room admin`, MAY set it (ADR-007 G-5), through `vox room retention` as the
+  message retention is set, with no identity passphrase (ADR-028 K-11). A member's own lower
+  retention (ADR-010 AR-29) and the shorter-wins rule (AR-30) MUST apply to Session steps as they
+  do to messages. `vox status --json` and the app's room settings MUST show it beside the message
+  retention. An ended Session's steps age by it (ADR-029 SE-5 as amended).
+- **SA-10. Peers of earlier releases.** SA-7 and SA-8 change what peers send each other. A v0.4.4
+  node MUST keep syncing the room's messages with a peer of an earlier release (ADR-034 UP-2), and
+  nothing it sends MAY poison that peer's room. A v0.4.3 member without drive receives no Session
+  steps from a v0.4.4 node. What a v0.4.3 member with drive sees of a Session written by a v0.4.4
+  node, and what a v0.4.4 node does with steps a v0.4.3 node still writes into the room's log, is
+  to be measured with the shipped v0.4.3 binary before SA-7 is built, and the release's notes MUST
+  say it in one sentence.
+- **SA-11. The format step.** The Session-step retention (a field of the room's policy, ADR-007)
+  and whatever the store needs to hold steps apart from the room's log are part of v0.4.4's one
+  format step (SA-5): one raise of the format, one upgrade and one proof (SA-6) with SA-3 and
+  ADR-032 AN-14. After the upgrade, every step a member with drive held and its retention still
+  keeps MUST read in full, and an open Session MUST continue.
+- **SA-12. Proof.** SA-7, SA-8 and SA-9 MUST each be proved by real use of the shipped binary
+  (ADR-018 §9), extending the drive journey where it fits, with a mutant that turns each proof red
+  on its own assertion, labelled PRODUCT (ADR-018 §7):
+  1. SA-7: in a room of three nodes, where the session's node trusts one member with drive and one
+     with read only, a test-side peer acting as the read-only member (apparatus, ADR-018) asks both
+     other nodes for the Session's steps and MUST get none, while the room's messages reach it.
+     Mutant: serve steps to every member.
+  2. SA-8: a member given drive that joins after a Session has written steps MUST see, in its
+     Session tab and with `vox room session`, only the steps written after it joined, and a
+     test-side request for earlier steps MUST get none. Mutant: backfill from the start.
+  3. SA-9: in a room whose Session-step retention is set shorter than its message retention, a
+     Session's steps MUST be gone from every member with drive once that retention passes, while
+     the room's messages of the same age remain; and a new room MUST report a 7-day Session-step
+     retention. Mutant: steps age by the message retention.
+
 ### 9. Renaming a node
 
 - **RN-1.** Renaming a node MUST update every place on this machine that names it: each harness's
@@ -269,6 +323,10 @@ allow drive access for the node I'm using from the macOS app."
 | #677 | A widening is confirmed by the person (a Touch ID or password check was considered) | Refused inside an agent's session as its hook marks it; the passphrase and its window stay; no OS account check (LT-8) |
 | ADR-026 L-2; ADR-028 K-13 | `vox node attach <name> [--keep]`, `vox node detach <name>`; the hook shows the attach command | `vox node unlock <name>`, `vox node lock <name>`; the old verbs work and print the new ones (CW-7) |
 | ADR-026 F-3 | Format as of v0.4.3 | Sealed Session opening and end records raise the format, with an upgrade from every release since v0.4.0 (SA-5, SA-6) |
+| ADR-029 SC-1, SC-2 | A Session's steps are entries of the room's log, sealed, and every member holds them | Steps are sent, synced and stored only on the session's node and members with drive; members without drive never receive them (SA-7) |
+| ADR-029 SC-2a | A member reads a Session from the key's release onward; earlier sealed steps are in its copy of the log | A joining node gets steps only from the later of its join and its gaining drive; no backfill (SA-8) |
+| ADR-029 SE-5; ADR-010 AR-27, AR-28 | A Session's content follows the room's message retention, forever by default | Session steps have a retention of their own, by default 7 days or the message retention, whichever is shorter (SA-9) |
+| ADR-007 G-5 (the policy update) | A policy update changes the room's one retention | It also carries the Session-step retention (SA-9, SA-11) |
 
 ## Consequences
 
@@ -289,6 +347,11 @@ allow drive access for the node I'm using from the macOS app."
   upgrade for data roots written by v0.4.0 or later, and its proof (SA-5, SA-6).
 - Scripts and documents that use `vox node attach` or `detach` keep working, and are told the new
   verbs (CW-7).
+- A member without drive no longer stores or relays any Session's steps, and a member that joins
+  late does not get a Session's earlier steps (SA-7, SA-8). An agent's long Sessions cost disk and
+  sync only on the members that can read them, and only for the Session-step retention (SA-9).
+- A room's Session steps are kept 7 days by default, where they were kept as long as its messages
+  (SA-9).
 
 ## Open questions
 
@@ -299,12 +362,25 @@ allow drive access for the node I'm using from the macOS app."
   a v0.4.3 member can receive sealed records from a v0.4.4 member, and the answer is to be brought
   to the decider before SA-3 is built. Measuring compatibility between versions, so that peers of
   different releases are handled safely, is planned for v0.4.5.
+- **Session history on upgrade.** Three points are not decided by the decider's words and are to
+  be brought to him before SA-7, SA-9 and SA-11 are built: (1) whether a v0.4.4 member without
+  drive deletes, at the upgrade, the sealed Session steps an earlier release stored in its copy of
+  the log, and whether a member that loses drive later deletes the steps it holds (ADR-029 SC-2b
+  says it keeps what it already read); (2) whether the 7-day default applies on upgrade to rooms an
+  earlier release created, which by ADR-010 AR-31 deletes their older steps, against SA-5's
+  "nothing MAY be lost"; (3) whether a Session's opening and end records are steps under SA-7 and
+  SA-8, and so whether a member with drive that joins while a Session is open learns that the
+  Session exists and can drive it.
+- **Session-step retention, set.** When the creator sets a Session-step retention longer than the
+  room's message retention, whether steps may outlive the room's messages; and the exact words of
+  the `vox room retention` form that sets it.
 
 ## Related ADRs
 
 Depends on ADR-020, ADR-026, ADR-028, ADR-029. Amends ADR-014 (M-6, M-21), ADR-020 (2.1, 3.3, 3.7,
-6.5), ADR-026 (N-6, L-2, F-3), ADR-028 (E-2, E-4, K-10, K-12, K-13, K-15, K-18, W-1, W-2, W-4) and
-ADR-029 (SC-3, CL-2, CL-3, TA-1, RB-5, RB-5a). Cited: ADR-001, ADR-005, ADR-033, ADR-034.
+6.5), ADR-026 (N-6, L-2, F-3), ADR-028 (E-2, E-4, K-10, K-12, K-13, K-15, K-18, W-1, W-2, W-4),
+ADR-029 (SE-5, SC-1, SC-2, SC-2a, SC-3, CL-2, CL-3, TA-1, RB-5, RB-5a), ADR-010 (AR-27, AR-28) and
+ADR-007 (G-5's policy update). Cited: ADR-001, ADR-005, ADR-033, ADR-034.
 
 ## Engineering Mantra
 

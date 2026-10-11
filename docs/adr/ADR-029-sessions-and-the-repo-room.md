@@ -52,6 +52,8 @@ relies on is ADR-028 K-14.
 - **SE-5.** An ended Session MUST be closed and moved out of the person's way (shown apart from
   open Sessions, like an archived conversation). Its content MUST NOT be deleted when the session
   ends: it follows the room's retention (ADR-010 AR-28, AR-29), as the room's own messages do.
+  *Amended by ADR-031 SA-9 (the decider, 2026-10-10):* a Session's steps follow the room's
+  Session-step retention, by default 7 days or the room's message retention, whichever is shorter.
 - **SE-6.** A Session MUST belong to exactly one room, the room its session works in (§6). When a
   session moves room (RB-5), its Session in the old room MUST end as in SE-5 and a new Session MUST
   begin in the new room.
@@ -64,6 +66,9 @@ relies on is ADR-028 K-14.
   session's own questions and their answers; and the files sent either way (§3 DR-1). Content
   longer than the log's text limit (ADR-020 4.1) MUST be split across entries. File bytes MUST NOT
   enter the log: a file travels as a share addressed to its receiver (ADR-028 §5).
+  *Amended by ADR-031 SA-7 (the decider, 2026-10-10):* these steps are sent, synced and stored only
+  on the session's node and the members it trusts with drive; a member without drive never
+  receives them.
 - **SC-2.** A Session's content MUST be readable only by members of the room whom the session's
   node trusts with **drive** (ADR-028 K-14). Its entries MUST be sealed under a Session key that
   the session's node holds and releases only to those members, each release caused by a keyring
@@ -72,7 +77,8 @@ relies on is ADR-028 K-14.
 - **SC-2a.** The node MUST release the Session key to a member with drive when that member is
   admitted to the room or gains drive, whichever is later, retrying on the tick (ADR-020 3.2). A
   member reads the Session from that release onward, as ADR-006's forward-only rule does for
-  messages.
+  messages. *Amended by ADR-031 SA-8 (the decider, 2026-10-10):* a joining node gets a Session's
+  steps only from the later of its join and its gaining drive; no earlier step is sent to it.
 - **SC-2b.** When a member loses drive (downgraded to read, or untrusted), the node MUST rotate the
   Session key and release the new one only to the members that still have drive, as ADR-020 3.6
   does for the sender key. The member keeps what it already read and reads nothing sealed
@@ -249,7 +255,8 @@ me specify one if not".)
 
 ## Consequences
 
-- A busy session writes many entries into its room's log, kept as long as the room keeps messages.
+- A busy session writes many entries, kept only on the members with drive and only for the room's
+  Session-step retention (ADR-031 SA-7, SA-9, as amended 2026-10-10).
 - The person can follow and steer every session from the TUI or the app; Telegram is no longer
   needed for that.
 - Two sessions of one node can be told apart and addressed separately without either gaining any
