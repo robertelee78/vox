@@ -592,8 +592,12 @@ pub struct RetentionArgs {
     pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
-    /// `1h`, `1w`, `1m` (a month), a number of seconds, or `forever`. Asks for no passphrase.
-    pub duration: String,
+    /// Message lifetime: `1h`, `7d`, `1w`, `1m` (a month), seconds, or `forever`.
+    #[arg(required_unless_present = "steps", conflicts_with = "steps")]
+    pub duration: Option<String>,
+    /// Change Session-step lifetime separately from messages. Members can only shorten theirs.
+    #[arg(long, value_name = "DURATION", conflicts_with = "duration")]
+    pub steps: Option<String>,
 }
 
 /// `vox room get`
@@ -2678,7 +2682,19 @@ pub fn run() -> ExitCode {
                             crate::room_cli::rename(&paths, &a.room, &a.name).await
                         }
                         RoomCmd::Retention(a) => {
-                            crate::room_cli::retention(&paths, &a.room, &a.duration).await
+                            match (a.steps.as_deref(), a.duration.as_deref()) {
+                                (Some(duration), _) => {
+                                    crate::room_cli::retention(&paths, &a.room, duration, true)
+                                        .await
+                                }
+                                (_, Some(duration)) => {
+                                    crate::room_cli::retention(&paths, &a.room, duration, false)
+                                        .await
+                                }
+                                _ => Err(AppError::Usage(
+                                    "give a message duration or --steps <duration>".into(),
+                                )),
+                            }
                         }
                         RoomCmd::Get(a) => {
                             crate::room_cli::get_file(

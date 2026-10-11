@@ -4738,10 +4738,16 @@ pub async fn rename(paths: &Paths, room: &str, name: &str) -> Result<(), AppErro
 /// # Errors
 /// An unparseable duration, an unreachable node, an unknown room, or a caller who is not the
 /// room's admin. No passphrase is asked for (ADR-028 K-11).
-pub async fn retention(paths: &Paths, room: &str, duration: &str) -> Result<(), AppError> {
+pub async fn retention(
+    paths: &Paths,
+    room: &str,
+    duration: &str,
+    steps: bool,
+) -> Result<(), AppError> {
+    let kind = if steps { "Session steps" } else { "messages" };
     let ttl = vox_core::node::retention::parse_duration(duration).ok_or_else(|| {
         AppError::Usage(format!(
-            "{duration:?} is not a retention: use 1h, 1w, 1m (a month), a number of seconds, \
+            "{duration:?} is not a retention: use 1h, 7d, 1w, 1m (a month), a number of seconds, \
              or forever"
         ))
     })?;
@@ -4750,7 +4756,7 @@ pub async fn retention(paths: &Paths, room: &str, duration: &str) -> Result<(), 
     // What it is to do, said before it is done (ADR-028 E-5).
     let which = room_named(&mut client, channel_id).await;
     println!(
-        "vox: about to set how long {which} keeps messages: {}",
+        "vox: about to set how long {which} keeps {kind}: {}",
         match ttl {
             0 => "forever".to_owned(),
             t => vox_core::node::retention::describe(t),
@@ -4758,17 +4764,27 @@ pub async fn retention(paths: &Paths, room: &str, duration: &str) -> Result<(), 
     );
     if ttl > 0 {
         println!(
-            "     older messages are to be removed: on every member's node if you created the \
+            "     older {kind} are to be removed: on every member's node if you created the \
              room or are its admin, on this node alone otherwise"
         );
     }
+    if steps {
+        println!("     Session steps expire sooner when this node's message retention is shorter; room-message retention is unchanged");
+    }
     match client
-        .request(&Request::SetRetention { channel_id, ttl })
+        .request(&if steps {
+            Request::SetStepRetention {
+                channel_id,
+                seconds: ttl,
+            }
+        } else {
+            Request::SetRetention { channel_id, ttl }
+        })
         .await
     {
         Ok(Frame::Ok) => {
             println!(
-                "vox: {} keeps messages {}",
+                "vox: {} keeps {kind} {}",
                 which,
                 match ttl {
                     0 => "forever".to_owned(),
@@ -4776,9 +4792,7 @@ pub async fn retention(paths: &Paths, room: &str, duration: &str) -> Result<(), 
                 }
             );
             if ttl > 0 {
-                println!(
-                    "     older messages are removed now, on every member as this reaches them"
-                );
+                println!("     older {kind} are removed now, on every member as this reaches them");
                 println!(
                     "     a modified node can keep everything: this is not a security property"
                 );
@@ -4794,13 +4808,13 @@ pub async fn retention(paths: &Paths, room: &str, duration: &str) -> Result<(), 
             if own == room {
                 println!(
                     "vox: you follow the room's retention for {} again: this node keeps its \
-                     messages {}",
+                     {kind} {}",
                     which,
                     say(own)
                 );
             } else {
                 println!(
-                    "vox: set your own retention for {}: this node keeps its messages {}",
+                    "vox: set your own retention for {}: this node keeps its {kind} {}",
                     which,
                     say(own)
                 );
@@ -4817,9 +4831,9 @@ pub async fn retention(paths: &Paths, room: &str, duration: &str) -> Result<(), 
         }
         // The node's own words (`Fault::explain`) say why — including a member asking to keep
         // the room's messages longer than the room does, which has its own fault.
-        Ok(Frame::Error { reason }) => {
-            Err(AppError::Usage(format!("cannot set retention: {reason}")))
-        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!(
+            "cannot set {kind} retention: {reason}"
+        ))),
         Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }

@@ -160,6 +160,11 @@ final class NodeModel: ObservableObject {
     /// The room on screen's retention in seconds, 0 for forever; `nil` until read. What the
     /// Retention sheet opens at (D14).
     @Published private(set) var retentionSecs: UInt64?
+    @Published private(set) var stepRetention: FfiStepRetention?
+    @Published private(set) var stepRetentionAdmin = false
+    @Published private(set) var stepRetentionLoading = false
+    @Published private(set) var stepRetentionError: String?
+    private var stepRetentionRead = UUID()
     /// What the room on screen's timeline shows (ADR-029 CL-2): General each time a room opens.
     @Published var showing: Showing = .general {
         didSet {
@@ -278,7 +283,8 @@ final class NodeModel: ObservableObject {
                      "dismiss-offer": "Dismissing the offer…", "lan-helper": "Updating the LAN helper…",
                      "create-room": "Creating the room…", "join-room": "Joining the room…",
                      "copy-link": "Reading the room link…", "leave": "Leaving the room…",
-                     "retention": "Setting retention…", "rename": "Renaming the room…",
+                     "retention": "Setting retention…", "step-retention": "Setting Session step retention…",
+                     "rename": "Renaming the room…",
                      "admins": "Updating room admins…", "copy": "Copying…",
                      "share": "Sharing the service…", "stop-share": "Stopping the share…",
                      "attach": "Attaching…", "post": "Sending the message…",
@@ -729,6 +735,11 @@ final class NodeModel: ObservableObject {
         pulling = [:]
         retention = ""
         retentionSecs = nil
+        stepRetention = nil
+        stepRetentionAdmin = false
+        stepRetentionLoading = false
+        stepRetentionError = nil
+        stepRetentionRead = UUID()
         notices = []
         sessions = []
         sessionPages.clear()
@@ -790,6 +801,8 @@ final class NodeModel: ObservableObject {
             retentionSecs = keptSecs
             notices = done
             sessions = listed
+            await loadStepRetention()
+            guard case .room(id) = self.selection else { return }
             // A Session restored as this room's last view is read once the room lists it (D12).
             if showingSession { await readSession() }
             watchReads(id)
@@ -1295,6 +1308,53 @@ final class NodeModel: ObservableObject {
         }
     }
 
+    /// Separate room step policy and this node's effective limit, read together with who may
+    /// change the room rule. Failures stay in the Retention sheet with a retry.
+    func loadStepRetention() async {
+        guard let id = roomOnScreen, !stepRetentionLoading else { return }
+        let token = UUID()
+        stepRetentionRead = token
+        stepRetentionLoading = true
+        defer { if stepRetentionRead == token { stepRetentionLoading = false } }
+        do {
+            let (value, admins) = try await AppRequest.run("Reading Session step retention") { [client] in
+                let value = try await client.stepRetention(room: id)
+                let admins = try await client.admins(room: id)
+                return (value, admins)
+            }
+            guard roomOnScreen == id, stepRetentionRead == token else { return }
+            stepRetention = value
+            stepRetentionAdmin = admins.contains(me)
+            stepRetentionError = nil
+        } catch {
+            guard roomOnScreen == id, stepRetentionRead == token else { return }
+            stepRetentionError = sentence(error)
+        }
+    }
+
+    func setStepRetention(_ seconds: UInt64) async -> Bool {
+        guard let id = roomOnScreen else { return false }
+        let operation = "step-retention"
+        let attempt = begin(operation)
+        defer { end(attempt) }
+        do {
+            try await AppRequest.run("Setting Session step retention") { [client] in
+                try await client.setStepRetention(room: id, seconds: seconds)
+            }
+            guard roomOnScreen == id else { return true }
+            // A read started before the setter must not overwrite the new rule.
+            stepRetentionRead = UUID()
+            stepRetentionLoading = false
+            await loadStepRetention()
+            let scope = stepRetentionAdmin ? "The room's Session step rule is" : "This node's Session step rule is"
+            report(operation: operation, done: "\(scope) \(Retention.words(seconds)). Message retention still applies.")
+            return true
+        } catch {
+            report(error, operation: operation)
+            return false
+        }
+    }
+
     /// Rename the room on screen: its one name, as every member sees it (ADR-028 R-1). Only its
     /// creator or an admin may; the node's refusal is said as it comes. No passphrase (K-11).
     func renameRoom(to name: String) async -> Bool {
@@ -1615,6 +1675,8 @@ final class NodeModel: ObservableObject {
                 guard case .room(room) = self.selection else { return }
                 if let kept, kept != self.retention { self.retention = kept }
                 if let keptSecs, keptSecs != self.retentionSecs { self.retentionSecs = keptSecs }
+                await self.loadStepRetention()
+                guard case .room(room) = self.selection else { return }
                 if let done, done != self.notices { self.notices = done }
                 let listed = try? await self.client.sessions(room: room)
                 guard case .room(room) = self.selection else { return }
