@@ -73,6 +73,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var model: AppModel { AppModel.shared }
     /// SIGTERM, SIGHUP and SIGINT, each a clean quit (ADR-026 S-4).
     private var stops: [DispatchSourceSignal] = []
+    private var quitting = false
+    private var quitTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // **A stop signal quits the app as ⌘Q does** (ADR-026 S-4): the node is let go of by the
@@ -106,10 +108,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// when the app is gone.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard model.holdsNode else { return .terminateNow }
+        guard !quitting else { return .terminateLater }
+        quitting = true
+        // An independent run-loop deadline: cancellation of a stuck FFI call cannot hold quit.
+        let timer = Timer(timeInterval: 3, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated { self?.finishQuitting(sender) }
+        }
+        quitTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
         Task {
             await model.quit()
-            sender.reply(toApplicationShouldTerminate: true)
+            finishQuitting(sender)
         }
         return .terminateLater
+    }
+
+    private func finishQuitting(_ sender: NSApplication) {
+        guard quitting else { return }
+        quitting = false
+        quitTimer?.invalidate()
+        quitTimer = nil
+        sender.reply(toApplicationShouldTerminate: true)
     }
 }
