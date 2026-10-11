@@ -66,6 +66,7 @@ const T_REQ_UNKEEP: u64 = 4111;
 const T_REQ_ROOM_ASKS: u64 = 4112;
 const T_REQ_ROOM_BIND: u64 = 4113;
 const T_REQ_ROOM_DECLINE: u64 = 4114;
+const T_REQ_DETACH_FOR_RENAME: u64 = 4115;
 /// 4120–4129: the Session activity sink (ADR-029 §2, §3).
 const T_REQ_SESSION_ACTIVITY: u64 = 4120;
 const T_REQ_SESSION_ASK: u64 = 4121;
@@ -99,6 +100,7 @@ const CAUSE_LAST_HOLDER: u64 = 1;
 const CAUSE_DAEMON_STOPPING: u64 = 2;
 const CAUSE_PANICKED: u64 = 3;
 const CAUSE_STOPPED: u64 = 4;
+const CAUSE_RENAME: u64 = 5;
 
 // ---- types -------------------------------------------------------------------------------------
 
@@ -194,6 +196,12 @@ pub enum DaemonRequest {
     },
     /// Detach `node` (L-3). Answered [`DaemonFrame::Ok`] once it has detached.
     Detach {
+        /// The node.
+        node: NodeName,
+    },
+    /// Release a node's actor and store for a rename while preserving its remembered state.
+    /// Unlike a person asking to detach, a failed rename must keep its restart credentials.
+    DetachForRename {
         /// The node.
         node: NodeName,
     },
@@ -338,6 +346,8 @@ pub enum Opening {
 pub enum DetachCause {
     /// `vox node detach`, or a `Detach` request.
     Requested,
+    /// Its store is released during a node rename, with remembered credentials preserved.
+    Rename,
     /// It was attached implicitly and its last holder went (L-3).
     LastHolder,
     /// The daemon is stopping.
@@ -847,6 +857,9 @@ fn put_cause(e: &mut Encoder, c: &DetachCause) {
         DetachCause::Stopped => {
             e.array(1).uint(CAUSE_STOPPED);
         }
+        DetachCause::Rename => {
+            e.array(1).uint(CAUSE_RENAME);
+        }
     }
 }
 
@@ -859,6 +872,7 @@ fn cause(d: &mut Decoder<'_>) -> Result<DetachCause> {
         (CAUSE_DAEMON_STOPPING, 1) => DetachCause::DaemonStopping,
         (CAUSE_PANICKED, 2) => DetachCause::Panicked(text(d, "ipc panic message")?),
         (CAUSE_STOPPED, 1) => DetachCause::Stopped,
+        (CAUSE_RENAME, 1) => DetachCause::Rename,
         _ => return Err(Error::MalformedIpc("ipc detach cause")),
     })
 }
@@ -914,6 +928,9 @@ impl Opening {
                 }
                 DaemonRequest::Detach { node } => {
                     e.array(2).uint(T_REQ_DETACH).text(node.as_str());
+                }
+                DaemonRequest::DetachForRename { node } => {
+                    e.array(2).uint(T_REQ_DETACH_FOR_RENAME).text(node.as_str());
                 }
                 DaemonRequest::Unkeep { node } => {
                     e.array(2).uint(T_REQ_UNKEEP).text(node.as_str());
@@ -1084,6 +1101,9 @@ impl Opening {
                 })
             }
             (T_REQ_DETACH, 2) => Opening::Daemon(DaemonRequest::Detach {
+                node: name(&mut d, "ipc detach node")?,
+            }),
+            (T_REQ_DETACH_FOR_RENAME, 2) => Opening::Daemon(DaemonRequest::DetachForRename {
                 node: name(&mut d, "ipc detach node")?,
             }),
             (T_REQ_UNKEEP, 2) => Opening::Daemon(DaemonRequest::Unkeep {

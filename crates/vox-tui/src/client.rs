@@ -876,8 +876,8 @@ async fn attach_request(
 /// machine holds it, in one step: detached if attached, its directory moved, its keep (the
 /// `.daemon/attach` line and the Keychain item) moved with it, every harness wired to it wired to
 /// the new name, the app's chosen node too, and attached again as it was. A keyring on this
-/// machine that names it by the old name is said, with the `vox trust rename` for it: a keyring
-/// change takes that node's passphrase, typed by its owner.
+/// machine that still calls it the old name is updated through the normal keyring change:
+/// that node's passphrase, when needed, is typed by its owner.
 ///
 /// Whatever re-attaching needs is had before anything changes: a passphrase from where it was
 /// kept, else typed here.
@@ -889,6 +889,17 @@ pub async fn node_rename(args: &NodeArgs, old: &str, new: &str) -> Result<(), Ap
     let old = NodeName::parse(old)?;
     let new = NodeName::parse(new)?;
     let account = args.account()?;
+    let command = |args: &[&str]| {
+        let mut words = vec!["vox".to_owned()];
+        words.extend(args.iter().map(|arg| (*arg).to_owned()));
+        words.extend([
+            "--data-dir".to_owned(),
+            account.data_root.display().to_string(),
+            "--config-dir".to_owned(),
+            account.config_dir.display().to_string(),
+        ]);
+        vox_text::shell::command(&words)
+    };
     let on_disk = account.nodes_on_disk();
     if !on_disk.contains(&old) {
         return Err(AppError::Usage(format!(
@@ -946,10 +957,13 @@ pub async fn node_rename(args: &NodeArgs, old: &str, new: &str) -> Result<(), Ap
         }
         (None, false) => None,
     };
-    // ---- let go of it: detached, and its keep gone with its Keychain item ----
+    // ---- let go of it; `again` keeps the passphrase for restoring any failed move ----
     if was_attached {
         let mut d = daemon(&account).await?;
-        match d.request(DaemonRequest::Detach { node: old.clone() }).await {
+        match d
+            .request(DaemonRequest::DetachForRename { node: old.clone() })
+            .await
+        {
             Ok(DaemonFrame::Ok) => {}
             Ok(DaemonFrame::Refused(r)) => return Err(AppError::Usage(r.to_string())),
             Ok(other) => return Err(crate::client::unexpected_daemon(&other)),
@@ -957,29 +971,69 @@ pub async fn node_rename(args: &NodeArgs, old: &str, new: &str) -> Result<(), Ap
         }
     }
     if kept.is_some() {
-        if let Ok(mut d) = DaemonClient::open(&account.socket()).await {
-            let _ = d.request(DaemonRequest::Unkeep { node: old.clone() }).await;
-        } else {
-            forget_kept(&account, &old)?;
+        let forgotten = match DaemonClient::open(&account.socket()).await {
+            Ok(mut d) => match d.request(DaemonRequest::Unkeep { node: old.clone() }).await {
+                Ok(DaemonFrame::Ok) => Ok(()),
+                Ok(DaemonFrame::Refused(r)) => Err(AppError::Usage(r.to_string())),
+                Ok(other) => Err(crate::client::unexpected_daemon(&other)),
+                Err(e) => Err(AppError::Usage(e.to_string())),
+            },
+            Err(e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Version { .. })) => {
+                Err(AppError::Usage(e.to_string()))
+            }
+            Err(_) => forget_kept(&account, &old),
+        };
+        if let Err(e) = forgotten {
+            let restored = restore_rename_source(&account, args, &old, was_attached, &again).await;
+            let recovery = match restored {
+                Ok(()) => "its previous attachment and remembered state were restored".to_owned(),
+                Err(restore) => format!(
+                    "restoring its previous state failed: {restore}; run {}",
+                    command(&["node", "attach", old.as_str()])
+                ),
+            };
+            return Err(AppError::Usage(format!(
+                "node {old} was not renamed: removing its remembered name failed: {e}; {recovery}"
+            )));
         }
     }
     // ---- its name on disk ----
-    std::fs::rename(account.node_dir(&old), account.node_dir(&new)).map_err(|e| {
-        AppError::Usage(format!(
-            "node {old} is detached, but its directory could not be renamed to {new}: {e}; \
-             nothing else was changed, and `vox node attach {old}` attaches it again"
-        ))
-    })?;
+    if let Err(error) = std::fs::rename(account.node_dir(&old), account.node_dir(&new)) {
+        let restored = restore_rename_source(&account, args, &old, was_attached, &again).await;
+        let recovery = match restored {
+            Ok(()) => "its previous attachment and remembered state were restored".to_owned(),
+            Err(e) => format!(
+                "restoring its previous state failed: {e}; run {}",
+                command(&["node", "attach", old.as_str()])
+            ),
+        };
+        return Err(AppError::Usage(format!("node {old}'s directory could not be renamed to {new}: {error}; its name is unchanged; {recovery}")));
+    }
     println!("vox: node {old} is now node {new}; its fingerprint is the same");
+    // Finish independent places even if one cannot be written. The final refusal names only
+    // the unfinished places; it never hides the node that was already renamed.
+    let mut unfinished = Vec::new();
     // ---- every harness wired to it, and the app's choice ----
     for h in &crate::setup::HARNESSES {
         let Ok(wiring) = crate::setup::Wiring::of(h.key) else {
             continue;
         };
         if wiring.wired_node().as_deref() == Some(old.as_str()) {
-            for line in wiring.install(&new)? {
-                println!("  {line}");
+            if let Err(e) = wiring.rename_node(&new) {
+                let line = if h.key == "opencode" {
+                    format!("const VOX_NODE = \"{new}\"")
+                } else {
+                    format!(
+                        "vox agent hook --node {new} (and VOX_NODE={new} in its env, if present)"
+                    )
+                };
+                unfinished.push(format!(
+                    "{}: {e}; change its Vox hook line to: {line}",
+                    wiring.hook_file().display()
+                ));
+                continue;
             }
+            println!("vox: updated {}", wiring.hook_file().display());
             println!(
                 "vox: {} is connected to node {new} now; a session running now goes on as {old} \
                  until it is started again",
@@ -989,17 +1043,36 @@ pub async fn node_rename(args: &NodeArgs, old: &str, new: &str) -> Result<(), Ap
     }
     let chosen = account.config_dir.join("app").join("node");
     if std::fs::read_to_string(&chosen).is_ok_and(|s| s.trim() == old.as_str()) {
-        vox_core::node::paths::write_private_file_unique(&chosen, format!("{new}\n").as_bytes())
-            .map_err(|e| {
-                AppError::Usage(format!("the app's chosen node {}: {e}", chosen.display()))
-            })?;
-        println!("vox: Vox.app opens node {new} now");
+        let written = if std::fs::metadata(&chosen).is_ok_and(|m| m.permissions().readonly()) {
+            Err(vox_core::error::Error::Profile("file is read-only"))
+        } else {
+            vox_core::node::paths::write_private_file_unique(&chosen, format!("{new}\n").as_bytes())
+        };
+        match written {
+            Ok(()) => println!(
+                "vox: Vox.app opens node {new} now; updated {}",
+                chosen.display()
+            ),
+            Err(e) => unfinished.push(format!(
+                "{}: {e}; replace its node-name line with: {new}",
+                chosen.display()
+            )),
+        }
     }
     // ---- attached again, kept as it was ----
     if let Some((passphrase, keep)) = again {
-        ensure_daemon(&account, args.listen, &args.anchor_specs()).await?;
-        let mut d = daemon(&account).await?;
-        attach_request(&mut d, &new, passphrase, keep, args.anchor_specs()).await?;
+        let attached_again = async {
+            ensure_daemon(&account, args.listen, &args.anchor_specs()).await?;
+            let mut d = daemon(&account).await?;
+            attach_request(&mut d, &new, passphrase, keep, args.anchor_specs()).await
+        }
+        .await;
+        if let Err(e) = attached_again {
+            unfinished.push(format!(
+                "node {new} could not be attached again: {e}; run {}",
+                command(&["node", "attach", new.as_str()])
+            ));
+        }
     }
     // ---- keyrings on this machine that name it by its old name ----
     if let Some(fp) = fingerprint {
@@ -1008,27 +1081,94 @@ pub async fn node_rename(args: &NodeArgs, old: &str, new: &str) -> Result<(), Ap
             let Ok(paths) = account.node_paths(&other) else {
                 continue;
             };
-            if !attached(&account, &other).await? {
-                println!(
-                    "vox: node {other} is not attached, so its keyring is not read here; if it \
-                     names {old}: vox trust rename {b32} {new} --node {other}"
-                );
-                continue;
-            }
-            let Ok(mut c) = crate::room_cli::attach(&paths).await else {
-                continue;
-            };
-            if let Ok(Frame::Trusted { entries }) = c.trusted("").await {
-                if entries
-                    .iter()
-                    .any(|(id, name, _)| *id == fp && name.as_str() == old.as_str())
-                {
-                    println!(
-                        "vox: node {other}'s keyring names it {old}; to name it {new} there (it \
-                         asks for {other}'s passphrase): vox trust rename {b32} {new} --node {other}"
-                    );
+            let repair = command(&[
+                "trust",
+                "rename",
+                &b32,
+                new.as_str(),
+                "--node",
+                other.as_str(),
+            ]);
+            let attach_other = command(&["node", "attach", other.as_str()]);
+            let inspect = command(&["trust", "list", "--node", other.as_str()]);
+            match attached(&account, &other).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    unfinished.push(format!("{} was not read because node {other} is detached; run {attach_other}, then if its alias is {old}, run {repair}", paths.vault_file().display()));
+                    continue;
+                }
+                Err(e) => {
+                    unfinished.push(format!("{} could not be read: {e}; after the daemon is reachable, run {inspect} and, if its alias is {old}, {repair}", paths.vault_file().display()));
+                    continue;
                 }
             }
+            let inspected = async {
+                let mut c = crate::room_cli::attach(&paths).await?;
+                match c.trusted("").await {
+                    Ok(Frame::Trusted { entries }) => Ok(entries
+                        .iter()
+                        .any(|(id, name, _)| *id == fp && name.as_str() == old.as_str())),
+                    Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
+                    Ok(other) => Err(crate::client::unexpected(&other)),
+                    Err(e) => Err(AppError::Usage(e.to_string())),
+                }
+            }
+            .await;
+            match inspected {
+                Ok(false) => {}, // The person's custom alias is theirs and stays.
+                Ok(true) => {
+                    println!("vox: updating node {other}'s alias {old} to {new}");
+                    match crate::room_cli::trust_rename(&paths, &b32, new.as_str()).await {
+                        Ok(()) => println!("vox: updated {}: {old} is now {new}", paths.vault_file().display()),
+                        Err(e) => unfinished.push(format!("{}: {}; run {repair}", paths.vault_file().display(), e.to_string().lines().next().unwrap_or_default())),
+                    }
+                }
+                Err(e) => unfinished.push(format!("{} could not be read: {e}; run {inspect}, then if its alias is {old}, run {repair}", paths.vault_file().display())),
+            }
+        }
+    }
+    if unfinished.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::Usage(format!(
+            "node {old} is now {new}, but these places still need attention:\n{}",
+            unfinished.join("\n")
+        )))
+    }
+}
+
+/// Restore the old node after a failed rename, including a keep already removed by Unkeep.
+/// A previously detached kept node is suspended again without forgetting its credentials.
+async fn restore_rename_source(
+    account: &Account,
+    args: &NodeArgs,
+    name: &NodeName,
+    was_attached: bool,
+    again: &Option<(Zeroizing<String>, Option<KeepSource>)>,
+) -> Result<(), AppError> {
+    let Some((passphrase, keep)) = again else {
+        return Ok(());
+    };
+    let mut d = daemon(account).await?;
+    attach_request(
+        &mut d,
+        name,
+        passphrase.clone(),
+        keep.clone(),
+        args.anchor_specs(),
+    )
+    .await?;
+    if !was_attached {
+        // Daemon requests are one opening per connection; Attach has completed on `d`.
+        let mut d = daemon(account).await?;
+        match d
+            .request(DaemonRequest::DetachForRename { node: name.clone() })
+            .await
+        {
+            Ok(DaemonFrame::Ok) => {}
+            Ok(DaemonFrame::Refused(r)) => return Err(AppError::Usage(r.to_string())),
+            Ok(other) => return Err(crate::client::unexpected_daemon(&other)),
+            Err(e) => return Err(AppError::Usage(e.to_string())),
         }
     }
     Ok(())
