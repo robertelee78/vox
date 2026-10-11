@@ -273,6 +273,8 @@ pub struct StatusReport {
     pub anchors: Vec<AnchorStatus>,
     /// What needs looking at.
     pub unhealthy: Vec<Unhealthy>,
+    /// Rooms that recovered from their most recent failed write.
+    pub recovered: Vec<Unhealthy>,
     /// The machine's gateways, per address family (ADR-012 N-53, N-54).
     pub gateway: GatewayStatus,
     /// How long this node gives a tunnel whose bytes wait before closing it as stuck (V030-11):
@@ -536,8 +538,17 @@ impl StatusReport {
         );
         let _ = write!(
             j,
-            "\"unhealthy\":[{}]",
+            "\"unhealthy\":[{}],",
             list(self.unhealthy.iter().map(|u| format!(
+                "{{\"key\":{},\"message\":{}}}",
+                q(&u.key),
+                q(&u.message)
+            )))
+        );
+        let _ = write!(
+            j,
+            "\"recovered\":[{}]",
+            list(self.recovered.iter().map(|u| format!(
                 "{{\"key\":{},\"message\":{}}}",
                 q(&u.key),
                 q(&u.message)

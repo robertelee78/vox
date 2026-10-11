@@ -176,6 +176,22 @@ impl Store {
         self
     }
 
+    /// Reopen after a failed write, retaining the profile lock for the whole transition.
+    /// An empty durable transaction proves writes work before a poisoned room is reopened.
+    pub fn reopen_after_write_failure(&self) -> Result<()> {
+        let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
+        drop(std::mem::replace(&mut *backing, Backing::Closed));
+        let db = Database::create(&self.path).map_err(open_error)?;
+        *backing = Backing::Writable(db);
+        let Backing::Writable(db) = &*backing else {
+            unreachable!()
+        };
+        db.begin_write()
+            .map_err(storage("retry write"))?
+            .commit()
+            .map_err(storage("retry commit"))
+    }
+
     /// Reopen a read-only store writable; a no-op for one that already is.
     ///
     /// # Errors

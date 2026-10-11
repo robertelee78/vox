@@ -89,6 +89,9 @@ fn render(v: &Value) -> String {
             let _ = writeln!(o, "  ! {}", s(u, "message"));
         }
     }
+    for r in arr("recovered") {
+        let _ = writeln!(o, "{}", s(r, "message"));
+    }
     // What this node refused most recently, from its decision record (ADR-028 D-3).
     let refusals = arr("refusals");
     if !refusals.is_empty() {

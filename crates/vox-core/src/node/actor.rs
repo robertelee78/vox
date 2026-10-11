@@ -43,6 +43,8 @@ use crate::node::net::PeerPolicy;
 use crate::node::network::{Inbound, NodeNet};
 use crate::node::open_rooms::OpenRooms;
 use crate::node::paths::Paths;
+
+mod recovery;
 use crate::node::prekeys::{self, PrekeyRing};
 use crate::node::profile::Profile;
 use crate::node::status::PublishCause;
@@ -575,6 +577,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::Reopened { .. } => "holding a room that reopened",
         NetEvent::ReopenGone { .. } => "forgetting a room that no longer exists",
         NetEvent::ReopenFailed { .. } => "saying why a room did not reopen",
+        NetEvent::StoreReopened { .. } => "reopening a room after a failed save",
         NetEvent::ReopenFinished => "answering an unlock whose rooms are held again",
         NetEvent::LockSettled => "answering a lock that has settled",
         NetEvent::JoinAdmit { .. } => "admitting a joiner before accepting it",
@@ -1358,6 +1361,11 @@ enum NetEvent {
     },
     /// The reopening has tried every room (#208). A room still marked as reopening would not
     /// open: it stays remembered, and closed. The unlock is answered now.
+    StoreReopened {
+        channel_id: Digest32,
+        original: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+        opened: Box<crate::error::Result<ChannelState>>,
+    },
     ReopenFinished,
     /// A lock has settled: nothing it stopped holds a secret any more (V210-94).
     LockSettled,
@@ -3960,6 +3968,8 @@ impl EventStream {
 /// The node actor's state (owned by its task).
 pub struct Node {
     paths: Paths,
+    store_recovery: BTreeMap<Digest32, recovery::Retry>,
+    store_recovered: BTreeMap<Digest32, String>,
     profile: Option<Profile>,
     /// The network, present only while the identity is unlocked: binding the QUIC
     /// endpoint needs the identity's signer, so a locked node has no network
@@ -4672,6 +4682,8 @@ impl Node {
             stream_loops: std::collections::BTreeMap::new(),
             addresses_task: None,
             changes_task: None,
+            store_recovery: BTreeMap::new(),
+            store_recovered: BTreeMap::new(),
             anchor_backoff: BTreeMap::new(),
             anchor_dials: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
             anchor_window: BTreeMap::new(),
@@ -5060,6 +5072,7 @@ impl Node {
                         net.prune_board();
                     }
                     self.note_peers_seen();
+                    self.recover_storage();
                     self.retry_upgrades_if_due().await;
                     self.maintain_prekeys();
                     self.renew_records_if_due().await;
@@ -6900,6 +6913,14 @@ impl Node {
                 });
             }
             NetEvent::LockSettled => self.settle_lock().await,
+            NetEvent::StoreReopened {
+                channel_id,
+                original,
+                opened,
+            } => {
+                self.finish_store_recovery(channel_id, original, *opened)
+                    .await;
+            }
             NetEvent::ReopenFinished => {
                 self.reopening.clear();
                 self.reopen_task = None;
@@ -9829,10 +9850,10 @@ impl Node {
             }
             batch.commit()
         })();
-        if written.is_err() {
+        if let Err(e) = written {
             // As a failed per-room write always did: memory is ahead of the store.
             for (ch, _, _) in sealed {
-                ch.lock().await.poison();
+                ch.lock().await.poison(&e);
             }
         }
     }
@@ -15460,6 +15481,7 @@ impl Node {
             })
             .collect();
         report.diagnose();
+        self.storage_health(&mut report);
         report
     }
 

@@ -2152,3 +2152,192 @@ fn drive_given_on_an_idle_session_is_held_at_once_and_taken_back_at_once() {
          within 15 s ({landed:?}): no package from {KEEPER} was waiting, so arm 5 proved nothing"
     );
 }
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_full_room_recovers_and_keeps_its_session_entries);
+
+/// ADR-034 SR-1–SR-5: a real full filesystem, a held hook entry, and automatic recovery.
+/// Optional because userspace filesystem mounting is not available on every runner. The
+/// shipped CLI supplies every verdict; the sparse disk and filler are apparatus only.
+#[test]
+#[cfg(feature = "optional-proofs")]
+#[ignore = "optional real full-disk journey; run in release with optional-proofs"]
+fn a_full_room_recovers_and_keeps_its_session_entries() {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = writeln!(
+            std::io::stderr(),
+            "OPTIONAL PROOF NOT RUN: needs userspace macOS disk images"
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        watchdog::arm_for(Duration::from_secs(240));
+        std::fs::create_dir_all(SHORT_ROOT).expect("APPARATUS: short root");
+        let tmp = tempfile::Builder::new()
+            .prefix("full-")
+            .tempdir_in(SHORT_ROOT)
+            .expect("APPARATUS: scratch root");
+        let root = tmp.path().to_path_buf();
+        let mount = root.join("disk");
+        for d in [&mount, &root.join("home"), &root.join("work")] {
+            std::fs::create_dir_all(d).expect("APPARATUS: scratch directory");
+        }
+        let disk = root.join("scratch.sparseimage");
+        let created = Command::new("/usr/bin/hdiutil")
+            .args([
+                "create",
+                "-size",
+                "64m",
+                "-fs",
+                "HFS+",
+                "-volname",
+                "VoxRecoveryProof",
+                "-type",
+                "SPARSE",
+            ])
+            .arg(&disk)
+            .output()
+            .expect("APPARATUS: hdiutil create");
+        if !created.status.success() {
+            let _ = writeln!(
+                std::io::stderr(),
+                "OPTIONAL PROOF NOT RUN: userspace disk image unavailable: {}",
+                String::from_utf8_lossy(&created.stderr)
+            );
+            return;
+        }
+        let attached = Command::new("/usr/bin/hdiutil")
+            .args(["attach", "-nobrowse", "-mountpoint"])
+            .arg(&mount)
+            .arg(&disk)
+            .output()
+            .expect("APPARATUS: hdiutil attach");
+        if !attached.status.success() {
+            let _ = writeln!(
+                std::io::stderr(),
+                "OPTIONAL PROOF NOT RUN: userspace mount unavailable: {}",
+                String::from_utf8_lossy(&attached.stderr)
+            );
+            return;
+        }
+        struct Disk(PathBuf);
+        impl Drop for Disk {
+            fn drop(&mut self) {
+                let _ = Command::new("/usr/bin/hdiutil")
+                    .arg("detach")
+                    .arg(&self.0)
+                    .output();
+            }
+        }
+        let disk_guard = Disk(mount.clone());
+        let w = World {
+            data: mount.join("data"),
+            cfg: root.join("cfg"),
+            root: root.clone(),
+            _tmp: tmp,
+        };
+        w.staged(AGENT, &["node", "create", AGENT], None);
+        w.staged(AGENT, &["node", "attach", AGENT], None);
+        let daemon = Daemon(w.data.clone());
+        w.staged(
+            AGENT,
+            &[
+                "room",
+                "create",
+                "--passphrase-file",
+                "-",
+                "--name",
+                "recovery",
+            ],
+            Some("room passphrase\n"),
+        );
+        let room = w
+            .staged(AGENT, &["room", "list"], None)
+            .split_whitespace()
+            .next()
+            .expect("APPARATUS: created room listed")
+            .to_owned();
+        let transcript = root.join("transcript.jsonl");
+        std::fs::write(&transcript, "").expect("APPARATUS: transcript");
+        let mut prompt = base("UserPromptSubmit", &root.join("work"), &transcript);
+        prompt["prompt"] = "before the disk filled".into();
+        w.hook_done(&room, &prompt);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, seen, _) = w.vox(AGENT, &["room", "session", &room, SESSION], None);
+            if seen.contains("before the disk filled") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS: initial Session never opened: {seen}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let filler = mount.join("filler");
+        let mut f = std::fs::File::create(&filler).expect("APPARATUS: filler");
+        let block = vec![0x5a; 1024 * 1024];
+        while f.write_all(&block).is_ok() {}
+        while f.write_all(&block[..4096]).is_ok() {}
+        f.sync_all().expect("APPARATUS: flush filler");
+        drop(f);
+        let mut failure = String::new();
+        for n in 0..128 {
+            let (ok, out, err) = w.vox(
+                AGENT,
+                &[
+                    "room",
+                    "post",
+                    &room,
+                    &format!("force a durable write {n} {}", "x".repeat(60_000)),
+                ],
+                None,
+            );
+            if !ok {
+                failure = format!("{out}{err}");
+                break;
+            }
+        }
+        assert!(
+            !failure.is_empty(),
+            "APPARATUS: disk filled but no room write failed"
+        );
+        let (_, status, err) = w.vox(AGENT, &["status"], None);
+        assert!(status.contains("cannot save") && (status.contains("No space") || status.contains("os error 28")) && !status.contains("healthy: nothing"),
+            "PRODUCT: a full room concealed the OS error or claimed healthy: post={failure}; status={status}{err}");
+        println!("[proof] failed write and status: {failure}{status}");
+        prompt["prompt"] = "held while the room cannot save".into();
+        w.hook_done(&room, &prompt);
+        std::fs::remove_file(&filler).expect("APPARATUS: free disk space");
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let (seen, status) = loop {
+            let (_, seen, _) = w.vox(AGENT, &["room", "session", &room, SESSION], None);
+            let (_, status, _) = w.vox(AGENT, &["status"], None);
+            if seen.contains("held while the room cannot save")
+                && status.contains("recovered; it can save again")
+            {
+                break (seen, status);
+            }
+            assert!(Instant::now() < deadline, "PRODUCT: room did not recover and retain its Session without restart: session={seen}; status={status}");
+            std::thread::sleep(Duration::from_millis(500));
+        };
+        assert!(
+            !status.contains("cannot save"),
+            "PRODUCT: recovered room kept its cannot-save badge: {status}"
+        );
+        let (ok, out, err) = w.vox(
+            AGENT,
+            &["room", "post", &room, "saved after recovery"],
+            None,
+        );
+        assert!(
+            ok,
+            "PRODUCT: recovered room still refused a post: {out}{err}"
+        );
+        println!("[proof] room recovered without restarting; held entry reached its Session: {seen}{status}");
+        drop(daemon);
+        drop(disk_guard);
+    }
+}
