@@ -105,6 +105,7 @@ enum AppReplyFault {
     BackgroundTimeout,
     Oversize,
     Unparseable,
+    RequestState,
 }
 
 #[test]
@@ -112,6 +113,12 @@ enum AppReplyFault {
 fn an_app_drops_unreadable_replies_and_the_daemon_refuses_an_oversize_history() {
     delayed_app_reply(AppReplyFault::Oversize);
     delayed_app_reply(AppReplyFault::Unparseable);
+}
+
+#[test]
+#[ignore = "real daemon and an older Session page; CI runs in release"]
+fn an_older_request_page_shows_its_later_resolution() {
+    delayed_app_reply(AppReplyFault::RequestState);
 }
 
 fn delayed_app_reply(fault: AppReplyFault) {
@@ -136,21 +143,49 @@ fn delayed_app_reply(fault: AppReplyFault) {
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let alice = &room.workers[0];
     let node = alice.paths.account().nodes_on_disk()[0].clone();
-    if matches!(fault, AppReplyFault::Oversize) {
-        rt.block_on(async {
+    if matches!(fault, AppReplyFault::Oversize | AppReplyFault::RequestState) {
+        let before = rt.block_on(async {
             let mut c = IpcClient::open_at(&NodeSocket::one_shot(alice.paths.account().socket(),node.clone())).await
                 .expect("PRODUCT: the running daemon did not answer");
+            let approval=serde_json::json!({"kind":"approval","ref":"older-request","tool":"Read","summary":"old request","answerable":true}).to_string();
+            assert!(matches!(c.request(&Request::AppendSession{channel_id:room.cid,session_id:SESSION.to_owned(),body:approval}).await,Ok(Frame::Appended{..})),
+                "PRODUCT: the older approval could not be recorded");
+            let mut first=None;
             for n in 0..400 {
                 let body=serde_json::json!({"kind":"reply","seq":n,"text":"x".repeat(1024)}).to_string();
-                assert!(matches!(c.request(&Request::AppendSession {channel_id:room.cid,session_id:SESSION.to_owned(),body}).await,Ok(Frame::Appended{..})),
-                    "PRODUCT: the daemon refused a Session entry");
+                match c.request(&Request::AppendSession { channel_id:room.cid,session_id:SESSION.to_owned(),body }).await {
+                    Ok(Frame::Appended { entry }) => { first.get_or_insert(entry); },
+                    other => panic!("PRODUCT: the daemon refused a Session entry: {other:?}"),
+                }
             }
+            let resolved=serde_json::json!({"kind":"resolved","ref":"older-request","outcome":"allowed","by":"terminal"}).to_string();
+            assert!(matches!(c.request(&Request::AppendSession{channel_id:room.cid,session_id:SESSION.to_owned(),body:resolved}).await,Ok(Frame::Appended{..})),
+                "PRODUCT: the older approval could not be resolved");
             let answer=c.request(&Request::SessionEntries {channel_id:room.cid}).await;
             assert!(matches!(&answer,Ok(Frame::Error{reason}) if reason.contains("SessionEntries")),
                 "PRODUCT: a legacy whole-history reply did not name the oversized request: {answer:?}");
             assert!(matches!(c.request(&Request::Ping).await,Ok(Frame::Ok)),
                 "PRODUCT: the same connection failed after the oversized history was refused");
+            vox_core::node::link::b32_encode(&first.expect("APPARATUS: first reply"))
         });
+        if matches!(fault, AppReplyFault::RequestState) {
+            let read = alice.vox(
+                None,
+                &[
+                    "room", "session", &room.id, SESSION, "--before", &before, "--json",
+                ],
+            );
+            assert!(
+                read.ok
+                    && read.ndjson().iter().any(|v| v["ref"] == "older-request"
+                        && v["waiting"] == false
+                        && v["line"].as_str().is_some_and(
+                            |line| line.contains("answered in the terminal: approved")
+                        )),
+                "PRODUCT: an older Session page showed its resolved request as open: {read:?}"
+            );
+            return;
+        }
     }
     let socket = alice.paths.account().socket();
     let upstream = socket.with_extension("upstream");
@@ -1073,11 +1108,16 @@ fn a_hundred_thousand_entry_session_opens_in_one_second_with_bounded_memory() {
     let output = command
         .output()
         .expect("APPARATUS: start app-client process");
-    assert!(
-        output.status.success(),
-        "the app-client process reported:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    if !output.status.success() {
+        let report = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if report.contains("PRODUCT:") || report.contains("APPARATUS:") {
+            panic!("{report}");
+        }
+        panic!("APPARATUS: app-client proof process ended without a verdict: {report}");
+    }
     eprintln!("{}", String::from_utf8_lossy(&output.stderr));
 }

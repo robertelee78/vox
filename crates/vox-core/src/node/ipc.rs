@@ -6457,13 +6457,56 @@ impl IpcClient {
         which: crate::node::drive::SessionFilter,
         before: Option<Digest32>,
     ) -> Result<Frame> {
-        let reply = self
+        use crate::node::drive::SessionFilter;
+        let session = match &which {
+            SessionFilter::Session(id) => Some(id.clone()),
+            _ => None,
+        };
+        let mut reply = self
             .request(&Request::SessionPage {
                 channel_id,
                 which,
                 before,
             })
             .await?;
+        if let (Some(session_id), Frame::SessionPage { rows, .. }) = (session, &mut reply) {
+            let references: std::collections::BTreeSet<String> = rows
+                .iter()
+                .filter_map(|row| {
+                    let body: serde_json::Value = serde_json::from_str(&row.body).ok()?;
+                    matches!(body["kind"].as_str(), Some("approval" | "question"))
+                        .then(|| body["ref"].as_str().unwrap_or_default().to_owned())
+                        .filter(|r| !r.is_empty())
+                })
+                .collect();
+            for reference in references {
+                // A resolution can be outside the displayed page. Fetch its indexed request
+                // metadata, not the intervening transcript, so old approvals never look open.
+                match self
+                    .request(&Request::SessionPage {
+                        channel_id,
+                        which: SessionFilter::Request {
+                            session_id: session_id.clone(),
+                            reference,
+                        },
+                        before: None,
+                    })
+                    .await?
+                {
+                    Frame::SessionPage { rows: related, .. } => {
+                        for row in related {
+                            if serde_json::from_str::<serde_json::Value>(&row.body)
+                                .is_ok_and(|b| b["kind"] == "resolved")
+                                && !rows.iter().any(|r| r.entry_hash == row.entry_hash)
+                            {
+                                rows.push(row);
+                            }
+                        }
+                    }
+                    other => return Ok(self.older_daemon(other)),
+                }
+            }
+        }
         Ok(self.older_daemon(reply))
     }
 

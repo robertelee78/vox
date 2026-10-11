@@ -1277,39 +1277,6 @@ fn pulled_by_line(who: &[Digest32]) -> Option<String> {
     (!names.is_empty()).then(|| format!("{}{}", crate::ui::PULLED_BY, names.join(", ")))
 }
 
-/// silently treated as "from the beginning", which would re-deliver or skip without
-/// anyone knowing.
-fn after_cursor(
-    rows: &[vox_core::node::api::MessageRow],
-    cursor: Option<Digest32>,
-) -> Result<Vec<&vox_core::node::api::MessageRow>, AppError> {
-    // **Arrival, not position** (ADR-023 decision 1): the room is shown in its one order, where a
-    // late arrival lands *above* rows already shown, so "everything below the cursor" would skip it
-    // for good. What follows a cursor is what this node rendered after it, in the order it
-    // rendered it, so the last row is always the right next cursor — the same rule the node
-    // applies to `Read { since }`.
-    match cursor {
-        None => Ok(rows.iter().collect()),
-        Some(c) => {
-            let row = rows.iter().find(|r| r.entry_hash == c).ok_or_else(|| {
-                AppError::Usage(format!("cursor {} is not in this room's timeline", id(&c)))
-            })?;
-            // A message not received yet has no arrival to read on from (V030-10).
-            if row.owed {
-                return Err(AppError::Usage(format!(
-                    "cursor {} is a message not received yet; read on from one that has arrived",
-                    id(&c)
-                )));
-            }
-            let mark = row.arrival;
-            let mut newer: Vec<&vox_core::node::api::MessageRow> =
-                rows.iter().filter(|r| r.arrival > mark).collect();
-            newer.sort_by_key(|r| r.arrival);
-            Ok(newer)
-        }
-    }
-}
-
 /// One row as `vox room read` and `tail` print it: `<entry-hash> <author> <text>`, the author
 /// by this node's name for it, or its fingerprint when it has none (V210-162).
 ///

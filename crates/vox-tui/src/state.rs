@@ -849,16 +849,56 @@ impl UiState {
                 Action::Redraw
             }
             KeyCode::PageUp if self.screen == Screen::Channel => {
-                self.timeline_scroll = self.timeline_scroll.saturating_add(TIMELINE_PAGE);
+                if matches!(self.showing, Showing::Session(..)) {
+                    if let Some(command) = self.older_session(vm) {
+                        return Action::Dispatch(command);
+                    }
+                    let last = vm
+                        .active
+                        .as_ref()
+                        .map_or(0, |c| c.session_lines.len().saturating_sub(1));
+                    self.selected_session_line = Some(
+                        self.selected_session_line
+                            .unwrap_or(last)
+                            .saturating_sub(TIMELINE_PAGE),
+                    );
+                } else {
+                    if let Some(active) = vm.active.as_ref().filter(|c| c.room_older > 0) {
+                        let first = active.timeline.iter().find(|row| match &self.showing {
+                            Showing::Tag(tag) => row.tags.contains(tag),
+                            _ => true,
+                        });
+                        if first.is_none_or(|row| self.on_screen.contains(&row.entry_hash)) {
+                            if let Some(channel_id) = self.active_channel_id(vm) {
+                                return Action::Dispatch(Command::OlderRoom { channel_id });
+                            }
+                        }
+                    }
+                    self.timeline_scroll = self.timeline_scroll.saturating_add(TIMELINE_PAGE);
+                }
                 Action::Redraw
             }
             KeyCode::PageDown if self.screen == Screen::Channel => {
-                self.timeline_scroll = self.timeline_scroll.saturating_sub(TIMELINE_PAGE);
+                if matches!(self.showing, Showing::Session(..)) {
+                    let last = vm
+                        .active
+                        .as_ref()
+                        .map_or(0, |c| c.session_lines.len().saturating_sub(1));
+                    self.selected_session_line = Some(
+                        self.selected_session_line
+                            .unwrap_or(last)
+                            .saturating_add(TIMELINE_PAGE)
+                            .min(last),
+                    );
+                } else {
+                    self.timeline_scroll = self.timeline_scroll.saturating_sub(TIMELINE_PAGE);
+                }
                 Action::Redraw
             }
             KeyCode::End if self.screen == Screen::Channel => {
                 self.timeline_scroll = 0;
                 self.selected_message = None;
+                self.selected_session_line = None;
                 Action::Redraw
             }
             _ => Action::Redraw,
