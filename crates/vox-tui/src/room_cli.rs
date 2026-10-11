@@ -3544,10 +3544,15 @@ pub async fn get_file(
     let mut before = None;
     'pages: while offers.is_empty() {
         let which = vox_core::node::drive::SessionFilter::FilesOut;
-        let Ok(Frame::SessionPage { rows, older }) =
-            client.session_page(channel_id, which, before).await
-        else {
-            break;
+        let (rows, older) = match client.session_page(channel_id, which, before).await {
+            Ok(Frame::SessionPage { rows, older }) => (rows, older),
+            Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+            Ok(other) => return Err(crate::client::unexpected(&other)),
+            Err(error) => {
+                return Err(AppError::Usage(format!(
+                    "could not search the Session's files: {error}"
+                )))
+            }
         };
         before = rows.first().map(|r| r.entry_hash).filter(|_| older > 0);
         {
