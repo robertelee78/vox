@@ -2308,6 +2308,83 @@ fn a_full_room_recovers_and_keeps_its_session_entries() {
         assert!(status.contains("cannot save") && (status.contains("No space") || status.contains("os error 28")) && !status.contains("healthy: nothing"),
             "PRODUCT: a full room concealed the OS error or claimed healthy: post={failure}; status={status}{err}");
         println!("[proof] failed write and status: {failure}{status}");
+        // The terminal UI is the actual product on a PTY; no app clicks or private values.
+        use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem as _};
+        use std::io::Read as _;
+        let pair = NativePtySystem::default()
+            .openpty(PtySize {
+                rows: 50,
+                cols: 200,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("APPARATUS: TUI pty");
+        let mut cmd = CommandBuilder::new(VOX);
+        cmd.env_clear();
+        for (key, value) in [
+            ("HOME", root.join("home").display().to_string()),
+            ("VOX_DATA_DIR", w.data.display().to_string()),
+            ("VOX_CONFIG_DIR", w.cfg.display().to_string()),
+            ("VOX_NODE", AGENT.to_owned()),
+            ("TERM", "xterm-256color".to_owned()),
+            ("PATH", "/usr/bin:/bin".to_owned()),
+            ("VOX_PROXY", "127.0.0.1:0".to_owned()),
+        ] {
+            cmd.env(key, value);
+        }
+        struct Tui(Box<dyn portable_pty::Child + Send + Sync>);
+        impl Drop for Tui {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let tui = Tui(pair.slave.spawn_command(cmd).expect("APPARATUS: start TUI"));
+        drop(pair.slave);
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .expect("APPARATUS: TUI reader");
+        let mut input = pair.master.take_writer().expect("APPARATUS: TUI writer");
+        let screen = std::sync::Arc::new(std::sync::Mutex::new(vt100::Parser::new(50, 200, 0)));
+        let sink = std::sync::Arc::clone(&screen);
+        let master = pair.master;
+        std::thread::spawn(move || {
+            let _master = master;
+            let mut bytes = [0; 8192];
+            while let Ok(n) = reader.read(&mut bytes) {
+                if n == 0 {
+                    break;
+                }
+                sink.lock().unwrap().process(&bytes[..n]);
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let shown = screen.lock().unwrap().screen().contents();
+            if shown.contains("cannot save") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PRODUCT: TUI room list hid cannot-save state: {shown}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        input.write_all(b"\r").expect("APPARATUS: select room");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let shown = screen.lock().unwrap().screen().contents();
+            if shown.contains("No space left on device") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PRODUCT: TUI room hid its original OS cause: {shown}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
         prompt["prompt"] = "held while the room cannot save".into();
         w.hook_done(&room, &prompt);
         std::fs::remove_file(&filler).expect("APPARATUS: free disk space");
@@ -2337,6 +2414,22 @@ fn a_full_room_recovers_and_keeps_its_session_entries() {
             "PRODUCT: recovered room still refused a post: {out}{err}"
         );
         println!("[proof] room recovered without restarting; held entry reached its Session: {seen}{status}");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let shown = screen.lock().unwrap().screen().contents();
+            if shown.contains("recovered; it can save again") && !shown.contains("cannot save") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PRODUCT: TUI did not replace cannot-save with recovered: {shown}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        println!(
+            "[proof] TUI showed cannot-save and OS cause, then recovered and cleared the failure"
+        );
+        drop(tui);
         drop(daemon);
         drop(disk_guard);
     }

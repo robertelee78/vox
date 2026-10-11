@@ -2030,7 +2030,14 @@ impl DaemonCore {
                 })
         });
         ViewModel {
-            notice: self.notice.clone(),
+            // Health is persistent, unlike action notices dismissed by Enter. Keep the full
+            // OS cause visible even when the sidebar truncates it or the timeline is scrolled.
+            notice: self
+                .room_save_errors
+                .values()
+                .next()
+                .cloned()
+                .or_else(|| self.notice.clone()),
             channels,
             active,
             sync: match snap.connected_peers.len() {

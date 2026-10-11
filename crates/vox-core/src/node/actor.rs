@@ -16164,11 +16164,16 @@ impl Node {
             .and_then(|n| n.local_endpoints().ok())
             .map(|eps| eps.addrs().iter().map(ToString::to_string).collect())
             .unwrap_or_default();
-        let known: Vec<Digest32> = self
+        let mut known: Vec<Digest32> = self
             .profile
             .as_ref()
             .and_then(|p| p.store().channels().ok())
-            .unwrap_or_default();
+            .unwrap_or_else(|| prev.channels.iter().map(|c| c.channel_id).collect());
+        // A store being recovered may not answer reads yet. Its open rooms and the last
+        // saved list remain visible, with their cannot-save cause, throughout that retry.
+        known.extend(self.channels.keys().copied());
+        known.sort_unstable();
+        known.dedup();
         let anchoring = self
             .net
             .as_ref()

@@ -177,19 +177,60 @@ impl Store {
     }
 
     /// Reopen after a failed write, retaining the profile lock for the whole transition.
-    /// An empty durable transaction proves writes work before a poisoned room is reopened.
-    pub fn reopen_after_write_failure(&self) -> Result<()> {
+    /// Rewrite this room's persisted sealed state durably through the same allocation and
+    /// commit path that failed. An empty transaction can succeed on a full filesystem and
+    /// cannot establish that a room can save. The failed user operation is never replayed.
+    pub fn reopen_after_write_failure(&self, channel: &Digest32) -> Result<()> {
         let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
         drop(std::mem::replace(&mut *backing, Backing::Closed));
-        let db = Database::create(&self.path).map_err(open_error)?;
+        let db = match Database::create(&self.path) {
+            Ok(db) => db,
+            Err(e) => {
+                // A failed writable reopen must not hide saved rooms while waiting to retry.
+                if let Ok(db) = redb::Builder::new().open_read_only(&self.path) {
+                    *backing = Backing::ReadOnly(db);
+                }
+                return Err(open_error(e));
+            }
+        };
         *backing = Backing::Writable(db);
         let Backing::Writable(db) = &*backing else {
             unreachable!()
         };
-        db.begin_write()
-            .map_err(storage("retry write"))?
-            .commit()
-            .map_err(storage("retry commit"))
+        let original = db.begin_read().map_err(storage("retry read"))?;
+        let txn = db.begin_write().map_err(storage("retry write"))?;
+        {
+            let saved = original
+                .open_table(SEGMENTS)
+                .map_err(storage("retry read segments"))?;
+            let mut writable = txn
+                .open_table(SEGMENTS)
+                .map_err(storage("retry write segments"))?;
+            let lo: SegmentKey = (*channel, 0, 0);
+            let hi: SegmentKey = (*channel, u8::MAX, u64::MAX);
+            for row in saved
+                .range(lo..=hi)
+                .map_err(storage("retry room segments"))?
+            {
+                let (key, value) = row.map_err(storage("retry room segment"))?;
+                writable
+                    .insert(key.value(), value.value())
+                    .map_err(storage("retry save segment"))?;
+            }
+            let wraps = original
+                .open_table(SEK_WRAPS)
+                .map_err(storage("retry read room wrap"))?;
+            if let Some(wrap) = wraps
+                .get(*channel)
+                .map_err(storage("retry read room wrap"))?
+            {
+                txn.open_table(SEK_WRAPS)
+                    .map_err(storage("retry write room wrap"))?
+                    .insert(*channel, wrap.value())
+                    .map_err(storage("retry save room wrap"))?;
+            }
+        }
+        txn.commit().map_err(storage("retry commit room"))
     }
 
     /// Reopen a read-only store writable; a no-op for one that already is.
