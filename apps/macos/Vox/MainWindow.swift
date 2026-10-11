@@ -2227,7 +2227,7 @@ private struct LanHelperSheet: View {
             .accessibilityElement(children: .combine)
             .accessibilityIdentifier("lan-helper-steps")
             HStack(spacing: Space.s8) {
-                ProgressView().controlSize(.small)
+                Image(systemName: "person.crop.circle.badge.exclamationmark")
                 Text("Waiting for you to allow it…").secondaryText()
             }
             .accessibilityElement(children: .combine)
@@ -2271,6 +2271,10 @@ private struct StatusBar: View {
                     .accessibilityIdentifier("notifications-off")
             }
             Spacer()
+            if let progress = model.progressWords {
+                ProgressView(progress).controlSize(.small)
+                    .accessibilityIdentifier("action-progress")
+            }
             if let ended = model.ended {
                 StateMark(kind: .danger, words: ended)
             } else if let outcome = model.outcome {
