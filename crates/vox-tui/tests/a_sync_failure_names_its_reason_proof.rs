@@ -342,10 +342,18 @@ fn a_sync_that_did_not_complete_says_why() {
         ok,
         "APPARATUS: Carol could not join before departure: {out}{err}"
     );
+    let (ok, out, err) = vox_once(
+        &alice_dir,
+        &args(&["room", "post", &room, "hello after Carol joined"]),
+    );
+    assert!(
+        ok,
+        "APPARATUS: Alice could not post after Carol joined: {out}{err}"
+    );
     let deadline = Instant::now() + TIMEOUT;
     loop {
         let (_, read, _) = vox_once(&carol_dir, &args(&["room", "read", &room]));
-        if read.contains("hello from alice") {
+        if read.contains("hello after Carol joined") {
             break;
         }
         assert!(
