@@ -288,6 +288,9 @@ final class NodeModel: ObservableObject {
     @Published var keyringAsk: KeyringAsk?
     @Published private(set) var nodes: [NodeSummary] = []
     @Published private(set) var peers = 0
+    /// Last-known states are never presented as current while the daemon cannot be reached.
+    @Published private(set) var daemonReachable = true
+    var peerWords: String { daemonReachable ? (peers == 1 ? "1 peer" : "\(peers) peers") : "peers unknown" }
     /// The keyring window, as the TUI's status bar says it (K-9).
     @Published private(set) var keyring = ""
     /// Whether the LAN helper is approved, so the family LAN may be offered (ADR-014 M-12).
@@ -406,6 +409,7 @@ final class NodeModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
                 guard let self else { return }
                 await self.readFacts()
+                guard self.daemonReachable else { continue }
                 await self.readWaiting()
                 await self.readNewOnScreen()
             }
@@ -430,6 +434,33 @@ final class NodeModel: ObservableObject {
     /// The keyring, the nodes on this Mac, the peers and the keyring window, assigned only when
     /// they changed; and who trusts back, while the keyring is on screen.
     private func readFacts() async {
+        // Reachability first: failed reads must not leave stale node/peer states visible.
+        do {
+            let fresh = try await client.nodes()
+            let recovering = !daemonReachable
+            if fresh != nodes { nodes = fresh }
+            if fresh.first(where: { $0.name == node })?.state != "attached" {
+                daemonReachable = true
+                ended = "Node \(node) is detached."
+                peers = 0
+                return
+            }
+            let view = try await client.view()
+            daemonReachable = true
+            if Int(view.peers) != peers { peers = Int(view.peers) }
+            if view.keyring != keyring { keyring = view.keyring }
+            if fresh.first(where: { $0.name == node })?.state == "attached" {
+                ended = nil
+            }
+            if recovering {
+                if outcome?.operation == "" { outcome = nil }
+                try await client.subscribe(listener: Listener(model: self))
+            }
+        } catch {
+            daemonReachable = false
+            reportBackground(error)
+            return
+        }
         if let keyring = try? await client.trustList(), keyring != trusted { trusted = keyring }
         if let waiting = try? await client.pendingOffers(), waiting != offers { offers = waiting }
         await readRoomAsks()
@@ -439,11 +470,6 @@ final class NodeModel: ObservableObject {
             if rooms[i].offered != here.count { rooms[i].offered = here.count }
             let said = here.first.map { "\($0.short)… \($0.whyWords) — trust?" } ?? ""
             if rooms[i].offerSaid != said { rooms[i].offerSaid = said }
-        }
-        if let fresh = try? await client.nodes(), fresh != nodes { nodes = fresh }
-        if let view = try? await client.view() {
-            if Int(view.peers) != peers { peers = Int(view.peers) }
-            if view.keyring != keyring { keyring = view.keyring }
         }
         await recheckLanHelper()
         if selection == .keyring {
@@ -1485,6 +1511,9 @@ final class NodeModel: ObservableObject {
 
     fileprivate func stopped(_ text: String) {
         ended = text
+        if text.localizedCaseInsensitiveContains("daemon") {
+            daemonReachable = false
+        }
     }
 
     /// Attach this node again after it stopped, with `secret` if it needs its passphrase, and
