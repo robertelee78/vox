@@ -4596,8 +4596,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             let end = match before {
                 None => detail.timeline.len(),
                 Some(hash) => {
-                    let prefix =
-                        u64::from_be_bytes(hash[..8].try_into().expect("eight hash bytes"));
+                    let prefix = u64::from_be_bytes([hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7]]);
                     let Some(at) = detail.row_index.find(prefix).into_iter().find(|at| {
                         detail
                             .timeline
@@ -6230,13 +6229,11 @@ impl IpcClient {
         };
         let answering = while_answering(path, node.as_ref(), exchange);
         let out = match answer_within {
-            Some(within) => tokio::time::timeout(within, answering)
-                .await
-                .unwrap_or_else(|_| {
-                    Err(Error::Ipc(IpcHandshake::RequestTimedOut {
-                        secs: within.as_secs(),
-                    }))
-                }),
+            Some(within) => tokio::time::timeout(within, answering).await.unwrap_or({
+                Err(Error::Ipc(IpcHandshake::RequestTimedOut {
+                    secs: within.as_secs(),
+                }))
+            }),
             None => answering.await,
         };
         self.broken = out.is_err();
@@ -6279,13 +6276,11 @@ impl IpcClient {
         };
         let answering = while_answering(path, node.as_ref(), exchange);
         let out = match answer_within {
-            Some(within) => tokio::time::timeout(within, answering)
-                .await
-                .unwrap_or_else(|_| {
-                    Err(Error::Ipc(IpcHandshake::RequestTimedOut {
-                        secs: within.as_secs(),
-                    }))
-                }),
+            Some(within) => tokio::time::timeout(within, answering).await.unwrap_or({
+                Err(Error::Ipc(IpcHandshake::RequestTimedOut {
+                    secs: within.as_secs(),
+                }))
+            }),
             None => answering.await,
         };
         self.broken = out.is_err();
