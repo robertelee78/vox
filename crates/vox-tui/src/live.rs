@@ -621,6 +621,30 @@ impl DaemonCore {
         let Some(answer) = until_stopped(&self.rt, &self.stop, conn.client.request(request)) else {
             return Err(Lost::Gone("stopping".into()));
         };
+        self.answered(answer)
+    }
+
+    /// A room's Session entries, the Session `session_id`'s or every Session's, read in pages
+    /// (ADR-034 FR-1); `None` when the node did not list them.
+    fn session_entries(
+        &mut self,
+        room: Digest32,
+        session_id: Option<&str>,
+    ) -> Option<Vec<vox_core::node::drive::SessionRow>> {
+        let conn = self.conn.as_mut()?;
+        let answer = until_stopped(
+            &self.rt,
+            &self.stop,
+            conn.client.session_entries(room, session_id),
+        )?;
+        match self.answered(answer) {
+            Ok(Frame::SessionPage { rows, .. }) => Some(rows),
+            _ => None,
+        }
+    }
+
+    /// What the daemon's `answer` means here: a detach and a lost daemon said once.
+    fn answered(&mut self, answer: vox_core::error::Result<Frame>) -> Result<Frame, Lost> {
         match answer {
             Ok(Frame::NodeDetached { .. }) => {
                 self.detached();
@@ -1255,18 +1279,16 @@ impl DaemonCore {
             if drivable.is_empty() {
                 continue;
             }
-            let Ok(Frame::SessionEntries { rows }) =
-                self.request(&Request::SessionEntries { channel_id: room })
-            else {
-                continue;
-            };
-            let names = SessionNames {
-                trusted: &self.snapshot.trusted,
-                me: self.snapshot.me,
-            };
             let mut n = 0;
             for (node, id) in &drivable {
-                let mine = crate::session_cli::of_session(rows.clone(), id, node);
+                let Some(rows) = self.session_entries(room, Some(id)) else {
+                    continue;
+                };
+                let names = SessionNames {
+                    trusted: &self.snapshot.trusted,
+                    me: self.snapshot.me,
+                };
+                let mine = crate::session_cli::of_session(rows, id, node);
                 let here = crate::session_cli::lines(&mine, "", &names)
                     .iter()
                     .filter(|l| l.waiting.is_some())
@@ -1296,9 +1318,7 @@ impl DaemonCore {
             return;
         }
         self.session_stale = false;
-        let Ok(Frame::SessionEntries { rows }) =
-            self.request(&Request::SessionEntries { channel_id: room })
-        else {
+        let Some(rows) = self.session_entries(room, Some(&id)) else {
             return;
         };
         // The Session's own entries and the drive entries naming it, in written order: as

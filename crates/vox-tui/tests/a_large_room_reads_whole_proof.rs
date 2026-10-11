@@ -26,6 +26,21 @@
 //! The maximum row is the bound a page relies on: a reply always carries at least
 //! one row, so the largest row must fit a frame by itself.
 //!
+//! **A room past one frame of Session entries reads whole** (ADR-034 FR-1, PF-1). A room's Session
+//! entries were answered in one frame: the decider's room held 2,331 (an 837 KB reply), the client
+//! failed on the frame length without reading past it, and Vox.app kept the connection it could no
+//! longer read, so every later call failed at once, a room create among them. alice's agent opens
+//! a Session through its real hook, and its node is handed 2,400 entries of about 300 bytes through
+//! its own control socket, as the hook hands them; then
+//!
+//! 5. `vox room session --json` prints every one of them, in order;
+//! 6. the app's client (`VoxClient`, the library Vox.app links), attached to alice's node on her
+//!    daemon, lists the Session in `sessions` and reads every entry in `session_read`;
+//! 7. and `create_room` on that same client then makes a room.
+//!
+//! At the real 256 KiB frame: no frame knob may be set. Mutant: the daemon answers a page with
+//! every entry (`session_page` without its budget): red PRODUCT at 5, the reply too large to send.
+//!
 //! **Every red names its side** (V210-106). `PRODUCT:` quotes what a `vox` command did: a row
 //! missing, shown twice, out of order or cut short is the product's. `APPARATUS:` is this harness
 //! failing to run a process or a runtime.
@@ -42,6 +57,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use support::{until, Out, VOX};
+use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request};
 
 /// Rows of this many bytes of body, and how many: 5 MiB, twenty frames' worth.
 const ROW: usize = 32 * 1024;
@@ -50,6 +66,25 @@ const ROWS: usize = 160;
 /// The largest text a post may carry (`vox_core::node::content::MAX_TEXT_LEN`). A plain
 /// `vox room post` stores its body as the row's text, so this row is exactly that size.
 const MAX_TEXT: usize = 64 * 1024;
+
+/// How many Session entries alice's node is handed, and about how long each is: past 2,331, the
+/// decider's room, and four frames' worth.
+const SESSION_ENTRIES: usize = 2400;
+const SESSION_ENTRY: usize = 300;
+
+/// The harness session id of alice's agent.
+const SESSION: &str = "5b1d0c6e-7a2f-4e3b-8c9d-large-room-session";
+
+/// Entry `n` of alice's Session, in the harnesses' activity format: a reply of about
+/// [`SESSION_ENTRY`] bytes, its words naming it.
+fn session_entry(n: usize) -> (String, String) {
+    let head = format!("SESSION-ENTRY-{n:04} ");
+    let text = format!("{head}{}", "y".repeat(SESSION_ENTRY - 80 - head.len()));
+    let body =
+        serde_json::json!({ "v": 1, "session": SESSION, "kind": "reply", "seq": n, "text": text })
+            .to_string();
+    (text, body)
+}
 
 fn body(i: usize, len: usize) -> String {
     let head = format!("LARGE-ROOM-{i:03} ");
@@ -231,6 +266,159 @@ fn a_room_past_one_frame_of_history_reads_whole() {
         "PRODUCT: `vox room board --json` over a large room answered another schema: {}",
         board.stdout
     );
+
+    // ---- 5–7: a room past one frame of Session entries (ADR-034 FR-1) ----
+    assert!(
+        std::env::var_os("VOX_TEST_MAX_FRAME").is_none(),
+        "APPARATUS: VOX_TEST_MAX_FRAME is set; this proof runs at the real 256 KiB frame"
+    );
+    // alice's node, whatever `vox id` named it.
+    let node = match alice.paths.account().nodes_on_disk().as_slice() {
+        [one] => one.clone(),
+        many => panic!(
+            "APPARATUS: alice's data root holds {} nodes, not one",
+            many.len()
+        ),
+    };
+    // alice's agent opens its Session through its real hook, as Claude Code runs it.
+    let hooked = alice.vox_env(
+        None,
+        &[("CLAUDE_CODE_ENTRYPOINT", "cli")],
+        &["agent", "hook", "--node", node.as_str(), "--room", r],
+        Some(&format!(
+            r#"{{"session_id":"{SESSION}","hook_event_name":"UserPromptSubmit","cwd":"/tmp","transcript_path":"/tmp/t.jsonl","prompt":"go"}}"#
+        )),
+    );
+    // The hook never fails its harness: what it could not do, it says on stderr.
+    assert!(
+        hooked.ok && hooked.stderr.trim().is_empty(),
+        "PRODUCT (staging): alice's agent hook did not open its Session: {hooked:?}"
+    );
+    // Its entries, handed to alice's node on its control socket as the hook hands them.
+    let entries: Vec<(String, String)> = (1..=SESSION_ENTRIES).map(session_entry).collect();
+    let staged: usize = entries.iter().map(|(_, b)| b.len()).sum();
+    assert!(
+        staged > 2 * vox_core::node::ipc::MAX_FRAME,
+        "APPARATUS: this proof stages more than two frames of Session entries, not {staged} bytes"
+    );
+    rt.block_on(async {
+        let at = NodeSocket::one_shot(alice.paths.account().socket(), node.clone());
+        let mut c = IpcClient::open_at(&at)
+            .await
+            .unwrap_or_else(|e| panic!("PRODUCT (staging): alice's node did not answer: {e}"));
+        for (_, body) in &entries {
+            let req = Request::AppendSession {
+                channel_id: room.cid,
+                session_id: SESSION.to_owned(),
+                body: body.clone(),
+            };
+            match c.request(&req).await {
+                Ok(Frame::Appended { .. }) => {}
+                other => {
+                    panic!("PRODUCT (staging): alice's node refused a Session entry: {other:?}")
+                }
+            }
+        }
+    });
+    let wanted: Vec<String> = entries.iter().map(|(t, _)| format!("reply: {t}")).collect();
+    eprintln!("[proof] {SESSION_ENTRIES} Session entries staged, {staged} bytes of body");
+
+    // 5. `vox room session --json`.
+    let shown = alice.vox(None, &["room", "session", r, SESSION, "--json"]);
+    assert!(
+        shown.ok,
+        "PRODUCT: `vox room session --json` over {SESSION_ENTRIES} Session entries failed: {}",
+        shown.stderr.trim()
+    );
+    let lines: Vec<String> = shown
+        .ndjson()
+        .iter()
+        .filter(|v| v["kind"] == "reply")
+        .filter_map(|v| v["line"].as_str().map(str::to_owned))
+        .collect();
+    same_entries("vox room session --json", &lines, &wanted);
+
+    // 6. The app's client, attached to alice's node on her daemon.
+    let pass = |p: &str| {
+        vox_ffi::Passphrase::new(p.as_bytes().to_vec())
+            .unwrap_or_else(|e| panic!("APPARATUS: a passphrase: {e}"))
+    };
+    let data = alice.data.to_string_lossy().into_owned();
+    let client = rt
+        .block_on(vox_ffi::VoxClient::open(data))
+        .unwrap_or_else(|e| {
+            panic!("PRODUCT (staging): the app's client did not reach alice's daemon: {e}")
+        });
+    rt.block_on(client.attach(node.as_str().to_owned(), Some(pass(support::ID_PASS))))
+        .unwrap_or_else(|e| {
+            panic!("PRODUCT (staging): the app's client did not attach alice's node: {e}")
+        });
+    let listed = rt.block_on(client.sessions(room.id.clone()));
+    let listed = listed.unwrap_or_else(|e| {
+        panic!("PRODUCT: the app's `sessions` over {SESSION_ENTRIES} Session entries failed: {e}")
+    });
+    assert!(
+        listed.iter().any(|s| s.session_id == SESSION),
+        "PRODUCT: the app's `sessions` does not list alice's Session: {listed:?}"
+    );
+    let read = rt
+        .block_on(client.session_read(room.id.clone(), alice.b32(), SESSION.to_owned()))
+        .unwrap_or_else(|e| {
+            panic!("PRODUCT: the app's `session_read` over {SESSION_ENTRIES} Session entries failed: {e}")
+        });
+    let app_lines: Vec<String> = read
+        .entries
+        .iter()
+        .map(|e| e.line.clone())
+        .filter(|l| l.starts_with("reply: "))
+        .collect();
+    same_entries("the app's session_read", &app_lines, &wanted);
+
+    // 7. And the client still works: a room is made on it.
+    let made =
+        rt.block_on(client.create_room("after-the-large-read".into(), pass(support::ROOM_PASS)));
+    rt.block_on(client.close());
+    let made = made.unwrap_or_else(|e| {
+        panic!(
+            "PRODUCT: the app's `create_room` after reading the large room's Sessions failed: {e}"
+        )
+    });
+    eprintln!(
+        "[proof] the CLI printed {} entries, the app read {}, and made room {made}",
+        lines.len(),
+        app_lines.len()
+    );
+}
+
+/// Assert that `got`, the Session lines `verb` showed, are `wanted`'s entries: each once, in order,
+/// and each line the start of its entry's line. A red says which, and is the product's.
+fn same_entries(verb: &str, got: &[String], wanted: &[String]) {
+    let name = |l: &str| {
+        l.split(' ')
+            .find(|w| w.starts_with("SESSION-ENTRY-"))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert!(
+        got.len() == wanted.len(),
+        "PRODUCT: `{verb}` shows {} of the {} Session entries; the first missing is {:?}",
+        got.len(),
+        wanted.len(),
+        wanted
+            .iter()
+            .map(|w| name(w))
+            .find(|n| !got.iter().any(|g| name(g) == *n))
+    );
+    for (g, w) in got.iter().zip(wanted) {
+        // A line is cut to one line's length and ends "…" then.
+        let shown = g.strip_suffix('…').unwrap_or(g);
+        assert!(
+            name(g) == name(w) && w.starts_with(shown),
+            "PRODUCT: `{verb}` shows {:?} where {} was written, in that place",
+            g.chars().take(60).collect::<String>(),
+            name(w)
+        );
+    }
 }
 
 /// Assert that `got`, the large rows `verb` showed bob, are `sent`: each once, whole and in the

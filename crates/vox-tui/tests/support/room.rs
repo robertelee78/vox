@@ -46,7 +46,7 @@ pub const TIMEOUT: Duration = Duration::from_secs(60);
 /// bound — nothing a person runs waits on it — so it is sized to never be the thing that fails.
 const DAEMON_START_PATIENCE: Duration = Duration::from_secs(240);
 
-const ID_PASS: &str = "identity passphrase";
+pub const ID_PASS: &str = "identity passphrase";
 pub const ROOM_PASS: &str = "channel passphrase";
 
 /// Everything a harness might have put in this process's environment that would

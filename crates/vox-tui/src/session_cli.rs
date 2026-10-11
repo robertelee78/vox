@@ -60,11 +60,11 @@ pub async fn show(
     json: bool,
 ) -> Result<(), crate::app::AppError> {
     use crate::app::AppError;
-    use vox_core::node::ipc::{Frame, Request};
+    use vox_core::node::ipc::Frame;
     let mut client = crate::room_cli::attach(paths).await?;
     let channel_id = crate::room_cli::room_of(&mut client, room).await?;
-    let sessions = match client.request(&Request::Sessions { channel_id }).await {
-        Ok(Frame::Sessions { sessions }) => sessions,
+    let sessions = match client.sessions(channel_id).await {
+        Ok(Frame::SessionsPage { sessions, .. }) => sessions,
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
         Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
@@ -76,11 +76,13 @@ pub async fn show(
             &s.id,
         )
     };
-    let rows = match client
-        .request(&Request::SessionEntries { channel_id })
-        .await
-    {
-        Ok(Frame::SessionEntries { rows }) => rows,
+    // Only the named Session's entries, when the room's Sessions name it; else every Session's,
+    // among which `read` looks for one whose opening has not arrived yet.
+    let named = vox_core::node::sessions::resolve(&sessions, session, true, label_of)
+        .ok()
+        .map(|s| s.id.clone());
+    let rows = match client.session_entries(channel_id, named.as_deref()).await {
+        Ok(Frame::SessionPage { rows, .. }) => rows,
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
         Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),

@@ -858,7 +858,7 @@ async fn sessions_addressable(
     if addressed.is_empty() {
         return Ok(());
     }
-    let (sessions, _, known) = session_parts(c, channel_id).await?;
+    let (sessions, known) = sessions_known(c, channel_id).await?;
     for (fp, id) in addressed {
         match vox_core::node::sessions::addressable(&sessions, fp, id, |s| known.label(s)) {
             Ok(found) if found == *id => {}
@@ -881,17 +881,49 @@ type SessionParts = (
     Known,
 );
 
-/// A room's Sessions, the Session entries this node holds there, and how it names nodes.
-async fn session_parts(c: &mut IpcClient, channel_id: Digest32) -> Result<SessionParts, VoxError> {
-    let sessions = match ask(c, &Request::Sessions { channel_id }).await? {
-        Frame::Sessions { sessions } => sessions,
-        other => return Err(unexpected(&other)),
+/// A room's Sessions and how this node names nodes.
+async fn sessions_known(
+    c: &mut IpcClient,
+    channel_id: Digest32,
+) -> Result<(Vec<vox_core::node::sessions::SessionRow>, Known), VoxError> {
+    let sessions = room_sessions(c, channel_id).await?;
+    Ok((sessions, Known::of(c).await?))
+}
+
+/// A room's Sessions, read in pages (ADR-034 FR-1).
+async fn room_sessions(
+    c: &mut IpcClient,
+    channel_id: Digest32,
+) -> Result<Vec<vox_core::node::sessions::SessionRow>, VoxError> {
+    match c.sessions(channel_id).await {
+        Ok(Frame::SessionsPage { sessions, .. }) => Ok(sessions),
+        Ok(other) => Err(unexpected(&answered(other)?)),
+        Err(e) => Err(listing_failed("a room's Sessions", e)),
+    }
+}
+
+/// A paged listing whose answer did not come, or could not be read: not known to be whole, so
+/// not shown.
+fn listing_failed(what: &str, e: Error) -> VoxError {
+    VoxError::Unknown {
+        reason: format!("the vox daemon's answer listing {what} could not be read: {e}"),
+    }
+}
+
+/// A room's Sessions, the Session entries this node holds there (only the Session `session_id`'s
+/// when one is named), read in pages (ADR-034 FR-1), and how it names nodes.
+async fn session_parts(
+    c: &mut IpcClient,
+    channel_id: Digest32,
+    session_id: Option<&str>,
+) -> Result<SessionParts, VoxError> {
+    let (sessions, known) = sessions_known(c, channel_id).await?;
+    let rows = match c.session_entries(channel_id, session_id).await {
+        Ok(Frame::SessionPage { rows, .. }) => rows,
+        Ok(other) => return Err(unexpected(&answered(other)?)),
+        Err(e) => return Err(listing_failed("Session entries", e)),
     };
-    let rows = match ask(c, &Request::SessionEntries { channel_id }).await? {
-        Frame::SessionEntries { rows } => rows,
-        other => return Err(unexpected(&other)),
-    };
-    Ok((sessions, rows, Known::of(c).await?))
+    Ok((sessions, rows, known))
 }
 
 /// The open requests in the Session `s` that this node may answer: none without drive.
@@ -1077,7 +1109,7 @@ struct SessionsSeen {
 
 /// A room's Sessions as the app hears of them; `None` when the node will not say.
 async fn sessions_seen(c: &mut IpcClient, room: Digest32) -> Option<SessionsSeen> {
-    let (sessions, rows, known) = session_parts(c, room).await.ok()?;
+    let (sessions, rows, known) = session_parts(c, room, None).await.ok()?;
     let mut seen = SessionsSeen {
         sessions: sessions
             .iter()
@@ -1128,6 +1160,32 @@ struct Held {
 struct Lan {
     stop: tokio::sync::oneshot::Sender<()>,
     said: Arc<Mutex<Vec<String>>>,
+}
+
+impl Held {
+    /// Replace the connection if an exchange on it failed (ADR-034 WT-2, FR-3): its next reply
+    /// might be an earlier request's. The new one holds the node as the old one did, opened while
+    /// the old one still holds it, so the node stays attached between them and no passphrase is
+    /// needed again.
+    ///
+    /// # Errors
+    /// The new connection could not be opened, in the daemon's words; the old one is kept, broken,
+    /// and the next call tries again.
+    async fn mend(&mut self) -> Result<(), VoxError> {
+        if !self.client.is_broken() {
+            return Ok(());
+        }
+        let mut again = self.at.clone();
+        again.using.attach = AttachMode::Hold;
+        self.client = IpcClient::open_at(&again).await.map_err(|e| {
+            failed(format!(
+                "the app's connection to node {} broke, and a new one could not be opened: {}",
+                self.node,
+                said(&self.at.path, e)
+            ))
+        })?;
+        Ok(())
+    }
 }
 
 type Slot = Arc<tokio::sync::Mutex<Option<Held>>>;
@@ -1480,7 +1538,9 @@ macro_rules! on_held {
         $self
             .on_rt(async move {
                 let mut slot = held.lock().await;
-                let $c = &mut slot.as_mut().ok_or_else(not_attached)?.client;
+                let h = slot.as_mut().ok_or_else(not_attached)?;
+                h.mend().await?;
+                let $c = &mut h.client;
                 $body
             })
             .await
@@ -2808,7 +2868,7 @@ impl VoxClient {
     pub async fn sessions(&self, room: String) -> Result<Vec<FfiSession>, VoxError> {
         let channel_id = digest(&room, "room id")?;
         on_held!(self, |c| {
-            let (sessions, rows, known) = session_parts(c, channel_id).await?;
+            let (sessions, rows, known) = session_parts(c, channel_id, None).await?;
             Ok(sessions
                 .iter()
                 .map(|s| FfiSession {
@@ -2853,7 +2913,7 @@ impl VoxClient {
             .map(|p| (p.entry, p.path))
             .collect();
         on_held!(self, |c| {
-            let (sessions, rows, known) = session_parts(c, channel_id).await?;
+            let (sessions, rows, known) = session_parts(c, channel_id, Some(&session_id)).await?;
             let r = read(
                 &sessions,
                 rows,
@@ -2944,11 +3004,9 @@ impl VoxClient {
             let (at, node, trusted, action, shown) = {
                 let mut slot = held.lock().await;
                 let h = slot.as_mut().ok_or_else(not_attached)?;
+                h.mend().await?;
                 let names = names(&mut h.client).await?;
-                let sessions = match ask(&mut h.client, &Request::Sessions { channel_id }).await? {
-                    Frame::Sessions { sessions } => sessions,
-                    other => return Err(unexpected(&other)),
-                };
+                let sessions = room_sessions(&mut h.client, channel_id).await?;
                 let row = sessions
                     .into_iter()
                     .find(|s| s.id == session && s.open)
@@ -3085,6 +3143,7 @@ impl VoxClient {
             let found = {
                 let mut slot = held.lock().await;
                 let h = slot.as_mut().ok_or_else(not_attached)?;
+                h.mend().await?;
                 match ask(&mut h.client, &Request::Decisions { limit: u64::MAX }).await? {
                     Frame::Decisions { events } => events,
                     other => return Err(unexpected(&other)),
@@ -3604,6 +3663,7 @@ impl VoxClient {
                 async move {
                     let mut slot = held.lock().await;
                     let h = slot.as_mut().ok_or_else(not_attached)?;
+                    h.mend().await?;
                     let mut stream = IpcClient::open_at(&h.at)
                         .await
                         .map_err(|e| said(&socket, e))?;
@@ -3729,6 +3789,10 @@ async fn follow(
                     listener.on_ended("the app released its node".to_owned());
                     return;
                 };
+                if let Err(e) = h.mend().await {
+                    listener.on_ended(e.to_string());
+                    return;
+                }
                 let rows = match h.client.read_rows(room, since).await {
                     Ok(Frame::Rows { rows }) => rows,
                     Ok(Frame::NodeDetached { node }) => {
@@ -3801,6 +3865,9 @@ async fn sessions_told(
                 listener.on_ended("the app released its node".to_owned());
                 return false;
             };
+            if h.mend().await.is_err() {
+                continue;
+            }
             match sessions_seen(&mut h.client, room).await {
                 Some(now) => now,
                 None => continue,

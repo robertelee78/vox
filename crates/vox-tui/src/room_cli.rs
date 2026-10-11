@@ -410,8 +410,8 @@ async fn sessions_of(
     client: &mut IpcClient,
     channel_id: Digest32,
 ) -> Result<Vec<vox_core::node::sessions::SessionRow>, AppError> {
-    match client.request(&Request::Sessions { channel_id }).await {
-        Ok(Frame::Sessions { sessions }) => Ok(sessions),
+    match client.sessions(channel_id).await {
+        Ok(Frame::SessionsPage { sessions, .. }) => Ok(sessions),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
         Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
@@ -1752,12 +1752,7 @@ pub async fn sessions(paths: &Paths, room: &str, json: bool) -> Result<(), AppEr
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
     crate::ident::load_names(&mut client).await;
-    let rows = match client.request(&Request::Sessions { channel_id }).await {
-        Ok(Frame::Sessions { sessions }) => sessions,
-        Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-        Ok(other) => return Err(crate::client::unexpected(&other)),
-        Err(e) => return Err(AppError::Usage(e.to_string())),
-    };
+    let rows = sessions_of(&mut client, channel_id).await?;
     let label = |s: &vox_core::node::sessions::SessionRow| {
         vox_agentcomms::envelope::session_label(
             &crate::ident::name_of(&s.node),
@@ -3453,9 +3448,7 @@ pub async fn get_file(
     // **A file a Session sent out** (ADR-029 DR-1.8, #546): announced inside the Session, so only
     // a member that can open it finds it, by its name, SHA-256, tag or entry.
     if offers.is_empty() {
-        if let Ok(Frame::SessionEntries { rows }) = client
-            .request(&Request::SessionEntries { channel_id })
-            .await
+        if let Ok(Frame::SessionPage { rows, .. }) = client.session_entries(channel_id, None).await
         {
             let me = client.me();
             for r in rows.iter().rev().filter(|r| Some(r.author) != me) {
