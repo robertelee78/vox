@@ -4578,7 +4578,7 @@ fn one_line(text: &str) -> String {
 /// connection: a client that asked for a room it does not have should be told so
 /// and be able to ask something else.
 async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
-    match request {
+    let frame = match request {
         Request::RoomPage {
             channel_id,
             before,
@@ -5834,7 +5834,26 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 }),
             }
         }
+    };
+    // A failed room write retains the operating system's cause through the public reply.
+    if let Frame::Error { reason } = &frame {
+        if reason == crate::node::api::Fault::Storage.explain() {
+            if let Ok(status) = handle.status().await {
+                let causes = status
+                    .unhealthy
+                    .iter()
+                    .filter(|u| u.key.starts_with("room-store:"))
+                    .map(|u| u.message.as_str())
+                    .collect::<Vec<_>>();
+                if !causes.is_empty() {
+                    return Frame::Error {
+                        reason: causes.join("; "),
+                    };
+                }
+            }
+        }
     }
+    frame
 }
 
 /// Forward a subscription to a client until the client goes away or the node

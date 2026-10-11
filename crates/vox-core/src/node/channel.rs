@@ -973,6 +973,7 @@ pub struct ChannelState {
     /// after. Memory only, the newest [`SKIPPED_KEPT`]: a claim asks about its own post at once.
     skipped: std::collections::VecDeque<(Digest32, Vec<Digest32>)>,
     poisoned: bool,
+    save_error: Option<String>,
     /// Whether this node holds its own feed in the room as the room does (V210-164). A room
     /// joined starts without: this identity may have been in it before — it left, or its
     /// profile is new — and its earlier entries are with the other members. Writing before they
@@ -1778,6 +1779,7 @@ impl ChannelState {
             board_kept: BoardKept::default(),
             skipped: std::collections::VecDeque::new(),
             poisoned: false,
+            save_error: None,
             settled: true,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeMap::new(),
@@ -2263,6 +2265,7 @@ impl ChannelState {
             board_kept,
             skipped: std::collections::VecDeque::new(),
             poisoned: false,
+            save_error: None,
             settled,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeMap::new(),
@@ -2507,6 +2510,7 @@ impl ChannelState {
             board_kept: BoardKept::default(),
             skipped: std::collections::VecDeque::new(),
             poisoned: false,
+            save_error: None,
             settled: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeMap::new(),
@@ -2743,6 +2747,7 @@ impl ChannelState {
             &seg,
         ) {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         Ok(())
@@ -2824,6 +2829,7 @@ impl ChannelState {
             &seg,
         ) {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         Self::refresh_gov_preds(&self.dag, &mut self.gov_entries);
@@ -2871,6 +2877,7 @@ impl ChannelState {
             &seg,
         ) {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         Ok(self.anchors.len().saturating_sub(before.len()))
@@ -3093,6 +3100,7 @@ impl ChannelState {
             &seg,
         ) {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         Ok(())
@@ -3169,9 +3177,7 @@ impl ChannelState {
         now_millis: u64,
     ) -> Result<Digest32> {
         if self.poisoned {
-            return Err(Error::Profile(
-                "room is poisoned after a failed persist; reopen it",
-            ));
+            return Err(self.save_failure());
         }
         if !self.settled {
             return Err(Error::RoomNotSynced);
@@ -3198,6 +3204,7 @@ impl ChannelState {
                 .put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)
         {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         // As every other append: its page is found again when a checkpoint sheds its signature,
@@ -3252,6 +3259,7 @@ impl ChannelState {
             &seg,
         ) {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         Ok(())
@@ -3422,6 +3430,7 @@ impl ChannelState {
             &seg,
         ) {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         Ok(gone)
@@ -3612,9 +3621,7 @@ impl ChannelState {
         now_ms: u64,
     ) -> Result<u64> {
         if self.poisoned {
-            return Err(Error::Profile(
-                "room is poisoned after a failed persist; reopen it",
-            ));
+            return Err(self.save_failure());
         }
         let store = profile.store();
         let chain_id = next.chain_id();
@@ -3665,6 +3672,7 @@ impl ChannelState {
         })();
         if let Err(e) = persisted {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         let retired = self.sender.chain_id();
@@ -3968,6 +3976,7 @@ impl ChannelState {
                     &seg,
                 ) {
                     self.poisoned = true;
+                    self.save_error = Some(e.to_string());
                     return Err(e);
                 }
                 Ok(())
@@ -4025,8 +4034,9 @@ impl ChannelState {
 
     /// Mark this room poisoned: its state in memory is ahead of what reached the store, so it
     /// must be reopened before it is used (a batched write of its state failed).
-    pub fn poison(&mut self) {
+    pub fn poison(&mut self, e: &Error) {
         self.poisoned = true;
+        self.save_error = Some(e.to_string());
     }
 
     /// Mark every decision in `order` taken while this room was closed (V210-45), with no
@@ -4297,6 +4307,7 @@ impl ChannelState {
         let seg = seal_segment(&self.sek, SegmentKind::KeyMaterial, id, bytes)?;
         if let Err(e) = store.put_segment(&self.channel_id, SegmentKind::KeyMaterial, id, &seg) {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         Ok(())
@@ -4319,6 +4330,7 @@ impl ChannelState {
             store.put_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_FORKS, &seg)
         {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         self.forks_kept = kept;
@@ -4350,6 +4362,7 @@ impl ChannelState {
             &seg,
         ) {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         Ok(())
@@ -4369,6 +4382,7 @@ impl ChannelState {
             &seg,
         ) {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         Ok(())
@@ -4710,6 +4724,7 @@ impl ChannelState {
         })();
         if let Err(e) = persisted {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         Ok(pages.len())
@@ -4742,6 +4757,7 @@ impl ChannelState {
                 .put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)
         {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         self.log_ids.insert(hash, id);
@@ -4831,6 +4847,7 @@ impl ChannelState {
         })();
         if let Err(e) = persisted {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         let gone: BTreeSet<Digest32> = due.iter().map(|(h, _)| *h).collect();
@@ -4863,6 +4880,7 @@ impl ChannelState {
         )?;
         if let Err(e) = store.put_segment(&self.channel_id, SegmentKind::Index, log_id, &seg) {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         self.retention.track(
@@ -4924,9 +4942,7 @@ impl ChannelState {
         rows: &[(u64, SealedSegment)],
     ) -> Result<Digest32> {
         if self.poisoned {
-            return Err(Error::Profile(
-                "room is poisoned after a failed persist; reopen it",
-            ));
+            return Err(self.save_failure());
         }
         if !self.settled {
             return Err(Error::RoomNotSynced);
@@ -4957,6 +4973,7 @@ impl ChannelState {
         });
         if let Err(e) = written {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         self.log_ids.insert(hash, id);
@@ -5072,9 +5089,7 @@ impl ChannelState {
     ) -> Result<SyncOutcome> {
         let now_ms = now.get();
         if self.poisoned {
-            return Err(Error::Profile(
-                "room is poisoned after a failed persist; reopen it",
-            ));
+            return Err(self.save_failure());
         }
         // Per-author heads before the session, so the new entries can be found after.
         let before: BTreeMap<Digest32, u64> = self
@@ -5237,6 +5252,7 @@ impl ChannelState {
             Ok(b) => b,
             Err(e) => {
                 self.poisoned = true;
+                self.save_error = Some(e.to_string());
                 return Err(e);
             }
         };
@@ -5405,6 +5421,7 @@ impl ChannelState {
         };
         if let Err(e) = committed {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         self.chains_advanced = false;
@@ -5440,9 +5457,7 @@ impl ChannelState {
         let epoch = {
             let ch = shared.blocking_lock();
             if ch.poisoned {
-                return SessionReport::failed(SyncFailure::Poisoned(
-                    "room is poisoned after a failed persist; reopen it".to_owned(),
-                ));
+                return SessionReport::failed(SyncFailure::Poisoned(ch.save_failure().to_string()));
             }
             ch.epoch
         };
@@ -5488,9 +5503,7 @@ impl ChannelState {
     ) -> Result<usize> {
         let now_ms = now.get();
         if self.poisoned {
-            return Err(Error::Profile(
-                "room is poisoned after a failed persist; reopen it",
-            ));
+            return Err(self.save_failure());
         }
         let author = skdm.body.author_id;
         let key = self
@@ -5706,9 +5719,7 @@ impl ChannelState {
         now_millis: u64,
     ) -> Result<Digest32> {
         if self.poisoned {
-            return Err(Error::Profile(
-                "room is poisoned after a failed persist; reopen it",
-            ));
+            return Err(self.save_failure());
         }
         if !self.settled {
             return Err(Error::RoomNotSynced);
@@ -5787,6 +5798,7 @@ impl ChannelState {
         })();
         if let Err(e) = persisted {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         // An entry under the live key: a member that lost the one before can tell.
@@ -6011,6 +6023,7 @@ impl ChannelState {
             store.put_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_DRIVE, &seg)
         {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         Ok(())
@@ -6060,6 +6073,7 @@ impl ChannelState {
             &seg,
         ) {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         Ok(())
@@ -6201,6 +6215,7 @@ impl ChannelState {
         })();
         if let Err(e) = result {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         self.chains_advanced = false;
@@ -6248,6 +6263,7 @@ impl ChannelState {
         })();
         if let Err(e) = result {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         self.chains_advanced = false;
@@ -6342,6 +6358,7 @@ impl ChannelState {
                 // The chain advanced in memory but the advance was not persisted: a
                 // reopen would re-derive a consumed key. Poison instead.
                 self.poisoned = true;
+                self.save_error = Some(e.to_string());
                 Err(e)
             }
         }
@@ -6612,9 +6629,7 @@ impl ChannelState {
     ) -> Result<Accepted> {
         let now_ms = now.get();
         if self.poisoned {
-            return Err(Error::Profile(
-                "room is poisoned after a failed persist; reopen it",
-            ));
+            return Err(self.save_failure());
         }
         if entry.skeleton.channel_id != self.channel_id {
             return Err(Error::MalformedGovernance("entry binds another room"));
@@ -6669,6 +6684,7 @@ impl ChannelState {
             })?;
         if let Err(e) = store.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg) {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         self.log_ids.insert(entry_hash, id);
@@ -6787,9 +6803,7 @@ impl ChannelState {
         now_millis: u64,
     ) -> Result<&Rendered> {
         if self.poisoned {
-            return Err(Error::Profile(
-                "room is poisoned after a failed persist; reopen it",
-            ));
+            return Err(self.save_failure());
         }
         if !self.settled {
             return Err(Error::RoomNotSynced);
@@ -6890,6 +6904,7 @@ impl ChannelState {
         })();
         if let Err(e) = persisted {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         self.log_ids.insert(entry_hash, id);
@@ -7079,9 +7094,7 @@ impl ChannelState {
         now_millis: u64,
     ) -> Result<Digest32> {
         if self.poisoned {
-            return Err(Error::Profile(
-                "room is poisoned after a failed persist; reopen it",
-            ));
+            return Err(self.save_failure());
         }
         if !self.settled {
             return Err(Error::RoomNotSynced);
@@ -7153,6 +7166,7 @@ impl ChannelState {
         })();
         if let Err(e) = persisted {
             self.poisoned = true;
+            self.save_error = Some(e.to_string());
             return Err(e);
         }
         self.log_ids.insert(entry_hash, id);
@@ -7773,6 +7787,27 @@ impl ChannelState {
     #[must_use]
     pub fn generation(&self) -> Arc<std::sync::atomic::AtomicU64> {
         Arc::clone(&self.gen)
+    }
+
+    /// The original operating-system cause survives every later refusal while recovery retries.
+    pub fn save_failure(&self) -> Error {
+        Error::Storage {
+            op: "save room",
+            detail: self
+                .save_error
+                .clone()
+                .unwrap_or_else(|| "a previous write failed".into()),
+        }
+    }
+
+    /// Keys for reopening this same room after a failed store write; never leave the daemon.
+    pub(crate) fn recovery_keys(&self) -> Result<crate::node::open_rooms::RoomKeys> {
+        let key = <[u8; crate::atrest::sek::SEK_LEN]>::try_from(self.sek.key_bytes()?)
+            .map_err(|_| Error::MalformedAtRest("room SEK length"))?;
+        Ok(crate::node::open_rooms::RoomKeys {
+            sek: Zeroizing::new(key),
+            passphrase: self.passphrase.clone().ok_or(Error::AtRestLocked)?,
+        })
     }
 
     /// Whether a failed persist has poisoned this channel (reopen to continue).

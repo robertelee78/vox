@@ -2653,7 +2653,7 @@ impl Dispatch for Router {
 /// room the room map gave the session, or the room is not open on it yet, entries are held, in
 /// order, up to [`HELD_BYTES`] (the oldest dropped first), and appended once the room opens. A join
 /// that fails drops them. Either way the Session's first entry after them says how many were
-/// dropped. Any other failure is said in the daemon's log, naming the entry's kind, once until it
+/// dropped. A store write failure also holds the entries until automatic recovery. Any other failure is said in the daemon's log, naming the entry's kind, once until it
 /// changes or entries reach the Session again: the session goes on.
 async fn post_in_order(
     weak: std::sync::Weak<Inner>,
@@ -2665,13 +2665,36 @@ async fn post_in_order(
     let mut held = std::collections::VecDeque::<String>::new();
     let mut held_bytes = 0usize;
     let mut dropped = 0u64;
+    let mut source_ended = false;
+    let mut dropped_first = String::new();
+    let mut dropped_last = String::new();
+    let identify = |body: &str| {
+        let v = serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
+        format!(
+            "{} at {} (sequence {})",
+            v["kind"].as_str().unwrap_or("entry"),
+            v["ts"],
+            v["seq"]
+        )
+    };
     loop {
         // Waiting on the room: look again each second, and take what arrives meanwhile.
-        let next = if held.is_empty() {
-            rx.recv().await
+        let next = if source_ended {
+            if held.is_empty() {
+                return;
+            }
+            tokio::time::sleep(HELD_RETRY).await;
+            None
+        } else if held.is_empty() {
+            let next = rx.recv().await;
+            source_ended = next.is_none();
+            next
         } else {
             match tokio::time::timeout(HELD_RETRY, rx.recv()).await {
-                Ok(None) => return,
+                Ok(None) => {
+                    source_ended = true;
+                    None
+                }
                 Ok(next) => next,
                 Err(_) => None,
             }
@@ -2682,7 +2705,12 @@ async fn post_in_order(
             while held_bytes > HELD_BYTES {
                 let Some(old) = held.pop_front() else { break };
                 held_bytes -= old.len();
+                if dropped == 0 {
+                    dropped_first = identify(&old);
+                }
+                dropped_last = identify(&old);
                 dropped += 1;
+                eprintln!("vox daemon: {node}: session {session}: lost {dropped} held entries, from {dropped_first} through {dropped_last}; the room could not save before its 4 MiB hold filled");
             }
         } else if held.is_empty() {
             return;
@@ -2722,6 +2750,10 @@ async fn post_in_order(
         let member = handle.view().channels.iter().any(|c| c.channel_id == room);
         if !member && joins.as_ref().and_then(|j| j.status(&room_b32)).is_some() {
             // The join failed: what was held is dropped, and said once the Session opens.
+            if dropped == 0 {
+                dropped_first = held.front().map(|b| identify(b)).unwrap_or_default();
+            }
+            dropped_last = held.back().map(|b| identify(b)).unwrap_or_default();
             dropped += held.len() as u64;
             held.clear();
             held_bytes = 0;
@@ -2737,7 +2769,7 @@ async fn post_in_order(
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
                     "text": format!(
-                        "{dropped} {} of this session {} dropped before its room opened",
+                        "{dropped} {} of this session {} lost while its room could not save: from {dropped_first} through {dropped_last}",
                         if dropped == 1 { "entry" } else { "entries" },
                         if dropped == 1 { "was" } else { "were" }
                     ),
@@ -2761,6 +2793,24 @@ async fn post_in_order(
                 Err(vox_core::node::api::Outcome::Failed(
                     vox_core::node::api::Fault::ChannelNotOpen,
                 )) => break,
+                Err(vox_core::node::api::Outcome::Failed(vox_core::node::api::Fault::Storage)) => {
+                    let cause = handle
+                        .status()
+                        .await
+                        .ok()
+                        .and_then(|s| {
+                            s.unhealthy
+                                .into_iter()
+                                .find(|u| u.key == format!("room-store:{room_b32}"))
+                                .map(|u| u.message)
+                        })
+                        .unwrap_or_else(|| "the room cannot save".into());
+                    if failing.as_deref() != Some(cause.as_str()) {
+                        eprintln!("vox daemon: {node}: room {room_b32}: session {session}: entries are held until it recovers: {cause}");
+                        failing = Some(cause);
+                    }
+                    break;
+                }
                 Err(outcome) => {
                     held.pop_front();
                     held_bytes -= body.len();
