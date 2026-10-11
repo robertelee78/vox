@@ -54,7 +54,7 @@ impl Log {
             log.file.seek(SeekFrom::Start(0))?;
             log.file.read_to_end(&mut held)?;
             if held.split(|b| *b == b'\n').any(|line| {
-                !line.is_empty() && !(line.len() > 24 && line[10] == b'T' && line[23] == b'Z')
+                !(line.is_empty() || line.len() > 24 && line[10] == b'T' && line[23] == b'Z')
             }) {
                 log.file.set_len(0)?;
                 log.len = 0;
