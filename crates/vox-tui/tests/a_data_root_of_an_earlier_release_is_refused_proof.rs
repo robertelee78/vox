@@ -690,6 +690,7 @@ fn a_data_root_of_the_previous_release_opens_with_nothing_lost() {
         &[
             "room",
             "create",
+            "--name",
             "fresh-retention-default",
             "--passphrase-file",
             fresh_pass.to_str().expect("APPARATUS: UTF-8 path"),
