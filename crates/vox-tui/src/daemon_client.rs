@@ -55,6 +55,9 @@ pub async fn ensure_daemon(
         Err(e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Root)) => {
             return Err(AppError::Usage(format!("{e}")))
         }
+        Err(e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Version { .. })) => {
+            return Err(AppError::Usage(e.to_string()));
+        }
         Err(_) => {}
     }
     start_daemon(&std::env::current_exe()?, account, listen, anchors).await
@@ -107,14 +110,14 @@ pub async fn start_daemon(
     let t0 = Instant::now();
     let mut lost = false;
     let outcome = loop {
-        if DaemonClient::open(&socket).await.is_ok() {
+        if DaemonClient::observe(&socket).await.is_ok() {
             break Ok(Daemon::Started);
         }
         // **A daemon that ended is not waited for** (S-2): it said why in its log, and the
         // client says it at once. One that ended because another took the lock first left
         // that one answering.
         if !lost && matches!(child.try_wait(), Ok(Some(_))) {
-            if DaemonClient::open(&socket).await.is_ok() {
+            if DaemonClient::observe(&socket).await.is_ok() {
                 break Ok(Daemon::Running);
             }
             // **Lost the race to another start** (D-1, S-2): that daemon holds the lock and may

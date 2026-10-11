@@ -3,7 +3,7 @@
 //! not to update something if I'm in the middle of a transaction"), so nothing keeps running the
 //! version the update replaced.
 //!
-//! The daemon is asked to stop, as `vox daemon`'s own stop does: every node detaches and its keys
+//! The daemon receives its normal termination signal, as `vox daemon`'s own stop does: every node detaches and its keys
 //! are wiped. The new one attaches again every node whose passphrase it keeps (`--keep`, or the
 //! Keychain the app stores it in). Any other node that was attached stays detached, and the update
 //! names each one with the command that attaches it again.
@@ -11,20 +11,17 @@
 //! How the daemon was started decides how it is started again:
 //!
 //! - by a client (`--as-detached`): the new vox is started the same way, on the same address and
-//!   anchors; with no node it would keep attached, it is left stopped, and the next command that
-//!   needs it starts the new vox;
+//!   anchors;
 //! - as the app's login item (macOS): launchd starts it again, from the bundle now in place;
 //! - as the main process of a systemd user unit (Linux): `systemctl --user restart` that unit;
-//! - in a terminal, or by anything else (`vox daemon`): it is left running, and the person is
-//!   told, because only whoever started it can start it again the same way.
+//! - in a terminal, or by anything else (`vox daemon`): the installed binary starts it detached
+//!   on the same configured address and anchors; the terminal's old daemon ends.
 
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use vox_core::node::daemonipc::{
-    DaemonClient, DaemonFrame, DaemonRequest, DaemonStatus, NodeState,
-};
+use vox_core::node::daemonipc::{DaemonClient, NodeState};
 use vox_core::node::paths::{Account, NodeName};
 
 /// How long the old daemon is given to stop: it detaches every node first, each within its own
@@ -38,8 +35,8 @@ const LOGIN_ITEM: &str = "us.vox.daemon";
 
 /// How the running daemon was started, and so how it is started again.
 enum Started {
-    /// By a client, with these anchors.
-    ByClient(Vec<String>),
+    /// By a client.
+    ByClient,
     /// By launchd, as the app's login item: its `gui/<uid>/<label>` target.
     #[cfg(target_os = "macos")]
     LoginItem(String),
@@ -74,163 +71,185 @@ pub(super) fn restart_daemon(helper: &Path, now: &str) -> Vec<NodeName> {
     rt.block_on(restart(&account, helper, now))
 }
 
+/// The explicit repair offered when a client finds a daemon of a different release.
+pub(crate) fn restart_current(account: &Account) -> Result<(), crate::app::AppError> {
+    let helper = std::env::current_exe()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(restart_checked(
+        account,
+        &helper,
+        env!("CARGO_PKG_VERSION"),
+        true,
+    ))?;
+    Ok(())
+}
+
 async fn restart(account: &Account, helper: &Path, now: &str) -> Vec<NodeName> {
+    match restart_checked(account, helper, now, false).await {
+        Ok(nodes) => nodes,
+        Err(e) => {
+            println!("the vox daemon was not restarted: {e}");
+            Vec::new()
+        }
+    }
+}
+
+async fn restart_checked(
+    account: &Account,
+    helper: &Path,
+    now: &str,
+    start_if_absent: bool,
+) -> Result<Vec<NodeName>, crate::app::AppError> {
+    use crate::app::AppError;
     let socket = account.socket();
-    // No daemon: the next command that needs one starts the vox now in place.
-    let Ok(before) = status(&socket).await else {
-        return Vec::new();
+    // Read only Hello, then close. Even the updater sends no request to another release.
+    let before = match DaemonClient::observe(&socket).await {
+        Ok(d) => d,
+        Err(vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Unreachable { .. })) => {
+            if !start_if_absent {
+                return Ok(Vec::new());
+            }
+            crate::daemon_client::start_daemon(
+                helper,
+                account,
+                crate::client::DEFAULT_LISTEN
+                    .parse()
+                    .expect("default listen"),
+                &[],
+            )
+            .await?;
+            println!("the vox daemon was started and runs vox {now}");
+            return Ok(Vec::new());
+        }
+        Err(e) => return Err(AppError::Usage(e.to_string())),
     };
     let started = how_started(before.pid);
-    if matches!(started, Started::ByHand) {
-        println!(
-            "the vox daemon (pid {}) was started by `vox daemon`, so it is left running vox {}: \
-             stop it and start it again to run {now}",
-            before.pid, before.version
-        );
-        return Vec::new();
-    }
-    let attached: Vec<NodeName> = before
-        .nodes
+    let words = arguments(before.pid);
+    let anchors = words
+        .windows(2)
+        .filter(|w| w[0] == "--anchor")
+        .map(|w| w[1].clone())
+        .collect::<Vec<_>>();
+    let listen = words
+        .windows(2)
+        .find(|w| w[0] == "--listen")
+        .and_then(|w| w[1].parse().ok())
+        .unwrap_or_else(|| {
+            crate::client::DEFAULT_LISTEN
+                .parse()
+                .expect("default listen")
+        });
+    let attached = before
+        .attached
         .iter()
-        .filter(|n| matches!(n.state, NodeState::Attached | NodeState::Attaching))
         .map(|n| n.name.clone())
-        .collect();
-    let kept: Vec<NodeName> = before
-        .nodes
-        .iter()
-        .filter(|n| n.keep)
-        .map(|n| n.name.clone())
-        .collect();
+        .collect::<Vec<_>>();
+    let kept = crate::host::read_attach_file(&account.attach_file())
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
 
-    // ---- stop the old one (systemd stops a unit's itself) ------------------------------------
+    // A normal termination signal follows the daemon's own bounded shutdown path. Its pid
+    // came from this user's authenticated control socket, never a stale lock-file pid.
     #[cfg(target_os = "linux")]
     let by_unit = matches!(started, Started::UserUnit(_));
     #[cfg(not(target_os = "linux"))]
     let by_unit = false;
-    let stopped = by_unit
-        || match DaemonClient::open(&socket).await {
-            Ok(mut d) => matches!(d.request(DaemonRequest::Stop).await, Ok(DaemonFrame::Ok)),
-            Err(_) => false,
-        };
-    if !stopped || (!by_unit && !gone_within(before.pid, STOP_WITHIN).await) {
-        println!(
-            "the vox daemon (pid {}) did not stop within {} s, so it still runs vox {}; restart \
-             it to run {now}",
-            before.pid,
-            STOP_WITHIN.as_secs(),
-            before.version
-        );
-        return Vec::new();
+    if !by_unit {
+        let pid = i32::try_from(before.pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .ok_or_else(|| AppError::Usage("the daemon gave an invalid process id".into()))?;
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM)
+            .map_err(|e| AppError::Usage(format!("the daemon could not be stopped: {e}")))?;
+        if !gone_within(before.pid, STOP_WITHIN).await {
+            return Err(AppError::Usage(format!(
+                "the daemon (pid {}) did not stop within {} s; it still runs vox {}",
+                before.pid,
+                STOP_WITHIN.as_secs(),
+                before.version,
+            )));
+        }
     }
-
-    // ---- start the new one ----------------------------------------------------------------
     match started {
-        Started::ByClient(_) if kept.is_empty() => {
-            println!(
-                "the vox daemon was stopped; the next vox command that needs it starts vox {now}"
-            );
-            say_detached(&attached);
-            return attached;
-        }
-        Started::ByClient(anchors) => {
-            let listen = before
-                .listen
-                .parse()
-                .or_else(|_| crate::client::DEFAULT_LISTEN.parse())
-                .unwrap_or(std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
-            if let Err(e) =
-                crate::daemon_client::start_daemon(helper, account, listen, &anchors).await
-            {
-                println!("the vox daemon was stopped, and vox {now} did not start: {e}");
-                say_detached(&attached);
-                return attached;
-            }
-        }
         #[cfg(target_os = "macos")]
         Started::LoginItem(target) => {
-            let kicked = Command::new("/bin/launchctl")
+            let out = Command::new("/bin/launchctl")
                 .args(["kickstart", &target])
-                .output();
-            if !kicked.as_ref().is_ok_and(|o| o.status.success()) {
-                println!(
-                    "the vox daemon was stopped, and launchd did not start it again ({}); open \
-                     Vox to start it",
-                    kicked.map_or_else(
-                        |e| e.to_string(),
-                        |o| String::from_utf8_lossy(&o.stderr).trim().to_owned()
-                    )
-                );
-                say_detached(&attached);
-                return attached;
+                .bounded_output()?;
+            if !out.status.success() {
+                return Err(AppError::Usage(format!(
+                    "launchd did not restart the daemon: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
             }
         }
         #[cfg(target_os = "linux")]
         Started::UserUnit(unit) => {
-            let restarted = Command::new("systemctl")
+            let out = Command::new("systemctl")
                 .args(["--user", "restart", &unit])
-                .output();
-            if !restarted.as_ref().is_ok_and(|o| o.status.success()) {
-                println!(
-                    "the vox daemon runs as the systemd user unit {unit}, and `systemctl --user \
-                     restart {unit}` failed ({}); run it to run {now}",
-                    restarted.map_or_else(
-                        |e| e.to_string(),
-                        |o| String::from_utf8_lossy(&o.stderr).trim().to_owned()
-                    )
-                );
-                return Vec::new();
+                .bounded_output()?;
+            if !out.status.success() {
+                return Err(AppError::Usage(format!(
+                    "systemd did not restart the daemon: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
             }
-            println!("the systemd user unit {unit} was restarted");
         }
-        Started::ByHand => unreachable!("left running above"),
+        Started::ByClient | Started::ByHand => {
+            crate::daemon_client::start_daemon(helper, account, listen, &anchors).await?;
+        }
     }
-
-    // ---- what the new one has attached ------------------------------------------------------
     let t0 = Instant::now();
     let after = loop {
-        let now_status = status(&socket).await;
-        let settled = now_status.as_ref().is_ok_and(|s| {
-            kept.iter().all(|k| {
-                s.nodes
-                    .iter()
-                    .any(|n| &n.name == k && n.state == NodeState::Attached)
-            })
+        let greeting = DaemonClient::observe(&socket).await;
+        let ready = greeting.as_ref().is_ok_and(|d| {
+            d.version == now
+                && d.pid != before.pid
+                && kept.iter().all(|k| {
+                    d.attached
+                        .iter()
+                        .any(|n| &n.name == k && n.state == NodeState::Attached)
+                })
         });
-        if settled || t0.elapsed() >= REATTACH_WITHIN {
-            break now_status;
+        if ready {
+            break greeting.expect("greeting checked");
+        }
+        if t0.elapsed() >= REATTACH_WITHIN {
+            return Err(AppError::Usage(format!(
+                "the daemon did not return with its remembered nodes Ready on vox {now} within {} s; its log is {}",
+                REATTACH_WITHIN.as_secs(), account.log_file().display(),
+            )));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    match after {
-        Ok(after) => {
-            println!(
-                "the vox daemon was restarted and runs vox {} (pid {})",
-                after.version, after.pid
-            );
-            let missing: Vec<NodeName> = attached
-                .into_iter()
-                .filter(|a| {
-                    !after
-                        .nodes
-                        .iter()
-                        .any(|n| &n.name == a && n.state == NodeState::Attached)
-                })
-                .collect();
-            say_detached(&missing);
-            missing
-        }
-        Err(e) => {
-            println!(
-                "the vox daemon was restarted from {}, and does not answer this vox ({e}); \
-                 `vox node list` shows which nodes are attached",
-                helper.display()
-            );
-            let unkept: Vec<NodeName> =
-                attached.into_iter().filter(|a| !kept.contains(a)).collect();
-            say_detached(&unkept);
-            unkept
-        }
-    }
+    let ended = if attached.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; any held sessions on nodes {} ended",
+            attached
+                .iter()
+                .map(NodeName::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    println!("the vox daemon was restarted and runs vox {} (pid {}), and its remembered nodes are Ready{ended}",
+        after.version, after.pid);
+    let missing = attached
+        .into_iter()
+        .filter(|a| {
+            !after
+                .attached
+                .iter()
+                .any(|n| &n.name == a && n.state == NodeState::Attached)
+        })
+        .collect::<Vec<_>>();
+    say_detached(&missing);
+    Ok(missing)
 }
 
 /// Name each node the restart left detached, with the command that attaches it again.
@@ -263,18 +282,6 @@ pub(super) fn say_next(detached: &[NodeName]) {
     }
 }
 
-/// The daemon's own account of itself.
-async fn status(socket: &Path) -> Result<DaemonStatus, String> {
-    let mut d = DaemonClient::open(socket)
-        .await
-        .map_err(|e| e.to_string())?;
-    match d.request(DaemonRequest::Status).await {
-        Ok(DaemonFrame::Status(s)) => Ok(s),
-        Ok(other) => Err(format!("it answered {other:?}")),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
 /// Whether process `pid` has ended within `bound`.
 async fn gone_within(pid: u32, bound: Duration) -> bool {
     let t0 = Instant::now();
@@ -302,7 +309,7 @@ fn how_started(pid: u32) -> Started {
         let target = format!("gui/{}/{LOGIN_ITEM}", rustix::process::getuid().as_raw());
         if let Ok(o) = Command::new("/bin/launchctl")
             .args(["print", &target])
-            .output()
+            .bounded_output()
         {
             let launchd_pid = String::from_utf8_lossy(&o.stdout)
                 .lines()
@@ -320,12 +327,7 @@ fn how_started(pid: u32) -> Started {
     if !words.iter().any(|w| w == crate::daemon_client::AS_DETACHED) {
         return Started::ByHand;
     }
-    let anchors = words
-        .windows(2)
-        .filter(|w| w[0] == "--anchor")
-        .map(|w| w[1].clone())
-        .collect();
-    Started::ByClient(anchors)
+    Started::ByClient
 }
 
 /// Process `pid`'s arguments.
@@ -347,7 +349,7 @@ fn arguments(pid: u32) -> Vec<String> {
 fn arguments(pid: u32) -> Vec<String> {
     Command::new("/bin/ps")
         .args(["-ww", "-o", "args=", "-p", &pid.to_string()])
-        .output()
+        .bounded_output()
         .map(|o| {
             String::from_utf8_lossy(&o.stdout)
                 .split_whitespace()
@@ -372,7 +374,36 @@ fn user_unit(pid: u32) -> Option<String> {
         .to_owned();
     let main = Command::new("systemctl")
         .args(["--user", "show", "--property=MainPID", "--value", &unit])
-        .output()
+        .bounded_output()
         .ok()?;
     (String::from_utf8_lossy(&main.stdout).trim() == pid.to_string()).then_some(unit)
+}
+
+/// OS service managers and process inspection are bounded too: a stalled helper cannot leave
+/// an update (or the app's Restart Daemon action) waiting forever.
+trait BoundedOutput {
+    fn bounded_output(&mut self) -> std::io::Result<std::process::Output>;
+}
+impl BoundedOutput for Command {
+    fn bounded_output(&mut self) -> std::io::Result<std::process::Output> {
+        let mut child = self
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let began = Instant::now();
+        loop {
+            if child.try_wait()?.is_some() {
+                return child.wait_with_output();
+            }
+            if began.elapsed() >= STOP_WITHIN {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the service manager or process lookup did not answer within 30 s",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }

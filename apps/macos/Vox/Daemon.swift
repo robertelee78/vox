@@ -142,8 +142,10 @@ enum Daemon {
     /// the login item on, whose daemon may not be running (stopped, refused, or not loaded yet),
     /// and with which it cannot make a second (D-1: one holds the account's lock).
     static func reach() async throws -> VoxClient {
-        if let client = try? await VoxClient.open(dataRoot: "") {
-            return client
+        do {
+            return try await VoxClient.open(dataRoot: "")
+        } catch {
+            if versionMismatch(sentence(error)) { throw error }
         }
         try await startAsVoxDoes()
         let until = Date().addingTimeInterval(patience)
@@ -168,25 +170,56 @@ enum Daemon {
     /// `vox daemon --detach`: started in the background, its output in `<data root>/.daemon/log`,
     /// returning once it answers. A failure is its own sentence (M-7).
     private static func startAsVoxDoes() async throws {
-        let (status, said) = try await Task.detached { () throws -> (Int32, String) in
-            let p = Process()
-            p.executableURL = vox
-            p.arguments = ["daemon", "--detach"]
-            let out = Pipe()
-            p.standardOutput = out
-            p.standardError = out
-            p.standardInput = FileHandle.nullDevice
-            try p.run()
-            let bytes = out.fileHandleForReading.readDataToEndOfFile()
-            p.waitUntilExit()
-            return (p.terminationStatus, String(decoding: bytes, as: UTF8.self))
+        _ = try await command(["daemon", "--detach"], patience: patience)
+    }
+
+    /// The local Hello refusal includes both versions and this exact recovery command.
+    static func versionMismatch(_ words: String) -> Bool {
+        words.localizedCaseInsensitiveContains("daemon is")
+            && words.contains("daemon --restart")
+    }
+
+    /// Run the bundled command with an independent process deadline. Output goes to a private
+    /// temporary file so a full pipe cannot deadlock the command or this app.
+    static func command(_ arguments: [String], patience: TimeInterval) async throws -> String {
+        try await Task.detached {
+            let output = FileManager.default.temporaryDirectory
+                .appendingPathComponent("vox-app-\(UUID().uuidString)")
+            guard FileManager.default.createFile(atPath: output.path, contents: nil,
+                                                 attributes: [.posixPermissions: 0o600]) else {
+                throw VoxError.Failed(reason: "Vox could not create a temporary command log.")
+            }
+            defer { try? FileManager.default.removeItem(at: output) }
+            let file = try FileHandle(forWritingTo: output)
+            defer { try? file.close() }
+            let process = Process()
+            process.executableURL = vox
+            process.arguments = arguments
+            process.standardInput = FileHandle.nullDevice
+            process.standardOutput = file
+            process.standardError = file
+            try process.run()
+            let until = Date().addingTimeInterval(patience)
+            let watchdog = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+            watchdog.schedule(deadline: .now() + patience)
+            watchdog.setEventHandler {
+                if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+            }
+            watchdog.resume()
+            defer { watchdog.cancel() }
+            process.waitUntilExit()
+            if process.terminationReason == .uncaughtSignal && Date() >= until {
+                throw VoxError.Unknown(reason: "Vox did not finish within \(Int(patience)) seconds. "
+                                       + "Check its state before trying again.")
+            }
+            let words = try String(contentsOf: output, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard process.terminationStatus == 0 else {
+                throw VoxError.Failed(reason: words.isEmpty
+                                      ? "Vox exited with status \(process.terminationStatus)." : words)
+            }
+            return words
         }.value
-        guard status == 0 else {
-            let text = said.trimmingCharacters(in: .whitespacesAndNewlines)
-            throw StartFailure(kind: .exited, said: text.isEmpty
-                ? "the vox daemon did not start (vox exited \(status))"
-                : text.replacingOccurrences(of: "vox: ", with: ""))
-        }
     }
 
     /// The login item's last word on why it would not start, with when: its daemon writes it to

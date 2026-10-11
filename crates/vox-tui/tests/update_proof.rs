@@ -93,6 +93,9 @@ fn vox(bin: &Path, home: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Ou
     cmd.args(args)
         .env_clear()
         .env("HOME", home)
+        .env("VOX_DATA_DIR", home.join("data"))
+        .env("VOX_CONFIG_DIR", home.join("config"))
+        .env("VOX_PROXY", "127.0.0.1:0")
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .env("SHELL", "/bin/zsh")
         .env("TERM", "dumb");
@@ -577,14 +580,6 @@ fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
 
     #[cfg(target_os = "macos")]
     bundle_claims(&mut claims, &mut receipts);
-    // A standalone install on a Mac takes only a release Apple vouches for, which no fixture is;
-    // its restart is the same code as the bundle's, measured there.
-    #[cfg(target_os = "linux")]
-    {
-        test_knobs::require(&["VOX_TEST_RELEASE_BASE"]);
-        daemon_restart_claim(&mut claims, &mut receipts, false);
-    }
-
     dispose("vox update proof", &claims, &receipts, true);
 }
 
@@ -705,7 +700,9 @@ fn bundle_release_of(root: &Path, version: &str, helper: &Path, channels: &[(&st
         "APPARATUS: zipping the fixture app failed"
     );
     let zip_bytes = std::fs::read(&zip).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
-    let helper_bytes = std::fs::read(helper).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+    // Signing changes a Mach-O helper: the release record describes the signed bytes.
+    let helper_bytes = std::fs::read(app.join("Contents/Helpers/vox"))
+        .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
 
     let assets = root.join(format!("releases/download/v{version}"));
     let records = root.join("releases/latest/download");
@@ -1134,8 +1131,6 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
         }
     }
 
-    daemon_restart_claim(claims, receipts, true);
-
     // ---- a Vox.app install.sh did not make is not touched (M-29) ---------------------------
     {
         let tmp = tmpdir();
@@ -1154,75 +1149,19 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
     drop(server);
 }
 
-/// A copy of this build that says it is `version` (as long as [`VERSION`]): the next release, as
-/// far as anything can tell. Every `VERSION` in it that stands alone (not part of a longer version,
-/// nor a crate's `name-x.y.z` path) is rewritten; the copy is ad-hoc signed again, and refused as
-/// APPARATUS unless it answers `vox <version>`.
+/// A genuinely compiled next-release binary, supplied as proof apparatus. Patching version
+/// strings in a binary cannot change optimized version comparisons, so it proves a different
+/// program. Build this tree with the requested workspace version and supply its path.
 fn vox_saying(dir: &Path, version: &str) -> Result<PathBuf, String> {
-    let (from, to) = (VERSION.as_bytes(), version.as_bytes());
-    if from.len() != to.len() {
-        return Err(format!("{version:?} is not as long as {VERSION:?}"));
-    }
-    let mut bytes = std::fs::read(VOX).map_err(|e| format!("reading {VOX}: {e}"))?;
-    let part = |b: u8| b.is_ascii_digit() || b == b'.';
-    let mut i = 1;
-    while i + from.len() + 1 < bytes.len() {
-        if bytes[i] == from[0]
-            && &bytes[i..i + from.len()] == from
-            && !part(bytes[i - 1])
-            && bytes[i - 1] != b'-'
-            && !bytes[i + from.len()].is_ascii_digit()
-            && !(bytes[i + from.len()] == b'.' && bytes[i + from.len() + 1].is_ascii_digit())
-        {
-            bytes[i..i + from.len()].copy_from_slice(to);
-            i += from.len();
-        } else {
-            i += 1;
-        }
-    }
+    let fixture = std::env::var_os("VOX_PROOF_NEXT_BINARY")
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("set VOX_PROOF_NEXT_BINARY to a vox compiled as {version}"))?;
     let path = dir.join("vox");
-    std::fs::write(&path, &bytes).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    std::fs::copy(&fixture, &path).map_err(|e| format!("copying {}: {e}", fixture.display()))?;
     make_executable(&path);
-    // A test build's debug info takes it past the 256 MiB a release binary may be; the code that
-    // runs is the same without it.
-    #[cfg(target_os = "linux")]
-    {
-        let stripped = Command::new("strip")
-            .arg("--strip-debug")
-            .arg(&path)
-            .output()
-            .map_err(|e| format!("strip: {e}"))?;
-        if !stripped.status.success() {
-            return Err(format!(
-                "strip: {}",
-                String::from_utf8_lossy(&stripped.stderr).trim()
-            ));
-        }
-        let size = std::fs::metadata(&path).map_or(0, |m| m.len());
-        if size > 256 * 1024 * 1024 {
-            return Err(format!(
-                "the stripped copy is {size} bytes, over the 256 MiB a release binary may be"
-            ));
-        }
-    }
-    #[cfg(target_os = "macos")]
-    let signed = Command::new("/usr/bin/codesign")
-        .args(["--force", "--sign", "-"])
-        .arg(&path)
-        .output()
-        .map_err(|e| format!("codesign: {e}"))?;
-    #[cfg(target_os = "macos")]
-    if !signed.status.success() {
-        return Err(format!(
-            "codesign: {}",
-            String::from_utf8_lossy(&signed.stderr).trim()
-        ));
-    }
     let says = reports(&path);
     if says != format!("vox {version}") {
-        return Err(format!(
-            "the rewritten copy says {says:?}, not vox {version}"
-        ));
+        return Err(format!("the fixture says {says:?}, not vox {version}"));
     }
     Ok(path)
 }
@@ -1298,6 +1237,18 @@ fn holders(dir: &Path) -> Vec<String> {
     }
 }
 
+/// ADR-034 UP-1 and UP-2: the real update journey, isolated from unrelated download cases.
+#[test]
+#[ignore = "real update, production Argon2id; run in release with test-knobs"]
+fn an_update_restarts_its_daemon_and_refuses_a_different_local_version() {
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_RELEASE_BASE"]);
+    let mut claims = Vec::new();
+    let mut receipts = BTreeMap::new();
+    daemon_restart_claim(&mut claims, &mut receipts, cfg!(target_os = "macos"));
+    dispose("daemon update proof", &claims, &receipts, false);
+}
+
 /// Decider 2026-10-07: once `vox update` has put the new vox in place (Vox.app when `bundle`, the
 /// standalone binary otherwise), it restarts the running daemon onto the new version. A node it
 /// keeps the passphrase of is attached again; any other attached node is detached, and the update
@@ -1371,6 +1322,36 @@ fn daemon_restart_claim(
         ),
         ("VOX_LISTEN", "127.0.0.1:0"),
     ];
+    // Start it by hand, the update path that used to deliberately leave the old daemon alive.
+    let daemon_log = home.join("hand-daemon.log");
+    let log = std::fs::File::create(&daemon_log).expect("APPARATUS: daemon log");
+    let mut daemon = Command::new(&link);
+    daemon
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("VOX_PROXY", "127.0.0.1:0")
+        .envs(env.iter().copied())
+        .args(["daemon", "--no-node", "--listen", "127.0.0.1:0"])
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone().expect("APPARATUS: clone log"))
+        .stderr(log);
+    let mut daemon = daemon.spawn().expect("APPARATUS: start hand daemon");
+    let before_pid = daemon.id();
+    std::thread::spawn(move || {
+        let _ = daemon.wait();
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::fs::read_to_string(data.join(".daemon/lock"))
+        .ok()
+        .is_none_or(|p| p.trim() != before_pid.to_string())
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "APPARATUS: hand daemon never held the scratch root"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     let pass_arg = pass.to_str().expect("APPARATUS: a UTF-8 temp path");
     let mut staging = Vec::new();
     for args in [
@@ -1399,11 +1380,91 @@ fn daemon_restart_claim(
         };
         (attached("kept"), attached("plain"), out)
     };
+    let service = std::net::TcpListener::bind("127.0.0.1:0").expect("APPARATUS: local service");
+    let service_arg = format!(
+        "echo={}",
+        service
+            .local_addr()
+            .expect("APPARATUS: service address")
+            .port()
+    );
+    let held_log = home.join("held-serve.log");
+    let log = std::fs::File::create(&held_log).expect("APPARATUS: held serve log");
+    let mut serve = Command::new(&link);
+    serve
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("VOX_PROXY", "127.0.0.1:0")
+        .envs(env.iter().copied())
+        .args([
+            "serve",
+            &service_arg,
+            "--node",
+            "plain",
+            "--name",
+            "update-held",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone().expect("APPARATUS: clone log"))
+        .stderr(log);
+    let mut serve = serve.spawn().expect("APPARATUS: start held serve");
+    let serve_pid = serve.id();
+    let (ended_tx, ended_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = ended_tx.send(serve.wait());
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !std::fs::read_to_string(&held_log)
+        .unwrap_or_default()
+        .contains("vox://")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "APPARATUS: serve never offered its room: {}",
+            std::fs::read_to_string(&held_log).unwrap_or_default()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     let (kept_before, plain_before, before) = listed(&link);
+
+    // The other release's CLI refuses this daemon before using a node, and a hook says the
+    // same plain fix to its agent. These are two real binaries, with only the release string
+    // changed in the staged next release.
+    for args in [
+        vec!["status", "--node", "kept"],
+        vec![
+            "agent",
+            "hook",
+            "--node",
+            "kept",
+            "--session",
+            "version-refusal",
+            "--format",
+            "text",
+        ],
+    ] {
+        let refusal = said(&vox(&helper, home, &args, &env));
+        claims.push(claim(
+            "daemon.version_mismatch_refused",
+            refusal.contains(VERSION)
+                && refusal.contains(&next)
+                && refusal.contains("vox daemon --restart"),
+            format!("the next release's {} said {refusal:?}", args.join(" ")),
+        ));
+    }
 
     let out = vox(&link, home, &["update"], &env);
     let text = said(&out);
     let (kept_after, plain_after, after) = listed(&link);
+    let held_ended = ended_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .is_ok();
+    if !held_ended {
+        let _ = Command::new("/bin/kill")
+            .arg(serve_pid.to_string())
+            .status();
+    }
 
     // Every vox this left running is stopped, by its pid: whichever holds the account's files.
     for pid in holders(&data) {
@@ -1425,11 +1486,13 @@ fn daemon_restart_claim(
         id,
         out.status.success()
             && text.contains(&restarted)
+            && text.contains("held sessions on nodes kept, plain ended")
             && text.contains("node plain is detached")
             && text.contains("vox node attach plain")
             && !text.contains("node kept is detached")
             && kept_after
-            && !plain_after,
+            && !plain_after
+            && held_ended,
         format!(
             "with nodes kept (passphrase kept) and plain attached, `vox update` (exit_ok={}) said \
              {text:?}; then `vox node list` said {after:?} (kept attached={kept_after}, plain \
