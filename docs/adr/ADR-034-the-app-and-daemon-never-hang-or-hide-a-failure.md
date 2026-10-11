@@ -35,8 +35,9 @@ under it:
   vox".
 
 Later, Services showed a "Share a service" spinner that never resolved. And the app could not be
-quit: the decider found no Quit ⌘Q in its menus ("but no command-q option"; ⌘W closes the window).
-In the code, `applicationShouldTerminate` returns `.terminateLater` while the app holds a node and
+quit: the decider found no Quit ⌘Q in its menus ("command-q should be able to quit vox"; "but no
+command-q option"; ⌘W closes the window). In the code, `applicationShouldTerminate` (VoxApp.swift)
+returns `.terminateLater` while the app holds a node and
 waits for `model.quit()` with no bound, so on a wedged connection quitting never ends either. Why
 the menu item is missing is to be found when it is fixed. This ADR states, as requirements, what
 each of these broke.
@@ -126,10 +127,15 @@ each of these broke.
 - **QT-1.** The app's Vox menu MUST hold **Quit Vox** with ⌘Q, and the proof MUST find it in the
   running app's menu bar by its words and its shortcut.
 - **QT-2.** Quit Vox and ⌘Q MUST always quit the app promptly, whatever state the daemon, the node
-  or the connection is in. Letting go of the node (ADR-028 A-4) MUST be bounded, to a few seconds,
-  and MUST NOT block quitting: at the bound the app MUST quit anyway.
+  or the connection is in. `applicationShouldTerminate` MUST NOT await `model.quit()` without a
+  bound: letting go of the node (ADR-028 A-4) MUST take at most a few seconds and MUST NOT block
+  quitting; at the bound the app MUST quit anyway.
 - **QT-3.** When letting go of the node did not finish within the bound, the app MUST say so at its
   next start, in one sentence naming the node and its state as the daemon reports it then.
+- **QT-4. Proof.** A step of the app's proof (ADR-014 M-31, extending the first-run journey's quit
+  step) MUST press ⌘Q on the running app with its daemon connection wedged, and MUST assert that the
+  app's process has exited within the bound. Its mutant MUST restore the unbounded wait on
+  `model.quit()` and MUST turn that step red on its own assertion, labelled PRODUCT.
 
 ### 9. Proof
 
