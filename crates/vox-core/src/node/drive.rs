@@ -80,6 +80,12 @@ pub struct SessionRow {
     pub body: String,
 }
 
+/// A floor's author, recipient, room epoch and drive-key generation.
+pub(crate) type SessionFloorKey = (Digest32, Digest32, u64, u64);
+
+/// The recipient's membership generation, first permitted key iteration and first log sequence.
+pub(crate) type SessionFloorBoundary = (u64, u64, u64);
+
 /// A room's drive key material: this node's own chain, the drive keys other members released to
 /// it, and to whom this node has released which generation.
 #[derive(Default)]
@@ -92,7 +98,7 @@ pub struct DriveState {
     /// live generation stood when it became owed it.
     marks: BTreeMap<Digest32, (u64, u64)>,
     /// Public authorization floors, derived from verified control entries; never secret keys.
-    pub(crate) floors: BTreeMap<(Digest32, Digest32, u64, u64), (u64, u64, u64)>,
+    pub(crate) floors: BTreeMap<SessionFloorKey, SessionFloorBoundary>,
     pub(crate) floors_indexed: bool,
     /// Bodies a particular peer omitted, only until new authorization is learned or restart.
     pub(crate) omitted: BTreeMap<Digest32, (std::time::Instant, BTreeSet<(Digest32, u64)>)>,
