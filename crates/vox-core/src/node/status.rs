@@ -123,6 +123,8 @@ pub struct RoomStatus {
     /// for as long as a session ran: a person reading `vox status` saw no retention, "(busy)" for
     /// the keys held and no frozen member, with no reason (#58, #59).
     pub retention: u64,
+    /// Effective Session activity lifetime in seconds; zero means forever.
+    pub step_retention: u64,
     /// How many generations of this node's own sender key it still holds here (PRD-001
     /// R14: one, unless a full-history grant is still owed).
     pub key_generations: usize,
@@ -445,12 +447,13 @@ impl StatusReport {
             });
             let frozen = list(r.frozen.iter().map(|d| q(&b32_encode(d))));
             format!(
-                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync_ms\":{},\"retention\":{},\"key_generations\":{},\"received_key_generations\":{},\"frozen\":[{}],\"refused_below_checkpoint\":{},\"entries\":{},\"members\":[{}]}}",
+                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync_ms\":{},\"retention\":{},\"step_retention\":{},\"key_generations\":{},\"received_key_generations\":{},\"frozen\":[{}],\"refused_below_checkpoint\":{},\"entries\":{},\"members\":[{}]}}",
                 q(&b32_encode(&r.id)),
                 q(&r.name),
                 r.epoch,
                 opt(r.last_sync),
                 r.retention,
+                r.step_retention,
                 r.key_generations,
                 r.received_key_generations,
                 frozen,

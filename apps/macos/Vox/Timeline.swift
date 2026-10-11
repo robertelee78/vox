@@ -52,10 +52,10 @@ extension NodeModel {
         switch showing {
         case .general: return "Timeline · ⏱ \(retention)"
         case .all: return "Timeline — All · ⏱ \(retention)"
-        // A Session's title has no retention: it is the room's (as the TUI says it).
         case .session:
             guard let s = shownSession else { return "Timeline — a Session this room no longer lists" }
-            return "Timeline — \(s.label)\(s.open ? " · open" : " · ended")"
+            let kept = stepRetention.map { " · steps kept \(Retention.words($0.effectiveSeconds))" } ?? ""
+            return "Timeline — \(s.label)\(s.open ? " · open" : " · ended")\(kept)"
         case .tag(let tag): return "Timeline — tagged \(tag) · ⏱ \(retention)"
         }
     }

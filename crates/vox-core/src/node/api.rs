@@ -598,6 +598,14 @@ pub struct ChannelDetail {
     /// and the node's own (ADR-023 decision 2). What `vox status` reports. Carried in the view
     /// so a reader never has to take the room's lock, which a sync session holds while it runs.
     pub retention: u64,
+    /// Configured room message retention, seconds; zero means forever.
+    pub room_retention: u64,
+    /// Configured room Session step retention, seconds; zero means forever.
+    pub room_step_retention: u64,
+    /// Effective Session retention, capped by room and node message policies.
+    pub step_retention: u64,
+    /// This node's explicit Session retention override, if any.
+    pub local_step_retention: Option<u64>,
     /// `(what this node's own retention file asks, the room's)`, seconds, when the file asks to
     /// keep the room's messages longer than the room does (V030-32): ignored, the room's is in
     /// force, and the node says so. Carried in the view so a daemon says it from what the node
@@ -1011,6 +1019,13 @@ pub enum NodeCommand {
         /// The local address the forward is listening on.
         local: std::net::SocketAddr,
     },
+    /// Set the room's Session retention, or this member's shorter local rule.
+    SetStepRetention {
+        /// The room to change.
+        channel_id: Digest32,
+        /// Seconds to retain Session entries; zero means forever.
+        seconds: u64,
+    },
     /// Set a room's retention (PRD-001 R7, ADR-023 decision 2): `ttl` seconds, `0` for
     /// forever, as an ADR-007 policy-update. Only the room's admin may; it applies to what is
     /// already stored.
@@ -1413,7 +1428,7 @@ impl Fault {
                 "a room name is one DNS label: 1 to 63 of a-z, 0-9 and `-`, not starting or ending with `-`\n       it is the room part of every service address"
             }
             Fault::AboveRoomRetention => {
-                "a member may keep this room's messages for less time than the room does, never longer\n       ask the room's creator or an admin (`vox room admin list`) to change the room's retention"
+                "a member may keep this room's data for less time than the room does, never longer\n       ask the room's creator or an admin (`vox room admin list`) to change the room's retention"
             }
             Fault::NotAdmin => {
                 "only the room's admin may change that, and this identity is not its admin\n       the room's creator and the admins it named are; `vox room admin list` shows who"

@@ -390,6 +390,10 @@ fn detail_of(
             .map(|(member, by)| (member, by.into_iter().collect()))
             .collect(),
         retention: ch.effective_retention(),
+        room_retention: ch.room_retention(),
+        room_step_retention: ch.room_step_retention(),
+        step_retention: ch.effective_step_retention(),
+        local_step_retention: ch.local_step_retention(),
         retention_above_room: ch.retention_above_room(),
         key_generations: ch.key_generations(),
         received_key_generations: ch.received_key_generations(),
@@ -937,6 +941,7 @@ async fn run_session_worker(
     fence: Arc<crate::transport::stream_transport::Fence>,
     tx: mpsc::Sender<NetEvent>,
     channel_id: Digest32,
+    peer: Digest32,
     slot: Option<crate::node::ports::Slot>,
 ) -> crate::node::channel::SessionReport {
     let joined = tokio::task::spawn_blocking(move || {
@@ -949,7 +954,7 @@ async fn run_session_worker(
         // (`sync_over_room`).
         match target {
             SessionTarget::Channel(shared) => crate::node::channel::ChannelState::sync_over_room(
-                &shared, &store, &mut t, now_ms, &fence, &on_stored,
+                &shared, &store, peer, &mut t, now_ms, &fence, &on_stored,
             ),
         }
     })
@@ -4431,6 +4436,7 @@ pub struct Node {
     /// This node's own retention (ADR-023 decision 2), re-read from the config directory
     /// at most every [`RETENTION_REREAD_MS`] so an edit takes effect without a restart.
     node_retention: crate::node::retention::RetentionConfig,
+    node_step_retention: crate::node::retention::RetentionConfig,
     /// When `node_retention` was last read (unix milliseconds); `0` before the first read.
     retention_read_at: u64,
     /// Open rooms whose node retention must be re-applied because the file changed; applied by
@@ -4825,6 +4831,7 @@ impl Node {
             dismissed_offers: crate::node::offers::DismissedOffers::default(),
             peer_book: crate::node::peer_book::PeerBook::new(),
             node_retention: crate::node::retention::RetentionConfig::default(),
+            node_step_retention: crate::node::retention::RetentionConfig::default(),
             retention_read_at: 0,
             retention_dirty: std::collections::BTreeSet::new(),
             retention_warned: std::collections::BTreeSet::new(),
@@ -5457,6 +5464,10 @@ impl Node {
                 }
             }
             NodeCommand::Sync { channel_id } => self.sync_channel(&channel_id).await,
+            NodeCommand::SetStepRetention {
+                channel_id,
+                seconds,
+            } => self.set_step_retention(&channel_id, seconds).await,
             NodeCommand::SetRetention { channel_id, ttl } => {
                 self.set_retention(&channel_id, ttl).await
             }
@@ -6918,7 +6929,15 @@ impl Node {
                     // unlock is the same room, and a restart is exactly when its members have to
                     // be dialled from where they were last reached (`node::peer_book`).
                     let mut channel = *channel;
-                    channel.set_node_retention(self.node_retention_for(&channel_id));
+                    if let Err(e) = self.retention_before_publication(&mut channel) {
+                        let _ = self.event_tx.send(NodeEvent::NodeNote {
+                            note: format!(
+                                "room {} did not reopen: {e}; it stays closed",
+                                crate::node::link::b32_encode(&channel_id)
+                            ),
+                        });
+                        return;
+                    }
                     crate::node::status::SyncBook::note_set_aside(
                         &self.sync_book,
                         channel_id,
@@ -9560,6 +9579,7 @@ impl Node {
         };
         let mut channel = channel;
         channel.set_node_retention(self.node_retention_for(&parsed.channel_id));
+        channel.set_node_step_retention(self.node_step_retention.for_room(&parsed.channel_id));
         // A room joined again is published again (V030-14): its withdraw is kept no longer.
         self.withdrawn.remove(&parsed.channel_id);
         self.remember_or_say(&channel);
@@ -11579,6 +11599,7 @@ impl Node {
                 fence,
                 tx.clone(),
                 cid,
+                peer,
                 Some(slot),
             )
             .await;
@@ -11661,6 +11682,7 @@ impl Node {
                 fence,
                 tx.clone(),
                 channel_id,
+                peer,
                 None,
             )
             .await;
@@ -13956,6 +13978,7 @@ impl Node {
         // session on it (the retention fix, e2a74b9): every creation path comes through here.
         let id = ch.channel_id();
         ch.set_node_retention(self.node_retention_for(&id));
+        ch.set_node_step_retention(self.node_step_retention.for_room(&id));
         self.remember_or_say(&ch);
         self.channels
             .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
@@ -14133,6 +14156,7 @@ impl Node {
             return Outcome::Failed(fault_of(&e));
         }
         channel.set_node_retention(self.node_retention_for(&id));
+        channel.set_node_step_retention(self.node_step_retention.for_room(&id));
         self.remember_or_say(&channel);
         self.channels
             .insert(id, Arc::new(tokio::sync::Mutex::new(channel)));
@@ -14335,12 +14359,37 @@ impl Node {
         Box::pin(self.finish_open_channel_unboxed(ch))
     }
 
+    /// Apply this node's shorter limits after opening under the room policy, before a cached
+    /// row can be read or relayed. Failure follows the caller's ordinary open/recovery error path.
+    fn retention_before_publication(&mut self, ch: &mut ChannelState) -> crate::error::Result<()> {
+        let id = ch.channel_id();
+        ch.set_node_retention(self.node_retention_for(&id));
+        ch.set_node_step_retention(self.node_step_retention.for_room(&id));
+        let profile = self
+            .profile
+            .as_ref()
+            .ok_or(crate::error::Error::AtRestLocked)?;
+        ch.sweep_retention(profile.store(), self.now_ms())?;
+        Ok(())
+    }
+
     /// [`Self::finish_open_channel`], unboxed: see [`Boxed`].
     async fn finish_open_channel_unboxed(&mut self, mut ch: ChannelState) -> Outcome {
+        if let Err(e) = self.retention_before_publication(&mut ch) {
+            let _ = self.event_tx.send(NodeEvent::NodeNote {
+                note: format!(
+                    "room {} could not apply retention before opening: {e}",
+                    crate::node::link::b32_encode(&ch.channel_id())
+                ),
+            });
+            return Outcome::Failed(fault_of(&e));
+        }
+        self.publish_open_channel(ch).await
+    }
+
+    /// Publish a room only after both shared and local retention have been applied durably.
+    async fn publish_open_channel(&mut self, ch: ChannelState) -> Outcome {
         let channel_id = ch.channel_id();
-        // The node's own retention before the room is visible to anything that can start a
-        // session on it (the retention fix, e2a74b9).
-        ch.set_node_retention(self.node_retention_for(&channel_id));
         // What the open set aside is reported (V210-74), as a reopen reports it.
         crate::node::status::SyncBook::note_set_aside(&self.sync_book, channel_id, ch.set_aside());
         self.remember_or_say(&ch);
@@ -15512,6 +15561,7 @@ impl Node {
                 epoch: room.epoch,
                 last_sync: self.status.room_synced.get(&room.channel_id).copied(),
                 retention: room.retention,
+                step_retention: room.step_retention,
                 key_generations: room.key_generations,
                 received_key_generations: room.received_key_generations,
                 frozen: room.frozen.clone(),
@@ -15726,6 +15776,58 @@ impl Node {
         Outcome::Done
     }
 
+    async fn set_step_retention(&mut self, channel_id: &Digest32, ttl: u64) -> Outcome {
+        let now_ms = self.now_ms();
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return Outcome::Failed(Fault::ChannelNotOpen);
+        };
+        let me = match profile.signer() {
+            Ok(s) => crate::identity::composite::RootSigner::fingerprint(s),
+            Err(e) => return Outcome::Failed(fault_of(&e)),
+        };
+        let (governs, room) = {
+            let ch = shared.lock().await;
+            (
+                ch.governs_retention(&me, self.now_ms()),
+                crate::node::retention::shortest(ch.room_retention(), ch.room_step_retention()),
+            )
+        };
+        if !governs {
+            // Longer than the room keeps is refused; `0` is forever, the longest of all.
+            if room != 0 && (ttl == 0 || ttl > room) {
+                return Outcome::Failed(Fault::AboveRoomRetention);
+            }
+            // The room's own value is "follow the room": the member's line is cleared, so a later
+            // change to the room's retention reaches this node too.
+            let own = (ttl != room).then_some(ttl);
+            // Written to the node's own file (ADR-026 F-2), seeded from the account's when the
+            // node has none, so the other rooms' lines it was reading are kept.
+            let written = self
+                .paths
+                .own_config_path(crate::node::paths::STEP_RETENTION_FILE)
+                .and_then(|file| {
+                    crate::node::retention::RetentionConfig::write_room(&file, channel_id, own)
+                });
+            if written.is_err() {
+                return Outcome::Failed(Fault::RetentionFileUnwritable);
+            }
+            self.retention_read_at = 0;
+            self.refresh_node_retention(now_ms);
+            self.sweep_retention().await;
+            return Outcome::OwnRetention { own: ttl, room };
+        }
+        if let Err(e) = shared.lock().await.set_step_retention(profile, ttl, now_ms) {
+            return Outcome::Failed(fault_of(&e));
+        }
+        self.note_local_append(channel_id);
+        self.retention_read_at = 0; // re-read the node's own file too: an explicit act
+        self.sweep_retention().await;
+        Outcome::Done
+    }
+
     /// Re-read the node's own retention file when it is due (first use, then every
     /// [`RETENTION_REREAD_MS`]). An unreadable file keeps the last policy read rather than
     /// dropping to "no node limit", which would keep more than the operator asked for.
@@ -15739,6 +15841,14 @@ impl Node {
             {
                 if cfg != self.node_retention {
                     self.node_retention = cfg;
+                    self.retention_dirty = self.channels.keys().copied().collect();
+                }
+            }
+            if let Ok(cfg) =
+                crate::node::retention::RetentionConfig::load(&self.paths.step_retention_file())
+            {
+                if cfg != self.node_step_retention {
+                    self.node_step_retention = cfg;
                     self.retention_dirty = self.channels.keys().copied().collect();
                 }
             }
@@ -15783,6 +15893,7 @@ impl Node {
             };
             if self.retention_dirty.remove(cid) {
                 ch.set_node_retention(self.node_retention.for_room(cid));
+                ch.set_node_step_retention(self.node_step_retention.for_room(cid));
                 applied = true;
             }
             // **A node may keep less than its room, never more** (V030-32). A file value above the
@@ -16015,7 +16126,7 @@ impl Node {
             if has_session && ch.ensure_drive(profile.store(), holders, now_ms).is_err() {
                 return;
             }
-            let Ok(owed) = ch.owed_drive(profile.store(), holders) else {
+            let Ok(owed) = ch.owed_drive(profile, holders, now_ms) else {
                 return;
             };
             let mut releases = Vec::new();
@@ -16049,7 +16160,7 @@ impl Node {
             let mut ch = shared.lock().await;
             ch.key_change_unsaid()
                 && ch
-                    .owed_drive(profile.store(), holders)
+                    .owed_drive(profile, holders, now_ms)
                     .is_ok_and(|owed| owed.is_empty())
                 && ch
                     .append_session(

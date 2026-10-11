@@ -1485,6 +1485,9 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
         Screen::ChannelList => {
             " ↑/↓ select · Enter open · t tunnels · k keyring · d decisions · :new <name> · :join · :attach · Ctrl-C quit"
         }
+        Screen::Channel if ui.focus == Focus::Sessions => {
+            " A step is one thing an agent did in its Session: a message, a command it ran, or a file it edited. · ↑/↓ select · Enter open · Tab switch pane · :general · :all · Esc back"
+        }
         // A Session's own help line (ADR-029 §8): its driving words join it as they are built,
         // for a member with drive only (CL-3).
         Screen::Channel if showing_session(ui, vm).is_some_and(|x| x.can_drive) => {

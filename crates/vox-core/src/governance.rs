@@ -92,6 +92,7 @@ pub mod name;
 pub mod policy;
 pub mod presence;
 pub mod share;
+pub mod step_policy;
 
 pub use capability::{Capability, CapabilitySet};
 pub use cert::{AdminCert, AdminRevocation, RevocationReason};

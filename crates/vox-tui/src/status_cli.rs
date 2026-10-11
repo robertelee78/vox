@@ -130,6 +130,16 @@ fn render(v: &Value) -> String {
                 .and_then(Value::as_u64)
                 .unwrap_or(0)
         );
+        let _ = writeln!(
+            o,
+            "    messages: {}; Session steps: {}",
+            vox_core::node::retention::describe(
+                r.get("retention").and_then(Value::as_u64).unwrap_or(0)
+            ),
+            vox_core::node::retention::describe(
+                r.get("step_retention").and_then(Value::as_u64).unwrap_or(0)
+            )
+        );
         // A fork is a member caught signing two different entries at one position: loud,
         // because everything that member posts here is refused from then on.
         for f in r.get("frozen").and_then(Value::as_array).unwrap_or(&empty) {

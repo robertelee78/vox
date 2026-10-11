@@ -169,6 +169,8 @@ pub struct Evaluator {
     denied: BTreeMap<Digest32, DenyReason>,
     /// The effective channel policy after applying policy-updates over genesis.
     policy: ChannelPolicy,
+    /// Independent room Session-step lifetime; not part of genesis or the room's identity.
+    step_ttl_ms: u64,
     /// Each policy-update that took effect, in the room's order. What a client tells a person of
     /// the room's retention changing (ADR-028 R-7).
     retention_changes: Vec<RetentionChange>,
@@ -335,7 +337,7 @@ impl Evaluator {
         let admin_expires_ms = head.expires_ms;
         let denied = head.denied;
         let current_epoch = head.epoch;
-        let (policy, retention_changes) = resolver.resolve_policy(genesis)?;
+        let (policy, step_ttl_ms, retention_changes) = resolver.resolve_policy(genesis)?;
         let consent = resolver.resolve_consent()?;
         let lifecycle = resolver.resolve_lifecycle()?;
         let names = resolver.resolve_names()?;
@@ -347,6 +349,7 @@ impl Evaluator {
             admin_expires_ms,
             denied,
             policy,
+            step_ttl_ms,
             retention_changes,
             current_epoch,
             consent,
@@ -367,6 +370,7 @@ impl Evaluator {
             GovBody::ConsentGrant(g) => g.verify(author_key),
             GovBody::ConsentRevocation(r) => r.verify(author_key),
             GovBody::PolicyUpdate(p) => p.verify(author_key),
+            GovBody::StepPolicyUpdate(p) => p.verify(author_key),
             GovBody::Lifecycle(l) => l.verify(author_key),
             GovBody::Presence(p) => p.verify(author_key),
             GovBody::ServiceShare(s) => s.verify(author_key),
@@ -405,6 +409,13 @@ impl Evaluator {
     #[must_use]
     pub fn policy(&self) -> ChannelPolicy {
         self.policy
+    }
+
+    /// The room's configured Session-step lifetime in milliseconds (`0` forever), before the
+    /// message lifetime and this node's local choices clamp it. Defaults to seven days.
+    #[must_use]
+    pub fn step_ttl_ms(&self) -> u64 {
+        self.step_ttl_ms
     }
 
     /// Each change of the room's retention that took effect, in the room's order (ADR-028 R-7).
@@ -786,8 +797,8 @@ impl<'a> Resolver<'a> {
 
     /// Resolve the effective channel policy: fold in-effect policy-updates whose
     /// author holds `policy` in the update's STRICT past, over the canonical order,
-    /// taking the latest retention (`ttl`). A policy update carries nothing else
-    /// (V030-32): history mode and the suite floor stay as the genesis set them.
+    /// taking the latest message and Session-step lifetimes independently. History mode and
+    /// the suite floor stay as genesis set them; step defaults never alter genesis bytes.
     ///
     /// **Removal wins over an update made meanwhile** (ADR-007 G-23, G-25, #380), as over an end
     /// ([`Resolver::resolve_lifecycle`]): a delegated admin, cut off while the creator takes its
@@ -796,13 +807,16 @@ impl<'a> Resolver<'a> {
     fn resolve_policy(
         &mut self,
         genesis: &Genesis,
-    ) -> Result<(ChannelPolicy, Vec<RetentionChange>)> {
+    ) -> Result<(ChannelPolicy, u64, Vec<RetentionChange>)> {
         let mut policy = genesis.body.policy;
+        let mut step_ttl_ms = crate::governance::step_policy::DEFAULT_STEP_TTL_MS;
         let mut changes = Vec::new();
         let order: Vec<&GovEntry> = self.causality.order.clone();
         for e in order {
-            let GovBody::PolicyUpdate(p) = &e.body else {
-                continue;
+            let (messages, steps) = match &e.body {
+                GovBody::PolicyUpdate(p) => (p.body.ttl_ms, None),
+                GovBody::StepPolicyUpdate(p) => (None, Some(p.ttl_ms)),
+                _ => continue,
             };
             if !self.in_effect(e)? {
                 continue;
@@ -816,7 +830,10 @@ impl<'a> Resolver<'a> {
             {
                 continue;
             }
-            if let Some(ttl) = p.body.ttl_ms {
+            if let Some(ttl) = steps {
+                step_ttl_ms = ttl;
+            }
+            if let Some(ttl) = messages {
                 policy.ttl_ms = ttl;
                 changes.push(RetentionChange {
                     entry_hash: e.entry_hash,
@@ -825,7 +842,7 @@ impl<'a> Resolver<'a> {
                 });
             }
         }
-        Ok((policy, changes))
+        Ok((policy, step_ttl_ms, changes))
     }
 
     /// Resolve the room's shared name (ADR-028 R-1) exactly as [`Resolver::resolve_policy`]

@@ -67,6 +67,14 @@ pub struct OpenRoomSnap {
     /// ([`crate::node::api::ChannelDetail::retention`]): what the room's header always shows
     /// (ADR-028 R-7).
     pub retention: u64,
+    /// The room's configured message lifetime, before this node's shorter choice.
+    pub room_retention: u64,
+    /// The room's configured Session-step lifetime; zero means forever.
+    pub room_step_retention: u64,
+    /// This node's effective Session-step lifetime, clamped by message retention.
+    pub step_retention: u64,
+    /// This node's explicit shorter Session-step lifetime, if it has one.
+    pub local_step_retention: Option<u64>,
     /// The room's Sessions, oldest opening first (ADR-029;
     /// [`crate::node::sessions::fold`]).
     pub sessions: Vec<crate::node::sessions::SessionRow>,
@@ -136,6 +144,10 @@ impl NodeSnapshot {
                     trusted_by: d.trusted_by.clone(),
                     pulled_by: handle.shares().pulled_by(&d.channel_id),
                     retention: d.retention,
+                    room_retention: d.room_retention,
+                    room_step_retention: d.room_step_retention,
+                    step_retention: d.step_retention,
+                    local_step_retention: d.local_step_retention,
                     sessions: crate::node::sessions::fold(d),
                 })
                 .collect(),
@@ -170,7 +182,7 @@ impl NodeSnapshot {
         }
         e.array(self.open.len());
         for o in &self.open {
-            e.array(14)
+            e.array(18)
                 .bytes(&o.channel_id)
                 .text(o.name.as_deref().unwrap_or_default());
             digests(&mut e, &o.members);
@@ -218,6 +230,13 @@ impl NodeSnapshot {
             }
             e.uint(o.retention);
             crate::node::sessions::put_rows(&mut e, &o.sessions);
+            e.uint(o.room_retention)
+                .uint(o.room_step_retention)
+                .uint(o.step_retention);
+            e.array(usize::from(o.local_step_retention.is_some()));
+            if let Some(seconds) = o.local_step_retention {
+                e.uint(seconds);
+            }
         }
         e.array(self.trusted.len());
         for (fp, name) in &self.trusted {
@@ -290,7 +309,10 @@ impl NodeSnapshot {
         }
         let mut open = Vec::new();
         for _ in 0..d.array().map_err(bad("ipc snapshot open rooms"))? {
-            want(&mut d, 14, "ipc snapshot open room")?;
+            let fields = d.array().map_err(bad("ipc snapshot open room"))?;
+            if fields != 14 && fields != 18 {
+                return Err(Error::MalformedIpc("ipc snapshot open room"));
+            }
             let channel_id = digest(&mut d)?;
             let name = Some(d.text().map_err(bad("ipc snapshot open name"))?.to_owned())
                 .filter(|n| !n.is_empty());
@@ -367,6 +389,38 @@ impl NodeSnapshot {
             }
             let retention = d.uint().map_err(bad("ipc snapshot retention"))?;
             let sessions = crate::node::sessions::read_rows(&mut d)?;
+            let (room_retention, room_step_retention, step_retention, local_step_retention) =
+                if fields == 18 {
+                    let room_retention = d.uint().map_err(bad("ipc snapshot room retention"))?;
+                    let room_step_retention =
+                        d.uint().map_err(bad("ipc snapshot room step retention"))?;
+                    let step_retention = d.uint().map_err(bad("ipc snapshot step retention"))?;
+                    let local_step_retention = match d
+                        .array()
+                        .map_err(bad("ipc snapshot local step retention"))?
+                    {
+                        0 => None,
+                        1 => Some(
+                            d.uint()
+                                .map_err(bad("ipc snapshot local step retention seconds"))?,
+                        ),
+                        _ => return Err(Error::MalformedIpc("ipc snapshot local step retention")),
+                    };
+                    (
+                        room_retention,
+                        room_step_retention,
+                        step_retention,
+                        local_step_retention,
+                    )
+                } else {
+                    let steps = crate::node::retention::WEEK;
+                    (
+                        retention,
+                        steps,
+                        crate::node::retention::shortest(retention, steps),
+                        None,
+                    )
+                };
             open.push(OpenRoomSnap {
                 channel_id,
                 name,
@@ -381,6 +435,10 @@ impl NodeSnapshot {
                 trusted_by,
                 pulled_by,
                 retention,
+                room_retention,
+                room_step_retention,
+                step_retention,
+                local_step_retention,
                 sessions,
             });
         }
