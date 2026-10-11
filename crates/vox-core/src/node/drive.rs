@@ -92,7 +92,7 @@ pub struct DriveState {
     /// live generation stood when it became owed it.
     marks: BTreeMap<Digest32, (u64, u64)>,
     /// Public authorization floors, derived from verified control entries; never secret keys.
-    pub(crate) floors: BTreeMap<(Digest32, Digest32, u64, u64), (u64, u64)>,
+    pub(crate) floors: BTreeMap<(Digest32, Digest32, u64, u64), (u64, u64, u64)>,
     pub(crate) floors_indexed: bool,
     /// Bodies a particular peer omitted, only until new authorization is learned or restart.
     pub(crate) omitted: BTreeMap<Digest32, (std::time::Instant, BTreeSet<(Digest32, u64)>)>,

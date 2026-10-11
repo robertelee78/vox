@@ -1,6 +1,6 @@
 //! Public, root-authenticated Session history floors (ADR-031 SA-8).
 //!
-//! This is an explicit control subtype of the existing group-content carrier. Its eight-field
+//! This is an explicit control subtype of the existing group-content carrier. Its nine-field
 //! body is not a three-field encrypted GroupMessage. Published readers classify the carrier as
 //! content, keep the signed entry, and skip its unknown body without interrupting room sync.
 //! The enclosing Entry's root signature authenticates every field; no sender key is disclosed.
@@ -17,12 +17,13 @@ struct Floor {
     generation: u64,
     iteration: u64,
     first_seq: u64,
+    membership: u64,
 }
 
 impl Floor {
     fn wire(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(8)
+        e.array(9)
             .text(MARKER)
             .bytes(&self.room)
             .bytes(&self.author)
@@ -30,7 +31,8 @@ impl Floor {
             .uint(self.epoch)
             .uint(self.generation)
             .uint(self.iteration)
-            .uint(self.first_seq);
+            .uint(self.first_seq)
+            .uint(self.membership);
         let mut out = GROUP_MSG_SIGN_DOMAIN.as_bytes().to_vec();
         out.extend(e.finish());
         out
@@ -38,7 +40,7 @@ impl Floor {
 
     fn read(payload: &[u8]) -> Option<Self> {
         let mut d = Decoder::new(payload.strip_prefix(GROUP_MSG_SIGN_DOMAIN.as_bytes())?);
-        if d.array().ok()? != 8 || d.text().ok()? != MARKER {
+        if d.array().ok()? != 9 || d.text().ok()? != MARKER {
             return None;
         }
         let f = Self {
@@ -49,6 +51,7 @@ impl Floor {
             generation: d.uint().ok()?,
             iteration: d.uint().ok()?,
             first_seq: d.uint().ok()?,
+            membership: d.uint().ok()?,
         };
         d.finish().ok()?;
         (f.wire() == payload).then_some(f)
@@ -74,7 +77,7 @@ impl ChannelState {
             return;
         }
         let key = (floor.author, floor.recipient, floor.epoch, floor.generation);
-        let value = (floor.iteration, floor.first_seq);
+        let value = (floor.membership, floor.iteration, floor.first_seq);
         let old = self.drive.floors.get(&key).copied();
         if old.is_none_or(|old| value > old) {
             self.drive.floors.insert(key, value);
@@ -84,7 +87,7 @@ impl ChannelState {
         }
     }
 
-    fn index_session_floors(&mut self) {
+    pub(super) fn index_session_floors(&mut self) {
         if self.drive.floors_indexed {
             return;
         }
@@ -115,17 +118,44 @@ impl ChannelState {
         self.index_session_floors();
         let me = self.me();
         let members = self.drive_members();
-        // A hook may write immediately after trust gains drive, before the actor's next tick.
-        // Mark that grant before encrypting its first eligible step, not after it was written.
-        self.drive.take_owed(&members, holders);
-        let marks = holders
+        let Some(generation) = self.drive.chain.as_ref().map(SenderChain::chain_id) else {
+            return Ok(());
+        };
+        // A room left and rejoined holds none of the old release. Detect its signed current
+        // membership before writing a step, even if the actor's next lifecycle tick is later.
+        for recipient in holders.iter().filter(|p| members.contains(*p)) {
+            if self
+                .drive
+                .floors
+                .get(&(me, *recipient, self.epoch, generation))
+                .is_some_and(|(membership, _, _)| *membership != self.admission(recipient).0)
+            {
+                self.drive.forget(&[*recipient]);
+            }
+        }
+        let owed = self.drive.take_owed(&members, holders);
+        if !owed.is_empty() {
+            // Persist the new mark before its public floor: a restart cannot restore an old
+            // delivered mark beside a newer floor and silently skip the replacement release.
+            self.persist_drive(profile.store())?;
+        }
+        let mut marks = holders
             .iter()
             .filter(|p| members.contains(*p))
             .filter_map(|p| self.drive.floor_mark(p).map(|(g, i)| (*p, g, i)))
             .collect::<Vec<_>>();
+        // This also preserves the author's generation when every old step body is withheld
+        // on rejoin, including a Session with no other drive holders.
+        marks.push((me, generation, 0));
         for (recipient, generation, iteration) in marks {
             let key = (me, recipient, self.epoch, generation);
-            if self.drive.floors.contains_key(&key) {
+            let membership = self.admission(&recipient).0;
+            if self
+                .drive
+                .floors
+                .get(&key)
+                .is_some_and(|(m, i, _)| *m == membership && *i >= iteration)
+            {
                 continue;
             }
             let first_seq = self
@@ -150,9 +180,12 @@ impl ChannelState {
                 generation,
                 iteration,
                 first_seq,
+                membership,
             };
             self.append_control_kind(profile, &floor.wire(), now, EntryKind::Content)?;
-            self.drive.floors.insert(key, (iteration, first_seq));
+            self.drive
+                .floors
+                .insert(key, (membership, iteration, first_seq));
         }
         Ok(())
     }
@@ -168,9 +201,6 @@ impl ChannelState {
         if msg.header.channel_id != drive_channel(&self.channel_id) {
             return true;
         }
-        if entry.skeleton.author_id == *recipient {
-            return true;
-        }
         let key = (
             entry.skeleton.author_id,
             *recipient,
@@ -184,8 +214,13 @@ impl ChannelState {
         {
             return false;
         }
-        if let Some((iteration, seq)) = self.drive.floors.get(&key) {
-            return msg.header.iteration >= *iteration && entry.skeleton.seq >= *seq;
+        if entry.skeleton.author_id == *recipient {
+            return true;
+        }
+        if let Some((membership, iteration, seq)) = self.drive.floors.get(&key) {
+            return *membership == self.admission(recipient).0
+                && msg.header.iteration >= *iteration
+                && entry.skeleton.seq >= *seq;
         }
         // A published older author has no public floor record. This receiver can still
         // establish its own grant from the verified SKDM's chain: it cannot derive a key
