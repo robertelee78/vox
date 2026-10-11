@@ -216,6 +216,7 @@ private struct ShareForm: View {
     @State private var reach: (room: String, can: [String], cannot: [String])?
     @State private var failed: String?
     @State private var working: String?
+    @State private var audienceRead: UUID?
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s8) {
@@ -252,7 +253,9 @@ private struct ShareForm: View {
                     ForEach(model.rooms.filter(\.open)) { Text($0.name).tag($0.id) }
                 }
                 .accessibilityIdentifier("share-room")
-                .onChange(of: room) { r in Task { await audience(of: r) } }
+                .onChange(of: room) { r in
+                    if reach?.room != r { Task { await audience(of: r) } }
+                }
                 Text("Members will use \(shownTag).\(model.node).\(roomName).vox (each by their own name for this node).")
                     .accessibilityIdentifier("share-address")
                 ForEach(preview.warnings, id: \.self) { warning in
@@ -266,7 +269,7 @@ private struct ShareForm: View {
                         Text("Cannot reach it (not in your keyring): \(reach.cannot.joined(separator: ", ")).")
                             .secondaryText()
                     }
-                } else {
+                } else if audienceRead != nil {
                     Text("Finding who in \(roomName) can reach it…").secondaryText()
                         .accessibilityIdentifier("share-can-pending")
                 }
@@ -291,21 +294,29 @@ private struct ShareForm: View {
     private var shownTag: String { name }
 
     private func pick(_ service: ListeningService) async {
-        // The last pick's preview goes at once: it is not this service's.
         guard working == nil else { return }
+        let targetRoom = room.isEmpty ? (model.rooms.first(where: \.open)?.id ?? "") : room
+        guard !targetRoom.isEmpty else {
+            failed = "Join or create an open room before sharing a service."
+            return
+        }
         working = "Reading the service…"
         defer { working = nil }
         picked = service
         preview = nil
         failed = nil
         do {
-            let p = try await model.previewShare(port: service.port, udp: service.udp)
-            // An answer for a service no longer picked is dropped.
+            // One deadline covers both reads; no timed-out task can later change the form.
+            let (p, found) = try await AppRequest.run("Reading the service") {
+                let preview = try await model.previewShare(port: service.port, udp: service.udp)
+                let audience = try await model.reach(in: targetRoom)
+                return (preview, audience)
+            }
             guard picked?.line == service.line else { return }
             preview = (service.line, p)
             name = p.name
-            if room.isEmpty, let first = model.rooms.first(where: \.open) { room = first.id }
-            await audience(of: room)
+            room = targetRoom
+            reach = (targetRoom, found.can, found.cannot)
         } catch {
             guard picked?.line == service.line else { return }
             preview = nil
@@ -316,8 +327,14 @@ private struct ShareForm: View {
     /// Who in `room` can reach a share, kept only while `room` is still the one chosen.
     private func audience(of room: String) async {
         if reach?.room != room { reach = nil }
+        failed = nil
+        let reading = UUID()
+        audienceRead = reading
+        defer { if audienceRead == reading { audienceRead = nil } }
         do {
-            let found = try await model.reach(in: room)
+            let found = try await AppRequest.run("Reading who can reach the service") {
+                try await model.reach(in: room)
+            }
             guard self.room == room else { return }
             reach = (room, found.can, found.cannot)
         } catch {
@@ -333,12 +350,20 @@ private struct ShareForm: View {
         working = "Sharing the service…"
         defer { working = nil }
         let tag = preview.tag.hasPrefix("udp/") ? "udp/\(name)" : name
-        if let why = await model.shareService(room: room, tag: tag, local: preview.local) {
-            failed = why
-        } else {
-            picked = nil
-            self.preview = nil
-            await shared()
+        do {
+            let why = try await AppRequest.run("Sharing the service") {
+                await model.shareService(room: room, tag: tag, local: preview.local)
+            }
+            if let why {
+                failed = why
+            } else {
+                picked = nil
+                self.preview = nil
+                working = nil
+                await shared()
+            }
+        } catch {
+            failed = sentence(error)
         }
     }
 }

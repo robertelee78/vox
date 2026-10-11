@@ -47,5 +47,5 @@ private final class PendingAppRequest<Value> {
 private struct AppRequestTimeout: LocalizedError {
     let words: String
     let seconds: UInt64
-    var errorDescription: String? { "\(words) did not finish within \(seconds) seconds. Try again." }
+    var errorDescription: String? { "\(words) did not finish within \(seconds) seconds. Whether it finished is unknown; check before trying again." }
 }
