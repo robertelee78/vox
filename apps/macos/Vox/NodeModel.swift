@@ -1600,9 +1600,9 @@ final class NodeModel: ObservableObject {
 
     fileprivate func stopped(_ text: String) {
         ended = text
-        if text.localizedCaseInsensitiveContains("daemon") {
-            daemonReachable = false
-        }
+        // A detach is delivered by a live daemon; a stopped event stream cannot report
+        // the daemon's current state. The word "daemon" occurs in both sentences.
+        daemonReachable = text.localizedCaseInsensitiveContains("detached")
     }
 
     /// Attach this node again after it stopped, with `secret` if it needs its passphrase, and

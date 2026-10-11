@@ -1694,7 +1694,7 @@ private struct NodeStopped: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             StateMark(kind: .danger, words: model.daemonReachable
-                      ? "Node \(model.node) is detached: \(model.ended ?? "")"
+                      ? (model.ended ?? "Node \(model.node) is detached.")
                       : "The daemon cannot be reached. Node states and peers are unknown; Vox is reconnecting.")
                 .textSelection(.enabled)
                 .accessibilityIdentifier("node-stopped")
