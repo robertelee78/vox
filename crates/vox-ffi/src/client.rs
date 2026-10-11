@@ -104,7 +104,7 @@ pub struct RoomSummary {
     pub over: String,
 }
 
-/// Independent Session-step retention (ADR-031 SA-6); zero seconds means forever.
+/// Independent Session-step retention (ADR-031 SA-9); zero seconds means forever.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiStepRetention {
     /// The room's configured step lifetime, before message retention clamps it.

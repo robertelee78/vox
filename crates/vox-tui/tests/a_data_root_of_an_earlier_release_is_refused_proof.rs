@@ -422,10 +422,9 @@ fn seen(w: &room::Worker, room: &str, others: &[String], side: &str) -> Seen {
 #[ignore = "downloads the previous release; an anchor and two daemons of each; run in release"]
 fn a_data_root_of_the_previous_release_opens_with_nothing_lost() {
     watchdog::arm_for(Duration::from_secs(1200));
-    assert!(
-        cfg!(feature = "test-knobs"),
-        "APPARATUS: the upgrade retention journey requires --features test-knobs"
-    );
+    if !cfg!(feature = "test-knobs") {
+        panic!("APPARATUS: the upgrade retention journey requires --features test-knobs");
+    }
     let tmp = tempfile::tempdir().expect("APPARATUS: a temp dir");
     let (version, old) = previous_release::previous_release(tmp.path());
     let old = old.to_str().expect("APPARATUS: a UTF-8 path").to_owned();

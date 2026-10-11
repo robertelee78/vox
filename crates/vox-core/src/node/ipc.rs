@@ -757,7 +757,7 @@ pub enum Request {
         /// Seconds a message body is kept; `0` keeps it forever.
         ttl: u64,
     },
-    /// Set Session-step retention independently of room messages (ADR-031 SA-6). An admin
+    /// Set Session-step retention independently of room messages (ADR-031 SA-9). An admin
     /// changes the room rule; another member can shorten only this node's lifetime.
     SetStepRetention {
         /// The room.
