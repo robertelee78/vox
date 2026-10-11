@@ -2,8 +2,11 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: Accepted for v0.4.4 (the decider's Q&A, 2026-10-10, and his answers to this ADR's
-open questions, the same evening, and his story-plan answers that night: threads in the TUI).
+**Status**: Accepted for v0.4.5 (the decider's release split, 2026-10-10, night: v0.4.4 holds the
+fixes that let nodes join a room and work correctly, and the rest moves to v0.4.5); every
+requirement in this ADR ships in v0.4.5. Accepted from the decider's Q&A, 2026-10-10, his answers
+to this ADR's open questions the same evening, and his story-plan answers that night (threads in
+the TUI).
 Nothing in this ADR is built.
 **Date**: 2026-10-10
 **Deciders**: Robert E. Lee

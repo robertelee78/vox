@@ -2,10 +2,12 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: Accepted for v0.4.4 (the decider's Q&A, 2026-10-10, and his answers to this ADR's
-open questions, the same evening, and his story-plan answers that night: LT-8, a Mac over ssh,
-one format step; and his Session history decisions that night: SA-7–SA-12). Nothing in this
-ADR is built.
+**Status**: Accepted for v0.4.5, except SA-8, SA-9, SA-12.2, SA-12.3, SA-13, RN-1 and RN-2,
+which are accepted for v0.4.4 (the decider's release split, 2026-10-10, night: v0.4.4 holds the
+fixes that let nodes join a room and work correctly, and the rest moves to v0.4.5). Accepted from the
+decider's Q&A, 2026-10-10, his answers to this ADR's open questions the same evening, his
+story-plan answers that night (LT-8, a Mac over ssh, one format step), and his Session history
+decisions and answers that night (SA-7–SA-13). Nothing in this ADR is built.
 **Date**: 2026-10-10
 **Deciders**: Robert E. Lee
 **Tags**: agents, onboarding, hooks, keyring, trust, drive, sessions, macos
@@ -212,18 +214,18 @@ allow drive access for the node I'm using from the macOS app."
   every Session on the log to any member.)
 - **SA-3.** A Session's opening and end records MUST be sealed under its Session key (ADR-029 SC-2),
   so a member without drive cannot read them from its own copy of the log. This MUST ship in
-  v0.4.4 (the decider: do it now).
-- **SA-5. Upgrade.** Sealing these records is a format change (ADR-026 F-3): v0.4.4 MUST raise the
+  v0.4.5 (the decider's "do it now" was for v0.4.4; his release split moved it).
+- **SA-5. Upgrade.** Sealing these records is a format change (ADR-026 F-3): v0.4.5 MUST raise the
   data root's format and MUST upgrade, automatically and before anything else is written, every
   data root a release since v0.4.0 wrote. Every room, every Session and every entry an earlier
   release wrote MUST open and read in full after the upgrade, and an open Session MUST continue;
   nothing MAY be lost. Records an earlier release wrote unsealed stay as they were written in every
   member's copy of the log; from the upgrade on, the daemon MUST NOT serve them to a member without
   drive (SA-2), and the release's notes MUST say that earlier opening and end records stay readable
-  in a copy a member already holds. This is one format step with ADR-032 AN-14: v0.4.4 MUST raise
+  in a copy a member already holds. This is one format step with ADR-032 AN-14: v0.4.5 MUST raise
   the format once, with one upgrade and one proof (SA-6) for both.
 - **SA-6. Proof of the upgrade.** The upgrade MUST be proved by real use, on a data root and rooms
-  the shipped v0.4.3 binary wrote, with Sessions open and ended, opened by the v0.4.4 binary
+  the shipped v0.4.4 binary wrote, with Sessions open and ended, opened by the v0.4.5 binary
   (extending `a_data_root_of_the_previous_release_opens_with_nothing_lost`, ADR-026 F-3), with a
   mutant that turns it red on its own assertion (ADR-018 §7).
 - **SA-4.** A member without drive addresses the node (ADR-029 TA-4); the composer MUST NOT offer
@@ -232,7 +234,10 @@ allow drive access for the node I'm using from the macOS app."
 The decider's Session history decisions (2026-10-10, night), after the frame-length root cause
 (ADR-034 Context): "agents will often have MUCH MUCH MUCH longer sessions". A Session's steps are
 the entries ADR-029 SC-1 lists: tool calls, replies, turn ends, approvals, questions and answers,
-and file records.
+and file records. A Session's opening and end records are not steps: every member with drive
+learns that a Session exists, and can drive it, whenever it joined (the lead's call, 2026-10-10,
+on a point the decider left open).
+
 
 - **SA-7. Session steps live only with drive.** A Session's steps MUST be sent, synced, relayed and
   stored only to and on the session's own node and the members that node trusts with drive. A
@@ -240,14 +245,23 @@ and file records.
   The decider: "Session steps are kept only on members with drive (the only ones who can read
   them)." The room's own messages are not affected: a member without drive MUST be able to hold,
   verify and sync the room's log complete without any Session step, so nothing a member without
-  drive holds MAY need a Session step to verify or to sync.
+  drive holds MAY need a Session step to verify or to sync. At the upgrade to the release that
+  brings SA-7, a member without drive MUST delete the steps it holds. A member that loses drive
+  later MUST keep what it already read and MUST receive nothing newer (ADR-029 SC-2b holds). The
+  decider: "yes" to both.
 - **SA-8. Forward from the join.** A node that joins a room MUST get a Session's steps only from
   the later of its join and its gaining drive, going forward. No node MAY send it, and it MUST NOT
   fetch, a step written before then, whatever its trust. The decider: "A node that joins syncs a
   Session only from the point it joined, going forward — no backfill of Session history."
 - **SA-9. A retention for Session steps.** A room MUST have a retention for its Session steps,
   apart from its message retention (ADR-010 AR-28). Its default MUST be 7 days or the room's message
-  retention, whichever is shorter, where forever is longer than any duration. The decider: "a room
+  retention, whichever is shorter, where forever is longer than any duration. Steps MUST never
+  outlive the room's messages: the retention in force is always the shorter of the one set and the
+  message retention. It MUST be set with `vox room retention <room> --steps <dur>`, for example
+  `--steps 7d`. The 7-day default MUST apply plainly to rooms an earlier release created, from the
+  first start of the release that brings SA-9; no older step is kept for them. The decider: "lol
+  I'm the only user dude, we're still pre-alpha"; "yes" to steps never outliving messages and to
+  `--steps 7d`. The decider: "a room
   has its own retention for Session steps; default = 7 days or the room's message retention,
   whichever is shorter; the creator/admin may set it." Only the room's creator, or an admin it
   delegated with `vox room admin`, MAY set it (ADR-007 G-5), through `vox room retention` as the
@@ -255,18 +269,20 @@ and file records.
   retention (ADR-010 AR-29) and the shorter-wins rule (AR-30) MUST apply to Session steps as they
   do to messages. `vox status --json` and the app's room settings MUST show it beside the message
   retention. An ended Session's steps age by it (ADR-029 SE-5 as amended).
-- **SA-10. Peers of earlier releases.** SA-7 and SA-8 change what peers send each other. A v0.4.4
-  node MUST keep syncing the room's messages with a peer of an earlier release (ADR-034 UP-2), and
-  nothing it sends MAY poison that peer's room. A v0.4.3 member without drive receives no Session
-  steps from a v0.4.4 node. What a v0.4.3 member with drive sees of a Session written by a v0.4.4
-  node, and what a v0.4.4 node does with steps a v0.4.3 node still writes into the room's log, is
-  to be measured with the shipped v0.4.3 binary before SA-7 is built, and the release's notes MUST
-  say it in one sentence.
-- **SA-11. The format step.** The Session-step retention (a field of the room's policy, ADR-007)
-  and whatever the store needs to hold steps apart from the room's log are part of v0.4.4's one
-  format step (SA-5): one raise of the format, one upgrade and one proof (SA-6) with SA-3 and
-  ADR-032 AN-14. After the upgrade, every step a member with drive held and its retention still
-  keeps MUST read in full, and an open Session MUST continue.
+- **SA-10. Peers of earlier releases.** SA-7 and SA-8 change what peers send each other. A node of
+  the release that brings them MUST keep syncing the room's messages with a peer of an earlier
+  release (ADR-034 UP-2), and nothing it sends MAY poison that peer's room. A member of an earlier
+  release without drive receives no Session steps from a node with SA-7. What a member of an earlier
+  release with drive sees of a Session written by such a node, and what such a node does with steps
+  an earlier release still writes into the room's log, is to be measured with the shipped earlier
+  binary before SA-7 is built, and the release's notes MUST say it in one sentence.
+- **SA-11. The format step.** Whatever the store needs to hold steps apart from the room's log
+  (SA-7) is part of v0.4.5's one format step (SA-5): one raise of the format, one upgrade and one
+  proof (SA-6) with SA-3 and ADR-032 AN-14. After the upgrade, every step a member with drive held
+  and its retention still keeps MUST read in full, and an open Session MUST continue. SA-8 and
+  SA-9 ship in v0.4.4, before that step, and do not wait for it: where SA-9 needs a field the data
+  root lacks (the Session-step retention in the room's policy, ADR-007), v0.4.4 MUST carry its own
+  small upgrade for it, with nothing else in it.
 - **SA-12. Proof.** SA-7, SA-8 and SA-9 MUST each be proved by real use of the shipped binary
   (ADR-018 §9), extending the drive journey where it fits, with a mutant that turns each proof red
   on its own assertion, labelled PRODUCT (ADR-018 §7):
@@ -281,6 +297,10 @@ and file records.
      Session's steps MUST be gone from every member with drive once that retention passes, while
      the room's messages of the same age remain; and a new room MUST report a 7-day Session-step
      retention. Mutant: steps age by the message retention.
+- **SA-13. Saying "step".** The manual, the app, the TUI and every verb's help MUST explain a step
+  in plain words, as one thing an agent did in its Session: a message, a command it ran, a file it
+  edited. They MUST NOT use "step" without that meaning, and MUST NOT name it otherwise. The
+  decider asked what a step is: it is to be explained plainly where the person meets it.
 
 ### 9. Renaming a node
 
@@ -326,7 +346,8 @@ and file records.
 | ADR-029 SC-1, SC-2 | A Session's steps are entries of the room's log, sealed, and every member holds them | Steps are sent, synced and stored only on the session's node and members with drive; members without drive never receive them (SA-7) |
 | ADR-029 SC-2a | A member reads a Session from the key's release onward; earlier sealed steps are in its copy of the log | A joining node gets steps only from the later of its join and its gaining drive; no backfill (SA-8) |
 | ADR-029 SE-5; ADR-010 AR-27, AR-28 | A Session's content follows the room's message retention, forever by default | Session steps have a retention of their own, by default 7 days or the message retention, whichever is shorter (SA-9) |
-| ADR-007 G-5 (the policy update) | A policy update changes the room's one retention | It also carries the Session-step retention (SA-9, SA-11) |
+| ADR-007 G-5 (the policy update) | A policy update changes the room's one retention | It also carries the Session-step retention (SA-9), set with `--steps` |
+| ADR-031 SA-3, SA-5, SA-6, SA-11 (as first written) | Ship in v0.4.4, with the Session-step retention in the one format step | Ship in v0.4.5; SA-8, SA-9, SA-13, RN-1, RN-2 ship in v0.4.4, SA-9 with its own small upgrade (the decider's release split, 2026-10-10) |
 
 ## Consequences
 
@@ -343,37 +364,26 @@ and file records.
 - On upgrade, this machine's nodes that already share a room with the person's node trust each
   other, and the person's node gains drive over them (LT-9).
 - A member with read only no longer learns that a node has Sessions, or their names.
-- The Session opening and end records change on the wire and on disk, so v0.4.4 is to carry an
+- The Session opening and end records change on the wire and on disk, so v0.4.5 is to carry an
   upgrade for data roots written by v0.4.0 or later, and its proof (SA-5, SA-6).
 - Scripts and documents that use `vox node attach` or `detach` keep working, and are told the new
   verbs (CW-7).
 - A member without drive no longer stores or relays any Session's steps, and a member that joins
   late does not get a Session's earlier steps (SA-7, SA-8). An agent's long Sessions cost disk and
   sync only on the members that can read them, and only for the Session-step retention (SA-9).
-- A room's Session steps are kept 7 days by default, where they were kept as long as its messages
-  (SA-9).
+- A room's Session steps are kept 7 days by default, never longer than its messages, where they
+  were kept as long as its messages; rooms made before v0.4.4 lose their steps older than 7 days
+  at its first start (SA-9).
 
 ## Open questions
 
-- **A member of an earlier release in the room.** What a v0.4.3 node does when it receives a sealed
+- **A member of an earlier release in the room.** What a v0.4.4 node does when it receives a sealed
   opening or end record (skips it, refuses the entry, or poisons the room) is not known. It is to be
-  measured with the shipped v0.4.3 binary before SA-3 is built. Peers of different releases keep
+  measured with the shipped v0.4.4 binary before SA-3 is built. Peers of different releases keep
   syncing (ADR-034 UP-2 refuses a version difference only between a client and its own daemon), so
-  a v0.4.3 member can receive sealed records from a v0.4.4 member, and the answer is to be brought
+  a v0.4.4 member can receive sealed records from a v0.4.5 member, and the answer is to be brought
   to the decider before SA-3 is built. Measuring compatibility between versions, so that peers of
   different releases are handled safely, is planned for v0.4.5.
-- **Session history on upgrade.** Three points are not decided by the decider's words and are to
-  be brought to him before SA-7, SA-9 and SA-11 are built: (1) whether a v0.4.4 member without
-  drive deletes, at the upgrade, the sealed Session steps an earlier release stored in its copy of
-  the log, and whether a member that loses drive later deletes the steps it holds (ADR-029 SC-2b
-  says it keeps what it already read); (2) whether the 7-day default applies on upgrade to rooms an
-  earlier release created, which by ADR-010 AR-31 deletes their older steps, against SA-5's
-  "nothing MAY be lost"; (3) whether a Session's opening and end records are steps under SA-7 and
-  SA-8, and so whether a member with drive that joins while a Session is open learns that the
-  Session exists and can drive it.
-- **Session-step retention, set.** When the creator sets a Session-step retention longer than the
-  room's message retention, whether steps may outlive the room's messages; and the exact words of
-  the `vox room retention` form that sets it.
 
 ## Related ADRs
 
