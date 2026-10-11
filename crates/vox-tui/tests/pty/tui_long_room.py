@@ -36,6 +36,111 @@ def staging(why):
     """A step the product performs while the proof is set up, not done: the product's red."""
     print(f"{TAG} RED: PRODUCT (staging): {why}"); sys.exit(1)
 
+
+def paged_order():
+    import re
+    tui = None
+    code = 2
+    try:
+        stage("paged Order: opening attached node")
+        node = sys.argv[10]
+        tui = Tui([VOX, "tui", "--node", node], env)
+        if not tui.until(lambda: ROOM in tui.text(), 60, .2):
+            staging(f"room absent from TUI: {tui.text()}")
+        tui.key("\r", 1)
+        if not tui.until(lambda: "ORDER-PAGE-5999" in tui.text(), 60, .2):
+            staging(f"newest Order page absent from TUI: {tui.text()}")
+        stage("paged Order: reading each timeline page")
+        seen = set()
+        for _ in range(1400):
+            # Only the timeline is the verdict; matching a sidebar preview cannot count.
+            from vox_pty import pane
+            visible = [int(n) for n in re.findall(r"ORDER-PAGE-(\d{4})", "\n".join(pane(tui.display(), "Timeline")))]
+            if visible != sorted(visible):
+                print(f"{TAG} RED: PRODUCT: timeline rows are out of Order: {visible}")
+                return 1
+            seen.update(visible)
+            if len(seen) == 6000:
+                break
+            tui.key("\x1b[5~", .08)
+        if seen != set(range(6000)):
+            missing = sorted(set(range(6000)) - seen)
+            print(f"{TAG} RED: PRODUCT: TUI lost {len(missing)} of6000 Order rows; first missing {missing[:20]}; screen:\n{tui.text()}")
+            return 1
+        tui.key("\x1b[F", 1)
+        if "ORDER-PAGE-5999" not in tui.text():
+            print(f"{TAG} RED: PRODUCT: End did not restore newest row after paging:\n{tui.text()}")
+            return 1
+        print(f"{TAG} PASS: TUI showed all6000 entries in Order across pages; End returned to newest")
+        code = 0
+    except Hung as h:
+        print(f"{TAG} APPARATUS: driver watchdog at {h}")
+    finally:
+        disarm()
+        if tui is not None and not tui.stop():
+            print(f"{TAG} APPARATUS: TUI did not stop")
+            code = 2
+    return code
+
+if len(sys.argv) > 9 and sys.argv[9] == "order":
+    sys.exit(paged_order())
+
+
+def paged_members():
+    import re
+    from vox_pty import pane
+    tui = None
+    code = 2
+    try:
+        stage("70 members: opening attached node")
+        tui = Tui([VOX, "tui", "--node", sys.argv[10]], env)
+        if not tui.until(lambda: ROOM in tui.text(), 60, .2):
+            staging(f"70-member room absent: {tui.text()}")
+        tui.key("\r", 1)
+        if not tui.until(lambda: "READ-MARK-69" in tui.text(), 60, .2):
+            staging(f"70-member timeline did not open: {tui.text()}")
+        stage("70 members: read marks in the timeline")
+        seen, readers = set(), set()
+        for _ in range(300):
+            shown = "\n".join(pane(tui.display(), "Timeline"))
+            seen.update(int(n) for n in re.findall(r"READ-MARK-(\d{2})", shown))
+            readers.update(int(n) for n in re.findall(r"member-(\d{2})", shown))
+            if len(seen) == 70 and readers >= set(range(1, 70)):
+                break
+            tui.key("\x1b[5~", .1)
+        if seen != set(range(70)) or not readers >= set(range(1, 70)):
+            print(f"{TAG} RED: PRODUCT: TUI lost read marks: {len(seen)}/70 rows, {len(readers)}/69 readers; screen:\n{tui.text()}")
+            return 1
+        stage("70 members: each member's trust in the member pane")
+        tui.key("\t", .2)
+        tui.key("\t", .2)
+        trusted = set()
+        for _ in range(150):
+            lines = pane(tui.display(), "Members")
+            for i, line in enumerate(lines):
+                for number in re.findall(r"member-(\d{2})", line):
+                    if "trusted both ways" in " ".join(lines[i:i+4]):
+                        trusted.add(int(number))
+            if trusted >= set(range(1, 70)):
+                break
+            tui.key("\x1b[B", .1)
+        if not trusted >= set(range(1, 70)):
+            print(f"{TAG} RED: PRODUCT: TUI lost member trust: missing {sorted(set(range(1,70))-trusted)}; screen:\n{tui.text()}")
+            return 1
+        print(f"{TAG} PASS: 70-member TUI opened, every reader's mark and every peer's trust were shown")
+        code = 0
+    except Hung as h:
+        print(f"{TAG} APPARATUS: driver watchdog at {h}")
+    finally:
+        disarm()
+        if tui is not None and not tui.stop():
+            print(f"{TAG} APPARATUS: TUI did not stop")
+            code = 2
+    return code
+
+if len(sys.argv) > 9 and sys.argv[9] == "members":
+    sys.exit(paged_members())
+
 tui = None
 code = 2
 try:

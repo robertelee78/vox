@@ -1556,6 +1556,7 @@ pub async fn read(
     json: bool,
     only_late: bool,
     with_notices: bool,
+    unread: bool,
     tagged: &Tagged,
 ) -> Result<(), AppError> {
     let (mut client, channel_id, room_key) = open_room(paths, room).await?;
@@ -1569,8 +1570,19 @@ pub async fn read(
         // the cursor had been read. `--late` filters, so it reads on and keeps `--limit` of those.
         let take = usize::try_from(limit).unwrap_or(usize::MAX);
         let read = if only_late { 0 } else { take };
-        let Some(rows) = rows_of(&mut client, channel_id, since, before, read, tagged).await?
-        else {
+        let Some(rows) = (if unread {
+            match client.request(&Request::Unread { channel_id }).await? {
+                Frame::Rows { rows } => Some(rows),
+                Frame::Error { reason } => return Err(AppError::Usage(reason)),
+                other => {
+                    return Err(AppError::Usage(format!(
+                        "the node did not return unread messages: {other:?}"
+                    )))
+                }
+            }
+        } else {
+            rows_of(&mut client, channel_id, since, before, read, tagged).await?
+        }) else {
             return Err(AppError::Usage(format!(
                 "cursor {} is not in this room's timeline",
                 since.map(|c| id(&c)).unwrap_or_default()
@@ -1615,7 +1627,19 @@ pub async fn read(
     // those.
     let take = usize::try_from(limit).unwrap_or(usize::MAX);
     let read = if only_late { 0 } else { take };
-    let Some(shown) = rows_of(&mut client, channel_id, since, before, read, tagged).await? else {
+    let Some(shown) = (if unread {
+        match client.request(&Request::Unread { channel_id }).await? {
+            Frame::Rows { rows } => Some(rows),
+            Frame::Error { reason } => return Err(AppError::Usage(reason)),
+            other => {
+                return Err(AppError::Usage(format!(
+                    "the node did not return unread messages: {other:?}"
+                )))
+            }
+        }
+    } else {
+        rows_of(&mut client, channel_id, since, before, read, tagged).await?
+    }) else {
         return Err(AppError::Usage(format!(
             "cursor {} is not in this room's timeline",
             since.map(|c| id(&c)).unwrap_or_default()

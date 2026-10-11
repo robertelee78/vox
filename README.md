@@ -129,6 +129,10 @@ start the daemon and attach their node themselves. The one-shot verbs (`room`,
 `status`, `trust`, `share`, `service`, `app`) only ask an attached node, and say so if it is not:
 `vox node attach <name>` first.
 
+Read this node's complete retained decision history with `vox decisions` (newest first),
+or `vox decisions --json` for one event per line. `vox room read <room> --unread --json`
+reads every unread message without marking it read. Both follow every transport page.
+
 ### The interactive client
 
 ```

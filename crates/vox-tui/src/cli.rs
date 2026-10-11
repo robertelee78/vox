@@ -761,12 +761,12 @@ pub struct ShareListArgs {
     pub room: String,
 }
 
-/// `vox status`
+/// `vox status` and `vox decisions`.
 #[derive(Args, Debug, Clone)]
 pub struct StatusArgs {
     #[command(flatten)]
     pub profile: NodeArgs,
-    /// Print the node's report as JSON, for machines.
+    /// Print JSON, for machines.
     #[arg(long)]
     pub json: bool,
 }
@@ -1393,6 +1393,9 @@ pub struct RoomReadArgs {
     /// Read the bounded page before this entry; otherwise open at the newest page.
     #[arg(long, conflicts_with_all = ["since", "tag", "late", "hashes"])]
     pub before: Option<String>,
+    /// Read every message this node's person has not marked read, without marking it read.
+    #[arg(long, conflicts_with_all = ["since", "before", "limit", "tag", "late", "hashes", "notices"])]
+    pub unread: bool,
     /// At most this many messages in the page. 0 uses the page's row and byte bound.
     #[arg(long, default_value_t = 0)]
     pub limit: u64,
@@ -2212,6 +2215,8 @@ enum Cmd {
     /// counters per room and peer: sessions opened, admitted, refused, completed,
     /// partial and failed, and any backoff.
     Status(StatusArgs),
+    /// Every retained decision by this node, newest first; --json prints one event per line.
+    Decisions(StatusArgs),
     /// Wire an agent session into a room — Claude Code, Codex and OpenCode.
     ///
     /// The room settles who does what: an agent claims work there, asks there who is
@@ -2543,6 +2548,7 @@ pub fn run() -> ExitCode {
                                 a.json,
                                 a.late,
                                 a.notices,
+                                a.unread,
                                 &crate::room_cli::Tagged {
                                     tags: a.tag.clone(),
                                     from: a.from.clone(),
@@ -2833,6 +2839,32 @@ pub fn run() -> ExitCode {
                 }
             };
             match rt.block_on(crate::status_cli::status(&paths, args.json)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Cmd::Decisions(args) => {
+            let paths = match args.profile.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match rt.block_on(crate::status_cli::decisions(&paths, args.json)) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("vox: {e}");
