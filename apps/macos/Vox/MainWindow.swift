@@ -14,12 +14,28 @@ struct MainWindow: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if model.ended != nil {
+            if model.ended != nil || !model.daemonReachable {
                 NodeStopped(model: model)
                 Divider()
             }
             // A repo with no room (ADR-029 RB-5): one banner across the window.
             RoomAskBanner(model: model)
+            if model.daemonReachable && (!model.health.isEmpty || !model.recovered.isEmpty) {
+                VStack(alignment: .leading, spacing: Space.s4) {
+                    ForEach(model.health) { issue in
+                        StateMark(kind: .danger, words: issue.message)
+                            .accessibilityIdentifier("health-\(issue.key)")
+                    }
+                    ForEach(model.recovered) { notice in
+                        StateMark(kind: .plain, words: notice.message)
+                            .accessibilityIdentifier("recovered-\(notice.key)")
+                    }
+                }
+                .textSelection(.enabled)
+                .padding(Space.s12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Divider()
+            }
             NavigationSplitView {
                 // Dragged wider or narrower, and remembered (Columns).
                 Sidebar(model: model)
@@ -123,7 +139,7 @@ private struct Sidebar: View {
             // + that makes a room or joins one, as Room > New Room… and Join Room… do.
             Section {
                 HStack {
-                    NodeIdentity(name: model.node, attached: model.ended == nil)
+                    NodeIdentity(name: model.node, attached: model.ended == nil, known: model.daemonReachable)
                         .copyMenu([("Copy Name", model.node)])
                         .accessibilityIdentifier(model.ended == nil ? "attached" : "detached")
                     Spacer()
@@ -143,7 +159,7 @@ private struct Sidebar: View {
                         .copyMenu([("Copy Fingerprint", offer.fingerprint)])
                 }
                 ForEach(model.orderedRooms) { room in
-                    RoomRow(room: room, selected: model.selection == .room(room.id))
+                    RoomRow(room: room, selected: model.selection == .room(room.id), health: model.roomHealth(room.id))
                         .tag(NodeModel.Selection.room(room.id))
                         .sidebarRow(model.selection == .room(room.id))
                         .copyMenu([("Copy Name", room.name)])
@@ -163,7 +179,7 @@ private struct Sidebar: View {
         }
         .listStyle(.sidebar)
         // The nodes on this Mac, at the sidebar's foot (G5), whatever the rooms above scroll to.
-        .safeAreaInset(edge: .bottom, spacing: 0) { OnThisMachine(nodes: model.nodes) }
+        .safeAreaInset(edge: .bottom, spacing: 0) { OnThisMachine(nodes: model.nodes, known: model.daemonReachable) }
         // On bg.panel, not the system's sidebar material (L-6), drawn where the sidebar's
         // vibrancy cannot tint it (PanelFill).
         .scrollContentBackground(.hidden)
@@ -264,6 +280,8 @@ private struct NodeIdentity: View {
     let name: String
     /// False once the node stopped or was detached from outside (P12): said, not hidden.
     var attached = true
+    var known = true
+    private var state: String { known ? (attached ? "attached" : "detached") : "unknown" }
 
     var body: some View {
         HStack(alignment: .center, spacing: Space.s8) {
@@ -271,15 +289,15 @@ private struct NodeIdentity: View {
             VStack(alignment: .leading, spacing: Space.s4) {
                 Text(name).fontWeight(.semibold)
                 HStack(spacing: Space.s4) {
-                    Circle().fill(attached ? VoxTokens.Colors.accent : VoxTokens.Colors.danger)
+                    Circle().fill(known && attached ? VoxTokens.Colors.accent : VoxTokens.Colors.danger)
                         .frame(width: 6, height: 6)
-                    Text(attached ? "node attached" : "node detached").secondaryText()
+                    Text("node \(state)").secondaryText()
                 }
             }
         }
         .padding(.vertical, Space.s4)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("node \(name), \(attached ? "attached" : "detached")")
+        .accessibilityLabel("node \(name), \(state)")
     }
 }
 
@@ -287,6 +305,7 @@ private struct NodeIdentity: View {
 /// each a separate identity.
 private struct OnThisMachine: View {
     let nodes: [NodeSummary]
+    var known = true
 
     static func copy(_ words: String) {
         NSPasteboard.general.clearContents()
@@ -305,10 +324,10 @@ private struct OnThisMachine: View {
                     HStack {
                         Text(node.name)
                         Spacer()
-                        Text(node.state).secondaryText()
+                        Text(known ? node.state : "unknown").secondaryText()
                     }
                     .accessibilityElement(children: .ignore)
-                    .accessibilityLabel("\(node.name) \(node.state)")
+                    .accessibilityLabel("\(node.name) \(known ? node.state : "unknown")")
                     .contextMenu {
                         Button("Copy Name") { Self.copy(node.name) }
                         if !node.fingerprint.isEmpty {
@@ -325,7 +344,7 @@ private struct OnThisMachine: View {
                     .accessibilityIdentifier("machine-\(node.name)")
                     // A node that waits for its passphrase is attached from here, and remembered
                     // (#666): it then attaches by itself after every restart.
-                    if node.state != "attached" {
+                    if known && node.state != "attached" {
                         Button("Attach…") { AppModel.shared.attachNodeAsk = node.name }
                             .buttonStyle(.link)
                             .accessibilityLabel("Attach node \(node.name)")
@@ -392,6 +411,7 @@ private struct RoomRow: View {
     /// Whether it is the row selected: its second line then takes selection.secondary, which
     /// reads on the selection's fill (text.secondary would not: 3.66:1).
     var selected = false
+    var health: String?
 
     private var unread: Int { room.addressed + room.new }
     private var waits: Bool { room.need == .needsYou }
@@ -406,6 +426,10 @@ private struct RoomRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s4) {
+            if let health {
+                Text(health).font(Theme.small).foregroundStyle(VoxTokens.Colors.danger)
+                    .accessibilityIdentifier("room-health-\(room.id)")
+            }
             HStack(alignment: .firstTextBaseline, spacing: Space.s8) {
                 Text(room.name).fontWeight(.semibold).lineLimit(1).truncationMode(.tail)
                 Spacer(minLength: Space.s4)
@@ -756,6 +780,7 @@ private struct RoomView: View {
     @State private var sending = false
     /// The rows inside the visible part of the timeline, as last measured.
     @State private var inView: Set<String> = []
+    @State private var olderVisible = false
     /// The newest message when the messages last changed: if it was in view, the timeline follows
     /// the next one; scrolled up to read, it stays (as the TUI does, V210-82).
     @State private var newest: String?
@@ -885,6 +910,16 @@ private struct RoomView: View {
                                                         .accessibilityIdentifier("\(item.id)-copy")
                                                     }
                                                 }
+                                                if item.loadsOlder {
+                                                    if model.readingOlderTimeline {
+                                                        ProgressView("Loading earlier entries…").controlSize(.small)
+                                                    }
+                                                    Button("Show older entries") {
+                                                        Task { await model.readOlderTimeline() }
+                                                    }
+                                                    .disabled(model.readingOlderTimeline)
+                                                    .accessibilityIdentifier("\(item.id)-load")
+                                                }
                                             }
                                             .voxPadding(.horizontal, Space.s4)
                                             .reportsFrame(of: item.id)
@@ -1007,6 +1042,14 @@ private struct RoomView: View {
                                         ?? "\(item.id.prefix(10)) unmeasured"
                                 }
                                 readLog.debug("frames in \(room, privacy: .public): viewport \(Int(viewport.size.width))x\(Int(viewport.size.height)), \(frames.count) measured, last: \(tail.joined(separator: "; "), privacy: .public)")
+                                // Lazy rows may appear before they are on screen. Read older
+                                // entries only when the person has scrolled to their marker.
+                                let olderShown = !following && model.timelineItems
+                                    .first(where: \.loadsOlder).map { inView.contains($0.id) } == true
+                                if olderShown && !olderVisible {
+                                    Task { await model.readOlderTimeline() }
+                                }
+                                olderVisible = olderShown
                                 markSeen()
                                 keepNewest(scroller, viewport.size.height, "rows")
                             }
@@ -1033,10 +1076,14 @@ private struct RoomView: View {
                             .onChange(of: model.sessionEntries.count) { _ in
                                 centre(model.selectedRequest, scroller)
                             }
+                            .onChange(of: model.selectedEarlierRequest) { _ in
+                                centre(model.selectedRequest, scroller)
+                            }
                             // What is shown changed (General, All, a Session): it opens at its
                             // newest line, or, a Session with a request waiting, at that request,
                             // centred, so going to an approval shows it (P7).
                             .onChange(of: model.showing) { _ in
+                                olderVisible = false
                                 // The rows of what is now shown are laid out after this change,
                                 // so the scroll waits for the next turn of the main loop: asked
                                 // for at once, it could land before them and do nothing, leaving
@@ -1439,7 +1486,8 @@ private struct RoomView: View {
     /// Scroll the request `reference`'s entry to the middle of the timeline, once it is drawn.
     private func centre(_ reference: String?, _ scroller: ScrollViewProxy) {
         guard let reference,
-              let entry = model.sessionEntries.first(where: { $0.request?.reference == reference }) else { return }
+              let entry = (model.sessionEntries + [model.selectedEarlierRequest].compactMap { $0 })
+                .first(where: { $0.request?.reference == reference }) else { return }
         withAnimation(Theme.motion(reduced: reduceMotion)) {
             scroller.scrollTo("entry-\(entry.id)", anchor: .center)
         }
@@ -1690,21 +1738,29 @@ private struct NodeStopped: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            StateMark(kind: .danger, words: "Node \(model.node) is detached: \(model.ended ?? "")")
+            StateMark(kind: .danger, words: model.daemonReachable
+                      ? (model.ended ?? "Node \(model.node) is detached.")
+                      : (model.daemonFailure ?? "The daemon cannot be reached. Node states and peers are unknown; Vox is reconnecting."))
                 .textSelection(.enabled)
                 .accessibilityIdentifier("node-stopped")
-            Text("Nothing you typed is lost. Type node \(model.node)'s identity passphrase to attach "
-                + "it again; leave it empty if it needs none.")
-                .secondaryText()
-            HStack {
-                SecureInput(holder: field) { again() }
-                    .frame(width: Theme.scaled(260))
-                    .accessibilityIdentifier("node-stopped-passphrase")
-                    .accessibilityLabel("Identity passphrase for node \(model.node)")
-                Button("Attach Again") { again() }
-                    .accessibilityIdentifier("node-stopped-attach")
-                Button("Start Over") { Task { await AppModel.shared.start() } }
-                    .accessibilityIdentifier("node-stopped-start-over")
+            if Daemon.versionMismatch(model.daemonFailure ?? "") {
+                Button("Restart Daemon") { Task { await AppModel.shared.restartDaemon() } }
+                    .accessibilityIdentifier("node-stopped-restart-daemon")
+            }
+            if model.daemonReachable {
+                Text("Nothing you typed is lost. Type node \(model.node)'s identity passphrase to attach "
+                    + "it again; leave it empty if it needs none.")
+                    .secondaryText()
+                HStack {
+                    SecureInput(holder: field) { again() }
+                        .frame(width: Theme.scaled(260))
+                        .accessibilityIdentifier("node-stopped-passphrase")
+                        .accessibilityLabel("Identity passphrase for node \(model.node)")
+                    Button("Attach Again") { again() }
+                        .accessibilityIdentifier("node-stopped-attach")
+                    Button("Start Over") { Task { await AppModel.shared.start() } }
+                        .accessibilityIdentifier("node-stopped-start-over")
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2220,7 +2276,7 @@ private struct LanHelperSheet: View {
             .accessibilityElement(children: .combine)
             .accessibilityIdentifier("lan-helper-steps")
             HStack(spacing: Space.s8) {
-                ProgressView().controlSize(.small)
+                Image(systemName: "person.crop.circle.badge.exclamationmark")
                 Text("Waiting for you to allow it…").secondaryText()
             }
             .accessibilityElement(children: .combine)
@@ -2256,7 +2312,7 @@ private struct StatusBar: View {
     var body: some View {
         HStack(spacing: Space.s16) {
             Text("node \(model.node)")
-            Text(model.peers == 1 ? "1 peer" : "\(model.peers) peers")
+            Text(model.peerWords)
             Text(model.keyring)
             if model.notifying == false {
                 // M-23: said where the person works, so a missing notification is explained.
@@ -2264,6 +2320,10 @@ private struct StatusBar: View {
                     .accessibilityIdentifier("notifications-off")
             }
             Spacer()
+            if let progress = model.progressWords {
+                ProgressView(progress).controlSize(.small)
+                    .accessibilityIdentifier("action-progress")
+            }
             if let ended = model.ended {
                 StateMark(kind: .danger, words: ended)
             } else if let outcome = model.outcome {
@@ -2291,7 +2351,7 @@ private struct StatusBar: View {
 
     /// The bar, in words.
     private var words: String {
-        var parts = ["node \(model.node)", model.peers == 1 ? "1 peer" : "\(model.peers) peers",
+        var parts = ["node \(model.node)", model.peerWords,
                      model.keyring]
         if model.notifying == false {
             parts.append("notifications off (System Settings, Notifications, Vox)")

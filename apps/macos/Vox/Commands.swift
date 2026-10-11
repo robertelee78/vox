@@ -147,6 +147,10 @@ struct VoxCommands: Commands {
                 Task { await app.setKeepRunning(!app.keepRunning) }
             }
         }
+        CommandGroup(replacing: .appTermination) {
+            Button("Quit Vox") { NSApp.terminate(nil) }
+                .keyboardShortcut("q", modifiers: .command)
+        }
         CommandGroup(replacing: .newItem) { items("File") }
         CommandMenu("Room") { items("Room") }
         CommandMenu("Node") {
@@ -291,10 +295,12 @@ private struct RoomForm: View {
                 TextField("Room link (vox://…)", text: $link).font(Theme.mono)
                     .accessibilityLabel("Room link")
                     .accessibilityIdentifier("room-form-link")
+                    .disabled(submitting)
             } else {
                 TextField("Its name, as every member sees it", text: $name)
                     .accessibilityLabel("Room name")
                     .accessibilityIdentifier("room-form-name")
+                    .disabled(submitting)
             }
             Text(joining ? "The room's passphrase, sent to you another way than its link."
                 : "A passphrase for the room: send it another way than its link.").secondaryText()
@@ -302,10 +308,15 @@ private struct RoomForm: View {
                 .frame(width: Theme.scaled(320))
                 .accessibilityLabel(joining ? "Room passphrase" : "Passphrase for the new room")
                 .accessibilityIdentifier("room-form-passphrase")
+                .disabled(submitting)
             if noPassphrase {
                 // Allowed, and said (D16): a room without one is open to anyone with its link.
                 Text("No passphrase: anyone with the link can join.")
                     .accessibilityIdentifier("room-form-no-passphrase")
+            }
+            if submitting {
+                ProgressView(joining ? "Joining the room…" : "Creating the room…")
+                    .accessibilityIdentifier("room-form-progress")
             }
             OutcomeMark(outcome: model.failure(of: operation))
             HStack {
@@ -336,14 +347,17 @@ private struct RoomForm: View {
         // a room with no passphrase, never nothing done (D16).
         guard !submitting, joining ? !link.isEmpty : !name.isEmpty else { return }
         submitting = true
-        let secret = field.takeAllowingEmpty()
-        noPassphrase = true
+        // The secure control keeps the person's input through the result (ADR-034 PR-3).
+        let secret = field.copyAllowingEmpty()
         let (l, n) = (link, name)
         Task {
             let ok = joining ? await model.joinRoom(l, passphrase: secret)
                 : await model.createRoom(n, passphrase: secret)
             submitting = false
-            if ok { model.sheet = nil }
+            if ok {
+                field.clear()
+                model.sheet = nil
+            }
         }
     }
 }

@@ -97,8 +97,8 @@ private struct NodeFacts: View {
     let facts: MenuBarFacts
 
     var body: some View {
-        StateMark(kind: model.ended == nil ? .live : .danger,
-                  words: "node \(model.node), \(model.ended == nil ? "attached" : "detached")")
+        StateMark(kind: model.daemonReachable && model.ended == nil ? .live : .danger,
+                  words: "node \(model.node), \(model.daemonReachable ? (model.ended == nil ? "attached" : "detached") : "unknown")")
         Text(model.keyring).font(Theme.mono).secondaryText()
         section("NEEDS YOU") {
             let rooms = model.group(.needsYou)

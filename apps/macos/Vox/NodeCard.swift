@@ -128,6 +128,7 @@ struct NodeCard: View {
                 default:
                     EmptyView()
                 }
+                if let working = model.keyringWorking { ProgressView(working) }
                 KeyringReplaceAsk(model: model)
                 // The prompt only for this node's change; another waiting is one line (D1).
                 if let pending = model.keyringPending {
