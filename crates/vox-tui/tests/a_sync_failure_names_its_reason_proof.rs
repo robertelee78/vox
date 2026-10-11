@@ -331,7 +331,18 @@ fn a_sync_that_did_not_complete_says_why() {
     );
     let frozen_at = Instant::now();
     let seen = loop {
-        if let Some(l) = sync_failures(&mut alice, alice_before).into_iter().next() {
+        // The transport may retire the frozen peer before a room session starts. A failed
+        // reach is the real failure in that case, and must carry its reason too.
+        if let Some(l) = alice
+            .transcript()
+            .lines()
+            .skip(alice_before)
+            .find(|l| {
+                l.contains(DID_NOT_COMPLETE)
+                    || (l.contains("could not reach ") && l.contains(&bob_fp[..12]))
+            })
+            .map(str::to_owned)
+        {
             break Some(l);
         }
         if frozen_at.elapsed() > CONTROL_WITHIN {
@@ -339,6 +350,37 @@ fn a_sync_that_did_not_complete_says_why() {
         }
         std::thread::sleep(Duration::from_millis(250));
     };
+    // A sustained failure is a health condition, not a healthy room with an obscure counter.
+    let health_deadline = Instant::now() + Duration::from_secs(120);
+    let failing = loop {
+        let (ok, out, err) = vox_once(&alice_dir, &args(&["status"]));
+        assert!(
+            ok,
+            "PRODUCT: status failed while Bob was frozen: {out}{err}"
+        );
+        if out.contains("sync failing:") && !out.contains("healthy: nothing needs attention") {
+            break out;
+        }
+        assert!(Instant::now() < health_deadline, "PRODUCT: every sync with frozen Bob failed but status never said sync failing with its reason: {out}");
+        std::thread::sleep(Duration::from_secs(1));
+    };
+    println!("[proof] sustained peer failure is unhealthy, with its reason: {failing}");
+    // Public status shows the next retry receding while no reply arrives. Watch the user's
+    // sync-failure log for a further 20 seconds: a persistent failure must not loop every few
+    // seconds. This is an actual rate claim (ADR-018), not an internal counter assertion.
+    let backoff_from = lines_so_far(&mut alice);
+    std::thread::sleep(Duration::from_secs(20));
+    let retries: Vec<String> = alice
+        .transcript()
+        .lines()
+        .skip(backoff_from)
+        .filter(|l| {
+            l.contains(DID_NOT_COMPLETE)
+                || (l.contains("could not reach ") && l.contains(&bob_fp[..12]))
+        })
+        .map(str::to_owned)
+        .collect();
+    assert!(retries.len() <= 1, "PRODUCT: an unhealthy peer was retried every few seconds instead of backing off: {retries:?}");
     signal_and_confirm(&bob_pid, "-CONT");
     println!(
         "[proof] positive control: with bob frozen, alice's post ok={ok}; her report {:?} after \
@@ -348,7 +390,7 @@ fn a_sync_that_did_not_complete_says_why() {
     );
     assert!(
         seen.is_some(),
-        "PRODUCT (staging): with bob frozen, alice never reported a sync that {DID_NOT_COMPLETE:?} \
+        "APPARATUS: with bob frozen, no sync or reach failure was staged \
          within {CONTROL_WITHIN:?} (her post ok={ok}: {err}), so the silence during the rounds \
          proves nothing\n{}",
         alice.transcript()

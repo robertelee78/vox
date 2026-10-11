@@ -7381,6 +7381,11 @@ impl Node {
                         .map(|(r, _)| *r)
                         .collect();
                     for room in rooms {
+                        crate::node::status::SyncBook::with(&self.sync_book, room, peer, |c| {
+                            c.last_failure = Some(why.clone());
+                            c.consecutive_failures = c.consecutive_failures.saturating_add(1);
+                            c.failing_since.get_or_insert_with(std::time::Instant::now);
+                        });
                         self.enter_backoff(
                             room,
                             peer,
@@ -11386,7 +11391,21 @@ impl Node {
         let prior = port.backoff;
         let failures = prior.map_or(0, |b| b.failures).saturating_add(1);
         let timer = prior.map_or(0, |b| b.timer).wrapping_add(1);
-        let wait = crate::node::ports::backoff_wait(kind, failures);
+        let mut wait = crate::node::ports::backoff_wait(kind, failures);
+        crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| {
+            if c.consecutive_failures >= 2
+                && c.failing_since
+                    .is_some_and(|t| t.elapsed() >= Duration::from_secs(30))
+            {
+                // A persistently failing peer costs at most one retry per half minute, growing
+                // to five minutes. A new live connection or a successful sync still clears it.
+                wait = wait.max(Duration::from_secs(
+                    30u64
+                        .saturating_mul(1 << failures.saturating_sub(7).min(4))
+                        .min(300),
+                ));
+            }
+        });
         port.backoff = Some(crate::node::ports::Backoff {
             until: Some(std::time::Instant::now() + wait),
             failures,
@@ -11667,11 +11686,20 @@ impl Node {
         crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| {
             c.refused += u64::try_from(o.refused).unwrap_or(u64::MAX);
             match &report.fail {
-                None if o.complete => c.completed += 1,
-                None => c.partial += 1,
+                None => {
+                    if o.complete {
+                        c.completed += 1;
+                    } else {
+                        c.partial += 1;
+                    }
+                    c.consecutive_failures = 0;
+                    c.failing_since = None;
+                }
                 Some(f) => {
                     c.failed += 1;
                     c.last_failure = Some(f.to_string());
+                    c.consecutive_failures = c.consecutive_failures.saturating_add(1);
+                    c.failing_since.get_or_insert_with(std::time::Instant::now);
                 }
             }
         });
@@ -15526,6 +15554,11 @@ impl Node {
             })
             .collect();
         report.diagnose();
+        report
+            .unhealthy
+            .extend(crate::node::status::SyncBook::failing_peers(
+                &self.sync_book,
+            ));
         report
     }
 

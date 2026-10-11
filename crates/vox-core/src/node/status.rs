@@ -1013,6 +1013,10 @@ pub struct PortCounters {
     pub failed: u64,
     /// The last failure's reason.
     pub last_failure: Option<String>,
+    /// Start of this uninterrupted run of failed syncs, cleared by a successful session.
+    pub failing_since: Option<std::time::Instant>,
+    /// Consecutive sessions that failed in either direction.
+    pub consecutive_failures: u32,
     /// Results that arrived for an attempt already retired (ADR-025 D1a).
     pub stale: u64,
     /// Entries this peer served that were refused rather than held (V210-74): without their
@@ -1292,6 +1296,31 @@ impl SyncBook {
         manager: &std::sync::Arc<crate::node::net::ConnectionManager>,
     ) {
         self.connections = Some(std::sync::Arc::downgrade(manager));
+    }
+
+    /// Peers that have failed every sync for 30 seconds, in the person's status report.
+    /// A successful inbound or outbound session clears this condition immediately.
+    pub fn failing_peers(book: &SharedSyncBook) -> Vec<Unhealthy> {
+        let b = book.lock().unwrap_or_else(PoisonError::into_inner);
+        b.ports
+            .iter()
+            .filter_map(|((room, peer), c)| {
+                if c.consecutive_failures < 2 || c.failing_since?.elapsed().as_secs() < 30 {
+                    return None;
+                }
+                Some(Unhealthy {
+                    key: format!("sync-failing:{}:{}", b32_encode(room), b32_encode(peer)),
+                    message: format!(
+                        "room {}: peer {} sync failing: {}; retrying with backoff",
+                        short(room),
+                        short(peer),
+                        c.last_failure
+                            .as_deref()
+                            .unwrap_or("the peer did not answer")
+                    ),
+                })
+            })
+            .collect()
     }
 
     /// A new shared, empty book.
