@@ -55,7 +55,10 @@
 //! no my-claude; Claude Code's settings run its hook as the new name and set VOX_NODE to it; the
 //! hook registers as it and a post as it lands in its room; and on macOS a daemon restart attaches
 //! it again by the new name, its passphrase moved in the Keychain. Mutant: the harnesses' settings
-//! not rewritten; red as PRODUCT.
+//! not rewritten; red as PRODUCT. RN-1 (#742) extends that journey to Codex, the app's chosen
+//! node and LT aliases: a read-only OpenCode hook is named with its fix line, while the other
+//! hooks, remembered node and old-name alias still change. Custom aliases stay. Mutant: skip
+//! the Codex hook rewrite; PRODUCT on its new --node assertion.
 //!
 //! And **Vox never raises a Keychain window** (#666): on a Mac whose HOME has no keychain, with
 //! no test keychain given, `vox node create` at a terminal attaches the node within 60 s and says
@@ -784,6 +787,65 @@ fn setup_makes_a_node_for_each_installed_harness() {
     // (#666) ----
     let (_, before, _) = d.vox(&["id", "--node", "my-claude"]);
     let fp = before.trim().to_owned();
+    // RN-1 (#742): Claude and Codex both name it; a read-only third hook must be named with
+    // its repair without preventing the other files, aliases, or remembered node from changing.
+    let (_, codex, _) = d.vox(&["agent", "plugin", "codex", "--node", "my-claude"]);
+    let codex_file = d.root.join("codex/hooks.json");
+    write(&codex_file, &codex);
+    let (_, oc_hook, _) = d.vox(&["agent", "plugin", "opencode", "--node", "my-claude"]);
+    let readonly_hook = d.root.join("oc/plugin/vox.js");
+    let oc_before = std::fs::read_to_string(&readonly_hook).expect("APPARATUS: OpenCode plugin");
+    write(&readonly_hook, &oc_hook);
+    std::fs::set_permissions(
+        &readonly_hook,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o400),
+    )
+    .expect("APPARATUS: a read-only hook");
+    let chosen = d.root.join("c/app/node");
+    std::fs::create_dir_all(chosen.parent().unwrap()).expect("APPARATUS: app settings");
+    write(&chosen, "my-claude\n");
+    let (trusted, trust_out, trust_err) = d.vox(&[
+        "trust",
+        "add",
+        &fp,
+        "--name",
+        "my-claude",
+        "--node",
+        &opencode,
+    ]);
+    assert!(
+        trusted,
+        "PRODUCT (staging): trust my-claude from OpenCode: {trust_out}{trust_err}"
+    );
+    let (made, made_out, made_err) = d.vox_with(
+        &["node", "create", "alias-owner"],
+        &[("VOX_IDENTITY_PASSPHRASE", "")],
+    );
+    assert!(
+        made,
+        "PRODUCT (staging): create alias-owner: {made_out}{made_err}"
+    );
+    let (attached, attach_out, attach_err) = d.vox_with(
+        &["node", "attach", "alias-owner"],
+        &[("VOX_IDENTITY_PASSPHRASE", "")],
+    );
+    assert!(
+        attached,
+        "APPARATUS: attach custom-alias owner: {attach_out}{attach_err}"
+    );
+    let (trusted, trust_out, trust_err) = d.vox(&[
+        "trust",
+        "add",
+        &fp,
+        "--name",
+        "my-custom-alias",
+        "--node",
+        "alias-owner",
+    ]);
+    assert!(
+        trusted,
+        "APPARATUS: stage custom alias: {trust_out}{trust_err}"
+    );
     // Where there is no Keychain (Linux) my-claude is attached and not remembered, and rename
     // asks for its passphrase to attach it again: given here as a script gives it.
     let (ok, out, err) = d.vox_with(
@@ -792,9 +854,37 @@ fn setup_makes_a_node_for_each_installed_harness() {
     );
     println!("[proof] vox node rename my-claude claude-m5max-work said: {out}{err}");
     assert!(
-        ok,
-        "PRODUCT: `vox node rename my-claude claude-m5max-work` failed: {out}{err}"
+        !ok && err.contains(&readonly_hook.display().to_string())
+            && err.contains("read-only")
+            && err.contains("const VOX_NODE = \"claude-m5max-work\"")
+            && std::fs::read_to_string(&readonly_hook).unwrap_or_default() == oc_hook,
+        "PRODUCT: rename must report only the unfinished read-only hook with its path and exact fix line, leaving it unchanged: {out}{err}"
     );
+    let codex_now = std::fs::read_to_string(&codex_file).unwrap_or_default();
+    assert!(
+        codex_now.contains("--node claude-m5max-work") && !codex_now.contains("my-claude"),
+        "PRODUCT: rename must update Codex even when another hook is read-only: {codex_now}"
+    );
+    assert!(
+        std::fs::read_to_string(&chosen).unwrap_or_default().trim() == "claude-m5max-work",
+        "PRODUCT: rename must update the app's chosen node despite the read-only hook: {out}{err}"
+    );
+    let (listed, aliases, alias_err) = d.vox(&["trust", "list", "--node", &opencode]);
+    assert!(
+        listed && aliases.contains("claude-m5max-work") && !aliases.contains("my-claude"),
+        "PRODUCT: rename must change an LT alias still equal to the old name: {aliases}{alias_err}"
+    );
+    let (listed, aliases, alias_err) = d.vox(&["trust", "list", "--node", "alias-owner"]);
+    assert!(
+        listed && aliases.contains("my-custom-alias"),
+        "PRODUCT: rename must preserve the person's custom alias: {aliases}{alias_err}"
+    );
+    std::fs::set_permissions(
+        &readonly_hook,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .expect("APPARATUS: restore writable plugin");
+    write(&readonly_hook, &oc_before);
     let renamed = d.listed("claude-m5max-work");
     let (_, after, _) = d.vox(&["id", "--node", "claude-m5max-work"]);
     assert!(
