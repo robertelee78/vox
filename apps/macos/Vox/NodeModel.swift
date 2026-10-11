@@ -984,8 +984,9 @@ final class NodeModel: ObservableObject {
         let attempt = begin(operation)
         defer { end(attempt) }
         do {
-            if await Self.lanHelperStatus() != .enabled { try await lanHelper.unregister() }
-            try lanHelper.register()
+            let status = await Self.lanHelperStatus()
+            if status != .enabled && status != .notRegistered { try await lanHelper.unregister() }
+            if status != .enabled { try lanHelper.register() }
         } catch {
             report(error, operation: operation)
             return
@@ -1812,8 +1813,8 @@ extension NodeModel {
         defer { end(attempt) }
         switch await driveResult(a.session, in: a.room, action) {
         case let .taken(words): report(operation: operation, done: asSentence(words))
-        case let .refused(words): outcome = Outcome(operation: operation, kind: .refused, words: asSentence(words))
-        case let .unknown(words): outcome = Outcome(operation: operation, kind: .unknown, words: asSentence(words))
+        case let .refused(words): report(VoxError.Failed(reason: asSentence(words)), operation: operation)
+        case let .unknown(words): report(VoxError.Unknown(reason: asSentence(words)), operation: operation)
         }
         await readSession()
     }

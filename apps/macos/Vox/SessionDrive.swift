@@ -44,6 +44,7 @@ extension NodeModel {
                 return .unknown("no answer from \(s.label): it may or may not have been delivered")
             }
         } catch {
+            if Outcome.kind(of: error) == .unknown { return .unknown(sentence(error)) }
             return .refused(sentence(error))
         }
     }
@@ -62,6 +63,8 @@ struct SessionComposer: View {
     /// Whether the composer has the keyboard: ⇧↩ adds a line only then (P19).
     @FocusState private var composing: Bool
     @State private var said = ""
+    @State private var interruptSaid = ""
+    @State private var stopSaid = ""
     /// A send (or a file) waiting for its answer: only sending and the paperclip wait on it; Interrupt
     /// and Stop stay live (D13).
     @State private var sending = false
@@ -129,6 +132,11 @@ struct SessionComposer: View {
                     .accessibilityIdentifier("session-stop-confirm")
                 Button("Cancel", role: .cancel) {}
             }
+            if sending { ProgressView("Sending to \(session.label)…").controlSize(.small) }
+            if interrupting { ProgressView("Interrupting \(session.label)…").controlSize(.small) }
+            if stopping { ProgressView("Stopping \(session.label)…").controlSize(.small) }
+            if !interruptSaid.isEmpty { Text(interruptSaid).secondaryText().textSelection(.enabled) }
+            if !stopSaid.isEmpty { Text(stopSaid).secondaryText().textSelection(.enabled) }
             if !said.isEmpty {
                 Text(said)
                     .secondaryText()
@@ -159,6 +167,7 @@ struct SessionComposer: View {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !sending else { return }
         sending = true
+        said = ""
         let action: DriveAction = text.hasPrefix("/") ? .slash(command: text) : .text(text: text)
         Task {
             let result = await model.driveResult(session, in: room, action)
@@ -179,8 +188,9 @@ struct SessionComposer: View {
     private func interrupt() {
         guard !interrupting else { return }
         interrupting = true
+        interruptSaid = ""
         Task {
-            said = await model.drive(session, in: room, .interrupt)
+            interruptSaid = await model.drive(session, in: room, .interrupt)
             interrupting = false
         }
     }
@@ -189,15 +199,18 @@ struct SessionComposer: View {
     private func stop() {
         guard !stopping else { return }
         stopping = true
+        stopSaid = ""
         Task {
-            said = await model.drive(session, in: room, .stop)
+            stopSaid = await model.drive(session, in: room, .stop)
             stopping = false
         }
     }
 
     /// A file sent in: it waits as a send does.
     private func act(_ action: DriveAction) {
+        guard !sending else { return }
         sending = true
+        said = ""
         Task {
             said = await model.drive(session, in: room, action)
             sending = false
@@ -237,6 +250,7 @@ struct RequestView: View {
                     .accessibilityIdentifier("request-state-\(request.reference)")
             } else if session.canDrive {
                 if request.isQuestion { question } else { approval }
+                if busy { ProgressView("Sending your answer…").controlSize(.small) }
                 if !said.isEmpty {
                     Text(said).secondaryText().lineLimit(3).textSelection(.enabled)
                         .accessibilityIdentifier("request-said-\(request.reference)")
@@ -311,7 +325,9 @@ struct RequestView: View {
     }
 
     private func act(_ action: DriveAction) {
+        guard !busy else { return }
         busy = true
+        said = ""
         Task {
             said = await model.drive(session, in: room, action)
             busy = false
