@@ -2,8 +2,11 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: Accepted for v0.4.4 (the decider's Q&A, 2026-10-10, and his answers to this ADR's
-open questions, the same evening, and his story-plan answers that night: one format step).
+**Status**: Accepted for v0.4.5 (the decider's release split, 2026-10-10, night: v0.4.4 holds the
+fixes that let nodes join a room and work correctly, and the rest moves to v0.4.5); every
+requirement in this ADR ships in v0.4.5. Accepted from the decider's Q&A, 2026-10-10, his answers
+to this ADR's open questions the same evening, and his story-plan answers that night (one format
+step).
 Nothing in this ADR is built.
 **Date**: 2026-10-10
 **Deciders**: Robert E. Lee
@@ -109,9 +112,9 @@ do that."
 ### 7. Upgrade
 
 - **AN-14.** The room's anchors entry (AN-5) and the machine's list (AN-2) are format changes
-  (ADR-026 F-3): v0.4.4 MUST raise the data root's format and MUST upgrade, automatically and
+  (ADR-026 F-3): v0.4.5 MUST raise the data root's format and MUST upgrade, automatically and
   before anything else is written, every data root a release since v0.4.0 wrote (AN-4), and MUST
-  prove it on a data root the shipped v0.4.3 binary wrote, with nothing lost. This is one format
+  prove it on a data root the shipped v0.4.4 binary wrote, with nothing lost. This is one format
   step with ADR-031 SA-5: one raise of the format, one upgrade, and one proof (ADR-031 SA-6) for
   both.
 

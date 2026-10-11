@@ -4,9 +4,10 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 **Status**: Accepted for v0.4.4 (the decider's Q&A, 2026-10-10, and his answers to this ADR's
 open questions, the same evening; UP-2 and UP-3 revised with his story-plan answers that night;
-FR-4–FR-6 from his ruling on the frame-length root cause that night; FR-7–FR-10 and WT-5 from the
-fix's audit of every list reply, codified at his word that night). Nothing in this ADR is
-built.
+FR-4–FR-6 from his ruling on the frame-length root cause that night, with FR-6's bounds from his
+answer later that night; FR-7–FR-10 and WT-5 from the fix's audit of every list reply, codified at
+his word that night; PF-3 from his release split that night). This ADR stays in v0.4.4.
+Nothing in this ADR is built.
 **Date**: 2026-10-10
 **Deciders**: Robert E. Lee
 **Tags**: daemon, app, ffi, ipc, update, storage, health, logs, progress
@@ -105,11 +106,14 @@ fits a frame is not enough: a history may be any length.
   the memory the app uses to show a Session or a room, MUST be bounded by the pages shown, not by
   the history's length.
 - **FR-6. Proof at scale.** FR-4 and FR-5 MUST be proved by real use of the shipped binary and the
-  app's client on a Session of 100,000 entries: opening it MUST show the newest page within a
-  stated time bound, each older page down to the first MUST load within a stated time bound, and
-  the daemon's and the app's resident memory MUST stay under a stated bound throughout. The bounds MUST be written in the proof. Its mutant MUST make the
-  client fetch the whole history and MUST turn the proof red on its own assertion, labelled
-  PRODUCT.
+  app's client on a Session of 100,000 entries: opening it MUST show the newest page in under one
+  second, each older page down to the first MUST load in under one second, and the daemon's and the
+  app's resident memory MUST each stay under 50 MB throughout. The bounds MUST be written in the
+  proof. It is an on-demand proof, not a gate: an optional proof (the cargo feature
+  `optional-proofs`, ADR-018) that blocks no release and prints `OPTIONAL PROOF NOT RUN` when it
+  is not run. Its mutant MUST make the client fetch the whole history and MUST turn the proof red
+  on its own assertion, labelled PRODUCT. The decider: "ok" to under one second and under 50 MB,
+  on demand, not a gate.
 
 The fix's audit of every list reply (framefix, 2026-10-10, night) found these unbounded: the
 Sessions list (no count bound, and a member's session name and harness unchecked, so a row may be
@@ -202,6 +206,11 @@ we're working on hot fixes -- but this needs to be codified into ADRs, projects/
   (ADR-018 §9), each with a mutant that turns its proof red on its own assertion, labelled PRODUCT
   (ADR-018 §10.10). A proof extends an existing journey where one fits (ADR-018 §10.7): the large
   room read for FR-1–FR-3, at the real frame limit, through both the CLI and the app's client.
+- **PF-3. App screen proofs in v0.4.4.** The macOS guest VM for app proofs (ADR-014 M-32a, #684)
+  moves to v0.4.5. Until then, a v0.4.4 proof that drives the app's screen MUST run on the
+  decider's Mac only, and only with his OK each time it runs; it MUST NOT take his screen without
+  it. The decider, 2026-10-10: the VM moves to v0.4.5, and the few v0.4.4 app screen proofs run on
+  his Mac with his OK each time.
 - **PF-2.** A proof that needs a full disk MUST stage it in userspace, with no `sudo`. Where it
   cannot, it MUST print `OPTIONAL PROOF NOT RUN` (ADR-018 §10.2).
 
@@ -214,6 +223,7 @@ we're working on hot fixes -- but this needs to be codified into ADRs, projects/
 | ADR-028 A-4 | Quitting detaches the node, with no bound | Letting go of the node is bounded and never blocks quitting (QT-2) |
 | ADR-034 FR-1, FR-2 (as first written) | Lists are paged or bounded; an oversized reply is an error naming what was too large | Every list the clients take is paged with a cursor and a "more" mark, by rows and bytes (FR-7); a cap says what it left out (FR-8); member-written list fields are bounded and refused over it (FR-9); the error names the request and the connection stays usable (FR-10); a reopened connection keeps the node Ready (WT-5) |
 | ADR-034 FR-1 (as first written) | Lists are paged so a reply fits one frame | Also: no client fetches a whole history; the newest page first, older on scroll; pages from an index; proven at 100,000 entries (FR-4–FR-6) |
+| ADR-014 M-32a | App proofs run in a macOS guest VM | Moves to v0.4.5; in v0.4.4 an app screen proof runs on the decider's Mac only, with his OK each time (PF-3) |
 | ADR-026 C-4 | `Hello` reports the daemon's version | A client refuses its daemon when their versions differ and attempts nothing else (UP-2); both versions are named (UP-3); peers are unchanged |
 
 ## Consequences
@@ -234,13 +244,6 @@ we're working on hot fixes -- but this needs to be codified into ADRs, projects/
   version. Measuring compatibility between versions is planned for v0.4.5.
 - A room that ran out of disk loses nothing written after space returns, and the person is told
   what happened.
-
-## Open questions
-
-- **FR-6's bounds and weight.** The time and memory bounds are not yet stated by the decider, and a
-  100,000-entry proof is heavy: whether it blocks the release or is an optional proof (the cargo
-  feature `optional-proofs`, ADR-018) is the decider's call. Whether a room of 100,000 messages is
-  proved the same way as a Session of 100,000 entries is also his.
 
 ## Related ADRs
 
