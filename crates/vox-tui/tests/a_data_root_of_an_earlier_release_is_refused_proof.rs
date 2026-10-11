@@ -291,7 +291,10 @@ fn assert_retention(w: &room::Worker, room: &str, messages: u64, steps: u64) {
         .unwrap_or_else(|e| panic!("PRODUCT: status is not JSON: {e}: {}", o.stdout));
     let row = status["rooms"]
         .as_array()
-        .and_then(|rows| rows.iter().find(|row| row["id"].as_str() == Some(room)))
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row["id"].as_str() == Some(room) || row["name"].as_str() == Some(room))
+        })
         .unwrap_or_else(|| panic!("PRODUCT: status omitted room {room}: {}", o.stdout));
     assert_eq!(
         (row["retention"].as_u64(), row["step_retention"].as_u64()),
@@ -678,6 +681,30 @@ fn a_data_root_of_the_previous_release_opens_with_nothing_lost() {
         assert_upgrade_steps(w, &r.id, true);
         assert_retention(w, &r.id, 0, 7 * 86400);
     }
+    // A newly created room has the same seven-day step default; it is not only an upgrade rule.
+    let fresh_pass = tmp.path().join("fresh-room-pass");
+    std::fs::write(&fresh_pass, "fresh room passphrase\n")
+        .expect("APPARATUS: fresh room passphrase");
+    let created = r.workers[0].vox(
+        None,
+        &[
+            "room",
+            "create",
+            "fresh-retention-default",
+            "--passphrase-file",
+            fresh_pass.to_str().expect("APPARATUS: UTF-8 path"),
+        ],
+    );
+    assert!(
+        created.ok,
+        "PRODUCT: could not create a new room after upgrade: {created:?}"
+    );
+    assert_retention(
+        &r.workers[0],
+        "fresh-retention-default",
+        7 * 86400,
+        7 * 86400,
+    );
     let bob = &r.workers[1];
     for ttl in ["8d", "forever"] {
         let o = bob.vox(None, &["room", "retention", &r.id, "--steps", ttl]);

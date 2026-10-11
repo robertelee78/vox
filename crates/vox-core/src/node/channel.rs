@@ -161,6 +161,10 @@ fn parse_first_seen(bytes: &[u8]) -> Result<(u64, bool)> {
     Ok((t, steps))
 }
 
+fn retained_control(body: &[u8]) -> bool {
+    session_floor::is_session_floor(body) || crate::governance::step_policy::is_step_policy(body)
+}
+
 fn is_step_body(room: &Digest32, body: &[u8]) -> bool {
     GroupMessage::from_wire(body)
         .is_ok_and(|message| message.header.channel_id == drive_channel(room))
@@ -1958,6 +1962,21 @@ impl ChannelState {
                     }
                 },
             };
+            if entry
+                .payload
+                .as_deref()
+                .is_some_and(crate::governance::step_policy::is_step_policy)
+            {
+                match GovEntry::from_verified_log_entry(
+                    &entry,
+                    &key,
+                    channel_id,
+                    Default::default(),
+                ) {
+                    Ok(gov) => gov_entries.push(gov),
+                    Err(e) => set_aside.push(format!("{at}: {e}")),
+                }
+            }
             let saved_age = match store.get_segment(channel_id, SegmentKind::Index, id)? {
                 Some(seg) => parse_first_seen(&open_segment(&sek, SegmentKind::Index, id, &seg)?)?,
                 None => (now_ms, false),
@@ -1971,7 +1990,7 @@ impl ChannelState {
                 step_bodies.insert(entry.entry_hash());
             }
             if let Some(payload) = entry.payload.as_deref() {
-                if kind == EntryKind::Content && !session_floor::is_session_floor(payload) {
+                if kind == EntryKind::Content && !retained_control(payload) {
                     let first_seen = saved_age.0;
                     retention.track(
                         entry.entry_hash(),
@@ -4492,15 +4511,15 @@ impl ChannelState {
 
     /// Floor controls carry durable authorization, like governance: neither message nor
     /// Session activity expiry may erase the evidence another reader needs after a restart.
-    fn is_session_floor(&self, hash: &Digest32) -> bool {
+    fn is_retained_control(&self, hash: &Digest32) -> bool {
         self.dag
             .get_by_hash(hash)
             .and_then(|entry| entry.payload.as_deref())
-            .is_some_and(session_floor::is_session_floor)
+            .is_some_and(retained_control)
     }
 
     fn entry_retention(&self, hash: &Digest32) -> u64 {
-        if self.is_session_floor(hash) {
+        if self.is_retained_control(hash) {
             0
         } else if self.step_bodies.contains(hash) {
             self.effective_step_retention()
@@ -4733,7 +4752,7 @@ impl ChannelState {
                 "only the room's admin may set its Session retention",
             ));
         }
-        let update = crate::governance::policy::PolicyUpdate::build_steps(
+        let update = crate::governance::step_policy::StepPolicyUpdate::build(
             signer,
             &self.channel_id,
             self.epoch,
@@ -4950,7 +4969,7 @@ impl ChannelState {
     ) -> Result<usize> {
         let due: Vec<_> = due
             .iter()
-            .filter(|(hash, _)| !self.is_session_floor(hash))
+            .filter(|(hash, _)| !self.is_retained_control(hash))
             .copied()
             .collect();
         if due.is_empty() && !with_receivers {
@@ -5037,7 +5056,7 @@ impl ChannelState {
         log_id: u64,
         now_ms: u64,
     ) -> Result<()> {
-        if self.is_session_floor(&entry_hash) {
+        if self.is_retained_control(&entry_hash) {
             return Ok(());
         }
         let steps = self
@@ -5085,7 +5104,7 @@ impl ChannelState {
         log_id: u64,
         now_ms: u64,
     ) -> Result<()> {
-        if self.is_session_floor(&entry_hash) {
+        if self.is_retained_control(&entry_hash) {
             return Ok(());
         }
         let steps = self
@@ -5160,8 +5179,11 @@ impl ChannelState {
         let key = signer.public_key();
         let gov =
             GovEntry::from_verified_log_entry(&entry, &key, &self.channel_id, self.gov_heads())?;
+        // Step policy uses the existing content carrier so published readers retain the
+        // signed entry and continue its author's feed while skipping the unknown subtype.
+        let kind = classify_payload(payload)?;
         self.dag
-            .accept(entry, EntryKind::Governance, &key, &self.admission)
+            .accept(entry, kind, &key, &self.admission)
             .map_err(|_| Error::Profile("authored entry failed the acceptance predicate"))?;
         let written = profile.store().batch().and_then(|mut batch| {
             batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
@@ -5516,8 +5538,12 @@ impl ChannelState {
                         return Ok(Ok(Vec::new()));
                     };
                     self.owed.remove(&(author, seq));
-                    let gov = match refuse!(classify_payload(&payload)) {
-                        EntryKind::Governance => {
+                    let wire_kind = refuse!(classify_payload(&payload));
+                    let gov = match wire_kind {
+                        EntryKind::Governance | EntryKind::Content
+                            if wire_kind == EntryKind::Governance
+                                || crate::governance::step_policy::is_step_policy(&payload) =>
+                        {
                             let entry = refuse!(self
                                 .dag
                                 .get_by_hash(&entry_hash)
@@ -5532,7 +5558,7 @@ impl ChannelState {
                         }
                         // A checkpoint is stored and read by the DAG; there is nothing to render.
                         EntryKind::Checkpoint => return Ok(Ok(Vec::new())),
-                        EntryKind::Content => None,
+                        EntryKind::Content | EntryKind::Governance => None,
                     };
                     if let Some(gov) = gov {
                         if gov_pending.is_none() {
@@ -6870,7 +6896,12 @@ impl ChannelState {
             Some(payload) => classify_payload(payload)?,
             None => EntryKind::Content,
         };
-        let gov = if kind == EntryKind::Governance {
+        let gov = if kind == EntryKind::Governance
+            || entry
+                .payload
+                .as_deref()
+                .is_some_and(crate::governance::step_policy::is_step_policy)
+        {
             Some(GovEntry::from_verified_log_entry(
                 &entry,
                 &key,

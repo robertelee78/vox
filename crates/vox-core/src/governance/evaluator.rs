@@ -370,6 +370,7 @@ impl Evaluator {
             GovBody::ConsentGrant(g) => g.verify(author_key),
             GovBody::ConsentRevocation(r) => r.verify(author_key),
             GovBody::PolicyUpdate(p) => p.verify(author_key),
+            GovBody::StepPolicyUpdate(p) => p.verify(author_key),
             GovBody::Lifecycle(l) => l.verify(author_key),
             GovBody::Presence(p) => p.verify(author_key),
             GovBody::ServiceShare(s) => s.verify(author_key),
@@ -808,12 +809,14 @@ impl<'a> Resolver<'a> {
         genesis: &Genesis,
     ) -> Result<(ChannelPolicy, u64, Vec<RetentionChange>)> {
         let mut policy = genesis.body.policy;
-        let mut step_ttl_ms = crate::governance::policy::DEFAULT_STEP_TTL_MS;
+        let mut step_ttl_ms = crate::governance::step_policy::DEFAULT_STEP_TTL_MS;
         let mut changes = Vec::new();
         let order: Vec<&GovEntry> = self.causality.order.clone();
         for e in order {
-            let GovBody::PolicyUpdate(p) = &e.body else {
-                continue;
+            let (messages, steps) = match &e.body {
+                GovBody::PolicyUpdate(p) => (p.body.ttl_ms, None),
+                GovBody::StepPolicyUpdate(p) => (None, Some(p.ttl_ms)),
+                _ => continue,
             };
             if !self.in_effect(e)? {
                 continue;
@@ -827,10 +830,10 @@ impl<'a> Resolver<'a> {
             {
                 continue;
             }
-            if let Some(ttl) = p.body.step_ttl_ms {
+            if let Some(ttl) = steps {
                 step_ttl_ms = ttl;
             }
-            if let Some(ttl) = p.body.ttl_ms {
+            if let Some(ttl) = messages {
                 policy.ttl_ms = ttl;
                 changes.push(RetentionChange {
                     entry_hash: e.entry_hash,

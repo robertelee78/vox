@@ -296,7 +296,7 @@ const T_TRUST_LIST: u64 = 16;
 // Setting a room's retention deletes what is already stored (ADR-023 decision 2), so it is an
 // operator decision like the keyring and carries the identity passphrase the same way.
 const T_RETENTION: u64 = 23;
-/// [`Request::SetStepRetention`] (ADR-031 SA-6): independent Session-step lifetime.
+/// [`Request::SetStepRetention`] (ADR-031 SA-9): independent Session-step lifetime.
 const T_STEP_RETENTION: u64 = 7891;
 // Protocol 6 — every entry the node holds for a room, in the room's one order
 // (PRD-001 R13), readable or not. What "the same order on every node" is checked

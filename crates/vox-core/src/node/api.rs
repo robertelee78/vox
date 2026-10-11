@@ -1428,7 +1428,7 @@ impl Fault {
                 "a room name is one DNS label: 1 to 63 of a-z, 0-9 and `-`, not starting or ending with `-`\n       it is the room part of every service address"
             }
             Fault::AboveRoomRetention => {
-                "a member may keep this room's messages for less time than the room does, never longer\n       ask the room's creator or an admin (`vox room admin list`) to change the room's retention"
+                "a member may keep this room's data for less time than the room does, never longer\n       ask the room's creator or an admin (`vox room admin list`) to change the room's retention"
             }
             Fault::NotAdmin => {
                 "only the room's admin may change that, and this identity is not its admin\n       the room's creator and the admins it named are; `vox room admin list` shows who"

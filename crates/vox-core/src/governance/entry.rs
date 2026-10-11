@@ -67,6 +67,8 @@ pub enum GovBody {
     /// A policy-update (tag `0x0006`, body kind = policy-update): the room's retention.
     /// The rotation kind under the same tag is reserved and refused (V030-32).
     PolicyUpdate(Box<PolicyUpdate>),
+    /// Independent Session retention, carried as public content for older readers.
+    StepPolicyUpdate(Box<crate::governance::step_policy::StepPolicyUpdate>),
     /// A room-lifecycle fact (tag `0x0019`): the creator (or an admin) ending the room, or the
     /// creator's idle end (V030-08).
     Lifecycle(Box<RoomLifecycle>),
@@ -88,6 +90,11 @@ impl GovBody {
     /// A frame whose tag is not a governance struct is rejected with
     /// [`Error::MalformedGovernance`] — the governance plane's domain is closed.
     pub fn parse_framed(bytes: &[u8]) -> Result<Self> {
+        if crate::governance::step_policy::is_step_policy(bytes) {
+            return Ok(GovBody::StepPolicyUpdate(Box::new(
+                crate::governance::step_policy::StepPolicyUpdate::from_wire(bytes)?,
+            )));
+        }
         let frame = parse_frame(bytes)?;
         match frame.tag {
             StructTag::GenesisRecord => Ok(GovBody::Genesis(Box::new(Genesis::from_wire(bytes)?))),
@@ -127,6 +134,7 @@ impl GovBody {
             GovBody::ConsentGrant(g) => (g.body.channel_id, g.body.epoch),
             GovBody::ConsentRevocation(r) => (r.body.channel_id, r.body.epoch),
             GovBody::PolicyUpdate(p) => (p.body.channel_id, p.body.epoch),
+            GovBody::StepPolicyUpdate(p) => (p.channel_id, p.epoch),
             GovBody::Lifecycle(l) => (l.body.channel_id, l.body.epoch),
             GovBody::ServiceShare(s) => (s.body.channel_id, s.body.epoch),
             GovBody::Presence(p) => (p.body.channel_id, p.body.epoch),
@@ -145,6 +153,7 @@ impl GovBody {
             GovBody::ConsentGrant(g) => g.body.author_id,
             GovBody::ConsentRevocation(r) => r.body.author_id,
             GovBody::PolicyUpdate(p) => p.body.issuer_id,
+            GovBody::StepPolicyUpdate(p) => p.issuer_id,
             GovBody::Lifecycle(l) => l.body.issuer_id,
             GovBody::ServiceShare(s) => s.body.author_id,
             GovBody::Presence(p) => p.body.author_id,
