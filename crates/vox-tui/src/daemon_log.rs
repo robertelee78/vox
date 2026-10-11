@@ -49,10 +49,30 @@ impl Log {
         if std::fs::metadata(&previous).is_ok_and(|m| m.len() > LIMIT) {
             std::fs::remove_file(previous)?;
         }
+        if log.len != 0 {
+            let mut held = Vec::new();
+            log.file.seek(SeekFrom::Start(0))?;
+            log.file.read_to_end(&mut held)?;
+            if held.split(|b| *b == b'\n').any(|line| {
+                !line.is_empty() && !(line.len() > 24 && line[10] == b'T' && line[23] == b'Z')
+            }) {
+                log.file.set_len(0)?;
+                log.len = 0;
+                for line in held.split(|b| *b == b'\n') {
+                    log.line(line)?;
+                }
+            }
+        }
         Ok(log)
     }
 
     fn line(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if bytes.len() > LINE_LIMIT {
+            for chunk in bytes.chunks(LINE_LIMIT) {
+                self.line(chunk)?;
+            }
+            return Ok(());
+        }
         let line = String::from_utf8_lossy(bytes);
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
@@ -101,6 +121,20 @@ impl Capture {
         let log = Arc::new(Mutex::new(Log::open(path)?));
         let stdout = File::from(nix::unistd::dup(io::stdout())?);
         let stderr = File::from(nix::unistd::dup(io::stderr())?);
+        if !foreground && stderr.metadata()?.is_file() {
+            // The detached starter gives us a private, unlinked startup file, never the
+            // account log. Import its diagnostics only after this process owns the account.
+            use std::os::unix::fs::FileExt as _;
+            let len = stderr.metadata()?.len();
+            let mut bytes = vec![0; usize::try_from(len.min(64 * 1024)).unwrap_or(0)];
+            let read = stderr.read_at(&mut bytes, len.saturating_sub(64 * 1024))?;
+            let mut sink = log
+                .lock()
+                .map_err(|_| io::Error::other("daemon log lock poisoned"))?;
+            for line in bytes[..read].split(|b| *b == b'\n') {
+                sink.line(line)?;
+            }
+        }
         let (out_read, out_write) = UnixStream::pair()?;
         let (err_read, err_write) = UnixStream::pair()?;
         let stop = Arc::new(AtomicBool::new(false));

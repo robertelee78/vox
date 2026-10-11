@@ -91,7 +91,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
     }
     if args.as_detached {
         // **None of its starter's descriptors** (ADR-026 S-2): stdin is /dev/null and stdout and
-        // stderr are `.daemon/log`, as the client set them; anything else it inherited — a
+        // stderr are a private startup file until capture begins; anything else it inherited — a
         // harness's pipe that reached the hook without close-on-exec, say — is closed here,
         // before anything of the daemon's own (its runtime) is open. Kept open, it held the
         // hook's output pipe for the daemon's life, and a harness that reads its hook to the end

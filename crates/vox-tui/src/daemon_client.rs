@@ -2,7 +2,7 @@
 //!
 //! A client that may attach a node (a session-holding verb, an agent's hook, the TUI, `vox node
 //! attach`) and finds no daemon starts `vox daemon` detached, with the daemon's stdout and stderr
-//! in `<data root>/.daemon/log` from its first line, and waits up to [`START_WITHIN`] for its
+//! captured privately during startup, then in the bounded `<data root>/.daemon/log`, and waits up to [`START_WITHIN`] for its
 //! socket to answer. Two clients doing so at once end with one daemon: the second daemon cannot
 //! take the account lock (D-1) and leaves, and both clients find the first one's socket.
 
@@ -78,7 +78,10 @@ pub async fn start_daemon(
     let log_path = account.log_file();
     vox_core::node::paths::create_private_dir(&account.daemon_dir())
         .map_err(|e| AppError::Usage(e.to_string()))?;
-    let log = open_log(&log_path)?;
+    // Competing starters must not append raw lines to the winning daemon's log.
+    // The winning daemon imports these startup diagnostics once it owns the lock.
+    // An unlinked file also keeps a failed start's own output available to this caller.
+    let startup = tempfile::tempfile()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("daemon")
         .arg(AS_DETACHED)
@@ -96,8 +99,8 @@ pub async fn start_daemon(
     cmd.env_remove("VOX_IDENTITY_PASSPHRASE")
         .env_remove("VOX_ROOM_PASSPHRASE")
         .stdin(std::process::Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log);
+        .stdout(startup.try_clone()?)
+        .stderr(startup.try_clone()?);
     // Where this start's lines begin: a daemon that fails is reported in its own words, not in
     // an earlier start's.
     let from = std::fs::metadata(&log_path).map_or(0, |m| m.len());
@@ -122,14 +125,14 @@ pub async fn start_daemon(
             }
             // **Lost the race to another start** (D-1, S-2): that daemon holds the lock and may
             // not have bound the socket yet. Its socket is waited for, within the same bound.
-            if since(&log_path, from).contains("a daemon is already running") {
+            if startup_text(&startup).contains("a daemon is already running") {
                 lost = true;
                 continue;
             }
             break Err(AppError::Usage(format!(
                 "the daemon stopped as it started; it said (its log is {}):\n{}",
                 log_path.display(),
-                since(&log_path, from)
+                format_args!("{}\n{}", startup_text(&startup), since(&log_path, from))
             )));
         }
         if t0.elapsed() >= START_WITHIN {
@@ -137,7 +140,7 @@ pub async fn start_daemon(
                 "the daemon did not start within {} s. Its log, {}, ends:\n{}",
                 START_WITHIN.as_secs(),
                 log_path.display(),
-                tail(&log_path, 20)
+                format_args!("{}\n{}", startup_text(&startup), tail(&log_path, 20))
             )));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -160,21 +163,17 @@ fn since(path: &Path, from: u64) -> String {
     }
 }
 
-/// The daemon's log, appended to, `0600`.
-fn open_log(path: &Path) -> Result<std::fs::File, AppError> {
-    let mut o = std::fs::OpenOptions::new();
-    o.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        o.mode(0o600);
-    }
-    o.open(path).map_err(|e| {
-        AppError::Usage(format!(
-            "could not open the daemon's log {}: {e}",
-            path.display()
-        ))
-    })
+/// Read startup output without moving the child's shared descriptor offset.
+fn startup_text(file: &std::fs::File) -> String {
+    use std::os::unix::fs::FileExt as _;
+    let len = file.metadata().map_or(0, |m| m.len());
+    let mut bytes = vec![0; usize::try_from(len.min(64 * 1024)).unwrap_or(0)];
+    let read = file
+        .read_at(&mut bytes, len.saturating_sub(64 * 1024))
+        .unwrap_or(0);
+    String::from_utf8_lossy(&bytes[..read])
+        .trim_end()
+        .to_owned()
 }
 
 /// The last `n` lines of `path`, or a note that it could not be read.

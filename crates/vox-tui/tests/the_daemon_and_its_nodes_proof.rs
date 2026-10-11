@@ -1460,6 +1460,7 @@ fn the_daemons_log_is_bounded_counted_and_named_in_status() {
     d.expect("its control socket", Duration::from_secs(30), |l| {
         l.contains("control socket")
     });
+    let mut room = String::new();
     for turn in 0..3 {
         let (ok, out, err) = a.run(
             &[
@@ -1473,6 +1474,7 @@ fn the_daemons_log_is_bounded_counted_and_named_in_status() {
         );
         assert!(ok, "PRODUCT: attach {turn} failed: {out}{err}");
         if turn == 0 {
+            room = make_room(&a, "default");
             let (ok, out, err) = a.run(&["status", "--json"], "");
             assert!(ok, "PRODUCT: status failed: {out}{err}");
             let report: serde_json::Value = serde_json::from_str(&out)
@@ -1512,11 +1514,69 @@ fn the_daemons_log_is_bounded_counted_and_named_in_status() {
         detached[0].ends_with("[count=00000000000000000003]"),
         "PRODUCT: the repeated line did not count its three occurrences:\n{log}"
     );
+    assert!(
+        log.lines()
+            .any(|line| line.contains(&room) && line.contains("default")),
+        "PRODUCT: no daemon line named its node and room: {log}"
+    );
     for line in log.lines() {
         let stamp = line.split_whitespace().next().unwrap_or_default();
         assert!(
             stamp.len() == 24 && stamp.as_bytes()[10] == b'T' && stamp.ends_with('Z'),
             "PRODUCT: a daemon log line has no UTC timestamp: {line}"
+        );
+    }
+    // The next real daemon output must cross the bound, not just trim a legacy log.
+    let mut near_bound = b"2026-10-10T00:00:00.000Z ".to_vec();
+    near_bound.resize(1024 * 1024 - 1, b'x');
+    near_bound.push(b'\n');
+    std::fs::write(&log_path, near_bound).expect("APPARATUS: stage rotation boundary");
+    let port: u16 = std::fs::read_to_string(a.data.join(".daemon/port"))
+        .expect("APPARATUS: read kept port")
+        .trim()
+        .parse()
+        .expect("APPARATUS: numeric port");
+    let _busy = std::net::UdpSocket::bind(("127.0.0.1", port))
+        .expect("APPARATUS: occupy the stopped daemon's kept port");
+    let (ok, out, err) = a.run(
+        &[
+            "node",
+            "attach",
+            "default",
+            "--passphrase-file",
+            pass.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert!(
+        ok,
+        "PRODUCT: automatic start with a busy kept port failed: {out}{err}"
+    );
+    let pid = a
+        .lock_pid()
+        .expect("PRODUCT: the automatic daemon holds no lock");
+    // A second detached start loses the lock race and must not write an unstamped line.
+    let (ok, out, err) = a.run(&["daemon", "--as-detached"], "");
+    assert!(ok, "PRODUCT: a second detached start failed: {out}{err}");
+    stop_pid(pid);
+    let current = std::fs::read_to_string(&log_path).expect("PRODUCT: rotated log unreadable");
+    let previous = std::fs::metadata(log_path.with_extension("log.1"))
+        .expect("PRODUCT: daemon output crossed the bound without keeping a predecessor");
+    assert!(
+        current.len() <= 1024 * 1024 && previous.len() <= 1024 * 1024,
+        "PRODUCT: rotation exceeded its bounds: current {}, predecessor {}",
+        current.len(),
+        previous.len()
+    );
+    assert!(
+        current.contains("another program holds it"),
+        "PRODUCT: startup's moved-port explanation disappeared from the log: {current}"
+    );
+    for line in current.lines() {
+        let stamp = line.split_whitespace().next().unwrap_or_default();
+        assert!(
+            stamp.len() == 24 && stamp.as_bytes()[10] == b'T' && stamp.ends_with('Z'),
+            "PRODUCT: startup or losing-start log line lacks a UTC timestamp: {line}"
         );
     }
 }
