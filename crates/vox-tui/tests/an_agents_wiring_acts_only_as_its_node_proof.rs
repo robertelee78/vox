@@ -487,6 +487,33 @@ fn setup_makes_a_node_for_each_installed_harness() {
         r#"{"theme":"dark","hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"vox agent hook --node someone-else"},{"type":"command","command":"echo mine"}]}]}}"#,
     );
 
+    // ADR-031 RN-2: the stale hook explains itself on the first turn. The exact fix it
+    // names, `vox setup`, is the terminal journey below; its repaired hook must then work.
+    let missing_turn = [
+        "agent",
+        "hook",
+        "--node",
+        "someone-else",
+        "--session",
+        "missing-node",
+        "--format",
+        "text",
+    ];
+    let (ok, first, err) = d.vox(&missing_turn);
+    assert!(
+        ok && first.contains("node someone-else, which is not here")
+            && first.contains("run `vox setup` in a terminal")
+            && first.trim().lines().count() == 1,
+        "PRODUCT: a hook naming a missing node must say so on its first turn in one line with \
+         the fix; stdout={first:?}, stderr={err:?}"
+    );
+    let (ok, again, err) = d.vox(&missing_turn);
+    assert!(
+        ok && again.trim().is_empty(),
+        "PRODUCT: the missing-node notice must be said once per session; second turn \
+         stdout={again:?}, stderr={err:?}"
+    );
+
     let mut setup = Setup::spawn(&d, &path);
     // ---- Codex is said not found, and offered nothing ----
     // Read before anything is answered: what it found is said first, and a question for Codex
@@ -608,6 +635,25 @@ fn setup_makes_a_node_for_each_installed_harness() {
              said:\n{line}\nall:\n{out}{err}"
         );
     }
+    let (ok, repaired, err) = d.vox(&[
+        "agent",
+        "hook",
+        "--node",
+        "my-claude",
+        "--session",
+        "missing-node",
+        "--format",
+        "text",
+    ]);
+    assert!(
+        ok && !repaired.contains("not here")
+            && !repaired.contains("could not read")
+            && !err.contains("not attached")
+            && !err.contains("no vox daemon"),
+        "PRODUCT: after running the stated `vox setup` fix, the repaired hook must take its \
+         next turn normally; stdout={repaired:?}, stderr={err:?}"
+    );
+
     // ---- each harness is judged against its own node (#666): OpenCode's node's doctor leaves
     // Claude Code, wired to my-claude, as my-claude's ----
     let (ok, out, err) = d.vox(&["agent", "doctor", "--node", &format!("opencode-{host}")]);
