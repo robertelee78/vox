@@ -640,31 +640,37 @@ impl Waiting {
 /// further out, and it is why `vox forward` through an anchor could be driven to failure on demand
 /// and still say nothing about which rung refused it.
 pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
+    say_failure_for_node(ev, None);
+}
+
+/// A daemon event retains the node it belongs to in the shared log.
+pub(crate) fn say_failure_for_node(ev: &NodeEvent, node: Option<&str>) {
+    let prefix = node.map_or_else(|| "vox".to_owned(), |name| format!("vox: node {name}"));
     match ev {
         NodeEvent::PeerUnreachable { peer, why } => {
             eprintln!(
-                "vox: could not reach {} — {why}",
+                "{prefix}: could not reach {} — {why}",
                 crate::ident::author_id(peer)
             );
         }
         NodeEvent::JoinFailed { reason } => {
-            eprintln!("vox: a join did not complete — {reason}");
+            eprintln!("{prefix}: a join did not complete — {reason}");
         }
         NodeEvent::AddressWithheld { reason, .. } => {
-            eprintln!("vox: the address was not handed out — {reason}");
+            eprintln!("{prefix}: the address was not handed out — {reason}");
         }
         NodeEvent::AddressNote { note, .. } => {
-            eprintln!("vox: {note}");
+            eprintln!("{prefix}: {note}");
         }
         NodeEvent::RoomNotRemembered { channel_id, why } => {
             eprintln!(
-                "vox: room {} is open, but will not reopen by itself after a restart — {why}",
+                "{prefix}: room {} is open, but will not reopen by itself after a restart — {why}",
                 short(channel_id)
             );
         }
         NodeEvent::JoinSteps { joined, steps } => {
             eprintln!(
-                "vox: join {} — {steps}",
+                "{prefix}: join {} — {steps}",
                 if *joined { "got in" } else { "did not get in" }
             );
         }
@@ -674,7 +680,7 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
             why,
         } => {
             eprintln!(
-                "vox: a board would not take {what} for room {} — {why}",
+                "{prefix}: a board would not take {what} for room {} — {why}",
                 short(channel_id)
             );
         }
@@ -684,26 +690,26 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
             why,
         } => {
             eprintln!(
-                "vox: {} did not take our key for room {} — {why}; it is sent again",
+                "{prefix}: {} did not take our key for room {} — {why}; it is sent again",
                 crate::ident::author_id(peer),
                 short(channel_id)
             );
         }
         NodeEvent::StillRelayed { peer, reason } => {
             eprintln!(
-                "vox: still relayed to {} — {reason}",
+                "{prefix}: still relayed to {} — {reason}",
                 crate::ident::author_id(peer)
             );
         }
         NodeEvent::ProxyRefused { reason } => {
-            eprintln!("vox: tunnel refused or cut — {reason}");
+            eprintln!("{prefix}: tunnel refused or cut — {reason}");
         }
         NodeEvent::TunnelClosed { reason } => {
-            eprintln!("vox: tunnel closed — {reason}");
+            eprintln!("{prefix}: tunnel closed — {reason}");
         }
         NodeEvent::ReachWithdrawn { channel_id, port } => {
             eprintln!(
-                "vox: the host withdrew access to port {port} in room {} — that session was cut",
+                "{prefix}: the host withdrew access to port {port} in room {} — that session was cut",
                 short(channel_id)
             );
         }
@@ -713,42 +719,40 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
             reason,
         } => {
             eprintln!(
-                "vox: sync of room {} with {} did not complete — {reason}",
+                "{prefix}: sync of room {} with {} did not complete — {reason}",
                 short(channel_id),
                 crate::ident::author_id(peer)
             );
         }
         NodeEvent::Stalled { what, millis } => {
-            eprintln!("vox: busy {millis}ms — {what} — nobody could be answered");
+            eprintln!("{prefix}: busy {millis}ms — {what} — nobody could be answered");
         }
         NodeEvent::PublishCured { channel_id, what } => {
             eprintln!(
-                "vox: {what} for room {} was taken on a republish, after the board refused it as stale",
+                "{prefix}: {what} for room {} was taken on a republish, after the board refused it as stale",
                 short(channel_id)
             );
         }
         NodeEvent::ConnectionNote { peer, note } => {
             eprintln!(
-                "vox: connection to {} — {note}",
+                "{prefix}: connection to {} — {note}",
                 crate::ident::author_id(peer)
             );
         }
-        NodeEvent::NodeNote { note } => eprintln!("vox: {note}"),
-        NodeEvent::NetworkChanged { summary } => eprintln!("vox: {summary}"),
+        NodeEvent::NodeNote { note } => eprintln!("{prefix}: {note}"),
+        NodeEvent::NetworkChanged { summary } => eprintln!("{prefix}: {summary}"),
         NodeEvent::RetentionAboveRoom {
             channel_id,
             node,
             room,
-        } => say_retention_above_room(channel_id, *node, *room),
+        } => say_retention_with_prefix(channel_id, *node, *room, &prefix),
         _ => {}
     }
 }
 
-/// Say that this node's own retention file asks to keep a room longer than the room does, and is
-/// ignored (V030-32).
-pub(crate) fn say_retention_above_room(channel_id: &Digest32, node: u64, room: u64) {
+fn say_retention_with_prefix(channel_id: &Digest32, node: u64, room: u64, prefix: &str) {
     eprintln!(
-        "vox: warning: this node's retention file asks to keep room {} for {}, longer than the \
+        "{prefix}: warning: this node's retention file asks to keep room {} for {}, longer than the \
          room keeps it ({}); a member may keep less than the room, never more, so the room's {} \
          is in force",
         short(channel_id),

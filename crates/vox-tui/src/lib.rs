@@ -32,6 +32,7 @@ pub mod codex_trust;
 pub mod coord;
 pub mod daemon;
 pub mod daemon_client;
+mod daemon_log;
 pub mod daemon_proxy;
 pub mod doctor;
 pub mod drive;

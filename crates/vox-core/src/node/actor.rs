@@ -2466,6 +2466,7 @@ const JOINER_SEAL_GRACE: Duration = Duration::from_secs(60);
 /// joiner refused with the strongest reason heard (full, then a place lost to another newcomer,
 /// then a member that did not agree), which this node's log names member by member.
 async fn seat_round(
+    node_name: &str,
     tx: &mpsc::Sender<NetEvent>,
     channel_id: Digest32,
     joiner: Digest32,
@@ -2555,7 +2556,7 @@ async fn seat_round(
         return Ok(promised);
     };
     eprintln!(
-        "vox: a newcomer to room {} was not admitted — not every member agreed: {}",
+        "vox: node {node_name}: a newcomer to room {} was not admitted — not every member agreed: {}",
         crate::node::network::short_id(channel_id),
         said.join("; ")
     );
@@ -4828,7 +4829,14 @@ impl Node {
         if let Some(signer) = node.headless.clone() {
             // A headless node's identity is unlocked for its whole life: so is its record.
             if let Err(e) = node.decisions.unlock(&*signer) {
-                eprintln!("vox: this node's decision record cannot be sealed: {e}");
+                eprintln!(
+                    "vox: node {}: decision record cannot be sealed: {e}",
+                    node.paths
+                        .profile_dir
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                );
             }
             node.start_network()?;
         }
@@ -8421,6 +8429,13 @@ impl Node {
         self.reap_join_tasks();
         let admit_tx = self.net_tx.clone();
         let signals = Some((slot.worked(), slot.take_ended()));
+        let log_node = self
+            .paths
+            .profile_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         self.join_tasks.spawn(async move {
             let _slot = slot;
             let _carried = conn;
@@ -8446,7 +8461,7 @@ impl Node {
                         // here and promised by each member this node holds a connection to, or the
                         // joiner is refused, saying why, before anything is admitted.
                         let joiner = identity.fingerprint();
-                        let promised = seat_round(&admit_tx, channel_id, joiner).await?;
+                        let promised = seat_round(&log_node, &admit_tx, channel_id, joiner).await?;
                         let (ack, wait) = tokio::sync::oneshot::channel();
                         let admitted = if admit_tx
                             .send(NetEvent::JoinAdmit {
@@ -15326,6 +15341,7 @@ impl Node {
             .unwrap_or_default();
         let mut report = StatusReport {
             now,
+            log_path: self.paths.account().log_file().display().to_string(),
             refusals: self.decisions.recent(
                 crate::node::decisions::REFUSALS_SHOWN,
                 Some(crate::node::decisions::Decided::Refused),

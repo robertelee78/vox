@@ -316,6 +316,39 @@ final class NodeModel: ObservableObject {
     @Published private(set) var daemonReachable = true
     @Published private(set) var daemonFailure: String?
     var peerWords: String { daemonReachable ? (peers == 1 ? "1 peer" : "\(peers) peers") : "peers unknown" }
+    struct HealthNotice: Decodable, Identifiable, Equatable {
+        let key: String
+        let message: String
+        var id: String { key }
+    }
+    private struct HealthReport: Decodable {
+        let unhealthy: [HealthNotice]
+        let recovered: [HealthNotice]?
+        let log_path: String?
+    }
+    @Published private(set) var health: [HealthNotice] = []
+    @Published private(set) var recovered: [HealthNotice] = []
+    @Published private(set) var logPath: String?
+
+    func roomHealth(_ room: String) -> String? {
+        guard daemonReachable else { return nil }
+        let messages = health.filter { $0.key == "room-store:\(room)" || $0.key.hasPrefix("sync-failing:\(room):") }
+            .map(\.message)
+        return messages.isEmpty ? nil : messages.joined(separator: " ")
+    }
+
+    private func readHealth() async {
+        do {
+            let json = try await client.status()
+            let report = try JSONDecoder().decode(HealthReport.self, from: Data(json.utf8))
+            if report.unhealthy != health { health = report.unhealthy }
+            if report.recovered ?? [] != recovered { recovered = report.recovered ?? [] }
+            if report.log_path != logPath { logPath = report.log_path }
+        } catch {
+            reportBackground(error)
+        }
+    }
+
     /// The keyring window, as the TUI's status bar says it (K-9).
     @Published private(set) var keyring = ""
     /// Whether the LAN helper is approved, so the family LAN may be offered (ADR-014 M-12).
@@ -498,6 +531,7 @@ final class NodeModel: ObservableObject {
             let said = here.first.map { "\($0.short)… \($0.whyWords) — trust?" } ?? ""
             if rooms[i].offerSaid != said { rooms[i].offerSaid = said }
         }
+        await readHealth()
         await recheckLanHelper()
         if selection == .keyring {
             let back = await readTrustsBack()
