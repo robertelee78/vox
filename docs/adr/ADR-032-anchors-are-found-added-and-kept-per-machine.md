@@ -90,10 +90,12 @@ do that."
 
 - **AN-10.** The New Room sheet and `vox room create` MUST show the anchors the room's link will
   carry.
-- **AN-11.** A link MUST carry, after the inviting host (ADR-012 N-3), the room's own anchors, then
-  the inviting machine's anchors added by hand, up to `MAX_LINK_ANCHORS`. The joiner MUST keep the
-  room's own anchors as that room's, and MUST use the inviter's hand-added ones only to reach the
-  inviter for that join, never as the room's.
+- **AN-11.** A link MUST carry, besides the addresses ADR-012 N-3 puts in it, the room's own
+  anchors only (AN-5), up to `MAX_LINK_ANCHORS`. A node that holds the link or joins by it MUST NOT
+  add, change or remove any of the room's anchors; only the room's creator or an admin can (AN-8).
+  There is no inviter and no invitee: "there's just a room and a passphrase" (the decider,
+  2026-10-10); "a node in the room who gets the url shouldn't be able to change or append an
+  anchor".
 
 ### 6. Shown truthfully
 
@@ -115,7 +117,7 @@ do that."
 | ADR line | Was | Now |
 |---|---|---|
 | ADR-017 7.1–7.2; ADR-026 F-1, F-2 | Anchors are a per-node setting, read from the account's file when the node has none; `--anchor` merges for one command | One list per data root of anchors added by hand, dialled by every node (AN-2), with sources (AN-3); `vox anchor add` keeps one (AN-9) |
-| ADR-012 N-34 | The configured anchors are dialled and named in links, and persisted per room | A room's anchors are a governance entry set by its creator or an admin (AN-5, AN-8); links carry them, then the inviter's hand-added ones (AN-11) |
+| ADR-012 N-34 | The configured anchors are dialled and named in links, and persisted per room | A room's anchors are a governance entry set by its creator or an admin (AN-5, AN-8); links carry them and nothing else (AN-11) |
 | ADR-028 R-1 | The room's shared name is a governance entry | So are its anchors (AN-5) |
 
 ## Consequences
