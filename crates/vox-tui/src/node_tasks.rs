@@ -180,7 +180,7 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
     // nor one that fell behind, and the notice is said all the same.
     let mut said_above: std::collections::HashSet<(vox_core::hash::Digest32, u64, u64)> =
         std::collections::HashSet::new();
-    say_retention_above_room(&node.view(), &mut said_above);
+    say_retention_above_room(&node.view(), &mut said_above, &paths);
     // Counted at once, not at the first tick.
     if !deaf {
         tend(&paths, &node.view(), &answered, &mut tending);
@@ -190,7 +190,7 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
             item = events.next() => match item {
                 None => break,
                 Some(vox_core::node::actor::EventStreamItem::Lagged(n)) => {
-                    eprintln!("vox daemon: fell behind the node's events by {n}; re-reading every room");
+                    eprintln!("vox daemon: node {} fell behind its events by {n}; re-reading every room", paths.profile_dir.file_name().unwrap_or_default().to_string_lossy());
                     true
                 }
                 Some(vox_core::node::actor::EventStreamItem::Event(ev)) => {
@@ -204,12 +204,12 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
                             room,
                         } => {
                             if said_above.insert((*channel_id, *asked, *room)) {
-                                crate::tunnel_cli::say_retention_above_room(
-                                    channel_id, *asked, *room,
-                                );
+                                crate::tunnel_cli::say_failure_for_node(&ev, paths.profile_dir.file_name().and_then(|n| n.to_str()));
                             }
                         }
-                        other => crate::tunnel_cli::say_if_it_explains_a_failure(other),
+                        other => crate::tunnel_cli::say_failure_for_node(
+                            other, paths.profile_dir.file_name().and_then(|n| n.to_str()),
+                        ),
                     }
                     match ev {
                         vox_core::node::api::NodeEvent::NewEntry { channel_id, row } => {
@@ -246,7 +246,7 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
             _ = tick.tick() => true,
         };
         if sweep {
-            say_retention_above_room(&node.view(), &mut said_above);
+            say_retention_above_room(&node.view(), &mut said_above, &paths);
         }
         if sweep && !deaf {
             let view = node.view();
@@ -298,11 +298,19 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
 fn say_retention_above_room(
     view: &vox_core::node::api::NodeView,
     said: &mut std::collections::HashSet<(vox_core::hash::Digest32, u64, u64)>,
+    paths: &Paths,
 ) {
     for d in &view.open_channels {
         if let Some((asked, room)) = d.retention_above_room {
             if said.insert((d.channel_id, asked, room)) {
-                crate::tunnel_cli::say_retention_above_room(&d.channel_id, asked, room);
+                crate::tunnel_cli::say_failure_for_node(
+                    &vox_core::node::api::NodeEvent::RetentionAboveRoom {
+                        channel_id: d.channel_id,
+                        node: asked,
+                        room,
+                    },
+                    paths.profile_dir.file_name().and_then(|n| n.to_str()),
+                );
             }
         }
     }

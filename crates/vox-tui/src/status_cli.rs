@@ -62,6 +62,9 @@ fn render(v: &Value) -> String {
     for line in vox_text::fingerprint::card(s(v, "identity")) {
         let _ = writeln!(o, "  {line}");
     }
+    if let Some(path) = v.get("log_path").and_then(Value::as_str) {
+        let _ = writeln!(o, "daemon log: {path}");
+    }
     let empty = Vec::new();
     let arr = |k: &str| v.get(k).and_then(Value::as_array).unwrap_or(&empty);
     // Stored entries a room set aside when it opened (V210-74): said first, whatever else there is.

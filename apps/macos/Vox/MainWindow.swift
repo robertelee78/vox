@@ -20,6 +20,22 @@ struct MainWindow: View {
             }
             // A repo with no room (ADR-029 RB-5): one banner across the window.
             RoomAskBanner(model: model)
+            if model.daemonReachable && (!model.health.isEmpty || !model.recovered.isEmpty) {
+                VStack(alignment: .leading, spacing: Space.s4) {
+                    ForEach(model.health) { issue in
+                        StateMark(kind: .danger, words: issue.message)
+                            .accessibilityIdentifier("health-\(issue.key)")
+                    }
+                    ForEach(model.recovered) { notice in
+                        StateMark(kind: .plain, words: notice.message)
+                            .accessibilityIdentifier("recovered-\(notice.key)")
+                    }
+                }
+                .textSelection(.enabled)
+                .padding(Space.s12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Divider()
+            }
             NavigationSplitView {
                 // Dragged wider or narrower, and remembered (Columns).
                 Sidebar(model: model)
@@ -143,7 +159,7 @@ private struct Sidebar: View {
                         .copyMenu([("Copy Fingerprint", offer.fingerprint)])
                 }
                 ForEach(model.orderedRooms) { room in
-                    RoomRow(room: room, selected: model.selection == .room(room.id))
+                    RoomRow(room: room, selected: model.selection == .room(room.id), health: model.roomHealth(room.id))
                         .tag(NodeModel.Selection.room(room.id))
                         .sidebarRow(model.selection == .room(room.id))
                         .copyMenu([("Copy Name", room.name)])
@@ -395,6 +411,7 @@ private struct RoomRow: View {
     /// Whether it is the row selected: its second line then takes selection.secondary, which
     /// reads on the selection's fill (text.secondary would not: 3.66:1).
     var selected = false
+    var health: String?
 
     private var unread: Int { room.addressed + room.new }
     private var waits: Bool { room.need == .needsYou }
@@ -409,6 +426,10 @@ private struct RoomRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s4) {
+            if let health {
+                Text(health).font(Theme.small).foregroundStyle(VoxTokens.Colors.danger)
+                    .accessibilityIdentifier("room-health-\(room.id)")
+            }
             HStack(alignment: .firstTextBaseline, spacing: Space.s8) {
                 Text(room.name).fontWeight(.semibold).lineLimit(1).truncationMode(.tail)
                 Spacer(minLength: Space.s4)

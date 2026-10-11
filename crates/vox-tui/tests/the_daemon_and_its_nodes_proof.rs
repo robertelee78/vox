@@ -1440,3 +1440,83 @@ fn root_is_told_at_once_that_it_cannot_use_the_daemon() {
         );
     }
 }
+
+/// ADR-034 LG-1–LG-3: a real daemon replaces an old unbounded log and counts repeat lifecycle
+/// messages in place. Mutants: remove Log::open's old-file bound, or append repeated lines
+/// instead of updating their count; each fails its own PRODUCT assertion below.
+#[test]
+#[ignore = "real daemon and encrypted node profiles; run in release"]
+fn the_daemons_log_is_bounded_counted_and_named_in_status() {
+    watchdog::arm();
+    let a = Account::new();
+    a.make_node("default");
+    let log_path = a.data.join(".daemon/log");
+    std::fs::create_dir_all(log_path.parent().unwrap()).expect("APPARATUS: make daemon directory");
+    std::fs::write(&log_path, vec![b'x'; 3 * 1024 * 1024])
+        .expect("APPARATUS: stage a previous version's oversized daemon log");
+    let pass = a.data.with_extension("log-pass");
+    std::fs::write(&pass, format!("{PASS}\n")).expect("APPARATUS: passphrase file");
+    let d = Daemon::start(&a, &["--no-node"], &[]);
+    d.expect("its control socket", Duration::from_secs(30), |l| {
+        l.contains("control socket")
+    });
+    for turn in 0..3 {
+        let (ok, out, err) = a.run(
+            &[
+                "node",
+                "attach",
+                "default",
+                "--passphrase-file",
+                pass.to_str().unwrap(),
+            ],
+            "",
+        );
+        assert!(ok, "PRODUCT: attach {turn} failed: {out}{err}");
+        if turn == 0 {
+            let (ok, out, err) = a.run(&["status", "--json"], "");
+            assert!(ok, "PRODUCT: status failed: {out}{err}");
+            let report: serde_json::Value = serde_json::from_str(&out)
+                .unwrap_or_else(|e| panic!("PRODUCT: status was not JSON: {e}: {out}"));
+            assert_eq!(
+                report["log_path"].as_str(),
+                log_path.to_str(),
+                "PRODUCT: status did not name the daemon log: {out}"
+            );
+            let (ok, out, err) = a.run(&["status"], "");
+            assert!(
+                ok && out.contains(log_path.to_str().unwrap()),
+                "PRODUCT: readable status omitted the log: {out}{err}"
+            );
+        }
+        let (ok, out, err) = a.run(&["node", "detach", "default"], "");
+        assert!(ok, "PRODUCT: detach {turn} failed: {out}{err}");
+    }
+    d.stop();
+    let log =
+        std::fs::read_to_string(&log_path).expect("PRODUCT: the named daemon log was not readable");
+    assert!(
+        log.len() <= 1024 * 1024,
+        "PRODUCT: daemon log exceeded one MiB: {} bytes",
+        log.len()
+    );
+    let detached: Vec<_> = log
+        .lines()
+        .filter(|l| l.contains("node default detached"))
+        .collect();
+    assert_eq!(
+        detached.len(),
+        1,
+        "PRODUCT: repeat detach warnings were not collapsed into one line:\n{log}"
+    );
+    assert!(
+        detached[0].ends_with("[count=00000000000000000003]"),
+        "PRODUCT: the repeated line did not count its three occurrences:\n{log}"
+    );
+    for line in log.lines() {
+        let stamp = line.split_whitespace().next().unwrap_or_default();
+        assert!(
+            stamp.len() == 24 && stamp.as_bytes()[10] == b'T' && stamp.ends_with('Z'),
+            "PRODUCT: a daemon log line has no UTC timestamp: {line}"
+        );
+    }
+}

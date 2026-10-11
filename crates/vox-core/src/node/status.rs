@@ -237,6 +237,8 @@ impl GatewayFamily {
 /// Everything `vox status` shows.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StatusReport {
+    /// The account daemon's bounded diagnostic log (ADR-034 LG-3).
+    pub log_path: String,
     /// When this was taken, unix milliseconds.
     pub now: u64,
     /// The node's most recent refusals, newest first, from its decision record (ADR-028 D-3).
@@ -389,6 +391,7 @@ impl StatusReport {
     pub fn to_json(&self) -> String {
         let mut j = String::from("{");
         let _ = write!(j, "\"now_ms\":{},", self.now);
+        let _ = write!(j, "\"log_path\":{},", q(&self.log_path));
         let _ = write!(
             j,
             "\"identity\":{},",
