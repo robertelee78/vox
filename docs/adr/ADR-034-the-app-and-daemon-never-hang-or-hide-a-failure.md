@@ -160,7 +160,9 @@ we're working on hot fixes -- but this needs to be codified into ADRs, projects/
   a bug in Vox.
 - **SR-3.** It MUST say when the room recovered.
 - **SR-4.** A Session's entries MUST be held, not dropped, while its room cannot save, and written
-  when it recovers. When the hold reaches its bound, Vox MUST say which entries were lost.
+  when it recovers. When the hold reaches its bound, Vox MUST say which entries were lost. This
+  bound applies only while the disk is full, a physical limit; it is not a cap on a person's data
+  in normal use (FR-8; the lead's call, 2026-10-10).
 - **SR-5.** The fault MUST keep the operating system's error text.
 
 ### 5. Health is true
@@ -174,6 +176,8 @@ we're working on hot fixes -- but this needs to be codified into ADRs, projects/
 
 - **LG-1.** The daemon's log MUST be bounded in size, and a line repeated many times MUST be written
   once with its count.
+  This bounds only the daemon's own log, so it cannot fill the disk; it is not a cap on a person's
+  data (FR-8; the lead's call, 2026-10-10).
 - **LG-2.** Every line MUST carry a UTC timestamp and the node it is about, and a room's id when it is
   about a room.
 - **LG-3.** `vox status` and the app MUST name the log's path.
