@@ -484,14 +484,15 @@ enum RoomCmd {
     /// The name is one DNS label (a-z, 0-9 and `-`), because it is the room part of every service
     /// address in the room.
     Rename(RenameArgs),
-    /// Set how long the room keeps messages: `1h`, `1w`, `1m` (a month), a number of
-    /// seconds, or `forever`.
+    /// Set message lifetime, or use --steps to set Session-step lifetime separately.
     ///
-    /// It applies to **everything already in the room**, on every member, as the change
-    /// reaches them: shortening it deletes older messages. Only the room's admin may, and it
-    /// asks for the identity passphrase for that reason. A node can keep less than its room
-    /// (the `retention` file in its config directory); the shorter wins. This is look and
-    /// feel, not a security property: a modified node can keep everything.
+    /// A step is one thing an agent did in its Session: a message, a command it ran, or a file
+    /// it edited. Steps default to seven days or the message lifetime, whichever is shorter.
+    /// Durations are `1h`, `7d`, `1w`, `1m` (a month), seconds, or `forever`.
+    ///
+    /// Admins set the room rule; other members can shorten the lifetime on their own node.
+    /// Shortening a lifetime deletes older items immediately. Changing --steps does not change
+    /// message retention. Retention is housekeeping: a modified node can keep everything.
     Retention(RetentionArgs),
     /// Print a room's link, for someone else to `vox room join` with.
     ///
@@ -595,7 +596,11 @@ pub struct RetentionArgs {
     /// Message lifetime: `1h`, `7d`, `1w`, `1m` (a month), seconds, or `forever`.
     #[arg(required_unless_present = "steps", conflicts_with = "steps")]
     pub duration: Option<String>,
-    /// Change Session-step lifetime separately from messages. Members can only shorten theirs.
+    /// Set Session-step lifetime separately from messages: `7d`, `1h`, seconds, or `forever`.
+    ///
+    /// A step is one thing an agent did in its Session: a message, a command it ran, or a file
+    /// it edited. The default is seven days or the message lifetime, whichever is shorter.
+    /// Admins set the room rule; other members can only shorten their own node's lifetime.
     #[arg(long, value_name = "DURATION", conflicts_with = "duration")]
     pub steps: Option<String>,
 }

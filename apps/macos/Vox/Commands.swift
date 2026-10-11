@@ -466,6 +466,11 @@ private struct RetentionSheet: View {
                 .accessibilityIdentifier("retention-submit")
             Divider()
             Text("Session steps").font(.headline)
+            Text("A step is one thing an agent did in its Session: a message, a command it ran, or a file it edited.")
+                .secondaryText()
+                .accessibilityIdentifier("step-retention-meaning")
+            Text("By default, steps last for seven days or the message lifetime, whichever is shorter.")
+                .secondaryText()
             if let value = model.stepRetention {
                 Picker(model.stepRetentionAdmin ? "Room keeps steps" : "This node keeps steps", selection: $stepSeconds) {
                     ForEach(stepChoices, id: \.1) { Text($0.0).tag($0.1) }
