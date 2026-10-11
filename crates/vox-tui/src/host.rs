@@ -2704,17 +2704,6 @@ async fn post_in_order(
         if let Some(body) = next {
             held_bytes += body.len();
             held.push_back(body);
-            while held_bytes > HELD_BYTES {
-                let Some(old) = held.pop_front() else { break };
-                held_bytes -= old.len();
-                if dropped == 0 {
-                    dropped_first = identify(&old);
-                }
-                dropped_last = identify(&old);
-                dropped += 1;
-                dropped_reasons.insert(held_reason.clone());
-                eprintln!("vox daemon: {node}: session {session}: lost {dropped} held entries, from {dropped_first} through {dropped_last}; its 4 MiB hold filled while {held_reason}");
-            }
         } else if held.is_empty() {
             return;
         }
@@ -2747,12 +2736,12 @@ async fn post_in_order(
             continue;
         };
         let joins = lock(&router.inner.joins).get(&node).cloned();
-        if joins.as_ref().is_some_and(|j| j.under_way(&room_b32)) {
+        let joining = joins.as_ref().is_some_and(|j| j.under_way(&room_b32));
+        if joining {
             held_reason = "the room was still joining".to_owned();
-            continue;
         }
         let member = handle.view().channels.iter().any(|c| c.channel_id == room);
-        if !member && joins.as_ref().and_then(|j| j.status(&room_b32)).is_some() {
+        if !joining && !member && joins.as_ref().and_then(|j| j.status(&room_b32)).is_some() {
             // The join failed: what was held is dropped, and said once the Session opens.
             if dropped == 0 {
                 dropped_first = held.front().map(|b| identify(b)).unwrap_or_default();
@@ -2764,7 +2753,10 @@ async fn post_in_order(
             held_bytes = 0;
             continue;
         }
-        while let Some(body) = held.front().cloned() {
+        while !joining {
+            let Some(body) = held.front().cloned() else {
+                break;
+            };
             if dropped > 0 {
                 let notice = serde_json::json!({
                     "v": vox_agentcomms::activity::VERSION,
@@ -2839,6 +2831,19 @@ async fn post_in_order(
                     }
                 }
             }
+        }
+        // Once delivery resumes, drain the held entries before applying the cap. Otherwise
+        // the next enqueue could discard a held entry that the room is now able to save.
+        while held_bytes > HELD_BYTES {
+            let Some(old) = held.pop_front() else { break };
+            held_bytes -= old.len();
+            if dropped == 0 {
+                dropped_first = identify(&old);
+            }
+            dropped_last = identify(&old);
+            dropped += 1;
+            dropped_reasons.insert(held_reason.clone());
+            eprintln!("vox daemon: {node}: session {session}: lost {dropped} held entries, from {dropped_first} through {dropped_last}; its 4 MiB hold filled while {held_reason}");
         }
     }
 }
