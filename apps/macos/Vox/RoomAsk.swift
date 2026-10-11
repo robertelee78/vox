@@ -121,6 +121,8 @@ private struct RoomAskLine: View {
             .frame(width: Theme.scaled(320))
             .accessibilityLabel("Room passphrase")
             .accessibilityIdentifier("room-ask-passphrase")
+            .disabled(submitting)
+        if submitting { ProgressView("Binding the room…") }
         if noPassphrase {
             Text("No passphrase: for a room that has none.").secondaryText()
         }
@@ -145,11 +147,12 @@ private struct RoomAskLine: View {
     private func submit() {
         guard !submitting, room != nil || !link.isEmpty else { return }
         submitting = true
-        let secret = field.takeAllowingEmpty()
-        noPassphrase = true
+        let secret = field.copyAllowingEmpty()
         let (r, l) = (room, link)
         Task {
             if await model.bindRoom(dir, room: r, link: r == nil ? l : nil, passphrase: secret) {
+                field.clear()
+                noPassphrase = true
                 choosing = false
             }
             submitting = false

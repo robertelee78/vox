@@ -37,6 +37,7 @@ struct KeyringView: View {
                         .textSelection(.enabled)
                         .accessibilityIdentifier("keyring-said")
                 }
+                if let working = model.keyringWorking { ProgressView(working) }
                 KeyringReplaceAsk(model: model)
                 // A change for a node not in the keyring yet (an add) is asked for here; one for
                 // a node in it, beside its row (D1).
@@ -364,6 +365,7 @@ struct KeyringPassphrase: View {
                 Button(pending.action) { submit() }
                     .keyboardShortcut(.defaultAction)
                     .accessibilityIdentifier("keyring-passphrase-continue")
+                    .disabled(busy)
                 Button("Cancel") { model.cancelKeyring() }
                     .keyboardShortcut(.cancelAction)
                     .accessibilityIdentifier("keyring-passphrase-cancel")
