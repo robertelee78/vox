@@ -147,6 +147,10 @@ struct VoxCommands: Commands {
                 Task { await app.setKeepRunning(!app.keepRunning) }
             }
         }
+        CommandGroup(replacing: .appTermination) {
+            Button("Quit Vox") { NSApp.terminate(nil) }
+                .keyboardShortcut("q", modifiers: .command)
+        }
         CommandGroup(replacing: .newItem) { items("File") }
         CommandMenu("Room") { items("Room") }
         CommandMenu("Node") {
