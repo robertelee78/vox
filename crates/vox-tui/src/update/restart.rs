@@ -103,6 +103,9 @@ async fn restart_checked(
     start_if_absent: bool,
 ) -> Result<Vec<NodeName>, crate::app::AppError> {
     use crate::app::AppError;
+    let default_listen = crate::client::DEFAULT_LISTEN.parse().map_err(|e| {
+        AppError::Usage(format!("the default daemon listen address is invalid: {e}"))
+    })?;
     let socket = account.socket();
     // Read only Hello, then close. Even the updater sends no request to another release.
     let before = match DaemonClient::observe(&socket).await {
@@ -111,15 +114,7 @@ async fn restart_checked(
             if !start_if_absent {
                 return Ok(Vec::new());
             }
-            crate::daemon_client::start_daemon(
-                helper,
-                account,
-                crate::client::DEFAULT_LISTEN
-                    .parse()
-                    .expect("default listen"),
-                &[],
-            )
-            .await?;
+            crate::daemon_client::start_daemon(helper, account, default_listen, &[]).await?;
             println!("the vox daemon was started and runs vox {now}");
             return Ok(Vec::new());
         }
@@ -136,11 +131,7 @@ async fn restart_checked(
         .windows(2)
         .find(|w| w[0] == "--listen")
         .and_then(|w| w[1].parse().ok())
-        .unwrap_or_else(|| {
-            crate::client::DEFAULT_LISTEN
-                .parse()
-                .expect("default listen")
-        });
+        .unwrap_or(default_listen);
     let attached = before
         .attached
         .iter()
@@ -227,17 +218,17 @@ async fn restart_checked(
     let t0 = Instant::now();
     let after = loop {
         let greeting = DaemonClient::observe(&socket).await;
-        let ready = greeting.as_ref().is_ok_and(|d| {
-            d.version == now
+        if let Ok(d) = greeting {
+            if d.version == now
                 && d.pid != before.pid
                 && kept.iter().all(|k| {
                     d.attached
                         .iter()
                         .any(|n| &n.name == k && n.state == NodeState::Attached)
                 })
-        });
-        if ready {
-            break greeting.expect("greeting checked");
+            {
+                break d;
+            }
         }
         if t0.elapsed() >= REATTACH_WITHIN {
             return Err(AppError::Usage(format!(
