@@ -606,6 +606,11 @@ final class SecureFieldHolder {
         return Secret(Data(text.utf8))
     }
 
+    /// Copy for an operation whose result must leave the typed field intact (ADR-034 PR-3).
+    func copyAllowingEmpty() -> Secret { Secret(Data(field.stringValue.utf8)) }
+
+    func clear() { field.stringValue = "" }
+
     /// Whether nothing is typed now.
     var isEmpty: Bool { field.stringValue.isEmpty }
 }
@@ -619,6 +624,7 @@ struct SecureInput: NSViewRepresentable {
     /// Told whether the field is empty as it changes (never what it holds).
     var onEmpty: ((Bool) -> Void)? = nil
     let onSubmit: () -> Void
+    @Environment(\.isEnabled) private var isEnabled
 
     func makeNSView(context: Context) -> NSSecureTextField {
         holder.field.target = context.coordinator
@@ -630,6 +636,7 @@ struct SecureInput: NSViewRepresentable {
     func updateNSView(_ view: NSSecureTextField, context: Context) {
         context.coordinator.onSubmit = onSubmit
         context.coordinator.onEmpty = onEmpty
+        view.isEnabled = isEnabled
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(onSubmit: onSubmit, onEmpty: onEmpty) }
