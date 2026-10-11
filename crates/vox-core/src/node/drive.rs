@@ -119,6 +119,8 @@ pub enum SessionFilter {
     /// The Session with this harness session id, whoever wrote them (its node's own, and the drive
     /// entries naming it); or the one Session whose id begins with it, eight characters or more.
     Session(String),
+    /// Raw records for the Session summary's entry count and newest-change marker.
+    SessionRaw(String),
     /// Those announcing a file out of a Session (DR-1.8).
     FilesOut,
     /// Requests still answerable, without walking the Session's transcript.
@@ -132,13 +134,13 @@ pub enum SessionFilter {
     },
 }
 
-/// One page of Session entries: the rows, oldest first, and how many of the filter's rows are
-/// older than the page.
+/// One page of Session activity, oldest origins first, with each origin's complete parts and
+/// outcomes. Raw filters instead carry records in their original order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionPage {
-    /// The rows, in the order they were opened or written.
+    /// Activity origins and their indexed companions, or raw records for a raw filter.
     pub rows: Vec<SessionRow>,
-    /// How many older rows there are before the first.
+    /// How many older activities (raw records for a raw filter) precede this page.
     pub older: u64,
 }
 
@@ -159,6 +161,12 @@ pub struct SessionLog {
     requests: std::collections::HashMap<(String, String), Vec<usize>>,
     pending: std::collections::HashMap<String, Vec<usize>>,
     resolved: std::collections::HashSet<(String, Digest32, String)>,
+    visible: std::collections::HashMap<String, Vec<usize>>,
+    pieces: std::collections::HashMap<usize, Vec<usize>>,
+    open_parts: std::collections::HashMap<(String, Digest32, String, String), usize>,
+    activity_refs: std::collections::HashMap<usize, String>,
+    outcomes: std::collections::HashMap<(String, String), Vec<usize>>,
+    drives: std::collections::HashSet<(String, String)>,
 }
 
 impl SessionLog {
@@ -186,8 +194,92 @@ impl SessionLog {
                 self.files_out.push(at);
             }
             self.index_request(&row, at);
+            self.index_activity(&row, at);
         }
         self.rows.push(row);
+    }
+
+    fn index_activity(&mut self, row: &SessionRow, at: usize) {
+        let Ok(serde_json::Value::Object(body)) = serde_json::from_str(&row.body) else {
+            return;
+        };
+        let body = serde_json::Value::Object(body);
+        let kind = body["kind"].as_str().unwrap_or_default();
+        let reference = body["ref"]
+            .as_str()
+            .or_else(|| match kind {
+                "drive" => body["id"].as_str(),
+                "drive-result" => body["of"].as_str(),
+                _ => None,
+            })
+            .unwrap_or_default();
+        if matches!(kind, "tool-done" | "resolved" | "drive-result") && !reference.is_empty() {
+            self.outcomes
+                .entry((row.session_id.clone(), reference.to_owned()))
+                .or_default()
+                .push(at);
+        }
+        let drive_key = (row.session_id.clone(), reference.to_owned());
+        if kind == "drive" && !reference.is_empty() {
+            self.drives.insert(drive_key.clone());
+        }
+        // These records update another line rather than occupying a page themselves.
+        if matches!(kind, "tool-done" | "resolved")
+            || (kind == "drive"
+                && !matches!(
+                    body["action"].as_str(),
+                    Some("text" | "interrupt" | "stop" | "slash" | "file")
+                ))
+            || (kind == "drive-result" && (body["ok"] == true || self.drives.contains(&drive_key)))
+        {
+            return;
+        }
+        let part = body["part"]
+            .as_array()
+            .and_then(|p| Some((p.first()?.as_u64()?, p.get(1)?.as_u64()?)));
+        let key = (
+            row.session_id.clone(),
+            row.author,
+            kind.to_owned(),
+            reference.to_owned(),
+        );
+        if let Some((i, n)) = part {
+            if i > 1 {
+                if let Some(&origin) = self.open_parts.get(&key) {
+                    self.pieces.entry(origin).or_default().push(at);
+                    if i >= n {
+                        self.open_parts.remove(&key);
+                    }
+                    return;
+                }
+            }
+            if i < n {
+                self.open_parts.insert(key, at);
+            }
+        }
+        self.visible
+            .entry(row.session_id.clone())
+            .or_default()
+            .push(at);
+        if !reference.is_empty() {
+            self.activity_refs.insert(at, reference.to_owned());
+        }
+    }
+
+    fn activity(&self, at: usize) -> Vec<usize> {
+        let mut rows = vec![at];
+        if let Some(parts) = self.pieces.get(&at) {
+            rows.extend(parts);
+        }
+        if let Some(reference) = self.activity_refs.get(&at) {
+            if let Some(outcomes) = self
+                .outcomes
+                .get(&(self.rows[at].session_id.clone(), reference.clone()))
+            {
+                rows.extend(outcomes);
+            }
+        }
+        rows
     }
 
     fn index_request(&mut self, row: &SessionRow, at: usize) {
@@ -265,15 +357,20 @@ impl SessionLog {
                 .requests
                 .get(&(session_id.clone(), reference.clone()))
                 .map_or(&[], Vec::as_slice),
-            SessionFilter::Session(id) => {
-                if let Some(p) = self.by_session.get(id) {
+            SessionFilter::Session(id) | SessionFilter::SessionRaw(id) => {
+                let index = if matches!(which, SessionFilter::Session(_)) {
+                    &self.visible
+                } else {
+                    &self.by_session
+                };
+                if let Some(p) = index.get(id) {
                     return p;
                 }
                 let id = id.trim();
                 if id.chars().count() < 8 {
                     return &[];
                 }
-                let mut found = self.by_session.iter().filter(|(k, _)| k.starts_with(id));
+                let mut found = index.iter().filter(|(k, _)| k.starts_with(id));
                 match (found.next(), found.next()) {
                     (Some((_, p)), None) => p,
                     _ => &[],
@@ -304,22 +401,33 @@ impl SessionLog {
                 .and_then(|at| positions.binary_search(at).ok())
                 .ok_or_else(|| "cursor not among these Session entries".to_owned())?,
         };
+        let visible = matches!(which, SessionFilter::Session(_));
         let mut start = end;
         let mut bytes = 0usize;
+        let mut groups = Vec::new();
         while start > 0 {
-            let row = &self.rows[positions[start - 1]];
-            let cost = row.body.len() + row.session_id.len();
-            if start < end && (end - start >= max_rows || bytes + cost > max_bytes) {
+            let at = positions[start - 1];
+            let group = if visible { self.activity(at) } else { vec![at] };
+            let cost = group.iter().fold(0usize, |sum, &p| {
+                sum.saturating_add(self.rows[p].body.len() + self.rows[p].session_id.len())
+            });
+            if start < end && (end - start >= max_rows || bytes.saturating_add(cost) > max_bytes) {
                 break;
             }
-            bytes += cost;
+            bytes = bytes.saturating_add(cost);
+            groups.push(group);
             start -= 1;
         }
+        let mut seen = std::collections::HashSet::new();
+        let rows = groups
+            .into_iter()
+            .rev()
+            .flatten()
+            .filter(|p| seen.insert(*p))
+            .map(|p| self.rows[p].clone())
+            .collect();
         Ok(SessionPage {
-            rows: positions[start..end]
-                .iter()
-                .map(|&at| self.rows[at].clone())
-                .collect(),
+            rows,
             older: start as u64,
         })
     }

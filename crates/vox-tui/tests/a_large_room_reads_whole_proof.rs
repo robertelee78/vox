@@ -121,6 +121,161 @@ fn an_older_request_page_shows_its_later_resolution() {
     delayed_app_reply(AppReplyFault::RequestState);
 }
 
+/// A Session page carries visible activities whole, including results written much later and
+/// a reply split across more than one real frame. Mutants: select raw records instead of
+/// activity origins (empty newest page), or omit indexed pieces/outcomes (incomplete Details).
+#[test]
+#[ignore = "real daemon, completed tools and a multipart reply; CI runs in release"]
+fn session_pages_show_complete_activities_after_late_results() {
+    watchdog::arm();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("APPARATUS: runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: scratch profile");
+    let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
+    let alice = &room.workers[0];
+    let node = alice.paths.account().nodes_on_disk()[0].clone();
+    rt.block_on(async {
+        let mut c = IpcClient::open_at(&NodeSocket::one_shot(
+            alice.paths.account().socket(),
+            node.clone(),
+        ))
+        .await
+        .expect("PRODUCT: the running daemon did not answer");
+        for kind in ["tool", "tool-done"] {
+            for n in 0..220 {
+                let body = serde_json::json!({"kind":kind,"ref":format!("tool-{n:03}"),
+                    "tool":"Read","summary":format!("tool-{n:03}"),"input":format!("input-{n:03}"),
+                    "output":format!("output-{n:03}"),"ok":true})
+                .to_string();
+                assert!(
+                    matches!(
+                        c.request(&Request::AppendSession {
+                            channel_id: room.cid,
+                            session_id: SESSION.to_owned(),
+                            body
+                        })
+                        .await,
+                        Ok(Frame::Appended { .. })
+                    ),
+                    "PRODUCT: the daemon refused {kind} {n}"
+                );
+            }
+        }
+    });
+    let newest = alice.vox(
+        None,
+        &["room", "session", &room.id, SESSION, "--json", "--details"],
+    );
+    let shown = newest.ndjson();
+    assert!(newest.ok && shown.len() == 200 && shown.iter().any(|v| v["ref"] == "tool-219"),
+        "PRODUCT: the newest Session page lost its visible activities behind completion records: {newest:?}");
+    for row in &shown {
+        let reference = row["ref"]
+            .as_str()
+            .expect("PRODUCT: a tool line lost its reference");
+        assert!(
+            row["details"]
+                .to_string()
+                .contains(&reference.replace("tool-", "output-")),
+            "PRODUCT: the CLI tool details lost its later result: {row}"
+        );
+    }
+    let whole = (0..7)
+        .map(|n| {
+            format!(
+                "PART-{n}:{}",
+                char::from(b'a' + n).to_string().repeat(40 * 1024)
+            )
+        })
+        .collect::<Vec<_>>();
+    rt.block_on(async {
+        let mut c = IpcClient::open_at(&NodeSocket::one_shot(
+            alice.paths.account().socket(),
+            node.clone(),
+        ))
+        .await
+        .expect("PRODUCT: the running daemon did not answer");
+        for (n, text) in whole.iter().enumerate() {
+            let body =
+                serde_json::json!({"kind":"reply","ref":"whole-reply","part":[n+1,7],"text":text})
+                    .to_string();
+            assert!(
+                matches!(
+                    c.request(&Request::AppendSession {
+                        channel_id: room.cid,
+                        session_id: SESSION.to_owned(),
+                        body
+                    })
+                    .await,
+                    Ok(Frame::Appended { .. })
+                ),
+                "PRODUCT: the daemon refused a multipart reply"
+            );
+        }
+    });
+    let client = rt
+        .block_on(vox_ffi::VoxClient::open(
+            alice.data.to_string_lossy().into_owned(),
+        ))
+        .expect("PRODUCT: the app could not open its daemon");
+    let pass = vox_ffi::Passphrase::new(support::ID_PASS.as_bytes().to_vec())
+        .expect("APPARATUS: passphrase");
+    rt.block_on(client.attach(node.as_str().to_owned(), Some(pass)))
+        .expect("PRODUCT: the app could not attach");
+    let mut page = rt
+        .block_on(client.session_read(room.id.clone(), alice.b32(), SESSION.to_owned()))
+        .expect("PRODUCT: the app could not open the multipart activity");
+    assert!(page.entries.len() == 1 && page.entries[0].details.contains(&whole.concat()),
+        "PRODUCT: the app split or cut the newest activity's complete Details ({} entries, {} detail bytes)",
+        page.entries.len(),page.entries.first().map_or(0,|e|e.details.len()));
+    assert_eq!(
+        page.older, 220,
+        "PRODUCT: the app's older count included hidden records or split parts"
+    );
+    let mut tools = std::collections::BTreeSet::new();
+    while let Some(before) = page.before {
+        page = rt
+            .block_on(client.session_read_older(
+                room.id.clone(),
+                alice.b32(),
+                SESSION.to_owned(),
+                before,
+            ))
+            .expect("PRODUCT: the app could not read the older activities");
+        assert!(
+            !page.entries.is_empty(),
+            "PRODUCT: an older Session page was empty"
+        );
+        for entry in &page.entries {
+            let reference = entry
+                .line
+                .split_whitespace()
+                .nth(1)
+                .expect("PRODUCT: a tool line lost its name");
+            assert!(
+                entry
+                    .details
+                    .contains(&reference.replace("tool-", "input-"))
+                    && entry
+                        .details
+                        .contains(&reference.replace("tool-", "output-")),
+                "PRODUCT: the app's tool Details lost input or later output: {}",
+                entry.line
+            );
+            assert!(
+                tools.insert(reference.to_owned()),
+                "PRODUCT: the app showed {reference} twice"
+            );
+        }
+    }
+    assert_eq!(tools.len(), 220, "PRODUCT: the app lost older activities");
+    rt.block_on(client.close());
+    eprintln!("[proof] newest CLI page showed completed tools; app Details joined 7 parts across the real frame bound and all 220 older tools retained their later results");
+}
+
 fn delayed_app_reply(fault: AppReplyFault) {
     let background = matches!(fault, AppReplyFault::BackgroundTimeout);
     let timeout = matches!(
