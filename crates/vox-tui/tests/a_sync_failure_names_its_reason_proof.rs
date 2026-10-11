@@ -151,7 +151,8 @@ fn a_sync_that_did_not_complete_says_why() {
             .unwrap_or_else(|e| panic!("APPARATUS: cannot make {}: {e}", d.display()));
         d
     };
-    let (anchor_dir, alice_dir, bob_dir) = (dir("anchor"), dir("alice"), dir("bob"));
+    let (anchor_dir, alice_dir, bob_dir, carol_dir) =
+        (dir("anchor"), dir("alice"), dir("bob"), dir("carol"));
     let idpass = tmp.path().join("idpass");
     std::fs::write(&idpass, IDENTITY).expect("APPARATUS: cannot write the passphrase file");
 
@@ -320,6 +321,40 @@ fn a_sync_that_did_not_complete_says_why() {
         refused_posts.len()
     );
 
+    // Carol will later relay Bob's departure; admit her while all current members are live.
+    let carol_fp = fp(&carol_dir);
+    for (data, other, name) in [
+        (&alice_dir, &carol_fp, "carol"),
+        (&carol_dir, &alice_fp, "alice"),
+        (&carol_dir, &bob_fp, "bob"),
+        (&bob_dir, &carol_fp, "carol"),
+    ] {
+        let (ok, out, err) = vox_once(data, &args(&["trust", "add", other, "--name", name]));
+        assert!(ok, "APPARATUS: trust before relayed departure: {out}{err}");
+    }
+    let mut carol = daemon("carol", &carol_dir, &spec, &idpass);
+    let (ok, out, err) = vox_in(
+        &carol_dir,
+        &["room", "join", "--passphrase-file", "-", link.trim()],
+        "room pass",
+    );
+    assert!(
+        ok,
+        "APPARATUS: Carol could not join before departure: {out}{err}"
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let (_, read, _) = vox_once(&carol_dir, &args(&["room", "read", &room]));
+        if read.contains("hello from alice") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: Carol never caught up before departure: {read}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
     // A report seen above is its own positive control; a green needs one staged.
     // ---- the positive control: a sync that cannot complete is reported in these words ----------
     let alice_before = lines_so_far(&mut alice);
@@ -381,7 +416,6 @@ fn a_sync_that_did_not_complete_says_why() {
         .map(str::to_owned)
         .collect();
     assert!(retries.len() <= 1, "PRODUCT: an unhealthy peer was retried every few seconds instead of backing off: {retries:?}");
-    signal_and_confirm(&bob_pid, "-CONT");
     println!(
         "[proof] positive control: with bob frozen, alice's post ok={ok}; her report {:?} after \
          {:?}",
@@ -447,6 +481,66 @@ fn a_sync_that_did_not_complete_says_why() {
          cause: {logged:?}"
     );
 
+    // A departure relayed by another member must clear the departed peer's failure. Keep
+    // Alice stopped until Bob has left through Carol, so no successful Alice/Bob sync can
+    // clear the old health condition and mask a failure to retire it on departure.
+    let (ok, before, err) = vox_once(&alice_dir, &args(&["status"]));
+    assert!(
+        ok && before.contains("sync failing:"),
+        "APPARATUS: Bob's failing health was not held before departure: {before}{err}"
+    );
+    let alice_pid = alice.child.id().to_string();
+    signal_and_confirm(&alice_pid, "-STOP");
+    // Bob was killed above, so a new daemon reads exactly his existing profile. Alice cannot
+    // answer it; Carol is the live member who hears his departure.
+    let bob = daemon("bob leaving", &bob_dir, &spec, &idpass);
+    let (ok, out, err) = vox_once(&bob_dir, &args(&["room", "leave", &room]));
+    assert!(
+        ok,
+        "PRODUCT: Bob could not leave through Carol while Alice was offline: {out}{err}"
+    );
+    drop(bob);
+    signal_and_confirm(&alice_pid, "-CONT");
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let (ok, status, err) = vox_once(&alice_dir, &args(&["status"]));
+        assert!(ok, "PRODUCT: status after Bob left: {status}{err}");
+        if !status.contains("sync failing:") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "PRODUCT: Bob left through Carol, but Alice still calls the departed peer unhealthy: {status}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    println!("[proof] Bob's relayed departure cleared Alice's sync-failing health without a successful session with Bob");
+    let log = std::fs::read_to_string(alice_dir.join(".daemon/log"))
+        .unwrap_or_else(|e| panic!("PRODUCT: Alice's own daemon log cannot be read: {e}"));
+    let failures: Vec<&str> = log
+        .lines()
+        .filter(|line| {
+            line.contains(DID_NOT_COMPLETE)
+                || (line.contains("could not reach ") && line.contains(bob12))
+        })
+        .collect();
+    assert!(
+        !failures.is_empty(),
+        "PRODUCT: actual peer failures were absent from Alice's daemon log: {log}"
+    );
+    for line in &failures {
+        assert!(
+            line.as_bytes().get(10) == Some(&b'T') && line.as_bytes().get(23) == Some(&b'Z'),
+            "PRODUCT: a daemon failure has no UTC timestamp: {line}"
+        );
+    }
+    assert!(
+        failures.iter().any(|line| line.contains(&room[..12])
+            && (line.contains("default") || line.contains("alice"))),
+        "PRODUCT: failed room sync log lines omit their node and room context: {failures:?}"
+    );
+    println!(
+        "[proof] actual failed peer syncs persisted with UTC, node and room context: {failures:?}"
+    );
+    // Read its transcript before cleanup so errors name the relay if anything else failed.
+    let _ = carol.transcript();
     drop(anchor);
 }
 
