@@ -6,7 +6,8 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 open questions, the same evening; UP-2 and UP-3 revised with his story-plan answers that night;
 FR-4–FR-6 from his ruling on the frame-length root cause that night, with FR-6's bounds from his
 answer later that night; FR-7–FR-10 and WT-5 from the fix's audit of every list reply, codified at
-his word that night; PF-3 from his release split that night). This ADR stays in v0.4.4.
+his word that night; PF-3 from his release split that night; FR-8 restated and FR-9 withdrawn at his
+word, "we shouldn't have caps like these"). This ADR stays in v0.4.4.
 Nothing in this ADR is built.
 **Date**: 2026-10-10
 **Deciders**: Robert E. Lee
@@ -83,12 +84,14 @@ each of these broke.
 
 ### 3. Replies fit their frame
 
-- **FR-1.** Every reply that lists things MUST be paged or bounded so that one reply always fits one
+- **FR-1.** Every reply that lists things MUST be paged so that one reply always fits one
   frame: Session entries (by a cursor, and per Session), Sessions, snapshot lists, notices,
   decisions, members and shares. Every caller (the app, the TUI, `vox room session` and the rest)
   MUST page.
-- **FR-2.** A reply that would exceed the frame limit MUST be sent as a plain error naming what was
-  too large. The daemon MUST NOT write a frame over the limit.
+- **FR-2.** The frame limit is an internal guard only: replies are paged (FR-7), so it is never
+  reached. If a reply would exceed it, the daemon MUST send a plain error naming the request
+  (FR-10) and MUST NOT write a frame over the limit; reaching it is a defect in Vox's paging, never
+  a limit the person meets.
 - **FR-3.** A client that reads a frame over the limit, or one it cannot parse, MUST drop the
   connection (WT-2); it MUST NOT read the next reply from it.
 
@@ -134,21 +137,18 @@ we're working on hot fixes -- but this needs to be codified into ADRs, projects/
   7. the room snapshot's per-member lists (`read_by`, `trusted_by`), which MUST be paged or taken
      out of the snapshot into their own paged request.
 
-  A page MUST be bounded both in rows and in bytes, so that one page fits one frame even when a row
-  an earlier release wrote is longer than FR-9's bound.
-- **FR-8. Never truncated in silence.** No reply MAY drop rows without saying so. Where a reply is
-  capped, it MUST say how many rows it left out, and every client MUST show it, for example "120
-  older not shown".
-- **FR-9. Bounded fields.** Every free-text field a member writes that ends up in a list row (a
-  Session's name and harness, and every other such field) MUST have a length bound. A write over
-  it MUST be refused, where it is written, with one plain sentence naming the field and its bound;
-  it MUST NOT be cut short in silence. The bounds MUST be stated in the manual. The bounds are: a
-  Session's name 128 characters; its harness 32 characters; every other such field 256
-  characters, unless a tighter bound already applies to it. A longer value that a peer of an
-  earlier release wrote MUST be stored as received and shown cut with "…"; the cut is in display
-  only. (The lead's ruling, 2026-10-10, under the decider's delegation of engineering calls.)
-- **FR-10. An oversized reply is an error, not a desync.** FR-2's error MUST name the request
-  whose reply was too large, and the connection MUST stay usable for the next request.
+  A page's size is internal to Vox: the daemon fills each page, by rows and by bytes, so that it
+  fits one frame. A row larger than one page MUST be carried across pages and joined whole by the
+  client; it MUST NOT be cut.
+- **FR-8. No caps.** Nothing MAY ever be truncated, capped or refused for its size: not a list, not
+  a row, and not a field a member writes (a Session's name, its harness, or any other). Every list
+  is paged, the person can reach every row by paging, and no reply MAY drop rows. The decider,
+  2026-10-10: "we shouldn't have caps like these".
+- **FR-9.** Withdrawn (the decider, 2026-10-10: "we shouldn't have caps like these"). It bounded
+  the length of member-written list fields and refused a longer write; FR-8 forbids both.
+- **FR-10. An oversized reply is an error, not a desync.** Should FR-2's guard ever be reached, its
+  error MUST name the request whose reply was too large, and the connection MUST stay usable for
+  the next request.
 
 ### 4. A room that cannot save
 
@@ -221,7 +221,7 @@ we're working on hot fixes -- but this needs to be codified into ADRs, projects/
 | ADR-014 M-29 | The update asks the person to restart the app and the daemon | The update restarts the daemon itself (UP-1); a client refuses a daemon of another version (UP-2) |
 | ADR-014 M-21 | The menus as listed, with no Quit named | The Vox menu holds Quit Vox ⌘Q (QT-1) |
 | ADR-028 A-4 | Quitting detaches the node, with no bound | Letting go of the node is bounded and never blocks quitting (QT-2) |
-| ADR-034 FR-1, FR-2 (as first written) | Lists are paged or bounded; an oversized reply is an error naming what was too large | Every list the clients take is paged with a cursor and a "more" mark, by rows and bytes (FR-7); a cap says what it left out (FR-8); member-written list fields are bounded and refused over it (FR-9); the error names the request and the connection stays usable (FR-10); a reopened connection keeps the node Ready (WT-5) |
+| ADR-034 FR-1, FR-2 (as first written) | Lists are paged or bounded; an oversized reply is an error naming what was too large | Every list the clients take is paged with a cursor and a "more" mark, by rows and bytes (FR-7); a page's size is internal and a row too large for a page is carried across pages (FR-7); nothing is truncated, capped or refused for size (FR-8; FR-9's field bounds withdrawn); the frame limit is an internal guard never reached, and its error names the request and leaves the connection usable (FR-2, FR-10); a reopened connection keeps the node Ready (WT-5) |
 | ADR-034 FR-1 (as first written) | Lists are paged so a reply fits one frame | Also: no client fetches a whole history; the newest page first, older on scroll; pages from an index; proven at 100,000 entries (FR-4–FR-6) |
 | ADR-014 M-32a | App proofs run in a macOS guest VM | Moves to v0.4.5; in v0.4.4 an app screen proof runs on the decider's Mac only, with his OK each time (PF-3) |
 | ADR-026 C-4 | `Hello` reports the daemon's version | A client refuses its daemon when their versions differ and attempts nothing else (UP-2); both versions are named (UP-3); peers are unchanged |
@@ -233,9 +233,8 @@ we're working on hot fixes -- but this needs to be codified into ADRs, projects/
 - Readers of long lists make more round trips, and a history opens at its newest page whatever its
   length (FR-4, FR-5).
 - FR-7–FR-10 change only the protocol between a client and its own daemon, which UP-2 holds to
-  one version, so peers of other releases are unaffected by them. FR-9 refuses only what this node
-  writes; a longer field a peer of an earlier release wrote still arrives, is stored as received,
-  and is shown cut with "…" (FR-9).
+  one version, so peers of other releases are unaffected by them. No field is refused or cut for
+  its length, whichever release wrote it (FR-8).
 - Quitting never waits on the daemon; a node the app could not let go of in time is reported at the
   next start.
 - A client and a daemon of different versions do not work together until the daemon is restarted
