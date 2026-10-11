@@ -4,7 +4,8 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 **Status**: Accepted for v0.4.4 (the decider's Q&A, 2026-10-10, and his answers to this ADR's
 open questions, the same evening; UP-2 and UP-3 revised with his story-plan answers that night;
-FR-4–FR-6 from his ruling on the frame-length root cause that night). Nothing in this ADR is
+FR-4–FR-6 from his ruling on the frame-length root cause that night; FR-7–FR-10 and WT-5 from the
+fix's audit of every list reply, codified at his word that night). Nothing in this ADR is
 built.
 **Date**: 2026-10-10
 **Deciders**: Robert E. Lee
@@ -75,6 +76,9 @@ each of these broke.
   sentence, where the action was taken (ADR-014 M-7).
 - **WT-4.** While the daemon cannot be reached, the app MUST show each node's state and the room's
   peers as unknown, never as last known, and MUST clear "the daemon stopped" once it is back.
+- **WT-5. Reopened, not detached.** When a client drops a broken connection (WT-2, FR-3) and opens
+  a new one, the node it acts as MUST stay Ready (ADR-031 CW-1): reopening a connection MUST NOT
+  lock, detach or let go of the node, and the person MUST NOT be asked for anything.
 
 ### 3. Replies fit their frame
 
@@ -106,6 +110,37 @@ fits a frame is not enough: a history may be any length.
   the daemon's and the app's resident memory MUST stay under a stated bound throughout. The bounds MUST be written in the proof. Its mutant MUST make the
   client fetch the whole history and MUST turn the proof red on its own assertion, labelled
   PRODUCT.
+
+The fix's audit of every list reply (framefix, 2026-10-10, night) found these unbounded: the
+Sessions list (no count bound, and a member's session name and harness unchecked, so a row may be
+64 KiB), Decisions (the app asks for `u64::MAX`; over the frame at about 800 events), the services
+shared with a node, Unread (1,000 rows of up to 64 KiB each), a room's Order, and the room
+snapshot's per-member lists (`read_by`, about 128 bytes × members², and `trusted_by`, about
+members², over 128 KiB at about 63 members). Members and the share list fit. The decider: "I know
+we're working on hot fixes -- but this needs to be codified into ADRs, projects/tasks, etc".
+
+- **FR-7. Every list is paged.** Every reply that lists things and that the app, the TUI or a verb
+  takes MUST be paged, with a cursor and a "more" mark, and every caller MUST follow it, at least:
+  1. the Sessions list (`Sessions`);
+  2. a Session's entries (`SessionEntries` and its page form);
+  3. Decisions;
+  4. Unread;
+  5. the services shared with a node (`Services`);
+  6. a room's Order;
+  7. the room snapshot's per-member lists (`read_by`, `trusted_by`), which MUST be paged or taken
+     out of the snapshot into their own paged request.
+
+  A page MUST be bounded both in rows and in bytes, so that one page fits one frame even when a row
+  an earlier release wrote is longer than FR-9's bound.
+- **FR-8. Never truncated in silence.** No reply MAY drop rows without saying so. Where a reply is
+  capped, it MUST say how many rows it left out, and every client MUST show it, for example "120
+  older not shown".
+- **FR-9. Bounded fields.** Every free-text field a member writes that ends up in a list row (a
+  Session's name and harness, and every other such field) MUST have a length bound. A write over
+  it MUST be refused, where it is written, with one plain sentence naming the field and its bound;
+  it MUST NOT be cut short in silence. The bounds MUST be stated in the manual.
+- **FR-10. An oversized reply is an error, not a desync.** FR-2's error MUST name the request
+  whose reply was too large, and the connection MUST stay usable for the next request.
 
 ### 4. A room that cannot save
 
@@ -173,6 +208,7 @@ fits a frame is not enough: a history may be any length.
 | ADR-014 M-29 | The update asks the person to restart the app and the daemon | The update restarts the daemon itself (UP-1); a client refuses a daemon of another version (UP-2) |
 | ADR-014 M-21 | The menus as listed, with no Quit named | The Vox menu holds Quit Vox ⌘Q (QT-1) |
 | ADR-028 A-4 | Quitting detaches the node, with no bound | Letting go of the node is bounded and never blocks quitting (QT-2) |
+| ADR-034 FR-1, FR-2 (as first written) | Lists are paged or bounded; an oversized reply is an error naming what was too large | Every list the clients take is paged with a cursor and a "more" mark, by rows and bytes (FR-7); a cap says what it left out (FR-8); member-written list fields are bounded and refused over it (FR-9); the error names the request and the connection stays usable (FR-10); a reopened connection keeps the node Ready (WT-5) |
 | ADR-034 FR-1 (as first written) | Lists are paged so a reply fits one frame | Also: no client fetches a whole history; the newest page first, older on scroll; pages from an index; proven at 100,000 entries (FR-4–FR-6) |
 | ADR-026 C-4 | `Hello` reports the daemon's version | A client refuses its daemon when their versions differ and attempts nothing else (UP-2); both versions are named (UP-3); peers are unchanged |
 
@@ -182,6 +218,9 @@ fits a frame is not enough: a history may be any length.
   daemon, and says so.
 - Readers of long lists make more round trips, and a history opens at its newest page whatever its
   length (FR-4, FR-5).
+- FR-7–FR-10 change only the protocol between a client and its own daemon, which UP-2 holds to
+  one version, so peers of other releases are unaffected by them. FR-9 refuses only what this node
+  writes; a longer field a peer of an earlier release wrote still arrives (an open question below).
 - Quitting never waits on the daemon; a node the app could not let go of in time is reported at the
   next start.
 - A client and a daemon of different versions do not work together until the daemon is restarted
@@ -193,6 +232,9 @@ fits a frame is not enough: a history may be any length.
 
 ## Open questions
 
+- **FR-9's bounds.** The length bound for each member-written field (a Session's name, its
+  harness and the rest) is not yet stated. What a node shows of a longer field that a peer of an
+  earlier release wrote, cut with a mark or shown whole within FR-7's byte bound, is also open.
 - **FR-6's bounds and weight.** The time and memory bounds are not yet stated by the decider, and a
   100,000-entry proof is heavy: whether it blocks the release or is an optional proof (the cargo
   feature `optional-proofs`, ADR-018) is the decider's call. Whether a room of 100,000 messages is
