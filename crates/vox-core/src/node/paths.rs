@@ -48,6 +48,8 @@ pub const CONFIG_FILE: &str = "config";
 
 /// The node's retention policy file (ADR-023 decision 2), in the config directory.
 pub const RETENTION_FILE: &str = "retention";
+/// Local Session retention overrides, separate from ordinary room messages.
+pub const STEP_RETENTION_FILE: &str = "step-retention";
 
 /// The config file saying how long a tunnel's bytes may wait to be taken before it is closed as
 /// stuck (V030-11): one line, `600`, `600s`, `10m` or `1h`. Absent or unreadable, it is 10
@@ -546,6 +548,11 @@ impl Paths {
     #[must_use]
     pub fn retention_file(&self) -> PathBuf {
         self.config_path(RETENTION_FILE)
+    }
+
+    /// This node's Session retention policy, falling back to account configuration.
+    pub fn step_retention_file(&self) -> PathBuf {
+        self.config_path(STEP_RETENTION_FILE)
     }
 
     /// Which rooms `vox node` serves, for this node ([`SERVE_FILE`]; [`Self::config_path`]).

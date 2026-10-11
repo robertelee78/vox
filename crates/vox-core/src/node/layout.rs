@@ -129,7 +129,10 @@ pub fn refuse_old_layout(account: &Account) -> Result<()> {
 /// The data root's format (ADR-026 F-3): the layout of `.daemon/` and `nodes/`, and every format
 /// the files under them are in. A release that changes any of them raises it, and upgrades a root
 /// of every earlier value a supported release (v0.4.0 on) wrote.
-pub const DATA_ROOT_FORMAT: u32 = 1;
+// Format 2 adds separate Session retention and version-3 age records. Opening a
+// supported older root decodes its version-1/2 records and classifies stored drive
+// envelopes before the first retention sweep; no identity or room is rewritten.
+pub const DATA_ROOT_FORMAT: u32 = 2;
 
 /// What `.daemon/format` says: the data root's format and the vox that last served it.
 fn format_text(version: &str) -> String {

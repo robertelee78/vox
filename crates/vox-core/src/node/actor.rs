@@ -390,6 +390,10 @@ fn detail_of(
             .map(|(member, by)| (member, by.into_iter().collect()))
             .collect(),
         retention: ch.effective_retention(),
+        room_retention: ch.room_retention(),
+        room_step_retention: ch.room_step_retention(),
+        step_retention: ch.effective_step_retention(),
+        local_step_retention: ch.local_step_retention(),
         retention_above_room: ch.retention_above_room(),
         key_generations: ch.key_generations(),
         received_key_generations: ch.received_key_generations(),
@@ -4432,6 +4436,7 @@ pub struct Node {
     /// This node's own retention (ADR-023 decision 2), re-read from the config directory
     /// at most every [`RETENTION_REREAD_MS`] so an edit takes effect without a restart.
     node_retention: crate::node::retention::RetentionConfig,
+    node_step_retention: crate::node::retention::RetentionConfig,
     /// When `node_retention` was last read (unix milliseconds); `0` before the first read.
     retention_read_at: u64,
     /// Open rooms whose node retention must be re-applied because the file changed; applied by
@@ -4826,6 +4831,7 @@ impl Node {
             dismissed_offers: crate::node::offers::DismissedOffers::default(),
             peer_book: crate::node::peer_book::PeerBook::new(),
             node_retention: crate::node::retention::RetentionConfig::default(),
+            node_step_retention: crate::node::retention::RetentionConfig::default(),
             retention_read_at: 0,
             retention_dirty: std::collections::BTreeSet::new(),
             retention_warned: std::collections::BTreeSet::new(),
@@ -5458,6 +5464,10 @@ impl Node {
                 }
             }
             NodeCommand::Sync { channel_id } => self.sync_channel(&channel_id).await,
+            NodeCommand::SetStepRetention {
+                channel_id,
+                seconds,
+            } => self.set_step_retention(&channel_id, seconds).await,
             NodeCommand::SetRetention { channel_id, ttl } => {
                 self.set_retention(&channel_id, ttl).await
             }
@@ -6920,6 +6930,7 @@ impl Node {
                     // be dialled from where they were last reached (`node::peer_book`).
                     let mut channel = *channel;
                     channel.set_node_retention(self.node_retention_for(&channel_id));
+                    channel.set_node_step_retention(self.node_step_retention.for_room(&channel_id));
                     crate::node::status::SyncBook::note_set_aside(
                         &self.sync_book,
                         channel_id,
@@ -9561,6 +9572,7 @@ impl Node {
         };
         let mut channel = channel;
         channel.set_node_retention(self.node_retention_for(&parsed.channel_id));
+        channel.set_node_step_retention(self.node_step_retention.for_room(&parsed.channel_id));
         // A room joined again is published again (V030-14): its withdraw is kept no longer.
         self.withdrawn.remove(&parsed.channel_id);
         self.remember_or_say(&channel);
@@ -13959,6 +13971,7 @@ impl Node {
         // session on it (the retention fix, e2a74b9): every creation path comes through here.
         let id = ch.channel_id();
         ch.set_node_retention(self.node_retention_for(&id));
+        ch.set_node_step_retention(self.node_step_retention.for_room(&id));
         self.remember_or_say(&ch);
         self.channels
             .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
@@ -14136,6 +14149,7 @@ impl Node {
             return Outcome::Failed(fault_of(&e));
         }
         channel.set_node_retention(self.node_retention_for(&id));
+        channel.set_node_step_retention(self.node_step_retention.for_room(&id));
         self.remember_or_say(&channel);
         self.channels
             .insert(id, Arc::new(tokio::sync::Mutex::new(channel)));
@@ -14344,6 +14358,7 @@ impl Node {
         // The node's own retention before the room is visible to anything that can start a
         // session on it (the retention fix, e2a74b9).
         ch.set_node_retention(self.node_retention_for(&channel_id));
+        ch.set_node_step_retention(self.node_step_retention.for_room(&channel_id));
         // What the open set aside is reported (V210-74), as a reopen reports it.
         crate::node::status::SyncBook::note_set_aside(&self.sync_book, channel_id, ch.set_aside());
         self.remember_or_say(&ch);
@@ -15515,6 +15530,7 @@ impl Node {
                 epoch: room.epoch,
                 last_sync: self.status.room_synced.get(&room.channel_id).copied(),
                 retention: room.retention,
+                step_retention: room.step_retention,
                 key_generations: room.key_generations,
                 received_key_generations: room.received_key_generations,
                 frozen: room.frozen.clone(),
@@ -15729,6 +15745,58 @@ impl Node {
         Outcome::Done
     }
 
+    async fn set_step_retention(&mut self, channel_id: &Digest32, ttl: u64) -> Outcome {
+        let now_ms = self.now_ms();
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return Outcome::Failed(Fault::ChannelNotOpen);
+        };
+        let me = match profile.signer() {
+            Ok(s) => crate::identity::composite::RootSigner::fingerprint(s),
+            Err(e) => return Outcome::Failed(fault_of(&e)),
+        };
+        let (governs, room) = {
+            let ch = shared.lock().await;
+            (
+                ch.governs_retention(&me, self.now_ms()),
+                crate::node::retention::shortest(ch.room_retention(), ch.room_step_retention()),
+            )
+        };
+        if !governs {
+            // Longer than the room keeps is refused; `0` is forever, the longest of all.
+            if room != 0 && (ttl == 0 || ttl > room) {
+                return Outcome::Failed(Fault::AboveRoomRetention);
+            }
+            // The room's own value is "follow the room": the member's line is cleared, so a later
+            // change to the room's retention reaches this node too.
+            let own = (ttl != room).then_some(ttl);
+            // Written to the node's own file (ADR-026 F-2), seeded from the account's when the
+            // node has none, so the other rooms' lines it was reading are kept.
+            let written = self
+                .paths
+                .own_config_path(crate::node::paths::STEP_RETENTION_FILE)
+                .and_then(|file| {
+                    crate::node::retention::RetentionConfig::write_room(&file, channel_id, own)
+                });
+            if written.is_err() {
+                return Outcome::Failed(Fault::RetentionFileUnwritable);
+            }
+            self.retention_read_at = 0;
+            self.refresh_node_retention(now_ms);
+            self.sweep_retention().await;
+            return Outcome::OwnRetention { own: ttl, room };
+        }
+        if let Err(e) = shared.lock().await.set_step_retention(profile, ttl, now_ms) {
+            return Outcome::Failed(fault_of(&e));
+        }
+        self.note_local_append(channel_id);
+        self.retention_read_at = 0; // re-read the node's own file too: an explicit act
+        self.sweep_retention().await;
+        Outcome::Done
+    }
+
     /// Re-read the node's own retention file when it is due (first use, then every
     /// [`RETENTION_REREAD_MS`]). An unreadable file keeps the last policy read rather than
     /// dropping to "no node limit", which would keep more than the operator asked for.
@@ -15742,6 +15810,14 @@ impl Node {
             {
                 if cfg != self.node_retention {
                     self.node_retention = cfg;
+                    self.retention_dirty = self.channels.keys().copied().collect();
+                }
+            }
+            if let Ok(cfg) =
+                crate::node::retention::RetentionConfig::load(&self.paths.step_retention_file())
+            {
+                if cfg != self.node_step_retention {
+                    self.node_step_retention = cfg;
                     self.retention_dirty = self.channels.keys().copied().collect();
                 }
             }
@@ -15786,6 +15862,7 @@ impl Node {
             };
             if self.retention_dirty.remove(cid) {
                 ch.set_node_retention(self.node_retention.for_room(cid));
+                ch.set_node_step_retention(self.node_step_retention.for_room(cid));
                 applied = true;
             }
             // **A node may keep less than its room, never more** (V030-32). A file value above the

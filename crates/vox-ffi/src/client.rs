@@ -104,6 +104,19 @@ pub struct RoomSummary {
     pub over: String,
 }
 
+/// Independent Session-step retention (ADR-031 SA-6); zero seconds means forever.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiStepRetention {
+    /// The room's configured step lifetime, before message retention clamps it.
+    pub room_seconds: u64,
+    /// The room's step lifetime clamped by its configured message lifetime.
+    pub room_cap_seconds: u64,
+    /// What this node actually retains, including its shorter message/step choices.
+    pub effective_seconds: u64,
+    /// This node's explicit shorter step choice, if any.
+    pub local_seconds: Option<u64>,
+}
+
 /// One message, rendered.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct RoomMessage {
@@ -2420,7 +2433,26 @@ impl VoxClient {
             channel_id: digest(&room, "room id")?,
             ttl: ttl_secs,
         };
-        on_held!(self, |c| done(c, &req).await)
+        on_held!(self, |c| match ask(c, &req).await? {
+            Frame::Ok | Frame::OwnRetention { .. } => Ok(()),
+            other => Err(unexpected(&other)),
+        })
+    }
+
+    /// Set the room's Session-step lifetime, or this member's shorter local lifetime.
+    /// No identity passphrase is needed; the daemon enforces who can change the room rule.
+    ///
+    /// # Errors
+    /// A malformed room, a choice above the room cap by a member, or the daemon's refusal.
+    pub async fn set_step_retention(&self, room: String, seconds: u64) -> Result<(), VoxError> {
+        let req = Request::SetStepRetention {
+            channel_id: digest(&room, "room id")?,
+            seconds,
+        };
+        on_held!(self, |c| match ask(c, &req).await? {
+            Frame::Ok | Frame::OwnRetention { .. } => Ok(()),
+            other => Err(unexpected(&other)),
+        })
     }
 
     /// `room`'s admins, its creator first, as fingerprints.
@@ -3769,6 +3801,25 @@ impl VoxClient {
     pub async fn retention_secs(&self, room: String) -> Result<u64, VoxError> {
         match self.open_snap(&room).await?.0 {
             Some(open) => Ok(open.retention),
+            None => Err(failed("the room is not open on this node")),
+        }
+    }
+
+    /// The configured, capped and effective Session-step lifetime of this open room.
+    ///
+    /// # Errors
+    /// A malformed room, a room that is not open, or the daemon's refusal.
+    pub async fn step_retention(&self, room: String) -> Result<FfiStepRetention, VoxError> {
+        match self.open_snap(&room).await?.0 {
+            Some(open) => Ok(FfiStepRetention {
+                room_seconds: open.room_step_retention,
+                room_cap_seconds: vox_core::node::retention::shortest(
+                    open.room_step_retention,
+                    open.room_retention,
+                ),
+                effective_seconds: open.step_retention,
+                local_seconds: open.local_step_retention,
+            }),
             None => Err(failed("the room is not open on this node")),
         }
     }

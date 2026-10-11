@@ -296,6 +296,8 @@ const T_TRUST_LIST: u64 = 16;
 // Setting a room's retention deletes what is already stored (ADR-023 decision 2), so it is an
 // operator decision like the keyring and carries the identity passphrase the same way.
 const T_RETENTION: u64 = 23;
+/// [`Request::SetStepRetention`] (ADR-031 SA-6): independent Session-step lifetime.
+const T_STEP_RETENTION: u64 = 7891;
 // Protocol 6 — every entry the node holds for a room, in the room's one order
 // (PRD-001 R13), readable or not. What "the same order on every node" is checked
 // against, because a node's timeline shows only the rows it holds keys for.
@@ -754,6 +756,14 @@ pub enum Request {
         channel_id: Digest32,
         /// Seconds a message body is kept; `0` keeps it forever.
         ttl: u64,
+    },
+    /// Set Session-step retention independently of room messages (ADR-031 SA-6). An admin
+    /// changes the room rule; another member can shorten only this node's lifetime.
+    SetStepRetention {
+        /// The room.
+        channel_id: Digest32,
+        /// Seconds a Session step is kept; zero means forever, still bounded by messages.
+        seconds: u64,
     },
     /// Name a room for every member (ADR-028 R-1); its creator or an admin only, as the room's
     /// governance says. **Not gated on the identity passphrase** (ADR-028 K-11): it is asked for
@@ -1275,6 +1285,15 @@ impl Request {
             Request::SetRetention { channel_id, ttl } => {
                 e.array(3).uint(T_RETENTION).bytes(channel_id).uint(*ttl);
             }
+            Request::SetStepRetention {
+                channel_id,
+                seconds,
+            } => {
+                e.array(3)
+                    .uint(T_STEP_RETENTION)
+                    .bytes(channel_id)
+                    .uint(*seconds);
+            }
             Request::Untrust {
                 target,
                 identity_passphrase,
@@ -1573,6 +1592,18 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
                 Ok(Request::RenameRoom { channel_id, name })
+            }
+            (T_STEP_RETENTION, 3) => {
+                let channel_id = digest(&mut d)?;
+                let seconds = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc step retention"))?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::SetStepRetention {
+                    channel_id,
+                    seconds,
+                })
             }
             (T_RETENTION, 3) => {
                 let channel_id = digest(&mut d)?;
@@ -4700,6 +4731,14 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             },
         },
         // Not gated on the passphrase (ADR-028 K-11): the node's governance says who may.
+        Request::SetStepRetention { channel_id, seconds } => match handle
+            .apply(crate::node::api::NodeCommand::SetStepRetention { channel_id, seconds })
+            .await
+        {
+            crate::node::api::Outcome::Done => Frame::Ok,
+            crate::node::api::Outcome::OwnRetention { own, room } => Frame::OwnRetention { own, room },
+            other => Frame::Error { reason: other.to_string() },
+        },
         Request::SetRetention { channel_id, ttl } => match handle
             .apply(crate::node::api::NodeCommand::SetRetention { channel_id, ttl })
             .await
