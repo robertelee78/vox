@@ -190,6 +190,17 @@ MUST be reproduced by the harness when its fix is reverted.
 12. **Latency bounds hold under ordinary load.** A latency bound MUST hold on a machine doing ordinary
     work. A red under ordinary load is a product defect. A release gate MUST NOT require an idle
     machine, and a red MUST NOT be explained away by the machine's load.
+13. **Choosing what to run.** *Accepted for v0.4.4 (the decider's Q&A, 2026-10-10; #685); not built.* One command
+    MUST run, on demand only, either every proof or the proofs a diff from a given commit reaches,
+    and MUST print what it selected and why. The decider: "we need a full test suite, but need to
+    also be able to be smart about which parts changed, and be able to just test the changed parts
+    too". It is apparatus: it MUST NOT be a CI step, a release gate or a hook, and MUST NOT add a
+    proof. A proof that passed on the same binary and inputs MUST NOT be run again unless asked,
+    and the command MUST say where it passed; a proof whose last result is not a pass MUST always
+    be selected. Every red it prints MUST keep the proof's own PRODUCT, APPARATUS or CANNOT
+    MEASURE line (§10.1), and an optional proof it does not run MUST print `OPTIONAL PROOF NOT RUN`
+    (§10.2). On request it MUST say what changed since the last full run, and MUST NOT decide on or
+    start a full run by itself.
 
 ### §11 Publish only what CI proved
 
