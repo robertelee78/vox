@@ -5559,13 +5559,13 @@ impl IpcClient {
         };
         let answering = while_answering(path, node.as_ref(), exchange);
         let out = match answer_within {
-            Some(within) => tokio::time::timeout(within, answering)
-                .await
-                .unwrap_or_else(|_| {
-                    Err(Error::Ipc(IpcHandshake::RequestTimedOut {
+            Some(within) => {
+                tokio::time::timeout(within, answering)
+                    .await
+                    .unwrap_or(Err(Error::Ipc(IpcHandshake::RequestTimedOut {
                         secs: within.as_secs(),
-                    }))
-                }),
+                    })))
+            }
             None => answering.await,
         };
         self.broken = out.is_err();
@@ -5608,13 +5608,13 @@ impl IpcClient {
         };
         let answering = while_answering(path, node.as_ref(), exchange);
         let out = match answer_within {
-            Some(within) => tokio::time::timeout(within, answering)
-                .await
-                .unwrap_or_else(|_| {
-                    Err(Error::Ipc(IpcHandshake::RequestTimedOut {
+            Some(within) => {
+                tokio::time::timeout(within, answering)
+                    .await
+                    .unwrap_or(Err(Error::Ipc(IpcHandshake::RequestTimedOut {
                         secs: within.as_secs(),
-                    }))
-                }),
+                    })))
+            }
             None => answering.await,
         };
         self.broken = out.is_err();
