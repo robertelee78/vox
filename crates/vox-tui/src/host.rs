@@ -2767,12 +2767,13 @@ async fn post_in_order(
             held_bytes = 0;
             continue;
         }
-        while !joining {
-            let Some(body) = held.front().cloned() else {
-                break;
-            };
-            if dropped > 0 {
-                let notice = serde_json::json!({
+        if !joining {
+            loop {
+                let Some(body) = held.front().cloned() else {
+                    break;
+                };
+                if dropped > 0 {
+                    let notice = serde_json::json!({
                     "v": vox_agentcomms::activity::VERSION,
                     "session": session,
                     "kind": "notice",
@@ -2787,61 +2788,66 @@ async fn post_in_order(
                     ),
                 })
                 .to_string();
-                if append_entry(&handle, room, &session, &notice).await.is_ok() {
-                    dropped = 0;
-                    dropped_reasons.clear();
+                    if append_entry(&handle, room, &session, &notice).await.is_ok() {
+                        dropped = 0;
+                        dropped_reasons.clear();
+                    }
                 }
-            }
-            match append_entry(&handle, room, &session, &body).await {
-                Ok(()) => {
-                    held.pop_front();
-                    held_bytes -= body.len();
-                    if failing.take().is_some() {
-                        eprintln!(
+                match append_entry(&handle, room, &session, &body).await {
+                    Ok(()) => {
+                        held.pop_front();
+                        held_bytes -= body.len();
+                        if failing.take().is_some() {
+                            eprintln!(
                             "vox daemon: {node}: session {session}: entries reach its Session again"
                         );
+                        }
                     }
-                }
-                // Not open yet: held, and tried again.
-                Err(vox_core::node::api::Outcome::Failed(
-                    vox_core::node::api::Fault::ChannelNotOpen,
-                )) => {
-                    held_reason = "the room was not open".to_owned();
-                    break;
-                }
-                Err(vox_core::node::api::Outcome::Failed(vox_core::node::api::Fault::Storage)) => {
-                    let cause = handle
-                        .status()
-                        .await
-                        .ok()
-                        .and_then(|s| {
-                            s.unhealthy
-                                .into_iter()
-                                .find(|u| u.key == format!("room-store:{room_b32}"))
-                                .map(|u| u.message)
-                        })
-                        .unwrap_or_else(|| "the room cannot save".into());
-                    held_reason = cause.clone();
-                    if failing.as_deref() != Some(cause.as_str()) {
-                        eprintln!("vox daemon: {node}: room {room_b32}: session {session}: entries are held until it recovers: {cause}");
-                        failing = Some(cause);
+                    // Not open yet: held, and tried again.
+                    Err(vox_core::node::api::Outcome::Failed(
+                        vox_core::node::api::Fault::ChannelNotOpen,
+                    )) => {
+                        held_reason = "the room was not open".to_owned();
+                        break;
                     }
-                    break;
-                }
-                Err(outcome) => {
-                    held.pop_front();
-                    held_bytes -= body.len();
-                    if failing.as_deref() != Some(outcome.to_string().as_str()) {
-                        failing = Some(outcome.to_string());
-                        let kind = serde_json::from_str::<serde_json::Value>(&body)
+                    Err(vox_core::node::api::Outcome::Failed(
+                        vox_core::node::api::Fault::Storage,
+                    )) => {
+                        let cause = handle
+                            .status()
+                            .await
                             .ok()
-                            .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(str::to_owned))
-                            .unwrap_or_default();
-                        eprintln!(
+                            .and_then(|s| {
+                                s.unhealthy
+                                    .into_iter()
+                                    .find(|u| u.key == format!("room-store:{room_b32}"))
+                                    .map(|u| u.message)
+                            })
+                            .unwrap_or_else(|| "the room cannot save".into());
+                        held_reason = cause.clone();
+                        if failing.as_deref() != Some(cause.as_str()) {
+                            eprintln!("vox daemon: {node}: room {room_b32}: session {session}: entries are held until it recovers: {cause}");
+                            failing = Some(cause);
+                        }
+                        break;
+                    }
+                    Err(outcome) => {
+                        held.pop_front();
+                        held_bytes -= body.len();
+                        if failing.as_deref() != Some(outcome.to_string().as_str()) {
+                            failing = Some(outcome.to_string());
+                            let kind = serde_json::from_str::<serde_json::Value>(&body)
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("kind").and_then(|k| k.as_str()).map(str::to_owned)
+                                })
+                                .unwrap_or_default();
+                            eprintln!(
                             "vox daemon: {node}: session {session}: a {kind} entry did not reach \
                              its Session: {outcome} (said once; later entries refused the same \
                              way are not said)"
                         );
+                        }
                     }
                 }
             }
