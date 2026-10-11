@@ -1695,9 +1695,13 @@ private struct NodeStopped: View {
         VStack(alignment: .leading, spacing: 8) {
             StateMark(kind: .danger, words: model.daemonReachable
                       ? (model.ended ?? "Node \(model.node) is detached.")
-                      : "The daemon cannot be reached. Node states and peers are unknown; Vox is reconnecting.")
+                      : (model.daemonFailure ?? "The daemon cannot be reached. Node states and peers are unknown; Vox is reconnecting."))
                 .textSelection(.enabled)
                 .accessibilityIdentifier("node-stopped")
+            if Daemon.versionMismatch(model.daemonFailure ?? "") {
+                Button("Restart Daemon") { Task { await AppModel.shared.restartDaemon() } }
+                    .accessibilityIdentifier("node-stopped-restart-daemon")
+            }
             if model.daemonReachable {
                 Text("Nothing you typed is lost. Type node \(model.node)'s identity passphrase to attach "
                     + "it again; leave it empty if it needs none.")

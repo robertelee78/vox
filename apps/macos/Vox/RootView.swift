@@ -91,9 +91,15 @@ struct RootView: View {
                         .accessibilityIdentifier("login-item-off")
                 }
                 HStack {
-                    Button("Try Again") { Task { await model.start() } }
-                        .keyboardShortcut(.defaultAction)
-                        .accessibilityIdentifier("retry")
+                    if failure.kind == .versionMismatch {
+                        Button("Restart Daemon") { Task { await model.restartDaemon() } }
+                            .keyboardShortcut(.defaultAction)
+                            .accessibilityIdentifier("restart-daemon")
+                    } else {
+                        Button("Try Again") { Task { await model.start() } }
+                            .keyboardShortcut(.defaultAction)
+                            .accessibilityIdentifier("retry")
+                    }
                     if model.loginItemSaid != nil {
                         Button("Show Log in Finder") {
                             let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()

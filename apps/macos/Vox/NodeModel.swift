@@ -314,6 +314,7 @@ final class NodeModel: ObservableObject {
     @Published private(set) var peers = 0
     /// Last-known states are never presented as current while the daemon cannot be reached.
     @Published private(set) var daemonReachable = true
+    @Published private(set) var daemonFailure: String?
     var peerWords: String { daemonReachable ? (peers == 1 ? "1 peer" : "\(peers) peers") : "peers unknown" }
     /// The keyring window, as the TUI's status bar says it (K-9).
     @Published private(set) var keyring = ""
@@ -462,6 +463,7 @@ final class NodeModel: ObservableObject {
         do {
             let fresh = try await client.nodes()
             let recovering = !daemonReachable
+            daemonFailure = nil
             if fresh != nodes { nodes = fresh }
             if fresh.first(where: { $0.name == node })?.state != "attached" {
                 daemonReachable = true
@@ -482,6 +484,7 @@ final class NodeModel: ObservableObject {
             }
         } catch {
             daemonReachable = false
+            daemonFailure = sentence(error)
             reportBackground(error)
             return
         }

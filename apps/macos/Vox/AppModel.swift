@@ -154,6 +154,17 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Restart the same account's daemon using this app's bundled version (ADR-034 UP-2).
+    func restartDaemon() async {
+        phase = .starting
+        do {
+            _ = try await Daemon.command(["daemon", "--restart"], patience: 45)
+            await reach()
+        } catch {
+            phase = .unreachable(StartFailure(error))
+        }
+    }
+
     /// What was moved aside, from and to, said on the welcome that follows.
     @Published private(set) var movedAside: [MovedAside] = []
 
@@ -621,6 +632,8 @@ struct StartFailure: Error, Equatable {
         case notAnswering
         /// Another process holds the node (an older `vox` still running as it).
         case busy
+        /// The local client and its daemon have different release versions.
+        case versionMismatch
         /// Anything else.
         case other
     }
@@ -638,7 +651,9 @@ struct StartFailure: Error, Equatable {
         switch error {
         case let failure as StartFailure: self = failure
         case let VoxError.Busy(reason): self.init(kind: .busy, said: reason)
-        default: self.init(kind: .other, said: sentence(error))
+        default:
+            let words = sentence(error).replacingOccurrences(of: "this vox is", with: "this app is")
+            self.init(kind: Daemon.versionMismatch(words) ? .versionMismatch : .other, said: words)
         }
     }
 
@@ -648,6 +663,7 @@ struct StartFailure: Error, Equatable {
         case .exited: return "Vox can't start its background service"
         case .notAnswering: return "Vox's background service isn't answering"
         case .busy: return "Another copy of Vox is using this node"
+        case .versionMismatch: return said
         case .other: return "Vox can't reach its background service"
         }
     }
@@ -658,6 +674,7 @@ struct StartFailure: Error, Equatable {
         case .exited: return "It stopped as it started. Your rooms are unreachable until it runs."
         case .notAnswering: return "It may still be starting, or be stuck. Your rooms are unreachable until it answers."
         case .busy: return "Only one copy may act as a node at a time: a command that has not finished, or another copy of Vox, holds it."
+        case .versionMismatch: return "Restart the daemon to use this app's version. Remembered nodes return automatically."
         case .other: return "Your rooms are unreachable until it answers."
         }
     }
