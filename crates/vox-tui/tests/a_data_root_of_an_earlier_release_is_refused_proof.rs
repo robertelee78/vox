@@ -268,6 +268,55 @@ fn a_data_root_of_an_earlier_release_is_refused_and_unchanged() {
     assert!(red.is_empty(), "PRODUCT: {red:#?}");
 }
 
+/// Read the actual Session, including its full detail, through the worker's shipped CLI.
+fn assert_upgrade_steps(w: &room::Worker, room: &str, present: bool) {
+    let session = format!("upgrade-step-{}", w.name);
+    let marker = format!("STEP-BEFORE-UPGRADE-{}", w.name);
+    let o = w.vox(
+        None,
+        &["room", "session", room, &session, "--details", "--json"],
+    );
+    assert!(
+        o.ok && o.stdout.contains(&marker) == present,
+        "PRODUCT: {}'s Session must have old step present={present}; got {o:?}",
+        w.name
+    );
+}
+
+/// The user's status, rather than a private policy or store value, reports effective retention.
+fn assert_retention(w: &room::Worker, room: &str, messages: u64, steps: u64) {
+    let o = w.vox(None, &["status", "--json"]);
+    assert!(o.ok, "PRODUCT: {} could not read status: {o:?}", w.name);
+    let status: serde_json::Value = serde_json::from_str(&o.stdout)
+        .unwrap_or_else(|e| panic!("PRODUCT: status is not JSON: {e}: {}", o.stdout));
+    let row = status["rooms"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["id"].as_str() == Some(room)))
+        .unwrap_or_else(|| panic!("PRODUCT: status omitted room {room}: {}", o.stdout));
+    assert_eq!(
+        (row["retention"].as_u64(), row["step_retention"].as_u64()),
+        (Some(messages), Some(steps)),
+        "PRODUCT: {}'s status does not show the effective message and step retention: {row}",
+        w.name
+    );
+}
+
+fn await_upgrade_post(w: &room::Worker, room: &str, text: &str) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let o = w.vox(None, &["room", "read", room, "--limit", "1000"]);
+        if o.ok && o.stdout.contains(text) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: {} never read {text:?} within 60 seconds: {o:?}",
+            w.name
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// What a person sees of their node, read by `exe`: its fingerprint, the fingerprints in its
 /// keyring, its rooms, and the room's rows as `(entry hash, author, created ms, text)`.
 #[derive(Debug, PartialEq, Eq)]
@@ -335,12 +384,21 @@ fn seen(w: &room::Worker, room: &str, others: &[String], side: &str) -> Seen {
 /// view is read with that release. Then every process is stopped as a person stops it and started
 /// again from this build on the same data roots, and each member must see the same fingerprint,
 /// the same keyring, the same room, and the same rows in the same order with the same times; the
-/// share must still be listed; `.daemon/format` must say format 1, written by this build; and,
+/// share must still be listed; `.daemon/format` must say format 2, written by this build; and,
 /// once each member's daemon is started again by this build, so that it reads back what this build
 /// rewrote, a post written after the upgrade must reach the other member.
 ///
 /// Run before every release with the newest published release as the source (`VOX_UPGRADE_FROM`
-/// names another); it needs GitHub.
+/// names another), with `--features test-knobs`; it needs GitHub unless
+/// `VOX_PREVIOUS_RELEASE_DIR` contains the published artifact and its digest record.
+///
+/// ADR-034 FR-5 / #789: old hook activity survives the upgrade, the default seven-day step
+/// policy is separate from forever messages, members may shorten but never lengthen it, and
+/// an actual old peer keeps exchanging messages after the new policy event. At three days a
+/// member's two-day limit has removed only its steps; at eight days both members' expired
+/// steps are absent immediately and after restart, while forever messages remain.
+/// Mutants: classify every Session entry as a message → expired steps remain; ignore a member's
+/// step limit → its step remains at three days; apply step TTL to messages → forever posts vanish.
 ///
 /// **Which side a red is on.** A download, a digest or a staging step of the old release that
 /// fails is `APPARATUS:`; this build failing a verb, or seeing anything other than what the old
@@ -357,6 +415,10 @@ fn seen(w: &room::Worker, room: &str, others: &[String], side: &str) -> Seen {
 #[ignore = "downloads the previous release; an anchor and two daemons of each; run in release"]
 fn a_data_root_of_the_previous_release_opens_with_nothing_lost() {
     watchdog::arm_for(Duration::from_secs(1200));
+    assert!(
+        cfg!(feature = "test-knobs"),
+        "APPARATUS: the upgrade retention journey requires --features test-knobs"
+    );
     let tmp = tempfile::tempdir().expect("APPARATUS: a temp dir");
     let (version, old) = previous_release::previous_release(tmp.path());
     let old = old.to_str().expect("APPARATUS: a UTF-8 path").to_owned();
@@ -382,6 +444,56 @@ fn a_data_root_of_the_previous_release_opens_with_nothing_lost() {
             o.stderr.trim()
         );
     };
+    staged(
+        "forever message retention",
+        &r.workers[0].vox(None, &["room", "retention", &r.id, "forever"]),
+    );
+    // Use the published hook and its published daemon together. A current IPC client would
+    // couple this upgrade proof to an old, deliberately incompatible local protocol.
+    for w in &r.workers {
+        let session = format!("upgrade-step-{}", w.name);
+        let transcript = tmp.path().join(format!("{session}.jsonl"));
+        std::fs::write(&transcript, "").expect("APPARATUS: the old hook's transcript");
+        let node = w.paths.account().nodes_on_disk()[0].clone();
+        let payload = serde_json::json!({
+            "session_id": session,
+            "transcript_path": transcript,
+            "cwd": tmp.path(),
+            "permission_mode": "default",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": format!("STEP-BEFORE-UPGRADE-{}", w.name),
+            "prompt_id": "upgrade-prompt",
+        })
+        .to_string();
+        staged(
+            "Session activity through the old hook",
+            &w.vox_env(
+                None,
+                &[("CLAUDE_CODE_ENTRYPOINT", "cli")],
+                &["agent", "hook", "--node", node.as_str(), "--room", &r.id],
+                Some(&payload),
+            ),
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let o = w.vox(
+                None,
+                &["room", "session", &r.id, &session, "--details", "--json"],
+            );
+            if o.ok
+                && o.stdout
+                    .contains(&format!("STEP-BEFORE-UPGRADE-{}", w.name))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS: v{version} did not stage {}'s hook activity: {o:?}",
+                w.name
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
     for n in 1..=3 {
         for w in &r.workers {
             let text = format!("upgrade: {} {n}", w.name);
@@ -435,11 +547,6 @@ fn a_data_root_of_the_previous_release_opens_with_nothing_lost() {
         .iter()
         .map(|w| seen(w, &r.id, &fps, "APPARATUS: staging:"))
         .collect();
-    let t1 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("APPARATUS: the clock")
-        .as_millis();
-    let t1 = u64::try_from(t1).expect("APPARATUS: the clock");
     for (w, s) in r.workers.iter().zip(&before) {
         assert!(
             s.rows.len() >= 7 && s.keyring.len() == 1 && s.rooms.len() == 1,
@@ -451,7 +558,57 @@ fn a_data_root_of_the_previous_release_opens_with_nothing_lost() {
         );
     }
 
-    // The upgrade, as a person makes it: everything stopped, then started from this build.
+    // Upgrade alice first. Bob remains an actual published daemon and CLI on his original
+    // data root while the room receives a new step-retention policy event.
+    let legacy = r.workers.pop().expect("APPARATUS: bob exists");
+    r.upgrade(VOX);
+    assert_eq!(
+        seen(&r.workers[0], &r.id, &fps, "PRODUCT:"),
+        before[0],
+        "PRODUCT: alice lost data when her v{version} root was first upgraded"
+    );
+    assert_upgrade_steps(&r.workers[0], &r.id, true);
+    assert_retention(&r.workers[0], &r.id, 0, 7 * 86400);
+    for ttl in ["1d", "7d"] {
+        let o = r.workers[0].vox(None, &["room", "retention", &r.id, "--steps", ttl]);
+        assert!(
+            o.ok,
+            "PRODUCT: the administrator could not set separate step retention: {o:?}"
+        );
+    }
+    assert_retention(&r.workers[0], &r.id, 0, 7 * 86400);
+    let compatible = "published peer after the step policy update";
+    let o = legacy.vox(None, &["room", "post", &r.id, compatible]);
+    assert!(
+        o.ok,
+        "PRODUCT: v{version} could not post after the new policy event: {o:?}"
+    );
+    await_upgrade_post(&r.workers[0], &r.id, compatible);
+    let response = "new peer answers the published peer after the step policy update";
+    let o = r.workers[0].vox(None, &["room", "post", &r.id, response]);
+    assert!(
+        o.ok,
+        "PRODUCT: the new peer could not answer the published peer: {o:?}"
+    );
+    await_upgrade_post(&legacy, &r.id, response);
+    println!(
+        "[proof] v{version} and this build exchange ordinary messages after a step policy update"
+    );
+    r.workers.push(legacy);
+    // Bob's baseline is still read by the published CLI. Include the just-proven conversation
+    // in both baselines, then upgrade both together, as a person completes a rolling upgrade.
+    let before: Vec<Seen> = r
+        .workers
+        .iter()
+        .map(|w| seen(w, &r.id, &fps, "PRODUCT:"))
+        .collect();
+    let t1 = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("APPARATUS: the clock")
+            .as_millis(),
+    )
+    .expect("APPARATUS: the clock");
     r.upgrade(VOX);
     let mut red = Vec::new();
     for (w, b) in r.workers.iter().zip(&before) {
@@ -475,7 +632,7 @@ fn a_data_root_of_the_previous_release_opens_with_nothing_lost() {
             ));
         }
         let format = std::fs::read_to_string(w.data.join(".daemon/format")).unwrap_or_default();
-        let want = format!("format 1\nwritten-by vox {}\n", env!("CARGO_PKG_VERSION"));
+        let want = format!("format 2\nwritten-by vox {}\n", env!("CARGO_PKG_VERSION"));
         if format != want {
             red.push(format!(
                 "{}'s .daemon/format says {format:?}; this build serving it must write {want:?}",
@@ -517,4 +674,65 @@ fn a_data_root_of_the_previous_release_opens_with_nothing_lost() {
         ));
     }
     assert!(red.is_empty(), "PRODUCT: {red:#?}");
+    for w in &r.workers {
+        assert_upgrade_steps(w, &r.id, true);
+        assert_retention(w, &r.id, 0, 7 * 86400);
+    }
+    let bob = &r.workers[1];
+    for ttl in ["8d", "forever"] {
+        let o = bob.vox(None, &["room", "retention", &r.id, "--steps", ttl]);
+        assert!(!o.ok && o.stderr.contains("room"),
+            "PRODUCT: a member could extend steps beyond the room's seven-day cap, or got no reason: {o:?}");
+    }
+    // What status shows must include the message cap, even when the member asks for more steps.
+    for args in [
+        vec!["room", "retention", &r.id, "1h"],
+        vec!["room", "retention", &r.id, "--steps", "7d"],
+    ] {
+        let o = bob.vox(None, &args);
+        assert!(
+            o.ok,
+            "PRODUCT: setting the member's retention failed: {o:?}"
+        );
+    }
+    assert_retention(bob, &r.id, 3600, 3600);
+    let o = bob.vox(None, &["room", "retention", &r.id, "forever"]);
+    assert!(
+        o.ok,
+        "PRODUCT: the member could not follow forever messages again: {o:?}"
+    );
+    let o = bob.vox(None, &["room", "retention", &r.id, "--steps", "2d"]);
+    assert!(
+        o.ok,
+        "PRODUCT: a member could not shorten its own steps to two days: {o:?}"
+    );
+    assert_retention(bob, &r.id, 0, 2 * 86400);
+    assert_retention(&r.workers[0], &r.id, 0, 7 * 86400);
+
+    // Only the daemon clock moves. The public CLI reads the room immediately after reopening;
+    // there is no delay or retry that could hide a briefly visible expired step.
+    for (days, restart) in [(3_u64, false), (8, false), (8, true)] {
+        let step_ms = (days * 86400 * 1000).to_string();
+        for w in &mut r.workers {
+            let err = tmp
+                .path()
+                .join(format!("{}.day-{days}.restart-{restart}.err", w.name));
+            w.restart_daemon_as(VOX, &[("VOX_TEST_CLOCK_STEP_MS", &step_ms)], &err);
+            assert_upgrade_steps(w, &r.id, days == 3 && w.name == "alice");
+            assert!(
+                all_read(w),
+                "PRODUCT: {} lost forever messages or the share at day {days}, restart={restart}",
+                w.name
+            );
+            let o = w.vox(None, &["room", "read", &r.id, "--limit", "1000"]);
+            assert!(
+                o.ok && o.stdout.contains(compatible)
+                    && o.stdout.contains(response)
+                    && o.stdout.contains(after),
+                "PRODUCT: {} lost post-upgrade forever messages at day {days}: {o:?}",
+                w.name
+            );
+        }
+        println!("[proof] day {days}, restart={restart}: step expiry is visible on first read; forever messages remain");
+    }
 }
