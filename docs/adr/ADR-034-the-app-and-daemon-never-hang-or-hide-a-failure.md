@@ -130,8 +130,6 @@ each of these broke.
   or the connection is in. `applicationShouldTerminate` MUST NOT await `model.quit()` without a
   bound: letting go of the node (ADR-028 A-4) MUST take at most a few seconds and MUST NOT block
   quitting; at the bound the app MUST quit anyway.
-- **QT-3.** When letting go of the node did not finish within the bound, the app MUST say so at its
-  next start, in one sentence naming the node and its state as the daemon reports it then.
 - **QT-4. Proof.** A step of the app's proof (ADR-014 M-31, extending the first-run journey's quit
   step) MUST press ⌘Q on the running app with its daemon connection wedged, and MUST assert that the
   app's process has exited within the bound. Its mutant MUST restore the unbounded wait on
@@ -152,7 +150,7 @@ each of these broke.
 |---|---|---|
 | ADR-014 M-29 | The update asks the person to restart the app and the daemon | The update restarts the daemon itself (UP-1); a client refuses a daemon only on a real incompatibility (UP-2) |
 | ADR-014 M-21 | The menus as listed, with no Quit named | The Vox menu holds Quit Vox ⌘Q (QT-1) |
-| ADR-028 A-4 | Quitting detaches the node, with no bound | Letting go of the node is bounded and never blocks quitting (QT-2, QT-3) |
+| ADR-028 A-4 | Quitting detaches the node, with no bound | Letting go of the node is bounded and never blocks quitting (QT-2) |
 | ADR-026 C-4 | `Hello` reports the daemon's version | `Hello` also carries protocol versions and capabilities; a client refuses only when no protocol is shared or an action's capability is missing, never on version alone (UP-2); both versions are named when they differ (UP-3) |
 
 ## Consequences

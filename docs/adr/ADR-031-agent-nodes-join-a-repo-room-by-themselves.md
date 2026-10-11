@@ -104,13 +104,9 @@ allow drive access for the node I'm using from the macOS app."
   entry is due MUST get it when it is next Ready.
 - **LT-4.** An LT entry's alias MUST be the node's name on this machine (ADR-028 K-3, with K-4's
   suffix on a clash).
-- **LT-5.** Every automatic trust MUST be posted as a line in the room it follows from, in words
-  (ADR-028 E-5), for example "codex on this Mac was trusted automatically", naming who reads it and
-  that the person's node may drive it. The daemon MUST post it as an ordinary room message of the
-  person's node, one line per node trusted, so every member that reads the person's node sees it;
-  a person's node that is Locked MUST post it when it is next Ready. It MUST NOT add an entry type.
-  Every LT entry MUST also be recorded in each node's decision record (ADR-028 D-1). The decider
-  accepted LT's security cost (Consequences) on this condition: each automatic trust is shown.
+- **LT-5.** Every LT entry MUST be recorded in each node's decision record (ADR-028 D-1). No line is
+  posted in the room for an automatic trust: the decider, 2026-10-10, "Can skip it. It's not
+  needed."
 - **LT-6.** Removing an LT entry (ADR-028 K-6) MUST stop LT from adding that pair again, until the
   person adds it back by hand.
 - **LT-7.** Nothing is automatic for nodes on other machines. The decider: "for now", they trust
@@ -123,8 +119,7 @@ allow drive access for the node I'm using from the macOS app."
   person's standing rule, applied by the daemon, and grants drive only to the person's own node.
 - **LT-9. Existing pairs.** LT-1 MUST apply to pairs of this machine's nodes that already share a
   room with the person's node when a release with this ADR first starts, not only to new joins.
-  The daemon MUST write their entries at that start (or when each node is next Ready), and MUST
-  post LT-5's line for each node it trusted. A pair whose removal by hand is in either node's decision record
+  The daemon MUST write their entries at that start (or when each node is next Ready). A pair whose removal by hand is in either node's decision record
   (ADR-028 D-1, "a trust added or removed") MUST be treated as removed under LT-6 and left alone.
   The release's notes MUST say that existing local pairs are trusted on upgrade.
 
@@ -186,7 +181,7 @@ allow drive access for the node I'm using from the macOS app."
 
 - **JL-1.** When an agent's node joins a room and its session starts working there, the person's
   client MUST show one line in General, for example "codex (on this Mac) joined repo-to-cve and is
-  working in /opt/repo-to-cve", followed by LT-5's lines for what LT-1 granted. The join line MUST
+  working in /opt/repo-to-cve". The join line MUST
   be derived from the join and the session's claimed directory (ADR-020 2.3); it MUST NOT add an
   entry type.
 - **JL-2.** The agent's Session MUST open as a tab (ADR-033 LY-1) for each member it grants drive.
@@ -271,9 +266,9 @@ allow drive access for the node I'm using from the macOS app."
   node, join that room and so be read by, and read, every node of this machine. The OS account is
   already the boundary for the daemon's socket (ADR-026 C-6); this rule widens what a process
   inside it gains without a person, and with no keyring passphrase. The decider accepted this
-  cost (2026-10-10); each automatic trust is posted in the room (LT-5) so it is never silent.
+  cost (2026-10-10); each automatic trust is in each node's decision record (LT-5).
 - On upgrade, this machine's nodes that already share a room with the person's node trust each
-  other, and the person's node gains drive over them, with a line in the room for each (LT-9).
+  other, and the person's node gains drive over them (LT-9).
 - A member with read only no longer learns that a node has Sessions, or their names.
 - The Session opening and end records change on the wire and on disk, so v0.4.4 is to carry an
   upgrade for data roots written by v0.4.0 or later, and its proof (SA-5, SA-6).
