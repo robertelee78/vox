@@ -121,6 +121,9 @@ pub struct DaemonCore {
     /// The daemon's event task.
     daemon_events: tokio::task::JoinHandle<()>,
     snapshot: NodeSnapshot,
+    /// Storage failures by room id; a recovery replaces the failure with a notice.
+    room_save_errors: BTreeMap<Digest32, String>,
+    recovered_rooms: BTreeSet<String>,
     /// When the snapshot was last asked for; `None` asks now.
     asked: Option<Instant>,
     /// Whether the daemon's `.vox` proxy runs, and where, as last asked: the Shared pane's
@@ -419,6 +422,8 @@ impl DaemonCore {
             rx,
             daemon_events,
             snapshot: NodeSnapshot::default(),
+            room_save_errors: BTreeMap::new(),
+            recovered_rooms: BTreeSet::new(),
             asked: None,
             proxy: None,
             proxy_asked: None,
@@ -665,6 +670,8 @@ impl DaemonCore {
         self.active = None;
         self.timeline = None;
         self.snapshot = NodeSnapshot::default();
+        self.room_save_errors.clear();
+        self.recovered_rooms.clear();
         self.notice = Some(format!(
             "node {} was detached — give its passphrase to attach it again",
             self.node
@@ -947,6 +954,7 @@ impl DaemonCore {
         }
         self.asked = Some(Instant::now());
         self.ask_proxy();
+        self.ask_storage_health();
         self.on_disk = self
             .account
             .nodes_on_disk()
@@ -979,6 +987,48 @@ impl DaemonCore {
                     .get_or_insert(format!("the vox daemon stopped answering: {e}"));
             }
         }
+    }
+
+    /// Status carries the OS write failure without adding private storage state to a snapshot.
+    fn ask_storage_health(&mut self) {
+        let at =
+            vox_core::node::ipc::NodeSocket::one_shot(self.account.socket(), self.node.clone());
+        let Some(Ok(json)) =
+            until_stopped(&self.rt, &self.stop, vox_core::node::status::request(&at))
+        else {
+            return;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) else {
+            return;
+        };
+        self.room_save_errors.clear();
+        if let Some(rows) = v["unhealthy"].as_array() {
+            for row in rows {
+                if let Some(id) = row["key"]
+                    .as_str()
+                    .and_then(|k| k.strip_prefix("room-store:"))
+                    .and_then(|id| b32_decode(id, "room").ok())
+                {
+                    self.room_save_errors.insert(
+                        id,
+                        row["message"].as_str().unwrap_or("cannot save").to_owned(),
+                    );
+                }
+            }
+        }
+        let mut recovered = BTreeSet::new();
+        if let Some(rows) = v["recovered"].as_array() {
+            for row in rows {
+                let Some(key) = row["key"].as_str() else {
+                    continue;
+                };
+                if !self.recovered_rooms.contains(key) {
+                    self.notice = row["message"].as_str().map(str::to_owned);
+                }
+                recovered.insert(key.to_owned());
+            }
+        }
+        self.recovered_rooms = recovered;
     }
 
     /// Ask the daemon whether its `.vox` proxy runs, every [`PROXY_EVERY`], on a connection of
@@ -1726,14 +1776,18 @@ impl DaemonCore {
             .map(|c| ChannelSummary {
                 open: c.open,
                 channel_id: c.channel_id,
-                name: match (&c.name, c.open) {
-                    (Some(n), _) => vox_core::node::resolver::room_shown_here(
-                        Some(n),
-                        &c.channel_id,
-                        names_here(),
-                    ),
-                    (None, true) => vox_core::node::resolver::room_shown(None, &c.channel_id),
-                    (None, false) => format!("(closed {})", short_id(&c.channel_id)),
+                name: if let Some(cause) = self.room_save_errors.get(&c.channel_id) {
+                    cause.clone()
+                } else {
+                    match (&c.name, c.open) {
+                        (Some(n), _) => vox_core::node::resolver::room_shown_here(
+                            Some(n),
+                            &c.channel_id,
+                            names_here(),
+                        ),
+                        (None, true) => vox_core::node::resolver::room_shown(None, &c.channel_id),
+                        (None, false) => format!("(closed {})", short_id(&c.channel_id)),
+                    }
                 },
                 to_you: self.unread.get(&c.channel_id).map_or(0, |u| u.to_you),
                 waiting: self.waiting.get(&c.channel_id).copied().unwrap_or(0),
@@ -1960,21 +2014,30 @@ impl DaemonCore {
                         })
                         .collect(),
                     // **Every member held back, each on its own line** (V210-66).
-                    held_back: d
-                        .equivocations
-                        .iter()
-                        .map(|(author, seq)| {
+                    held_back: self
+                        .room_save_errors
+                        .get(&d.channel_id)
+                        .cloned()
+                        .into_iter()
+                        .chain(d.equivocations.iter().map(|(author, seq)| {
                             crate::ident::equivocation_notice(
                                 &crate::ident::member_name(&snap.trusted, author),
                                 *seq,
                             )
-                        })
+                        }))
                         .collect(),
                     reachability: reachability(&cid),
                 })
         });
         ViewModel {
-            notice: self.notice.clone(),
+            // Health is persistent, unlike action notices dismissed by Enter. Keep the full
+            // OS cause visible even when the sidebar truncates it or the timeline is scrolled.
+            notice: self
+                .room_save_errors
+                .values()
+                .next()
+                .cloned()
+                .or_else(|| self.notice.clone()),
             channels,
             active,
             sync: match snap.connected_peers.len() {

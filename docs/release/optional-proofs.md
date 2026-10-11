@@ -152,6 +152,12 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 | `a_post_answers_promptly_while_a_peer_posts_proof::a_post_answers_promptly_while_a_peer_posts` | `vox room post` is sluggish while someone else in the room is posting (100 ms). | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_post_answers_promptly_while_a_peer_posts_proof -- --ignored --exact a_post_answers_promptly_while_a_peer_posts` | a real machine | 11 s / 12 s |
 | `a_trust_check_does_not_stall_the_node_proof::a_trust_check_does_not_stall_posts_and_reads_on_the_same_node` | Posting and reading freeze while trust checks run (1 s and 150 ms bounds). | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_trust_check_does_not_stall_the_node_proof -- --ignored --exact a_trust_check_does_not_stall_posts_and_reads_on_the_same_node` | a real machine | 32 s / 42 s |
 
+### A full scratch filesystem (macOS; no sudo)
+
+| Proof | Symptom | Command | Needs | Measured |
+|---|---|---|---|---|
+| `a_claude_session_is_mirrored_and_answered_from_either_side_proof::a_full_room_recovers_and_keeps_its_session_entries` | A room stays unable to save after disk space returns, hides the OS error, or drops Session activity. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_claude_session_is_mirrored_and_answered_from_either_side_proof a_full_room_recovers_and_keeps_its_session_entries -- --ignored --nocapture` | A 64 MiB userspace HFS+ disk image via `hdiutil`; prints `OPTIONAL PROOF NOT RUN` if unavailable. | 32 s on a Mac |
+
 ### Heavy (minutes of work, thousands of posts, or long waits)
 
 | Proof | Helps troubleshoot | Run | Needs | Time |
