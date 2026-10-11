@@ -11065,6 +11065,8 @@ impl Node {
         self.port_queue.remove(channel_id, peer);
         crate::node::status::SyncBook::with(&self.sync_book, *channel_id, *peer, |c| {
             c.backoff = None;
+            c.consecutive_failures = 0;
+            c.failing_since = None;
         });
     }
 
