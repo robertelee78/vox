@@ -2385,6 +2385,24 @@ fn a_full_room_recovers_and_keeps_its_session_entries() {
             std::thread::sleep(Duration::from_millis(100));
         }
 
+        // Fill the actual hold through Claude's hook while the filesystem still cannot save.
+        // Hooks split long activity before queueing it; no internal queue counter is a verdict.
+        prompt["prompt"] = ("x".repeat(6 * 1024 * 1024)).into();
+        w.hook_done(&room, &prompt);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let log = std::fs::read_to_string(w.data.join(".daemon/log")).unwrap_or_default();
+            if log
+                .lines()
+                .any(|line| line.contains(SESSION) && line.contains("4 MiB hold filled"))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "PRODUCT: a full room received 6 MiB of hook activity but never reported its overflowing hold: {log}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // A small final entry is within the retained tail. It must reach the Session together
+        // with a readable account of the earlier entries that were lost at the bound.
         prompt["prompt"] = "held while the room cannot save".into();
         w.hook_done(&room, &prompt);
         std::fs::remove_file(&filler).expect("APPARATUS: free disk space");
@@ -2404,6 +2422,38 @@ fn a_full_room_recovers_and_keeps_its_session_entries() {
             !status.contains("cannot save"),
             "PRODUCT: recovered room kept its cannot-save badge: {status}"
         );
+        let (ok, detail_json, err) = w.vox(
+            AGENT,
+            &["room", "session", &room, SESSION, "--json", "--details"],
+            None,
+        );
+        assert!(
+            ok,
+            "PRODUCT: recovered Session Details could not be read: {err}"
+        );
+        let loss = detail_json.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find_map(|value| value["details"]["notice"].as_str().filter(|text| text.contains("lost while held")).map(str::to_owned))
+            .unwrap_or_else(|| panic!("PRODUCT: Session Details omitted the full notice naming the entries lost at the hold bound: {}", detail_json.chars().take(1000).collect::<String>()));
+        let count = loss
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
+        let sequences: Vec<u64> = loss
+            .split("(sequence ")
+            .skip(1)
+            .filter_map(|part| part.split(')').next()?.parse().ok())
+            .collect();
+        let timestamps = ["from user at ", "through user at "].iter().all(|label| {
+            loss.split_once(label)
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|value| value > 0)
+        });
+        assert!(count > 0 && timestamps && sequences.len() == 2 && sequences[0] <= sequences[1] && (loss.contains("No space") || loss.contains("os error 28")),
+            "PRODUCT: overflow notice did not name how many entries, their first and last kind/time/sequence, and the save failure: {loss}");
+        println!("[proof] held tail arrived after overflow and Session Details names exactly what was lost: {loss}");
         let (ok, out, err) = w.vox(
             AGENT,
             &["room", "post", &room, "saved after recovery"],
