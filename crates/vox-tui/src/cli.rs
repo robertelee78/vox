@@ -618,6 +618,9 @@ pub struct GetFileArgs {
 /// `vox daemon`
 #[derive(Args, Debug, Clone)]
 pub struct DaemonArgs {
+    /// Restart this data root's daemon using the installed vox; remembered nodes return Ready.
+    #[arg(long, conflicts_with_all = ["node", "keep", "passphrase_file", "detach", "no_node", "as_detached", "login_item"])]
+    pub restart: bool,
     #[command(flatten)]
     pub profile: AccountArgs,
     /// Read the passphrases from this file, for a service manager that prefers one: the

@@ -1410,7 +1410,42 @@ pub struct DaemonClient {
     pub attached: Vec<NodeInfo>,
 }
 
+/// A daemon's greeting, read without sending it any request. Used to restart an older local
+/// daemon: the connection is already closed when this value is returned.
+#[derive(Debug)]
+pub struct DaemonGreeting {
+    /// Its release.
+    pub version: String,
+    /// The process serving the checked, own-user socket.
+    pub pid: u32,
+    /// Nodes it greeted with.
+    pub attached: Vec<NodeInfo>,
+}
+
 impl DaemonClient {
+    /// Observe a local daemon without sending it anything, including across release versions.
+    /// The returned value holds no connection and cannot issue a request.
+    pub async fn observe(path: &std::path::Path) -> Result<DaemonGreeting> {
+        let d = Self::greet(path, None).await?;
+        // A restart may signal this process. Bind the Hello pid to the kernel's peer identity,
+        // rather than trusting a number supplied in the greeting or in a stale lock file.
+        let peer = d
+            .stream
+            .peer_cred()
+            .ok()
+            .and_then(|c| c.pid())
+            .and_then(|p| u32::try_from(p).ok());
+        if peer != Some(d.pid) {
+            return Err(Error::Ipc(crate::error::IpcHandshake::NotYours {
+                detail: "the daemon's process id does not match its control socket".into(),
+            }));
+        }
+        Ok(DaemonGreeting {
+            version: d.version,
+            pid: d.pid,
+            attached: d.attached,
+        })
+    }
     /// Connect to the daemon's socket at `path`, checked as this user's own, and read its hello
     /// within [`crate::node::ipc::ANSWER_WITHIN`].
     ///
@@ -1433,6 +1468,17 @@ impl DaemonClient {
     /// # Errors
     /// As [`DaemonClient::open`].
     pub async fn open_noting(path: &std::path::Path, waiting: Option<fn()>) -> Result<Self> {
+        let daemon = Self::greet(path, waiting).await?;
+        if daemon.version != env!("CARGO_PKG_VERSION") {
+            return Err(Error::Ipc(crate::error::IpcHandshake::Version {
+                mine: env!("CARGO_PKG_VERSION").into(),
+                theirs: daemon.version,
+            }));
+        }
+        Ok(daemon)
+    }
+
+    async fn greet(path: &std::path::Path, waiting: Option<fn()>) -> Result<Self> {
         use crate::error::IpcHandshake;
         use crate::node::ipc::{connect_own, read_frame, silent, ANSWER_WITHIN, PROTOCOL_VERSION};
         let greeted = tokio::time::timeout(ANSWER_WITHIN, async {
@@ -1569,6 +1615,7 @@ pub fn unreached(socket: &std::path::Path, node: Option<&str>, e: crate::error::
             )
         }
         Error::Ipc(IpcHandshake::Refused { reason }) => reason,
+        Error::Ipc(h @ IpcHandshake::Version { .. }) => h.to_string(),
         Error::Ipc(h @ IpcHandshake::ClosedBeforeHello) => {
             format!("the daemon's socket at {path} accepted, but {h}: it may be stopping. Try again.")
         }

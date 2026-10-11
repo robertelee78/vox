@@ -620,6 +620,14 @@ pub enum IpcHandshake {
         /// The protocol the node greeted with.
         theirs: u64,
     },
+    /// The local daemon and its client are different releases (ADR-034 UP-2).
+    #[error("Vox's daemon is {theirs} and this vox is {mine}: run `vox daemon --restart`.")]
+    Version {
+        /// This client's release.
+        mine: String,
+        /// The local daemon's release.
+        theirs: String,
+    },
     /// What answered did not greet at all.
     #[error("what answered on the control socket did not greet like a vox node")]
     NotHello,

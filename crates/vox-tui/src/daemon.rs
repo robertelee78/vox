@@ -82,6 +82,13 @@ const START_GRACE: Duration = Duration::from_secs(10);
 /// socket cannot be bound — the last of which **is** fatal here, unlike in the TUI,
 /// because serving that socket is this command's entire purpose.
 pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
+    if args.restart {
+        let account = Account::of(
+            args.profile.data_dir.as_deref(),
+            args.profile.config_dir.as_deref(),
+        )?;
+        return crate::update::restart::restart_current(&account);
+    }
     if args.as_detached {
         // **None of its starter's descriptors** (ADR-026 S-2): stdin is /dev/null and stdout and
         // stderr are `.daemon/log`, as the client set them; anything else it inherited — a

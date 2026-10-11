@@ -1220,6 +1220,9 @@ pub async fn node_list(args: &NodeArgs) -> Result<(), AppError> {
             Ok(DaemonFrame::Nodes(n)) => n,
             _ => d.attached.clone(),
         },
+        Err(e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Version { .. })) => {
+            return Err(AppError::Usage(e.to_string()));
+        }
         Err(_) => Vec::new(),
     };
     let mut names: Vec<NodeName> = account.nodes_on_disk();

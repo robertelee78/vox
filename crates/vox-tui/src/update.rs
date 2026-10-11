@@ -41,7 +41,7 @@ use crate::app::AppError;
 
 #[cfg(target_os = "macos")]
 mod bundle;
-mod restart;
+pub(crate) mod restart;
 
 /// The repository releases are published from.
 const REPO: &str = "robertelee78/vox";

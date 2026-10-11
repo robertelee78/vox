@@ -1352,7 +1352,9 @@ pub async fn run(
             }
             return Ok(());
         }
-        Err(u @ (Unregistered::NoDaemon(_) | Unregistered::Attaching(_))) => {
+        Err(
+            u @ (Unregistered::NoDaemon(_) | Unregistered::Attaching(_) | Unregistered::Version(_)),
+        ) => {
             let words = u.said(&input);
             eprintln!("vox agent hook: {words}");
             emit(format, &raw, &input.event, &format!("{words}\n"), "");
@@ -1389,6 +1391,8 @@ pub(crate) enum Unregistered {
     NoDaemon(String),
     /// The hook's node is being attached by the daemon's start (a kept node), not yet done.
     Attaching(vox_core::node::paths::NodeName),
+    /// A local daemon of another release is refused before any request.
+    Version(String),
     /// Anything else, in words.
     Failed(AppError),
 }
@@ -1454,6 +1458,7 @@ impl Unregistered {
                  started ({why}); ask the operator to {}.",
                 crate::client::START_DAEMON
             ),
+            Self::Version(why) => why.clone(),
             Self::Failed(e) => e.to_string(),
         }
     }
@@ -1493,7 +1498,14 @@ impl Daemon {
         }
         crate::daemon_client::ensure_daemon(&self.account, self.listen, &self.anchors)
             .await
-            .map_err(|e| Unregistered::NoDaemon(one_line_reason(&e)))?;
+            .map_err(|e| {
+                let why = one_line_reason(&e);
+                if why.contains("Vox's daemon is ") {
+                    Unregistered::Version(why)
+                } else {
+                    Unregistered::NoDaemon(why)
+                }
+            })?;
         let mut record = crate::wake::Session::from_env(&input.session_id, input.codex);
         // **The harness, from its own input** when its environment named no wake channel: Claude
         // Code's payload names its event (ADR-029 SE-3 labels a Session by it).
