@@ -501,7 +501,10 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                 }
             }
             // A line Vox itself says in the Session.
-            "notice" => format!("Vox: {}", one_line(b.str("text"))),
+            "notice" => {
+                details.push(("notice".into(), b.str("text").to_owned()));
+                format!("Vox: {}", one_line(b.str("text")))
+            }
             "drive-result" => {
                 // A result paired with its drive's tag is drawn on that drive's line.
                 if !b.str("of").is_empty() && driven.contains(b.str("of")) {
