@@ -38,6 +38,24 @@ struct SettingsView: View {
                 Text("What needs you, your shares and your live tunnels, one click away.")
             }
             setting {
+                HStack {
+                    Button("Update Vox") { Task { await app.updateVox() } }
+                        .disabled(app.updating)
+                        .accessibilityIdentifier("settings-update")
+                    if app.updating { ProgressView("Updating Vox…") }
+                    if app.updated {
+                        Button("Restart Vox") { app.reopenUpdatedApp() }
+                            .accessibilityIdentifier("settings-update-restart")
+                    }
+                }
+            } said: {
+                Text("Installs the latest release and restarts its daemon. Remembered nodes return automatically; held sessions end.")
+                if let said = app.updateSaid {
+                    Text(said).textSelection(.enabled)
+                        .accessibilityIdentifier("settings-update-said")
+                }
+            }
+            setting {
                 Picker("Conversation text size", selection: Binding(
                     get: { app.textScale },
                     set: { app.setTextSize($0) })) {

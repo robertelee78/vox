@@ -146,6 +146,18 @@ async fn restart_checked(
         .iter()
         .map(|n| n.name.clone())
         .collect::<Vec<_>>();
+    // The updater process still runs its original release after the binary is replaced. It
+    // can ask its matching daemon for the names of services/forwards about to end. A repair
+    // from a different release reads Hello only, as every other mismatched client must.
+    let held = if before.version == env!("CARGO_PKG_VERSION") {
+        tokio::time::timeout(Duration::from_secs(10), held_names(account, &attached))
+            .await
+            .map_err(|_| {
+                AppError::Usage("the daemon did not name its held sessions within 10 s".into())
+            })??
+    } else {
+        Vec::new()
+    };
     let kept = crate::host::read_attach_file(&account.attach_file())
         .into_iter()
         .map(|(name, _)| name)
@@ -225,17 +237,25 @@ async fn restart_checked(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    let ended = if attached.is_empty() {
-        String::new()
-    } else {
-        format!(
+    let ended = match (held.is_empty(), attached.is_empty()) {
+        (false, _) => format!(
+            "; held sessions {} ended, along with other connections on nodes {}",
+            held.join(", "),
+            attached
+                .iter()
+                .map(NodeName::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        (true, false) => format!(
             "; any held sessions on nodes {} ended",
             attached
                 .iter()
                 .map(NodeName::as_str)
                 .collect::<Vec<_>>()
                 .join(", ")
-        )
+        ),
+        (true, true) => String::new(),
     };
     println!("the vox daemon was restarted and runs vox {} (pid {}), and its remembered nodes are Ready{ended}",
         after.version, after.pid);
@@ -250,6 +270,58 @@ async fn restart_checked(
         .collect::<Vec<_>>();
     say_detached(&missing);
     Ok(missing)
+}
+
+/// Named services and forwards on the matching daemon, before ending their held connections.
+async fn held_names(
+    account: &Account,
+    nodes: &[NodeName],
+) -> Result<Vec<String>, crate::app::AppError> {
+    use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request};
+    let mut names = Vec::new();
+    for node in nodes {
+        let at = NodeSocket::one_shot(account.socket(), node.clone());
+        let report = vox_core::node::status::request(&at)
+            .await
+            .map_err(|e| crate::app::AppError::Usage(e.to_string()))?;
+        let report: serde_json::Value = serde_json::from_str(&report).map_err(|e| {
+            crate::app::AppError::Usage(format!("the daemon's status did not parse: {e}"))
+        })?;
+        let mut client = IpcClient::open_at(&at)
+            .await
+            .map_err(|e| crate::app::AppError::Usage(e.to_string()))?;
+        if let Some(rooms) = report["rooms"].as_array() {
+            for room in rooms {
+                let Some(id) = room["id"]
+                    .as_str()
+                    .and_then(|r| vox_core::node::link::b32_decode(r, "room").ok())
+                else {
+                    continue;
+                };
+                if let Frame::Services { room, services, .. } = client
+                    .request(&Request::Services { channel_id: id })
+                    .await
+                    .map_err(|e| crate::app::AppError::Usage(e.to_string()))?
+                {
+                    for (service, _) in services {
+                        names.push(format!("{node}/{room}/{service}"));
+                    }
+                }
+            }
+        }
+        if let Some(forwards) = report["forwards"].as_array() {
+            for f in forwards {
+                names.push(format!(
+                    "{node} forward {} at {}",
+                    f["service"].as_str().unwrap_or("unknown"),
+                    f["local"].as_str().unwrap_or("unknown")
+                ));
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
 }
 
 /// Name each node the restart left detached, with the command that attaches it again.
