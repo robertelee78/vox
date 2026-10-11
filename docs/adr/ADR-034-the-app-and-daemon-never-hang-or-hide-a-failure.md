@@ -2,7 +2,8 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: Proposed (the decider's Q&A, 2026-10-10). Nothing in this ADR is built.
+**Status**: Accepted for v0.4.4 (the decider's Q&A, 2026-10-10, and his answers to this ADR's
+open questions, the same evening). Nothing in this ADR is built.
 **Date**: 2026-10-10
 **Deciders**: Robert E. Lee
 **Tags**: daemon, app, ffi, ipc, update, storage, health, logs, progress
@@ -10,7 +11,8 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 **Inputs**: the decider's live session of 2026-10-10, his daemon log, and three root-cause
 analyses of that day: the stuck room create, the poisoned room, and the IPC frame length. The
 decider's ruling on them: fold the fixes into v0.4.4 with the redesign, with no separate fix
-release.
+release. His answer on version refusal: refuse only on a real incompatibility, never on a version
+difference alone (UP-2); every other first choice "ok".
 
 ## Context
 
@@ -42,10 +44,18 @@ requirements, what each of these broke.
 - **UP-1.** `vox update` and the app's update MUST stop the running daemon and start the new
   version's daemon as part of the update, so every remembered node comes back Ready (ADR-031 CW-3),
   and MUST say so in one sentence, naming any held session (ADR-026 L-7) the restart ended.
-- **UP-2.** The app, the TUI and every verb MUST compare the daemon's version (ADR-026 C-4) with
-  their own, and MUST refuse to work with a daemon of another version, saying so in one sentence
-  with the action that fixes it ("Vox's daemon is 0.4.2 and this app is 0.4.3: restart the
-  daemon"); the app MUST offer that action as a button.
+- **UP-2.** A client (the app, the TUI, every verb) MUST refuse a daemon only on a real
+  incompatibility, found by negotiation: `Hello` (ADR-026 C-4) MUST carry the IPC protocol
+  versions and the capabilities each side has, beside the version. The client MUST refuse when the
+  two share no protocol version, and MUST refuse an action whose capability the daemon lacks, that
+  action only. It MUST NOT refuse on a version difference alone. A refusal MUST be one plain
+  sentence naming what is incompatible and the action that fixes it ("Vox's daemon (0.4.2) cannot
+  page Session entries, which this app needs: restart the daemon"); the app MUST offer that action
+  as a button. A `Hello` with no protocol list (from v0.4.3 or earlier) MUST be read as protocol 1
+  with the capabilities of the version it names. The decider: "Ok starting point, but we might not
+  always want to be so brittle."
+- **UP-3.** When the client's and the daemon's versions differ, `vox status` and the app's status
+  MUST name both, whether or not anything is refused.
 
 ### 2. No unbounded wait
 
@@ -120,14 +130,16 @@ requirements, what each of these broke.
 
 | ADR line | Was | Now |
 |---|---|---|
-| ADR-014 M-29 | The update asks the person to restart the app and the daemon | The update restarts the daemon itself; a client refuses a daemon of another version (UP-1, UP-2) |
-| ADR-026 C-4 | `Hello` reports the daemon's version | Every client compares it and refuses a mismatch (UP-2) |
+| ADR-014 M-29 | The update asks the person to restart the app and the daemon | The update restarts the daemon itself (UP-1); a client refuses a daemon only on a real incompatibility (UP-2) |
+| ADR-026 C-4 | `Hello` reports the daemon's version | `Hello` also carries protocol versions and capabilities; a client refuses only when no protocol is shared or an action's capability is missing, never on version alone (UP-2); both versions are named when they differ (UP-3) |
 
 ## Consequences
 
 - An update ends the held sessions (`vox serve`, `vox forward` and the like) running on the old
   daemon, and says so.
 - Readers of long lists make more round trips.
+- A client and a daemon of different versions keep working together wherever they share a protocol
+  and the capabilities an action needs; the person sees both versions named.
 - A room that ran out of disk loses nothing written after space returns, and the person is told
   what happened.
 

@@ -2,12 +2,15 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: Proposed (the decider's Q&A, 2026-10-10). Nothing in this ADR is built.
+**Status**: Accepted for v0.4.4 (the decider's Q&A, 2026-10-10, and his answers to this ADR's
+open questions, the same evening). Nothing in this ADR is built.
 **Date**: 2026-10-10
 **Deciders**: Robert E. Lee
 **Tags**: agents, onboarding, hooks, keyring, trust, drive, sessions, macos
 **Related**: ADR-001, ADR-005, ADR-014, ADR-020, ADR-026, ADR-028, ADR-029, ADR-033, ADR-034
-**Inputs**: the decider's product Q&A of 2026-10-10 (Q1–Q8, Q16a, Q18); the onboarding
+**Inputs**: the decider's product Q&A of 2026-10-10 (Q1–Q8, Q16a, Q18) and his answers to the
+open questions (local trust without the keyring passphrase, its cost, existing pairs, the CLI
+verbs, sealing Session records now; every other first choice "ok"); the onboarding
 evaluation of 2026-10-10 (three evaluators and a CLI measurement pass on v0.4.3's room-polish
 build); issues #677 (person-confirmed trust) and #681 (the app manages the agent nodes on this
 Mac).
@@ -93,13 +96,21 @@ allow drive access for the node I'm using from the macOS app."
 - **LT-2.** Where there is no person's node (no Vox.app, or none chosen), LT-1 MUST NOT apply:
   this machine's nodes trust each other the normal way, and no node gets drive automatically.
 - **LT-3.** An LT entry MUST be written by the daemon, from facts it holds itself (both nodes are
-  its own, and the node shares a room with the person's node); no request from any process MAY cause or widen one.
-  It MUST NOT ask for the identity passphrase and MUST NOT open the keyring window (ADR-028 K-12).
-  A node that is Locked when its entry is due MUST get it when it is next Ready.
+  its own, and the node shares a room with the person's node); no request from any process MAY
+  cause or widen one. LT-1 is the person's standing rule, applied by the daemon, only to nodes of
+  this machine, with drive going only to the person's own node; it is therefore exempt from the
+  keyring passphrase (the decider, 2026-10-10): an LT entry MUST NOT ask for the identity
+  passphrase and MUST NOT open the keyring window (ADR-028 K-12). A node that is Locked when its
+  entry is due MUST get it when it is next Ready.
 - **LT-4.** An LT entry's alias MUST be the node's name on this machine (ADR-028 K-3, with K-4's
   suffix on a clash).
-- **LT-5.** Every LT entry MUST be stated in words (ADR-028 E-5) in the join line (JL-1) and
-  recorded in each node's decision record (ADR-028 D-1).
+- **LT-5.** Every automatic trust MUST be posted as a line in the room it follows from, in words
+  (ADR-028 E-5), for example "codex on this Mac was trusted automatically", naming who reads it and
+  that the person's node may drive it. The daemon MUST post it as an ordinary room message of the
+  person's node, one line per node trusted, so every member that reads the person's node sees it;
+  a person's node that is Locked MUST post it when it is next Ready. It MUST NOT add an entry type.
+  Every LT entry MUST also be recorded in each node's decision record (ADR-028 D-1). The decider
+  accepted LT's security cost (Consequences) on this condition: each automatic trust is shown.
 - **LT-6.** Removing an LT entry (ADR-028 K-6) MUST stop LT from adding that pair again, until the
   person adds it back by hand.
 - **LT-7.** Nothing is automatic for nodes on other machines. The decider: "for now", they trust
@@ -110,6 +121,12 @@ allow drive access for the node I'm using from the macOS app."
   `vox trust drive`, the app's Trust) MUST be confirmed by the person as #677 requires, whatever
   the passphrase and the keyring window say. LT-1 is not such a widening by a process: it is the
   person's standing rule, applied by the daemon, and grants drive only to the person's own node.
+- **LT-9. Existing pairs.** LT-1 MUST apply to pairs of this machine's nodes that already share a
+  room with the person's node when a release with this ADR first starts, not only to new joins.
+  The daemon MUST write their entries at that start (or when each node is next Ready), and MUST
+  post LT-5's line for each node it trusted. A pair whose removal by hand is in either node's decision record
+  (ADR-028 D-1, "a trust added or removed") MUST be treated as removed under LT-6 and left alone.
+  The release's notes MUST say that existing local pairs are trusted on upgrade.
 
 ### 4. A repository with no room
 
@@ -135,7 +152,8 @@ allow drive access for the node I'm using from the macOS app."
 
 - **CW-1.** Each node on this machine MUST be shown as **Ready** (attached) or **Locked** (needs its
   passphrase). No client, hook, notice or manual page MAY name these states or their changes with
-  any other word: not attach, detach, keep, connect, sign out or start over.
+  any other word: not attach, detach, keep, connect, sign out or start over. The old verbs that
+  CW-7 keeps working are the one exception, and only in what they print.
 - **CW-2.** **Unlock…** MUST be the one action on a Locked node. It MUST ask for the passphrase and
   always remember the node (ADR-028 K-10: the Keychain on a Mac), with no choice to offer.
 - **CW-3.** After a daemon restart, an update or a reboot, every remembered node MUST come back
@@ -145,7 +163,14 @@ allow drive access for the node I'm using from the macOS app."
   stay on disk.
 - **CW-5.** A node made with no passphrase MUST never be shown Locked.
 - **CW-6.** A hook that finds its node Locked MUST say "Open Vox to unlock <node>" on a Mac with
-  Vox.app, and K-13's command elsewhere.
+  Vox.app, and `vox node unlock <node>` (CW-7) elsewhere, as K-13 requires.
+- **CW-7. The verbs.** At a terminal the verbs MUST be `vox node unlock <name>`, which does what
+  Unlock… does (CW-2), and `vox node lock <name>`, which locks the node and forgets what brings it
+  back, as Forget does (CW-4), so it stays Locked across restarts until unlocked. The decider:
+  "yes" to the rename. `vox node attach` and `vox node detach` MUST keep working, do what `unlock`
+  and `lock` do, and print the new verb, for example "`vox node attach` is now `vox node unlock`".
+  `attach --keep` MUST be accepted and have no further effect, since `unlock` always remembers.
+  Every other place that prints a command (PC-1) MUST print the new verbs.
 
 ### 6. When the keyring passphrase is asked for
 
@@ -161,8 +186,9 @@ allow drive access for the node I'm using from the macOS app."
 
 - **JL-1.** When an agent's node joins a room and its session starts working there, the person's
   client MUST show one line in General, for example "codex (on this Mac) joined repo-to-cve and is
-  working in /opt/repo-to-cve", followed by what LT-1 granted. The line MUST be derived from the
-  join and the session's claimed directory (ADR-020 2.3); it MUST NOT add an entry type.
+  working in /opt/repo-to-cve", followed by LT-5's lines for what LT-1 granted. The join line MUST
+  be derived from the join and the session's claimed directory (ADR-020 2.3); it MUST NOT add an
+  entry type.
 - **JL-2.** The agent's Session MUST open as a tab (ADR-033 LY-1) for each member it grants drive.
 - **JL-3.** A join MUST NOT post a notification.
 - **JL-4.** The agent MUST be told at its next turn that its node joined, in which room, and who
@@ -179,7 +205,20 @@ allow drive access for the node I'm using from the macOS app."
   Sessions and those of nodes that trust the asker with drive. (Today `Request::Sessions` answers
   every Session on the log to any member.)
 - **SA-3.** A Session's opening and end records MUST be sealed under its Session key (ADR-029 SC-2),
-  so a member without drive cannot read them from its own copy of the log.
+  so a member without drive cannot read them from its own copy of the log. This MUST ship in
+  v0.4.4 (the decider: do it now).
+- **SA-5. Upgrade.** Sealing these records is a format change (ADR-026 F-3): v0.4.4 MUST raise the
+  data root's format and MUST upgrade, automatically and before anything else is written, every
+  data root a release since v0.4.0 wrote. Every room, every Session and every entry an earlier
+  release wrote MUST open and read in full after the upgrade, and an open Session MUST continue;
+  nothing MAY be lost. Records an earlier release wrote unsealed stay as they were written in every
+  member's copy of the log; from the upgrade on, the daemon MUST NOT serve them to a member without
+  drive (SA-2), and the release's notes MUST say that earlier opening and end records stay readable
+  in a copy a member already holds.
+- **SA-6. Proof of the upgrade.** The upgrade MUST be proved by real use, on a data root and rooms
+  the shipped v0.4.3 binary wrote, with Sessions open and ended, opened by the v0.4.4 binary
+  (extending `a_data_root_of_the_previous_release_opens_with_nothing_lost`, ADR-026 F-3), with a
+  mutant that turns it red on its own assertion (ADR-018 §7).
 - **SA-4.** A member without drive addresses the node (ADR-029 TA-4); the composer MUST NOT offer
   that node's Sessions.
 
@@ -220,6 +259,9 @@ allow drive access for the node I'm using from the macOS app."
 | ADR-020 6.5 | The hook drains every room its node holds | Not into a session that works in no room (RM-6) |
 | ADR-014 M-6, M-21 | Keep Running decides whether the node stays attached; Node menu Attach, Detach | Every remembered node returns Ready (CW-3); Node menu Unlock…, Forget (CW-2, CW-4) |
 | #681 | Drive stays at the terminal | The person's node gets drive over this machine's agent nodes automatically (LT-1.3) |
+| ADR-028 K-12 | Every keyring change asks for the identity passphrase, with the 30-minute window | Except LT-1's entries, the person's standing rule applied by the daemon (LT-3) |
+| ADR-026 L-2; ADR-028 K-13 | `vox node attach <name> [--keep]`, `vox node detach <name>`; the hook shows the attach command | `vox node unlock <name>`, `vox node lock <name>`; the old verbs work and print the new ones (CW-7) |
+| ADR-026 F-3 | Format as of v0.4.3 | Sealed Session opening and end records raise the format, with an upgrade from every release since v0.4.0 (SA-5, SA-6) |
 
 ## Consequences
 
@@ -228,16 +270,29 @@ allow drive access for the node I'm using from the macOS app."
 - Any process that can run as this OS account and knows a room's link and passphrase can make a
   node, join that room and so be read by, and read, every node of this machine. The OS account is
   already the boundary for the daemon's socket (ADR-026 C-6); this rule widens what a process
-  inside it gains without a person.
+  inside it gains without a person, and with no keyring passphrase. The decider accepted this
+  cost (2026-10-10); each automatic trust is posted in the room (LT-5) so it is never silent.
+- On upgrade, this machine's nodes that already share a room with the person's node trust each
+  other, and the person's node gains drive over them, with a line in the room for each (LT-9).
 - A member with read only no longer learns that a node has Sessions, or their names.
-- The Session opening and end records change on the wire, so this release is to carry an upgrade
-  for rooms written by v0.4.0 or later (ADR-026 F-3).
+- The Session opening and end records change on the wire and on disk, so v0.4.4 is to carry an
+  upgrade for data roots written by v0.4.0 or later, and its proof (SA-5, SA-6).
+- Scripts and documents that use `vox node attach` or `detach` keep working, and are told the new
+  verbs (CW-7).
+
+## Open questions
+
+- **A member of an earlier release in the room.** What a v0.4.3 node does when it receives a sealed
+  opening or end record (skips it, refuses the entry, or poisons the room) is not known. It is to be
+  measured with the shipped v0.4.3 binary before SA-3 is built, and the answer decides whether
+  sealing needs ADR-034 UP-2's capability negotiation between peers as well as between a client and
+  its daemon.
 
 ## Related ADRs
 
 Depends on ADR-020, ADR-026, ADR-028, ADR-029. Amends ADR-014 (M-6, M-21), ADR-020 (2.1, 3.3, 3.7,
-6.5), ADR-026 (N-6), ADR-028 (E-2, E-4, K-10, K-13, K-15, K-18, W-1, W-2, W-4) and ADR-029 (SC-3,
-CL-2, CL-3, TA-1, RB-5, RB-5a). Cited: ADR-001, ADR-005, ADR-033, ADR-034.
+6.5), ADR-026 (N-6, L-2, F-3), ADR-028 (E-2, E-4, K-10, K-12, K-13, K-15, K-18, W-1, W-2, W-4) and
+ADR-029 (SC-3, CL-2, CL-3, TA-1, RB-5, RB-5a). Cited: ADR-001, ADR-005, ADR-033, ADR-034.
 
 ## Engineering Mantra
 

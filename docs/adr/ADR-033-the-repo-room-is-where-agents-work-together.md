@@ -2,22 +2,25 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: Proposed (the decider's Q&A, 2026-10-10). Nothing in this ADR is built.
+**Status**: Accepted for v0.4.4 (the decider's Q&A, 2026-10-10, and his answers to this ADR's
+open questions, the same evening). Nothing in this ADR is built.
 **Date**: 2026-10-10
 **Deciders**: Robert E. Lee
 **Tags**: rooms, threads, pause, sessions, layout, composer, claims, macos, tui
 **Related**: ADR-014, ADR-020, ADR-021, ADR-028, ADR-029, ADR-031, ADR-034
 **Inputs**: the decider's product Q&A of 2026-10-10 (Q9–Q19) and its screenshots of the room
-window; issue #683 (the room window works like a chat app), whose flat room list shipped in v0.4.3.
+window; his answers to the open questions (who does what shows the room's claims only, with no
+awa or GitHub; every other first choice "ok"); issue #683 (the room window works like a chat
+app), whose flat room list shipped in v0.4.3.
 
 ## Context
 
 The decider uses one room per repository, and in it: "The rooms I use for repos are a way for the
 agents to distribute load, and collaborate on hard issues." There he reads General, watches a
 Session live, drives one, answers an agent waiting on him, hands files, and steers "conversations
-for hard collaborative problems". Every agent also carries the awa skills: the room says who does
-what (claims, asks, hand-offs and tags), and the GitHub issue holds progress and proofs (ADR-021
-§1).
+for hard collaborative problems". The room says who does what: claims, asks, hand-offs and tags.
+Where an agent records its progress is the agent's business. The decider: "vox is agent comms.
+Agents know how to communicate with github."
 
 To steer a hard problem he asked to address several agents at once, give each problem a focused
 thread, pause the agents at once, and see at a glance who works on what and who waits on whom. Of
@@ -46,8 +49,9 @@ the general/main part of the room."
   MUST count them and MUST NOT show them in full (ADR-020 6.6). Every member still sees the starting
   message in General.
 - **TH-5.** A reply MUST carry its starting message's tags (`task:`, `project:`, `milestone:`)
-  automatically, so a thread stays linked to its awa story. Vox's verbs and clients MUST add them;
-  the model MUST NOT be relied on to.
+  automatically, so a thread keeps the tags its starting message had. Vox's verbs and clients MUST
+  add them; the model MUST NOT be relied on to. Vox MUST NOT read, resolve or link what a tag
+  names (WD-4).
 - **TH-6.** A thread's message MUST be labelled with its thread in an agent's news, by the first
   line of the starting message.
 
@@ -118,13 +122,19 @@ the general/main part of the room."
 
 ### 6. Who does what
 
+The decider: "vox is agent comms. Agents know how to communicate with github." Vox shows the room's
+own claims and asks, and nothing from awa, GitHub or any tracker.
+
 - **WD-1.** The members panel MUST show, per member and per session, what it holds and who waits on
-  whom: the resources it claims (ADR-021 §4, as `vox room board` folds them), the work reference and
-  `task:` tag of each, and the addressed asks, hand-offs and `blocked` messages not yet answered.
+  whom: the room's claims (ADR-021 §4, as `vox room board` folds them), with each claim's `task:`
+  tag and work reference as plain text, and the addressed asks, hand-offs and `blocked` messages
+  not yet answered.
 - **WD-2.** It MUST be computed from the room's log each time it is shown, by the daemon's own fold,
-  and MUST NOT be stored (ADR-021 1.2). Vox MUST NOT read the tracker to show it.
+  and MUST NOT be stored (ADR-021 1.2).
 - **WD-3.** The app MUST read the board and claims through the daemon, as the CLI does; it MUST NOT
   fold claims itself. A room message given to the app MUST carry its `data.work` beside its tags.
+- **WD-4.** No client, verb or hook of Vox MAY read awa, GitHub or any tracker, call its API, or
+  turn a tag or work reference into a link to it (ADR-021 1.2).
 
 ## Superseded and amended lines
 
@@ -144,7 +154,8 @@ the general/main part of the room."
 - Pausing a room stops every agent the person can drive in it at once; agents on other people's
   machines that do not grant drive keep running and are named.
 - The room window loses its header block and its Sessions column; the members panel carries who
-  does what.
+  does what, from the room's own claims.
+- A person who wants an item's progress reads it where the agents record it; Vox does not show it.
 
 ## Related ADRs
 

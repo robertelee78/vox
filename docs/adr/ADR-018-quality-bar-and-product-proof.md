@@ -190,7 +190,7 @@ MUST be reproduced by the harness when its fix is reverted.
 12. **Latency bounds hold under ordinary load.** A latency bound MUST hold on a machine doing ordinary
     work. A red under ordinary load is a product defect. A release gate MUST NOT require an idle
     machine, and a red MUST NOT be explained away by the machine's load.
-13. **Choosing what to run.** *Proposed (the decider's Q&A, 2026-10-10; #685).* One command
+13. **Choosing what to run.** *Accepted for v0.4.4 (the decider's Q&A, 2026-10-10; #685); not built.* One command
     MUST run, on demand only, either every proof or the proofs a diff from a given commit reaches,
     and MUST print what it selected and why. The decider: "we need a full test suite, but need to
     also be able to be smart about which parts changed, and be able to just test the changed parts

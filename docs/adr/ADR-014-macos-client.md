@@ -204,7 +204,7 @@ F-9–F-11; RR-1, RR-3, RR-4 (RR-2 is the daemon's); D-3; L-1–L-10; W-1–W-6;
 - **M-32.** The suite MUST run only on demand (to take the app through its pieces, or to
   troubleshoot), and MUST be run once on the final release candidate before the tag. Not run, it
   MUST say that it did not run.
-- **M-32a.** *Proposed (the decider's Q&A, 2026-10-10; #684):* the suite and the app's UI
+- **M-32a.** *Accepted for v0.4.4 (the decider's Q&A, 2026-10-10; #684); not built:* the suite and the app's UI
   evaluations MUST run in a macOS guest VM on the same Mac (Virtualization.framework), with no
   `sudo`, so that nothing they do appears on or takes the host's screen, keyboard focus or
   pasteboard. The decider: "a vm or some such where I don't lose ability to use my laptop during
