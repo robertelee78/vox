@@ -2428,19 +2428,46 @@ fn a_full_room_recovers_and_keeps_its_session_entries() {
             !status.contains("cannot save"),
             "PRODUCT: recovered room kept its cannot-save badge: {status}"
         );
-        let (ok, detail_json, err) = w.vox(
-            AGENT,
-            &["room", "session", &room, SESSION, "--json", "--details"],
-            None,
-        );
-        assert!(
-            ok,
-            "PRODUCT: recovered Session Details could not be read: {err}"
-        );
-        let loss = detail_json.lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .find_map(|value| value["details"]["notice"].as_str().filter(|text| text.contains("lost while held")).map(str::to_owned))
-            .unwrap_or_else(|| panic!("PRODUCT: Session Details omitted the full notice naming the entries lost at the hold bound: {}", detail_json.chars().take(1000).collect::<String>()));
+        // Recovery writes the loss notice before the retained tail. Follow the CLI's own
+        // older-page command until its page is reached, as a person opening older Details does.
+        let mut before: Option<String> = None;
+        let mut cursors = std::collections::BTreeSet::new();
+        let mut pages = 0;
+        let loss = loop {
+            let mut args = vec!["room", "session", &room, SESSION, "--json", "--details"];
+            if let Some(cursor) = before.as_deref() {
+                args.extend(["--before", cursor]);
+            }
+            let (ok, detail_json, err) = w.vox(AGENT, &args, None);
+            assert!(
+                ok,
+                "PRODUCT: recovered Session Details page could not be read: {err}"
+            );
+            pages += 1;
+            if let Some(notice) = detail_json
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find_map(|value| {
+                    value["details"]["notice"]
+                        .as_str()
+                        .filter(|text| text.contains("lost while held"))
+                        .map(str::to_owned)
+                })
+            {
+                break notice;
+            }
+            // JSON contains only the entries; the advertised --before cursor is on stderr.
+            let next = err.lines()
+                .find_map(|line| line.split_once("--before ")
+                    .and_then(|(_, rest)| rest.split_whitespace().next()))
+                .unwrap_or_else(|| panic!(
+                    "PRODUCT: Session Details omitted the full loss notice after reading all {pages} pages: {}",
+                    detail_json.chars().take(1000).collect::<String>()));
+            assert!(cursors.insert(next.to_owned()),
+                "PRODUCT: Session's older-page command repeated cursor {next}, so older Details cannot be reached");
+            before = Some(next.to_owned());
+        };
+        println!("[proof] read {pages} Session Details pages to reach the complete loss notice");
         let count = loss
             .split_whitespace()
             .next()
