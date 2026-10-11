@@ -1971,7 +1971,7 @@ impl ChannelState {
                 step_bodies.insert(entry.entry_hash());
             }
             if let Some(payload) = entry.payload.as_deref() {
-                if kind == EntryKind::Content {
+                if kind == EntryKind::Content && !session_floor::is_session_floor(payload) {
                     let first_seen = saved_age.0;
                     retention.track(
                         entry.entry_hash(),
@@ -4490,8 +4490,19 @@ impl ChannelState {
         self.forget_settled_owed();
     }
 
+    /// Floor controls carry durable authorization, like governance: neither message nor
+    /// Session activity expiry may erase the evidence another reader needs after a restart.
+    fn is_session_floor(&self, hash: &Digest32) -> bool {
+        self.dag
+            .get_by_hash(hash)
+            .and_then(|entry| entry.payload.as_deref())
+            .is_some_and(session_floor::is_session_floor)
+    }
+
     fn entry_retention(&self, hash: &Digest32) -> u64 {
-        if self.step_bodies.contains(hash) {
+        if self.is_session_floor(hash) {
+            0
+        } else if self.step_bodies.contains(hash) {
             self.effective_step_retention()
         } else {
             self.effective_retention()
@@ -4937,12 +4948,17 @@ impl ChannelState {
         due: &[(Digest32, Tracked)],
         with_receivers: bool,
     ) -> Result<usize> {
+        let due: Vec<_> = due
+            .iter()
+            .filter(|(hash, _)| !self.is_session_floor(hash))
+            .copied()
+            .collect();
         if due.is_empty() && !with_receivers {
             return Ok(0);
         }
         let mut pages = Vec::with_capacity(due.len());
         let shed = self.effective_retention() != 0;
-        for (hash, t) in due {
+        for (hash, t) in &due {
             self.dag.prune_payload(hash);
             // Pruned below its author's checkpoint: the signature goes with the body.
             if shed {
@@ -5021,6 +5037,9 @@ impl ChannelState {
         log_id: u64,
         now_ms: u64,
     ) -> Result<()> {
+        if self.is_session_floor(&entry_hash) {
+            return Ok(());
+        }
         let steps = self
             .dag
             .get_by_hash(&entry_hash)
@@ -5066,6 +5085,9 @@ impl ChannelState {
         log_id: u64,
         now_ms: u64,
     ) -> Result<()> {
+        if self.is_session_floor(&entry_hash) {
+            return Ok(());
+        }
         let steps = self
             .dag
             .get_by_hash(&entry_hash)
