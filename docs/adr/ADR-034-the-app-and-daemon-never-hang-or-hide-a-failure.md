@@ -51,17 +51,17 @@ each of these broke.
 - **UP-1.** `vox update` and the app's update MUST stop the running daemon and start the new
   version's daemon as part of the update, so every remembered node comes back Ready (ADR-031 CW-3),
   and MUST say so in one sentence, naming any held session (ADR-026 L-7) the restart ended.
-- **UP-2.** A client (the app, the TUI, every verb) MUST refuse a daemon whose version differs from
-  its own, and MUST NOT attempt any other request on that connection. The decider: "if not
-  matching, don't attempt". The refusal MUST be one plain sentence naming both versions and the
-  action that fixes it ("Vox's daemon is 0.4.2 and this app is 0.4.4: restart the daemon"); the
-  app MUST offer that action as a button. The same MUST hold between peers: a node MUST NOT sync,
-  relay or send a room's entries to a peer whose version differs from its own, and MUST say so in
-  one plain sentence naming the peer and both versions (in `vox status` and the room's members
-  panel). Measuring when two versions are compatible, so that a difference need not always refuse,
+- **UP-2.** A client of a daemon (the app, the TUI, every verb and every hook) MUST refuse its own
+  daemon when their versions differ, and MUST NOT attempt any other request on that connection.
+  The decider: "if not matching, don't attempt". The refusal MUST be one plain sentence naming both
+  versions and the action that fixes it ("Vox's daemon is 0.4.2 and this app is 0.4.4: restart the
+  daemon"); the app MUST offer that action as a button. This applies only between a client and its
+  own daemon: peers of different versions MUST be left as they are, and no node MAY refuse to sync,
+  relay or send a room's entries to a peer because its version differs (the decider, 2026-10-10).
+  Measuring when two versions are compatible, between a client and its daemon and between peers,
   is planned for v0.4.5 and is not part of this ADR.
-- **UP-3.** When a client and its daemon, or two peers, differ in version, `vox status` and the
-  app's status MUST name both versions.
+- **UP-3.** When a client's and its daemon's versions differ, `vox status` and the app's status MUST
+  name both versions.
 
 ### 2. No unbounded wait
 
@@ -152,7 +152,7 @@ each of these broke.
 | ADR-014 M-29 | The update asks the person to restart the app and the daemon | The update restarts the daemon itself (UP-1); a client refuses a daemon of another version (UP-2) |
 | ADR-014 M-21 | The menus as listed, with no Quit named | The Vox menu holds Quit Vox ⌘Q (QT-1) |
 | ADR-028 A-4 | Quitting detaches the node, with no bound | Letting go of the node is bounded and never blocks quitting (QT-2) |
-| ADR-026 C-4 | `Hello` reports the daemon's version | A client refuses a daemon whose version differs and attempts nothing else (UP-2); peers of different versions do not sync (UP-2); both versions are named (UP-3) |
+| ADR-026 C-4 | `Hello` reports the daemon's version | A client refuses its daemon when their versions differ and attempts nothing else (UP-2); both versions are named (UP-3); peers are unchanged |
 
 ## Consequences
 
@@ -163,9 +163,8 @@ each of these broke.
   next start.
 - A client and a daemon of different versions do not work together until the daemon is restarted
   on the client's version, and the person is told which to restart.
-- Members of one room on different releases do not sync with each other until both run the same
-  release: a member that has not upgraded falls silent to the ones that have, and each side names
-  the other's version. The decider accepted this for now; v0.4.5 is to measure compatibility.
+- Peers of different releases keep syncing as before; nothing in this ADR refuses a peer for its
+  version. Measuring compatibility between versions is planned for v0.4.5.
 - A room that ran out of disk loses nothing written after space returns, and the person is told
   what happened.
 
