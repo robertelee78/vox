@@ -920,6 +920,7 @@ async fn run_session_worker(
     fence: Arc<crate::transport::stream_transport::Fence>,
     tx: mpsc::Sender<NetEvent>,
     channel_id: Digest32,
+    peer: Digest32,
     slot: Option<crate::node::ports::Slot>,
 ) -> crate::node::channel::SessionReport {
     let joined = tokio::task::spawn_blocking(move || {
@@ -932,7 +933,7 @@ async fn run_session_worker(
         // (`sync_over_room`).
         match target {
             SessionTarget::Channel(shared) => crate::node::channel::ChannelState::sync_over_room(
-                &shared, &store, &mut t, now_ms, &fence, &on_stored,
+                &shared, &store, peer, &mut t, now_ms, &fence, &on_stored,
             ),
         }
     })
@@ -11512,6 +11513,7 @@ impl Node {
                 fence,
                 tx.clone(),
                 cid,
+                peer,
                 Some(slot),
             )
             .await;
@@ -11594,6 +11596,7 @@ impl Node {
                 fence,
                 tx.clone(),
                 channel_id,
+                peer,
                 None,
             )
             .await;
@@ -15947,7 +15950,7 @@ impl Node {
             if has_session && ch.ensure_drive(profile.store(), holders, now_ms).is_err() {
                 return;
             }
-            let Ok(owed) = ch.owed_drive(profile.store(), holders) else {
+            let Ok(owed) = ch.owed_drive(profile, holders, now_ms) else {
                 return;
             };
             let mut releases = Vec::new();
@@ -15981,7 +15984,7 @@ impl Node {
             let mut ch = shared.lock().await;
             ch.key_change_unsaid()
                 && ch
-                    .owed_drive(profile.store(), holders)
+                    .owed_drive(profile, holders, now_ms)
                     .is_ok_and(|owed| owed.is_empty())
                 && ch
                     .append_session(

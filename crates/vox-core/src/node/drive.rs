@@ -91,6 +91,11 @@ pub struct DriveState {
     /// Member → `(generation, iteration)` from which it is owed this node's drive key: where the
     /// live generation stood when it became owed it.
     marks: BTreeMap<Digest32, (u64, u64)>,
+    /// Public authorization floors, derived from verified control entries; never secret keys.
+    pub(crate) floors: BTreeMap<(Digest32, Digest32, u64, u64), (u64, u64)>,
+    pub(crate) floors_indexed: bool,
+    /// Bodies a particular peer omitted, only until new authorization is learned or restart.
+    pub(crate) omitted: BTreeMap<Digest32, (std::time::Instant, BTreeSet<(Digest32, u64)>)>,
     /// Drive keys released to this node, by `(author, generation)`.
     pub(crate) receivers: BTreeMap<(Digest32, u64), ReceiverChain>,
     /// Member → the generation of this node's drive key last released to it.
@@ -122,6 +127,10 @@ pub fn is_file_out(row: &SessionRow) -> bool {
 }
 
 impl DriveState {
+    pub(crate) fn floor_mark(&self, member: &Digest32) -> Option<(u64, u64)> {
+        self.marks.get(member).copied()
+    }
+
     /// Make `chain` this node's live drive generation, marking every member of `holders` owed it
     /// from its first entry.
     pub fn begin(&mut self, chain: SenderChain, holders: impl IntoIterator<Item = Digest32>) {
@@ -293,6 +302,9 @@ impl DriveState {
             chain,
             origin,
             marks,
+            floors: BTreeMap::new(),
+            floors_indexed: false,
+            omitted: BTreeMap::new(),
             receivers,
             delivered,
             sessions: Vec::new(),

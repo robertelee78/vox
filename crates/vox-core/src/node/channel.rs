@@ -37,6 +37,8 @@
 //! alone. M14 adds other authors' entries, SKDMs, consent and sync on top of the
 //! same layout.
 
+pub(crate) mod session_floor;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use zeroize::Zeroizing;
@@ -4733,6 +4735,19 @@ impl ChannelState {
     /// Append a control entry (a checkpoint) on this identity's own feed: signed and stored
     /// like governance, never folded into the ADR-007 evaluator, since it grants nothing.
     fn append_control(&mut self, profile: &Profile, payload: &[u8], now_ms: u64) -> Result<()> {
+        self.append_control_kind(profile, payload, now_ms, EntryKind::Checkpoint)
+    }
+
+    fn append_control_kind(
+        &mut self,
+        profile: &Profile,
+        payload: &[u8],
+        now_ms: u64,
+        kind: EntryKind,
+    ) -> Result<()> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
         if !self.settled {
             return Err(Error::RoomNotSynced);
         }
@@ -4744,13 +4759,8 @@ impl ChannelState {
         let id = self.next_log_id;
         let log_seg = seal_segment(&self.sek, SegmentKind::LogDb, id, &entry.to_wire())?;
         self.dag
-            .accept(
-                entry,
-                EntryKind::Checkpoint,
-                &signer.public_key(),
-                &self.admission,
-            )
-            .map_err(|_| Error::Profile("authored checkpoint failed the acceptance predicate"))?;
+            .accept(entry, kind, &signer.public_key(), &self.admission)
+            .map_err(|_| Error::Profile("authored control failed the acceptance predicate"))?;
         if let Err(e) =
             profile
                 .store()
@@ -5448,6 +5458,7 @@ impl ChannelState {
     pub fn sync_over_room<T: Transport>(
         shared: &tokio::sync::Mutex<Self>,
         store: &Store,
+        peer: Digest32,
         transport: &mut T,
         now: crate::time::Ms,
         fence: &crate::transport::stream_transport::Fence,
@@ -5464,6 +5475,7 @@ impl ChannelState {
         let room = ChannelSessionRoom {
             shared,
             store,
+            peer,
             now_ms,
             epoch,
             fence,
@@ -5731,6 +5743,7 @@ impl ChannelState {
         if stale {
             self.begin_drive(holders, now_ms)?;
         }
+        self.ensure_session_floors(profile, holders, now_ms)?;
         let chain = self
             .drive
             .chain
@@ -5884,14 +5897,16 @@ impl ChannelState {
     /// from them.
     pub fn owed_drive(
         &mut self,
-        store: &Store,
+        profile: &Profile,
         holders: &BTreeSet<Digest32>,
+        now: crate::time::Ms,
     ) -> Result<Vec<Digest32>> {
         let members = self.drive_members();
         let owed = self.drive.take_owed(&members, holders);
         if !owed.is_empty() {
-            self.persist_drive(store)?;
+            self.persist_drive(profile.store())?;
         }
+        self.ensure_session_floors(profile, holders, now.get())?;
         Ok(owed)
     }
 
@@ -7861,6 +7876,7 @@ impl ChannelState {
 /// A channel as a [`crate::log::sync::SessionRoom`]: each step locks the room, does its work, and
 /// lets go. See [`ChannelState::sync_over_room`].
 struct ChannelSessionRoom<'a> {
+    peer: Digest32,
     shared: &'a tokio::sync::Mutex<ChannelState>,
     store: &'a Store,
     now_ms: u64,
@@ -7922,8 +7938,33 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
         );
         let mut wants = crate::log::sync::wants_for_unfrozen(&room.dag, remote);
         // And every body owed here that this peer's feed reaches (V030-10).
+        // An omission means only that this peer did not supply the body in that exchange.
+        // Retry later: it may have fetched the body elsewhere without moving its feed head.
+        if room
+            .drive
+            .omitted
+            .get(&self.peer)
+            .is_some_and(|(at, _)| at.elapsed() >= std::time::Duration::from_secs(30))
+        {
+            room.drive.omitted.remove(&self.peer);
+        }
         let owed = room.owed_wants(remote, &wants);
-        wants.extend(owed);
+        for range in owed {
+            for seq in range.from_seq..=range.to_seq {
+                if !room
+                    .drive
+                    .omitted
+                    .get(&self.peer)
+                    .is_some_and(|(_, m)| m.contains(&(range.author_id, seq)))
+                {
+                    wants.push(crate::log::sync::WantRange {
+                        author_id: range.author_id,
+                        from_seq: seq,
+                        to_seq: seq,
+                    });
+                }
+            }
+        }
         Ok(wants)
     }
 
@@ -7931,10 +7972,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
         &self,
         wants: &[crate::log::sync::WantRange],
     ) -> std::result::Result<Vec<Vec<u8>>, crate::wire::WireError> {
-        Ok(crate::log::sync::entries_for_wants(
-            &self.room()?.dag,
-            wants,
-        ))
+        Ok(self.room()?.session_entries_for(&self.peer, wants))
     }
 
     fn apply(&self, staged: Vec<Vec<u8>>) -> crate::log::sync::ApplyReport {
@@ -7963,6 +8001,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
             &ch.admission,
             &staged,
         );
+        ch.filter_received_session_bodies(self.peer, &staged);
         match ch.absorb_arrived(self.store, &before, self.now_ms) {
             Ok(got) => {
                 let mut out = self.out.borrow_mut();

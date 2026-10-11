@@ -33,6 +33,12 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/ports.rs"]
+mod ports;
+#[path = "support/previous_release.rs"]
+mod previous_release;
+#[path = "../../vox-core/tests/support/raw_sync.rs"]
+mod raw_sync;
 #[path = "support/typed.rs"]
 mod typed;
 
@@ -2433,4 +2439,347 @@ fn a_full_room_recovers_and_keeps_its_session_entries() {
         drop(daemon);
         drop(disk_guard);
     }
+}
+
+fn complete_room_id(w: &World, node: &str, room: &str) -> vox_core::hash::Digest32 {
+    let json = w.staged(node, &["room", "read", room, "--json"], None);
+    let id = json
+        .lines()
+        .find_map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).ok()?;
+            value["room"].as_str().map(str::to_owned)
+        })
+        .expect("APPARATUS: a room message names its complete room id");
+    vox_core::node::link::b32_decode(&id, "room").expect("APPARATUS: complete room id")
+}
+
+/// An ordinary admitted peer's wire requests, as apparatus. The member's real node has already
+/// detached; only its scratch identity is opened here. Every asserted entry is the response of
+/// the other, still-running shipped binary, never an internal value of an in-process node.
+fn served_to_member(
+    w: &World,
+    member: &str,
+    target: &str,
+    room: &str,
+) -> Vec<vox_core::log::entry::Entry> {
+    use vox_core::node::link::b32_decode;
+    use vox_core::node::paths::{Account, NodeName};
+    let address = ports::loopback_listen(&w.staged(target, &["status", "--json"], None))
+        .expect("APPARATUS: target's loopback address");
+    let target_id = b32_decode(w.staged(target, &["id"], None).trim(), "target")
+        .expect("APPARATUS: target fingerprint");
+    let cid = complete_room_id(w, target, room);
+    let paths = Account::of(Some(&w.data), Some(&w.cfg))
+        .expect("APPARATUS: account")
+        .node_paths(&NodeName::parse(member).expect("APPARATUS: member name"))
+        .expect("APPARATUS: member paths");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("APPARATUS: peer runtime");
+    let entries = rt.block_on(async {
+        let endpoint =
+            raw_sync::endpoint_as_member(&paths, format!("pass of {member}").as_bytes()).await;
+        let conn = std::sync::Arc::new(
+            endpoint
+                .connect(address, target_id, raw_sync::now())
+                .await
+                .expect("APPARATUS: admitted peer connection"),
+        );
+        let _responses = raw_sync::answer_victim(std::sync::Arc::clone(&conn));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let entries = loop {
+            let response = raw_sync::ask(&conn, cid, 0, raw_sync::Ask::Everything, None).await;
+            if response.hello && response.ended.is_none() && !response.wires.is_empty() {
+                break response
+                    .wires
+                    .into_iter()
+                    .map(|wire| {
+                        vox_core::log::entry::Entry::from_wire(&wire)
+                            .expect("PRODUCT: peer served malformed log entry")
+                    })
+                    .collect::<Vec<_>>();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS: room sync did not reach an answered exchange: {response:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        conn.close(vox_core::wire::WireError::ShuttingDown);
+        endpoint.close();
+        let _ = tokio::time::timeout(Duration::from_secs(2), endpoint.wait_idle()).await;
+        entries
+    });
+    rt.shutdown_background();
+    entries
+}
+
+/// A late member reads steps only after its join and drive grant, including through a relay.
+#[test]
+#[ignore = "real binary, production Argon2id; run in release"]
+fn a_sessions_steps_start_at_the_later_of_join_and_drive() {
+    watchdog::arm_for(Duration::from_secs(360));
+    let (w, _daemon, room) = World::setup();
+    let transcript = w.root.join("forward-session.jsonl");
+    std::fs::write(&transcript, "").expect("APPARATUS: transcript");
+    let mut prompt = base("UserPromptSubmit", &w.root.join("work"), &transcript);
+    let read = |node: &str, wanted: &str| {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let (_, shown, err) = w.vox(node, &["room", "session", &room, SESSION], None);
+            if shown.contains(wanted) {
+                break shown;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PRODUCT: {node} never read its eligible Session step {wanted:?}: {shown}{err}"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    prompt["prompt"] = "STEP BEFORE LATE JOIN".into();
+    w.hook_done(&room, &prompt);
+    read(PERSON, "STEP BEFORE LATE JOIN");
+    // Record the old step positions from what the real relay serves their author, so the
+    // negative check below also proves the payload exists and is serveable to an eligible node.
+    w.staged(AGENT, &["node", "detach", AGENT], None);
+    let before = served_to_member(&w, AGENT, PERSON, &room);
+    let cid = complete_room_id(&w, PERSON, &room);
+    let drive_namespace = vox_core::node::drive::drive_channel(&cid);
+    let before_steps = before
+        .iter()
+        .filter(|e| {
+            e.payload
+                .as_deref()
+                .and_then(|p| vox_core::group::message::GroupMessage::from_wire(p).ok())
+                .is_some_and(|m| m.header.channel_id == drive_namespace)
+        })
+        .map(|e| (e.skeleton.author_id, e.skeleton.seq))
+        .collect::<Vec<_>>();
+    assert!(
+        !before_steps.is_empty(),
+        "APPARATUS: author could not retrieve its old Session step from the relay"
+    );
+    w.staged(AGENT, &["node", "attach", AGENT], None);
+    let refuses_history = |entries: &[vox_core::log::entry::Entry], where_from: &str| {
+        for (author, seq) in &before_steps {
+            let entry = entries
+                .iter()
+                .find(|e| e.skeleton.author_id == *author && e.skeleton.seq == *seq)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "PRODUCT: {where_from} omitted the signed skeleton needed to sync the room"
+                    )
+                });
+            assert!(entry.payload.is_none(), "PRODUCT: {where_from} served a prejoin Session step body to the late member at sequence {seq}");
+        }
+        assert!(
+            entries.iter().any(|e| e
+                .payload
+                .as_deref()
+                .and_then(|p| vox_core::group::message::GroupMessage::from_wire(p).ok())
+                .is_some_and(|m| m.header.channel_id == drive_namespace)),
+            "PRODUCT: {where_from} also withheld every eligible later step"
+        );
+    };
+    let agent_fp = w.staged(AGENT, &["id"], None).trim().to_owned();
+    let link = w
+        .staged(PERSON, &["room", "link", &room], None)
+        .trim()
+        .to_owned();
+    let late = "late-member";
+    w.staged(late, &["node", "create", late], None);
+    w.staged(late, &["node", "attach", late], None);
+    let late_fp = w.staged(late, &["id"], None).trim().to_owned();
+    // Drive was granted first; the later join still sets the history boundary.
+    w.staged(
+        AGENT,
+        &["trust", "add", &late_fp, "--name", late, "--drive"],
+        None,
+    );
+    w.staged(late, &["trust", "add", &agent_fp, "--name", AGENT], None);
+    w.staged(
+        late,
+        &["room", "join", "--passphrase-file", "-", &link],
+        Some("room passphrase\n"),
+    );
+    prompt["prompt"] = "STEP AFTER LATE JOIN".into();
+    w.hook_done(&room, &prompt);
+    let shown = read(late, "STEP AFTER LATE JOIN");
+    assert!(
+        !shown.contains("STEP BEFORE LATE JOIN"),
+        "PRODUCT: a late member received prejoin Session history: {shown}"
+    );
+
+    read(PERSON, "STEP AFTER LATE JOIN");
+    // The author and recipient need not be online together for later, eligible steps.
+    w.staged(late, &["node", "detach", late], None);
+    refuses_history(&served_to_member(&w, late, AGENT, &room), "the author");
+    refuses_history(&served_to_member(&w, late, PERSON, &room), "the relay");
+    prompt["prompt"] = "STEP RELAYED AFTER JOIN".into();
+    w.hook_done(&room, &prompt);
+    read(PERSON, "STEP RELAYED AFTER JOIN");
+    w.staged(AGENT, &["node", "detach", AGENT], None);
+    w.staged(late, &["node", "attach", late], None);
+    let shown = read(late, "STEP RELAYED AFTER JOIN");
+    assert!(
+        !shown.contains("STEP BEFORE LATE JOIN"),
+        "PRODUCT: a relay supplied prejoin Session history: {shown}"
+    );
+    w.staged(AGENT, &["node", "attach", AGENT], None);
+
+    let later_drive = "later-drive";
+    w.staged(later_drive, &["node", "create", later_drive], None);
+    w.staged(later_drive, &["node", "attach", later_drive], None);
+    let reader_fp = w.staged(later_drive, &["id"], None).trim().to_owned();
+    w.staged(
+        AGENT,
+        &["trust", "add", &reader_fp, "--name", later_drive],
+        None,
+    );
+    w.staged(
+        later_drive,
+        &["trust", "add", &agent_fp, "--name", AGENT],
+        None,
+    );
+    w.staged(
+        later_drive,
+        &["room", "join", "--passphrase-file", "-", &link],
+        Some("room passphrase\n"),
+    );
+    prompt["prompt"] = "STEP AFTER JOIN BEFORE DRIVE".into();
+    w.hook_done(&room, &prompt);
+    read(PERSON, "STEP AFTER JOIN BEFORE DRIVE");
+    w.staged(
+        AGENT,
+        &["trust", "add", &reader_fp, "--name", later_drive, "--drive"],
+        None,
+    );
+    prompt["prompt"] = "STEP AFTER DRIVE GRANT".into();
+    w.hook_done(&room, &prompt);
+    let shown = read(later_drive, "STEP AFTER DRIVE GRANT");
+    assert!(
+        !shown.contains("STEP BEFORE LATE JOIN") && !shown.contains("STEP AFTER JOIN BEFORE DRIVE"),
+        "PRODUCT: gaining drive backfilled earlier Session steps: {shown}"
+    );
+    // Actual published readers keep syncing ordinary room messages after public floors.
+    std::fs::create_dir_all(w.root.join("old-release"))
+        .expect("APPARATUS: previous release directory");
+    let (old_version, old_binary) = previous_release::previous_release(&w.root.join("old-release"));
+    let old_data = w.root.join("old-data");
+    let old_cfg = w.root.join("old-config");
+    let old_home = w.root.join("old-home");
+    std::fs::create_dir_all(&old_home).expect("APPARATUS: old HOME");
+    let old_command = |args: &[&str]| {
+        let mut command = Command::new(&old_binary);
+        command
+            .env_clear()
+            .env("HOME", &old_home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("VOX_DATA_DIR", &old_data)
+            .env("VOX_CONFIG_DIR", &old_cfg)
+            .env("VOX_IDENTITY_PASSPHRASE", "published identity")
+            .env("VOX_NODE", "published")
+            .env("VOX_LISTEN", "127.0.0.1:0")
+            .env("VOX_PROXY", "127.0.0.1:0")
+            .args(args);
+        command
+    };
+    let old_run = |args: &[&str], input: Option<&str>| {
+        let mut command = old_command(args);
+        if typed::is_keyring_change(args) {
+            let (ok, text) = typed::keyring(&command);
+            assert!(ok, "APPARATUS: published trust command failed: {text}");
+            return text;
+        }
+        let mut child = command
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("APPARATUS: published vox");
+        if let Some(input) = input {
+            child
+                .stdin
+                .take()
+                .expect("APPARATUS: published stdin")
+                .write_all(input.as_bytes())
+                .expect("APPARATUS: published input");
+        }
+        let out = child
+            .wait_with_output()
+            .expect("APPARATUS: published output");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success(),
+            "PRODUCT: published {old_version} `vox {}` failed: {text}",
+            args.join(" ")
+        );
+        text
+    };
+    old_run(&["node", "create", "published"], None);
+    old_run(&["node", "attach", "published"], None);
+    let _old_daemon = Daemon(old_data.clone());
+    let old_fp = old_run(&["id"], None).trim().to_owned();
+    old_run(&["trust", "add", &agent_fp, "--name", AGENT], None);
+    old_run(
+        &["room", "join", "--passphrase-file", "-", &link],
+        Some("room passphrase\n"),
+    );
+    w.staged(
+        AGENT,
+        &["trust", "add", &old_fp, "--name", "published", "--drive"],
+        None,
+    );
+    prompt["prompt"] = "STEP WITH PUBLISHED READER".into();
+    w.hook_done(&room, &prompt);
+    w.staged(
+        AGENT,
+        &["room", "post", &room, "ordinary message after public floor"],
+        None,
+    );
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let text = old_run(&["room", "read", &room], None);
+        if text.contains("ordinary message after public floor") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: public floor interrupted published {old_version} room sync: {text}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    old_run(
+        &[
+            "room",
+            "post",
+            &room,
+            "ordinary reply from published reader",
+        ],
+        None,
+    );
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let text = w.staged(AGENT, &["room", "read", &room], None);
+        if text.contains("ordinary reply from published reader") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: current node lost published peer's ordinary reply: {text}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    println!("[proof] join and drive boundaries hold at author and relay; published {old_version} exchanges ordinary messages across floor controls");
 }
