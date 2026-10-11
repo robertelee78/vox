@@ -1466,6 +1466,53 @@ fn daemon_restart_claim(
             .status();
     }
 
+    // Exercise the current client's remaining callers against the other real release. This
+    // direction lets the already-compiled next-version fixture remain independent of the fix.
+    for args in [
+        vec!["daemon", "--node", "kept"],
+        vec!["node", "detach", "kept"],
+        vec!["node", "rename", "kept", "renamed-by-mismatch"],
+    ] {
+        let refusal = said(&vox(Path::new(VOX), home, &args, &env));
+        claims.push(claim(
+            "daemon.all_callers_preserve_version_refusal",
+            refusal.contains(VERSION)
+                && refusal.contains(&next)
+                && refusal.contains("vox daemon --restart")
+                && !refusal.contains("no vox daemon answers")
+                && !refusal.contains("passphrase"),
+            format!("the current release's {} said {refusal:?}", args.join(" ")),
+        ));
+    }
+    let (_, _, after_refusals) = listed(&link);
+    claims.push(claim(
+        "daemon.mismatched_rename_preserves_attached_node",
+        after_refusals
+            .lines()
+            .any(|l| l.split_whitespace().take(2).eq(["kept", "attached"]))
+            && !after_refusals.contains("renamed-by-mismatch"),
+        format!("after the refused rename, vox node list said {after_refusals:?}"),
+    ));
+    // Uninstall an independent managed copy of this release while the scratch account still
+    // runs the other release. It must stop that authenticated daemon before removing its copy.
+    let removal = tmpdir();
+    let uninstall = if bundle {
+        #[cfg(target_os = "macos")]
+        {
+            bundle_install(removal.path(), Some("stable"))
+        }
+        #[cfg(not(target_os = "macos"))]
+        unreachable!("macOS bundle")
+    } else {
+        install_dir(removal.path(), "stable").join("vox")
+    };
+    let removed = said(&vox(&uninstall, home, &["uninstall"], &env));
+    claims.push(claim(
+        "daemon.uninstall_stops_another_local_version",
+        removed.contains("stopped the vox daemon (pid "),
+        format!("uninstall against the other release's daemon said {removed:?}"),
+    ));
+
     // Every vox this left running is stopped, by its pid: whichever holds the account's files.
     for pid in holders(&data) {
         let _ = Command::new("/bin/kill").arg(pid).status();
