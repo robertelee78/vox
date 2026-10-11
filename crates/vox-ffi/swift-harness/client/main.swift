@@ -266,7 +266,7 @@ do {
 
     // One-step sharing (ADR-028 S-4, #444): what listens here, what sharing it says, then share.
     let port = UInt16(readLine() ?? "") ?? 0
-    let here = await client.listening()
+    let here = try await client.listening()
     for s in here.services where s.port == port {
         say("LISTENING \(s.line) EVERY \(s.everyInterface)")
     }

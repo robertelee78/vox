@@ -5864,6 +5864,14 @@ impl IpcClient {
     ///
     /// Any failure leaves the connection [broken](Self::is_broken).
     pub async fn request(&mut self, req: &Request) -> Result<Frame> {
+        if self.broken {
+            return Err(Error::MalformedIpc(
+                "the connection broke; open a new connection",
+            ));
+        }
+        // A caller may cancel this future at any await, including a half-written frame. Leave
+        // it broken in that case too; only a complete exchange makes it reusable (WT-2).
+        self.broken = true;
         let Self {
             stream, path, node, ..
         } = self;
@@ -5878,7 +5886,7 @@ impl IpcClient {
             Frame::from_bytes(&body)
         };
         let out = while_answering(path, node.as_ref(), exchange).await;
-        self.broken |= out.is_err();
+        self.broken = out.is_err();
         out
     }
 
@@ -5897,6 +5905,12 @@ impl IpcClient {
     /// # Errors
     /// If the node cannot be reached, or hangs up before it answers.
     pub async fn exchange(&mut self, body: &[u8]) -> Result<Vec<u8>> {
+        if self.broken {
+            return Err(Error::MalformedIpc(
+                "the connection broke; open a new connection",
+            ));
+        }
+        self.broken = true;
         let Self {
             stream, path, node, ..
         } = self;
@@ -5910,7 +5924,7 @@ impl IpcClient {
             }
         };
         let out = while_answering(path, node.as_ref(), exchange).await;
-        self.broken |= out.is_err();
+        self.broken = out.is_err();
         out
     }
 

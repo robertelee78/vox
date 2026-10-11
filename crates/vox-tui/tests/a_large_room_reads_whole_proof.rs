@@ -75,6 +75,138 @@ const SESSION_ENTRY: usize = 300;
 /// The harness session id of alice's agent.
 const SESSION: &str = "5b1d0c6e-7a2f-4e3b-8c9d-large-room-session";
 
+/// A transport delay on the app's held connection must not leave its controls waiting for ever.
+/// The daemon stays responsive to other connections: this specifically exercises the FFI's
+/// total bound, beyond the core's daemon-liveness probe. The next request must open a new
+/// connection, and the node must stay Ready (ADR-034 WT-1, WT-2, WT-5; #698).
+#[test]
+#[ignore = "real daemon and the app's 60-second request deadline; run in release on demand"]
+fn an_app_request_times_out_and_reconnects_without_losing_its_node() {
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    watchdog::arm();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("APPARATUS: runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: scratch profile");
+    // The shared journey proves readability by exchanging rows, so it needs two members.
+    let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
+    let alice = &room.workers[0];
+    let node = alice.paths.account().nodes_on_disk()[0].clone();
+    let socket = alice.paths.account().socket();
+    let upstream = socket.with_extension("upstream");
+    std::fs::rename(&socket, &upstream).expect("APPARATUS: move scratch daemon socket");
+    let listener = UnixListener::bind(&socket).expect("APPARATUS: bind delayed transport");
+    let armed = Arc::new(AtomicBool::new(false));
+    let delayed = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    // Let the one held reply go on panic too; no paused worker or daemon survives this proof.
+    struct Release(Arc<AtomicBool>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let _release = Release(Arc::clone(&release));
+    let (arm_proxy, delayed_proxy, release_proxy) = (
+        Arc::clone(&armed),
+        Arc::clone(&delayed),
+        Arc::clone(&release),
+    );
+    std::thread::spawn(move || {
+        for accepted in listener.incoming() {
+            let Ok(mut down) = accepted else { break };
+            let Ok(mut up) = UnixStream::connect(&upstream) else {
+                break;
+            };
+            let Ok(mut down_read) = down.try_clone() else {
+                break;
+            };
+            let Ok(mut up_write) = up.try_clone() else {
+                break;
+            };
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut down_read, &mut up_write);
+                let _ = up_write.shutdown(std::net::Shutdown::Write);
+            });
+            let (armed, delayed, release) = (
+                Arc::clone(&arm_proxy),
+                Arc::clone(&delayed_proxy),
+                Arc::clone(&release_proxy),
+            );
+            std::thread::spawn(move || {
+                let mut bytes = [0; 8192];
+                while let Ok(n) = up.read(&mut bytes) {
+                    if n == 0 {
+                        break;
+                    }
+                    if armed.swap(false, Ordering::SeqCst) {
+                        delayed.store(true, Ordering::SeqCst);
+                        while !release.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                    }
+                    if down.write_all(&bytes[..n]).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    let client = rt
+        .block_on(vox_ffi::VoxClient::open(
+            alice.data.to_string_lossy().into_owned(),
+        ))
+        .expect("PRODUCT: the app could not connect to the running daemon");
+    let pass = vox_ffi::Passphrase::new(support::ID_PASS.as_bytes().to_vec())
+        .expect("APPARATUS: passphrase");
+    rt.block_on(client.attach(node.as_str().to_owned(), Some(pass)))
+        .expect("PRODUCT: the app could not attach its node");
+    armed.store(true, Ordering::SeqCst);
+    let began = Instant::now();
+    let answer = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(65), client.sessions(room.id.clone())).await
+    });
+    assert!(
+        delayed.load(Ordering::SeqCst),
+        "APPARATUS: no app reply was delayed"
+    );
+    let answer = answer.expect("PRODUCT: the app's request still waits after its 60-second bound");
+    let reason = answer
+        .expect_err("PRODUCT: the app answered before the delayed reply arrived")
+        .to_string();
+    assert!(
+        reason.contains("60 seconds"),
+        "PRODUCT: the app's deadline said: {reason}"
+    );
+    release.store(true, Ordering::SeqCst);
+    let next = rt.block_on(client.sessions(room.id.clone()));
+    assert!(
+        next.is_ok(),
+        "PRODUCT: the app's next request could not reconnect: {next:?}"
+    );
+    let state = alice.vox(None, &["status", "--json"]);
+    assert!(
+        state.ok,
+        "PRODUCT: the node was not Ready after the app reconnected: {state:?}"
+    );
+    let nodes = alice.vox(None, &["node", "list"]);
+    assert!(
+        nodes.ok
+            && nodes.stdout.lines().any(|l| l.contains(node.as_str())
+                && (l.contains("Ready") || l.contains("ready") || l.contains("attached"))
+                && !l.contains("detached")),
+        "PRODUCT: the app's node did not stay Ready: {nodes:?}"
+    );
+    rt.block_on(client.close());
+    eprintln!("[proof] delayed app reply ended in {reason} after {:?}; the next call succeeded and the node stayed Ready", began.elapsed());
+}
+
 /// Entry `n` of alice's Session, in the harnesses' activity format: a reply of about
 /// [`SESSION_ENTRY`] bytes, its words naming it.
 fn session_entry(n: usize) -> (String, String) {

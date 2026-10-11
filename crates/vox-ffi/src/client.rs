@@ -1554,8 +1554,18 @@ impl VoxClient {
         T: Send + 'static,
         F: std::future::Future<Output = Result<T, VoxError>> + Send + 'static,
     {
+        // This includes waiting for the held-connection mutex: another stalled call must not
+        // leave every control in the app waiting behind it (ADR-034 WT-1). The deadline
+        // cancels its exchange; IpcClient marks an exchange broken before its first write, so
+        // the next call opens a fresh connection while retaining the node's hold (WT-2, WT-5).
         self.rt
-            .spawn(fut)
+            .spawn(async move {
+                tokio::time::timeout(std::time::Duration::from_secs(60), fut)
+                    .await
+                    .unwrap_or_else(|_| Err(VoxError::Unknown {
+                        reason: "vox did not finish this request within 60 seconds; its outcome is unknown. Try again to reconnect.".into(),
+                    }))
+            })
             .await
             .map_err(|_| failed("the app's connection to vox stopped"))?
     }
@@ -2521,13 +2531,17 @@ impl VoxClient {
     /// **Read here, in the app's process, not by the daemon**, as `vox serve` and the TUI read it:
     /// unprivileged, `lsof` and `ss` see what the user running them may see, and the person
     /// sharing is the app's user. It needs no node attached.
-    pub async fn listening(&self) -> ListeningServices {
+    /// # Errors
+    /// The local service lookup failed or did not finish within the app's request bound.
+    pub async fn listening(&self) -> Result<ListeningServices, VoxError> {
         let found = self
-            .rt
-            .spawn_blocking(vox_core::node::probe::listening)
-            .await
-            .unwrap_or_default();
-        ListeningServices {
+            .on_rt(async {
+                tokio::task::spawn_blocking(vox_core::node::probe::listening)
+                    .await
+                    .map_err(|_| failed("the local service lookup stopped before it answered"))
+            })
+            .await?;
+        Ok(ListeningServices {
             services: found
                 .iter()
                 .map(|l| ListeningService {
@@ -2544,7 +2558,7 @@ impl VoxClient {
                 })
                 .collect(),
             may_be_missing: vox_core::node::probe::MAY_BE_MISSING.to_owned(),
-        }
+        })
     }
 
     /// What sharing the service listening on `port` would do (ADR-028 S-4), said before it is
