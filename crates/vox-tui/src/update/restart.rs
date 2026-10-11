@@ -150,11 +150,21 @@ async fn restart_checked(
     // can ask its matching daemon for the names of services/forwards about to end. A repair
     // from a different release reads Hello only, as every other mismatched client must.
     let held = if before.version == env!("CARGO_PKG_VERSION") {
-        tokio::time::timeout(Duration::from_secs(10), held_names(account, &attached))
-            .await
-            .map_err(|_| {
-                AppError::Usage("the daemon did not name its held sessions within 10 s".into())
-            })??
+        match tokio::time::timeout(Duration::from_secs(10), held_names(account, &attached)).await {
+            Ok(Ok(names)) => names,
+            result => {
+                let why = match result {
+                    Ok(Err(e)) => e.to_string(),
+                    Err(_) => "the daemon did not answer within 10 s".to_owned(),
+                    Ok(Ok(_)) => unreachable!("successful snapshot handled above"),
+                };
+                println!(
+                    "held session names could not be determined for nodes {}: {why}; restarting the daemon",
+                    attached.iter().map(NodeName::as_str).collect::<Vec<_>>().join(", ")
+                );
+                Vec::new()
+            }
+        }
     } else {
         Vec::new()
     };

@@ -904,7 +904,7 @@ pub async fn node_rename(args: &NodeArgs, old: &str, new: &str) -> Result<(), Ap
         .node_paths(&old)
         .ok()
         .and_then(|p| p.shown_fingerprint());
-    let was_attached = attached(&account, &old).await;
+    let was_attached = attached(&account, &old).await?;
     let kept = crate::host::read_attach_file(&account.attach_file())
         .into_iter()
         .find(|(n, _)| *n == old)
@@ -1008,7 +1008,7 @@ pub async fn node_rename(args: &NodeArgs, old: &str, new: &str) -> Result<(), Ap
             let Ok(paths) = account.node_paths(&other) else {
                 continue;
             };
-            if !attached(&account, &other).await {
+            if !attached(&account, &other).await? {
                 println!(
                     "vox: node {other} is not attached, so its keyring is not read here; if it \
                      names {old}: vox trust rename {b32} {new} --node {other}"
@@ -1080,7 +1080,7 @@ pub async fn node_forget_passphrase(args: &NodeArgs, name: &str) -> Result<(), A
                 "vox: node {name}'s passphrase is forgotten: nothing is stored for it in the \
                  Keychain, and the daemon no longer attaches it by itself when it starts"
             );
-            if attached(&account, &name).await {
+            if attached(&account, &name).await? {
                 println!(
                     "vox: node {name} stays attached now; `vox node detach {name}` detaches it"
                 );
@@ -1113,17 +1113,21 @@ pub async fn attach_with(
 }
 
 /// Whether node `name` is attached to the account's running daemon now: `false` with no daemon.
-pub async fn attached(account: &Account, name: &NodeName) -> bool {
-    let Ok(mut d) = DaemonClient::open(&account.socket()).await else {
-        return false;
+pub async fn attached(account: &Account, name: &NodeName) -> Result<bool, AppError> {
+    let mut d = match DaemonClient::open(&account.socket()).await {
+        Ok(d) => d,
+        Err(e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Version { .. })) => {
+            return Err(AppError::Usage(e.to_string()));
+        }
+        Err(_) => return Ok(false),
     };
     let nodes = match d.request(DaemonRequest::Nodes).await {
         Ok(DaemonFrame::Nodes(n)) => n,
         _ => d.attached.clone(),
     };
-    nodes
+    Ok(nodes
         .iter()
-        .any(|n| &n.name == name && matches!(n.state, NodeState::Attached))
+        .any(|n| &n.name == name && matches!(n.state, NodeState::Attached)))
 }
 
 /// `vox node detach <name>`: detach it (L-3); its connections close and its keys are wiped.
@@ -1265,6 +1269,12 @@ pub(crate) const START_DAEMON: &str = if cfg!(target_os = "macos") {
 /// The daemon, or why there is none.
 async fn daemon(account: &Account) -> Result<DaemonClient, AppError> {
     DaemonClient::open(&account.socket()).await.map_err(|e| {
+        if matches!(
+            &e,
+            vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Version { .. })
+        ) {
+            return AppError::Usage(e.to_string());
+        }
         AppError::Usage(format!(
             "no vox daemon answers at {} ({e}); to start one, {START_DAEMON}",
             account.socket().display()

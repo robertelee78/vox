@@ -95,7 +95,7 @@ async fn first_missing(args: &NodeArgs, key: &str, dir: &Path) -> Result<String,
             ),
         ));
     }
-    if !crate::client::attached(&account, &node).await {
+    if !crate::client::attached(&account, &node).await? {
         return Ok(format!(
             "Vox: {} is node {node} here, and {node} is not attached, so this session is in no \
              Vox room. Tell the operator, in these words: \"Node {node} is not attached. Run \

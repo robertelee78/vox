@@ -365,16 +365,14 @@ fn stop_daemon(plan: &mut Plan, account: &Account) {
         return;
     };
     plan.step(format!("stop the vox daemon (pid {pid})"), move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?;
-        rt.block_on(async {
-            use vox_core::node::daemonipc::{DaemonClient, DaemonRequest};
-            if let Ok(mut d) = DaemonClient::open(&socket).await {
-                let _ = d.request(DaemonRequest::Stop).await;
-            }
-        });
+        // Hello authenticates this pid against the local socket's kernel peer credentials.
+        // Termination works across releases without sending an incompatible IPC request.
+        let process = i32::try_from(pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .ok_or_else(|| "the daemon gave an invalid process id".to_owned())?;
+        rustix::process::kill_process(process, rustix::process::Signal::TERM)
+            .map_err(|e| format!("the daemon could not be stopped: {e}"))?;
         if gone_within(pid, END_WITHIN) {
             Ok(format!("stopped the vox daemon (pid {pid})"))
         } else {
@@ -393,7 +391,7 @@ fn daemon_pid(socket: &Path) -> Option<u32> {
         .build()
         .ok()?;
     rt.block_on(async {
-        vox_core::node::daemonipc::DaemonClient::open(socket)
+        vox_core::node::daemonipc::DaemonClient::observe(socket)
             .await
             .ok()
             .map(|d| d.pid)
