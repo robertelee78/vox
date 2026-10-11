@@ -74,15 +74,21 @@ impl Node {
                     )
                 })
                 .await;
-                if let Some(opened) = opened {
-                    let _ = tx
-                        .send(NetEvent::StoreReopened {
-                            channel_id: id,
-                            original,
-                            opened: Box::new(opened),
-                        })
-                        .await;
-                }
+                // A cancelled/panicked worker must leave the same retry path as a failed
+                // reopen. Otherwise busy remains true and this room can never recover.
+                let opened = opened.unwrap_or_else(|| {
+                    Err(crate::error::Error::Storage {
+                        op: "recover room",
+                        detail: "the recovery worker stopped before completion; retrying".into(),
+                    })
+                });
+                let _ = tx
+                    .send(NetEvent::StoreReopened {
+                        channel_id: id,
+                        original,
+                        opened: Box::new(opened),
+                    })
+                    .await;
             });
         }
     }

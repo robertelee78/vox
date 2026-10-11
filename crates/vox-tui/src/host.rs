@@ -2668,6 +2668,8 @@ async fn post_in_order(
     let mut source_ended = false;
     let mut dropped_first = String::new();
     let mut dropped_last = String::new();
+    let mut held_reason = "the room was not yet ready to accept entries".to_owned();
+    let mut dropped_reasons = std::collections::BTreeSet::new();
     let identify = |body: &str| {
         let v = serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
         format!(
@@ -2710,7 +2712,8 @@ async fn post_in_order(
                 }
                 dropped_last = identify(&old);
                 dropped += 1;
-                eprintln!("vox daemon: {node}: session {session}: lost {dropped} held entries, from {dropped_first} through {dropped_last}; the room could not save before its 4 MiB hold filled");
+                dropped_reasons.insert(held_reason.clone());
+                eprintln!("vox daemon: {node}: session {session}: lost {dropped} held entries, from {dropped_first} through {dropped_last}; its 4 MiB hold filled while {held_reason}");
             }
         } else if held.is_empty() {
             return;
@@ -2745,6 +2748,7 @@ async fn post_in_order(
         };
         let joins = lock(&router.inner.joins).get(&node).cloned();
         if joins.as_ref().is_some_and(|j| j.under_way(&room_b32)) {
+            held_reason = "the room was still joining".to_owned();
             continue;
         }
         let member = handle.view().channels.iter().any(|c| c.channel_id == room);
@@ -2755,6 +2759,7 @@ async fn post_in_order(
             }
             dropped_last = held.back().map(|b| identify(b)).unwrap_or_default();
             dropped += held.len() as u64;
+            dropped_reasons.insert("the room's join failed".to_owned());
             held.clear();
             held_bytes = 0;
             continue;
@@ -2769,14 +2774,16 @@ async fn post_in_order(
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
                     "text": format!(
-                        "{dropped} {} of this session {} lost while its room could not save: from {dropped_first} through {dropped_last}",
+                        "{dropped} {} of this session {} lost while held: from {dropped_first} through {dropped_last}; {}",
                         if dropped == 1 { "entry" } else { "entries" },
-                        if dropped == 1 { "was" } else { "were" }
+                        if dropped == 1 { "was" } else { "were" },
+                        dropped_reasons.iter().cloned().collect::<Vec<_>>().join("; ")
                     ),
                 })
                 .to_string();
                 if append_entry(&handle, room, &session, &notice).await.is_ok() {
                     dropped = 0;
+                    dropped_reasons.clear();
                 }
             }
             match append_entry(&handle, room, &session, &body).await {
@@ -2792,7 +2799,10 @@ async fn post_in_order(
                 // Not open yet: held, and tried again.
                 Err(vox_core::node::api::Outcome::Failed(
                     vox_core::node::api::Fault::ChannelNotOpen,
-                )) => break,
+                )) => {
+                    held_reason = "the room was not open".to_owned();
+                    break;
+                }
                 Err(vox_core::node::api::Outcome::Failed(vox_core::node::api::Fault::Storage)) => {
                     let cause = handle
                         .status()
@@ -2805,6 +2815,7 @@ async fn post_in_order(
                                 .map(|u| u.message)
                         })
                         .unwrap_or_else(|| "the room cannot save".into());
+                    held_reason = cause.clone();
                     if failing.as_deref() != Some(cause.as_str()) {
                         eprintln!("vox daemon: {node}: room {room_b32}: session {session}: entries are held until it recovers: {cause}");
                         failing = Some(cause);
