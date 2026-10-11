@@ -341,6 +341,12 @@ impl core::fmt::Debug for ReceiverChain {
 }
 
 impl ReceiverChain {
+    /// An iteration at or after the verified key release, or an older one whose skipped key
+    /// is still held. No iteration before the release can be derived from this chain.
+    pub(crate) fn can_open_iteration(&self, iteration: u64) -> bool {
+        iteration >= self.next_iteration || self.skipped.contains_key(&iteration)
+    }
+
     /// Build a receiver chain from a **verified** SKDM. The caller MUST have
     /// called [`Skdm::verify`] (or [`Skdm::verify_and_signing_key`]) first; this
     /// re-verifies the SKDM against `author_root` and the expected channel/epoch

@@ -177,14 +177,28 @@ impl ChannelState {
             msg.header.epoch,
             msg.header.chain_id,
         );
-        self.drive.floors.get(&key).is_some_and(|(iteration, seq)| {
-            msg.header.iteration >= *iteration
-                && entry.skeleton.seq >= *seq
-                && self
-                    .admission(recipient)
-                    .1
-                    .is_none_or(|at| entry.skeleton.claimed_ms >= at)
-        })
+        if self
+            .admission(recipient)
+            .1
+            .is_some_and(|at| entry.skeleton.claimed_ms < at)
+        {
+            return false;
+        }
+        if let Some((iteration, seq)) = self.drive.floors.get(&key) {
+            return msg.header.iteration >= *iteration && entry.skeleton.seq >= *seq;
+        }
+        // A published older author has no public floor record. This receiver can still
+        // establish its own grant from the verified SKDM's chain: it cannot derive a key
+        // before that release. This local evidence grants no forwarding rights to others.
+        // After restart the sealed receiver state retains its live and skipped keys; already
+        // rendered history remains in the cache, without inventing old grants for relays.
+        *recipient == self.me()
+            && msg.header.epoch == self.epoch
+            && self
+                .drive
+                .receivers
+                .get(&(entry.skeleton.author_id, msg.header.chain_id))
+                .is_some_and(|chain| chain.can_open_iteration(msg.header.iteration))
     }
 
     /// Keep signed skeletons while withholding bodies older than the recipient's authorization.

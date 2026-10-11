@@ -6178,6 +6178,9 @@ impl ChannelState {
             return Err(Error::SizeLimitExceeded("room drive keys"));
         }
         self.drive.receivers.insert(slot, chain);
+        // An older author may have served a skeleton before its authenticated release arrived.
+        // Its newly available local key makes eligible bodies worth asking for again now.
+        self.drive.omitted.clear();
         self.persist_drive(store)?;
         let before = self.drive.sessions.len();
         self.backfill(store, &skdm.body.author_id, now_ms)?;
