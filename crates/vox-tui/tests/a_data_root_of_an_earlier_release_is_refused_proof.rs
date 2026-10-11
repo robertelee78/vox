@@ -572,14 +572,14 @@ fn a_data_root_of_the_previous_release_opens_with_nothing_lost() {
     );
     assert_upgrade_steps(&r.workers[0], &r.id, true);
     assert_retention(&r.workers[0], &r.id, 0, 7 * 86400);
-    for ttl in ["1d", "7d"] {
+    for (ttl, seconds) in [("1d", 86400), ("7d", 7 * 86400)] {
         let o = r.workers[0].vox(None, &["room", "retention", &r.id, "--steps", ttl]);
         assert!(
             o.ok,
             "PRODUCT: the administrator could not set separate step retention: {o:?}"
         );
+        assert_retention(&r.workers[0], &r.id, 0, seconds);
     }
-    assert_retention(&r.workers[0], &r.id, 0, 7 * 86400);
     let compatible = "published peer after the step policy update";
     let o = legacy.vox(None, &["room", "post", &r.id, compatible]);
     assert!(
