@@ -528,11 +528,7 @@ impl Wiring {
     /// Install the hook and the skill for `node`: what was written, as a person reads it.
     pub(crate) fn install(&self, node: &NodeName) -> Result<Vec<String>, AppError> {
         let hook = self.hook_file();
-        match self.key {
-            "claude" => merge_hooks(&hook, &crate::agent_hook::claude_settings(node))?,
-            "codex" => merge_hooks(&hook, &crate::agent_hook::codex_hooks(node))?,
-            _ => write(&hook, &crate::agent_hook::opencode_plugin(node))?,
-        }
+        self.install_hook(node)?;
         let mut said = vec![format!("installed the hook in {}", hook.display())];
         said.extend(
             crate::skill_pack::install_into(&self.skill_dir())?
@@ -540,6 +536,25 @@ impl Wiring {
                 .map(crate::skill_pack::Done::said),
         );
         Ok(said)
+    }
+
+    /// Change the hook's node without reinstalling unrelated skills (ADR-031 RN-1). A file
+    /// marked read-only stays so: an atomic replacement must not bypass that choice.
+    pub(crate) fn rename_node(&self, node: &NodeName) -> Result<(), AppError> {
+        let hook = self.hook_file();
+        if std::fs::metadata(&hook).is_ok_and(|m| m.permissions().readonly()) {
+            return Err(AppError::Usage(format!("{} is read-only", hook.display())));
+        }
+        self.install_hook(node)
+    }
+
+    fn install_hook(&self, node: &NodeName) -> Result<(), AppError> {
+        let hook = self.hook_file();
+        match self.key {
+            "claude" => merge_hooks(&hook, &crate::agent_hook::claude_settings(node)),
+            "codex" => merge_hooks(&hook, &crate::agent_hook::codex_hooks(node)),
+            _ => write(&hook, &crate::agent_hook::opencode_plugin(node)),
+        }
     }
 }
 
