@@ -34,8 +34,12 @@ under it:
   `vox status` said "healthy: nothing needs attention". The post said "an internal error — a bug in
   vox".
 
-Later, Services showed a "Share a service" spinner that never resolved. This ADR states, as
-requirements, what each of these broke.
+Later, Services showed a "Share a service" spinner that never resolved. And the app could not be
+quit: the decider found no Quit ⌘Q in its menus ("but no command-q option"; ⌘W closes the window).
+In the code, `applicationShouldTerminate` returns `.terminateLater` while the app holds a node and
+waits for `model.quit()` with no bound, so on a wedged connection quitting never ends either. Why
+the menu item is missing is to be found when it is fixed. This ADR states, as requirements, what
+each of these broke.
 
 ## Requirements
 
@@ -117,7 +121,17 @@ requirements, what each of these broke.
 - **PR-3.** The New Room sheet MUST keep what the person typed until the create ends, MUST show the
   create in progress, and MUST NOT say "No passphrase" for a room created with one.
 
-### 8. Proof
+### 8. Quitting
+
+- **QT-1.** The app's Vox menu MUST hold **Quit Vox** with ⌘Q, and the proof MUST find it in the
+  running app's menu bar by its words and its shortcut.
+- **QT-2.** Quit Vox and ⌘Q MUST always quit the app promptly, whatever state the daemon, the node
+  or the connection is in. Letting go of the node (ADR-028 A-4) MUST be bounded, to a few seconds,
+  and MUST NOT block quitting: at the bound the app MUST quit anyway.
+- **QT-3.** When letting go of the node did not finish within the bound, the app MUST say so at its
+  next start, in one sentence naming the node and its state as the daemon reports it then.
+
+### 9. Proof
 
 - **PF-1.** Each claim above MUST be proved by real use of the shipped binary or the shipped app
   (ADR-018 §9), each with a mutant that turns its proof red on its own assertion, labelled PRODUCT
@@ -131,6 +145,8 @@ requirements, what each of these broke.
 | ADR line | Was | Now |
 |---|---|---|
 | ADR-014 M-29 | The update asks the person to restart the app and the daemon | The update restarts the daemon itself (UP-1); a client refuses a daemon only on a real incompatibility (UP-2) |
+| ADR-014 M-21 | The menus as listed, with no Quit named | The Vox menu holds Quit Vox ⌘Q (QT-1) |
+| ADR-028 A-4 | Quitting detaches the node, with no bound | Letting go of the node is bounded and never blocks quitting (QT-2, QT-3) |
 | ADR-026 C-4 | `Hello` reports the daemon's version | `Hello` also carries protocol versions and capabilities; a client refuses only when no protocol is shared or an action's capability is missing, never on version alone (UP-2); both versions are named when they differ (UP-3) |
 
 ## Consequences
@@ -138,6 +154,8 @@ requirements, what each of these broke.
 - An update ends the held sessions (`vox serve`, `vox forward` and the like) running on the old
   daemon, and says so.
 - Readers of long lists make more round trips.
+- Quitting never waits on the daemon; a node the app could not let go of in time is reported at the
+  next start.
 - A client and a daemon of different versions keep working together wherever they share a protocol
   and the capabilities an action needs; the person sees both versions named.
 - A room that ran out of disk loses nothing written after space returns, and the person is told
@@ -145,8 +163,8 @@ requirements, what each of these broke.
 
 ## Related ADRs
 
-Depends on ADR-014, ADR-018, ADR-026, ADR-028. Amends ADR-014 (M-29) and ADR-026 (C-4). Cited:
-ADR-008, ADR-010, ADR-016, ADR-025, ADR-029, ADR-031.
+Depends on ADR-014, ADR-018, ADR-026, ADR-028. Amends ADR-014 (M-21, M-29), ADR-026 (C-4) and
+ADR-028 (A-4). Cited: ADR-008, ADR-010, ADR-016, ADR-025, ADR-029, ADR-031.
 
 ## Engineering Mantra
 

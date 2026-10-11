@@ -45,7 +45,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [031](ADR-031-agent-nodes-join-a-repo-room-by-themselves.md) | Agent Nodes Join a Repo's Room by Themselves (a hook from install, setup in the app, trust between one machine's nodes, Ready or Locked, `vox node unlock`/`lock`, Sessions need drive and their records are sealed) — accepted for v0.4.4 | 020, 026, 028, 029 |
 | [032](ADR-032-anchors-are-found-added-and-kept-per-machine.md) | Anchors Are Found, Added and Kept per Machine (a room's anchors set at creation, by hand or by a search the person chooses, changed only by its creator or an admin; a machine's hand-added list; shown with source and reach) — accepted for v0.4.4 | 012, 026 |
 | [033](ADR-033-the-repo-room-is-where-agents-work-together.md) | The Repo Room Is Where Agents Work Together (threads, pause, room marks, the composer, Session tabs, who does what from the room's claims only) — accepted for v0.4.4 | 020, 021, 028, 029, 031 |
-| [034](ADR-034-the-app-and-daemon-never-hang-or-hide-a-failure.md) | The App and the Daemon Never Hang or Hide a Failure (updates restart the daemon, refusal only on a real incompatibility, bounded waits, paged replies, a room that cannot save recovers, true health, bounded logs) — accepted for v0.4.4 | 014, 018, 026, 028 |
+| [034](ADR-034-the-app-and-daemon-never-hang-or-hide-a-failure.md) | The App and the Daemon Never Hang or Hide a Failure (updates restart the daemon, refusal only on a real incompatibility, bounded waits, paged replies, a room that cannot save recovers, true health, bounded logs, Quit always quits) — accepted for v0.4.4 | 014, 018, 026, 028 |
 
 ## Tiers
 
@@ -107,7 +107,7 @@ planned. This is the roll-up.
 | 031 | accepted for v0.4.4 (the decider, 2026-10-10), **not built**; amends 014, 020, 026, 028, 029 |
 | 032 | accepted for v0.4.4 (the decider, 2026-10-10), **not built**; amends 012, 017, 026, 028 |
 | 033 | accepted for v0.4.4 (the decider, 2026-10-10), **not built**; amends 014, 028, 029 |
-| 034 | accepted for v0.4.4 (the decider, 2026-10-10), **not built**; amends 014, 026 |
+| 034 | accepted for v0.4.4 (the decider, 2026-10-10), **not built**; amends 014, 026, 028 |
 
 ## Conformance-vector obligations
 
