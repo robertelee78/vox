@@ -138,7 +138,11 @@ we're working on hot fixes -- but this needs to be codified into ADRs, projects/
 - **FR-9. Bounded fields.** Every free-text field a member writes that ends up in a list row (a
   Session's name and harness, and every other such field) MUST have a length bound. A write over
   it MUST be refused, where it is written, with one plain sentence naming the field and its bound;
-  it MUST NOT be cut short in silence. The bounds MUST be stated in the manual.
+  it MUST NOT be cut short in silence. The bounds MUST be stated in the manual. The bounds are: a
+  Session's name 128 characters; its harness 32 characters; every other such field 256
+  characters, unless a tighter bound already applies to it. A longer value that a peer of an
+  earlier release wrote MUST be stored as received and shown cut with "…"; the cut is in display
+  only. (The lead's ruling, 2026-10-10, under the decider's delegation of engineering calls.)
 - **FR-10. An oversized reply is an error, not a desync.** FR-2's error MUST name the request
   whose reply was too large, and the connection MUST stay usable for the next request.
 
@@ -220,7 +224,8 @@ we're working on hot fixes -- but this needs to be codified into ADRs, projects/
   length (FR-4, FR-5).
 - FR-7–FR-10 change only the protocol between a client and its own daemon, which UP-2 holds to
   one version, so peers of other releases are unaffected by them. FR-9 refuses only what this node
-  writes; a longer field a peer of an earlier release wrote still arrives (an open question below).
+  writes; a longer field a peer of an earlier release wrote still arrives, is stored as received,
+  and is shown cut with "…" (FR-9).
 - Quitting never waits on the daemon; a node the app could not let go of in time is reported at the
   next start.
 - A client and a daemon of different versions do not work together until the daemon is restarted
@@ -232,9 +237,6 @@ we're working on hot fixes -- but this needs to be codified into ADRs, projects/
 
 ## Open questions
 
-- **FR-9's bounds.** The length bound for each member-written field (a Session's name, its
-  harness and the rest) is not yet stated. What a node shows of a longer field that a peer of an
-  earlier release wrote, cut with a mark or shown whole within FR-7's byte bound, is also open.
 - **FR-6's bounds and weight.** The time and memory bounds are not yet stated by the decider, and a
   100,000-entry proof is heavy: whether it blocks the release or is an optional proof (the cargo
   feature `optional-proofs`, ADR-018) is the decider's call. Whether a room of 100,000 messages is
