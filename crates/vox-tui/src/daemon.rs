@@ -235,6 +235,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
             }
         },
     };
+    let _log = crate::daemon_log::Capture::start(&account.log_file(), !args.as_detached)?;
     let router = serving.router.clone();
     router.attach_kept();
 
@@ -629,13 +630,13 @@ fn attach_foreground(
             rt.block_on(open_rooms_by_line(&handle, &line));
         }
     }
-    say_held(&handle, account);
+    say_held(&handle, account, node);
     Ok(None)
 }
 
 /// The lines a started daemon prints: what is held, by id, because the names cannot be shown for
 /// rooms that stayed closed and a silent daemon is how that went unnoticed.
-fn say_held(handle: &vox_core::node::actor::NodeHandle, account: &Account) {
+fn say_held(handle: &vox_core::node::actor::NodeHandle, account: &Account, node: &NodeName) {
     let view = handle.view();
     let (open, shut) = (
         view.channels.iter().filter(|c| c.open).count(),
@@ -643,7 +644,7 @@ fn say_held(handle: &vox_core::node::actor::NodeHandle, account: &Account) {
     );
     if shut > 0 {
         eprintln!(
-            "vox daemon: {open} room(s) open, {shut} still closed — a closed room \
+            "vox daemon: node {node}: {open} room(s) open, {shut} still closed — a closed room \
              answers nothing but `room list`"
         );
     }
@@ -651,11 +652,11 @@ fn say_held(handle: &vox_core::node::actor::NodeHandle, account: &Account) {
         .identity
         .map(|i| vox_core::node::link::b32_encode(&i.fingerprint))
         .unwrap_or_default();
-    println!("vox daemon: identity {fp}");
+    println!("vox daemon: identity {fp} (node {node})");
     println!("vox daemon: control socket {}", account.socket().display());
     for room in view.open_channels {
         println!(
-            "vox daemon: holding room {} open",
+            "vox daemon: holding room {} open (node {node})",
             vox_core::node::link::b32_encode(&room.channel_id)
         );
     }
@@ -875,7 +876,7 @@ fn already_running(
         .me()
         .map(|f| vox_core::node::link::b32_encode(&f))
         .unwrap_or_default();
-    println!("vox daemon: identity {fp}");
+    println!("vox daemon: identity {fp} (node {node})");
     println!("vox daemon: control socket {}", socket.display());
     println!("vox daemon: node {node} is held by the daemon already running here");
     let mut held = held;

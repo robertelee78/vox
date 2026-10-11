@@ -150,7 +150,7 @@ pub async fn start_daemon(
 /// What `path` holds past byte `from`: this start's lines.
 fn since(path: &Path, from: u64) -> String {
     match std::fs::read(path) {
-        Ok(bytes) => String::from_utf8_lossy(bytes.get(from as usize..).unwrap_or_default())
+        Ok(bytes) => String::from_utf8_lossy(bytes.get(from as usize..).unwrap_or(&bytes))
             .trim_end()
             .to_owned(),
         Err(e) => format!("(it could not be read: {e})"),
