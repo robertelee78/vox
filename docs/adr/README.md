@@ -42,6 +42,10 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [028](ADR-028-one-experience-keyring-rooms-services-files.md) | One Experience (keyring, rooms, services and files in the TUI and the app; look; install) — accepted for v0.4.0 | 005, 007, 014, 015, 016, 017, 020, 023, 026, 029 |
 | [029](ADR-029-sessions-and-the-repo-room.md) | Sessions, and the Room a Session Works In (a Session per harness session; drive; talking to one session; the room map; setup) — accepted for v0.4.0 | 020, 021, 026, 028 |
 | [030](ADR-030-pq-post-compromise-security-for-pairwise-key-delivery.md) | Post-Quantum Post-Compromise Security for Pairwise Key Delivery (a fresh PQXDH per delivered key) — accepted; built in v0.4.3 | 002, 003, 004, 006 |
+| [031](ADR-031-agent-nodes-join-a-repo-room-by-themselves.md) | Agent Nodes Join a Repo's Room by Themselves (a hook from install, setup in the app, trust between one machine's nodes, Ready or Locked, Sessions need drive) — proposed for v0.4.4 | 020, 026, 028, 029 |
+| [032](ADR-032-anchors-are-found-added-and-kept-per-machine.md) | Anchors Are Found, Added and Kept per Machine (found on the network, added by hand, carried by a room; shown with source and reach) — proposed for v0.4.4 | 012, 026 |
+| [033](ADR-033-the-repo-room-is-where-agents-work-together.md) | The Repo Room Is Where Agents Work Together (threads, pause, room marks, the composer, Session tabs, who does what) — proposed for v0.4.4 | 020, 021, 028, 029, 031 |
+| [034](ADR-034-the-app-and-daemon-never-hang-or-hide-a-failure.md) | The App and the Daemon Never Hang or Hide a Failure (updates restart the daemon, bounded waits, paged replies, a room that cannot save recovers, true health, bounded logs) — proposed for v0.4.4 | 014, 018, 026, 028 |
 
 ## Tiers
 
@@ -63,6 +67,8 @@ does not import that branch's unreleased command surface into the released manua
   external tracker consumes), 022 (datagram flows and the app API).
 - **Tier 9 — Behaviour under load:** 023 (room lifecycle), 024 (congestion control), 025 (sync
   scheduling).
+- **Tier 10 — Using it every day (v0.4.4):** 031 (agents join a repo's room), 032 (anchors per
+  machine), 033 (the repo room), 034 (nothing hangs or hides a failure).
 
 ## Status (integrate/v0.3.0)
 
@@ -98,6 +104,10 @@ planned. This is the roll-up.
 | 025 | accepted; built as V210-34 (#209) |
 | 026 | accepted 2026-10-03, **not built** (#397); amends 005, 008, 010, 011, 012, 013, 014, 015, 016, 017, 020, 021 |
 | 030 | accepted (2026-10-09); built in v0.4.3; amends 004 (Q1, O5) and 006 (S-4, S-17) |
+| 031 | proposed (the decider's Q&A, 2026-10-10), not built; amends 014, 020, 026, 028, 029 |
+| 032 | proposed (the decider's Q&A, 2026-10-10), not built; amends 012, 017, 026 |
+| 033 | proposed (the decider's Q&A, 2026-10-10), not built; amends 014, 028, 029 |
+| 034 | proposed (the decider's Q&A, 2026-10-10), not built; amends 014, 026 |
 
 ## Conformance-vector obligations
 

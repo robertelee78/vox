@@ -1,0 +1,149 @@
+# ADR-034: The App and the Daemon Never Hang or Hide a Failure
+
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
+
+**Status**: Proposed (the decider's Q&A, 2026-10-10). Nothing in this ADR is built.
+**Date**: 2026-10-10
+**Deciders**: Robert E. Lee
+**Tags**: daemon, app, ffi, ipc, update, storage, health, logs, progress
+**Related**: ADR-008, ADR-010, ADR-014, ADR-016, ADR-018, ADR-025, ADR-026, ADR-028, ADR-029
+**Inputs**: the decider's live session of 2026-10-10, his daemon log, and three root-cause
+analyses of that day: the stuck room create, the poisoned room, and the IPC frame length. The
+decider's ruling on them: fold the fixes into v0.4.4 with the redesign, with no separate fix
+release.
+
+## Context
+
+On 2026-10-10 the decider pressed Create on a New Room sheet with a passphrase. The sheet then
+showed an empty passphrase field, "No passphrase: anyone with the link can join." and a disabled
+Create, and stayed so for more than four minutes, with no progress and no error. Three defects lay
+under it:
+
+- `vox update` replaced the app with 0.4.3 and left the 0.4.2 daemon running. The decider: "vox
+  update replaced the app with 0.4.3, but the 0.4.2 daemon kept running <-- failure in our update
+  process."
+- A room's Session entries (2,331 of them) made an 837 KB reply to `SessionEntries`, over the
+  256 KiB frame limit. The client failed without draining the reply, the app kept the desynced
+  connection, and every later call, the create included, failed or waited without bound on the
+  connection's lock.
+- A store write failed during a disk-full episode, and the room was marked poisoned in memory,
+  which nothing cleared but a restart. Its syncs then failed every few seconds, the log grew without
+  bound and without timestamps or node names, and the agent's Session entries were dropped, while
+  `vox status` said "healthy: nothing needs attention". The post said "an internal error — a bug in
+  vox".
+
+Later, Services showed a "Share a service" spinner that never resolved. This ADR states, as
+requirements, what each of these broke.
+
+## Requirements
+
+### 1. Updates
+
+- **UP-1.** `vox update` and the app's update MUST stop the running daemon and start the new
+  version's daemon as part of the update, so every remembered node comes back Ready (ADR-031 CW-3),
+  and MUST say so in one sentence, naming any held session (ADR-026 L-7) the restart ended.
+- **UP-2.** The app, the TUI and every verb MUST compare the daemon's version (ADR-026 C-4) with
+  their own, and MUST refuse to work with a daemon of another version, saying so in one sentence
+  with the action that fixes it ("Vox's daemon is 0.4.2 and this app is 0.4.3: restart the
+  daemon"); the app MUST offer that action as a button.
+
+### 2. No unbounded wait
+
+- **WT-1.** Every request the app makes through `vox-ffi` MUST end within a stated bound, with its
+  answer or with a sentence (ADR-028 E-7). No call MAY wait without bound on a lock, a connection or
+  the daemon.
+- **WT-2.** A connection that fails a transport step, or whose frames no longer line up, MUST be
+  dropped and a new one opened. It MUST NOT be used again.
+- **WT-3.** No error MAY be swallowed: every failure MUST reach the person who asked, as E-7's
+  sentence, where the action was taken (ADR-014 M-7).
+- **WT-4.** While the daemon cannot be reached, the app MUST show each node's state and the room's
+  peers as unknown, never as last known, and MUST clear "the daemon stopped" once it is back.
+
+### 3. Replies fit their frame
+
+- **FR-1.** Every reply that lists things MUST be paged or bounded so that one reply always fits one
+  frame: Session entries (by a cursor, and per Session), Sessions, snapshot lists, notices,
+  decisions, members and shares. Every caller (the app, the TUI, `vox room session` and the rest)
+  MUST page.
+- **FR-2.** A reply that would exceed the frame limit MUST be sent as a plain error naming what was
+  too large. The daemon MUST NOT write a frame over the limit.
+- **FR-3.** A client that reads a frame over the limit, or one it cannot parse, MUST drop the
+  connection (WT-2); it MUST NOT read the next reply from it.
+
+### 4. A room that cannot save
+
+- **SR-1.** A room whose store write failed MUST recover by itself once writes succeed again: it MUST
+  retry with backoff and reopen its store, with no restart and no command.
+- **SR-2.** While it cannot save, `vox status`, the room list in the TUI and the app, and the app's
+  room MUST say so plainly, with the cause from the operating system, for example "repo-to-cve
+  cannot save: the disk is full. It recovers by itself when space is freed." It MUST NOT be called
+  a bug in Vox.
+- **SR-3.** It MUST say when the room recovered.
+- **SR-4.** A Session's entries MUST be held, not dropped, while its room cannot save, and written
+  when it recovers. When the hold reaches its bound, Vox MUST say which entries were lost.
+- **SR-5.** The fault MUST keep the operating system's error text.
+
+### 5. Health is true
+
+- **HL-1.** `vox status` and the app MUST NOT say healthy while a room cannot save (SR-2) or a peer's
+  syncs all fail.
+- **HL-2.** A peer whose every sync fails over a window MUST be shown as "sync failing", with the
+  reason, and its syncs MUST back off (ADR-025), not repeat every few seconds.
+
+### 6. Logs
+
+- **LG-1.** The daemon's log MUST be bounded in size, and a line repeated many times MUST be written
+  once with its count.
+- **LG-2.** Every line MUST carry a UTC timestamp and the node it is about, and a room's id when it is
+  about a room.
+- **LG-3.** `vox status` and the app MUST name the log's path.
+
+### 7. Every action ends
+
+- **PR-1.** Every action in the app MUST show progress while it runs and MUST end with an outcome:
+  what it did, or E-7's sentence. A control MUST NOT stay disabled without saying why.
+- **PR-2.** No spinner MAY run without a bound; at the bound it MUST give way to a sentence. Sharing a
+  service MUST list what can be shared, or say why it cannot.
+- **PR-3.** The New Room sheet MUST keep what the person typed until the create ends, MUST show the
+  create in progress, and MUST NOT say "No passphrase" for a room created with one.
+
+### 8. Proof
+
+- **PF-1.** Each claim above MUST be proved by real use of the shipped binary or the shipped app
+  (ADR-018 §9), each with a mutant that turns its proof red on its own assertion, labelled PRODUCT
+  (ADR-018 §10.10). A proof extends an existing journey where one fits (ADR-018 §10.7): the large
+  room read for FR-1–FR-3, at the real frame limit, through both the CLI and the app's client.
+- **PF-2.** A proof that needs a full disk MUST stage it in userspace, with no `sudo`. Where it
+  cannot, it MUST print `OPTIONAL PROOF NOT RUN` (ADR-018 §10.2).
+
+## Superseded and amended lines
+
+| ADR line | Was | Now |
+|---|---|---|
+| ADR-014 M-29 | The update asks the person to restart the app and the daemon | The update restarts the daemon itself; a client refuses a daemon of another version (UP-1, UP-2) |
+| ADR-026 C-4 | `Hello` reports the daemon's version | Every client compares it and refuses a mismatch (UP-2) |
+
+## Consequences
+
+- An update ends the held sessions (`vox serve`, `vox forward` and the like) running on the old
+  daemon, and says so.
+- Readers of long lists make more round trips.
+- A room that ran out of disk loses nothing written after space returns, and the person is told
+  what happened.
+
+## Related ADRs
+
+Depends on ADR-014, ADR-018, ADR-026, ADR-028. Amends ADR-014 (M-29) and ADR-026 (C-4). Cited:
+ADR-008, ADR-010, ADR-016, ADR-025, ADR-029, ADR-031.
+
+## Engineering Mantra
+
+These principles are binding on all work under this ADR:
+
+- **Do not be lazy.** Plenty of time to do it right.
+- **No shortcuts.** Every component is built to production quality from day one.
+- **Never make assumptions.** Dive deep before writing a single line of code.
+- **Measure three times, cut once.** Verify designs, implementations, and outputs.
+- **No fallback. No stub code.** No `todo!()`, no `unimplemented!()`, no "we'll fix this later." If a feature isn't ready, it doesn't ship — but what ships is complete. And if we need it, we build it: no false deferrals.
+- **Chesterton's Fence.** Always understand what exists and why before changing or removing it.
+- **Pure excellence.** A finding emitted by r2c is one a senior IOActive consultant would defend in front of a client.
