@@ -505,7 +505,10 @@ fn a_sync_that_did_not_complete_says_why() {
     loop {
         let (ok, status, err) = vox_once(&alice_dir, &args(&["status"]));
         assert!(ok, "PRODUCT: status after Bob left: {status}{err}");
-        if !status.contains("sync failing:") {
+        if !status
+            .lines()
+            .any(|line| line.contains("sync failing:") && line.contains(bob12))
+        {
             break;
         }
         assert!(Instant::now() < deadline, "PRODUCT: Bob left through Carol, but Alice still calls the departed peer unhealthy: {status}");
