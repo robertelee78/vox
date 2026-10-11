@@ -294,10 +294,11 @@ allow drive access for the node I'm using from the macOS app."
 
 - **A member of an earlier release in the room.** What a v0.4.3 node does when it receives a sealed
   opening or end record (skips it, refuses the entry, or poisons the room) is not known. It is to be
-  measured with the shipped v0.4.3 binary before SA-3 is built. Under ADR-034 UP-2 a v0.4.4 node
-  does not sync with a peer of another version, so the measurement is to confirm that a v0.4.3
-  member is never sent a sealed record and is not harmed. Measuring compatibility between versions,
-  so that peers of different releases can share a room, is planned for v0.4.5 (ADR-034 UP-2).
+  measured with the shipped v0.4.3 binary before SA-3 is built. Peers of different releases keep
+  syncing (ADR-034 UP-2 refuses a version difference only between a client and its own daemon), so
+  a v0.4.3 member can receive sealed records from a v0.4.4 member, and the answer is to be brought
+  to the decider before SA-3 is built. Measuring compatibility between versions, so that peers of
+  different releases are handled safely, is planned for v0.4.5.
 
 ## Related ADRs
 
