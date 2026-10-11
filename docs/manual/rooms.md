@@ -135,10 +135,29 @@ A room keeps messages forever until its creator or an admin sets a retention:
 vox room retention family 1w
 ```
 
-The duration is `1h`, `1w`, `1m` (a month), a number of seconds, or `forever`. It applies to every
+The duration is `1h`, `7d`, `1w`, `1m` (a month), a number of seconds, or `forever`. It applies to every
 message already in the room, on every member, so shortening it deletes older messages. A member
 who is not an admin can only keep less on its own node. A modified node can keep everything:
 retention is housekeeping, not security.
+
+## Set how long Session steps stay
+
+A step is one thing an agent did in its Session: a message, a command it ran, or a file it
+edited. Steps have their own lifetime: by default, seven days or the room's message lifetime,
+whichever is shorter. A shorter message lifetime on your node can shorten it further.
+
+```sh
+vox room retention family --steps 7d
+```
+
+The creator or an admin changes the room's step rule. Other members use the same command to
+choose a shorter lifetime on their own node, such as `--steps 1d`. Choosing the room's current
+step limit again removes that local choice. In Vox.app, open **Retention** and use the separate
+**Session steps** control; **Use room rule** removes your node's shorter choice.
+
+Shortening the step lifetime deletes older steps immediately, including steps already recorded.
+It does not change the lifetime of ordinary room messages or shared files. `--steps forever`
+still cannot keep steps beyond the message lifetime. Deleted steps cannot be restored.
 
 ## Name admins
 

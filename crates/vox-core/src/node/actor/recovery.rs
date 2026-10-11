@@ -108,6 +108,13 @@ impl Node {
             self.store_recovery.remove(&id);
             return;
         }
+        // A storage reopen initially knows the room policy. Apply this node's shorter limits
+        // before success is reported or the replacement is exposed; retain the original OS
+        // cause and retry state if that additional write fails.
+        let opened = opened.and_then(|mut channel| {
+            self.retention_before_publication(&mut channel)?;
+            Ok(channel)
+        });
         match opened {
             Ok(channel) => {
                 let name = self
@@ -124,7 +131,7 @@ impl Node {
                 for peer in peers {
                     self.drop_port(&id, &peer);
                 }
-                self.finish_open_channel(channel).await;
+                self.publish_open_channel(channel).await;
                 self.store_recovered
                     .insert(id, format!("{name} recovered; it can save again"));
                 eprintln!(

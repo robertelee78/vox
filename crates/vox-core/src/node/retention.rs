@@ -48,6 +48,7 @@ pub fn parse_duration(text: &str) -> Option<u64> {
     let scale = match unit {
         "" | "s" => 1,
         "h" => HOUR,
+        "d" => 24 * HOUR,
         "w" => WEEK,
         "m" => MONTH,
         _ => return None,
@@ -225,6 +226,8 @@ pub(crate) struct Tracked {
     pub claimed_ms: Option<u64>,
     /// Its plaintext cache row, once rendered.
     pub cache_id: Option<u64>,
+    /// Encrypted Session activity, including a body this node cannot decrypt.
+    pub steps: bool,
 }
 
 impl Tracked {
@@ -242,6 +245,7 @@ impl Tracked {
 pub(crate) struct RetentionIndex {
     live: HashMap<Digest32, Tracked>,
     by_age: BTreeSet<(u64, Digest32)>,
+    by_step_age: BTreeSet<(u64, Digest32)>,
 }
 
 impl RetentionIndex {
@@ -249,6 +253,9 @@ impl RetentionIndex {
     pub fn track(&mut self, hash: Digest32, tracked: Tracked) {
         self.forget(&hash);
         self.by_age.insert((tracked.base(), hash));
+        if tracked.steps {
+            self.by_step_age.insert((tracked.base(), hash));
+        }
         self.live.insert(hash, tracked);
     }
 
@@ -270,7 +277,21 @@ impl RetentionIndex {
     pub fn forget(&mut self, hash: &Digest32) -> Option<Tracked> {
         let t = self.live.remove(hash)?;
         self.by_age.remove(&(t.base(), *hash));
+        self.by_step_age.remove(&(t.base(), *hash));
         Some(t)
+    }
+
+    /// Remove Session bodies due under their separate policy without scanning messages.
+    pub fn take_steps_due(&mut self, cutoff_ms: u64) -> Vec<(Digest32, Tracked)> {
+        let due: Vec<Digest32> = self
+            .by_step_age
+            .iter()
+            .take_while(|(base, _)| *base <= cutoff_ms)
+            .map(|(_, hash)| *hash)
+            .collect();
+        due.into_iter()
+            .filter_map(|hash| self.forget(&hash).map(|t| (hash, t)))
+            .collect()
     }
 
     /// Remove and return every entry whose age base is at or before `cutoff_ms`.

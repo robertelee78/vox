@@ -9,11 +9,22 @@ and drive it. To drive a session, the agent's node must trust your node with **r
 A **Session** is one harness session, such as one Claude Code, Codex or OpenCode session a
 person opened, as it appears in its room. Vox makes one when an interactive session's hook first
 runs. A headless run, such as `claude -p` or `codex exec`, gets none. A Session ends when the
-harness session ends, and what it holds is kept as long as the room keeps messages.
+harness session ends. Its steps have a separate lifetime from the room conversation.
 
 A Session records what its session does: what was typed, each tool call with a one-line summary
 of its result, the replies, the end of each turn, approvals and questions with who answered them,
 and files sent either way. None of it appears in the room's conversation.
+
+A step is one thing an agent did in its Session: a message, a command it ran, or a file it
+edited. By default, steps stay for seven days or the room's message lifetime, whichever is
+shorter. A shorter message lifetime on your node can shorten it further. Keeping ordinary room
+messages forever therefore does not keep Session steps forever.
+
+Set the step lifetime separately with `vox room retention family --steps 7d`, or the **Session
+steps** control in Vox.app's **Retention** sheet. An admin sets the room rule; other members may
+choose a shorter lifetime for their own node. **Use room rule** removes that local choice.
+Shortening it deletes older steps immediately and leaves ordinary messages and shared files
+under their own retention. See [Session step retention](rooms.md#set-how-long-session-steps-stay).
 
 The session's node decides who sees inside:
 

@@ -107,6 +107,8 @@ pub fn previous_release(dir: &Path) -> (String, PathBuf) {
             .expect("APPARATUS: making the previous release's vox executable");
     }
     let said = Command::new(&bin)
+        .env("VOX_DATA_DIR", dir.join("version-data"))
+        .env("VOX_CONFIG_DIR", dir.join("version-config"))
         .arg("--version")
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())

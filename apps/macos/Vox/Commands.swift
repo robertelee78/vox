@@ -412,6 +412,28 @@ private struct RetentionSheet: View {
     @ObservedObject var model: NodeModel
     @State private var seconds: UInt64 = 0
     @State private var opened = false
+    @State private var stepSeconds: UInt64 = 0
+    @State private var stepsOpened = false
+
+    private var stepCurrent: UInt64? {
+        guard let value = model.stepRetention else { return nil }
+        return model.stepRetentionAdmin ? value.roomSeconds : (value.localSeconds ?? value.roomCapSeconds)
+    }
+
+    private var stepChoices: [(String, UInt64)] {
+        guard let value = model.stepRetention else { return [] }
+        var choices = Retention.choices
+        if !model.stepRetentionAdmin {
+            choices = choices.filter {
+                $0.1 != value.roomCapSeconds && (value.roomCapSeconds == 0 || ($0.1 > 0 && $0.1 < value.roomCapSeconds))
+            }
+            choices.insert(("Use room rule (\(Retention.words(value.roomCapSeconds)))", value.roomCapSeconds), at: 0)
+        }
+        if let stepCurrent, !choices.contains(where: { $0.1 == stepCurrent }) {
+            choices.append((Retention.words(stepCurrent), stepCurrent))
+        }
+        return choices
+    }
 
     /// What the room keeps now, `nil` until it is known.
     private var current: UInt64? { model.retentionSecs }
@@ -437,22 +459,69 @@ private struct RetentionSheet: View {
                 .secondaryText()
                 .accessibilityIdentifier("retention-effect")
             OutcomeMark(outcome: model.failure(of: "retention"), id: "retention-said")
-            HStack {
-                Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
-                // Never the Return default (A9): a retention deletes text, so Set is pressed on
-                // purpose, and only once another retention is chosen (D14).
-                Button("Set", role: seconds == 0 ? nil : .destructive) { submit() }
-                    .disabled(current == nil || seconds == current)
-                    .accessibilityIdentifier("retention-submit")
+            if let progress = model.progress(of: "retention") { ProgressView(progress) }
+            // Retention can delete text: neither setter is the Return default.
+            Button("Set message retention", role: seconds == 0 ? nil : .destructive) { submit() }
+                .disabled(current == nil || seconds == current || model.progress(of: "retention") != nil)
+                .accessibilityIdentifier("retention-submit")
+            Divider()
+            Text("Session steps").font(.headline)
+            Text("A step is one thing an agent did in its Session: a message, a command it ran, or a file it edited.")
+                .secondaryText()
+                .accessibilityIdentifier("step-retention-meaning")
+            Text("By default, steps last for seven days or the message lifetime, whichever is shorter.")
+                .secondaryText()
+            if let value = model.stepRetention {
+                Picker(model.stepRetentionAdmin ? "Room keeps steps" : "This node keeps steps", selection: $stepSeconds) {
+                    ForEach(stepChoices, id: \.1) { Text($0.0).tag($0.1) }
+                }
+                .accessibilityIdentifier("step-retention-choice")
+                Text("Room step rule: \(Retention.words(value.roomSeconds)). This node keeps steps for \(Retention.words(value.effectiveSeconds)); message retention may shorten this.")
+                    .secondaryText()
+                    .accessibilityIdentifier("step-retention-current")
+                Text(stepEffect).secondaryText().accessibilityIdentifier("step-retention-effect")
+                if let progress = model.progress(of: "step-retention") { ProgressView(progress) }
+                Button("Set Session step retention", role: stepSeconds == 0 ? nil : .destructive) {
+                    let chosen = stepSeconds
+                    Task {
+                        if await model.setStepRetention(chosen) { stepsOpened = false; openSteps() }
+                    }
+                }
+                .disabled(stepCurrent == nil || stepSeconds == stepCurrent || model.progress(of: "step-retention") != nil)
+                .accessibilityIdentifier("step-retention-submit")
+            } else if model.stepRetentionLoading {
+                ProgressView("Reading Session step retention…")
             }
+            if let error = model.stepRetentionError {
+                Text(error).foregroundStyle(.red)
+                Button("Retry") { Task { await model.loadStepRetention() } }
+                    .disabled(model.stepRetentionLoading)
+            }
+            OutcomeMark(outcome: model.failure(of: "step-retention"), id: "step-retention-said")
+            HStack { Spacer(); Button("Done") { model.sheet = nil }.keyboardShortcut(.cancelAction) }
         }
         .padding(Space.s24)
-        .frame(width: Theme.scaled(440))
+        .frame(width: Theme.scaled(480))
         .onAppear {
             model.clearOutcome(of: "retention")
+            model.clearOutcome(of: "step-retention")
             open()
+            openSteps()
         }
+        .task { await model.loadStepRetention() }
         .onChange(of: model.retentionSecs) { _ in open() }
+        .onChange(of: stepCurrent) { _ in openSteps() }
+    }
+
+    private var stepEffect: String {
+        let scope = model.stepRetentionAdmin ? "This changes the room rule for every member." : "This changes only this node; it cannot keep steps longer than the room rule."
+        return scope + " Older Session steps are deleted at once when the lifetime is shortened. Messages and shared files keep their own retention. Deleted steps cannot be restored."
+    }
+
+    private func openSteps() {
+        guard !stepsOpened, let stepCurrent else { return }
+        stepSeconds = stepCurrent
+        stepsOpened = true
     }
 
     /// What the choice does, said before it is set: the text, the files it shared and their

@@ -484,14 +484,15 @@ enum RoomCmd {
     /// The name is one DNS label (a-z, 0-9 and `-`), because it is the room part of every service
     /// address in the room.
     Rename(RenameArgs),
-    /// Set how long the room keeps messages: `1h`, `1w`, `1m` (a month), a number of
-    /// seconds, or `forever`.
+    /// Set message lifetime, or use --steps to set Session-step lifetime separately.
     ///
-    /// It applies to **everything already in the room**, on every member, as the change
-    /// reaches them: shortening it deletes older messages. Only the room's admin may, and it
-    /// asks for the identity passphrase for that reason. A node can keep less than its room
-    /// (the `retention` file in its config directory); the shorter wins. This is look and
-    /// feel, not a security property: a modified node can keep everything.
+    /// A step is one thing an agent did in its Session: a message, a command it ran, or a file
+    /// it edited. Steps default to seven days or the message lifetime, whichever is shorter.
+    /// Durations are `1h`, `7d`, `1w`, `1m` (a month), seconds, or `forever`.
+    ///
+    /// Admins set the room rule; other members can shorten the lifetime on their own node.
+    /// Shortening a lifetime deletes older items immediately. Changing --steps does not change
+    /// message retention. Retention is housekeeping: a modified node can keep everything.
     Retention(RetentionArgs),
     /// Print a room's link, for someone else to `vox room join` with.
     ///
@@ -592,8 +593,16 @@ pub struct RetentionArgs {
     pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
-    /// `1h`, `1w`, `1m` (a month), a number of seconds, or `forever`. Asks for no passphrase.
-    pub duration: String,
+    /// Message lifetime: `1h`, `7d`, `1w`, `1m` (a month), seconds, or `forever`.
+    #[arg(required_unless_present = "steps", conflicts_with = "steps")]
+    pub duration: Option<String>,
+    /// Set Session-step lifetime separately from messages: `7d`, `1h`, seconds, or `forever`.
+    ///
+    /// A step is one thing an agent did in its Session: a message, a command it ran, or a file
+    /// it edited. The default is seven days or the message lifetime, whichever is shorter.
+    /// Admins set the room rule; other members can only shorten their own node's lifetime.
+    #[arg(long, value_name = "DURATION", conflicts_with = "duration")]
+    pub steps: Option<String>,
 }
 
 /// `vox room get`
@@ -764,12 +773,12 @@ pub struct ShareListArgs {
     pub room: String,
 }
 
-/// `vox status`
+/// `vox status` and `vox decisions`.
 #[derive(Args, Debug, Clone)]
 pub struct StatusArgs {
     #[command(flatten)]
     pub profile: NodeArgs,
-    /// Print the node's report as JSON, for machines.
+    /// Print JSON, for machines.
     #[arg(long)]
     pub json: bool,
 }
@@ -1396,6 +1405,9 @@ pub struct RoomReadArgs {
     /// Read the bounded page before this entry; otherwise open at the newest page.
     #[arg(long, conflicts_with_all = ["since", "tag", "late", "hashes"])]
     pub before: Option<String>,
+    /// Read every message this node's person has not marked read, without marking it read.
+    #[arg(long, conflicts_with_all = ["since", "before", "limit", "tag", "late", "hashes", "notices"])]
+    pub unread: bool,
     /// At most this many messages in the page. 0 uses the page's row and byte bound.
     #[arg(long, default_value_t = 0)]
     pub limit: u64,
@@ -2215,6 +2227,8 @@ enum Cmd {
     /// counters per room and peer: sessions opened, admitted, refused, completed,
     /// partial and failed, and any backoff.
     Status(StatusArgs),
+    /// Every retained decision by this node, newest first; --json prints one event per line.
+    Decisions(StatusArgs),
     /// Wire an agent session into a room — Claude Code, Codex and OpenCode.
     ///
     /// The room settles who does what: an agent claims work there, asks there who is
@@ -2546,6 +2560,7 @@ pub fn run() -> ExitCode {
                                 a.json,
                                 a.late,
                                 a.notices,
+                                a.unread,
                                 &crate::room_cli::Tagged {
                                     tags: a.tag.clone(),
                                     from: a.from.clone(),
@@ -2681,7 +2696,19 @@ pub fn run() -> ExitCode {
                             crate::room_cli::rename(&paths, &a.room, &a.name).await
                         }
                         RoomCmd::Retention(a) => {
-                            crate::room_cli::retention(&paths, &a.room, &a.duration).await
+                            match (a.steps.as_deref(), a.duration.as_deref()) {
+                                (Some(duration), _) => {
+                                    crate::room_cli::retention(&paths, &a.room, duration, true)
+                                        .await
+                                }
+                                (_, Some(duration)) => {
+                                    crate::room_cli::retention(&paths, &a.room, duration, false)
+                                        .await
+                                }
+                                _ => Err(AppError::Usage(
+                                    "give a message duration or --steps <duration>".into(),
+                                )),
+                            }
                         }
                         RoomCmd::Get(a) => {
                             crate::room_cli::get_file(
@@ -2836,6 +2863,32 @@ pub fn run() -> ExitCode {
                 }
             };
             match rt.block_on(crate::status_cli::status(&paths, args.json)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Cmd::Decisions(args) => {
+            let paths = match args.profile.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match rt.block_on(crate::status_cli::decisions(&paths, args.json)) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("vox: {e}");
