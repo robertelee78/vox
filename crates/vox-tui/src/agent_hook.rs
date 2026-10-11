@@ -1524,7 +1524,15 @@ impl Daemon {
         let mut d = DaemonClient::open(&self.account.socket())
             .await
             .map_err(|e| {
-                Unregistered::NoDaemon(e.to_string().lines().next().unwrap_or_default().to_owned())
+                let words = e.to_string().lines().next().unwrap_or_default().to_owned();
+                if matches!(
+                    &e,
+                    vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Version { .. })
+                ) {
+                    Unregistered::Version(words)
+                } else {
+                    Unregistered::NoDaemon(words)
+                }
             })?;
         // **Never without a bound** (#408): the hook runs inside a model's turn, and a wait with
         // no end hangs the harness. The daemon refuses a node still detaching after
@@ -1585,6 +1593,9 @@ impl Daemon {
                         reason: reason.to_owned(),
                     })
                     .await;
+            }
+            Err(e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Version { .. })) => {
+                eprintln!("vox agent hook: {e}");
             }
             Err(_) => crate::wake::end(paths, session),
         }
