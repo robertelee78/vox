@@ -453,7 +453,7 @@ fn seen(w: &room::Worker, room: &str, others: &[String], side: &str) -> Seen {
 /// view is read with that release. Then every process is stopped as a person stops it and started
 /// again from this build on the same data roots, and each member must see the same fingerprint,
 /// the same keyring, the same room, and the same rows in the same order with the same times; the
-/// share must still be listed; `.daemon/format` must say format 2, written by this build; and,
+/// share must still be listed; `.daemon/format` must say format 3, written by this build; and,
 /// once each member's daemon is started again by this build, so that it reads back what this build
 /// rewrote, a post written after the upgrade must reach the other member.
 ///
@@ -700,7 +700,7 @@ fn a_data_root_of_the_previous_release_opens_with_nothing_lost() {
             ));
         }
         let format = std::fs::read_to_string(w.data.join(".daemon/format")).unwrap_or_default();
-        let want = format!("format 2\nwritten-by vox {}\n", env!("CARGO_PKG_VERSION"));
+        let want = format!("format 3\nwritten-by vox {}\n", env!("CARGO_PKG_VERSION"));
         if format != want {
             red.push(format!(
                 "{}'s .daemon/format says {format:?}; this build serving it must write {want:?}",
