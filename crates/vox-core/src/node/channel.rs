@@ -37,6 +37,7 @@
 //! alone. M14 adds other authors' entries, SKDMs, consent and sync on top of the
 //! same layout.
 
+mod legacy_session;
 pub(crate) mod session_floor;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -871,6 +872,8 @@ pub struct ChannelState {
     /// Read records decrypted into a batch not yet committed: applied by
     /// [`Self::place_committed`] once it has, as rendered rows are.
     pending_reads: Vec<(ReadRow, u64)>,
+    /// Sealed exact-hash subtype evidence; never a permission or recovery eligibility decision.
+    legacy_sessions: legacy_session::LegacySessions,
     /// How far each other member's node holds this identity's feed here, by its own word in its
     /// last sync with this node (ADR-028 R-6): the highest seq of the feed its frontier named.
     /// Persisted as [`SEG_HELD`].
@@ -1772,6 +1775,7 @@ impl ChannelState {
             read_records: BTreeMap::new(),
             reads: BTreeMap::new(),
             pending_reads: Vec::new(),
+            legacy_sessions: legacy_session::LegacySessions::default(),
             held: BTreeMap::new(),
             owed: BTreeSet::new(),
             owed_asked_to: None,
@@ -2285,6 +2289,7 @@ impl ChannelState {
             read_records,
             reads,
             pending_reads: Vec::new(),
+            legacy_sessions: legacy_session::LegacySessions::default(),
             held,
             owed,
             owed_asked_to: None,
@@ -2325,6 +2330,7 @@ impl ChannelState {
         };
         // Apply the new default while upgrading an existing room, before publishing any
         // cached Session rows or permitting a sync to send its old encrypted bodies.
+        room.restore_legacy_sessions(store, now.0)?;
         room.sweep_retention(store, now)?;
         Ok(room)
     }
@@ -2535,6 +2541,7 @@ impl ChannelState {
             read_records: BTreeMap::new(),
             reads: BTreeMap::new(),
             pending_reads: Vec::new(),
+            legacy_sessions: legacy_session::LegacySessions::default(),
             held: BTreeMap::new(),
             owed: BTreeSet::new(),
             owed_asked_to: None,
@@ -4648,6 +4655,7 @@ impl ChannelState {
             .filter_map(|(author, seq)| self.dag.feed(author)?.get(*seq))
             .filter(move |e| {
                 e.payload.is_none()
+                    && !self.legacy_sessions.is_session(&e.entry_hash())
                     && !expired_at(
                         e.skeleton.claimed_ms,
                         now,
@@ -4972,7 +4980,8 @@ impl ChannelState {
             .filter(|(hash, _)| !self.is_retained_control(hash))
             .copied()
             .collect();
-        if due.is_empty() && !with_receivers {
+        self.reconcile_legacy_sessions(self.now_hint)?;
+        if due.is_empty() && !with_receivers && !self.legacy_sessions.dirty() {
             return Ok(0);
         }
         let mut pages = Vec::with_capacity(due.len());
@@ -5000,16 +5009,7 @@ impl ChannelState {
                 seal_segment(&self.sek, SegmentKind::LogDb, t.log_id, &wire)?,
             ));
         }
-        let receivers_seg = if with_receivers {
-            Some(seal_segment(
-                &self.sek,
-                SegmentKind::KeyMaterial,
-                SEG_RECEIVERS,
-                &receivers_bytes(&self.receivers),
-            )?)
-        } else {
-            None
-        };
+        self.reconcile_legacy_sessions(self.now_hint)?;
         let persisted = (|| -> Result<()> {
             let mut batch = store.batch()?;
             for (log_id, cache_id, age, page) in &pages {
@@ -5019,13 +5019,10 @@ impl ChannelState {
                     batch.delete_segment(&self.channel_id, SegmentKind::PlaintextCache, *c)?;
                 }
             }
-            if let Some(seg) = &receivers_seg {
-                batch.put_segment(
-                    &self.channel_id,
-                    SegmentKind::KeyMaterial,
-                    SEG_RECEIVERS,
-                    seg,
-                )?;
+            if with_receivers {
+                self.queue_receivers(&mut batch)?;
+            } else {
+                self.queue_legacy_sessions(&mut batch)?;
             }
             batch.commit()
         })();
@@ -5034,6 +5031,7 @@ impl ChannelState {
             self.save_error = Some(e.to_string());
             return Err(e);
         }
+        self.legacy_sessions.committed();
         let gone: BTreeSet<Digest32> = due.iter().map(|(h, _)| *h).collect();
         self.timeline.retain(|r| !gone.contains(&r.entry_hash));
         // A Session entry follows the room's retention (SE-5).
@@ -5529,6 +5527,11 @@ impl ChannelState {
                     let log_seg = seal_segment(&self.sek, SegmentKind::LogDb, id, &wire)?;
                     batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
                     logged += 1;
+                    if let Some((seen_author, session)) =
+                        self.legacy_sessions.observed.remove(&entry_hash)
+                    {
+                        self.remember_legacy_kind(entry_hash, seen_author, session)?;
+                    }
                     let Some(payload) = payload else {
                         // A skeleton: stored, never rendered. Its body is owed unless it has
                         // expired here (V030-10).
@@ -5638,8 +5641,11 @@ impl ChannelState {
         let committed = match write_failed {
             Some(e) => Err(e),
             None => (|| -> Result<()> {
+                self.reconcile_legacy_sessions(now_ms)?;
                 if chains_advanced || self.chains_advanced {
                     self.queue_receivers(&mut batch)?;
+                } else {
+                    self.queue_legacy_sessions(&mut batch)?;
                 }
                 batch.commit()
             })(),
@@ -6239,8 +6245,10 @@ impl ChannelState {
         // Only a Session entry opens under a drive key: a node's message to the room is sealed
         // under its sender key, for every reader.
         let Ok(Decoded::Session(entry)) = crate::node::content::decode(&plaintext) else {
+            self.remember_legacy_kind(entry_hash, author, false)?;
             return Ok(());
         };
+        self.remember_legacy_kind(entry_hash, author, true)?;
         if self.already_expired(&entry_hash, entry.created_millis, now_ms) {
             expired.extend(self.retention.forget(&entry_hash).map(|t| (entry_hash, t)));
             return Ok(());
@@ -6599,6 +6607,8 @@ impl ChannelState {
                 && expired.is_empty()
                 && self.pending_reads.is_empty()
                 && self.drive.pending.is_empty()
+                && !self.chains_advanced
+                && !self.legacy_sessions.dirty()
             {
                 return Ok(None);
             }
@@ -6713,7 +6723,11 @@ impl ChannelState {
             }
             // A Session entry sealed under the sender key is not one: its node gave it to every
             // reader, and the Session is only for those with drive (SC-2). Not shown.
-            Ok(Decoded::Session(_) | Decoded::LegacySessionIndex(_)) | Err(_) => return Ok(None),
+            Ok(Decoded::LegacySessionIndex(index)) => {
+                self.accept_legacy_index(entry_hash, author, index, now_ms)?;
+                return Ok(None);
+            }
+            Ok(Decoded::Session(_)) | Err(_) => return Ok(None),
         };
         if self.already_expired(&entry_hash, content.created_millis, now_ms) {
             expired.extend(self.retention.forget(&entry_hash).map(|t| (entry_hash, t)));
@@ -6758,6 +6772,7 @@ impl ChannelState {
         rows: Vec<Rendered>,
         expired: &[(Digest32, Tracked)],
     ) -> Result<()> {
+        self.legacy_sessions.committed();
         for (row, cache_id) in std::mem::take(&mut self.drive.pending) {
             self.retention
                 .rendered(&row.entry_hash, row.created_millis, cache_id);
@@ -6799,6 +6814,7 @@ impl ChannelState {
             SEG_RECEIVERS,
             &receivers_seg,
         )?;
+        self.queue_legacy_sessions(batch)?;
         // The drive keys advance in the same passes.
         self.queue_drive(batch)
     }
@@ -8261,6 +8277,13 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
             &ch.admission,
             &staged,
         );
+        if let Err(e) = ch.inspect_legacy_bodies(&staged) {
+            ch.poisoned = true;
+            ch.save_error = Some(e.to_string());
+            *self.fatal.borrow_mut() = Some(e);
+            report.fail = Some(crate::wire::WireError::TransportFailed);
+            return report;
+        }
         ch.filter_received_session_bodies(self.peer, &staged);
         match ch.absorb_arrived(self.store, &before, self.now_ms) {
             Ok(got) => {

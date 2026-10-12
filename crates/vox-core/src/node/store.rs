@@ -62,6 +62,7 @@ const fn kind_code(kind: SegmentKind) -> u8 {
         // because it belongs to no channel), but a kind must map to a stable code
         // or this match stops being exhaustive.
         SegmentKind::Trust => 8,
+        SegmentKind::SessionClassification => 9,
     }
 }
 

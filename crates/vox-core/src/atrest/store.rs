@@ -77,6 +77,8 @@ pub enum SegmentKind {
     /// sealed under a key derived from the identity factor alone
     /// ([`crate::node::prekeys`], ADR-016 M14.3).
     PrekeyRing,
+    /// Authenticated legacy Session subtype evidence, scoped to one room (#804).
+    SessionClassification,
 }
 
 impl SegmentKind {
@@ -89,6 +91,7 @@ impl SegmentKind {
             SegmentKind::KeyMaterial => b"vox/seg/key-material/v1",
             SegmentKind::PrekeyRing => b"vox/seg/prekey-ring/v1",
             SegmentKind::Trust => b"vox/seg/trust-keyring/v1",
+            SegmentKind::SessionClassification => b"vox/seg/session-classification/v1",
         }
     }
 }
