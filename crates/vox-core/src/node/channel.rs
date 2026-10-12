@@ -5450,6 +5450,23 @@ impl ChannelState {
             ..SyncOutcome::default()
         };
         if arrived.is_empty() {
+            // A repeated authenticated body can invalidate an earlier declaration without
+            // adding a log row. Keep that contradiction even across an immediate restart.
+            let persisted = (|| -> Result<()> {
+                self.reconcile_legacy_sessions(now_ms)?;
+                if self.legacy_sessions.dirty() {
+                    let mut batch = store.batch()?;
+                    self.queue_legacy_sessions(&mut batch)?;
+                    batch.commit()?;
+                    self.legacy_sessions.committed();
+                }
+                Ok(())
+            })();
+            if let Err(e) = persisted {
+                self.poisoned = true;
+                self.save_error = Some(e.to_string());
+                return Err(e);
+            }
             return Ok(out);
         }
         // **One durable commit for the whole batch** (see `render_content_into`).
