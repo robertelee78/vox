@@ -4369,6 +4369,12 @@ final class FirstRunProof: XCTestCase {
         guard running.count == 1, let pid = running.first, executable(pid) == appExe else {
             throw Apparatus("after starting Vox Proof, the \(proofAppID) processes are \(running.map { "\($0) \(executable($0))" }), not one of \(appExe)")
         }
+        // Diagnose a missed long-path control socket without emitting the process's
+        // other environment values. XCTest and the unsandboxed stager may use
+        // different temporary directories, which would change its fallback address.
+        let temporary = stager.run(["/usr/bin/python3", "-c",
+            "import re, subprocess, tempfile; s = subprocess.check_output(['/bin/ps', 'e', '-p', '\(pid)', '-o', 'command='], text=True); m = re.search(r'(?:^| )TMPDIR=([^ ]+)', s); print('app TMPDIR=' + (m.group(1).strip() if m else '<unset>')); print('stager temporary=' + tempfile.gettempdir())"], env: [:])
+        print("[guard diagnostic] \(temporary.out.trimmingCharacters(in: .whitespacesAndNewlines))")
         // Keep the guest's actual screen even when accessibility cannot produce a snapshot.
         // This is a diagnostic artifact, never a product verdict or a new gate.
         let screen = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
