@@ -6713,7 +6713,7 @@ impl ChannelState {
             }
             // A Session entry sealed under the sender key is not one: its node gave it to every
             // reader, and the Session is only for those with drive (SC-2). Not shown.
-            Ok(Decoded::Session(_)) | Err(_) => return Ok(None),
+            Ok(Decoded::Session(_) | Decoded::LegacySessionIndex(_)) | Err(_) => return Ok(None),
         };
         if self.already_expired(&entry_hash, content.created_millis, now_ms) {
             expired.extend(self.retention.forget(&entry_hash).map(|t| (entry_hash, t)));
