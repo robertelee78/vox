@@ -1224,8 +1224,8 @@ fn emit(format: Format, raw_input: &str, event: &str, vox: &str, room: &str) {
 /// `Err` is a usage error from the caller's own arguments, which is reported
 /// before any harness is involved.
 ///
-/// `room_arg` narrows the drain to one room. Without it the hook drains **every room the node
-/// holds** (V210-163): an agent is its node, and hears what its node hears.
+/// `room_arg` narrows the drain to one room. Without it, a session assigned a room hears every
+/// room its node holds (V210-163); a session working in no room gets no room news (ADR-031 RM-6).
 pub async fn run(
     paths: &Paths,
     daemon: &Daemon,
@@ -1325,7 +1325,16 @@ pub async fn run(
                 std::path::Path::new(&input.cwd),
                 daemon.node.as_str(),
             );
-            drain(paths, room_arg, &input, &raw, format, note).await
+            drain(
+                paths,
+                room_arg,
+                answer.room.is_some(),
+                &input,
+                &raw,
+                format,
+                note,
+            )
+            .await
         }
         Err(Unregistered::NotAttached(node)) => {
             // **Said once per session, not every turn** (#666): the operator was told the
@@ -1918,6 +1927,7 @@ fn offers_said(paths: &Paths, offered: &[(String, String)]) -> String {
 async fn drain(
     paths: &Paths,
     room_arg: Option<&str>,
+    session_has_room: bool,
     input: &HookInput,
     raw_input: &str,
     format: Format,
@@ -1946,6 +1956,10 @@ async fn drain(
             let id = resolve_prefix(arg, &ids)?;
             rooms.into_iter().filter(|(r, _, _, _)| *r == id).collect()
         }
+        // The daemon's registration is authoritative: it also preserves a room
+        // deliberately selected for an existing session. With none, another
+        // room's news is not this session's news (ADR-031 RM-6).
+        None if !session_has_room => Vec::new(),
         None => rooms,
     };
 
