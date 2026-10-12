@@ -6,6 +6,8 @@
 #   scripts/app-proofs.sh                     # every proof
 #   scripts/app-proofs.sh FirstRunProof       # one class (xcodebuild's -only-testing)
 #   scripts/app-proofs.sh LaunchProof         # scripts/app-launch-proof.py alone: no UI automation
+#   scripts/app-proofs.sh --host FirstRunProof # explicitly use this Mac's desktop
+# Default: a headless macOS guest; setup in docs/release/app-proof-vm.md.
 #   VOX_PROOF_APP=<any other Vox.app>         # refused before anything runs (see below)
 #
 # It builds the macOS slice of VoxFFI.xcframework, the release `vox`, and the app; puts `vox` in
@@ -26,10 +28,22 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-# Say this before even reading the pasteboard. Guest dispatch belongs ahead of this point;
-# a local run uses the desktop of the account running it.
-echo "app-proofs: this local run is about to use this Mac's screen, keyboard focus and clipboard." >&2
+if [ "${VOX_PROOF_VM_GUEST:-}" = 1 ]; then
+    case "$(sysctl -n hw.model)" in
+        VirtualMac*) echo "app-proofs: using the guest desktop and clipboard" ;;
+        *) echo "app-proofs: APPARATUS: guest mode requires a macOS virtual machine" >&2; exit 2 ;;
+    esac
+elif [ "${1:-}" = --host ]; then
+    shift
+    # Say this before even reading the pasteboard.
+    echo "app-proofs: this local run is about to use this Mac's screen, keyboard focus and clipboard." >&2
+else
+    [ "${1:-}" != --vm ] || shift
+    exec python3 "$ROOT/scripts/app-proofs-vm.py" "$@"
+fi
 DERIVED="$ROOT/target/xcode"
+RESULTS="${VOX_PROOF_RESULTS:-$ROOT/target/app-proof-results/$(date -u +%Y%m%dT%H%M%SZ)}"
+mkdir -p "$RESULTS"
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/vox-app-proofs.XXXXXX")"
 # **The person's clipboard is put back as it was** (v0.4.1): the proofs paste and copy through the
 # general pasteboard. Every item and type is kept here and restored at exit, red, green or a crash
@@ -54,7 +68,18 @@ restore_clipboard() {
         || echo "app-proofs: the clipboard could not be put back as it was" >&2
     rm -f "$SCRATCH/pasteboard.plist"
 }
-trap 'restore_clipboard; rm -rf "$SCRATCH"' EXIT
+collect_results() {
+    local status=0
+    for artifact in xcodebuild.log real-touch.log; do
+        if [ -f "$SCRATCH/$artifact" ] && ! cp "$SCRATCH/$artifact" "$RESULTS/"; then
+            echo "app-proofs: APPARATUS: could not collect $artifact" >&2
+            status=2
+        fi
+    done
+    echo "app-proofs: results: $RESULTS"
+    return "$status"
+}
+trap 'restore_clipboard; collect_results || exit 2; rm -rf "$SCRATCH"' EXIT
 # Killed or interrupted, the run still ends through its EXIT trap (which stops what it started).
 trap 'exit 130' INT TERM HUP
 
@@ -242,7 +267,7 @@ trap_unregister() {
 launch_status=0
 watch_real &
 WATCH_REAL=$!
-trap 'restore_clipboard; kill "$WATCH_REAL" 2>/dev/null || true; rm -rf "$SCRATCH"' EXIT
+trap 'restore_clipboard; kill "$WATCH_REAL" 2>/dev/null || true; collect_results || exit 2; rm -rf "$SCRATCH"' EXIT
 if [ "$#" -eq 0 ] || [ "$*" = "LaunchProof" ]; then
     python3 scripts/app-launch-proof.py "$APP" || launch_status=$?
     if [ "$*" = "LaunchProof" ]; then
@@ -276,11 +301,25 @@ finish() {
     kill "$STAGER" 2>/dev/null || true
     wait "$STAGER" 2>/dev/null || true
     trap_unregister
+    collect_results || status=2
     if [ "$status" -ne 0 ]; then
+        # restore_clipboard ran first: its saved contents are never copied to results.
+        if ! cp -R "$SCRATCH" "$RESULTS/scratch"; then
+            echo "app-proofs: APPARATUS: could not collect the red scratch evidence" >&2
+            status=2
+        fi
+        mkdir -p "$RESULTS/crash-reports" || status=2
+        for report in "$HOME"/Library/Logs/DiagnosticReports/VoxAppProofs-Runner-*.ips; do
+            if [ -f "$report" ] && ! cp "$report" "$RESULTS/crash-reports/"; then
+                echo "app-proofs: APPARATUS: could not collect the runner crash report" >&2
+                status=2
+            fi
+        done
         echo "app-proofs: kept for reading the red: $SCRATCH" >&2
     else
         rm -rf "$SCRATCH"
     fi
+    exit "$status"
 }
 trap finish EXIT
 for _ in $(seq 1 100); do [ -s "$SCRATCH/stager.port" ] && break; sleep 0.1; done
@@ -311,12 +350,13 @@ TEST_RUNNER_VOX_PROOF_APP="$APP" TEST_RUNNER_VOX_PROOF_SCRATCH="$SCRATCH" \
     TEST_RUNNER_VOX_PROOF_KNOBS_VOX="$ROOT/target/proof-knobs/release/vox" \
     TEST_RUNNER_VOX_PROOF_CONTINUE="${VOX_PROOF_CONTINUE:-}" \
     xcodebuild -project apps/macos/Vox.xcodeproj -scheme Vox -configuration Release \
-    -derivedDataPath "$DERIVED" ${only[@]+"${only[@]}"} test-without-building \
+    -derivedDataPath "$DERIVED" -resultBundlePath "$RESULTS/AppProofs.xcresult" \
+    ${only[@]+"${only[@]}"} test-without-building \
     2>&1 | tee "$SCRATCH/xcodebuild.log" || status=$?
 check_real || exit 2
 if grep -q "enabling automation mode" "$SCRATCH/xcodebuild.log"; then
     echo "app-proofs: APPARATUS (precondition unmet): UI automation is not allowed on this Mac, so" \
-        "no proof ran. Allow it once: sudo DevToolsSecurity -enable, then approve the prompt" \
+        "no proof ran. Enable developer mode in this guest, then approve the prompt" \
         "macOS shows on the next run." >&2
     exit 2
 fi
