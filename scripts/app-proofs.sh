@@ -26,6 +26,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+# Say this before even reading the pasteboard. Guest dispatch belongs ahead of this point;
+# a local run uses the desktop of the account running it.
+echo "app-proofs: this local run is about to use this Mac's screen, keyboard focus and clipboard." >&2
 DERIVED="$ROOT/target/xcode"
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/vox-app-proofs.XXXXXX")"
 # **The person's clipboard is put back as it was** (v0.4.1): the proofs paste and copy through the
