@@ -354,6 +354,11 @@ TEST_RUNNER_VOX_PROOF_APP="$APP" TEST_RUNNER_VOX_PROOF_SCRATCH="$SCRATCH" \
     ${only[@]+"${only[@]}"} test-without-building \
     2>&1 | tee "$SCRATCH/xcodebuild.log" || status=$?
 check_real || exit 2
+if grep -q "Failed to get matching snapshots: Timed out while evaluating UI query" "$SCRATCH/xcodebuild.log"; then
+    echo "app-proofs: APPARATUS (UI query timeout): XCTest could not read the app's accessibility" \
+        "snapshot; this runner failure proves no product behavior. See $RESULTS/AppProofs.xcresult." >&2
+    exit 2
+fi
 if grep -q "enabling automation mode" "$SCRATCH/xcodebuild.log"; then
     echo "app-proofs: APPARATUS (precondition unmet): UI automation is not allowed on this Mac, so" \
         "no proof ran. Enable developer mode in this guest, then approve the prompt" \

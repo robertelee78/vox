@@ -4361,6 +4361,12 @@ final class FirstRunProof: XCTestCase {
         guard running.count == 1, let pid = running.first, executable(pid) == appExe else {
             throw Apparatus("after starting Vox Proof, the \(proofAppID) processes are \(running.map { "\($0) \(executable($0))" }), not one of \(appExe)")
         }
+        // Keep the guest's actual screen even when accessibility cannot produce a snapshot.
+        // This is a diagnostic artifact, never a product verdict or a new gate.
+        let screen = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        screen.name = "Screen after launching Vox Proof"
+        screen.lifetime = .keepAlways
+        add(screen)
         // The profile, positively, before any step. The account's own config has answered the
         // first-run question (checked here, by the stager), so an app asking it is not reading
         // the account's config: the launch environment, which comes whole or not at all, reached it.
