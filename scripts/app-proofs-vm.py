@@ -115,7 +115,7 @@ def execute(root, tart, vm, user, sha, state, machine):
 set timeout 30
 spawn -noecho {*}$argv
 expect {
-    -re "(?i)password:" {send -- "$env(VOX_VM_BOOTSTRAP_PASSWORD)\r"; exp_continue}
+    -nocase -re "password:" {send -- "$env(VOX_VM_BOOTSTRAP_PASSWORD)\r"; exp_continue}
     eof {catch wait result; exit [lindex $result 3]}
     timeout {exit 2}
 }
