@@ -282,6 +282,7 @@ fn a_data_root_of_an_earlier_release_is_refused_and_unchanged() {
             "format marker is not valid",
         ),
         ("broken-format-link", "", "format marker could not be read"),
+        ("linked-format", "", "format marker could not be read"),
     ] {
         let data = tmp.path().join(name);
         std::fs::create_dir_all(data.join(".daemon")).expect("APPARATUS: the format directory");
@@ -289,6 +290,14 @@ fn a_data_root_of_an_earlier_release_is_refused_and_unchanged() {
         if name == "broken-format-link" {
             std::os::unix::fs::symlink("missing-format", data.join(".daemon/format"))
                 .expect("APPARATUS: the broken format marker");
+        } else if name == "linked-format" {
+            // The text is supported; following the link would admit the root. The marker
+            // itself must be a regular file, rather than an unchecked indirect read.
+            let target = outside.join("linked-format");
+            std::fs::write(&target, "format 2\nwritten-by vox 0.4.4\n")
+                .expect("APPARATUS: the linked marker's target");
+            std::os::unix::fs::symlink(&target, data.join(".daemon/format"))
+                .expect("APPARATUS: the linked format marker");
         } else {
             std::fs::write(data.join(".daemon/format"), marker)
                 .expect("APPARATUS: the unsupported format marker");

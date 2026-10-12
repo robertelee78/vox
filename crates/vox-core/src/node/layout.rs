@@ -146,27 +146,66 @@ pub const DATA_ROOT_FORMAT: u32 = 2;
 /// newer than this build. Refusing it preserves the person's data instead of silently downgrading
 /// the marker and opening stores with incompatible code.
 pub fn data_root_format(account: &Account) -> Result<u32> {
+    read_data_root_format(account).map(|(format, _)| format)
+}
+
+/// Keep the admitted marker's text so stamping never reopens an unchecked path to compare it.
+fn read_data_root_format(account: &Account) -> Result<(u32, Option<String>)> {
     const MAX_MARKER_BYTES: u64 = 4096;
     let path = account.daemon_dir().join(FORMAT_FILE);
     let refused = |why: String| Error::DataRootNotRead {
         root: account.data_root.display().to_string(),
         why,
     };
-    let file = match std::fs::File::open(&path) {
-        Ok(file) => file,
-        Err(e)
-            if e.kind() == std::io::ErrorKind::NotFound
-                && std::fs::symlink_metadata(&path)
-                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            return Ok(1);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(refused(
+                "its format marker could not be read: it is not a regular file; \
+                 nothing in it was changed"
+                    .into(),
+            ));
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((1, None)),
         Err(e) => {
             return Err(refused(format!(
                 "its format marker could not be read: {e}; nothing in it was changed"
             )));
         }
-    };
+    }
+    // A pre-open path check alone races a replacement by a FIFO or symlink. Open without
+    // following a link or waiting for a pipe's writer, then check the descriptor itself before
+    // reading. A changed or unreadable marker is never treated as the missing v0.4.0 marker.
+    #[cfg(unix)]
+    let opened = rustix::fs::open(
+        &path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map(std::fs::File::from)
+    .map_err(std::io::Error::from);
+    #[cfg(not(unix))]
+    let opened = std::fs::File::open(&path);
+    let file = opened.map_err(|e| {
+        refused(format!(
+            "its format marker could not be read: {e}; nothing in it was changed"
+        ))
+    })?;
+    let metadata = file.metadata().map_err(|e| {
+        refused(format!(
+            "its format marker could not be read: {e}; nothing in it was changed"
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(refused(
+            "its format marker could not be read: it is not a regular file; \
+             nothing in it was changed"
+                .into(),
+        ));
+    }
     let mut text = String::new();
     file.take(MAX_MARKER_BYTES + 1)
         .read_to_string(&mut text)
@@ -194,7 +233,7 @@ pub fn data_root_format(account: &Account) -> Result<u32> {
              nothing in it was changed"
         )));
     }
-    Ok(format)
+    Ok((format, Some(text)))
 }
 
 /// What `.daemon/format` says: the data root's format and the vox that last served it.
@@ -210,10 +249,10 @@ fn format_text(version: &str) -> String {
 /// The existing format is not supported, or the file cannot be written.
 pub fn stamp_format(account: &Account, version: &str) -> Result<()> {
     // Recheck under the account lock: never replace a marker we cannot interpret.
-    data_root_format(account)?;
+    let (_, held) = read_data_root_format(account)?;
     let path = account.daemon_dir().join(FORMAT_FILE);
     let text = format_text(version);
-    if std::fs::read_to_string(&path).is_ok_and(|held| held == text) {
+    if held.as_deref() == Some(text.as_str()) {
         return Ok(());
     }
     write_private_file(&path, text.as_bytes())
