@@ -14,6 +14,8 @@
 //! it tells which one it holds. A root without the file was last served by v0.4.0, which wrote
 //! none: format 1.
 
+use std::io::Read as _;
+
 use crate::error::{Error, Result};
 use crate::node::headless::IDENTITY_FILE;
 use crate::node::paths::{
@@ -109,11 +111,12 @@ pub fn move_old_layout_aside(
 /// node. Nothing is created, locked or written either way.
 ///
 /// # Errors
-/// [`Error::DataRootNotRead`], naming the root and the first such directory.
+/// [`Error::DataRootNotRead`], naming the root and the first such directory, or an unreadable,
+/// malformed or newer format marker. A marker this build cannot read must never be overwritten.
 pub fn refuse_old_layout(account: &Account) -> Result<()> {
     let old = old_layout_dirs(account);
     match old.first() {
-        None => Ok(()),
+        None => data_root_format(account).map(|_| ()),
         Some(first) => Err(Error::DataRootNotRead {
             root: account.data_root.display().to_string(),
             why: format!(
@@ -134,6 +137,60 @@ pub fn refuse_old_layout(account: &Account) -> Result<()> {
 // envelopes before the first retention sweep; no identity or room is rewritten.
 pub const DATA_ROOT_FORMAT: u32 = 2;
 
+/// Read the supported format before opening or writing anything in the data root (ADR-026 F-3).
+/// A missing marker is format 1, written by v0.4.0; an existing but unreadable marker is not.
+/// The writer's version is descriptive: the format number decides whether this build can read it.
+///
+/// # Errors
+/// [`Error::DataRootNotRead`] when the marker cannot be read, is malformed, or names a format
+/// newer than this build. Refusing it preserves the person's data instead of silently downgrading
+/// the marker and opening stores with incompatible code.
+pub fn data_root_format(account: &Account) -> Result<u32> {
+    const MAX_MARKER_BYTES: u64 = 4096;
+    let path = account.daemon_dir().join(FORMAT_FILE);
+    let refused = |why: String| Error::DataRootNotRead {
+        root: account.data_root.display().to_string(),
+        why,
+    };
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(1),
+        Err(e) => {
+            return Err(refused(format!(
+                "its format marker could not be read: {e}; nothing in it was changed"
+            )));
+        }
+    };
+    let mut text = String::new();
+    file.take(MAX_MARKER_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| {
+            refused(format!(
+                "its format marker could not be read: {e}; nothing in it was changed"
+            ))
+        })?;
+    let format = text
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("format "))
+        .filter(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|number| number.parse::<u32>().ok())
+        .filter(|number| *number > 0);
+    let Some(format) = format.filter(|_| text.len() as u64 <= MAX_MARKER_BYTES) else {
+        return Err(refused(
+            "its format marker is not valid; nothing in it was changed".into(),
+        ));
+    };
+    if format > DATA_ROOT_FORMAT {
+        return Err(refused(format!(
+            "data format {format} needs a newer Vox (this build reads through format \
+             {DATA_ROOT_FORMAT}); use the version that last opened it or a newer one; \
+             nothing in it was changed"
+        )));
+    }
+    Ok(format)
+}
+
 /// What `.daemon/format` says: the data root's format and the vox that last served it.
 fn format_text(version: &str) -> String {
     format!("format {DATA_ROOT_FORMAT}\nwritten-by vox {version}\n")
@@ -144,8 +201,10 @@ fn format_text(version: &str) -> String {
 /// the running vox's.
 ///
 /// # Errors
-/// The file cannot be written.
+/// The existing format is not supported, or the file cannot be written.
 pub fn stamp_format(account: &Account, version: &str) -> Result<()> {
+    // Recheck under the account lock: never replace a marker we cannot interpret.
+    data_root_format(account)?;
     let path = account.daemon_dir().join(FORMAT_FILE);
     let text = format_text(version);
     if std::fs::read_to_string(&path).is_ok_and(|held| held == text) {

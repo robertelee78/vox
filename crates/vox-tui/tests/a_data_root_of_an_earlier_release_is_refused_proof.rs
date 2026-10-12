@@ -1,10 +1,6 @@
-//! V030-46 (#423, ADR-026 F-3) — **Vox carries no code for data from earlier releases: a fresh
-//! data root works end to end, and one laid out by a release before v0.3.0 is refused with a
-//! plain reason and left byte for byte unchanged**, through the shipped binary.
-//!
-//! Nobody has run a Vox release (decider, 2026-10-04), so nothing needs migrating: Vox carries no
-//! code that reads, converts or moves such a data root. What is left is a refusal, before anything
-//! is written.
+//! V030-46 (#423, ADR-026 F-3) — a fresh data root works end to end, supported roots from v0.4.0
+//! onward upgrade, and an unsupported layout or format is refused before anything is written.
+//! A format from a newer Vox, or a damaged marker, must not be mistaken for a supported old root.
 //!
 //! **Arm 1, fresh data roots, end to end** (`support/room.rs`): an anchor and two members, each
 //! made by `vox id`, attached in its own `vox daemon`; `vox room create`, `invite`, `join` and
@@ -19,6 +15,8 @@
 //! data root is snapshotted before and after (every path, every file's bytes): it must be
 //! identical. The config directory and `HOME` are outside it, so nothing legitimate writes inside
 //! it.
+//! The same journey also tries a current-layout root with a future format and a damaged marker
+//! (#741). Neither may be opened, stamped with this build's format, or otherwise changed.
 //!
 //! **Arm 3, a data root of the previous published release** (ADR-026 F-3, decider 2026-10-08):
 //! made by that release, downloaded and digest-checked, and opened by this build with nothing lost
@@ -35,6 +33,8 @@
 //!
 //! Mutation: the refusal removed (`refuse_old_layout` answering `Ok`) → red: the verbs run, and
 //! `nodes/` and `.daemon/` appear in the old data root.
+//! Mutation for #741: skip `data_root_format` at admission → PRODUCT red when `vox node list`
+//! succeeds on the future root instead of saying that a newer Vox is needed.
 
 #![cfg(unix)]
 
@@ -266,6 +266,53 @@ fn a_data_root_of_an_earlier_release_is_refused_and_unchanged() {
         after == before
     );
     assert!(red.is_empty(), "PRODUCT: {red:#?}");
+
+    // An unsupported format is as dangerous to open as an unsupported directory layout.
+    // The marker and opaque store are test-side apparatus; the verdict is the shipped CLI's
+    // refusal and the person's data remaining unchanged, not a parser's internal result.
+    for (name, marker, reason) in [
+        (
+            "future-format",
+            "format 4294967295\nwritten-by vox future\n",
+            "needs a newer Vox",
+        ),
+        (
+            "damaged-format",
+            "format interrupted\n",
+            "format marker is not valid",
+        ),
+    ] {
+        let data = tmp.path().join(name);
+        std::fs::create_dir_all(data.join(".daemon")).expect("APPARATUS: the format directory");
+        std::fs::create_dir_all(data.join("nodes/default")).expect("APPARATUS: the node directory");
+        std::fs::write(data.join(".daemon/format"), marker)
+            .expect("APPARATUS: the unsupported format marker");
+        std::fs::write(
+            data.join("nodes/default/store.redb"),
+            b"do not open this store",
+        )
+        .expect("APPARATUS: the person's store");
+        std::fs::write(data.join("notes.txt"), b"a file of the person's own")
+            .expect("APPARATUS: the person's notes");
+        let before = snapshot(&data);
+        // List first: a mutant that removes admission must turn red immediately, rather than
+        // relying on a watchdog after accidentally starting a daemon.
+        for argv in std::iter::once(&["node", "list"][..])
+            .chain(verbs.into_iter().filter(|argv| *argv != ["node", "list"]))
+        {
+            let (status, said) = run_on(&data, &outside, argv);
+            assert!(
+                status == Some(false) && said.contains(REASON) && said.contains(reason),
+                "PRODUCT: {name}: vox {argv:?} must refuse with {reason:?}; \
+                 exit ok={status:?}, said {said:?}"
+            );
+            assert_eq!(
+                snapshot(&data),
+                before,
+                "PRODUCT: {name}: vox {argv:?} changed a data root it cannot read"
+            );
+        }
+    }
 }
 
 /// Read the actual Session, including its full detail, through the worker's shipped CLI.
