@@ -5456,7 +5456,12 @@ pub async fn trust_list(paths: &Paths) -> Result<(), AppError> {
                 return Ok(());
             }
             // What each entry grants, read or read + drive (ADR-028 K-14).
+            let names: Vec<_> = entries
+                .iter()
+                .map(|(id, name, _)| (*id, name.clone()))
+                .collect();
             for (id, petname, capability) in entries {
+                let petname = crate::ident::alias_of(&names, &id).unwrap_or(petname);
                 println!(
                     "{}  {petname}  {}",
                     vox_core::node::link::b32_encode(&id),

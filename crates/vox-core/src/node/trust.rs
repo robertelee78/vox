@@ -72,10 +72,12 @@ pub const TRUST_META_KEY: &str = "trust";
 /// Only slot; the keyring is a single blob.
 pub const TRUST_SEGMENT_ID: u64 = 0;
 
-/// Encoding version of the keyring body, with each identity's history grant and capability
-/// (ADR-028 K-14). Version 2, without the capability, is still read, each entry as
-/// [`Capability::Read`]; version 1 (no grants) was an earlier release's (#423).
-const KEYRING_VERSION: u64 = 3;
+/// Version 4 keeps manual removals alongside grants, so local trust never undoes a removal
+/// after a restart (ADR-031 LT-6). Versions 2 and 3 remain readable without changing grants.
+const KEYRING_VERSION: u64 = 4;
+
+/// The version with capabilities but without local-trust removal history.
+const KEYRING_VERSION_CAPABILITIES: u64 = 3;
 
 /// The version before the capability: read, never written.
 const KEYRING_VERSION_READ_ONLY: u64 = 2;
@@ -196,6 +198,11 @@ pub struct Keyring {
     full_history: BTreeSet<Digest32>,
     /// The identities trusted with drive (ADR-028 K-14); everyone else has [`Capability::Read`].
     drive: BTreeSet<Digest32>,
+    /// A person's removals forbid automatic local trust until they add that identity back.
+    /// Kept in the same sealed write as the keyring, independently of decision-log retention.
+    local_removals: BTreeSet<Digest32>,
+    /// Older roots import the still-retained removal decisions before automatic trust runs.
+    local_history_imported: bool,
 }
 
 impl Keyring {
@@ -248,6 +255,7 @@ impl Keyring {
             return Err(Error::SizeLimitExceeded("trusted identities"));
         }
         self.entries.insert(fingerprint, name.to_owned());
+        self.local_removals.remove(&fingerprint);
         match history {
             HistoryGrant::Full => self.full_history.insert(fingerprint),
             HistoryGrant::Now => self.full_history.remove(&fingerprint),
@@ -316,7 +324,34 @@ impl Keyring {
     pub fn untrust(&mut self, fingerprint: &Digest32) -> bool {
         self.full_history.remove(fingerprint);
         self.drive.remove(fingerprint);
-        self.entries.remove(fingerprint).is_some()
+        let removed = self.entries.remove(fingerprint).is_some();
+        if removed {
+            self.local_removals.insert(*fingerprint);
+        }
+        removed
+    }
+
+    /// Identities a manual removal has blacklisted from automatic local trust.
+    #[must_use]
+    pub fn local_removals(&self) -> &BTreeSet<Digest32> {
+        &self.local_removals
+    }
+
+    /// Whether the retained decision history has already been imported.
+    #[must_use]
+    pub fn local_history_imported(&self) -> bool {
+        self.local_history_imported
+    }
+
+    /// Preserve older manual removals before enabling automatic trust. An existing grant means
+    /// the person added that identity back; it is never withdrawn by importing older history.
+    pub fn import_local_removals(&mut self, removed: impl IntoIterator<Item = Digest32>) {
+        for fingerprint in removed {
+            if !self.is_trusted(&fingerprint) {
+                self.local_removals.insert(fingerprint);
+            }
+        }
+        self.local_history_imported = true;
     }
 
     /// Whether `fingerprint` is trusted.
@@ -358,7 +393,7 @@ impl Keyring {
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(2).uint(KEYRING_VERSION).array(self.entries.len());
+        e.array(4).uint(KEYRING_VERSION).array(self.entries.len());
         for (fp, name) in &self.entries {
             e.array(4)
                 .bytes(fp)
@@ -366,6 +401,11 @@ impl Keyring {
                 .uint(u64::from(self.full_history.contains(fp)))
                 .uint(u64::from(self.drive.contains(fp)));
         }
+        e.array(self.local_removals.len());
+        for fp in &self.local_removals {
+            e.bytes(fp);
+        }
+        e.uint(u64::from(self.local_history_imported));
         e.finish()
     }
 
@@ -373,7 +413,7 @@ impl Keyring {
     pub fn from_bytes(b: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(b);
         let outer = d.array().map_err(|_| Error::MalformedAtRest("keyring"))?;
-        if outer != 2 {
+        if !matches!(outer, 2 | 4) {
             return Err(Error::MalformedAtRest("keyring arity"));
         }
         let version = d
@@ -381,8 +421,9 @@ impl Keyring {
             .map_err(|_| Error::MalformedAtRest("keyring version"))?;
         // A version-2 keyring has no capability: each entry reads as read (ADR-028 K-14).
         let row_arity = match version {
-            KEYRING_VERSION => 4,
-            KEYRING_VERSION_READ_ONLY => 3,
+            KEYRING_VERSION if outer == 4 => 4,
+            KEYRING_VERSION_CAPABILITIES if outer == 2 => 4,
+            KEYRING_VERSION_READ_ONLY if outer == 2 => 3,
             _ => return Err(Error::MalformedAtRest("keyring version")),
         };
         let n = d
@@ -437,12 +478,46 @@ impl Keyring {
             }
             entries.insert(fp, name);
         }
+        let mut local_removals = BTreeSet::new();
+        let mut local_history_imported = false;
+        if version == KEYRING_VERSION {
+            let n = d
+                .array()
+                .map_err(|_| Error::MalformedAtRest("local trust removals"))?;
+            // Each encoded digest needs at least 34 bytes. Do not reserve from a forged count;
+            // removal history must not expire merely because a node has had many past peers.
+            if n > b.len() / 34 {
+                return Err(Error::MalformedAtRest("local trust removal count"));
+            }
+            for _ in 0..n {
+                let fp = Digest32::try_from(
+                    d.bytes()
+                        .map_err(|_| Error::MalformedAtRest("local trust removal"))?,
+                )
+                .map_err(|_| Error::MalformedAtRest("local trust removal fingerprint"))?;
+                if entries.contains_key(&fp) || !local_removals.insert(fp) {
+                    return Err(Error::MalformedAtRest(
+                        "local trust removal conflicts with keyring",
+                    ));
+                }
+            }
+            local_history_imported = match d
+                .uint()
+                .map_err(|_| Error::MalformedAtRest("local trust import"))?
+            {
+                0 => false,
+                1 => true,
+                _ => return Err(Error::MalformedAtRest("local trust import")),
+            };
+        }
         d.finish()
             .map_err(|_| Error::MalformedAtRest("keyring trailing"))?;
         Ok(Self {
             entries,
             full_history,
             drive,
+            local_removals,
+            local_history_imported,
         })
     }
 
