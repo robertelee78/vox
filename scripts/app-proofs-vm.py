@@ -158,6 +158,11 @@ if [ ! -e "$account_app/login-item" ]; then
     printf 'no\\n' > "$account_app/login-item"
     echo 'app-proofs: staged guest account first-run answer for scratch-profile guard'
 fi
+python3 - "$account_app/login-item" <<'PY'
+import pathlib, sys
+if pathlib.Path(sys.argv[1]).read_text().strip() not in ("keep", "no"):
+    sys.exit("app-proofs: APPARATUS: guest account first-run answer is invalid; scratch-profile guard cannot rely on it")
+PY
 mkdir -p {shlex.quote(guest + '/results/' + stamp)}
 VOX_PROOF_VM_GUEST=1 VOX_PROOF_RESULTS={shlex.quote(guest + '/results/' + stamp)} {controls} \\
     RUSTC_WRAPPER= CARGO_PROFILE_RELEASE_STRIP=none python3 scripts/app-proofs-vm.py --guest-run {shlex.quote(guest)} {args}
