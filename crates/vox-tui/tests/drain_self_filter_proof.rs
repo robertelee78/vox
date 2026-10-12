@@ -125,6 +125,55 @@ fn a_drain_drops_only_its_own_session_on_its_own_harness() {
             },
         );
     }
+    // A harness in an unmapped directory works in no room (ADR-031 RM-6),
+    // even though its node holds this room and its posts are already readable.
+    let unmapped = tmp.path().join("unmapped-repo");
+    std::fs::create_dir(&unmapped).expect("APPARATUS: make the session's unmapped directory");
+    let input = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "UNMAPPED",
+        "cwd": unmapped,
+    })
+    .to_string();
+    let outside = h.vox_in(
+        None,
+        &["agent", "hook", "--node", "default", "--format", "text"],
+        Some(&input),
+    );
+    assert!(
+        outside.ok,
+        "PRODUCT: the unmapped session's hook failed: {outside:?}"
+    );
+    assert!(
+        ["OWN-A-ON-H", "SIBLING-B-ON-H", "SAME-NAME-A-ON-H-PRIME"]
+            .iter()
+            .all(|body| !outside.stdout.contains(body)),
+        "PRODUCT: a session working in no room received another room's news: {}",
+        outside.stdout
+    );
+    // A deliberate session assignment is retained even though its directory is
+    // still unmapped; the next ordinary hook must now deliver the room's news.
+    let assigned = h.vox(Some("UNMAPPED"), &["agent", "room", r, "--node", "default"]);
+    assert!(
+        assigned.ok,
+        "PRODUCT: assigning the session to its node's room failed: {assigned:?}"
+    );
+    let inside = h.vox_in(
+        None,
+        &["agent", "hook", "--node", "default", "--format", "text"],
+        Some(&input),
+    );
+    assert!(
+        inside.ok,
+        "PRODUCT: the assigned session's hook failed: {inside:?}"
+    );
+    assert!(
+        ["OWN-A-ON-H", "SIBLING-B-ON-H", "SAME-NAME-A-ON-H-PRIME"]
+            .iter()
+            .all(|body| inside.stdout.contains(body)),
+        "PRODUCT: a deliberately assigned session received no expected room news: {}",
+        inside.stdout
+    );
     let a = drain(h, r, "A");
     assert!(
         !a.contains("OWN-A-ON-H"),
