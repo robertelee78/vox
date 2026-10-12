@@ -2331,6 +2331,9 @@ impl ChannelState {
         // Apply the new default while upgrading an existing room, before publishing any
         // cached Session rows or permitting a sync to send its old encrypted bodies.
         room.restore_legacy_sessions(store, now.0)?;
+        // A revoked member may hold no body from the newest drive generation. Restore the
+        // author's signed generation announcements before exposing its Session permissions.
+        room.index_session_floors();
         room.sweep_retention(store, now)?;
         Ok(room)
     }
@@ -5861,10 +5864,11 @@ impl ChannelState {
     }
 
     /// The nodes whose Sessions this node can read inside here, sorted: itself, and each node
-    /// whose **live** drive key it holds (SC-2) — the generation of that node's newest
-    /// drive-sealed entry here, or any it released while it has written none. A member whose key
-    /// was rotated away (SC-2b) drops out at the first entry sealed under the new one, which the
-    /// author writes as it changes the key ([`crate::node::drive::KEY_CHANGED`]), unless a
+    /// whose **live** drive key it holds (SC-2). The author's signed Session floors announce its
+    /// generation even when this node is forbidden from receiving the new step bodies. For an
+    /// older author without floors, the newest retained drive-sealed entry is the fallback.
+    /// A member whose key was rotated away (SC-2b) drops out when the new generation arrives,
+    /// unless a
     /// key-package from that author for this node waits to be opened (until the end of the sync
     /// session that brought it, when the node opens it): before that, nothing here can tell the key
     /// changed, and the session's node is the authority on whom it lets drive (DR-2).
@@ -5875,7 +5879,7 @@ impl ChannelState {
         let mut from: BTreeSet<Digest32> = held
             .into_iter()
             .filter(|author| {
-                let newest = self.dag.feed(author).and_then(|f| {
+                let legacy = self.dag.feed(author).and_then(|f| {
                     (1..=f.max_seq())
                         .rev()
                         .filter_map(|seq| f.get(seq))
@@ -5884,6 +5888,16 @@ impl ChannelState {
                         .find(|m| m.header.channel_id == ns)
                         .map(|m| m.header.chain_id)
                 });
+                // A floor is root-authenticated by this author. An exact-hash Session index
+                // only establishes subtype and must never confer or preserve drive authority.
+                let announced = self
+                    .drive
+                    .floors
+                    .keys()
+                    .filter(|(a, _, epoch, _)| a == author && *epoch <= self.epoch)
+                    .map(|(_, _, _, generation)| *generation)
+                    .max();
+                let newest = legacy.into_iter().chain(announced).max();
                 newest.is_none_or(|g| self.drive.receivers.contains_key(&(*author, g)))
                     // A key-package from this author for this node, not yet opened, may hold
                     // that generation: it is posted before the entry under it, so it arrives
