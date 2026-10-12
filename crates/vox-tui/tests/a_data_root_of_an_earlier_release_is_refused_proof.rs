@@ -281,12 +281,18 @@ fn a_data_root_of_an_earlier_release_is_refused_and_unchanged() {
             "format interrupted\n",
             "format marker is not valid",
         ),
+        ("broken-format-link", "", "format marker could not be read"),
     ] {
         let data = tmp.path().join(name);
         std::fs::create_dir_all(data.join(".daemon")).expect("APPARATUS: the format directory");
         std::fs::create_dir_all(data.join("nodes/default")).expect("APPARATUS: the node directory");
-        std::fs::write(data.join(".daemon/format"), marker)
-            .expect("APPARATUS: the unsupported format marker");
+        if name == "broken-format-link" {
+            std::os::unix::fs::symlink("missing-format", data.join(".daemon/format"))
+                .expect("APPARATUS: the broken format marker");
+        } else {
+            std::fs::write(data.join(".daemon/format"), marker)
+                .expect("APPARATUS: the unsupported format marker");
+        }
         std::fs::write(
             data.join("nodes/default/store.redb"),
             b"do not open this store",

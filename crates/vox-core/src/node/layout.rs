@@ -154,7 +154,13 @@ pub fn data_root_format(account: &Account) -> Result<u32> {
     };
     let file = match std::fs::File::open(&path) {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(1),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(&path)
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(1);
+        }
         Err(e) => {
             return Err(refused(format!(
                 "its format marker could not be read: {e}; nothing in it was changed"
