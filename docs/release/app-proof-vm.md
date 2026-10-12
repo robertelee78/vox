@@ -28,6 +28,11 @@ configuration. Cirrus images have the public bootstrap account `admin` with pass
 `VOX_PROOF_VM` selects another already-cloned VM. Only a VM started by this runner
 with its isolation flags may be reused.
 
+For a fresh guest account, the runner records `no` for Vox's default first-run
+answer if none exists. It preserves an existing answer and never starts Vox on
+that default profile. This lets the proof's safety guard recognize the first-run
+question as belonging to its separate scratch config.
+
 The preflight checks developer mode in the guest. If macOS requests UI automation
 approval, or Vox needs notification permission, approve it **inside the guest**.
 The guest's VNC endpoint is recorded in its `vm.log` under the cache directory.

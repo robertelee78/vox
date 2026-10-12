@@ -148,6 +148,16 @@ if ! command -v rustup >/dev/null; then
     sh ../rustup-init.sh -y --profile minimal --default-toolchain none
 fi
 rustup show active-toolchain
+# A fresh guest has never answered Vox's first-run question. Stage the default
+# account's answer so the existing proof can distinguish it from scratch config:
+# only the scratch app should ask the question. Never start Vox on this default.
+case "$(sysctl -n hw.model)" in VirtualMac*) ;; *) echo 'app-proofs: APPARATUS: guest is not a virtual Mac' >&2; exit 2 ;; esac
+account_app="$HOME/Library/Application Support/vox/app"
+if [ ! -e "$account_app/login-item" ]; then
+    mkdir -p "$account_app"
+    printf 'no\\n' > "$account_app/login-item"
+    echo 'app-proofs: staged guest account first-run answer for scratch-profile guard'
+fi
 mkdir -p {shlex.quote(guest + '/results/' + stamp)}
 VOX_PROOF_VM_GUEST=1 VOX_PROOF_RESULTS={shlex.quote(guest + '/results/' + stamp)} {controls} \\
     RUSTC_WRAPPER= CARGO_PROFILE_RELEASE_STRIP=none python3 scripts/app-proofs-vm.py --guest-run {shlex.quote(guest)} {args}
