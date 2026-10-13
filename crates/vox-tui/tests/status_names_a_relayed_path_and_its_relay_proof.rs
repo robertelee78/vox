@@ -375,12 +375,12 @@ fn unreachable_anchor_check(
             });
     eprintln!(
         "[test] j's anchors: {}\nj's join said:\n{joined}",
-        v["anchors"]
+        v["node_anchors"]
     );
     // No member of the room — r, which let j in, nor a1, which r's link names at its address —
     // is among j's anchors.
     let names: Vec<(String, String)> = ws[..j].iter().map(|w| (w.name.clone(), w.b32())).collect();
-    let listed: Vec<&str> = v["anchors"]
+    let listed: Vec<&str> = v["node_anchors"]
         .as_array()
         .map(|a| {
             a.iter()
@@ -398,7 +398,7 @@ fn unreachable_anchor_check(
         listed.is_empty(),
         "PRODUCT: j's `vox status --json` lists members of the room among its anchors: {listed:?} \
          (r {r_short} let it in). Its anchors: {}",
-        v["anchors"]
+        v["node_anchors"]
     );
 }
 

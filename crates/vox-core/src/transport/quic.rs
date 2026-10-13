@@ -151,6 +151,7 @@ fn sample_overflow(
 /// One node on a [`SharedEndpoint`].
 struct Registered {
     management: bool,
+    anchor: bool,
     local: Arc<LocalNode>,
     signer: Arc<dyn RootSigner + Send + Sync>,
     /// Where the node's accepted connections go, when something routes them by node
@@ -912,6 +913,7 @@ impl SharedEndpoint {
                 id,
                 Registered {
                     management,
+                    anchor: false,
                     local: Arc::clone(&local),
                     signer: Arc::clone(&signer),
                     inbound,
@@ -936,6 +938,11 @@ impl SharedEndpoint {
             .is_some_and(|r| Arc::ptr_eq(&r.local, local))
         {
             reg.remove(&local.id());
+            self.mux.anchor_lookup.serve(
+                reg.iter()
+                    .filter_map(|(id, r)| r.anchor.then_some(*id))
+                    .collect(),
+            );
         }
     }
 
@@ -956,7 +963,15 @@ impl SharedEndpoint {
     /// off the exchange, and close every connection it had, as stopping. Every other node's
     /// registration and connections are left as they are.
     pub fn evict(&self, local: &Digest32) {
-        lock(&self.registry).remove(local);
+        {
+            let mut reg = lock(&self.registry);
+            reg.remove(local);
+            self.mux.anchor_lookup.serve(
+                reg.iter()
+                    .filter_map(|(id, r)| r.anchor.then_some(*id))
+                    .collect(),
+            );
+        }
         let conns = lock(&self.by_node).remove(local).unwrap_or_default();
         for c in conns {
             c.close(
@@ -964,6 +979,40 @@ impl SharedEndpoint {
                 WireError::ShuttingDown.to_string().as_bytes(),
             );
         }
+    }
+
+    /// Explicit lookup at this address, followed by the ordinary signed listener proof pinned
+    /// to its answer. No CLAIM, room stream, local identity or peer session is sent/created.
+    pub async fn lookup_anchor(&self, address: SocketAddr) -> Result<Digest32> {
+        let answer = self.mux.lookup_anchor(address).await?;
+        if answer.fingerprints.is_empty() {
+            return Err(Error::Handshake("that address advertised no anchor".into()));
+        }
+        if answer.truncated || answer.fingerprints.len() != 1 {
+            let choices = answer
+                .fingerprints
+                .iter()
+                .map(crate::node::link::b32_encode)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::Handshake(format!(
+                "that address serves more than one anchor; use fingerprint@address: {choices}"
+            )));
+        }
+        let expected = answer.fingerprints[0];
+        let connecting = self
+            .endpoint
+            .connect_with(self.client.clone(), address, "vox.invalid")
+            .map_err(|error| Error::Handshake(format!("anchor lookup: {error}")))?;
+        let connection = tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting)
+            .await
+            .map_err(|_| Error::Handshake("anchor lookup handshake timed out".into()))?
+            .map_err(handshake_failed)?;
+        confirm_handshake(&connection)?;
+        identity::probe(&connection, expected)
+            .await
+            .map_err(|error| error.into_error(address, &expected))?;
+        Ok(expected)
     }
 
     /// The fingerprints of the nodes registered now.
@@ -1164,6 +1213,23 @@ impl VoxEndpoint {
     #[must_use]
     pub fn shared(&self) -> &Arc<SharedEndpoint> {
         &self.shared
+    }
+
+    /// Only an explicitly served anchor answers public lookup; ordinary node identities stay
+    /// undiscoverable. Registration lifetime owns this flag and removes it on detach/eviction.
+    pub fn serve_anchor_lookup(&self, served: bool) {
+        let mut reg = lock(&self.shared.registry);
+        if let Some(entry) = reg
+            .get_mut(&self.local_id)
+            .filter(|r| Arc::ptr_eq(&r.local, &self.local))
+        {
+            entry.anchor = served && !entry.management;
+            self.shared.mux.anchor_lookup.serve(
+                reg.iter()
+                    .filter_map(|(id, r)| r.anchor.then_some(*id))
+                    .collect(),
+            );
+        }
     }
 
     /// Whether this view's node had the endpoint to itself.

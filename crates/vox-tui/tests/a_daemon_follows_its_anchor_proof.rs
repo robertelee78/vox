@@ -361,7 +361,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         "PRODUCT: a hand-added machine anchor acquired a room source: {last:?}"
     );
 
-    // The public list describes inputs, not reach. Wait for the node's public status
+    // Wait for this particular node's public status
     // to say the anchor is reached, then create: create waits for its initial publish
     // rounds. Thus Bob's one-shot join follows a real product readiness boundary.
     let deadline = std::time::Instant::now() + FOLLOW_PATIENCE;
@@ -371,7 +371,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
             let reached = ok
                 && serde_json::from_str::<serde_json::Value>(&report)
                     .ok()
-                    .and_then(|value| value["anchors"].as_array().cloned())
+                    .and_then(|value| value["node_anchors"].as_array().cloned())
                     .is_some_and(|anchors| {
                         anchors
                             .iter()
@@ -597,7 +597,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
             let reached = ok
                 && serde_json::from_str::<serde_json::Value>(&report)
                     .ok()
-                    .and_then(|status| status["anchors"].as_array().cloned())
+                    .and_then(|status| status["node_anchors"].as_array().cloned())
                     .is_some_and(|anchors| {
                         anchors
                             .iter()
@@ -618,7 +618,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         panic!("PRODUCT: second node returned invalid status JSON: {error}: {report:?}")
     });
     assert!(
-        status["anchors"]
+        status["node_anchors"]
             .as_array()
             .is_some_and(|anchors| anchors.len() == 1 && anchors[0]["id"] == machine_id),
         "PRODUCT: unrelated node's status inherited another node's room anchor: {report:?}"

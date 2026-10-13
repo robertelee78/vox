@@ -667,6 +667,8 @@ pub struct ChannelDetail {
 pub struct NodeView {
     /// Display-only last-known anchors of every saved room, separate from dialing authority.
     pub room_anchors: Vec<RoomAnchorView>,
+    /// Actual dial observations for anchors this running node uses, not saved provenance.
+    pub anchor_reach: Vec<(Digest32, crate::node::daemonipc::AnchorReach)>,
     /// Why the saved-room inventory could not be read or kept. Never an empty-list success.
     pub anchor_inventory_error: Option<String>,
     /// The profile's identity, or `None` before one is created.

@@ -187,40 +187,45 @@ vox node --node anchor --listen 0.0.0.0:4433
 with no subcommand runs a node as an anchor, in the foreground.
 
 Use a port the other hosts can reach, here 4433. The anchor prints its `FINGERPRINT@ADDRESS`
-lines, one per address, and writes them to the anchors file on its own machine, so nodes there
-use it. On each other host, add one of those lines to its anchors file, below, or pass it with
-`--anchor`. A room link made on such a host carries the anchor to whoever joins with it. Check the
-anchor's fingerprint through a way you trust before anyone uses it.
+lines, one per address, and writes them on its own machine so local nodes can use it.
+On another machine, open **Settings › Network** or use:
 
-An anchor is a host you run, not an account somewhere. It holds no room key and stores nothing
-for rooms it is not in. An anchor only helps nodes find each other: if a member refused your
-passphrase, the member was already reached.
+```sh
+vox anchor add FINGERPRINT@anchor.example:4433
+# Or look up and verify the anchor at a host and port:
+vox anchor add anchor.example 4433
+vox anchor list
+vox anchor list --json
+vox anchor remove FINGERPRINT
+```
+
+A fingerprint supplied explicitly can be added while the anchor is offline. Host-and-port lookup
+must reach the endpoint and verify its answer before adding it. If that endpoint serves several
+anchors, Vox asks you to select one with `FINGERPRINT@ADDRESS`.
+
+An anchor is a host you run, not an account somewhere. It holds no room key and cannot read the
+room's contents. If a member refused your passphrase, the member was already reached.
 
 ### How a node gets its anchors
 
-A node uses every anchor it learns from these three sources together:
+- **Added by hand:** one list for the machine's data root, used by every Ready node. Settings
+  and `vox anchor add|remove` update it immediately. Host names are resolved again every 30 seconds.
+  The daemon keeps it at `.daemon/anchors` in the data root. `--anchor FINGERPRINT@ADDRESS`
+  and `VOX_ANCHORS` supply manual inputs for the daemon's life.
+- **From room NAME:** that room's creator or admin sets its anchors. A room link carries only
+  those anchors. Adding one by hand never puts it into any room's link. Removing its manual
+  source leaves independent room sources in the list.
 
-- **Its anchors file.** One `FINGERPRINT@ADDRESS` per line. The address is a multiaddr such as
-  `/ip4/203.0.113.7/udp/4433`, or `host:port`. Blank lines and lines starting with `#` are skipped.
-  A node reads `nodes/NAME/config/anchors` in the data root if it exists, and otherwise the
-  account's `anchors` in the config directory: `~/Library/Application Support/vox/anchors` on a
-  Mac, `~/.config/vox/anchors` on Linux. `VOX_CONFIG_DIR`, or `XDG_CONFIG_HOME`, moves it. The
-  daemon reads the file when the node becomes Ready and every 30 seconds after. A line it cannot use is
-  skipped, and named with its line number by the command that made the node Ready and in the
-  daemon's log.
-- **`--anchor FINGERPRINT@ADDRESS`**, repeatable, on any command that makes a node Ready or starts the
-  daemon, such as `vox node unlock`, `vox serve`, `vox connect`, `vox up`, `vox forward` and
-  `vox daemon`. `VOX_ANCHORS` takes a comma-separated list.
-- **The room link.** A link names the anchors its sharer uses. Joining with it keeps them for that
-  room.
-
-An anchors file that names one anchor:
-
-```text
-# the family's anchor on the NAS
-ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a@/ip4/203.0.113.7/udp/4433
-```
+`vox anchor list`, `vox status` and Settings show the fingerprint, addresses, sources and real
+reach observations. `vox status --json` includes the same machine records. A configured anchor
+that no running node has tried says **not observed**; configuration alone never counts as reached.
+The room's inspector shows its own anchors. A closed room or Locked node leaves **last known**
+provenance visible, without turning that inventory into dialing authority.
 
 When your machine changes network, such as from home Wi-Fi to a phone hotspot, the daemon notices
 within seconds, publishes its new addresses and dials its peers and anchors again. See
 [after a network change](troubleshooting.md#peers-cannot-find-me-after-a-network-change).
+
+The `anchors` array in `vox status --json` is the same machine inventory. The
+`node_anchors` diagnostics describe only the selected node's configured anchors and current
+reach, so a room source on another local node is not mistaken for this node's dialing scope.

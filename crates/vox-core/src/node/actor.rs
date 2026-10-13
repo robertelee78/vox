@@ -4303,6 +4303,7 @@ pub struct Node {
     /// Per anchor this node keeps and did not hold a connection to at the last look: since when
     /// (unix milliseconds). What `vox status` and the notifier read (PRD-001 R37).
     anchor_unreached_since: BTreeMap<Digest32, u64>,
+    anchor_last_reached: BTreeMap<Digest32, u64>,
     /// Peers a room's sync is dialling right now (`reach_for_sync`), so one is not dialled twice.
     sync_dials: BTreeSet<Digest32>,
     /// When each open room's own records are next renewed on this node's board and its anchors
@@ -4964,6 +4965,7 @@ impl Node {
             anchor_connected_at: BTreeMap::new(),
             anchors_up: BTreeMap::new(),
             anchor_unreached_since: BTreeMap::new(),
+            anchor_last_reached: BTreeMap::new(),
             sync_dials: BTreeSet::new(),
             records_renew_at: BTreeMap::new(),
             ports: BTreeMap::new(),
@@ -5939,6 +5941,7 @@ impl Node {
         };
         let link = presence.attach(signer)?;
         let endpoint = link.endpoint;
+        endpoint.serve_anchor_lookup(self.anchor_boards);
         // How long a stuck tunnel is given (V030-11): this node's setting, on this node.
         endpoint.local().set_stuck_after(self.stuck_after);
         let mut net = NodeNet::new(endpoint, Arc::clone(&presence), Arc::clone(&self.clock));
@@ -6856,14 +6859,18 @@ impl Node {
             self.say_anchor_lost(&net, id, &conn, silent.get(&id).copied());
         }
         self.anchors_up = watched;
-        let me = net.local_id();
+        // A normal peer dial may already hold this anchor. Its authenticated session receipt
+        // is a real reach observation too; never call that existing connection unobserved.
+        for (id, conn) in &up {
+            self.anchor_last_reached
+                .entry(*id)
+                .and_modify(|at| *at = (*at).max(conn.session().ts_ms))
+                .or_insert(conn.session().ts_ms);
+        }
         self.anchor_unreached_since
             .retain(|id, _| known.iter().any(|(k, _)| k == id) && !up.contains_key(id));
-        for (id, _) in &known {
-            if *id != me && !up.contains_key(id) {
-                self.anchor_unreached_since.entry(*id).or_insert(now);
-            }
-        }
+        self.anchor_last_reached
+            .retain(|id, _| known.iter().any(|(k, _)| k == id));
         for (id, candidates) in known {
             if id == net.local_id() || up.contains_key(&id) {
                 continue;
@@ -6903,6 +6910,7 @@ impl Node {
         silent: Option<Duration>,
     ) {
         let now = self.now_ms().get();
+        self.anchor_unreached_since.entry(id).or_insert(now);
         let lasted = match self.anchor_connected_at.get(&id) {
             Some((serial, at)) if *serial == conn.serial() => {
                 let at = *at;
@@ -6977,6 +6985,8 @@ impl Node {
         {
             return false;
         }
+        let now = self.now_ms().get();
+        self.anchor_unreached_since.entry(id).or_insert(now);
         // Untold until a publish round says it holds this node's records (`PublishDone`): a
         // circuit it refuses as a stranger meanwhile is asked again then.
         net.board_untold(id);
@@ -7912,6 +7922,8 @@ impl Node {
                 // superseded at once is a flap, not a success.
                 self.anchor_connected_at
                     .insert(peer, (tracked.serial(), self.now_ms().get()));
+                self.anchor_last_reached.insert(peer, self.now_ms().get());
+                self.anchor_unreached_since.remove(&peer);
                 self.anchor_window.remove(&peer);
                 // Said, so a log shows a redial's outcome as well as its start (#243, a CI red
                 // whose forward said it dialled and then nothing).
@@ -16662,6 +16674,11 @@ impl Node {
             .filter(|(id, _)| Some(*id) != me_net)
             .map(|(id, _)| crate::node::status::AnchorStatus {
                 id,
+                reached: self.anchor_last_reached.contains_key(&id)
+                    && self
+                        .net
+                        .as_ref()
+                        .is_some_and(|net| net.manager().held(&id).is_some()),
                 unreached_since: self.anchor_unreached_since.get(&id).copied(),
             })
             .collect();
@@ -17457,6 +17474,7 @@ impl Node {
             .unwrap_or_default();
         self.view_tx.send_replace(NodeView {
             room_anchors: self.anchor_inventory.clone(),
+            anchor_reach: self.anchor_reach(),
             anchor_inventory_error: self.anchor_inventory_load_error.clone(),
             identity,
             locked,
@@ -17735,6 +17753,7 @@ impl Node {
         }
         let view = NodeView {
             room_anchors: inventory.into_values().collect(),
+            anchor_reach: self.anchor_reach(),
             anchor_inventory_error,
             identity,
             locked,
@@ -17822,6 +17841,32 @@ impl Node {
         } else {
             "room host's board"
         }
+    }
+
+    /// Only observed dials supply reach. A configured but untried anchor is unknown.
+    fn anchor_reach(&self) -> Vec<(Digest32, crate::node::daemonipc::AnchorReach)> {
+        self.kept_anchors()
+            .into_iter()
+            .filter_map(|(id, _)| {
+                let last_reached_ms = self.anchor_last_reached.get(&id).copied();
+                let unreached_since_ms = self.anchor_unreached_since.get(&id).copied();
+                if last_reached_ms.is_none() && unreached_since_ms.is_none() {
+                    return None;
+                }
+                let connected = self
+                    .net
+                    .as_ref()
+                    .is_some_and(|net| net.manager().held(&id).is_some());
+                Some((
+                    id,
+                    crate::node::daemonipc::AnchorReach {
+                        connected,
+                        last_reached_ms,
+                        unreached_since_ms: if connected { None } else { unreached_since_ms },
+                    },
+                ))
+            })
+            .collect()
     }
 
     /// The boards this node holds an open connection to now, each with [`Self::board_note`].

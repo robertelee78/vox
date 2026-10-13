@@ -829,39 +829,7 @@ pub(crate) async fn dial_with(
     };
     let deadline = Instant::now() + EXCHANGE_TIMEOUT;
     let exchange = async {
-        let (mut send, mut recv) = conn.open_bi().await.map_err(|_| closed(conn))?;
-        write_frame(&mut send, &StreamKind::Identity.frame())
-            .await
-            .map_err(|_| closed(conn))?;
-        write_frame(&mut send, &Ask { target: expected }.encode())
-            .await
-            .map_err(|_| closed(conn))?;
-        let patience = deadline.saturating_duration_since(Instant::now());
-        let prove = match read_frame_within(&mut recv, MAX_FLIGHT, patience).await {
-            Ok(Some(f)) => f,
-            Ok(None) => return Err(closed(conn)),
-            Err(Error::SizeLimitExceeded(_)) => return Err(bad_prove(conn, "an oversize PROVE")),
-            // No PROVE by the deadline is a silence, not a broken stream: the read's own patience
-            // ends at the deadline, before the timeout below does.
-            Err(_) if Instant::now() >= deadline && conn.close_reason().is_none() => {
-                conn.close(close_code(BAD_PROVE), b"");
-                return Err(DialFailed::TimedOut);
-            }
-            Err(_) => return Err(closed(conn)),
-        };
-        let Ok(prove) = Prove::decode(&prove) else {
-            return Err(bad_prove(conn, "a malformed PROVE"));
-        };
-        if prove.target.fingerprint() != expected {
-            return Err(bad_prove(conn, "a PROVE for another node"));
-        }
-        if prove
-            .target
-            .verify(&resp_input(&e, &expected, &prove.instance), &prove.sig)
-            .is_err()
-        {
-            return Err(bad_prove(conn, "a PROVE whose signature does not verify"));
-        }
+        let (mut send, _recv, prove) = prove_listener(conn, expected, &e, deadline).await?;
         // Only now does anything about this node leave.
         let me = signer.fingerprint();
         let sig = signer
@@ -893,6 +861,63 @@ pub(crate) async fn dial_with(
             Err(DialFailed::TimedOut)
         }
     }
+}
+
+/// Verify the named listener on this TLS session without revealing any local node identity.
+/// Used only after explicit anchor lookup; this never creates an authenticated Vox connection.
+pub async fn probe(conn: &Connection, expected: Digest32) -> std::result::Result<(), DialFailed> {
+    let e = exporter(conn).map_err(|_| DialFailed::Exporter)?;
+    let deadline = Instant::now() + EXCHANGE_TIMEOUT;
+    let result =
+        tokio::time::timeout_at(deadline, prove_listener(conn, expected, &e, deadline)).await;
+    conn.close(quinn::VarInt::from_u32(0), b"anchor lookup complete");
+    match result {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(DialFailed::TimedOut),
+    }
+}
+
+async fn prove_listener(
+    conn: &Connection,
+    expected: Digest32,
+    e: &[u8; EXPORTER_LEN],
+    deadline: Instant,
+) -> std::result::Result<(quinn::SendStream, quinn::RecvStream, Prove), DialFailed> {
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|_| closed(conn))?;
+    write_frame(&mut send, &StreamKind::Identity.frame())
+        .await
+        .map_err(|_| closed(conn))?;
+    write_frame(&mut send, &Ask { target: expected }.encode())
+        .await
+        .map_err(|_| closed(conn))?;
+    let patience = deadline.saturating_duration_since(Instant::now());
+    let prove = match read_frame_within(&mut recv, MAX_FLIGHT, patience).await {
+        Ok(Some(f)) => f,
+        Ok(None) => return Err(closed(conn)),
+        Err(Error::SizeLimitExceeded(_)) => return Err(bad_prove(conn, "an oversize PROVE")),
+        // No PROVE by the deadline is a silence, not a broken stream: the read's own patience
+        // ends at the deadline, before the timeout below does.
+        Err(_) if Instant::now() >= deadline && conn.close_reason().is_none() => {
+            conn.close(close_code(BAD_PROVE), b"");
+            return Err(DialFailed::TimedOut);
+        }
+        Err(_) => return Err(closed(conn)),
+    };
+    let Ok(prove) = Prove::decode(&prove) else {
+        return Err(bad_prove(conn, "a malformed PROVE"));
+    };
+    if prove.target.fingerprint() != expected {
+        return Err(bad_prove(conn, "a PROVE for another node"));
+    }
+    if prove
+        .target
+        .verify(&resp_input(e, &expected, &prove.instance), &prove.sig)
+        .is_err()
+    {
+        return Err(bad_prove(conn, "a PROVE whose signature does not verify"));
+    }
+    Ok((send, recv, prove))
 }
 
 fn bad_prove(conn: &Connection, why: &'static str) -> DialFailed {

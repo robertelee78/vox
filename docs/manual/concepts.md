@@ -59,8 +59,8 @@ served.
 Nodes that can reach each other directly need no anchor. When two hosts cannot find or reach each
 other, for example when both are behind NAT, an anchor that both can reach introduces them and
 may relay their encrypted packets. You run it yourself. It holds no room key and cannot read
-anything. A node learns its anchors from its anchors file, from `--anchor`, and from the room
-links it joins with ([when an anchor is needed](services.md#when-an-anchor-is-needed)).
+anything. Settings › Network and `vox anchor add` keep manual anchors for the machine; a room
+can also carry its own anchors, set by its creator or an admin ([when an anchor is needed](services.md#when-an-anchor-is-needed)).
 
 ## What encryption covers
 

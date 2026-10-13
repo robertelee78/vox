@@ -1,4 +1,4 @@
-//! The read-only machine anchor projection. Mutation controls extend this surface separately.
+//! The daemon's machine anchor controls and its single provenance/reach projection.
 
 use vox_core::node::daemonipc::{AnchorSource, DaemonClient, DaemonFrame, DaemonRequest};
 use vox_core::node::link::b32_encode;
@@ -27,30 +27,41 @@ pub async fn list(account: &Account, json: bool) -> Result<(), AppError> {
             ))
         }
     };
+    show(&anchors, json);
+    Ok(())
+}
+
+/// Add/remove through the daemon's one serialized machine list.
+pub async fn change(
+    account: &Account,
+    listen: std::net::SocketAddr,
+    anchors: &[String],
+    request: DaemonRequest,
+) -> Result<(), AppError> {
+    vox_core::node::layout::refuse_old_layout(account)?;
+    crate::daemon_client::ensure_daemon(account, listen, anchors).await?;
+    let mut client =
+        DaemonClient::open_noting(&account.socket(), Some(crate::client::say_daemon_waiting))
+            .await?;
+    match client.request(request).await? {
+        DaemonFrame::Anchors(anchors) => {
+            show(&anchors, false);
+            Ok(())
+        }
+        DaemonFrame::AnchorFailed(why) => Err(AppError::Usage(why)),
+        DaemonFrame::Refused(why) => Err(AppError::Usage(why.to_string())),
+        _ => Err(AppError::Usage(
+            "the daemon did not return the changed anchor list".into(),
+        )),
+    }
+}
+
+fn show(anchors: &[vox_core::node::daemonipc::AnchorInfo], json: bool) {
     if json {
-        let anchors: Vec<_> = anchors
-            .iter()
-            .map(|anchor| {
-                let sources: Vec<_> = anchor
-                    .sources
-                    .iter()
-                    .map(|source| match source {
-                        AnchorSource::AddedByHand => serde_json::json!({"kind": "added-by-hand"}),
-                        AnchorSource::Room { room, name, stale } => serde_json::json!({
-                            "kind": "room", "room": b32_encode(room), "name": name, "stale": stale,
-                        }),
-                    })
-                    .collect();
-                serde_json::json!({
-                    "fingerprint": b32_encode(&anchor.fingerprint),
-                    "addresses": anchor.addresses,
-                    "sources": sources,
-                })
-            })
-            .collect();
         println!(
             "{}",
-            serde_json::json!({"schema": "vox.anchor.list/1", "anchors": anchors})
+            serde_json::json!({"schema":"vox.anchor.list/1",
+            "anchors":anchors.iter().map(vox_core::node::daemonipc::AnchorInfo::to_json).collect::<Vec<_>>() })
         );
     } else if anchors.is_empty() {
         println!("No manual or saved-room anchors on this machine.");
@@ -77,15 +88,15 @@ pub async fn list(account: &Account, json: bool) -> Result<(), AppError> {
                 })
                 .collect();
             println!(
-                "{}  {}  {}",
+                "{}  {}  {}  {}",
                 b32_encode(&anchor.fingerprint)
                     .chars()
                     .take(12)
                     .collect::<String>(),
                 anchor.addresses.join(", "),
-                sources.join("; ")
+                sources.join("; "),
+                anchor.reach_words(vox_core::transport::quic::unix_now_ms()),
             );
         }
     }
-    Ok(())
 }

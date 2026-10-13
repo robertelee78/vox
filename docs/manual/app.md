@@ -272,3 +272,10 @@ The app is dark only. Text meets a contrast of at least 4.5:1, and a selection i
 colour alone. It follows **Increase Contrast**, **Reduce Motion** and **Reduce Transparency** in
 System Settings, Accessibility, Display. **View > Bigger**, **Smaller** and **Actual Size** change
 the conversation's size, up to twice the usual.
+
+### Network settings
+
+**Settings › Network** lists manual anchors and each saved room's own sources, with reach from
+the daemon's authenticated dials. Add an anchor as `fingerprint@address` or `host:port`.
+**Remove** removes only its manual source; a room's creator or admin changes its own anchors.
+The room inspector shows that room's anchors and the same reach wording.

@@ -130,6 +130,7 @@ fn key(addr: SocketAddr) -> SocketAddr {
 /// The socket every endpoint runs on: the real one plus the circuits.
 pub struct MuxSocket {
     inner: Arc<dyn AsyncUdpSocket>,
+    pub(crate) anchor_lookup: crate::transport::anchor_lookup::Lookup,
     circuits: Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>,
     /// Which address each peer's newest live circuit stands at, for each local node the socket
     /// carries circuits for (ADR-026 P-1): keyed (local node, remote node), so two nodes sharing
@@ -267,6 +268,7 @@ impl MuxSocket {
         Arc::new(Self {
             ipv6,
             inner,
+            anchor_lookup: crate::transport::anchor_lookup::Lookup::default(),
             circuits: Mutex::new(HashMap::new()),
             by_peer: Mutex::new(HashMap::new()),
             owners: Mutex::new(HashMap::new()),
@@ -277,6 +279,27 @@ impl MuxSocket {
             received: std::sync::atomic::AtomicU64::new(0),
             failing: Mutex::new(None),
         })
+    }
+
+    /// Ask one explicit endpoint, using this daemon's existing UDP socket and a fresh nonce.
+    pub(crate) async fn lookup_anchor(
+        &self,
+        target: SocketAddr,
+    ) -> Result<crate::transport::anchor_lookup::Candidates> {
+        let (packet, pending) = self.anchor_lookup.begin(target)?;
+        self.inner
+            .try_send(&Transmit {
+                destination: target,
+                ecn: None,
+                contents: &packet,
+                segment_size: None,
+                src_ip: None,
+            })
+            .map_err(|error| crate::error::Error::Path {
+                op: "send anchor lookup",
+                detail: error.to_string(),
+            })?;
+        pending.wait().await
     }
 
     /// **A failed read of the real socket is said, and read again; it never ends the endpoint.**
@@ -622,7 +645,41 @@ impl AsyncUdpSocket for MuxSocket {
                 self.received
                     .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                 self.read_works();
-                Poll::Ready(Ok(n))
+                let mut kept = 0;
+                for i in 0..n {
+                    let stride = meta[i].stride.max(1);
+                    let mut write = 0;
+                    for begin in (0..meta[i].len).step_by(stride) {
+                        let end = (begin + stride).min(meta[i].len);
+                        let bytes = &bufs[i][begin..end];
+                        if crate::transport::anchor_lookup::is_packet(bytes) {
+                            if let Some(reply) = self.anchor_lookup.receive(meta[i].addr, bytes) {
+                                let _ = self.inner.try_send(&Transmit {
+                                    destination: meta[i].addr,
+                                    ecn: None,
+                                    contents: &reply,
+                                    segment_size: None,
+                                    src_ip: meta[i].dst_ip,
+                                });
+                            }
+                        } else {
+                            bufs[i].copy_within(begin..end, write);
+                            write += end - begin;
+                        }
+                    }
+                    meta[i].len = write;
+                    if write > 0 {
+                        bufs.swap(kept, i);
+                        meta.swap(kept, i);
+                        kept += 1;
+                    }
+                }
+                if kept == 0 {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Ok(kept))
+                }
             }
             // quinn passes over a reset itself: an ICMP report a peer could forge, not the socket's.
             Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset => {
