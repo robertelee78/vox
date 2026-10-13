@@ -2345,7 +2345,7 @@ final class FirstRunProof: XCTestCase {
                       "the principal top line must expose the room tabs") else { return }
         words(ui, Key.id("session-\(s1.prefix(8))"), timeout: 20,
               "two Sessions of one node must label its first tab with alias and name",
-              until: { $0 == "claude-a · S1-WORDS" })
+              until: { $0.contains("claude-a · S1-WORDS") && $0.contains("waiting on you") })
         words(ui, Key.id("session-\(s2.prefix(8))"), timeout: 20,
               "two Sessions of one node must label its second tab with alias and name",
               until: { $0 == "claude-a · S2-WORDS" })
@@ -2473,8 +2473,10 @@ final class FirstRunProof: XCTestCase {
         guard present(ui, compose, timeout: 10, "General must restore the room composer") else { return }
         tap(ui, Key.id("sessions-ended"), "Ended menu in the top row")
         tap(ui, Key.menuItem("claude-a · S2-WORDS"), "S2 from the Ended menu")
-        guard present(ui, sessionCompose, timeout: 20,
-                      "choosing an ended Session must switch the centre to its Session") else { return }
+        guard words(ui, Key.id("timeline-title"), timeout: 20,
+                    "choosing an ended Session must switch the centre to its ended history",
+                    until: { $0.contains("S2-WORDS") && $0.contains("ended") }) != nil else { return }
+        XCTAssertNil(locate(ui, sessionCompose), "PRODUCT: an ended Session must not offer a drive composer")
 
         // RM-1/3/5: two sessions in a repo and its worktree raise one dialog, not a banner.
         try staged(vox, ["node", "attach", "claude-a", "--passphrase-file", pass("claude-a")], env: voxEnv)
@@ -3230,7 +3232,10 @@ final class FirstRunProof: XCTestCase {
         try local.resume()
         guard words(ui, Key.id("room-tab-members"), timeout: 45,
                     "the same room must recover the changed authoritative three-member roster without reopening",
-                    until: { $0.contains("3 members") && $0.contains("forever") }) != nil else { return }
+                    until: { $0.contains("3 members") }) != nil else { return }
+        guard words(ui, Key.id("timeline-title"), timeout: 10,
+                    "the recovered room must preserve its forever retention",
+                    until: { $0.contains("forever") }) != nil else { return }
         guard present(ui, Key.id("member-bob"), timeout: 10,
                       "the recovered room must retain its actual remote member") else { return }
         guard timelineBody("RECOVERY-KEPT", timeout: 10,
@@ -3252,7 +3257,10 @@ final class FirstRunProof: XCTestCase {
         }
         guard words(ui, Key.id("room-tab-members"), timeout: 15,
                     "the recovered room's live watcher must show Bob's later retention change without reopening",
-                    until: { $0.contains("3 members") && $0.contains("1 hour") }) != nil else { return }
+                    until: { $0.contains("3 members") }) != nil else { return }
+        guard words(ui, Key.id("timeline-title"), timeout: 15,
+                    "the room watcher must refresh retention to one hour",
+                    until: { $0.contains("1 hour") }) != nil else { return }
         print("[proof] transport: unavailable retained timeline; same room recovered roster; later remote retention reached header")
     }
 

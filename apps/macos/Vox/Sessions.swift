@@ -104,7 +104,8 @@ struct RoomTabs: View {
                     ForEach(model.openSessions.map { RoomSessionTab(room: room, session: $0) }) { item in
                         let session = item.session
                         Divider().frame(height: 20)
-                        tab(model.sessionTabLabel(session),
+                        tab(session.pending > 0 ? "! " + model.sessionTabLabel(session) + " · waiting on you"
+                                                : model.sessionTabLabel(session),
                             .session(node: session.nodeFingerprint, id: session.sessionId),
                             id: "session-\(session.shortId)")
                     }
