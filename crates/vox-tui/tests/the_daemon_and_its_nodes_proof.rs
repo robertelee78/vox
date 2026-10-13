@@ -88,6 +88,7 @@ impl Account {
         let data = tmp.path().join("d");
         let cfg = tmp.path().join("c");
         std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(tmp.path().join("home")).unwrap();
         // Every new unlock remembers: use only this proof's private Keychain on a Mac.
         if cfg!(target_os = "macos") {
             test_knobs::require(&["VOX_TEST_KEYCHAIN"]);
@@ -130,7 +131,7 @@ impl Account {
         c.env_clear()
             // A proof's daemon never takes port 1080 (.cargo/config.toml).
             .env("VOX_PROXY", "127.0.0.1:0");
-        for key in ["PATH", "HOME", "TMPDIR"] {
+        for key in ["PATH", "TMPDIR"] {
             if let Some(v) = std::env::var_os(key) {
                 c.env(key, v);
             }
@@ -145,6 +146,7 @@ impl Account {
                 .arg(self._tmp.path().join("identity.pass"));
         }
         c.env("VOX_TEST_KEYCHAIN", self._tmp.path().join("k.keychain-db"))
+            .env("HOME", self._tmp.path().join("home"))
             .env("VOX_NOTIFY_COMMAND", self._tmp.path().join("notify"))
             .env("VOX_DATA_DIR", &self.data)
             .env("VOX_CONFIG_DIR", &self.cfg)
@@ -548,6 +550,26 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
 #[test]
 #[ignore = "real binaries with production Argon2id; run in release"]
 fn a_kept_node_and_its_room_come_back_after_a_restart() {
+    // Observe the saved-credential outcome through macOS's public Keychain tool. Never request
+    // the password (-w/-g), and never search a real or default Keychain.
+    fn saved_item(a: &Account, keychain: &Path) -> std::process::Output {
+        let accessible = Command::new("/usr/bin/security")
+            .args(["unlock-keychain", "-p", ""])
+            .arg(keychain)
+            .output()
+            .expect("APPARATUS: open this proof's private Keychain");
+        assert!(
+            accessible.status.success(),
+            "APPARATUS: private Keychain is not accessible: {}",
+            String::from_utf8_lossy(&accessible.stderr)
+        );
+        Command::new("/usr/bin/security")
+            .args(["find-generic-password", "-s", "us.vox.node", "-a"])
+            .arg(a.data.join("nodes/default"))
+            .arg(keychain)
+            .output()
+            .expect("APPARATUS: query saved credential in private Keychain")
+    }
     // Keep the old attach file readable while refusing atomic replacement on a Mac. Elsewhere
     // a directory at the destination stages unreadable-record refusal; its old file is restored
     // before retry. Drop restores either fixture even if a PRODUCT assertion panics.
@@ -788,8 +810,9 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         "PRODUCT: lock/unlock must preserve the room and its messages: {out}{err}"
     );
 
-    // A remembered node whose secret is unavailable is already stopped. Lock must still forget
-    // its restart entry; restoring that secret later must not bring it back.
+    // A remembered node whose secret is unavailable is already stopped. A missing Keychain
+    // cannot confirm deletion: Lock must report that failure, then permit a retry after it is
+    // restored even though the restart entry was already removed.
     stop_pid(
         a.lock_pid()
             .expect("APPARATUS: daemon before missing secret"),
@@ -800,6 +823,14 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         pass.clone()
     };
     let away = remembered.with_extension("away");
+    if cfg!(target_os = "macos") {
+        let item = saved_item(&a, &remembered);
+        assert!(
+            item.status.success(),
+            "APPARATUS: the saved credential to forget is absent: {}",
+            String::from_utf8_lossy(&item.stderr)
+        );
+    }
     std::fs::rename(&remembered, &away).expect("APPARATUS: temporarily remove remembered secret");
     let (ok, out, err) = a.run(&["daemon", "--detach"], "");
     assert!(
@@ -825,13 +856,44 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         );
     }
     let (ok, out, err) = a.run(&["node", "detach", "default"], "");
+    if cfg!(target_os = "macos") {
+        assert!(!ok && err.contains("could not forget") && err.contains("keychain")
+            && err.contains("retry") && !out.contains("Locked and forgotten"),
+            "PRODUCT: an unavailable Keychain must refuse full forgotten success and explain retry: {out}{err}");
+        let (_, shown, err) = a.run(&["node", "list"], "");
+        assert!(shown.lines().any(|l| l.starts_with("default ") && l.contains("Locked") && !l.contains("(remembered)")),
+            "PRODUCT: failed secret deletion must show that the restart entry was removed: {shown}{err}");
+    } else {
+        assert!(
+            ok && out.contains("Locked and forgotten"),
+            "PRODUCT: detach must forget an already-stopped node's restart file: {out}{err}"
+        );
+    }
     assert!(
-        ok && err.contains("`vox node detach` is now `vox node lock`")
-            && out.contains("Locked and forgotten"),
-        "PRODUCT: detach must forget an already-stopped node and print the lock alias: {out}{err}"
+        err.contains("`vox node detach` is now `vox node lock`"),
+        "PRODUCT: detach must print the lock alias: {out}{err}"
     );
-    stop_pid(a.lock_pid().expect("APPARATUS: stopped node's daemon"));
     std::fs::rename(&away, &remembered).expect("APPARATUS: restore remembered secret");
+    if cfg!(target_os = "macos") {
+        let item = saved_item(&a, &remembered);
+        assert!(
+            item.status.success(),
+            "APPARATUS: restore did not make the saved credential available: {}",
+            String::from_utf8_lossy(&item.stderr)
+        );
+    }
+    let (ok, out, err) = a.run(&["node", "lock", "default"], "");
+    assert!(ok && out.contains("Locked and forgotten"),
+        "PRODUCT: after restoring secret storage, Lock must retry cleanup without a restart entry: {out}{err}");
+    if cfg!(target_os = "macos") {
+        let item = saved_item(&a, &remembered);
+        // security exposes errSecItemNotFound (-25300) as exit status 44. An access/OS error
+        // is not absence, and finding the item means Vox falsely claimed it was forgotten.
+        assert_eq!(item.status.code(), Some(44),
+            "PRODUCT: successful Lock must delete the saved Keychain credential, not only its restart entry: status={} {}",
+            item.status, String::from_utf8_lossy(&item.stderr));
+    }
+    stop_pid(a.lock_pid().expect("APPARATUS: stopped node's daemon"));
     let (ok, out, err) = a.run(&["daemon", "--detach"], "");
     assert!(ok, "APPARATUS: restart after restoring secret: {out}{err}");
     let (_, shown, err) = a.run(&["node", "list"], "");
@@ -873,10 +935,14 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
                 && !out.contains("Ready and remembered") && !out.contains("Locked and forgotten"),
                 "PRODUCT: unreadable remembered state must be refused without claiming a change: {out}{err}");
         }
-        let (_, shown, err) = a.run(&["node", "list"], "");
-        assert!(shown.lines().any(|l| l.starts_with("default ") && l.contains("Ready") && l.contains("(remembered)")),
-            "PRODUCT: an unreadable file must not erase the last known remembered state: {shown}{err}");
+        let (ok, shown, err) = a.run(&["node", "list"], "");
+        assert!(!ok && err.contains("cannot read remembered nodes")
+            && err.contains("the saved file was not changed") && !shown.contains("Ready"),
+            "PRODUCT: an unreadable remembered-state file must refuse a public listing rather than guess: {shown}{err}");
     }
+    let (ok, shown, err) = a.run(&["node", "list"], "");
+    assert!(ok && shown.lines().any(|l| l.starts_with("default ") && l.contains("Ready") && l.contains("(remembered)")),
+        "PRODUCT: restoring the unreadable fixture must show the unchanged Ready and remembered node: {shown}{err}");
     {
         let _blocked = UnwritableAttach::new(attach_file.clone(), false);
         let (ok, out, err) = a.run(&["node", "lock", "default"], "");
@@ -937,7 +1003,8 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
             "",
         );
         assert!(
-            !ok && err.contains("Ready but not remembered")
+            !ok && err.contains("Ready, but remembering could not be confirmed")
+                && err.contains("keychain")
                 && !out.contains("Ready and remembered"),
             "PRODUCT: a failed remember must fail unlock and name its partial state: {out}{err}"
         );

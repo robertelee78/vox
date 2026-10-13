@@ -578,7 +578,12 @@ final class AppModel: ObservableObject {
     }
 
     /// Why unlocking a saved node failed.
-    @Published private(set) var keepNodeSaid: String?
+    @Published private(set) var keepNodeSaid: (node: String, message: String)?
+
+    func dismissKeepNodeError(_ node: String) {
+        guard keepNodeSaid?.node == node else { return }
+        keepNodeSaid = nil
+    }
 
     /// A node on this Mac whose Attach… was chosen under ON THIS MACHINE (#666), its passphrase
     /// asked for; nil when none is asked.
@@ -602,6 +607,7 @@ final class AppModel: ObservableObject {
     func keepNode(_ node: String, passphrase secret: Secret) async {
         guard let client, !nodeActionInProgress else { secret.wipe(); return }
         let generation = beginNodeRequest()
+        keepNodeSaid = nil
         nodeActionInProgress = true
         defer { nodeActionInProgress = false }
         do {
@@ -638,7 +644,7 @@ final class AppModel: ObservableObject {
             keepNodeSaid = nil
         } catch {
             guard ownsNodeRequest(client, generation) else { return }
-            keepNodeSaid = sentence(error)
+            keepNodeSaid = (node, sentence(error))
             try? await refreshNodeState(client, generation: generation)
         }
     }

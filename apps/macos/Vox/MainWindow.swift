@@ -9,6 +9,7 @@ import SwiftUI
 
 struct MainWindow: View {
     @ObservedObject var model: NodeModel
+    @ObservedObject private var app = AppModel.shared
     /// The sidebar's width at launch, the one last kept, read once for this window.
     @State private var sidebarIdeal = Columns.width(.sidebar)
 
@@ -16,6 +17,22 @@ struct MainWindow: View {
         VStack(spacing: 0) {
             if model.ended != nil || !model.daemonReachable {
                 NodeStopped(model: model)
+                Divider()
+            }
+            if let said = app.keepNodeSaid, said.node == model.node, app.attachNodeAsk == nil {
+                HStack(alignment: .top, spacing: Space.s12) {
+                    Text(said.message).foregroundStyle(.red)
+                        .textSelection(.enabled)
+                        .accessibilityIdentifier("node-stopped-unlock-error")
+                    Spacer()
+                    if model.nodeStatus != "Locked" {
+                        Button("Retry Unlock…") { app.attachNodeAsk = model.node }
+                            .accessibilityIdentifier("node-unlock-retry")
+                    }
+                    Button("Dismiss") { app.dismissKeepNodeError(model.node) }
+                        .accessibilityIdentifier("node-unlock-error-dismiss")
+                }
+                .padding(Space.s12)
                 Divider()
             }
             if model.daemonReachable && (!model.health.isEmpty || !model.recovered.isEmpty) {

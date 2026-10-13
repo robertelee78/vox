@@ -304,7 +304,7 @@ fn a_restarted_daemon_holds_every_room_it_held_without_a_room_passphrase() {
     );
     let (ok, out, err) = vox_plain(&alice, &["node", "lock", "free"], None);
     assert!(
-        ok && out.contains("stays Ready"),
+        ok && out.contains("is Ready after the lock request"),
         "PRODUCT: no-passphrase Lock did not stay Ready: {out}{err}"
     );
 
