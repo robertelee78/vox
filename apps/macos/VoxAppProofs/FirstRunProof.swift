@@ -1792,6 +1792,487 @@ final class FirstRunProof: XCTestCase {
             }
         }
 
+        // Add Computer works before a personal node exists. Separate accounts keep computer
+        // policy out of this journey's later individual-node onboarding assertions.
+        let computerRoot = root.appendingPathComponent("computer-pairing")
+        func computerEnv(_ name: String) -> [String: String] {
+            ["VOX_DATA_DIR": computerRoot.appendingPathComponent(name + "/data").path,
+             "VOX_CONFIG_DIR": computerRoot.appendingPathComponent(name + "/config").path,
+             "VOX_PROXY": "127.0.0.1:0",
+             "HOME": computerRoot.appendingPathComponent(name + "/home").path]
+        }
+        let computerA = computerEnv("a").merging([
+            "VOX_TEST_KEYCHAIN": computerRoot.appendingPathComponent("a/pairing.keychain-db").path
+        ]) { $1 }
+        let computerB = computerEnv("b").merging([
+            "VOX_TEST_KEYCHAIN": computerRoot.appendingPathComponent("b/pairing.keychain-db").path
+        ]) { $1 }
+        for environment in [computerA, computerB] {
+            let madeHome = stager.run(["/bin/mkdir", "-p", environment["HOME"]!], env: [:])
+            guard madeHome.status == 0 else {
+                throw Apparatus("cannot create pairing account's scratch HOME: \(madeHome.out)")
+            }
+            let madeKeychain = stager.run(["/usr/bin/security", "create-keychain", "-p", "",
+                                          environment["VOX_TEST_KEYCHAIN"]!],
+                                         env: ["HOME": environment["HOME"]!])
+            guard madeKeychain.status == 0 else {
+                throw Apparatus("cannot create pairing account's private Keychain: \(madeKeychain.out)")
+            }
+        }
+        // Only these owned apparatus daemons use the private Keychains for remembered unlocks.
+        // Keep each account's Keychain across app restarts; app and bundled CLI stay ordinary.
+        let hostA = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: computerA,
+                              until: "vox daemon: control socket")
+        defer { hostA.terminate() }
+        let hostB = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: computerB,
+                              until: "vox daemon: control socket")
+        defer { hostB.terminate() }
+        for environment in [computerA, computerB] {
+            try stager.write(Data("no\n".utf8), to: environment["VOX_CONFIG_DIR"]! + "/app/login-item")
+        }
+        let computerPass = computerRoot.appendingPathComponent("protected.pass").path
+        try stager.write(Data("protected pairing identity\n".utf8), to: computerPass)
+        try staged(vox, ["node", "create", "protected"],
+                   env: computerB.merging(["VOX_IDENTITY_PASSPHRASE": "protected pairing identity"]) { $1 })
+        try staged(vox, ["node", "attach", "protected", "--passphrase-file", computerPass], env: computerB)
+        let repo = computerRoot.appendingPathComponent("repo").path
+        let madeRepo = stager.run(["/bin/mkdir", "-p", repo], env: [:])
+        guard madeRepo.status == 0 else { throw Apparatus("cannot stage pairing repository: \(madeRepo.out)") }
+        let initialized = stager.run(["/usr/bin/git", "init", "--quiet", repo], env: [:])
+        guard initialized.status == 0 else { throw Apparatus("cannot initialize pairing repository: \(initialized.out)") }
+        try staged(vox, ["room", "create", "--node", "protected", "--name", "pairing-kept",
+                         "--bind", repo, "--passphrase-file", computerPass], env: computerB)
+        let keptRooms = try staged(vox, ["room", "list", "--node", "protected"], env: computerB)
+        let keptRoom = try line(keptRooms) { $0.contains(" pairing-kept") }
+            .split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        guard !keptRoom.isEmpty else { throw Apparatus("the pairing fixture has no retained room") }
+        try staged(vox, ["node", "detach", "protected"], env: computerB)
+        let noNodes = try staged(vox, ["node", "list"], env: computerA)
+        guard noNodes == "vox: no node yet; make one with vox node create and a name for it" else {
+            throw Apparatus("computer A must have zero nodes before Add Computer: \(noNodes)")
+        }
+        func computerStatus(_ environment: [String: String]) throws -> [String: Any] {
+            let raw = try staged(vox, ["computer", "status", "--json"], env: environment)
+            guard let status = try JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any] else {
+                throw Apparatus("computer status was not a JSON record: \(raw)")
+            }
+            return status
+        }
+        let initialA = try computerStatus(computerA)
+        guard let managementA = initialA["this_computer"] as? [String: Any],
+              let managementName = managementA["name"] as? String,
+              let managementFp = managementA["fingerprint"] as? String, managementFp.count == 52,
+              let installation = managementA["installation"] as? String,
+              let policy = initialA["policy"] as? String else {
+            throw Apparatus("computer A's public management identity or policy is absent: \(initialA)")
+        }
+        let pairingUI = voxApp(appPath)
+        defer { pairingUI.terminate() }
+        func openComputers(_ environment: [String: String]) throws {
+            pairingUI.launchEnvironment = environment
+            let account = try computerStatus(environment)
+            guard let identity = account["this_computer"] as? [String: Any],
+                  let fingerprint = identity["fingerprint"] as? String, fingerprint.count == 52 else {
+                throw Apparatus("the scratch account's public computer fingerprint is absent: \(account)")
+            }
+            try launchVox(pairingUI, appPath, env: environment, scratch: scratchPath,
+                          computerFingerprint: fingerprint)
+            guard present(pairingUI, Key.id("computer-trust-sheet"), timeout: 15,
+                          "Add Computer must open its account-owned view") else { throw Product("Add Computer did not open") }
+        }
+        func quitComputerAccount() throws {
+            let computerView = pairingUI.scrollViews.matching(identifier: "computer-trust-sheet").firstMatch
+            if computerView.exists {
+                // SwiftUI propagates the sheet's identifier onto its Done button.
+                // Scope the visible action to the actual sheet and its button label.
+                let done = pairingUI.sheets.buttons.matching(NSPredicate(
+                    format: "identifier == %@ AND label == %@", "computer-trust-sheet", "Done")).firstMatch
+                guard done.exists, done.isHittable, inView(pairingUI, done) else {
+                    keepTree(pairingUI, "the computer account's Done action could not be delivered")
+                    XCTFail("APPARATUS: the visible computer view’s Done button could not be staged for account switching")
+                    throw Apparatus("the visible computer view's Done button could not be staged for account switching")
+                }
+                done.click()
+                let closedUntil = Date().addingTimeInterval(5)
+                while done.exists && Date() < closedUntil { Thread.sleep(forTimeInterval: 0.2) }
+                guard !done.exists else {
+                    keepTree(pairingUI, "Done did not close the computer view")
+                    XCTFail("PRODUCT: Done must close the computer view before quitting this account")
+                    throw Product("Done must close the computer view before quitting this account")
+                }
+            }
+            guard pairingUI.state == .runningForeground else {
+                keepTree(pairingUI, "the computer account app was not foreground for Quit")
+                XCTFail("APPARATUS: Command-Q could not be delivered to a foreground Vox account")
+                throw Apparatus("Command-Q could not be delivered to a foreground Vox account")
+            }
+            pairingUI.typeKey("q", modifierFlags: .command)
+            guard pairingUI.wait(for: .notRunning, timeout: 15) else {
+                keepTree(pairingUI, "public Quit did not stop the computer account app")
+                XCTFail("PRODUCT: Command-Q must quit Vox before switching accounts")
+                throw Product("Command-Q must quit Vox before switching accounts")
+            }
+        }
+        try openComputers(computerA)
+        tap(pairingUI, Key.id("computer-pairing-begin"), "Create an unused invitation")
+        guard present(pairingUI, Key.id("computer-pairing-code"), timeout: 20,
+                      "an unused invitation must be shown before cancellation") else { return }
+        tap(pairingUI, Key.id("computer-pairing-cancel"), "Cancel Pairing before approval")
+        guard present(pairingUI, Key.id("computer-pairing-begin"), timeout: 20,
+                      "cancelling an unused invitation must permit a new one") else { return }
+        let cancelledA = try computerStatus(computerA)
+        XCTAssertTrue(cancelledA["invite_link"] is NSNull && cancelledA["pairing"] is NSNull,
+                      "PRODUCT: Cancel Pairing must retire the unused invitation; \(cancelledA)")
+        tap(pairingUI, Key.id("computer-pairing-begin"), "Create Pairing Code with zero nodes")
+        guard let code = words(pairingUI, Key.id("computer-pairing-code"), timeout: 20,
+                               "a node-free computer must create a pairing code", until: { $0.hasPrefix("vox") }) else { return }
+        let copiedCode = copiedBy(pairingUI) {
+            tap(pairingUI, Key.id("computer-copy-code"), "Copy Pairing Code")
+        }
+        XCTAssertEqual(copiedCode, code,
+                       "PRODUCT: Copy Pairing Code must copy the code shown by this node-free computer")
+        let invitedA = try computerStatus(computerA)
+        XCTAssertEqual((invitedA["this_computer"] as? [String: Any])?["fingerprint"] as? String, managementFp,
+                       "PRODUCT: inviting must keep the account's management identity")
+        XCTAssertEqual(try staged(vox, ["node", "list"], env: computerA), noNodes,
+                       "PRODUCT: Add Computer must not create or infer a personal chat node")
+        try quitComputerAccount()
+        try openComputers(computerB)
+        type(pairingUI, Key.id("computer-pairing-input"), code, "the other computer's pairing code")
+        tap(pairingUI, Key.id("computer-pairing-preview"), "Review Computer before approval")
+        present(pairingUI, Key.showing(managementName), timeout: 20, "Review must name the authenticated computer")
+        present(pairingUI, Key.showing(managementFp), timeout: 20, "Review must show its complete authenticated management fingerprint")
+        present(pairingUI, Key.showing("Installation " + installation), timeout: 20,
+                "Review must distinguish this installation")
+        words(pairingUI, Key.id("computer-trust-policy"), timeout: 15,
+              "Review must show the exact fixed policy before approval", until: { $0 == policy })
+        let previewB = try computerStatus(computerB)
+        guard let pairing = previewB["pairing"] as? [String: Any],
+              let peer = pairing["peer"] as? [String: Any], peer["fingerprint"] as? String == managementFp else {
+            throw Apparatus("the authenticated proposal for computer A was not staged: \(previewB)")
+        }
+        tap(pairingUI, Key.id("computer-pairing-approve"), "Approve on the reviewing computer only")
+        guard words(pairingUI, Key.id("computer-pairing-waiting"), timeout: 20,
+                    "one-sided approval must wait for the other computer", until: { $0.contains("Confirm on the other computer") }) != nil else { return }
+        XCTAssertNil(locateEverywhere(pairingUI, Key.id("computer-pairing-cancel")),
+                     "PRODUCT: a signed approval must not offer a live Cancel action")
+        XCTAssertNil(locateEverywhere(pairingUI, Key.id("computer-trust-confirmed")),
+                     "PRODUCT: one-sided approval must not claim confirmed")
+        try quitComputerAccount()
+        try openComputers(computerA)
+        tap(pairingUI, Key.id("computer-pairing-approve"), "Explicit approval on the inviting computer")
+        guard present(pairingUI, Key.id("computer-trust-applying"), timeout: 30,
+                      "the second signed approval must be recorded before leaving this computer") else { return }
+        try quitComputerAccount()
+        try openComputers(computerB)
+        guard words(pairingUI, Key.id("computer-pending-nodes"), timeout: 30,
+                    "a protected detached node must remain pending until ordinary attach", until: { $0.contains("protected") }) != nil else { return }
+        XCTAssertNil(locateEverywhere(pairingUI, Key.id("computer-trust-confirmed")),
+                     "PRODUCT: computer trust must not claim confirmed while a protected node remains unapplied")
+        try staged(vox, ["node", "attach", "protected", "--passphrase-file", computerPass], env: computerB)
+        guard present(pairingUI, Key.id("computer-trust-confirmed"), timeout: 45,
+                      "ordinary protected-node attach must allow applied confirmation") else { return }
+        XCTAssertNil(locateEverywhere(pairingUI, Key.id("computer-pending-nodes")),
+                     "PRODUCT: ordinary attach must clear this node from the pending list")
+        let afterRooms = try staged(vox, ["room", "list", "--node", "protected"], env: computerB)
+        XCTAssertEqual(afterRooms, keptRooms, "PRODUCT: computer pairing must preserve existing rooms")
+        let mapSession = "79979979-aaaa-4bbb-8ccc-000000000799"
+        let hookInput = try JSONSerialization.data(withJSONObject: ["session_id": mapSession,
+            "hook_event_name": "UserPromptSubmit", "cwd": repo, "transcript_path": repo + "/t.jsonl", "prompt": "go"])
+        let hooked = run(vox, ["agent", "hook", "--node", "protected", "--format", "text"],
+                         env: computerB.merging(["CLAUDE_CODE_ENTRYPOINT": "cli"]) { $1 },
+                         input: String(decoding: hookInput, as: UTF8.self))
+        guard hooked.status == 0 else { throw Apparatus("repository-session staging failed: \(hooked.out)") }
+        let keptSessions = try staged(vox, ["room", "sessions", "--node", "protected", keptRoom], env: computerB)
+        XCTAssertTrue(keptSessions.contains(mapSession.prefix(8)),
+                      "PRODUCT: the existing repository binding must still open its session in the retained room; \(keptSessions)")
+        try quitComputerAccount()
+        try openComputers(computerA)
+        guard present(pairingUI, Key.id("computer-trust-confirmed"), timeout: 45,
+                      "both computers must show confirmed only after policy application") else { return }
+        let appliedA = try computerStatus(computerA), appliedB = try computerStatus(computerB)
+        XCTAssertEqual(appliedA["state"] as? String, "confirmed", "PRODUCT: inviting computer must be applied")
+        XCTAssertEqual(appliedB["state"] as? String, "confirmed", "PRODUCT: reviewing computer must be applied")
+        try quitComputerAccount()
+        print("[proof] Add Computer: zero-node invitation; authenticated review; one-sided waiting; protected-node pending; ordinary attach; both confirmed; existing room and repo binding retained")
+        // Native OpenCode Session driving uses the existing plugin host apparatus, with no
+        // model or room override. Actual room joins and the saved repo binding remain authority.
+        guard let nativeNode = env["VOX_PROOF_NATIVE_NODE"],
+              let nativeHostSource = env["VOX_PROOF_OPENCODE_HOST"],
+              stager.run(["/bin/test", "-x", nativeNode], env: [:]).status == 0,
+              stager.run(["/bin/test", "-r", nativeHostSource], env: [:]).status == 0 else {
+            throw Apparatus("the existing native OpenCode host and Node executable must be staged before this journey")
+        }
+        for name in ["paired-personal", "paired-ordinary"] {
+            try staged(vox, ["node", "create", name],
+                       env: computerA.merging(["VOX_IDENTITY_PASSPHRASE": "protected pairing identity"]) { $1 })
+            try staged(vox, ["node", "attach", name, "--passphrase-file", computerPass], env: computerA)
+        }
+        let keptLink = try line(staged(vox, ["room", "link", "--node", "protected", keptRoom], env: computerB)) {
+            $0.hasPrefix("vox://")
+        }
+        for name in ["paired-personal", "paired-ordinary"] {
+            try staged(vox, ["room", "join", "--node", name, "--passphrase-file", computerPass, keptLink], env: computerA)
+            let joined = try staged(vox, ["room", "list", "--node", name], env: computerA)
+            guard joined.contains(keptRoom) else { throw Apparatus("native drive node \(name) did not join the retained room: \(joined)") }
+        }
+        let personalFp = try line(staged(vox, ["id", "--node", "paired-personal"], env: computerA)) { $0.count == 52 }
+        pairingUI.launchEnvironment = computerA
+        try launchVox(pairingUI, appPath, env: computerA, scratch: scratchPath,
+                      nodeFingerprint: (name: "paired-personal", fingerprint: personalFp))
+        tap(pairingUI, Key.id("node-paired-personal"), "Choose paired-personal as the personal node")
+        guard present(pairingUI, Key.id("room-pairing-kept"), timeout: 30,
+                      "the selected personal node must show its joined retained room") else { return }
+        tap(pairingUI, Key.id("room-pairing-kept"), "Open the joined retained room")
+        let ordinaryFp = try line(staged(vox, ["id", "--node", "paired-ordinary"], env: computerA)) { $0.count == 52 }
+        let rosterUntil = Date().addingTimeInterval(30)
+        var nativeRoster = ""
+        while Date() < rosterUntil {
+            nativeRoster = try staged(vox, ["room", "roster", "--node", "protected", keptRoom], env: computerB)
+            if nativeRoster.contains(personalFp) && nativeRoster.contains(ordinaryFp) { break }
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        guard nativeRoster.contains(personalFp) && nativeRoster.contains(ordinaryFp) else {
+            throw Apparatus("native drive's exact personal and ordinary identities are not both room members: \(nativeRoster)")
+        }
+        // A short, uniquely owned scratch temp directory lets the real plugin's Unix sockets fit.
+        let nativeTempResult = stager.run(["/usr/bin/mktemp", "-d", "/tmp/vox-799-native.XXXXXXXX"], env: [:])
+        let nativeTemp = nativeTempResult.out.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard nativeTempResult.status == 0, nativeTemp.hasPrefix("/tmp/vox-799-native."), !nativeTemp.contains("\n") else {
+            throw Apparatus("cannot stage the native plugin's private temporary directory: \(nativeTempResult.out)")
+        }
+        defer { _ = stager.run(["/bin/rm", "-rf", nativeTemp], env: [:]) }
+        let nativeSession = "ses_799_pair_drive_0001"
+        let nativePlugin = computerRoot.appendingPathComponent("native-plugin.mjs").path
+        // This command ships JavaScript on stdout and installation advice on stderr.
+        // Install it exactly as a person redirects the command, without mixing the streams.
+        let pluginAdvice = computerRoot.appendingPathComponent("native-plugin-advice.txt").path
+        let installedPlugin = stager.run(["/bin/sh", "-c",
+            "exec \"$1\" agent plugin opencode --node protected > \"$2\" 2> \"$3\"",
+            "install-plugin", vox, nativePlugin, pluginAdvice], env: computerB)
+        guard installedPlugin.status == 0 else {
+            throw Apparatus("the native OpenCode plugin could not be installed from command stdout: \(installedPlugin.out)")
+        }
+        let nativeEnv = computerB.merging(["PATH": "/usr/bin:/bin", "TMPDIR": nativeTemp,
+                                          "VOX_BIN": vox, "VOX_IDENTITY_PASSPHRASE": "protected pairing identity"]) { $1 }
+        let nativeHost = try stager.jsonHost([nativeNode, nativeHostSource, nativePlugin, nativeSession],
+                                            env: nativeEnv, cwd: repo,
+                                            stderr: computerRoot.appendingPathComponent("native-host.stderr").path)
+        defer { nativeHost.terminate() }
+        _ = try nativeHost.command("title Pairing native OpenCode")
+        _ = try nativeHost.command("turn NATIVE-799-INITIAL")
+        func nativeEvent(_ object: [String: Any]) throws {
+            let json = try JSONSerialization.data(withJSONObject: object)
+            _ = try nativeHost.command("event " + String(decoding: json, as: UTF8.self))
+        }
+        let initialUser: [String: Any] = ["type": "message.updated", "properties": ["info":
+            ["id": "msg_799_user", "sessionID": nativeSession, "role": "user"]]]
+        let initialText: [String: Any] = ["type": "message.part.updated", "properties": ["part":
+            ["id": "part_799_user", "messageID": "msg_799_user", "sessionID": nativeSession,
+             "type": "text", "text": "NATIVE-799-INITIAL"]]]
+        let nativeInitialUntil = Date().addingTimeInterval(60)
+        var nativeInitial = ""
+        while Date() < nativeInitialUntil {
+            try nativeEvent(initialUser); try nativeEvent(initialText)
+            nativeInitial = run(vox, ["room", "session", "--node", "paired-personal", keptRoom, nativeSession], env: computerA).out
+            if nativeInitial.contains("NATIVE-799-INITIAL") { break }
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        guard nativeInitial.contains("NATIVE-799-INITIAL") else {
+            throw Apparatus("the repo-bound native Session was not established for the personal receiver: \(nativeInitial)")
+        }
+        tap(pairingUI, Key.id("session-\(nativeSession.prefix(8))"), "The native OpenCode Session in the joined room")
+        guard present(pairingUI, Key.id("session-compose"), timeout: 30,
+                      "the selected personal node must be able to drive a covered ordinary node's native Session") else { return }
+        words(pairingUI, Key.id("session-compose-as"), timeout: 10,
+              "native Session input must be sent as the selected personal node", until: { $0.contains("paired-personal") })
+        type(pairingUI, Key.id("session-compose"), "NATIVE-799-APP-SAY\r", "Say into the native OpenCode Session")
+        guard words(pairingUI, Key.id("session-said"), timeout: 30,
+                    "the native Session must report accepted app input", until: { $0.hasSuffix(": typed") }) != nil else { return }
+        let nativeCalls = try nativeHost.command("calls 30 1", within: 40)
+        let acceptedCalls = nativeCalls["calls"] as? [[String: Any]] ?? []
+        XCTAssertTrue(acceptedCalls.contains { call in
+            let parts = (call["body"] as? [String: Any])?["parts"] as? [[String: Any]]
+            return call["method"] as? String == "POST" && call["url"] as? String == "/session/\(nativeSession)/prompt_async"
+                && parts?.first?["text"] as? String == "NATIVE-799-APP-SAY"
+        }, "PRODUCT: app say must reach exactly the native recipient Session as prompt_async; host read \(nativeCalls)")
+        try nativeEvent(["type": "message.updated", "properties": ["info":
+            ["id": "msg_799_reply", "sessionID": nativeSession, "role": "assistant", "providerID": "opencode", "modelID": "apparatus"]]])
+        try nativeEvent(["type": "message.part.updated", "properties": ["part":
+            ["id": "part_799_reply", "messageID": "msg_799_reply", "sessionID": nativeSession,
+             "type": "text", "text": "NATIVE-799-REPLY"]]])
+        try nativeEvent(["type": "session.idle", "properties": ["sessionID": nativeSession]])
+        let nativeTimeline = pairingUI.scrollViews.matching(identifier: "timeline").firstMatch
+        guard nativeTimeline.waitForExistence(timeout: 10) else {
+            throw Apparatus("the selected native Session has no public timeline for reading its returned step")
+        }
+        let nativeReplyLines = nativeTimeline.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND (label CONTAINS %@ OR CAST(value, 'NSString') CONTAINS %@)",
+            "entry-line-", "NATIVE-799-REPLY", "NATIVE-799-REPLY"))
+        func nativeReplyVisible(_ line: XCUIElement) -> Bool {
+            let body = line.frame, clip = nativeTimeline.frame, window = pairingUI.windows.firstMatch.frame
+            return [body.minX, body.minY, body.width, body.height,
+                    clip.minX, clip.minY, clip.width, clip.height,
+                    window.minX, window.minY, window.width, window.height].allSatisfy { $0.isFinite }
+                && body.width > 0 && body.height > 0 && clip.width > 0 && clip.height > 0
+                && clip.contains(body) && window.contains(body)
+        }
+        let nativeReplyUntil = Date().addingTimeInterval(30)
+        while Date() < nativeReplyUntil {
+            let line = nativeReplyLines.firstMatch
+            if line.exists && nativeReplyVisible(line) { break }
+            let clip = nativeTimeline.frame
+            guard clip.width > 0, clip.height > 0, clip.height.isFinite else {
+                throw Apparatus("the native Session's timeline has no finite positive viewport: \(clip)")
+            }
+            if line.exists, !line.frame.isEmpty {
+                nativeTimeline.scroll(byDeltaX: 0, deltaY: max(-200, min(200, clip.midY - line.frame.midY)))
+            } else {
+                // Realize the newest native entry through normal public scrolling.
+                nativeTimeline.scroll(byDeltaX: 0, deltaY: -min(200, clip.height * 0.75))
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        let nativeReplyLine = nativeReplyLines.firstMatch
+        guard nativeReplyLine.exists else {
+            keepTree(pairingUI, "native reply absent from the selected Session entry lines")
+            throw Product("the native Session's returned NATIVE-799-REPLY step must appear as its own timeline entry, not a sidebar preview")
+        }
+        guard nativeReplyVisible(nativeReplyLine) else {
+            keepTree(pairingUI, "native returned step could not be brought inside its timeline")
+            throw Apparatus("cannot stage the native returned step visibly: entry \(nativeReplyLine.frame), timeline \(nativeTimeline.frame), window \(pairingUI.windows.firstMatch.frame)")
+        }
+        let ordinaryGrantUntil = Date().addingTimeInterval(30)
+        var ordinaryGrant = ""
+        while Date() < ordinaryGrantUntil {
+            let grants = try staged(vox, ["trust", "list", "--node", "protected"], env: computerB)
+            ordinaryGrant = grants.split(whereSeparator: \.isNewline).map(String.init)
+                .first { $0.split(whereSeparator: \.isWhitespace).first.map(String.init) == ordinaryFp } ?? ""
+            if ordinaryGrant.split(whereSeparator: \.isWhitespace).last == "read", !ordinaryGrant.contains("drive") { break }
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        guard ordinaryGrant.split(whereSeparator: \.isWhitespace).last == "read", !ordinaryGrant.contains("drive") else {
+            throw Apparatus("the exact covered ordinary member's Read without drive grant was not established: \(ordinaryGrant)")
+        }
+        let ordinarySessions = try staged(vox, ["room", "sessions", "--node", "paired-ordinary", keptRoom], env: computerA)
+        checkNonUI {
+            XCTAssertFalse(ordinarySessions.contains(nativeSession.prefix(8)) || ordinarySessions.contains("Pairing native OpenCode"),
+                           "PRODUCT: Read without drive must not discover the native Session; \(ordinarySessions)")
+        }
+        let ordinarySay = run(vox, ["room", "session", "--node", "paired-ordinary", keptRoom, nativeSession,
+                                   "--say", "NATIVE-799-ORDINARY-MUST-NOT-ARRIVE"], env: computerA)
+        checkNonUI {
+            XCTAssertTrue(ordinarySay.status != 0 && ordinarySay.out.contains("no Session in this room is named " + nativeSession),
+                          "PRODUCT: a Read-only member must be refused without disclosing the native Session; \(ordinarySay.out)")
+        }
+        let callsAfterRefusal = try nativeHost.command("calls 2 2", within: 5)
+        checkNonUI {
+            XCTAssertEqual((callsAfterRefusal["calls"] as? [[String: Any]])?.count, acceptedCalls.count,
+                           "PRODUCT: refused ordinary-node input must not reach the native recipient; \(callsAfterRefusal)")
+        }
+        nativeHost.terminate()
+        try quitComputerAccount()
+        print("[proof] paired selected personal node drove the repo-bound native OpenCode Session through app say; recipient received exact prompt and returned visible step; joined ordinary node refused with no recipient call")
+
+        // The ordinary app must explain a real storage refusal, not retain its old confirmation.
+        try staged(vox, ["node", "create", "storage-failure"],
+                   env: computerB.merging(["VOX_IDENTITY_PASSPHRASE": "protected pairing identity"]) { $1 })
+        try openComputers(computerB)
+        let managementDirectory = computerB["VOX_DATA_DIR"]! + "/.daemon/computer"
+        do {
+            let restricted = stager.run(["/bin/chmod", "0500", managementDirectory], env: [:])
+            guard restricted.status == 0 else { throw Apparatus("cannot restrict scratch computer storage: \(restricted.out)") }
+            defer { _ = stager.run(["/bin/chmod", "0700", managementDirectory], env: [:]) }
+            let refused = run(vox, ["node", "attach", "storage-failure", "--passphrase-file", computerPass], env: computerB)
+            XCTAssertNotEqual(refused.status, 0,
+                              "PRODUCT: a new managed node must not attach when its computer policy cannot be saved; \(refused.out)")
+        }
+        let repairedMode = stager.run(["/bin/chmod", "0700", managementDirectory], env: [:])
+        guard repairedMode.status == 0 else { throw Apparatus("cannot restore scratch computer storage: \(repairedMode.out)") }
+        guard present(pairingUI, Key.id("computer-trust-quarantined"), timeout: 30,
+                      "failed computer storage must visibly suspend trust") else { return }
+        guard words(pairingUI, Key.id("computer-pairing-problem"), timeout: 20,
+                    "storage suspension must explain the storage problem", until: { $0.contains("storage") }) != nil else { return }
+        XCTAssertNil(locateEverywhere(pairingUI, Key.id("computer-trust-confirmed")),
+                     "PRODUCT: a storage failure must not leave the app claiming confirmed")
+        try quitComputerAccount()
+
+        // Existing clock apparatus writes a past authenticated deadline. Restarting with normal
+        // clocks makes it genuinely expired to the ordinary app and both ordinary daemons.
+        let computerC = computerEnv("c"), computerD = computerEnv("d")
+        for environment in [computerC, computerD] {
+            let madeHome = stager.run(["/bin/mkdir", "-p", environment["HOME"]!], env: [:])
+            guard madeHome.status == 0 else { throw Apparatus("cannot create expiry account HOME: \(madeHome.out)") }
+            try stager.write(Data("no\n".utf8), to: environment["VOX_CONFIG_DIR"]! + "/app/login-item")
+        }
+        let behind = ["VOX_TEST_CLOCK_STEP_MS": "-700000"]
+        let pastC = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"],
+                              env: computerC.merging(behind) { $1 }, until: "vox daemon: control socket")
+        defer { pastC.terminate() }
+        let pastD = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"],
+                              env: computerD.merging(behind) { $1 }, until: "vox daemon: control socket")
+        defer { pastD.terminate() }
+        let invitedC = try staged(vox, ["computer", "invite", "--json"], env: computerC)
+        guard let inviteRecord = try JSONSerialization.jsonObject(with: Data(invitedC.utf8)) as? [String: Any],
+              let expiredCode = inviteRecord["invite_link"] as? String else {
+            throw Apparatus("expiry fixture has no public invitation: \(invitedC)")
+        }
+        let previewD = try staged(vox, ["computer", "pair", expiredCode, "--preview", "--json"], env: computerD)
+        guard let previewRecord = try JSONSerialization.jsonObject(with: Data(previewD.utf8)) as? [String: Any],
+              let expiredPairing = previewRecord["pairing"] as? [String: Any],
+              let expiredOperation = expiredPairing["operation_id"] as? String else {
+            throw Apparatus("expiry fixture has no authenticated proposal: \(previewD)")
+        }
+        try staged(vox, ["computer", "approve", expiredOperation, "--json"], env: computerC)
+        let receiptDeadline = Date().addingTimeInterval(20)
+        var remoteReceipt = try computerStatus(computerD)
+        while (remoteReceipt["pairing"] as? [String: Any])?["approved_there"] as? Bool != true,
+              Date() < receiptDeadline {
+            Thread.sleep(forTimeInterval: 0.2)
+            remoteReceipt = try computerStatus(computerD)
+        }
+        guard (remoteReceipt["pairing"] as? [String: Any])?["approved_there"] as? Bool == true else {
+            throw Apparatus("expiry peer has not received the one-sided signed approval: \(remoteReceipt)")
+        }
+        pastC.terminate(); pastD.terminate()
+        let normalC = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: computerC,
+                                until: "vox daemon: control socket")
+        defer { normalC.terminate() }
+        let normalD = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: computerD,
+                                until: "vox daemon: control socket")
+        defer { normalD.terminate() }
+        let expiredStatus = try computerStatus(computerC)
+        guard let persistedPairing = expiredStatus["pairing"] as? [String: Any],
+              let expiredMillis = persistedPairing["expires_ms"] as? NSNumber,
+              expiredMillis.doubleValue / 1000 < Date().timeIntervalSince1970,
+              persistedPairing["approved_here"] as? Bool == true else {
+            throw Apparatus("ordinary-clock expired signed attempt was not staged: \(expiredStatus)")
+        }
+        try openComputers(computerC)
+        guard words(pairingUI, Key.id("computer-pairing-expired"), timeout: 20,
+                    "expired signed intent must explain its local-only closure",
+                    until: { $0.contains("closing here does not remove its trust") }) != nil else { return }
+        guard words(pairingUI, Key.id("computer-pairing-cancel"), timeout: 15,
+                    "expired signed intent must offer Close Expired Attempt",
+                    until: { $0 == "Close Expired Attempt" }) != nil else { return }
+        tap(pairingUI, Key.id("computer-pairing-cancel"), "Close Expired Attempt locally")
+        guard present(pairingUI, Key.id("computer-pairing-begin"), timeout: 20,
+                      "closing expired intent must allow a fresh invitation") else { return }
+        tap(pairingUI, Key.id("computer-pairing-begin"), "Create a fresh invitation after expiry")
+        guard present(pairingUI, Key.id("computer-pairing-code"), timeout: 20,
+                      "fresh invitation must be displayed after local expiry closure") else { return }
+        let freshC = try computerStatus(computerC)
+        XCTAssertNotEqual(freshC["invite_id"] as? String, inviteRecord["invite_id"] as? String,
+                          "PRODUCT: after closing expired intent the new invitation must be distinct")
+        try staged(vox, ["computer", "cancel", expiredOperation, "--json"], env: computerC)
+        let afterOldClose = try computerStatus(computerC)
+        XCTAssertEqual(afterOldClose["invite_id"] as? String, freshC["invite_id"] as? String,
+                       "PRODUCT: retrying closure of the expired intent must not cancel or replace the fresh invitation")
+        XCTAssertTrue(afterOldClose["pairing"] is NSNull,
+                      "PRODUCT: retired expired intent must not replace the fresh invitation's state; \(afterOldClose)")
+        try quitComputerAccount()
+        print("[proof] Add Computer: unused invitation cancelled; signed expiry closed with local-only warning and fresh invitation preserved; storage refusal visibly suspends confirmation")
+
         let ui = voxApp(appPath)
         ui.launchEnvironment = voxEnv
         try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
@@ -5738,7 +6219,8 @@ final class FirstRunProof: XCTestCase {
     /// staged only here, or asks the first-run question the account's own config has answered.
     /// The account's data root shown, or none of these, stops the case.
     private func launchVox(_ ui: XCUIApplication, _ appPath: String, env: [String: String],
-                           scratch: String) throws {
+                           scratch: String, computerFingerprint: String? = nil,
+                           nodeFingerprint: (name: String, fingerprint: String)? = nil) throws {
         try scratchOnly(env, under: scratch)
         let appExe = resolved(appPath + "/Contents/MacOS/Vox")
         if let running = proofApps().first {
@@ -5771,6 +6253,10 @@ final class FirstRunProof: XCTestCase {
         let realRoot = Key.showing("Library/Application Support/vox")
         let scratchSigns: [Key] = [Key.showing(resolved(scratch)), Key.showing(scratch),
                                    Key.id("node-alice"), Key.showing("node alice"), Key.showing("alice")]
+        // Zero-node accounts have no node/path clue in Welcome. Open only the read-only
+        // account view: no invitation, approval or other pairing action precedes verification.
+        if computerFingerprint != nil { ui.typeKey(",", modifierFlags: .command) }
+        var openedComputerView = false
         let until = Date().addingTimeInterval(30)
         while Date() < until {
             if let real = locate(ui, realRoot) {
@@ -5778,6 +6264,30 @@ final class FirstRunProof: XCTestCase {
                 keepTree(ui, "Vox.app showed the account's data root")
                 ui.terminate()
                 throw Apparatus("Vox.app is on the account's real profile, not this run's scratch one: it shows \(said); stopped before any step")
+            }
+            if let fingerprint = computerFingerprint {
+                if !openedComputerView, let button = locate(ui, Key.id("settings-add-computer")), button.isHittable {
+                    button.click()
+                    openedComputerView = true
+                }
+                let sheet = ui.scrollViews.matching(identifier: "computer-trust-sheet").firstMatch
+                let identity = sheet.descendants(matching: .staticText)
+                    .matching(NSPredicate(format: "label == %@ OR CAST(value, 'NSString') == %@", fingerprint, fingerprint)).firstMatch
+                if sheet.exists, identity.exists {
+                    print("[guard] Vox.app (pid \(pid)) shows this scratch account's exact public computer fingerprint: \(fingerprint)")
+                    return
+                }
+                Thread.sleep(forTimeInterval: 0.5)
+                continue
+            }
+            if let expected = nodeFingerprint {
+                let identity = ui.windows.staticTexts.matching(identifier: "node-fingerprint-" + expected.name).firstMatch
+                if identity.exists, shown(identity).filter({ !$0.isWhitespace }) == expected.fingerprint {
+                    print("[guard] Vox.app (pid \(pid)) shows this scratch account's exact public node fingerprint: \(expected.fingerprint)")
+                    return
+                }
+                Thread.sleep(forTimeInterval: 0.5)
+                continue
             }
             if let sign = scratchSigns.first(where: { locate(ui, $0) != nil }) {
                 print("[guard] Vox.app (pid \(pid)) is on this run's scratch profile: it shows \(sign)")
@@ -5790,8 +6300,10 @@ final class FirstRunProof: XCTestCase {
             Thread.sleep(forTimeInterval: 0.5)
         }
         keepTree(ui, "Vox.app could not be shown on the scratch profile")
-        ui.terminate()
-        throw Apparatus("Vox.app could not be shown to be on this run's scratch profile within 30 s (no scratch path, no node staged here, nor a first-run question the account has answered); stopped before any step")
+        // Report the staging fault before teardown attempts to terminate a possibly stalled app.
+        let missingClue = computerFingerprint.map { "the read-only Add Computer view did not show the required scratch computer fingerprint \($0)" }
+            ?? "no scratch path, no node staged here, nor a first-run question the account has answered"
+        throw Apparatus("Vox.app could not be shown to be on this run's scratch profile within 30 s (\(missingClue)); stopped before any pairing or other product step")
     }
 
     /// The proof hides (⌘H) or quits (⌘Q) Vox itself: what takes the foreground next is handed
