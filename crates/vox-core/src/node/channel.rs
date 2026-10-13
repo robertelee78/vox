@@ -39,6 +39,7 @@
 
 mod legacy_session;
 mod legacy_session_sender;
+mod private_session;
 pub(crate) mod session_floor;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -164,7 +165,9 @@ fn parse_first_seen(bytes: &[u8]) -> Result<(u64, bool)> {
 }
 
 fn retained_control(body: &[u8]) -> bool {
-    session_floor::is_session_floor(body) || crate::governance::step_policy::is_step_policy(body)
+    session_floor::is_session_floor(body)
+        || private_session::is_support(body)
+        || crate::governance::step_policy::is_step_policy(body)
 }
 
 fn is_step_body(room: &Digest32, body: &[u8]) -> bool {
@@ -877,6 +880,7 @@ pub struct ChannelState {
     legacy_sessions: legacy_session::LegacySessions,
     /// Last verified own-feed sequence covered by emitted legacy Session declarations.
     legacy_announced: Option<u64>,
+    private_sessions: private_session::PrivateSessions,
     /// How far each other member's node holds this identity's feed here, by its own word in its
     /// last sync with this node (ADR-028 R-6): the highest seq of the feed its frontier named.
     /// Persisted as [`SEG_HELD`].
@@ -1780,6 +1784,7 @@ impl ChannelState {
             pending_reads: Vec::new(),
             legacy_sessions: legacy_session::LegacySessions::default(),
             legacy_announced: None,
+            private_sessions: private_session::PrivateSessions::default(),
             held: BTreeMap::new(),
             owed: BTreeSet::new(),
             owed_asked_to: None,
@@ -2295,6 +2300,7 @@ impl ChannelState {
             pending_reads: Vec::new(),
             legacy_sessions: legacy_session::LegacySessions::default(),
             legacy_announced: None,
+            private_sessions: private_session::PrivateSessions::default(),
             held,
             owed,
             owed_asked_to: None,
@@ -2339,6 +2345,7 @@ impl ChannelState {
         // A revoked member may hold no body from the newest drive generation. Restore the
         // author's signed generation announcements before exposing its Session permissions.
         room.index_session_floors();
+        room.restore_private_sessions(store)?;
         room.sweep_retention(store, now)?;
         Ok(room)
     }
@@ -2551,6 +2558,7 @@ impl ChannelState {
             pending_reads: Vec::new(),
             legacy_sessions: legacy_session::LegacySessions::default(),
             legacy_announced: None,
+            private_sessions: private_session::PrivateSessions::default(),
             held: BTreeMap::new(),
             owed: BTreeSet::new(),
             owed_asked_to: None,
@@ -4806,7 +4814,8 @@ impl ChannelState {
                     .take_steps_due(now_ms.saturating_sub(step_ttl.saturating_mul(1_000))),
             );
         }
-        let pruned = self.prune(store, &due, false)?;
+        let pruned =
+            self.prune(store, &due, false)? + self.sweep_private_sessions(store, now_ms)?;
         if pruned > 0 {
             self.last_pruned_at = now_ms;
         }
@@ -5942,6 +5951,7 @@ impl ChannelState {
             .filter_map(|p| GroupMessage::from_wire(p).ok())
             .filter(|m| m.header.channel_id == ns)
             .map(|m| m.header.chain_id)
+            .chain(self.private_drive_used())
             .max()
     }
 
@@ -6006,118 +6016,7 @@ impl ChannelState {
         holders: &BTreeSet<Digest32>,
         now_millis: u64,
     ) -> Result<Digest32> {
-        if self.poisoned {
-            return Err(self.save_failure());
-        }
-        if !self.settled {
-            return Err(Error::RoomNotSynced);
-        }
-        let signer = profile.signer()?;
-        let me = signer.fingerprint();
-        if !self.authors.contains_key(&me) {
-            return Err(Error::Profile("this identity is not an author of the room"));
-        }
-        if self.ended(now_millis).is_some() {
-            return Err(Error::Profile("this room has ended"));
-        }
-        let content = crate::node::content::SessionEntry::new(now_millis, session_id, body)?;
-        let now_ms = now_millis;
-        let stale = match &self.drive.chain {
-            None => true,
-            Some(c) => c.epoch() != self.epoch || c.should_rotate(now_ms),
-        };
-        if stale {
-            self.begin_drive(holders, now_ms)?;
-        }
-        self.ensure_session_floors(profile, holders, now_ms)?;
-        let chain = self
-            .drive
-            .chain
-            .as_mut()
-            .ok_or(Error::Profile("drive key missing"))?;
-        let plaintext = Zeroizing::new(content.to_canonical_vec());
-        let payload = chain.encrypt(&plaintext)?.to_wire();
-        let skeleton = self.next_skeleton(&me, &payload, now_millis);
-        let entry = Entry::build_signed(signer, skeleton, payload)?;
-        let entry_hash = entry.entry_hash();
-        let wire = entry.to_wire();
-        let row = SessionRow {
-            entry_hash,
-            author: me,
-            created_millis: now_millis,
-            session_id: content.session_id,
-            body: content.body,
-        };
-        let id = self.next_log_id;
-        let log_seg = seal_segment(&self.sek, SegmentKind::LogDb, id, &wire)?;
-        let cache_seg = seal_segment(
-            &self.sek,
-            SegmentKind::PlaintextCache,
-            id,
-            &session_cache_bytes(&row),
-        )?;
-        let drive_seg = seal_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_DRIVE,
-            &self.drive.to_state(),
-        )?;
-        let seen_seg = seal_segment(
-            &self.sek,
-            SegmentKind::Index,
-            id,
-            &first_seen_bytes(now_ms, true),
-        )?;
-        let key = signer.public_key();
-        self.dag
-            .accept(entry, EntryKind::Content, &key, &self.admission)
-            .map_err(|_| Error::Profile("authored entry failed the acceptance predicate"))?;
-        let persisted = (|| -> Result<()> {
-            let mut batch = profile.store().batch()?;
-            batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
-            batch.put_segment(
-                &self.channel_id,
-                SegmentKind::PlaintextCache,
-                id,
-                &cache_seg,
-            )?;
-            batch.put_segment(
-                &self.channel_id,
-                SegmentKind::KeyMaterial,
-                SEG_DRIVE,
-                &drive_seg,
-            )?;
-            batch.put_segment(&self.channel_id, SegmentKind::Index, id, &seen_seg)?;
-            batch.commit()
-        })();
-        if let Err(e) = persisted {
-            self.poisoned = true;
-            self.save_error = Some(e.to_string());
-            return Err(e);
-        }
-        // An entry under the live key: a member that lost the one before can tell.
-        self.drive.change_unsaid = Some(false);
-        self.log_ids.insert(entry_hash, id);
-        self.next_log_id = id.saturating_add(1);
-        self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.step_bodies.insert(entry_hash);
-        self.retention.track(
-            entry_hash,
-            Tracked {
-                log_id: id,
-                first_seen_ms: now_ms,
-                steps: true,
-                claimed_ms: Some(now_ms),
-                cache_id: Some(id),
-            },
-        );
-        // A key-changed entry is kept with the rest, so it is opened once, but it is no
-        // Session's: nothing is said of it.
-        if !crate::node::drive::is_key_changed(&row.session_id) {
-            self.drive.news.push(row.session_id.clone());
-        }
-        self.drive.sessions.push(row);
-        Ok(entry_hash)
+        self.append_private_session(profile, session_id, body, holders, now_millis)
     }
 
     /// The sessions with an entry placed in this room since the last call, each once: what the
@@ -6239,6 +6138,7 @@ impl ChannelState {
             return Err(Error::SizeLimitExceeded("room drive keys"));
         }
         self.drive.receivers.insert(slot, chain);
+        self.reset_private_pulls();
         // An older author may have served a skeleton before its authenticated release arrived.
         // Its newly available local key makes eligible bodies worth asking for again now.
         self.drive.omitted.clear();

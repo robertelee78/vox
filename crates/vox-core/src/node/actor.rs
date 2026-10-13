@@ -573,6 +573,8 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::NetworkChanged(_) => "acting on a change of the machine's network",
         NetEvent::Stranded(_) => "dialling again peers a network change stranded",
         NetEvent::SyncDone { .. } => "filing a sync that finished",
+        NetEvent::PrivateSessionAsk { .. } => "authorizing private Session records",
+        NetEvent::PrivateSessionDone { .. } => "filing private Session records",
         NetEvent::RoomStored { .. } => "evaluating a room whose log grew",
         NetEvent::SlotFreed => "starting a queued sync",
         NetEvent::BackoffExpired { .. } => "retrying a sync whose backoff is due",
@@ -968,6 +970,18 @@ async fn run_session_worker(
 /// Work the network produced that only the actor can handle, because it needs
 /// channel state (ADR-016: the actor stays the single writer).
 enum NetEvent {
+    PrivateSessionAsk {
+        peer: Digest32,
+        ask: crate::node::sessionstream::Ask,
+        send: quinn::SendStream,
+        recv: quinn::RecvStream,
+        conn: Arc<crate::transport::quic::VoxConnection>,
+    },
+    PrivateSessionDone {
+        channel_id: Digest32,
+        peer: Digest32,
+        page: crate::error::Result<crate::node::sessionstream::Page>,
+    },
     /// A program asked, through the app API, to open an app stream to `peer`: reach it
     /// through the ladder and hand the connection back (ADR-022 decision 7).
     AppDial(crate::node::app::AppDial),
@@ -1819,6 +1833,26 @@ async fn serve_typed(
                     return;
                 };
                 let _ = tx.send(NetEvent::AgreeAsk { peer, ask, send }).await;
+            });
+        }
+        Ok(Inbound::Session { peer, send, recv }) => {
+            state.failures = 0;
+            let tx = tx.clone();
+            let conn = Arc::clone(&conn);
+            tokio::spawn(async move {
+                let mut recv = recv;
+                let Ok(ask) = crate::node::sessionstream::read_ask(&mut recv).await else {
+                    return;
+                };
+                let _ = tx
+                    .send(NetEvent::PrivateSessionAsk {
+                        peer,
+                        ask,
+                        send,
+                        recv,
+                        conn,
+                    })
+                    .await;
             });
         }
         Ok(Inbound::Sync { peer, send, recv }) => {
@@ -5149,6 +5183,7 @@ impl Node {
                     // Drive keys too (ADR-029 SC-2a, SC-2b): changed if a holder lost drive,
                     // and released to whoever is owed one.
                     self.tend_drive_keys().await;
+                    self.tend_private_sessions().await;
                     // R14: a superseded generation's key goes once no full-history grant
                     // still has to release it.
                     let pruned = self.prune_superseded_keys().await;
@@ -7998,6 +8033,52 @@ impl Node {
                     }
                 }
             }
+            NetEvent::PrivateSessionAsk {
+                peer,
+                ask,
+                mut send,
+                mut recv,
+                conn,
+            } => {
+                let Some(shared) = self.channels.get(&ask.room).map(Arc::clone) else {
+                    crate::transport::streams::refuse(&mut send, &mut recv);
+                    return;
+                };
+                let holders = self.drive_holders();
+                let page = shared.lock().await.private_page(&ask, &peer, &holders);
+                match page {
+                    Ok(page) => {
+                        tokio::spawn(async move {
+                            let _connection = conn;
+                            let _ = crate::node::sessionstream::answer(send, page).await;
+                        });
+                    }
+                    Err(_) => crate::transport::streams::refuse(&mut send, &mut recv),
+                }
+            }
+            NetEvent::PrivateSessionDone {
+                channel_id,
+                peer,
+                page,
+            } => {
+                let (Some(shared), Some(store)) = (
+                    self.channels.get(&channel_id).map(Arc::clone),
+                    self.log_store(),
+                ) else {
+                    return;
+                };
+                let result = shared.lock().await.finish_private_pull(
+                    &store,
+                    peer,
+                    page,
+                    (self.millis_clock)(),
+                );
+                self.say_session_news(&channel_id).await;
+                self.refresh_network_view().await;
+                if result.is_ok_and(|more| more) {
+                    self.pull_private_sessions(channel_id, peer).await;
+                }
+            }
             NetEvent::SyncDone {
                 channel_id,
                 peer,
@@ -8009,6 +8090,7 @@ impl Node {
                 // outcome, current or not: a session that failed late may have applied some entries
                 // first.
                 self.install_key_packages(&channel_id).await;
+                self.pull_private_sessions(channel_id, peer).await;
                 // A session that sent this node's HAVE from at least the generation its departure
                 // was written at, and ended cleanly, handed that peer the departure (V210-164).
                 let heard = report.out.gen_have.filter(|_| report.fail.is_none());
@@ -8204,6 +8286,9 @@ impl Node {
                     Inbound::Pairwise { .. } => {
                         // Unreachable: the stream loop reads these and sends
                         // `NetEvent::Pairwise` once the frames are in hand.
+                    }
+                    Inbound::Session { .. } => {
+                        // The stream loop reads the bounded preamble off the actor.
                     }
                     Inbound::Sync { .. } => {
                         // Unreachable: the stream loop converts these into
@@ -16026,6 +16111,60 @@ impl Node {
             .collect()
     }
 
+    async fn tend_private_sessions(&mut self) {
+        let rooms: Vec<_> = self
+            .channels
+            .iter()
+            .map(|(id, room)| (*id, Arc::clone(room)))
+            .collect();
+        for (room, shared) in rooms {
+            let members = shared.lock().await.drive_members();
+            for peer in members {
+                self.pull_private_sessions(room, peer).await;
+            }
+        }
+    }
+
+    /// Pull through the separate typed stream. No network wait holds the actor or room lock.
+    /// It shares the ordinary outbound slot budget, and retries only while a connection exists.
+    async fn pull_private_sessions(&mut self, channel_id: Digest32, peer: Digest32) {
+        let Some(conn) = self
+            .net
+            .as_ref()
+            .and_then(|net| net.manager().existing(&peer))
+        else {
+            return;
+        };
+        let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
+            return;
+        };
+        let Some(slot) = crate::node::ports::Slots::take(&self.slots, peer, Box::new(|| {})) else {
+            return;
+        };
+        let Some(ask) = shared.lock().await.start_private_pull(peer) else {
+            return;
+        };
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            let page = tokio::time::timeout(
+                Duration::from_secs(10),
+                crate::node::sessionstream::pull(&conn, ask),
+            )
+            .await
+            .unwrap_or(Err(crate::error::Error::Unreachable(
+                "private Session page timed out",
+            )));
+            let _ = tx
+                .send(NetEvent::PrivateSessionDone {
+                    channel_id,
+                    peer,
+                    page,
+                })
+                .await;
+        });
+    }
+
     /// Append one Session entry under this node's drive key (ADR-029 SC-1, SC-2), then release
     /// that key to whoever with drive is owed it, so a member owed it from the entry reads it.
     async fn append_session(
@@ -16120,6 +16259,9 @@ impl Node {
             // Ordinary-key declarations name only this node's authenticated legacy hashes.
             // They let read-only peers identify withheld steps without granting drive.
             if ch.announce_legacy_sessions(profile, now_millis).is_err() {
+                return;
+            }
+            if ch.announce_private_support(profile, now_millis).is_err() {
                 return;
             }
             if ch

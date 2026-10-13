@@ -3,8 +3,7 @@
 //!
 //! ## The claims
 //! 1. **Read only with drive** (SC-2, SC-2a, SC-4). Alice's node trusts bob with read + drive
-//!    and carol with read only. The entries of alice's Session reach both of their nodes in the
-//!    room's log, and bob's node opens every one of them; carol's opens none, though it reads
+//!    and carol with read only. Bob's node opens every Session entry; carol's opens none, though it reads
 //!    alice's messages to the room written before and after them. Neither shows Session activity
 //!    in the room's timeline (`vox room read`).
 //!    `vox room sessions --json` says so too: alice's Session is listed for both, `can_drive`
@@ -503,19 +502,6 @@ fn fetch_as(
     Ok(head.lines().next().unwrap_or_default().to_owned())
 }
 
-/// How many entries `m`'s node holds in the room, as `vox status --json` counts them.
-fn entries(m: &Member, room: &str) -> u64 {
-    let (_, o, _) = m.vox(&["status", "--json"], None);
-    let v: serde_json::Value = serde_json::from_str(&o).unwrap_or_default();
-    v["rooms"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|r| r["id"].as_str().is_some_and(|id| id.starts_with(room)))
-        .and_then(|r| r["entries"].as_u64())
-        .unwrap_or(0)
-}
-
 #[test]
 #[ignore = "an anchor and three daemons with production Argon2id; CI runs it in release"]
 fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key() {
@@ -570,7 +556,6 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     let before: Vec<String> = (1..=ENTRIES)
         .map(|n| format!("BEFORE-DOWNGRADE {n}"))
         .collect();
-    let carol_held = entries(&carol, &room);
     for (n, text) in before.iter().enumerate() {
         match rt.block_on(alice.socket(&rt).request(&Request::AppendSession {
             channel_id: id,
@@ -582,10 +567,9 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         }
     }
     let bob_read = until(Duration::from_secs(120), || opened(&bob, &room) == before);
-    // Carol's control: a room message alice posts after the entries, read by carol, so her node
-    // holds the log past them.
+    // A delivered ordinary message is the positive control. Private Session steps are no
+    // longer room-log entries, so a count of public entries cannot stage their delivery.
     let carol_synced = posts_until_read(&alice, &carol, &room, "AFTER-ENTRIES");
-    let carol_holds = entries(&carol, &room).saturating_sub(carol_held);
     let carol_opened = opened(&carol, &room);
     let bob_lists = until(Duration::from_secs(60), || {
         can_drive(&bob, &room) == Some(true)
@@ -594,14 +578,12 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     let timeline_bob = bob.vox(&["room", "read", &room], None).1;
     let timeline_carol = carol.vox(&["room", "read", &room], None).1;
     eprintln!(
-        "[proof] claim 1: bob opened {:?}; carol synced past them: {carol_synced}, holds {carol_holds} \
-         new entries, opened {carol_opened:?}",
+        "[proof] claim 1: bob opened {:?}; carol reads later chat: {carol_synced}, opened {carol_opened:?}",
         opened(&bob, &room)
     );
     assert!(
-        carol_synced && carol_holds as usize >= ENTRIES,
-        "APPARATUS (staging): carol's node never held the log past alice's Session entries ({carol_holds} \
-         new entries, synced {carol_synced}), so her opening none would say nothing"
+        carol_synced,
+        "PRODUCT: read-only Carol did not receive ordinary chat after Alice wrote private Session steps"
     );
     assert!(
         bob_read,

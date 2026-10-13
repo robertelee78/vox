@@ -63,6 +63,7 @@ const fn kind_code(kind: SegmentKind) -> u8 {
         // or this match stops being exhaustive.
         SegmentKind::Trust => 8,
         SegmentKind::SessionClassification => 9,
+        SegmentKind::PrivateSession => 10,
     }
 }
 
