@@ -1174,12 +1174,21 @@ final class FirstRunProof: XCTestCase {
         }
         // A single-member inspector fits even in the smallest supported window. Populate a
         // real roster so scrolling is necessary rather than claiming a pass without overflow.
+        // Keep these members remote: nine local identities expose the separate sidebar
+        // clipping defect tracked by #767, before this inspector journey can open its room.
+        let membersRoot = root.appendingPathComponent("members")
+        let membersEnv = ["VOX_DATA_DIR": membersRoot.appendingPathComponent("data").path,
+                          "VOX_CONFIG_DIR": membersRoot.appendingPathComponent("config").path,
+                          "VOX_PROXY": "127.0.0.1:0"]
+        let membersDaemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"],
+                                      env: membersEnv, until: "vox daemon: control socket")
+        defer { membersDaemon.terminate() }
         for index in 1...8 {
             let name = "member-\(index)"
             try staged(vox, ["node", "create", name],
-                       env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "alice identity"]) { $1 })
-            try staged(vox, ["node", "attach", name, "--passphrase-file", idPass], env: voxEnv)
-            try staged(vox, ["room", "join", "--node", name, "--passphrase-file", roomPass, link], env: voxEnv)
+                       env: membersEnv.merging(["VOX_IDENTITY_PASSPHRASE": "alice identity"]) { $1 })
+            try staged(vox, ["node", "attach", name, "--passphrase-file", idPass], env: membersEnv)
+            try staged(vox, ["room", "join", "--node", name, "--passphrase-file", roomPass, link], env: membersEnv)
         }
         try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
         try stager.write(Data("alice\n".utf8), to: config + "/app/node")
