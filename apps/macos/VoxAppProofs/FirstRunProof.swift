@@ -5646,6 +5646,10 @@ final class FirstRunProof: XCTestCase {
 
     /// `key` as one of `container`'s elements themselves, else among their descendants.
     private func find(_ key: Key, in container: XCUIElementQuery) -> XCUIElement? {
+        if case .menuItem = key,
+           let visible = key.query(in: container).allElementsBoundByIndex.first(where: { $0.exists && $0.isHittable }) {
+            return visible
+        }
         if let own = key.selves(in: container)?.firstMatch, own.exists { return own }
         let found = key.query(in: container).firstMatch
         return found.exists ? found : nil
