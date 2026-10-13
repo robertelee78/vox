@@ -496,6 +496,8 @@ enum RoomCmd {
     /// The name is one DNS label (a-z, 0-9 and `-`), because it is the room part of every service
     /// address in the room.
     Rename(RenameArgs),
+    /// Change the room's signed anchor set. Only its creator or an admin may.
+    Anchors(RoomAnchorsArgs),
     /// Set message lifetime, or use --steps to set Session-step lifetime separately.
     ///
     /// A step is one thing an agent did in its Session: a message, a command it ran, or a file
@@ -588,6 +590,28 @@ pub struct AdminArgs {
     pub room: String,
     /// The member, by fingerprint or a unique prefix of it (for `add` and `remove`).
     pub member: Option<String>,
+}
+
+/// `vox room anchors <room> add|remove`.
+#[derive(Args, Debug, Clone)]
+pub struct RoomAnchorsArgs {
+    #[command(flatten)]
+    pub profile: NodeArgs,
+    /// The room's shared name or ID.
+    pub room: String,
+    #[command(subcommand)]
+    pub change: RoomAnchorChange,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum RoomAnchorChange {
+    /// Add anchors as fingerprint@host:port or fingerprint@multiaddr.
+    Add {
+        #[arg(required = true)]
+        anchors: Vec<String>,
+    },
+    /// Remove an anchor by its full fingerprint; removing the last clears the set.
+    Remove { fingerprint: String },
 }
 
 /// `vox room rename`
@@ -2584,6 +2608,7 @@ pub fn run() -> ExitCode {
                 RoomCmd::Link(a) => &a.profile,
                 RoomCmd::Retention(a) => &a.profile,
                 RoomCmd::Rename(a) => &a.profile,
+                RoomCmd::Anchors(a) => &a.profile,
                 RoomCmd::Leave(a) | RoomCmd::End(a) => &a.profile,
                 RoomCmd::Admin(a) => &a.profile,
             };
@@ -2771,6 +2796,9 @@ pub fn run() -> ExitCode {
                         RoomCmd::Admin(a) => {
                             crate::room_cli::admin(&paths, &a.action, &a.room, a.member.as_deref())
                                 .await
+                        }
+                        RoomCmd::Anchors(a) => {
+                            crate::room_cli::anchors(&paths, &a.room, &a.change).await
                         }
                         RoomCmd::Rename(a) => {
                             crate::room_cli::rename(&paths, &a.room, &a.name).await

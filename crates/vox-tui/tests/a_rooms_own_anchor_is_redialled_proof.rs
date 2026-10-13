@@ -46,7 +46,15 @@
 //! the republish poll's slowest turn. A bound missed while the
 //! apparatus was over [`APPARATUS_BUDGET`] is APPARATUS (runner stalled); otherwise it is the product's.
 //!
+//! **Signed replacements (ADR-032 AN-5, #781).** After the original relay recovery, the
+//! creator signs A, then [A,B], then [A,C]. Both members' public status must name exactly
+//! the current set and authenticated connections to those identities. A non-admin is refused.
+//! The guest restarts on the same current-version data and keeps [A,C]. An old room link
+//! cannot resurrect B, and removing every room anchor remains empty after the old link is
+//! supplied again; the host's independent machine A remains configured. No upgrade fixture.
+//!
 //! **Mutations that must turn it red:**
+//! - Select the first authorized RoomAnchors statement: the [A,B] assertion fails PRODUCT.
 //! - Redial only the configured set (`kept_anchors` in `actor.rs` returns `self.anchors` alone,
 //!   the code before V210-75): the forward never redials the room's anchor, the host can reach
 //!   it only through that anchor, and no echo carries again.
@@ -289,6 +297,189 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
         "PRODUCT: the forward did not say its room's anchor connection went ({GONE:?}); in a \
          debug build this is #287 (V210-93), a stopping anchor's closes lost as it exits\n{said}"
     );
+    signed_replacements(&mut w);
+}
+
+/// Extend the same running product journey; the original single-anchor recovery above is
+/// already measured before any alternative route is introduced.
+fn signed_replacements(w: &mut RelayWorld) {
+    let bdir = w.tmp.path().join("anchor-b");
+    let cdir = w.tmp.path().join("anchor-c");
+    let _reaper = world::Reaper(vec![bdir.clone(), cdir.clone()]);
+    let b = relay::Anchor::start(&bdir);
+    let c = relay::Anchor::start(&cdir);
+    let aid = anchor_id(&w.anchor.v4_spec);
+    let bid = anchor_id(&b.v4_spec);
+    let cid = anchor_id(&c.v4_spec);
+    change(w, "add", &[&w.anchor.v4_spec, &w.anchor.v6_spec]);
+    expect_sets(w, &[&aid], &[&aid], &[&aid]);
+
+    let (ok, out, err) = world::vox_once(
+        &w.guest_dir,
+        &args(&["room", "anchors", &w.room, "remove", &aid]),
+    );
+    assert!(
+        !ok && err.contains("not its admin"),
+        "PRODUCT: an ordinary member could change anchors, or did not receive NotAdmin: {ok}\n{out}\n{err}"
+    );
+    change(w, "add", &[&b.v4_spec, &b.v6_spec]);
+    expect_sets(w, &[&aid, &bid], &[&aid, &bid], &[&aid, &bid]);
+    let stale_link = command(&w.host_dir, &["room", "link", &w.room])
+        .trim()
+        .to_owned();
+    assert!(
+        stale_link.starts_with("vox://") && stale_link.contains(&bid),
+        "PRODUCT: the room link omitted the signed second anchor: {stale_link}"
+    );
+
+    change(w, "remove", &[&bid]);
+    change(w, "add", &[&c.v4_spec, &c.v6_spec]);
+    expect_sets(w, &[&aid, &cid], &[&aid, &cid], &[&aid, &cid]);
+
+    // Crash only this owned scratch daemon. The new forward still has no --anchor. After
+    // the original split-family proof, dual-stack now lets the ordinary 'host moved' link
+    // refresh contact the host directly; that API deliberately requires an answer there.
+    assert!(
+        world::kill_daemon(&w.guest_dir).is_some(),
+        "APPARATUS: guest daemon to restart is absent"
+    );
+    drop(w.fwd.take());
+    let mut fwd = VoxProc::spawn(
+        "restarted-forward",
+        &w.guest_dir,
+        &args(&[
+            "forward",
+            &w.hostname(),
+            "127.0.0.1:0",
+            "--listen",
+            "[::]:0",
+        ]),
+    );
+    let line = fwd.expect_line("the restarted forward's address", |line| {
+        line.starts_with("vox: forwarding ")
+    });
+    let at = world::address_in(&mut fwd, &line, 2);
+    w.fwd = Some(fwd);
+    assert!(
+        round_trip(at, b"after-room-anchor-restart", Duration::from_secs(30))
+            .is_ok_and(|got| got == b"after-room-anchor-restart"),
+        "PRODUCT: current-version restart lost the working room forward"
+    );
+    expect_sets(w, &[&aid, &cid], &[&aid, &cid], &[&aid, &cid]);
+    command(
+        &w.guest_dir,
+        &[
+            "room",
+            "join",
+            &stale_link,
+            "--passphrase-file",
+            &w.passphrase_file(),
+        ],
+    );
+    expect_sets(w, &[&aid, &cid], &[&aid, &cid], &[&aid, &cid]);
+
+    // Explicit empty is a statement, not 'no statement'. Old persisted join hints and a
+    // newly supplied old link must not restore B or C, while machine A stays independent.
+    change(w, "remove", &[&aid]);
+    change(w, "remove", &[&cid]);
+    expect_sets(w, &[], &[&aid], &[]);
+    command(
+        &w.guest_dir,
+        &[
+            "room",
+            "join",
+            &stale_link,
+            "--passphrase-file",
+            &w.passphrase_file(),
+        ],
+    );
+    expect_sets(w, &[], &[&aid], &[]);
+}
+
+fn anchor_id(spec: &str) -> String {
+    spec.split_once('@')
+        .expect("APPARATUS: anchor spec has @")
+        .0
+        .to_owned()
+}
+
+fn command(data: &std::path::Path, argv: &[&str]) -> String {
+    let (ok, out, err) = world::vox_once(data, &args(argv));
+    println!("[781] {argv:?} -> {ok}\n{out}\n{err}");
+    assert!(ok, "PRODUCT: {argv:?} failed\n{out}\n{err}");
+    out
+}
+
+fn change(w: &RelayWorld, action: &str, values: &[&str]) {
+    let mut argv = vec!["room", "anchors", &w.room, action];
+    argv.extend_from_slice(values);
+    command(&w.host_dir, &argv);
+}
+
+/// Public projections and authenticated peer identities, never local store contents. A
+/// query failure is PRODUCT, not an empty list. The patience only bounds convergence.
+fn expect_sets(w: &RelayWorld, room_set: &[&str], host_set: &[&str], guest_set: &[&str]) {
+    use std::collections::BTreeSet;
+    let room_expected: BTreeSet<_> = room_set.iter().copied().collect();
+    for (data, expected) in [(&w.host_dir, host_set), (&w.guest_dir, guest_set)] {
+        let expected: BTreeSet<_> = expected.iter().copied().collect();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let raw = command(data, &["status", "--json"]);
+            let status: serde_json::Value = serde_json::from_str(&raw)
+                .unwrap_or_else(|e| panic!("PRODUCT: status is not JSON: {e}\n{raw}"));
+            let anchors: BTreeSet<_> = status["anchors"]
+                .as_array()
+                .expect("PRODUCT: status omitted anchors")
+                .iter()
+                .map(|a| {
+                    a["id"]
+                        .as_str()
+                        .expect("PRODUCT: anchor has no fingerprint")
+                })
+                .collect();
+            let peers: BTreeSet<_> = status["peers"]
+                .as_array()
+                .expect("PRODUCT: status omitted authenticated peers")
+                .iter()
+                .map(|p| p["id"].as_str().expect("PRODUCT: peer has no fingerprint"))
+                .collect();
+            let listed = command(data, &["anchor", "list", "--json"]);
+            let inventory: serde_json::Value = serde_json::from_str(&listed)
+                .unwrap_or_else(|e| panic!("PRODUCT: anchor list is not JSON: {e}\n{listed}"));
+            let own: BTreeSet<_> = inventory["anchors"]
+                .as_array()
+                .expect("PRODUCT: anchor list omitted anchors")
+                .iter()
+                .filter(|a| {
+                    a["sources"]
+                        .as_array()
+                        .expect("PRODUCT: anchor omitted sources")
+                        .iter()
+                        .any(|s| {
+                            s["kind"] == "room"
+                                && s["room"].as_str().is_some_and(|id| id.starts_with(&w.room))
+                        })
+                })
+                .map(|a| {
+                    a["fingerprint"]
+                        .as_str()
+                        .expect("PRODUCT: inventory anchor has no fingerprint")
+                })
+                .collect();
+            if anchors == expected && expected.is_subset(&peers) && own == room_expected {
+                println!(
+                    "[781] current room set {own:?}, configured {anchors:?}, authenticated peers {peers:?}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PRODUCT: room anchor statement did not replace the old set and reach its authenticated identities; expected room {room_expected:?}, configured {expected:?}\n{raw}\n{listed}"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
 }
 
 /// Send `sig` (`-STOP` or `-CONT`) to the process `pid` and confirm it took: `ps` must show the

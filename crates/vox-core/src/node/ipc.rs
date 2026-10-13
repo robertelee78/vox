@@ -356,6 +356,8 @@ const T_SET_ADMIN: u64 = 34;
 const T_ADMINS: u64 = 35;
 /// `[36, channel_id, name]` — [`Request::RenameRoom`] (ADR-028 R-1).
 const T_RENAME_ROOM: u64 = 36;
+/// Room anchor governance (ADR-032 AN-5); no identity-passphrase gate.
+const T_ROOM_ANCHORS: u64 = 781;
 /// `NodeEvent::RoomEnded` and `NodeEvent::RoomRemoved` (V030-08). Additive.
 const T_ROOM_ENDED: u64 = 2440;
 const T_ROOM_REMOVED: u64 = 2441;
@@ -778,6 +780,15 @@ pub enum Request {
         channel_id: Digest32,
         /// Seconds a Session step is kept; zero means forever, still bounded by messages.
         seconds: u64,
+    },
+    /// Add/remove room anchors by appending the resulting complete signed set (ADR-032 AN-5).
+    ChangeRoomAnchors {
+        /// The room.
+        channel_id: Digest32,
+        /// Anchors to add, replacing addresses for an identity already present.
+        add: crate::nat::bootstrap::BootstrapSet,
+        /// The anchor to remove, if any.
+        remove: Option<Digest32>,
     },
     /// Name a room for every member (ADR-028 R-1); its creator or an admin only, as the room's
     /// governance says. **Not gated on the identity passphrase** (ADR-028 K-11): it is asked for
@@ -1253,6 +1264,17 @@ impl Request {
             Request::Create { name, passphrase } => {
                 e.array(3).uint(T_CREATE).text(name).text(passphrase);
             }
+            Request::ChangeRoomAnchors {
+                channel_id,
+                add,
+                remove,
+            } => {
+                e.array(4)
+                    .uint(T_ROOM_ANCHORS)
+                    .bytes(channel_id)
+                    .bytes(&add.to_bytes())
+                    .bytes(remove.as_ref().map_or(&[][..], |id| &id[..]));
+            }
             Request::RenameRoom { channel_id, name } => {
                 e.array(3).uint(T_RENAME_ROOM).bytes(channel_id).text(name);
             }
@@ -1659,6 +1681,18 @@ impl Request {
                     target,
                     petname,
                     identity_passphrase,
+                })
+            }
+            (T_ROOM_ANCHORS, 4) => {
+                let channel_id = digest(&mut d)?;
+                let add = crate::nat::bootstrap::BootstrapSet::from_bytes(d.bytes()?)?;
+                let remove = optional_digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::ChangeRoomAnchors {
+                    channel_id,
+                    add,
+                    remove,
                 })
             }
             (T_RENAME_ROOM, 3) => {
@@ -4840,6 +4874,13 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     reason: other.to_string(),
                 },
             },
+        },
+        Request::ChangeRoomAnchors { channel_id, add, remove } => match handle
+            .apply(crate::node::api::NodeCommand::ChangeRoomAnchors { channel_id, add, remove })
+            .await
+        {
+            crate::node::api::Outcome::Done => Frame::Ok,
+            other => Frame::Error { reason: other.to_string() },
         },
         // Not gated on the passphrase (ADR-028 K-11): the room's governance says who may.
         Request::RenameRoom { channel_id, name } => match handle

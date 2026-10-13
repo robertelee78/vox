@@ -79,6 +79,8 @@ pub enum GovBody {
     Presence(Box<Presence>),
     /// The room's shared name, stated by its creator or an admin (tag `0x001F`, ADR-028 R-1).
     RoomName(Box<RoomName>),
+    /// The room's complete anchor set, stated by its creator or an admin (ADR-032 AN-5).
+    RoomAnchors(Box<crate::governance::anchors::RoomAnchors>),
 }
 
 impl GovBody {
@@ -116,6 +118,9 @@ impl GovBody {
                 ServiceShare::from_wire(bytes)?,
             ))),
             StructTag::RoomName => Ok(GovBody::RoomName(Box::new(RoomName::from_wire(bytes)?))),
+            StructTag::RoomAnchors => Ok(GovBody::RoomAnchors(Box::new(
+                crate::governance::anchors::RoomAnchors::from_wire(bytes)?,
+            ))),
             StructTag::PolicyRotation => Ok(GovBody::PolicyUpdate(Box::new(
                 PolicyUpdate::from_wire(bytes)?,
             ))),
@@ -139,6 +144,7 @@ impl GovBody {
             GovBody::ServiceShare(s) => (s.body.channel_id, s.body.epoch),
             GovBody::Presence(p) => (p.body.channel_id, p.body.epoch),
             GovBody::RoomName(n) => (n.body.channel_id, n.body.epoch),
+            GovBody::RoomAnchors(a) => (a.body.channel_id, a.body.epoch),
         }
     }
 
@@ -158,6 +164,7 @@ impl GovBody {
             GovBody::ServiceShare(s) => s.body.author_id,
             GovBody::Presence(p) => p.body.author_id,
             GovBody::RoomName(n) => n.body.issuer_id,
+            GovBody::RoomAnchors(a) => a.body.issuer_id,
         }
     }
 }

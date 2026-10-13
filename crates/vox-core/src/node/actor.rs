@@ -5507,6 +5507,11 @@ impl Node {
             NodeCommand::CreateChannel { name, passphrase } => {
                 self.create_channel(&name, &passphrase).await
             }
+            NodeCommand::ChangeRoomAnchors {
+                channel_id,
+                add,
+                remove,
+            } => self.change_room_anchors(&channel_id, &add, remove).await,
             NodeCommand::RenameRoom { channel_id, name } => {
                 self.rename_room(&channel_id, &name).await
             }
@@ -8532,6 +8537,11 @@ impl Node {
                 report,
             } => {
                 let current = self.file_session(channel_id, peer, token, &report);
+                // Even a failed/retired sync may have durably applied a signed replacement.
+                // Refresh from the room's actual evaluator before publishing its records.
+                if report.out.governance > 0 {
+                    self.adopt_channel_anchors(&channel_id, None).await;
+                }
                 // Sender keys the log delivered in this session (ADR-023 decision 4). Whatever the
                 // outcome, current or not: a session that failed late may have applied some entries
                 // first.
@@ -10467,9 +10477,10 @@ impl Node {
         answered: &[Digest32],
         reply: oneshot::Sender<Outcome>,
     ) {
-        let mut anchors: Vec<(Digest32, Vec<std::net::SocketAddr>)> = Vec::new();
+        let mut signed = false;
         if let Some(shared) = self.channels.get(&room).map(Arc::clone) {
             let mut channel = shared.lock().await;
+            signed = channel.has_anchor_statement();
             let mut kept = BootstrapSet::new();
             for n in named.nodes() {
                 if answered.contains(&n.id) || !channel.is_known_member(&n.id) {
@@ -10477,33 +10488,22 @@ impl Node {
                 }
             }
             if let Some(profile) = self.profile.as_ref() {
-                let _ = channel.add_anchors(profile.store(), &kept);
-            }
-            let mut own = BootstrapSet::new();
-            for n in channel.anchors().nodes() {
-                if !channel.is_known_member(&n.id) {
-                    let _ = own.add(n.clone());
-                }
-            }
-            self.room_anchors.insert(room, own);
-            for n in named.nodes() {
-                if !channel.is_known_member(&n.id) {
-                    anchors.push((n.id, n.endpoints.direct_candidates()));
+                if let Err(error) = channel.add_anchors(profile.store(), &kept) {
+                    let _ = reply.send(Outcome::Failed(fault_of(&error)));
+                    return;
                 }
             }
         }
-        if let Some(net) = self.net.clone() {
-            self.sync_anchor_scopes(&net);
-            for (id, candidates) in anchors {
-                self.anchor_ids.insert(id);
-                self.dial_anchor(&net, id, candidates);
-            }
-        }
+        self.adopt_channel_anchors(&room, None).await;
         let _ = self.event_tx.send(NodeEvent::NodeNote {
             note: format!(
-                "room {}: a member answered at the address given, which is kept as the room's \
-                 from now on",
-                crate::node::network::short_id(room)
+                "room {}: a member answered at the address given; {}",
+                crate::node::network::short_id(room),
+                if signed {
+                    "the room's signed anchor set is unchanged"
+                } else {
+                    "its bootstrap addresses are kept"
+                },
             ),
         });
         let _ = reply.send(Outcome::Done);
@@ -16782,13 +16782,45 @@ impl Node {
         self.app.set_reachers(&self.reachers);
     }
 
-    /// Set a room's retention, then apply it here at once and push the policy-update to the
-    /// other members, whose own sweeps apply it as it arrives (ADR-023 decision 2).
-    /// `vox room retention` (V030-32): the room's creator or an admin sets the **room's**
-    /// retention, on every member. Any other member sets **their own node's** retention for the
-    /// room, at or below the room's — it changes nothing anywhere else — and is refused above it.
-    /// Name a room for every member (ADR-028 R-1): its creator or an admin appends a room-name
-    /// statement; anyone else is refused, and told who may.
+    /// Append the complete signed room set, preserving independent machine/other-room scopes.
+    async fn change_room_anchors(
+        &mut self,
+        channel_id: &Digest32,
+        add: &BootstrapSet,
+        remove: Option<Digest32>,
+    ) -> Outcome {
+        let now = self.now_ms();
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return Outcome::Failed(Fault::ChannelNotOpen);
+        };
+        let changed = {
+            let mut ch = shared.lock().await;
+            let mut next = BootstrapSet::new();
+            for anchor in ch.anchors().nodes() {
+                // A link's member address is bootstrap routing, never a room anchor.
+                if Some(anchor.id) != remove && !ch.is_known_member(&anchor.id) {
+                    if let Err(error) = next.add(anchor.clone()) {
+                        return Outcome::Failed(fault_of(&error));
+                    }
+                }
+            }
+            next.merge_endpoints(add)
+                .and_then(|()| ch.set_anchors(profile, &next, now))
+        };
+        if let Err(error) = changed {
+            return Outcome::Failed(fault_of(&error));
+        }
+        self.note_local_append(channel_id);
+        self.adopt_channel_anchors(channel_id, None).await;
+        self.publish_channel_to_anchors(channel_id, PublishCause::Governance)
+            .await;
+        Outcome::Done
+    }
+
+    /// Name a room for every member: only its creator or an admin may.
     async fn rename_room(&mut self, channel_id: &Digest32, name: &str) -> Outcome {
         if crate::governance::name::room_name(name).as_deref() != Ok(name) {
             return Outcome::Failed(Fault::NotARoomName);
@@ -16807,6 +16839,7 @@ impl Node {
         Outcome::Done
     }
 
+    /// Set the room rule when authorized; another member may shorten only its own retention.
     async fn set_retention(&mut self, channel_id: &Digest32, ttl: u64) -> Outcome {
         let now_ms = self.now_ms();
         let Some(profile) = self.profile.as_ref() else {
@@ -18597,9 +18630,10 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::MalformedGovernance("only the room's admin may set its retention") => {
             Fault::NotAdmin
         }
-        Error::MalformedGovernance("only the room's creator or an admin may rename it") => {
-            Fault::NotAdmin
-        }
+        Error::MalformedGovernance(
+            "only the room's creator or an admin may rename it"
+            | "only the room's creator or an admin may change its anchors",
+        ) => Fault::NotAdmin,
         Error::MalformedGovernance("room name is not a DNS label") => Fault::NotARoomName,
         // A room's lifecycle (V030-08): said as what it is, not as an internal fault.
         Error::Profile("this room has ended") => Fault::RoomEnded,

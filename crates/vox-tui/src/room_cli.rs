@@ -4949,6 +4949,58 @@ pub async fn create(
     }
 }
 
+/// Change a room's anchors through its ordinary governance writer.
+///
+/// # Errors
+/// Invalid anchor input, an unavailable room, or the room's NotAdmin refusal.
+pub async fn anchors(
+    paths: &Paths,
+    room: &str,
+    change: &crate::cli::RoomAnchorChange,
+) -> Result<(), AppError> {
+    let change = change.clone();
+    let (add, remove) = tokio::task::spawn_blocking(move || {
+        let mut add = vox_core::nat::bootstrap::BootstrapSet::new();
+        let remove = match change {
+            crate::cli::RoomAnchorChange::Add { anchors } => {
+                for spec in anchors {
+                    vox_core::node::link::merge_anchor_spec(&mut add, &spec)?;
+                }
+                None
+            }
+            crate::cli::RoomAnchorChange::Remove { fingerprint } => Some(
+                vox_core::node::link::b32_decode(&fingerprint, "anchor fingerprint")?,
+            ),
+        };
+        Ok::<_, vox_core::error::Error>((add, remove))
+    })
+    .await
+    .map_err(|error| AppError::Usage(error.to_string()))??;
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    match client
+        .request(&Request::ChangeRoomAnchors {
+            channel_id,
+            add,
+            remove,
+        })
+        .await
+    {
+        Ok(Frame::Ok) => {
+            println!(
+                "vox: changed the anchors of {} for every member",
+                short(&channel_id)
+            );
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!(
+            "cannot change the room's anchors: {reason}"
+        ))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
+        Err(error) => Err(AppError::Usage(error.to_string())),
+    }
+}
+
 /// `vox room rename` — give a room a new name, for every member (ADR-028 R-1).
 ///
 /// # Errors

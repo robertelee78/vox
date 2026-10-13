@@ -2937,13 +2937,24 @@ impl ChannelState {
     /// The anchors this channel is published to and read from (M15.1).
     #[must_use]
     pub fn anchors(&self) -> &BootstrapSet {
-        &self.anchors
+        self.evaluator.room_anchors().unwrap_or(&self.anchors)
+    }
+
+    /// Whether governance, rather than bootstrap hints, supplies the room's set.
+    #[must_use]
+    pub fn has_anchor_statement(&self) -> bool {
+        self.evaluator.room_anchors().is_some()
     }
 
     /// Add anchors for this channel — the set is persisted sealed under the SEK
     /// like every other per-channel segment, so a restart still knows where the
     /// swarm's board is. Returns how many were new.
     pub fn add_anchors(&mut self, store: &Store, more: &BootstrapSet) -> Result<usize> {
+        // A stale link is only a way to reach a member, never an authority to restore an
+        // anchor removed by the room's signed statement (including an explicit empty set).
+        if self.has_anchor_statement() {
+            return Ok(0);
+        }
         let before = self.anchors.clone();
         // `merge_endpoints`, not `merge`: an anchor that moved is the same identity at a
         // new address, and `merge` keeps the first entry per identity and drops the rest.
@@ -7551,6 +7562,29 @@ impl ChannelState {
                 now.get(),
             )
             .is_granted()
+    }
+
+    /// Replace the room's complete anchor set with an authorized signed statement.
+    pub fn set_anchors(
+        &mut self,
+        profile: &Profile,
+        anchors: &BootstrapSet,
+        now: crate::time::Ms,
+    ) -> Result<()> {
+        let signer = profile.signer()?;
+        if !self.may_rename(&signer.fingerprint(), now) {
+            return Err(Error::MalformedGovernance(
+                "only the room's creator or an admin may change its anchors",
+            ));
+        }
+        let statement = crate::governance::anchors::RoomAnchors::build(
+            signer,
+            &self.channel_id,
+            self.epoch,
+            anchors,
+        )?;
+        self.append_governance(profile, &statement.to_wire(), now.get())?;
+        Ok(())
     }
 
     /// Name the room `name` for every member (ADR-028 R-1): append a room-name statement. Only

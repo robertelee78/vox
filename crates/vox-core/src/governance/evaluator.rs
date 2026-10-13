@@ -202,6 +202,8 @@ pub struct Evaluator {
     /// Every room-name statement that counts (ADR-028 R-1), in the canonical order: the name,
     /// the entry that stated it, and its author. The last is the room's name.
     names: Vec<NameStatement>,
+    /// The last authorized anchor statement; Some(empty) explicitly clears the set.
+    room_anchors: Option<crate::nat::bootstrap::BootstrapSet>,
     /// The entries that passed pass 1 (bound to this channel, signature verified under
     /// their author's root), by entry hash: what [`Evaluator::build_reusing`] need not
     /// verify again.
@@ -341,6 +343,7 @@ impl Evaluator {
         let consent = resolver.resolve_consent()?;
         let lifecycle = resolver.resolve_lifecycle()?;
         let names = resolver.resolve_names()?;
+        let room_anchors = resolver.resolve_anchors()?;
 
         Ok(Self {
             channel_id,
@@ -356,6 +359,7 @@ impl Evaluator {
             members,
             lifecycle,
             names,
+            room_anchors,
             verified: verified_hashes,
         })
     }
@@ -375,6 +379,7 @@ impl Evaluator {
             GovBody::Presence(p) => p.verify(author_key),
             GovBody::ServiceShare(s) => s.verify(author_key),
             GovBody::RoomName(n) => n.verify(author_key),
+            GovBody::RoomAnchors(a) => a.verify(author_key),
         }
     }
 
@@ -396,6 +401,12 @@ impl Evaluator {
     #[must_use]
     pub fn room_name(&self) -> Option<&str> {
         self.names.last().map(|n| n.name.as_str())
+    }
+
+    /// The last authorized room-anchor statement, including an explicitly empty set.
+    #[must_use]
+    pub fn room_anchors(&self) -> Option<&crate::nat::bootstrap::BootstrapSet> {
+        self.room_anchors.as_ref()
     }
 
     /// Every room-name statement that counts, in the canonical order (ADR-028 R-1): the last is
@@ -874,6 +885,31 @@ impl<'a> Resolver<'a> {
             });
         }
         Ok(names)
+    }
+
+    /// As for the shared name: Policy in the strict causal past, removal wins, and the
+    /// last statement in the canonical order supplies the whole set (ADR-032 AN-5/8).
+    fn resolve_anchors(&mut self) -> Result<Option<crate::nat::bootstrap::BootstrapSet>> {
+        let mut anchors = None;
+        for e in self.causality.order.clone() {
+            let GovBody::RoomAnchors(statement) = &e.body else {
+                continue;
+            };
+            if !self.in_effect(e)? {
+                continue;
+            }
+            let before = self.strict_before(&e.entry_hash)?;
+            if !before
+                .authority
+                .get(&e.author_id)
+                .is_some_and(|c| c.grants(&Capability::Policy))
+                || self.revoked_meanwhile(&e.author_id, &e.entry_hash)?
+            {
+                continue;
+            }
+            anchors = Some(statement.body.anchors.clone());
+        }
+        Ok(anchors)
     }
 
     /// Resolve consent edges. Consent is single-writer (`A` alone authors `A`'s

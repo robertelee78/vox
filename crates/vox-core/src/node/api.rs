@@ -1089,6 +1089,15 @@ pub enum NodeCommand {
         /// The new name, one DNS label (ADR-028 R-2).
         name: String,
     },
+    /// Add/remove room anchors by appending the resulting complete signed set (ADR-032 AN-5).
+    ChangeRoomAnchors {
+        /// The room.
+        channel_id: Digest32,
+        /// Anchors to add, replacing addresses for an identity already present.
+        add: crate::nat::bootstrap::BootstrapSet,
+        /// The anchor to remove, if any.
+        remove: Option<Digest32>,
+    },
     /// Append one entry of a Session (ADR-029 SC-1), sealed under this node's drive key so only
     /// members it trusts with drive read it (SC-2).
     AppendSession {
