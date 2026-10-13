@@ -20,7 +20,8 @@
 //! projection alone cannot prove it. Bob's machine list must identify the learned room source.
 //!
 //! This consolidates the former single-address, eight-address and bad-line runs into one
-//! journey. It does not prove live DNS-record changes, multiple attached nodes, helper
+//! journey. It also attaches Carol before refresh and requires both identities to report their own
+//! reach. It does not prove live DNS-record changes, helper
 //! isolation, canonical migration or all #779 requirements. Those remain separate claims.
 //!
 //! Mutants must fail the corresponding product assertion: disable refresh, retain old
@@ -71,6 +72,8 @@ fn vox_stdin(
     cmd.args(args)
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", cfg)
+        .env("VOX_NODE", "default")
+        .env_remove("VOX_ANCHORS")
         // In the environment, not argv: a command line is world-readable (ADR-015).
         .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
         .env_remove("VOX_ROOM");
@@ -126,6 +129,8 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
             .args(["node", "--listen", "127.0.0.1:0"])
             .env("VOX_DATA_DIR", &anchor_data)
             .env("VOX_CONFIG_DIR", &anchor_cfg)
+            .env("VOX_NODE", "default")
+            .env_remove("VOX_ANCHORS")
             // To a file, never a pipe nobody reads: `vox node` prints a status line each
             // time its peers change, and once the read end of a pipe is gone that print
             // fails and takes the anchor down. An earlier version of this proof dropped
@@ -205,6 +210,8 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         .args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", &data)
         .env("VOX_CONFIG_DIR", &cfg)
+        .env("VOX_NODE", "default")
+        .env_remove("VOX_ANCHORS")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::from(
@@ -236,6 +243,18 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         );
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+
+    // A second identity attaches before refresh. It owns no room, but the shared
+    // hand-added anchor must provide its own reach too, rather than only Alice's.
+    let (ok, _, err) = vox_stdin(
+        &data,
+        &cfg,
+        &["node", "create", "carol", "--passphrase-file", "-"],
+        Some(IDENTITY),
+    );
+    assert!(ok, "PRODUCT: creating the second node failed: {err}");
+    let (ok, _, err) = vox(&data, &cfg, &["node", "attach", "carol", "--no-remember"]);
+    assert!(ok, "PRODUCT: attaching the second node failed: {err}");
 
     // ---- the anchor moves: the configuration is rewritten under the running daemon ----
     std::fs::write(anchors_file_for(&cfg), format!("{bad}{real_spec}\n"))
@@ -318,25 +337,26 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     // to say the anchor is reached, then create: create waits for its initial publish
     // rounds. Thus Bob's one-shot join follows a real product readiness boundary.
     let deadline = std::time::Instant::now() + FOLLOW_PATIENCE;
-    loop {
-        let (ok, report, err) = vox(&data, &cfg, &["status", "--json"]);
-        let reached = ok
-            && serde_json::from_str::<serde_json::Value>(&report)
-                .ok()
-                .and_then(|value| value["anchors"].as_array().cloned())
-                .is_some_and(|anchors| {
-                    anchors
-                        .iter()
-                        .any(|anchor| anchor["id"] == anchor_id && anchor["reached"] == true)
-                });
-        if reached {
-            break;
+    for node in ["default", "carol"] {
+        loop {
+            let (ok, report, err) = vox(&data, &cfg, &["status", "--json", "--node", node]);
+            let reached = ok
+                && serde_json::from_str::<serde_json::Value>(&report)
+                    .ok()
+                    .and_then(|value| value["anchors"].as_array().cloned())
+                    .is_some_and(|anchors| {
+                        anchors
+                            .iter()
+                            .any(|anchor| anchor["id"] == anchor_id && anchor["reached"] == true)
+                    });
+            if reached {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline,
+                "PRODUCT: attached node {node} never reported its own reach to the moved machine anchor: {report:?} {err:?}");
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "PRODUCT: status never reported the moved anchor reached: {report:?} {err:?}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        println!("[proof] attached node {node} reached the refreshed machine anchor");
     }
     let (ok, _, err) = vox_stdin(
         &data,
@@ -416,6 +436,8 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         .args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", &bob_data)
         .env("VOX_CONFIG_DIR", &bob_cfg)
+        .env("VOX_NODE", "default")
+        .env_remove("VOX_ANCHORS")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::from(
