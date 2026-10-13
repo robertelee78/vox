@@ -2513,17 +2513,37 @@ final class FirstRunProof: XCTestCase {
         }
         let vox = appPath + "/Contents/Helpers/vox"
         let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("timeline-recovery")
+        guard let knobs = env["VOX_PROOF_KNOBS_VOX"], !knobs.isEmpty else {
+            throw Apparatus("VOX_PROOF_KNOBS_VOX is required for this journey's isolated Keychains")
+        }
+        let madeRoot = stager.run(["/bin/mkdir", "-p", root.path], env: [:])
+        let hasKnob = stager.run(["/usr/bin/python3", "-c",
+            "import sys; sys.exit(0 if b'VOX_TEST_KEYCHAIN' in open(sys.argv[1],'rb').read() else 1)", knobs], env: [:])
+        guard madeRoot.status == 0, hasKnob.status == 0 else {
+            throw Apparatus("cannot stage scratch Keychains: the directory or daemon test knob is missing")
+        }
+        for name in ["alice", "bob"] {
+            let keychain = root.appendingPathComponent("\(name).keychain-db").path
+            let madeKeychain = stager.run(["/usr/bin/security", "create-keychain", "-p", "", keychain],
+                                         env: ["HOME": root.path])
+            guard madeKeychain.status == 0 else {
+                throw Apparatus("cannot create \(name)'s private Keychain: \(madeKeychain.out)")
+            }
+        }
         func nodeEnv(_ name: String) -> [String: String] {
             ["VOX_DATA_DIR": root.appendingPathComponent(name + "/data").path,
              "VOX_CONFIG_DIR": root.appendingPathComponent(name + "/config").path,
-             "VOX_PROXY": "127.0.0.1:0"]
+             "VOX_PROXY": "127.0.0.1:0",
+             "VOX_TEST_KEYCHAIN": root.appendingPathComponent("\(name).keychain-db").path]
         }
         let alice = nodeEnv("alice"), bob = nodeEnv("bob")
         let pass = root.appendingPathComponent("pass").path
         try stager.write(Data("recovery pass\n".utf8), to: pass)
-        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: alice,
+        // Only these owned apparatus daemons target private Keychains through real Security APIs.
+        // The app and every CLI invocation remain the ordinary bundled binary.
+        daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: alice,
                            until: "vox daemon: control socket")
-        let remote = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: bob,
+        let remote = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: bob,
                                until: "vox daemon: control socket")
         defer { remote.terminate() }
         for (name, environment) in [("alice", alice), ("bob", bob)] {
