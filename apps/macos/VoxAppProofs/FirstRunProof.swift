@@ -2118,9 +2118,38 @@ final class FirstRunProof: XCTestCase {
         ui.launchEnvironment = alice
         try launchVox(ui, appPath, env: alice, scratch: scratchPath)
         defer { ui.terminate() }
+        func timelineBody(_ text: String, timeout: TimeInterval, _ outcome: String) -> Bool {
+            guard windowReadable(ui) else { return false }
+            func drawn(_ frame: CGRect) -> Bool {
+                frame.minX.isFinite && frame.minY.isFinite && frame.maxX.isFinite
+                    && frame.maxY.isFinite && frame.width > 0 && frame.height > 0
+            }
+            let until = Date().addingTimeInterval(timeout)
+            while Date() < until {
+                if let timeline = locate(ui, Key.id("timeline")), drawn(timeline.frame) {
+                    let bounds = timeline.frame
+                    let windows = ui.windows.allElementsBoundByIndex.map(\.frame).filter(drawn)
+                    // A sidebar preview contains this marker too. Require the exact message
+                    // body drawn inside the timeline; the application query also finds text
+                    // that XCTest omits from its window-scoped query (#684).
+                    let matches = ui.descendants(matching: .any).matching(
+                        NSPredicate(format: "label == %@ OR value == %@", text, text)
+                    ).allElementsBoundByIndex
+                    if matches.contains(where: { body in
+                        let frame = body.frame
+                        return drawn(frame) && bounds.contains(frame)
+                            && windows.contains(where: { $0.contains(frame) })
+                    }) { return true }
+                }
+                Thread.sleep(forTimeInterval: 0.25)
+            }
+            keepTree(ui, "the timeline did not display the exact message body \(text)")
+            XCTFail("PRODUCT: \(outcome); no exact \(text.debugDescription) body is visible inside the timeline. The app shows: \(onScreen(ui))")
+            return false
+        }
         tap(ui, Key.id("room-recovery"), "the remote recovery room")
-        guard present(ui, Key.showing("RECOVERY-OLD"), timeout: 60,
-                      "the old remote message must be visible before pruning") else { return }
+        guard timelineBody("RECOVERY-OLD", timeout: 60,
+                           "the old remote message body must be visible before pruning") else { return }
         guard present(ui, Key.id("member-bob"), timeout: 30,
                       "the initial authoritative room page and roster must be displayed before pruning") else { return }
         let pids = proofApps()
@@ -2157,8 +2186,8 @@ final class FirstRunProof: XCTestCase {
         guard stager.run(["/bin/kill", "-CONT", String(pid)], env: [:]).status == 0 else {
             throw Apparatus("the scratch app could not be resumed")
         }
-        guard present(ui, Key.showing("RECOVERY-KEPT"), timeout: 30,
-                      "after its old displayed mark is pruned, the room must show the retained message without another post") else { return }
+        guard timelineBody("RECOVERY-KEPT", timeout: 30,
+                           "after its old displayed mark is pruned, the timeline must show the retained message body without another post") else { return }
         guard present(ui, Key.id("member-bob"), timeout: 10,
                       "the recovered room's inspector must still show its remote member") else { return }
         print("[proof] timeline: displayed OLD; shipped CLI confirmed OLD pruned and KEPT complete; resumed same app without another post; KEPT and bob visible")
