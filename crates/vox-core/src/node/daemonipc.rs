@@ -531,7 +531,7 @@ pub enum AnchorSource {
         room: Digest32,
         /// The last observed shared name; empty for an unnamed room.
         name: String,
-        /// The room could not be read now (closed, locked or busy).
+        /// At least one saved local observation could not be read now (closed, locked or busy).
         stale: bool,
     },
 }

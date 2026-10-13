@@ -742,7 +742,14 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         assert!(ok, "PRODUCT: locking {node} failed: {out}{err}");
     }
     let locked = machine_list(&bob_data, &bob_cfg);
-    assert_saved_source(&locked, anchor_id, &room, renamed, true);
+    assert_saved_source(
+        &locked,
+        anchor_id,
+        &room,
+        renamed,
+        true,
+        &learned["addresses"],
+    );
     let (ok, shown, err) = vox(&bob_data, &bob_cfg, &["anchor", "list"]);
     assert!(
         ok && shown.contains(renamed) && shown.contains("last known"),
@@ -791,7 +798,14 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     let restarted = machine_list(&bob_data, &bob_cfg);
-    assert_saved_source(&restarted, anchor_id, &room, renamed, true);
+    assert_saved_source(
+        &restarted,
+        anchor_id,
+        &room,
+        renamed,
+        true,
+        &learned["addresses"],
+    );
     let (ok, nodes, err) = vox(&bob_data, &bob_cfg, &["node", "list"]);
     assert!(
         ok && ["default", "dave"].iter().all(|node| nodes
@@ -810,7 +824,14 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     loop {
         let inventory = machine_list(&bob_data, &bob_cfg);
         if room_source(&inventory, anchor_id).is_some_and(|source| source["stale"] == false) {
-            assert_saved_source(&inventory, anchor_id, &room, renamed, false);
+            assert_saved_source(
+                &inventory,
+                anchor_id,
+                &room,
+                renamed,
+                false,
+                &learned["addresses"],
+            );
             break;
         }
         assert!(
@@ -889,6 +910,7 @@ fn assert_saved_source(
     room: &str,
     name: &str,
     stale: bool,
+    addresses: &serde_json::Value,
 ) {
     let source = room_source(inventory, anchor)
         .unwrap_or_else(|| panic!("PRODUCT: saved room's anchor disappeared: {inventory}"));
@@ -906,6 +928,10 @@ fn assert_saved_source(
         .iter()
         .find(|row| row["fingerprint"] == anchor)
         .unwrap();
+    assert_eq!(
+        &row["addresses"], addresses,
+        "PRODUCT: saved room's anchor addresses changed across lock or restart: {inventory}"
+    );
     assert_eq!(
         row["sources"].as_array().unwrap().len(),
         1,

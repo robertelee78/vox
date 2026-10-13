@@ -467,7 +467,8 @@ impl Router {
         }
         drop(manual);
         let attached: BTreeMap<_, _> = self.attached_handles().into_iter().collect();
-        let mut rooms = BTreeMap::<Digest32, vox_core::node::api::RoomAnchorView>::new();
+        let mut rooms = Vec::new();
+        let mut names = BTreeMap::<Digest32, (bool, u64, String)>::new();
         for node in self.nodes() {
             let inventory = if let Some(handle) = attached.get(node.name.as_str()) {
                 let view = handle.view();
@@ -486,18 +487,21 @@ impl Router {
                 })?
             };
             for room in inventory {
-                // Several local nodes can hold one room. Prefer an opened observation, then
-                // the latest recorded change, so a stale copy cannot resurrect removed anchors
-                // or an old shared name beside a current room on this daemon.
-                let replace = rooms.get(&room.room).is_none_or(|old| {
-                    (!room.stale, room.observed_at) > (!old.stale, old.observed_at)
-                });
-                if replace {
-                    rooms.insert(room.room, room);
+                // Every saved local copy contributes its own observed anchors. One node leaving
+                // must not remove another node's saved-room provenance. Prefer a live shared
+                // name, then the latest observed change, without discarding either anchor set.
+                let observation = (
+                    !room.stale,
+                    room.observed_at,
+                    room.name.clone().unwrap_or_default(),
+                );
+                if names.get(&room.room).is_none_or(|old| observation > *old) {
+                    names.insert(room.room, observation);
                 }
+                rooms.push(room);
             }
         }
-        for room in rooms.into_values() {
+        for room in rooms {
             for anchor in room.anchors.nodes() {
                 let entry = all.entry(anchor.id).or_insert_with(|| AnchorInfo {
                     fingerprint: anchor.id,
@@ -507,11 +511,19 @@ impl Router {
                 entry
                     .addresses
                     .extend(anchor.endpoints.addrs().iter().map(ToString::to_string));
-                entry.sources.push(AnchorSource::Room {
-                    room: room.room,
-                    name: room.name.clone().unwrap_or_default(),
-                    stale: room.stale,
-                });
+                if let Some(AnchorSource::Room { stale, .. }) = entry.sources.iter_mut().find(
+                    |source| matches!(source, AnchorSource::Room { room: id, .. } if *id == room.room),
+                ) {
+                    // A union that contains any last-known observation is marked as such,
+                    // including an old address held by a locked local copy of the same room.
+                    *stale |= room.stale;
+                } else {
+                    entry.sources.push(AnchorSource::Room {
+                        room: room.room,
+                        name: names.get(&room.room).map_or_else(String::new, |row| row.2.clone()),
+                        stale: room.stale,
+                    });
+                }
             }
         }
         Ok(all
