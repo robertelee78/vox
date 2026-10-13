@@ -3108,20 +3108,35 @@ final class FirstRunProof: XCTestCase {
         }
         let want = three.sorted { postedAt[$0]! < postedAt[$1]! }
             .map { "bob, \(copiedTime(postedAt[$0]!)): \($0)" }.joined(separator: "\n")
-        var shownRows: [XCUIElement] = []
-        for text in three {
-            let until = Date().addingTimeInterval(30)
-            var row: XCUIElement?
-            while Date() < until && row == nil {
-                row = rowSaying(ui, "bob: \(text)")
-                if row == nil { Thread.sleep(forTimeInterval: 0.25) }
+        // The preceding copy deliberately leaves an older reading position selected.
+        // Use the public window control and scroll before attempting a three-body drag.
+        ui.menuBars.menuBarItems["Window"].click()
+        self.tap(ui, Key.menuItem("Fill"), "Window › Fill")
+        let multiCopyTimeline = ui.scrollViews.matching(identifier: "timeline").firstMatch
+        guard multiCopyTimeline.exists else {
+            throw Apparatus("cannot stage three-message copying: no timeline scroll view")
+        }
+        func copyRowsVisible() -> Bool {
+            let clip = multiCopyTimeline.frame
+            return three.allSatisfy { text in
+                guard let body = textSaying(ui, text), let row = rowSaying(ui, "bob: \(text)") else { return false }
+                let point = CGPoint(x: row.frame.minX + row.frame.width * 0.97, y: row.frame.midY)
+                return !body.frame.isEmpty && !clip.isEmpty && clip.contains(body.frame)
+                    && ui.windows.firstMatch.frame.contains(body.frame) && clip.contains(point) && body.isHittable && row.isHittable
             }
-            guard let row else {
-                keepTree(ui, "no row says bob: \(text)")
-                XCTFail("PRODUCT: alice's timeline must show bob's \(text) as its own row within 30 s")
-                return
-            }
-            shownRows.append(row)
+        }
+        let copyRowsUntil = Date().addingTimeInterval(30)
+        while Date() < copyRowsUntil && !copyRowsVisible() {
+            multiCopyTimeline.scroll(byDeltaX: 0, deltaY: -200)
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        guard copyRowsVisible() else {
+            keepTree(ui, "three COPY bodies are not visible together inside their timeline")
+            throw Apparatus("cannot stage three-message copying: COPY ONE, TWO and THREE bodies and row click points must be visible together; no clipboard assertion was attempted")
+        }
+        let shownRows = three.compactMap { rowSaying(ui, "bob: \($0)") }
+        guard shownRows.count == three.count else {
+            throw Apparatus("three COPY rows disappeared while preparing selection")
         }
         // A click on a row's empty right side selects the row, never its words.
         func click(_ row: XCUIElement, _ keys: XCUIElement.KeyModifierFlags = []) {
