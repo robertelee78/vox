@@ -386,9 +386,10 @@ final class FirstRunProof: XCTestCase {
     /// and bounds only: never an image. Nil when nothing covers it, or Vox has no window.
     /// A window of the system's over the screen point `at` that takes clicks there and is no part
     /// of Vox: a Notification Center banner or panel, or the screenshot overlay (screencaptureui,
-    /// "Screenshot"), which may be the person's own. By the window list's owner, layer and bounds
-    /// only, never an image. Its owner, layer and bounds, else nil. Never stopped: waited out.
-    private func systemOverlayOver(_ at: CGPoint) -> String? {
+    /// "Screenshot"), which may be the person's own. Uses window ownership, layer and bounds,
+    /// plus target hittability for Notification Center's transparent container. Never an image.
+    /// Its owner, layer and bounds, else nil. Never stopped: waited out.
+    private func systemOverlayOver(_ at: CGPoint, targetHittable: Bool) -> String? {
         let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
                                                  kCGNullWindowID) as? [[String: Any]] ?? []
         for w in windows {
@@ -398,6 +399,11 @@ final class FirstRunProof: XCTestCase {
                   (w[kCGWindowAlpha as String] as? Double ?? 1) > 0,
                   let b = w[kCGWindowBounds as String] as? NSDictionary,
                   let r = CGRect(dictionaryRepresentation: b as CFDictionary), r.contains(at) else { continue }
+            // Notification Center can own a transparent full-screen container while its
+            // banner occupies only a corner. Its bounds alone do not show interception.
+            // XCTest's hit eligibility permits the click; the journey still proves its result.
+            // Screenshot overlays retain their existing guard regardless of hit eligibility.
+            if owner == "Notification Center", targetHittable { continue }
             return "\(owner), layer \(w[kCGWindowLayer as String] ?? "?"), \(Int(r.width))×\(Int(r.height)) at \(Int(r.minX)),\(Int(r.minY))"
         }
         return nil
@@ -4598,10 +4604,10 @@ final class FirstRunProof: XCTestCase {
                     // a person waits, and never stopped: it may be theirs.
                     let at = CGPoint(x: e.frame.midX, y: e.frame.midY)
                     let clearBy = Date().addingTimeInterval(20)
-                    while systemOverlayOver(at) != nil, Date() < clearBy {
+                    while systemOverlayOver(at, targetHittable: e.isHittable) != nil, Date() < clearBy {
                         Thread.sleep(forTimeInterval: 0.5)
                     }
-                    if let held = systemOverlayOver(at) {
+                    if let held = systemOverlayOver(at, targetHittable: e.isHittable) {
                         keepTree(ui, "a system window covered \(what)")
                         XCTFail("APPARATUS: \(held) covered \(what) (\(key)) for 20 s; not Vox's, and left alone",
                                 file: file, line: line)
