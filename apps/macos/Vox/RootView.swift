@@ -20,6 +20,7 @@ struct RootView: View {
                 ScrollView { setup }
             }
         }
+        .safeAreaInset(edge: .top) { AgentSetupOffers(model: model) }
         .safeAreaInset(edge: .bottom) {
             if let said = model.agentSetupSaid {
                 HStack(alignment: .top) {
@@ -35,6 +36,10 @@ struct RootView: View {
             }
         }
         // Node › Sign Out…: what it does, said first (E-5), done only when confirmed.
+        .sheet(item: $model.agentSetupAsk) { request in
+            AgentSetupSheet(request: request, model: model)
+                .interactiveDismissDisabled(model.agentSetupBusy)
+        }
         .sheet(isPresented: $model.signingOut) {
             if let node = model.signedInAs {
                 SignOutSheet(node: node, model: model)

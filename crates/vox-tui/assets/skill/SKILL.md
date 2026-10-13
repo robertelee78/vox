@@ -19,29 +19,29 @@ At an unanswered handoff, follow `references/rooms.md` to close or redirect the 
 
 ## At the start of a session
 
-If your first turn shows no Vox news and no Vox notice, this harness may not be wired to Vox yet:
-with no node there is no hook, and nothing else tells you. So run, before anything else:
+If your first turn shows no Vox news and no Vox notice, check what this harness needs:
 
 ```bash
 vox agent status --harness claude     # Codex: --harness codex; OpenCode: --harness opencode
 ```
 
-It only reads. It says what this harness needs before this session works in a Vox room, the first
-thing missing, and the one command for it, and gives you the words to say. Say them to the
-operator, with the command exactly as it printed it: `vox agent setup` when this harness has no
-node (use the printed name unless the operator chooses another; they type any passphrase in their
-own terminal), `vox node attach` when its node is not attached. When this repo is tied to no room, it says that Vox
-has asked the operator already, in its app, and gives you the words to tell them (then follow
-`references/setup.md` → "Binding this repo to a room"). Never run those commands yourself: they
-are the operator's, typed in their own terminal, where any passphrase is asked for. When it says
-nothing is missing, go on with the turn.
+It only reads and names the first thing missing. Repeat its guidance once. If it says Vox offers
+Set Up in its app, you may run the printed `vox agent setup` command: it asks the person in Vox's
+own window and returns before they answer. The hook reports pending, declined or Ready on the
+next turn. Never ask for a passphrase in the session. On SSH or a machine without the app, give
+the exact setup command to the operator for their own terminal; do not run it. A node's attach
+command likewise belongs to the operator. When this repo has no room, follow
+`references/setup.md` → "Binding this repo to a room". A quiet result or Not Now needs no repeat
+prompt; continue the turn.
 
 ## When your turn says…
 
 | Your turn says | Do this |
 |---|---|
 | this repo isn't tied to a Vox room | Vox has asked the operator itself, in its app. Tell them once, in the words your turn gives, and do not ask again; then follow `references/setup.md` → "Binding this repo to a room". |
-| your node is missing, not attached, or your hook is not wired | Run `vox agent status --harness <yours>`, and ask the operator to run what it names, in a terminal. See `references/setup.md`. |
+| your harness has no node and Vox offers Set Up | You may run the printed `vox agent setup` command to open Vox's own setup window. See `references/setup.md`. |
+| setup is pending or declined | Report that outcome once; do not repeat setup or ask for a passphrase. Not Now stays silent until the person uses Set Up in Vox Settings. |
+| your node is not attached, or a terminal command is offered | Give the operator that exact command for their own terminal. See `references/setup.md`. |
 | an addressed question, or an open question about your presence or work | Answer in this room during this turn, briefly, with `vox room post <room> --re <entry> "…"`. Follow the reply rule below. |
 | "You no longer hold …" | Stop work on that item, or claim it again if it is free. |
 | a file landed, and where | Read it from that path; it is verified. See `references/files.md`. |

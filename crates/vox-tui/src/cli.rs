@@ -1059,6 +1059,12 @@ pub struct AgentSetupArgs {
     /// The node's name; defaults to <harness>-<host>, folded to a valid node name.
     #[arg(long)]
     pub node: Option<String>,
+    /// Complete only the hook wiring for a node the app already made and kept.
+    #[arg(long, hide = true, requires = "node")]
+    pub finish: bool,
+    /// Check app setup's name and harness before making its node; writes nothing.
+    #[arg(long, hide = true, requires = "finish")]
+    pub check: bool,
 }
 
 /// `vox agent doctor`
@@ -3021,9 +3027,9 @@ pub fn run() -> ExitCode {
             }
         }
         Cmd::Agent(AgentCmd::Hook(args)) => {
-            // HK-2: a light hook never resolves an account or enters node/daemon code.
-            // HK-3/4's onboarding notice and Not Now state are a separate outcome (#721).
-            if args.light.is_some() {
+            // HK-2/3: only account configuration and a one-line notice; no node or daemon.
+            if let Some(harness) = args.light.as_deref() {
+                crate::agent_hook::light(&args, harness);
                 return ExitCode::SUCCESS;
             }
             let node = match vox_core::node::paths::NodeName::parse(
@@ -3176,6 +3182,15 @@ pub fn run() -> ExitCode {
             }
         }
         Cmd::Agent(AgentCmd::Setup(args)) => match block_on_client(async move {
+            if args.finish {
+                return crate::agent_setup::finish(
+                    &args.profile.as_node_args(),
+                    &args.harness,
+                    args.node.as_deref().unwrap_or_default(),
+                    args.check,
+                )
+                .await;
+            }
             crate::agent_setup::setup(
                 &args.profile.as_node_args(),
                 &args.harness,
@@ -3229,7 +3244,11 @@ pub fn run() -> ExitCode {
         },
         Cmd::Agent(AgentCmd::Plugin(args)) => {
             if args.install {
-                return if crate::setup::install_light_hooks() {
+                let installed = crate::setup::install_light_hooks();
+                if let Ok(account) = vox_core::node::paths::Account::of(None, None) {
+                    crate::agent_onboarding::discover(&account);
+                }
+                return if installed {
                     ExitCode::SUCCESS
                 } else {
                     ExitCode::FAILURE

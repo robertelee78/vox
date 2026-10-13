@@ -1444,9 +1444,26 @@ final class FirstRunProof: XCTestCase {
         let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("new-person")
         let data = root.appendingPathComponent("data").path
         let config = root.appendingPathComponent("config").path
-        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        guard let knobs = env["VOX_PROOF_KNOBS_VOX"], !knobs.isEmpty else {
+            throw Apparatus("VOX_PROOF_KNOBS_VOX is required for this journey's isolated Keychain")
+        }
+        let keychain = root.appendingPathComponent("agent-setup.keychain-db").path
+        let madeRoot = stager.run(["/bin/mkdir", "-p", root.path], env: [:])
+        let hasKnob = stager.run(["/usr/bin/python3", "-c",
+            "import sys; sys.exit(0 if b'VOX_TEST_KEYCHAIN' in open(sys.argv[1],'rb').read() else 1)", knobs], env: [:])
+        guard madeRoot.status == 0, hasKnob.status == 0 else {
+            throw Apparatus("cannot stage a scratch Keychain: the directory or daemon test knob is missing")
+        }
+        let madeKeychain = stager.run(["/usr/bin/security", "create-keychain", "-p", "", keychain],
+                                     env: ["HOME": root.path])
+        guard madeKeychain.status == 0 else {
+            throw Apparatus("cannot create this journey's private Keychain: \(madeKeychain.out)")
+        }
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0",
+                      "VOX_TEST_KEYCHAIN": keychain]
         // An empty data root and its daemon: no node on this Mac.
-        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+        // Only this apparatus daemon has test knobs; the app and its bundled CLI are unchanged.
+        daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
         let before = run(vox, ["node", "list"], env: voxEnv)
         guard before.status == 0, nodeLine(before.out, "alice") == nil else {
@@ -1555,6 +1572,36 @@ final class FirstRunProof: XCTestCase {
             }
             throw Product("clicking the visible installed-hook Dismiss button must remove the button and paths panel; both did not disappear")
         }
+
+        // Setup may precede the person's own node. Choosing none is permitted; declining a
+        // later setup must not erase the fact that this node belongs to harness setup.
+        ui.typeKey(",", modifierFlags: .command)
+        tap(ui, Key.id("settings-agent-setup-opencode"), "Set Up OpenCode before choosing a personal node")
+        words(ui, Key.id("agent-setup-no-passphrase"), timeout: 10,
+              "an empty passphrase must show the consequence before setup",
+              until: { $0.contains("identity key is kept on this machine unencrypted")
+                  && $0.contains("anyone who can read its data folder can act as this node")
+                  && $0.contains("passphrase is encouraged") })
+        if tap(ui, Key.id("agent-setup-name"), "OpenCode node name") {
+            ui.typeKey("a", modifierFlags: .command)
+            el(ui, Key.id("agent-setup-name")).typeText("opencode-app")
+        }
+        tap(ui, Key.id("agent-setup-make"), "Set Up with no passphrase")
+        words(ui, Key.id("agent-hooks-installed"), timeout: 90,
+              "a node without a passphrase must be Ready and remembered",
+              until: { $0.contains("opencode-app") && $0.contains("Ready and remembered") })
+        let unprotected = run(vox, ["node", "list"], env: voxEnv).out
+        XCTAssertTrue(nodeLine(unprotected, "opencode-app")?.contains(" attached ") == true
+                        && nodeLine(unprotected, "opencode-app")?.hasSuffix("(kept)") == true,
+                      "PRODUCT: setup with no passphrase must make a remembered Ready node; got \(unprotected)")
+        ui.typeKey(",", modifierFlags: .command)
+        tap(ui, Key.id("settings-agent-setup-opencode"), "Reopen already-Ready OpenCode setup")
+        tap(ui, Key.id("agent-setup-decline"), "Not Now after the node is already Ready")
+        ui.terminate()
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        present(ui, Key.id("node-opencode-app"), timeout: 30,
+                "the sole harness node must remain an explicit choice after restart and a later Not Now")
+        tap(ui, Key.id("new-node"), "New Node for the person, leaving the harness node unselected")
 
         // The welcome: the node is made here.
         let name = Key.id("new-node-name")
@@ -1687,6 +1734,108 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue((nodeLine(nodes, "bob")?.contains(" attached ") ?? false)
                         && chosen.trimmingCharacters(in: .whitespacesAndNewlines) == "bob",
                       "PRODUCT: signed in as the new node bob, the app must act as bob: `vox node list` says \(nodes), its choice \(chosen.debugDescription)")
+
+        // HK-3/4 and NC-2/3: a real agent command returns before the person answers; all secret
+        // input remains in this app. Declining this explicit request is reported once, whereas
+        // declining an unsolicited Codex offer silences the next session outright.
+        let setupSession = "app-setup-claude-session"
+        let agentEnv = voxEnv.merging(["HOME": skillHome.path,
+                                      "CLAUDE_CODE_SESSION_ID": setupSession]) { $1 }
+        tap(ui, Key.id("agent-setup-offer-claude"), "Open the unsolicited Claude setup offer")
+        present(ui, Key.id("agent-setup-name"), timeout: 10, "the initial offer must have its own window")
+        // An explicit request arrives while that offer is open. Its actual directory/name must
+        // replace the old offer before the person answers; the requesting session gets the answer.
+        let setupRequest = stager.run(["/bin/sh", "-c", "cd \"$1\" && exec \"$2\" agent setup claude --node claude-app",
+                                      "agent-setup", root.path, vox],
+                                     env: agentEnv)
+        XCTAssertTrue(setupRequest.status == 0 && setupRequest.out.contains("Vox has asked the person"),
+                      "PRODUCT: agent setup must return with the app handoff before any answer; got \(setupRequest.out)")
+        present(ui, Key.id("agent-setup-harness"), timeout: 20,
+                "the agent's setup request must open the app's own window")
+        words(ui, Key.id("agent-setup-harness"), timeout: 5, "the window must name Claude Code",
+              until: { $0.contains("Claude Code") })
+        words(ui, Key.id("agent-setup-directory"), timeout: 5, "the window must name the requesting directory",
+              until: { $0 == "Directory: \(root.path)" })
+        words(ui, Key.id("agent-setup-name"), timeout: 5, "the window must name the proposed node",
+              until: { $0.contains("claude-app") })
+        func light(_ harness: String, _ session: String) -> String {
+            run(vox, ["agent", "hook", "--light", harness, "--session", session, "--format", "text"],
+                env: voxEnv.merging(["HOME": skillHome.path]) { $1 }).out
+        }
+        let pending = light("claude", setupSession)
+        XCTAssertTrue(pending.contains("has not answered") && pending.split(separator: "\n").count == 1,
+                      "PRODUCT: the next hook turn must report pending in one sentence; got \(pending)")
+        tap(ui, Key.id("agent-setup-decline"), "Not Now for the explicit request")
+        let declined = light("claude", setupSession)
+        XCTAssertTrue(declined.contains("declined") && declined.split(separator: "\n").count == 1
+                        && light("claude", setupSession).isEmpty
+                        && light("claude", "later-claude-session").isEmpty,
+                      "PRODUCT: request decline is said once to its requester, then future sessions stay silent; got \(declined)")
+
+        present(ui, Key.id("agent-setup-offer-codex"), timeout: 10,
+                "a node-free Codex harness must get its own Set Up offer")
+        tap(ui, Key.id("agent-setup-not-now-codex"), "Not Now for the unsolicited Codex offer")
+        XCTAssertTrue(light("codex", "later-codex-session").isEmpty,
+                      "PRODUCT: Not Now must persist for this harness: the next Codex session must get no setup line")
+        let quietStatus = run(vox, ["agent", "status", "--harness", "codex"],
+                              env: voxEnv.merging(["HOME": skillHome.path]) { $1 })
+        XCTAssertTrue(quietStatus.status == 0 && quietStatus.out.isEmpty,
+                      "PRODUCT: the skill's status check must not repeat setup after Not Now; got \(quietStatus.out)")
+
+        ui.typeKey(",", modifierFlags: .command)
+        tap(ui, Key.id("settings-agent-setup-claude"), "Set Up Claude Code in Settings after Not Now")
+        present(ui, Key.id("agent-setup-passphrase"), timeout: 10,
+                "Settings must reopen the app-owned secure setup fields")
+        let setupSecret = "SETUP-SECRET-ONLY-IN-APP-723"
+        type(ui, Key.id("agent-setup-passphrase"), setupSecret, "the app-owned node passphrase")
+        type(ui, Key.id("agent-setup-passphrase-again"), setupSecret, "the app-owned passphrase again")
+        tap(ui, Key.id("agent-setup-make"), "Set Up the agent node")
+        words(ui, Key.id("agent-hooks-installed"), timeout: 90,
+              "the app must say the agent node is Ready and remembered",
+              until: { $0.contains("claude-app") && $0.contains("Ready and remembered") })
+        let afterSetup = run(vox, ["node", "list"], env: voxEnv).out
+        XCTAssertTrue(nodeLine(afterSetup, "claude-app")?.contains(" attached ") == true
+                        && nodeLine(afterSetup, "claude-app")?.hasSuffix("(kept)") == true,
+                      "PRODUCT: app setup must make and remember the Ready agent node; got \(afterSetup)")
+        let ready = light("claude", setupSession)
+        XCTAssertTrue(ready.contains("claude-app is made and Ready")
+                        && ready.split(separator: "\n").count == 1,
+                      "PRODUCT: the requester's next turn must say made and Ready in one sentence; got \(ready)")
+        let wiredHook = stager.run(["/bin/cat", skillHome.appendingPathComponent(".claude/settings.json").path], env: [:])
+        XCTAssertTrue(wiredHook.out.contains("agent hook --node claude-app")
+                        && !wiredHook.out.contains("agent hook --light claude"),
+                      "PRODUCT: Set Up must replace the light hook with the made node's hook; got \(wiredHook.out)")
+        let stillPersonal = stager.run(["/bin/cat", config + "/app/node"], env: [:]).out
+        XCTAssertEqual(stillPersonal.trimmingCharacters(in: .whitespacesAndNewlines), "bob",
+                       "PRODUCT: making the agent node must not select it as the person's app node")
+        let otherRequest = run(vox, ["agent", "setup", "claude", "--node", "unwanted"], env: agentEnv)
+        XCTAssertTrue(otherRequest.status == 0 && otherRequest.out.contains("left as it is"),
+                      "PRODUCT: an already-wired harness must refuse another node before opening setup; got \(otherRequest.out)")
+        ui.typeKey(",", modifierFlags: .command)
+        tap(ui, Key.id("settings-agent-setup-claude"), "Reopen Claude setup to check its edited name")
+        if tap(ui, Key.id("agent-setup-name"), "Edit the already-wired harness's node name") {
+            ui.typeKey("a", modifierFlags: .command)
+            el(ui, Key.id("agent-setup-name")).typeText("unwanted")
+        }
+        tap(ui, Key.id("agent-setup-make"), "Set Up with a conflicting harness node")
+        words(ui, Key.id("agent-setup-failed"), timeout: 15,
+              "the app must refuse an already-wired harness before making another node",
+              until: { $0.contains("already set up as node claude-app") })
+        let refusedSetup = run(vox, ["node", "list"], env: voxEnv).out
+        XCTAssertNil(nodeLine(refusedSetup, "unwanted"),
+                     "PRODUCT: refused setup must not leave a new remembered node; got \(refusedSetup)")
+        tap(ui, Key.id("agent-setup-decline"), "Close the refused setup")
+        let leaks = stager.run(["/usr/bin/python3", "-c",
+            "import os,sys; needle=sys.argv[1].encode(); hits=[]\nfor root,dirs,files in os.walk(sys.argv[2]):\n for name in files:\n  p=os.path.join(root,name)\n  if os.path.isfile(p) and needle in open(p,'rb').read(): hits.append(p)\nprint('\\n'.join(hits)); sys.exit(1 if hits else 0)",
+            setupSecret, root.path], env: [:])
+        XCTAssertTrue(leaks.status == 0 && !setupRequest.out.contains(setupSecret)
+                        && !pending.contains(setupSecret) && !declined.contains(setupSecret)
+                        && !ready.contains(setupSecret) && !agentEnv.values.contains(setupSecret),
+                      "PRODUCT: the app's passphrase must appear in no agent output, environment or plaintext file; leaks: \(leaks.out)")
+
+        _ = run(vox, ["node", "detach", "opencode-app"], env: voxEnv)
+        _ = run(vox, ["node", "detach", "claude-app"], env: voxEnv)
+        print("[proof] agent setup: returned before answer; pending/declined/Ready hook outcomes; persistent Not Now; app-only passphrase; node kept; personal node unchanged")
         _ = run(vox, ["node", "detach", "bob"], env: voxEnv)
         print("[proof] sign out: \(out.debugDescription) after; sign-in listed \(listedAlice.debugDescription); signed in as new node bob")
     }

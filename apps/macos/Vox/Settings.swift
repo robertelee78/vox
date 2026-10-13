@@ -12,6 +12,20 @@ struct SettingsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s20) {
+            if !app.agentSetups.isEmpty {
+                setting {
+                    ForEach(app.agentSetups) { request in
+                        HStack {
+                            Text(request.name)
+                            Spacer()
+                            Button("Set Up") { app.offerAgentSetup(request) }
+                                .accessibilityIdentifier("settings-agent-setup-\(request.harness)")
+                        }
+                    }
+                } said: {
+                    Text("Set up a harness for Vox here, including one you chose Not Now for.")
+                }
+            }
             setting {
                 // The one Keep Running switch: the same call as Vox > Keep Running While Logged In
                 // (#571), so the two always agree.

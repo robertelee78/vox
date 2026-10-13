@@ -85,6 +85,12 @@ final class AppModel: ObservableObject {
     private var client: VoxClient?
     /// Changed harness configuration files, reported by the launch's light-hook installation.
     @Published var agentSetupSaid: String?
+    @Published private(set) var agentSetups: [AgentSetupRequest] = []
+    @Published private(set) var agentSetupOffers: [AgentSetupRequest] = []
+    @Published var agentSetupAsk: AgentSetupRequest?
+    @Published private(set) var agentSetupBusy = false
+    @Published private(set) var agentSetupFailed: String?
+    private var agentSetupTimer: Timer?
 
     /// Whether the person chose Keep Running at first run: then a node is kept attached when the
     /// app quits, once its passphrase is in the Keychain or it needs none (ADR-014 M-6, M-8).
@@ -101,6 +107,13 @@ final class AppModel: ObservableObject {
     /// Ask about the login item at first run; then reach the daemon, and attach the node chosen at
     /// first run, or ask which.
     func start() async {
+        AgentSetupStore.registerApp()
+        refreshAgentSetups()
+        if agentSetupTimer == nil {
+            agentSetupTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.refreshAgentSetups() }
+            }
+        }
         Daemon.refreshSkillPack { [weak self] said in self?.agentSetupSaid = said }
         if Daemon.kept() == nil {
             phase = .askingLoginItem
@@ -222,7 +235,7 @@ final class AppModel: ObservableObject {
     private func offerNodes(_ nodes: [NodeSummary]) async {
         switch nodes.count {
         case 0: phase = .welcome(said: nil)
-        case 1: await use(nodes[0])
+        case 1 where !AgentSetupStore.madeNode(nodes[0].name): await use(nodes[0])
         default:
             nodeList = nodes
             phase = .choosing(nodes.map(\.name))
@@ -409,6 +422,14 @@ final class AppModel: ObservableObject {
     /// The system opened `url`: a room link goes to the Join sheet, now or once a node is attached.
     func openLink(_ url: URL) {
         guard url.scheme?.lowercased() == "vox" else { return }
+        if url.host?.lowercased() == "agent-setup" {
+            let harness = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first { $0.name == "harness" }?.value
+            refreshAgentSetups()
+            if let request = agentSetups.first(where: { $0.harness == harness }),
+               !AgentSetupStore.declined(request) { offerAgentSetup(request) }
+            return
+        }
         // **A node on this Mac waits for its passphrase** (#666): `vox` opens
         // vox://attach-node?node=N where it would have printed "run in a terminal"; the person
         // gets a notification with Attach…, which opens the Attach sheet for it.
@@ -630,6 +651,102 @@ final class AppModel: ObservableObject {
             at: file.deletingLastPathComponent(), withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700])
         try? Data((node + "\n").utf8).write(to: file, options: .atomic)
+    }
+
+    func refreshAgentSetups() {
+        let requests = AgentSetupStore.requests()
+        if agentSetups != requests { agentSetups = requests }
+        let offers = requests.filter { !AgentSetupStore.declined($0) && !AgentSetupStore.answered($0) }
+        if agentSetupOffers != offers { agentSetupOffers = offers }
+    }
+
+    func offerAgentSetup(_ request: AgentSetupRequest) {
+        guard !agentSetupBusy else { return }
+        agentSetupFailed = nil
+        agentSetupAsk = request
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.windows.first(where: { $0.identifier?.rawValue == "main" || $0.title == "Vox" })?
+            .makeKeyAndOrderFront(nil)
+    }
+
+    func declineAgentSetup(_ request: AgentSetupRequest) {
+        guard !agentSetupBusy else { return }
+        do {
+            let held = try AgentSetupStore.lock(request)
+            defer { try? held.close() }
+            guard currentAgentSetup(request) else { return }
+            try AgentSetupStore.answer(request, outcome: "declined", node: request.node)
+            agentSetupAsk = nil
+            agentSetupSaid = "\(request.name) setup is declined. You can choose Set Up in Vox Settings later."
+            refreshAgentSetups()
+        } catch {
+            agentSetupFailed = sentence(error)
+            agentSetupSaid = sentence(error)
+        }
+    }
+
+    /// An open sheet can outlive an unsolicited offer being replaced by an agent's request.
+    /// Show that new request for a fresh click; never answer a window the person has not read.
+    private func currentAgentSetup(_ shown: AgentSetupRequest) -> Bool {
+        guard let current = AgentSetupStore.requests().first(where: { $0.harness == shown.harness })
+        else {
+            agentSetupFailed = "This setup request is no longer available. Open Set Up again."
+            return false
+        }
+        guard current.request == shown.request && current.dir == shown.dir && current.node == shown.node
+        else {
+            offerAgentSetup(current)
+            agentSetupFailed = "A newer setup request arrived. Review it before choosing Set Up or Not Now."
+            return false
+        }
+        return true
+    }
+
+    /// Only the app creates and remembers the node. It never selects the agent's node as the
+    /// person's node, and its passphrase never enters a command, environment, file or reply.
+    func setUpAgent(_ request: AgentSetupRequest, name: String, passphrase secret: Secret,
+                    again: Secret) async {
+        guard !agentSetupBusy else { secret.wipe(); again.wipe(); return }
+        let held: FileHandle
+        do { held = try AgentSetupStore.lock(request) }
+        catch {
+            secret.wipe(); again.wipe()
+            agentSetupFailed = sentence(error)
+            return
+        }
+        defer { try? held.close() }
+        guard currentAgentSetup(request) else { secret.wipe(); again.wipe(); return }
+        let same = secret.matches(again)
+        again.wipe()
+        guard same else {
+            secret.wipe()
+            agentSetupFailed = "The two passphrases differ; nothing was created."
+            return
+        }
+        agentSetupBusy = true
+        agentSetupFailed = nil
+        defer { agentSetupBusy = false }
+        do {
+            let passphrase = try secret.passphrase()
+            defer { passphrase.wipe() }
+            _ = try await Daemon.command(["agent", "setup", request.harness, "--node", name,
+                                          "--finish", "--check"],
+                                         patience: 30, environment: Daemon.harnessEnvironment())
+            let client: VoxClient
+            if let existing = self.client { client = existing }
+            else { client = try await Daemon.reach() }
+            let nodes = try await client.nodes()
+            if !nodes.contains(where: { $0.name == name }) {
+                _ = try await client.createNode(node: name, passphrase: passphrase)
+            }
+            try await client.keep(node: name, passphrase: passphrase)
+            _ = try await Daemon.command(["agent", "setup", request.harness, "--node", name, "--finish"],
+                                         patience: 30, environment: Daemon.harnessEnvironment())
+            try AgentSetupStore.answer(request, outcome: "ready", node: name)
+            refreshAgentSetups()
+            agentSetupAsk = nil
+            agentSetupSaid = "\(request.name) is set up as node \(name), Ready and remembered."
+        } catch { agentSetupFailed = sentence(error) }
     }
 }
 
