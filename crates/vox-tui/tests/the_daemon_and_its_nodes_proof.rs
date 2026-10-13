@@ -548,11 +548,106 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
 #[test]
 #[ignore = "real binaries with production Argon2id; run in release"]
 fn a_kept_node_and_its_room_come_back_after_a_restart() {
+    // Keep the old attach file readable while refusing atomic replacement on a Mac. Elsewhere
+    // a directory at the destination stages the same write failure; its old file is restored
+    // before retry. Drop restores either fixture even if a PRODUCT assertion panics.
+    struct UnwritableAttach {
+        path: PathBuf,
+        backup: Option<PathBuf>,
+    }
+    impl UnwritableAttach {
+        fn new(path: PathBuf, unreadable: bool) -> Self {
+            let fixture = if cfg!(target_os = "macos") && !unreadable {
+                let status = Command::new("chflags")
+                    .arg("uchg")
+                    .arg(&path)
+                    .status()
+                    .expect("APPARATUS: make scratch attach file immutable");
+                assert!(status.success(), "APPARATUS: cannot protect attach fixture");
+                Self { path, backup: None }
+            } else {
+                let backup = path.with_extension("saved");
+                std::fs::rename(&path, &backup).expect("APPARATUS: save attach fixture");
+                let fixture = Self {
+                    path,
+                    backup: Some(backup),
+                };
+                std::fs::create_dir(&fixture.path).expect("APPARATUS: block attach destination");
+                fixture
+            };
+            let probe = fixture.path.with_extension("probe");
+            std::fs::write(&probe, "probe").expect("APPARATUS: attach replacement probe");
+            let blocked = std::fs::rename(&probe, &fixture.path).is_err();
+            let _ = std::fs::remove_file(&probe);
+            assert!(
+                blocked,
+                "APPARATUS: attach destination accepted replacement; write failure was not staged"
+            );
+            fixture
+        }
+    }
+    impl Drop for UnwritableAttach {
+        fn drop(&mut self) {
+            if let Some(backup) = &self.backup {
+                let _ = std::fs::remove_dir(&self.path);
+                std::fs::rename(backup, &self.path)
+                    .expect("APPARATUS: restore scratch attach file");
+            } else {
+                let status = Command::new("chflags")
+                    .arg("nouchg")
+                    .arg(&self.path)
+                    .status()
+                    .expect("APPARATUS: clear scratch immutable flag");
+                assert!(
+                    status.success(),
+                    "APPARATUS: cannot clear scratch immutable flag"
+                );
+            }
+        }
+    }
     watchdog::arm();
     let a = Account::new();
     a.make_node("default");
     let pass = a.data.with_extension("pass");
     std::fs::write(&pass, format!("{PASS}\n")).unwrap();
+    let (ok, out, err) = a.run(&["daemon", "--detach"], "");
+    assert!(
+        ok,
+        "APPARATUS: daemon before persistence failure: {out}{err}"
+    );
+    let attach_file = a.data.join(".daemon/attach");
+    std::fs::write(&attach_file, "").expect("APPARATUS: empty remembered-state file");
+    {
+        let _blocked = UnwritableAttach::new(attach_file.clone(), false);
+        let (ok, out, err) = a.run(
+            &[
+                "node",
+                "unlock",
+                "default",
+                "--passphrase-file",
+                pass.to_str().unwrap(),
+            ],
+            "",
+        );
+        let truthful = if cfg!(target_os = "macos") {
+            err.contains("Ready, but remembering could not be confirmed")
+                && err.contains("could not write")
+        } else {
+            err.contains("could not read remembered state") && err.contains("it was not changed")
+        };
+        assert!(
+            !ok && truthful && !out.contains("Ready and remembered"),
+            "PRODUCT: failed persistence must fail unlock and name its partial state: {out}{err}"
+        );
+        let (_, shown, err) = a.run(&["node", "list"], "");
+        assert!(
+            shown.lines().any(|l| l.starts_with("default ")
+                && l.contains("attached")
+                && !l.contains("(kept)")),
+            "PRODUCT: a failed first remember must not appear kept: {shown}{err}"
+        );
+    }
+    // The ordinary successful unlock below is also the retry after storage is restored.
     let (ok, out, err) = a.run(
         &[
             "node",
@@ -701,6 +796,68 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
     assert!(
         ok && out.contains("before the restart"),
         "PRODUCT: locking an already-stopped node must preserve messages: {out}{err}"
+    );
+    {
+        let _blocked = UnwritableAttach::new(attach_file.clone(), true);
+        for args in [
+            vec![
+                "node",
+                "unlock",
+                "default",
+                "--passphrase-file",
+                pass.to_str().unwrap(),
+            ],
+            vec!["node", "lock", "default"],
+        ] {
+            let (ok, out, err) = a.run(&args, "");
+            assert!(!ok && err.contains("could not read remembered state") && err.contains("it was not changed")
+                && !out.contains("Ready and remembered") && !out.contains("Locked and forgotten"),
+                "PRODUCT: unreadable remembered state must be refused without claiming a change: {out}{err}");
+        }
+        let (_, shown, err) = a.run(&["node", "list"], "");
+        assert!(shown.lines().any(|l| l.starts_with("default ") && l.contains("attached") && l.contains("(kept)")),
+            "PRODUCT: an unreadable file must not erase the last known remembered state: {shown}{err}");
+    }
+    {
+        let _blocked = UnwritableAttach::new(attach_file.clone(), false);
+        let (ok, out, err) = a.run(&["node", "lock", "default"], "");
+        let truthful = if cfg!(target_os = "macos") {
+            err.contains("could not forget") && err.contains("could not write")
+        } else {
+            err.contains("could not read remembered state") && err.contains("it was not changed")
+        };
+        assert!(
+            !ok && truthful && !out.contains("Locked and forgotten"),
+            "PRODUCT: failed persistence must not claim lock forgot the node: {out}{err}"
+        );
+        let (_, shown, err) = a.run(&["node", "list"], "");
+        assert!(shown.lines().any(|l| l.starts_with("default ") && l.contains("attached")
+            && (!cfg!(target_os = "macos") || l.contains("(kept)"))),
+            "PRODUCT: failed forgetting must leave the node Ready and show its surviving remembered state: {shown}{err}");
+    }
+    stop_pid(a.lock_pid().expect("APPARATUS: daemon after failed lock"));
+    let (ok, out, err) = a.run(&["daemon", "--detach"], "");
+    assert!(ok, "APPARATUS: restart after failed lock: {out}{err}");
+    assert!(wait_until(Duration::from_secs(60), || a.run(&["room", "read", &room], "").1.contains("before the restart")),
+        "PRODUCT: failed forgetting must preserve the saved secret needed by the surviving entry: {}", a.log());
+    let (ok, out, err) = a.run(&["node", "lock", "default"], "");
+    assert!(
+        ok && out.contains("Locked and forgotten"),
+        "PRODUCT: restoring storage must let lock retry succeed: {out}{err}"
+    );
+    let (ok, out, err) = a.run(
+        &[
+            "node",
+            "unlock",
+            "default",
+            "--passphrase-file",
+            pass.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert!(
+        ok && out.contains("Ready and remembered"),
+        "PRODUCT: unlock after the repaired lock must succeed: {out}{err}"
     );
     let (ok, out, err) = a.run(&["node", "attach", "default", "--no-remember"], "");
     assert!(
