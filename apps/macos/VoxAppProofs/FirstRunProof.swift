@@ -2038,7 +2038,29 @@ final class FirstRunProof: XCTestCase {
                     let now = s1Read()
                     return (now.contains("\"waiting\":true"), "`vox room session --json` said \(now.debugDescription)")
                 })
-        tap(ui, requestRow, "S1's waiting request")
+        guard let waitingRow = locate(ui, requestRow),
+              let requestTimeline = locate(ui, Key.id("timeline")) else {
+            throw Apparatus("the waiting request and its timeline could not be located for selection")
+        }
+        // The row's center is inside Why; select its blank padding, not an editable child.
+        let interactive = waitingRow.descendants(matching: .any).allElementsBoundByIndex.filter {
+            [.button, .textField, .secureTextField, .textView].contains($0.elementType)
+                && $0.identifier != waitingRow.identifier
+        }.map(\.frame)
+        let frame = waitingRow.frame
+        let points = [CGPoint(x: frame.maxX - 2, y: frame.minY + 2),
+                      CGPoint(x: frame.minX + 2, y: frame.minY + 2),
+                      CGPoint(x: frame.maxX - 2, y: frame.maxY - 2)]
+        guard waitingRow.isHittable, let point = points.first(where: { point in
+            point.x.isFinite && point.y.isFinite && frame.contains(point)
+                && requestTimeline.frame.contains(point) && ui.windows.firstMatch.frame.contains(point)
+                && !interactive.contains(where: { $0.contains(point) })
+        }), systemOverlayOver(point, targetHittable: waitingRow.isHittable) == nil else {
+            keepTree(ui, "no exposed request-row padding for selection")
+            throw Apparatus("the waiting request has no visible click point outside its interactive children")
+        }
+        waitingRow.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: point.x - frame.minX, dy: point.y - frame.minY)).click()
         if let row = locate(ui, requestRow), !row.isSelected {
             keepTree(ui, "the waiting request clicked in S1 was not selected")
             XCTFail("PRODUCT: clicking the waiting request in S1 must select it; its row is not selected")
@@ -3305,24 +3327,38 @@ final class FirstRunProof: XCTestCase {
         guard opened.status == 0 else {
             throw Apparatus("bob's Claude Code hook, to open a Session in mission, exited \(opened.status): \(opened.out)")
         }
+        func d7IsOpen() -> (Bool, String) {
+            let result = run(vox, ["room", "sessions", "--node", "alice", "--json", room], env: voxEnv)
+            let exact = result.out.split(separator: "\n").contains { line in
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { return false }
+                return row["node"] as? String == bobFp && row["id"] as? String == d7Session
+                    && row["open"] as? Bool == true
+            }
+            return (result.status == 0 && exact, result.out)
+        }
         let sessionsUntil = Date().addingTimeInterval(30)
-        var listed = ""
-        while Date() < sessionsUntil && !listed.contains(d7Session.prefix(8)) {
-            listed = run(vox, ["room", "sessions", "--node", "alice", room], env: voxEnv).out
-            if !listed.contains(d7Session.prefix(8)) { Thread.sleep(forTimeInterval: 0.5) }
+        var listed = d7IsOpen()
+        while Date() < sessionsUntil && !listed.0 {
+            Thread.sleep(forTimeInterval: 0.5)
+            listed = d7IsOpen()
         }
-        guard listed.contains(d7Session.prefix(8)) else {
-            throw Apparatus("alice's `vox room sessions` never listed bob's Session \(d7Session) in 30 s: \(listed)")
+        guard listed.0 else {
+            throw Apparatus("alice's public Session JSON did not list bob's exact open Session \(d7Session) in 30 s: \(listed.1)")
         }
-        // Its opening is a line of the room, said as every reader says it (#406): "<name · short
-        // id> opened", as `vox room read` prints it, never a blank row under bob's name.
-        let openedLine = Key.showing("\(d7Session.prefix(8)) opened")
-        present(ui, openedLine, timeout: 30,
-                "bob's Session's opening must read in alice's timeline as `vox room read` says it, \"\(d7Session.prefix(8)) opened\", not as a blank row",
-                premise: Premise("alice's `vox room read` says bob's Session \(d7Session) opened") {
-                    let read = self.run(vox, ["room", "read", "--node", "alice", room], env: voxEnv).out
-                    return (read.contains("\(d7Session.prefix(8)) opened"), String(read.suffix(800)))
-                })
+        // ADR-029 CL-2: Session openings belong in Sessions/All, never General. The real
+        // Session panel must identify the exact open Session before its To: recipient is used.
+        let sessionsPanel = ui.windows.firstMatch.descendants(matching: .any)
+            .matching(identifier: "sessions").firstMatch
+        let d7PanelRow = sessionsPanel.descendants(matching: .button)
+            .matching(identifier: "session-\(d7Session.prefix(8))").firstMatch
+        let panelUntil = Date().addingTimeInterval(30)
+        while Date() < panelUntil && !(d7PanelRow.exists && d7PanelRow.label.contains("bob · \(d7Session.prefix(8))")) {
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        guard d7PanelRow.exists && d7PanelRow.label.contains("bob · \(d7Session.prefix(8))") else {
+            keepTree(ui, "bob's exact open Session missing from its Sessions panel")
+            throw Product("the Sessions panel must show bob · \(d7Session.prefix(8)) for the exact open Session alice's public JSON lists; \(listed.1)")
+        }
         let toBox = Key.id("compose-to")
         tap(ui, toBox, "To:")
         // By its own id: bob has another Session open in mission (bob-proof, his hook's from step 4).
