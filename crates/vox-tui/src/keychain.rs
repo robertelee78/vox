@@ -154,8 +154,8 @@ pub use mac::{forget, read, store};
 
 #[cfg(not(target_os = "macos"))]
 const NOT_HERE: &str = "this system has no Keychain Vox can store it in, so after the daemon \
-                        restarts the node is to be attached again by hand; or keep it: attach it \
-                        with `vox node unlock` and --passphrase-file naming the file that holds it";
+                        restarts unlock the node again by hand; to remember it, use `vox node unlock` \
+                        with --passphrase-file naming the file that holds its passphrase";
 
 /// Store `passphrase` for `account`. Not on this platform.
 ///
