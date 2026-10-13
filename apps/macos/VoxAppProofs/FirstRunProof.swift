@@ -345,7 +345,7 @@ final class FirstRunProof: XCTestCase {
     override func tearDown() {
         // Restore owned immutable fixtures even when XCTest stops before Swift defers run.
         for path in immutableScratchFiles {
-            let cleared = stager.run(["/bin/chflags", "nouchg", path], env: [:])
+            let cleared = stager.run(["/usr/bin/chflags", "nouchg", path], env: [:])
             if cleared.status != 0 { XCTFail("APPARATUS: cannot restore scratch attach-file flags: \(cleared.out)") }
         }
         immutableScratchFiles = []
@@ -729,10 +729,10 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("the owned scratch attach file is absent")
         }
         immutableScratchFiles.append(attachFile)
-        guard stager.run(["/bin/chflags", "uchg", attachFile], env: [:]).status == 0 else {
+        guard stager.run(["/usr/bin/chflags", "uchg", attachFile], env: [:]).status == 0 else {
             throw Apparatus("cannot make the owned scratch attach file immutable")
         }
-        defer { _ = stager.run(["/bin/chflags", "nouchg", attachFile], env: [:]) }
+        defer { _ = stager.run(["/usr/bin/chflags", "nouchg", attachFile], env: [:]) }
         let blocked = stager.run(["/usr/bin/python3", "-c",
             "import os,sys; p=sys.argv[1]; probe=p+'.proof-probe'; open(probe,'w').write('probe')\ntry:\n os.replace(probe,p)\nexcept OSError:\n print('REPLACEMENT-BLOCKED'); sys.exit(0)\nfinally:\n if os.path.exists(probe): os.unlink(probe)\nsys.exit(1)", attachFile], env: [:])
         guard blocked.status == 0 && blocked.out.contains("REPLACEMENT-BLOCKED") else {
@@ -749,7 +749,7 @@ final class FirstRunProof: XCTestCase {
                     until: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) != nil else { return }
         guard present(ui, Key.id("node-unlock-retry"), timeout: 20,
                       "the Ready node's remembering refusal must offer Retry Unlock") else { return }
-        let writable = stager.run(["/bin/chflags", "nouchg", attachFile], env: [:])
+        let writable = stager.run(["/usr/bin/chflags", "nouchg", attachFile], env: [:])
         guard writable.status == 0 else { throw Apparatus("cannot restore scratch attach-file writability: \(writable.out)") }
         immutableScratchFiles.removeAll { $0 == attachFile }
         tap(ui, Key.id("node-unlock-retry"), "Retry Unlock after restoring writable storage")
