@@ -63,7 +63,7 @@ Developer ID. A `vox` you built from source is not replaced.
 The update restarts the daemon onto the new version, so update when it is safe to interrupt your
 rooms and services. Every node detaches as the daemon stops. The new daemon attaches again each
 node it remembers. For any other node, the update prints the command that attaches it, such as
-`vox node attach robertgpt`. A daemon you started yourself with `vox daemon` keeps running the old
+`vox node unlock robertgpt`. A daemon you started yourself with `vox daemon` keeps running the old
 version, and the update says so. An open `vox tui` or Vox app keeps the old version until you
 restart it.
 

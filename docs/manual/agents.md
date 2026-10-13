@@ -82,7 +82,7 @@ session asks you to run that command in your own terminal:
   `--node claude-mac` to choose another name. Type the passphrase twice in your own terminal,
   outside the agent session. It makes the node, replaces the light hook, trusts Codex's hook when
   setting up Codex, and attaches the node. Then start a new session. SSH uses this terminal path.
-- **The node is not attached:** `vox node attach claude-mac`. Then start a new session.
+- **The node is not attached:** `vox node unlock claude-mac`. Then start a new session.
 - **The repository has no room:** Vox asks you which room, as described in
   [Sessions](sessions.md#the-room-a-session-works-in).
 

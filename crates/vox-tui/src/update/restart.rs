@@ -330,7 +330,7 @@ fn say_detached(nodes: &[NodeName]) {
     for node in nodes {
         println!(
             "node {node} is detached, as the daemon remembers no passphrase for it; attach it \
-             again with `vox node attach {node}`"
+             again with `vox node unlock {node}`"
         );
     }
 }
@@ -341,14 +341,14 @@ pub(super) fn say_next(detached: &[NodeName]) {
     match detached {
         [] => println!("Next: run `vox status` to see your nodes and rooms on this version"),
         [node] => println!(
-            "Next: run `vox node attach {node}`; it asks for the passphrase once and then \
+            "Next: run `vox node unlock {node}`; it asks for the passphrase once and then \
              remembers it"
         ),
         nodes => println!(
             "Next: attach each: {}; each asks for its passphrase once and then remembers it",
             nodes
                 .iter()
-                .map(|n| vox_text::shell::command(&["vox", "node", "attach", n.as_str()]))
+                .map(|n| vox_text::shell::command(&["vox", "node", "unlock", n.as_str()]))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),

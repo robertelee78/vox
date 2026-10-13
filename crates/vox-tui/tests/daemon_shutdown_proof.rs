@@ -59,6 +59,8 @@
 
 #![cfg(unix)]
 
+use sync_pair::attach as unlock_staging;
+
 #[path = "support/sync_pair.rs"]
 mod sync_pair;
 
@@ -111,7 +113,8 @@ fn collect(stream: impl Read + Send + 'static) -> Arc<Mutex<Vec<String>>> {
 impl Proc {
     fn spawn(name: &'static str, dir: &std::path::Path, args: &[&str], stdin: &str) -> Self {
         let mut child = Command::new(VOX)
-            .args(args)
+            .args(crate::unlock_staging::persistent_args(dir, args, IDPASS))
+            .env("VOX_TEST_KEYCHAIN", crate::unlock_staging::keychain(dir))
             .env("VOX_DATA_DIR", dir)
             .env("VOX_CONFIG_DIR", dir.join("cfg"))
             .env("VOX_IDENTITY_PASSPHRASE", IDPASS)
@@ -164,7 +167,8 @@ impl Proc {
 
 fn vox(dir: &std::path::Path, args: &[&str], stdin: &str) -> (bool, String) {
     let mut child = Command::new(VOX)
-        .args(args)
+        .args(crate::unlock_staging::persistent_args(dir, args, IDPASS))
+        .env("VOX_TEST_KEYCHAIN", crate::unlock_staging::keychain(dir))
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env("VOX_IDENTITY_PASSPHRASE", IDPASS)

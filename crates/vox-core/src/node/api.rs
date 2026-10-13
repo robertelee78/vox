@@ -1323,7 +1323,7 @@ impl Fault {
                 "this node has no identity yet\n       create one with `vox id` (or start `vox tui`)"
             }
             Fault::IdentityExists => {
-                "this node already has an identity\n       use it: `vox node attach` unlocks it; for another node, vox node create and a name for it"
+                "this node already has an identity\n       use it: `vox node unlock` unlocks it; for another node, vox node create and a name for it"
             }
             Fault::Locked => {
                 "the identity is locked\n       unlock it: pipe the identity passphrase to `vox daemon`, or run `vox tui`"
@@ -1377,10 +1377,10 @@ impl Fault {
                  or copied from another node's data directory"
             }
             Fault::ShuttingDown => {
-                "the node is shutting down\n       attach it again (`vox node attach`), then try again"
+                "the node is shutting down\n       attach it again (`vox node unlock`), then try again"
             }
             Fault::NotNetworked => {
-                "this node is not on the network: it is locked, or was started without a listen address\n       attach it with `vox node attach`, which unlocks it and puts it on the network"
+                "this node is not on the network: it is locked, or was started without a listen address\n       attach it with `vox node unlock`, which unlocks it and puts it on the network"
             }
             Fault::BadLink => {
                 "that address will not parse, or names a room this node cannot use\n       check you copied the whole vox:// address"

@@ -69,6 +69,8 @@
 #![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
 
+use world::attach as unlock_staging;
+
 #[path = "support/optional_proof.rs"]
 mod optional_proof;
 optional_proof::not_run!(a_first_direct_connection_completes_in_under_two_seconds);
@@ -646,17 +648,22 @@ fn a_node_reads_the_board_before_bridging() {
 fn attach_on(dir: &std::path::Path, anchor: &str, listen: &str) {
     use std::io::Write as _;
     let mut child = std::process::Command::new(world::VOX)
-        .args([
-            "node",
-            "attach",
-            world::DEFAULT_NODE,
-            "--passphrase-file",
-            "-",
-            "--listen",
-            listen,
-            "--anchor",
-            anchor,
-        ])
+        .args(crate::unlock_staging::persistent_args(
+            dir,
+            &[
+                "node",
+                "attach",
+                world::DEFAULT_NODE,
+                "--passphrase-file",
+                "-",
+                "--listen",
+                listen,
+                "--anchor",
+                anchor,
+            ],
+            world::IDENTITY,
+        ))
+        .env("VOX_TEST_KEYCHAIN", crate::unlock_staging::keychain(dir))
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env_remove("VOX_NODE")

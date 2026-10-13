@@ -117,6 +117,8 @@
 
 #![cfg(unix)]
 
+use thread_room::attach as unlock_staging;
+
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -156,7 +158,9 @@ const HARNESS_VARS: &[&str] = &[
 /// `vox` with the profile at `data`/`cfg` and none of [`HARNESS_VARS`].
 fn vox(data: &Path, cfg: &Path) -> Command {
     let mut c = Command::new(VOX);
-    c.env("VOX_DATA_DIR", data).env("VOX_CONFIG_DIR", cfg);
+    c.env("VOX_DATA_DIR", data)
+        .env("VOX_CONFIG_DIR", cfg)
+        .env("VOX_TEST_KEYCHAIN", crate::unlock_staging::keychain(data));
     for v in HARNESS_VARS {
         c.env_remove(v);
     }
@@ -406,14 +410,14 @@ fn a_hook_never_attaches_its_node_and_says_how_to() {
     let listed = node_list();
     println!("[proof] (7) the hook told the agent: {told:?}; `vox node list`: {listed:?}");
     assert!(
-        ok && told.contains("node default is not attached")
+        ok && told.contains("node default is Locked")
             && told.contains(
-                "ask the operator to run `vox node attach default` in a terminal outside this \
+                "ask the operator to run `vox node unlock default` in a terminal outside this \
                  session"
             )
             && listed.lines().any(|l| l.starts_with("default detached")),
         "PRODUCT: with node default detached, the hook must leave it detached and tell the agent \
-         the command for the operator, `vox node attach default` (ADR-028 K-13); it exited ok \
+         the command for the operator, `vox node unlock default` (ADR-028 K-13); it exited ok \
          {ok}, told the agent {told:?}, and `vox node list` says {listed:?}"
     );
     // The operator attaches it, outside the session: the next turn reads.
@@ -3253,14 +3257,7 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     let pass = pass.to_str().expect("APPARATUS: a UTF-8 path");
     for args in [
         vec!["node", "create", "personal", "--passphrase-file", pass],
-        vec![
-            "node",
-            "attach",
-            "personal",
-            "--no-remember",
-            "--passphrase-file",
-            pass,
-        ],
+        vec!["node", "attach", "personal", "--passphrase-file", pass],
         vec![
             "room",
             "join",

@@ -22,6 +22,82 @@ const DAEMON_GRACE: Duration = Duration::from_secs(3);
 /// How long a detached node's auto-started daemon may take to exit (it lingers 1 s, ADR-026 L-8).
 const GONE_WITHIN: Duration = Duration::from_secs(20);
 
+/// Keep the secret used by existing node-attachment staging in this proof's data root. Unlock
+/// always remembers now: stdin/environment staging must supply a persistent file off macOS.
+/// Explicit files are unchanged, and room-join stdin is never changed.
+pub fn persistent_args(data: &Path, args: &[&str], passphrase: &str) -> Vec<String> {
+    let mut args: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+    if !args
+        .windows(2)
+        .any(|a| a == ["node", "attach"] || a == ["node", "unlock"])
+    {
+        return args;
+    }
+    let flag = args.iter().position(|a| a == "--passphrase-file");
+    if flag.is_some_and(|i| args.get(i + 1).is_some_and(|a| a != "-")) {
+        return args;
+    }
+    std::fs::create_dir_all(data).expect("APPARATUS: scratch passphrase directory");
+    // Each node may have a different secret on one daemon.
+    let node = args
+        .windows(3)
+        .find(|a| a[0] == "node" && matches!(a[1].as_str(), "attach" | "unlock"))
+        .map(|a| a[2].as_str())
+        .expect("APPARATUS: attachment node");
+    let file = data.join(format!("proof-passphrase-{node}"));
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut out = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&file)
+        .expect("APPARATUS: private persistent passphrase file");
+    writeln!(out, "{passphrase}").expect("APPARATUS: write persistent passphrase");
+    let path = file
+        .to_str()
+        .expect("APPARATUS: UTF-8 passphrase path")
+        .to_owned();
+    if let Some(i) = flag {
+        args[i + 1] = path;
+    } else {
+        args.extend(["--passphrase-file".into(), path]);
+    }
+    args
+}
+
+/// A private macOS Keychain for existing CLI staging, never the person's login Keychain.
+/// Every command builder on the same scratch root uses it, including the daemon's first start.
+pub fn keychain(data: &Path) -> PathBuf {
+    let path = data.join("proof.keychain-db");
+    if cfg!(target_os = "macos") {
+        static CREATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = CREATE.lock().expect("APPARATUS: Keychain staging lock");
+        if !path.is_file() {
+            let binary =
+                std::fs::read(env!("CARGO_BIN_EXE_vox")).expect("APPARATUS: read proof binary");
+            assert!(
+                binary
+                    .windows(b"VOX_TEST_KEYCHAIN".len())
+                    .any(|w| w == b"VOX_TEST_KEYCHAIN"),
+                "APPARATUS: this Mac proof requires a binary built with --features test-knobs"
+            );
+            std::fs::create_dir_all(data).expect("APPARATUS: scratch Keychain directory");
+            let made = Command::new("/usr/bin/security")
+                .args(["create-keychain", "-p", ""])
+                .arg(&path)
+                .output()
+                .expect("APPARATUS: create private Keychain");
+            assert!(
+                made.status.success(),
+                "APPARATUS: private Keychain creation failed: {}",
+                String::from_utf8_lossy(&made.stderr)
+            );
+        }
+    }
+    path
+}
+
 /// A data root, its config directory and the identity passphrase of its node.
 #[derive(Clone, Debug)]
 pub struct Root {
@@ -42,7 +118,8 @@ impl Root {
 
     fn vox(&self, args: &[&str], stdin: &str) -> (bool, String) {
         let mut child = Command::new(env!("CARGO_BIN_EXE_vox"))
-            .args(args)
+            .args(persistent_args(&self.data, args, &self.passphrase))
+            .env("VOX_TEST_KEYCHAIN", keychain(&self.data))
             // A daemon this starts never takes port 1080 (the same rule as `world::proxy`).
             .env(
                 "VOX_PROXY",

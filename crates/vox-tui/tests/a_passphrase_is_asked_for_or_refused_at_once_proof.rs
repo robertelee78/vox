@@ -529,7 +529,7 @@ fn no_command_waits_for_input_it_cannot_get() {
             vec!["service", "add", "aaaa", "ssh", "127.0.0.1:22"],
         ),
     ] {
-        check(what, &mut vox_cmd(&bob, &args), false, &["vox node attach"]);
+        check(what, &mut vox_cmd(&bob, &args), false, &["vox node unlock"]);
     }
     // The verb that opens the node is `vox node attach`: with no terminal and no passphrase given,
     // it must not wait, and must say how to give one.
@@ -553,7 +553,7 @@ fn no_command_waits_for_input_it_cannot_get() {
         vox_cmd(&bob, &["service", "add", "aaaa", "ssh", "127.0.0.1:22"])
             .env("VOX_IDENTITY_PASSPHRASE", IDPASS),
         false,
-        &["vox node attach"],
+        &["vox node unlock"],
     );
     let _ = daemon.kill();
     let _ = daemon.wait();

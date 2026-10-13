@@ -65,7 +65,7 @@ pub fn needs(
     needs.push((
         "node attached".to_owned(),
         true,
-        "`vox node attach`".to_owned(),
+        "`vox node unlock`".to_owned(),
     ));
     if theirs {
         needs.push((
