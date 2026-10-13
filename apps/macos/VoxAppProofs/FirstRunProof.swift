@@ -1736,8 +1736,15 @@ final class FirstRunProof: XCTestCase {
         defer { _ = stager.run(["/bin/rm", "-rf", nativeTemp], env: [:]) }
         let nativeSession = "ses_799_pair_drive_0001"
         let nativePlugin = computerRoot.appendingPathComponent("native-plugin.mjs").path
-        let pluginText = try staged(vox, ["agent", "plugin", "opencode", "--node", "protected"], env: computerB)
-        try stager.write(Data(pluginText.utf8), to: nativePlugin)
+        // This command ships JavaScript on stdout and installation advice on stderr.
+        // Install it exactly as a person redirects the command, without mixing the streams.
+        let pluginAdvice = computerRoot.appendingPathComponent("native-plugin-advice.txt").path
+        let installedPlugin = stager.run(["/bin/sh", "-c",
+            "exec \"$1\" agent plugin opencode --node protected > \"$2\" 2> \"$3\"",
+            "install-plugin", vox, nativePlugin, pluginAdvice], env: computerB)
+        guard installedPlugin.status == 0 else {
+            throw Apparatus("the native OpenCode plugin could not be installed from command stdout: \(installedPlugin.out)")
+        }
         let nativeEnv = computerB.merging(["PATH": "/usr/bin:/bin", "TMPDIR": nativeTemp,
                                           "VOX_BIN": vox, "VOX_IDENTITY_PASSPHRASE": "protected pairing identity"]) { $1 }
         let nativeHost = try stager.jsonHost([nativeNode, nativeHostSource, nativePlugin, nativeSession],
