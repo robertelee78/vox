@@ -31,6 +31,7 @@ pub mod appipc;
 pub mod card;
 pub mod channel;
 pub mod circuitstream;
+pub mod computer;
 pub mod consent_order;
 pub mod content;
 pub mod coordstream;

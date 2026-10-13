@@ -363,6 +363,10 @@ impl PulledBook {
 
 /// The shares one node serves.
 pub struct Shares {
+    computer: Option<(
+        Arc<crate::node::computer::Computer>,
+        Arc<std::sync::atomic::AtomicU64>,
+    )>,
     paths: Paths,
     /// Weak, so the shares never keep a stopped node's command queue open.
     cmd: mpsc::WeakSender<(NodeCommand, oneshot::Sender<Outcome>)>,
@@ -403,8 +407,13 @@ impl Shares {
         cmd: mpsc::WeakSender<(NodeCommand, oneshot::Sender<Outcome>)>,
         view: watch::Receiver<NodeView>,
         events: broadcast::Sender<NodeEvent>,
+        computer: Option<(
+            Arc<crate::node::computer::Computer>,
+            Arc<std::sync::atomic::AtomicU64>,
+        )>,
     ) -> Arc<Self> {
         let shares = Arc::new(Self {
+            computer,
             pulled: Arc::new(std::sync::Mutex::new(PulledBook::load(
                 // Beside the share records, not among them: `restore` reads every `*.json` there
                 // as one, and removes what is not.
@@ -463,6 +472,7 @@ impl Shares {
     /// may serve (`only`).
     fn witness(&self, tag: &str, room: Digest32, only: Only) -> Witness {
         Witness {
+            computer: self.computer.clone(),
             book: Arc::clone(&self.pulled),
             tag: tag.to_owned(),
             room,
@@ -1007,6 +1017,10 @@ impl Shares {
 /// Who a share's completed fetches are recorded against, and how its server tells them apart.
 #[derive(Clone)]
 struct Witness {
+    computer: Option<(
+        Arc<crate::node::computer::Computer>,
+        Arc<std::sync::atomic::AtomicU64>,
+    )>,
     book: Arc<std::sync::Mutex<PulledBook>>,
     tag: String,
     room: Digest32,
@@ -1033,7 +1047,11 @@ impl Witness {
     fn allowed(&self, member: Option<Digest32>) -> bool {
         match &self.only {
             Only::Anyone => true,
-            Only::Drive => member.is_some_and(|m| self.view.borrow().drive.contains(&m)),
+            Only::Drive => {
+                self.computer.as_ref().is_none_or(|(computer, applied)| {
+                    computer.policy_current(applied.load(std::sync::atomic::Ordering::Acquire))
+                }) && member.is_some_and(|m| self.view.borrow().drive.contains(&m))
+            }
             Only::Node(n) => member == Some(*n),
         }
     }

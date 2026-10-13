@@ -77,6 +77,10 @@ impl Node {
         name: &str,
         capability: Capability,
     ) -> Outcome {
+        // A local grant queued before pairing cannot widen the fixed computer policy.
+        if self.computer.as_ref().is_some_and(|c| c.grouped()) {
+            return Outcome::Done;
+        }
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };

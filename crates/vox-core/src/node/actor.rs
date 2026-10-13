@@ -44,6 +44,7 @@ use crate::node::network::{Inbound, NodeNet};
 use crate::node::open_rooms::OpenRooms;
 use crate::node::paths::Paths;
 
+mod computer;
 mod local_trust;
 mod recovery;
 use crate::node::prekeys::{self, PrekeyRing};
@@ -625,6 +626,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::Names(_) => "resolving a .vox name",
         NetEvent::SessionPage { .. } => "reading a page of a room's Session entries",
         NetEvent::MemberDialer(_) => "lending the proxy its dialer",
+        NetEvent::ComputerPolicy(_) => "applying computer trust",
         NetEvent::LocalTrustBlacklist(_) => "reading local trust removal decisions",
         NetEvent::TrustLocalNode { .. } => "applying the daemon's local trust policy",
     }
@@ -697,6 +699,8 @@ pub struct NodeConfig {
     pub argon2: Argon2Profile,
     /// Where to bind, or `None` for a node that does not network.
     pub bind: Option<Bind>,
+    /// Owning daemon's durable computer policy, consulted before networking.
+    pub computer: Option<Arc<crate::node::computer::Computer>>,
     /// An override for the ADR-005 PoW parameters a join binds (tests reduce them).
     pub pow_params: Option<crate::join::pow::PowParams>,
     /// The anchors, if any, that bridge this node to peers it cannot reach directly
@@ -780,6 +784,7 @@ impl NodeConfig {
             millis_clock: crate::time::millis_clock_with_test_skew(),
             argon2: Argon2Profile::default(),
             bind: None,
+            computer: None,
             pow_params: None,
             anchors: BootstrapSet::new(),
             headless: None,
@@ -1024,6 +1029,7 @@ enum NetEvent {
     MemberDialer(oneshot::Sender<crate::error::Result<MemberDialer>>),
     /// Daemon-internal only: no IPC request maps to these policy operations.
     LocalTrustBlacklist(oneshot::Sender<crate::error::Result<Option<BTreeSet<Digest32>>>>),
+    ComputerPolicy(oneshot::Sender<crate::error::Result<()>>),
     TrustLocalNode {
         fingerprint: Digest32,
         name: String,
@@ -3788,6 +3794,8 @@ const fn worth_another_responder(fault: Fault) -> bool {
 /// and none of them can starve another (ADR-020 §7).
 #[derive(Debug, Clone)]
 pub struct NodeHandle {
+    computer: Option<Arc<crate::node::computer::Computer>>,
+    computer_revision: Arc<std::sync::atomic::AtomicU64>,
     cmd_tx: mpsc::Sender<(NodeCommand, oneshot::Sender<Outcome>)>,
     view_rx: watch::Receiver<NodeView>,
     /// Kept so a client may subscribe at any time after the node started.
@@ -3967,7 +3975,17 @@ impl NodeHandle {
     /// The latest view (cheap clone of the watch value).
     #[must_use]
     pub fn view(&self) -> NodeView {
-        self.view_rx.borrow().clone()
+        let mut view = self.view_rx.borrow().clone();
+        if let Some(c) = &self.computer {
+            if !c.policy_current(
+                self.computer_revision
+                    .load(std::sync::atomic::Ordering::Acquire),
+            ) {
+                // Fail closed while the actor reconciles the newly durable policy.
+                view.drive.clear();
+            }
+        }
+        view
     }
 
     /// A receiver that resolves whenever the view changes.
@@ -4183,6 +4201,8 @@ pub struct Node {
     net_tx: mpsc::Sender<NetEvent>,
     /// Where the endpoint binds, if this node networks at all.
     bind: Option<Bind>,
+    computer: Option<Arc<crate::node::computer::Computer>>,
+    computer_revision: Arc<std::sync::atomic::AtomicU64>,
     /// The headless transport identity, if this node runs without a vault.
     headless: Option<Arc<crate::identity::composite::SoftwareRootSigner>>,
     /// See [`NodeConfig::anchor_boards`].
@@ -4833,6 +4853,7 @@ impl Node {
             millis_clock,
             argon2,
             bind,
+            computer,
             pow_params,
             anchors,
             headless,
@@ -4879,6 +4900,8 @@ impl Node {
             presence: None,
             net_tx,
             bind,
+            computer,
+            computer_revision: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             anchor_ids: anchors.nodes().iter().map(|n| n.id).collect(),
             room_anchors: BTreeMap::new(),
             anchors,
@@ -5070,6 +5093,9 @@ impl Node {
             cmd_tx.downgrade(),
             node.view_tx.subscribe(),
             handle_event_tx.clone(),
+            node.computer
+                .clone()
+                .map(|c| (c, Arc::clone(&node.computer_revision))),
         );
         let pulls = crate::node::pulls::Pulls::spawn(
             node.paths.clone(),
@@ -5079,8 +5105,12 @@ impl Node {
         );
         let paths = node.paths.clone();
         let decisions = node.decisions.clone();
+        let computer = node.computer.clone();
+        let computer_revision = Arc::clone(&node.computer_revision);
         let actor = tokio::spawn(node.run(cmd_rx, net_rx));
         let handle = NodeHandle {
+            computer,
+            computer_revision,
             cmd_tx,
             view_rx,
             event_tx: handle_event_tx,
@@ -5116,6 +5146,14 @@ impl Node {
                 received = cmd_rx.recv() => {
                     let Some((command, reply)) = received else { break };
                     let shutdown = matches!(command, NodeCommand::Shutdown);
+                    // Creating/unlocking the identity must reach start_network(), which applies
+                    // computer policy before registering an endpoint. A locked store cannot be
+                    // reconciled before Unlock has opened it.
+                    let opens_identity = matches!(command, NodeCommand::Unlock { .. } | NodeCommand::CreateIdentity { .. });
+                    if !shutdown && !opens_identity && self.apply_computer_keyring().await.is_err() {
+                        let _=reply.send(Outcome::Failed(Fault::Storage));
+                        continue;
+                    }
                     let name = command_name(&command);
                     let started = std::time::Instant::now();
                     // Proof the actor is taking commands (V210-83): it changes nothing, so nothing
@@ -5282,6 +5320,7 @@ impl Node {
                     self.schedule().await;
                 }
                 Some(event) = net_rx.recv() => {
+                    if !matches!(&event, NetEvent::ComputerPolicy(_)) && self.apply_computer_keyring().await.is_err() { continue; }
                     let name = net_event_name(&event);
                     let started = std::time::Instant::now();
                     self.handle_net(event).await;
@@ -5290,6 +5329,7 @@ impl Node {
                     self.schedule().await;
                 }
                 _ = ticker.tick() => {
+                    if self.apply_computer_keyring().await.is_err() { continue; }
                     if let Some(net) = self.net.as_ref() {
                         // Connections a better path displaced are closed once their
                         // grace is up (M15.1b).
@@ -5389,6 +5429,9 @@ impl Node {
 
     /// [`Self::handle`], unboxed: see [`Boxed`].
     async fn handle_unboxed(&mut self, command: NodeCommand) -> Outcome {
+        if self.computer_change_refused(&command) {
+            return Outcome::Failed(Fault::ComputerPolicy);
+        }
         match command {
             NodeCommand::CreateIdentity { passphrase } => self.create_identity(&passphrase),
             NodeCommand::Unlock { passphrase } => self.unlock(&passphrase).await,
@@ -5783,6 +5826,23 @@ impl Node {
     /// identity and spawn the accept loop. A no-op when this node does not network,
     /// or when it is already up.
     fn start_network(&mut self) -> crate::error::Result<()> {
+        self.prepare_computer_binding()?;
+        for attempt in 0..8 {
+            self.apply_computer_keyring_at(0)?;
+            if self.computer.as_ref().is_none_or(|c| {
+                c.policy_current(
+                    self.computer_revision
+                        .load(std::sync::atomic::Ordering::Acquire),
+                )
+            }) {
+                break;
+            }
+            if attempt == 7 {
+                return Err(Error::Profile(
+                    "computer policy is still changing; attach again after it settles",
+                ));
+            }
+        }
         let Some(bind) = self.bind.as_ref() else {
             return Ok(());
         };
@@ -8497,6 +8557,17 @@ impl Node {
             }
             NetEvent::Names(reply) => {
                 let _ = reply.send(self.resolver_snapshot().await);
+            }
+            NetEvent::ComputerPolicy(reply) => {
+                let result = match self.prepare_computer_binding() {
+                    Ok(()) => self.apply_computer_keyring().await,
+                    Err(e) => Err(e),
+                };
+                if result.is_ok() {
+                    self.refresh_reachers().await;
+                    self.tend_drive_keys().await;
+                }
+                let _ = reply.send(result);
             }
             NetEvent::LocalTrustBlacklist(reply) => {
                 let _ = reply.send(self.local_trust_blacklist());
@@ -16517,7 +16588,16 @@ impl Node {
                 .or_insert_with(crate::node::tunnel::empty_reachers);
             // A recompute is not a decision: this wakes the serving tasks only if the set
             // really moved. The rule and its reason live in `publish_reachers`.
-            crate::node::tunnel::publish_reachers(slot, next);
+            if let Some(computer) = &self.computer {
+                computer.publish_reachers(
+                    slot,
+                    next,
+                    self.computer_revision
+                        .load(std::sync::atomic::Ordering::Acquire),
+                );
+            } else {
+                crate::node::tunnel::publish_reachers(slot, next);
+            }
             let offer = self
                 .offered
                 .entry(*cid)

@@ -37,6 +37,9 @@ impl Router {
     }
 
     async fn reconcile_local_trust(&self) -> Result<(), String> {
+        if self.inner.defaults.computer.computer.grouped() {
+            return Ok(());
+        }
         // This is the app's existing persisted choice, kept when its window is closed. Neither
         // a remote name nor a caller-supplied fingerprint can designate the personal node.
         let path = self.inner.account.config_dir.join("app/node");

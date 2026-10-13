@@ -253,7 +253,19 @@ impl CpaceState {
         sid: &[u8],
     ) -> Result<(Self, [u8; CPACE_SHARE_LEN])> {
         let ci = channel_identifier(channel_id, epoch);
-        let g = calculate_generator(passphrase, &ci, sid);
+        Self::start_with_context(passphrase, &ci, suite_id, sid)
+    }
+
+    /// Begin the same CPace construction with a caller-owned, domain-separated context.
+    /// Computer pairing binds both management identities and the exact enrollment intent;
+    /// room callers retain `start` and its existing channel identifier.
+    pub fn start_with_context(
+        passphrase: &[u8],
+        context: &[u8],
+        suite_id: u16,
+        sid: &[u8],
+    ) -> Result<(Self, [u8; CPACE_SHARE_LEN])> {
+        let g = calculate_generator(passphrase, context, sid);
         let scalar = sample_scalar()?;
         let share_point = g * scalar;
         let own_share = share_point.compress().to_bytes();
