@@ -1708,7 +1708,12 @@ final class FirstRunProof: XCTestCase {
         present(ui, Key.id("agent-setup-name"), timeout: 10, "the initial offer must have its own window")
         // An explicit request arrives while that offer is open. Its actual directory/name must
         // replace the old offer before the person answers; the requesting session gets the answer.
-        let requestedDirectory = root.resolvingSymlinksInPath().path
+        let physicalDirectory = stager.run(["/bin/sh", "-c", "cd \"$1\" && /bin/pwd -P",
+                                           "request-directory", root.path], env: [:])
+        let requestedDirectory = physicalDirectory.out.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard physicalDirectory.status == 0, requestedDirectory.hasPrefix("/") else {
+            throw Apparatus("the requesting scratch directory could not be staged: \(physicalDirectory.out)")
+        }
         let setupRequest = stager.run(["/bin/sh", "-c", "cd \"$1\" && exec \"$2\" agent setup claude --node claude-app",
                                       "agent-setup", requestedDirectory, vox],
                                      env: agentEnv)
@@ -1718,7 +1723,7 @@ final class FirstRunProof: XCTestCase {
                 "the agent's setup request must open the app's own window")
         words(ui, Key.id("agent-setup-harness"), timeout: 5, "the window must name Claude Code",
               until: { $0.contains("Claude Code") })
-        words(ui, Key.id("agent-setup-directory"), timeout: 5, "the window must name the requesting directory",
+        words(ui, Key.id("agent-setup-directory"), timeout: 5, "the window must name the requesting directory \(requestedDirectory)",
               until: { $0 == "Directory: \(requestedDirectory)" })
         words(ui, Key.id("agent-setup-name"), timeout: 5, "the window must name the proposed node",
               until: { $0.contains("claude-app") })
