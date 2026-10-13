@@ -615,8 +615,8 @@ pub(crate) async fn post_structured(
         opts.urgent,
     )
     .await?;
-    let thread = match (known_thread, &opts.thread) {
-        (Some(root), Some(explicit)) if root != *explicit => {
+    let mut thread = match (known_thread, &opts.thread) {
+        (Some(root), Some(explicit)) if !root.eq_ignore_ascii_case(explicit.trim()) => {
             return Err(AppError::Usage(format!(
                 "--thread {explicit} contradicts the message being replied to: its thread is {root}"
             )));
@@ -625,6 +625,18 @@ pub(crate) async fn post_structured(
         (None, Some(explicit)) => Some(explicit.clone()),
         (None, None) => re.clone(),
     };
+    // An operation keeps the root its first post used even if a missing parent arrives, or
+    // retention removes one, before a retry. Only the automatic root is inherited: a changed
+    // --re or explicit --thread still goes through the normal semantic conflict/refusal checks.
+    if re.is_some() && opts.thread.is_none() {
+        if let Some(prior) = coord::op_group(&mut client, cid, &op)
+            .await?
+            .into_iter()
+            .find(|p| p.author == snap.me && p.envelope.re == re)
+        {
+            thread = prior.envelope.thread;
+        }
+    }
     let draft = Draft {
         kind,
         to,

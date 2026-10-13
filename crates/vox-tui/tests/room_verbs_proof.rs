@@ -1013,7 +1013,7 @@ fn a_link_card_is_fetched_by_the_senders_node_alone() {
         .enable_all()
         .build()
         .expect("APPARATUS: a tokio runtime");
-    let r = rt.block_on(support::room(tmp.path(), &["alice", "bob", "carol"]));
+    let mut r = rt.block_on(support::room(tmp.path(), &["alice", "bob", "carol"]));
     let (alice, bob) = (&r.workers[0], &r.workers[1]);
     let room = r.id.clone();
     let count = |s: &std::sync::Arc<std::sync::Mutex<Vec<String>>>| s.lock().unwrap().clone();
@@ -1139,6 +1139,16 @@ fn a_link_card_is_fetched_by_the_senders_node_alone() {
     };
     let plain = thread_post(alice, &["THREAD-PLAIN-ROOT"]);
     let plain_reply = thread_post(alice, &["--re", &plain, "THREAD-PLAIN-REPLY"]);
+    let upper = thread_post(
+        alice,
+        &[
+            "--re",
+            &plain.to_ascii_uppercase(),
+            "--thread",
+            &plain,
+            "THREAD-UPPERCASE-REPLY",
+        ],
+    );
     let root = thread_post(alice, &["--to", "bob", "THREAD-ROOT @bob status please"]);
     support::until(
         bob,
@@ -1207,7 +1217,7 @@ fn a_link_card_is_fetched_by_the_senders_node_alone() {
             &["room", "read", &room, "--json"],
             |o| {
                 o.stdout.contains("THREAD-FILE")
-                    && [&plain_reply, &root, &reply, &nested]
+                    && [&plain_reply, &upper, &root, &reply, &nested]
                         .iter()
                         .all(|id| o.stdout.contains(id.as_str()))
             },
@@ -1215,6 +1225,7 @@ fn a_link_card_is_fetched_by_the_senders_node_alone() {
         let rows = read.ndjson();
         for (entry, parent, thread) in [
             (&plain_reply, &plain, &plain),
+            (&upper, &plain, &plain),
             (&reply, &root, &root),
             (&nested, &reply, &root),
         ] {
@@ -1223,7 +1234,8 @@ fn a_link_card_is_fetched_by_the_senders_node_alone() {
                 .find(|r| r["entry_hash"] == entry.as_str())
                 .map(|r| r["envelope"].clone())
                 .unwrap_or_default();
-            assert!(env["re"] == parent.as_str() && env["thread"] == thread.as_str(),
+            assert!(env["re"].as_str().is_some_and(|re| re.eq_ignore_ascii_case(parent))
+                    && env["thread"] == thread.as_str(),
                     "PRODUCT: {} must read reply {entry} answering {parent} in thread {thread}; got {env}",
                     reader.name);
         }
@@ -1275,6 +1287,89 @@ fn a_link_card_is_fetched_by_the_senders_node_alone() {
         !contradiction.ok && contradiction.stderr.contains("contradicts"),
         "PRODUCT: a known reply cannot be put in a different explicit thread: {contradiction:?}"
     );
+
+    // A reply queued while its parent is unavailable keeps its operation's original meaning
+    // when the parent arrives. Freeze only this fixture's peers while Bob comes back online.
+    r.stop(1);
+    let late_root = thread_post(&r.workers[0], &["THREAD-LATE-ROOT"]);
+    let late_parent = thread_post(&r.workers[0], &["--re", &late_root, "THREAD-LATE-PARENT"]);
+    struct Frozen(u32);
+    impl Drop for Frozen {
+        fn drop(&mut self) {
+            let _ = Command::new("kill")
+                .args(["-CONT", &self.0.to_string()])
+                .status();
+        }
+    }
+    let frozen: Vec<_> = [
+        r.anchor_pid(),
+        r.workers[0]
+            .daemon_pid()
+            .expect("APPARATUS: Alice's daemon"),
+        r.workers[2]
+            .daemon_pid()
+            .expect("APPARATUS: Carol's daemon"),
+    ]
+    .into_iter()
+    .map(|pid| {
+        let stopped = Command::new("kill")
+            .args(["-STOP", &pid.to_string()])
+            .status()
+            .expect("APPARATUS: send SIGSTOP to a fixture peer");
+        assert!(
+            stopped.success(),
+            "APPARATUS: could not pause fixture peer {pid}"
+        );
+        Frozen(pid)
+    })
+    .collect();
+    r.restart(1);
+    let bob = &r.workers[1];
+    let before = bob.vox(None, &["room", "read", &room, "--json"]);
+    assert!(
+        !before
+            .expect_ok("read offline Bob's room")
+            .ndjson()
+            .iter()
+            .any(|row| row["entry_hash"] == late_parent),
+        "APPARATUS: Bob already holds the deliberately unavailable parent"
+    );
+    let args = [
+        "--re",
+        &late_parent,
+        "--op",
+        "thread-late-retry-753",
+        "THREAD-LATE-REPLY",
+    ];
+    let queued = thread_post(bob, &args);
+    drop(frozen);
+    support::until(
+        bob,
+        None,
+        "the previously missing parent to reach Bob",
+        &["room", "read", &room, "--json"],
+        |o| {
+            o.ndjson()
+                .iter()
+                .any(|row| row["entry_hash"] == late_parent)
+        },
+    );
+    assert_eq!(
+        thread_post(bob, &args),
+        queued,
+        "PRODUCT: the same --op reply must stay a retry when its previously missing parent arrives"
+    );
+    let after = bob.vox(None, &["room", "read", &room, "--json"]);
+    let rows = after.expect_ok("read the retried reply").ndjson();
+    let replies: Vec<_> = rows
+        .iter()
+        .filter(|row| row["entry_hash"] == queued)
+        .collect();
+    assert!(
+        replies.len() == 1 && replies[0]["envelope"]["thread"] == late_parent,
+        "PRODUCT: the retried reply must appear once with its original root: {replies:?}"
+    );
+    eprintln!("[proof] a missing parent arrived; retry kept the original entry and thread");
 }
 
 /// The room the fixture holds, as `vox` at integrate 48b1c743 made it: its id is its genesis hash.

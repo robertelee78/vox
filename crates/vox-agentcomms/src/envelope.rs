@@ -629,6 +629,8 @@ pub fn reply_thread_by(re: &str, mut parent: impl FnMut(&str) -> Option<String>)
         Envelope::parse(&text)
             .ok()
             .and_then(|p| p.thread)
-            .unwrap_or_else(|| re.to_owned()),
+            .unwrap_or_else(|| re.to_owned())
+            .trim()
+            .to_ascii_lowercase(),
     )
 }
