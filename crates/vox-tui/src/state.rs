@@ -652,7 +652,8 @@ impl UiState {
                 let member = self.offer(vm).map(|o| o.member);
                 self.start_prompt(PromptKind::AcceptOffer, member);
                 if let Mode::Prompt(prompt) = &mut self.mode {
-                    if let Some((_, name)) = vm.presented.iter().find(|(fp, _)| Some(*fp) == member) {
+                    if let Some((_, name)) = vm.presented.iter().find(|(fp, _)| Some(*fp) == member)
+                    {
                         prompt.fields[0] = Zeroizing::new(name.clone());
                     }
                 }
