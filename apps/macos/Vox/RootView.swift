@@ -228,8 +228,8 @@ private struct AttachNodeSheet: View {
                 .frame(width: Theme.scaled(320))
                 .accessibilityIdentifier("attach-node-passphrase")
                 .accessibilityLabel("Identity passphrase for node \(node)")
-            if let said = model.keepNodeSaid {
-                Said(text: said)
+            if let said = model.keepNodeSaid, said.node == node {
+                Said(text: said.message)
             }
             HStack {
                 Button("Unlock") { attach() }
