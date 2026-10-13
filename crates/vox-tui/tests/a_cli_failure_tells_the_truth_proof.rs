@@ -89,6 +89,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/attach.rs"]
+mod unlock_staging;
+
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -148,7 +151,8 @@ fn collect(stream: impl Read + Send + 'static, hold: Arc<AtomicBool>) -> Arc<Mut
 
 fn command(dir: &std::path::Path, args: &[&str], envs: &[(&str, &str)]) -> Command {
     let mut c = Command::new(VOX);
-    c.args(args)
+    c.args(crate::unlock_staging::persistent_args(dir, args, IDPASS))
+        .env("VOX_TEST_KEYCHAIN", crate::unlock_staging::keychain(dir))
         .envs(envs.iter().copied())
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))

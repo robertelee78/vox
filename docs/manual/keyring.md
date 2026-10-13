@@ -12,8 +12,8 @@ a node of its own. Never share one between a person and an agent.
 |---|---|
 | Make a node | `vox node create robertgpt` |
 | List the nodes on this machine | `vox node list` |
-| Attach a node | `vox node attach robertgpt` |
-| Detach a node | `vox node detach robertgpt` |
+| Attach a node | `vox node unlock robertgpt` |
+| Detach a node | `vox node lock robertgpt` |
 | Stop Vox attaching it by itself | `vox node forget-passphrase robertgpt` |
 | Rename it on this machine | `vox node rename robertgpt robert-laptop` |
 | Sign it out | `vox node signout robertgpt` |
@@ -26,17 +26,25 @@ At a terminal, `vox node create` also attaches the node. Run by a script, it onl
 is no backup of a node: its keys never leave the machine. If the machine is lost, make a new node,
 and ask everyone who trusted the old one to remove it and trust the new one.
 
-An attached node runs in the daemon until you detach it. Attaching remembers it: Vox stores the
-passphrase in the Keychain (nothing, for a node with none), and the daemon attaches the node again
-whenever it starts, after an update or a reboot too. Anyone who can unlock this Mac's login
-keychain can then attach it. To attach without remembering, add `--no-remember`. On Linux there is
-no Keychain, so keep the node with a passphrase file instead:
-`vox node attach robertgpt --keep --passphrase-file ~/.vox-robertgpt-passphrase`.
+`vox node unlock` makes a node Ready and always remembers it for daemon restarts, updates and
+reboots. On a Mac its passphrase is stored in the Keychain, whether typed or supplied through a
+file or environment variable. A node with no passphrase needs no secret stored. On a system
+without a Keychain, a protected node needs a private persistent passphrase file:
+`vox node unlock robertgpt --passphrase-file ~/.vox-robertgpt-passphrase`.
+Keep that file in place: the daemon reads it again at each start. Stdin (`-`) and an environment
+variable cannot supply a remembered file. There is no option to unlock without remembering.
+If remembering fails, unlock returns a failure and describes the resulting state. A previous
+remembered entry may remain; if Vox cannot read it, it reports that uncertainty. Correct the
+reported problem and retry.
+
+`vox node attach` is now `vox node unlock`; `vox node detach` is now `vox node lock`.
+The old names print the new name and do the same thing. `attach --keep` is accepted and has no
+further effect, since unlock always remembers.
 
 `vox node list` shows each node as `attached` or `detached`, with its fingerprint, and `(kept)` for
 one the daemon attaches by itself.
 
-`vox node detach` closes the node's connections, stops its services and wipes its keys from
+`vox node lock` closes the node's connections, stops its services and wipes its keys from
 memory. It also forgets the node: the daemon stops attaching it by itself, and its passphrase
 leaves the Keychain. Its rooms and keyring stay on disk.
 
@@ -48,7 +56,7 @@ wired to it, and the app's choice of node. If a keyring on this machine names th
 command prints the `vox trust rename` that updates it.
 
 `vox node signout` detaches the node, forgets it, and makes the app forget it chose it. Its rooms
-and messages stay. `vox node attach` brings it back.
+and messages stay. `vox node unlock` brings it back.
 
 ## When the passphrase is asked for
 
@@ -76,7 +84,7 @@ An agent's node follows the same rules. You, the operator, type its passphrase i
 outside the agent's session:
 
 ```sh
-vox node attach claude-mac
+vox node unlock claude-mac
 vox trust add f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq --name ann --node claude-mac
 ```
 
@@ -84,7 +92,7 @@ The agent's hook never attaches the node and never takes a passphrase. While the
 detached, the agent is told so, with the command for you:
 
 ```text
-Vox could not read your rooms this turn: node claude-mac is not attached, and a hook never attaches it. Ask the operator to run, in a terminal outside this session: vox node attach claude-mac
+Vox could not read your rooms this turn: node claude-mac is not attached, and a hook never attaches it. Ask the operator to run, in a terminal outside this session: vox node unlock claude-mac
 ```
 
 ## Compare before trusting

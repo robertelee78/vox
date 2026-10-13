@@ -12,7 +12,7 @@
 //!    the node (its passphrase typed twice), wires the harness's hook to it and the agent skill
 //!    beside it, as `vox setup` does for that one harness, and attaches the node; or, for a node
 //!    that exists, wires it and attaches it;
-//! 2. the node not attached: `vox node attach <node>`;
+//! 2. the node not attached: `vox node unlock <node>`;
 //! 3. the session's directory not bound to a room: the ask the hook gives (ADR-029 RB-5), with
 //!    `vox room join <link> --node <node> --bind <dir>`.
 //!
@@ -113,7 +113,7 @@ async fn first_missing(args: &NodeArgs, key: &str, dir: &Path) -> Result<String,
              Vox room. Tell the operator, in these words: \"Node {node} is not attached. Run \
              this in a terminal of your own; it asks there for the node's passphrase once, and \
              Vox then remembers it and attaches the node by itself after every restart. Then \
-             start a new session.\"\n    vox node attach {node}\n\
+             start a new session.\"\n    vox node unlock {node}\n\
              Never run it yourself, and never ask for the passphrase here.\n",
             h.name
         ));
@@ -179,7 +179,7 @@ async fn in_bound_room(
             "Vox: {harness} is node {node}, attached; this repo ({}) is bound to room {short}, \
              and {node} is not in it, so this session cannot post there. {node} joins it by \
              itself, with the room map's passphrase, when a session starts here; if that failed, \
-             Vox asks the operator (Vox.app banner), or they run at a terminal: {}\n",
+             Vox asks the operator (Vox.app dialog), or they run at a terminal: {}\n",
             dir.display(),
             vox_text::shell::command(&["vox", "room", "join", link, "--node", node.as_str()]),
         ),
@@ -220,7 +220,7 @@ pub async fn setup(args: &NodeArgs, key: &str, name: Option<&str>) -> Result<(),
     if let Some(wired) = &wired {
         if wired != &name {
             println!(
-                "vox: {} is connected to node {wired}; left as it is. `vox node attach {wired}` \
+                "vox: {} is connected to node {wired}; left as it is. `vox node unlock {wired}` \
                  attaches it",
                 h.name
             );

@@ -211,6 +211,26 @@ fn worktree_of(dir: &Path) -> Option<(PathBuf, PathBuf)> {
     Some((top.to_path_buf(), main))
 }
 
+/// The repository the person answers for (ADR-031 RM-5). An existing map override keeps its
+/// own boundary; otherwise subfolders and linked worktrees ask for the main repository once.
+/// Outside git, the canonical start directory is the boundary, as before.
+#[must_use]
+pub fn ask_directory(entries: &[Entry], start: &Path) -> PathBuf {
+    let same = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if let Some(entry) = resolve(entries, start) {
+        return same(&entry.repo);
+    }
+    let start = same(start);
+    if let Some((_, main)) = worktree_of(&start) {
+        return main;
+    }
+    start
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .unwrap_or(&start)
+        .to_path_buf()
+}
+
 /// The room the map gives a session started in `start`, as `(room id in base32, link,
 /// passphrase)`: what the hook registers the session with (ADR-029 RB-2, RB-3). `None` when no
 /// `repo` is `start`.
@@ -307,7 +327,7 @@ pub fn note(
          - Use an existing room: put the pasted link in place of <link>, inside its single quotes:\n    \
          {bind}\n\
          Once it says bound, put this session in the room: {into}\n\
-         If Vox.app is running, they can also answer its room banner; Vox puts this session in \
+         If Vox.app is running, they can also answer its room dialog; Vox puts this session in \
          that room itself.\n\
          - If they say no: run {none}, and no session started here is asked again.\n"
     ))

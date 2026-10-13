@@ -30,7 +30,7 @@ use vox_core::node::paths::Paths;
 mod layout;
 
 #[path = "attach.rs"]
-mod attach;
+pub mod attach;
 
 #[path = "typed.rs"]
 pub mod typed;

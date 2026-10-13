@@ -117,6 +117,8 @@
 
 #![cfg(unix)]
 
+use thread_room::attach as unlock_staging;
+
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -156,7 +158,9 @@ const HARNESS_VARS: &[&str] = &[
 /// `vox` with the profile at `data`/`cfg` and none of [`HARNESS_VARS`].
 fn vox(data: &Path, cfg: &Path) -> Command {
     let mut c = Command::new(VOX);
-    c.env("VOX_DATA_DIR", data).env("VOX_CONFIG_DIR", cfg);
+    c.env("VOX_DATA_DIR", data)
+        .env("VOX_CONFIG_DIR", cfg)
+        .env("VOX_TEST_KEYCHAIN", crate::unlock_staging::keychain(data));
     for v in HARNESS_VARS {
         c.env_remove(v);
     }
@@ -406,14 +410,14 @@ fn a_hook_never_attaches_its_node_and_says_how_to() {
     let listed = node_list();
     println!("[proof] (7) the hook told the agent: {told:?}; `vox node list`: {listed:?}");
     assert!(
-        ok && told.contains("node default is not attached")
+        ok && told.contains("node default is Locked")
             && told.contains(
-                "ask the operator to run `vox node attach default` in a terminal outside this \
+                "ask the operator to run `vox node unlock default` in a terminal outside this \
                  session"
             )
             && listed.lines().any(|l| l.starts_with("default detached")),
         "PRODUCT: with node default detached, the hook must leave it detached and tell the agent \
-         the command for the operator, `vox node attach default` (ADR-028 K-13); it exited ok \
+         the command for the operator, `vox node unlock default` (ADR-028 K-13); it exited ok \
          {ok}, told the agent {told:?}, and `vox node list` says {listed:?}"
     );
     // The operator attaches it, outside the session: the next turn reads.
@@ -3253,14 +3257,7 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     let pass = pass.to_str().expect("APPARATUS: a UTF-8 path");
     for args in [
         vec!["node", "create", "personal", "--passphrase-file", pass],
-        vec![
-            "node",
-            "attach",
-            "personal",
-            "--no-remember",
-            "--passphrase-file",
-            pass,
-        ],
+        vec!["node", "attach", "personal", "--passphrase-file", pass],
         vec![
             "room",
             "join",
@@ -3526,10 +3523,13 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         joined.contains("personal (on this machine): reads you; you read it"),
         "PRODUCT: the next turn did not name its local reader and whom it reads: {joined}"
     );
+    let joined_json: serde_json::Value = serde_json::from_str(&joined).unwrap_or_default();
+    let joined_context = joined_json["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or(&joined);
     assert!(
-        joined.contains(&format!(
-            "{remote}: does not read you yet; you do not read it yet"
-        )),
+        joined_context.lines().any(|line| line.contains(&remote)
+            && line.contains(": does not read you yet; you do not read it yet")),
         "PRODUCT: the next turn omitted the remote member not reading it yet: {joined}"
     );
     let again = turn(mapped, &repo);
@@ -3596,6 +3596,90 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         );
     };
     let repo_s = repo.to_string_lossy().into_owned();
+    // RM-5 (#727): before a repository has a map entry, its root, subfolder and linked
+    // worktree raise one canonical ask. A terminal binding answers it for later sessions;
+    // moving the sessions already waiting is the app's RoomBind path, proven in FirstRunProof.
+    let unbound = tmp.path().join("unbound-repo");
+    let unbound_tree = tmp.path().join("unbound-worktree");
+    std::fs::create_dir_all(unbound.join("nested"))
+        .expect("APPARATUS: cannot stage an unmapped repository");
+    let unbound = std::fs::canonicalize(unbound).expect("APPARATUS: canonical unmapped repository");
+    let unbound_s = unbound.to_string_lossy().into_owned();
+    git(&["init", "-q", &unbound_s]);
+    git(&[
+        "-C",
+        &unbound_s,
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "first",
+    ]);
+    git(&[
+        "-C",
+        &unbound_s,
+        "worktree",
+        "add",
+        "-q",
+        &unbound_tree.to_string_lossy(),
+        "-b",
+        "other",
+    ]);
+    let waiting = [
+        ("72700001-aaaa-4bbb-8ccc-000000000001", unbound.clone()),
+        (
+            "72700002-aaaa-4bbb-8ccc-000000000002",
+            unbound.join("nested"),
+        ),
+        ("72700003-aaaa-4bbb-8ccc-000000000003", unbound_tree.clone()),
+    ];
+    for (id, dir) in &waiting {
+        let first = turn(id, dir);
+        assert!(
+            first.contains("isn't tied to a Vox room"),
+            "PRODUCT: an unmapped repository's first turn must say it has no room: {first}"
+        );
+    }
+    let asked = asks();
+    let repo_asks: Vec<_> = asked
+        .lines()
+        .filter(|l| {
+            l.starts_with("Vox needs you:")
+                && (l.contains("unbound-repo") || l.contains("unbound-worktree"))
+        })
+        .collect();
+    assert!(repo_asks.len() == 1 && repo_asks[0].contains(&format!("in {} has no room", unbound.display())),
+        "PRODUCT: root/subfolder/worktree must ask once for their main repository; status said:\n{asked}");
+    let bound = in_terminal(
+        &data,
+        &cfg,
+        &[
+            "room", "join", &link_home, "--node", "default", "--bind", &unbound_s,
+        ],
+        &[("passphrase", "channel passphrase\r")],
+    );
+    assert!(
+        bound.contains("vox: bound"),
+        "PRODUCT: one repository answer must bind it: {bound}"
+    );
+    for (index, (_, dir)) in waiting.iter().enumerate() {
+        let id = format!("7271000{index}-aaaa-4bbb-8ccc-000000000010");
+        let next = turn(&id, dir);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !open_in(&home, &id) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        assert!(!next.contains("isn't tied to a Vox room") && open_in(&home, &id),
+            "PRODUCT: one main-repository binding must put later root/subfolder/worktree sessions in its room: {id} {next}; sessions {:?}", sessions(&home));
+    }
+    assert!(
+        !asks().lines().any(|l| l.starts_with("Vox needs you:")
+            && (l.contains("unbound-repo") || l.contains("unbound-worktree"))),
+        "PRODUCT: the canonical repository ask remained after its answer: {}",
+        asks()
+    );
+    eprintln!("[proof] (2b/RM-5) root, nested folder and worktree asked once; one bind answered the ask and all three later sessions");
+
     let worktree = tmp.path().join("repo-worktree");
     git(&["init", "-q", &repo_s]);
     git(&[

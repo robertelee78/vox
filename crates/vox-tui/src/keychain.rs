@@ -1,6 +1,6 @@
 //! A kept node's identity passphrase in the macOS login keychain (ADR-028 K-10, ADR-014 M-6).
 //!
-//! Only the daemon touches it: it stores the passphrase when a client (`vox node attach`, `vox
+//! Only the daemon touches it: it stores the passphrase when a client (`vox node unlock`, `vox
 //! node create`, `vox setup`, `vox agent setup`, Vox.app) asks it to keep a node it has just
 //! attached with that passphrase (#666), reads it to attach the node again when it starts, and
 //! removes it when the node is detached by hand or its passphrase is forgotten. One generic-password item per node, under the
@@ -139,7 +139,7 @@ pub use mac::{forget, read, store};
 #[cfg(not(target_os = "macos"))]
 const NOT_HERE: &str = "this system has no Keychain Vox can store it in, so after the daemon \
                         restarts the node is to be attached again by hand; or keep it: attach it \
-                        with --keep and --passphrase-file naming the file that holds it";
+                        with `vox node unlock` and --passphrase-file naming the file that holds it";
 
 /// Store `passphrase` for `account`. Not on this platform.
 ///

@@ -30,6 +30,9 @@
 #![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
 
+#[path = "support/attach.rs"]
+mod unlock_staging;
+
 #[path = "support/optional_proof.rs"]
 mod optional_proof;
 optional_proof::not_run!(a_live_opencode_session_is_mirrored_and_driven);
@@ -104,7 +107,12 @@ fn vox_as(
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", &home)
         .env("LANG", "en_US.UTF-8")
-        .args(args)
+        .args(crate::unlock_staging::persistent_args(
+            data,
+            args,
+            &format!("the {node} node's identity passphrase"),
+        ))
+        .env("VOX_TEST_KEYCHAIN", crate::unlock_staging::keychain(data))
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", cfg)
         .env(

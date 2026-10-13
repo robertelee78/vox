@@ -391,7 +391,7 @@ fn attach(args: &NodeArgs, name: &NodeName, passphrase: zeroize::Zeroizing<Strin
         .and_then(|rt| rt.block_on(crate::client::attach_with(args, name, passphrase, true)));
     if let Err(e) = attached {
         println!(
-            "vox setup: node {name} is made, but not attached: {e}\n  attach it: vox node attach \
+            "vox setup: node {name} is made, but not attached: {e}\n  attach it: vox node unlock \
              {name}"
         );
     }

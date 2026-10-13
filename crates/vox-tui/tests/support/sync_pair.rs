@@ -28,7 +28,7 @@ use vox_core::node::ipc::{Frame, IpcClient, Request};
 mod layout;
 
 #[path = "attach.rs"]
-mod attach;
+pub mod attach;
 
 #[path = "typed.rs"]
 mod typed;
