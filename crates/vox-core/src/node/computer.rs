@@ -29,6 +29,8 @@ pub const PROTOCOL: u64 = 1;
 pub const INVITE_LIFETIME_MS: u64 = 600_000;
 const MAX_RECORDS: usize = 4096;
 const MAX_STATE: u64 = 64 * 1024 * 1024;
+const HISTORY_FULL: &str = "computer control history is full; no authority was discarded";
+const STORAGE_FAILED: &str = "computer policy storage failed; computer trust is suspended until storage is repaired and the daemon restarted";
 
 fn bad() -> Error {
     Error::Profile("computer management state is malformed; it was left unchanged")
@@ -678,9 +680,7 @@ impl State {
             return Err(Error::SignatureInvalid);
         }
         if self.history.len() >= MAX_RECORDS {
-            return Err(Error::Profile(
-                "computer control history is full; no authority was discarded",
-            ));
+            return Err(Error::Profile(HISTORY_FULL));
         }
         self.history.insert(r.id(), r);
         self.fold_history()
@@ -1034,6 +1034,7 @@ pub struct PolicyPlan {
 /// One persistent management identity and transaction domain, owned by its account daemon.
 pub struct Computer {
     path: PathBuf,
+    storage_failed: std::sync::atomic::AtomicBool,
     pub(crate) signer: Arc<dyn RootSigner + Send + Sync>,
     pub(crate) state: Mutex<State>,
     // Existing live room gates, weakly held: a durable policy change invalidates them before
@@ -1046,6 +1047,41 @@ impl Computer {
     /// Local durable policy revision.
     pub fn revision(&self) -> u64 {
         lock(&self.state).revision
+    }
+
+    /// A failed policy write invalidates current grants even when the durable revision did not
+    /// advance. Restart revalidates the retained state and its ability to be saved before attach.
+    pub(crate) fn policy_current(&self, applied: u64) -> bool {
+        let s = lock(&self.state);
+        s.genesis.is_none() || (self.storage_ready().is_ok() && s.revision == applied)
+    }
+
+    pub(crate) fn storage_ready(&self) -> Result<()> {
+        if self
+            .storage_failed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            Err(Error::Profile(STORAGE_FAILED))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn invalidate_reachers(&self) {
+        lock(&self.reachers).retain(|weak| {
+            if let Some(gate) = weak.upgrade() {
+                crate::node::tunnel::publish_reachers(&gate, Default::default());
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    fn storage_failure(&self) {
+        self.storage_failed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.invalidate_reachers();
     }
 
     /// A computer with no attached nodes still has an authenticated empty roster.
@@ -1154,6 +1190,7 @@ impl Computer {
         let Some(g) = &s.genesis else {
             return Ok(None);
         };
+        self.storage_ready()?;
         let mut covered = std::collections::BTreeSet::new();
         let mut owner = None;
         for r in s.history.values() {
@@ -1297,12 +1334,21 @@ impl Computer {
             if state.description.fingerprint()? != signer.fingerprint() {
                 return Err(bad());
             }
-            return Ok(Arc::new(Self {
+            if state.history.len() >= MAX_RECORDS {
+                return Err(Error::Profile(HISTORY_FULL));
+            }
+            let c = Arc::new(Self {
                 path,
+                storage_failed: std::sync::atomic::AtomicBool::new(false),
                 signer,
                 state: Mutex::new(state),
                 reachers: Mutex::new(Vec::new()),
-            }));
+            });
+            // Validate present storage before any endpoint or managed node can resume authority.
+            // If a failed prior write could not persist its fault, the retained signed state is
+            // still the only durable boundary; we never fabricate the missing transaction.
+            c.save(&lock(&c.state))?;
+            return Ok(c);
         }
         let root = SoftwareRootSigner::generate()?;
         let fpr =
@@ -1340,6 +1386,7 @@ impl Computer {
         };
         let c = Arc::new(Self {
             path,
+            storage_failed: std::sync::atomic::AtomicBool::new(false),
             signer: Arc::new(root),
             state: Mutex::new(state),
             reachers: Mutex::new(Vec::new()),
@@ -1369,19 +1416,23 @@ impl Computer {
     /// Commit a complete management transaction before publishing it to live authorization.
     pub(crate) fn change<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
         let mut held = lock(&self.state);
+        self.storage_ready()?;
         let mut next = held.clone();
-        let value = f(&mut next)?;
+        let value = match f(&mut next) {
+            Ok(value) => value,
+            Err(Error::Profile(HISTORY_FULL)) => {
+                self.storage_failure();
+                return Err(Error::Profile(HISTORY_FULL));
+            }
+            Err(error) => return Err(error),
+        };
         if held.body() != next.body() {
-            self.save(&next)?;
+            if let Err(error) = self.save(&next) {
+                self.storage_failure();
+                return Err(error);
+            }
             if held.revision != next.revision {
-                lock(&self.reachers).retain(|weak| {
-                    if let Some(gate) = weak.upgrade() {
-                        crate::node::tunnel::publish_reachers(&gate, Default::default());
-                        true
-                    } else {
-                        false
-                    }
-                });
+                self.invalidate_reachers();
             }
             *held = next;
         }
@@ -1402,7 +1453,9 @@ impl Computer {
         }
         crate::node::tunnel::publish_reachers(
             gate,
-            if state.genesis.is_none() || applied == state.revision {
+            if state.genesis.is_none()
+                || (self.storage_ready().is_ok() && applied == state.revision)
+            {
                 next
             } else {
                 Default::default()

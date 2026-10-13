@@ -52,6 +52,9 @@ impl Node {
         let Some(c) = &self.computer else {
             return Ok(());
         };
+        if c.grouped() {
+            c.storage_ready()?;
+        }
         if !c.grouped()
             || self
                 .computer_revision
@@ -108,6 +111,7 @@ impl Node {
         if !computer.grouped() {
             return Ok(Vec::new());
         }
+        computer.storage_ready()?;
         let revision = computer.revision();
         if self
             .computer_revision

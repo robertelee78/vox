@@ -3977,12 +3977,10 @@ impl NodeHandle {
     pub fn view(&self) -> NodeView {
         let mut view = self.view_rx.borrow().clone();
         if let Some(c) = &self.computer {
-            if c.grouped()
-                && self
-                    .computer_revision
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    != c.revision()
-            {
+            if !c.policy_current(
+                self.computer_revision
+                    .load(std::sync::atomic::Ordering::Acquire),
+            ) {
                 // Fail closed while the actor reconciles the newly durable policy.
                 view.drive.clear();
             }
@@ -5832,11 +5830,10 @@ impl Node {
         for attempt in 0..8 {
             self.apply_computer_keyring_at(0)?;
             if self.computer.as_ref().is_none_or(|c| {
-                !c.grouped()
-                    || c.revision()
-                        == self
-                            .computer_revision
-                            .load(std::sync::atomic::Ordering::Acquire)
+                c.policy_current(
+                    self.computer_revision
+                        .load(std::sync::atomic::Ordering::Acquire),
+                )
             }) {
                 break;
             }

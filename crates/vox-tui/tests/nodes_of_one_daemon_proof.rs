@@ -568,6 +568,7 @@ fn local_nodes_trust_each_other_without_a_prompt_and_remember_removals() {
         ring(names[1])
     );
     pair_computers(&a, &elsewhere, &fps, &remote, fresh, &fresh_fp, &room);
+    close_expired_pairing();
     drop(daemons);
 }
 
@@ -826,6 +827,110 @@ fn pair_computers(
         operation,
         "PRODUCT: retrying the completed approval created a different operation"
     );
+    // A policy write failure must stop previously working computer-derived authority, not leave
+    // the old receipt looking confirmed. Make only this scratch management directory unwritable.
+    a.make_node("storage-failure-node");
+    use std::os::unix::fs::PermissionsExt as _;
+    let management = a.data.join(".daemon/computer");
+    std::fs::set_permissions(&management, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let (ok, out, err) = a.run(
+        &[
+            "node",
+            "attach",
+            "storage-failure-node",
+            "--passphrase-file",
+            "-",
+        ],
+        PASS,
+    );
+    std::fs::set_permissions(&management, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        !ok,
+        "PRODUCT: a managed node attached although its new policy could not be saved: {out}{err}"
+    );
+    let failed = computer(a, &["status"]);
+    assert!(
+        failed["state"] == "quarantined"
+            && failed["problem"]
+                .as_str()
+                .is_some_and(|p| p.contains("storage")),
+        "PRODUCT: failed policy persistence retained a confirmed success: {failed}"
+    );
+    let (ok, out, err) = a.run(
+        &[
+            "room",
+            "post",
+            room,
+            "must not use stale computer grants",
+            "--node",
+            "agent-one",
+        ],
+        "",
+    );
+    assert!(!ok, "PRODUCT: previously attached node still posted under stale computer policy after a failed write: {out}{err}");
+}
+
+// A signed but incomplete ceremony can be closed after its authenticated deadline, without
+// claiming to withdraw the signature from an offline peer. A later old result cannot replace a
+// fresh local invitation. The existing release/test-knobs clock step avoids sleeping ten minutes.
+fn close_expired_pairing() {
+    let a = Account::new();
+    let b = Account::new();
+    let invitation = computer(&a, &["invite"]);
+    let link = invitation["invite_link"].as_str().unwrap();
+    let preview = computer(&b, &["pair", link, "--preview"]);
+    let op = preview["pairing"]["operation_id"].as_str().unwrap();
+    computer(&a, &["approve", op]);
+    assert!(
+        wait_until(Duration::from_secs(15), || computer(&b, &["status"])
+            ["pairing"]["approved_there"]
+            == true),
+        "APPARATUS: joiner has not yet received the signed one-sided approval"
+    );
+    for id in [op, invitation["invite_id"].as_str().unwrap()] {
+        let (ok, out, err) = a.run(&["computer", "cancel", id, "--json"], "");
+        assert!(!ok && err.contains("already signed"), "PRODUCT: live signed approval was described as withdrawn using its operation or saved invite ID: {out}{err}");
+    }
+    stop_pid(a.lock_pid().expect("APPARATUS: expiring scratch daemon"));
+    let stepped = Daemon::start(&a, &["--no-node"], &[("VOX_TEST_CLOCK_STEP_MS", "700000")]);
+    stepped.expect("its control socket", Duration::from_secs(30), |l| {
+        l.contains("control socket")
+    });
+    let closed = computer(&a, &["cancel", op]);
+    assert!(
+        closed["state"] == "individual"
+            && closed["problem"]
+                .as_str()
+                .is_some_and(|p| p.contains("does not remove trust there")),
+        "PRODUCT: closing an expired attempt did not explain its local-only outcome: {closed}"
+    );
+    let fresh = computer(&a, &["invite"]);
+    assert!(
+        fresh["invite_id"] != invitation["invite_id"] && fresh["pairing"].is_null(),
+        "PRODUCT: an expired one-sided approval stranded this computer: {fresh}"
+    );
+    computer(&b, &["approve", op]);
+    assert!(
+        wait_until(Duration::from_secs(15), || computer(&b, &["status"])
+            ["problem"]
+            .as_str()
+            .is_some_and(|p| p.contains("closed locally"))),
+        "PRODUCT: late completed intent was not refused after the other computer closed it"
+    );
+    let after = computer(&a, &["status"]);
+    assert!(
+        after["state"] == "waiting"
+            && after["invite_id"] == fresh["invite_id"]
+            && after["computers"].as_array().unwrap().is_empty(),
+        "PRODUCT: late old approval activated or replaced the fresh local pairing: {after}"
+    );
+    computer(&a, &["cancel", op]);
+    assert_eq!(
+        computer(&a, &["status"])["invite_id"],
+        fresh["invite_id"],
+        "PRODUCT: retrying close of the old attempt cancelled the new invitation"
+    );
+    drop(stepped);
 }
 
 /// CT-11 and CT-9: two zero-node installations on opposite address families pair through a

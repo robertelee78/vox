@@ -16,9 +16,12 @@ use std::time::Duration;
 
 const PAIR_DOMAIN: &[u8] = b"vox/computer-pair/v1\0";
 const PATIENCE: Duration = Duration::from_secs(15);
-const MAX_FRAME: usize = 1024 * 1024;
+// An exchange carries retained records from the same bounded transaction, never a smaller
+// unrelated limit that would strand an otherwise valid roster as nodes are added.
+const MAX_FRAME: usize = MAX_STATE as usize;
 fn now() -> u64 {
-    crate::time::system_millis_clock()()
+    static CLOCK: std::sync::OnceLock<crate::time::Clock> = std::sync::OnceLock::new();
+    CLOCK.get_or_init(crate::time::clock_with_test_skew)()
 }
 fn text_id(id: &Digest32) -> String {
     crate::node::link::b32_encode(id)
@@ -240,7 +243,7 @@ impl Management {
         let net = Arc::new(NodeNet::new(
             link.endpoint,
             presence,
-            crate::time::system_clock(),
+            crate::time::clock_with_test_skew(),
         ));
         let mut policy = crate::node::net::PeerPolicy::new();
         for a in anchors.nodes() {
@@ -433,22 +436,33 @@ impl Management {
     /// Cancel a current uncommitted operation. Signed completed enrollment is never undone here.
     pub fn cancel(&self, operation: &str) -> Result<ComputerStatus> {
         let id = crate::node::link::b32_decode(operation, "computer pairing operation")?;
-        self.computer.change(|s| {
+        let closed_expired = self.computer.change(|s| {
             if s.genesis.is_some() {
                 return Err(Error::Profile(
                     "this pairing is established; cancellation does not remove computer trust",
                 ));
             }
             if s.cancelled.contains_key(&id) {
-                return Ok(());
+                return Ok(false);
             }
-            let pending = s.pending.as_ref().is_some_and(|g| g.incarnation() == id);
+            let pending_nonce = s.pending.as_ref().and_then(|g| {
+                (g.incarnation() == id || s.invitations.iter().any(|i| i.id == id && i.nonce == g.nonce))
+                    .then_some(g.nonce)
+            });
+            let pending = pending_nonce.is_some();
             if s.invitations.iter().any(|i| i.id == id && i.cancelled) {
-                return Ok(());
+                return Ok(false);
+            }
+            let locally_approved = pending && s.pending.as_ref().is_some_and(|g| {
+                side(g, &self.computer.signer.fingerprint())
+                    .ok().is_some_and(|at| g.approvals[at].is_some())
+            });
+            if locally_approved && s.pending_expires > now() {
+                return Err(Error::Profile("this approval is already signed and the other computer may complete it; wait for its result or close the incomplete attempt after it expires"));
             }
             let mut found = pending;
             for i in &mut s.invitations {
-                if (i.id == id || pending) && !i.cancelled {
+                if (i.id == id || pending_nonce == Some(i.nonce)) && !i.cancelled {
                     found = true;
                     i.cancelled = true;
                 }
@@ -456,16 +470,21 @@ impl Management {
             if !found {
                 return Err(Error::Profile("that computer pairing is no longer current"));
             }
-            if let Some(g) = s.pending.take() {
-                s.cancelled.insert(g.incarnation(), g);
+            if pending {
+                if let Some(g) = s.pending.take() {
+                    s.cancelled.insert(g.incarnation(), g);
+                }
+                if let Some(link) = s.pair_link.take() {
+                    s.cancelled_links.push(link);
+                }
+                s.pending_expires = 0;
+                s.rosters.clear();
             }
-            if let Some(link) = s.pair_link.take() {
-                s.cancelled_links.push(link);
-            }
-            s.pending_expires = 0;
-            s.rosters.clear();
-            Ok(())
+            Ok(locally_approved)
         })?;
+        if closed_expired {
+            *lock(&self.problem) = Some("Expired attempt closed on this computer. Its signed intent remains retained and cannot activate here. The other computer may have recorded approval; this does not remove trust there.".into());
+        }
         self.status()
     }
     /// Authenticate a supplied code before exposing the peer as an approval candidate.
@@ -589,7 +608,8 @@ impl Management {
             })
             .transpose()?;
         let pending_nodes = lock(&self.pending_nodes).clone();
-        let state = if !s.quarantined.is_empty() {
+        let storage_failed = self.computer.storage_ready().is_err();
+        let state = if storage_failed || !s.quarantined.is_empty() {
             "quarantined"
         } else if s.genesis.is_some() {
             if s.receipts.len() == 2
@@ -624,7 +644,9 @@ impl Management {
                 .transpose()?
                 .unwrap_or_default(),
             pending_nodes,
-            problem: if !s.quarantined.is_empty() {
+            problem: if storage_failed {
+                Some(STORAGE_FAILED.into())
+            } else if !s.quarantined.is_empty() {
                 Some("Conflicting computer authority is quarantined; retained signed evidence requires operator recovery.".into())
             } else {
                 lock(&self.problem).clone()
@@ -1197,6 +1219,11 @@ fn activate(s: &mut State) -> Result<()> {
     let Some(g) = s.pending.as_ref() else {
         return Ok(());
     };
+    if s.cancelled.contains_key(&g.incarnation()) {
+        return Err(Error::Profile(
+            "this computer pairing attempt was closed locally; its retained intent cannot activate",
+        ));
+    }
     if g.approvals.iter().all(Option::is_some) && s.genesis.is_none() {
         g.verify(true)?;
         s.genesis = Some(g.clone());
@@ -1231,6 +1258,11 @@ fn merge(s: &mut State, bytes: &[u8], peer: Digest32) -> Result<()> {
     let mut d = Decoder::new(bytes);
     arity(&mut d, 3)?;
     let incoming = Genesis::decode(d.bytes()?)?;
+    if s.cancelled.contains_key(&incoming.incarnation()) {
+        return Err(Error::Profile(
+            "this computer pairing attempt was closed locally; its retained intent cannot activate",
+        ));
+    }
     let local = s.description.fingerprint()?;
     let current = s
         .genesis

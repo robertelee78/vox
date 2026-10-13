@@ -1049,8 +1049,7 @@ impl Witness {
             Only::Anyone => true,
             Only::Drive => {
                 self.computer.as_ref().is_none_or(|(computer, applied)| {
-                    !computer.grouped()
-                        || computer.revision() == applied.load(std::sync::atomic::Ordering::Acquire)
+                    computer.policy_current(applied.load(std::sync::atomic::Ordering::Acquire))
                 }) && member.is_some_and(|m| self.view.borrow().drive.contains(&m))
             }
             Only::Node(n) => member == Some(*n),
