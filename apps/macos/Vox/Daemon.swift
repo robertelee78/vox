@@ -170,7 +170,16 @@ enum Daemon {
     /// `vox daemon --detach`: started in the background, its output in `<data root>/.daemon/log`,
     /// returning once it answers. A failure is its own sentence (M-7).
     private static func startAsVoxDoes() async throws {
-        _ = try await command(["daemon", "--detach"], patience: patience)
+        do {
+            _ = try await command(["daemon", "--detach"], patience: patience)
+        } catch let error as VoxError {
+            // Only the startup command's refusal belongs to the can't-start card. Ordinary
+            // IPC failures and a command deadline retain their own classification.
+            if case .Failed = error, !versionMismatch(sentence(error)) {
+                throw StartFailure(kind: .startRefused, said: sentence(error))
+            }
+            throw error
+        }
     }
 
     /// The local Hello refusal includes both versions and this exact recovery command.
