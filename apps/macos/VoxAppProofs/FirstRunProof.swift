@@ -1180,10 +1180,50 @@ final class FirstRunProof: XCTestCase {
               until: { $0 == "node alice, Ready" })
         words(ui, Key.id("machine-bob"), timeout: 10, "the sidebar's foot must list bob and his state (G5)",
               until: { $0 == "bob Ready" })
+        try staged(vox, ["node", "lock", "bob"], env: voxEnv)
+        guard words(ui, Key.id("machine-bob"), timeout: 30,
+                    "the footer must show the other saved node Locked",
+                    until: { $0 == "bob Locked" }) != nil else { return }
+        tap(ui, Key.id("machine-attach-bob"), "Unlock Bob from his footer row")
+        guard present(ui, Key.id("attach-node-passphrase"), timeout: 20,
+                      "Bob's footer Unlock must open his passphrase sheet") else { return }
+        type(ui, Key.id("attach-node-passphrase"), "bob identity", "Bob's Unlock passphrase")
+        tap(ui, Key.id("attach-node"), "Unlock Bob")
+        guard words(ui, Key.id("machine-bob"), timeout: 30,
+                    "Bob must become Ready after footer Unlock",
+                    until: { $0 == "bob Ready" }) != nil else { return }
+        words(ui, Key.id("attached"), timeout: 10,
+              "unlocking Bob must preserve this window acting as Alice",
+              until: { $0 == "node alice, Ready" })
+        ui.menuBars.menuBarItems["View"].click()
+        tap(ui, Key.menuItem("Keyring"), "View > Keyring")
+        guard present(ui, Key.id("keyring-capability-bob"), timeout: 10,
+                      "View > Keyring must open the existing keyring view") else { return }
+        ui.menuBars.menuBarItems["View"].click()
+        tap(ui, Key.menuItem("Decision Record"), "View > Decision Record")
+        guard present(ui, Key.id("decisions-about"), timeout: 10,
+                      "View > Decision Record must open the existing decision record") else { return }
+        ui.menuBars.menuBarItems["View"].click()
+        tap(ui, Key.menuItem("Services"), "View > Services")
+        guard present(ui, Key.id("services-view"), timeout: 10,
+                      "View > Services must open the existing services view") else { return }
         let foot = locate(ui, Key.id("on-this-machine"))?.frame ?? .null
-        let lastAbove = locate(ui, Key.id("services"))?.frame ?? .null
-        XCTAssertTrue(!foot.isNull && !lastAbove.isNull && foot.minY > lastAbove.maxY,
-                      "PRODUCT: \"ON THIS MACHINE\" must be at the sidebar's foot, below Services (G5); it is at \(foot), Services at \(lastAbove)")
+        let roomListElement = ui.scrollViews.matching(identifier: "sidebar-rooms").firstMatch
+        let nodeScrollElement = ui.scrollViews.matching(identifier: "machine-nodes-scroll").firstMatch
+        guard roomListElement.exists, nodeScrollElement.exists else {
+            throw Product("the sidebar must expose its room list and machine-node scroll container")
+        }
+        let roomList = roomListElement.frame
+        let nodeScroll = nodeScrollElement.frame
+        let footer = locate(ui, Key.id("machine-footer"))?.frame ?? .null
+        let window = ui.windows.firstMatch.frame
+        guard [roomList, nodeScroll, foot, footer, window].allSatisfy({ frame in
+            frame.minX.isFinite && frame.minY.isFinite && frame.width.isFinite && frame.height.isFinite
+                && frame.width > 0 && frame.height > 0
+        }) else { throw Apparatus("the sidebar's public geometry was not finite and positive") }
+        XCTAssertTrue(foot.minY >= roomList.maxY && nodeScroll.minY >= foot.maxY
+                      && footer.minY >= nodeScroll.maxY && window.contains(foot) && window.contains(footer),
+                      "PRODUCT: the machine title and footer must remain visible below the room list, around the bounded node scroll; rooms=\(roomList), title=\(foot), rows=\(nodeScroll), footer=\(footer)")
 
         // CW-4 supersedes Sign Out: Forget keeps this window's identity and all data.
         ui.menuBars.menuBarItems["Node"].click()
@@ -1325,6 +1365,11 @@ final class FirstRunProof: XCTestCase {
         guard expectedMembers.allSatisfy({ roster.contains($0) }) else {
             throw Apparatus("inspector staging not achieved: Alice's public roster is missing remote members")
         }
+        // Nine saved identities exercise the machine footer independently of the remote roster.
+        for index in 2...9 {
+            try staged(vox, ["node", "create", "local-\(index)"],
+                       env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "alice identity"]) { $1 })
+        }
         try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
         try stager.write(Data("alice\n".utf8), to: config + "/app/node")
         // The widths start from the standard ones: the column keys, in the bundle under proof's
@@ -1348,6 +1393,32 @@ final class FirstRunProof: XCTestCase {
         present(ui, Key.id("inspector"), timeout: 10, "a room on screen must show its inspector")
         guard present(ui, Key.showing("9 members"), timeout: 20,
                       "the staged room must display its nine-member roster") else { return }
+
+        let machineScroll = ui.scrollViews.matching(identifier: "machine-nodes-scroll").firstMatch
+        let ninthNode = ui.descendants(matching: .any).matching(identifier: "machine-local-9").firstMatch
+        guard machineScroll.exists else { throw Product("the machine footer must expose its scrollable saved-node list") }
+        func machineFrameDrawn(_ frame: CGRect) -> Bool {
+            frame.minX.isFinite && frame.minY.isFinite && frame.width.isFinite && frame.height.isFinite
+                && frame.width > 0 && frame.height > 0
+        }
+        guard machineFrameDrawn(machineScroll.frame), machineFrameDrawn(ui.windows.firstMatch.frame) else {
+            throw Apparatus("the machine scroll/window geometry was not finite and positive")
+        }
+        let ninthUntil = Date().addingTimeInterval(15)
+        while Date() < ninthUntil && !(ninthNode.exists && machineFrameDrawn(ninthNode.frame)
+                                      && machineScroll.frame.contains(ninthNode.frame)) {
+            machineScroll.scroll(byDeltaX: 0, deltaY: -100)
+        }
+        XCTAssertTrue(ninthNode.exists && machineFrameDrawn(ninthNode.frame) && machineScroll.frame.contains(ninthNode.frame),
+                      "PRODUCT: the ninth saved node must be reachable by scrolling the machine footer")
+        let machineTitle = el(ui, Key.id("on-this-machine")).frame
+        let machineFooter = el(ui, Key.id("machine-footer")).frame
+        guard machineFrameDrawn(machineTitle), machineFrameDrawn(machineFooter),
+              machineFrameDrawn(ui.windows.firstMatch.frame) else {
+            throw Apparatus("the machine title/footer/window geometry was not finite and positive")
+        }
+        XCTAssertTrue(ui.windows.firstMatch.frame.contains(machineTitle) && ui.windows.firstMatch.frame.contains(machineFooter),
+                      "PRODUCT: scrolling saved nodes must keep the machine title and footer visible")
 
         func inspectorDivider() -> XCUIElement {
             ui.descendants(matching: .any).matching(identifier: "inspector-divider").firstMatch
@@ -1534,7 +1605,8 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("login-item-not-now"), "Not Now")
         present(ui, Key.id("attached"), timeout: 60,
                 "the app, its node chosen before, must open attached as alice")
-        tap(ui, Key.id("keyring"), "Keyring in the sidebar")
+        ui.menuBars.menuBarItems["View"].click()
+        tap(ui, Key.menuItem("Keyring"), "View > Keyring")
         // Asked first: whether the app may notify, in its own status bar.
         let statusNow = words(ui, Key.id("status"), timeout: 10,
                               "the window must have a status bar") ?? ""
@@ -2561,7 +2633,8 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("staging not achieved: Bob must be outside Alice's keyring before manual Trust; `vox trust list` said \(beforeBobTrust)")
         }
         print("[proof] before manual Trust, Alice's public trust list excludes Bob: \(beforeBobTrust.debugDescription)")
-        tap(ui, Key.id("keyring"), "Keyring in the sidebar")
+        ui.menuBars.menuBarItems["View"].click()
+        tap(ui, Key.menuItem("Keyring"), "View > Keyring")
         type(ui, Key.id("keyring-add-fingerprint"), bobFp, "the fingerprint field")
         words(ui, Key.id("keyring-add-alias"), timeout: 90,
               "Bob is connected but untrusted: the editable default must be bob without typing", until: { $0 == "bob" }, field: true)
@@ -2601,7 +2674,8 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("keyring-replace-no"), "Keep Waiting Change")
 
         // The passphrase, typed where bob's change waits, makes bob's change only.
-        tap(ui, Key.id("keyring"), "Keyring in the sidebar")
+        ui.menuBars.menuBarItems["View"].click()
+        tap(ui, Key.menuItem("Keyring"), "View > Keyring")
         type(ui, Key.id("keyring-passphrase"), "alice identity", "the keyring's passphrase field")
         tap(ui, Key.id("keyring-passphrase-continue"), "Trust (with the passphrase)")
         let listUntil = Date().addingTimeInterval(30)
@@ -2641,7 +2715,8 @@ final class FirstRunProof: XCTestCase {
         type(ui, Key.id("offer-alias"), "local-carol", "the explicit local override")
         tap(ui, Key.id("offer-accept"), "Trust Carol as local-carol")
         keyringPassphraseIfAsked(ui) { self.run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out.contains(carolFp) }
-        tap(ui, Key.id("keyring"), "the keyring after accepting Carol")
+        ui.menuBars.menuBarItems["View"].click()
+        tap(ui, Key.menuItem("Keyring"), "the keyring after accepting Carol")
         words(ui, Key.id("keyring-capability-local-carol"), timeout: 30,
               "the local override is accepted with read", until: { $0 == "read" })
         try staged(vox, ["trust", "add", "--node", "carol", aliceFp, "--name", "alice",
@@ -2671,7 +2746,8 @@ final class FirstRunProof: XCTestCase {
             XCTAssertEqual(NSPasteboard.general.string(forType: .string), "\(remoteName) <\(carolFp)>",
                            "PRODUCT: a copied presented identity must carry the remote self-name and the unchanged full fingerprint")
             tap(ui, Key.id("card-close"), "Close Carol's card")
-            tap(ui, Key.id("keyring"), "the keyring after remote rename/reconnect/rejoin")
+            ui.menuBars.menuBarItems["View"].click()
+            tap(ui, Key.menuItem("Keyring"), "the keyring after remote rename/reconnect/rejoin")
             words(ui, Key.id("keyring-capability-local-carol"), timeout: 30,
                   "remote metadata must leave the existing \(capability) grant unchanged", until: { $0 == capability })
             let ring = run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out
@@ -3112,7 +3188,8 @@ final class FirstRunProof: XCTestCase {
               "bob joined and was trusted while the room was on screen: its inspector must list him in alice's keyring",
               until: { $0.hasPrefix("bob, trusted both ways") || $0.hasPrefix("bob, waiting for the other side") })
         // Off the room, so a message to alice is unread: a room on screen is read.
-        tap(ui, Key.id("keyring"), "Keyring in the sidebar")
+        ui.menuBars.menuBarItems["View"].click()
+        tap(ui, Key.menuItem("Keyring"), "View > Keyring")
         try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "NEEDS-YOU"],
                    env: bobSession)
         // One list of rooms, no headings (the decider, v0.4.3): mission's row says it needs
@@ -3925,7 +4002,8 @@ final class FirstRunProof: XCTestCase {
         try staged(vox, ["node", "create", "carol"],
                    env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "carol identity"]) { $1 })
         let carolFp = try line(staged(vox, ["id", "--node", "carol"], env: voxEnv)) { $0.count == 52 }
-        tap(ui, Key.id("keyring"), "Keyring in the sidebar")
+        ui.menuBars.menuBarItems["View"].click()
+        tap(ui, Key.menuItem("Keyring"), "View > Keyring")
         let addFp = Key.id("keyring-add-fingerprint")
         present(ui, addFp, timeout: 10, "the keyring view must offer to add a node")
         // Pasted from Edit › Paste, as the field invites ("paste or type", v0.4.1).
@@ -4152,7 +4230,8 @@ final class FirstRunProof: XCTestCase {
         // its time of day, and the whole date and time to VoiceOver; the unread line sits above it,
         // and today's divider above that. Times are the ones the node keeps, in milliseconds. It
         // stages what it unread579 itself, so it runs from step 6 too (VOX_PROOF_FROM=6).
-        tap(ui, Key.id("keyring"), "Keyring in the sidebar")
+        ui.menuBars.menuBarItems["View"].click()
+        tap(ui, Key.menuItem("Keyring"), "View > Keyring")
         try staged(vox, ["room", "post", "--node", "bob", room, "UNREAD-579"], env: voxEnv)
         var unread579: (id: String, millis: UInt64)?
         let unread579Until = Date().addingTimeInterval(30)
@@ -4723,7 +4802,8 @@ final class FirstRunProof: XCTestCase {
         guard refusedJoin.status != 0 else {
             throw Apparatus("carol's join with a wrong passphrase was not refused: \(refusedJoin.out)")
         }
-        tap(ui, Key.id("decisions"), "Decision record in the sidebar")
+        ui.menuBars.menuBarItems["View"].click()
+        tap(ui, Key.menuItem("Decision Record"), "View > Decision Record")
         let topWords = words(ui, Key.id("decision-0"), timeout: 30,
                              "carol's refused join must be at the top of the decision record",
                              until: { $0.hasPrefix("refused: to join a room") }) ?? ""
@@ -4753,7 +4833,8 @@ final class FirstRunProof: XCTestCase {
         guard let live = Line(bobBound), live.roundTrip("BEFORE-UNTRUST\n") == "BEFORE-UNTRUST\n" else {
             throw Apparatus("bob's forward at \(bobBound) carried nothing before the untrust")
         }
-        tap(ui, Key.id("keyring"), "Keyring in the sidebar")
+        ui.menuBars.menuBarItems["View"].click()
+        tap(ui, Key.menuItem("Keyring"), "View > Keyring")
         tap(ui, Key.id("keyring-remove-bob"), "Remove… on bob", premise: trusted(vox, voxEnv, bobFp, "bob"))
         words(ui, Key.id("keyring-remove-effect"), timeout: 10,
               "removing bob must say what removing does first",
@@ -5006,7 +5087,8 @@ final class FirstRunProof: XCTestCase {
         print("[proof] dave's row: \(rowSaid); card: \(directions) → \(cardSaid)")
         // (15f, G2) The keyring's card for dave: each direction, the room it covers, and what
         // removing him would change, behind a disclosure.
-        tap(ui, Key.id("keyring"), "Keyring in the sidebar")
+        ui.menuBars.menuBarItems["View"].click()
+        tap(ui, Key.menuItem("Keyring"), "View > Keyring")
         tap(ui, Key.id("keyring-row-dave"), "dave's keyring entry", premise: trusted(vox, voxEnv, daveFp, "dave"))
         let ringHead = words(ui, Key.id("keyring-card-heading"), timeout: 15,
                              "dave's keyring card must head \"dave ⇄ you\": he trusts alice too",
