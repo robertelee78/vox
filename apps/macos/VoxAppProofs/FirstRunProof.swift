@@ -3007,6 +3007,7 @@ final class FirstRunProof: XCTestCase {
         if windowReadable(ui) {
             if let body = textSaying(ui, "NEEDS-YOU") {
                 try stageTimelineCopy(ui, body, "bob's message NEEDS-YOU")
+                body.click()
                 let copied = selectAndCopy(ui, body, "bob's message NEEDS-YOU")
                 if copied != "NEEDS-YOU" {
                     keepTree(ui, "message copy did not put NEEDS-YOU on the pasteboard")
