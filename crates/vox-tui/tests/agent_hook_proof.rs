@@ -3660,8 +3660,15 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     let create_dir = tmp.path().join("create repo & 'co!");
     std::fs::create_dir_all(&create_dir).expect("APPARATUS: cannot make create repository");
     let create_dir = std::fs::canonicalize(&create_dir).unwrap_or(create_dir);
-    let create_notice =
-        turn("5f5f5f5f-aaaa-4bbb-8ccc-0000000005f1", &create_dir).replace("\\n", "\n");
+    let create_hook = turn("5f5f5f5f-aaaa-4bbb-8ccc-0000000005f1", &create_dir);
+    let create_context: serde_json::Value =
+        serde_json::from_str(&create_hook).unwrap_or_else(|e| {
+            panic!("PRODUCT: the hook's Claude output is malformed: {e}: {create_hook}")
+        });
+    let create_notice = create_context["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
     let command_for = |verb: &str| {
         create_notice
             .lines()
