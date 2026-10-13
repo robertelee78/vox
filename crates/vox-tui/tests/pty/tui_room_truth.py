@@ -1078,7 +1078,14 @@ try:
                 and "spare  detached" in s and "default  attached" in s
                 and bool(s) and s[0] == "node default · attached")
     tui.until(regions, 30, 1)
-    claim("regions", regions(), f"sidebar: {side()!r}")
+    before_ctrl_n = "\n".join(tui.display())
+    if "Rooms (Enter: open" not in before_ctrl_n:
+        apparatus("removed-next staging needs the real room list on screen with an addressed room")
+    tui.key("\x0e", 1)  # Ctrl-N must not jump away from this room list.
+    after_ctrl_n = "\n".join(tui.display())
+    claim("regions", regions() and "Rooms (Enter: open" in after_ctrl_n
+          and "Ctrl-N: next room" not in after_ctrl_n,
+          f"room list must retain marks/counts without a next-room control or Ctrl-N jump: {side()!r}; screen: {after_ctrl_n!r}")
 
     stage("newcomer")
     # Frank joins through Alice's link while Bob's TUI is open. Bob trusts Alice; nobody trusts Frank
