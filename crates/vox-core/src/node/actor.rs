@@ -5148,7 +5148,11 @@ impl Node {
                 received = cmd_rx.recv() => {
                     let Some((command, reply)) = received else { break };
                     let shutdown = matches!(command, NodeCommand::Shutdown);
-                    if !shutdown && self.apply_computer_keyring().await.is_err() {
+                    // Creating/unlocking the identity must reach start_network(), which applies
+                    // computer policy before registering an endpoint. A locked store cannot be
+                    // reconciled before Unlock has opened it.
+                    let opens_identity = matches!(command, NodeCommand::Unlock { .. } | NodeCommand::CreateIdentity { .. });
+                    if !shutdown && !opens_identity && self.apply_computer_keyring().await.is_err() {
                         let _=reply.send(Outcome::Failed(Fault::Storage));
                         continue;
                     }
