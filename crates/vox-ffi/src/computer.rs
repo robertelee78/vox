@@ -45,6 +45,22 @@ impl From<core::PairingPreview> for PairingPreview {
         }
     }
 }
+/// Application receipt for one member at the exact current group frontier.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ComputerApplication {
+    /// Enrolled installation.
+    pub computer: ComputerIdentity,
+    /// Verified complete application; false means pending, not necessarily offline.
+    pub confirmed: bool,
+}
+impl From<core::ComputerApplication> for ComputerApplication {
+    fn from(v: core::ComputerApplication) -> Self {
+        Self {
+            computer: v.computer.into(),
+            confirmed: v.confirmed,
+        }
+    }
+}
 /// Public daemon-wide pairing state, independent of any selected chat node.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ComputerStatus {
@@ -64,6 +80,8 @@ pub struct ComputerStatus {
     pub pairing: Option<PairingPreview>,
     /// Explicitly enrolled installations.
     pub computers: Vec<ComputerIdentity>,
+    /// Each enrolled member’s exact-frontier application receipt.
+    pub applications: Vec<ComputerApplication>,
     /// Nodes still requiring normal attach or policy reconciliation.
     pub pending_nodes: Vec<String>,
     /// Reachability or protocol problem; never evidence of success.
@@ -80,6 +98,7 @@ impl From<core::ComputerStatus> for ComputerStatus {
             invite_expires_ms: v.invite_expires_ms,
             pairing: v.pairing.map(Into::into),
             computers: v.computers.into_iter().map(Into::into).collect(),
+            applications: v.applications.into_iter().map(Into::into).collect(),
             pending_nodes: v.pending_nodes,
             problem: v.problem,
         }

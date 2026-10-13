@@ -872,11 +872,10 @@ fn pair_computers(
             && computer(b, &["status"])["state"] == "confirmed"),
         "PRODUCT: paired computer confirmation did not recover after restart"
     );
-    assert_eq!(
-        computer(a, &["approve", operation])["pairing"]["operation_id"],
-        operation,
-        "PRODUCT: retrying the completed approval created a different operation"
-    );
+    let retried = computer(a, &["approve", operation]);
+    assert!(retried["state"]=="confirmed" && retried["pairing"].is_null(),
+        "PRODUCT: retrying the completed approval reopened a ceremony or lost confirmation: {retried}");
+    enroll_third(a, b, local, remote, late, late_fp, &other_agent, room);
     // A policy write failure must stop previously working computer-derived authority, not leave
     // the old receipt looking confirmed. Make only this scratch management directory unwritable.
     a.make_node("storage-failure-node");
@@ -918,6 +917,200 @@ fn pair_computers(
         "",
     );
     assert!(!ok, "PRODUCT: previously attached node still posted under stale computer policy after a failed write: {out}{err}");
+}
+
+// #800 extends this same trust journey through a non-founding member. The first computer is
+// deliberately offline for enrollment; its eventual application must come from signed history.
+#[allow(clippy::too_many_arguments)]
+fn enroll_third(
+    a: &Account,
+    b: &Account,
+    local: &[String],
+    remote: &str,
+    late: &str,
+    late_fp: &str,
+    other_agent: &str,
+    room: &str,
+) {
+    let c = Account::new();
+    let beast = c.make_node("codex-beast");
+    let helper = c.make_node("opencode-beast");
+    for name in ["codex-beast", "opencode-beast"] {
+        let (ok, out, err) = c.run(&["node", "attach", name, "--passphrase-file", "-"], PASS);
+        assert!(
+            ok,
+            "APPARATUS: attach the third installation's nodes: {out}{err}"
+        );
+    }
+    let a_id = computer(a, &["status"])["this_computer"]["fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let b_id = computer(b, &["status"])["this_computer"]["fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let c_id = computer(&c, &["status"])["this_computer"]["fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let pid = a
+        .lock_pid()
+        .expect("APPARATUS: founder daemon before offline enrollment");
+    stop_pid(pid);
+    assert!(!alive(pid), "APPARATUS: founder daemon did not stop");
+    let invite = computer(b, &["invite"]);
+    let link = invite["invite_link"]
+        .as_str()
+        .expect("PRODUCT: enrolled member did not offer Add Computer");
+    let preview = computer(&c, &["pair", link, "--preview"]);
+    let op = preview["pairing"]["operation_id"].as_str().unwrap();
+    assert!(preview["computers"].as_array().unwrap().is_empty(),"PRODUCT: receiving an existing group's history enrolled the third computer before approval: {preview}");
+    computer(&c, &["approve", op]);
+    computer(b, &["approve", op]);
+    let ring = |account: &Account, name: &str| {
+        let (ok, out, err) = account.run(&["trust", "list", "--node", name], "");
+        assert!(
+            ok,
+            "PRODUCT: group member {name}'s keyring unavailable: {out}{err}"
+        );
+        out
+    };
+    let has = |shown: &str, fp: &str, drive: bool| {
+        shown
+            .lines()
+            .any(|line| line.contains(fp) && line.contains("read + drive") == drive)
+    };
+    assert!(wait_until(Duration::from_secs(60),|| {
+        let bs=computer(b,&["status"]);let cs=computer(&c,&["status"]);
+        bs["computers"].as_array().is_some_and(|v|v.len()==3)&&cs["computers"].as_array().is_some_and(|v|v.len()==3)
+            &&has(&ring(b,"remote-agent"),&beast,false)&&has(&ring(&c,"codex-beast"),remote,true)&&has(&ring(&c,"codex-beast"),&local[0],true)
+    }),"PRODUCT: third computer did not join the existing group through its non-founding member while the founder was offline: {}; {}",computer(b,&["status"]),computer(&c,&["status"]));
+    let pending = computer(b, &["status"]);
+    assert!(
+        pending["state"] != "confirmed"
+            && pending["applications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["computer"]["fingerprint"] == a_id && v["confirmed"] == false),
+        "PRODUCT: unreachable founder was reported as having applied the new enrollment: {pending}"
+    );
+    assert!(
+        c.run(&["room", "list", "--node", "codex-beast"], "")
+            .1
+            .trim()
+            == "no rooms",
+        "PRODUCT: group enrollment admitted the third computer to a room"
+    );
+    // Stop the sponsor too. Catch-up must be possible from the new equal member's authenticated
+    // retained history, not an online founder/sponsor vote or a second pairing ceremony.
+    let pid = b.lock_pid().expect("APPARATUS: sponsor daemon");
+    stop_pid(pid);
+    assert!(!alive(pid), "APPARATUS: sponsor daemon did not stop");
+    for name in ["personal", "agent-one", "agent-two", "agent-three", late] {
+        let (ok, out, err) = a.run(&["node", "attach", name, "--passphrase-file", "-"], PASS);
+        assert!(
+            ok,
+            "PRODUCT: original member could not resume for group catch-up: {out}{err}"
+        );
+    }
+    assert!(wait_until(Duration::from_secs(60),||has(&ring(a,"agent-one"),&beast,false)&&has(&ring(a,"agent-one"),&helper,false)),"PRODUCT: the third computer's signed enrollment did not propagate to the original member without the sponsor: {}",ring(a,"agent-one"));
+    for (account, name, personal) in [
+        (a, "personal", true),
+        (a, "agent-one", false),
+        (&c, "codex-beast", false),
+        (&c, "opencode-beast", false),
+    ] {
+        let own = if name == "personal" {
+            local[0].as_str()
+        } else if name == "agent-one" {
+            local[1].as_str()
+        } else if name == "codex-beast" {
+            beast.as_str()
+        } else {
+            helper.as_str()
+        };
+        let peers = [
+            (local[0].as_str(), true),
+            (local[1].as_str(), false),
+            (late_fp, false),
+            (remote, true),
+            (other_agent, false),
+            (beast.as_str(), false),
+            (helper.as_str(), false),
+        ];
+        let shown = ring(account, name);
+        for (fp, peer_personal) in peers {
+            if fp != own {
+                assert!(has(&shown,fp,!personal&&peer_personal),"PRODUCT: propagated group policy for {name} has wrong read/drive for {fp}: {shown}");
+            }
+        }
+    }
+    let (ok, link, err) = a.run(&["room", "link", room, "--node", "personal"], "");
+    assert!(
+        ok,
+        "APPARATUS: existing room invitation after restart: {err}"
+    );
+    let link = link.lines().find(|s| s.starts_with("vox://")).unwrap();
+    let (ok, out, err) = c.run(
+        &[
+            "room",
+            "join",
+            link,
+            "--node",
+            "codex-beast",
+            "--passphrase-file",
+            "-",
+        ],
+        ROOM_PASS,
+    );
+    assert!(ok,"PRODUCT: third computer could not independently join the room after group enrollment: {out}{err}");
+    let text = "third computer communicates while its enrolling sponsor is offline";
+    let (ok, out, err) = c.run(&["room", "post", room, text, "--node", "codex-beast"], "");
+    assert!(
+        ok,
+        "PRODUCT: third enrolled computer could not post without sponsor: {out}{err}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(30), || a
+            .run(&["room", "read", room, "--node", "agent-one"], "")
+            .1
+            .contains(text)),
+        "PRODUCT: original member could not read the third computer without its sponsor"
+    );
+    for name in ["remote", "remote-agent"] {
+        let (ok, out, err) = b.run(&["node", "attach", name, "--passphrase-file", "-"], PASS);
+        assert!(ok, "PRODUCT: sponsor restart failed: {out}{err}");
+    }
+    assert!(
+        wait_until(Duration::from_secs(60), || [a, b, &c].into_iter().all(
+            |account| {
+                let st = computer(account, &["status"]);
+                st["state"] == "confirmed"
+                    && st["applications"]
+                        .as_array()
+                        .is_some_and(|v| v.len() == 3 && v.iter().all(|v| v["confirmed"] == true))
+            }
+        )),
+        "PRODUCT: group confirmations did not converge after all three reconnected: {}; {}; {}",
+        computer(a, &["status"]),
+        computer(b, &["status"]),
+        computer(&c, &["status"])
+    );
+    for account in [a, b, &c] {
+        let st = computer(account, &["status"]);
+        for id in [&a_id, &b_id, &c_id] {
+            assert!(
+                st["computers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v["fingerprint"] == *id),
+                "PRODUCT: group identity changed during catch-up: {st}"
+            );
+        }
+    }
 }
 
 // A signed but incomplete ceremony can be closed after its authenticated deadline, without

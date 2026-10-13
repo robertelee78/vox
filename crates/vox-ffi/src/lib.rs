@@ -43,7 +43,7 @@ pub use client::{
     RoomGroup, RoomLink, RoomMessage, RoomServices, RoomSummary, SharedService, TrustedNode,
     UnreadLevel, VoxClient,
 };
-pub use computer::{ComputerIdentity, ComputerStatus, PairingPreview};
+pub use computer::{ComputerApplication, ComputerIdentity, ComputerStatus, PairingPreview};
 
 /// Anything that went wrong, with the core's reason.
 #[derive(Debug, thiserror::Error, uniffi::Error)]

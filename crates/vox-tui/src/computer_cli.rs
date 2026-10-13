@@ -182,6 +182,18 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
     if let Some(id) = &status.invite_id {
         println!("Cancel: vox computer cancel {id}");
     }
+    for application in &status.applications {
+        println!(
+            "{}  {}  {}",
+            application.computer.name,
+            application.computer.fingerprint,
+            if application.confirmed {
+                "confirmed"
+            } else {
+                "pending application"
+            }
+        );
+    }
     for pending in &status.pending_nodes {
         println!("pending: {pending}");
     }
