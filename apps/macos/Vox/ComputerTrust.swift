@@ -231,7 +231,9 @@ struct ComputerTrustView: View {
             }
             Button("Cancel", role: .cancel) { bindingChoice = nil }
         } message: { choice in
-            Text("Node: \(choice.binding.name)\n\(choice.binding.node)\nPrevious manager: \(choice.binding.computer)\n"
+            Text(choice.binding.action == "recover-group"
+                 ? "Abandon this removed group here and purge its covered grants before starting a fresh pairing? Signed history and the retired group identity remain recorded so old updates cannot restore it. This does not remove trust or erase data on unreachable computers."
+                 : "Node: \(choice.binding.name)\n\(choice.binding.node)\nPrevious manager: \(choice.binding.computer)\n"
                  + (choice.binding.action == "release"
                     ? "Release only to \(choice.destination). This computer relinquishes the binding and automatic policy for this node. The destination must approve and unlock it."
                     : "Approve \(choice.binding.action) to this computer using the retained signed evidence. No trust is applied until the node signs with its unlocked local vault. If its key was compromised, create a fresh node instead."))
@@ -243,6 +245,10 @@ struct ComputerTrustView: View {
         if status.state == "removed" {
             Text("This computer was removed. Its automatic group trust is being revoked. To rejoin, use a new pairing code from a remaining member and approve again.")
                 .accessibilityIdentifier("computer-trust-removed")
+            Button("Abandon This Group Locally…") {
+                bindingChoice = BindingChoice(binding: ComputerBindingAction(node: "group", name: "This group", computer: status.thisComputer.fingerprint, action: "recover-group"), destination: "", frontier: status.frontier)
+            }
+            .disabled(model.busy || !model.reachable)
         } else if status.state == "quarantined" {
             Text("Computer trust is suspended.")
                 .accessibilityIdentifier("computer-trust-quarantined")

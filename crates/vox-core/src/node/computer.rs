@@ -861,6 +861,7 @@ pub(crate) struct State {
     selected: Option<Digest32>,
     selected_name: String,
     binding_approvals: BTreeMap<Digest32, BindingApproval>,
+    retired_groups: BTreeMap<Digest32, Enrollment>,
 }
 impl State {
     fn group(&self) -> Option<Digest32> {
@@ -890,6 +891,24 @@ impl State {
                     })
             })
     }
+    fn was_enrolled(&self, peer: &Digest32) -> bool {
+        if self.genesis.as_ref().is_some_and(|g| {
+            g.computers
+                .iter()
+                .any(|c| c.fingerprint().ok() == Some(*peer))
+        }) {
+            return true;
+        }
+        self.derive().is_ok_and(|authority| {
+            authority.accepted.iter().any(|id| {
+                self.history[id]
+                    .event()
+                    .ok()
+                    .and_then(|e| e.addition)
+                    .is_some_and(|a| a.computers[1].fingerprint().ok() == Some(*peer))
+            })
+        })
+    }
     fn descriptions(&self) -> BTreeMap<Digest32, Description> {
         self.members
             .values()
@@ -901,11 +920,26 @@ impl State {
             })
             .collect()
     }
+    fn accepted_history(&self) -> Result<BTreeSet<Digest32>> {
+        let mut accepted = if self.genesis.is_some() {
+            self.derive()?.accepted
+        } else {
+            BTreeSet::new()
+        };
+        for genesis in self.retired_groups.values() {
+            let mut retired = self.clone();
+            retired.genesis = Some(genesis.clone());
+            retired.group_genesis = None;
+            retired.pending = None;
+            accepted.extend(retired.derive()?.accepted);
+        }
+        Ok(accepted)
+    }
     fn terminal_bindings(&self) -> Result<Vec<(Digest32, Binding)>> {
         let authority = self.derive()?;
         let mut bindings = BTreeMap::new();
         let mut previous = BTreeSet::new();
-        for id in &authority.accepted {
+        for id in &authority.binding_records {
             let event = self.history[id].event()?;
             for binding in event.bindings {
                 if let Some(approval) = binding.approval()? {
@@ -1157,11 +1191,44 @@ impl State {
             .values()
             .filter_map(|g| g.computer.fingerprint().ok())
             .collect();
+        let all_grants: EventGrants = initial
+            .into_iter()
+            .chain(
+                events
+                    .iter()
+                    .filter(|(id, _)| accepted.contains(*id))
+                    .filter_map(|(id, e)| {
+                        e.addition.as_ref().map(|add| {
+                            (
+                                add.grants[1],
+                                Grant {
+                                    computer: add.computers[1].clone(),
+                                    sponsor: Some(e.grant),
+                                    event: *id,
+                                },
+                            )
+                        })
+                    }),
+            )
+            .collect();
+        let positive = |id: &Digest32| -> Result<bool> {
+            let remaining: BTreeSet<_> = accepted
+                .iter()
+                .filter(|other| !ancestry[*other].contains(id))
+                .copied()
+                .collect();
+            Ok(
+                exclude_retired(&events, &ancestry, &remaining, all_grants.clone())?
+                    .0
+                    .iter()
+                    .any(|(grant, _)| *grant == events[id].grant),
+            )
+        };
         let mut rosters = BTreeMap::new();
         let mut reaches = BTreeMap::new();
         for id in &accepted {
             let e = &events[id];
-            if !active.contains(&e.author) {
+            if !active.contains(&e.author) || !positive(id)? {
                 continue;
             }
             if e.roster_revision > 0
@@ -1182,36 +1249,9 @@ impl State {
         let mut bindings: BTreeMap<Digest32, (Digest32, Digest32, Binding)> = BTreeMap::new();
         let mut successors: BTreeMap<(Digest32, Digest32), BTreeSet<Digest32>> = BTreeMap::new();
         let mut releases: BTreeMap<Digest32, Vec<(Digest32, Release)>> = BTreeMap::new();
-        let all_grants: EventGrants = initial
-            .into_iter()
-            .chain(events.iter().filter_map(|(id, e)| {
-                e.addition.as_ref().map(|add| {
-                    (
-                        add.grants[1],
-                        Grant {
-                            computer: add.computers[1].clone(),
-                            sponsor: Some(e.grant),
-                            event: *id,
-                        },
-                    )
-                })
-            }))
-            .collect();
-        let positive = |id: &Digest32| -> Result<bool> {
-            let remaining: BTreeSet<_> = accepted
-                .iter()
-                .filter(|other| !ancestry[*other].contains(id))
-                .copied()
-                .collect();
-            Ok(
-                exclude_retired(&events, &ancestry, &remaining, all_grants.clone())?
-                    .0
-                    .iter()
-                    .any(|(grant, _)| *grant == events[id].grant),
-            )
-        };
         let mut released = BTreeSet::new();
         let mut valid_releases = BTreeSet::new();
+        let mut binding_records = BTreeSet::new();
         for id in &accepted {
             let event = &events[id];
             if let Some(release) = &event.release {
@@ -1224,6 +1264,10 @@ impl State {
                         .push((*id, release.clone()));
                 }
             }
+            if !positive(id)? {
+                continue;
+            }
+            binding_records.insert(*id);
             for binding in &event.bindings {
                 let node = binding.verify(&event.author, &group)?;
                 let approval = binding.approval()?;
@@ -1282,96 +1326,109 @@ impl State {
             accepted,
             binding_owners,
             valid_releases,
+            binding_records,
         })
     }
     fn fold_history(&mut self) -> Result<()> {
         let next = self.derive()?;
-        if self.members != next.members
+        let first_activation = self.genesis.as_ref().is_some_and(|g| {
+            g.grants.iter().any(|grant| {
+                !self
+                    .intervals
+                    .values()
+                    .flatten()
+                    .any(|interval| interval.grants.contains(grant))
+            })
+        });
+        if first_activation
+            || self.members != next.members
             || self.rosters != next.rosters
             || self.quarantined != next.quarantined
             || self.reaches != next.reaches
         {
             let revision = self.revision.checked_add(1).ok_or_else(bad)?;
-            let mut active: BTreeMap<Digest32, BTreeSet<Digest32>> = BTreeMap::new();
-            for (id, grant) in &next.members {
-                let manager = grant.computer.fingerprint()?;
-                if !next.quarantined.contains(&manager) {
-                    active.entry(manager).or_default().insert(*id);
-                }
-            }
-            // A retirement boundary is local and immutable. Replayed or concurrent negative
-            // evidence cannot move it over a later deliberate individual trust decision.
-            for (manager, intervals) in &mut self.intervals {
-                if let Some(last) = intervals.last_mut().filter(|i| i.retirement.is_none()) {
-                    if let Some(grants) = active.get(manager) {
-                        last.grants.extend(grants.iter().copied());
-                    } else {
-                        last.retirement = Some(revision);
+            if self.genesis.is_some() {
+                let mut active: BTreeMap<Digest32, BTreeSet<Digest32>> = BTreeMap::new();
+                for (id, grant) in &next.members {
+                    let manager = grant.computer.fingerprint()?;
+                    if !next.quarantined.contains(&manager) {
+                        active.entry(manager).or_default().insert(*id);
                     }
                 }
-            }
-            for (manager, grants) in active {
-                let intervals = self.intervals.entry(manager).or_default();
-                if intervals.last().is_none_or(|i| i.retirement.is_some()) {
-                    intervals.push(MembershipInterval {
-                        activation: revision,
-                        retirement: None,
-                        grants,
-                    });
-                }
-            }
-            // A removed member may first be learned together with its removal. Retain a
-            // retirement boundary even when this installation never activated its grants;
-            // later binding evidence then uses this boundary, not the later arrival revision.
-            let mut known: BTreeMap<Digest32, BTreeSet<Digest32>> = BTreeMap::new();
-            if let Some(g) = self
-                .genesis
-                .as_ref()
-                .or(self.group_genesis.as_ref())
-                .or(self.pending.as_ref())
-            {
-                for (grant, description) in g.grants.iter().zip(&g.computers) {
-                    known
-                        .entry(description.fingerprint()?)
-                        .or_default()
-                        .insert(*grant);
-                }
-                for (id, record) in &self.history {
-                    if !next.accepted.contains(id) {
-                        continue;
-                    }
-                    let e = record.event()?;
-                    if e.group == g.incarnation() {
-                        if let Some(add) = e.addition {
-                            known
-                                .entry(add.computers[1].fingerprint()?)
-                                .or_default()
-                                .insert(add.grants[1]);
+                // A retirement boundary is local and immutable. Replayed or concurrent negative
+                // evidence cannot move it over a later deliberate individual trust decision.
+                for (manager, intervals) in &mut self.intervals {
+                    if let Some(last) = intervals.last_mut().filter(|i| i.retirement.is_none()) {
+                        if let Some(grants) = active.get(manager) {
+                            last.grants.extend(grants.iter().copied());
+                        } else {
+                            last.retirement = Some(revision);
                         }
                     }
                 }
-            }
-            for (manager, grants) in known {
-                self.intervals.entry(manager).or_insert_with(|| {
-                    vec![MembershipInterval {
-                        activation: revision,
-                        retirement: Some(revision),
-                        grants,
-                    }]
-                });
-            }
-            let nodes = |rosters: &BTreeMap<Digest32, Control>| -> Result<BTreeSet<Digest32>> {
-                let mut ids = BTreeSet::new();
-                for roster in rosters.values() {
-                    let e = roster.event()?;
-                    for b in e.bindings {
-                        ids.insert(b.verify(&e.author, &e.group)?);
+                for (manager, grants) in active {
+                    let intervals = self.intervals.entry(manager).or_default();
+                    if intervals.last().is_none_or(|i| i.retirement.is_some()) {
+                        intervals.push(MembershipInterval {
+                            activation: revision,
+                            retirement: None,
+                            grants,
+                        });
                     }
                 }
-                Ok(ids)
-            };
-            for node in nodes(&self.rosters)?.difference(&nodes(&next.rosters)?) {
-                self.retired_nodes.insert(*node, revision);
+                // A removed member may first be learned together with its removal. Retain a
+                // retirement boundary even when this installation never activated its grants;
+                // later binding evidence then uses this boundary, not the later arrival revision.
+                let mut known: BTreeMap<Digest32, BTreeSet<Digest32>> = BTreeMap::new();
+                if let Some(g) = self
+                    .genesis
+                    .as_ref()
+                    .or(self.group_genesis.as_ref())
+                    .or(self.pending.as_ref())
+                {
+                    for (grant, description) in g.grants.iter().zip(&g.computers) {
+                        known
+                            .entry(description.fingerprint()?)
+                            .or_default()
+                            .insert(*grant);
+                    }
+                    for (id, record) in &self.history {
+                        if !next.accepted.contains(id) {
+                            continue;
+                        }
+                        let e = record.event()?;
+                        if e.group == g.incarnation() {
+                            if let Some(add) = e.addition {
+                                known
+                                    .entry(add.computers[1].fingerprint()?)
+                                    .or_default()
+                                    .insert(add.grants[1]);
+                            }
+                        }
+                    }
+                }
+                for (manager, grants) in known {
+                    self.intervals.entry(manager).or_insert_with(|| {
+                        vec![MembershipInterval {
+                            activation: revision,
+                            retirement: Some(revision),
+                            grants,
+                        }]
+                    });
+                }
+                let nodes = |rosters: &BTreeMap<Digest32, Control>| -> Result<BTreeSet<Digest32>> {
+                    let mut ids = BTreeSet::new();
+                    for roster in rosters.values() {
+                        let e = roster.event()?;
+                        for b in e.bindings {
+                            ids.insert(b.verify(&e.author, &e.group)?);
+                        }
+                    }
+                    Ok(ids)
+                };
+                for node in nodes(&self.rosters)?.difference(&nodes(&next.rosters)?) {
+                    self.retired_nodes.insert(*node, revision);
+                }
             }
             self.members = next.members;
             self.rosters = next.rosters;
@@ -1385,7 +1442,7 @@ impl State {
 
     fn body(&self) -> Vec<u8> {
         let mut e = Encoder::for_secrets();
-        e.array(24)
+        e.array(25)
             .bytes(&self.description.encode())
             .uint(self.revision)
             .array(self.invitations.len());
@@ -1502,11 +1559,15 @@ impl State {
         for (node, approval) in &self.binding_approvals {
             e.array(2).bytes(node).bytes(&approval.encode());
         }
+        e.array(self.retired_groups.len());
+        for (group, genesis) in &self.retired_groups {
+            e.array(2).bytes(group).bytes(&genesis.encode());
+        }
         e.finish()
     }
     fn read(vault: Vec<u8>, body: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(body);
-        arity(&mut d, 24)?;
+        arity(&mut d, 25)?;
         let description = Description::decode(d.bytes()?)?;
         let revision = d.uint()?;
         let n = count(&mut d)?;
@@ -1741,8 +1802,22 @@ impl State {
                 return Err(bad());
             }
         }
+        let mut retired_groups = BTreeMap::new();
+        for _ in 0..count(&mut d)? {
+            arity(&mut d, 2)?;
+            let group = digest(&mut d)?;
+            let genesis = Enrollment::decode(d.bytes()?)?;
+            genesis.verify(true)?;
+            if genesis.group.is_some()
+                || group != genesis.incarnation()
+                || retired_groups.insert(group, genesis).is_some()
+            {
+                return Err(bad());
+            }
+        }
         d.finish()?;
         let mut s = Self {
+            retired_groups,
             binding_approvals,
             intervals,
             retired_nodes,
@@ -1776,6 +1851,7 @@ impl State {
             let group = s
                 .group()
                 .filter(|g| *g == e.group)
+                .or_else(|| s.retired_groups.contains_key(&e.group).then_some(e.group))
                 .or_else(|| {
                     s.cancelled
                         .values()
@@ -1795,6 +1871,7 @@ impl State {
         } else if !s.rosters.is_empty() {
             return Err(bad());
         }
+        s.accepted_history()?;
         Ok(s)
     }
 }
@@ -1877,6 +1954,7 @@ struct Authority {
     accepted: BTreeSet<Digest32>,
     binding_owners: BTreeMap<Digest32, Digest32>,
     valid_releases: BTreeSet<Digest32>,
+    binding_records: BTreeSet<Digest32>,
 }
 type EventGrants = Vec<(Digest32, Grant)>;
 
@@ -1994,7 +2072,8 @@ impl Computer {
     /// advance. Restart revalidates the retained state and its ability to be saved before attach.
     pub(crate) fn policy_current(&self, applied: u64) -> bool {
         let s = lock(&self.state);
-        s.genesis.is_none() || (self.storage_ready().is_ok() && s.revision == applied)
+        (s.genesis.is_none() && s.intervals.is_empty())
+            || (self.storage_ready().is_ok() && s.revision == applied)
     }
 
     pub(crate) fn storage_ready(&self) -> Result<()> {
@@ -2163,19 +2242,18 @@ impl Computer {
     /// membership. The revision is local journal order, not a distributed membership clock.
     pub fn plan(&self, node: Digest32) -> Result<Option<PolicyPlan>> {
         let s = lock(&self.state);
-        let Some(g) = &s.genesis else {
+        if s.genesis.is_none() && s.intervals.is_empty() {
             return Ok(None);
-        };
+        }
         self.storage_ready()?;
+        let group = s.genesis.as_ref().map(Enrollment::incarnation);
         let mut covered = BTreeMap::new();
         let mut owner = None;
         let authority = s.derive()?;
+        let accepted = s.accepted_history()?;
         for (record_id, r) in &s.history {
-            if !authority.accepted.contains(record_id) {
-                continue;
-            }
             let e = r.event()?;
-            if e.group != g.incarnation() {
+            if !accepted.contains(record_id) {
                 continue;
             }
             for b in &e.bindings {
@@ -2193,13 +2271,13 @@ impl Computer {
             "this managed node has no authenticated binding yet",
         ))?;
         let mut nodes = BTreeMap::new();
-        for (manager, r) in &s.rosters {
+        for (manager, r) in s.rosters.iter().filter(|_| group.is_some()) {
             if s.quarantined.contains(manager) {
                 continue;
             }
-            let (_, personal, bindings) = r.read(manager, &g.incarnation())?;
+            let (_, personal, bindings) = r.read(manager, &group.ok_or_else(bad)?)?;
             for b in bindings {
-                let id = b.verify(manager, &g.incarnation())?;
+                let id = b.verify(manager, &group.ok_or_else(bad)?)?;
                 if authority.binding_owners.get(&id) != Some(&b.id()) {
                     continue;
                 }
@@ -2292,15 +2370,17 @@ impl Computer {
             // Another authenticated roster may have arrived during the node store write.
             // Record the exact revision actually applied; the actor retries before authorizing.
 
-            let interval = s.genesis.as_ref().ok_or_else(bad)?.incarnation();
+            let interval = s
+                .genesis
+                .as_ref()
+                .map(Enrollment::incarnation)
+                .unwrap_or([0; 32]);
             let applied = s.applied.entry(node).or_insert_with(|| AppliedPolicy {
                 revision,
                 interval,
                 grants: BTreeMap::new(),
             });
-            if applied.interval != interval {
-                return Err(bad());
-            }
+            applied.interval = interval;
             for peer in covered {
                 applied.grants.entry(*peer).or_insert(revision);
             }
@@ -2399,6 +2479,7 @@ impl Computer {
     }
     fn individual_permitted(&self, node: Digest32, peer: &Digest32) -> Result<bool> {
         let s = lock(&self.state);
+        self.storage_ready()?;
         let Some(group) = s.group() else {
             return Ok(true);
         };
@@ -2507,6 +2588,7 @@ impl Computer {
             selected: None,
             selected_name: String::new(),
             binding_approvals: BTreeMap::new(),
+            retired_groups: BTreeMap::new(),
             links: Vec::new(),
             group_genesis: None,
             members: BTreeMap::new(),
@@ -2596,7 +2678,7 @@ impl Computer {
         }
         crate::node::tunnel::publish_reachers(
             gate,
-            if state.genesis.is_none()
+            if (state.genesis.is_none() && state.intervals.is_empty())
                 || (self.storage_ready().is_ok() && applied == state.revision)
             {
                 next
@@ -2612,7 +2694,8 @@ impl Computer {
     }
     /// Whether computer mode has been explicitly established, never inferred from node trust.
     pub fn grouped(&self) -> bool {
-        lock(&self.state).genesis.is_some()
+        let s = lock(&self.state);
+        s.genesis.is_some() || !s.intervals.is_empty()
     }
     /// Digest of the current signed transaction body, for local diagnostics without its secrets.
     pub fn state_digest(&self) -> Digest32 {

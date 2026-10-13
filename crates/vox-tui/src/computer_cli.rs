@@ -10,9 +10,9 @@ pub enum ComputerCmd {
     /// Release this node to one enrolled computer, or approve its transfer/recovery here.
     Binding {
         /// release requires --destination; transfer accepts its signed release; recover requires removal/fault evidence.
-        #[arg(value_parser = ["release", "transfer", "recover"])]
+        #[arg(value_parser = ["release", "transfer", "recover", "recover-group"])]
         action: String,
-        /// Full node fingerprint from the authenticated computer roster.
+        /// Full node fingerprint; use group for recover-group.
         node: String,
         #[arg(long, default_value = "")]
         destination: String,

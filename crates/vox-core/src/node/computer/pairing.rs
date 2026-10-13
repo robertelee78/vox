@@ -625,9 +625,9 @@ impl Management {
         }
         {
             let s = lock(&self.computer.state);
-            if s.genesis.is_some() && s.grant(&self.computer.signer.fingerprint()).is_some() {
-                return Err(Error::Profile("this computer is already paired"));
-            }
+            // A fresh authenticated invitation can carry a removal this offline computer
+            // has not learned yet. The merge below still refuses an already-active target,
+            // another group, and every unapproved enrollment.
             if s.genesis.is_none()
                 && (s.pair_link.as_ref().is_some_and(|l| l.as_str() != url)
                     || (s.pending.is_some() && s.pair_link.is_none()))
@@ -700,11 +700,14 @@ impl Management {
         destination: &str,
         expected: &str,
     ) -> Result<ComputerStatus> {
+        if action == "recover-group" {
+            return self.recover_group(expected);
+        }
         let node = crate::node::link::b32_decode(node, "node fingerprint")?;
         let local = self.computer.signer.fingerprint();
         self.computer.change(|s| {
             if frontier(s) != expected { return Err(Error::Profile("computer trust changed; review the binding operation again")); }
-            let group = s.group().ok_or_else(bad)?;
+            let group = s.genesis.as_ref().map(Enrollment::incarnation).ok_or(Error::Profile("computer enrollment must finish before changing a management binding"))?;
             if s.grant(&local).is_none() { return Err(Error::Profile("an active computer manager must approve this binding operation")); }
             let bindings: Vec<_> = s.terminal_bindings()?.into_iter().filter(|(manager, binding)|
                 binding.verify(manager, &group).ok() == Some(node)).collect();
@@ -751,11 +754,57 @@ impl Management {
         self.status()
     }
 
+    /// Deliberate local abandonment after removal/fault. Retired history remains pinned against
+    /// replay. Every old covered grant is journalled for purge before any new group can apply.
+    fn recover_group(&self, expected: &str) -> Result<ComputerStatus> {
+        let local = self.computer.signer.fingerprint();
+        self.computer.change(|s| {
+            if frontier(s) != expected {
+                return Err(Error::Profile(
+                    "computer trust changed; review local recovery again",
+                ));
+            }
+            if s.grant(&local).is_some() {
+                return Err(Error::Profile(
+                    "remove this computer from the group before abandoning its incarnation",
+                ));
+            }
+            let genesis = s
+                .genesis
+                .take()
+                .ok_or(Error::Profile("there is no established group to retire"))?;
+            s.revision = s.revision.checked_add(1).ok_or_else(bad)?;
+            for intervals in s.intervals.values_mut() {
+                if let Some(interval) = intervals.last_mut().filter(|i| i.retirement.is_none()) {
+                    interval.retirement = Some(s.revision);
+                }
+            }
+            s.retired_groups.insert(genesis.incarnation(), genesis);
+            s.members.clear();
+            s.rosters.clear();
+            s.reaches.clear();
+            s.quarantined.clear();
+            s.receipts.clear();
+            s.pending = None;
+            s.group_genesis = None;
+            s.pair_link = None;
+            s.links.clear();
+            s.pending_expires = 0;
+            s.binding_approvals.clear();
+            for invitation in &mut s.invitations {
+                invitation.cancelled = true;
+            }
+            Ok(())
+        })?;
+        self.status()
+    }
+
     /// Confirm removal against the exact displayed signed frontier and affected roster.
     pub fn remove(&self, target: &str, expected: &str) -> Result<ComputerStatus> {
         let target = crate::node::link::b32_decode(target, "computer fingerprint")?;
         self.computer.change(|s| {
             if frontier(s) != expected { return Err(Error::Profile("computer trust changed; review the computer and affected nodes again before removing it")); }
+            if s.genesis.is_none() { return Err(Error::Profile("computer enrollment must finish before removing a member")); }
             let mut grants: Vec<_> = s.members.iter().filter_map(|(id, g)|
                 (g.computer.fingerprint().ok() == Some(target)).then_some(*id)).collect();
             grants.sort();
@@ -855,7 +904,7 @@ impl Management {
             }
         }
         let mut binding_actions = Vec::new();
-        if s.grant(&local).is_some() {
+        if s.genesis.is_some() && s.grant(&local).is_some() {
             for (manager, binding) in s.terminal_bindings()? {
                 let node = binding.verify(&manager, &s.group().ok_or_else(bad)?)?;
                 let released_here = authority.valid_releases.iter().any(|id| {
@@ -1663,6 +1712,7 @@ fn activate(s: &mut State, signer: &dyn RootSigner) -> Result<()> {
             if s.genesis.is_none() {
                 return Err(bad());
             }
+            s.fold_history()?;
             s.revision = s.revision.checked_add(1).ok_or_else(bad)?;
             s.receipts.clear();
         }
@@ -1715,6 +1765,15 @@ fn merge(s: &mut State, bytes: &[u8], peer: Digest32, signer: &dyn RootSigner) -
     };
     let genesis = read(d.bytes()?)?;
     let incoming = read(d.bytes()?)?;
+    if genesis
+        .iter()
+        .chain(incoming.iter())
+        .any(|g| s.retired_groups.contains_key(&g.incarnation()))
+    {
+        return Err(Error::Profile(
+            "this group was retired locally; old signed state cannot reactivate it",
+        ));
+    }
     // A fresh invitation has no current intent to compare with. Recognize an exact retired
     // operation before the group/current-intent checks so its late result keeps the truthful
     // local-close outcome instead of turning into an unexplained authentication refusal.
@@ -1729,7 +1788,9 @@ fn merge(s: &mut State, bytes: &[u8], peer: Digest32, signer: &dyn RootSigner) -
     }
     let local = s.description.fingerprint()?;
     let candidate = s.pending.as_ref().is_some_and(|p| side(p, &peer).is_ok());
-    let previously_enrolled = s.grant(&peer).is_some();
+    // Former managers may carry retained negative/fork evidence and receive their removal.
+    // This grants no positive authority: every event is independently checked at its prefix.
+    let previously_enrolled = s.was_enrolled(&peer);
     if let Some(g) = genesis {
         g.verify(true)?;
         if g.group.is_some() || Some(g.incarnation()) != s.group() {
