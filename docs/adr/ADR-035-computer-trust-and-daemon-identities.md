@@ -134,20 +134,17 @@ nodes on the Macs can drive its other nodes. No node is to be guessed to be pers
   Existing read/drive revocation behavior applies to connections and Sessions, rather than
   merely deleting the computer's row from the app.
 
-### 5. Design, upgrade and product proof
+### 5. Design, current data and product proof
 
-- **CT-19.** The upgrade MUST preserve existing individual node trust, aliases, identities, rooms,
-  repository bindings and data until the person explicitly enables computer trust. An upgrade
-  MUST NOT infer a computer group from existing trust, names, shared IP addresses or room members.
-- **CT-20.** Any on-disk change MUST follow ADR-026 F-3: automatic upgrade from every supported
-  release since v0.4.0, proved on a data root the published v0.4.4 binary wrote. Computer identity,
-  group membership and policy storage MUST be coordinated with #741's one v0.4.5 format step;
-  this feature MUST NOT invent an independent second format raise. Earlier peers that do not
-  support computer trust MUST remain usable through individual node trust, with support stated
-  accurately. The design must settle the new control protocol's compatibility before building it.
-  The pairing implementation owns its new data and upgrade contribution to the existing journey;
-  #741 owns final acceptance of the combined release upgrade. Contributors are to integrate with
-  that contract, not wait for the entire combined proof before they can implement their part.
+- **CT-19.** Current-version individual node trust, aliases, identities, rooms, repository bindings
+  and data MUST be preserved until the person explicitly enables computer trust. Computer groups
+  MUST NOT be inferred from existing trust, names, shared IP addresses or room members.
+- **CT-20.** On-disk state MUST follow ADR-026 F-3's current-release data and format discipline.
+  Computer identity, group membership and policy storage MUST retain their specified integrity
+  and restart behavior. The data-format marker MUST continue to identify the format and the
+  version that wrote it; unsupported layouts or formats, including future or malformed markers,
+  MUST be refused unchanged with the reason. Removing prior-release compatibility requirements
+  MUST NOT authorize a reset, deletion or silent reinterpretation of unsupported data.
 - **CT-21.** Validation MUST extend existing real app/CLI/daemon/drive journeys, using scratch
   VOX_DATA_DIR and VOX_CONFIG_DIR. It MUST exercise two Macs' personal nodes plus a headless
   computer, one enrollment bringing the third into the group, a newly created and removed node,
@@ -156,25 +153,35 @@ nodes on the Macs can drive its other nodes. No node is to be guessed to be pers
   Assertions MUST concern visible state and actual read/drive outcomes. Each proof needs a
   mutant that turns its own product assertion red; inability to stage a case is APPARATUS.
   ADR-018 holds: no unit or mechanism gates, no gratuitous repeats, app evaluations and live-model
-  spikes remain optional, and the release's upgrade proof is extended rather than duplicated.
+  spikes remain optional.
 - **CT-22.** Before implementation, the design MUST settle daemon-key protection and lifecycle;
   authenticated enrollment and proof of node management; authority for group additions, removal
   and personal-node changes, including authority exercised by a non-founding member and the
   consequences of a compromised member; update ordering and offline convergence; lost/replaced
   installations and duplicate restored identities; computer-name ownership, local aliases and
   collisions; the storage lifecycle of earlier individual grants under CT-4/CT-16; the exact
-  pairing flow; and the shared migration and older-peer behavior. It MUST follow the existing
-  cryptographic policy rather than choose a new cryptosystem
-  as a side effect of this feature. These are technical design obligations, not permission to
-  reopen the product decisions above or to mark implementation stories Ready without a design.
+  pairing flow; and the current-version storage lifecycle. It MUST follow the existing
+  cryptographic policy rather than choose a new cryptosystem as a side effect of this feature.
+  These are technical design obligations, not permission to reopen the product decisions above
+  or to mark implementation stories Ready without a design.
 
 ## Accepted technical contract
 
 The [revision-2 technical contract on #798](https://github.com/robertelee78/vox/issues/798#issuecomment-6137614328)
 settles CT-22's identity, pairing, causal membership, fork, policy-journal, transfer/recovery,
-retained-history, compatibility and shared-upgrade design. It has an
+and retained-history design. It has an
 [independent GLM-5.3 GO](https://github.com/robertelee78/vox/issues/798#issuecomment-6137677323).
-That contract governs implementation; CT-1 through CT-22 remain the product requirements.
+That contract governs implementation subject to the scope clarification below; CT-1 through
+CT-22 remain the product requirements.
+
+For v0.4.5, the decider's [2026-10-12 scope decision](https://github.com/robertelee78/vox/issues/741#issuecomment-6138851941),
+recorded in ADR-026 F-3, supersedes the revision-2 contract's prior-release data migration,
+mixed-version wire compatibility, published-release fixture/proof and combined release-upgrade
+obligations. Neither #741 nor those historical clauses is an implementation or acceptance
+prerequisite. No replacement migration architecture is required. The contract's authenticated
+identity, pairing, membership, policy journal, current-data integrity, restart/recovery and room
+boundaries remain in force.
+
 The following clarifications delimit its changes to earlier ADRs:
 
 - The daemon MUST have a separate computer-management identity using the existing composite-key
@@ -193,8 +200,8 @@ The following clarifications delimit its changes to earlier ADRs:
   or a human identity. Vox MUST NOT present it as physical-device attestation. A copied node vault
   alone MUST NOT establish or transfer management authority.
 
-Technical GO is design acceptance. CT-21's actual product journeys and CT-20's migration
-contribution remain required; #741 still owns the combined release-upgrade acceptance.
+Technical GO is design acceptance. CT-21's actual product journeys and CT-20's current-data
+protections remain required.
 
 ## Superseded and amended lines
 
@@ -214,18 +221,18 @@ predecessor ADRs' node, room and transport rules are not otherwise replaced.
 
 ## Implementation order and related work
 
-The accepted revision-2 contract settles CT-22 and the shared design boundary with #741.
+The accepted revision-2 contract, with the scope clarification above, settles CT-22.
 Implementation is to begin with authenticated two-computer pairing and its two trust modes,
 followed by group enrollment without repeated pairings, ongoing roster and personal selection
 changes, and complete removal. Group updates and removal MUST use that same membership design
 and daemon-owned transaction domain, not competing state stores. Each implementation story still
 requires its approved handoff and scoped acceptance; the design verdict is not product acceptance.
 
-#724/#725 still own automatic trust between eligible local nodes outside computer mode. #796
+#724 owns automatic trust between eligible local nodes outside computer mode. #796
 owns presented node names and local alias preservation. #677 owns the common operator-only trust
-boundary. #741 owns the release's combined format step. #794 owns the installed skill's real-work
-behavior, and #795 owns repository/room isolation. This ADR must integrate with those outcomes,
-not duplicate or silently replace their implementation work.
+boundary. #794 owns the installed skill's real-work behavior, and #795 owns repository/room
+isolation. This ADR must integrate with those outcomes, not duplicate or silently replace their
+implementation work.
 
 Depends on ADR-002, ADR-003, ADR-010, ADR-012, ADR-018, ADR-026, ADR-028, ADR-029 and ADR-031. Amends the
 lines listed above. Pairing does not require a new room, a central account service or new room
@@ -240,4 +247,5 @@ choice when the person does not want to trust an entire Vox installation.
 
 Computer trust intentionally gives broader authority than individual node trust. The roster,
 personal selection and group removal are authorization state, not advisory telemetry. Their
-authentication, recovery and upgrade design are prerequisites to a safe, understandable product.
+authentication, data integrity and recovery design are prerequisites to a safe, understandable
+product.
