@@ -27,7 +27,9 @@
 //! 2. **Losing drive changes the key** (SC-2b). Alice downgrades bob to read (`vox trust read`).
 //!    Bob's node opens none of the entries alice's Session writes afterwards, while it still holds
 //!    the ones it read before and still reads alice's messages to the room; and its
-//!    `vox room sessions --json` lists alice's Session with `can_drive` false.
+//!    `vox room sessions --json` no longer lists alice's Session (ADR-031 SA-1/SA-2, #739).
+//!    Its metadata and session-address target disappear, including after restart; node-only
+//!    messages still work. The owner keeps its own Session, and regrant restores discovery.
 //!
 //! 5. **A burst of key-packages names a fresh one-time prekey each** (ADR-030 P-3). With a
 //!    Session of alice's in two rooms, alice gives carol drive (`vox trust drive`): carol is owed
@@ -58,9 +60,9 @@
 //! - **Release the drive key on read** (claim 1): `drive_holders` in
 //!   `crates/vox-core/src/node/actor.rs` returns every trusted node. Carol's node opens alice's
 //!   Session entries: red PRODUCT.
-//! - **`can_drive` always true** (claims 1 and 2): `sessions::fold` in
-//!   `crates/vox-core/src/node/sessions.rs` sets it true. Carol's listing says she can drive:
-//!   red PRODUCT.
+//! - **Return retained Sessions without current drive** (#739): remove only the final
+//!   `can_drive` filter in `sessions::fold`. Bob's revoked Session reappears in the shipped
+//!   listing: red PRODUCT on the absence assertion, not on staging.
 //! - **A Session's file served to any trusted member** (claim 3): `Witness::allowed` in
 //!   `crates/vox-core/src/node/shares.rs` lets anyone in. Carol is served the file: red PRODUCT.
 //! - **A driven file taken without checking drive** (claim 4): the DR-2 check in `drive` in
@@ -93,6 +95,9 @@ mod raw_sync;
 #[path = "support/typed.rs"]
 mod typed;
 
+#[path = "support/attach.rs"]
+mod unlock_staging;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -112,7 +117,7 @@ const ENTRIES: usize = 3;
 /// hook inheriting the operator's tmux binds its session to the operator's own pane, and a drive is
 /// typed there), `CLAUDE*`, `CODEX*`, `OPENCODE*` or `VOX_*`. Walked from the environment itself,
 /// not a fixed list, so a variable a harness adds later is cleared too.
-fn vox_cmd() -> Command {
+fn vox_cmd(data: &Path) -> Command {
     let mut cmd = Command::new(VOX);
     // A clean environment: every variable this process has is removed by name except this
     // whitelist of what any program needs, so nothing of a harness, a terminal or the operator's
@@ -127,6 +132,12 @@ fn vox_cmd() -> Command {
             cmd.env_remove(&k);
         }
     }
+    let home = data.join("home");
+    std::fs::create_dir_all(&home).expect("APPARATUS: scratch HOME");
+    cmd.env("HOME", home)
+        .env("VOX_DATA_DIR", data)
+        .env("VOX_CONFIG_DIR", data.join("cfg"))
+        .env("VOX_TEST_KEYCHAIN", unlock_staging::keychain(data));
     // A daemon this starts never takes port 1080.
     cmd.env("VOX_PROXY", "127.0.0.1:0");
     // **Checked, not trusted**: every such variable in this process's environment is removed from
@@ -174,7 +185,7 @@ impl Member {
         stdin: Option<&str>,
         env: &[(&str, &str)],
     ) -> (bool, String, String) {
-        let mut cmd = vox_cmd();
+        let mut cmd = vox_cmd(&self.data);
         // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028
         // K-13): the passphrase file's first line, typed at the prompt.
         if typed::is_keyring_change(args) {
@@ -304,7 +315,7 @@ fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
     );
     let err = std::fs::File::create(tmp.join(format!("{name}.daemon.err")))
         .expect("APPARATUS: create a log file");
-    let child = vox_cmd()
+    let child = vox_cmd(&m.data)
         .args(["daemon", "--listen", "127.0.0.1:0", "--anchor", anchor])
         .arg("--passphrase-file")
         .arg(&m.pass)
@@ -333,7 +344,7 @@ fn anchor(tmp: &Path) -> (Proc, String) {
     std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: create a staging dir");
     let out = tmp.join("anchor.out");
     let p = Proc(
-        vox_cmd()
+        vox_cmd(&dir)
             .args(["node", "--listen", "127.0.0.1:0"])
             .env("VOX_DATA_DIR", &dir)
             .env("VOX_CONFIG_DIR", dir.join("cfg"))
@@ -423,11 +434,55 @@ fn channel_id(rt: &tokio::runtime::Runtime, m: &Member, short: &str) -> [u8; 32]
 /// Whether `m`'s `vox room sessions --json` lists alice's Session as one it can drive; `None` if
 /// it does not list it.
 fn can_drive(m: &Member, room: &str) -> Option<bool> {
-    let (_, out, _) = m.vox(&["room", "sessions", room, "--json"], None);
+    let (ok, out, err) = m.vox(&["room", "sessions", room, "--json"], None);
+    assert!(ok, "PRODUCT: Session listing failed: {out}{err}");
     out.lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|e| panic!("PRODUCT: malformed Session listing: {line}; {e}"))
+        })
         .find(|v| v["id"] == SESSION)
-        .and_then(|v| v["can_drive"].as_bool())
+        .map(|v| {
+            v["can_drive"]
+                .as_bool()
+                .unwrap_or_else(|| panic!("PRODUCT: Session listing omitted drive: {v}"))
+        })
+}
+
+/// A person can address a visible Session, but read-only and revoked members address its node.
+fn session_target(member: &Member, owner: &Member, room: &str, allowed: bool) {
+    let target = format!("{}/{SESSION}", owner.fp);
+    let (ok, out, err) = member.vox(
+        &[
+            "room",
+            "post",
+            room,
+            "--to",
+            &target,
+            "session-target-proof",
+        ],
+        None,
+    );
+    if allowed {
+        assert!(
+            ok,
+            "PRODUCT: current driver could not address the Session: {out}{err}"
+        );
+    } else {
+        assert!(
+            !ok && format!("{out}{err}").contains("no Session in this room is named"),
+            "PRODUCT: member without current drive must be refused the retained Session target: {out}{err}"
+        );
+        let (ok, out, err) = member.vox(
+            &["room", "post", room, "--to", &owner.fp, "node-target-proof"],
+            None,
+        );
+        assert!(
+            ok,
+            "PRODUCT: read-only member could not address the node: {out}{err}"
+        );
+    }
 }
 
 /// How many one-time prekeys `m`'s node has used, as its `vox status --json` says (`prekeys`
@@ -628,6 +683,14 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         None,
         "PRODUCT: read-only member reopened sealed lifecycle metadata from its own data root"
     );
+
+    assert_eq!(
+        can_drive(&alice, &room),
+        Some(true),
+        "PRODUCT: the owner must still discover its own Session without a remote drive grant"
+    );
+    session_target(&bob, &alice, &room, true);
+    session_target(&carol, &alice, &room, false);
 
     // ---- claim 3: alice's session sends a file out of its Session; it reaches bob alone ----
     let file = tmp.path().join("for-drive.bin");
@@ -856,14 +919,20 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
          written afterwards: he opened {bob_now:?}"
     );
     assert_eq!(
-        bob_lists_after,
-        Some(false),
+        bob_lists_after, None,
         "PRODUCT: after the downgrade and the entries sealed since, bob's `vox room sessions \
-         --json` must list alice's Session with can_drive false"
+         --json` must omit alice's retained Session"
     );
     assert!(
         before.iter().all(|b| bob_now.contains(b)),
         "PRODUCT: bob keeps the Session entries he read before the downgrade: he has {bob_now:?}"
+    );
+
+    session_target(&bob, &alice, &room, false);
+    assert_eq!(
+        can_drive(&alice, &room),
+        Some(true),
+        "PRODUCT: revoking a peer must not hide the owner's own Session"
     );
 
     // ---- claim 5: a burst of key-packages to one member names a fresh one-time prekey each ----
@@ -1003,6 +1072,13 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         "PRODUCT: Bob's restart after drive loss changed the steps he had already read"
     );
 
+    assert_eq!(
+        can_drive(&bob, &room),
+        None,
+        "PRODUCT: restart after drive loss must not restore retained Session discovery"
+    );
+    session_target(&bob, &alice, &room, false);
+
     // A fourth member joins the already-running Session with drive. Its room admission and
     // later regrant each begin a new readable interval; neither releases earlier ciphertext.
     let mut dave = member(tmp.path(), "dave", &spec);
@@ -1085,8 +1161,8 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     );
     assert_eq!(
         can_drive(&dave, &room),
-        Some(false),
-        "PRODUCT: revoked late member still advertises drive"
+        None,
+        "PRODUCT: revoked late member still discovers the retained Session"
     );
 
     let (ok, o, e) = alice.vox(
@@ -1108,6 +1184,7 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
             == Some(true)),
         "PRODUCT: regranted member did not regain its ongoing Session"
     );
+    session_target(&dave, &alice, &room, true);
     // The relay has the missed step. The regranted member asks both it and the owner before
     // any new step is written: neither may backfill even encrypted earlier records.
     private_wire_refused(&mut dave, &[&alice, &carol], id, &spec);
@@ -1159,8 +1236,8 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     assert_no_lifecycle(&bob, &room, SESSION);
     assert_eq!(
         session_state(&bob, &room, SESSION),
-        Some(true),
-        "PRODUCT: revoked reader opened a new end record after losing drive"
+        None,
+        "PRODUCT: revoked reader rediscovered retained lifecycle metadata after the Session ended"
     );
     // A new grant after the end receives retained lifecycle state, never the missed steps.
     let (ok, out, err) = alice.vox(
@@ -1213,8 +1290,7 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         "APPARATUS: could not restore the legacy arm's read-only receiver: {out}{err}"
     );
     assert!(
-        until(Duration::from_secs(60), || can_drive(&bob, &room)
-            == Some(false)),
+        until(Duration::from_secs(60), || can_drive(&bob, &room).is_none()),
         "APPARATUS: legacy arm's read-only permission boundary was not staged"
     );
     legacy_placeholder_journey(&mut alice, &mut bob, id, &room, &spec);
@@ -1224,9 +1300,17 @@ fn session_state(member: &Member, room: &str, session: &str) -> Option<bool> {
     let (ok, out, err) = member.vox(&["room", "sessions", room, "--json"], None);
     assert!(ok, "PRODUCT: Session listing failed: {out}{err}");
     out.lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|e| panic!("PRODUCT: malformed Session listing: {line}; {e}"))
+        })
         .find(|row| row["id"] == session)
-        .and_then(|row| row["open"].as_bool())
+        .map(|row| {
+            row["open"]
+                .as_bool()
+                .unwrap_or_else(|| panic!("PRODUCT: Session listing omitted open state: {row}"))
+        })
 }
 
 /// Read the actual member's public log through its shipped CLI, not a UI visibility filter.
@@ -1237,11 +1321,26 @@ fn assert_no_lifecycle(member: &Member, room: &str, session: &str) {
         ok,
         "PRODUCT: member could not read its own room data: {out}{err}"
     );
-    assert!(
-        !out.contains(session),
-        "PRODUCT: {} opened a Session lifecycle record from its own public log: {out}",
-        member.name
-    );
+    // A legitimate room message may address this Session by ID. Only a lifecycle envelope
+    // exposes its opening/end metadata; matching the ID anywhere would misclassify that chat.
+    for line in out.lines().filter(|line| !line.trim().is_empty()) {
+        let row: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("PRODUCT: malformed public room row: {line}; {e}"));
+        let text = row["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("PRODUCT: public room row omitted its text: {row}"));
+        let lifecycle = vox_agentcomms::envelope::Envelope::parse(text).is_ok_and(|env| {
+            matches!(
+                env.kind.as_str(),
+                vox_agentcomms::envelope::SESSION | vox_agentcomms::envelope::SESSION_END
+            )
+        });
+        assert!(
+            !lifecycle,
+            "PRODUCT: {} opened lifecycle metadata for {session} from its public log: {row}",
+            member.name
+        );
+    }
 }
 
 /// An authenticated member asks the actual owner and an actual holder for
@@ -1380,7 +1479,7 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
     drop(endpoint);
     drop(rt);
     drop(profile);
-    let child = vox_cmd()
+    let child = vox_cmd(&member.data)
         .args(["daemon", "--listen", "127.0.0.1:0", "--anchor", anchor])
         .arg("--passphrase-file")
         .arg(&member.pass)
@@ -1654,13 +1753,13 @@ fn legacy_placeholder_journey(
     );
     assert_eq!(
         can_drive(bob, room),
-        Some(false),
-        "PRODUCT: subtype classification granted Bob drive"
+        None,
+        "PRODUCT: subtype classification restored Bob's revoked Session discovery"
     );
     drop(conn);
     drop(ep);
     drop(bob._daemon.take());
-    let child = vox_cmd()
+    let child = vox_cmd(&bob.data)
         .args(["daemon", "--listen", "127.0.0.1:0", "--anchor", anchor])
         .arg("--passphrase-file")
         .arg(&bob.pass)
@@ -1684,7 +1783,7 @@ fn legacy_placeholder_journey(
     );
     assert_eq!(
         can_drive(bob, room),
-        Some(false),
-        "PRODUCT: receiver restart changed drive permission"
+        None,
+        "PRODUCT: receiver restart restored revoked Session discovery"
     );
 }
