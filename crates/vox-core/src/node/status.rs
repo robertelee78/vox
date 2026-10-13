@@ -1859,31 +1859,40 @@ pub async fn request(at: &crate::node::ipc::NodeSocket) -> Result<String> {
         let report = ask(at).await?;
         let mut value: serde_json::Value =
             serde_json::from_str(&report).map_err(|_| Error::MalformedIpc("ipc status JSON"))?;
-        use crate::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
+        let anchors = request_anchors(at).await?;
+        // Retain the selected node's dial scope as diagnostics; the primary list is
+        // this daemon's complete manual and saved-room inventory (ADR-032 AN-12).
+        value["node_anchors"] = value["anchors"].take();
+        value["anchors"] = serde_json::Value::Array(anchors.iter().map(|a| a.to_json()).collect());
+        Ok(value.to_string())
+    })
+    .await
+    .map_err(|_| crate::node::ipc::silent())?
+}
+
+/// Read the daemon's anchor inventory without selecting or unlocking a node.
+///
+/// # Errors
+/// The daemon refuses the inventory, cannot answer within the ordinary IPC deadline, or
+/// sends a malformed answer. A failed read is never an empty inventory.
+pub async fn request_anchors(
+    at: &crate::node::ipc::NodeSocket,
+) -> Result<Vec<crate::node::daemonipc::AnchorInfo>> {
+    use crate::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
+    tokio::time::timeout(crate::node::ipc::ANSWER_WITHIN, async {
         let mut daemon = DaemonClient::open_noting(&at.path, at.waiting).await?;
         match daemon.request(DaemonRequest::Anchors).await? {
-            DaemonFrame::Anchors(anchors) => {
-                // Retain the selected node's dial scope as diagnostics; the primary list is
-                // this daemon's complete manual and saved-room inventory (ADR-032 AN-12).
-                value["node_anchors"] = value["anchors"].take();
-                value["anchors"] =
-                    serde_json::Value::Array(anchors.iter().map(|a| a.to_json()).collect());
-            }
-            DaemonFrame::Refused(why) => {
-                return Err(Error::Path {
-                    op: "read machine anchors",
-                    detail: why.to_string(),
-                })
-            }
-            DaemonFrame::AnchorFailed(why) => {
-                return Err(Error::Path {
-                    op: "read machine anchors",
-                    detail: why,
-                })
-            }
-            _ => return Err(Error::MalformedIpc("ipc machine anchors")),
+            DaemonFrame::Anchors(anchors) => Ok(anchors),
+            DaemonFrame::Refused(why) => Err(Error::Path {
+                op: "read machine anchors",
+                detail: why.to_string(),
+            }),
+            DaemonFrame::AnchorFailed(why) => Err(Error::Path {
+                op: "read machine anchors",
+                detail: why,
+            }),
+            _ => Err(Error::MalformedIpc("ipc machine anchors")),
         }
-        Ok(value.to_string())
     })
     .await
     .map_err(|_| crate::node::ipc::silent())?

@@ -420,17 +420,27 @@ impl Router {
         let account = self.inner.account.clone();
         let extra = state.specs.clone();
         let result = tokio::task::spawn_blocking(move || {
-            vox_core::node::link::change_manual_anchor(&account, &extra, add.as_deref(), remove)?;
+            let remaining = vox_core::node::link::change_manual_anchor(
+                &account,
+                &extra,
+                add.as_deref(),
+                remove,
+            )?;
             let mut set = BootstrapSet::new();
-            let skipped = vox_core::node::link::merge_machine_anchors(&mut set, &account)?;
-            Ok::<_, vox_core::Error>((set, skipped))
+            let mut skipped = vox_core::node::link::merge_machine_anchors(&mut set, &account)?;
+            for spec in &remaining {
+                if let Err(error) = vox_core::node::link::merge_anchor_spec(&mut set, spec) {
+                    skipped.push(format!("anchor {spec} is skipped: {error}"));
+                }
+            }
+            Ok::<_, vox_core::Error>((set, skipped, remaining))
         })
         .await
         .map_err(|error| format!("manual anchor update did not finish: {error}"))?
         .map_err(|error| error.to_string())?;
-        // All startup inputs are now in the canonical file; otherwise a removed transient
-        // input would silently reappear on the next periodic refresh.
-        state.specs.clear();
+        // A removed transient input must not return on refresh, while unrelated startup
+        // inputs remain daemon-only rather than silently becoming persistent.
+        state.specs = result.2;
         state.set = result.0;
         state.skipped = result.1;
         self.deliver_manual_anchors(&state).await;

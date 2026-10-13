@@ -90,7 +90,7 @@ struct NetworkSettingsView: View {
             }
             ScrollView {
                 VStack(alignment: .leading, spacing: Space.s16) {
-                    if model.loaded && model.anchors.isEmpty {
+                    if model.loaded && model.reachable && model.anchors.isEmpty {
                         Text("No manual or saved-room anchors on this machine.").secondaryText()
                     }
                     ForEach(model.anchors, id: \.fingerprint) { anchor in
@@ -140,7 +140,7 @@ struct RoomAnchorsView: View {
         let anchors = model.anchors.filter { $0.sources.contains { $0.room == room } }
         VStack(alignment: .leading, spacing: Space.s8) {
             if !model.loaded && model.busy { ProgressView("Reading anchors…") }
-            if model.loaded && anchors.isEmpty { Text("This room has no anchors.").secondaryText() }
+            if model.loaded && model.reachable && anchors.isEmpty { Text("This room has no anchors.").secondaryText() }
             ForEach(anchors, id: \.fingerprint) { anchor in
                 AnchorNetworkRow(anchor: anchor, reachable: model.reachable)
             }

@@ -304,7 +304,9 @@ pub fn merge_machine_anchors(
 
 /// Write one manual change without discarding any other input, including comments or lines
 /// the refresh cannot currently resolve. Unreadable input refuses the write unchanged. Once
-/// created, the existing canonical machine file is the sole manual source.
+/// created, the existing canonical machine file is the sole durable manual source. Returned
+/// command-line inputs retain their daemon-only lifetime; removing also removes a matching
+/// transient input, but an unrelated input is never made durable by this change.
 ///
 /// # Errors
 /// An unreadable input, a missing manual fingerprint on remove, or an atomic write failure.
@@ -313,7 +315,7 @@ pub fn change_manual_anchor(
     extra: &[String],
     add: Option<&str>,
     remove: Option<Digest32>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let mut lines = Vec::new();
     for file in account.anchor_input_files() {
         match std::fs::read_to_string(&file) {
@@ -329,20 +331,18 @@ pub fn change_manual_anchor(
             }
         }
     }
-    for spec in extra {
-        if !lines.iter().any(|line| line.trim() == spec.trim()) {
-            lines.push(spec.clone());
-        }
-    }
+    let mut remaining = extra.to_vec();
     if let Some(id) = remove {
         let before = lines.len();
-        lines.retain(|line| {
+        let keep = |line: &String| {
             line.trim()
                 .split_once('@')
                 .and_then(|(fp, _)| b32_decode(fp.trim(), "anchor fingerprint").ok())
                 != Some(id)
-        });
-        if lines.len() == before {
+        };
+        lines.retain(keep);
+        remaining.retain(keep);
+        if lines.len() == before && remaining.len() == extra.len() {
             return Err(Error::Profile(
                 "this anchor was not added by hand; a room's anchors are changed by its admin",
             ));
@@ -356,7 +356,8 @@ pub fn change_manual_anchor(
     crate::node::paths::write_private_file(
         &account.anchors_file(),
         format!("{}\n", lines.join("\n")).as_bytes(),
-    )
+    )?;
+    Ok(remaining)
 }
 
 /// Add an anchor spec to a set, merging its address into an anchor already named.
