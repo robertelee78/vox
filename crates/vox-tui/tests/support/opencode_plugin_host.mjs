@@ -14,6 +14,8 @@
 //   wake <secs>   wait for `vox daemon` to relay a wake through the plugin's socket; OpenCode
 //                 then runs `chat.message` on the relayed prompt, and so does this:
 //                 `{"kind":"wake","relayed":…,"text":…}`, or `{"kind":"no-wake"}` past <secs>
+//   notice <secs> take the same wake without starting its turn yet, as a busy OpenCode can do;
+//                 the room remains unread until a later `turn` or `wake`.
 //   event <json>  one event of OpenCode's bus, as OpenCode hands it to the plugin's `event` hook:
 //                 `{"kind":"event"}` once the hook returned
 //   title <text>  the session's title as OpenCode holds it, from now on: what the plugin reads
@@ -129,7 +131,7 @@ for await (const line of lines) {
   try {
     if (cmd === "turn") {
       say({ kind: "turn", text: await turn(hooks, arg) })
-    } else if (cmd === "wake") {
+    } else if (cmd === "wake" || cmd === "notice") {
       if (!prompts.length) {
         await new Promise((resolve) => {
           const timer = setTimeout(resolve, Number(arg) * 1000)
@@ -142,7 +144,8 @@ for await (const line of lines) {
       }
       const p = prompts.shift()
       if (!p) say({ kind: "no-wake" })
-      else say({ kind: "wake", relayed: p.text, text: await turn(hooks, p.text) })
+      else say({ kind: "wake", relayed: p.text,
+        ...(cmd === "wake" ? { text: await turn(hooks, p.text) } : {}) })
     } else if (cmd === "title") {
       title = arg
       say({ kind: "title" })
