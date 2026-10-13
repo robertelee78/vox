@@ -57,6 +57,8 @@
 
 #![cfg(unix)]
 
+use attach as unlock_staging;
+
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -89,7 +91,8 @@ fn vox(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, Stri
 
 fn vox_plain(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
     let mut cmd = Command::new(VOX);
-    cmd.args(args)
+    cmd.args(crate::unlock_staging::persistent_args(dir, args, IDPASS))
+        .env("VOX_TEST_KEYCHAIN", crate::unlock_staging::keychain(dir))
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env("VOX_IDENTITY_PASSPHRASE", IDPASS)

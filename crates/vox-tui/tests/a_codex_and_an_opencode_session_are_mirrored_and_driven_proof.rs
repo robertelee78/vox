@@ -61,6 +61,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/attach.rs"]
+mod unlock_staging;
+
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -154,7 +157,15 @@ impl World {
             .env("VOX_IDENTITY_PASSPHRASE", format!("pass of {node}"))
             .env("VOX_NODE", node)
             .env("VOX_LISTEN", "127.0.0.1:0")
-            .args(args);
+            .args(crate::unlock_staging::persistent_args(
+                &self.data,
+                args,
+                &format!("pass of {node}"),
+            ))
+            .env(
+                "VOX_TEST_KEYCHAIN",
+                crate::unlock_staging::keychain(&self.data),
+            );
         c
     }
 

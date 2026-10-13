@@ -27,6 +27,9 @@
 //! test, `VOX_PROOF_ALLOW_UNPROVEN=<id-or-prefix>[,…]` accepts a named CANNOT MEASURE gap; the
 //! optional one reads no such variable.
 
+#[path = "support/attach.rs"]
+mod unlock_staging;
+
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -1322,7 +1325,12 @@ fn daemon_restart_claim(
     let config = home.join("config");
     let pass = home.join("pass");
     write(&pass, "update proof passphrase\n");
+    let private_keychain = crate::unlock_staging::keychain(&data);
     let env = [
+        (
+            "VOX_TEST_KEYCHAIN",
+            private_keychain.to_str().expect("APPARATUS: Keychain path"),
+        ),
         ("VOX_TEST_RELEASE_BASE", server.base.as_str()),
         ("VOX_NO_SHELL_SETUP", "1"),
         (
@@ -1378,7 +1386,6 @@ fn daemon_restart_claim(
             "--passphrase-file",
             pass_arg,
         ],
-        &["node", "attach", "plain", "--passphrase-file", pass_arg],
     ] {
         let out = vox(&link, home, args, &env);
         if !out.status.success() {
@@ -1410,6 +1417,7 @@ fn daemon_restart_claim(
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .env("VOX_PROXY", "127.0.0.1:0")
         .envs(env.iter().copied())
+        .env("VOX_IDENTITY_PASSPHRASE", "update proof passphrase")
         .args([
             "serve",
             &service_arg,
@@ -1580,7 +1588,7 @@ fn daemon_restart_claim(
             && text.contains(&restarted)
             && text.contains("held sessions plain/update-held/echo ended")
             && text.contains("node plain is detached")
-            && text.contains("vox node attach plain")
+            && text.contains("vox node unlock plain")
             && !text.contains("node kept is detached")
             && kept_after
             && !plain_after

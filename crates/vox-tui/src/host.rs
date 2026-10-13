@@ -163,7 +163,7 @@ struct Attached {
 
 /// How a node is wanted, and so how its attach counts.
 enum Want {
-    /// `vox node attach` (or `--keep` at start): stays until detached by hand (L-3).
+    /// `vox node unlock` (or `--keep` at start): stays until detached by hand (L-3).
     Explicit(Option<KeepSource>),
     /// A held connection: attached implicitly if need be, and held while the connection is open.
     Hold,
@@ -409,7 +409,7 @@ impl Router {
             .collect()
     }
 
-    /// Attach `node` by hand (`vox node attach`), recording it in the attach file when `keep` is
+    /// Attach `node` by hand (`vox node unlock`), recording it in the attach file when `keep` is
     /// given (L-4). Idempotent: an attached node stays as it is, and is now held by hand.
     ///
     /// # Errors
@@ -444,11 +444,90 @@ impl Router {
                 .keep_in_keychain(node, passphrase, rooms, anchors)
                 .await;
         }
-        let g = self
-            .want(node, Want::Explicit(keep), passphrase, rooms, anchors)
+        let mut g = self
+            .want(node, Want::Checked, passphrase.clone(), rooms, anchors)
             .await?;
-        self.write_attach_file(None).await;
+        if keep.is_some() {
+            self.verify_kept_passphrase(node, &g, passphrase.as_deref().map_or("", |p| p))
+                .await?;
+        }
+        // Never hold the file lock while waiting for an earlier detach: that detach may need
+        // the same lock to forget its entry. Apply the explicit keep only after the read works.
+        let _file = self.inner.keep_file.lock().await;
+        let was = self.kept_record(node)?;
+        {
+            let mut slots = lock(&self.inner.slots);
+            match slots.get_mut(node) {
+                Some(Slot::Attached(a)) if a.generation == g.generation => {
+                    g.info = self.grant(node, a, Want::Explicit(keep)).info;
+                }
+                _ => return Err(Refusal::NotAttached { node: node.clone() }),
+            }
+        }
+        self.write_attach_file_held(None, was)
+            .await
+            .map_err(|e| self.remember_failed(node, e))?;
         Ok((g.info, g.notes))
+    }
+
+    fn remember_failed(&self, node: &NodeName, why: String) -> Refusal {
+        Refusal::Failed {
+            node: node.clone(),
+            why: format!(
+                "node {node} is Ready, but remembering could not be confirmed: {why}; correct the storage problem and run `vox node unlock {node}` again"
+            ),
+        }
+    }
+
+    /// A Ready node still has to prove a replacement restart secret. A new attachment already
+    /// checked it while opening the vault. Headless nodes have no vault or passphrase to check.
+    async fn verify_kept_passphrase(
+        &self,
+        node: &NodeName,
+        grant: &Granted,
+        secret: &str,
+    ) -> Result<(), Refusal> {
+        if grant.attached_now {
+            return Ok(());
+        }
+        let failed = |why: String| Refusal::Failed {
+            node: node.clone(),
+            why,
+        };
+        match grant
+            .handle
+            .apply(NodeCommand::VerifyPassphrase {
+                passphrase: Secret::new(secret.as_bytes().to_vec()),
+            })
+            .await
+        {
+            Outcome::Done => Ok(()),
+            Outcome::Failed(Fault::NoIdentity)
+                if secret.is_empty()
+                    && self.inner.account.node_paths(node).is_ok_and(|p| {
+                        !p.vault_file().is_file()
+                            && vox_core::node::headless::identity_file(&p).is_file()
+                    }) =>
+            {
+                Ok(())
+            }
+            Outcome::Failed(Fault::WrongPassphrase) => Err(failed(format!(
+                "that is not node {node}'s identity passphrase, so nothing was stored"
+            ))),
+            other => Err(failed(format!(
+                "its passphrase could not be checked ({other}), so nothing was stored"
+            ))),
+        }
+    }
+
+    fn kept_record(&self, node: &NodeName) -> Result<BTreeMap<NodeName, KeepSource>, Refusal> {
+        let path = self.inner.account.attach_file();
+        read_attach_file_checked(&path)
+            .map(|entries| entries.into_iter().collect())
+            .map_err(|e| Refusal::Failed {
+                node: node.clone(),
+                why: format!("could not read remembered state at {}: {e}; it was not changed; correct the storage problem and retry", path.display()),
+            })
     }
 
     /// **Kept with its passphrase in the Keychain** (ADR-028 K-10, ADR-014 M-6): stored only once
@@ -476,29 +555,10 @@ impl Router {
         let mut g = self
             .want(node, Want::Checked, passphrase, rooms, anchors)
             .await?;
-        if !g.attached_now {
-            match g
-                .handle
-                .apply(NodeCommand::VerifyPassphrase {
-                    passphrase: Secret::new(secret.as_bytes().to_vec()),
-                })
-                .await
-            {
-                Outcome::Done => {}
-                Outcome::Failed(Fault::WrongPassphrase) => {
-                    return Err(failed(format!(
-                        "that is not node {node}'s identity passphrase, so nothing was stored"
-                    )))
-                }
-                other => {
-                    return Err(failed(format!(
-                        "its passphrase could not be checked ({other}), so nothing was stored"
-                    )))
-                }
-            }
-        }
+        self.verify_kept_passphrase(node, &g, &secret).await?;
         let account = self.keychain_account(node);
         let _file = self.inner.keep_file.lock().await;
+        let was = self.kept_record(node)?;
         let stored = {
             let account = account.clone();
             tokio::task::spawn_blocking(move || crate::keychain::store(&account, &secret))
@@ -512,6 +572,10 @@ impl Router {
                     if stored.is_ok() {
                         a.implicit = false;
                         a.keep = Some(KeepSource::Keychain(account.clone()));
+                    } else {
+                        // The failed store removes its Keychain item below. Do not retain a
+                        // stale restart entry or tell the client this node is still remembered.
+                        a.keep = None;
                     }
                     g.info = info_of_attached(node, a);
                     true
@@ -519,16 +583,26 @@ impl Router {
                 _ => false,
             }
         };
-        if !kept || stored.is_err() {
-            // Nothing is left in the Keychain that the attach file does not name.
-            forget_in_keychain(account).await;
-        }
         if !kept {
+            self.forget_unrecorded_keychain(&account).await;
             return Err(failed(format!(
                 "node {node} was detached while it was being kept, so nothing is kept"
             )));
         }
+        // Persist before forgetting a Keychain item: a failed write may leave its old entry.
+        let saved = self.write_attach_file_held(None, was).await;
+        if let Err(e) = saved {
+            self.forget_unrecorded_keychain(&account).await;
+            let mut refusal = self.remember_failed(node, e);
+            if let (Err(store), Refusal::Failed { why, .. }) = (&stored, &mut refusal) {
+                // A failed Keychain store may itself have lost the secret. Retaining the
+                // recorded entry is not a claim that its secret was restored.
+                why.push_str(&format!("; the Keychain store also failed: {store}; its saved passphrase could not be confirmed"));
+            }
+            return Err(refusal);
+        }
         if let Err(e) = stored {
+            self.forget_unrecorded_keychain(&account).await;
             g.notes.push(if e == crate::keychain::NO_KEYCHAIN {
                 format!("node {node} is attached; {e}")
             } else {
@@ -538,8 +612,21 @@ impl Router {
                 )
             });
         }
-        self.write_attach_file_held(None).await;
         Ok((g.info, g.notes))
+    }
+
+    async fn forget_unrecorded_keychain(&self, account: &str) {
+        let path = self.inner.account.attach_file();
+        let Ok(recorded) = read_attach_file_checked(&path) else {
+            // An unreadable record is not evidence that its secret is unneeded.
+            return;
+        };
+        if !recorded
+            .iter()
+            .any(|(_, source)| matches!(source, KeepSource::Keychain(saved) if saved == account))
+        {
+            forget_in_keychain(account.to_owned()).await;
+        }
     }
 
     /// Stop keeping `node` (ADR-014 M-6, #571): Vox.app's Keep Running turned off. Its line leaves
@@ -555,6 +642,7 @@ impl Router {
             return Err(Refusal::NoSuchNode { node: node.clone() });
         }
         let _file = self.inner.keep_file.lock().await;
+        let was = self.kept_record(node)?;
         {
             let mut slots = lock(&self.inner.slots);
             if let Some(Slot::Attached(a)) = slots.get_mut(node) {
@@ -563,7 +651,12 @@ impl Router {
                 }
             }
         }
-        self.write_attach_file_held(Some(node)).await;
+        self.write_attach_file_held(Some(node), was)
+            .await
+            .map_err(|why| Refusal::Failed {
+                node: node.clone(),
+                why: format!("could not forget node {node}'s remembered state: {why}; the node was not locked; correct the storage problem and retry"),
+            })?;
         Ok(())
     }
 
@@ -1838,9 +1931,17 @@ impl Router {
             KeepSource::File(path) => match crate::tunnel_cli::passphrase_file_text(path) {
                 Ok(text) => split_passphrases(&text),
                 Err(e) => {
+                    let command = vox_text::shell::command(&[
+                        "vox",
+                        "node",
+                        "unlock",
+                        node.as_str(),
+                        "--passphrase-file",
+                        &path.to_string_lossy(),
+                    ]);
                     eprintln!(
-                        "vox daemon: could not attach kept node {node}: its passphrase file {}: \
-                         {e}",
+                        "vox daemon: node {node} is Locked: its remembered passphrase file {} \
+                         is unavailable: {e}; restore the file, then run `{command}`",
                         path.display()
                     );
                     return;
@@ -1876,7 +1977,7 @@ impl Router {
             crate::notify::needs_passphrase(
                 &paths,
                 node.as_str(),
-                &format!("It did not attach by itself. Run in a terminal: vox node attach {node}"),
+                &format!("It did not attach by itself. Run in a terminal: vox node unlock {node}"),
             );
         })
         .await;
@@ -2307,7 +2408,9 @@ impl Router {
         // Detached by hand: its line goes, and with it a passphrase kept for it in the Keychain,
         // before an attach waiting for this detach can keep it again.
         if forget_keep {
-            self.write_attach_file(Some(&node)).await;
+            if let Err(e) = self.write_attach_file(Some(&node)).await {
+                eprintln!("vox daemon: could not forget node {node}: {e}");
+            }
         }
         let _ = done.send(true);
         if !matches!(cause, DetachCause::DaemonStopping) {
@@ -2322,9 +2425,14 @@ impl Router {
     /// Rewrite `.daemon/attach` from the kept nodes attached now and the lines already there for
     /// nodes not attached (a kept node that failed to attach stays kept), less `forget`: a node
     /// detached by hand.
-    async fn write_attach_file(&self, forget: Option<&NodeName>) {
+    async fn write_attach_file(&self, forget: Option<&NodeName>) -> Result<(), String> {
         let _file = self.inner.keep_file.lock().await;
-        self.write_attach_file_held(forget).await;
+        let path = self.inner.account.attach_file();
+        let was = read_attach_file_checked(&path)
+            .map_err(|e| format!("could not read {}: {e}", path.display()))?
+            .into_iter()
+            .collect();
+        self.write_attach_file_held(forget, was).await
     }
 
     /// [`Self::write_attach_file`], with `keep_file` held by the caller.
@@ -2332,12 +2440,15 @@ impl Router {
     /// **A Keychain item lives only while the attach file names it** (ADR-014 M-6): a line that
     /// goes, or now names another source, takes its item with it, whatever made it go (a detach
     /// by hand, a keep with a passphrase file, an attach that is not kept).
-    async fn write_attach_file_held(&self, forget: Option<&NodeName>) {
+    async fn write_attach_file_held(
+        &self,
+        forget: Option<&NodeName>,
+        was: BTreeMap<NodeName, KeepSource>,
+    ) -> Result<(), String> {
         if self.inner.stopping.load(Ordering::SeqCst) {
-            return;
+            return Err("the daemon is stopping".into());
         }
         let path = self.inner.account.attach_file();
-        let was: BTreeMap<NodeName, KeepSource> = read_attach_file(&path).into_iter().collect();
         let mut kept = was.clone();
         {
             let slots = lock(&self.inner.slots);
@@ -2377,8 +2488,24 @@ impl Router {
         if let Err(e) = vox_core::node::paths::create_private_dir(&self.inner.account.daemon_dir())
             .and_then(|()| vox_core::node::paths::write_private_file_unique(&path, text.as_bytes()))
         {
-            eprintln!("vox daemon: could not write {}: {e}", path.display());
-            return;
+            // Report what is actually persisted, not the requested keep/unkeep. Read again:
+            // a failure flushing the directory can follow a successful atomic rename.
+            let (recorded, uncertainty) = match read_attach_file_checked(&path) {
+                Ok(entries) => (entries.into_iter().collect(), String::new()),
+                Err(read) => (was, format!("; current remembered state could not be read ({read}); the previous entry is retained in memory")),
+            };
+            for (name, slot) in lock(&self.inner.slots).iter_mut() {
+                if let Slot::Attached(a) = slot {
+                    a.keep = recorded.get(name).cloned();
+                    if a.keep.is_some() {
+                        a.implicit = false;
+                    }
+                }
+            }
+            return Err(format!(
+                "could not write {}: {e}{uncertainty}",
+                path.display()
+            ));
         }
         let named: BTreeSet<&str> = kept
             .values()
@@ -2394,6 +2521,7 @@ impl Router {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -2499,10 +2627,19 @@ pub(crate) fn split_passphrases(text: &str) -> (Option<Zeroizing<String>>, Vec<Z
 /// `.daemon/attach`: one line per kept node, `<name>\t(none|file:<path>|keychain:<account>)`. A
 /// line that does not parse is skipped.
 pub(crate) fn read_attach_file(path: &std::path::Path) -> Vec<(NodeName, KeepSource)> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
+    read_attach_file_checked(path).unwrap_or_default()
+}
+
+fn read_attach_file_checked(
+    path: &std::path::Path,
+) -> std::io::Result<Vec<(NodeName, KeepSource)>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
     };
-    text.lines()
+    Ok(text
+        .lines()
         .filter_map(|line| {
             let (name, source) = line.split_once('\t')?;
             let name = NodeName::parse(name).ok()?;
@@ -2515,7 +2652,7 @@ pub(crate) fn read_attach_file(path: &std::path::Path) -> Vec<(NodeName, KeepSou
             };
             Some((name, source))
         })
-        .collect()
+        .collect())
 }
 
 impl Dispatch for Router {
