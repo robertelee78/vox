@@ -1166,6 +1166,21 @@ final class FirstRunProof: XCTestCase {
         try staged(vox, ["node", "attach", "alice", "--passphrase-file", idPass], env: voxEnv)
         try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", roomPass,
                          "--name", "columns"], env: voxEnv)
+        let room = try line(staged(vox, ["room", "list", "--node", "alice"], env: voxEnv)) {
+            $0.contains(" columns")
+        }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        let link = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        // A single-member inspector fits even in the smallest supported window. Populate a
+        // real roster so scrolling is necessary rather than claiming a pass without overflow.
+        for index in 1...8 {
+            let name = "member-\(index)"
+            try staged(vox, ["node", "create", name],
+                       env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "alice identity"]) { $1 })
+            try staged(vox, ["node", "attach", name, "--passphrase-file", idPass], env: voxEnv)
+            try staged(vox, ["room", "join", "--node", name, "--passphrase-file", roomPass, link], env: voxEnv)
+        }
         try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
         try stager.write(Data("alice\n".utf8), to: config + "/app/node")
         // The widths start from the standard ones: the column keys, in the bundle under proof's
