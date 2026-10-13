@@ -45,6 +45,8 @@ mod watchdog;
 #[path = "support/world.rs"]
 mod world;
 
+use world::attach as local_attach;
+
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -164,10 +166,260 @@ fn echo() -> u16 {
     port
 }
 
+/// The same status journey, before its network scene: named nodes in the CLI, TUI and hook.
+/// These commands have no auto-unlock wrapper; each observed state is the product's own.
+fn node_command(dir: &std::path::Path, args: &[&str], input: &str) -> (bool, String, String) {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vox"))
+        .args(args)
+        .env("HOME", dir.join("home"))
+        .env("VOX_DATA_DIR", dir)
+        .env("VOX_CONFIG_DIR", dir.join("cfg"))
+        .env("VOX_TEST_KEYCHAIN", local_attach::keychain(dir))
+        .env("VOX_PROXY", "127.0.0.1:0")
+        .env_remove("VOX_NODE")
+        .env_remove("VOX_ROOM")
+        .env_remove("VOX_IDENTITY_PASSPHRASE")
+        .env_remove("VOX_ROOM_PASSPHRASE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: run the status journey's vox command");
+    child
+        .stdin
+        .take()
+        .expect("APPARATUS: piped input")
+        .write_all(input.as_bytes())
+        .expect("APPARATUS: give vox its command input");
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+struct StatusNodes(tempfile::TempDir);
+impl Drop for StatusNodes {
+    fn drop(&mut self) {
+        let _ = node_command(self.0.path(), &["daemon", "stop"], "");
+    }
+}
+
+/// A real terminal screen, using the same portable-pty/vt100 apparatus as the wording journey.
+struct StatusTui {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    input: Box<dyn Write + Send>,
+    screen: Arc<Mutex<vt100::Parser>>,
+}
+impl Drop for StatusTui {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+impl StatusTui {
+    fn start(dir: &std::path::Path, node: &str) -> Self {
+        use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem as _};
+        let pair = NativePtySystem::default()
+            .openpty(PtySize {
+                rows: 45,
+                cols: 150,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("APPARATUS: open the status terminal");
+        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_vox"));
+        cmd.args(["tui", "--node", node, "--listen", "127.0.0.1:0"]);
+        cmd.env("HOME", dir.join("home"));
+        cmd.env("VOX_DATA_DIR", dir);
+        cmd.env("VOX_CONFIG_DIR", dir.join("cfg"));
+        cmd.env("VOX_TEST_KEYCHAIN", local_attach::keychain(dir));
+        cmd.env("VOX_PROXY", "127.0.0.1:0");
+        cmd.env("TERM", "xterm-256color");
+        for name in [
+            "VOX_NODE",
+            "VOX_ROOM",
+            "VOX_IDENTITY_PASSPHRASE",
+            "VOX_ROOM_PASSPHRASE",
+        ] {
+            cmd.env_remove(name);
+        }
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .expect("APPARATUS: start vox tui");
+        drop(pair.slave);
+        let input = pair
+            .master
+            .take_writer()
+            .expect("APPARATUS: terminal input");
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .expect("APPARATUS: terminal output");
+        let screen = Arc::new(Mutex::new(vt100::Parser::new(45, 150, 0)));
+        let sink = Arc::clone(&screen);
+        std::thread::spawn(move || {
+            let _master = pair.master;
+            let mut buf = [0; 8192];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                sink.lock()
+                    .expect("APPARATUS: screen lock")
+                    .process(&buf[..n]);
+            }
+        });
+        Self {
+            child,
+            input,
+            screen,
+        }
+    }
+    fn sees(&self, want: &str, matches: impl Fn(&str) -> bool) -> String {
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            let shown = self
+                .screen
+                .lock()
+                .expect("APPARATUS: screen lock")
+                .screen()
+                .contents();
+            if matches(&shown) {
+                return shown;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PRODUCT: vox tui never showed {want}:\n{shown}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+fn ready_and_locked_are_the_states_a_person_sees() {
+    let scratch = StatusNodes(tempfile::tempdir().expect("APPARATUS: status scratch root"));
+    let dir = scratch.0.path();
+    std::fs::create_dir_all(dir.join("home")).expect("APPARATUS: scratch HOME");
+    let run = |args: &[&str], input: &str| {
+        let (ok, out, err) = node_command(dir, args, input);
+        assert!(ok, "PRODUCT: vox {args:?} failed: {out}{err}");
+        format!("{out}{err}")
+    };
+    run(
+        &["node", "create", "private", "--passphrase-file", "-"],
+        "private passphrase\n",
+    );
+    let created = run(
+        &[
+            "node",
+            "create",
+            "free",
+            "--passphrase-file",
+            "-",
+            "--listen",
+            "127.0.0.1:0",
+        ],
+        "\n",
+    );
+    assert!(
+        created.contains("Ready"),
+        "PRODUCT: a no-passphrase node was not made Ready: {created}"
+    );
+    let listed = run(&["node", "list"], "");
+    let row = |text: &str, name: &str, status: &str| {
+        text.lines()
+            .any(|l| l.split_whitespace().next() == Some(name) && l.contains(status))
+    };
+    assert!(row(&listed, "private", "Locked") && row(&listed, "free", "Ready"),
+        "PRODUCT: node list must show protected private Locked and passphrase-free free Ready: {listed}");
+    for (node, want) in [("private", "Locked"), ("free", "Ready")] {
+        let (ok, json, err) = node_command(dir, &["status", "--node", node, "--json"], "");
+        assert!(ok, "PRODUCT: {node} status failed: {json}{err}");
+        let json: Value = serde_json::from_str(&json).expect("PRODUCT: status was not JSON");
+        assert_eq!(
+            json["status"], want,
+            "PRODUCT: {node}'s JSON status must be {want}: {json}"
+        );
+        let text = run(&["status", "--node", node], "");
+        assert!(
+            text.contains(want),
+            "PRODUCT: {node}'s text status must say {want}: {text}"
+        );
+    }
+    let turn =
+        serde_json::json!({"session_id":"locked-status", "cwd":dir.join("home")}).to_string();
+    let hook = run(
+        &["agent", "hook", "--node", "private", "--format", "text"],
+        &turn,
+    );
+    assert!(
+        hook.contains("private is Locked") && hook.contains("vox node unlock private"),
+        "PRODUCT: a hook on a Locked node must say Locked and how to unlock: {hook}"
+    );
+    let tui = StatusTui::start(dir, "free");
+    let screen = tui.sees("free Ready and private Locked", |t| {
+        t.contains("free  Ready") && t.contains("private  Locked")
+    });
+    assert!(
+        !screen.contains("Unlock node"),
+        "PRODUCT: a passphrase-free node asked to unlock: {screen}"
+    );
+    for action in ["lock", "forget-passphrase"] {
+        let out = run(&["node", action, "free"], "");
+        assert!(
+            !out.contains("Locked"),
+            "PRODUCT: {action} falsely called a passphrase-free node Locked: {out}"
+        );
+        let listed = run(&["node", "list"], "");
+        assert!(
+            row(&listed, "free", "Ready"),
+            "PRODUCT: {action} stopped the passphrase-free node: {listed}"
+        );
+    }
+    drop(tui);
+    #[allow(unused_mut)]
+    let mut tui = StatusTui::start(dir, "private");
+    tui.sees("Unlock node for the Locked node", |t| {
+        t.contains("Unlock node") && t.contains("private  Locked")
+    });
+    // macOS has the existing Keychain in which a typed TUI unlock can be remembered.
+    #[cfg(target_os = "macos")]
+    {
+        tui.input
+            .write_all(b"private passphrase\r")
+            .and_then(|()| tui.input.flush())
+            .expect("APPARATUS: type the node's passphrase into the TUI");
+        tui.sees("private Ready after TUI Unlock", |t| {
+            t.contains("private  Ready") && !t.contains("Unlock node")
+        });
+        let listed = run(&["node", "list"], "");
+        assert!(
+            row(&listed, "private", "Ready")
+                && listed
+                    .lines()
+                    .any(|l| l.contains("private") && l.contains("(remembered)")),
+            "PRODUCT: TUI Unlock did not make and remember private Ready: {listed}"
+        );
+    }
+    drop(tui);
+    let locked = run(&["node", "lock", "private"], "");
+    assert!(
+        locked.contains("private is Locked and forgotten"),
+        "PRODUCT: protected Lock did not say its resulting state: {locked}"
+    );
+    eprintln!("[proof] Ready/Locked in CLI status/list, TUI and hook; no-passphrase Lock/Forget stayed Ready");
+}
+
 #[test]
 #[ignore = "real binaries, production Argon2id and a PoW; run in release"]
 fn vox_status_shows_rooms_peers_tunnels_udp_flows_and_what_is_unhealthy() {
     watchdog::arm();
+    ready_and_locked_are_the_states_a_person_sees();
     // ---- the sink: counts each numbered datagram it receives ----
     let sink = UdpSocket::bind("127.0.0.1:0")
         .unwrap_or_else(|e| panic!("APPARATUS: no UDP port for the sink: {e}"));

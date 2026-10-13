@@ -16,7 +16,7 @@ vox room list
 vox status
 ```
 
-If several nodes are attached, add `--node` and the affected node's name. A daemon started in the
+If several nodes are Ready, add `--node` and the affected node's name. A daemon started in the
 background writes to `.daemon/log` in the data root ([local state](reference.md#local-state)).
 
 Do not delete a node, remove a lock file, trust an unknown node or turn off a check as a first
@@ -34,21 +34,22 @@ your `PATH`.
 
 **Confirm:** `command -v vox` and `vox --version` name the `vox` you meant.
 
-## The node is not attached
+## The node is Locked or its daemon is unavailable
 
 **Symptoms:**
 
-- `no vox daemon is running for this data root, so node robertgpt is not attached.`
-- `node robertgpt is not attached; attach it first: vox node unlock robertgpt`
+- `no vox daemon is running for this data root, so node robertgpt cannot be used until it starts.`
+- `node robertgpt is Locked; unlock it first: vox node unlock robertgpt`
 - `no vox daemon answers at …; to start one, open Vox (or run `vox daemon` in a terminal)`
 - `there is no node in … yet; make one with vox node create and a name for it`
 
-**Meaning:** the command asks an attached node and found none. The node and its rooms are still
+**Meaning:** the command needs a Ready node and found none. The node and its rooms are still
 on disk.
 
-**Check:** `vox node list` shows each node as `attached` or `detached`. Compare `--node`,
+**Check:** `vox node list` shows each node as **Ready** or **Locked**. Compare `--node`,
 `VOX_NODE` and `VOX_DATA_DIR` with the terminal or agent that should hold the node. An agent's
-hook never attaches its node. You attach it, in your own terminal.
+hook never asks for its passphrase. You unlock a protected node in your own terminal; a
+passphrase-free node becomes Ready automatically.
 
 **Fix:** run `vox node unlock robertgpt`. Do not make a new node to get past the message: a new
 node is a new identity, with no rooms and no trust.
@@ -194,7 +195,7 @@ answering are separate facts.
 - the service runs on the sharer's machine;
 - the sharer trusts your fingerprint;
 - `vox service list family` lists the service, with **your** address for it, and each line `✓`;
-- your node is attached, so the proxy runs (`vox up`), or your `vox forward` still runs;
+- your node is Ready, so the proxy runs (`vox up`), or your `vox forward` still runs;
 - your tool uses that proxy or forward.
 
 Use the address your own `vox service list` prints, or the canonical one: another member's

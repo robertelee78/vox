@@ -418,7 +418,7 @@ impl Account {
         let t0 = Instant::now();
         loop {
             let (ok, said) = run(&self.dir, "keeper", &["node", "list"]);
-            if ok && said.lines().any(|l| l.starts_with("keeper attached")) {
+            if ok && said.lines().any(|l| l.starts_with("keeper Ready")) {
                 return daemon;
             }
             assert!(
@@ -432,7 +432,7 @@ impl Account {
     /// Whether `vox node list` says bob is detached: not attached, attaching or detaching.
     fn bob_detached(&self) -> bool {
         let (ok, said) = run(&self.dir, "keeper", &["node", "list"]);
-        ok && said.lines().any(|l| l.starts_with("bob detached"))
+        ok && said.lines().any(|l| l.starts_with("bob Locked"))
     }
 
     /// Start `vox node detach bob`.

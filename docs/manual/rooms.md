@@ -1,7 +1,7 @@
 # Rooms and messages
 
 This page shows how to create and join rooms, post and read, and end a room. The examples act as
-the only attached node and use the room `family`. A room's ID from `vox room list`, or the start
+the only Ready node and use the room `family`. A room's ID from `vox room list`, or the start
 of it, works in place of its name.
 
 ## Find the room you mean

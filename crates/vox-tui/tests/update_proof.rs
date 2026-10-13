@@ -1587,9 +1587,9 @@ fn daemon_restart_claim(
         out.status.success()
             && text.contains(&restarted)
             && text.contains("held sessions plain/update-held/echo ended")
-            && text.contains("node plain is detached")
+            && text.contains("node plain is Locked")
             && text.contains("vox node unlock plain")
-            && !text.contains("node kept is detached")
+            && !text.contains("node kept is Locked")
             && kept_after
             && !plain_after
             && held_ended,

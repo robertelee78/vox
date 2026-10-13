@@ -180,7 +180,7 @@ fn a_one_shot_verb_says_in_words_that_its_node_was_detached_mid_request() {
 
     // ---- the claim ------------------------------------------------------------------------
     assert!(
-        said.contains("node n was detached from the vox daemon, so this stopped"),
+        said.contains("the connection to node n ended, so this operation ended"),
         "PRODUCT: the create did not say its node was detached: {said}"
     );
     assert!(

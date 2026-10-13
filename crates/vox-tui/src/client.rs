@@ -294,7 +294,7 @@ pub fn one_shot(paths: &Paths) -> Result<NodeSocket, AppError> {
 
 /// What a verb says on stderr, once, when the daemon has not greeted it within a second.
 pub const DAEMON_WAITING: &str = "vox: waiting: the vox daemon here has not answered yet — it may \
-     be busy (moving or attaching a node) or stopped (Ctrl-Z, which goes on once resumed); this \
+     be busy (moving or unlocking a node) or stopped (Ctrl-Z, which goes on once resumed); this \
      waits up to 10 s";
 
 /// Say [`DAEMON_WAITING`]: a verb waiting on the daemon is never silent.
@@ -604,7 +604,7 @@ pub async fn hold_until_closed(client: &mut IpcClient) -> AppError {
         match client.next().await {
             Ok(Some(Frame::NodeDetached { node })) => {
                 return AppError::Usage(format!(
-                    "node {node} was detached from the vox daemon, so this stopped"
+                    "the connection to node {node} ended, so this operation ended"
                 ))
             }
             Ok(Some(_)) => {}
@@ -625,7 +625,7 @@ pub async fn hold_until_closed(client: &mut IpcClient) -> AppError {
 pub fn unexpected(frame: &Frame) -> AppError {
     AppError::Usage(match frame {
         Frame::NodeDetached { node } => {
-            format!("node {node} was detached from the vox daemon, so this stopped")
+            format!("the connection to node {node} ended, so this operation ended")
         }
         Frame::Error { reason } => reason.clone(),
         other => mismatch(&format!("{other:?}")),
@@ -710,7 +710,7 @@ pub async fn node_create(
         );
         println!("{}", vox_core::node::link::b32_encode(&fp));
         eprintln!("vox: {}", crate::ident::NO_BACKUP);
-        return Ok(());
+        return attach_with(args, &name, Zeroizing::new(String::new()), false).await;
     }
     // **The passphrase is had before anything is written**: resolving the paths makes
     // `nodes/<name>/`, and a create refused for want of one leaves nothing behind.
@@ -733,15 +733,15 @@ pub async fn node_create(
     eprintln!("vox: {}", crate::ident::NO_BACKUP);
     // **Attached at once at a terminal; a script only makes it** (#666): a script's node is
     // attached when the script says so, and a daemon is not left running behind it.
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        eprintln!("vox: node {name} is not attached; attach it: vox node unlock {name}");
+    if !passphrase.is_empty() && !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        eprintln!("vox: node {name} is Locked; unlock it: vox node unlock {name}");
         return Ok(());
     }
     attach_with(args, &name, passphrase, typed)
         .await
         .map_err(|e| {
             AppError::Usage(format!(
-            "node {name} was created, but not attached: {e}\n\x20      Attach it: vox node unlock \
+            "node {name} was created, but did not become Ready: {e}\n\x20      Unlock it: vox node unlock \
              {name}"
         ))
         })
@@ -829,7 +829,7 @@ fn given_not_typed(file: Option<&Path>) -> bool {
     file.is_some() || std::env::var_os("VOX_IDENTITY_PASSPHRASE").is_some()
 }
 
-/// How node `name`, attached with `passphrase`, is remembered, so the daemon attaches it again
+/// How node `name`, attached with `passphrase`, is remembered, so the daemon makes it Ready again
 /// whenever it starts with nobody typing (#666, ADR-028 K-10): a node with no passphrase needs
 /// nothing stored; a passphrase `typed` at the terminal is stored in the Keychain once the daemon
 /// has proved it. One from a file or `VOX_IDENTITY_PASSPHRASE` is not stored, which is said.
@@ -842,7 +842,7 @@ fn remembered(name: &NodeName, passphrase: &str, typed: bool) -> Option<KeepSour
     } else {
         eprintln!(
             "vox: node {name}'s passphrase came from a file or VOX_IDENTITY_PASSPHRASE, so it is \
-             not stored in the Keychain; to have the daemon attach it at each start, attach it \
+             not stored in the Keychain; to have the daemon make it Ready at each start, unlock it \
              again with `vox node unlock` and its name (with --passphrase-file on systems without a Keychain)"
         );
         None
@@ -884,24 +884,23 @@ async fn attach_request(
                 }
                 println!("vox: node {name} is Ready and remembered");
             } else {
-                println!("vox: node {} attached{}", info.name, kept(&info));
+                println!("vox: node {} is Ready{}", info.name, kept(&info));
             }
             if info.keep {
                 match asked {
                     Some(KeepSource::Keychain(_)) => println!(
                         "vox: its passphrase is remembered in the Keychain, so the daemon \
-                         attaches node {name} again by itself whenever it starts; `vox node \
-                         forget-passphrase {name}` forgets it"
+                         makes node {name} Ready again by itself whenever it starts; `vox node \
+                         lock {name}` locks and forgets it"
                     ),
                     Some(KeepSource::None) => println!(
-                        "vox: node {name} has no passphrase, so the daemon attaches it again by \
-                         itself whenever it starts; `vox node forget-passphrase {name}` stops that"
+                        "vox: node {name} has no passphrase, so it becomes Ready whenever the daemon starts; no secret is stored"
                     ),
                     _ => {}
                 }
             } else {
                 println!(
-                    "vox: node {name} is not remembered: after the daemon restarts, attach it \
+                    "vox: node {name} is not remembered: after the daemon restarts, unlock it \
                      again with `vox node unlock {name}`"
                 );
             }
@@ -989,7 +988,7 @@ pub async fn node_rename(args: &NodeArgs, old: &str, new: &str) -> Result<(), Ap
             Some((first, Some(KeepSource::File(f.clone()))))
         }
         (None, true) => {
-            println!("vox: node {old} is attached and not remembered; its passphrase attaches it again as {new}");
+            println!("vox: node {old} is Ready and not remembered; its passphrase makes it Ready again as {new}");
             let typed = !given_not_typed(None);
             let passphrase = tokio::task::spawn_blocking(|| attach_passphrase(None, None))
                 .await
@@ -1111,7 +1110,7 @@ pub async fn node_rename(args: &NodeArgs, old: &str, new: &str) -> Result<(), Ap
         .await;
         if let Err(e) = attached_again {
             unfinished.push(format!(
-                "node {new} could not be attached again: {e}; run {}",
+                "node {new} could not become Ready again: {e}; run {}",
                 command(&["node", "unlock", new.as_str()])
             ));
         }
@@ -1136,7 +1135,7 @@ pub async fn node_rename(args: &NodeArgs, old: &str, new: &str) -> Result<(), Ap
             match attached(&account, &other).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    unfinished.push(format!("{} was not read because node {other} is detached; run {attach_other}, then if its alias is {old}, run {repair}", paths.vault_file().display()));
+                    unfinished.push(format!("{} was not read because node {other} could not be used; run {attach_other}, then if its alias is {old}, run {repair}", paths.vault_file().display()));
                     continue;
                 }
                 Err(e) => {
@@ -1260,11 +1259,10 @@ pub async fn node_forget_passphrase(args: &NodeArgs, name: &str) -> Result<(), A
     {
         Ok(DaemonFrame::Ok) => {
             println!(
-                "vox: node {name}'s passphrase is forgotten: nothing is stored for it in the \
-                 Keychain, and the daemon no longer attaches it by itself when it starts"
+                "vox: node {name}'s remembered credentials are forgotten; its rooms and messages stay here"
             );
             if attached(&account, &name).await? {
-                println!("vox: node {name} stays attached now; `vox node lock {name}` detaches it");
+                println!("vox: node {name} stays Ready now; `vox node lock {name}` locks it if it has a passphrase");
             }
             Ok(())
         }
@@ -1311,6 +1309,26 @@ pub async fn attached(account: &Account, name: &NodeName) -> Result<bool, AppErr
         .any(|n| &n.name == name && matches!(n.state, NodeState::Attached)))
 }
 
+/// Read the daemon's public status, starting it if necessary. A missing or unreadable
+/// record is an error, never a guessed Locked label.
+pub async fn node_status(
+    args: &NodeArgs,
+    name: &NodeName,
+) -> Result<Option<vox_core::node::daemonipc::NodeStatus>, AppError> {
+    let account = args.account()?;
+    ensure_daemon(&account, args.listen, &args.anchor_specs()).await?;
+    let mut d = daemon(&account).await?;
+    match d.request(DaemonRequest::Nodes).await? {
+        DaemonFrame::Nodes(nodes) => nodes
+            .into_iter()
+            .find(|n| &n.name == name)
+            .map(|n| n.status)
+            .ok_or_else(|| AppError::Usage(format!("there is no node {name}"))),
+        DaemonFrame::Refused(r) => Err(AppError::Usage(r.to_string())),
+        other => Err(unexpected_daemon(&other)),
+    }
+}
+
 /// Lock a node and forget its restart state, even when it is already Locked (ADR-031 CW-7).
 /// Its identity, rooms, messages and the app's chosen node stay where they are.
 ///
@@ -1340,6 +1358,24 @@ pub async fn node_lock(args: &NodeArgs, name: &str) -> Result<(), AppError> {
         .await
     {
         Ok(DaemonFrame::Ok | DaemonFrame::Refused(Refusal::NotAttached { .. })) => {
+            let mut d = daemon(&account).await?;
+            let nodes = match d.request(DaemonRequest::Nodes).await {
+                Ok(DaemonFrame::Nodes(nodes)) => nodes,
+                Ok(DaemonFrame::Refused(r)) => return Err(AppError::Usage(r.to_string())),
+                Ok(other) => return Err(unexpected_daemon(&other)),
+                Err(e) => return Err(AppError::Usage(e.to_string())),
+            };
+            if nodes.iter().any(|n| {
+                n.name == name && n.status == Some(vox_core::node::daemonipc::NodeStatus::Ready)
+            }) {
+                println!("vox: node {name} has no passphrase and stays Ready; its remembered credentials are forgotten");
+                return Ok(());
+            }
+            if !nodes.iter().any(|n| {
+                n.name == name && n.status == Some(vox_core::node::daemonipc::NodeStatus::Locked)
+            }) {
+                return Err(AppError::Usage(format!("node {name}'s credentials are forgotten, but its status is not yet known; run `vox node list`")));
+            }
             println!(
                 "vox: node {name} is Locked and forgotten; its rooms and messages stay here; \
                  `vox node unlock {name}` makes it Ready again"
@@ -1362,54 +1398,16 @@ pub async fn node_lock(args: &NodeArgs, name: &str) -> Result<(), AppError> {
 pub async fn node_signout(args: &NodeArgs, name: &str) -> Result<(), AppError> {
     let name = NodeName::parse(name)?;
     let account = args.account()?;
-    if !account.nodes_on_disk().contains(&name) {
-        return Err(AppError::Usage(format!(
-            "no node {name} in this data root; `vox node list` lists them"
-        )));
-    }
-    let mut d = daemon(&account).await?;
-    let asked = |what: &str, r: Result<DaemonFrame, Error>| -> Result<bool, AppError> {
-        match r {
-            Ok(DaemonFrame::Ok) => Ok(true),
-            Ok(DaemonFrame::Refused(Refusal::NotAttached { .. })) => Ok(false),
-            Ok(DaemonFrame::Refused(r)) => Err(AppError::Usage(r.to_string())),
-            Ok(other) => Err(crate::client::unexpected_daemon(&other)),
-            Err(e) => Err(AppError::Usage(format!(
-                "the daemon did not answer {what}: {e}"
-            ))),
-        }
-    };
-    // Not kept first, so nothing attaches it again: its line and its Keychain item go.
-    asked(
-        "the unkeep",
-        d.request(DaemonRequest::Unkeep { node: name.clone() })
-            .await,
-    )?;
-    // A connection of its own: the daemon answers one such request per connection.
-    let mut d = daemon(&account).await?;
-    let detached = asked(
-        "the detach",
-        d.request(DaemonRequest::Detach { node: name.clone() })
-            .await,
-    )?;
-    // The app opens the node it remembers by itself: not this one any more.
+    node_lock(args, name.as_str()).await?;
     let chosen = account.config_dir.join("app").join("node");
-    let remembered = std::fs::read_to_string(&chosen).is_ok_and(|s| s.trim() == name.to_string());
-    if remembered {
-        std::fs::remove_file(&chosen).map_err(|e| {
-            AppError::Usage(format!(
-                "node {name} is detached and no longer kept, but the app's choice of it, {}, could \
-                 not be removed: {e}",
-                chosen.display()
-            ))
-        })?;
+    if std::fs::read_to_string(&chosen).is_ok_and(|s| s.trim() == name.as_str()) {
+        std::fs::remove_file(&chosen).map_err(|e| AppError::Usage(format!(
+            "node {name}'s credentials are forgotten, but the app's choice at {} could not be removed: {e}", chosen.display()
+        )))?;
+        println!(
+            "vox: the app's choice of node {name} is forgotten; its rooms and messages stay here"
+        );
     }
-    println!(
-        "vox: node {name} signed out: {}, no longer kept, its Keychain passphrase forgotten{}; its \
-         rooms and messages stay here, and `vox node unlock {name}` uses it again",
-        if detached { "detached" } else { "not attached" },
-        if remembered { ", and the app no longer opens it by itself" } else { "" }
-    );
     Ok(())
 }
 
@@ -1419,22 +1417,20 @@ pub async fn node_signout(args: &NodeArgs, name: &str) -> Result<(), AppError> {
 /// If the account cannot be resolved.
 pub async fn node_list(args: &NodeArgs) -> Result<(), AppError> {
     let account = args.account()?;
+    ensure_daemon(&account, args.listen, &args.anchor_specs()).await?;
     let running: Vec<NodeInfo> = match DaemonClient::open(&account.socket()).await {
         Ok(mut d) => match d.request(DaemonRequest::Nodes).await {
             Ok(DaemonFrame::Nodes(n)) => n,
-            _ => d.attached.clone(),
+            Ok(DaemonFrame::Refused(r)) => return Err(AppError::Usage(r.to_string())),
+            Ok(other) => return Err(unexpected_daemon(&other)),
+            Err(e) => return Err(AppError::Usage(e.to_string())),
         },
         Err(e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Version { .. })) => {
             return Err(AppError::Usage(e.to_string()));
         }
-        Err(_) => Vec::new(),
+        Err(e) => return Err(AppError::Usage(e.to_string())),
     };
-    let mut names: Vec<NodeName> = account.nodes_on_disk();
-    for n in &running {
-        if !names.contains(&n.name) {
-            names.push(n.name.clone());
-        }
-    }
+    let mut names: Vec<NodeName> = running.iter().map(|n| n.name.clone()).collect();
     names.sort();
     if names.is_empty() {
         println!("vox: no node yet; make one with vox node create and a name for it");
@@ -1442,12 +1438,7 @@ pub async fn node_list(args: &NodeArgs) -> Result<(), AppError> {
     }
     for name in names {
         let info = running.iter().find(|n| n.name == name);
-        let state = match info.map(|i| i.state) {
-            Some(NodeState::Attached) => "attached",
-            Some(NodeState::Attaching) => "attaching",
-            Some(NodeState::Detaching) => "detaching",
-            Some(NodeState::Detached) | None => "detached",
-        };
+        let state = info.and_then(|i| i.status).map_or("…", |s| s.as_str());
         let fp = info
             .and_then(|i| i.fingerprint)
             .map(|f| vox_core::node::link::b32_encode(&f))
@@ -1485,8 +1476,7 @@ async fn daemon(account: &Account) -> Result<DaemonClient, AppError> {
 /// How a node stays attached, as `vox node` lists it.
 fn kept(info: &NodeInfo) -> String {
     match (info.state, info.keep, info.implicit) {
-        (_, true, _) => " (kept)".into(),
-        (NodeState::Attached, false, true) => " (held)".into(),
+        (_, true, _) => " (remembered)".into(),
         _ => String::new(),
     }
 }

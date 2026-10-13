@@ -154,10 +154,7 @@ impl CoreHandle for OfflineCore {
     }
 
     fn startup_notice(&self) -> Option<String> {
-        Some(
-            "offline — no node attached: navigation only. Attach a node to create/join and chat."
-                .to_owned(),
-        )
+        Some("No Ready node: navigation only. Unlock a node to create/join and chat.".to_owned())
     }
 }
 
@@ -759,9 +756,7 @@ pub fn run_node(
     rt.block_on(router.attach(&node, None, None, Vec::new(), Vec::new()))
         .map_err(|r| AppError::Usage(r.to_string()))?;
     let Some(node) = router.handle_of(&node) else {
-        return Err(AppError::Usage(format!(
-            "node {node} detached as it attached"
-        )));
+        return Err(AppError::Usage(format!("node {node} could not stay Ready")));
     };
     // Kept for the anchors file the loop below writes (M17.4).
     let anchors_paths = paths.clone();
@@ -1595,11 +1590,25 @@ fn event_loop(io: &mut impl TerminalIo, core: &mut impl CoreHandle) -> Result<()
         if ui.mode.is_normal() {
             if !vm.has_identity && was_attached.is_none() {
                 ui.start_prompt(PromptKind::CreateIdentity, None);
-            } else if !vm.attached && vm.has_identity && was_attached != Some(false) {
+            } else if !vm.attached
+                && vm.has_identity
+                && was_attached != Some(false)
+                && vm
+                    .machine_nodes
+                    .iter()
+                    .any(|(name, status)| name == &vm.node && status.as_deref() == Some("Locked"))
+            {
                 ui.start_prompt(PromptKind::Attach, None);
             }
         }
-        was_attached = Some(vm.attached);
+        let shown = vm
+            .machine_nodes
+            .iter()
+            .find(|(name, _)| name == &vm.node)
+            .and_then(|(_, status)| status.as_deref());
+        if !vm.has_identity || vm.attached || shown.is_some() {
+            was_attached = Some(vm.attached || shown == Some("Ready"));
+        }
 
         io.draw(&mut |f| render(f, &vm, &mut ui))?;
         if !ui.on_screen.is_empty() {

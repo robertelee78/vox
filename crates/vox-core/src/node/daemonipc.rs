@@ -127,6 +127,26 @@ pub enum NodeState {
     Detaching,
 }
 
+/// The two states a person sees (ADR-031 CW-1). Mechanical transitions have no label yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeStatus {
+    /// Its identity is open and its node is running.
+    Ready,
+    /// Its identity needs a passphrase before it can run.
+    Locked,
+}
+
+impl NodeStatus {
+    /// The same words in every client.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "Ready",
+            Self::Locked => "Locked",
+        }
+    }
+}
+
 /// One node as the daemon reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeInfo {
@@ -134,6 +154,8 @@ pub struct NodeInfo {
     pub name: NodeName,
     /// Where it is in its life.
     pub state: NodeState,
+    /// Ready or Locked; absent only while a start or stop is in flight.
+    pub status: Option<NodeStatus>,
     /// Its identity's fingerprint, once known.
     pub fingerprint: Option<Digest32>,
     /// Attached implicitly, so it detaches when its last holder goes (L-3).
@@ -470,7 +492,7 @@ impl std::fmt::Display for Refusal {
         match self {
             Self::NotAttached { node } => write!(
                 f,
-                "node {node} is not attached; unlock it first: vox node unlock {node}"
+                "node {node} is Locked; unlock it first: vox node unlock {node}"
             ),
             Self::NoSuchNode { node } => write!(f, "there is no node {node}"),
             Self::WrongPassphrase { node } => {
@@ -486,8 +508,7 @@ impl std::fmt::Display for Refusal {
             ),
             Self::StillDetaching { node } => write!(
                 f,
-                "node {node} is still detaching (its stop waits for work it was doing); try \
-                 again once it has"
+                "node {node}'s work is still stopping; try again once it has finished"
             ),
         }
     }
@@ -813,14 +834,19 @@ fn state(d: &mut Decoder<'_>) -> Result<NodeState> {
 }
 
 fn put_info(e: &mut Encoder, i: &NodeInfo) {
-    e.array(5).text(i.name.as_str());
+    e.array(6).text(i.name.as_str());
     put_state(e, i.state);
     put_fp(e, i.fingerprint.as_ref());
     e.uint(u64::from(i.implicit)).uint(u64::from(i.keep));
+    e.uint(match i.status {
+        None => 0,
+        Some(NodeStatus::Ready) => 1,
+        Some(NodeStatus::Locked) => 2,
+    });
 }
 
 fn info(d: &mut Decoder<'_>) -> Result<NodeInfo> {
-    if d.array().map_err(malformed("ipc node info"))? != 5 {
+    if d.array().map_err(malformed("ipc node info"))? != 6 {
         return Err(Error::MalformedIpc("ipc node info"));
     }
     Ok(NodeInfo {
@@ -829,6 +855,12 @@ fn info(d: &mut Decoder<'_>) -> Result<NodeInfo> {
         fingerprint: fp(d, "ipc node info fingerprint")?,
         implicit: flag(d, "ipc node info implicit")?,
         keep: flag(d, "ipc node info keep")?,
+        status: match d.uint().map_err(malformed("ipc node status"))? {
+            0 => None,
+            1 => Some(NodeStatus::Ready),
+            2 => Some(NodeStatus::Locked),
+            _ => return Err(Error::MalformedIpc("ipc node status")),
+        },
     })
 }
 
@@ -1795,7 +1827,7 @@ pub fn unreached(socket: &std::path::Path, node: Option<&str>, e: crate::error::
         Error::Ipc(IpcHandshake::Unreachable { reason }) => {
             let (detached, attach) = node.map_or((String::new(), String::new()), |n| {
                 (
-                    format!(", so node {n} is not attached"),
+                    format!(", so node {n} cannot be used until it starts"),
                     format!(", or `vox node unlock {n}`"),
                 )
             });

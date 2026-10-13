@@ -128,7 +128,7 @@ impl DaemonProxy {
         let mut state = self.state();
         if let State::Up { bound, task } = &*state {
             task.abort();
-            eprintln!("vox daemon: the .vox proxy on {bound} stopped: no node is attached");
+            eprintln!("vox daemon: the .vox proxy on {bound} stopped: no node is Ready");
         }
         *state = State::Off;
     }
@@ -136,12 +136,12 @@ impl DaemonProxy {
     /// Where it listens, or why it does not.
     ///
     /// # Errors
-    /// The bind's reason, or that no node is attached.
+    /// The bind's reason, or that no node is Ready.
     pub fn report(&self) -> Result<SocketAddr, String> {
         match &*self.state() {
             State::Up { bound, .. } => Ok(*bound),
             State::Failed(why) => Err(why.clone()),
-            State::Off => Err("no node is attached, so the .vox proxy is not running".to_owned()),
+            State::Off => Err("no node is Ready, so the .vox proxy is not running".to_owned()),
         }
     }
 }
@@ -182,7 +182,7 @@ impl vox_core::node::up::Names for Nodes {
                 }
             }
         }
-        Err(first.unwrap_or_else(|| "no node is attached".to_owned()))
+        Err(first.unwrap_or_else(|| "no node is Ready".to_owned()))
     }
 }
 
@@ -194,7 +194,7 @@ impl vox_core::node::up::HostDialer for Nodes {
     ) -> vox_core::error::Result<Arc<VoxConnection>> {
         let Some((_, node)) = holder(&(self.0)(), channel_id).cloned() else {
             return Err(vox_core::error::Error::Unreachable(
-                "no attached node holds that room open any more",
+                "no Ready node holds that room open any more",
             ));
         };
         node.member_dialer()

@@ -225,7 +225,7 @@ fn a_joiner_restarted_before_its_first_sync_reaches_its_host_through_the_relay()
     let deadline = Instant::now() + Duration::from_secs(600);
     while !std::fs::read_to_string(&log)
         .unwrap_or_default()
-        .contains("detached (its last holder went)")
+        .contains("finished its work (its last holder went)")
     {
         assert!(
             Instant::now() < deadline,

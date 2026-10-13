@@ -393,7 +393,7 @@ impl StatusReport {
     /// shape is small and fixed and the crate carries no serializer.
     #[must_use]
     pub fn to_json(&self) -> String {
-        let mut j = String::from("{");
+        let mut j = String::from("{\"status\":\"Ready\",");
         let _ = write!(j, "\"now_ms\":{},", self.now);
         let _ = write!(j, "\"log_path\":{},", q(&self.log_path));
         let _ = write!(

@@ -1613,8 +1613,8 @@ impl Unregistered {
                 harness_name(input)
             ),
             Self::Attaching(node) => format!(
-                "Vox: node {node} is attaching (the vox daemon has just started); this session \
-                 joins it once it is attached, and your rooms show from your next turn."
+                "Vox is preparing node {node}; this session joins it once it is Ready, and \
+                 your rooms show from your next turn."
             ),
             Self::NoDaemon(why) => format!(
                 "Vox could not read your rooms because no vox daemon runs and none could be \
@@ -1730,7 +1730,7 @@ impl Daemon {
             } => Ok(Registered { room, new, joining }),
             DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::StillDetaching { node }) => {
                 Err(AppError::Usage(format!(
-                    "node {node} is still detaching; this turn reads nothing"
+                    "node {node}'s work is still stopping; this turn reads nothing"
                 ))
                 .into())
             }

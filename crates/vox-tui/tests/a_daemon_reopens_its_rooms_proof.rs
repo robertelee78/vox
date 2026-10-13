@@ -12,7 +12,7 @@
 //!
 //! ```text
 //! vox id; vox trust add …               # alice and bob, consenting to each other
-//! vox daemon                            # identity passphrase ONLY, both times, every time
+//! vox daemon                            # unlock once and remember; no passphrase on restarts
 //! vox room create / post                # alice's room, one post
 //! vox room link / vox room join       # bob joins it (the join path remembers too)
 //! (kill -9 both daemons) vox daemon     # a crash: both rooms must be open again
@@ -96,7 +96,10 @@ fn vox(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, Stri
 
 fn vox_plain(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
     let mut cmd = Command::new(VOX);
-    cmd.args(args)
+    cmd.args(attach::persistent_args(dir, args, IDENTITY))
+        .env("HOME", dir.join("home"))
+        .env("VOX_TEST_KEYCHAIN", attach::keychain(dir))
+        .env("VOX_PROXY", "127.0.0.1:0")
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         // In the environment, not argv: a command line is world-readable (ADR-015).
@@ -132,37 +135,48 @@ fn vox_plain(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, S
     )
 }
 
-/// Start `vox daemon` given the identity passphrase and **nothing else**, then wait until it
-/// answers.
+/// Start `vox daemon` without any passphrase. The first start is explicitly unlocked once;
+/// every restart has only the state the product remembered, never an auto-unlock helper.
 fn daemon(dir: &Path, tag: &str) -> Daemon {
     let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out")))
         .expect("APPARATUS: harness file I/O");
     let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err")))
         .expect("APPARATUS: harness file I/O");
-    let mut child = Command::new(VOX)
-        .args(["daemon", "--listen", "127.0.0.1:0"])
+    let child = Command::new(VOX)
+        .args(["daemon", "--no-node", "--listen", "127.0.0.1:0"])
+        .env("HOME", dir.join("home"))
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
+        .env("VOX_TEST_KEYCHAIN", attach::keychain(dir))
+        .env("VOX_PROXY", "127.0.0.1:0")
+        .env_remove("VOX_NODE")
         .env_remove("VOX_ROOM")
-        .stdin(Stdio::piped())
+        .env_remove("VOX_IDENTITY_PASSPHRASE")
+        .env_remove("VOX_ROOM_PASSPHRASE")
+        .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
         .expect("APPARATUS: spawn vox daemon");
-    let mut pipe = child.stdin.take().expect("APPARATUS: daemon stdin");
-    pipe.write_all(format!("{IDENTITY}\n").as_bytes())
-        .expect("APPARATUS: write the daemon's passphrase");
-    drop(pipe);
     let d = Daemon(child);
+    // Only the first start receives an explicit operator unlock. Restart probes below use
+    // vox_plain: the staging wrapper must never unlock on behalf of the claim.
+    if tag.ends_with("-start") {
+        let (ok, out, err) = vox_plain(dir, &["node", "unlock", "default"], None);
+        assert!(
+            ok && out.contains("Ready"),
+            "PRODUCT (staging): initial Unlock failed: {out}{err}"
+        );
+    }
     // The first start is staging; every later start is the restart this proof is about.
     let side = if tag.ends_with("-start") {
         "PRODUCT (staging): on its first start,"
     } else {
-        "PRODUCT: restarted with only its identity passphrase,"
+        "PRODUCT: restarted without any passphrase input,"
     };
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
-        let (ok, _, err) = vox(dir, &["room", "list"], None);
+        let (ok, _, err) = vox_plain(dir, &["room", "list", "--node", "default"], None);
         if ok {
             return d;
         }
@@ -178,8 +192,8 @@ fn daemon(dir: &Path, tag: &str) -> Daemon {
 /// `vox room read` must succeed on `room` — which it does only if the room is OPEN on the
 /// daemon — and, when `want` is given, must return that post.
 fn reads(dir: &Path, who: &str, when: &str, room: &str, want: Option<&str>) {
-    let (ok, out, err) = vox(dir, &["room", "read", room], None);
-    let (_, listed, _) = vox(dir, &["room", "list"], None);
+    let (ok, out, err) = vox_plain(dir, &["room", "read", room, "--node", "default"], None);
+    let (_, listed, _) = vox_plain(dir, &["room", "list", "--node", "default"], None);
     // At the first start the room being open is staging; after a restart it is the claim.
     let side = if when == "start" {
         "PRODUCT (staging):"
@@ -200,6 +214,23 @@ fn reads(dir: &Path, who: &str, when: &str, room: &str, want: Option<&str>) {
     }
 }
 
+/// The public status comes from the reopened live node, with no helper unlock.
+fn free_is_ready(dir: &Path, when: &str) {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        let (ok, out, err) = vox_plain(dir, &["status", "--node", "free", "--json"], None);
+        let status = serde_json::from_str::<serde_json::Value>(&out).ok();
+        if ok && status.as_ref().is_some_and(|s| s["status"] == "Ready") {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: the passphrase-free node did not become Ready {when}: {out}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[test]
 #[ignore = "real vox daemons and production Argon2id; CI runs it in release"]
 fn a_restarted_daemon_holds_every_room_it_held_without_a_room_passphrase() {
@@ -208,6 +239,7 @@ fn a_restarted_daemon_holds_every_room_it_held_without_a_room_passphrase() {
     let alice = tmp.path().join("alice");
     let bob = tmp.path().join("bob");
     for d in [&alice, &bob] {
+        std::fs::create_dir_all(d.join("home")).expect("APPARATUS: scratch HOME");
         std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: harness file I/O");
     }
 
@@ -259,11 +291,29 @@ fn a_restarted_daemon_holds_every_room_it_held_without_a_room_passphrase() {
     assert!(ok, "PRODUCT (staging): vox room join failed: {err}");
     reads(&bob, "bob", "start", &room, None);
 
-    // ---- a crash: SIGKILL both, restart both with the identity passphrase alone --------
+    // A passphrase-free node is Ready after creation and after Forget. It has no saved
+    // credential to restore; startup must actually open its identity with an empty credential.
+    let (ok, out, err) = vox_plain(
+        &alice,
+        &["node", "create", "free", "--passphrase-file", "-"],
+        Some("\n"),
+    );
+    assert!(
+        ok && out.contains("Ready"),
+        "PRODUCT: no-passphrase creation was not Ready: {out}{err}"
+    );
+    let (ok, out, err) = vox_plain(&alice, &["node", "lock", "free"], None);
+    assert!(
+        ok && out.contains("stays Ready"),
+        "PRODUCT: no-passphrase Lock did not stay Ready: {out}{err}"
+    );
+
+    // ---- a crash: SIGKILL both, restart both without supplying any passphrase --------
     drop(a);
     drop(b);
     let a = daemon(&alice, "alice-crash");
     let b = daemon(&bob, "bob-crash");
+    free_is_ready(&alice, "after a crash");
     reads(&alice, "alice", "crash", &room, Some(POST));
     reads(&bob, "bob", "crash", &room, None);
     drop(b);
@@ -271,10 +321,18 @@ fn a_restarted_daemon_holds_every_room_it_held_without_a_room_passphrase() {
     // ---- a clean stop: SIGTERM, restart ------------------------------------------------
     a.terminate();
     let _a = daemon(&alice, "alice-term");
+    free_is_ready(&alice, "after a clean daemon stop");
     reads(&alice, "alice", "term", &room, Some(POST));
     let (ok, _, err) = vox(
         &alice,
-        &["room", "post", &room, "said after the restarts"],
+        &[
+            "room",
+            "post",
+            &room,
+            "said after the restarts",
+            "--node",
+            "default",
+        ],
         None,
     );
     assert!(ok, "PRODUCT: the reopened room refused a post: {err}");

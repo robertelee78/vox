@@ -85,6 +85,8 @@ pub struct NodeSummary {
     pub name: String,
     /// `detached`, `attaching`, `attached` or `detaching`.
     pub state: String,
+    /// `Ready` or `Locked`; absent while the daemon is starting or stopping this node.
+    pub status: Option<String>,
     /// Its identity fingerprint, base32; empty until the daemon knows it.
     pub fingerprint: String,
     /// Attached with `--keep`: attached again whenever the daemon starts.
@@ -1291,7 +1293,7 @@ fn attach_said(socket: &std::path::Path, node: &NodeName, e: Error) -> VoxError 
 fn answered(frame: Frame) -> Result<Frame, VoxError> {
     match frame {
         Frame::NodeDetached { node } => Err(VoxError::Detached {
-            reason: format!("node {node} was detached from the vox daemon"),
+            reason: format!("the connection to node {node} ended"),
         }),
         // The node says why as a sentence; the passphrase gate's is its own fault's, word for
         // word, so it is told apart here, once, and typed for the client (D1).
@@ -1364,7 +1366,7 @@ async fn start_file_for(
 }
 
 fn not_attached() -> VoxError {
-    failed("no node is attached in this app yet")
+    failed("choose a Ready node in this app first")
 }
 
 /// Shown, never laid out: a name another party chose.
@@ -1980,6 +1982,7 @@ impl VoxClient {
                         NodeState::Detaching => "detaching",
                     }
                     .to_owned(),
+                    status: n.status.map(|s| s.as_str().to_owned()),
                     fingerprint: n.fingerprint.map(|f| b32_encode(&f)).unwrap_or_default(),
                     keep: n.keep,
                 })
@@ -2016,29 +2019,35 @@ impl VoxClient {
         )
         .map_err(|e| failed(e.to_string()))?;
         let secret = passphrase.copy();
+        let unprotected = secret.is_empty();
         // The node's own clock, a test step included (V210-64), as `vox node create` stamps it.
         let now_ms = (vox_core::time::clock_with_test_skew())();
-        self.on_rt(async move {
-            // Argon2id and the files: off the runtime's workers.
-            tokio::task::spawn_blocking(move || {
-                vox_core::node::profile::Profile::create_node(
-                    paths,
-                    secret.as_bytes(),
-                    now_ms,
-                    &|| {},
-                )
-                .map(|fp| b32_encode(&fp))
-                .map_err(|e| match vox_core::node::actor::fault_of(&e) {
-                    f @ (vox_core::node::api::Fault::IdentityFileUnwritable
-                    | vox_core::node::api::Fault::Storage
-                    | vox_core::node::api::Fault::ProfileBusy) => failed(f.to_string()),
-                    _ => failed(e.to_string()),
+        let fingerprint = self
+            .on_rt(async move {
+                // Argon2id and the files: off the runtime's workers.
+                tokio::task::spawn_blocking(move || {
+                    vox_core::node::profile::Profile::create_node(
+                        paths,
+                        secret.as_bytes(),
+                        now_ms,
+                        &|| {},
+                    )
+                    .map(|fp| b32_encode(&fp))
+                    .map_err(|e| match vox_core::node::actor::fault_of(&e) {
+                        f @ (vox_core::node::api::Fault::IdentityFileUnwritable
+                        | vox_core::node::api::Fault::Storage
+                        | vox_core::node::api::Fault::ProfileBusy) => failed(f.to_string()),
+                        _ => failed(e.to_string()),
+                    })
                 })
+                .await
+                .map_err(|_| failed("making the node stopped"))?
             })
-            .await
-            .map_err(|_| failed("making the node stopped"))?
-        })
-        .await
+            .await?;
+        if unprotected {
+            self.keep(node, None).await?;
+        }
+        Ok(fingerprint)
     }
 
     /// Act as `node`, attaching it if it is not attached (with `passphrase`, its identity's), and
@@ -2119,7 +2128,7 @@ impl VoxClient {
             DaemonFrame::Attached(info, _) if info.keep => Ok(()),
             DaemonFrame::Attached(_, notes) => Err(failed(notes.join("; "))),
             _ => Err(failed(format!(
-                "the vox daemon did not say node {node} is kept"
+                "the vox daemon did not confirm that node {node} is remembered"
             ))),
         }
     }
@@ -2135,7 +2144,7 @@ impl VoxClient {
         match self.daemon(DaemonRequest::Unkeep { node: name }).await? {
             DaemonFrame::Ok => Ok(()),
             other => Err(failed(format!(
-                "the vox daemon did not say node {node} is no longer kept ({other:?})"
+                "the vox daemon did not confirm that node {node} is forgotten ({other:?})"
             ))),
         }
     }
@@ -2173,7 +2182,7 @@ impl VoxClient {
         match answer {
             DaemonFrame::Ok => Ok(()),
             _ => Err(failed(format!(
-                "the vox daemon did not say node {node} detached"
+                "the vox daemon did not confirm the lock of node {node}"
             ))),
         }
     }
@@ -4266,7 +4275,7 @@ async fn follow(
             // Events were dropped for this client: every room it follows is read from its cursor.
             Ok(Some(Frame::Lagged { .. })) => cursors.keys().copied().collect(),
             Ok(Some(Frame::NodeDetached { node })) => {
-                listener.on_ended(format!("node {node} was detached from the vox daemon"));
+                listener.on_ended(format!("the connection to node {node} ended"));
                 return;
             }
             Ok(Some(_)) => continue,
@@ -4305,8 +4314,7 @@ async fn follow(
                     let rows = match h.client.request(&request).await {
                         Ok(Frame::Rows { rows } | Frame::RoomPage { rows, .. }) => rows,
                         Ok(Frame::NodeDetached { node }) => {
-                            listener
-                                .on_ended(format!("node {node} was detached from the vox daemon"));
+                            listener.on_ended(format!("the connection to node {node} ended"));
                             return;
                         }
                         // The cursor's row has gone (it expired): start again from the newest.

@@ -1666,7 +1666,7 @@ fn a_kept_node_is_reached_again_at_its_address_after_a_restart() {
     assert!(ok, "PRODUCT: vox daemon --detach failed: {out}{err}");
     let pid = a.lock_pid().expect("PRODUCT: no daemon holds the lock");
     let attached = wait_until(Duration::from_secs(60), || {
-        a.log().contains("vox daemon: attached kept node default")
+        a.log().contains("vox daemon: node default is Ready")
     });
     let after = if attached {
         addresses_for(&invite(&a), &fp)

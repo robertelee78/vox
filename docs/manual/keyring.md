@@ -1,7 +1,7 @@
 # Identity and keyring
 
 This page shows how to manage your nodes and decide whom each one trusts. The examples act as
-`robertgpt`, whose keyring holds `ann`. With more than one node attached, add `--node robertgpt`.
+`robertgpt`, whose keyring holds `ann`. With more than one node Ready, add `--node robertgpt`.
 
 ## Your nodes
 
@@ -12,17 +12,16 @@ a node of its own. Never share one between a person and an agent.
 |---|---|
 | Make a node | `vox node create robertgpt` |
 | List the nodes on this machine | `vox node list` |
-| Attach a node | `vox node unlock robertgpt` |
-| Detach a node | `vox node lock robertgpt` |
-| Stop Vox attaching it by itself | `vox node forget-passphrase robertgpt` |
+| Unlock a node | `vox node unlock robertgpt` |
+| Lock and forget a node | `vox node lock robertgpt` |
 | Rename it on this machine | `vox node rename robertgpt robert-laptop` |
-| Sign it out | `vox node signout robertgpt` |
 
 `vox node create` asks for the identity passphrase twice, or reads it from `--passphrase-file`.
 Leave it empty to make a node with none: Vox then says that the node's key is kept unencrypted, so
 anyone who can read its data folder can act as it. There is no command to change a passphrase.
 
-At a terminal, `vox node create` also attaches the node. Run by a script, it only makes it. There
+At a terminal, `vox node create` also makes the node Ready. A script creates a protected node
+Locked; a node with no passphrase becomes Ready immediately. There
 is no backup of a node: its keys never leave the machine. If the machine is lost, make a new node,
 and ask everyone who trusted the old one to remove it and trust the new one.
 
@@ -37,35 +36,29 @@ If remembering fails, unlock returns a failure and describes the resulting state
 remembered entry may remain; if Vox cannot read it, it reports that uncertainty. Correct the
 reported problem and retry.
 
-`vox node attach` is now `vox node unlock`; `vox node detach` is now `vox node lock`.
-The old names print the new name and do the same thing. `attach --keep` is accepted and has no
-further effect, since unlock always remembers.
+`vox node list` shows each node as **Ready** or **Locked**, with its fingerprint, and
+`(remembered)` when Vox has saved how to start it again. A progress mark appears while work is
+starting or stopping; an unreadable saved record reports its reason instead of guessing a state.
 
-`vox node list` shows each node as `attached` or `detached`, with its fingerprint, and `(kept)` for
-one the daemon attaches by itself.
-
-`vox node lock` closes the node's connections, stops its services and wipes its keys from
-memory. It also forgets the node: the daemon stops attaching it by itself, and its passphrase
-leaves the Keychain. Its rooms and keyring stay on disk.
-
-`vox node forget-passphrase` forgets the node in the same way but leaves it attached.
+**Ready** means the node is running and can work. **Locked** means its protected identity needs
+unlocking. `vox node lock` closes a protected node's connections, stops its services, wipes its
+keys from memory and forgets its remembered passphrase. Its rooms and keyring stay on disk.
+A node made with no passphrase always becomes Ready when Vox runs. Lock or Forget removes any
+remembered entry but cannot lock an identity that has no passphrase; Vox says it stays Ready.
 
 `vox node rename` keeps the node's identity, so its fingerprint stays the same. It moves the name
 everywhere this machine holds it: the node's directory, its remembered passphrase, the harnesses
 wired to it, and the app's choice of node. If a keyring on this machine names the node, the
 command prints the `vox trust rename` that updates it.
 
-`vox node signout` detaches the node, forgets it, and makes the app forget it chose it. Its rooms
-and messages stay. `vox node unlock` brings it back.
-
 ## When the passphrase is asked for
 
-Vox asks for the identity passphrase in two cases only: when you attach the node, and when you
+Vox asks for the identity passphrase in two cases only: when you unlock the node, and when you
 change its keyring with `vox trust add`, `remove`, `rename`, `drive` or `read`. Posting, reading,
 sharing, and a room's name or retention never ask.
 
 A passphrase typed for a keyring change opens the keyring for 30 minutes. Further changes in that
-time do not ask. A passphrase typed to attach the node does not open it. While the keyring is
+time do not ask. A passphrase typed to unlock the node does not open it. While the keyring is
 open, any program running as you, an agent included, can change it. `vox status` shows the state
 on its second line: `keyring asks for the passphrase`, or `keyring open 30m` with the minutes left.
 
@@ -88,11 +81,11 @@ vox node unlock claude-mac
 vox trust add f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq --name ann --node claude-mac
 ```
 
-The agent's hook never attaches the node and never takes a passphrase. While the node is
-detached, the agent is told so, with the command for you:
+The agent's hook never asks for a passphrase. A passphrase-free node becomes Ready by itself;
+for a Locked node the agent gets the command for you:
 
 ```text
-Vox could not read your rooms this turn: node claude-mac is not attached, and a hook never attaches it. Ask the operator to run, in a terminal outside this session: vox node unlock claude-mac
+Vox node claude-mac is Locked; ask the operator to run `vox node unlock claude-mac` in a terminal outside this session.
 ```
 
 ## Compare before trusting

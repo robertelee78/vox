@@ -10,9 +10,9 @@ command, give the exact arguments of the `vox` you run. `vox man` prints the sam
 |---|---|
 | node | one identity: its own keys, fingerprint, rooms, keyring and services |
 | fingerprint | the 52-character public name of a node's keys |
-| daemon | the background program that runs the attached nodes of one data root |
-| attached | running in the daemon; a detached node is on disk but does nothing |
-| kept | attached again by the daemon by itself whenever it starts |
+| daemon | the background program that runs the Ready nodes of one data root |
+| Ready / Locked | running in the daemon / a protected identity waiting for Unlock |
+| remembered | Vox has saved how to make the node Ready whenever the daemon starts |
 | keyring | the nodes a node trusts, each with your name for it |
 | room link | the `vox://…` address that tells a newcomer where to find a room |
 | entry hash | the ID of one message, the first column of `vox room read` |
@@ -31,20 +31,20 @@ command, give the exact arguments of the `vox` you run. `vox man` prints the sam
 | Task | Command | Needs |
 |---|---|---|
 | Set up this machine for its harnesses | `vox setup` | a terminal |
-| Make, attach, list, detach, sign out a node | `vox node create`, `attach`, `list`, `detach`, `signout` | the node's passphrase, if it has one |
+| Make, unlock, list or lock a node | `vox node create`, `unlock`, `list`, `lock` | the node's passphrase, if it has one |
 | Rename a node, or forget its passphrase | `vox node rename`, `forget-passphrase` | the node on this machine |
 | Open the terminal interface | `vox` or `vox tui` | a terminal |
-| Run the daemon in a terminal | `vox daemon` | nothing: attaching a node starts one |
+| Run the daemon in a terminal | `vox daemon` | nothing: unlocking a node starts one |
 | Run an anchor | `vox node`, with no subcommand | a headless node |
-| Rooms and messages | `vox room list`, `create`, `link`, `join`, `roster`, `post`, `read`, `tail`, `rename`, `retention`, `admin`, `leave`, `end` | an attached node |
-| What the node is doing | `vox status`, `vox status --json` | an attached node |
+| Rooms and messages | `vox room list`, `create`, `link`, `join`, `roster`, `post`, `read`, `tail`, `rename`, `retention`, `admin`, `leave`, `end` | an Ready node |
+| What the node is doing | `vox status`, `vox status --json` | an Ready node |
 | Your fingerprint | `vox id` | |
 | Trust | `vox trust add`, `list`, `offers`, `dismiss`, `rename`, `remove`, `drive`, `read` | a compared fingerprint; the passphrase, typed at a terminal, for a change |
 | Share a service | `vox serve`, `vox service add`, `list`, `remove` | a running local service |
 | Join a room for its services | `vox connect` | the room link and passphrase |
 | Reach a service | `vox up`, `vox forward` | the sharer's trust |
 | Close tunnels | `vox tunnel close` | `vox status` lists them |
-| Share and pull files | `vox share`, `vox share list`, `vox share stop`, `vox room get` | an attached node |
+| Share and pull files | `vox share`, `vox share list`, `vox share stop`, `vox room get` | an Ready node |
 | A room's local network | `vox lan up` | the LAN helper |
 | Wire a harness | `vox agent setup`, `plugin`, `skill`, `trust`, `doctor`, `status` | `--node` |
 | Sessions | `vox room sessions`, `vox room session`, `vox agent room`, `vox agent send` | read + drive, to drive |
@@ -53,12 +53,12 @@ command, give the exact arguments of the `vox` you run. `vox man` prints the sam
 ## How a command picks its node
 
 A command acts as the first of these that names a node: `--node`, then `VOX_NODE`, then the only
-attached node, then the only node on disk. If none settles it, the command refuses and lists the
+Ready node, then the only node on disk. If none settles it, the command refuses and lists the
 nodes. Name the node explicitly in scripts and agent setups.
 
 `vox node unlock`, `serve`, `connect`, `up`, `forward` and `lan up` start the daemon if none runs,
-and attach their node. Other commands only ask an attached node, and say so if it is not attached,
-with the `vox node unlock` that attaches it.
+and unlock their node. Other commands only ask an Ready node, and say so if it is Locked,
+with the `vox node unlock` that makes it Ready.
 
 The data root is chosen by `--data-dir`, then `VOX_DATA_DIR`, then the platform default. The
 config directory by `--config-dir`, then `VOX_CONFIG_DIR`, then `XDG_CONFIG_HOME`, then the
@@ -74,7 +74,7 @@ Linux. It holds:
 - `nodes/NAME/`, one node: its identity (`vault.cbor`), its room store (`store.redb`), its own
   `config/`, cursors, agent sessions, `files/ROOM_ID/` for the shares it pulled, and `decisions/`
   for its decision record.
-- `.daemon/`, the daemon's: its lock, control socket, port, the list of nodes it attaches by
+- `.daemon/`, the daemon's: its lock, control socket, port, the list of nodes it makes Ready by
   itself (`attach`), its `log`, and `format`, which records the data's format and the version of
   `vox` that last served it.
 - `rooms`, the room map: which room an agent session works in, by its start directory
@@ -124,10 +124,10 @@ At a terminal, Vox asks with a hidden prompt. Without one:
   at a terminal ([when the passphrase is asked for](keyring.md#when-the-passphrase-is-asked-for)).
 
 Vox refuses a passphrase on the command line, because other processes can read it. It refuses
-`VOX_ROOM_PASSPHRASE` too. `VOX_IDENTITY_PASSPHRASE` works for attaching, but other processes of
+`VOX_ROOM_PASSPHRASE` too. `VOX_IDENTITY_PASSPHRASE` works for unlocking, but other processes of
 your user can read it.
 
-On a Mac, `vox node unlock` remembers the passphrase in the Keychain. On Linux, keep a node with a
+On a Mac, `vox node unlock` remembers the passphrase in the Keychain. On Linux, remember a node with a
 file instead, readable only by you:
 
 ```sh
@@ -176,7 +176,7 @@ the problem.
 
 `vox`, or `vox tui`, opens the terminal interface. It is another client of the same daemon, so it
 runs beside the command line and agents. It acts as one node. `vox tui --node spare` opens one as
-another. `:attach` attaches its node. `:quit` exits.
+another. `:unlock` makes its node Ready. `:quit` exits.
 
 On the room list:
 

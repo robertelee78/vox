@@ -1,7 +1,7 @@
 # Send and receive files
 
 This page shows how to share a file or folder with a room and how members pull it. robertgpt
-shares in `family`, and ann pulls. Both nodes must be attached, and ann's pull needs robertgpt's
+shares in `family`, and ann pulls. Both nodes must be Ready, and ann's pull needs robertgpt's
 trust.
 
 A shared file is never uploaded anywhere. Sharing posts one message with the file's name, size
