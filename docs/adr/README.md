@@ -46,7 +46,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [032](ADR-032-anchors-are-found-added-and-kept-per-machine.md) | Anchors Are Found, Added and Kept per Machine (a room's anchors set at creation, by hand or by a search the person chooses, changed only by its creator or an admin; a machine's hand-added list; shown with source and reach) — accepted for v0.4.4 | 012, 026 |
 | [033](ADR-033-the-repo-room-is-where-agents-work-together.md) | The Repo Room Is Where Agents Work Together (threads, pause, room marks, the composer, Session tabs, who does what from the room's claims only) — accepted for v0.4.4 | 020, 021, 028, 029, 031 |
 | [034](ADR-034-the-app-and-daemon-never-hang-or-hide-a-failure.md) | The App and the Daemon Never Hang or Hide a Failure (updates restart the daemon, refusal only on a real incompatibility, bounded waits, paged replies, a room that cannot save recovers, true health, bounded logs, Quit always quits) — accepted for v0.4.4 | 014, 018, 026, 028 |
-| [035](ADR-035-computer-trust-and-daemon-identities.md) | Computer Trust and Daemon Identities (pair once, all managed nodes, selected personal nodes get drive, individual node trust remains) — product requirements accepted for v0.4.5; protocol design pending | 002, 003, 012, 018, 026, 028, 029, 031 |
+| [035](ADR-035-computer-trust-and-daemon-identities.md) | Computer Trust and Daemon Identities (pair once, all managed nodes, selected personal nodes get drive, individual node trust remains) — product requirements and technical contract revision 2 accepted for v0.4.5 | 002, 003, 010, 012, 018, 026, 028, 029, 031 |
 
 ## Tiers
 
@@ -110,7 +110,7 @@ planned. This is the roll-up.
 | 032 | accepted for v0.4.4 (the decider, 2026-10-10), **not built**; amends 012, 017, 026, 028 |
 | 033 | accepted for v0.4.4 (the decider, 2026-10-10), **not built**; amends 014, 028, 029 |
 | 034 | accepted for v0.4.4 (the decider, 2026-10-10), **not built**; amends 014, 026, 028 |
-| 035 | product requirements accepted for v0.4.5 (the decider, 2026-10-12), **not built**; protocol and upgrade design pending; amends 020, 026, 031 while preserving node identities |
+| 035 | product requirements accepted for v0.4.5 (the decider, 2026-10-12); technical contract revision 2 independently accepted (GO), **not built**; narrowly amends 002, 010, 020, 026, 031 while preserving node identities and one daemon endpoint |
 
 ## Conformance-vector obligations
 

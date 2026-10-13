@@ -2,9 +2,10 @@
 
 **Date**: 2026-10-12
 
-**Status**: Product requirements accepted for v0.4.5 from the decider's Q&A on 2026-10-12.
-The authenticated protocol, membership ordering and upgrade design still require review before
-implementation. Nothing in this ADR is built.
+**Status**: Accepted for v0.4.5: product requirements and technical contract revision 2.
+The product requirements come from the decider's Q&A on 2026-10-12. The technical contract has
+independent GO as recorded below; implementation and product acceptance remain outstanding.
+Nothing in this ADR is built.
 
 **Deciders**: robertelee78
 
@@ -167,12 +168,45 @@ nodes on the Macs can drive its other nodes. No node is to be guessed to be pers
   as a side effect of this feature. These are technical design obligations, not permission to
   reopen the product decisions above or to mark implementation stories Ready without a design.
 
+## Accepted technical contract
+
+The [revision-2 technical contract on #798](https://github.com/robertelee78/vox/issues/798#issuecomment-6137614328)
+settles CT-22's identity, pairing, causal membership, fork, policy-journal, transfer/recovery,
+retained-history, compatibility and shared-upgrade design. It has an
+[independent GLM-5.3 GO](https://github.com/robertelee78/vox/issues/798#issuecomment-6137677323).
+That contract governs implementation; CT-1 through CT-22 remain the product requirements.
+The following clarifications delimit its changes to earlier ADRs:
+
+- The daemon MUST have a separate computer-management identity using the existing composite-key
+  software vault, with an empty passphrase for unattended operation. Its private directory under
+  `.daemon/computer` MUST have mode `0700` and its owned files mode `0600`, with atomic install,
+  ownership and symlink checks, and no secret logging. Its protection is the OS-account boundary;
+  it does not protect against a copied data root or a compromised account. This vault MUST remain
+  distinct from node vaults and MUST NOT change their passphrase or lifecycle rules.
+- The management identity MUST register as a distinct role on the daemon's existing
+  `SharedEndpoint`, one QUIC endpoint and one UDP socket, including when zero nodes are attached.
+  It MUST NOT create a second network presence or dispatch node/room streams. The daemon remains
+  outside rooms; node identities remain the authority for room communication and drive.
+- A node-management binding MUST be signed by both the node and its managing computer according
+  to the contract; it confers computer-policy authority only through explicit computer enrollment.
+  It asserts opted-in management within that group, not a link to physical hardware, other data roots
+  or a human identity. Vox MUST NOT present it as physical-device attestation. A copied node vault
+  alone MUST NOT establish or transfer management authority.
+
+Technical GO is design acceptance. CT-21's actual product journeys and CT-20's migration
+contribution remain required; #741 still owns the combined release-upgrade acceptance.
+
 ## Superseded and amended lines
 
-| Existing rule | Amendment for explicitly enrolled computer groups |
+These are narrow successor amendments. Requirements not named here remain in force; the
+predecessor ADRs' node, room and transport rules are not otherwise replaced.
+
+| Existing rule | Amendment for computer management and explicitly enrolled groups |
 |---|---|
-| ADR-026 D-2: the daemon holds no identity key | The daemon has a distinct computer-management identity (CT-1); it remains outside rooms and can run with zero nodes |
-| ADR-002: a node identity is not a device | Unchanged for nodes; a separate daemon identity authenticates a Vox installation, without replacing node identities |
+| ADR-026 D-2: the daemon holds no identity key | Supersede only the no-identity-key clause: the daemon MUST hold the separate persistent computer-management identity (CT-1 and the accepted contract). It MUST NOT be a node or join rooms and MUST run with zero nodes attached |
+| ADR-026 D-3: one UDP socket and one QUIC endpoint per data root | Preserved: the management identity MUST use a distinct role on that same daemon-owned endpoint and socket, never a second network presence or node/room dispatch role |
+| ADR-010 AR-5: a generated identity vault is wrapped under an identity passphrase | For the separate unattended computer-management vault only, the existing software vault MUST use an empty passphrase and the OS-account protection specified above. Node-vault and room-store protections remain unchanged; no hardware or copied-root protection is claimed |
+| ADR-002 D1: Vox does not attest a link between a device and an identity | Opt-in, node-and-computer-signed management bindings MAY establish group management membership under CT-5 and the accepted contract. They MUST NOT attest physical-device ownership or hardware identity. Nodes remain separate identities, and ordinary individual trust establishes no management relationship |
 | ADR-020 10.1 and ADR-031 LT-3: no remote identity vouches for others in granting read | An explicitly authorized computer-group policy may use authenticated daemon rosters; ordinary node trust still introduces nobody (CT-2/CT-5/CT-8) |
 | ADR-031 LT-7: nothing automatic for nodes on other machines | Computer trust is the explicit alternative; individual remote node trust remains available (CT-2/CT-3) |
 | ADR-031 LT-6: a removed local automatic pair stays removed | Unchanged outside computer mode; computer mode has no per-node exception and removal is at computer scope (CT-4/CT-16) |
@@ -180,10 +214,12 @@ nodes on the Macs can drive its other nodes. No node is to be guessed to be pers
 
 ## Implementation order and related work
 
-First settle CT-22 and the integration with #741. Then build authenticated two-computer pairing
-and its two trust modes, group enrollment without repeated pairings, ongoing roster and personal
-selection changes, and complete removal. Group updates and removal are to share one membership
-design, not invent competing state stores.
+The accepted revision-2 contract settles CT-22 and the shared design boundary with #741.
+Implementation is to begin with authenticated two-computer pairing and its two trust modes,
+followed by group enrollment without repeated pairings, ongoing roster and personal selection
+changes, and complete removal. Group updates and removal MUST use that same membership design
+and daemon-owned transaction domain, not competing state stores. Each implementation story still
+requires its approved handoff and scoped acceptance; the design verdict is not product acceptance.
 
 #724/#725 still own automatic trust between eligible local nodes outside computer mode. #796
 owns presented node names and local alias preservation. #677 owns the common operator-only trust
@@ -191,7 +227,7 @@ boundary. #741 owns the release's combined format step. #794 owns the installed 
 behavior, and #795 owns repository/room isolation. This ADR must integrate with those outcomes,
 not duplicate or silently replace their implementation work.
 
-Depends on ADR-002, ADR-003, ADR-012, ADR-018, ADR-026, ADR-028, ADR-029 and ADR-031. Amends the
+Depends on ADR-002, ADR-003, ADR-010, ADR-012, ADR-018, ADR-026, ADR-028, ADR-029 and ADR-031. Amends the
 lines listed above. Pairing does not require a new room, a central account service or new room
 membership. It is not a claim that the whole physical computer or every OS account shares one
 daemon identity.
