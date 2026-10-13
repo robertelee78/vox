@@ -62,6 +62,7 @@ impl Account {
         let data = tmp.path().join("d");
         let cfg = tmp.path().join("c");
         std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(tmp.path().join("home")).unwrap();
         Self {
             _tmp: tmp,
             data,
@@ -74,7 +75,7 @@ impl Account {
         c.env_clear()
             // A proof's daemon never takes port 1080 (.cargo/config.toml).
             .env("VOX_PROXY", "127.0.0.1:0");
-        for key in ["PATH", "HOME", "TMPDIR"] {
+        for key in ["PATH", "TMPDIR"] {
             if let Some(v) = std::env::var_os(key) {
                 c.env(key, v);
             }
@@ -86,6 +87,7 @@ impl Account {
             "VOX_TEST_KEYCHAIN",
             crate::unlock_staging::keychain(&self.data),
         )
+        .env("HOME", self._tmp.path().join("home"))
         .env("VOX_DATA_DIR", &self.data)
         .env("VOX_CONFIG_DIR", &self.cfg)
         .env("VOX_LISTEN", "127.0.0.1:0")
@@ -614,6 +616,7 @@ fn pair_computers(
     room: &str,
     daemons: &mut Vec<Daemon>,
 ) {
+    computer(a, &["personal", "personal"]);
     let other_agent = b.make_node("remote-agent");
     for node in ["remote", "remote-agent"] {
         let (ok, out, err) = b.run(&["node", "attach", node, "--passphrase-file", "-"], PASS);
@@ -621,6 +624,7 @@ fn pair_computers(
     }
     std::fs::create_dir_all(b.cfg.join("app")).unwrap();
     std::fs::write(b.cfg.join("app/node"), "remote\n").unwrap();
+    computer(b, &["personal", "remote"]);
     let ring = |account: &Account, node: &str| {
         let (ok, out, err) = account.run(&["trust", "list", "--node", node], "");
         assert!(ok, "PRODUCT: {node}'s keyring was unavailable: {out}{err}");
@@ -1703,4 +1707,652 @@ fn a_kept_node_is_reached_again_at_its_address_after_a_restart() {
         "PRODUCT: after the restart the member read the node = {m_read}, the node read the \
          member = {a_read}\nlog:\n{log}"
     );
+}
+
+/// #801/#802: use the existing account/CLI journey's staging without replaying #799/#800's
+/// pairing, anchor, expired-invitation or storage-failure assertions. These three computers
+/// exercise only the changed roster, selection, removal and explicit binding outcomes.
+#[test]
+#[ignore = "real binaries with production Argon2id; run in release"]
+fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
+    watchdog::arm();
+    let a = Account::new();
+    let b = Account::new();
+    let c = Account::new();
+    let ready = |account: &Account, name: &str| {
+        let (ok, out, err) = account.run(&["node", "unlock", name, "--passphrase-file", "-"], PASS);
+        assert!(ok, "PRODUCT: ready {name}: {out}{err}");
+    };
+    let create = |account: &Account, name: &str| {
+        let id = account.make_node(name);
+        let (ok, out, err) = account.run(&["node", "unlock", name, "--passphrase-file", "-"], PASS);
+        assert!(
+            ok,
+            "APPARATUS: create/ready scratch node {name}: {out}{err}"
+        );
+        id
+    };
+    let old = create(&a, "old-personal");
+    let new = create(&a, "new-personal");
+    let remote = create(&b, "remote-personal");
+    let worker = create(&b, "worker");
+    let moving = create(&b, "moving");
+    create(&c, "observer");
+    let ring = |account: &Account, name: &str| {
+        let (ok, out, err) = account.run(&["trust", "list", "--node", name], "");
+        assert!(
+            ok,
+            "PRODUCT: {name}'s effective keyring unavailable: {out}{err}"
+        );
+        out
+    };
+    let has = |shown: &str, fp: &str, drive: bool| {
+        shown
+            .lines()
+            .any(|line| line.contains(fp) && line.contains("read + drive") == drive)
+    };
+    // This earlier individual exception must not survive removal of its computer.
+    for (account, name) in [(&a, "old-personal"), (&c, "observer")] {
+        let (ok, out, err) = account.run(
+            &[
+                "trust",
+                "add",
+                &remote,
+                "--name",
+                "my-remote",
+                "--drive",
+                "--node",
+                name,
+            ],
+            "",
+        );
+        assert!(ok, "APPARATUS: earlier individual drive: {out}{err}");
+    }
+    computer(&a, &["personal", "old-personal"]);
+    computer(&b, &["personal", "remote-personal"]);
+    let enroll = |sponsor: &Account, incoming: &Account| {
+        let offer = computer(sponsor, &["invite"]);
+        let preview = computer(
+            incoming,
+            &["pair", offer["invite_link"].as_str().unwrap(), "--preview"],
+        );
+        let op = preview["pairing"]["operation_id"].as_str().unwrap();
+        computer(incoming, &["approve", op]);
+        computer(sponsor, &["approve", op]);
+    };
+    enroll(&a, &b);
+    enroll(&b, &c);
+    assert!(
+        wait_until(Duration::from_secs(60), || has(
+            &ring(&b, "worker"),
+            &old,
+            true
+        ) && has(
+            &ring(&b, "worker"),
+            &new,
+            false
+        ) && has(
+            &ring(&c, "observer"),
+            &worker,
+            false
+        )),
+        "APPARATUS: three-computer fixed-policy staging never completed"
+    );
+    let a_id = computer(&a, &["status"])["this_computer"]["fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let b_id = computer(&b, &["status"])["this_computer"]["fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let c_id = computer(&c, &["status"])["this_computer"]["fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let room = make_room(&b, "worker");
+    let link = b.run(&["room", "link", &room, "--node", "worker"], "").1;
+    let link = link
+        .lines()
+        .find(|l| l.starts_with("vox://"))
+        .expect("APPARATUS: room link");
+    for (account, node) in [
+        (&a, "old-personal"),
+        (&a, "new-personal"),
+        (&b, "remote-personal"),
+        (&c, "observer"),
+    ] {
+        let (ok, out, err) = account.run(
+            &[
+                "room",
+                "join",
+                link,
+                "--node",
+                node,
+                "--passphrase-file",
+                "-",
+            ],
+            ROOM_PASS,
+        );
+        assert!(
+            ok,
+            "APPARATUS: shared room for changed drive outcome: {out}{err}"
+        );
+    }
+    // The real harness hook opens a real Session. Driving a file needs no terminal stand-in:
+    // success means the peer actually receives the exact bytes; refusal must leave no file.
+    let hook = |account: &Account, node: &str, session: &str| {
+        let payload = format!(
+            r#"{{"session_id":"{session}","hook_event_name":"UserPromptSubmit","cwd":"{}","prompt":"computer policy update"}}"#,
+            account._tmp.path().display()
+        );
+        let (ok, out, err) = account.run(
+            &["agent", "hook", "--node", node, "--room", &room],
+            &payload,
+        );
+        assert!(ok, "APPARATUS: Session hook for {node}: {out}{err}");
+    };
+    hook(&b, "worker", "computer-policy-worker");
+    hook(&a, "old-personal", "computer-policy-local");
+    let files = |account: &Account, node: &str, name: &str| -> bool {
+        let root = account.data.join("nodes").join(node).join("files");
+        std::fs::read_dir(root)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|entry| {
+                std::fs::read(entry.path().join(name)).ok().as_deref()
+                    == Some(b"computer-policy-payload")
+            })
+    };
+    let drive = |from: &Account,
+                 node: &str,
+                 to: &Account,
+                 target: &str,
+                 session: &str,
+                 name: &str,
+                 allowed: bool| {
+        let file = from._tmp.path().join(name);
+        std::fs::write(&file, b"computer-policy-payload").unwrap();
+        let (ok, out, err) = from.run(
+            &[
+                "room",
+                "session",
+                &room,
+                session,
+                "--file",
+                file.to_str().unwrap(),
+                "--node",
+                node,
+            ],
+            "",
+        );
+        if allowed {
+            assert!(
+                ok && out.contains("pulling"),
+                "PRODUCT: {node}'s current automatic drive did not deliver its file: {out}{err}"
+            );
+            assert!(
+                wait_until(Duration::from_secs(30), || files(to, target, name)),
+                "PRODUCT: accepted drive file from {node} did not arrive byte-for-byte"
+            );
+        } else {
+            assert!(!ok, "PRODUCT: {node} retained revoked drive: {out}{err}");
+            assert!(
+                !files(to, target, name),
+                "PRODUCT: refused drive from {node} still delivered a file"
+            );
+        }
+    };
+    assert!(
+        wait_until(Duration::from_secs(30), || a
+            .run(
+                &[
+                    "room",
+                    "sessions",
+                    &room,
+                    "--node",
+                    "old-personal",
+                    "--json"
+                ],
+                ""
+            )
+            .1
+            .contains("computer-policy-worker")),
+        "APPARATUS: initial driver did not discover the target Session"
+    );
+    drive(
+        &a,
+        "old-personal",
+        &b,
+        "worker",
+        "computer-policy-worker",
+        "before-selection",
+        true,
+    );
+
+    offline_for_enrollment(&c, "selection observer");
+    computer(&a, &["personal", "new-personal"]);
+    assert!(
+        wait_until(Duration::from_secs(30), || has(
+            &ring(&b, "worker"),
+            &new,
+            true
+        ) && has(
+            &ring(&b, "worker"),
+            &old,
+            false
+        )),
+        "PRODUCT: personal selection did not move drive from old to new"
+    );
+    let pending = computer(&a, &["status"]);
+    assert!(
+        pending["applications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["computer"]["fingerprint"] == c_id && v["confirmed"] == false),
+        "PRODUCT: offline computer falsely acknowledged the selection: {pending}"
+    );
+    drive(
+        &a,
+        "old-personal",
+        &b,
+        "worker",
+        "computer-policy-worker",
+        "old-after-selection",
+        false,
+    );
+    assert!(
+        wait_until(Duration::from_secs(30), || a
+            .run(
+                &[
+                    "room",
+                    "sessions",
+                    &room,
+                    "--node",
+                    "new-personal",
+                    "--json"
+                ],
+                ""
+            )
+            .1
+            .contains("computer-policy-worker")),
+        "PRODUCT: new personal node could not discover its newly authorized Session"
+    );
+    drive(
+        &a,
+        "new-personal",
+        &b,
+        "worker",
+        "computer-policy-worker",
+        "new-after-selection",
+        true,
+    );
+    offline_for_enrollment(&a, "saved selection");
+    ready(&a, "new-personal");
+    ready(&a, "old-personal");
+    assert_eq!(
+        computer(&a, &["status"])["selected_node"],
+        new,
+        "PRODUCT: daemon restart forgot the saved personal identity"
+    );
+    ready(&c, "observer");
+    assert!(
+        wait_until(Duration::from_secs(30), || has(
+            &ring(&c, "observer"),
+            &new,
+            true
+        ) && has(
+            &ring(&c, "observer"),
+            &old,
+            false
+        )),
+        "PRODUCT: reconnect restored stale personal drive"
+    );
+    computer(&a, &["personal", "--clear"]);
+    assert!(
+        wait_until(Duration::from_secs(30), || has(
+            &ring(&b, "worker"),
+            &new,
+            false
+        )),
+        "PRODUCT: headless selection retained personal drive"
+    );
+    computer(&a, &["personal", "new-personal"]);
+    assert!(
+        wait_until(Duration::from_secs(30), || has(
+            &ring(&b, "worker"),
+            &new,
+            true
+        )),
+        "PRODUCT: headless computer could not select a personal node without re-pairing"
+    );
+
+    let added = create(&a, "added");
+    assert!(
+        wait_until(Duration::from_secs(30), || has(
+            &ring(&b, "worker"),
+            &added,
+            false
+        ) && has(
+            &ring(&c, "observer"),
+            &added,
+            false
+        )),
+        "PRODUCT: new node did not acquire the group read policy"
+    );
+    let (ok, out, err) = b.run(
+        &[
+            "trust",
+            "rename",
+            &added,
+            "my-stable-alias",
+            "--node",
+            "worker",
+        ],
+        "",
+    );
+    assert!(ok, "APPARATUS: chosen local alias: {out}{err}");
+    let (ok, out, err) = a.run(&["node", "rename", "added", "renamed"], "");
+    assert!(ok, "PRODUCT: managed-node rename: {out}{err}");
+    ready(&a, "renamed");
+    assert!(
+        wait_until(Duration::from_secs(30), || computer(&c, &["status"])
+            ["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["fingerprint"] == added && n["name"] == "renamed")),
+        "PRODUCT: authenticated rename/fingerprint did not propagate"
+    );
+    assert!(
+        ring(&b, "worker")
+            .lines()
+            .any(|l| l.contains(&added) && l.contains("my-stable-alias")),
+        "PRODUCT: presented rename replaced the person's alias"
+    );
+    let (ok, out, err) = a.run(&["node", "lock", "renamed"], "");
+    assert!(
+        ok,
+        "APPARATUS: stop owned node before deleting its scratch directory: {out}{err}"
+    );
+    std::fs::remove_dir_all(a.data.join("nodes/renamed")).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(30), || !ring(&b, "worker")
+            .contains(&added)
+            && !ring(&c, "observer").contains(&added)),
+        "PRODUCT: removed node retained roster grants"
+    );
+    let replacement = create(&a, "renamed");
+    assert_ne!(
+        replacement, added,
+        "APPARATUS: replacement needs a fresh identity"
+    );
+    assert!(
+        wait_until(Duration::from_secs(30), || has(
+            &ring(&b, "worker"),
+            &replacement,
+            false
+        )),
+        "PRODUCT: replacement identity was not published"
+    );
+    assert!(
+        !ring(&b, "worker")
+            .lines()
+            .any(|l| l.contains(&replacement) && l.contains("my-stable-alias")),
+        "PRODUCT: a replacement fingerprint silently inherited the old identity's alias"
+    );
+
+    let binding = |account: &Account, action: &str, node: &str, destination: &str| {
+        let status = computer(account, &["status"]);
+        computer(
+            account,
+            &[
+                "binding",
+                action,
+                node,
+                "--destination",
+                destination,
+                "--confirm",
+                status["frontier"].as_str().unwrap(),
+            ],
+        )
+    };
+    let copy_node = |from: &Account, to: &Account, name: &str| {
+        let (ok, out, err) = from.run(&["node", "lock", name], "");
+        assert!(ok, "APPARATUS: close owned transfer vault: {out}{err}");
+        let copied = Command::new("cp")
+            .arg("-R")
+            .arg(from.data.join("nodes").join(name))
+            .arg(to.data.join("nodes").join(name))
+            .status()
+            .unwrap();
+        assert!(
+            copied.success(),
+            "APPARATUS: copy only the owned scratch node vault"
+        );
+    };
+    copy_node(&b, &a, "moving");
+    let (ok, out, err) = a.run(
+        &["node", "unlock", "moving", "--passphrase-file", "-"],
+        PASS,
+    );
+    assert!(
+        !ok,
+        "PRODUCT: copied vault silently changed managers: {out}{err}"
+    );
+    binding(&b, "release", &moving, &a_id);
+    assert!(
+        wait_until(Duration::from_secs(30), || computer(&a, &["status"])
+            ["binding_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["node"] == moving && v["action"] == "transfer")),
+        "PRODUCT: signed release did not reach its chosen destination"
+    );
+    binding(&a, "transfer", &moving, "");
+    ready(&a, "moving");
+    assert!(
+        wait_until(Duration::from_secs(30), || computer(&c, &["status"])
+            ["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["fingerprint"] == moving && n["computer"] == a_id)),
+        "PRODUCT: approved node+destination binding did not transfer management"
+    );
+
+    // A previously stronger individual grant is already consumed by policy; changing A's
+    // personal node makes old-personal a drive target for B's personal node.
+    hook(&a, "old-personal", "computer-policy-local");
+    assert!(
+        wait_until(Duration::from_secs(30), || b
+            .run(
+                &[
+                    "room",
+                    "sessions",
+                    &room,
+                    "--node",
+                    "remote-personal",
+                    "--json"
+                ],
+                ""
+            )
+            .1
+            .contains("computer-policy-local")),
+        "APPARATUS: remote personal Session discovery before removal"
+    );
+    drive(
+        &b,
+        "remote-personal",
+        &a,
+        "old-personal",
+        "computer-policy-local",
+        "before-removal",
+        true,
+    );
+    offline_for_enrollment(&c, "removal observer");
+    let status = computer(&a, &["status"]);
+    computer(
+        &a,
+        &[
+            "remove",
+            &b_id,
+            "--confirm",
+            status["frontier"].as_str().unwrap(),
+        ],
+    );
+    assert!(
+        wait_until(Duration::from_secs(30), || !ring(&a, "old-personal")
+            .contains(&remote)
+            && !ring(&a, "new-personal").contains(&worker)),
+        "PRODUCT: removal preserved pre-pairing individual or group trust"
+    );
+    let pending = computer(&a, &["status"]);
+    assert!(
+        pending["removed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["fingerprint"] == b_id)
+            && pending["applications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["computer"]["fingerprint"] == c_id && v["confirmed"] == false),
+        "PRODUCT: removal/remaining offline application was not shown truthfully: {pending}"
+    );
+    drive(
+        &b,
+        "remote-personal",
+        &a,
+        "old-personal",
+        "computer-policy-local",
+        "after-removal",
+        false,
+    );
+    ready(&c, "observer");
+    assert!(
+        wait_until(Duration::from_secs(30), || !ring(&c, "observer")
+            .contains(&remote)
+            && !ring(&c, "observer").contains(&worker)),
+        "PRODUCT: reconnect kept the removed computer's old grants"
+    );
+    offline_for_enrollment(&b, "removed computer");
+    ready(&b, "remote-personal");
+    assert!(
+        wait_until(Duration::from_secs(30), || computer(&b, &["status"])
+            ["state"]
+            == "removed"),
+        "PRODUCT: removed computer's restart/old view restored membership"
+    );
+    for (account, node, peer, name) in [
+        (&a, "old-personal", remote.as_str(), "my-remote"),
+        (&b, "remote-personal", old.as_str(), "old-personal"),
+    ] {
+        let (ok, out, err) = account.run(
+            &[
+                "trust", "add", peer, "--name", name, "--drive", "--node", node,
+            ],
+            "",
+        );
+        assert!(
+            ok,
+            "PRODUCT: later explicit individual trust was refused: {out}{err}"
+        );
+    }
+    offline_for_enrollment(&a, "later individual trust");
+    ready(&a, "old-personal");
+    ready(&a, "new-personal");
+    assert!(
+        has(&ring(&a, "old-personal"), &remote, true),
+        "PRODUCT: replay/restart purged a deliberate post-removal individual grant"
+    );
+
+    // Lost-manager recovery uses the retained former binding and removal frontier, and the
+    // destination still needs the node's real unlocked key. Copying alone remains insufficient.
+    copy_node(&b, &c, "worker");
+    binding(&c, "recover", &worker, "");
+    ready(&c, "worker");
+    assert!(
+        wait_until(Duration::from_secs(30), || computer(&a, &["status"])
+            ["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["fingerprint"] == worker && n["computer"] == c_id)),
+        "PRODUCT: explicit recovery did not publish its successor management binding"
+    );
+    enroll(&a, &b);
+    assert!(
+        wait_until(Duration::from_secs(30), || computer(&b, &["status"])
+            ["computers"]
+            .as_array()
+            .is_some_and(|v| v.len() == 3)
+            && has(&ring(&a, "old-personal"), &remote, true)),
+        "PRODUCT: fresh deliberate re-enrollment failed"
+    );
+    assert!(
+        computer(&a, &["status"])["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|n| n["fingerprint"] == worker)
+            .all(|n| n["computer"] == c_id),
+        "PRODUCT: re-enrollment restored the former manager's superseded node binding"
+    );
+    // Explicitly abandoning a group after the last manager is removed retains retirement
+    // evidence, clears covered grants, and permits a fresh ceremony only by operator choice.
+    for target in [&a_id, &c_id, &b_id] {
+        let status = computer(&b, &["status"]);
+        computer(
+            &b,
+            &[
+                "remove",
+                target,
+                "--confirm",
+                status["frontier"].as_str().unwrap(),
+            ],
+        );
+        if target == &a_id {
+            assert!(
+                wait_until(Duration::from_secs(30), || computer(&a, &["status"])
+                    ["state"]
+                    == "removed"),
+                "PRODUCT: removed A did not receive its signed retirement"
+            );
+        }
+    }
+    binding(&b, "recover-group", "group", "");
+    assert!(
+        computer(&b, &["status"])["computers"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "PRODUCT: local group abandonment retained membership"
+    );
+    assert!(
+        !ring(&b, "remote-personal").contains(&old),
+        "PRODUCT: local abandonment preserved covered grants"
+    );
+    assert!(
+        wait_until(Duration::from_secs(30), || computer(&a, &["status"])
+            ["state"]
+            == "removed"),
+        "PRODUCT: locally removed manager did not retain retirement evidence"
+    );
+    binding(&a, "recover-group", "group", "");
+    enroll(&b, &a);
+    assert!(
+        wait_until(Duration::from_secs(30), || computer(&a, &["status"])
+            ["computers"]
+            .as_array()
+            .is_some_and(|v| v.len() == 2)),
+        "PRODUCT: deliberate fresh group after abandonment failed"
+    );
+    eprintln!("[proof] #801/#802 changed roster, personal drive, removal, transfer, recovery and deliberate re-enrollment outcomes passed");
 }

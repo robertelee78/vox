@@ -5589,15 +5589,9 @@ impl Node {
                 fingerprint,
                 petname,
             } => {
-                if let Some(c) = &self.computer {
+                if let (Some(c), Some(profile)) = (&self.computer, &self.profile) {
                     if c.grouped() {
-                        if let Err(e) = c.individual_choice(
-                            self.profile
-                                .as_ref()
-                                .map(Profile::fingerprint)
-                                .unwrap_or([0; 32]),
-                            fingerprint,
-                        ) {
+                        if let Err(e) = c.individual_choice(profile.fingerprint(), fingerprint) {
                             return Outcome::Failed(fault_of(&e));
                         }
                     }
@@ -5620,15 +5614,9 @@ impl Node {
                 history,
                 capability,
             } => {
-                if let Some(c) = &self.computer {
+                if let (Some(c), Some(profile)) = (&self.computer, &self.profile) {
                     if c.grouped() {
-                        if let Err(e) = c.individual_choice(
-                            self.profile
-                                .as_ref()
-                                .map(Profile::fingerprint)
-                                .unwrap_or([0; 32]),
-                            fingerprint,
-                        ) {
+                        if let Err(e) = c.individual_choice(profile.fingerprint(), fingerprint) {
                             return Outcome::Failed(fault_of(&e));
                         }
                     }
