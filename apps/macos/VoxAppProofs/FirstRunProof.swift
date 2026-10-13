@@ -2972,13 +2972,24 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("tagged root post returned no entry hash: \(taggedPost)")
         }
         try staged(vox, ["room", "post", "--node", "bob", "--re", taggedRoot, room, "TAGGED-THREAD-MIDDLE"], env: voxEnv)
-        words(ui, Key.timelineRow("bob: TAGGED-THREAD-MIDDLE"), timeout: 30,
-              "the app must receive the tagged thread's middle reply", until: { $0.contains("TAGGED-THREAD-MIDDLE") })
         guard let fromBob = entry("TAGGED-THREAD-MIDDLE") else {
             throw Apparatus("the staged tagged middle reply has no entry hash")
         }
         let middleKey = Key.timelineRow("bob: TAGGED-THREAD-MIDDLE")
-        let middle = el(ui, middleKey)
+        guard let replyTimeline = locate(ui, Key.id("timeline")) else {
+            throw Apparatus("the timeline could not be found to scroll to the staged middle reply")
+        }
+        // The prior quote jump deliberately leaves an earlier message selected and in view.
+        // Scroll to the newer reply before asking the virtualized timeline for its row.
+        let visibleUntil = Date().addingTimeInterval(20)
+        while Date() < visibleUntil && locate(ui, middleKey) == nil {
+            replyTimeline.scroll(byDeltaX: 0, deltaY: -200)
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        guard let middle = locate(ui, middleKey) else {
+            keepTree(ui, "the tagged middle reply could not be staged by scrolling")
+            throw Apparatus("the timeline could not be scrolled to the CLI-held tagged middle reply")
+        }
         if !inView(ui, middle) { scrollTo(ui, middle) }
         guard let timeline = locate(ui, Key.id("timeline")),
               timeline.frame.contains(middle.frame), inView(ui, middle) else {
