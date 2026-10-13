@@ -120,7 +120,14 @@ final class NodeModel: ObservableObject {
     private let client: VoxClient
 
     @Published private(set) var rooms: [Room] = []
-    @Published var selection: Selection?
+    @Published var selection: Selection? {
+        didSet {
+            roomReadGeneration = UUID()
+            rejectedRoomMark = nil
+        }
+    }
+    private var roomReadGeneration = UUID()
+    private var rejectedRoomMark: String?
     /// The first message that was unread when the room came on screen, and how many were: where
     /// the timeline draws its unread line. It stays while the room is on screen; what arrives
     /// meanwhile is read as it is shown.
@@ -450,7 +457,14 @@ final class NodeModel: ObservableObject {
         do {
             let rows: [RoomMessage]
             if let after = lastRead[room] {
-                rows = try await client.read(room: room, after: after, limit: 0)
+                do {
+                    rows = try await client.read(room: room, after: after, limit: 0)
+                } catch where Self.rejectedForwardMark(error) {
+                    // Retention can remove the last preview row. Retire its mark before the
+                    // bounded read, so a failed recovery never retries that expired mark.
+                    lastRead[room] = nil
+                    rows = try await client.roomRead(room: room).messages
+                }
             } else {
                 rows = try await client.roomRead(room: room).messages
             }
@@ -510,24 +524,48 @@ final class NodeModel: ObservableObject {
     /// this loop at most (the walkthrough's WHERE-15, posted while every peer was offline, never
     /// came as an event to the reopened app).
     private func readNewOnScreen() async {
-        guard case let .room(id) = selection else { return }
+        guard case let .room(id) = selection, ended == nil else { return }
+        let generation = roomReadGeneration
         do {
             let rows: [RoomMessage]
-            if let after = messages.last?.id {
-                rows = try await client.read(room: id, after: after, limit: 0)
+            var recovery: FfiRoomRead?
+            if let after = messages.last?.id, after != rejectedRoomMark {
+                do {
+                    rows = try await client.read(room: id, after: after, limit: 0)
+                } catch where Self.rejectedForwardMark(error) {
+                    guard generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
+                    rejectedRoomMark = after
+                    let page = try await client.roomRead(room: id)
+                    rows = page.messages
+                    recovery = page
+                }
             } else {
                 let page = try await client.roomRead(room: id)
-                guard case .room(id) = selection else { return }
                 rows = page.messages
+                recovery = page
+            }
+            guard generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
+            let new = rows.filter { byID[$0.id] == nil && !$0.owed }
+            if let page = recovery {
+                // Keep the valid view until this same selection's replacement is ready.
                 roomOlder = page.older
                 roomBefore = page.before
+                messages = page.messages
+                rejectedRoomMark = nil
+                lastRead[id] = page.messages.last?.id
             }
-            guard case .room(id) = selection else { return }
-            let new = rows.filter { byID[$0.id] == nil && !$0.owed }
             for message in new { arrived(message, in: id) }
         } catch {
+            guard generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
             reportBackground(error)
         }
+    }
+
+    /// Only a refused forward history mark warrants reanchoring. A disconnect, permission
+    /// refusal or malformed reply must retain its own error instead of becoming an empty page.
+    private static func rejectedForwardMark(_ error: Error) -> Bool {
+        guard case let VoxError.Failed(reason) = error else { return false }
+        return reason == "page mark not in this room's timeline"
     }
 
     /// The timeline's previous page is fetched only at the person's scroll position or request.
@@ -1779,6 +1817,8 @@ final class NodeModel: ObservableObject {
     }
 
     fileprivate func stopped(_ text: String) {
+        roomReadGeneration = UUID()
+        rejectedRoomMark = nil
         ended = text
         // A detach is delivered by a live daemon; a stopped event stream cannot report
         // the daemon's current state. The word "daemon" occurs in both sentences.
