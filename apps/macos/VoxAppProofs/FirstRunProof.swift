@@ -2070,6 +2070,98 @@ final class FirstRunProof: XCTestCase {
         print("[proof] keyring: bob's change named and waiting; carol's offer showed only the waiting line; a second change asked first; the passphrase trusted bob only")
     }
 
+    /// A remote room's retained message is recovered after the displayed forward mark expires,
+    /// without another post or reopening the room. All staging uses the shipped CLI.
+    func testRoomTimelineRecoversAfterItsDisplayedMarkIsPruned() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
+            throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are required")
+        }
+        let vox = appPath + "/Contents/Helpers/vox"
+        let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("timeline-recovery")
+        func nodeEnv(_ name: String) -> [String: String] {
+            ["VOX_DATA_DIR": root.appendingPathComponent(name + "/data").path,
+             "VOX_CONFIG_DIR": root.appendingPathComponent(name + "/config").path,
+             "VOX_PROXY": "127.0.0.1:0"]
+        }
+        let alice = nodeEnv("alice"), bob = nodeEnv("bob")
+        let pass = root.appendingPathComponent("pass").path
+        try stager.write(Data("recovery pass\n".utf8), to: pass)
+        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: alice,
+                           until: "vox daemon: control socket")
+        let remote = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: bob,
+                               until: "vox daemon: control socket")
+        defer { remote.terminate() }
+        for (name, environment) in [("alice", alice), ("bob", bob)] {
+            try staged(vox, ["node", "create", name],
+                       env: environment.merging(["VOX_IDENTITY_PASSPHRASE": "recovery pass"]) { $1 })
+            try staged(vox, ["node", "attach", name, "--passphrase-file", pass], env: environment)
+        }
+        let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: alice)) { $0.count == 52 }
+        let bobFp = try line(staged(vox, ["id", "--node", "bob"], env: bob)) { $0.count == 52 }
+        try staged(vox, ["room", "create", "--node", "bob", "--passphrase-file", pass, "--name", "recovery"], env: bob)
+        let room = try line(staged(vox, ["room", "list", "--node", "bob"], env: bob)) {
+            $0.contains(" recovery")
+        }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        let link = try line(staged(vox, ["room", "link", "--node", "bob", room], env: bob)) { $0.hasPrefix("vox://") }
+        try staged(vox, ["room", "join", "--node", "alice", "--passphrase-file", pass, link], env: alice)
+        for (name, fp, alias, environment) in [("alice", bobFp, "bob", alice), ("bob", aliceFp, "alice", bob)] {
+            try staged(vox, ["trust", "add", "--node", name, fp, "--name", alias,
+                             "--identity-passphrase-file", pass], env: environment)
+        }
+        try stager.write(Data("no\n".utf8), to: alice["VOX_CONFIG_DIR"]! + "/app/login-item")
+        try stager.write(Data("alice\n".utf8), to: alice["VOX_CONFIG_DIR"]! + "/app/node")
+        try staged(vox, ["room", "post", "--node", "bob", room, "RECOVERY-OLD"], env: bob)
+        let ui = voxApp(appPath)
+        ui.launchEnvironment = alice
+        try launchVox(ui, appPath, env: alice, scratch: scratchPath)
+        defer { ui.terminate() }
+        tap(ui, Key.id("room-recovery"), "the remote recovery room")
+        guard present(ui, Key.showing("RECOVERY-OLD"), timeout: 60,
+                      "the old remote message must be visible before pruning") else { return }
+        guard present(ui, Key.id("member-bob"), timeout: 30,
+                      "the initial authoritative room page and roster must be displayed before pruning") else { return }
+        let pids = proofApps()
+        guard pids.count == 1, let pid = pids.first,
+              executable(pid) == resolved(appPath + "/Contents/MacOS/Vox") else {
+            throw Apparatus("staging not achieved: the scratch proof app PID is ambiguous")
+        }
+        guard stager.run(["/bin/kill", "-STOP", String(pid)], env: [:]).status == 0 else {
+            throw Apparatus("the scratch app could not be paused")
+        }
+        defer { _ = stager.run(["/bin/kill", "-CONT", String(pid)], env: [:]) }
+        Thread.sleep(forTimeInterval: 31)
+        try staged(vox, ["room", "post", "--node", "bob", room, "RECOVERY-KEPT"], env: bob)
+        try staged(vox, ["room", "retention", "--node", "bob", room, "30"], env: bob)
+        var history = "", pruned = false
+        func completeKept(_ history: String) -> Bool {
+            history.split(separator: "\n").contains { line in
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { return false }
+                return row["text"] as? String == "RECOVERY-KEPT" && row["owed"] as? Bool == false
+            }
+        }
+        let until = Date().addingTimeInterval(20)
+        while Date() < until {
+            history = run(vox, ["room", "read", "--node", "alice", room, "--json"], env: alice).out
+            if completeKept(history) && !history.contains("RECOVERY-OLD") { pruned = true; break }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        try staged(vox, ["room", "retention", "--node", "bob", room, "forever"], env: bob)
+        guard pruned else { throw Apparatus("pruning not established with a retained complete message: \(history)") }
+        let retained = run(vox, ["room", "read", "--node", "alice", room, "--json"], env: alice).out
+        guard completeKept(retained) && !retained.contains("RECOVERY-OLD") else {
+            throw Apparatus("the kept message expired before forever retention was restored: \(retained)")
+        }
+        guard stager.run(["/bin/kill", "-CONT", String(pid)], env: [:]).status == 0 else {
+            throw Apparatus("the scratch app could not be resumed")
+        }
+        guard present(ui, Key.showing("RECOVERY-KEPT"), timeout: 30,
+                      "after its old displayed mark is pruned, the room must show the retained message without another post") else { return }
+        guard present(ui, Key.id("member-bob"), timeout: 10,
+                      "the recovered room's inspector must still show its remote member") else { return }
+        print("[proof] timeline: displayed OLD; shipped CLI confirmed OLD pruned and KEPT complete; resumed same app without another post; KEPT and bob visible")
+    }
+
     func testFirstRunAttachesTheNodeAndQuitDetachesIt() throws {
         let env = ProcessInfo.processInfo.environment
         guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
