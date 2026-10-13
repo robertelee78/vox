@@ -1472,11 +1472,13 @@ final class FirstRunProof: XCTestCase {
         // The welcome: the node is made here.
         // Diagnose the observed startup deadline with the real app's child, without
         // dumping its environment or changing the command's deadline.
+        let startupAppPIDs = NSRunningApplication.runningApplications(withBundleIdentifier: proofAppID)
+            .filter { !$0.isTerminated }.map { $0.processIdentifier }
         let startup = stager.run(["/usr/bin/python3", "-c", """
             import pathlib, re, subprocess, time
             time.sleep(3)
             rows = subprocess.check_output(['/bin/ps', '-axo', 'pid,ppid,command'], text=True).splitlines()
-            apps = [int(r.strip().split(None, 2)[0]) for r in rows if '\(appPath)/Contents/MacOS/Vox' in r and 'python' not in r]
+            apps = \(startupAppPIDs)
             out = pathlib.Path('\(root.path)') / 'startup-diagnostic.txt'
             with out.open('w') as f:
                 f.write('app PIDs: ' + repr(apps) + '\\n')
@@ -4496,6 +4498,14 @@ final class FirstRunProof: XCTestCase {
     private func missing(_ ui: XCUIApplication, _ key: Key, _ product: String, premise: Premise? = nil,
                          file: StaticString, line: UInt) {
         keepTree(ui, "\(key) was not shown")
+        // Startup failure has its own screen, before the normal status field exists.
+        // Reading that screen is a product refusal, not evidence that AX search failed.
+        if let failure = locateEverywhere(ui, Key.id("start-failure")),
+           let details = locateEverywhere(ui, Key.id("said")) {
+            XCTFail("PRODUCT: \(product); Vox instead shows \(shown(failure)) — \(shown(details))",
+                    file: file, line: line)
+            return
+        }
         // Premise: the same search finds a known sibling of the same kind; if not, the search is
         // what failed, not the app.
         if locateEverywhere(ui, key.sibling) == nil {
