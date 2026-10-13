@@ -1132,8 +1132,8 @@ fn legacy_placeholder_journey(
     let conn = rt
         .block_on(ep.connect(victim_at, victim_id, raw_sync::now()))
         .expect("APPARATUS: donor connects to real receiver");
-    let offer = |entry: &Entry| {
-        let y = rt.block_on(raw_sync::ask_offering(
+    let exchange = |entry: &Entry| {
+        rt.block_on(raw_sync::ask_offering(
             &conn,
             room_id,
             epoch,
@@ -1146,10 +1146,15 @@ fn legacy_placeholder_journey(
                 },
                 entry.to_wire(),
             )],
-        ));
+        ))
+    };
+    let offer = |entry: &Entry| {
+        let y = exchange(entry);
         assert!(
             y.hello && y.served == 1,
-            "APPARATUS: receiver did not request the staged entry: {y:?}"
+            "APPARATUS: receiver did not request staged seq {} hash {}: {y:?}",
+            entry.skeleton.seq,
+            b32_encode(&entry.entry_hash())
         );
     };
     let owed = |member: &Member, hash: [u8; 32]| {
@@ -1174,7 +1179,21 @@ fn legacy_placeholder_journey(
         owed(bob, ordinary.entry_hash()),
         "PRODUCT: classifying a Session also hid an ordinary missing chat body"
     );
-    offer(&ordinary);
+    // The earlier skeleton truthfully told Bob this peer lacked its body. The production
+    // receiver suppresses another request to that peer temporarily, even when its feed head
+    // stays put. Keep offering the now-available body until Bob actually requests it; neither
+    // bypass the omission hint nor interpret a staging watchdog as a product verdict.
+    assert!(
+        until(Duration::from_secs(45), || {
+            let y = exchange(&ordinary);
+            assert!(
+                y.hello && y.ended.is_none(),
+                "APPARATUS: ordinary-body refill exchange failed: {y:?}"
+            );
+            y.served == 1
+        }),
+        "APPARATUS: receiver did not request the available ordinary body before staging watchdog"
+    );
     offer(&positive);
     assert!(bob.reads(room, "LEGACY-PROOF-RECOVERED-CHAT") && bob.reads(room, "LEGACY-PROOF-AFTER-INDEX"),
         "PRODUCT: ordinary missing chat did not recover across the index's consumed sender iteration");
