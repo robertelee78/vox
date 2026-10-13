@@ -1036,15 +1036,11 @@ enum NetEvent {
         capability: crate::node::trust::Capability,
         reply: oneshot::Sender<Outcome>,
     },
-    /// A held room's address was given again and a member it names answered there (V210-167):
-    /// keep what it names as the room's, dial its anchors, and answer the join.
+    /// A held room's address was given again and a member answered there (V210-167).
+    /// Its authenticated address is recorded by `Dialed`; answer without changing room anchors.
     AddressReached {
         /// The room.
         room: Digest32,
-        /// Every node the address names but this one.
-        named: BootstrapSet,
-        /// The members that answered there.
-        answered: Vec<Digest32>,
         /// The join's answer.
         reply: oneshot::Sender<Outcome>,
     },
@@ -6985,36 +6981,27 @@ impl Node {
         true
     }
 
-    /// Make a channel's anchors this node's: record `more` on the channel (persisted
-    /// under its SEK), treat every one as an anchor,
-    /// and dial any not yet connected. Called when a channel is created, opened or
-    /// joined.
-    async fn adopt_channel_anchors(&mut self, channel_id: &Digest32, more: Option<&BootstrapSet>) {
+    /// Apply the room's signed anchor set to this node's room scope and dial missing peers.
+    /// Creation, reopen, join and governance changes all use this path; URL hints do not.
+    async fn adopt_channel_anchors(&mut self, channel_id: &Digest32) {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
         };
         let (anchors, own, members, settled) = {
-            let mut channel = shared.lock().await;
-            if let (Some(profile), Some(more)) = (self.profile.as_ref(), more) {
-                let _ = channel.add_anchors(profile.store(), more);
-            }
-            // A link names the member who issued it too, last; a member is reached at the
-            // addresses its board record gives, not kept like an anchor at the link's.
+            let channel = shared.lock().await;
+            let anchors = channel.anchors();
+            // A known member is reached through the member ladder, even if the room's
+            // statement names it; it must not become an anchor-only dial.
             let mut own = BootstrapSet::new();
             let mut members = std::collections::BTreeSet::new();
-            for n in channel.anchors().nodes() {
+            for n in anchors.nodes() {
                 if channel.is_known_member(&n.id) {
                     members.insert(n.id);
                 } else {
                     let _ = own.add(n.clone());
                 }
             }
-            (
-                channel.anchors().clone(),
-                own,
-                members,
-                channel.is_settled(),
-            )
+            (anchors, own, members, channel.is_settled())
         };
         self.room_anchors.insert(*channel_id, own);
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
@@ -7246,13 +7233,8 @@ impl Node {
     async fn handle_net_unboxed(&mut self, event: NetEvent) {
         match event {
             NetEvent::Heard { from, entries } => self.heard_nearby(from, &entries).await,
-            NetEvent::AddressReached {
-                room,
-                named,
-                answered,
-                reply,
-            } => {
-                self.keep_room_address(room, &named, &answered, reply).await;
+            NetEvent::AddressReached { room, reply } => {
+                self.keep_room_address(room, reply).await;
             }
             NetEvent::Reopened {
                 channel_id,
@@ -7288,7 +7270,7 @@ impl Node {
                     self.mark_decisions_on_open(&channel_id).await;
                     self.resume_leave(&channel_id).await;
                     self.act_on_removals_while_closed(&channel_id).await;
-                    self.adopt_channel_anchors(&channel_id, None).await;
+                    self.adopt_channel_anchors(&channel_id).await;
                     self.refresh_network_view().await;
                     // Who may reach this room's services and apps: the app gate holds no room it
                     // was not told about, and refused every dial here with "this node does not
@@ -8540,7 +8522,7 @@ impl Node {
                 // Even a failed/retired sync may have durably applied a signed replacement.
                 // Refresh from the room's actual evaluator before publishing its records.
                 if report.out.governance > 0 {
-                    self.adopt_channel_anchors(&channel_id, None).await;
+                    self.adopt_channel_anchors(&channel_id).await;
                 }
                 // Sender keys the log delivered in this session (ADR-023 decision 4). Whatever the
                 // outcome, current or not: a session that failed late may have applied some entries
@@ -10370,9 +10352,9 @@ impl Node {
     /// A room's address given for a room this node already holds: **the address is where its host
     /// is now** (V210-167). It was refused ("already holds that room"), so a member whose host
     /// had moved had no way to say where it went. The members it names are dialled there, even
-    /// when a connection to one is held elsewhere; the members that answer there, and the anchors
-    /// it names, are kept as the room's (`keep_room_address`), so the next start dials them there
-    /// too. An address nobody answers at changes nothing: a stale
+    /// when a connection to one is held elsewhere. An authenticated member's new address is
+    /// recorded through `Dialed`, without changing the room's signed anchors. An address
+    /// nobody answers at changes nothing: a stale
     /// one from chat history must not overwrite where the room's members really are. `Done` once
     /// a member answered; `Unreachable` (said with why) when none did; `BadLink` when the address
     /// names no other member of the room, which is so when this node is its host.
@@ -10454,56 +10436,18 @@ impl Node {
                 });
                 let _ = reply.send(Outcome::Failed(Fault::Unreachable));
             } else {
-                let _ = tx
-                    .send(NetEvent::AddressReached {
-                        room,
-                        named,
-                        answered,
-                        reply,
-                    })
-                    .await;
+                let _ = tx.send(NetEvent::AddressReached { room, reply }).await;
             }
         });
     }
 
-    /// A held room's address that a member answered at: keep, as the room's, the members that
-    /// answered there and the anchors it names, dial those anchors, and answer the join `Done`
-    /// (V210-167). A member it names that did not answer keeps the address this node had for it:
-    /// only an answer shows a member is where the address says.
-    async fn keep_room_address(
-        &mut self,
-        room: Digest32,
-        named: &BootstrapSet,
-        answered: &[Digest32],
-        reply: oneshot::Sender<Outcome>,
-    ) {
-        let mut signed = false;
-        if let Some(shared) = self.channels.get(&room).map(Arc::clone) {
-            let mut channel = shared.lock().await;
-            signed = channel.has_anchor_statement();
-            let mut kept = BootstrapSet::new();
-            for n in named.nodes() {
-                if answered.contains(&n.id) || !channel.is_known_member(&n.id) {
-                    let _ = kept.add(n.clone());
-                }
-            }
-            if let Some(profile) = self.profile.as_ref() {
-                if let Err(error) = channel.add_anchors(profile.store(), &kept) {
-                    let _ = reply.send(Outcome::Failed(fault_of(&error)));
-                    return;
-                }
-            }
-        }
-        self.adopt_channel_anchors(&room, None).await;
+    /// A member answered at the supplied address; its `Dialed` event has already recorded
+    /// that authenticated endpoint. Link hints never change the room's signed anchor set.
+    async fn keep_room_address(&mut self, room: Digest32, reply: oneshot::Sender<Outcome>) {
         let _ = self.event_tx.send(NodeEvent::NodeNote {
             note: format!(
-                "room {}: a member answered at the address given; {}",
+                "room {}: a member answered at the address given; the room's signed anchor set is unchanged",
                 crate::node::network::short_id(room),
-                if signed {
-                    "the room's signed anchor set is unchanged"
-                } else {
-                    "its bootstrap addresses are kept"
-                },
             ),
         });
         let _ = reply.send(Outcome::Done);
@@ -10610,8 +10554,8 @@ impl Node {
         self.adopt_join_session(parsed.channel_id, responder, joined.session, true)
             .await;
         // **The member that answered the join is a member, not an anchor** (V030-51): the link
-        // names it with an address, as it names the room's anchors, and its record may not be
-        // among those admitted yet. Recorded first, so the anchors adopted below leave it out.
+        // names it with an address and its record may not be among those admitted yet.
+        // Record that membership independently of the room's signed anchor history.
         if let (Some(profile), Some(shared)) = (
             self.profile.as_ref(),
             self.channels.get(&parsed.channel_id).map(Arc::clone),
@@ -10623,16 +10567,9 @@ impl Node {
                 let _ = channel.note_member(profile.store(), *member);
             }
         }
-        // The link's anchors are this channel's anchors from now on (persisted, so a
-        // restart still knows where the room's board is).
-        let mut learned = BootstrapSet::new();
-        for a in parsed.anchors.iter().filter(|a| a.id != me) {
-            let _ = learned.add(a.clone());
-        }
-        // Locally configured anchors remain a separate machine source. Their addresses
-        // take precedence for local dials, without rewriting the room's statement.
-        self.adopt_channel_anchors(&parsed.channel_id, Some(&learned))
-            .await;
+        // The join's link routes served only that operation. The room's signed history,
+        // once synced over the joined connection, supplies its authoritative anchors.
+        self.adopt_channel_anchors(&parsed.channel_id).await;
         self.refresh_network_view().await;
         self.publish_channel_locally(&parsed.channel_id).await;
         // And on every anchor we hold, so every other member can find our key and
@@ -15001,7 +14938,7 @@ impl Node {
         self.remember_or_say(&ch);
         self.channels
             .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
-        self.adopt_channel_anchors(&id, None).await;
+        self.adopt_channel_anchors(&id).await;
         self.refresh_network_view().await;
         self.publish_channel_locally(&id).await;
         self.publish_channel_to_anchors(&id, PublishCause::Opened)
@@ -15179,7 +15116,7 @@ impl Node {
         self.remember_or_say(&channel);
         self.channels
             .insert(id, Arc::new(tokio::sync::Mutex::new(channel)));
-        self.adopt_channel_anchors(&id, None).await;
+        self.adopt_channel_anchors(&id).await;
         self.refresh_network_view().await;
         self.publish_channel_locally(&id).await;
         self.publish_channel_to_anchors(&id, PublishCause::Opened)
@@ -15448,7 +15385,7 @@ impl Node {
         self.mark_decisions_on_open(&channel_id).await;
         self.resume_leave(&channel_id).await;
         self.act_on_removals_while_closed(&channel_id).await;
-        self.adopt_channel_anchors(&channel_id, None).await;
+        self.adopt_channel_anchors(&channel_id).await;
         self.refresh_network_view().await;
         // As a reopened room: the app gate must know the room before anything dials it.
         self.refresh_reachers().await;
@@ -16814,7 +16751,7 @@ impl Node {
             return Outcome::Failed(fault_of(&error));
         }
         self.note_local_append(channel_id);
-        self.adopt_channel_anchors(channel_id, None).await;
+        self.adopt_channel_anchors(channel_id).await;
         self.publish_channel_to_anchors(channel_id, PublishCause::Governance)
             .await;
         Outcome::Done

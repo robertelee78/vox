@@ -2,7 +2,7 @@
 //! through the shipped binary.
 //!
 //! A node keeps two kinds of anchor: the ones it is configured with (`--anchor`, the anchors
-//! file), and the ones a room recorded when it was created or joined — for a member who joined
+//! file), and the ones its creator or an admin stated on the room's log — for a member who joined
 //! from an invite, often the only anchor it has. Only the configured set was redialled. A room's
 //! own anchor was dialled once, when the room opened, and never again: the first time it
 //! restarted, the member lost its board and its relay for as long as the process ran.
@@ -10,9 +10,9 @@
 //! **The scene** (`support/relay.rs`, `Split::Families`, so the only path between host and guest
 //! is a circuit through the anchor): the guest joins, and then runs `vox forward` **with no
 //! `--anchor` and no anchors file**, so the one anchor that process knows is the one its room
-//! recorded at the join. (The join itself names the anchor by its IPv6 address with `--anchor`,
-//! because the guest listens on `[::1]` and the invite names the anchor as the IPv4 host reached
-//! it; the join is where the room records it.) The echo carries over the circuit, the anchor is
+//! learned from the creator's signed statement. (The join itself names the anchor by its IPv6
+//! address with `--anchor`, because the guest listens on `[::1]`.) The echo carries over the
+//! circuit, the anchor is
 //! stopped with SIGINT and brought back [`DOWN`] later on the same port, and the forward must
 //! carry an echo again within [`BACK_WITHIN`] of its return, and say it saw its anchor go.
 //!
@@ -47,14 +47,14 @@
 //! apparatus was over [`APPARATUS_BUDGET`] is APPARATUS (runner stalled); otherwise it is the product's.
 //!
 //! **Signed replacements (ADR-032 AN-5, #781).** After the original relay recovery, the
-//! creator signs A, then [A,B], then [A,C]. Both members' public status must name exactly
-//! the current set and authenticated connections to those identities. A non-admin is refused.
+//! creator replaces the initial signed A with [A,B], then [A,C]. Both members' public status
+//! must name exactly the current set and authenticated connections to those identities. A non-admin is refused.
 //! The guest restarts on the same current-version data and keeps [A,C]. An old room link
 //! cannot resurrect B, and removing every room anchor remains empty after the old link is
 //! supplied again; the host's independent machine A remains configured. No upgrade fixture.
 //!
 //! **Mutations that must turn it red:**
-//! - Select the first authorized RoomAnchors statement: the [A,B] assertion fails PRODUCT.
+//! - Select the first authorized RoomAnchors statement: the chosen room-anchor set fails PRODUCT.
 //! - Redial only the configured set (`kept_anchors` in `actor.rs` returns `self.anchors` alone,
 //!   the code before V210-75): the forward never redials the room's anchor, the host can reach
 //!   it only through that anchor, and no echo carries again.
@@ -100,6 +100,9 @@ const APPARATUS_BUDGET: Duration = Duration::from_secs(2);
 fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
     watchdog::arm();
     let mut w = RelayWorld::new(Split::Families);
+    // The creator explicitly chooses the room's initial anchor. A machine anchor or URL
+    // hint cannot make that choice for the room (ADR-032 AN-5/AN-9).
+    change(&w, "add", &[&w.anchor.v4_spec, &w.anchor.v6_spec]);
     let (ok, took, out, err) = w.join_guest();
     assert!(
         ok,
@@ -311,7 +314,6 @@ fn signed_replacements(w: &mut RelayWorld) {
     let aid = anchor_id(&w.anchor.v4_spec);
     let bid = anchor_id(&b.v4_spec);
     let cid = anchor_id(&c.v4_spec);
-    change(w, "add", &[&w.anchor.v4_spec, &w.anchor.v6_spec]);
     expect_sets(w, &[&aid], &[&aid], &[&aid]);
 
     let (ok, out, err) = world::vox_once(
