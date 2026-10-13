@@ -407,6 +407,34 @@ fn detail_of(
     }
 }
 
+/// Publish the owner's currently open Session metadata after the new reader's key position
+/// has been chosen, before its consent commits. Forward-only keys cannot open an earlier
+/// Session opening. Republishing metadata makes the ongoing Session discoverable without
+/// releasing any old step or ordinary message. A crash before consent retries this snapshot;
+/// once consent commits, its retained key already covers every part written here.
+fn refresh_session_openings(
+    channel: &mut ChannelState,
+    profile: &Profile,
+    now: crate::time::Ms,
+) -> crate::error::Result<()> {
+    let me = channel.me();
+    let detail = detail_of(channel, None, now);
+    for row in crate::node::sessions::fold(&detail)
+        .into_iter()
+        .filter(|row| row.node == me && row.open)
+    {
+        let opening = crate::node::sessions::Opening {
+            id: row.id,
+            harness: row.harness,
+            name: row.name,
+        };
+        for part in crate::node::sessions::opening_parts(&opening) {
+            channel.append_text(profile, &part, now.get())?;
+        }
+    }
+    Ok(())
+}
+
 /// A room's lock if it can be had by `deadline`. A free lock is taken even once the deadline has
 /// passed: only a held one is given up.
 async fn by<T>(
@@ -573,6 +601,8 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::NetworkChanged(_) => "acting on a change of the machine's network",
         NetEvent::Stranded(_) => "dialling again peers a network change stranded",
         NetEvent::SyncDone { .. } => "filing a sync that finished",
+        NetEvent::PrivateSessionAsk { .. } => "authorizing private Session records",
+        NetEvent::PrivateSessionDone { .. } => "filing private Session records",
         NetEvent::RoomStored { .. } => "evaluating a room whose log grew",
         NetEvent::SlotFreed => "starting a queued sync",
         NetEvent::BackoffExpired { .. } => "retrying a sync whose backoff is due",
@@ -592,6 +622,10 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::ChannelUnsealed { .. } => "holding a room whose key was unwrapped",
         NetEvent::Dialed { .. } => "adopting a connection a join dialled",
         NetEvent::JoinerDone { .. } => "finishing a join",
+        NetEvent::ValidationReady { .. } => "registering a local room validation",
+        NetEvent::ValidationConnecting { .. } => "owning a local validation endpoint",
+        NetEvent::ValidationConnection { .. } => "binding a local validation connection",
+        NetEvent::ValidationDone { .. } => "finishing a local room validation",
         NetEvent::ForwardDialed { .. } => "binding a forward whose dial landed",
         NetEvent::Heard { .. } => "dialling a member heard nearby",
         NetEvent::AddressReached { .. } => "keeping a room address whose host answered",
@@ -968,6 +1002,19 @@ async fn run_session_worker(
 /// Work the network produced that only the actor can handle, because it needs
 /// channel state (ADR-016: the actor stays the single writer).
 enum NetEvent {
+    PrivateSessionAsk {
+        peer: Digest32,
+        ask: crate::node::sessionstream::Ask,
+        send: quinn::SendStream,
+        recv: quinn::RecvStream,
+        conn: Arc<crate::transport::quic::VoxConnection>,
+    },
+    PrivateSessionDone {
+        channel_id: Digest32,
+        peer: Digest32,
+        room: SharedChannel,
+        page: crate::error::Result<crate::node::sessionstream::Page>,
+    },
     /// A program asked, through the app API, to open an app stream to `peer`: reach it
     /// through the ladder and hand the connection back (ADR-022 decision 7).
     AppDial(crate::node::app::AppDial),
@@ -1431,6 +1478,31 @@ enum NetEvent {
         /// What the join came to. Boxed: a won join carries a whole session.
         result: Box<std::result::Result<JoinerWon, JoinerLost>>,
     },
+    ValidationConnecting {
+        operation: u64,
+        remote: std::net::SocketAddr,
+        ack: oneshot::Sender<crate::error::Result<()>>,
+    },
+    /// Self connections are isolated before normal peer/discovery bookkeeping.
+    ValidationConnection {
+        conn: Arc<VoxConnection>,
+    },
+    /// An owned local validator opened its actual stream, before sending WANT.
+    ValidationReady {
+        operation: u64,
+        remote: std::net::SocketAddr,
+        stream: quinn::StreamId,
+        answered: oneshot::Sender<crate::error::Result<()>>,
+        ended: oneshot::Receiver<()>,
+        ack: oneshot::Sender<crate::error::Result<()>>,
+    },
+    /// Both ends of local authentication finished; the actor must recheck the room.
+    ValidationDone {
+        operation: u64,
+        result: crate::error::Result<()>,
+        reply: oneshot::Sender<Outcome>,
+        ack: oneshot::Sender<()>,
+    },
     /// A room's key was sealed under its passphrase on a blocking thread (the slow part of
     /// creating a room): finish the room and answer the command that asked for it.
     ChannelSealed {
@@ -1821,6 +1893,26 @@ async fn serve_typed(
                 let _ = tx.send(NetEvent::AgreeAsk { peer, ask, send }).await;
             });
         }
+        Ok(Inbound::Session { peer, send, recv }) => {
+            state.failures = 0;
+            let tx = tx.clone();
+            let conn = Arc::clone(&conn);
+            tokio::spawn(async move {
+                let mut recv = recv;
+                let Ok(ask) = crate::node::sessionstream::read_ask(&mut recv).await else {
+                    return;
+                };
+                let _ = tx
+                    .send(NetEvent::PrivateSessionAsk {
+                        peer,
+                        ask,
+                        send,
+                        recv,
+                        conn,
+                    })
+                    .await;
+            });
+        }
         Ok(Inbound::Sync { peer, send, recv }) => {
             state.failures = 0;
             let tx = tx.clone();
@@ -2137,6 +2229,10 @@ fn spawn_inbound_pump(
                     let Some(conn) = conn else { break };
                     let (net, tx) = (Arc::clone(&net), tx.clone());
                     tokio::spawn(async move {
+                        if conn.peer_id() == net.local_id() {
+                            let _ = tx.send(NetEvent::ValidationConnection { conn: Arc::new(conn) }).await;
+                            return;
+                        }
                         let filed = net.manager().take_inbound(conn).await;
                         let _ = serve_filed(&net, &tx, filed).await;
                     });
@@ -2709,6 +2805,59 @@ struct Joiner {
 /// `Locked` if the task is dropped before it hands the reply on, so the caller is told what
 /// happened rather than that the node went away.
 struct AnsweredIfAborted(Option<oneshot::Sender<Outcome>>);
+
+type ValidationRegistry = Arc<std::sync::Mutex<BTreeMap<u64, ValidationOperation>>>;
+type ValidationReply = Arc<std::sync::Mutex<Option<oneshot::Sender<Outcome>>>>;
+
+struct ValidationOperation {
+    room: Digest32,
+    original: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+    epoch: u64,
+    attach: u64,
+    abort: Option<tokio::task::AbortHandle>,
+    permit: Option<ValidationPermit>,
+    // Keep the unfiled responder alive until both proofs and the final actor check finish.
+    server: Option<Arc<VoxConnection>>,
+    remote: Option<std::net::SocketAddr>,
+    consumed: bool,
+    local_ip: std::net::IpAddr,
+    reply: ValidationReply,
+}
+
+struct ValidationPermit {
+    remote: std::net::SocketAddr,
+    stream: quinn::StreamId,
+    answered: oneshot::Sender<crate::error::Result<()>>,
+    ended: oneshot::Receiver<()>,
+}
+
+/// Removes even an unconsumed permit and ends its responder when the client is cancelled.
+struct ValidationGuard {
+    registry: ValidationRegistry,
+    operation: u64,
+    ended: Option<oneshot::Sender<()>>,
+    reply: ValidationReply,
+}
+
+impl Drop for ValidationGuard {
+    fn drop(&mut self) {
+        self.registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.operation);
+        if let Some(ended) = self.ended.take() {
+            let _ = ended.send(());
+        }
+        if let Some(reply) = self
+            .reply
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = reply.send(Outcome::Failed(Fault::Locked));
+        }
+    }
+}
 
 impl AnsweredIfAborted {
     /// The reply, for the task to pass on now that it was not aborted.
@@ -4171,6 +4320,9 @@ pub struct Node {
     /// so the last handle goes with the lock and "locked" keeps meaning *now* instead of *once
     /// this joiner gets bored*.
     join_tasks: tokio::task::JoinSet<()>,
+    /// Exact, one-shot local validations; never selected merely because a peer is self.
+    validations: ValidationRegistry,
+    validation_seq: u64,
     /// **Places promised in each room** (V030-30, #366), `(room, newcomer)` → who asked and until
     /// when: this node's own, held while it asks the others, and those it promised a member that
     /// asked. Each counts against the room's cap until the newcomer is an author here, an abort
@@ -4755,6 +4907,8 @@ impl Node {
             passphrase_entered_at: Arc::default(),
             keyring_change_proved: false,
             join_tasks: tokio::task::JoinSet::new(),
+            validations: Arc::default(),
+            validation_seq: 0,
             seat_promises: BTreeMap::new(),
             secret_work: Arc::new(tokio::sync::RwLock::new(())),
             joining: std::collections::BTreeSet::new(),
@@ -5061,6 +5215,11 @@ impl Node {
                         self.publish().await;
                         continue;
                     }
+                    if let NodeCommand::CheckRoomPassphrase { channel_id, passphrase } = command {
+                        self.begin_room_validation(channel_id, passphrase, reply).await;
+                        self.note_if_stalled(name, started);
+                        continue;
+                    }
                     // **A leave is answered once another member has the departure** (V210-164):
                     // see `begin_leave`.
                     if let NodeCommand::LeaveRoom { channel_id } = command {
@@ -5149,6 +5308,7 @@ impl Node {
                     // Drive keys too (ADR-029 SC-2a, SC-2b): changed if a holder lost drive,
                     // and released to whoever is owed one.
                     self.tend_drive_keys().await;
+                    self.tend_private_sessions().await;
                     // R14: a superseded generation's key goes once no full-history grant
                     // still has to release it.
                     let pruned = self.prune_superseded_keys().await;
@@ -5285,7 +5445,7 @@ impl Node {
             // Answered through `begin_join_channel`, which the run loop calls instead of this; a
             // join reaching here would have to be answered inline, which is the stall that
             // function exists to remove.
-            NodeCommand::JoinChannel { .. } => {
+            NodeCommand::JoinChannel { .. } | NodeCommand::CheckRoomPassphrase { .. } => {
                 debug_assert!(false, "JoinChannel is answered by begin_join_channel");
                 Outcome::Failed(Fault::Internal)
             }
@@ -6929,7 +7089,7 @@ impl Node {
                     // unlock is the same room, and a restart is exactly when its members have to
                     // be dialled from where they were last reached (`node::peer_book`).
                     let mut channel = *channel;
-                    if let Err(e) = self.retention_before_publication(&mut channel) {
+                    if let Err(e) = self.retention_before_publication(&mut channel).await {
                         let _ = self.event_tx.send(NodeEvent::NodeNote {
                             note: format!(
                                 "room {} did not reopen: {e}; it stays closed",
@@ -7198,6 +7358,86 @@ impl Node {
                     .finish_forward(&channel_id, &host, &service_tag, local, *result)
                     .await;
                 let _ = reply.send(outcome);
+            }
+            NetEvent::ValidationConnecting {
+                operation,
+                remote,
+                ack,
+            } => {
+                let result = match self.validation_room(operation).await {
+                    Ok(_) => {
+                        let mut active = self
+                            .validations
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match active.get_mut(&operation) {
+                            Some(op) if op.remote.is_none() && remote.ip() == op.local_ip => {
+                                op.remote = Some(remote);
+                                Ok(())
+                            }
+                            _ => Err(Error::MalformedJoin("validation endpoint is not owned")),
+                        }
+                    }
+                    Err(e) => Err(e),
+                };
+                let _ = ack.send(result);
+            }
+            NetEvent::ValidationConnection { conn } => {
+                self.accept_validation_connection(conn).await
+            }
+            NetEvent::ValidationReady {
+                operation,
+                remote,
+                stream,
+                answered,
+                ended,
+                ack,
+            } => {
+                let result = match self.validation_room(operation).await {
+                    Ok(_) => {
+                        let mut active = self
+                            .validations
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match active.get_mut(&operation) {
+                            Some(op)
+                                if op.permit.is_none()
+                                    && !op.consumed
+                                    && op.remote == Some(remote)
+                                    && remote.ip() == op.local_ip =>
+                            {
+                                op.permit = Some(ValidationPermit {
+                                    remote,
+                                    stream,
+                                    answered,
+                                    ended,
+                                });
+                                Ok(())
+                            }
+                            _ => Err(Error::MalformedJoin(
+                                "local validation no longer owns its stream",
+                            )),
+                        }
+                    }
+                    Err(e) => Err(e),
+                };
+                let _ = ack.send(result);
+            }
+            NetEvent::ValidationDone {
+                operation,
+                result,
+                reply,
+                ack,
+            } => {
+                let result = match result {
+                    Ok(()) => self.validation_room(operation).await.map(|_| ()),
+                    Err(e) => Err(e),
+                };
+                let _ = reply.send(match result {
+                    Ok(()) => Outcome::Done,
+                    Err(e) => Outcome::Failed(fault_of(&e)),
+                });
+                let _ = ack.send(());
             }
             NetEvent::JoinerDone {
                 reply,
@@ -7998,6 +8238,58 @@ impl Node {
                     }
                 }
             }
+            NetEvent::PrivateSessionAsk {
+                peer,
+                ask,
+                mut send,
+                mut recv,
+                conn,
+            } => {
+                let Some(shared) = self.channels.get(&ask.room).map(Arc::clone) else {
+                    crate::transport::streams::refuse(&mut send, &mut recv);
+                    return;
+                };
+                let holders = self.drive_holders();
+                let page = shared.lock().await.private_page(&ask, &peer, &holders);
+                match page {
+                    Ok(page) => {
+                        tokio::spawn(async move {
+                            let _connection = conn;
+                            let _ = crate::node::sessionstream::answer(send, page).await;
+                        });
+                    }
+                    Err(_) => crate::transport::streams::refuse(&mut send, &mut recv),
+                }
+            }
+            NetEvent::PrivateSessionDone {
+                channel_id,
+                peer,
+                room,
+                page,
+            } => {
+                let (Some(shared), Some(store)) = (
+                    self.channels.get(&channel_id).map(Arc::clone),
+                    self.log_store(),
+                ) else {
+                    return;
+                };
+                // A result for a room closed and reopened while the network task ran belongs
+                // to the old state, never the freshly loaded keys or recovery cursors.
+                if !Arc::ptr_eq(&shared, &room) {
+                    return;
+                }
+                let result = shared.lock().await.finish_private_pull(
+                    &store,
+                    peer,
+                    page,
+                    (self.millis_clock)(),
+                );
+                self.say_session_news(&channel_id).await;
+                self.refresh_network_view().await;
+                if result.is_ok_and(|more| more) {
+                    self.pull_private_sessions(channel_id, peer).await;
+                }
+            }
             NetEvent::SyncDone {
                 channel_id,
                 peer,
@@ -8009,6 +8301,7 @@ impl Node {
                 // outcome, current or not: a session that failed late may have applied some entries
                 // first.
                 self.install_key_packages(&channel_id).await;
+                self.pull_private_sessions(channel_id, peer).await;
                 // A session that sent this node's HAVE from at least the generation its departure
                 // was written at, and ended cleanly, handed that peer the departure (V210-164).
                 let heard = report.out.gen_have.filter(|_| report.fail.is_none());
@@ -8205,6 +8498,9 @@ impl Node {
                         // Unreachable: the stream loop reads these and sends
                         // `NetEvent::Pairwise` once the frames are in hand.
                     }
+                    Inbound::Session { .. } => {
+                        // The stream loop reads the bounded preamble off the actor.
+                    }
                     Inbound::Sync { .. } => {
                         // Unreachable: the stream loop converts these into
                         // `NetEvent::SyncRequest` once the preamble is read.
@@ -8378,6 +8674,13 @@ impl Node {
         send: quinn::SendStream,
         recv: quinn::RecvStream,
     ) {
+        // A self join without an owned local permit must never fall through admission: that
+        // path consumes an OTP before the self-witness is rejected.
+        if self.net.as_ref().is_some_and(|net| net.local_id() == peer) {
+            self.answer_room_validation(conn, channel_id, epoch, send, recv)
+                .await;
+            return;
+        }
         let now_ms = (self.millis_clock)();
         // A room that ended takes nobody in, and a node that left it answers for it no more
         // (V030-08); each is said as what it is, before the challenge, so the joiner is not told its
@@ -9206,6 +9509,438 @@ impl Node {
     /// that was joining a room answered nothing else meanwhile: not its other rooms, not its
     /// control socket, not the responder's own follow-ups. Measured through the real binaries:
     /// `busy 9829–28943ms — joining a room`. The caller still waits for its join; nobody else does.
+    /// Check exact operation ownership and the held room again, including after both proofs.
+    async fn validation_room(
+        &self,
+        operation: u64,
+    ) -> crate::error::Result<Arc<tokio::sync::Mutex<ChannelState>>> {
+        let (room, original, epoch, attach) = {
+            let active = self
+                .validations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let op = active
+                .get(&operation)
+                .ok_or(Error::JoinRefused("local validation was cancelled"))?;
+            (op.room, op.original.clone(), op.epoch, op.attach)
+        };
+        if attach != self.delivery_epoch || self.profile.is_none() {
+            return Err(Error::AtRestLocked);
+        }
+        let current = self
+            .channels
+            .get(&room)
+            .ok_or(Error::JoinRefused("room is no longer open"))?;
+        let original = original
+            .upgrade()
+            .ok_or(Error::JoinRefused("room was replaced"))?;
+        if !Arc::ptr_eq(current, &original) {
+            return Err(Error::JoinRefused("room was replaced"));
+        }
+        {
+            let ch = original.lock().await;
+            if ch.ended((self.millis_clock)()).is_some() {
+                return Err(Error::JoinRoomEnded);
+            }
+            if ch.has_left(&ch.me()) {
+                return Err(Error::JoinResponderLeft);
+            }
+            if ch.epoch() != epoch || !ch.can_answer_join() {
+                return Err(Error::JoinRefused("room changed during validation"));
+            }
+        }
+        Ok(original)
+    }
+
+    fn cancel_room_validations(&self, room: Option<&Digest32>, fault: Fault) {
+        let aborted = {
+            let mut active = self
+                .validations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ids = active
+                .iter()
+                .filter(|(_, op)| room.is_none_or(|r| r == &op.room))
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| active.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        for op in aborted {
+            if let Some(reply) = op
+                .reply
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = reply.send(Outcome::Failed(fault));
+            }
+            if let Some(task) = op.abort {
+                task.abort();
+            }
+        }
+    }
+
+    /// Production join authentication on a direct local connection, without admission.
+    async fn begin_room_validation(
+        &mut self,
+        room: Digest32,
+        passphrase: Secret,
+        reply: oneshot::Sender<Outcome>,
+    ) {
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            let _ = reply.send(Outcome::Failed(Fault::NotNetworked));
+            return;
+        };
+        let Some(profile) = self.profile.as_ref() else {
+            let _ = reply.send(Outcome::Failed(Fault::Locked));
+            return;
+        };
+        let Some(shared) = self.channels.get(&room).map(Arc::clone) else {
+            let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+            return;
+        };
+        let ctx = {
+            let ch = shared.lock().await;
+            if ch.ended((self.millis_clock)()).is_some() {
+                let _ = reply.send(Outcome::Failed(Fault::RoomEnded));
+                return;
+            }
+            if ch.has_left(&ch.me()) {
+                let _ = reply.send(Outcome::Failed(Fault::ResponderLeft));
+                return;
+            }
+            match ch.join_context() {
+                Ok(mut ctx) => {
+                    if let Some(pow) = self.pow_params {
+                        ctx.pow_params = pow;
+                    }
+                    ctx
+                }
+                Err(e) => {
+                    let _ = reply.send(Outcome::Failed(fault_of(&e)));
+                    return;
+                }
+            }
+        };
+        let Ok(signer) = profile.signer_arc() else {
+            let _ = reply.send(Outcome::Failed(Fault::Locked));
+            return;
+        };
+        let at = match net.manager().endpoint().local_addr() {
+            Ok(mut at) => {
+                if at.ip().is_unspecified() {
+                    at.set_ip(if at.is_ipv4() {
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                    } else {
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                    });
+                }
+                at
+            }
+            Err(e) => {
+                let _ = reply.send(Outcome::Failed(fault_of(&e)));
+                return;
+            }
+        };
+        let Some(operation) = self.validation_seq.checked_add(1) else {
+            let _ = reply.send(Outcome::Failed(Fault::Internal));
+            return;
+        };
+        self.validation_seq = operation;
+        let replied = Arc::new(std::sync::Mutex::new(Some(reply)));
+        {
+            let mut active = self
+                .validations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // The control socket cannot fan an unbounded number of memory-hard solves out.
+            if active.len() >= 2 {
+                if let Some(reply) = replied
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = reply.send(Outcome::Failed(Fault::MembersBusy));
+                }
+                return;
+            }
+            active.insert(
+                operation,
+                ValidationOperation {
+                    room,
+                    original: Arc::downgrade(&shared),
+                    epoch: ctx.epoch,
+                    attach: self.delivery_epoch,
+                    abort: None,
+                    permit: None,
+                    server: None,
+                    remote: None,
+                    consumed: false,
+                    local_ip: at.ip(),
+                    reply: Arc::clone(&replied),
+                },
+            );
+        }
+        let tx = self.net_tx.clone();
+        let registry = Arc::clone(&self.validations);
+        let now = (self.millis_clock)();
+        self.reap_join_tasks();
+        let abort = self.join_tasks.spawn(async move {
+            let (ended, ending) = oneshot::channel();
+            let _guard = ValidationGuard {
+                registry,
+                operation,
+                ended: Some(ended),
+                reply: Arc::clone(&replied),
+            };
+            let mut local = at;
+            local.set_port(0);
+            let endpoint = crate::transport::quic::VoxEndpoint::bind(signer.clone(), local);
+            let mut connection = None;
+            let result = async {
+                let endpoint = endpoint
+                    .as_ref()
+                    .map_err(|_| Error::MalformedJoin("local validation endpoint did not bind"))?;
+                let (ack, owned) = oneshot::channel();
+                tx.send(NetEvent::ValidationConnecting {
+                    operation,
+                    remote: endpoint.local_addr()?,
+                    ack,
+                })
+                .await
+                .map_err(|_| Error::JoinRefused("node stopped during validation"))?;
+                owned
+                    .await
+                    .map_err(|_| Error::JoinRefused("validation ownership was cancelled"))??;
+                let conn = endpoint.connect(at, net.local_id(), now).await?;
+                let streams = crate::transport::streams::open_typed(
+                    &conn,
+                    crate::transport::streams::StreamKind::Join,
+                )
+                .await?;
+                if streams.0.id() != streams.1.id() {
+                    return Err(Error::MalformedJoin("validation stream halves differ"));
+                }
+                let (answered, answer) = oneshot::channel();
+                let (ack, registered) = oneshot::channel();
+                tx.send(NetEvent::ValidationReady {
+                    operation,
+                    remote: endpoint.local_addr()?,
+                    stream: streams.0.id(),
+                    answered,
+                    ended: ending,
+                    ack,
+                })
+                .await
+                .map_err(|_| Error::JoinRefused("node stopped during validation"))?;
+                registered
+                    .await
+                    .map_err(|_| Error::JoinRefused("validation registration was cancelled"))??;
+                let ik = crate::identity::keyagreement::X25519IdentityKey::from_secret_bytes(
+                    *signer.x25519_identity_secret(),
+                );
+                let result = crate::node::joinstream::run_initiator_validation(
+                    &conn,
+                    streams,
+                    ctx,
+                    &passphrase,
+                    &*signer,
+                    &ik,
+                )
+                .await;
+                // Keep the exact connection and its endpoint alive through the actor's final
+                // check; its local address cannot be recycled for a different operation.
+                connection = Some(conn);
+                // If WANT never reached the responder, its answer sender is still in the
+                // pending permit. Do not wait on that unstarted exchange after a client error.
+                result?;
+                answer
+                    .await
+                    .map_err(|_| Error::JoinRefused("local responder was cancelled"))?
+            }
+            .await;
+            let reply = replied
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(reply) = reply {
+                let (ack, finished) = oneshot::channel();
+                if tx
+                    .send(NetEvent::ValidationDone {
+                        operation,
+                        result,
+                        reply,
+                        ack,
+                    })
+                    .await
+                    .is_ok()
+                {
+                    let _ = finished.await;
+                }
+            }
+            drop(connection);
+            drop(endpoint);
+        });
+        if let Some(op) = self
+            .validations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&operation)
+        {
+            op.abort = Some(abort);
+        }
+    }
+
+    /// An owned self connection gets only its one validation stream, never peer discovery.
+    async fn accept_validation_connection(&mut self, conn: Arc<VoxConnection>) {
+        let operation = {
+            let mut active = self
+                .validations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            active.iter_mut().find_map(|(id, op)| {
+                if op.remote != Some(conn.quinn().remote_address())
+                    || op.server.is_some()
+                    || conn.via_circuit()
+                    || self
+                        .net
+                        .as_ref()
+                        .is_none_or(|net| net.local_id() != conn.peer_id())
+                {
+                    return None;
+                }
+                op.server = Some(Arc::clone(&conn));
+                Some(*id)
+            })
+        };
+        if let Some(operation) = operation {
+            if self.validation_room(operation).await.is_ok() {
+                let tx = self.net_tx.clone();
+                self.reap_join_tasks();
+                self.join_tasks.spawn(async move {
+                    let request = async {
+                        let (kind, send, mut recv) =
+                            crate::transport::streams::accept_typed(&conn).await?;
+                        if kind != crate::transport::streams::StreamKind::Join {
+                            return Err(Error::MalformedJoin(
+                                "local validation requires a Join stream",
+                            ));
+                        }
+                        let (channel_id, epoch) =
+                            crate::node::joinstream::read_join_request(&mut recv).await?;
+                        tx.send(NetEvent::JoinRequest {
+                            peer: conn.peer_id(),
+                            conn: Arc::clone(&conn),
+                            channel_id,
+                            epoch,
+                            send,
+                            recv,
+                        })
+                        .await
+                        .map_err(|_| Error::JoinRefused("node stopped during validation"))
+                    }
+                    .await;
+                    if request.is_err() {
+                        conn.close(crate::wire::WireError::AuthenticatorInvalid);
+                    }
+                });
+                return;
+            }
+        }
+        conn.close(crate::wire::WireError::AuthenticatorInvalid);
+    }
+
+    async fn answer_room_validation(
+        &mut self,
+        conn: Arc<VoxConnection>,
+        room: Digest32,
+        epoch: u64,
+        send: quinn::SendStream,
+        recv: quinn::RecvStream,
+    ) {
+        let found = {
+            let mut active = self
+                .validations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            active.iter_mut().find_map(|(id, op)| {
+                let permit = op.permit.as_ref()?;
+                if op.room != room
+                    || op.epoch != epoch
+                    || permit.remote != conn.quinn().remote_address()
+                    || permit.stream != recv.id()
+                    || send.id() != recv.id()
+                    || conn.via_circuit()
+                    || op.server.as_ref().map(|server| server.serial()) != Some(conn.serial())
+                    || op.consumed
+                {
+                    return None;
+                }
+                // Bound to this exact authenticated connection, then consumed once, atomically.
+                let permit = op.permit.take()?;
+                op.consumed = true;
+                Some((*id, permit))
+            })
+        };
+        let Some((operation, permit)) = found else {
+            Self::spawn_refuse_join(send);
+            return;
+        };
+        let prepared = async {
+            let shared = self.validation_room(operation).await?;
+            let ch = shared.lock().await;
+            let mut ctx = ch.join_context()?;
+            if let Some(pow) = self.pow_params {
+                ctx.pow_params = pow;
+            }
+            let passphrase = zeroize::Zeroizing::new(ch.join_passphrase()?.to_vec());
+            let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+            let signer = profile.signer_arc()?;
+            let store = profile.store_handle();
+            let ring = self
+                .prekeys
+                .as_ref()
+                .map(Arc::clone)
+                .ok_or(Error::AtRestLocked)?;
+            Ok::<_, Error>((ctx, passphrase, signer, store, ring))
+        }
+        .await;
+        let (ctx, passphrase, signer, store, ring) = match prepared {
+            Ok(inputs) => inputs,
+            Err(e) => {
+                let _ = permit.answered.send(Err(e));
+                Self::spawn_refuse_join(send);
+                return;
+            }
+        };
+        let now = (self.millis_clock)();
+        self.reap_join_tasks();
+        self.join_tasks.spawn(async move {
+            let cfg = crate::node::joinstream::ResponderConfig {
+                ctx,
+                passphrase: &passphrase,
+                root: &*signer,
+                base_difficulty: crate::join::pow::Difficulty::DEFAULT_INVITE,
+                pending_joins: 1,
+                now_ms: now,
+                worked: None,
+            };
+            let result = crate::node::joinstream::run_responder_validation(
+                send,
+                recv,
+                conn.peer_id(),
+                &cfg,
+                &store,
+                &ring,
+                Some(permit.ended),
+            )
+            .await;
+            let _ = permit.answered.send(result);
+        });
+    }
+
     async fn begin_join_channel(
         &mut self,
         link: String,
@@ -9798,6 +10533,9 @@ impl Node {
                 .unwrap_or((skdm.body.chain_id, skdm.body.iteration));
             // The generations before the live one that the decision — or a full-history grant —
             // covers (V210-45, PRD-001 R12) are owed in the grant's own transaction (V210-88).
+            if let Err(e) = refresh_session_openings(&mut channel, profile, now_ms) {
+                return Outcome::Failed(fault_of(&e));
+            }
             match channel.issue_consent(profile, target, &skdm, full, entitled_from, now_ms) {
                 Ok((_, history_owed)) => history_owed,
                 Err(e) => return Outcome::Failed(fault_of(&e)),
@@ -12379,9 +13117,10 @@ impl Node {
                         .and_then(|p| p.first().copied())
                         .unwrap_or((skdm.body.chain_id, skdm.body.iteration));
                     let mut channel = shared.lock().await;
-                    channel
-                        .issue_consent(profile, peer, &skdm, full, entitled_from, now_ms)
-                        .is_ok()
+                    refresh_session_openings(&mut channel, profile, now_ms).is_ok()
+                        && channel
+                            .issue_consent(profile, peer, &skdm, full, entitled_from, now_ms)
+                            .is_ok()
                         && (entitled_from.0 >= skdm.body.chain_id
                             || channel
                                 .owe_history(profile.store(), peer, entitled_from.0)
@@ -13787,6 +14526,7 @@ impl Node {
     /// up to one Argon2id derivation, it would answer nobody meanwhile (V210-71). Until then the
     /// node is *locking* ([`NodeView::locking`]). The returned receiver fires once it has settled.
     async fn lock_all(&mut self) -> oneshot::Receiver<()> {
+        self.cancel_room_validations(None, Fault::Locked);
         self.passphrase_entered_at
             .store(0, std::sync::atomic::Ordering::Relaxed);
         // The record's key goes with the identity's; a headless node's identity never locks.
@@ -14361,7 +15101,36 @@ impl Node {
 
     /// Apply this node's shorter limits after opening under the room policy, before a cached
     /// row can be read or relayed. Failure follows the caller's ordinary open/recovery error path.
-    fn retention_before_publication(&mut self, ch: &mut ChannelState) -> crate::error::Result<()> {
+    async fn retention_before_publication(
+        &mut self,
+        ch: &mut ChannelState,
+    ) -> crate::error::Result<()> {
+        // Resolve stored packages before deciding which pre-upgrade Session copies the node
+        // may keep. The room is not published or available to readers/sync yet. This uses the
+        // usual prekey-consumption path and trust check, never a new source of permission.
+        if ch.needs_session_upgrade() {
+            let ctx = ch.join_context()?;
+            let now = self.now_ms();
+            for package in ch.take_inbound_packages() {
+                let Ok(init) = package.initial_message() else {
+                    continue;
+                };
+                let Some(mut session) = self.respond_to_initial(&init, &ctx).await else {
+                    continue;
+                };
+                let Ok(skdm) = package.open(&mut session, now.get()) else {
+                    continue;
+                };
+                if !self.trust.is_trusted(&skdm.body.author_id) {
+                    ch.hold_package(package);
+                    continue;
+                }
+                let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+                // A malformed package is skipped just as during ordinary delivery. A failed
+                // durable write poisons the room, which finish_session_upgrade refuses below.
+                let _ = ch.accept_skdm(profile.store(), &skdm, now);
+            }
+        }
         let id = ch.channel_id();
         ch.set_node_retention(self.node_retention_for(&id));
         ch.set_node_step_retention(self.node_step_retention.for_room(&id));
@@ -14369,13 +15138,14 @@ impl Node {
             .profile
             .as_ref()
             .ok_or(crate::error::Error::AtRestLocked)?;
+        ch.finish_session_upgrade(profile.store(), self.now_ms().get())?;
         ch.sweep_retention(profile.store(), self.now_ms())?;
         Ok(())
     }
 
     /// [`Self::finish_open_channel`], unboxed: see [`Boxed`].
     async fn finish_open_channel_unboxed(&mut self, mut ch: ChannelState) -> Outcome {
-        if let Err(e) = self.retention_before_publication(&mut ch) {
+        if let Err(e) = self.retention_before_publication(&mut ch).await {
             let _ = self.event_tx.send(NodeEvent::NodeNote {
                 note: format!(
                     "room {} could not apply retention before opening: {e}",
@@ -16026,6 +16796,61 @@ impl Node {
             .collect()
     }
 
+    async fn tend_private_sessions(&mut self) {
+        let rooms: Vec<_> = self
+            .channels
+            .iter()
+            .map(|(id, room)| (*id, Arc::clone(room)))
+            .collect();
+        for (room, shared) in rooms {
+            let members = shared.lock().await.drive_members();
+            for peer in members {
+                self.pull_private_sessions(room, peer).await;
+            }
+        }
+    }
+
+    /// Pull through the separate typed stream. No network wait holds the actor or room lock.
+    /// It shares the ordinary outbound slot budget, and retries only while a connection exists.
+    async fn pull_private_sessions(&mut self, channel_id: Digest32, peer: Digest32) {
+        let Some(conn) = self
+            .net
+            .as_ref()
+            .and_then(|net| net.manager().existing(&peer))
+        else {
+            return;
+        };
+        let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
+            return;
+        };
+        let Some(slot) = crate::node::ports::Slots::take(&self.slots, peer, Box::new(|| {})) else {
+            return;
+        };
+        let Some(ask) = shared.lock().await.start_private_pull(peer) else {
+            return;
+        };
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            let page = tokio::time::timeout(
+                Duration::from_secs(10),
+                crate::node::sessionstream::pull(&conn, ask),
+            )
+            .await
+            .unwrap_or(Err(crate::error::Error::Unreachable(
+                "private Session page timed out",
+            )));
+            let _ = tx
+                .send(NetEvent::PrivateSessionDone {
+                    channel_id,
+                    peer,
+                    room: shared,
+                    page,
+                })
+                .await;
+        });
+    }
+
     /// Append one Session entry under this node's drive key (ADR-029 SC-1, SC-2), then release
     /// that key to whoever with drive is owed it, so a member owed it from the entry reads it.
     async fn append_session(
@@ -16117,6 +16942,14 @@ impl Node {
                 return;
             };
             let mut ch = shared.lock().await;
+            // Ordinary-key declarations name only this node's authenticated legacy hashes.
+            // They let read-only peers identify withheld steps without granting drive.
+            if ch.announce_legacy_sessions(profile, now_millis).is_err() {
+                return;
+            }
+            if ch.announce_private_support(profile, now_millis).is_err() {
+                return;
+            }
             if ch
                 .rotate_drive_if_lost(profile.store(), holders, now_ms)
                 .is_err()
@@ -16302,6 +17135,40 @@ impl Node {
     }
 
     async fn publish(&mut self) {
+        // State changes cancel validators too. Never wait on a room lock here: the final
+        // validation check still requires the exact room and epoch before answering success.
+        let active = self
+            .validations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(|op| (op.room, op.original.clone(), op.epoch, op.attach))
+            .collect::<Vec<_>>();
+        for (room, original, epoch, attach) in active {
+            let fault = if attach != self.delivery_epoch || self.profile.is_none() {
+                Some(Fault::Locked)
+            } else {
+                match (self.channels.get(&room), original.upgrade()) {
+                    (Some(current), Some(original)) if Arc::ptr_eq(current, &original) => {
+                        current.try_lock().ok().and_then(|ch| {
+                            if ch.ended((self.millis_clock)()).is_some() {
+                                Some(Fault::RoomEnded)
+                            } else if ch.has_left(&ch.me()) {
+                                Some(Fault::ResponderLeft)
+                            } else if ch.epoch() != epoch || !ch.can_answer_join() {
+                                Some(Fault::Refused)
+                            } else {
+                                None
+                            }
+                        })
+                    }
+                    _ => Some(Fault::ChannelNotOpen),
+                }
+            };
+            if let Some(fault) = fault {
+                self.cancel_room_validations(Some(&room), fault);
+            }
+        }
         let (view, read) = self.view_of().await;
         self.fresh_details
             .retain(|id, _| self.channels.contains_key(id) && !read.contains(id));

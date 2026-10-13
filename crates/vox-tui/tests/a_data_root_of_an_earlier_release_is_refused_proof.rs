@@ -1,10 +1,6 @@
-//! V030-46 (#423, ADR-026 F-3) — **Vox carries no code for data from earlier releases: a fresh
-//! data root works end to end, and one laid out by a release before v0.3.0 is refused with a
-//! plain reason and left byte for byte unchanged**, through the shipped binary.
-//!
-//! Nobody has run a Vox release (decider, 2026-10-04), so nothing needs migrating: Vox carries no
-//! code that reads, converts or moves such a data root. What is left is a refusal, before anything
-//! is written.
+//! V030-46 (#423, ADR-026 F-3) — a fresh data root works end to end, supported roots from v0.4.0
+//! onward upgrade, and an unsupported layout or format is refused before anything is written.
+//! A format from a newer Vox, or a damaged marker, must not be mistaken for a supported old root.
 //!
 //! **Arm 1, fresh data roots, end to end** (`support/room.rs`): an anchor and two members, each
 //! made by `vox id`, attached in its own `vox daemon`; `vox room create`, `invite`, `join` and
@@ -19,6 +15,8 @@
 //! data root is snapshotted before and after (every path, every file's bytes): it must be
 //! identical. The config directory and `HOME` are outside it, so nothing legitimate writes inside
 //! it.
+//! The same journey also tries a current-layout root with a future format and a damaged marker
+//! (#741). Neither may be opened, stamped with this build's format, or otherwise changed.
 //!
 //! **Arm 3, a data root of the previous published release** (ADR-026 F-3, decider 2026-10-08):
 //! made by that release, downloaded and digest-checked, and opened by this build with nothing lost
@@ -35,6 +33,8 @@
 //!
 //! Mutation: the refusal removed (`refuse_old_layout` answering `Ok`) → red: the verbs run, and
 //! `nodes/` and `.daemon/` appear in the old data root.
+//! Mutation for #741: skip `data_root_format` at admission → PRODUCT red when `vox node list`
+//! succeeds on the future root instead of saying that a newer Vox is needed.
 
 #![cfg(unix)]
 
@@ -46,6 +46,11 @@ mod previous_release;
 
 #[path = "support/room.rs"]
 mod room;
+
+#[path = "support/ports.rs"]
+mod ports;
+#[path = "../../vox-core/tests/support/raw_sync.rs"]
+mod raw_sync;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -266,6 +271,68 @@ fn a_data_root_of_an_earlier_release_is_refused_and_unchanged() {
         after == before
     );
     assert!(red.is_empty(), "PRODUCT: {red:#?}");
+
+    // An unsupported format is as dangerous to open as an unsupported directory layout.
+    // The marker and opaque store are test-side apparatus; the verdict is the shipped CLI's
+    // refusal and the person's data remaining unchanged, not a parser's internal result.
+    for (name, marker, reason) in [
+        (
+            "future-format",
+            "format 4294967295\nwritten-by vox future\n",
+            "needs a newer Vox",
+        ),
+        (
+            "damaged-format",
+            "format interrupted\n",
+            "format marker is not valid",
+        ),
+        ("broken-format-link", "", "format marker could not be read"),
+        ("linked-format", "", "format marker could not be read"),
+    ] {
+        let data = tmp.path().join(name);
+        std::fs::create_dir_all(data.join(".daemon")).expect("APPARATUS: the format directory");
+        std::fs::create_dir_all(data.join("nodes/default")).expect("APPARATUS: the node directory");
+        if name == "broken-format-link" {
+            std::os::unix::fs::symlink("missing-format", data.join(".daemon/format"))
+                .expect("APPARATUS: the broken format marker");
+        } else if name == "linked-format" {
+            // The text is supported; following the link would admit the root. The marker
+            // itself must be a regular file, rather than an unchecked indirect read.
+            let target = outside.join("linked-format");
+            std::fs::write(&target, "format 2\nwritten-by vox 0.4.4\n")
+                .expect("APPARATUS: the linked marker's target");
+            std::os::unix::fs::symlink(&target, data.join(".daemon/format"))
+                .expect("APPARATUS: the linked format marker");
+        } else {
+            std::fs::write(data.join(".daemon/format"), marker)
+                .expect("APPARATUS: the unsupported format marker");
+        }
+        std::fs::write(
+            data.join("nodes/default/store.redb"),
+            b"do not open this store",
+        )
+        .expect("APPARATUS: the person's store");
+        std::fs::write(data.join("notes.txt"), b"a file of the person's own")
+            .expect("APPARATUS: the person's notes");
+        let before = snapshot(&data);
+        // List first: a mutant that removes admission must turn red immediately, rather than
+        // relying on a watchdog after accidentally starting a daemon.
+        for argv in std::iter::once(&["node", "list"][..])
+            .chain(verbs.into_iter().filter(|argv| *argv != ["node", "list"]))
+        {
+            let (status, said) = run_on(&data, &outside, argv);
+            assert!(
+                status == Some(false) && said.contains(REASON) && said.contains(reason),
+                "PRODUCT: {name}: vox {argv:?} must refuse with {reason:?}; \
+                 exit ok={status:?}, said {said:?}"
+            );
+            assert_eq!(
+                snapshot(&data),
+                before,
+                "PRODUCT: {name}: vox {argv:?} changed a data root it cannot read"
+            );
+        }
+    }
 }
 
 /// Read the actual Session, including its full detail, through the worker's shipped CLI.
@@ -368,6 +435,11 @@ fn seen(w: &room::Worker, room: &str, others: &[String], side: &str) -> Seen {
     let rows = ok(&["room", "read", room, "--json", "--limit", "1000"])
         .ndjson()
         .iter()
+        // A v0.4.4 read-only member displays withheld Session bodies as unread placeholders.
+        // Their removal is required by #787. Compare received content, including every staged
+        // message/share/opening and its original hash, author and time; do not require an
+        // intentionally removed placeholder to survive the upgrade as though it were data.
+        .filter(|r| r["owed"] != true)
         .map(|r| {
             (
                 r["entry_hash"].as_str().unwrap_or_default().to_owned(),
@@ -391,7 +463,7 @@ fn seen(w: &room::Worker, room: &str, others: &[String], side: &str) -> Seen {
 /// view is read with that release. Then every process is stopped as a person stops it and started
 /// again from this build on the same data roots, and each member must see the same fingerprint,
 /// the same keyring, the same room, and the same rows in the same order with the same times; the
-/// share must still be listed; `.daemon/format` must say format 2, written by this build; and,
+/// share must still be listed; `.daemon/format` must say format 3, written by this build; and,
 /// once each member's daemon is started again by this build, so that it reads back what this build
 /// rewrote, a post written after the upgrade must reach the other member.
 ///
@@ -419,7 +491,7 @@ fn seen(w: &room::Worker, room: &str, others: &[String], side: &str) -> Seen {
 /// red, `PRODUCT:` this build cannot unlock the node; the retired set left out of the version-3
 /// encoding → red at the restart, `PRODUCT:` the daemon this build started again cannot unlock the node.
 #[test]
-#[ignore = "downloads the previous release; an anchor and two daemons of each; run in release"]
+#[ignore = "downloads the previous release; scratch anchors and member daemons; run in release"]
 fn a_data_root_of_the_previous_release_opens_with_nothing_lost() {
     watchdog::arm_for(Duration::from_secs(1200));
     if !cfg!(feature = "test-knobs") {
@@ -638,7 +710,7 @@ fn a_data_root_of_the_previous_release_opens_with_nothing_lost() {
             ));
         }
         let format = std::fs::read_to_string(w.data.join(".daemon/format")).unwrap_or_default();
-        let want = format!("format 2\nwritten-by vox {}\n", env!("CARGO_PKG_VERSION"));
+        let want = format!("format 3\nwritten-by vox {}\n", env!("CARGO_PKG_VERSION"));
         if format != want {
             red.push(format!(
                 "{}'s .daemon/format says {format:?}; this build serving it must write {want:?}",
@@ -781,5 +853,498 @@ fn a_data_root_of_the_previous_release_opens_with_nothing_lost() {
         println!(
             "[proof] day {days}, restart={restart}: step expiry is visible on first read; forever messages remain"
         );
+    }
+    drop(r);
+    legacy_session_copies_upgrade(tmp.path(), &old, &rt);
+}
+
+/// The original author asks real daemons for its own encrypted records. This bypasses neither
+/// protocol nor authentication; it prevents a recipient-permission filter from concealing a
+/// retained copy. The verdict is the daemon's wire response, never an in-process store value.
+struct SessionCopies {
+    public: Vec<vox_core::log::entry::Entry>,
+    private: Vec<Vec<u8>>,
+}
+
+fn session_copies_as_owner(
+    r: &mut room::Room,
+    rt: &tokio::runtime::Runtime,
+    upgraded: bool,
+) -> Vec<SessionCopies> {
+    use vox_core::cbor::{Decoder, Encoder};
+    use vox_core::log::entry::Entry;
+    use vox_core::transport::framing::{read_frame, write_frame};
+    use vox_core::transport::streams::{open_typed, StreamKind};
+
+    let side = if r.workers[0].exe == VOX {
+        "PRODUCT"
+    } else {
+        "APPARATUS"
+    };
+    let targets: Vec<_> = r.workers[1..]
+        .iter()
+        .map(|w| {
+            let o = w.vox(None, &["status", "--json"]);
+            assert!(
+                o.ok,
+                "{side}: {} could not report its endpoint: {o:?}",
+                w.name
+            );
+            (
+                w.name.clone(),
+                w.fp,
+                ports::loopback_listen(&o.stdout).expect("APPARATUS: scratch holder endpoint"),
+            )
+        })
+        .collect();
+    r.workers[0].stop_daemon();
+    let endpoint = rt.block_on(raw_sync::endpoint_as_member(
+        &r.workers[0].paths,
+        room::ID_PASS.as_bytes(),
+    ));
+    let mut copies = Vec::new();
+    for (name, fingerprint, addr) in targets {
+        let conn = rt
+            .block_on(endpoint.connect(addr, fingerprint, raw_sync::now()))
+            .expect("APPARATUS: original author connects to the scratch holder");
+        let y = rt.block_on(raw_sync::ask(
+            &conn,
+            r.cid,
+            0,
+            raw_sync::Ask::Everything,
+            None,
+        ));
+        assert!(
+            y.hello && y.ended.is_none() && !y.wires.is_empty(),
+            "{side}: {name} did not serve its held public history: hello={}, ended={:?}, entries={}",
+            y.hello, y.ended, y.wires.len()
+        );
+        let public = y
+            .wires
+            .iter()
+            .map(|wire| Entry::from_wire(wire).expect("PRODUCT: invalid public entry from holder"))
+            .collect();
+        let mut private = Vec::new();
+        if upgraded {
+            let mut incarnation = [0; 32];
+            let mut after = 0;
+            let mut finished = false;
+            for _ in 0..32 {
+                let bytes = rt.block_on(async {
+                    let (mut send, mut recv) = open_typed(&conn, StreamKind::Session)
+                        .await
+                        .expect("PRODUCT: original author could not open private Session stream");
+                    let mut e = Encoder::new();
+                    e.array(5)
+                        .uint(1)
+                        .bytes(&r.cid)
+                        .uint(0)
+                        .bytes(&incarnation)
+                        .uint(after);
+                    write_frame(&mut send, &e.finish())
+                        .await
+                        .expect("APPARATUS: original author sends private request");
+                    send.finish()
+                        .expect("APPARATUS: original author finishes private request");
+                    read_frame(&mut recv, 4 * 1024 * 1024)
+                        .await
+                        .expect("PRODUCT: holder's private Session response failed")
+                        .expect("PRODUCT: holder gave no private Session response")
+                });
+                let mut d = Decoder::new(&bytes);
+                assert_eq!(
+                    d.array().expect("PRODUCT: private page array"),
+                    5,
+                    "PRODUCT: invalid private Session page shape"
+                );
+                assert_eq!(
+                    d.uint().expect("PRODUCT: private page version"),
+                    1,
+                    "PRODUCT: invalid private Session page version"
+                );
+                incarnation = d
+                    .bytes()
+                    .expect("PRODUCT: private page incarnation")
+                    .try_into()
+                    .expect("PRODUCT: invalid private page incarnation");
+                after = d.uint().expect("PRODUCT: private page cursor");
+                let more = d.uint().expect("PRODUCT: private page continuation");
+                for _ in 0..d.array().expect("PRODUCT: private page records") {
+                    private.push(d.bytes().expect("PRODUCT: private record bytes").to_vec());
+                }
+                d.finish().expect("PRODUCT: trailing private page bytes");
+                if more == 0 {
+                    finished = true;
+                    break;
+                }
+                assert_eq!(more, 1, "PRODUCT: invalid private page continuation");
+            }
+            assert!(
+                finished,
+                "APPARATUS: staged private history exceeded bounded probe"
+            );
+        }
+        copies.push(SessionCopies { public, private });
+    }
+    drop(endpoint);
+    r.restart(0);
+    copies
+}
+
+/// Extend the published-release journey with the users for whom a cache-only assertion is
+/// insufficient: a current driver, a driver revoked before upgrade, and an ordinary reader.
+/// Mutants: skip the public rewrite -> the author's public wire request receives old ciphertext;
+/// keep revoked legacy copies -> its private request recovers them; drop authorized copies ->
+/// the current driver loses readable history and/or the original signed private record.
+/// During the rolling upgrade, published drive and read-only peers must still exchange chat
+/// with the upgraded author, without receiving its new private steps or extra placeholders.
+fn legacy_session_copies_upgrade(root: &Path, old: &str, rt: &tokio::runtime::Runtime) {
+    use vox_core::cbor::Decoder;
+    use vox_core::group::message::GroupMessage;
+    use vox_core::log::entry::Entry;
+    use vox_core::node::drive::drive_channel;
+
+    let tmp = root.join("legacy-session-copies");
+    std::fs::create_dir(&tmp).expect("APPARATUS: legacy Session scratch directory");
+    let mut r = rt.block_on(room::room_as(
+        &tmp,
+        &["owner", "current", "revoked", "reader"],
+        old,
+    ));
+    let session = "legacy-upgrade-session";
+    let room_id = r.id.clone();
+    let first = "LEGACY-BEFORE-REVOCATION";
+    let second = "LEGACY-AFTER-REVOCATION";
+    let rolling = "PRIVATE-WHILE-PEERS-STILL-PUBLISHED";
+    let new = "PRIVATE-AFTER-UPGRADE-REVOCATION";
+    let hook = |w: &room::Worker, text: &str, side: &str| {
+        let transcript = tmp.join("session.jsonl");
+        std::fs::write(&transcript, "").expect("APPARATUS: scratch Session transcript");
+        let payload = serde_json::json!({
+            "session_id": session, "transcript_path": transcript, "cwd": tmp,
+            "permission_mode": "default", "hook_event_name": "UserPromptSubmit",
+            "prompt": text, "prompt_id": text,
+        })
+        .to_string();
+        let node = w.paths.account().nodes_on_disk()[0].clone();
+        let o = w.vox_env(
+            None,
+            &[("CLAUDE_CODE_ENTRYPOINT", "cli")],
+            &["agent", "hook", "--node", node.as_str(), "--room", &room_id],
+            Some(&payload),
+        );
+        assert!(o.ok, "{side}: Session hook failed: {o:?}");
+    };
+    let history = |w: &room::Worker| {
+        w.vox(
+            None,
+            &["room", "session", &room_id, session, "--details", "--json"],
+        )
+    };
+    let wait_old_history = |w: &room::Worker, wanted: &[&str]| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let o = history(w);
+            if o.ok && wanted.iter().all(|text| o.stdout.contains(text)) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS: published {} did not stage its readable Session steps: {o:?}",
+                w.name
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    };
+    for i in [1, 2] {
+        let o = r.workers[0].vox(
+            None,
+            &[
+                "trust",
+                "drive",
+                &r.workers[i].b32(),
+                "--identity-passphrase-file",
+                r.workers[0].pass.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            o.ok,
+            "APPARATUS: published owner could not grant drive: {o:?}"
+        );
+    }
+    hook(&r.workers[0], first, "APPARATUS");
+    for i in [1, 2] {
+        wait_old_history(&r.workers[i], &[first]);
+    }
+    let o = r.workers[0].vox(
+        None,
+        &[
+            "trust",
+            "read",
+            &r.workers[2].b32(),
+            "--identity-passphrase-file",
+            r.workers[0].pass.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        o.ok,
+        "APPARATUS: published owner could not revoke drive: {o:?}"
+    );
+    hook(&r.workers[0], second, "APPARATUS");
+    wait_old_history(&r.workers[1], &[first, second]);
+    let control = "ORDINARY-CHAT-AFTER-OLD-STEPS";
+    let o = r.workers[0].vox(None, &["room", "post", &r.id, control]);
+    assert!(
+        o.ok,
+        "APPARATUS: published ordinary control post failed: {o:?}"
+    );
+    for w in &r.workers[1..] {
+        await_upgrade_post(w, &r.id, control);
+    }
+    let o = history(&r.workers[2]);
+    assert!(
+        o.ok && o.stdout.contains(first) && !o.stdout.contains(second),
+        "APPARATUS: old revoked driver must hold only its earlier readable step: {o:?}"
+    );
+
+    let before = session_copies_as_owner(&mut r, rt, false);
+    let legacy: Vec<BTreeMap<_, _>> = before
+        .iter()
+        .map(|copies| {
+            copies
+                .public
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .payload
+                        .as_deref()
+                        .and_then(|p| GroupMessage::from_wire(p).ok())
+                        .is_some_and(|m| m.header.channel_id == drive_channel(&r.cid))
+                })
+                .map(|entry| (entry.entry_hash(), entry.to_wire()))
+                .collect()
+        })
+        .collect();
+    assert!(
+        legacy[0].len() >= 2 && !legacy[1].is_empty(),
+        "APPARATUS: original author did not recover staged ciphertext from both legacy drivers"
+    );
+    println!(
+        "[proof] published holders served original author {} / {} / {} legacy encrypted records",
+        legacy[0].len(),
+        legacy[1].len(),
+        legacy[2].len()
+    );
+    let old_general: Vec<_> = r.workers[1..]
+        .iter()
+        .map(|w| {
+            let o = w.vox(None, &["room", "read", &r.id, "--limit", "1000"]);
+            assert!(
+                o.ok,
+                "APPARATUS: published reader failed before rolling upgrade: {o:?}"
+            );
+            o.stdout.matches("not received yet").count()
+        })
+        .collect();
+    r.workers[0].exe = VOX.to_owned();
+    r.restart(0);
+    hook(&r.workers[0], rolling, "PRODUCT");
+    let compatibility = "CHAT-AFTER-PRIVATE-STEP-WITH-PUBLISHED-PEERS";
+    let o = r.workers[0].vox(None, &["room", "post", &r.id, compatibility]);
+    assert!(
+        o.ok,
+        "PRODUCT: upgraded author could not post beside its private step: {o:?}"
+    );
+    for (i, w) in r.workers[1..].iter().enumerate() {
+        await_upgrade_post(w, &r.id, compatibility);
+        let o = w.vox(None, &["room", "read", &r.id, "--limit", "1000"]);
+        assert!(o.ok && !o.stdout.contains(rolling)
+            && o.stdout.matches("not received yet").count() == old_general[i],
+            "PRODUCT: published {} received new private activity or new missing-body placeholders: {o:?}", w.name);
+        let o = history(w);
+        assert!(o.ok && !o.stdout.contains(rolling)
+            && o.stdout.contains(first) == (i < 2)
+            && o.stdout.contains(second) == (i == 0),
+            "PRODUCT: published {}'s existing Session history changed during rolling upgrade: {o:?}", w.name);
+        let response = format!("PUBLISHED-{}-ANSWERS-UPGRADED-OWNER", w.name);
+        let o = w.vox(None, &["room", "post", &r.id, &response]);
+        assert!(
+            o.ok,
+            "PRODUCT: published {} could not answer upgraded owner: {o:?}",
+            w.name
+        );
+        await_upgrade_post(&r.workers[0], &r.id, &response);
+    }
+    let mixed = session_copies_as_owner(&mut r, rt, false);
+    for (i, copies) in mixed.iter().enumerate() {
+        let encrypted: BTreeMap<_, _> = copies
+            .public
+            .iter()
+            .filter(|entry| {
+                entry
+                    .payload
+                    .as_deref()
+                    .and_then(|p| GroupMessage::from_wire(p).ok())
+                    .is_some_and(|m| m.header.channel_id == drive_channel(&r.cid))
+            })
+            .map(|entry| (entry.entry_hash(), entry.to_wire()))
+            .collect();
+        assert_eq!(
+            encrypted,
+            legacy[i],
+            "PRODUCT: published {} received new encrypted Session records during rolling upgrade",
+            r.workers[i + 1].name
+        );
+    }
+    println!("[proof] published drive, revoked and read-only peers exchange chat with upgraded owner; no new private ciphertext or placeholders");
+    r.upgrade(VOX);
+    for w in &r.workers {
+        await_upgrade_post(w, &r.id, control);
+    }
+    room::until(
+        &r.workers[1],
+        None,
+        "authorized private step after completing rolling upgrade",
+        &["room", "session", &r.id, session, "--details", "--json"],
+        |o| o.ok && o.stdout.contains(rolling),
+    );
+    for i in [0, 1] {
+        let o = r.workers[i].vox(
+            None,
+            &["room", "session", &r.id, session, "--details", "--json"],
+        );
+        assert!(
+            o.ok && o.stdout.contains(first)
+                && o.stdout.contains(second)
+                && o.stdout.contains(rolling),
+            "PRODUCT: {} lost authorized legacy Session history: {o:?}",
+            r.workers[i].name
+        );
+    }
+    for i in [2, 3] {
+        let o = r.workers[i].vox(
+            None,
+            &["room", "session", &r.id, session, "--details", "--json"],
+        );
+        assert!(
+            o.ok && !o.stdout.contains(first)
+                && !o.stdout.contains(second)
+                && !o.stdout.contains(rolling),
+            "PRODUCT: {} retained forbidden legacy Session cache: {o:?}",
+            r.workers[i].name
+        );
+    }
+
+    for restart in [false, true] {
+        if restart {
+            // After migration, losing drive must preserve the history already read. A new
+            // step and an ordinary later post make absence of the new private step measurable.
+            let o = r.workers[0].vox(
+                None,
+                &[
+                    "trust",
+                    "read",
+                    &r.workers[1].b32(),
+                    "--identity-passphrase-file",
+                    r.workers[0].pass.to_str().unwrap(),
+                ],
+            );
+            assert!(
+                o.ok,
+                "PRODUCT: owner could not revoke current driver: {o:?}"
+            );
+            let transcript = tmp.join("session.jsonl");
+            let node = r.workers[0].paths.account().nodes_on_disk()[0].clone();
+            let payload = serde_json::json!({"session_id": session, "transcript_path": transcript,
+                "cwd": tmp, "permission_mode": "default", "hook_event_name": "UserPromptSubmit",
+                "prompt": new, "prompt_id": new})
+            .to_string();
+            let o = r.workers[0].vox_env(
+                None,
+                &[("CLAUDE_CODE_ENTRYPOINT", "cli")],
+                &["agent", "hook", "--node", node.as_str(), "--room", &r.id],
+                Some(&payload),
+            );
+            assert!(o.ok, "PRODUCT: post-upgrade Session hook failed: {o:?}");
+            let o = r.workers[0].vox(None, &["room", "post", &r.id, "ORDINARY-AFTER-NEW-REVOKE"]);
+            assert!(o.ok, "PRODUCT: post-upgrade control post failed: {o:?}");
+            for w in &r.workers[1..] {
+                await_upgrade_post(w, &r.id, "ORDINARY-AFTER-NEW-REVOKE");
+            }
+            r.upgrade(VOX);
+        }
+        let after = session_copies_as_owner(&mut r, rt, true);
+        // A read-only old member held only skeletons, so it needs the upgraded author's
+        // declaration before those placeholders can be classified. The wire-copy checks
+        // above did not wait for this: migration must precede service publication.
+        let online = format!("MIGRATED-OWNER-ONLINE-{restart}");
+        let o = r.workers[0].vox(None, &["room", "post", &r.id, &online]);
+        assert!(
+            o.ok,
+            "PRODUCT: upgraded owner could not post its live control: {o:?}"
+        );
+        for w in &r.workers[1..] {
+            await_upgrade_post(w, &r.id, &online);
+        }
+        for (i, copies) in after.iter().enumerate() {
+            for hash in legacy[i].keys() {
+                let entry = copies
+                    .public
+                    .iter()
+                    .find(|e| e.entry_hash() == *hash)
+                    .expect("PRODUCT: migration lost a signed public skeleton");
+                assert!(entry.payload.is_none(),
+                    "PRODUCT: {} still served legacy Session ciphertext publicly, restart={restart}",
+                    r.workers[i + 1].name);
+            }
+            if i != 0 {
+                assert!(copies.private.is_empty(),
+                    "PRODUCT: {} retained {} private Session copies without drive at upgrade, restart={restart}",
+                    r.workers[i + 1].name, copies.private.len());
+            } else {
+                let migrated: BTreeMap<_, _> = copies
+                    .private
+                    .iter()
+                    .filter_map(|wire| {
+                        let mut d = Decoder::new(wire);
+                        if d.array().ok()? != 2 || d.uint().ok()? != 2 {
+                            return None;
+                        }
+                        let original = d.bytes().ok()?.to_vec();
+                        let entry = Entry::from_wire(&original).ok()?;
+                        Some((entry.entry_hash(), original))
+                    })
+                    .collect();
+                for (hash, wire) in &legacy[0] {
+                    assert_eq!(migrated.get(hash), Some(wire),
+                        "PRODUCT: current driver did not preserve original signed legacy record privately, restart={restart}");
+                }
+            }
+            let w = &r.workers[i + 1];
+            let o = room::until(
+                w,
+                None,
+                "upgraded author's Session declarations in General",
+                &["room", "read", &r.id, "--limit", "1000"],
+                |o| o.ok && o.stdout.contains(&online) && !o.stdout.contains("not received yet"),
+            );
+            assert!(o.ok && o.stdout.contains(control) && !o.stdout.contains("not received yet")
+                && !o.stdout.contains(first) && !o.stdout.contains(second) && !o.stdout.contains(new)
+                && !o.stdout.contains(rolling),
+                "PRODUCT: {}'s General lost ordinary chat or exposed private activity/placeholder: {o:?}", w.name);
+            let o = w.vox(
+                None,
+                &["room", "session", &r.id, session, "--details", "--json"],
+            );
+            assert!(
+                o.ok && o.stdout.contains(first) == (i == 0)
+                    && o.stdout.contains(second) == (i == 0)
+                    && o.stdout.contains(rolling) == (i == 0)
+                    && !o.stdout.contains(new),
+                "PRODUCT: {}'s retained Session history changed, restart={restart}: {o:?}",
+                w.name
+            );
+        }
+        println!("[proof] legacy encrypted copies removed from public sync; private originals only at authorized migration holder; restart={restart}");
     }
 }

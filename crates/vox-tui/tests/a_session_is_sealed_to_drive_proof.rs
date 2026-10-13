@@ -1,10 +1,9 @@
 //! **ADR-029 SC-2, SC-2a, SC-2b (#543) — a Session is read only by the members its node trusts
-//! with drive**, through the shipped `vox` binary: a `vox node` anchor and three `vox daemon`s.
+//! with drive**, through the shipped `vox` binary: a `vox node` anchor and four `vox daemon`s.
 //!
 //! ## The claims
 //! 1. **Read only with drive** (SC-2, SC-2a, SC-4). Alice's node trusts bob with read + drive
-//!    and carol with read only. The entries of alice's Session reach both of their nodes in the
-//!    room's log, and bob's node opens every one of them; carol's opens none, though it reads
+//!    and carol with read only. Bob's node opens every Session entry; carol's opens none, though it reads
 //!    alice's messages to the room written before and after them. Neither shows Session activity
 //!    in the room's timeline (`vox room read`).
 //!    `vox room sessions --json` says so too: alice's Session is listed for both, `can_drive`
@@ -34,6 +33,11 @@
 //!    alice's drive key in both rooms at once, each as a key-package in that room's log. Carol's
 //!    own `vox status` says how many one-time prekeys her node has used: exactly two more. Two
 //!    packages naming one prekey use one, and the second is opened as a replay, last-resort.
+//! 6. **A late join discovers the ongoing Session, starting with its grant** (#787). Dave joins
+//!    after earlier activity, sees the open Session and reads only its subsequent steps. After
+//!    losing and regaining drive he keeps previously read history, misses the revoked interval,
+//!    and reads new steps. Raw requests to both the author and an authorized relay return no
+//!    ciphertext from before his first grant or from an earlier grant after regrant.
 //!
 //! ## The staging
 //! - Every `vox` is the shipped binary in a scratch `VOX_DATA_DIR`/`VOX_CONFIG_DIR`; every step a
@@ -68,10 +72,20 @@
 //! - **No rotation on losing drive** (claim 2): `rotate_drive_if_lost` in
 //!   `crates/vox-core/src/node/channel.rs` returns the lost members without changing the key. Bob's
 //!   node opens the entries written after his downgrade: red PRODUCT.
+//! - **No opening refresh on a new reader's consent** (claim 6): Dave reads fresh chat but the
+//!   ongoing Session is missing from `vox room sessions`: red PRODUCT.
+//! - **Regrant treated as continuous permission** (claim 6): ignore the start of a recipient's
+//!   grant in later generations in `private_permitted`. The author returns old ciphertext to
+//!   Dave's raw request after regrant: red PRODUCT.
 #![cfg(unix)]
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+
+#[path = "support/ports.rs"]
+mod ports;
+#[path = "../../vox-core/tests/support/raw_sync.rs"]
+mod raw_sync;
 
 #[path = "support/typed.rs"]
 mod typed;
@@ -498,21 +512,8 @@ fn fetch_as(
     Ok(head.lines().next().unwrap_or_default().to_owned())
 }
 
-/// How many entries `m`'s node holds in the room, as `vox status --json` counts them.
-fn entries(m: &Member, room: &str) -> u64 {
-    let (_, o, _) = m.vox(&["status", "--json"], None);
-    let v: serde_json::Value = serde_json::from_str(&o).unwrap_or_default();
-    v["rooms"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|r| r["id"].as_str().is_some_and(|id| id.starts_with(room)))
-        .and_then(|r| r["entries"].as_u64())
-        .unwrap_or(0)
-}
-
 #[test]
-#[ignore = "an anchor and three daemons with production Argon2id; CI runs it in release"]
+#[ignore = "an anchor and four daemons with production Argon2id; CI runs it in release"]
 fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key() {
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
@@ -521,9 +522,9 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         .build()
         .expect("APPARATUS: a runtime");
     let (_anchor, spec) = anchor(tmp.path());
-    let alice = member(tmp.path(), "alice", &spec);
-    let bob = member(tmp.path(), "bob", &spec);
-    let carol = member(tmp.path(), "carol", &spec);
+    let mut alice = member(tmp.path(), "alice", &spec);
+    let mut bob = member(tmp.path(), "bob", &spec);
+    let mut carol = member(tmp.path(), "carol", &spec);
 
     // ---- one room; alice trusts bob with drive and carol with read; they trust her back ----
     let (ok, _, e) = alice.vox(
@@ -565,7 +566,6 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     let before: Vec<String> = (1..=ENTRIES)
         .map(|n| format!("BEFORE-DOWNGRADE {n}"))
         .collect();
-    let carol_held = entries(&carol, &room);
     for (n, text) in before.iter().enumerate() {
         match rt.block_on(alice.socket(&rt).request(&Request::AppendSession {
             channel_id: id,
@@ -577,10 +577,9 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         }
     }
     let bob_read = until(Duration::from_secs(120), || opened(&bob, &room) == before);
-    // Carol's control: a room message alice posts after the entries, read by carol, so her node
-    // holds the log past them.
+    // A delivered ordinary message is the positive control. Private Session steps are no
+    // longer room-log entries, so a count of public entries cannot stage their delivery.
     let carol_synced = posts_until_read(&alice, &carol, &room, "AFTER-ENTRIES");
-    let carol_holds = entries(&carol, &room).saturating_sub(carol_held);
     let carol_opened = opened(&carol, &room);
     let bob_lists = until(Duration::from_secs(60), || {
         can_drive(&bob, &room) == Some(true)
@@ -589,14 +588,12 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     let timeline_bob = bob.vox(&["room", "read", &room], None).1;
     let timeline_carol = carol.vox(&["room", "read", &room], None).1;
     eprintln!(
-        "[proof] claim 1: bob opened {:?}; carol synced past them: {carol_synced}, holds {carol_holds} \
-         new entries, opened {carol_opened:?}",
+        "[proof] claim 1: bob opened {:?}; carol reads later chat: {carol_synced}, opened {carol_opened:?}",
         opened(&bob, &room)
     );
     assert!(
-        carol_synced && carol_holds as usize >= ENTRIES,
-        "APPARATUS (staging): carol's node never held the log past alice's Session entries ({carol_holds} \
-         new entries, synced {carol_synced}), so her opening none would say nothing"
+        carol_synced,
+        "PRODUCT: read-only Carol did not receive ordinary chat after Alice wrote private Session steps"
     );
     assert!(
         bob_read,
@@ -620,6 +617,7 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         "PRODUCT: Session activity must not show in the room's timeline (SC-4): bob's read: \
          {timeline_bob}\ncarol's read: {timeline_carol}"
     );
+    private_wire_refused(&mut carol, &[&alice, &bob], id, &spec);
 
     // ---- claim 3: alice's session sends a file out of its Session; it reaches bob alone ----
     let file = tmp.path().join("for-drive.bin");
@@ -963,5 +961,597 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         away.is_empty(),
         "APPARATUS (precondition unmet): carol was not connected to alice when her keys went, so \
          they went to her signed prekey as a member away's do: {away:?}"
+    );
+    // Carol's later grant discovers the already-open Session, without earlier step backfill.
+    let late = "AFTER-LATE-DRIVE-GRANT";
+    assert!(
+        matches!(
+            rt.block_on(alice.socket(&rt).request(&Request::AppendSession {
+                channel_id: id,
+                session_id: SESSION.to_owned(),
+                body: reply(100, late),
+            })),
+            Ok(Frame::Appended { .. })
+        ),
+        "PRODUCT: owner could not append after Carol's late drive grant"
+    );
+    assert!(
+        until(Duration::from_secs(60), || opened(&carol, &room) == [late]),
+        "PRODUCT: newly drive-enabled Carol must read only the post-grant step; got {:?}",
+        opened(&carol, &room)
+    );
+    assert_eq!(
+        can_drive(&carol, &room),
+        Some(true),
+        "PRODUCT: Carol's late grant did not make the ongoing Session driveable"
+    );
+    // Carol demonstrably holds the new ciphertext now. Bob cannot get it from her or its owner.
+    private_wire_refused(&mut bob, &[&alice, &carol], id, &spec);
+    assert_eq!(
+        opened(&bob, &room),
+        before,
+        "PRODUCT: Bob's restart after drive loss changed the steps he had already read"
+    );
+
+    // A fourth member joins the already-running Session with drive. Its room admission and
+    // later regrant each begin a new readable interval; neither releases earlier ciphertext.
+    let mut dave = member(tmp.path(), "dave", &spec);
+    alice.trust(&dave, true);
+    dave.trust(&alice, false);
+    carol.trust(&dave, false);
+    dave.trust(&carol, false);
+    let (ok, o, e) = dave.vox(
+        &["room", "join", "--passphrase-file", "-", link.trim()],
+        Some(&format!("{ROOM_PASS}\n")),
+    );
+    assert!(
+        ok,
+        "PRODUCT: drive-enabled late member could not join: {o}{e}"
+    );
+    assert!(
+        posts_until_read(&alice, &dave, &room, "READY-LATE-MEMBER"),
+        "APPARATUS: late member never read its ordinary control post"
+    );
+    assert!(
+        until(Duration::from_secs(60), || can_drive(&dave, &room)
+            == Some(true)),
+        "PRODUCT: late member with drive did not discover the ongoing Session"
+    );
+    private_wire_refused(&mut dave, &[&alice, &carol], id, &spec);
+    assert!(
+        opened(&dave, &room).is_empty(),
+        "PRODUCT: late member read pre-admission Session history"
+    );
+
+    let append = |seq, text: &str| {
+        assert!(
+            matches!(
+                rt.block_on(alice.socket(&rt).request(&Request::AppendSession {
+                    channel_id: id,
+                    session_id: SESSION.to_owned(),
+                    body: reply(seq, text),
+                })),
+                Ok(Frame::Appended { .. })
+            ),
+            "PRODUCT: owner could not append {text}"
+        );
+    };
+    let joined = "AFTER-LATE-ROOM-JOIN";
+    append(101, joined);
+    assert!(
+        until(Duration::from_secs(60), || opened(&dave, &room) == [joined]),
+        "PRODUCT: late member must read only its post-admission step; got {:?}",
+        opened(&dave, &room)
+    );
+    let (ok, o, e) = alice.vox(
+        &[
+            "trust",
+            "read",
+            &dave.fp,
+            "--identity-passphrase-file",
+            alice.pass(),
+        ],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: owner could not revoke late member's drive: {o}{e}"
+    );
+    let absent = "WHILE-LATE-MEMBER-REVOKED";
+    append(102, absent);
+    assert!(
+        until(Duration::from_secs(60), || opened(&carol, &room)
+            == [late, joined, absent]),
+        "PRODUCT: continuously authorized relay did not receive the intervening step"
+    );
+    assert!(
+        posts_until_read(&alice, &dave, &room, "AFTER-LATE-MEMBER-REVOKE"),
+        "APPARATUS: revoked late member never read its ordinary control post"
+    );
+    assert_eq!(
+        opened(&dave, &room),
+        [joined],
+        "PRODUCT: revoking late member's drive erased old history or released a new step"
+    );
+    assert_eq!(
+        can_drive(&dave, &room),
+        Some(false),
+        "PRODUCT: revoked late member still advertises drive"
+    );
+
+    let (ok, o, e) = alice.vox(
+        &[
+            "trust",
+            "drive",
+            &dave.fp,
+            "--identity-passphrase-file",
+            alice.pass(),
+        ],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: owner could not regrant late member's drive: {o}{e}"
+    );
+    assert!(
+        until(Duration::from_secs(60), || can_drive(&dave, &room)
+            == Some(true)),
+        "PRODUCT: regranted member did not regain its ongoing Session"
+    );
+    // The relay has the missed step. The regranted member asks both it and the owner before
+    // any new step is written: neither may backfill even encrypted earlier records.
+    private_wire_refused(&mut dave, &[&alice, &carol], id, &spec);
+    let regranted = "AFTER-LATE-MEMBER-REGRANT";
+    append(103, regranted);
+    assert!(
+        until(Duration::from_secs(60), || opened(&dave, &room)
+            == [joined, regranted]),
+        "PRODUCT: regrant must preserve held history and add only new activity; got {:?}",
+        opened(&dave, &room)
+    );
+    assert!(
+        posts_until_read(&alice, &dave, &room, "AFTER-REGRANT-CONTROL"),
+        "APPARATUS: regranted member never read its ordinary control post"
+    );
+    for member in [&bob, &carol, &dave] {
+        let (ok, shown, err) = member.vox(&["room", "read", &room], None);
+        assert!(
+            ok && !shown.contains("not received yet")
+                && [late, joined, absent, regranted]
+                    .iter()
+                    .all(|text| !shown.contains(text)),
+            "PRODUCT: {}'s General exposed Session content or withheld placeholders: {shown}{err}",
+            member.name
+        );
+    }
+    assert_eq!(
+        opened(&bob, &room),
+        before,
+        "PRODUCT: another member's join and regrant changed Bob's already-read history"
+    );
+    legacy_placeholder_journey(&mut alice, &mut bob, id, &room, &spec);
+}
+
+/// An authenticated but unauthorized member asks the actual owner and an actual holder for
+/// their private wire pages. Verdicts come from the shipped daemons' responses, not store data.
+fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32], anchor: &str) {
+    use vox_core::cbor::{Decoder, Encoder};
+    use vox_core::node::link::b32_decode;
+    use vox_core::node::paths::Paths;
+    use vox_core::node::profile::Profile;
+    use vox_core::transport::framing::{read_frame, write_frame};
+    use vox_core::transport::quic::VoxEndpoint;
+    use vox_core::transport::streams::{open_typed, StreamKind};
+
+    let targets: Vec<_> = holders
+        .iter()
+        .map(|h| {
+            let (_, status, _) = h.vox(&["status", "--json"], None);
+            (
+                h.name,
+                ports::loopback_listen(&status).expect("APPARATUS: holder address"),
+                b32_decode(&h.fp, "private wire holder").expect("APPARATUS: holder fingerprint"),
+            )
+        })
+        .collect();
+    drop(member._daemon.take());
+    let paths = Paths::resolve(
+        "default",
+        Some(&member.data),
+        Some(&member.data.join("cfg")),
+    )
+    .expect("APPARATUS: stopped scratch member paths");
+    let mut profile = Profile::open(paths).expect("APPARATUS: stopped scratch member opens");
+    profile
+        .unlock(ID_PASS.as_bytes())
+        .expect("APPARATUS: scratch member unlocks");
+    let signer = profile
+        .signer_arc()
+        .expect("APPARATUS: scratch member signs");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("APPARATUS: private wire peer runtime");
+    let endpoint = rt.block_on(async {
+        VoxEndpoint::bind(signer, "127.0.0.1:0".parse().unwrap())
+            .expect("APPARATUS: private wire peer binds")
+    });
+    for (name, addr, fingerprint) in targets {
+        let connection = rt
+            .block_on(endpoint.connect(addr, fingerprint, raw_sync::now()))
+            .expect("APPARATUS: private wire peer connects to holder");
+        let mut incarnation = [0u8; 32];
+        let mut after = 0;
+        let mut finished = false;
+        for _ in 0..32 {
+            let bytes = rt.block_on(async {
+                let (mut send, mut recv) = open_typed(&connection, StreamKind::Session)
+                    .await
+                    .expect("APPARATUS: private wire peer opens stream");
+                let mut e = Encoder::new();
+                e.array(5)
+                    .uint(1)
+                    .bytes(&room)
+                    .uint(0)
+                    .bytes(&incarnation)
+                    .uint(after);
+                write_frame(&mut send, &e.finish())
+                    .await
+                    .expect("APPARATUS: private wire peer asks");
+                send.finish()
+                    .expect("APPARATUS: private wire peer finishes request");
+                read_frame(&mut recv, 4 * 1024 * 1024)
+                    .await
+                    .expect("PRODUCT: member's private Session page exchange failed")
+                    .expect("PRODUCT: member received no private Session response")
+            });
+            let mut d = Decoder::new(&bytes);
+            assert_eq!(
+                d.array().expect("PRODUCT: private Session page array"),
+                5,
+                "PRODUCT: malformed private Session page"
+            );
+            assert_eq!(
+                d.uint().expect("PRODUCT: private Session page integer"),
+                1,
+                "PRODUCT: wrong private Session page version"
+            );
+            incarnation = d
+                .bytes()
+                .expect("PRODUCT: private Session page incarnation")
+                .try_into()
+                .expect("PRODUCT: invalid private Session incarnation");
+            after = d.uint().expect("PRODUCT: private Session page integer");
+            let more = d.uint().expect("PRODUCT: private Session page integer");
+            let records = d.array().expect("PRODUCT: private Session page array");
+            assert_eq!(records, 0,
+                "PRODUCT: {name} served {records} encrypted Session records to {} outside its current grant", member.name);
+            d.finish()
+                .expect("PRODUCT: extra bytes in private Session page");
+            if more == 0 {
+                finished = true;
+                break;
+            }
+            assert_eq!(more, 1, "PRODUCT: invalid private Session continuation");
+        }
+        assert!(
+            finished,
+            "APPARATUS: bounded private wire probe did not finish the staged history"
+        );
+        eprintln!(
+            "[proof] {name} served no private Session record to {}",
+            member.name
+        );
+    }
+    drop(endpoint);
+    drop(rt);
+    drop(profile);
+    let child = vox_cmd()
+        .args(["daemon", "--listen", "127.0.0.1:0", "--anchor", anchor])
+        .arg("--passphrase-file")
+        .arg(&member.pass)
+        .env("VOX_DATA_DIR", &member.data)
+        .env("VOX_CONFIG_DIR", member.data.join("cfg"))
+        .env_remove("VOX_ROOM")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("APPARATUS: restart private wire probe member");
+    member._daemon = Some(Proc(child));
+    assert!(
+        until(Duration::from_secs(90), || member
+            .vox(&["room", "list"], None)
+            .0),
+        "APPARATUS: private wire probe member did not restart"
+    );
+}
+
+/// Raw signed input is apparatus; every verdict below is a real receiver CLI result.
+/// The donor stays stopped, so the synthetic append cannot fork its running feed.
+fn legacy_placeholder_journey(
+    alice: &mut Member,
+    bob: &mut Member,
+    room_id: [u8; 32],
+    room: &str,
+    anchor: &str,
+) {
+    use vox_core::atrest::idfactor::SignatureIdentityFactor;
+    use vox_core::atrest::store::{open_segment, SegmentKind};
+    use vox_core::group::SenderChain;
+    use vox_core::log::entry::{Entry, EntrySkeleton, ZERO_HASH};
+    use vox_core::log::feed::lipmaa;
+    use vox_core::log::sync::FeedFrontier;
+    use vox_core::node::content::{Content, LegacySessionIndex, SessionEntry};
+    use vox_core::node::link::{b32_decode, b32_encode};
+    use vox_core::node::paths::Paths;
+    use vox_core::node::profile::Profile;
+    use vox_core::suite::algo;
+    use vox_core::transport::quic::VoxEndpoint;
+
+    assert!(
+        posts_until_read(alice, bob, room, "LEGACY-PROOF-BEFORE-DONOR-STOP"),
+        "APPARATUS: receiver did not catch up with the donor before raw input staging"
+    );
+    let (_, status, _) = bob.vox(&["status", "--json"], None);
+    let victim_at = ports::loopback_listen(&status)
+        .expect("APPARATUS: Bob's scratch daemon has no loopback address");
+    let victim_id = b32_decode(&bob.fp, "proof victim").expect("APPARATUS: Bob's fingerprint");
+    drop(alice._daemon.take());
+    let paths = Paths::resolve("default", Some(&alice.data), Some(&alice.data.join("cfg")))
+        .expect("APPARATUS: donor scratch paths");
+    let mut profile = Profile::open(paths).expect("APPARATUS: stopped donor profile opens");
+    profile
+        .unlock(ID_PASS.as_bytes())
+        .expect("APPARATUS: donor unlocks");
+    let signer = profile.signer_arc().expect("APPARATUS: donor signer");
+    let author = profile.fingerprint();
+    let wrap = profile
+        .store()
+        .get_sek_wrap(&room_id)
+        .expect("APPARATUS: donor SEK wrap lookup")
+        .expect("APPARATUS: donor holds the room");
+    let sek = wrap
+        .unwrap_sek(
+            &SignatureIdentityFactor::new(&*signer),
+            &room_id,
+            ROOM_PASS.as_bytes(),
+        )
+        .expect("APPARATUS: donor room unwraps");
+    let sender_segment = profile
+        .store()
+        .segments(&room_id, SegmentKind::KeyMaterial)
+        .expect("APPARATUS: donor key pages")
+        .into_iter()
+        .find(|(id, _)| *id == 1)
+        .expect("APPARATUS: donor sender page")
+        .1;
+    let sender_bytes = open_segment(&sek, SegmentKind::KeyMaterial, 1, &sender_segment)
+        .expect("APPARATUS: sender page opens");
+    let mut sender =
+        SenderChain::from_state(&sender_bytes).expect("APPARATUS: sender state decodes");
+    let mut feed = std::collections::BTreeMap::new();
+    for (id, page) in profile
+        .store()
+        .segments(&room_id, SegmentKind::LogDb)
+        .expect("APPARATUS: donor log pages")
+    {
+        let bytes = open_segment(&sek, SegmentKind::LogDb, id, &page)
+            .expect("APPARATUS: donor log page opens");
+        let entry = Entry::from_wire(&bytes).expect("APPARATUS: donor log wire");
+        if entry.skeleton.author_id == author {
+            feed.insert(entry.skeleton.seq, entry);
+        }
+    }
+    let epoch = sender.epoch();
+    let mut append = |payload: Vec<u8>| {
+        let seq = feed.last_key_value().map_or(1, |(n, _)| n + 1);
+        let hash_at = |n| feed.get(&n).map_or(ZERO_HASH, Entry::entry_hash);
+        let skeleton = EntrySkeleton {
+            author_id: author,
+            seq,
+            prev_hash: hash_at(seq - 1),
+            lipmaa_backlink: if seq == 1 {
+                ZERO_HASH
+            } else {
+                hash_at(lipmaa(seq))
+            },
+            channel_id: room_id,
+            epoch,
+            algo_ids: [algo::COMPOSITE_ED25519_ML_DSA_65, algo::AES_256_GCM],
+            payload_hash: vox_core::hash::sha256(&payload),
+            payload_len: payload.len() as u64,
+            end_of_feed: false,
+            claimed_ms: raw_sync::now(),
+            seen: Vec::new(),
+        };
+        let entry = Entry::build_signed(&*signer, skeleton, payload)
+            .expect("APPARATUS: donor append signs");
+        feed.insert(seq, entry.clone());
+        entry
+    };
+    let now = raw_sync::now();
+    let mut private = SenderChain::new(
+        &vox_core::node::drive::drive_channel(&room_id),
+        epoch,
+        &author,
+        0,
+        now,
+    )
+    .expect("APPARATUS: legacy drive chain");
+    let session = SessionEntry::new(now, SESSION, "LEGACY-WITHHELD-STEP")
+        .expect("APPARATUS: legacy Session envelope");
+    let legacy = append(
+        private
+            .encrypt(&session.to_canonical_vec())
+            .expect("APPARATUS: seal legacy Session")
+            .to_wire(),
+    );
+    let ordinary =
+        Content::text(now, "LEGACY-PROOF-RECOVERED-CHAT").expect("APPARATUS: ordinary envelope");
+    let ordinary = append(
+        sender
+            .encrypt(&ordinary.to_canonical_vec())
+            .expect("APPARATUS: seal ordinary chat")
+            .to_wire(),
+    );
+    let index = LegacySessionIndex::new(now, room_id, author, vec![legacy.entry_hash()])
+        .expect("APPARATUS: checked exact-hash index");
+    let declaration = append(
+        sender
+            .encrypt(&index.to_canonical_vec())
+            .expect("APPARATUS: seal index with ordinary sender key")
+            .to_wire(),
+    );
+    let positive =
+        Content::text(now, "LEGACY-PROOF-AFTER-INDEX").expect("APPARATUS: later chat envelope");
+    let positive = append(
+        sender
+            .encrypt(&positive.to_canonical_vec())
+            .expect("APPARATUS: seal later chat")
+            .to_wire(),
+    );
+    let skeleton = |entry: &Entry| {
+        Entry::build_signed_skeleton_only(&*signer, entry.skeleton.clone())
+            .expect("APPARATUS: signed missing-body skeleton")
+    };
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("APPARATUS: raw peer runtime");
+    let ep = rt.block_on(async {
+        VoxEndpoint::bind(signer.clone(), "127.0.0.1:0".parse().unwrap())
+            .expect("APPARATUS: bind donor endpoint")
+    });
+    let conn = rt
+        .block_on(ep.connect(victim_at, victim_id, raw_sync::now()))
+        .expect("APPARATUS: donor connects to real receiver");
+    let exchange = |entry: &Entry| {
+        rt.block_on(raw_sync::ask_offering(
+            &conn,
+            room_id,
+            epoch,
+            raw_sync::Ask::Ranges(Vec::new()),
+            vec![(
+                FeedFrontier {
+                    author_id: author,
+                    max_seq: entry.skeleton.seq,
+                    head_hash: entry.entry_hash(),
+                },
+                entry.to_wire(),
+            )],
+        ))
+    };
+    let offer = |entry: &Entry| {
+        let y = exchange(entry);
+        assert!(
+            y.hello && y.served == 1,
+            "APPARATUS: receiver did not request staged seq {} hash {}: {y:?}",
+            entry.skeleton.seq,
+            b32_encode(&entry.entry_hash())
+        );
+        // The responder FINs its send half while it is still draining our input. That FIN
+        // proves nothing about acceptance of the entry we just sent. Wait for its next public
+        // frontier to acknowledge this staged position before asserting on the receiver CLI.
+        assert!(
+            until(Duration::from_secs(10), || {
+                let receipt = rt.block_on(raw_sync::ask(
+                    &conn,
+                    room_id,
+                    epoch,
+                    raw_sync::Ask::Ranges(Vec::new()),
+                    None,
+                ));
+                receipt.hello
+                    && receipt
+                        .have
+                        .iter()
+                        .any(|(a, seq)| *a == author && *seq >= entry.skeleton.seq)
+            }),
+            "APPARATUS: receiver never acknowledged staged seq {} hash {} in its frontier",
+            entry.skeleton.seq,
+            b32_encode(&entry.entry_hash())
+        );
+    };
+    let owed = |member: &Member, hash: [u8; 32]| {
+        let (ok, out, err) = member.vox(&["room", "read", room, "--json"], None);
+        assert!(ok, "PRODUCT: receiver room read failed: {out}{err}");
+        out.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|row| row["entry_hash"] == b32_encode(&hash) && row["owed"] == true)
+    };
+    offer(&skeleton(&legacy));
+    offer(&skeleton(&ordinary));
+    assert!(
+        owed(bob, legacy.entry_hash()) && owed(bob, ordinary.entry_hash()),
+        "APPARATUS: the receiver never showed both staged missing bodies before the index"
+    );
+    offer(&declaration);
+    assert!(
+        !owed(bob, legacy.entry_hash()),
+        "PRODUCT: an authenticated legacy Session hash still appears as missing chat"
+    );
+    assert!(
+        owed(bob, ordinary.entry_hash()),
+        "PRODUCT: classifying a Session also hid an ordinary missing chat body"
+    );
+    // The earlier skeleton truthfully told Bob this peer lacked its body. The production
+    // receiver suppresses another request to that peer temporarily, even when its feed head
+    // stays put. Keep offering the now-available body until Bob actually requests it; neither
+    // bypass the omission hint nor interpret a staging watchdog as a product verdict.
+    assert!(
+        until(Duration::from_secs(45), || {
+            let y = exchange(&ordinary);
+            assert!(
+                y.hello && y.ended.is_none(),
+                "APPARATUS: ordinary-body refill exchange failed: {y:?}"
+            );
+            y.served == 1
+        }),
+        "APPARATUS: receiver did not request the available ordinary body before staging watchdog"
+    );
+    offer(&positive);
+    assert!(bob.reads(room, "LEGACY-PROOF-RECOVERED-CHAT") && bob.reads(room, "LEGACY-PROOF-AFTER-INDEX"),
+        "PRODUCT: ordinary missing chat did not recover across the index's consumed sender iteration");
+    assert!(
+        !owed(bob, ordinary.entry_hash()) && !owed(bob, legacy.entry_hash()),
+        "PRODUCT: recovered chat or classified Session still appears as missing chat"
+    );
+    assert_eq!(
+        can_drive(bob, room),
+        Some(false),
+        "PRODUCT: subtype classification granted Bob drive"
+    );
+    drop(conn);
+    drop(ep);
+    drop(bob._daemon.take());
+    let child = vox_cmd()
+        .args(["daemon", "--listen", "127.0.0.1:0", "--anchor", anchor])
+        .arg("--passphrase-file")
+        .arg(&bob.pass)
+        .env("VOX_DATA_DIR", &bob.data)
+        .env("VOX_CONFIG_DIR", bob.data.join("cfg"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("APPARATUS: restart scratch receiver");
+    bob._daemon = Some(Proc(child));
+    assert!(
+        until(Duration::from_secs(90), || bob
+            .vox(&["room", "list"], None)
+            .0),
+        "APPARATUS: restarted receiver never answered"
+    );
+    assert!(
+        !owed(bob, legacy.entry_hash()) && bob.reads(room, "LEGACY-PROOF-RECOVERED-CHAT"),
+        "PRODUCT: receiver restart lost classification or recovered chat"
+    );
+    assert_eq!(
+        can_drive(bob, room),
+        Some(false),
+        "PRODUCT: receiver restart changed drive permission"
     );
 }

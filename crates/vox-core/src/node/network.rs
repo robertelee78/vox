@@ -283,6 +283,15 @@ impl MembershipOracle for SharedMembership {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Inbound {
+    /// A member requests a page of privately held Session records.
+    Session {
+        /// The authenticated peer.
+        peer: Digest32,
+        /// The stream's send half.
+        send: SendStream,
+        /// The stream's receive half.
+        recv: RecvStream,
+    },
     /// The peer is starting an ADR-005 join; the actor answers with the channel's
     /// retained passphrase and its prekey ring.
     Join {
@@ -900,6 +909,7 @@ impl NodeNet {
             StreamKind::Sync => Ok(Inbound::Sync { peer, send, recv }),
             StreamKind::Agree => Ok(Inbound::Agree { peer, send, recv }),
             StreamKind::Seat => Ok(Inbound::Seat { peer, send, recv }),
+            StreamKind::Session => Ok(Inbound::Session { peer, send, recv }),
             // Closed at the gate (`net::refuse_second_exchange`) before any stream is dispatched: one more
             // identity stream is a second exchange on one connection (ADR-011 requirement 33).
             StreamKind::Identity => Err(Error::StreamRefused(

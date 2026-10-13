@@ -560,6 +560,9 @@ pub struct CreateRoomArgs {
     /// (a month), or a number of seconds. Off unless given.
     #[arg(long)]
     pub idle_end: Option<String>,
+    /// Bind this directory to the created room after checking its passphrase.
+    #[arg(long, value_name = "DIR")]
+    pub bind: Option<PathBuf>,
 }
 
 /// `vox room admin`
@@ -2682,6 +2685,7 @@ pub fn run() -> ExitCode {
                                 &a.name,
                                 a.passphrase_file.as_deref(),
                                 a.idle_end.as_deref(),
+                                a.bind.as_deref(),
                             )
                             .await
                         }

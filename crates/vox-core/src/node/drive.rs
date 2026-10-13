@@ -10,8 +10,8 @@
 //! It is the sender-key machinery (ADR-006) over its own namespace: the chain, its SKDMs and its
 //! messages are bound to [`drive_channel`] rather than the room's id, so its AEAD data, its
 //! cross-signature and its receiver slots can never be taken for the sender key's, nor the sender
-//! key's for it. Its entries are ordinary content entries of the room's log (the skeleton is the
-//! room's), so they sync, age and prune as messages do (SE-5).
+//! key's for it. New steps use the private Session stream and store outside the room log (SA-7).
+//! Published older writers' ordinary drive-sealed entries remain readable during upgrade.
 //!
 //! - **Release** (SC-2a): to each member admitted to the room whose keyring entry carries drive,
 //!   from where it became owed the key, so it reads from then onward: a member that had drive when

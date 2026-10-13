@@ -73,6 +73,7 @@ pub mod seatstream;
 pub mod service_reach;
 pub mod session_view;
 pub mod sessions;
+pub(crate) mod sessionstream;
 pub mod shares;
 pub mod snapshot;
 pub mod status;

@@ -274,14 +274,20 @@ pub async fn open_when_member(
     if open.is_some_and(|row| session.name.is_none() || row.name == session.name) {
         return Ok(());
     }
+    for part in opening_parts(session) {
+        post(handle, room, part).await?;
+    }
+    Ok(())
+}
+
+/// The same ordinary public metadata is used by a hook and when a new reader needs to learn
+/// which Sessions are still open. This carries neither a Session step nor a drive grant.
+pub(crate) fn opening_parts(session: &Opening) -> Vec<String> {
     let mut env = Envelope::new(SESSION, "");
     env.from.clone_from(&session.id);
     env.at.session_name.clone_from(&session.name);
     env.data = serde_json::json!({ "session": { "harness": session.harness } });
-    for part in metadata_parts(env.to_text()) {
-        post(handle, room, part).await?;
-    }
-    Ok(())
+    metadata_parts(env.to_text())
 }
 
 /// A Session's metadata has no field-size limit. Each retained room record still fits the
