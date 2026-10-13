@@ -39,32 +39,13 @@ struct RootView: View {
                 .fixedSize(horizontal: false, vertical: true)
             }
         }
-        // Node › Sign Out…: what it does, said first (E-5), done only when confirmed.
         .sheet(item: $model.agentSetupAsk) { request in
             AgentSetupSheet(request: request, model: model)
                 .id(request.id)
                 .interactiveDismissDisabled(model.agentSetupBusy)
         }
-        .sheet(isPresented: $model.signingOut) {
-            if let node = model.signedInAs {
-                SignOutSheet(node: node, model: model)
-                    .padding(Space.s24)
-                    .font(Theme.text)
-                    .panelSurface()
-            }
-        }
-        // Keep Running turned on with a node attached: keep it now, with its passphrase.
-        .sheet(isPresented: Binding(get: { model.keepNodeAsk != nil },
-                                    set: { if !$0, let n = model.keepNodeAsk { model.declineToKeepNode(n) } })) {
-            if let node = model.keepNodeAsk {
-                KeepNodeOffer(node: node, model: model)
-                    .padding(Space.s24)
-                    .font(Theme.text)
-                    .panelSurface()
-            }
-        }
-        // Forget Passphrase (#666): what it did.
-        .alert("Forget Passphrase", isPresented: Binding(get: { model.forgotSaid != nil },
+        // Forget failure is reported without changing the node's authoritative status.
+        .alert("Forget", isPresented: Binding(get: { model.forgotSaid != nil },
                                                          set: { if !$0 { model.forgotSaid = nil } })) {
             Button("OK") {}
         } message: {
@@ -153,19 +134,25 @@ struct RootView: View {
             case let .passphrase(node, said):
                 PassphraseForm(node: node, said: said, model: model)
             case let .attaching(node):
-                ProgressView("Attaching node \(node)…")
+                ProgressView("Unlocking node \(node)…")
             case .attached:
                 ProgressView("Opening the node…")
             case let .detached(node):
                 // E-4: this window is node <node>'s, attached or not. Attach it again, or quit.
-                Text("Node \(node) is detached.").heading()
-                Text("This window acts only as node \(node). Attach it again to go on, or quit Vox.")
+                Text(model.selectedNodeStatus == "Locked" ? "Node \(node) is Locked."
+                     : "Node \(node) is unavailable.").heading()
+                Text("This window acts only as node \(node). Your data is preserved.")
                     .secondaryText()
                     .accessibilityIdentifier("detached-why")
                 HStack {
-                    Button("Attach \(node) Again") { Task { await model.attachAgain() } }
-                        .keyboardShortcut(.defaultAction)
-                        .accessibilityIdentifier("attach-again")
+                    if model.selectedNodeStatus == "Locked" {
+                        Button("Unlock…") { Task { await model.attachAgain() } }
+                            .keyboardShortcut(.defaultAction)
+                            .accessibilityIdentifier("attach-again")
+                    } else {
+                        Button("Try Again") { Task { await model.attachAgain() } }
+                            .accessibilityIdentifier("attach-again")
+                    }
                     Button("Quit Vox") { NSApp.terminate(nil) }
                         .accessibilityIdentifier("detached-quit")
                 }
@@ -220,50 +207,6 @@ private struct LoginItemQuestion: View {
 
 /// Keep Running turned on while node `node` is attached: keep it now, its passphrase stored in the
 /// Keychain (M-6, ADR-028 K-10), or not, said plainly.
-private struct KeepNodeOffer: View {
-    let node: String
-    @ObservedObject var model: AppModel
-    @State private var field = SecureFieldHolder()
-    /// Set while one Store is being asked: one key press may ask twice.
-    @State private var submitted = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: Space.s12) {
-            Text("Keep node \(node) attached?").title()
-            Text("Keep Running is on. To keep node \(node) attached when Vox is closed and after a "
-                + "restart, Vox stores its passphrase in the Keychain. Anyone who can unlock this "
-                + "Mac's login keychain can then attach node \(node). Without it, node \(node) stays "
-                + "attached only while Vox is open, and after a restart it needs its passphrase.")
-                .secondaryText()
-                .accessibilityIdentifier("keep-node-why")
-            SecureInput(holder: field) { store() }
-                .frame(width: Theme.scaled(320))
-                .accessibilityIdentifier("keep-node-passphrase")
-                .accessibilityLabel("Identity passphrase for node \(node)")
-            if let said = model.keepNodeSaid {
-                Said(text: said)
-            }
-            HStack {
-                Button("Store in Keychain") { store() }
-                    .accessibilityIdentifier("keep-node-store")
-                Button("Not Now") { model.declineToKeepNode(node) }
-                    .accessibilityIdentifier("keep-node-not-now")
-            }
-        }
-    }
-
-    private func store() {
-        // A node may have no passphrase (ADR-005 J-2): an empty field keeps none.
-        guard !submitted else { return }
-        submitted = true
-        DispatchQueue.main.async { submitted = false }
-        let secret = field.takeAllowingEmpty()
-        Task { await model.keepNode(node, passphrase: secret) }
-    }
-}
-
-/// Attach a node on this Mac that waits for its passphrase, and remember it (#666): the passphrase
-/// is stored in the Keychain, so the node attaches again by itself after every restart.
 private struct AttachNodeSheet: View {
     let node: String
     @ObservedObject var model: AppModel
@@ -273,11 +216,11 @@ private struct AttachNodeSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s12) {
-            Text("Attach node \(node)").title()
+            Text("Unlock node \(node)").title()
             Text("Type node \(node)'s identity passphrase, or leave it empty for a node made with "
-                + "none. Vox stores it in the Keychain, so node \(node) attaches again by itself "
-                + "after a restart; anyone who can unlock this Mac's login keychain can then attach "
-                + "node \(node). Forget Passphrase, on its row under ON THIS MACHINE or in the Node "
+                + "none. Vox stores it in the Keychain, so node \(node) becomes Ready again by itself "
+                + "after a restart; anyone who can unlock this Mac's login keychain can then unlock "
+                + "node \(node). Forget, on its row under ON THIS MACHINE or in the Node "
                 + "menu, forgets it.")
                 .secondaryText()
                 .accessibilityIdentifier("attach-node-why")
@@ -289,7 +232,7 @@ private struct AttachNodeSheet: View {
                 Said(text: said)
             }
             HStack {
-                Button("Attach") { attach() }
+                Button("Unlock") { attach() }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.voxPrimary)
                     .accessibilityIdentifier("attach-node")
@@ -472,7 +415,7 @@ private struct Chooser: View {
     var body: some View {
         Text("Which node are you?").heading()
         Text("Pick the node you post, trust and share as here, or make a new one. Vox acts as it "
-            + "until you sign out.")
+            + "until you lock it.")
             .secondaryText()
         ForEach(nodes, id: \.self) { node in
             let fp = model.nodeList.first { $0.name == node }?.fingerprint ?? ""
@@ -496,7 +439,7 @@ private struct Chooser: View {
                     .accessibilityIdentifier("node-\(node)")
                     .accessibilityLabel(fp.isEmpty ? "Act as node \(node)"
                         : "Act as node \(node), fingerprint \(fingerprintCard(fingerprint: fp).grouped)")
-                    Text(fp.isEmpty ? "Its fingerprint is known once this node has been attached."
+                    Text(fp.isEmpty ? "Its fingerprint is known once this node is Ready."
                                     : fingerprintCard(fingerprint: fp).grouped)
                         .font(Theme.mono).secondaryText().textSelection(.enabled)
                         .accessibilityIdentifier("node-fingerprint-\(node)")
@@ -513,64 +456,30 @@ private struct Chooser: View {
 }
 
 /// Node › Sign Out…: what signing out does, then Sign Out or Cancel.
-private struct SignOutSheet: View {
-    let node: String
-    @ObservedObject var model: AppModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: Space.s16) {
-            Text("Sign out of node \(node)?").title()
-            Text("Vox detaches node \(node), stops keeping it attached, and forgets its passphrase "
-                + "in the Keychain and that this app opens it. Node \(node), its rooms and its "
-                + "messages stay on this Mac. Then you choose a node to sign in as, or make a new "
-                + "one.")
-                .accessibilityIdentifier("sign-out-effect")
-            HStack {
-                Button("Cancel") { model.signingOut = false }
-                    .keyboardShortcut(.cancelAction)
-                Button("Sign Out") { Task { await model.signOut() } }
-                    .keyboardShortcut(.defaultAction)
-                    .accessibilityIdentifier("sign-out-confirm")
-            }
-        }
-        .frame(width: Theme.scaled(440))
-    }
-}
-
-/// The node's identity passphrase, typed straight into a secure field whose bytes go to the
-/// client and are wiped (M-5).
 private struct PassphraseForm: View {
     let node: String
     let said: String?
     @ObservedObject var model: AppModel
     @State private var field = SecureFieldHolder()
     /// ADR-028 K-10 as amended (#666): on until the person turns it off, for this node.
-    @State private var keepInKeychain = true
     /// Set while one Attach is being asked: Return and the button may both ask at one key press,
     /// and an empty passphrase no longer tells the second from the first.
     @State private var submitted = false
 
     var body: some View {
-        Text("Attach node \(node)").heading()
+        Text("Unlock node \(node)").heading()
         Text("Type node \(node)'s identity passphrase, or leave it empty for a node made with none.")
             .secondaryText()
         SecureInput(holder: field) { submit() }
             .frame(width: Theme.scaled(320))
             .accessibilityIdentifier("passphrase")
             .accessibilityLabel("Identity passphrase for node \(node)")
-        Toggle("Remember the passphrase in the Keychain, so node \(node) attaches again by "
-            + "itself after Vox quits or the Mac restarts", isOn: $keepInKeychain)
-            .accessibilityIdentifier("keep-in-keychain")
-        Text(keepInKeychain
-            ? "Anyone who can unlock this Mac's login keychain can then attach node \(node)."
-            : "Without it, your rooms are reachable only while Vox is open, and node \(node) "
-                + "asks for its passphrase again after a restart.")
+        Text("Unlock always remembers this node for daemon restarts, updates and reboots. Its passphrase is stored in this Mac's Keychain, regardless of Keep Running.")
             .secondaryText()
-            .accessibilityIdentifier("keep-in-keychain-why")
         if let said {
             Said(text: said)
         }
-        Button("Attach") { submit() }
+        Button("Unlock") { submit() }
             .keyboardShortcut(.defaultAction)
             .buttonStyle(.voxPrimary)
             .accessibilityIdentifier("attach")
@@ -583,8 +492,7 @@ private struct PassphraseForm: View {
         DispatchQueue.main.async { submitted = false }
         // A node may have no passphrase (ADR-005 J-2): an empty field attaches it with none.
         let secret = field.takeAllowingEmpty()
-        let keep = keepInKeychain
-        Task { await model.attach(node, passphrase: secret, keepInKeychain: keep) }
+        Task { await model.attach(node, passphrase: secret) }
     }
 }
 
