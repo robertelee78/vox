@@ -385,7 +385,7 @@ fn a_one_shot_verb_refuses_an_unattached_node() {
         err.trim()
     );
     assert!(
-        !ok && err.contains("node b is not attached") && err.contains("vox node attach b"),
+        !ok && err.contains("node b is not attached") && err.contains("vox node unlock b"),
         "PRODUCT: a one-shot verb for an unattached node must refuse, saying how to attach it; \
          ok={ok}: {out}{err}"
     );

@@ -30,6 +30,8 @@
 
 #![cfg(unix)]
 
+use world::attach as unlock_staging;
+
 #[path = "support/world.rs"]
 mod world;
 
@@ -59,7 +61,8 @@ const KNOWN_VAULT_VERSIONS: [u8; 1] = [2];
 
 fn vox_with(exe: &Path, data: &Path, argv: &[&str], stdin: Option<&str>) -> (bool, String, String) {
     let mut cmd = Command::new(exe);
-    cmd.args(argv)
+    cmd.args(crate::unlock_staging::persistent_args(data, argv, IDENTITY))
+        .env("VOX_TEST_KEYCHAIN", crate::unlock_staging::keychain(data))
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", data.join("cfg"))
         .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)

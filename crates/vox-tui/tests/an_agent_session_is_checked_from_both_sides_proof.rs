@@ -576,7 +576,7 @@ fn an_agent_session_is_checked_from_both_sides() {
         &v,
         "node",
         "fail",
-        "vox node attach",
+        "vox node unlock",
     );
 
     // ---- (6) a ping to a stopped node: a named timeout ----
