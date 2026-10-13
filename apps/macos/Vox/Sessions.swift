@@ -50,7 +50,10 @@ extension NodeModel {
         case .session: shown = shownSession?.label ?? "a Session"
         case .tag(let tag): shown = "tagged \(tag)"
         }
-        return "\(people == 1 ? "1 member" : "\(people) members") · \(shown) · ⏱ \(retention)"
+        let roster = !daemonReachable ? "members unavailable"
+            : roomMembersPending ? "members loading"
+            : people == 1 ? "1 member" : "\(people) members"
+        return "\(roster) · \(shown) · ⏱ \(retention)"
     }
 
     /// Every tag the room's messages on hand carry, sorted (#636): what the header's filter offers.

@@ -2393,6 +2393,185 @@ final class FirstRunProof: XCTestCase {
 
     }
 
+    /// A remote room's retained message is recovered after the displayed forward mark expires,
+    /// without another post or reopening the room. All staging uses the shipped CLI.
+    func testRoomTimelineRecoversAfterItsDisplayedMarkIsPruned() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
+            throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are required")
+        }
+        let vox = appPath + "/Contents/Helpers/vox"
+        let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("timeline-recovery")
+        func nodeEnv(_ name: String) -> [String: String] {
+            ["VOX_DATA_DIR": root.appendingPathComponent(name + "/data").path,
+             "VOX_CONFIG_DIR": root.appendingPathComponent(name + "/config").path,
+             "VOX_PROXY": "127.0.0.1:0"]
+        }
+        let alice = nodeEnv("alice"), bob = nodeEnv("bob")
+        let pass = root.appendingPathComponent("pass").path
+        try stager.write(Data("recovery pass\n".utf8), to: pass)
+        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: alice,
+                           until: "vox daemon: control socket")
+        let remote = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: bob,
+                               until: "vox daemon: control socket")
+        defer { remote.terminate() }
+        for (name, environment) in [("alice", alice), ("bob", bob)] {
+            try staged(vox, ["node", "create", name],
+                       env: environment.merging(["VOX_IDENTITY_PASSPHRASE": "recovery pass"]) { $1 })
+            try staged(vox, ["node", "attach", name, "--passphrase-file", pass], env: environment)
+        }
+        let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: alice)) { $0.count == 52 }
+        let bobFp = try line(staged(vox, ["id", "--node", "bob"], env: bob)) { $0.count == 52 }
+        try staged(vox, ["room", "create", "--node", "bob", "--passphrase-file", pass, "--name", "recovery"], env: bob)
+        let room = try line(staged(vox, ["room", "list", "--node", "bob"], env: bob)) {
+            $0.contains(" recovery")
+        }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        let link = try line(staged(vox, ["room", "link", "--node", "bob", room], env: bob)) { $0.hasPrefix("vox://") }
+        try staged(vox, ["room", "join", "--node", "alice", "--passphrase-file", pass, link], env: alice)
+        for (name, fp, alias, environment) in [("alice", bobFp, "bob", alice), ("bob", aliceFp, "alice", bob)] {
+            try staged(vox, ["trust", "add", "--node", name, fp, "--name", alias,
+                             "--identity-passphrase-file", pass], env: environment)
+        }
+        try stager.write(Data("no\n".utf8), to: alice["VOX_CONFIG_DIR"]! + "/app/login-item")
+        try stager.write(Data("alice\n".utf8), to: alice["VOX_CONFIG_DIR"]! + "/app/node")
+        try staged(vox, ["room", "post", "--node", "bob", room, "RECOVERY-OLD"], env: bob)
+        let ui = voxApp(appPath)
+        ui.launchEnvironment = alice
+        try launchVox(ui, appPath, env: alice, scratch: scratchPath)
+        defer { ui.terminate() }
+        func timelineBody(_ text: String, timeout: TimeInterval, _ outcome: String) -> Bool {
+            guard windowReadable(ui) else { return false }
+            func drawn(_ frame: CGRect) -> Bool {
+                frame.minX.isFinite && frame.minY.isFinite && frame.maxX.isFinite
+                    && frame.maxY.isFinite && frame.width > 0 && frame.height > 0
+            }
+            let until = Date().addingTimeInterval(timeout)
+            while Date() < until {
+                if let timeline = locate(ui, Key.id("timeline")), drawn(timeline.frame) {
+                    let bounds = timeline.frame
+                    let windows = ui.windows.allElementsBoundByIndex.map(\.frame).filter(drawn)
+                    // A sidebar preview contains this marker too. Require the exact message
+                    // body drawn inside the timeline; the application query also finds text
+                    // that XCTest omits from its window-scoped query (#684).
+                    let matches = ui.descendants(matching: .any).matching(
+                        NSPredicate(format: "label == %@ OR value == %@", text, text)
+                    ).allElementsBoundByIndex
+                    if matches.contains(where: { body in
+                        let frame = body.frame
+                        return drawn(frame) && bounds.contains(frame)
+                            && windows.contains(where: { $0.contains(frame) })
+                    }) { return true }
+                }
+                Thread.sleep(forTimeInterval: 0.25)
+            }
+            keepTree(ui, "the timeline did not display the exact message body \(text)")
+            XCTFail("PRODUCT: \(outcome); no exact \(text.debugDescription) body is visible inside the timeline. The app shows: \(onScreen(ui))")
+            return false
+        }
+        tap(ui, Key.id("room-recovery"), "the remote recovery room")
+        guard timelineBody("RECOVERY-OLD", timeout: 60,
+                           "the old remote message body must be visible before pruning") else { return }
+        guard present(ui, Key.id("member-bob"), timeout: 30,
+                      "the initial authoritative room page and roster must be displayed before pruning") else { return }
+        let pids = proofApps()
+        guard pids.count == 1, let pid = pids.first,
+              executable(pid) == resolved(appPath + "/Contents/MacOS/Vox") else {
+            throw Apparatus("staging not achieved: the scratch proof app PID is ambiguous")
+        }
+        guard stager.run(["/bin/kill", "-STOP", String(pid)], env: [:]).status == 0 else {
+            throw Apparatus("the scratch app could not be paused")
+        }
+        defer { _ = stager.run(["/bin/kill", "-CONT", String(pid)], env: [:]) }
+        Thread.sleep(forTimeInterval: 31)
+        try staged(vox, ["room", "post", "--node", "bob", room, "RECOVERY-KEPT"], env: bob)
+        try staged(vox, ["room", "retention", "--node", "bob", room, "30"], env: bob)
+        var history = "", pruned = false
+        func completeKept(_ history: String) -> Bool {
+            history.split(separator: "\n").contains { line in
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { return false }
+                return row["text"] as? String == "RECOVERY-KEPT" && row["owed"] as? Bool == false
+            }
+        }
+        let until = Date().addingTimeInterval(20)
+        while Date() < until {
+            history = run(vox, ["room", "read", "--node", "alice", room, "--json"], env: alice).out
+            if completeKept(history) && !history.contains("RECOVERY-OLD") { pruned = true; break }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        try staged(vox, ["room", "retention", "--node", "bob", room, "forever"], env: bob)
+        guard pruned else { throw Apparatus("pruning not established with a retained complete message: \(history)") }
+        let retained = run(vox, ["room", "read", "--node", "alice", room, "--json"], env: alice).out
+        guard completeKept(retained) && !retained.contains("RECOVERY-OLD") else {
+            throw Apparatus("the kept message expired before forever retention was restored: \(retained)")
+        }
+        guard stager.run(["/bin/kill", "-CONT", String(pid)], env: [:]).status == 0 else {
+            throw Apparatus("the scratch app could not be resumed")
+        }
+        guard timelineBody("RECOVERY-KEPT", timeout: 30,
+                           "after its old displayed mark is pruned, the timeline must show the retained message body without another post") else { return }
+        guard present(ui, Key.id("member-bob"), timeout: 10,
+                      "the recovered room's inspector must still show its remote member") else { return }
+        print("[proof] timeline: displayed OLD; shipped CLI confirmed OLD pruned and KEPT complete; resumed same app without another post; KEPT and bob visible")
+        // Interrupt only the daemon this journey started, keeping the same app and room open.
+        guard let local = daemon else { throw Apparatus("the started Alice daemon handle is absent") }
+        try local.pause()
+        defer { try? local.resume() }
+        // A suspended daemon answers only when its 60-second IPC deadline expires.
+        guard words(ui, Key.id("room-header-meta"), timeout: 90,
+                    "an interrupted daemon must make the room's members unavailable, not authoritative",
+                    until: { $0.contains("members unavailable") }) != nil else { return }
+        guard timelineBody("RECOVERY-KEPT", timeout: 10,
+                           "a transport interruption must preserve the displayed retained timeline") else { return }
+        // A changed remote roster makes recovery distinguishable from the retained old view.
+        try staged(vox, ["node", "create", "charlie"],
+                   env: bob.merging(["VOX_IDENTITY_PASSPHRASE": "recovery pass"]) { $1 })
+        try staged(vox, ["node", "attach", "charlie", "--passphrase-file", pass], env: bob)
+        let charlieFp = try line(staged(vox, ["id", "--node", "charlie"], env: bob)) { $0.count == 52 }
+        try staged(vox, ["room", "join", "--node", "charlie", "--passphrase-file", pass, link], env: bob)
+        let expectedRoster = Set([aliceFp, bobFp, charlieFp])
+        let rosterUntil = Date().addingTimeInterval(30)
+        var rosterSaid = ""
+        var changedRoster = false
+        while Date() < rosterUntil {
+            let roster = run(vox, ["room", "roster", "--node", "bob", room], env: bob)
+            rosterSaid = roster.out
+            let fingerprints = Set(roster.out.split(whereSeparator: \.isNewline)
+                .map { $0.trimmingCharacters(in: .whitespaces) }.filter { $0.count == 52 })
+            if roster.status == 0 && fingerprints == expectedRoster {
+                changedRoster = true
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        guard changedRoster else {
+            throw Apparatus("the remote three-member roster was not staged before Alice resumed: \(rosterSaid)")
+        }
+        try local.resume()
+        guard words(ui, Key.id("room-header-meta"), timeout: 45,
+                    "the same room must recover the changed authoritative three-member roster without reopening",
+                    until: { $0.contains("3 members") && $0.contains("forever") }) != nil else { return }
+        guard present(ui, Key.id("member-bob"), timeout: 10,
+                      "the recovered room must retain its actual remote member") else { return }
+        guard timelineBody("RECOVERY-KEPT", timeout: 10,
+                           "the recovered transport must retain the complete timeline") else { return }
+        // This later header update is supplied by the room watcher, not message polling.
+        try staged(vox, ["room", "retention", "--node", "bob", room, "3600"], env: bob)
+        let retentionUntil = Date().addingTimeInterval(30)
+        var retentionSaid = ""
+        while Date() < retentionUntil {
+            retentionSaid = run(vox, ["room", "read", "--node", "alice", room, "--notices"], env: alice).out
+            if retentionSaid.contains("1 hour") { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        guard retentionSaid.contains("1 hour") else {
+            throw Apparatus("the remote owner's changed retention did not reach Alice before checking the watcher: \(retentionSaid)")
+        }
+        guard words(ui, Key.id("room-header-meta"), timeout: 15,
+                    "the recovered room's live watcher must show Bob's later retention change without reopening",
+                    until: { $0.contains("3 members") && $0.contains("1 hour") }) != nil else { return }
+        print("[proof] transport: unavailable retained timeline; same room recovered roster; later remote retention reached header")
+    }
+
     func testFirstRunAttachesTheNodeAndQuitDetachesIt() throws {
         let env = ProcessInfo.processInfo.environment
         guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
