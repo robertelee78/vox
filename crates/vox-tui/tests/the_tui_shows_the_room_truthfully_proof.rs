@@ -46,7 +46,10 @@
 //!   line, by his name for her: "alice renamed the room to family" (ADR-028 R-1, E-5);
 //! - `quote`: Alice posts q-root, q-mid replying to it, and 50 lines; Bob selects q-mid, presses
 //!   Ctrl-R and sends q-answer. His post's `re` names q-mid, and the TUI shows it under "┆ alice:
-//!   q-mid…", one level, never q-root, while q-mid itself is off screen (ADR-028 R-9, #485);
+//!   q-mid…", one level, never q-root, while q-mid itself is off screen (ADR-028 R-9, #485).
+//!   Both replies' `thread` names q-root without passing --thread (ADR-033 TH-1, TH-3);
+//! - `thread`: Bob replies to q-mid with @alice; the shipped post answers q-mid, stays in
+//!   q-root's thread, and addresses Alice (ADR-033 TH-1, TH-3, #753);
 //! - `jump`: Bob selects q-answer and presses Enter, and q-mid is scrolled to and selected;
 //! - `address`: a canonical address Alice posts reads as Bob's node writes it, "open
 //!   nas-web.alice.family.vox please" (ADR-028 S-1a, #488);
@@ -189,7 +192,7 @@
 //! `:interrupt` sent as a stop (`steer`),
 //! a Session's `:share` sending the path as text (`share`), notices placed by time again
 //! (`order`), or times rounded to the second (`session-order`). It passes only on the script's PASS with
-//! all 50 claims ok. Also: the dismissals not kept across a restart (`offer`), a dismissal kept
+//! all 51 claims ok. Also: the dismissals not kept across a restart (`offer`), a dismissal kept
 //! against the member rather than its join, so no offer when it joins again (`reoffer`), or no
 //! offer from a consent grant, so no offer back (`offerback`).
 //!
@@ -288,7 +291,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (50 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (51 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -302,8 +305,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (50, 50),
-                "APPARATUS: the driver said PASS without all 50 claims ok: {said}"
+                (51, 51),
+                "APPARATUS: the driver said PASS without all 51 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),

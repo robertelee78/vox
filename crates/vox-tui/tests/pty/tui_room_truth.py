@@ -29,6 +29,7 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             lines. Bob selects q-mid (Up), presses Ctrl-R and sends q-answer: his post's `re` names
             q-mid, and the TUI shows it under "┆ alice: q-mid…", one level, not q-root, with q-mid
             itself off screen (ADR-028 R-9, #485);
+  thread    An @alice reply to q-mid stays in q-root's thread and addresses Alice (#753).
   jump      Bob selects q-answer and presses Enter: the view moves to q-mid, selected;
   address   a canonical address Alice posts reads as Bob's node writes it: "open
             nas-web.alice.family.vox please" (ADR-028 S-1a, #488);
@@ -546,8 +547,8 @@ try:
         p = run("alice", "room", "post", room, "--json", "--session", "quote-proof", *args)
         if p.returncode != 0: product(f"alice's `vox room post {' '.join(args)}` failed: {p.stderr.strip()}")
         return json.loads(p.stdout.strip().splitlines()[-1])["entry_hash"]
-    q_root = alice_posts("q-root what shall we build")
-    q_mid = alice_posts("--re", q_root, "--thread", q_root, "q-mid the lexer first")
+    q_root = alice_posts("--to", fp["bob"], "q-root @bob what shall we build")
+    q_mid = alice_posts("--re", q_root, "q-mid the lexer first")
     FILL = 50  # more lines than the pane holds, so q-mid is off screen under the reply
     for i in range(1, FILL + 1):
         p = run("alice", "room", "post", room, f"f-{i:03d}")
@@ -581,7 +582,7 @@ try:
     shown = rows()
     at = next(i for i, r in enumerate(shown) if "you: q-answer" in r)
     above = shown[at - 1] if at else ""
-    def bob_reply_re():
+    def bob_message(body):
         r = run("bob", "room", "read", room, "--json", "--limit", "500")
         for line in r.stdout.splitlines():
             try:
@@ -589,14 +590,17 @@ try:
             except ValueError:
                 continue
             env = row.get("envelope") or {}
-            if env.get("body") == "q-answer on it":
-                return env.get("re")
-        return None
-    wrote = bob_reply_re()
+            if env.get("body") == body:
+                return env
+        return {}
+    wrote = bob_message("q-answer on it")
+    mid = bob_message("q-mid the lexer first")
     mid_off = not any("alice: q-mid" in r and "┆" not in r for r in shown)
-    claim("quote", wrote == q_mid and "┆ alice: q-mid the lexer first" in above and "q-root" not in above
+    claim("quote", wrote.get("re") == q_mid and wrote.get("thread") == q_root
+          and mid.get("thread") == q_root and "┆ alice: q-mid the lexer first" in above and "q-root" not in above
           and mid_off,
-          f"bob's reply's re names q-mid: {wrote == q_mid} (re {wrote!r}); the row above it: "
+          f"bob's reply: re {wrote.get('re')!r}, thread {wrote.get('thread')!r}; "
+          f"q-mid's thread {mid.get('thread')!r}, expected root {q_root!r}; the row above it: "
           f"{above.strip()!r}; q-mid itself off screen: {mid_off}")
 
     stage("jump")
@@ -607,6 +611,18 @@ try:
     jumped = tui.until(lambda: "alice: q-mid" in selected() and "┆" not in selected(), 5, 0.2)
     claim("jump", "q-answer" in sel_reply and jumped,
           f"selected before Enter: {sel_reply.strip()!r}; after: {selected().strip()!r}")
+    # An @addressed reply uses the same rule as the plain reply, even to a reply rather than
+    # General's root. Its To: addresses Alice but does not create a separate/private thread.
+    stage("thread")
+    tui.key("\x12", 0.3)
+    tui.key("@alice q-addressed on it", 0.3)
+    tui.key("\r", 1)
+    tui.key("\x1b[F", 0.5)
+    tui.until(lambda: bool(bob_message("@alice q-addressed on it")), 30, 0.5)
+    addressed = bob_message("@alice q-addressed on it")
+    claim("thread", addressed.get("re") == q_mid and addressed.get("thread") == q_root
+          and addressed.get("to") == [fp["alice"]],
+          f"@alice reply must answer q-mid in q-root's thread and address alice; got {addressed!r}")
     tui.key("\x1b[F", 0)  # End
     tui.until(lambda: has(timeline(), f"f-{FILL:03d}"), 5, 0.2)
     focus("Timeline")  # where the stages below begin
