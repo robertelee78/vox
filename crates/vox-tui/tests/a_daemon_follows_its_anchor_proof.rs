@@ -21,7 +21,10 @@
 //!
 //! This consolidates the former single-address, eight-address and bad-line runs into one
 //! journey. It also attaches Carol before refresh and requires both identities to report their own
-//! reach. It does not prove live DNS-record changes, helper
+//! reach. Dave then creates an unrelated room on Bob’s daemon: its public status must
+//! show no anchor or live connection to Bob’s room anchor, and the machine list must
+//! retain only the original room source. This is an observed status claim, not a claim
+//! that no future helper traffic can occur. It does not prove live DNS-record changes, helper
 //! isolation, canonical migration or all #779 requirements. Those remain separate claims.
 //!
 //! Mutants must fail the corresponding product assertion: disable refresh, retain old
@@ -510,6 +513,73 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
                 .is_some_and(|id| id.starts_with(&room)),
         "PRODUCT: Bob's room-link anchor was not sourced to the joined room alone: {bob_list:?}"
     );
+
+    // A room-link anchor belongs to Bob's joined room. A second identity on this
+    // daemon creates an unrelated room without inheriting that room's input.
+    let (ok, _, err) = vox_stdin(
+        &bob_data,
+        &bob_cfg,
+        &["node", "create", "dave", "--passphrase-file", "-"],
+        Some(IDENTITY),
+    );
+    assert!(ok, "PRODUCT: creating Bob's second node failed: {err}");
+    let (ok, _, err) = vox(
+        &bob_data,
+        &bob_cfg,
+        &["node", "attach", "dave", "--no-remember"],
+    );
+    assert!(ok, "PRODUCT: attaching Bob's second node failed: {err}");
+    let (ok, _, err) = vox_stdin(
+        &bob_data,
+        &bob_cfg,
+        &[
+            "room",
+            "create",
+            "--node",
+            "dave",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "unrelated",
+        ],
+        Some(ROOM_PASS),
+    );
+    assert!(
+        ok,
+        "PRODUCT: second node could not create its unrelated room without an anchor: {err}"
+    );
+    let (ok, report, err) = vox(&bob_data, &bob_cfg, &["status", "--node", "dave", "--json"]);
+    assert!(ok, "PRODUCT: second node's public status failed: {err}");
+    let status: serde_json::Value = serde_json::from_str(&report).unwrap_or_else(|error| {
+        panic!("PRODUCT: second node returned invalid status JSON: {error}: {report:?}")
+    });
+    assert!(
+        status["anchors"].as_array().is_some_and(Vec::is_empty),
+        "PRODUCT: unrelated node's status inherited another node's room anchor: {report:?}"
+    );
+    assert!(status["peers"].as_array().is_some_and(|peers|
+        peers.iter().all(|peer| peer["id"] != anchor_id)),
+        "PRODUCT: unrelated node's status shows a connection to another node's room anchor: {report:?}");
+    let (ok, after, err) = vox(&bob_data, &bob_cfg, &["anchor", "list", "--json"]);
+    assert!(
+        ok,
+        "PRODUCT: machine list failed after unrelated room creation: {err}"
+    );
+    let after: serde_json::Value = serde_json::from_str(&after)
+        .unwrap_or_else(|error| panic!("PRODUCT: machine list returned invalid JSON: {error}"));
+    let recorded = after["anchors"]
+        .as_array()
+        .and_then(|anchors| {
+            anchors
+                .iter()
+                .find(|anchor| anchor["fingerprint"] == anchor_id)
+        })
+        .unwrap_or_else(|| panic!("PRODUCT: machine list lost Bob's joined-room anchor: {after}"));
+    assert_eq!(
+        recorded["sources"], learned["sources"],
+        "PRODUCT: unrelated room acquired Bob's joined-room anchor source: {after}"
+    );
+    println!("[proof] unrelated node created its room without inheriting Bob's room anchor");
 
     // Trust after the join, as `support/room.rs` does (forward-only rooms release a key
     // at once to a member trusted after joining).
