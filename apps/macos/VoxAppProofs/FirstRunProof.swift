@@ -1902,8 +1902,8 @@ final class FirstRunProof: XCTestCase {
     ///   Send Urgent enabled in a Session).
     /// - D13: a prompt the Session does not take stays in its composer (mutant: cleared before
     ///   delivery), and ⌃C asks before stopping.
-    /// - P1: ⌘J opens S1 with its waiting request selected, and ⌥⌘Y approves it: the hook gets
-    ///   "allow" (mutant: ⌘J opening the room only).
+    /// - P1: selecting S1 and clicking its waiting request selects that request; ⌥⌘Y approves
+    ///   it and the hook gets "allow" (mutant: request-row selection omitted).
     /// - RM-1/2/3/5 (#727): a main repo and its worktree raise one dialog. A wrong room
     ///   passphrase leaves the map unchanged; Choose binds both waiting sessions. Create uses
     ///   alice with her keyring window closed, no identity prompt, and both next turns follow.
@@ -1919,7 +1919,23 @@ final class FirstRunProof: XCTestCase {
         let config = root.appendingPathComponent("config").path
         let work = root.appendingPathComponent("work").path
         let home = root.appendingPathComponent("home").path
-        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        guard let knobs = env["VOX_PROOF_KNOBS_VOX"], !knobs.isEmpty else {
+            throw Apparatus("VOX_PROOF_KNOBS_VOX is required for this journey's isolated Keychain")
+        }
+        let keychain = root.appendingPathComponent("sessions.keychain-db").path
+        let madeRoot = stager.run(["/bin/mkdir", "-p", root.path], env: [:])
+        let hasKnob = stager.run(["/usr/bin/python3", "-c",
+            "import sys; sys.exit(0 if b'VOX_TEST_KEYCHAIN' in open(sys.argv[1],'rb').read() else 1)", knobs], env: [:])
+        guard madeRoot.status == 0, hasKnob.status == 0 else {
+            throw Apparatus("cannot stage a scratch Keychain: the directory or daemon test knob is missing")
+        }
+        let madeKeychain = stager.run(["/usr/bin/security", "create-keychain", "-p", "", keychain],
+                                     env: ["HOME": root.path])
+        guard madeKeychain.status == 0 else {
+            throw Apparatus("cannot create this journey's private Keychain: \(madeKeychain.out)")
+        }
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0",
+                      "VOX_TEST_KEYCHAIN": keychain]
         let pass = { (name: String) in root.appendingPathComponent("\(name).pass").path }
         try stager.write(Data("alice identity\n".utf8), to: pass("alice"))
         try stager.write(Data("agent identity\n".utf8), to: pass("claude-a"))
@@ -1935,7 +1951,9 @@ final class FirstRunProof: XCTestCase {
         guard mapMode.status == 0 else {
             throw Apparatus("the scratch room map's private permissions could not be staged: \(mapMode.out)")
         }
-        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+        // Only this owned apparatus daemon targets the scratch Keychain through real Security APIs.
+        // The app and every CLI invocation still use the ordinary bundled binary.
+        daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
         for (name, words) in [("alice", "alice identity"), ("claude-a", "agent identity")] {
             try staged(vox, ["node", "create", name],
@@ -2126,7 +2144,7 @@ final class FirstRunProof: XCTestCase {
         present(ui, Key.showing("It ends the session."), timeout: 10,
                 "⌃C must ask before stopping the Session")
         ui.typeKey(.escape, modifierFlags: [])
-        print("[proof] sessions: ⌘J landed on S1's request and ⌥⌘Y approved it; work's draft kept; ⌘↩ in S1 sent nothing; S1's draft stayed in S1; S2 said \(said.debugDescription) and kept the prompt; ⌃C asked")
+        print("[proof] sessions: clicking S1's waiting request selected it and ⌥⌘Y approved it; work's draft kept; ⌘↩ in S1 sent nothing; S1's draft stayed in S1; S2 said \(said.debugDescription) and kept the prompt; ⌃C asked")
 
         // RM-1/3/5: two sessions in a repo and its worktree raise one dialog, not a banner.
         try staged(vox, ["node", "attach", "claude-a", "--passphrase-file", pass("claude-a")], env: voxEnv)
