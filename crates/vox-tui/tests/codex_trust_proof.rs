@@ -65,7 +65,9 @@ fn isolated(program: &str, home: &Path) -> Command {
     }
     c.env("HOME", &user_home)
         .env("TMPDIR", &user_home)
-        .env("CODEX_HOME", home);
+        .env("CODEX_HOME", home)
+        .env("VOX_DATA_DIR", home.join("vox-data"))
+        .env("VOX_CONFIG_DIR", home.join("vox-config"));
     c
 }
 
@@ -80,7 +82,10 @@ fn codex_present(home: &Path) -> bool {
 /// command replaced. The shape is the product's, not this file's: a hand-written shape is how a
 /// flat entry Codex ignores shipped while this proof stayed green (V210-133, #352).
 fn plugin_entry(command: &str) -> serde_json::Value {
+    let scratch = tempfile::tempdir().expect("APPARATUS: plugin scratch roots");
     let out = Command::new(VOX)
+        .env("VOX_DATA_DIR", scratch.path().join("data"))
+        .env("VOX_CONFIG_DIR", scratch.path().join("config"))
         .args(["agent", "plugin", "codex", "--node", "default"])
         .output()
         .expect("APPARATUS: cannot run vox agent plugin codex");
@@ -125,6 +130,10 @@ const HOSTILE: &[&str] = &[
     "vox agent hook --node default --profile default",
     // Two nodes: which one would it act as?
     "vox agent hook --node default --node other",
+    "vox agent hook --light codex --node default",
+    "vox agent hook --light claude",
+    "vox agent hook --light codex --data-dir /tmp/other",
+    "vox agent hook --light codex; echo changed",
 ];
 
 /// `command -> trustStatus`, asked of Codex's own app-server, independently of vox.
@@ -280,6 +289,24 @@ fn vox_trusts_its_own_codex_hook_and_nothing_else() {
         "APPARATUS (precondition not met): this proof needs `codex` on PATH — an absent Codex is not a pass"
     );
     const HOOK: &str = "vox agent hook --node default";
+    const LIGHT: &str = "vox agent hook --light codex";
+
+    // HK-1: installation itself trusts the light hook; no manual trust command follows it.
+    let automatic = home.join("automatic-light");
+    std::fs::create_dir_all(&automatic).expect("APPARATUS: scratch Codex config");
+    let installed = isolated(VOX, &automatic)
+        .args(["agent", "plugin", "--install"])
+        .output()
+        .expect("APPARATUS: run hook installation");
+    let installed_said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&installed.stdout),
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    assert!(installed.status.success()
+        && installed_said.contains(automatic.join("hooks.json").to_str().expect("APPARATUS: UTF-8 path"))
+        && status_of(&automatic, LIGHT) == "trusted",
+        "PRODUCT: installing Codex's light hook must name its file and trust it without another step: {installed_said}");
 
     // ---- (1) before: both untrusted ----
     // A real file named `vox` that is not this vox: a path ending in `/vox` is not enough.
@@ -301,7 +328,7 @@ fn vox_trusts_its_own_codex_hook_and_nothing_else() {
         "{} agent hook --node default --room abcdef",
         this_vox.display()
     );
-    let mut all: Vec<&str> = vec![HOOK, &own_abs, &evil, &symlinked];
+    let mut all: Vec<&str> = vec![HOOK, LIGHT, &own_abs, &evil, &symlinked];
     all.extend_from_slice(HOSTILE);
     write_hooks(home, &all);
     assert_eq!(
@@ -318,8 +345,13 @@ fn vox_trusts_its_own_codex_hook_and_nothing_else() {
     // ---- (2) vox trusts its own entry, and only its own ----
     let (ok, said) = vox_trust(home);
     assert!(
-        ok && said.contains("2 newly trusted"),
-        "PRODUCT: `vox agent trust codex` must trust Vox's two entries: {said}"
+        ok && said.contains("3 newly trusted"),
+        "PRODUCT: `vox agent trust codex` must trust Vox's node entries and exact light hook: {said}"
+    );
+    assert_eq!(
+        status_of(home, LIGHT),
+        "trusted",
+        "PRODUCT: the installed Codex light hook must be trusted without a node"
     );
     assert_eq!(
         status_of(home, &own_abs),
