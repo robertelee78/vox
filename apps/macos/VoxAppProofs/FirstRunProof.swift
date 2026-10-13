@@ -2987,10 +2987,16 @@ final class FirstRunProof: XCTestCase {
         }
         // The prior quote jump deliberately leaves an earlier message selected and in view.
         // Scroll to the newer reply before asking the virtualized timeline for its row.
+        func middleVisible(_ row: XCUIElement, in bounds: CGRect) -> Bool {
+            guard let body = textSaying(ui, "TAGGED-THREAD-MIDDLE") else { return false }
+            return bounds.contains(body.frame)
+                && bounds.contains(CGPoint(x: row.frame.midX, y: row.frame.midY))
+                && inView(ui, row)
+        }
         let visibleUntil = Date().addingTimeInterval(20)
         while Date() < visibleUntil {
             if let row = locate(ui, middleKey),
-               replyTimeline.frame.contains(row.frame), inView(ui, row) { break }
+               middleVisible(row, in: replyTimeline.frame) { break }
             replyTimeline.scroll(byDeltaX: 0, deltaY: -200)
             Thread.sleep(forTimeInterval: 0.25)
         }
@@ -2999,9 +3005,9 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("the timeline could not be scrolled to the CLI-held tagged middle reply")
         }
         guard let timeline = locate(ui, Key.id("timeline")),
-              timeline.frame.contains(middle.frame), inView(ui, middle) else {
+              middleVisible(middle, in: timeline.frame) else {
             keepTree(ui, "the tagged middle reply was not inside its timeline")
-            throw Apparatus("the tagged middle reply could not be staged wholly inside the timeline")
+            throw Apparatus("the tagged middle reply's body and click point could not be staged inside the timeline")
         }
         guard tap(ui, middleKey, "bob's reply to select it") else { return }
         let selectedUntil = Date().addingTimeInterval(5)
