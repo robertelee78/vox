@@ -265,6 +265,8 @@ pub struct StructuredIndex {
     /// from rendered rows, so only from messages this node can read: a tag is part of its
     /// message, and a node that cannot open the message holds no tag of it.
     pub by_tag: std::collections::BTreeMap<String, Chunks<u32>>,
+    /// Reply positions by the General message they name (ADR-033 TH-4). Readable rows only.
+    pub by_thread: std::collections::BTreeMap<Digest32, Chunks<u32>>,
 }
 
 impl std::fmt::Debug for StructuredIndex {
@@ -280,6 +282,7 @@ impl std::fmt::Debug for StructuredIndex {
             )
             .field("by_op", &self.by_op.len())
             .field("by_tag", &self.by_tag.len())
+            .field("by_thread", &self.by_thread.len())
             .finish()
     }
 }
@@ -428,9 +431,18 @@ impl StructuredIndex {
             std::collections::BTreeMap::new();
         let mut by_tag: std::collections::BTreeMap<String, Vec<u32>> =
             std::collections::BTreeMap::new();
+        let mut by_thread: std::collections::BTreeMap<Digest32, Vec<u32>> =
+            std::collections::BTreeMap::new();
         let mut ops = Vec::new();
         for (i, text) in texts.into_iter().enumerate() {
             let at = u32::try_from(start + i).unwrap_or(u32::MAX);
+            if let Some(root) = vox_agentcomms::envelope::Envelope::parse(text)
+                .ok()
+                .and_then(|e| e.thread)
+                .and_then(|h| crate::node::link::b32_decode(h.trim(), "thread").ok())
+            {
+                by_thread.entry(root).or_default().push(at);
+            }
             for tag in message_tags(text) {
                 by_tag.entry(tag).or_default().push(at);
             }
@@ -449,6 +461,10 @@ impl StructuredIndex {
         }
         for (tag, at) in by_tag {
             let entry = next.by_tag.entry(tag).or_default();
+            *entry = entry.appended(at);
+        }
+        for (root, at) in by_thread {
+            let entry = next.by_thread.entry(root).or_default();
             *entry = entry.appended(at);
         }
         next.by_op = next.by_op.appended(ops);

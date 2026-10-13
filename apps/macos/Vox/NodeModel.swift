@@ -1533,21 +1533,6 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// The next room that needs the person, if any (W-2).
-    func nextNeedingYou() async {
-        if let room = orderedRooms.first(where: { $0.need == .needsYou }) {
-            // A request waiting in one of its Sessions: that Session, that request (P1).
-            if let waiting = await firstWaiting(in: room.id) {
-                await openRequest(room: room.id, node: waiting.node, session: waiting.session,
-                                  reference: waiting.reference)
-            } else {
-                await show(.room(room.id))
-            }
-        } else if let offer = offers.first {
-            await show(.offer(offer.fingerprint))
-        }
-    }
-
     /// Share the file or folder at `url` in the room on screen, addressed to `to` (members'
     /// fingerprints; none: the room) with `note`, in one message (ADR-028 F-1). Whether it was.
     func attach(_ url: URL, to: [String], note: String, urgent: Bool = false) async -> Bool {

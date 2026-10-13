@@ -1296,10 +1296,10 @@ final class FirstRunProof: XCTestCase {
                      withVelocity: .slow, thenHoldForDuration: 0.5)
         Thread.sleep(forTimeInterval: 1)
         let inspector = ui.descendants(matching: .any).matching(identifier: "inspector").firstMatch
-        // The LAN toggle, or the helper removal control when the helper is already allowed.
-        // Turning the LAN on now asks for the helper in a sheet; there is no inline Allow button.
+        // The read-only LAN status remains in the inspector; its control lives in Room.
+        // Turning the LAN on from Room asks for its helper; there is no inline control.
         let lan = ui.descendants(matching: .any).matching(NSPredicate(
-            format: "identifier == 'family-lan' OR identifier == 'family-lan-remove'")).firstMatch
+            format: "identifier == 'family-lan-status'")).firstMatch
         func lanInView() -> Bool {
             lan.exists && lan.frame.maxY <= inspector.frame.maxY + 1 && lan.frame.minY >= inspector.frame.minY
         }
@@ -2803,7 +2803,20 @@ final class FirstRunProof: XCTestCase {
         // in System Settings would.
         let helperFile = config + "/app/proof-lan-helper"
         try stager.write(Data("ask\n".utf8), to: helperFile + ".approval")
-        tap(ui, Key.id("family-lan"), "the family LAN's toggle in mission's inspector")
+        XCTAssertNil(locateEverywhere(ui, Key.id("next-needs-you")),
+                     "PRODUCT: no Next Room That Needs You control may remain")
+        let roomMenuForLan = ui.menuBars.menuBarItems["Room"]
+        roomMenuForLan.click()
+        XCTAssertFalse(roomMenuForLan.menuItems["Next Room That Needs You"].exists,
+                       "PRODUCT: Room must not offer Next Room That Needs You")
+        let lanMenuItem = roomMenuForLan.menuItems["Turn On Family LAN"]
+        guard lanMenuItem.waitForExistence(timeout: 5) else {
+            throw Product("Room must offer Turn On Family LAN for the selected room")
+        }
+        guard lanMenuItem.isEnabled else {
+            throw Product("Turn On Family LAN must be enabled for the selected live room")
+        }
+        lanMenuItem.click()
         let steps = words(ui, Key.id("lan-helper-steps"), timeout: 15,
                           "turning the family LAN on, with no LAN helper allowed, must ask for it and say where: \"System Settings › General › Login Items & Extensions\", then \"Allow in the Background\"",
                           until: { $0.contains("System Settings › General › Login Items & Extensions")
@@ -3087,12 +3100,22 @@ final class FirstRunProof: XCTestCase {
         reaches("⌘↑ with the reply selected") { ui.typeKey(.upArrow, modifierFlags: .command) }
         print("[proof] bob's reply quotes \"re you: FROM-ALICE\", and its quote and ⌘↑ go to it")
 
-        // (4c1) Reply in Thread answers bob's reply but stays under the original General root
-        // (ADR-033 TH-1, TH-3, #753). Exercise the app action and read what the other node gets.
-        guard let fromBob = entry("REPLY-TO-ALICE") else {
-            throw Apparatus("the staged REPLY-TO-ALICE has no entry hash to reply to")
+        // (4c1) Reply in Thread stays under its General root and inherits its three tags
+        // (ADR-033 TH-1, TH-3, TH-5, #753/#756). No tags are typed in the app reply.
+        let taggedPost = try staged(vox, ["room", "post", "--node", "bob", "--json",
+                                         "--task", "#756", "--project", "literal-project",
+                                         "--milestone", "literal-milestone", room, "TAGGED-THREAD-ROOT"], env: voxEnv)
+        guard let posted = try JSONSerialization.jsonObject(with: Data(taggedPost.utf8)) as? [String: Any],
+              let taggedRoot = posted["entry_hash"] as? String else {
+            throw Apparatus("tagged root post returned no entry hash: \(taggedPost)")
         }
-        tap(ui, Key.showing(": REPLY-TO-ALICE"), "bob's reply to select it")
+        try staged(vox, ["room", "post", "--node", "bob", "--re", taggedRoot, room, "TAGGED-THREAD-MIDDLE"], env: voxEnv)
+        words(ui, Key.showing(": TAGGED-THREAD-MIDDLE"), timeout: 30,
+              "the app must receive the tagged thread's middle reply", until: { $0.contains("TAGGED-THREAD-MIDDLE") })
+        guard let fromBob = entry("TAGGED-THREAD-MIDDLE") else {
+            throw Apparatus("the staged tagged middle reply has no entry hash")
+        }
+        tap(ui, Key.showing(": TAGGED-THREAD-MIDDLE"), "bob's reply to select it")
         ui.menuBars.menuBarItems["Room"].click()
         let replyInThread = ui.menuBars.menuItems["Reply in Thread"]
         guard replyInThread.waitForExistence(timeout: 5), replyInThread.isEnabled else {
@@ -3114,8 +3137,11 @@ final class FirstRunProof: XCTestCase {
             if threadReply.isEmpty { Thread.sleep(forTimeInterval: 0.5) }
         }
         XCTAssertTrue(threadReply["re"] as? String == fromBob
-                      && threadReply["thread"] as? String == fromAlice,
-                      "PRODUCT: Reply in Thread must reach bob answering his reply \(fromBob) in General root \(fromAlice); bob read \(threadReply)")
+                      && threadReply["thread"] as? String == taggedRoot,
+                      "PRODUCT: Reply in Thread must reach bob answering his reply \(fromBob) in General root \(taggedRoot); bob read \(threadReply)")
+        XCTAssertEqual((threadReply["tags"] as? [String])?.sorted(),
+                       ["milestone:literal-milestone", "project:literal-project", "task:#756"],
+                       "PRODUCT: an untagged app reply must inherit its General starting message's three tags; bob read \(threadReply)")
         print("[proof] Reply in Thread: bob reads the app's nested reply in the original General thread")
 
         // (4d) To: offers bob's open Session under him, and a message to it alone is addressed to
