@@ -26,8 +26,11 @@
 //! show only the separate machine anchor and no live connection to Bob’s room anchor, and the machine list must
 //! retain only the original room source. This is an observed status claim, not a claim
 //! that no future helper traffic can occur. It does not prove live DNS-record changes, helper
-//! isolation or previous-release migration. The same journey then checks a renamed room’s
-//! provenance through node lock and daemon restart, and removes it when Bob leaves.
+//! isolation or previous-release migration. Dave then joins Bob's room with one additional
+//! anchor address and locks: the list must union both local observations, deduplicate the room
+//! source, prefer Bob's live renamed label, and mark the union last-known. Dave leaving must
+//! remove only his contribution. The journey then keeps Bob's provenance through node lock and
+//! daemon restart, and removes it when Bob leaves.
 //!
 //! Mutants must fail the corresponding product assertion: disable refresh, retain old
 //! addresses, fail the whole file on its bad line, carry manual anchors in issued room links,
@@ -720,8 +723,38 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         std::fs::read_to_string(&bob_err).unwrap_or_default()
     );
 
-    // The inventory is a machine display of saved rooms, including a room whose node is
-    // locked. Rename on the creator first so a stale initial name cannot satisfy the proof.
+    // A second local copy of the same room may hold a different address observation. Supply
+    // that input through the public join command, just as Bob's invitation supplied its anchor.
+    // The extra, old address need not answer: the link still carries the real current route.
+    let extra_address = format!("/ip4/127.0.0.1/udp/{}", dead_ports[0]);
+    let dave_link = format!("{link}&b={extra_address}");
+    let (ok, out, err) = vox_stdin(
+        &bob_data,
+        &bob_cfg,
+        &[
+            "room", "join", "--node", "dave", "--passphrase-file", "-", &dave_link,
+        ],
+        Some(ROOM_PASS),
+    );
+    assert!(
+        ok,
+        "PRODUCT: Dave could not join Bob's room on the same daemon: {out}{err}"
+    );
+    let mut union_addresses = vec![address.to_owned(), extra_address];
+    union_addresses.sort();
+    let union_addresses = serde_json::json!(union_addresses);
+    let joined = machine_list(&bob_data, &bob_cfg);
+    assert_saved_source(
+        &joined, anchor_id, &room, "mission", false, &union_addresses,
+    );
+    let (ok, out, err) = vox(&bob_data, &bob_cfg, &["node", "lock", "dave"]);
+    assert!(
+        ok,
+        "PRODUCT: locking Dave's shared-room copy failed: {out}{err}"
+    );
+
+    // Bob observes the rename live while Dave keeps the old name and extra address on disk.
+    // The union must keep that address, prefer the live name, and still say it is last-known.
     let renamed = "mission-renamed";
     let (ok, out, err) = vox(&data, &cfg, &["room", "rename", &room, renamed]);
     assert!(ok, "PRODUCT: renaming the shared room failed: {out}{err}");
@@ -729,6 +762,9 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     loop {
         let inventory = machine_list(&bob_data, &bob_cfg);
         if room_source(&inventory, anchor_id).is_some_and(|source| source["name"] == renamed) {
+            assert_saved_source(
+                &inventory, anchor_id, &room, renamed, true, &union_addresses,
+            );
             break;
         }
         assert!(
@@ -737,6 +773,28 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         );
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+    println!("[proof] live and locked copies union their addresses and room source, with the live name and last-known marking");
+
+    // Leaving one local copy removes only its contribution, while Bob still holds the room.
+    let (ok, out, err) = vox(&bob_data, &bob_cfg, &["node", "unlock", "dave"]);
+    assert!(
+        ok,
+        "PRODUCT: unlocking Dave's shared-room copy failed: {out}{err}"
+    );
+    let (ok, out, err) = vox(
+        &bob_data, &bob_cfg, &["room", "leave", "--node", "dave", &room],
+    );
+    assert!(
+        ok,
+        "PRODUCT: Dave could not leave his shared-room copy: {out}{err}"
+    );
+    let left_copy = machine_list(&bob_data, &bob_cfg);
+    assert_saved_source(
+        &left_copy, anchor_id, &room, renamed, false, &learned["addresses"],
+    );
+    println!("[proof] Dave leaving removes his extra address while Bob's live room source remains");
+
+    // The inventory also keeps Bob's remaining saved-room observation when both nodes lock.
     for node in ["default", "dave"] {
         let (ok, out, err) = vox(&bob_data, &bob_cfg, &["node", "lock", node]);
         assert!(ok, "PRODUCT: locking {node} failed: {out}{err}");
@@ -930,12 +988,12 @@ fn assert_saved_source(
         .unwrap();
     assert_eq!(
         &row["addresses"], addresses,
-        "PRODUCT: saved room's anchor addresses changed across lock or restart: {inventory}"
+        "PRODUCT: saved room's anchor address union is wrong: {inventory}"
     );
     assert_eq!(
         row["sources"].as_array().unwrap().len(),
         1,
-        "PRODUCT: saved room anchor acquired machine dialing provenance: {inventory}"
+        "PRODUCT: saved room anchor has duplicate or machine dialing provenance: {inventory}"
     );
 }
 
