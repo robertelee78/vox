@@ -93,6 +93,81 @@ pub struct NodeSummary {
     pub keep: bool,
 }
 
+/// One source in the daemon's shared machine anchor inventory.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AnchorSourceSummary {
+    /// added-by-hand or room.
+    pub kind: String,
+    /// Full room identity for a room source.
+    pub room: Option<String>,
+    /// Last observed shared room name.
+    pub name: Option<String>,
+    /// The source includes a closed or locked observation.
+    pub stale: bool,
+}
+
+/// Real authenticated-dial observations; absent means no observation by a running node.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AnchorReachSummary {
+    /// An observing node currently holds an authenticated connection.
+    pub connected: bool,
+    /// Most recent authenticated anchor dial, Unix milliseconds.
+    pub last_reached_ms: Option<u64>,
+    /// No observing node has a connection since this Unix time.
+    pub unreached_since_ms: Option<u64>,
+}
+
+/// The shared machine record, also used by a room's members panel by matching source.room.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AnchorSummary {
+    /// Full anchor fingerprint, base32.
+    pub fingerprint: String,
+    /// Configured addresses, deduplicated.
+    pub addresses: Vec<String>,
+    /// Independent manual and saved-room provenance.
+    pub sources: Vec<AnchorSourceSummary>,
+    /// Absent until a running node has a dial observation.
+    pub reach: Option<AnchorReachSummary>,
+    /// Daemon-derived reach words for display.
+    pub reach_text: String,
+}
+
+impl From<vox_core::node::daemonipc::AnchorInfo> for AnchorSummary {
+    fn from(anchor: vox_core::node::daemonipc::AnchorInfo) -> Self {
+        let reach_text = anchor.reach_words(vox_core::transport::quic::unix_now_ms());
+        Self {
+            fingerprint: b32_encode(&anchor.fingerprint),
+            addresses: anchor.addresses,
+            sources: anchor
+                .sources
+                .into_iter()
+                .map(|source| match source {
+                    vox_core::node::daemonipc::AnchorSource::AddedByHand => AnchorSourceSummary {
+                        kind: "added-by-hand".into(),
+                        room: None,
+                        name: None,
+                        stale: false,
+                    },
+                    vox_core::node::daemonipc::AnchorSource::Room { room, name, stale } => {
+                        AnchorSourceSummary {
+                            kind: "room".into(),
+                            room: Some(b32_encode(&room)),
+                            name: Some(name),
+                            stale,
+                        }
+                    }
+                })
+                .collect(),
+            reach: anchor.reach.map(|r| AnchorReachSummary {
+                connected: r.connected,
+                last_reached_ms: r.last_reached_ms,
+                unreached_since_ms: r.unreached_since_ms,
+            }),
+            reach_text,
+        }
+    }
+}
+
 /// A room the acting node holds.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct RoomSummary {
@@ -1750,6 +1825,14 @@ impl VoxClient {
             .map_err(|_| failed("the app's connection to vox stopped"))?
     }
 
+    async fn anchor_request(&self, req: DaemonRequest) -> Result<Vec<AnchorSummary>, VoxError> {
+        match self.daemon(req).await? {
+            DaemonFrame::Anchors(anchors) => Ok(anchors.into_iter().map(Into::into).collect()),
+            DaemonFrame::AnchorFailed(why) => Err(failed(why)),
+            _ => Err(failed("the daemon did not return its anchor list")),
+        }
+    }
+
     async fn daemon(&self, req: DaemonRequest) -> Result<DaemonFrame, VoxError> {
         let socket = self.socket.clone();
         self.on_rt(async move {
@@ -1961,6 +2044,25 @@ impl VoxClient {
         vox_core::node::computer::operator_only().map_err(|e| failed(e.to_string()))?;
         self.computer_request(DaemonRequest::ComputerCancel {
             operation: operation_id,
+        })
+        .await
+    }
+
+    /// The machine's manual and saved-room anchor sources and actual dial observations.
+    pub async fn anchors(&self) -> Result<Vec<AnchorSummary>, VoxError> {
+        self.anchor_request(DaemonRequest::Anchors).await
+    }
+
+    /// Add fingerprint@address or host:port; host lookup proves the returned fingerprint.
+    pub async fn add_anchor(&self, input: String) -> Result<Vec<AnchorSummary>, VoxError> {
+        self.anchor_request(DaemonRequest::AnchorAdd { input })
+            .await
+    }
+
+    /// Remove only the manual source; a room's independent source remains visible.
+    pub async fn remove_anchor(&self, fingerprint: String) -> Result<Vec<AnchorSummary>, VoxError> {
+        self.anchor_request(DaemonRequest::AnchorRemove {
+            fingerprint: digest(&fingerprint, "anchor fingerprint")?,
         })
         .await
     }

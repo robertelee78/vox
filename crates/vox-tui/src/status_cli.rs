@@ -25,35 +25,29 @@ pub async fn status(paths: &Paths, json: bool) -> Result<(), AppError> {
         other => return Err(crate::client::unexpected_daemon(&other)),
     };
     let name = crate::client::name_of(paths)?;
-    if nodes.iter().any(|n| n.name == name && n.status.is_none()) {
-        if json {
-            println!(
-                "{}",
-                serde_json::json!({"node": name.as_str(), "status": null})
-            );
-        } else {
-            println!("node {name}  …");
-        }
-        return Ok(());
-    }
     if let Some(info) = nodes
         .iter()
-        .find(|n| n.name == name && n.status == Some(NodeStatus::Locked))
+        .find(|n| n.name == name && n.status != Some(NodeStatus::Ready))
     {
+        let anchors = vox_core::node::status::request_anchors(&at)
+            .await
+            .map_err(|e| crate::client::said(&at, e))?;
+        let value = serde_json::json!({
+            "node": name.as_str(), "status": info.status.map(|s| s.as_str()),
+            "identity": info.fingerprint.map(|f| vox_core::node::link::b32_encode(&f)),
+            "anchors": anchors.iter().map(|a| a.to_json()).collect::<Vec<_>>(),
+        });
         if json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "node": name.as_str(), "status": "Locked",
-                    "identity": info.fingerprint.map(|f| vox_core::node::link::b32_encode(&f)),
-                })
-            );
+            println!("{value}");
         } else {
-            println!("node {name}  Locked");
-            println!(
-                "Unlock with {}",
-                vox_text::shell::command(&["vox", "node", "unlock", name.as_str()])
-            );
+            println!("node {name}  {}", info.status.map_or("…", |s| s.as_str()));
+            if info.status == Some(NodeStatus::Locked) {
+                println!(
+                    "Unlock with {}",
+                    vox_text::shell::command(&["vox", "node", "unlock", name.as_str()])
+                );
+            }
+            print!("{}", render_anchors(&value));
         }
         return Ok(());
     }
@@ -85,6 +79,49 @@ fn ago(now_ms: u64, v: &Value) -> String {
     }
 }
 
+/// Shared anchor wording, including when the selected node is Locked or in transition.
+fn render_anchors(v: &Value) -> String {
+    use std::fmt::Write as _;
+    let mut o = String::new();
+    for a in v["anchors"].as_array().into_iter().flatten() {
+        let sources = a["sources"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|source| {
+                if source["kind"] == "added-by-hand" {
+                    "added by hand".to_owned()
+                } else {
+                    format!(
+                        "from room {}{}",
+                        source["name"].as_str().unwrap_or(""),
+                        if source["stale"] == true {
+                            " (last known)"
+                        } else {
+                            ""
+                        }
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let addresses = a["addresses"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let reach = s(a, "reach_text");
+        let _ = writeln!(
+            o,
+            "anchor {}  {addresses}  {sources}  {reach}",
+            short(s(a, "fingerprint"))
+        );
+    }
+    o
+}
+
 /// The report for a person.
 fn render(v: &Value) -> String {
     use std::fmt::Write as _;
@@ -109,7 +146,8 @@ fn render(v: &Value) -> String {
     }
     let empty = Vec::new();
     let arr = |k: &str| v.get(k).and_then(Value::as_array).unwrap_or(&empty);
-    // Stored entries a room set aside when it opened (V210-74): said first, whatever else there is.
+    o.push_str(&render_anchors(v));
+    // Stored entries a room set aside when it opened (V210-74), before the room details.
     for r in arr("set_aside") {
         for e in r.get("entries").and_then(Value::as_array).unwrap_or(&empty) {
             let _ = writeln!(

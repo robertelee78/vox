@@ -199,6 +199,44 @@ pub struct Management {
     revoked_transport: Mutex<std::collections::BTreeSet<(Digest32, Digest32, u64)>>,
 }
 impl Management {
+    /// The account's explicit host:port lookup uses its existing socket, but no management
+    /// identity or authority. The returned fingerprint is proved before it is persisted.
+    pub async fn lookup_anchor(&self, input: &str) -> Result<String> {
+        let input = input.to_owned();
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let resolve = input.clone();
+            let addresses = tokio::task::spawn_blocking(move || {
+                crate::node::link::parse_anchor_addrs(&resolve)
+            })
+            .await
+            .map_err(|error| {
+                Error::Handshake(format!("anchor address lookup stopped: {error}"))
+            })??;
+            let mut errors = Vec::new();
+            for address in addresses.iter().filter_map(|a| a.socket_addr()).take(8) {
+                match self
+                    .net
+                    .manager()
+                    .endpoint()
+                    .shared()
+                    .lookup_anchor(address)
+                    .await
+                {
+                    Ok(id) => return Ok(format!("{}@{input}", crate::node::link::b32_encode(&id))),
+                    Err(error) => errors.push(format!("{address}: {error}")),
+                }
+            }
+            Err(Error::Handshake(format!(
+                "no anchor was verified at {input}: {}",
+                errors.join("; ")
+            )))
+        })
+        .await
+        .map_err(|_| {
+            Error::Handshake("anchor lookup did not finish within 20 s; nothing was added".into())
+        })?
+    }
+
     /// Sign a receipt only for the exact locally applied policy and authenticated roster frontier.
     /// The remote receipt is a separate statement: offline peers remain pending.
     pub fn record_application(&self) -> Result<()> {

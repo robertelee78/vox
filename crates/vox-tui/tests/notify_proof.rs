@@ -513,10 +513,10 @@ fn notify_off_raises_nothing() {
     );
 }
 
-/// The anchor named `id` in alice's `vox status --json`: `Some(reached)`, or `None` if she does
+/// The anchor named `id` in alice's node-specific status observations: `Some(reached)`, or `None` if she does
 /// not list it.
 fn anchor_reached(s: &Value, id: &str) -> Option<bool> {
-    s["anchors"]
+    s["node_anchors"]
         .as_array()?
         .iter()
         .find(|a| a["id"].as_str() == Some(id))
@@ -606,7 +606,7 @@ fn an_unreachable_anchor_notifies_once_and_once_when_it_is_back() {
             Instant::now() < reached,
             "CANNOT MEASURE: alice never both reached her anchor {anchor_short} and held a direct \
              connection to bob: anchors {}, peers {}",
-            s["anchors"],
+            s["node_anchors"],
             s["peers"]
         );
         std::thread::sleep(Duration::from_millis(500));
@@ -717,7 +717,7 @@ fn an_unreachable_anchor_notifies_once_and_once_when_it_is_back() {
             "PRODUCT: no \"recovered\" notification {:?} after the anchor was back; alice's \
              anchors: {}; notifications: {:?}",
             back.elapsed(),
-            status(&alice_dir)["anchors"],
+            status(&alice_dir)["node_anchors"],
             notes(&file)
         );
         std::thread::sleep(Duration::from_millis(250));

@@ -55,6 +55,7 @@ const T_SESSION_REGISTERED: u64 = 4011;
 const T_ROOM_ASKS: u64 = 4012;
 const T_ROOM_ANSWER: u64 = 4013;
 const T_ANCHORS: u64 = 4014;
+const T_ANCHOR_FAILED: u64 = 4015;
 /// 4020–4029: the Session activity sink (ADR-029 §2, §3).
 const T_SESSION_ANSWER: u64 = 4020;
 
@@ -76,6 +77,8 @@ const T_REQ_ROOM_BIND: u64 = 4113;
 const T_REQ_ROOM_DECLINE: u64 = 4114;
 const T_REQ_DETACH_FOR_RENAME: u64 = 4115;
 const T_REQ_ANCHORS: u64 = 4116;
+const T_REQ_ANCHOR_ADD: u64 = 4117;
+const T_REQ_ANCHOR_REMOVE: u64 = 4118;
 /// 4120–4129: the Session activity sink (ADR-029 §2, §3).
 const T_REQ_SESSION_ACTIVITY: u64 = 4120;
 const T_REQ_SESSION_ASK: u64 = 4121;
@@ -210,6 +213,16 @@ pub enum KeepSource {
 pub enum DaemonRequest {
     /// The daemon's manual and saved-room anchor list, with provenance. Needs no node.
     Anchors,
+    /// Keep a manual fingerprint@address or look up an anchor at host:port.
+    AnchorAdd {
+        /// Fingerprint@address, or an address for bounded identity lookup.
+        input: String,
+    },
+    /// Remove only the manual source for this fingerprint, preserving room sources.
+    AnchorRemove {
+        /// Anchor whose manual source is to be removed.
+        fingerprint: Digest32,
+    },
     /// Read this installation's computer trust and pending approval.
     ComputerStatus,
     /// Operator starts an expiring one-time invitation.
@@ -539,6 +552,75 @@ pub struct AnchorInfo {
     pub addresses: Vec<String>,
     /// Why this machine uses it.
     pub sources: Vec<AnchorSource>,
+    /// Actual observations from active nodes of this daemon; None means not observed.
+    pub reach: Option<AnchorReach>,
+}
+
+/// A current authenticated connection and the daemon's actual dial history, never configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorReach {
+    /// At least one observing node currently holds an authenticated connection.
+    pub connected: bool,
+    /// Most recent successful authenticated anchor dial, Unix milliseconds.
+    pub last_reached_ms: Option<u64>,
+    /// All observing nodes have been without a connection since this time, Unix milliseconds.
+    pub unreached_since_ms: Option<u64>,
+}
+
+impl AnchorInfo {
+    /// The same truthful reach sentence for terminal and native displays.
+    #[must_use]
+    pub fn reach_words(&self, now_ms: u64) -> String {
+        let Some(reach) = &self.reach else {
+            return "not observed by a running node".into();
+        };
+        if reach.connected {
+            let Some(at) = reach.last_reached_ms else {
+                return "connected; dial time unavailable".into();
+            };
+            let seconds = now_ms.saturating_sub(at) / 1000;
+            let ago = if seconds < 60 {
+                format!("{seconds} s")
+            } else if seconds < 3600 {
+                format!("{} min", seconds / 60)
+            } else {
+                format!("{} h", seconds / 3600)
+            };
+            return format!("reached {ago} ago (connected)");
+        }
+        match reach.unreached_since_ms {
+            Some(at) => format!(
+                "not reached since {:02}:{:02} UTC",
+                (at / 3_600_000) % 24,
+                (at / 60_000) % 60
+            ),
+            None => "not connected; awaiting the next dial observation".into(),
+        }
+    }
+
+    /// The common public JSON record used by anchor list, status and native clients.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        use crate::node::link::b32_encode;
+        let sources: Vec<_> = self
+            .sources
+            .iter()
+            .map(|source| match source {
+                AnchorSource::AddedByHand => serde_json::json!({"kind":"added-by-hand"}),
+                AnchorSource::Room { room, name, stale } => serde_json::json!({
+                    "kind":"room", "room":b32_encode(room), "name":name, "stale":stale,
+                }),
+            })
+            .collect();
+        serde_json::json!({
+            "fingerprint":b32_encode(&self.fingerprint), "addresses":self.addresses,
+            "sources":sources, "reach_text":self.reach_words(crate::transport::quic::unix_now_ms()),
+            "reach":self.reach.as_ref().map(|reach| serde_json::json!({
+                "connected":reach.connected, "last_reached_ms":reach.last_reached_ms,
+                "unreached_since_ms":reach.unreached_since_ms,
+            })),
+        })
+    }
 }
 
 /// Why an anchor belongs in the machine's list.
@@ -640,6 +722,8 @@ pub struct AskingSession {
 pub enum DaemonFrame {
     /// The shared anchor list, in fingerprint order.
     Anchors(Vec<AnchorInfo>),
+    /// A machine anchor operation failed, without selecting a node.
+    AnchorFailed(String),
     /// Typed computer status encoded as public JSON, including the local one-time link.
     ComputerStatus(String),
     /// A computer operation failed; no node identity is involved.
@@ -1085,6 +1169,12 @@ impl Opening {
                 DaemonRequest::Status => {
                     e.array(1).uint(T_REQ_STATUS);
                 }
+                DaemonRequest::AnchorAdd { input } => {
+                    e.array(2).uint(T_REQ_ANCHOR_ADD).text(input);
+                }
+                DaemonRequest::AnchorRemove { fingerprint } => {
+                    e.array(2).uint(T_REQ_ANCHOR_REMOVE).bytes(fingerprint);
+                }
                 DaemonRequest::Anchors => {
                     e.array(1).uint(T_REQ_ANCHORS);
                 }
@@ -1257,6 +1347,13 @@ impl Opening {
             }),
             (T_REQ_STATUS, 1) => Opening::Daemon(DaemonRequest::Status),
             (T_REQ_ANCHORS, 1) => Opening::Daemon(DaemonRequest::Anchors),
+            (T_REQ_ANCHOR_ADD, 2) => Opening::Daemon(DaemonRequest::AnchorAdd {
+                input: text(&mut d, "ipc anchor input")?,
+            }),
+            (T_REQ_ANCHOR_REMOVE, 2) => Opening::Daemon(DaemonRequest::AnchorRemove {
+                fingerprint: fp(&mut d, "ipc anchor fingerprint")?
+                    .ok_or(Error::MalformedIpc("ipc anchor fingerprint"))?,
+            }),
             (T_REQ_METRICS, 1) => Opening::Daemon(DaemonRequest::Metrics),
             (T_REQ_SUBSCRIBE, 1) => Opening::Daemon(DaemonRequest::Subscribe),
             (T_REQ_COMPUTER_STATUS, 1) => Opening::Daemon(DaemonRequest::ComputerStatus),
@@ -1405,7 +1502,7 @@ impl DaemonFrame {
             DaemonFrame::Anchors(anchors) => {
                 e.array(2).uint(T_ANCHORS).array(anchors.len());
                 for anchor in anchors {
-                    e.array(3).bytes(&anchor.fingerprint);
+                    e.array(4).bytes(&anchor.fingerprint);
                     put_texts(&mut e, &anchor.addresses);
                     e.array(anchor.sources.len());
                     for source in &anchor.sources {
@@ -1422,7 +1519,17 @@ impl DaemonFrame {
                             }
                         }
                     }
+                    if let Some(reach) = &anchor.reach {
+                        e.array(3).uint(u64::from(reach.connected));
+                        e.uint(reach.last_reached_ms.unwrap_or(0));
+                        e.uint(reach.unreached_since_ms.unwrap_or(0));
+                    } else {
+                        e.array(0);
+                    }
                 }
+            }
+            DaemonFrame::AnchorFailed(why) => {
+                e.array(2).uint(T_ANCHOR_FAILED).text(why);
             }
             DaemonFrame::Metrics(text) => {
                 e.array(2).uint(T_METRICS).text(text);
@@ -1478,7 +1585,7 @@ impl DaemonFrame {
                 let n = d.array().map_err(malformed("ipc anchors"))?;
                 let mut anchors = Vec::with_capacity(n.min(256));
                 for _ in 0..n {
-                    if d.array().map_err(malformed("ipc anchor"))? != 3 {
+                    if d.array().map_err(malformed("ipc anchor"))? != 4 {
                         return Err(Error::MalformedIpc("ipc anchor arity"));
                     }
                     let fingerprint = fp(&mut d, "ipc anchor fingerprint")?
@@ -1511,10 +1618,29 @@ impl DaemonFrame {
                             _ => return Err(Error::MalformedIpc("ipc anchor source")),
                         });
                     }
+                    let reach = match d.array().map_err(malformed("ipc anchor reach"))? {
+                        0 => None,
+                        3 => {
+                            let connected = match d.uint()? {
+                                0 => false,
+                                1 => true,
+                                _ => return Err(Error::MalformedIpc("ipc anchor connected")),
+                            };
+                            let reached = d.uint()?;
+                            let unreached = d.uint()?;
+                            Some(AnchorReach {
+                                connected,
+                                last_reached_ms: (reached != 0).then_some(reached),
+                                unreached_since_ms: (unreached != 0).then_some(unreached),
+                            })
+                        }
+                        _ => return Err(Error::MalformedIpc("ipc anchor reach")),
+                    };
                     anchors.push(AnchorInfo {
                         fingerprint,
                         addresses,
                         sources,
+                        reach,
                     });
                 }
                 DaemonFrame::Anchors(anchors)
@@ -1522,6 +1648,7 @@ impl DaemonFrame {
             (T_ATTACHED_INFO, 3) => {
                 DaemonFrame::Attached(info(&mut d)?, texts(&mut d, "ipc attached notes")?)
             }
+            (T_ANCHOR_FAILED, 2) => DaemonFrame::AnchorFailed(text(&mut d, "anchor failure")?),
             (T_COMPUTER_STATUS, 2) => DaemonFrame::ComputerStatus(text(&mut d, "computer status")?),
             (T_COMPUTER_FAILED, 2) => {
                 DaemonFrame::ComputerFailed(text(&mut d, "computer refusal")?)

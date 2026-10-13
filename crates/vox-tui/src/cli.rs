@@ -825,7 +825,20 @@ pub struct StatusArgs {
 /// Inspect the daemon's machine anchor list without choosing or attaching a node.
 #[derive(Subcommand, Debug, Clone)]
 pub enum AnchorCmd {
-    /// List manual anchors and open rooms' own anchors, with their sources.
+    /// Add a manual anchor as fingerprint@address or host:port (also accepts host and port separately).
+    Add {
+        input: String,
+        port: Option<u16>,
+        #[command(flatten)]
+        account: AccountArgs,
+    },
+    /// Remove only this fingerprint's manual source; room anchors remain their rooms'.
+    Remove {
+        fingerprint: String,
+        #[command(flatten)]
+        account: AccountArgs,
+    },
+    /// List manual and saved-room anchors with their sources and actual reach.
     List {
         #[command(flatten)]
         account: AccountArgs,
@@ -2579,9 +2592,47 @@ pub fn run() -> ExitCode {
                 .await
             })
         }
-        Cmd::Anchor(AnchorCmd::List { account, json }) => {
+        Cmd::Anchor(command) => {
             match block_on_client(async move {
-                crate::anchor_cli::list(&account.as_node_args().account()?, json).await
+                match command {
+                    AnchorCmd::List { account, json } => {
+                        crate::anchor_cli::list(&account.as_node_args().account()?, json).await
+                    }
+                    AnchorCmd::Add {
+                        input,
+                        port,
+                        account,
+                    } => {
+                        let input = match port {
+                            Some(port) if input.contains(':') && !input.starts_with('[') => {
+                                format!("[{input}]:{port}")
+                            }
+                            Some(port) => format!("{input}:{port}"),
+                            None => input,
+                        };
+                        crate::anchor_cli::change(
+                            &account.as_node_args().account()?,
+                            account.listen,
+                            &account.anchors,
+                            vox_core::node::daemonipc::DaemonRequest::AnchorAdd { input },
+                        )
+                        .await
+                    }
+                    AnchorCmd::Remove {
+                        fingerprint,
+                        account,
+                    } => {
+                        let fingerprint =
+                            vox_core::node::link::b32_decode(&fingerprint, "anchor fingerprint")?;
+                        crate::anchor_cli::change(
+                            &account.as_node_args().account()?,
+                            account.listen,
+                            &account.anchors,
+                            vox_core::node::daemonipc::DaemonRequest::AnchorRemove { fingerprint },
+                        )
+                        .await
+                    }
+                }
             }) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {

@@ -10,6 +10,7 @@ import SwiftUI
 struct SettingsView: View {
     @ObservedObject var app: AppModel
     @State private var showingComputers = false
+    @State private var showingNetwork = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s20) {
@@ -77,6 +78,12 @@ struct SettingsView: View {
             } said: {
                 Text("Trust the nodes on your computers together, or keep choosing individual nodes.")
             }
+            setting {
+                Button("Network…") { showingNetwork = true }
+                    .accessibilityIdentifier("settings-network")
+            } said: {
+                Text("Add or remove this machine's anchors, and see each anchor's source and reach.")
+            }
             if let node = app.node { DaemonLogSetting(node: node) }
             setting {
                 Picker("Conversation text size", selection: Binding(
@@ -97,6 +104,7 @@ struct SettingsView: View {
         .frame(width: Theme.scaled(460), alignment: .topLeading)
         .contentSurface()
         .sheet(isPresented: $showingComputers) { ComputerTrustView() }
+        .sheet(isPresented: $showingNetwork) { NetworkSettingsView() }
     }
 
     /// One setting: its control, then what it does in secondary text.
