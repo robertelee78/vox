@@ -445,8 +445,12 @@ impl Router {
                 .await;
         }
         let mut g = self
-            .want(node, Want::Checked, passphrase, rooms, anchors)
+            .want(node, Want::Checked, passphrase.clone(), rooms, anchors)
             .await?;
+        if keep.is_some() {
+            self.verify_kept_passphrase(node, &g, passphrase.as_deref().map_or("", |p| p))
+                .await?;
+        }
         // Never hold the file lock while waiting for an earlier detach: that detach may need
         // the same lock to forget its entry. Apply the explicit keep only after the read works.
         let _file = self.inner.keep_file.lock().await;
@@ -472,6 +476,47 @@ impl Router {
             why: format!(
                 "node {node} is Ready, but remembering could not be confirmed: {why}; correct the storage problem and run `vox node unlock {node}` again"
             ),
+        }
+    }
+
+    /// A Ready node still has to prove a replacement restart secret. A new attachment already
+    /// checked it while opening the vault. Headless nodes have no vault or passphrase to check.
+    async fn verify_kept_passphrase(
+        &self,
+        node: &NodeName,
+        grant: &Granted,
+        secret: &str,
+    ) -> Result<(), Refusal> {
+        if grant.attached_now {
+            return Ok(());
+        }
+        let failed = |why: String| Refusal::Failed {
+            node: node.clone(),
+            why,
+        };
+        match grant
+            .handle
+            .apply(NodeCommand::VerifyPassphrase {
+                passphrase: Secret::new(secret.as_bytes().to_vec()),
+            })
+            .await
+        {
+            Outcome::Done => Ok(()),
+            Outcome::Failed(Fault::NoIdentity)
+                if secret.is_empty()
+                    && self.inner.account.node_paths(node).is_ok_and(|p| {
+                        !p.vault_file().is_file()
+                            && vox_core::node::headless::identity_file(&p).is_file()
+                    }) =>
+            {
+                Ok(())
+            }
+            Outcome::Failed(Fault::WrongPassphrase) => Err(failed(format!(
+                "that is not node {node}'s identity passphrase, so nothing was stored"
+            ))),
+            other => Err(failed(format!(
+                "its passphrase could not be checked ({other}), so nothing was stored"
+            ))),
         }
     }
 
@@ -510,27 +555,7 @@ impl Router {
         let mut g = self
             .want(node, Want::Checked, passphrase, rooms, anchors)
             .await?;
-        if !g.attached_now {
-            match g
-                .handle
-                .apply(NodeCommand::VerifyPassphrase {
-                    passphrase: Secret::new(secret.as_bytes().to_vec()),
-                })
-                .await
-            {
-                Outcome::Done => {}
-                Outcome::Failed(Fault::WrongPassphrase) => {
-                    return Err(failed(format!(
-                        "that is not node {node}'s identity passphrase, so nothing was stored"
-                    )))
-                }
-                other => {
-                    return Err(failed(format!(
-                        "its passphrase could not be checked ({other}), so nothing was stored"
-                    )))
-                }
-            }
-        }
+        self.verify_kept_passphrase(node, &g, &secret).await?;
         let account = self.keychain_account(node);
         let _file = self.inner.keep_file.lock().await;
         let was = self.kept_record(node)?;

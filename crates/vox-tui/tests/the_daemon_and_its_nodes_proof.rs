@@ -549,7 +549,7 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
 #[ignore = "real binaries with production Argon2id; run in release"]
 fn a_kept_node_and_its_room_come_back_after_a_restart() {
     // Keep the old attach file readable while refusing atomic replacement on a Mac. Elsewhere
-    // a directory at the destination stages the same write failure; its old file is restored
+    // a directory at the destination stages unreadable-record refusal; its old file is restored
     // before retry. Drop restores either fixture even if a PRODUCT assertion panics.
     struct UnwritableAttach {
         path: PathBuf,
@@ -665,6 +665,65 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
     let room = make_room(&a, "default");
     let (ok, out, err) = a.run(&["room", "post", &room, "before the restart"], "");
     assert!(ok, "APPARATUS: post before restart: {out}{err}");
+    let (ok, out, err) = a.run(&["node", "forget-passphrase", "default"], "");
+    assert!(
+        ok,
+        "APPARATUS: temporarily forget the Ready node: {out}{err}"
+    );
+    let (_, listed, err) = a.run(&["node", "list"], "");
+    assert!(listed.lines().any(|l| l.starts_with("default ") && l.contains("attached") && !l.contains("(kept)")),
+        "APPARATUS: empty-input refusal needs a protected Ready but unremembered node: {listed}{err}");
+    let empty = pass.with_extension("empty");
+    std::fs::write(&empty, "\n").expect("APPARATUS: empty passphrase input");
+    let (ok, out, err) = a.run(
+        &[
+            "node",
+            "unlock",
+            "default",
+            "--passphrase-file",
+            empty.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert!(!ok && err.contains("identity passphrase") && !out.contains("Ready and remembered"),
+        "PRODUCT: a Ready protected node must reject empty input instead of remembering no passphrase: {out}{err}");
+    let (_, listed, err) = a.run(&["node", "list"], "");
+    assert!(
+        listed
+            .lines()
+            .any(|l| l.starts_with("default ") && l.contains("attached") && !l.contains("(kept)")),
+        "PRODUCT: rejected empty input must leave the Ready node unremembered: {listed}{err}"
+    );
+    let (ok, out, err) = a.run(
+        &[
+            "node",
+            "unlock",
+            "default",
+            "--passphrase-file",
+            pass.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert!(
+        ok && out.contains("Ready and remembered"),
+        "PRODUCT: correct passphrase retry must remember the Ready node: {out}{err}"
+    );
+    let wrong = pass.with_extension("wrong");
+    std::fs::write(&wrong, "wrong identity passphrase\n")
+        .expect("APPARATUS: wrong persistent input");
+    let (ok, out, err) = a.run(
+        &[
+            "node",
+            "unlock",
+            "default",
+            "--passphrase-file",
+            wrong.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert!(!ok && err.contains("identity passphrase") && !out.contains("Ready and remembered"),
+        "PRODUCT: wrong input must not replace an already-Ready node's usable restart secret: {out}{err}");
+    // The restart and room read below prove the rejected replacement left usable material.
     stop_pid(a.lock_pid().expect("APPARATUS: unlocked node's daemon"));
     let supplied = pass.with_extension("supplied");
     if cfg!(target_os = "macos") {
