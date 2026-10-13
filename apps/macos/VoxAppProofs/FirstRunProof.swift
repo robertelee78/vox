@@ -1708,13 +1708,14 @@ final class FirstRunProof: XCTestCase {
             let joined = try staged(vox, ["room", "list", "--node", name], env: computerA)
             guard joined.contains(keptRoom) else { throw Apparatus("native drive node \(name) did not join the retained room: \(joined)") }
         }
+        let personalFp = try line(staged(vox, ["id", "--node", "paired-personal"], env: computerA)) { $0.count == 52 }
         pairingUI.launchEnvironment = computerA
-        try launchVox(pairingUI, appPath, env: computerA, scratch: scratchPath)
+        try launchVox(pairingUI, appPath, env: computerA, scratch: scratchPath,
+                      nodeFingerprint: (name: "paired-personal", fingerprint: personalFp))
         tap(pairingUI, Key.id("node-paired-personal"), "Choose paired-personal as the personal node")
         guard present(pairingUI, Key.id("room-pairing-kept"), timeout: 30,
                       "the selected personal node must show its joined retained room") else { return }
         tap(pairingUI, Key.id("room-pairing-kept"), "Open the joined retained room")
-        let personalFp = try line(staged(vox, ["id", "--node", "paired-personal"], env: computerA)) { $0.count == 52 }
         let ordinaryFp = try line(staged(vox, ["id", "--node", "paired-ordinary"], env: computerA)) { $0.count == 52 }
         let rosterUntil = Date().addingTimeInterval(30)
         var nativeRoster = ""
@@ -5466,7 +5467,8 @@ final class FirstRunProof: XCTestCase {
     /// show the exact full computer fingerprint read from this scratch account's public CLI.
     /// The account's data root shown, or the required clue absent, stops the case.
     private func launchVox(_ ui: XCUIApplication, _ appPath: String, env: [String: String],
-                           scratch: String, computerFingerprint: String? = nil) throws {
+                           scratch: String, computerFingerprint: String? = nil,
+                           nodeFingerprint: (name: String, fingerprint: String)? = nil) throws {
         try scratchOnly(env, under: scratch)
         let appExe = resolved(appPath + "/Contents/MacOS/Vox")
         if let running = proofApps().first {
@@ -5521,6 +5523,15 @@ final class FirstRunProof: XCTestCase {
                     .matching(NSPredicate(format: "label == %@ OR CAST(value, 'NSString') == %@", fingerprint, fingerprint)).firstMatch
                 if sheet.exists, identity.exists {
                     print("[guard] Vox.app (pid \(pid)) shows this scratch account's exact public computer fingerprint: \(fingerprint)")
+                    return
+                }
+                Thread.sleep(forTimeInterval: 0.5)
+                continue
+            }
+            if let expected = nodeFingerprint {
+                let identity = ui.windows.staticTexts.matching(identifier: "node-fingerprint-" + expected.name).firstMatch
+                if identity.exists, shown(identity).filter({ !$0.isWhitespace }) == expected.fingerprint {
+                    print("[guard] Vox.app (pid \(pid)) shows this scratch account's exact public node fingerprint: \(expected.fingerprint)")
                     return
                 }
                 Thread.sleep(forTimeInterval: 0.5)
