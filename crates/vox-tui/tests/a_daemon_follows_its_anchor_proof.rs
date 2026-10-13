@@ -21,8 +21,9 @@
 //!
 //! This consolidates the former single-address, eight-address and bad-line runs into one
 //! journey. It also attaches Carol before refresh and requires both identities to report their own
-//! reach. Dave then creates an unrelated room on Bob’s daemon: its public status must
-//! show no anchor or live connection to Bob’s room anchor, and the machine list must
+//! reach. Dave then creates an unrelated room on Bob’s daemon, where both identities must dial
+//! a separate hand-added anchor: its public status must
+//! show only the separate machine anchor and no live connection to Bob’s room anchor, and the machine list must
 //! retain only the original room source. This is an observed status claim, not a claim
 //! that no future helper traffic can occur. It does not prove live DNS-record changes, helper
 //! isolation, canonical migration or all #779 requirements. Those remain separate claims.
@@ -116,18 +117,12 @@ fn a_daemon_picks_up_an_anchor_that_moved_under_it() {
     follow(&[9, 10, 11, 12, 13, 14, 15, 16], true);
 }
 
-/// The scene: the daemon starts with the anchor at `dead_ports`, the file is rewritten to name
-/// its real one, and the daemon must follow. With `bad_line`, both versions of the file start with
-/// a line whose host does not resolve.
-fn follow(dead_ports: &[u16], bad_line: bool) {
-    watchdog::arm();
-    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
-
-    // ---- a real anchor, on a port nobody knew at startup ----
-    let anchor_data = tmp.path().join("anchor-data");
-    let anchor_cfg = tmp.path().join("anchor-cfg");
+/// A real headless anchor; return its published route and keep its process alive.
+fn start_anchor(root: &std::path::Path, name: &str) -> (Proc, String) {
+    let anchor_data = root.join(format!("{name}-data"));
+    let anchor_cfg = root.join(format!("{name}-cfg"));
     std::fs::create_dir_all(&anchor_cfg).expect("APPARATUS: harness file I/O");
-    let mut anchor = Proc(
+    let anchor = Proc(
         Command::new(VOX)
             .args(["node", "--listen", "127.0.0.1:0"])
             .env("VOX_DATA_DIR", &anchor_data)
@@ -140,11 +135,11 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
             // the pipe, so the anchor died the moment the daemon reached it — hidden only
             // because the joiner then went to the daemon directly.
             .stdout(Stdio::from(
-                std::fs::File::create(tmp.path().join("anchor.out"))
+                std::fs::File::create(root.join(format!("{name}.out")))
                     .expect("APPARATUS: harness file I/O"),
             ))
             .stderr(Stdio::from(
-                std::fs::File::create(tmp.path().join("anchor.err"))
+                std::fs::File::create(root.join(format!("{name}.err")))
                     .expect("APPARATUS: harness file I/O"),
             ))
             .spawn()
@@ -158,7 +153,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
             std::time::Instant::now() < deadline,
             "PRODUCT (staging): the anchor never wrote its spec to {}; its stderr: {:?}",
             anchors_file.display(),
-            std::fs::read_to_string(tmp.path().join("anchor.err")).unwrap_or_default()
+            std::fs::read_to_string(root.join(format!("{name}.err"))).unwrap_or_default()
         );
         if let Ok(text) = std::fs::read_to_string(&anchors_file) {
             if let Some(line) = text
@@ -171,6 +166,18 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     };
+
+    (anchor, real_spec)
+}
+
+/// The scene: the daemon starts with the anchor at `dead_ports`, the file is rewritten to name
+/// its real one, and the daemon must follow. With `bad_line`, both versions of the file start with
+/// a line whose host does not resolve.
+fn follow(dead_ports: &[u16], bad_line: bool) {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
+
+    let (mut anchor, real_spec) = start_anchor(tmp.path(), "anchor");
 
     // ---- a client profile, and an anchors file pointing at nothing ----
     let data = tmp.path().join("data");
@@ -514,6 +521,20 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         "PRODUCT: Bob's room-link anchor was not sourced to the joined room alone: {bob_list:?}"
     );
 
+    // The exact acceptance scene: on Bob's daemon, both Bob and Dave dial a
+    // separate hand-added anchor, while the joined room's original anchor stays local.
+    let (_machine_anchor, machine_spec) = start_anchor(tmp.path(), "machine");
+    let machine_id = machine_spec
+        .split_once('@')
+        .expect("APPARATUS: machine anchor printed a route")
+        .0;
+    assert_ne!(
+        machine_id, anchor_id,
+        "APPARATUS: the two anchors must have distinct identities"
+    );
+    std::fs::write(anchors_file_for(&bob_cfg), format!("{machine_spec}\n"))
+        .expect("APPARATUS: write Bob's manual anchor input");
+
     // A room-link anchor belongs to Bob's joined room. A second identity on this
     // daemon creates an unrelated room without inheriting that room's input.
     let (ok, _, err) = vox_stdin(
@@ -546,15 +567,39 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     );
     assert!(
         ok,
-        "PRODUCT: second node could not create its unrelated room without an anchor: {err}"
+        "PRODUCT: second node could not create its unrelated room without the other room’s anchor: {err}"
     );
+    let deadline = std::time::Instant::now() + FOLLOW_PATIENCE;
+    for node in ["default", "dave"] {
+        loop {
+            let (ok, report, err) = vox(&bob_data, &bob_cfg, &["status", "--node", node, "--json"]);
+            let reached = ok
+                && serde_json::from_str::<serde_json::Value>(&report)
+                    .ok()
+                    .and_then(|status| status["anchors"].as_array().cloned())
+                    .is_some_and(|anchors| {
+                        anchors
+                            .iter()
+                            .any(|anchor| anchor["id"] == machine_id && anchor["reached"] == true)
+                    });
+            if reached {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline,
+                "PRODUCT: node {node} did not reach the separate hand-added machine anchor: {report:?} {err:?}");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        println!("[proof] Bob daemon node {node} reached the separate hand-added anchor");
+    }
     let (ok, report, err) = vox(&bob_data, &bob_cfg, &["status", "--node", "dave", "--json"]);
     assert!(ok, "PRODUCT: second node's public status failed: {err}");
     let status: serde_json::Value = serde_json::from_str(&report).unwrap_or_else(|error| {
         panic!("PRODUCT: second node returned invalid status JSON: {error}: {report:?}")
     });
     assert!(
-        status["anchors"].as_array().is_some_and(Vec::is_empty),
+        status["anchors"]
+            .as_array()
+            .is_some_and(|anchors| anchors.len() == 1 && anchors[0]["id"] == machine_id),
         "PRODUCT: unrelated node's status inherited another node's room anchor: {report:?}"
     );
     assert!(status["peers"].as_array().is_some_and(|peers|
@@ -578,6 +623,19 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     assert_eq!(
         recorded["sources"], learned["sources"],
         "PRODUCT: unrelated room acquired Bob's joined-room anchor source: {after}"
+    );
+    let manual = after["anchors"]
+        .as_array()
+        .and_then(|anchors| {
+            anchors
+                .iter()
+                .find(|anchor| anchor["fingerprint"] == machine_id)
+        })
+        .unwrap_or_else(|| panic!("PRODUCT: machine list omitted the hand-added anchor: {after}"));
+    assert_eq!(
+        manual["sources"],
+        serde_json::json!([{"kind": "added-by-hand"}]),
+        "PRODUCT: the hand-added anchor acquired a room source: {after}"
     );
     println!("[proof] unrelated node created its room without inheriting Bob's room anchor");
 
