@@ -6965,7 +6965,7 @@ impl Node {
                     // unlock is the same room, and a restart is exactly when its members have to
                     // be dialled from where they were last reached (`node::peer_book`).
                     let mut channel = *channel;
-                    if let Err(e) = self.retention_before_publication(&mut channel) {
+                    if let Err(e) = self.retention_before_publication(&mut channel).await {
                         let _ = self.event_tx.send(NodeEvent::NodeNote {
                             note: format!(
                                 "room {} did not reopen: {e}; it stays closed",
@@ -14453,7 +14453,36 @@ impl Node {
 
     /// Apply this node's shorter limits after opening under the room policy, before a cached
     /// row can be read or relayed. Failure follows the caller's ordinary open/recovery error path.
-    fn retention_before_publication(&mut self, ch: &mut ChannelState) -> crate::error::Result<()> {
+    async fn retention_before_publication(
+        &mut self,
+        ch: &mut ChannelState,
+    ) -> crate::error::Result<()> {
+        // Resolve stored packages before deciding which pre-upgrade Session copies the node
+        // may keep. The room is not published or available to readers/sync yet. This uses the
+        // usual prekey-consumption path and trust check, never a new source of permission.
+        if ch.needs_session_upgrade() {
+            let ctx = ch.join_context()?;
+            let now = self.now_ms();
+            for package in ch.take_inbound_packages() {
+                let Ok(init) = package.initial_message() else {
+                    continue;
+                };
+                let Some(mut session) = self.respond_to_initial(&init, &ctx).await else {
+                    continue;
+                };
+                let Ok(skdm) = package.open(&mut session, now.get()) else {
+                    continue;
+                };
+                if !self.trust.is_trusted(&skdm.body.author_id) {
+                    ch.hold_package(package);
+                    continue;
+                }
+                let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+                // A malformed package is skipped just as during ordinary delivery. A failed
+                // durable write poisons the room, which finish_session_upgrade refuses below.
+                let _ = ch.accept_skdm(profile.store(), &skdm, now);
+            }
+        }
         let id = ch.channel_id();
         ch.set_node_retention(self.node_retention_for(&id));
         ch.set_node_step_retention(self.node_step_retention.for_room(&id));
@@ -14461,13 +14490,14 @@ impl Node {
             .profile
             .as_ref()
             .ok_or(crate::error::Error::AtRestLocked)?;
+        ch.finish_session_upgrade(profile.store(), self.now_ms().get())?;
         ch.sweep_retention(profile.store(), self.now_ms())?;
         Ok(())
     }
 
     /// [`Self::finish_open_channel`], unboxed: see [`Boxed`].
     async fn finish_open_channel_unboxed(&mut self, mut ch: ChannelState) -> Outcome {
-        if let Err(e) = self.retention_before_publication(&mut ch) {
+        if let Err(e) = self.retention_before_publication(&mut ch).await {
             let _ = self.event_tx.send(NodeEvent::NodeNote {
                 note: format!(
                     "room {} could not apply retention before opening: {e}",

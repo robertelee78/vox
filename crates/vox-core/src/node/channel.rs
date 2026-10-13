@@ -2346,6 +2346,14 @@ impl ChannelState {
         // author's signed generation announcements before exposing its Session permissions.
         room.index_session_floors();
         room.restore_private_sessions(store)?;
+        room.private_sessions
+            .legacy_pending
+            .extend(room.step_bodies.iter().copied().filter(|hash| {
+                room.dag
+                    .get_by_hash(hash)
+                    .is_some_and(|e| e.payload.is_some())
+            }));
+        room.private_sessions.upgrading = !room.private_sessions.legacy_pending.is_empty();
         room.sweep_retention(store, now)?;
         Ok(room)
     }
@@ -4582,10 +4590,12 @@ impl ChannelState {
         let (now, ttl) = (self.now_hint, self.effective_retention());
         let step_ttl = self.effective_step_retention();
         let steps = &self.step_bodies;
+        let private = &self.private_sessions;
         let dag = &self.dag;
         self.owed.retain(|(author, seq)| {
             dag.feed(author).and_then(|f| f.get(*seq)).is_some_and(|e| {
                 e.payload.is_none()
+                    && !private.contains(&e.entry_hash())
                     && !expired_at(
                         e.skeleton.claimed_ms,
                         now,
@@ -5082,6 +5092,7 @@ impl ChannelState {
             .is_some_and(|body| is_step_body(&self.channel_id, body));
         if steps {
             self.step_bodies.insert(entry_hash);
+            self.private_sessions.legacy_pending.insert(entry_hash);
         }
         let claimed_ms = self
             .dag
@@ -5130,6 +5141,7 @@ impl ChannelState {
             .is_some_and(|body| is_step_body(&self.channel_id, body));
         if steps {
             self.step_bodies.insert(entry_hash);
+            self.private_sessions.legacy_pending.insert(entry_hash);
         }
         let claimed_ms = self
             .dag
@@ -5682,6 +5694,7 @@ impl ChannelState {
                 } else {
                     self.queue_legacy_sessions(&mut batch)?;
                 }
+                self.queue_private_generations(&mut batch)?;
                 batch.commit()
             })(),
         };
@@ -5912,7 +5925,11 @@ impl ChannelState {
                     .filter(|(a, _, epoch, _)| a == author && *epoch <= self.epoch)
                     .map(|(_, _, _, generation)| *generation)
                     .max();
-                let newest = legacy.into_iter().chain(announced).max();
+                let newest = legacy
+                    .into_iter()
+                    .chain(announced)
+                    .chain(self.legacy_drive_generation(author))
+                    .max();
                 newest.is_none_or(|g| self.drive.receivers.contains_key(&(*author, g)))
                     // A key-package from this author for this node, not yet opened, may hold
                     // that generation: it is posted before the entry under it, so it arrives
@@ -6145,6 +6162,7 @@ impl ChannelState {
         self.persist_drive(store)?;
         let before = self.drive.sessions.len();
         self.backfill(store, &skdm.body.author_id, now_ms)?;
+        self.render_pending_private(store, now_ms)?;
         // What it opened of Sessions: a key-changed entry is none of theirs.
         Ok(self.drive.sessions.rows()[before..]
             .iter()
@@ -6734,6 +6752,7 @@ impl ChannelState {
         if !expired.is_empty() {
             self.prune(store, expired, true)?;
         }
+        self.migrate_legacy_steps(store, self.now_hint)?;
         Ok(())
     }
 

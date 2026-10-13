@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 use crate::group::message::GroupMessage;
 use crate::hash::{sha256, Digest32, COMPOSITE_SIG_LEN};
 use crate::identity::composite::{CompositePublicKey, CompositeSignature, RootSigner};
+use crate::log::entry::Entry;
 use crate::transport::framing::{read_frame, write_frame};
 use crate::transport::quic::VoxConnection;
 use crate::transport::streams::{open_typed, StreamKind};
@@ -25,7 +26,13 @@ const MAX_PAGE: usize = PAGE_RECORDS * (MAX_RECORD + 8) + 128;
 pub(crate) struct Record {
     pub room: Digest32,
     pub message: GroupMessage,
-    signature: CompositeSignature,
+    proof: Proof,
+}
+
+enum Proof {
+    Private(Box<CompositeSignature>),
+    /// Preserve the original author's signature and entry identity during upgrade.
+    Legacy(Box<Entry>),
 }
 
 impl Record {
@@ -47,17 +54,38 @@ impl Record {
         Ok(Self {
             room,
             message,
-            signature,
+            proof: Proof::Private(Box::new(signature)),
+        })
+    }
+
+    pub fn legacy(entry: Entry) -> Result<Self> {
+        let message = GroupMessage::from_wire(
+            entry
+                .payload
+                .as_deref()
+                .ok_or(Error::MalformedBundle("legacy Session body missing"))?,
+        )?;
+        Ok(Self {
+            room: entry.skeleton.channel_id,
+            message,
+            proof: Proof::Legacy(Box::new(entry)),
         })
     }
 
     pub fn wire(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(4)
-            .uint(1)
-            .bytes(&self.room)
-            .bytes(&self.message.to_wire())
-            .bytes(&self.signature.to_bytes());
+        match &self.proof {
+            Proof::Private(signature) => {
+                e.array(4)
+                    .uint(1)
+                    .bytes(&self.room)
+                    .bytes(&self.message.to_wire())
+                    .bytes(&signature.to_bytes());
+            }
+            Proof::Legacy(entry) => {
+                e.array(2).uint(2).bytes(&entry.to_wire());
+            }
+        }
         e.finish()
     }
 
@@ -66,21 +94,24 @@ impl Record {
             return Err(Error::SizeLimitExceeded("private Session record"));
         }
         let mut d = Decoder::new(bytes);
-        if d.array()? != 4 || d.uint()? != 1 {
-            return Err(Error::MalformedBundle("private Session record version"));
-        }
-        let room = digest(&mut d)?;
-        let message = GroupMessage::from_wire(d.bytes()?)?;
-        let signature: [u8; COMPOSITE_SIG_LEN] = d
-            .bytes()?
-            .try_into()
-            .map_err(|_| Error::InvalidSignatureEncoding)?;
-        d.finish()?;
-        let record = Self {
-            room,
-            message,
-            signature: CompositeSignature::from_bytes(&signature)?,
+        let record = match (d.array()?, d.uint()?) {
+            (4, 1) => {
+                let room = digest(&mut d)?;
+                let message = GroupMessage::from_wire(d.bytes()?)?;
+                let signature: [u8; COMPOSITE_SIG_LEN] = d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| Error::InvalidSignatureEncoding)?;
+                Self {
+                    room,
+                    message,
+                    proof: Proof::Private(Box::new(CompositeSignature::from_bytes(&signature)?)),
+                }
+            }
+            (2, 2) => Self::legacy(Entry::from_wire(d.bytes()?)?)?,
+            _ => return Err(Error::MalformedBundle("private Session record version")),
         };
+        d.finish()?;
         if record.wire() != bytes {
             return Err(Error::MalformedBundle(
                 "noncanonical private Session record",
@@ -96,11 +127,33 @@ impl Record {
         {
             return Err(Error::MalformedBundle("private Session binding"));
         }
-        key.verify(&Self::signing_input(room, &self.message), &self.signature)
+        match &self.proof {
+            Proof::Private(signature) => {
+                key.verify(&Self::signing_input(room, &self.message), signature)
+            }
+            Proof::Legacy(entry) => {
+                if entry.skeleton.author_id != self.message.header.author_id
+                    || entry.skeleton.epoch != self.message.header.epoch
+                {
+                    return Err(Error::MalformedBundle("legacy Session binding"));
+                }
+                entry.verify(key)
+            }
+        }
     }
 
     pub fn hash(&self) -> Digest32 {
-        sha256(&self.wire())
+        match &self.proof {
+            Proof::Private(_) => sha256(&self.wire()),
+            Proof::Legacy(entry) => entry.entry_hash(),
+        }
+    }
+
+    pub fn legacy_claimed_ms(&self) -> Option<u64> {
+        match &self.proof {
+            Proof::Legacy(entry) => Some(entry.skeleton.claimed_ms),
+            Proof::Private(_) => None,
+        }
     }
 }
 
