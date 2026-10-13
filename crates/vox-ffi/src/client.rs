@@ -574,6 +574,16 @@ pub struct Member {
     pub key_waits: Option<String>,
 }
 
+/// Current daemon-derived eligibility for individual Trust controls. Refresh when policy
+/// changes; the daemon separately rechecks authorization when the person performs the action.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct IndividualTrustEligibility {
+    /// False for managed group grants, quarantine, or policy still applying locally.
+    pub can_manage_individual_trust: bool,
+    /// User-facing reason when false; empty when eligible.
+    pub reason: String,
+}
+
 /// An entry of the trust keyring.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct TrustedNode {
@@ -2889,8 +2899,33 @@ impl VoxClient {
         Ok(list)
     }
 
-    /// The nodes offered to the keyring (ADR-028 K-15 – K-18), in fingerprint order: as the node
-    /// keeps them, so the TUI and the app always agree, dismissals included.
+    /// Whether current daemon policy permits individual Trust controls for this fingerprint.
+    /// This is a current observation; mutations check policy again when performed.
+    ///
+    /// # Errors
+    /// Invalid fingerprint, unavailable node, or daemon refusal.
+    pub async fn individual_trust_eligibility(
+        &self,
+        fingerprint: String,
+    ) -> Result<IndividualTrustEligibility, VoxError> {
+        let member = digest(&fingerprint)?;
+        on_held!(self, |c| {
+            match ask(c, &Request::IndividualTrustEligibility { member }).await? {
+                Frame::IndividualTrustEligibility { can_manage, reason } => {
+                    Ok(IndividualTrustEligibility {
+                        can_manage_individual_trust: can_manage,
+                        reason,
+                    })
+                }
+                _ => Err(failed(
+                    "the node did not report individual trust eligibility",
+                )),
+            }
+        })
+    }
+
+    /// The current keyring offers in fingerprint order, including local dismissals.
+    /// Presence alone is not individual-trust eligibility.
     ///
     /// # Errors
     /// The node's refusal.

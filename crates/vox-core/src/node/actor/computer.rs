@@ -4,6 +4,51 @@ use crate::identity::composite::RootSigner;
 use crate::node::trust::HistoryGrant;
 
 impl NodeHandle {
+    /// Current daemon policy for rendering individual Trust actions. This is an observation,
+    /// never an authorization token: every mutation reconciles and checks policy again.
+    pub fn individual_trust_eligibility(&self, peer: Digest32) -> (bool, String) {
+        let view = self.view();
+        let Some(me) = view.identity.as_ref().map(|id| id.fingerprint) else {
+            return (
+                false,
+                "make this node Ready before changing individual trust".into(),
+            );
+        };
+        if self.cmd_tx.is_closed() || view.locked || view.locking {
+            return (
+                false,
+                "make this node Ready before changing individual trust".into(),
+            );
+        }
+        if me == peer {
+            return (false, "a node does not grant trust to itself".into());
+        }
+        let Some(computer) = &self.computer else {
+            return (true, String::new());
+        };
+        let applied = self
+            .computer_revision
+            .load(std::sync::atomic::Ordering::Acquire);
+        if !computer.policy_current(applied) {
+            return (
+                false,
+                "computer policy is pending application on this node".into(),
+            );
+        }
+        let result = match computer.capability(me, &peer) {
+            Ok(Some(_)) => (false, "this node's trust is managed by My computers".into()),
+            Ok(None) => (true, String::new()),
+            Err(e) => (false, e.to_string()),
+        };
+        if !computer.policy_current(applied) {
+            return (
+                false,
+                "computer policy changed; refresh before changing individual trust".into(),
+            );
+        }
+        result
+    }
+
     /// Ask the already attached node to sign its management binding and durably apply policy.
     pub async fn reconcile_computer(&self) -> crate::error::Result<()> {
         let (reply, rx) = oneshot::channel();
