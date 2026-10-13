@@ -73,3 +73,17 @@ room-ask diff still selects both adapters, and each decides whether its prior pa
 Product dependencies use module-level granularity: an unrelated function in a reached
 host, actor, or channel module can invalidate the observation. This is not a claim of
 function-precise product dependency analysis; proof methods and local apparatus are isolated.
+
+The measured app room-ask adapter at `53006a5f` passed its actual selected XCTest in
+51.819 seconds: the nested app driver exited zero. Its enclosing old command exited one
+because it incorrectly treated an unrelated skipped LaunchProof as failure; the corrected
+parser uses the actual selected test result. The CLI adapter's measured pass is bound to
+`2e266787`. Genuine logs can be imported on corrected-driver-only copies of these sources
+to demonstrate unchanged-flow retention without replaying either feature proof.
+
+The current-main composition changes no production source. It preserves current native
+helpers and the full Session privacy journey, which the room-ask selector explicitly skips.
+This composition does not inherit unchanged fingerprints blindly: newer Ready/Locked CLI
+behavior and app menu apparatus change relevant inputs. Those differences are reported,
+not concealed by rebinding old observations as new runtime evidence. No integration-only
+fixer-green replay is required or claimed.
