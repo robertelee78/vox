@@ -121,11 +121,13 @@ pub enum StructTag {
     /// admitting member signed, so every member learns of the newcomer while it is offline. It
     /// carries no signature of its own: the witness is the evidence.
     AdmissionNotice = 0x0020,
+    /// The room's complete signed anchor set (ADR-032 AN-5).
+    RoomAnchors = 0x0021,
 }
 
 impl StructTag {
     /// All registered tags, in ascending order.
-    pub const ALL: [StructTag; 28] = [
+    pub const ALL: [StructTag; 29] = [
         StructTag::LogEntry,
         StructTag::Skdm,
         StructTag::AdminCert,
@@ -154,6 +156,7 @@ impl StructTag {
         StructTag::IdentityClaim,
         StructTag::RoomName,
         StructTag::AdmissionNotice,
+        StructTag::RoomAnchors,
     ];
 
     /// The 2-byte tag value.
@@ -290,6 +293,7 @@ impl StructTag {
             StructTag::IdentityProve => "vox-id/v2/resp",
             StructTag::IdentityClaim => "vox-id/v2/init",
             StructTag::RoomName => "vox/room-name/v1",
+            StructTag::RoomAnchors => "vox/room-anchors/v1",
             StructTag::AdmissionNotice => "vox/admission-notice/v1",
         }
     }

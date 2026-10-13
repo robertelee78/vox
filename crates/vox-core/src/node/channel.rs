@@ -93,12 +93,7 @@ const SEG_AUTHORS: u64 = 2;
 const SEG_RECEIVERS: u64 = 3;
 /// Segment id of this identity's sender chain in `KeyMaterial`.
 const SEG_SENDER: u64 = 1;
-/// The anchors segment id within [`SegmentKind::KeyMaterial`] (M15.1): the
-/// bootstrap nodes this channel's records are published to and read from — the
-/// configured set plus whatever the invite link that brought this node in named.
-/// A node that forgot them after a restart could not republish its address and
-/// would fall off the swarm.
-const SEG_ANCHORS: u64 = 4;
+// KeyMaterial slot 4 held unsigned bootstrap hints. It is not room authority.
 /// The offered-services segment id within [`SegmentKind::KeyMaterial`] (ADR-013,
 /// M16.1): the `service_tag → local address` map this node **binds** for this
 /// channel. Host configuration, not authorization — who may *reach* it is the host's
@@ -122,8 +117,7 @@ const SEG_DELIVERED: u64 = 7;
 ///
 /// Persisted because it is republished with every member bundle record, for as long
 /// as this node is a member. A node that forgot it after a restart could publish no
-/// bundle at all, and would fall off every board — the same reason `SEG_ANCHORS`
-/// exists.
+/// bundle at all, and would fall off every board.
 const SEG_ADMISSION: u64 = 8;
 
 /// Version of an entry's retention record: the `Index` segment sharing its `LogDb` id,
@@ -924,8 +918,6 @@ pub struct ChannelState {
     /// (M14.5b). Present only for authors that consented; its presence is what
     /// makes their content readable.
     receivers: BTreeMap<(Digest32, u64), ReceiverChain>,
-    /// The anchors this channel is published to (M15.1), persisted in `SEG_ANCHORS`.
-    anchors: BootstrapSet,
     /// The services this node offers in this channel (ADR-013 Bind config, M16.1),
     /// persisted in `SEG_SERVICES` — except those in `transient`.
     services: BTreeMap<String, SocketAddr>,
@@ -1797,7 +1789,6 @@ impl ChannelState {
             held_packages: Vec::new(),
             gov_entries: Vec::new(),
             receivers: BTreeMap::new(),
-            anchors: BootstrapSet::new(),
             services: BTreeMap::new(),
             kinds: BTreeMap::new(),
             transient: BTreeSet::new(),
@@ -1829,6 +1820,9 @@ impl ChannelState {
         // member that joins reads it there (ADR-028 R-1).
         let statement = crate::governance::name::RoomName::build(signer, &channel_id, epoch, name)?;
         room.append_governance(profile, &statement.to_wire(), now_ms)?;
+        // A fresh room chooses no anchors until its creator or an admin says otherwise.
+        // Machine configuration and join-link hints never supply room authority (AN-5/AN-9).
+        room.set_anchors(profile, &BootstrapSet::new(), now)?;
         Ok(room)
     }
 
@@ -2161,15 +2155,6 @@ impl ChannelState {
                 }
                 None => BTreeMap::new(),
             };
-        // The anchors this channel is published to (M15.1). A channel from before the
-        // segment existed has none recorded, which is what it had.
-        let anchors = match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_ANCHORS)? {
-            Some(seg) => {
-                let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_ANCHORS, &seg)?;
-                BootstrapSet::from_bytes(&bytes)?
-            }
-            None => BootstrapSet::new(),
-        };
         // The services this node offers here (ADR-013 M16.1).
         let (services, kinds) =
             match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_SERVICES)? {
@@ -2313,7 +2298,6 @@ impl ChannelState {
             held_packages: Vec::new(),
             gov_entries,
             receivers,
-            anchors,
             services,
             kinds,
             transient: BTreeSet::new(),
@@ -2579,7 +2563,6 @@ impl ChannelState {
             held_packages: Vec::new(),
             gov_entries: Vec::new(),
             receivers: BTreeMap::new(),
-            anchors: BootstrapSet::new(),
             services: BTreeMap::new(),
             kinds: BTreeMap::new(),
             transient: BTreeSet::new(),
@@ -2934,44 +2917,11 @@ impl ChannelState {
         Ok(true)
     }
 
-    /// The anchors this channel is published to and read from (M15.1).
+    /// Only the room's signed governance supplies its anchors. Until that history arrives,
+    /// no room anchors are known; the current join uses its separate operation-scoped routes.
     #[must_use]
-    pub fn anchors(&self) -> &BootstrapSet {
-        &self.anchors
-    }
-
-    /// Add anchors for this channel — the set is persisted sealed under the SEK
-    /// like every other per-channel segment, so a restart still knows where the
-    /// swarm's board is. Returns how many were new.
-    pub fn add_anchors(&mut self, store: &Store, more: &BootstrapSet) -> Result<usize> {
-        let before = self.anchors.clone();
-        // `merge_endpoints`, not `merge`: an anchor that moved is the same identity at a
-        // new address, and `merge` keeps the first entry per identity and drops the rest.
-        // A room would otherwise go on handing out the address its anchor had when the
-        // room was made, in every invite link, for ever.
-        self.anchors.merge_endpoints(more)?;
-        // Compared whole, not by counting addresses: a move replaces one address with
-        // another, which leaves the count where it was (V210-75).
-        if self.anchors == before {
-            return Ok(0);
-        }
-        let seg = seal_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_ANCHORS,
-            &self.anchors.to_bytes(),
-        )?;
-        if let Err(e) = store.put_segment(
-            &self.channel_id,
-            SegmentKind::KeyMaterial,
-            SEG_ANCHORS,
-            &seg,
-        ) {
-            self.poisoned = true;
-            self.save_error = Some(e.to_string());
-            return Err(e);
-        }
-        Ok(self.anchors.len().saturating_sub(before.len()))
+    pub fn anchors(&self) -> BootstrapSet {
+        self.evaluator.room_anchors().cloned().unwrap_or_default()
     }
 
     /// A shared handle to this channel's evaluator, for a task that must keep asking
@@ -7551,6 +7501,29 @@ impl ChannelState {
                 now.get(),
             )
             .is_granted()
+    }
+
+    /// Replace the room's complete anchor set with an authorized signed statement.
+    pub fn set_anchors(
+        &mut self,
+        profile: &Profile,
+        anchors: &BootstrapSet,
+        now: crate::time::Ms,
+    ) -> Result<()> {
+        let signer = profile.signer()?;
+        if !self.may_rename(&signer.fingerprint(), now) {
+            return Err(Error::MalformedGovernance(
+                "only the room's creator or an admin may change its anchors",
+            ));
+        }
+        let statement = crate::governance::anchors::RoomAnchors::build(
+            signer,
+            &self.channel_id,
+            self.epoch,
+            anchors,
+        )?;
+        self.append_governance(profile, &statement.to_wire(), now.get())?;
+        Ok(())
     }
 
     /// Name the room `name` for every member (ADR-028 R-1): append a room-name statement. Only

@@ -80,6 +80,7 @@
 //! No stubs, no `todo!()`, no shortcuts. Every type here is complete and tested,
 //! and the evaluator is golden-vector-gated.
 
+pub mod anchors;
 pub mod capability;
 pub mod cert;
 pub mod consent;
