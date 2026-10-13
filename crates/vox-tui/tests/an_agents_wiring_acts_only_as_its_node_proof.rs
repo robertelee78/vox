@@ -856,7 +856,7 @@ fn setup_makes_a_node_for_each_installed_harness() {
             !renamed && refused.contains("could not be renamed"),
             "APPARATUS: the source-directory ACL did not stage an OS rename failure: {refused}"
         );
-        assert!(refused.contains("its previous attachment and remembered state were restored")
+        assert!(refused.contains("its previous node state and remembered state were restored")
         && retained.contains(" Locked") && retained.contains("(remembered)")
         && d.listed("rename-cannot-land").is_empty(),
         "PRODUCT: a denied rename must restore the old detached, remembered node: {refused}; node list: {retained}");

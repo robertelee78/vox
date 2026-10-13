@@ -69,7 +69,7 @@ struct ComputerTrustView: View {
                         }
                         pairing(status)
                         if !status.pendingNodes.isEmpty {
-                            Text("Waiting for these nodes to attach or apply computer trust:")
+                            Text("Waiting for these nodes to become Ready or apply computer trust:")
                                 .secondaryText()
                             Text(status.pendingNodes.joined(separator: ", "))
                                 .textSelection(.enabled)

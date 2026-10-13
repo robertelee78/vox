@@ -1648,7 +1648,7 @@ impl AccountArgs {
     }
 }
 
-/// `vox node create|attach|detach|list`.
+/// `vox node create|unlock|lock|list`.
 #[derive(Subcommand, Debug, Clone)]
 pub enum NodeCmd {
     /// Make a new node: an identity with its own rooms, trust and services. Its files are
@@ -1732,8 +1732,7 @@ pub enum NodeCmd {
         #[command(flatten)]
         account: AccountArgs,
     },
-    /// Sign a node out: detach it, stop keeping it (its `.daemon/attach` line and Keychain
-    /// passphrase go), and forget the app's choice of it, so nothing brings it back without you.
+    /// Forget a node and the app's choice of it: remove its remembered state and saved passphrase.
     /// Its rooms and messages stay on disk; `vox node unlock` uses it again.
     #[command(hide = true)]
     Signout {
@@ -1832,7 +1831,7 @@ where
 #[derive(Args, Debug, Clone)]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct AnchorArgs {
-    /// `vox node create|attach|detach|list`; without one, `vox node` runs the anchor.
+    /// `vox node create|unlock|lock|list`; without one, `vox node` runs the anchor.
     #[command(subcommand)]
     pub cmd: Option<NodeCmd>,
     #[command(flatten)]
@@ -2252,13 +2251,13 @@ enum Cmd {
     ///
     /// echo 'my passphrase' | vox daemon --node alice
     ///
-    /// `--keep` attaches that node again whenever the daemon starts. When a daemon already runs
+    /// `--keep` remembers how to make that node Ready when the daemon starts. When a daemon already runs
     /// for this data root, a `vox daemon --node <name>` makes the node Ready to it instead.
     ///
     /// You rarely need to start it by hand: `vox serve`, `connect`, `up`, `forward`,
     /// `lan up`, `vox node unlock` and the TUI start one in the background when none runs, and
     /// that one exits when it has no node and no client left. One started here runs until
-    /// stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each detaches every node cleanly
+    /// stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops every node cleanly
     /// and stops it.
     Daemon(DaemonArgs),
     /// Offer a local TCP port as a room-bound service, in one command.
@@ -2345,7 +2344,7 @@ enum Cmd {
     /// This is how a tool reaches a room-bound service by name — the same shape a Tor user
     /// reaches a `.onion` through, and for the same reason: it needs no privilege of any
     /// kind. `ssh` is pointed at it with one `ProxyCommand` line, which `vox up` prints;
-    /// most other tools take `ALL_PROXY=socks5h://…`. Attaches this node if it is not, prints
+    /// most other tools take `ALL_PROXY=socks5h://…`. Makes this node Ready if it is not, prints
     /// and exits; `--watch` stays and prints what the proxy refuses until stopped (SIGINT,
     /// SIGTERM, SIGHUP or SIGQUIT).
     Up(UpArgs),

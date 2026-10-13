@@ -113,10 +113,10 @@ pub async fn doctor(paths: &Paths, room: Option<&str>, json: bool) -> Result<(),
                 e.to_string(),
                 match paths.profile_dir.file_name() {
                     Some(n) => format!(
-                        "attach this node: {} (it starts the daemon if none runs)",
+                        "unlock this node: {} (it starts the daemon if none runs)",
                         vox_text::shell::command(&["vox", "node", "unlock", &n.to_string_lossy()])
                     ),
-                    None => "attach this node with vox node unlock and its name (it starts the \
+                    None => "unlock this node with vox node unlock and its name (it starts the \
                              daemon if none runs)"
                         .to_owned(),
                 },

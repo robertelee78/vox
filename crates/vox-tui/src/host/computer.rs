@@ -32,7 +32,7 @@ impl Router {
                         .find(|(name, _)| name == info.name.as_str())
                     else {
                         pending.push(format!(
-                            "{}: attach this node to apply computer trust",
+                            "{}: make this node Ready to apply computer trust",
                             info.name
                         ));
                         continue;

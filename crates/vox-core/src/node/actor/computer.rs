@@ -42,7 +42,7 @@ impl Node {
             return computer.bind_node(s.as_ref(), name, false);
         }
         Err(Error::Profile(
-            "managed node awaits its ordinary attach passphrase",
+            "managed node needs its passphrase to become Ready",
         ))
     }
 
