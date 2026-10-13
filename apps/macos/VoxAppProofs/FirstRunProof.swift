@@ -701,6 +701,15 @@ final class FirstRunProof: XCTestCase {
         let plainAfterForget = try staged(vox, ["node", "list"], env: voxEnv)
         XCTAssertTrue(nodeLine(plainAfterForget, "plain")?.contains("Ready") == true,
                       "PRODUCT: a passphraseless node must remain Ready through Forget and restart; \(plainAfterForget)")
+        XCTAssertTrue(nodeLine(plainAfterForget, "alice")?.contains("Ready") == true,
+                      "PRODUCT: Unlock in the app must remember alice even with Keep Running Off; \(plainAfterForget)")
+        words(ui, Key.id("machine-alice"), timeout: 90,
+              "alice unlocked in the app must return Ready after restart without another passphrase",
+              until: { $0 == "alice Ready" })
+        XCTAssertEqual(read("login-item"), "no", "PRODUCT: Unlock must leave Keep Running Off")
+        tap(ui, Key.id("room-lifecycle"), "Open the retained room after the app's remembered Unlock and restart")
+        present(ui, Key.showing("LIFECYCLE-BODY-PRESERVED"), timeout: 30,
+                "alice's original complete message must remain visible after remembered Unlock and restart")
         // Nothing here registered a real login item: none is loaded for this user.
         let uid = stager.run(["/usr/bin/id", "-u"], env: [:]).out.trimmingCharacters(in: .whitespacesAndNewlines)
         // Only the proof build's own: the person's own Vox (us.vox.app) may have its login item
