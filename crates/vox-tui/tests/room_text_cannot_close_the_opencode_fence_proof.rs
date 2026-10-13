@@ -746,10 +746,13 @@ fn room_text_cannot_close_the_plugins_fence_nor_pass_as_the_user() {
         "A-HELD-BEFORE-MOVE",
     );
     bind(session, other_room);
+    // This valid urgent post must succeed without a foreign pending-wake obligation.
+    // Several false wakes are ambiguous for a nonurgent post (which may omit its re),
+    // but would wrongly refuse an urgent post. No --to: this post wakes nobody else.
     let moved_post = post_in(
         other_room,
         session,
-        &["--type", "answer"],
+        &["--type", "answer", "--urgent"],
         "B-FRESH-AFTER-MOVE",
     );
     let (ok, rows, err) = vox(&data, &cfg, &["room", "read", other_room, "--json"], "");
@@ -766,7 +769,7 @@ fn room_text_cannot_close_the_plugins_fence_nor_pass_as_the_user() {
             panic!("PRODUCT: the moved structured post has no envelope: {posted}; {e}")
         });
     assert!(envelope.get("re").is_none_or(serde_json::Value::is_null),
-        "PRODUCT: an ask received outside the session's saved room must not become its implicit reply after a move: {posted}");
+        "PRODUCT: a valid urgent post must not inherit an implicit reply from an ask received outside the session's saved room before the move: {posted}");
     let moved_turn = host.ask("turn first turn after deliberate move", turn_within);
     let text = moved_turn["text"].as_str().unwrap_or_default();
     assert!(
