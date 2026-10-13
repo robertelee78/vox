@@ -124,11 +124,13 @@ final class NodeModel: ObservableObject {
         didSet {
             roomReadGeneration = UUID()
             rejectedRoomMark = nil
+            if case .room = selection { roomNeedsPage = true } else { roomNeedsPage = false }
         }
     }
     private var roomReadGeneration = UUID()
     private var rejectedRoomMark: String?
     private var roomMessageRevision = UUID()
+    private var roomNeedsPage = false
     /// The first message that was unread when the room came on screen, and how many were: where
     /// the timeline draws its unread line. It stays while the room is on screen; what arrives
     /// meanwhile is read as it is shown.
@@ -533,7 +535,7 @@ final class NodeModel: ObservableObject {
         do {
             let rows: [RoomMessage]
             var recovery: FfiRoomRead?
-            if let after = messages.last?.id, after != rejectedRoomMark {
+            if !roomNeedsPage, let after = messages.last?.id, after != rejectedRoomMark {
                 do {
                     rows = try await client.read(room: id, after: after, limit: 0)
                 } catch where Self.rejectedForwardMark(error) {
@@ -564,6 +566,7 @@ final class NodeModel: ObservableObject {
                 messages = page.messages
                 if let recoveredMembers { members = recoveredMembers }
                 rejectedRoomMark = nil
+                roomNeedsPage = false
                 lastRead[id] = page.messages.last?.id
             }
             for message in new { arrived(message, in: id) }
@@ -823,6 +826,8 @@ final class NodeModel: ObservableObject {
         }
         guard case let .room(id) = selection, ended == nil else { return }
         let generation = roomReadGeneration
+        let messageRevision = roomMessageRevision
+        roomNeedsPage = true
         if !seeded.contains(id), let rows = try? await client.unread(room: id) {
             seeded.insert(id)
             for message in rows { count(message, in: id) }
@@ -844,6 +849,7 @@ final class NodeModel: ObservableObject {
             let done = (try? await client.notices(room: id)) ?? []
             let listed = (try? await client.sessions(room: id)) ?? []
             guard generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
+            guard messageRevision == roomMessageRevision else { return }
             // The page and its inspector replace the prior view together, after both reads
             // have succeeded. An ordinary refresh must not publish a half-empty room.
             roomOlder = page.older
@@ -851,6 +857,7 @@ final class NodeModel: ObservableObject {
             unreadFrom = read.first { unreadIDs.contains($0.id) }?.id
             unreadCount = unread.count
             messages = read
+            roomNeedsPage = false
             roomServices = services
             members = rows
             retention = kept
@@ -1838,6 +1845,7 @@ final class NodeModel: ObservableObject {
     fileprivate func stopped(_ text: String) {
         roomReadGeneration = UUID()
         rejectedRoomMark = nil
+        roomNeedsPage = false
         ended = text
         // A detach is delivered by a live daemon; a stopped event stream cannot report
         // the daemon's current state. The word "daemon" occurs in both sentences.
