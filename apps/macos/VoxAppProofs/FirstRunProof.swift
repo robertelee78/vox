@@ -1147,12 +1147,20 @@ final class FirstRunProof: XCTestCase {
         words(ui, Key.id("machine-bob"), timeout: 10, "the sidebar's foot must list bob and his state (G5)",
               until: { $0 == "bob attached" })
         let foot = locate(ui, Key.id("on-this-machine"))?.frame ?? .null
-        let roomList = ui.scrollViews.matching(identifier: "sidebar-rooms").firstMatch.frame
-        let nodeScroll = ui.scrollViews.matching(identifier: "machine-nodes-scroll").firstMatch.frame
+        let roomListElement = ui.scrollViews.matching(identifier: "sidebar-rooms").firstMatch
+        let nodeScrollElement = ui.scrollViews.matching(identifier: "machine-nodes-scroll").firstMatch
+        guard roomListElement.exists, nodeScrollElement.exists else {
+            throw Product("the sidebar must expose its room list and machine-node scroll container")
+        }
+        let roomList = roomListElement.frame
+        let nodeScroll = nodeScrollElement.frame
         let footer = locate(ui, Key.id("machine-footer"))?.frame ?? .null
         let window = ui.windows.firstMatch.frame
-        XCTAssertTrue(!foot.isNull && !footer.isNull && !roomList.isEmpty && !nodeScroll.isEmpty
-                      && foot.minY >= roomList.maxY && nodeScroll.minY >= foot.maxY
+        guard [roomList, nodeScroll, foot, footer, window].allSatisfy({ frame in
+            frame.minX.isFinite && frame.minY.isFinite && frame.width.isFinite && frame.height.isFinite
+                && frame.width > 0 && frame.height > 0
+        }) else { throw Apparatus("the sidebar's public geometry was not finite and positive") }
+        XCTAssertTrue(foot.minY >= roomList.maxY && nodeScroll.minY >= foot.maxY
                       && footer.minY >= nodeScroll.maxY && window.contains(foot) && window.contains(footer),
                       "PRODUCT: the machine title and footer must remain visible below the room list, around the bounded node scroll; rooms=\(roomList), title=\(foot), rows=\(nodeScroll), footer=\(footer)")
 
@@ -1330,14 +1338,26 @@ final class FirstRunProof: XCTestCase {
         let machineScroll = ui.scrollViews.matching(identifier: "machine-nodes-scroll").firstMatch
         let ninthNode = ui.descendants(matching: .any).matching(identifier: "machine-local-9").firstMatch
         guard machineScroll.exists else { throw Product("the machine footer must expose its scrollable saved-node list") }
+        func machineFrameDrawn(_ frame: CGRect) -> Bool {
+            frame.minX.isFinite && frame.minY.isFinite && frame.width.isFinite && frame.height.isFinite
+                && frame.width > 0 && frame.height > 0
+        }
+        guard machineFrameDrawn(machineScroll.frame), machineFrameDrawn(ui.windows.firstMatch.frame) else {
+            throw Apparatus("the machine scroll/window geometry was not finite and positive")
+        }
         let ninthUntil = Date().addingTimeInterval(15)
-        while Date() < ninthUntil && !(ninthNode.exists && machineScroll.frame.contains(ninthNode.frame)) {
+        while Date() < ninthUntil && !(ninthNode.exists && machineFrameDrawn(ninthNode.frame)
+                                      && machineScroll.frame.contains(ninthNode.frame)) {
             machineScroll.scroll(byDeltaX: 0, deltaY: -100)
         }
-        XCTAssertTrue(ninthNode.exists && !ninthNode.frame.isEmpty && machineScroll.frame.contains(ninthNode.frame),
+        XCTAssertTrue(ninthNode.exists && machineFrameDrawn(ninthNode.frame) && machineScroll.frame.contains(ninthNode.frame),
                       "PRODUCT: the ninth saved node must be reachable by scrolling the machine footer")
         let machineTitle = el(ui, Key.id("on-this-machine")).frame
         let machineFooter = el(ui, Key.id("machine-footer")).frame
+        guard machineFrameDrawn(machineTitle), machineFrameDrawn(machineFooter),
+              machineFrameDrawn(ui.windows.firstMatch.frame) else {
+            throw Apparatus("the machine title/footer/window geometry was not finite and positive")
+        }
         XCTAssertTrue(ui.windows.firstMatch.frame.contains(machineTitle) && ui.windows.firstMatch.frame.contains(machineFooter),
                       "PRODUCT: scrolling saved nodes must keep the machine title and footer visible")
 
