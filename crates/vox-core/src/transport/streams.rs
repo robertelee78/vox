@@ -60,6 +60,8 @@ pub enum StreamKind {
     Seat = 12,
     /// Drive-authorized Session records outside the public room log (ADR-031 SA-7).
     Session = 13,
+    /// Optional signed node-name metadata, independent of room and trust authority (#796).
+    Presentation = 15,
 }
 
 /// The largest kind frame we will read: `[kind]` is 2 bytes; anything bigger is
@@ -84,6 +86,7 @@ impl StreamKind {
             11 => Some(Self::Identity),
             12 => Some(Self::Seat),
             13 => Some(Self::Session),
+            15 => Some(Self::Presentation),
             _ => None,
         }
     }

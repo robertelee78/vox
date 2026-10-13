@@ -842,8 +842,50 @@ final class NodeModel: ObservableObject {
 
     /// Trust `fingerprint` as `alias`, granting read, and drive as well when `drive` (K-14,
     /// K-16). Whether it was done.
+    /// Self-names are ephemeral metadata, never keyring or grants.
+    @Published var presentedNames: [String: String] = [:]
+
+    private func rememberPresentation(_ fingerprint: String, _ name: String) {
+        if presentedNames[fingerprint] == nil, presentedNames.count >= 4096, let oldest = presentedNames.keys.sorted().first { presentedNames.removeValue(forKey: oldest) }
+        presentedNames[fingerprint] = name
+    }
+
+    func presentedDisplayName(_ fingerprint: String, _ name: String) -> String {
+        let otherNames = presentedNames.filter { $0.key != fingerprint }.map { $0.value }
+            + trusted.filter { $0.fingerprint != fingerprint }.map { $0.name }
+            + offers.filter { $0.fingerprint != fingerprint }.map { $0.presentedName }
+        return clashingAlias(others: otherNames, alias: name) == nil ? name : name + "#" + fingerprint.prefix(6)
+    }
+
+    func identityInput(_ text: String) -> CopiedIdentity? {
+        let raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if raw.hasSuffix(">"), let start = raw.range(of: " <", options: .backwards) {
+            let name = String(raw[..<start.lowerBound])
+            let tail = raw[start.upperBound...].dropLast()
+            let fp = tail.filter { !$0.isWhitespace && $0 != "-" && $0 != "·" }.lowercased()
+            return try? parseCopiedIdentity(text: "\(name) <\(fp)>")
+        }
+        return try? parseCopiedIdentity(text: raw.filter { !$0.isWhitespace && $0 != "-" && $0 != "·" }.lowercased())
+    }
+
+    func presentedName(_ fingerprint: String) async -> String? {
+        guard let identity = identityInput(fingerprint) else { return nil }
+        if let name = try? await client.presentedName(fingerprint: identity.fingerprint) {
+            rememberPresentation(identity.fingerprint, name)
+            return name
+        }
+        return nil
+    }
+
+    func suggestedName(_ identity: String) async -> String? {
+        guard let parsed = identityInput(identity) else { return nil }
+        if let name = parsed.name { return name }
+        return await presentedName(parsed.fingerprint)
+    }
+
     func trust(_ fingerprint: String, as alias: String, drive: Bool) async -> Bool {
-        let fp = fingerprint.filter { !$0.isWhitespace && $0 != "-" && $0 != "·" }.lowercased()
+        guard let parsed = identityInput(fingerprint) else { return false }
+        let fp = parsed.fingerprint
         return await keyringChange(fingerprint: fp, alias: alias,
                                    words: "trust \(alias), \(Capability.words(drive))",
                                    action: "Trust") { [client] pass in
@@ -1641,11 +1683,16 @@ final class NodeModel: ObservableObject {
         let back = Set(consents.inbound)
         // Their trust in this node, whether or not this node trusts them (D4): both directions.
         if back != trustsMe { trustsMe = back }
+        for member in roster where !member.presentedName.isEmpty { rememberPresentation(member.fingerprint, member.presentedName) }
+        let displayNames = roster.map { m in (m.fingerprint, m.name.isEmpty ? m.presentedName : m.name) }
         return roster.filter { $0.fingerprint != me }.map { m in
             let trust = Trust.of(inKeyring: keyring[m.fingerprint] != nil,
                                  trustsYou: back.contains(m.fingerprint))
+            let rawName = m.name.isEmpty ? m.presentedName : m.name
+            let clash = clashingAlias(others: displayNames.filter { $0.0 != m.fingerprint }.map { $0.1 }, alias: rawName) != nil
+            let shown = rawName.isEmpty ? String(m.fingerprint.prefix(12)) : rawName + (clash ? "#" + m.fingerprint.prefix(6) : "")
             return MemberRow(id: m.fingerprint,
-                             name: m.name.isEmpty ? String(m.fingerprint.prefix(12)) : m.name,
+                             name: m.name.isEmpty && !m.presentedName.isEmpty ? "\(shown) · \(m.fingerprint.prefix(12))" : shown,
                              trust: trust, drive: keyring[m.fingerprint] ?? false,
                              trustsYou: back.contains(m.fingerprint),
                              keyWaits: m.keyWaits)

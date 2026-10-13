@@ -2150,8 +2150,8 @@ final class FirstRunProof: XCTestCase {
         let data = root.appendingPathComponent("data").path
         let config = root.appendingPathComponent("config").path
         let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
-        // Attached nodes on Alice's daemon can become trusted automatically (#724). Carol
-        // must really be a peer on another daemon for this manual-offer journey.
+        // Attached nodes on Alice's daemon can become trusted automatically (#724). Bob and
+        // Carol must both be peers on another daemon for this manual-trust journey.
         let carolRoot = root.appendingPathComponent("carol-host")
         let carolEnv = ["VOX_DATA_DIR": carolRoot.appendingPathComponent("data").path,
                         "VOX_CONFIG_DIR": carolRoot.appendingPathComponent("config").path,
@@ -2169,12 +2169,13 @@ final class FirstRunProof: XCTestCase {
                                     until: "vox daemon: control socket")
         defer { carolDaemon.terminate() }
         for name in ["alice", "bob", "carol"] {
-            let nodeEnv = name == "carol" ? carolEnv : voxEnv
+            let nodeEnv = name == "alice" ? voxEnv : carolEnv
             try staged(vox, ["node", "create", name],
                        env: nodeEnv.merging(["VOX_IDENTITY_PASSPHRASE": "\(name) identity"]) { $1 })
             try staged(vox, ["node", "attach", name, "--passphrase-file", pass(name)], env: nodeEnv)
         }
-        let bobFp = try line(staged(vox, ["id", "--node", "bob"], env: voxEnv)) { $0.count == 52 }
+        let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
+        let bobFp = try line(staged(vox, ["id", "--node", "bob"], env: carolEnv)) { $0.count == 52 }
         let carolFp = try line(staged(vox, ["id", "--node", "carol"], env: carolEnv)) { $0.count == 52 }
         try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", pass("room"),
                          "--name", "pending"], env: voxEnv)
@@ -2184,6 +2185,8 @@ final class FirstRunProof: XCTestCase {
         let link = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
             $0.hasPrefix("vox://")
         }
+        // Bob and Carol are connected but untrusted: presentation must be available before trust.
+        try staged(vox, ["room", "join", "--node", "bob", "--passphrase-file", pass("room"), link], env: carolEnv)
         // Carol joins: alice is offered carol (K-15).
         try staged(vox, ["room", "join", "--node", "carol", "--passphrase-file", pass("room"), link],
                    env: carolEnv)
@@ -2223,7 +2226,14 @@ final class FirstRunProof: XCTestCase {
                             "carol's offer must say what trusting her gives") ?? ""
         XCTAssertFalse(explain.lowercased().contains("drive"),
                        "PRODUCT: the offer must say trusting gives read, with no drive (the app gives none); it says \(explain.debugDescription)")
-        type(ui, Key.id("offer-alias"), "carol", "carol's alias field")
+        words(ui, Key.id("offer-presented-name"), timeout: 90,
+              "Carol must present her own name before Alice trusts her", until: { $0 == "Name it presents: carol" })
+        words(ui, Key.id("offer-fingerprint"), timeout: 10,
+              "the suggested name must keep Carol's whole fingerprint visible", until: {
+                  $0.filter { !$0.isWhitespace }.lowercased() == carolFp
+              })
+        words(ui, Key.id("offer-alias"), timeout: 10,
+              "Carol's presented name must be the editable local alias default, without typing", until: { $0 == "carol" }, field: true)
         tap(ui, Key.id("offer-accept"), "Trust on carol's offer")
         present(ui, Key.id("keyring-passphrase-continue"), timeout: 15,
                 "Trust on carol's offer, the keyring window closed, must ask for the passphrase")
@@ -2235,14 +2245,21 @@ final class FirstRunProof: XCTestCase {
               until: { $0.contains("This node's identity has a passphrase") })
         tap(ui, Key.id("keyring-passphrase-cancel"), "Cancel in the passphrase form")
         present(ui, Key.id("offer-accept"), timeout: 10, "Cancel must bring back the offer's Trust")
+        tap(ui, Key.id("offer-alias"), "Focus Carol's alias after cancelling")
         el(ui, Key.id("offer-alias")).typeKey("a", modifierFlags: .command)
         el(ui, Key.id("offer-alias")).typeKey(XCUIKeyboardKey.delete.rawValue, modifierFlags: [])
         print("[proof] offer: \(explain.debugDescription); one Trust while the form was open; empty passphrase said needed; Cancel brought Trust back")
 
         // Bob's change, waiting for the passphrase, named.
+        let beforeBobTrust = try staged(vox, ["trust", "list", "--node", "alice"], env: voxEnv)
+        guard !beforeBobTrust.contains(bobFp) else {
+            throw Apparatus("staging not achieved: Bob must be outside Alice's keyring before manual Trust; `vox trust list` said \(beforeBobTrust)")
+        }
+        print("[proof] before manual Trust, Alice's public trust list excludes Bob: \(beforeBobTrust.debugDescription)")
         tap(ui, Key.id("keyring"), "Keyring in the sidebar")
         type(ui, Key.id("keyring-add-fingerprint"), bobFp, "the fingerprint field")
-        type(ui, Key.id("keyring-add-alias"), "bob", "the alias field")
+        words(ui, Key.id("keyring-add-alias"), timeout: 90,
+              "Bob is connected but untrusted: the editable default must be bob without typing", until: { $0 == "bob" }, field: true)
         tap(ui, Key.id("keyring-trust"), "Trust")
         words(ui, Key.id("keyring-passphrase-why"), timeout: 15,
               "a change waiting for the passphrase must name itself",
@@ -2269,7 +2286,10 @@ final class FirstRunProof: XCTestCase {
               "carol's offer must say a keyring change is waiting, and which",
               until: { $0.contains("trust bob") })
         // Trusting carol while bob's waits: asked first; kept.
-        type(ui, Key.id("offer-alias"), "carol", "carol's alias field")
+        tap(ui, Key.id("offer-alias"), "Focus Carol's explicit alias")
+        el(ui, Key.id("offer-alias")).typeKey("a", modifierFlags: .command)
+        el(ui, Key.id("offer-alias")).typeKey(XCUIKeyboardKey.delete.rawValue, modifierFlags: [])
+        type(ui, Key.id("offer-alias"), "carol", "carol's explicit local alias field")
         tap(ui, Key.id("offer-accept"), "Trust on carol's offer")
         present(ui, Key.id("keyring-replace-ask"), timeout: 15,
                 "a second change waiting for the passphrase must ask before replacing the first")
@@ -2288,6 +2308,82 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(list.contains(bobFp) && !list.contains(carolFp),
                       "PRODUCT: the passphrase typed for bob's change must trust bob, and not carol; `vox trust list` says \(list)")
         print("[proof] keyring: bob's change named and waiting; carol's offer showed only the waiting line; a second change asked first; the passphrase trusted bob only")
+
+        // A genuinely disconnected identity has never supplied metadata: manual fallback remains usable.
+        let missingEnv = ["VOX_DATA_DIR": root.appendingPathComponent("missing-data").path,
+                          "VOX_CONFIG_DIR": root.appendingPathComponent("missing-config").path,
+                          "VOX_PROXY": "127.0.0.1:0"]
+        let missingFp = try line(staged(vox, ["id", "--identity-passphrase-file", pass("bob")], env: missingEnv)) { $0.count == 52 }
+        type(ui, Key.id("keyring-add-fingerprint"), missingFp, "an identity with no connection or presented name")
+        words(ui, Key.id("keyring-add-alias"), timeout: 10,
+              "a disconnected identity must leave the manual name field empty", until: { $0.isEmpty }, field: true)
+        type(ui, Key.id("keyring-add-alias"), "manual-fallback", "the manual fallback alias")
+        tap(ui, Key.id("keyring-trust"), "Trust the explicitly named missing-metadata identity")
+        keyringPassphraseIfAsked(ui) { self.run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out.contains(missingFp) }
+        words(ui, Key.id("keyring-capability-manual-fallback"), timeout: 30,
+              "the manual fallback must remain usable and grant read", until: { $0 == "read" })
+
+        // An explicit local override wins over Carol's authenticated default.
+        tap(ui, Key.id("room-pending"), "pending in the sidebar")
+        tap(ui, offer, "Carol's still-waiting offer")
+        words(ui, Key.id("offer-presented-name"), timeout: 30,
+              "Carol's authenticated name stays visible beside her full fingerprint", until: { $0 == "Name it presents: carol" })
+        words(ui, Key.id("offer-explain"), timeout: 10,
+              "a presented name must not conceal that Carol is outside the keyring", until: { $0.contains("not in your keyring") })
+        tap(ui, Key.id("offer-alias"), "Carol's editable default")
+        el(ui, Key.id("offer-alias")).typeKey("a", modifierFlags: .command)
+        el(ui, Key.id("offer-alias")).typeKey(XCUIKeyboardKey.delete.rawValue, modifierFlags: [])
+        type(ui, Key.id("offer-alias"), "local-carol", "the explicit local override")
+        tap(ui, Key.id("offer-accept"), "Trust Carol as local-carol")
+        keyringPassphraseIfAsked(ui) { self.run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out.contains(carolFp) }
+        tap(ui, Key.id("keyring"), "the keyring after accepting Carol")
+        words(ui, Key.id("keyring-capability-local-carol"), timeout: 30,
+              "the local override is accepted with read", until: { $0 == "read" })
+        try staged(vox, ["trust", "add", "--node", "carol", aliceFp, "--name", "alice",
+                         "--identity-passphrase-file", pass("carol")], env: carolEnv)
+
+        // Both read and read + drive remain the person's choices through remote rename/reconnect/rejoin.
+        var remoteName = "carol"
+        for (newName, capability) in [("renamed-carol", "read"), ("carol-again", "read + drive")] {
+            if capability == "read + drive" {
+                try staged(vox, ["trust", "drive", "--node", "alice", carolFp,
+                                 "--identity-passphrase-file", pass("alice")], env: voxEnv)
+            }
+            try staged(vox, ["node", "rename", remoteName, newName],
+                       env: carolEnv.merging(["VOX_IDENTITY_PASSPHRASE": "carol identity"]) { $1 })
+            remoteName = newName
+            try staged(vox, ["room", "leave", "--node", remoteName, room], env: carolEnv)
+            try staged(vox, ["room", "join", "--node", remoteName, "--passphrase-file", pass("room"), link], env: carolEnv)
+            tap(ui, Key.id("room-pending"), "pending after the remote node renamed and rejoined")
+            words(ui, Key.id("member-local-carol"), timeout: 90,
+                  "a remote rename/reconnect/rejoin must leave the member's local alias unchanged", until: { $0.hasPrefix("local-carol,") })
+            tap(ui, Key.id("member-local-carol"), "Carol under the retained local alias")
+            words(ui, Key.id("card-your-name"), timeout: 10,
+                  "the member card must distinguish the local alias", until: { $0 == "Your name: local-carol" })
+            words(ui, Key.id("card-presented-name"), timeout: 90,
+                  "the member card must refresh only the remote presented name", until: { $0 == "Name it presents: \(remoteName)" })
+            tap(ui, Key.id("card-copy-identity"), "Copy the refreshed presented name and fingerprint")
+            XCTAssertEqual(NSPasteboard.general.string(forType: .string), "\(remoteName) <\(carolFp)>",
+                           "PRODUCT: a copied presented identity must carry the remote self-name and the unchanged full fingerprint")
+            tap(ui, Key.id("card-close"), "Close Carol's card")
+            tap(ui, Key.id("keyring"), "the keyring after remote rename/reconnect/rejoin")
+            words(ui, Key.id("keyring-capability-local-carol"), timeout: 30,
+                  "remote metadata must leave the existing \(capability) grant unchanged", until: { $0 == capability })
+            let ring = run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out
+            XCTAssertTrue(ring.contains(carolFp) && ring.contains("local-carol") && ring.contains(capability),
+                          "PRODUCT: local alias and \(capability) must survive the remote rename/rejoin: \(ring)")
+            let control = "PRESENTED-NAMES-\(remoteName)-CONTROL"
+            try staged(vox, ["room", "post", "--node", "alice", room, control], env: voxEnv)
+            var read = ""
+            let untilRead = Date().addingTimeInterval(60)
+            while Date() < untilRead && !read.contains(control) {
+                read = run(vox, ["room", "read", "--node", remoteName, room], env: carolEnv).out
+                if !read.contains(control) { Thread.sleep(forTimeInterval: 0.5) }
+            }
+            XCTAssertTrue(read.contains(control), "PRODUCT: the retained \(capability) grant must still permit actual room communication: \(read)")
+        }
+        print("[proof] #796 app: pretrust presented name/fingerprint/state; defaults accepted without typing; missing metadata manual fallback; local override and both read/drive grants retained across remote renames/rejoins; refreshed card and copied identity; real granted chat")
+
     }
 
     func testFirstRunAttachesTheNodeAndQuitDetachesIt() throws {
@@ -2734,6 +2830,7 @@ final class FirstRunProof: XCTestCase {
         // member wrote (v0.4.1).
         if windowReadable(ui) {
             if let body = textSaying(ui, "NEEDS-YOU") {
+                try stageTimelineCopy(ui, body, "bob's message NEEDS-YOU")
                 let copied = selectAndCopy(ui, body, "bob's message NEEDS-YOU")
                 if copied != "NEEDS-YOU" {
                     keepTree(ui, "message copy did not put NEEDS-YOU on the pasteboard")
@@ -4179,7 +4276,7 @@ final class FirstRunProof: XCTestCase {
         // her yet is P2's TrustBanner, proved at 5d.
         try staged(vox, ["trust", "add", "--node", "dave", aliceFp, "--name", "alice",
                          "--identity-passphrase-file", davePass], env: voxEnv)
-        let daveRow = Key.id("member-\(daveFp.prefix(12))")
+        let daveRow = Key.id("member-dave · \(daveFp.prefix(12))")
         let rowSaid = words(ui, daveRow, timeout: 60,
                             "dave trusts alice and she has not trusted him: her member pane must say \"not in keyring, trusts you\"",
                             until: { $0.hasSuffix("not in keyring, trusts you") }) ?? ""
@@ -4226,7 +4323,10 @@ final class FirstRunProof: XCTestCase {
                           until: { $0.hasSuffix("all 13 groups.") && $0.hasPrefix("Matches ") }) ?? ""
         print("[proof] compare: offer \(offerSoFar); card \(soFar) → \(wrong) → \(whole)")
         tap(ui, Key.id("card-trust-open"), "Trust… on dave's card")
-        type(ui, Key.id("card-alias"), "dave", "the card's alias field")
+        words(ui, Key.id("card-presented-name"), timeout: 90,
+              "Dave's card must present his authenticated name beside his fingerprint before trust", until: { $0 == "Name it presents: dave" })
+        words(ui, Key.id("card-alias"), timeout: 10,
+              "Dave's editable presented-name default must be accepted without typing", until: { $0 == "dave" }, field: true)
         // Trusting gives read, with no drive choice (the decider, v0.4.1): the form says read
         // only and offers no grant to pick.
         words(ui, Key.id("card-trust-effect"), timeout: 10,
@@ -5087,6 +5187,38 @@ final class FirstRunProof: XCTestCase {
         let e = ui.windows.firstMatch.descendants(matching: .any)
             .matching(NSPredicate(format: "value == %@ OR label == %@", words, words)).firstMatch
         return e.exists ? e : nil
+    }
+
+    /// An unnamed Text can be AX-hittable while clipped outside its timeline. Establish the
+    /// actual visible body before selecting; failure here cannot be a clipboard verdict.
+    private func stageTimelineCopy(_ ui: XCUIApplication, _ e: XCUIElement, _ what: String) throws {
+        let timeline = ui.scrollViews.matching(identifier: "timeline").firstMatch
+        guard timeline.exists else {
+            keepTree(ui, "no public timeline scroll view for copying \(what)")
+            throw Apparatus("cannot stage copying \(what): no timeline scroll view")
+        }
+        func visible() -> Bool {
+            let body = e.frame
+            let clip = timeline.frame
+            return !body.isEmpty && !clip.isEmpty && clip.contains(body)
+                && ui.windows.firstMatch.frame.contains(body) && e.isHittable
+        }
+        for _ in 0..<20 {
+            if visible() { break }
+            let body = e.frame
+            let clip = timeline.frame
+            guard !body.isEmpty && !clip.isEmpty else { break }
+            guard body.minY < clip.minY || body.maxY > clip.maxY else { break }
+            // A fixed 200-point scroll can leap across a 115-point timeline forever.
+            // Move toward the viewport's center by the observed distance, as a person does.
+            let distance = clip.midY - body.midY
+            timeline.scroll(byDeltaX: 0, deltaY: max(-200, min(200, distance)))
+            print("[proof] copy staging \(what): body \(body) → \(e.frame), timeline \(timeline.frame)")
+        }
+        guard visible() else {
+            keepTree(ui, "copy target not visible inside its timeline: \(what)")
+            throw Apparatus("cannot stage copying \(what): body \(e.frame), timeline \(timeline.frame), hittable \(e.isHittable); no selection or clipboard assertion was attempted")
+        }
     }
 
     private func selectAndCopy(_ ui: XCUIApplication, _ e: XCUIElement, _ what: String,

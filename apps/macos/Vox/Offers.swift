@@ -16,13 +16,14 @@ extension OfferInfo {
 
 /// An offer in the sidebar, under needs you: "offer: <fingerprint>… joined".
 struct OfferRow: View {
+    @ObservedObject var model: NodeModel
     let offer: OfferInfo
 
     var body: some View {
-        Text("offer: \(offer.short)… \(offer.whyWords)")
+        Text("offer: \(model.presentedDisplayName(offer.fingerprint, offer.presentedName)) \(offer.short)… \(offer.whyWords) (not in keyring)")
             .font(Theme.mono)
             .accessibilityIdentifier("offer-\(offer.fingerprint.prefix(12))")
-            .accessibilityLabel("trust offer: \(offer.short)… \(offer.whyWords)")
+            .accessibilityLabel("trust offer: \(model.presentedDisplayName(offer.fingerprint, offer.presentedName)) \(offer.fingerprint), not in keyring, \(offer.whyWords)")
     }
 }
 
@@ -75,7 +76,9 @@ struct OfferCard: View {
             .accessibilityHidden(true)
             Text(card.grouped).font(Theme.mono).textSelection(.enabled)
                 .accessibilityIdentifier("offer-fingerprint")
+            .task(id: offer.presentedName) { if alias.isEmpty { alias = offer.presentedName } }
         }
+        if !offer.presentedName.isEmpty { Text("Name it presents: \(offer.presentedName)").accessibilityIdentifier("offer-presented-name") }
         Text(offer.said).accessibilityIdentifier("offer-said")
         // The same compare as the keyring's, collapsed until asked for (#624): nothing to remove
         // here.

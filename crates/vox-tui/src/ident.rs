@@ -83,6 +83,9 @@ pub fn member_name(trusted: &[(Digest32, String)], fp: &Digest32) -> String {
 /// This process's copy of the node's names for its members: `(fingerprint, name)`.
 static NAMES: OnceLock<Vec<(Digest32, String)>> = OnceLock::new();
 
+/// Display-only authenticated suggestions, never inputs to identity resolution.
+static PRESENTED: OnceLock<Vec<(Digest32, String)>> = OnceLock::new();
+
 /// This node's own fingerprint, as the node reported it, for [`name_of`].
 static ME: OnceLock<Digest32> = OnceLock::new();
 
@@ -103,6 +106,7 @@ pub async fn load_names(client: &mut IpcClient) {
     }
     if let Ok(Frame::Trusted { entries }) = client.trusted("").await {
         let _ = NAMES.set(names_of(entries));
+        let _ = PRESENTED.set(client.presented_names().await.unwrap_or_default());
     }
 }
 
@@ -137,7 +141,10 @@ pub fn name_of(fp: &Digest32) -> String {
     if ME.get() == Some(fp) {
         return YOU.to_owned();
     }
-    name_in(names(), fp)
+    name_in(
+        &display_names(names(), PRESENTED.get().map_or(&[], Vec::as_slice)),
+        fp,
+    )
 }
 
 /// [`member_name`], but [`YOU`] for `me`: how the daemon names an author to its own agents.
@@ -417,4 +424,30 @@ impl Reading {
             ),
         }
     }
+}
+
+/// Display entries only: remote names always retain fingerprint and trust-state text.
+/// These entries must never be used to resolve recipients or decide authority.
+pub fn display_names(
+    trusted: &[(Digest32, String)],
+    presented: &[(Digest32, String)],
+) -> Vec<(Digest32, String)> {
+    let mut entries = trusted.to_vec();
+    entries.extend(
+        presented
+            .iter()
+            .filter(|(fp, _)| !trusted.iter().any(|(t, _)| t == fp))
+            .cloned(),
+    );
+    entries
+        .iter()
+        .map(|(fp, name)| {
+            let shown = alias_of(&entries, fp).unwrap_or_else(|| name.clone());
+            if trusted.iter().any(|(t, _)| t == fp) {
+                (*fp, shown)
+            } else {
+                (*fp, format!("{shown} · {} {NOT_IN_KEYRING}", author_id(fp)))
+            }
+        })
+        .collect()
 }

@@ -185,7 +185,7 @@ impl PeerPolicy {
     pub fn allows(class: PeerClass, kind: StreamKind) -> bool {
         // **Any peer may say it is stopping** (V210-93): it speaks only of the connection it
         // arrives on, which the peer is about to close anyway.
-        if kind == StreamKind::Goodbye {
+        if matches!(kind, StreamKind::Goodbye | StreamKind::Presentation) {
             return true;
         }
         match class {
