@@ -1522,7 +1522,11 @@ fn merge(s: &mut State, bytes: &[u8], peer: Digest32, signer: &dyn RootSigner) -
         }
         r.verify(&group)?;
         if !s.history.contains_key(&id) && s.history.len() >= MAX_RECORDS {
-            return Err(Error::Profile(HISTORY_FULL));
+            return Err(Error::Profile(if previously_enrolled {
+                HISTORY_FULL
+            } else {
+                "incoming computer history exceeds admission limit"
+            }));
         }
         s.history.insert(id, r);
     }

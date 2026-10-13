@@ -810,7 +810,7 @@ impl State {
                 events.insert(*id, r.verify(&group)?);
             }
         }
-        let initial: BTreeMap<_, _> = g
+        let initial: Vec<_> = g
             .grants
             .iter()
             .zip(&g.computers)
@@ -854,23 +854,22 @@ impl State {
                         prefix.extend(ancestry[h].iter().copied());
                     }
                 }
-                let available: BTreeMap<_, _> = grants
+                let available: Vec<_> = grants
                     .iter()
                     .filter(|(_, v)| v.event == group || prefix.contains(&v.event))
                     .map(|(k, v)| (*k, v.clone()))
                     .collect();
                 let (active, _) = exclude_forks(&events, &ancestry, &prefix, available)?;
-                if active
-                    .get(&e.grant)
-                    .is_none_or(|a| a.computer.fingerprint().ok() != Some(e.author))
-                {
+                if !active.iter().any(|(id, a)| {
+                    *id == e.grant && a.computer.fingerprint().ok() == Some(e.author)
+                }) {
                     return Err(Error::SignatureInvalid);
                 }
                 if let Some(add) = &e.addition {
                     let target = add.computers[1].fingerprint()?;
                     if active
-                        .values()
-                        .any(|a| a.computer.fingerprint().ok() == Some(target))
+                        .iter()
+                        .any(|(_, a)| a.computer.fingerprint().ok() == Some(target))
                     {
                         return Err(Error::Profile("computer is already enrolled in this group"));
                     }
@@ -879,9 +878,10 @@ impl State {
                         sponsor: Some(e.grant),
                         event: id,
                     };
-                    if grants.insert(add.grants[1], grant).is_some() {
-                        return Err(bad());
-                    }
+                    // Retain grants by ADD event until fork exclusion. Two independently
+                    // valid branches can carry the same approved intent/grant: neither branch
+                    // may discard the other's transferable fork evidence at insertion.
+                    grants.push((add.grants[1], grant));
                 }
                 if e.roster_revision > 0 {
                     let old = prefix
@@ -931,7 +931,14 @@ impl State {
                 break;
             }
         }
-        members.retain(|id, _| !retired.contains(id));
+        members.retain(|(id, _)| !retired.contains(id));
+        let mut unique = BTreeMap::new();
+        for (id, grant) in members {
+            if unique.insert(id, grant).is_some() {
+                return Err(bad());
+            }
+        }
+        let members = unique;
         let active: std::collections::BTreeSet<_> = members
             .values()
             .filter_map(|g| g.computer.fingerprint().ok())
@@ -1278,16 +1285,15 @@ struct Authority {
     quarantined: std::collections::BTreeSet<Digest32>,
     complete: bool,
 }
+type EventGrants = Vec<(Digest32, Grant)>;
+
 /// Fork exclusion follows sponsor edges, preserving additions on the shared safe prefix.
 fn exclude_forks(
     events: &BTreeMap<Digest32, ControlEvent>,
     ancestry: &BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
     selected: &std::collections::BTreeSet<Digest32>,
-    mut grants: BTreeMap<Digest32, Grant>,
-) -> Result<(
-    BTreeMap<Digest32, Grant>,
-    std::collections::BTreeSet<Digest32>,
-)> {
+    mut grants: EventGrants,
+) -> Result<(EventGrants, std::collections::BTreeSet<Digest32>)> {
     let mut forks = BTreeMap::new();
     let mut seqs = BTreeMap::new();
     for id in selected {
@@ -1327,7 +1333,7 @@ fn exclude_forks(
         }
         denied.extend(invalid);
     }
-    grants.retain(|id, _| !denied.contains(id));
+    grants.retain(|(id, _)| !denied.contains(id));
     Ok((grants, forks.into_keys().collect()))
 }
 

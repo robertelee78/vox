@@ -919,6 +919,22 @@ fn pair_computers(
     assert!(!ok, "PRODUCT: previously attached node still posted under stale computer policy after a failed write: {out}{err}");
 }
 
+// This scenario measures a computer being unavailable, not graceful shutdown timing. Keep
+// the daemon's log if SIGTERM does not establish staging, then use the existing scratch crash
+// helper and verify that no daemon holds this account's lock before continuing.
+fn offline_for_enrollment(account: &Account, label: &str) {
+    let pid = layout::daemon_pid(&account.data).expect("APPARATUS: scratch daemon to take offline");
+    stop_pid(pid);
+    if layout::daemon_pid(&account.data).is_some() {
+        eprintln!("APPARATUS: {label} did not release its lock after SIGTERM; staging a scratch host loss. Daemon log: {}",account.log());
+        layout::kill_daemon(&account.data);
+    }
+    assert!(
+        layout::daemon_pid(&account.data).is_none(),
+        "APPARATUS: {label} still holds its daemon lock after scratch hard-stop"
+    );
+}
+
 // #800 extends this same trust journey through a non-founding member. The first computer is
 // deliberately offline for enrollment; its eventual application must come from signed history.
 #[allow(clippy::too_many_arguments)]
@@ -954,11 +970,7 @@ fn enroll_third(
         .as_str()
         .unwrap()
         .to_owned();
-    let pid = a
-        .lock_pid()
-        .expect("APPARATUS: founder daemon before offline enrollment");
-    stop_pid(pid);
-    assert!(!alive(pid), "APPARATUS: founder daemon did not stop");
+    offline_for_enrollment(a, "founder");
     let invite = computer(b, &["invite"]);
     let link = invite["invite_link"]
         .as_str()
@@ -1005,9 +1017,7 @@ fn enroll_third(
     );
     // Stop the sponsor too. Catch-up must be possible from the new equal member's authenticated
     // retained history, not an online founder/sponsor vote or a second pairing ceremony.
-    let pid = b.lock_pid().expect("APPARATUS: sponsor daemon");
-    stop_pid(pid);
-    assert!(!alive(pid), "APPARATUS: sponsor daemon did not stop");
+    offline_for_enrollment(b, "sponsor");
     for name in ["personal", "agent-one", "agent-two", "agent-three", late] {
         let (ok, out, err) = a.run(&["node", "attach", name, "--passphrase-file", "-"], PASS);
         assert!(
