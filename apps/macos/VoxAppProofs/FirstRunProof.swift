@@ -3047,6 +3047,14 @@ final class FirstRunProof: XCTestCase {
         // Bob's message, selected by dragging across it and copied, as a person copies what a
         // member wrote (v0.4.1).
         if windowReadable(ui) {
+            guard let copyTimeline = locate(ui, Key.id("timeline")) else {
+                throw Apparatus("the timeline could not be found to return to the earlier copy target")
+            }
+            let copyVisibleUntil = Date().addingTimeInterval(20)
+            while Date() < copyVisibleUntil && textSaying(ui, "NEEDS-YOU") == nil {
+                copyTimeline.scroll(byDeltaX: 0, deltaY: 200)
+                Thread.sleep(forTimeInterval: 0.25)
+            }
             if let body = textSaying(ui, "NEEDS-YOU") {
                 try stageTimelineCopy(ui, body, "bob's message NEEDS-YOU")
                 body.click()
