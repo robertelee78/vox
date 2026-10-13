@@ -1470,39 +1470,6 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("login-item-not-now"), "Not Now")
 
         // The welcome: the node is made here.
-        // Diagnose the observed startup deadline with the real app's child, without
-        // dumping its environment or changing the command's deadline.
-        let startupAppPIDs = NSRunningApplication.runningApplications(withBundleIdentifier: proofAppID)
-            .filter { !$0.isTerminated }.map { $0.processIdentifier }
-        let startup = stager.run(["/usr/bin/python3", "-c", """
-            import pathlib, re, subprocess, time
-            time.sleep(3)
-            rows = subprocess.check_output(['/bin/ps', '-axo', 'pid,ppid,command'], text=True).splitlines()
-            apps = \(startupAppPIDs)
-            out = pathlib.Path('\(root.path)') / 'startup-diagnostic.txt'
-            with out.open('w') as f:
-                f.write('app PIDs: ' + repr(apps) + '\\n')
-                found = False
-                for row in rows:
-                    parts = row.strip().split(None, 2)
-                    if len(parts) < 3 or not parts[0].isdigit() or not parts[1].isdigit(): continue
-                    if int(parts[1]) not in apps or 'daemon --detach' not in parts[2]: continue
-                    found = True
-                    pid = parts[0]
-                    f.write('helper ' + row + '\\n'); f.flush()
-                    s = subprocess.check_output(['/bin/ps', 'e', '-p', pid, '-o', 'command='], text=True)
-                    for key in ['VOX_DATA_DIR', 'VOX_CONFIG_DIR', 'TMPDIR']:
-                        m = re.search(r'(?:^| )' + key + r'=([^ ]+)', s)
-                        f.write(key + '=' + (repr(m.group(1)) if m else '<unset>') + '\\n')
-                    names = re.findall(r'(?:^| )((?:DYLD_|XCInject|XCTest)[^ =]*)=', s)
-                    f.write('injection variable names: ' + repr(names) + '\\n'); f.flush()
-                    subprocess.run(['/usr/bin/sample', pid, '2', '1', '-file', str(out.with_suffix('.sample.txt'))], stdout=f, stderr=f)
-                if not found and len(apps) == 1:
-                    f.write('no live daemon --detach child; sampling app wait instead\\n'); f.flush()
-                    subprocess.run(['/usr/bin/sample', str(apps[0]), '2', '1', '-file', str(out.with_suffix('.sample.txt'))], stdout=f, stderr=f)
-            print('startup diagnostic: ' + str(out))
-            """], env: [:])
-        print(startup.out)
         let name = Key.id("new-node-name")
         present(ui, name, timeout: 30,
                 "with no node on this Mac, the first run must offer to make one in the app")
@@ -1649,6 +1616,9 @@ final class FirstRunProof: XCTestCase {
         }
         let shownNow = containers(ui).flatMap { $0.allElementsBoundByIndex }
             .compactMap { try? $0.snapshot() }
+            // XCTest includes closed system menus (including Apple Recent Items).
+            // Only an open container shows its words to the person.
+            .filter { !$0.frame.isEmpty }
             .flatMap(words)
         let words = ["Terminal", "terminal", "command line", "vox node", "vox room", "vox id", "vox trust", "`vox"]
         if let said = shownNow.first(where: { text in words.contains { text.contains($0) } }) {
