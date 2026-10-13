@@ -670,7 +670,7 @@ final class FirstRunProof: XCTestCase {
               "the app must recover the passphraseless node Ready after restart",
               until: { $0 == "plain Ready" })
         // Query metadata only in this owned Keychain: never ask Security to print a secret.
-        let keychainAccount = resolved(data + "/nodes/alice")
+        let keychainAccount = data + "/nodes/alice"
         func storedCredential() -> (status: Int32, out: String) {
             let result = stager.run(["/usr/bin/security", "find-generic-password", "-s", "us.vox.node",
                                      "-a", keychainAccount, keychain], env: ["HOME": home])
