@@ -4230,7 +4230,7 @@ impl Drop for Counted {
 /// If the socket cannot be placed.
 pub fn bind_account<D: Dispatch>(dispatch: std::sync::Arc<D>, path: PathBuf) -> Result<IpcServer> {
     // `.daemon/` is the daemon's own, made private here if the lock has not made it yet. **Not
-    // the shared fallback** (`<tmp>/vox-<uid>`, for a data root whose socket path is too long):
+    // the shared fallback** (`/tmp/vox-<uid>-<16 hex>`, for a data root whose socket path is too long):
     // `create_private_dir` follows a symlink and changes the mode of whatever it points at, and
     // anyone can plant one there. `place_socket` creates or refuses that one itself, by lstat.
     if let Some(dir) = path.parent() {

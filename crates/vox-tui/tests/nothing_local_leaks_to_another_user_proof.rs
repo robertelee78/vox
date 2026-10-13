@@ -973,7 +973,7 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
 #[ignore = "real daemons and production Argon2id; CI runs it in release"]
 fn the_control_socket_is_private_and_a_client_refuses_one_that_is_not_its_own() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().expect("APPARATUS: a temp dir");
+    let tmp = tempfile::tempdir_in("/tmp").expect("APPARATUS: a short scratch temp dir");
     let uid = my_uid(tmp.path());
     let t = tmp.path().join("t");
     std::fs::create_dir_all(&t).expect("APPARATUS: the shared temp dir");
@@ -990,8 +990,17 @@ fn the_control_socket_is_private_and_a_client_refuses_one_that_is_not_its_own() 
     q.id();
 
     // ---- (4) the fallback directory is private, even if it was left wide open ----
-    let private = t.join(format!("vox-{uid}"));
-    std::fs::create_dir(&private).expect("APPARATUS: staging the open per-user dir");
+    // Discover only this scratch root's advertised endpoint before staging attacks there.
+    let (mut probe, sock) = p.daemon(None);
+    signal(probe.pid(), "TERM");
+    assert!(
+        probe.exited_within(Duration::from_secs(30)).is_some(),
+        "PRODUCT: the scratch daemon did not stop before its directory was staged"
+    );
+    let private = sock
+        .parent()
+        .expect("PRODUCT: socket has no directory")
+        .to_path_buf();
     std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o777))
         .expect("APPARATUS: staging the open per-user dir");
     let (_pd, sock) = p.daemon(None);
@@ -1038,16 +1047,6 @@ fn the_control_socket_is_private_and_a_client_refuses_one_that_is_not_its_own() 
         sock_meta.mode() & 0o7777,
         sock_meta.uid()
     );
-    let in_tmp: Vec<String> = std::fs::read_dir(&t)
-        .expect("APPARATUS: list the shared temp dir")
-        .filter_map(Result::ok)
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.ends_with(".sock"))
-        .collect();
-    assert!(
-        in_tmp.is_empty(),
-        "PRODUCT: a control socket landed in the shared temp directory itself: {in_tmp:?}"
-    );
     let (ok, _, err) = p.run(
         &[
             "room",
@@ -1069,6 +1068,45 @@ fn the_control_socket_is_private_and_a_client_refuses_one_that_is_not_its_own() 
         ok && out.contains("p-only-room"),
         "PRODUCT (staging): room list: {out} {err}"
     );
+
+    // The app and a terminal can inherit different temporary directories. Both must reach
+    // this already-running daemon, including when a caller's TMPDIR exceeds sun_path.
+    let long_tmp = t.join("long-temporary-directory-".repeat(8));
+    std::fs::create_dir(&long_tmp).expect("APPARATUS: a long temporary directory");
+    let other_tmp = tmp.path().join("other");
+    std::fs::create_dir(&other_tmp).expect("APPARATUS: another short temporary directory");
+    let clients: Vec<Profile> = [&other_tmp, &long_tmp]
+        .into_iter()
+        .map(|temporary| Profile {
+            data: p.data.clone(),
+            cfg: p.cfg.clone(),
+            pass: p.pass.clone(),
+            env: vec![("TMPDIR".into(), temporary.to_string_lossy().into_owned())],
+        })
+        .collect();
+    let competing: Vec<Running> = clients
+        .iter()
+        .map(|client| client.spawn(&["daemon", "--detach"]))
+        .collect();
+    for mut reuse in competing {
+        let ended = reuse.exited_within(Duration::from_secs(30));
+        assert_eq!(ended, Some(true),
+            "PRODUCT: concurrent same-root client with a different TMPDIR could not reuse its daemon: {}", reuse.said());
+    }
+    for (client, temporary) in clients.iter().zip([&other_tmp, &long_tmp]) {
+        let (ok, out, err) = client.vox(&["daemon", "--detach"]);
+        assert!(
+            ok,
+            "PRODUCT: same-root client with TMPDIR {} could not reuse its daemon: {out} {err}",
+            temporary.display()
+        );
+        let (ok, out, err) = client.vox(&["room", "list"]);
+        assert!(
+            ok && out.contains("p-only-room"),
+            "PRODUCT: same-root client with TMPDIR {} could not read its room: {out} {err}",
+            temporary.display()
+        );
+    }
 
     // ---- (5) a client refuses what is at its socket path unless it is its own socket ----
     let (mut qd, q_sock) = q.daemon(None);
@@ -1097,29 +1135,20 @@ fn the_control_socket_is_private_and_a_client_refuses_one_that_is_not_its_own() 
     std::fs::remove_file(&q_sock).expect("APPARATUS: removing the planted symlink");
 
     // ---- (4) a per-user directory that is a symlink is refused, not followed ----
-    let t3 = tmp.path().join("t3");
     let elsewhere = tmp.path().join("elsewhere");
-    std::fs::create_dir_all(&t3).expect("APPARATUS: staging t3");
     std::fs::create_dir_all(&elsewhere).expect("APPARATUS: staging elsewhere");
     std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o755))
         .expect("APPARATUS: staging elsewhere");
-    std::os::unix::fs::symlink(&elsewhere, t3.join(format!("vox-{uid}")))
+    let q_private = q_sock.parent().expect("PRODUCT: q socket has no directory");
+    std::fs::remove_dir(q_private).expect("APPARATUS: remove the stopped scratch socket directory");
+    std::os::unix::fs::symlink(&elsewhere, q_private)
         .expect("APPARATUS: planting the symlinked per-user dir");
-    let q3 = Profile {
-        env: vec![(
-            "TMPDIR".into(),
-            t3.to_str()
-                .expect("APPARATUS: a UTF-8 temp path")
-                .to_owned(),
-        )],
-        ..Profile::new(&tmp.path().join("b".repeat(90)), &[])
-    };
-    let mut d3 = q3.spawn(&[
+    let mut d3 = q.spawn(&[
         "daemon",
         "--listen",
         "127.0.0.1:0",
         "--passphrase-file",
-        q3.p(),
+        q.p(),
     ]);
     let ended = d3.exited_within(Duration::from_secs(120));
     let said = d3.said();
@@ -1150,7 +1179,8 @@ fn the_control_socket_is_private_and_a_client_refuses_one_that_is_not_its_own() 
         "PRODUCT: the directory the symlink points at was used or changed: it holds {touched:?}, \
          mode {elsewhere_mode:o} (was 755)"
     );
-    eprintln!("[proof] private dir 0700 (from 0777): 1; socket 0600: 1; sockets in <tmp>: 0; foreign socket refused: 1; symlinked dir refused: 1");
+    std::fs::remove_file(q_private).expect("APPARATUS: remove the staged scratch symlink");
+    eprintln!("[proof] private directory and socket; distinct short/long TMPDIR clients; foreign socket and symlinked directory refused");
 }
 
 #[test]
