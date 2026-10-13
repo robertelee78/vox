@@ -865,6 +865,13 @@ pub enum NodeCommand {
         /// The channel passphrase.
         passphrase: Secret,
     },
+    /// Authenticate a held room's supplied passphrase without admitting a member.
+    CheckRoomPassphrase {
+        /// The held room.
+        channel_id: Digest32,
+        /// Supplied by the operator over the local control socket.
+        passphrase: Secret,
+    },
     /// Trust an identity node-wide, under a local petname (ADR-020 §3).
     ///
     /// The decision is per **identity**, not per room: from here on, every room

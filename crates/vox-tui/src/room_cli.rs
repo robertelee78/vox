@@ -4382,6 +4382,55 @@ fn room_passphrase(
     Ok(crate::tunnel_cli::encouraged(p, "room").to_owned())
 }
 
+async fn check_room_passphrase(
+    client: &mut IpcClient,
+    room: Digest32,
+    passphrase: &str,
+) -> Result<(), AppError> {
+    match client
+        .request(&Request::CheckRoomPassphrase {
+            channel_id: room,
+            passphrase: zeroize::Zeroizing::new(passphrase.to_owned()),
+        })
+        .await
+    {
+        Ok(Frame::Ok) => Ok(()),
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!(
+            "the room passphrase was not authenticated; the repo was not bound: {reason}"
+        ))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+async fn save_repo_binding(
+    client: &mut IpcClient,
+    data_root: &std::path::Path,
+    dir: &std::path::Path,
+    room: Digest32,
+    link: &str,
+    passphrase: &str,
+) -> Result<(), AppError> {
+    if !rooms_of(client)
+        .await?
+        .into_iter()
+        .any(|(id, _, open, over)| id == room && open && over.is_empty())
+    {
+        return Err(AppError::Usage(
+            "the room is no longer open; the repo was not bound".into(),
+        ));
+    }
+    println!("vox: binding {} to this room in the room map {}: every agent session started there, from any harness, is to work in it; every node of this data root can read the map, the passphrase included", dir.display(), crate::room_map::path(data_root).display());
+    match crate::room_map::bind(data_root, dir, link, passphrase)? {
+        Some(was) => println!(
+            "vox: bound {}, replacing what the room map held for it: {was}",
+            dir.display()
+        ),
+        None => println!("vox: bound {}", dir.display()),
+    }
+    Ok(())
+}
+
 /// `vox room join` — join a room over a running node (ADR-020 §12).
 ///
 /// This is what makes agent comms reachable on a host with no terminal. `vox
@@ -4412,6 +4461,12 @@ pub async fn join(
                     dir.display()
                 ))
             })?;
+            if !dir.is_dir() {
+                return Err(AppError::Usage(format!(
+                    "--bind {}: not a directory",
+                    dir.display()
+                )));
+            }
             crate::room_map::read(&data_root)?;
             Some(dir)
         }
@@ -4438,11 +4493,25 @@ pub async fn join(
         Err(_) => None,
     };
     if let (Some(name), Some(dir)) = (held.as_ref(), bind.as_ref()) {
-        return Err(AppError::Usage(format!(
-            "this node already holds {name}, so nothing was joined and no passphrase checked; to \
-             bind {} to it, run `vox agent room {name}` from a session started there, at a terminal",
-            dir.display()
-        )));
+        let passphrase = zeroize::Zeroizing::new(room_passphrase(
+            passphrase_file,
+            "the room's passphrase",
+            false,
+        )?);
+        let parsed = vox_core::node::link::InviteLink::parse(link)
+            .map_err(|e| AppError::Usage(e.to_string()))?;
+        check_room_passphrase(&mut client, parsed.channel_id, &passphrase).await?;
+        save_repo_binding(
+            &mut client,
+            &data_root,
+            dir,
+            parsed.channel_id,
+            link,
+            &passphrase,
+        )
+        .await?;
+        println!("vox: checked the passphrase for held room {name}; its membership is unchanged");
+        return Ok(());
     }
     if let Some(name) = held {
         return match client
@@ -4606,11 +4675,32 @@ pub async fn create(
     name: &str,
     passphrase_file: Option<&std::path::Path>,
     idle_end: Option<&str>,
+    bind: Option<&std::path::Path>,
 ) -> Result<(), AppError> {
     // Every member sees the room under this name, and it is the room part of every service
     // address in it: one DNS label (ADR-028 R-1, R-2). Said before a passphrase is asked for.
     let name = vox_core::governance::name::room_name(name)
         .map_err(|why| AppError::Usage(format!("cannot create the room: {why}")))?;
+    let data_root = paths.account().data_root;
+    let bind = match bind {
+        Some(dir) => {
+            let dir = std::fs::canonicalize(dir).map_err(|e| {
+                AppError::Usage(format!(
+                    "--bind {}: not a directory here: {e}",
+                    dir.display()
+                ))
+            })?;
+            if !dir.is_dir() {
+                return Err(AppError::Usage(format!(
+                    "--bind {}: not a directory",
+                    dir.display()
+                )));
+            }
+            crate::room_map::read(&data_root)?;
+            Some(dir)
+        }
+        None => None,
+    };
     // Checked before anything is made: a typo must not leave a room with no idle end behind.
     let idle_secs = match idle_end {
         None => None,
@@ -4640,6 +4730,11 @@ pub async fn create(
         )));
     }
     let passphrase = room_passphrase(passphrase_file, "a passphrase for the new room", true)?;
+    let kept = zeroize::Zeroizing::new(if bind.is_some() {
+        passphrase.clone()
+    } else {
+        String::new()
+    });
     let before: Vec<Digest32> = match idle_secs {
         Some(_) => rooms_of(&mut client)
             .await?
@@ -4657,6 +4752,27 @@ pub async fn create(
     {
         Ok(Frame::Ok) => {
             println!("vox: created {name}");
+            if let Some(dir) = bind.as_ref() {
+                let made = rooms_of(&mut client)
+                    .await?
+                    .into_iter()
+                    .find(|(_, held, open, over)| held == &name && *open && over.is_empty())
+                    .map(|(id, _, _, _)| id)
+                    .ok_or_else(|| {
+                        AppError::Usage(
+                            "the room was created, but is no longer open; the repo was not bound"
+                                .into(),
+                        )
+                    })?;
+                check_room_passphrase(&mut client, made, &kept).await?;
+                let link = match client.request(&Request::Invite { channel_id: made }).await {
+                    Ok(Frame::Link { url, .. }) => url,
+                    Ok(Frame::Error { reason }) => return Err(AppError::Usage(format!("the room was created, but its link was not made and the repo was not bound: {reason}"))),
+                    Ok(other) => return Err(crate::client::unexpected(&other)),
+                    Err(e) => return Err(AppError::Usage(e.to_string())),
+                };
+                save_repo_binding(&mut client, &data_root, dir, made, &link, &kept).await?;
+            }
             if let Some(idle_secs) = idle_secs {
                 let made = rooms_of(&mut client)
                     .await?

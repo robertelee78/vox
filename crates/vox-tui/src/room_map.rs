@@ -281,22 +281,34 @@ pub fn note(
         "--bind",
         &dir.display().to_string(),
     ]);
+    let create = vox_text::shell::command(&[
+        "vox",
+        "room",
+        "create",
+        "--name",
+        "<name>",
+        "--node",
+        node,
+        "--bind",
+        &dir.display().to_string(),
+    ]);
     let into = vox_text::shell::command(&["vox", "agent", "room", "<room>", "--node", node]);
     let none = vox_text::shell::command(&["vox", "agent", "room", "--none", "--node", node]);
     let dir = dir.display();
     Some(format!(
-        "Vox: this repo ({dir}) isn't tied to a Vox room, and Vox has asked the operator which \
-         room it works in (a banner in Vox.app, and `vox agent status`). Tell them once, in one \
-         sentence, in these words, and do not ask again on later turns: \"This repo isn't tied to \
-         a Vox room. Vox has asked you in its app; you can also paste its room link here, or say \
-         no.\"\n\
-         - If they answer in Vox.app: Vox puts this session in that room itself; run nothing.\n\
-         - If they paste a link here: never ask for the room's passphrase here. Give them this \
-         command exactly, with the link they pasted in place of <link>, inside its single quotes, \
-         to run in a terminal of their own (it asks for the passphrase there, and saves the link \
-         for this repo so every later session started here works in that room):\n    \
-         {bind}\n  \
-         Once it says joined, put this session in the room: {into}\n\
+        "Vox: this repo ({dir}) isn't tied to a Vox room. Tell the operator once, and do not ask \
+         again on later turns: \"This repo isn't tied to a Vox room. You can create one for it, \
+         paste an existing room's link here, or say no.\"\n\
+         Give them these commands to run in a terminal of their own; never ask for a room \
+         passphrase in this session. Each command asks for it in their terminal and binds this \
+         repo for every later session started here.\n\
+         - Create a room: choose its name in place of <name>, inside the single quotes:\n    \
+         {create}\n\
+         - Use an existing room: put the pasted link in place of <link>, inside its single quotes:\n    \
+         {bind}\n\
+         Once it says bound, put this session in the room: {into}\n\
+         If Vox.app is running, they can also answer its room banner; Vox puts this session in \
+         that room itself.\n\
          - If they say no: run {none}, and no session started here is asked again.\n"
     ))
 }

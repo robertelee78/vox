@@ -275,6 +275,8 @@ const T_STOP_FORWARD: u64 = 9;
 // get one onto it. `vox daemon` made the feature runnable headless; these make it
 // reachable headless.
 const T_JOIN: u64 = 11;
+/// Additive local room-passphrase authentication (ADR-031 RM-3).
+const T_CHECK_ROOM_PASSPHRASE: u64 = 31728;
 const T_CREATE: u64 = 12;
 const T_INVITE: u64 = 13;
 // Protocol 5 — the trust keyring, **gated on the identity passphrase** (ADR-020 §3, §7).
@@ -686,6 +688,13 @@ pub enum Request {
         /// The `vox://` address.
         link: String,
         /// The room's passphrase, which the link does not carry.
+        passphrase: zeroize::Zeroizing<String>,
+    },
+    /// Authenticate a held room's passphrase with the join exchange, without admission.
+    CheckRoomPassphrase {
+        /// The held room.
+        channel_id: Digest32,
+        /// Collected in the operator's terminal, carried only on the local socket.
         passphrase: zeroize::Zeroizing<String>,
     },
     /// Create a room on this node.
@@ -1194,6 +1203,15 @@ impl Request {
             }
             Request::Join { link, passphrase } => {
                 e.array(3).uint(T_JOIN).text(link).text(passphrase);
+            }
+            Request::CheckRoomPassphrase {
+                channel_id,
+                passphrase,
+            } => {
+                e.array(3)
+                    .uint(T_CHECK_ROOM_PASSPHRASE)
+                    .bytes(channel_id)
+                    .text(passphrase);
             }
             Request::Create { name, passphrase } => {
                 e.array(3).uint(T_CREATE).text(name).text(passphrase);
@@ -1837,6 +1855,15 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::StopForward { local })
+            }
+            (T_CHECK_ROOM_PASSPHRASE, 3) => {
+                let channel_id = digest(&mut d)?;
+                let passphrase = zeroize::Zeroizing::new(d.text()?.to_owned());
+                d.finish()?;
+                Ok(Request::CheckRoomPassphrase {
+                    channel_id,
+                    passphrase,
+                })
             }
             (T_JOIN, 3) => {
                 let link = text(&mut d, "ipc join link")?;
@@ -5621,6 +5648,15 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 other => Frame::Error {
                     reason: other.to_string(),
                 },
+            }
+        }
+        Request::CheckRoomPassphrase { channel_id, mut passphrase } => {
+            match handle.apply(crate::node::api::NodeCommand::CheckRoomPassphrase {
+                channel_id,
+                passphrase: crate::node::api::Secret::new(std::mem::take(&mut *passphrase).into_bytes()),
+            }).await {
+                crate::node::api::Outcome::Done => Frame::Ok,
+                other => Frame::Error { reason: other.to_string() },
             }
         }
         Request::Join {
