@@ -213,6 +213,9 @@ pub struct RoomMessage {
     pub to: Vec<String>,
     /// The message it answers, or empty.
     pub re: String,
+    /// The canonical General message whose thread contains this reply, or empty for General.
+    /// This comes from `thread`, independently of the immediate reply target `re`.
+    pub thread: String,
     /// Whether its author marked it urgent.
     pub urgent: bool,
     /// It took its place above messages already shown.
@@ -234,6 +237,30 @@ pub struct RoomMessage {
     /// What it relates to, as its sender tagged it (#636): `task:#636`, `project:vox`, each on
     /// one line and cut, sorted. Shown only to those who can read the message.
     pub tags: Vec<String>,
+}
+
+/// One author in a thread summary, named by this node's keyring.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ThreadAuthor {
+    /// The complete author fingerprint.
+    pub fingerprint: String,
+    /// This node's local name, empty when unnamed.
+    pub name: String,
+}
+
+/// A thread summary from all replies this node retains and can read, not a UI timeline page.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ThreadSummary {
+    /// The General message starting the thread.
+    pub root: String,
+    /// Exact retained readable reply count, excluding the root.
+    pub reply_count: u64,
+    /// Latest reply send time in milliseconds, zero when there are no retained replies.
+    pub last_reply_millis: u64,
+    /// One bounded page of distinct repliers in fingerprint order.
+    pub authors: Vec<ThreadAuthor>,
+    /// Pass this as `after_author` for the remaining authors; absent means complete.
+    pub next_author: Option<String>,
 }
 
 /// The OS, OS version and CPU architecture a node says it runs on, from its `hello` (ADR-020
@@ -1452,7 +1479,7 @@ fn shown_name(s: &str) -> String {
 fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str>) -> RoomMessage {
     use vox_agentcomms::attention::{unread_level, UnreadLevel as L};
     let reveal = |s: &str| vox_agentcomms::envelope::reveal_keeping(s, |c| c == '\n' || c == '\t');
-    let (kind, text, to, re, urgent, file, image, card, platform) =
+    let (kind, text, to, re, thread, urgent, file, image, card, platform) =
         match vox_agentcomms::envelope::Envelope::parse(&row.text) {
             Ok(env) => (
                 shown_name(&env.kind),
@@ -1470,6 +1497,11 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str
                 },
                 env.to.iter().map(|t| shown_name(t)).collect(),
                 env.re.as_deref().map(shown_name).unwrap_or_default(),
+                env.thread
+                    .as_deref()
+                    .and_then(|root| b32_decode(root.trim(), "thread").ok())
+                    .map(|root| b32_encode(&root))
+                    .unwrap_or_default(),
                 env.urgent,
                 file_offer(&env, names.contains_key(&row.author)),
                 image_of(&env),
@@ -1480,6 +1512,7 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str
                 vox_agentcomms::envelope::SAY.to_owned(),
                 reveal(&row.text),
                 Vec::new(),
+                String::new(),
                 String::new(),
                 false,
                 None,
@@ -1497,6 +1530,7 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str
         text,
         to,
         re,
+        thread,
         urgent,
         late: row.late,
         owed: row.owed,
@@ -2478,6 +2512,99 @@ impl VoxClient {
                     .iter()
                     .map(|r| rendered(r, &names, me.as_deref()))
                     .collect()),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
+    /// One bounded page of thread replies in arrival order. Empty `since` starts the thread;
+    /// the next request follows the last returned id. An empty page finishes the read.
+    /// This does not drain later pages or read another room.
+    ///
+    /// # Errors
+    /// A malformed id, an invalid cursor, or the node's refusal.
+    pub async fn read_thread_page(
+        &self,
+        room: String,
+        root: String,
+        since: String,
+    ) -> Result<Vec<RoomMessage>, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let root = digest(&root, "thread root")?;
+        let since = if since.is_empty() {
+            None
+        } else {
+            Some(digest(&since, "message id")?)
+        };
+        on_held!(self, |c| {
+            let names = names(c).await?;
+            let me = c.me().map(|f| b32_encode(&f));
+            match ask(
+                c,
+                &Request::Thread {
+                    channel_id,
+                    root,
+                    since,
+                },
+            )
+            .await?
+            {
+                Frame::Rows { rows } => Ok(rows
+                    .iter()
+                    .map(|r| rendered(r, &names, me.as_deref()))
+                    .collect()),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
+    /// The complete readable reply count and latest time, with a bounded author page.
+    /// Pass `next_author` back as `after_author` only when more author names are needed.
+    ///
+    /// # Errors
+    /// A malformed id or author cursor, or the node's refusal.
+    pub async fn thread_summary(
+        &self,
+        room: String,
+        root: String,
+        after_author: Option<String>,
+    ) -> Result<ThreadSummary, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let root = digest(&root, "thread root")?;
+        let after_author = after_author
+            .as_deref()
+            .map(|fp| digest(fp, "fingerprint"))
+            .transpose()?;
+        on_held!(self, |c| {
+            let names = names(c).await?;
+            match ask(
+                c,
+                &Request::ThreadSummary {
+                    channel_id,
+                    root,
+                    after_author,
+                },
+            )
+            .await?
+            {
+                Frame::ThreadSummary {
+                    reply_count,
+                    last_reply_millis,
+                    authors,
+                    next_author,
+                } => Ok(ThreadSummary {
+                    root: b32_encode(&root),
+                    reply_count,
+                    last_reply_millis,
+                    authors: authors
+                        .into_iter()
+                        .map(|fp| ThreadAuthor {
+                            fingerprint: b32_encode(&fp),
+                            name: names.get(&fp).cloned().unwrap_or_default(),
+                        })
+                        .collect(),
+                    next_author: next_author.map(|fp| b32_encode(&fp)),
+                }),
                 other => Err(unexpected(&other)),
             }
         })
