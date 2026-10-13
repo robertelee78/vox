@@ -2771,6 +2771,7 @@ final class FirstRunProof: XCTestCase {
         // member wrote (v0.4.1).
         if windowReadable(ui) {
             if let body = textSaying(ui, "NEEDS-YOU") {
+                try stageTimelineCopy(ui, body, "bob's message NEEDS-YOU")
                 let copied = selectAndCopy(ui, body, "bob's message NEEDS-YOU")
                 if copied != "NEEDS-YOU" {
                     keepTree(ui, "message copy did not put NEEDS-YOU on the pasteboard")
@@ -5064,6 +5065,38 @@ final class FirstRunProof: XCTestCase {
         let e = ui.windows.firstMatch.descendants(matching: .any)
             .matching(NSPredicate(format: "value == %@ OR label == %@", words, words)).firstMatch
         return e.exists ? e : nil
+    }
+
+    /// An unnamed Text can be AX-hittable while clipped outside its timeline. Establish the
+    /// actual visible body before selecting; failure here cannot be a clipboard verdict.
+    private func stageTimelineCopy(_ ui: XCUIApplication, _ e: XCUIElement, _ what: String) throws {
+        let timeline = ui.scrollViews.matching(identifier: "timeline").firstMatch
+        guard timeline.exists else {
+            keepTree(ui, "no public timeline scroll view for copying \(what)")
+            throw Apparatus("cannot stage copying \(what): no timeline scroll view")
+        }
+        func visible() -> Bool {
+            let body = e.frame
+            let clip = timeline.frame
+            return !body.isEmpty && !clip.isEmpty && clip.contains(body)
+                && ui.windows.firstMatch.frame.contains(body) && e.isHittable
+        }
+        for _ in 0..<20 {
+            if visible() { break }
+            let body = e.frame
+            let clip = timeline.frame
+            guard !body.isEmpty && !clip.isEmpty else { break }
+            guard body.minY < clip.minY || body.maxY > clip.maxY else { break }
+            // A fixed 200-point scroll can leap across a 115-point timeline forever.
+            // Move toward the viewport's center by the observed distance, as a person does.
+            let distance = clip.midY - body.midY
+            timeline.scroll(byDeltaX: 0, deltaY: max(-200, min(200, distance)))
+            print("[proof] copy staging \(what): body \(body) → \(e.frame), timeline \(timeline.frame)")
+        }
+        guard visible() else {
+            keepTree(ui, "copy target not visible inside its timeline: \(what)")
+            throw Apparatus("cannot stage copying \(what): body \(e.frame), timeline \(timeline.frame), hittable \(e.isHittable); no selection or clipboard assertion was attempted")
+        }
     }
 
     private func selectAndCopy(_ ui: XCUIApplication, _ e: XCUIElement, _ what: String,
