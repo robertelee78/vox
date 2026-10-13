@@ -5872,6 +5872,11 @@ impl ChannelState {
         self.drive.sessions.page(which, before, max_rows, max_bytes)
     }
 
+    /// The private lifecycle records used to discover Sessions, separate from activity.
+    pub fn session_records(&self) -> Vec<SessionRow> {
+        self.drive.sessions.lifecycle().cloned().collect()
+    }
+
     /// The files other members' Sessions sent out here that this node opened (ADR-029 DR-1.8).
     #[must_use]
     pub fn session_files(&self) -> Vec<SessionRow> {

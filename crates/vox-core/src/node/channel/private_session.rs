@@ -517,23 +517,31 @@ impl ChannelState {
     }
 
     pub(super) fn sweep_private_sessions(&mut self, store: &Store, now: u64) -> Result<usize> {
-        let ttl = self.effective_step_retention();
-        if ttl == 0 || self.poisoned {
+        if self.poisoned {
             return Ok(0);
         }
-        let before = now.saturating_sub(ttl.saturating_mul(1000));
         let due: Vec<_> = self
             .private_sessions
             .records
             .iter()
             .filter(|(_, s)| {
-                s.first_seen.min(
-                    s.row
-                        .as_ref()
-                        .map(|r| r.created_millis)
-                        .or_else(|| s.record.legacy_claimed_ms())
-                        .unwrap_or(s.first_seen),
-                ) <= before
+                let ttl = if s
+                    .row
+                    .as_ref()
+                    .is_some_and(|r| crate::node::sessions::is_record(&r.body))
+                {
+                    self.effective_retention()
+                } else {
+                    self.effective_step_retention()
+                };
+                ttl != 0
+                    && s.first_seen.min(
+                        s.row
+                            .as_ref()
+                            .map(|r| r.created_millis)
+                            .or_else(|| s.record.legacy_claimed_ms())
+                            .unwrap_or(s.first_seen),
+                    ) <= now.saturating_sub(ttl.saturating_mul(1000))
             })
             .map(|(id, s)| (*id, s.record.hash()))
             .collect();
@@ -604,12 +612,90 @@ impl ChannelState {
         Ok(hash)
     }
 
-    /// A newly written step does not advance any public feed or refer to its heads.
+    /// Copy retained lifecycle state into the current grant without backfilling a step. Old
+    /// public copies stay unchanged (SA-5). Exact content/time matches make retry and restart
+    /// idempotent; a new grant needs a freshly sealed copy after its own key position.
+    pub(crate) fn refresh_session_records(
+        &mut self,
+        profile: &Profile,
+        holders: &BTreeSet<Digest32>,
+        owed: &[Digest32],
+        now: u64,
+    ) -> Result<()> {
+        let me = self.me();
+        let mut records = Vec::new();
+        for r in self.timeline.iter().filter(|r| r.author == me) {
+            let Ok(env) = vox_agentcomms::envelope::Envelope::parse(&r.text) else {
+                continue;
+            };
+            if !crate::node::sessions::is_record(&r.text) {
+                continue;
+            }
+            // An old multipart wrapper carries its bundle tag instead of `from`; the complete
+            // envelope inside still supplies the harness's actual id when folded.
+            let id = if env.from.is_empty() {
+                env.data["session_parts"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            } else {
+                env.from
+            };
+            records.push((r.created_millis, id, r.text.clone()));
+        }
+        records.extend(
+            self.drive
+                .sessions
+                .lifecycle()
+                .filter(|r| r.author == me)
+                .map(|r| (r.created_millis, r.session_id.clone(), r.body.clone())),
+        );
+        if records.is_empty() || self.has_left(&me) || self.ended(now).is_some() {
+            return Ok(());
+        }
+        self.rotate_drive_if_lost(profile.store(), holders, crate::time::Ms(now))?;
+        let mut seen = BTreeSet::new();
+        for (created, session, body) in records {
+            if !seen.insert((created, body.clone())) {
+                continue;
+            }
+            let covered = self
+                .drive
+                .sessions
+                .lifecycle()
+                .filter(|r| r.author == me && r.created_millis == created && r.body == body)
+                .filter_map(|r| self.private_sessions.hashes.get(&r.entry_hash))
+                .filter_map(|id| self.private_sessions.records.get(id))
+                .any(|saved| {
+                    owed.iter()
+                        .all(|peer| self.private_permitted(&saved.record, peer))
+                });
+            if covered {
+                continue;
+            }
+            let content = crate::node::content::SessionEntry::new(created, &session, &body)?;
+            self.append_private_content(profile, content, holders, now)?;
+        }
+        Ok(())
+    }
+
+    /// A newly written record does not advance any public feed or refer to its heads.
     pub(super) fn append_private_session(
         &mut self,
         profile: &Profile,
         session_id: &str,
         body: &str,
+        holders: &BTreeSet<Digest32>,
+        now: u64,
+    ) -> Result<Digest32> {
+        let content = crate::node::content::SessionEntry::new(now, session_id, body)?;
+        self.append_private_content(profile, content, holders, now)
+    }
+
+    fn append_private_content(
+        &mut self,
+        profile: &Profile,
+        content: crate::node::content::SessionEntry,
         holders: &BTreeSet<Digest32>,
         now: u64,
     ) -> Result<Digest32> {
@@ -625,7 +711,6 @@ impl ChannelState {
         if self.has_left(&self.me()) || self.ended(now).is_some() {
             return Err(Error::Profile("this room has ended or was left"));
         }
-        let content = crate::node::content::SessionEntry::new(now, session_id, body)?;
         if self
             .drive
             .chain
@@ -648,7 +733,7 @@ impl ChannelState {
             let row = SessionRow {
                 entry_hash: record.hash(),
                 author: self.me(),
-                created_millis: now,
+                created_millis: content.created_millis,
                 session_id: content.session_id,
                 body: content.body,
             };
