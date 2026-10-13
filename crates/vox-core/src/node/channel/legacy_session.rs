@@ -121,6 +121,8 @@ pub(super) struct LegacySessions {
     pages: BTreeMap<u64, Page>,
     /// A view of Target pages, including durable contradictions (false).
     targets: BTreeMap<Digest32, bool>,
+    /// Changes to whether a target may appear as an owed timeline row.
+    display_revision: u64,
     /// Deletes are dirty ids with no corresponding page. Cleared only after durable commit.
     dirty: BTreeSet<u64>,
     /// Verified incoming bodies inspected before their log id is allocated and before floors
@@ -131,6 +133,10 @@ pub(super) struct LegacySessions {
 impl LegacySessions {
     pub(super) fn is_session(&self, hash: &Digest32) -> bool {
         self.targets.get(hash) == Some(&true)
+    }
+
+    pub(super) fn display_revision(&self) -> u64 {
+        self.display_revision
     }
 
     pub(super) fn dirty(&self) -> bool {
@@ -146,6 +152,9 @@ impl LegacySessions {
             return;
         }
         if let Page::Target { hash, session, .. } = &page {
+            if self.is_session(hash) != *session {
+                self.display_revision = self.display_revision.wrapping_add(1);
+            }
             self.targets.insert(*hash, *session);
         }
         self.pages.insert(id, page);
@@ -154,7 +163,9 @@ impl LegacySessions {
 
     fn remove(&mut self, id: u64) {
         if let Some(Page::Target { hash, .. }) = self.pages.remove(&id) {
-            self.targets.remove(&hash);
+            if self.targets.remove(&hash) == Some(true) {
+                self.display_revision = self.display_revision.wrapping_add(1);
+            }
         }
         self.dirty.insert(id);
     }

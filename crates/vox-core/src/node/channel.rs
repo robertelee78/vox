@@ -42,6 +42,7 @@ mod legacy_session_sender;
 mod private_session;
 pub(crate) mod session_floor;
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use zeroize::Zeroizing;
@@ -724,6 +725,38 @@ impl std::fmt::Display for RoomEnd {
     }
 }
 
+/// Inputs of an already-published timeline. The existing sync generation's allocation
+/// identifies this open room, but its value is deliberately not used: durable log credit
+/// does not cover body filling, classification, expiry or sender-key backfill.
+#[derive(Debug, Clone)]
+pub(crate) struct DisplayStamp {
+    incarnation: Arc<std::sync::atomic::AtomicU64>,
+    rewrite: u64,
+    rendered_len: usize,
+    order_revision: u64,
+    body_revision: u64,
+    session_revision: u64,
+    retention: (u64, u64),
+    expires_at: Option<u64>,
+    pub(crate) owed: bool,
+}
+
+impl PartialEq for DisplayStamp {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.incarnation, &other.incarnation)
+            && self.rewrite == other.rewrite
+            && self.rendered_len == other.rendered_len
+            && self.order_revision == other.order_revision
+            && self.body_revision == other.body_revision
+            && self.session_revision == other.session_revision
+            && self.retention == other.retention
+            && self.expires_at == other.expires_at
+            && self.owed == other.owed
+    }
+}
+
+impl Eq for DisplayStamp {}
+
 /// A rendered (decrypted, render-gated) message in the timeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rendered {
@@ -896,6 +929,9 @@ pub struct ChannelState {
     timeline: Vec<Rendered>,
     /// The [`Dag::reorder_generation`] the timeline was last sorted at.
     timeline_generation: u64,
+    /// Changes that cannot extend the previous rendered prefix. Pure end appends are
+    /// distinguished by timeline length; unchanged owed rows need no repeated scan.
+    display_rewrite: u64,
     /// entry hash -> the `LogDb` page it is stored in, so a signature dropped under a
     /// checkpoint (ADR-023 decision 3) can be rewritten in place.
     log_ids: std::collections::HashMap<Digest32, u64>,
@@ -1590,14 +1626,18 @@ fn sort_timeline(dag: &Dag, timeline: &mut [Rendered]) {
 /// Mark each row placed above a row the reader had already been shown — shown at least
 /// [`LATE_AFTER_MS`] before this one arrived (see [`Rendered::late`]). One pass from the
 /// bottom, tracking the earliest time any row below was shown.
-fn mark_late(timeline: &mut [Rendered]) {
+fn mark_late(timeline: &mut [Rendered]) -> bool {
     let mut earliest_below = u64::MAX;
+    let mut changed = false;
     for r in timeline.iter_mut().rev() {
-        r.late = earliest_below
+        let late = earliest_below
             .checked_add(LATE_AFTER_MS)
             .is_some_and(|seen| r.shown_at_ms >= seen);
+        changed |= r.late != late;
+        r.late = late;
         earliest_below = earliest_below.min(r.shown_at_ms);
     }
+    changed
 }
 
 impl ChannelState {
@@ -1783,6 +1823,7 @@ impl ChannelState {
             now_hint: now_ms,
             timeline: Vec::new(),
             timeline_generation: 0,
+            display_rewrite: 0,
             log_ids: std::collections::HashMap::new(),
             inbound_packages: Vec::new(),
             packages_from: BTreeSet::new(),
@@ -2292,6 +2333,7 @@ impl ChannelState {
             now_hint: now_ms,
             timeline,
             timeline_generation,
+            display_rewrite: 0,
             log_ids,
             inbound_packages,
             packages_from,
@@ -2557,6 +2599,7 @@ impl ChannelState {
             now_hint: now_ms,
             timeline: Vec::new(),
             timeline_generation: 0,
+            display_rewrite: 0,
             log_ids: std::collections::HashMap::new(),
             inbound_packages: Vec::new(),
             packages_from: BTreeSet::new(),
@@ -4537,6 +4580,7 @@ impl ChannelState {
 
     /// Drop from the owed bodies every one that has arrived, or has expired here since.
     fn forget_settled_owed(&mut self) {
+        let before = self.owed.len();
         let (now, ttl) = (self.now_hint, self.effective_retention());
         let step_ttl = self.effective_step_retention();
         let steps = &self.step_bodies;
@@ -4557,6 +4601,9 @@ impl ChannelState {
                     )
             })
         });
+        if self.owed.len() != before {
+            self.invalidate_display();
+        }
     }
 
     /// The positions to ask a peer for whose bodies are owed here (V030-10), as want ranges: each
@@ -4625,19 +4672,20 @@ impl ChannelState {
 
     /// The entries whose body is owed here and not expired: each is shown as **not received yet**
     /// ([`ChannelState::shown_timeline`]).
-    fn owed_shown(&self) -> impl Iterator<Item = &crate::log::entry::Entry> + '_ {
+    fn owed_shown(&self) -> impl Iterator<Item = (&Entry, Digest32, u64)> + '_ {
         let now = self.now_hint;
         self.owed
             .iter()
             .filter_map(|(author, seq)| self.dag.feed(author)?.get(*seq))
-            .filter(move |e| {
-                e.payload.is_none()
-                    && !self.legacy_sessions.is_session(&e.entry_hash())
-                    && !expired_at(
-                        e.skeleton.claimed_ms,
-                        now,
-                        self.entry_retention(&e.entry_hash()),
-                    )
+            .filter_map(move |e| {
+                if e.payload.is_some() {
+                    return None;
+                }
+                let hash = e.entry_hash();
+                let ttl = self.entry_retention(&hash);
+                (!self.legacy_sessions.is_session(&hash)
+                    && !expired_at(e.skeleton.claimed_ms, now, ttl))
+                .then_some((e, hash, ttl))
             })
     }
 
@@ -4652,21 +4700,68 @@ impl ChannelState {
     /// (V030-10). An expired message is not shown at all (PRD-001 R10).
     #[must_use]
     pub fn shown_timeline(&self) -> Vec<Rendered> {
+        self.display_timeline().0.into_owned()
+    }
+
+    fn invalidate_display(&mut self) {
+        self.display_rewrite = self.display_rewrite.wrapping_add(1);
+    }
+
+    /// Check before walking any owed or rendered rows. Wall-clock progress only matters
+    /// when it crosses the first visible owed row's expiry, using the room's own clock.
+    pub(crate) fn display_is_current(&self, stamp: &DisplayStamp) -> bool {
+        self.display_extends(stamp) && stamp.rendered_len == self.timeline.len()
+    }
+
+    pub(crate) fn display_extends(&self, stamp: &DisplayStamp) -> bool {
+        Arc::ptr_eq(&self.gen, &stamp.incarnation)
+            && self.display_rewrite == stamp.rewrite
+            && self.dag.reorder_generation() == stamp.order_revision
+            && self.dag.body_generation() == stamp.body_revision
+            && self.legacy_sessions.display_revision() == stamp.session_revision
+            && (self.effective_retention(), self.effective_step_retention()) == stamp.retention
+            && stamp.rendered_len <= self.timeline.len()
+            && stamp.expires_at.is_none_or(|at| self.now_hint < at)
+    }
+
+    /// Build only after the previous projection's stamp no longer matches. Borrow the
+    /// ordinary rendered timeline, and hash each owed skeleton once while collecting both
+    /// its placeholder and the next expiry boundary for subsequent constant-time reuse.
+    pub(crate) fn display_timeline(&self) -> (Cow<'_, [Rendered]>, DisplayStamp) {
+        let mut expires_at = None;
         let owed: Vec<Rendered> = self
             .owed_shown()
-            .map(|e| Rendered {
-                entry_hash: e.entry_hash(),
-                author: e.skeleton.author_id,
-                created_millis: e.skeleton.claimed_ms,
-                text: String::new(),
-                arrival: 0,
-                shown_at_ms: 0,
-                late: false,
-                owed: true,
+            .map(|(e, hash, ttl)| {
+                if ttl != 0 {
+                    if let Some(at) = e.skeleton.claimed_ms.checked_add(ttl.saturating_mul(1_000)) {
+                        expires_at = Some(expires_at.map_or(at, |old: u64| old.min(at)));
+                    }
+                }
+                Rendered {
+                    entry_hash: hash,
+                    author: e.skeleton.author_id,
+                    created_millis: e.skeleton.claimed_ms,
+                    text: String::new(),
+                    arrival: 0,
+                    shown_at_ms: 0,
+                    late: false,
+                    owed: true,
+                }
             })
             .collect();
+        let stamp = DisplayStamp {
+            incarnation: self.gen.clone(),
+            rewrite: self.display_rewrite,
+            rendered_len: self.timeline.len(),
+            order_revision: self.dag.reorder_generation(),
+            body_revision: self.dag.body_generation(),
+            session_revision: self.legacy_sessions.display_revision(),
+            retention: (self.effective_retention(), self.effective_step_retention()),
+            expires_at,
+            owed: !owed.is_empty(),
+        };
         if owed.is_empty() {
-            return self.timeline.clone();
+            return (Cow::Borrowed(&self.timeline), stamp);
         }
         let mut rows: Vec<Rendered> = self.timeline.iter().cloned().chain(owed).collect();
         // Sorted only: the `late` marks are the timeline's, and an owed row was never shown.
@@ -4675,7 +4770,7 @@ impl ChannelState {
                 .order_key(&r.entry_hash)
                 .unwrap_or((u64::MAX, r.entry_hash))
         });
-        rows
+        (Cow::Owned(rows), stamp)
     }
 
     /// Set the **room's** retention (PRD-001 R7): append an ADR-007 policy-update carrying
@@ -5011,7 +5106,11 @@ impl ChannelState {
         }
         self.legacy_sessions.committed();
         let gone: BTreeSet<Digest32> = due.iter().map(|(h, _)| *h).collect();
+        let before = self.timeline.len();
         self.timeline.retain(|r| !gone.contains(&r.entry_hash));
+        if self.timeline.len() != before {
+            self.invalidate_display();
+        }
         // A Session entry follows the room's retention (SE-5).
         self.drive
             .sessions
@@ -5019,7 +5118,9 @@ impl ChannelState {
         for h in &gone {
             self.forget_read_record(h);
         }
-        mark_late(&mut self.timeline);
+        if mark_late(&mut self.timeline) {
+            self.invalidate_display();
+        }
         Ok(due.len())
     }
 
@@ -5041,7 +5142,9 @@ impl ChannelState {
             .and_then(|entry| entry.payload.as_deref())
             .is_some_and(|body| is_step_body(&self.channel_id, body));
         if steps {
-            self.step_bodies.insert(entry_hash);
+            if self.step_bodies.insert(entry_hash) {
+                self.invalidate_display();
+            }
             self.private_sessions.legacy_pending.insert(entry_hash);
         }
         let claimed_ms = self
@@ -5090,7 +5193,9 @@ impl ChannelState {
             .and_then(|entry| entry.payload.as_deref())
             .is_some_and(|body| is_step_body(&self.channel_id, body));
         if steps {
-            self.step_bodies.insert(entry_hash);
+            if self.step_bodies.insert(entry_hash) {
+                self.invalidate_display();
+            }
             self.private_sessions.legacy_pending.insert(entry_hash);
         }
         let claimed_ms = self
@@ -5532,12 +5637,16 @@ impl ChannelState {
                     let Some(payload) = payload else {
                         // A skeleton: stored, never rendered. Its body is owed unless it has
                         // expired here (V030-10).
-                        if !self.body_expired(claimed, crate::time::Ms(now_ms)) {
-                            self.owed.insert((author, seq));
+                        if !self.body_expired(claimed, crate::time::Ms(now_ms))
+                            && self.owed.insert((author, seq))
+                        {
+                            self.invalidate_display();
                         }
                         return Ok(Ok(Vec::new()));
                     };
-                    self.owed.remove(&(author, seq));
+                    if self.owed.remove(&(author, seq)) {
+                        self.invalidate_display();
+                    }
                     let wire_kind = refuse!(classify_payload(&payload));
                     let gov = match wire_kind {
                         EntryKind::Governance | EntryKind::Content
@@ -6759,8 +6868,12 @@ impl ChannelState {
         let at = self
             .timeline
             .partition_point(|r| dag.order_key(&r.entry_hash) <= key);
+        let appended = at == self.timeline.len();
         self.timeline.insert(at, rendered);
-        mark_late(&mut self.timeline);
+        let remarked = mark_late(&mut self.timeline);
+        if !appended || remarked {
+            self.invalidate_display();
+        }
     }
 
     /// Re-sort the timeline if any stored entry moved in the order since it was last
@@ -6771,6 +6884,7 @@ impl ChannelState {
         if generation != self.timeline_generation {
             sort_timeline(&self.dag, &mut self.timeline);
             self.timeline_generation = generation;
+            self.invalidate_display();
         }
     }
 
