@@ -1138,6 +1138,28 @@ fn legacy_placeholder_journey(
             entry.skeleton.seq,
             b32_encode(&entry.entry_hash())
         );
+        // The responder FINs its send half while it is still draining our input. That FIN
+        // proves nothing about acceptance of the entry we just sent. Wait for its next public
+        // frontier to acknowledge this staged position before asserting on the receiver CLI.
+        assert!(
+            until(Duration::from_secs(10), || {
+                let receipt = rt.block_on(raw_sync::ask(
+                    &conn,
+                    room_id,
+                    epoch,
+                    raw_sync::Ask::Ranges(Vec::new()),
+                    None,
+                ));
+                receipt.hello
+                    && receipt
+                        .have
+                        .iter()
+                        .any(|(a, seq)| *a == author && *seq >= entry.skeleton.seq)
+            }),
+            "APPARATUS: receiver never acknowledged staged seq {} hash {} in its frontier",
+            entry.skeleton.seq,
+            b32_encode(&entry.entry_hash())
+        );
     };
     let owed = |member: &Member, hash: [u8; 32]| {
         let (ok, out, err) = member.vox(&["room", "read", room, "--json"], None);
