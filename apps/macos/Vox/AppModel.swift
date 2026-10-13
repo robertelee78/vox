@@ -659,6 +659,8 @@ struct StartFailure: Error, Equatable {
     enum Kind: Equatable {
         /// The daemon Vox started stopped as it started (`vox daemon` exited).
         case exited
+        /// The startup command refused, including preparation before a process could start.
+        case startRefused
         /// No daemon answered within Vox's patience.
         case notAnswering
         /// Another process holds the node (an older `vox` still running as it).
@@ -691,7 +693,7 @@ struct StartFailure: Error, Equatable {
     /// The card's headline.
     var headline: String {
         switch kind {
-        case .exited: return "Vox can't start its background service"
+        case .exited, .startRefused: return "Vox can't start its background service"
         case .notAnswering: return "Vox's background service isn't answering"
         case .busy: return "Another copy of Vox is using this node"
         case .versionMismatch: return said
@@ -703,6 +705,7 @@ struct StartFailure: Error, Equatable {
     var cause: String {
         switch kind {
         case .exited: return "It stopped as it started. Your rooms are unreachable until it runs."
+        case .startRefused: return "Its start was refused. Your rooms are unreachable until it runs."
         case .notAnswering: return "It may still be starting, or be stuck. Your rooms are unreachable until it answers."
         case .busy: return "Only one copy may act as a node at a time: a command that has not finished, or another copy of Vox, holds it."
         case .versionMismatch: return "Restart the daemon to use this app's version. Remembered nodes return automatically."
