@@ -390,8 +390,12 @@ impl Router {
         }
         state.set = set;
         state.skipped = skipped;
-        // Keep the refresh lock until delivery finishes: an older refresh cannot overwrite a
-        // newer one, and a node becoming attached is installed under this same lock.
+        self.deliver_manual_anchors(&state).await;
+        (state.set.clone(), state.skipped.clone())
+    }
+
+    async fn deliver_manual_anchors(&self, state: &MachineAnchors) {
+        // Keep the refresh lock until delivery finishes: no old set can overtake a mutation.
         for (_, node) in self.attached_handles() {
             let _ = node
                 .apply(NodeCommand::SetAnchors {
@@ -399,7 +403,59 @@ impl Router {
                 })
                 .await;
         }
-        (state.set.clone(), state.skipped.clone())
+    }
+
+    async fn change_manual_anchor(
+        &self,
+        add: Option<String>,
+        remove: Option<Digest32>,
+    ) -> Result<Vec<AnchorInfo>, String> {
+        // Lookup is bounded network work outside the writer lock; only its verified result is
+        // committed. A supplied fingerprint is an offline configuration input, not reach proof.
+        let add = match add {
+            Some(input) => Some(self.resolve_manual_anchor(&input).await?),
+            None => None,
+        };
+        let mut state = self.inner.manual_anchors.lock().await;
+        let account = self.inner.account.clone();
+        let extra = state.specs.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            vox_core::node::link::change_manual_anchor(&account, &extra, add.as_deref(), remove)?;
+            let mut set = BootstrapSet::new();
+            let skipped = vox_core::node::link::merge_machine_anchors(&mut set, &account)?;
+            Ok::<_, vox_core::Error>((set, skipped))
+        })
+        .await
+        .map_err(|error| format!("manual anchor update did not finish: {error}"))?
+        .map_err(|error| error.to_string())?;
+        // All startup inputs are now in the canonical file; otherwise a removed transient
+        // input would silently reappear on the next periodic refresh.
+        state.specs.clear();
+        state.set = result.0;
+        state.skipped = result.1;
+        self.deliver_manual_anchors(&state).await;
+        drop(state);
+        self.anchor_list().await.map_err(|error| {
+            format!("manual anchors saved, but inventory could not be read: {error}")
+        })
+    }
+
+    async fn resolve_manual_anchor(&self, input: &str) -> Result<String, String> {
+        let input = input.trim().to_owned();
+        if input.contains('@') {
+            let checked = input.clone();
+            tokio::task::spawn_blocking(move || vox_core::node::link::parse_anchor_spec(&checked))
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
+            return Ok(input);
+        }
+        self.inner
+            .defaults
+            .computer
+            .lookup_anchor(&input)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     /// The proxy runs while any node is attached: bound at the first attach, stopped at the last
@@ -468,6 +524,7 @@ impl Router {
                         .map(ToString::to_string)
                         .collect(),
                     sources: vec![AnchorSource::AddedByHand],
+                    reach: None,
                 },
             );
         }
@@ -513,6 +570,7 @@ impl Router {
                     fingerprint: anchor.id,
                     addresses: Vec::new(),
                     sources: Vec::new(),
+                    reach: None,
                 });
                 entry
                     .addresses
@@ -529,6 +587,25 @@ impl Router {
                         name: names.get(&room.room).map_or_else(String::new, |row| row.2.clone()),
                         stale: room.stale,
                     });
+                }
+            }
+        }
+        for (_, handle) in attached {
+            for (id, reach) in handle.view().anchor_reach {
+                if let Some(anchor) = all.get_mut(&id) {
+                    match &mut anchor.reach {
+                        None => anchor.reach = Some(reach),
+                        Some(current) => {
+                            current.connected |= reach.connected;
+                            current.last_reached_ms =
+                                current.last_reached_ms.max(reach.last_reached_ms);
+                            current.unreached_since_ms = if current.connected {
+                                None
+                            } else {
+                                current.unreached_since_ms.max(reach.unreached_since_ms)
+                            };
+                        }
+                    }
                 }
             }
         }
@@ -3087,6 +3164,18 @@ impl Dispatch for Router {
                 Ok(anchors) => DaemonFrame::Anchors(anchors),
                 Err(why) => refused(why),
             },
+            DaemonRequest::AnchorAdd { input } => {
+                match self.change_manual_anchor(Some(input), None).await {
+                    Ok(anchors) => DaemonFrame::Anchors(anchors),
+                    Err(why) => DaemonFrame::AnchorFailed(why),
+                }
+            }
+            DaemonRequest::AnchorRemove { fingerprint } => {
+                match self.change_manual_anchor(None, Some(fingerprint)).await {
+                    Ok(anchors) => DaemonFrame::Anchors(anchors),
+                    Err(why) => DaemonFrame::AnchorFailed(why),
+                }
+            }
             DaemonRequest::ComputerStatus
             | DaemonRequest::ComputerBegin
             | DaemonRequest::ComputerPreview { .. }

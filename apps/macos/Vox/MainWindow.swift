@@ -2288,6 +2288,11 @@ private struct Inspector: View {
                 } header: {
                     heading("MEMBERS")
                 }
+                Section {
+                    RoomAnchorsView(room: room)
+                } header: {
+                    heading("ANCHORS")
+                }
             }
             .padding(Space.s12)
         }

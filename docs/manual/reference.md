@@ -84,9 +84,10 @@ The config directory is `~/Library/Application Support/vox/` on a Mac and `~/.co
 Linux. A node reads each setting file from its own `nodes/NAME/config/` first, and from the config
 directory otherwise. The files include:
 
-- `anchors`, one `FINGERPRINT@ADDRESS` per line
-  ([How a node gets its anchors](services.md#how-a-node-gets-its-anchors));
 - `config`, `key = value` lines, such as `notify-command = PROGRAM`.
+
+Manual anchors are kept separately at `.daemon/anchors` in the data root. Use `vox anchor add`,
+`vox anchor list` and `vox anchor remove` ([anchors](services.md#how-a-node-gets-its-anchors)).
 
 Vox creates these files readable by your account only. They are not caches: never delete them to
 get past an error, and never attach them to a report.

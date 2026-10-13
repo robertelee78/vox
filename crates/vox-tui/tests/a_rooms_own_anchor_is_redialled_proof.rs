@@ -430,7 +430,7 @@ fn expect_sets(w: &RelayWorld, room_set: &[&str], host_set: &[&str], guest_set: 
             let raw = command(data, &["status", "--json"]);
             let status: serde_json::Value = serde_json::from_str(&raw)
                 .unwrap_or_else(|e| panic!("PRODUCT: status is not JSON: {e}\n{raw}"));
-            let anchors: BTreeSet<_> = status["anchors"]
+            let anchors: BTreeSet<_> = status["node_anchors"]
                 .as_array()
                 .expect("PRODUCT: status omitted anchors")
                 .iter()

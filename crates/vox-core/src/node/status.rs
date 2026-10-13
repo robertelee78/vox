@@ -292,6 +292,8 @@ pub struct StatusReport {
 pub struct AnchorStatus {
     /// Its identity.
     pub id: Digest32,
+    /// An authenticated connection is currently held, not inferred from a missing timestamp.
+    pub reached: bool,
     /// Since when this node has not reached it (unix milliseconds); `None` while it is reached.
     pub unreached_since: Option<u64>,
 }
@@ -538,7 +540,7 @@ impl StatusReport {
             list(self.anchors.iter().map(|a| format!(
                 "{{\"id\":{},\"reached\":{},\"unreached_since_ms\":{}}}",
                 q(&b32_encode(&a.id)),
-                a.unreached_since.is_none(),
+                a.reached,
                 opt(a.unreached_since)
             )))
         );
@@ -1853,9 +1855,38 @@ pub async fn serve(stream: &mut UnixStream, handle: &NodeHandle) -> Result<()> {
 /// # Errors
 /// If the node cannot be reached, does not answer in time, or answers something else.
 pub async fn request(at: &crate::node::ipc::NodeSocket) -> Result<String> {
-    tokio::time::timeout(crate::node::ipc::ANSWER_WITHIN, ask(at))
-        .await
-        .map_err(|_| crate::node::ipc::silent())?
+    tokio::time::timeout(crate::node::ipc::ANSWER_WITHIN, async {
+        let report = ask(at).await?;
+        let mut value: serde_json::Value =
+            serde_json::from_str(&report).map_err(|_| Error::MalformedIpc("ipc status JSON"))?;
+        use crate::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
+        let mut daemon = DaemonClient::open_noting(&at.path, at.waiting).await?;
+        match daemon.request(DaemonRequest::Anchors).await? {
+            DaemonFrame::Anchors(anchors) => {
+                // Retain the selected node's dial scope as diagnostics; the primary list is
+                // this daemon's complete manual and saved-room inventory (ADR-032 AN-12).
+                value["node_anchors"] = value["anchors"].take();
+                value["anchors"] =
+                    serde_json::Value::Array(anchors.iter().map(|a| a.to_json()).collect());
+            }
+            DaemonFrame::Refused(why) => {
+                return Err(Error::Path {
+                    op: "read machine anchors",
+                    detail: why.to_string(),
+                })
+            }
+            DaemonFrame::AnchorFailed(why) => {
+                return Err(Error::Path {
+                    op: "read machine anchors",
+                    detail: why,
+                })
+            }
+            _ => return Err(Error::MalformedIpc("ipc machine anchors")),
+        }
+        Ok(value.to_string())
+    })
+    .await
+    .map_err(|_| crate::node::ipc::silent())?
 }
 
 async fn ask(at: &crate::node::ipc::NodeSocket) -> Result<String> {

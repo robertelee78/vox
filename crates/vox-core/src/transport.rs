@@ -73,3 +73,6 @@ pub mod streams;
 pub(crate) mod taper;
 pub mod verifier;
 pub(crate) mod vox_bbr;
+
+/// Explicit, bounded anchor lookup on the existing UDP socket.
+pub mod anchor_lookup;

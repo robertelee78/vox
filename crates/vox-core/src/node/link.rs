@@ -172,7 +172,7 @@ pub fn parse_anchor_spec(text: &str) -> Result<BootstrapNode> {
 /// # Errors
 /// [`Error::MalformedAnchor`] if the text is neither a multiaddr nor `host:port`, or
 /// if a name resolves to nothing.
-fn parse_anchor_addrs(text: &str) -> Result<Vec<Multiaddr>> {
+pub fn parse_anchor_addrs(text: &str) -> Result<Vec<Multiaddr>> {
     if text.starts_with('/') {
         // `/dns4/<name>/udp/<port>` — the multiaddr spelling of a name.
         let parts: Vec<&str> = text.split('/').collect();
@@ -300,6 +300,63 @@ pub fn merge_machine_anchors(
         skipped.extend(merge_anchors_file(set, &file)?);
     }
     Ok(skipped)
+}
+
+/// Write one manual change without discarding any other input, including comments or lines
+/// the refresh cannot currently resolve. Unreadable input refuses the write unchanged. Once
+/// created, the existing canonical machine file is the sole manual source.
+///
+/// # Errors
+/// An unreadable input, a missing manual fingerprint on remove, or an atomic write failure.
+pub fn change_manual_anchor(
+    account: &crate::node::paths::Account,
+    extra: &[String],
+    add: Option<&str>,
+    remove: Option<Digest32>,
+) -> Result<()> {
+    let mut lines = Vec::new();
+    for file in account.anchor_input_files() {
+        match std::fs::read_to_string(&file) {
+            Ok(text) => lines.extend(text.lines().map(str::to_owned)),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && std::fs::symlink_metadata(&file).is_err() => {}
+            Err(error) => {
+                return Err(Error::Path {
+                    op: "change manual anchors",
+                    detail: format!("{}: {error}", file.display()),
+                })
+            }
+        }
+    }
+    for spec in extra {
+        if !lines.iter().any(|line| line.trim() == spec.trim()) {
+            lines.push(spec.clone());
+        }
+    }
+    if let Some(id) = remove {
+        let before = lines.len();
+        lines.retain(|line| {
+            line.trim()
+                .split_once('@')
+                .and_then(|(fp, _)| b32_decode(fp.trim(), "anchor fingerprint").ok())
+                != Some(id)
+        });
+        if lines.len() == before {
+            return Err(Error::Profile(
+                "this anchor was not added by hand; a room's anchors are changed by its admin",
+            ));
+        }
+    }
+    if let Some(spec) = add {
+        if !lines.iter().any(|line| line.trim() == spec) {
+            lines.push(spec.to_owned());
+        }
+    }
+    crate::node::paths::write_private_file(
+        &account.anchors_file(),
+        format!("{}\n", lines.join("\n")).as_bytes(),
+    )
 }
 
 /// Add an anchor spec to a set, merging its address into an anchor already named.

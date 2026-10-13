@@ -110,6 +110,42 @@ fn render(v: &Value) -> String {
     let empty = Vec::new();
     let arr = |k: &str| v.get(k).and_then(Value::as_array).unwrap_or(&empty);
     // Stored entries a room set aside when it opened (V210-74): said first, whatever else there is.
+    for a in arr("anchors") {
+        let sources = a["sources"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|source| {
+                if source["kind"] == "added-by-hand" {
+                    "added by hand".to_owned()
+                } else {
+                    format!(
+                        "from room {}{}",
+                        source["name"].as_str().unwrap_or(""),
+                        if source["stale"] == true {
+                            " (last known)"
+                        } else {
+                            ""
+                        }
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let addresses = a["addresses"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let reach = s(a, "reach_text");
+        let _ = writeln!(
+            o,
+            "anchor {}  {addresses}  {sources}  {reach}",
+            short(s(a, "fingerprint"))
+        );
+    }
     for r in arr("set_aside") {
         for e in r.get("entries").and_then(Value::as_array).unwrap_or(&empty) {
             let _ = writeln!(
