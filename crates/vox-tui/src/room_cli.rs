@@ -279,6 +279,14 @@ pub(crate) async fn post(
     if body.trim().is_empty() {
         return Err(AppError::Usage("refusing to post an empty message".into()));
     }
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    // A raw envelope may name another authoring session. The command still acts inside the
+    // caller's registered working room; its supplied `from` cannot bypass that boundary.
+    if let Some(session) = session.as_deref() {
+        vox_core::node::sessions::check_working_room(paths, session, &channel_id)
+            .map_err(AppError::Usage)?;
+    }
     // **A message from a harness session says which** (ADR-029 MD-1, MD-2): its `from` is the
     // session's id, whatever the agent wrote, and the node fills in its name. A message that
     // already names a session, and one no session sends (a person's), is posted as given.
@@ -289,8 +297,6 @@ pub(crate) async fn post(
         }
         _ => body,
     };
-    let mut client = attach(paths).await?;
-    let channel_id = room_of(&mut client, room).await?;
     match client
         .request(&Request::Post {
             channel_id,
