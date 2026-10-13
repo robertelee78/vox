@@ -7723,6 +7723,9 @@ impl Node {
                 let mut puts: Vec<Vec<u8>> = Vec::new();
                 let rooms: Vec<Digest32> = self.channels.keys().copied().collect();
                 for room in rooms {
+                    if !self.anchor_serves_room(&room, &peer) {
+                        continue;
+                    }
                     if let Some(r) = self.admin_roster(&room).await {
                         puts.push(r);
                     }
@@ -12027,11 +12030,13 @@ impl Node {
         for (cid, shared) in &self.channels {
             let (anchors, known) = {
                 let ch = shared.lock().await;
-                let anchors: Vec<Digest32> = ch
+                let anchors: BTreeSet<Digest32> = ch
                     .anchors()
                     .nodes()
                     .iter()
                     .map(|a| a.id)
+                    .chain(self.anchors.nodes().iter().map(|a| a.id))
+                    .filter(|a| self.anchor_serves_room(cid, a))
                     .filter(|a| !ch.is_member(a))
                     .filter(|a| only.is_none_or(|o| o == *a))
                     .collect();
@@ -15308,6 +15313,7 @@ impl Node {
         for conn in self
             .anchor_ids
             .iter()
+            .filter(|id| self.anchor_serves_room(channel_id, id))
             .filter_map(|id| net.manager().existing(id))
         {
             Self::put_withdraws(&conn, vec![wire.clone()]);
