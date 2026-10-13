@@ -1517,61 +1517,7 @@ final class FirstRunProof: XCTestCase {
             XCTAssertTrue(content.status == 0 && content.out.contains("agent hook --light \(harness)"),
                           "PRODUCT: first run must install \(harness)'s light hook at \(path); it reads \(content.out), window said \(hookSaid)")
         }
-        // The footer is drawn outside the setup scroll area. XCTest can report its
-        // visible button as non-hittable; drive the actual mouse and prove dismissal.
-        let dismiss = el(ui, Key.id("agent-hooks-dismiss"))
-        let button = dismiss.frame
-        func drawn(_ frame: CGRect) -> Bool {
-            frame.minX.isFinite && frame.minY.isFinite && frame.maxX.isFinite
-                && frame.maxY.isFinite && frame.width > 0 && frame.height > 0
-        }
-        guard drawn(button), let window = ui.windows.allElementsBoundByIndex.first(where: {
-            drawn($0.frame) && $0.frame.contains(button)
-        }) else {
-            keepTree(ui, "the installed-hook Dismiss button was not inside the window")
-            throw Apparatus("the installed-hook Dismiss button has no visible window-contained click point: \(button)")
-        }
-        let at = CGPoint(x: button.midX, y: button.midY)
-        let clearBy = Date().addingTimeInterval(20)
-        var overlay = systemOverlayOver(at, targetHittable: dismiss.isHittable)
-        while overlay?.hasPrefix("Screenshot,") == true, Date() < clearBy {
-            Thread.sleep(forTimeInterval: 0.5)
-            overlay = systemOverlayOver(at, targetHittable: dismiss.isHittable)
-        }
-        guard overlay?.hasPrefix("Screenshot,") != true else {
-            keepTree(ui, "a screenshot overlay covered the installed-hook Dismiss button")
-            throw Apparatus("\(overlay!) covered the installed-hook Dismiss click for 20 s")
-        }
-        // Notification Center's transparent container may cover this point in its
-        // window list. Its bounds alone cannot establish interception; the result
-        // of the real click decides, with an ambiguous interception named separately.
-        let currentButton = dismiss.frame
-        let currentWindow = window.frame
-        guard drawn(currentButton), drawn(currentWindow), currentWindow.contains(currentButton) else {
-            throw Apparatus("the installed-hook Dismiss button moved outside its window before the click")
-        }
-        let clickAt = CGPoint(x: currentButton.midX, y: currentButton.midY)
-        overlay = systemOverlayOver(clickAt, targetHittable: dismiss.isHittable)
-        guard overlay?.hasPrefix("Screenshot,") != true else {
-            throw Apparatus("\(overlay!) covers the installed-hook Dismiss button's current click point")
-        }
-        print("[apparatus] hook Dismiss: id=\(dismiss.identifier), frame=\(currentButton), hittable=\(dismiss.isHittable), overlay=\(overlay ?? "none")")
-        let origin = currentWindow.origin
-        window.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
-            .withOffset(CGVector(dx: clickAt.x - origin.x, dy: clickAt.y - origin.y)).click()
-        let dismissedBy = Date().addingTimeInterval(5)
-        func panelGone() -> Bool {
-            locateEverywhere(ui, Key.id("agent-hooks-dismiss")) == nil
-                && locateEverywhere(ui, Key.id("agent-hooks-installed")) == nil
-        }
-        while !panelGone() && Date() < dismissedBy { Thread.sleep(forTimeInterval: 0.25) }
-        guard panelGone() else {
-            keepTree(ui, "the installed-hook panel remained after the actual Dismiss click")
-            if let overlay {
-                throw Apparatus("the physical Dismiss click left the panel open with possible interception by \(overlay)")
-            }
-            throw Product("clicking the visible installed-hook Dismiss button must remove the button and paths panel; both did not disappear")
-        }
+        try dismissInstalledHookNotice(ui)
 
         // Setup may precede the person's own node. Choosing none is permitted; declining a
         // later setup must not erase the fact that this node belongs to harness setup.
@@ -1635,6 +1581,11 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(nodeLine(listed, "alice")?.contains(" attached ") ?? false,
                       "PRODUCT: the app's new node must be alice, attached, as `vox node list` lists it; it says \(listed)")
 
+        // Choosing a node can install its harness hooks and publish another paths notice.
+        if locateEverywhere(ui, Key.id("agent-hooks-installed")) != nil {
+            try dismissInstalledHookNotice(ui)
+        }
+
         // In no room yet: the window offers the ways in.
         let newRoom = Key.id("empty-new-room")
         present(ui, newRoom, timeout: 15, "a node in no room must be offered New Room in the window")
@@ -1646,6 +1597,18 @@ final class FirstRunProof: XCTestCase {
         type(ui, roomName, "first", "the room's name field")
         type(ui, Key.id("room-form-passphrase"), "first room", "the room's passphrase field")
         tap(ui, Key.id("room-form-submit"), "Create")
+        if locateEverywhere(ui, Key.id("agent-hooks-installed")) != nil {
+            try dismissInstalledHookNotice(ui)
+        }
+        guard present(ui, Key.id("room-first"), timeout: 30,
+                      "the room created in the app must appear in its sidebar",
+                      premise: inRoom(vox, voxEnv, "first")) else { return }
+        let firstRow = el(ui, Key.id("room-first"))
+        guard !firstRow.frame.isEmpty,
+              ui.windows.allElementsBoundByIndex.contains(where: { $0.frame.contains(firstRow.frame) }) else {
+            keepTree(ui, "first room row outside the window after clearing hook paths")
+            throw Apparatus("cannot stage first-room click after hook notice dismissal: row \(firstRow.frame), windows \(ui.windows.allElementsBoundByIndex.map(\.frame))")
+        }
         tap(ui, Key.id("room-first"), "first in the sidebar", premise: inRoom(vox, voxEnv, "first"))
         let compose = Key.id("compose")
         present(ui, compose, timeout: 15, "the new room must offer its composer")
@@ -5028,6 +4991,66 @@ final class FirstRunProof: XCTestCase {
         }
         Thread.sleep(forTimeInterval: 0.5)
         return el(ui, key).value as? String
+    }
+
+    /// Reuse the accepted physical footer action when later setup publishes another notice.
+    private func dismissInstalledHookNotice(_ ui: XCUIApplication) throws {
+        // The footer is drawn outside the setup scroll area. XCTest can report its
+        // visible button as non-hittable; drive the actual mouse and prove dismissal.
+        let dismiss = el(ui, Key.id("agent-hooks-dismiss"))
+        let button = dismiss.frame
+        func drawn(_ frame: CGRect) -> Bool {
+            frame.minX.isFinite && frame.minY.isFinite && frame.maxX.isFinite
+                && frame.maxY.isFinite && frame.width > 0 && frame.height > 0
+        }
+        guard drawn(button), let window = ui.windows.allElementsBoundByIndex.first(where: {
+            drawn($0.frame) && $0.frame.contains(button)
+        }) else {
+            keepTree(ui, "the installed-hook Dismiss button was not inside the window")
+            throw Apparatus("the installed-hook Dismiss button has no visible window-contained click point: \(button)")
+        }
+        let at = CGPoint(x: button.midX, y: button.midY)
+        let clearBy = Date().addingTimeInterval(20)
+        var overlay = systemOverlayOver(at, targetHittable: dismiss.isHittable)
+        while overlay?.hasPrefix("Screenshot,") == true, Date() < clearBy {
+            Thread.sleep(forTimeInterval: 0.5)
+            overlay = systemOverlayOver(at, targetHittable: dismiss.isHittable)
+        }
+        guard overlay?.hasPrefix("Screenshot,") != true else {
+            keepTree(ui, "a screenshot overlay covered the installed-hook Dismiss button")
+            throw Apparatus("\(overlay!) covered the installed-hook Dismiss click for 20 s")
+        }
+        // Notification Center's transparent container may cover this point in its
+        // window list. Its bounds alone cannot establish interception; the result
+        // of the real click decides, with an ambiguous interception named separately.
+        let currentButton = dismiss.frame
+        let currentWindow = window.frame
+        guard drawn(currentButton), drawn(currentWindow), currentWindow.contains(currentButton) else {
+            throw Apparatus("the installed-hook Dismiss button moved outside its window before the click")
+        }
+        let clickAt = CGPoint(x: currentButton.midX, y: currentButton.midY)
+        overlay = systemOverlayOver(clickAt, targetHittable: dismiss.isHittable)
+        guard overlay?.hasPrefix("Screenshot,") != true else {
+            throw Apparatus("\(overlay!) covers the installed-hook Dismiss button's current click point")
+        }
+        print("[apparatus] hook Dismiss: id=\(dismiss.identifier), frame=\(currentButton), hittable=\(dismiss.isHittable), overlay=\(overlay ?? "none")")
+        let origin = currentWindow.origin
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
+            .withOffset(CGVector(dx: clickAt.x - origin.x, dy: clickAt.y - origin.y)).click()
+        let dismissedBy = Date().addingTimeInterval(5)
+        func panelGone() -> Bool {
+            locateEverywhere(ui, Key.id("agent-hooks-dismiss")) == nil
+                && locateEverywhere(ui, Key.id("agent-hooks-installed")) == nil
+        }
+        while !panelGone() && Date() < dismissedBy { Thread.sleep(forTimeInterval: 0.25) }
+        guard panelGone() else {
+            keepTree(ui, "the installed-hook panel remained after the actual Dismiss click")
+            if let overlay {
+                throw Apparatus("the physical Dismiss click left the panel open with possible interception by \(overlay)")
+            }
+            throw Product("clicking the visible installed-hook Dismiss button must remove the button and paths panel; both did not disappear")
+        }
+
     }
 
     /// Select what `key` shows by dragging across it, as a person does, and copy it with ⌘C: what
