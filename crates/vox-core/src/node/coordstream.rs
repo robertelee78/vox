@@ -57,6 +57,7 @@ use crate::hash::Digest32;
 use crate::nat::holepunch::{CoordMessage, Coordinator, PunchPlan, Role, Step};
 use crate::nat::multiaddr::{EndpointList, Multiaddr, MAX_ENDPOINTS};
 use crate::nat::reachability::connect_direct_within;
+use crate::nat::service::ComputerTransportPermit;
 use crate::node::net::PeerClass;
 use crate::transport::framing::{read_frame, write_frame};
 use crate::transport::quic::{VoxConnection, VoxEndpoint};
@@ -300,11 +301,17 @@ pub enum CoordInbound {
 /// names, `shares_room` says whether the two share a room this node serves (a relay is
 /// only ever between them — see `NodeNet::relays_between`), and `connected` resolves a
 /// fingerprint to a live connection (the coordinator's own peer table).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "separate room, transport and introduction authorities remain explicit"
+)]
 pub async fn serve_coord<F>(
     peer: Digest32,
     observed: Option<Multiaddr>,
     classify: &(dyn Fn(&Digest32) -> PeerClass + Sync),
     shares_room: &(dyn Fn(&Digest32, &Digest32) -> bool + Sync),
+    transport: &(dyn Fn(&Digest32, &Digest32) -> Option<ComputerTransportPermit> + Sync),
+    accepts_origin: &(dyn Fn(&Digest32, &Digest32) -> bool + Sync),
     mut send: SendStream,
     mut recv: RecvStream,
     connected: F,
@@ -331,10 +338,15 @@ where
         CoordFrame::Relay { peer: target } => {
             // Both ends must be peers this node relays for: a member may not make it
             // open a coord stream to an identity it knows nothing about.
-            if !relays_for(classify(&peer))
-                || !relays_for(classify(&target))
-                || !shares_room(&peer, &target)
-            {
+            let ordinary = relays_for(classify(&peer))
+                && relays_for(classify(&target))
+                && shares_room(&peer, &target);
+            let permit = if ordinary {
+                None
+            } else {
+                transport(&peer, &target)
+            };
+            if !ordinary && permit.is_none() {
                 refuse(&mut send, CoordRefusal::NotAuthorized).await;
                 return Err(Error::StreamRefused("coord: peer may not ask for a relay"));
             }
@@ -342,12 +354,12 @@ where
                 refuse(&mut send, CoordRefusal::NotConnected).await;
                 return Err(Error::HolePunchFailed("coord: target not connected"));
             };
-            relay_session(peer, send, recv, &target_conn).await?;
+            relay_session(peer, send, recv, &target_conn, permit).await?;
             Ok(CoordInbound::Answered)
         }
         // A coordinator offering a session: accept only from a member or anchor.
         CoordFrame::From { peer: origin } => {
-            if !accepts_relayed(classify(&peer), classify(&origin)) {
+            if !accepts_origin(&peer, &origin) {
                 refuse(&mut send, CoordRefusal::NotAuthorized).await;
                 return Err(Error::StreamRefused("coord: peer may not coordinate"));
             }
@@ -393,6 +405,7 @@ async fn relay_session(
     mut asker_send: SendStream,
     asker_recv: RecvStream,
     target: &Arc<VoxConnection>,
+    permit: Option<ComputerTransportPermit>,
 ) -> Result<()> {
     let (mut target_send, mut target_recv) = open_typed(target, StreamKind::Coord).await?;
     send_frame(&mut target_send, &CoordFrame::From { peer: asker }).await?;
@@ -416,6 +429,10 @@ async fn relay_session(
         tokio::select! {
             _ = &mut up => {}
             _ = &mut down => {}
+            () = async {
+                if let Some(permit) = permit { permit.revoked().await; }
+                else { std::future::pending::<()>().await; }
+            } => {}
         }
     })
     .await;

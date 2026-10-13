@@ -97,6 +97,12 @@ impl PeerPolicy {
         self.anchors.insert(anchor);
     }
 
+    /// Whether this exact identity is a configured anchor, even if it is also a member.
+    #[must_use]
+    pub fn is_anchor(&self, peer: &Digest32) -> bool {
+        self.anchors.contains(peer)
+    }
+
     /// Expect a join from `joiner` (until [`PeerPolicy::forget_joiner`]).
     pub fn expect_joiner(&mut self, joiner: Digest32) {
         self.pending_joiners.insert(joiner);
