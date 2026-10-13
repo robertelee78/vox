@@ -5883,6 +5883,11 @@ final class FirstRunProof: XCTestCase {
         // under it on screen (XCTest also found it among the sidebar's descendants); a target
         // with no identifier, or in no scroll view, is clicked where it is.
         let id = e.identifier
+        if id.hasPrefix("machine-") {
+            let machine = ui.windows.firstMatch.scrollViews.matching(identifier: "machine-nodes-scroll").firstMatch
+            guard machine.exists else { return false }
+            return machine.frame.contains(f)
+        }
         guard !id.isEmpty, let view = ui.windows.firstMatch.scrollViews.allElementsBoundByIndex.first(where: {
             $0.frame.minX <= f.midX && f.midX <= $0.frame.maxX
                 && $0.descendants(matching: .any).matching(identifier: id).firstMatch.exists
@@ -5893,10 +5898,17 @@ final class FirstRunProof: XCTestCase {
     private func scrollTo(_ ui: XCUIApplication, _ e: XCUIElement) {
         let target = e.frame
         let id = e.identifier
-        guard let view = ui.windows.firstMatch.scrollViews.allElementsBoundByIndex.first(where: {
+        let machine = ui.windows.firstMatch.scrollViews.matching(identifier: "machine-nodes-scroll").firstMatch
+        let view: XCUIElement?
+        if id.hasPrefix("machine-") {
+            view = machine.exists ? machine : nil
+        } else {
+            view = ui.windows.firstMatch.scrollViews.allElementsBoundByIndex.first(where: {
             $0.frame.minX <= target.midX && target.midX <= $0.frame.maxX
                 && (id.isEmpty || $0.descendants(matching: .any).matching(identifier: id).firstMatch.exists)
-        }) else { return }
+            })
+        }
+        guard let view else { return }
         for _ in 0..<20 where !inView(ui, e) {
             let now = e.frame
             let down = now.maxY > view.frame.maxY
