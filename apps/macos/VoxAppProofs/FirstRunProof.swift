@@ -4765,6 +4765,12 @@ final class FirstRunProof: XCTestCase {
         // under it on screen (XCTest also found it among the sidebar's descendants); a target
         // with no identifier, or in no scroll view, is clicked where it is.
         let id = e.identifier
+        // XCTest reports the persistent hook footer among the setup scroll view's
+        // descendants even though the rendered footer is its sibling. Its button
+        // must be hittable and wholly inside the actual window, not that scroll area.
+        if id == "agent-hooks-dismiss" {
+            return ui.windows.allElementsBoundByIndex.contains { $0.frame.contains(f) }
+        }
         guard !id.isEmpty, let view = ui.windows.firstMatch.scrollViews.allElementsBoundByIndex.first(where: {
             $0.frame.minX <= f.midX && f.midX <= $0.frame.maxX
                 && $0.descendants(matching: .any).matching(identifier: id).firstMatch.exists
