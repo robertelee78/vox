@@ -1321,11 +1321,26 @@ fn assert_no_lifecycle(member: &Member, room: &str, session: &str) {
         ok,
         "PRODUCT: member could not read its own room data: {out}{err}"
     );
-    assert!(
-        !out.contains(session),
-        "PRODUCT: {} opened a Session lifecycle record from its own public log: {out}",
-        member.name
-    );
+    // A legitimate room message may address this Session by ID. Only a lifecycle envelope
+    // exposes its opening/end metadata; matching the ID anywhere would misclassify that chat.
+    for line in out.lines().filter(|line| !line.trim().is_empty()) {
+        let row: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("PRODUCT: malformed public room row: {line}; {e}"));
+        let text = row["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("PRODUCT: public room row omitted its text: {row}"));
+        let lifecycle = vox_agentcomms::envelope::Envelope::parse(text).is_ok_and(|env| {
+            matches!(
+                env.kind.as_str(),
+                vox_agentcomms::envelope::SESSION | vox_agentcomms::envelope::SESSION_END
+            )
+        });
+        assert!(
+            !lifecycle,
+            "PRODUCT: {} opened lifecycle metadata for {session} from its public log: {row}",
+            member.name
+        );
+    }
 }
 
 /// An authenticated member asks the actual owner and an actual holder for
