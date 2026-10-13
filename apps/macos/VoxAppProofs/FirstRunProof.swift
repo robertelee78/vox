@@ -2489,6 +2489,20 @@ final class FirstRunProof: XCTestCase {
                         "choosing an ended Session must switch the centre to its ended history",
                         until: { $0.contains("S2-WORDS") && $0.contains("ended") }) != nil else { return }
             XCTAssertNil(locate(ui, sessionCompose), "PRODUCT: an ended Session must not offer a drive composer")
+            let endedRead = try staged(vox, ["room", "session", room, s2, "--node", "alice", "--json"], env: voxEnv)
+            guard endedRead.contains("S2-WORDS") else { throw Apparatus("ended S2's retained body was not staged: \(endedRead)") }
+            let endedBody = ui.descendants(matching: .staticText).matching(NSPredicate(
+                format: "identifier BEGINSWITH %@ AND (label CONTAINS %@ OR CAST(value, 'NSString') CONTAINS %@)",
+                "entry-line-", "S2-WORDS", "S2-WORDS")).firstMatch
+            guard endedBody.waitForExistence(timeout: 20) else {
+                throw Product("the selected ended Session's retained S2-WORDS body must appear in the centre")
+            }
+            let endedTimeline = ui.scrollViews.matching(identifier: "timeline").firstMatch
+            guard endedTimeline.exists, [endedBody.frame, endedTimeline.frame, ui.windows.firstMatch.frame].allSatisfy({
+                $0.minX.isFinite && $0.minY.isFinite && $0.width.isFinite && $0.height.isFinite && $0.width > 0 && $0.height > 0
+            }), endedTimeline.frame.contains(endedBody.frame), ui.windows.firstMatch.frame.contains(endedBody.frame) else {
+                throw Apparatus("the ended Session body is not realized visibly inside its actual timeline")
+            }
 
         } else { print("NOT RUN: Sessions approval/composer/draft/stop flows; selected room-ask only") }
 
