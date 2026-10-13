@@ -297,70 +297,71 @@ fn over_of(ch: &ChannelState) -> Option<String> {
     ch.has_left(&ch.me()).then(|| "left".to_owned())
 }
 
-/// A room's detail for the view, from its state. `prev` is the room's detail last published: its
-/// timeline is shared rather than rebuilt when the room's timeline has not changed since
-/// (V210-71), since most publishes are about something else, and is **extended** by the rows
-/// added since when it has (V210-120). A room's timeline only grows at its end, so the published
-/// one is a prefix of it: rebuilding it whole made every message cost the room's whole history.
+/// A room's detail for the view, reusing the previous timeline and its indices whenever the
+/// display inputs still match, including owed rows (#862). Pure end appends extend the shared
+/// prefix (V210-120); fills, expiry, classification and ordering changes rebuild it.
 fn detail_of(
     ch: &ChannelState,
     prev: Option<&ChannelDetail>,
     now: crate::time::Ms,
 ) -> ChannelDetail {
     let (frozen, refused_below_checkpoint) = ch.fork_watch();
-    // A room with a message not received yet (V030-10) is shown with it in place, rebuilt each
-    // time: filling one in changes a row inside the timeline, so the published one is no longer
-    // a prefix of it. Only a timeline with none on either side may be shared or extended.
-    let owed = ch.shows_owed();
-    let shown;
-    let rows: &[Rendered] = if owed {
-        shown = ch.shown_timeline();
-        &shown
+    let (timeline, structured, row_index, display_stamp) = if let Some(p) =
+        prev.filter(|p| ch.display_is_current(&p.display_stamp))
+    {
+        (
+            p.timeline.clone(),
+            p.structured.clone(),
+            p.row_index.clone(),
+            p.display_stamp.clone(),
+        )
     } else {
-        ch.timeline()
+        let (rows, stamp) = ch.display_timeline();
+        let prefix = prev.filter(|p| {
+            let n = p.timeline.len();
+            !stamp.owed
+                && !p.display_stamp.owed
+                && ch.display_extends(&p.display_stamp)
+                && n <= rows.len()
+                && p.timeline.first().map(|r| r.entry_hash) == rows.first().map(|r| r.entry_hash)
+                && p.timeline.last().map(|r| r.entry_hash)
+                    == n.checked_sub(1).map(|i| rows[i].entry_hash)
+        });
+        // All three projections use the same prefix decision. First/last hashes alone
+        // cannot establish that a middle row's text, position or late flag is unchanged.
+        let (timeline, structured, base, from) = match prefix {
+            Some(p) => {
+                let from = p.timeline.len();
+                (
+                    p.timeline.appended(rows[from..].iter().map(row_of)),
+                    p.structured
+                        .appended(from, rows[from..].iter().map(|r| &r.text)),
+                    p.row_index.clone(),
+                    from,
+                )
+            }
+            None => (
+                rows.iter().map(row_of).collect(),
+                crate::node::api::StructuredIndex::default()
+                    .appended(0, rows.iter().map(|r| &r.text)),
+                crate::node::api::OpRuns::default(),
+                0,
+            ),
+        };
+        let row_index = base.appended(
+            rows[from..]
+                .iter()
+                .enumerate()
+                .filter_map(|(i, r)| {
+                    Some((
+                        u64::from_be_bytes(r.entry_hash[..8].try_into().ok()?),
+                        u32::try_from(from + i).ok()?,
+                    ))
+                })
+                .collect(),
+        );
+        (timeline, structured, row_index, stamp)
     };
-    let prefix = |p: &&ChannelDetail| {
-        let n = p.timeline.len();
-        !owed
-            && !p.timeline.iter().any(|r| r.owed)
-            && p.channel_id == ch.channel_id()
-            && n <= rows.len()
-            && p.timeline.first().map(|r| r.entry_hash) == rows.first().map(|r| r.entry_hash)
-            && p.timeline.last().map(|r| r.entry_hash)
-                == n.checked_sub(1).map(|i| rows[i].entry_hash)
-    };
-    // The structured-post index grows with the timeline, from the same rows (V210-120).
-    let (timeline, structured) = match prev.filter(prefix) {
-        Some(p) if p.timeline.len() == rows.len() => (p.timeline.clone(), p.structured.clone()),
-        Some(p) => {
-            let from = p.timeline.len();
-            (
-                p.timeline.appended(rows[from..].iter().map(row_of)),
-                p.structured
-                    .appended(from, rows[from..].iter().map(|r| &r.text)),
-            )
-        }
-        None => (
-            rows.iter().map(row_of).collect(),
-            crate::node::api::StructuredIndex::default().appended(0, rows.iter().map(|r| &r.text)),
-        ),
-    };
-    let (base, from) = prev.filter(prefix).map_or_else(
-        || (crate::node::api::OpRuns::default(), 0),
-        |p| (p.row_index.clone(), p.timeline.len()),
-    );
-    let row_index = base.appended(
-        rows[from..]
-            .iter()
-            .enumerate()
-            .filter_map(|(i, r)| {
-                Some((
-                    u64::from_be_bytes(r.entry_hash[..8].try_into().ok()?),
-                    u32::try_from(from + i).ok()?,
-                ))
-            })
-            .collect(),
-    );
     // Who trusts each member (ADR-028 K-7), once: this identity's own entry is `consenting`.
     let trusted_by = ch.trusted_by();
     let consenting = trusted_by.get(&ch.me()).cloned().unwrap_or_default();
@@ -371,6 +372,7 @@ fn detail_of(
         epoch: ch.epoch(),
         members: ch.members(),
         timeline,
+        display_stamp,
         row_index,
         order: ch.order_keys(),
         structured,
@@ -17676,7 +17678,11 @@ impl Node {
             mlock_active &= ch.mlock_active();
             open_channels.push(detail_of(
                 &ch,
-                prev.open_channels.iter().find(|d| d.channel_id == *id),
+                self.fresh_details
+                    .get(id)
+                    .map(|(_, detail)| detail)
+                    .filter(|detail| ch.display_is_current(&detail.display_stamp))
+                    .or_else(|| prev.open_channels.iter().find(|d| d.channel_id == *id)),
                 self.now_ms(),
             ));
         }

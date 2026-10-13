@@ -573,6 +573,8 @@ pub struct ChannelDetail {
     /// IPC read page takes one — used to copy every room's whole timeline (V210-71); and a new
     /// message adds its row without rebuilding the rest (V210-120).
     pub timeline: Timeline,
+    /// Local reuse stamp for the already-built display; never serialized or sent to peers.
+    pub(crate) display_stamp: crate::node::channel::DisplayStamp,
     /// Entry-hash prefixes to timeline positions. Collisions are checked against the row's full
     /// hash. Shared sorted runs let history pages locate their cursor without scanning history.
     pub row_index: OpRuns,

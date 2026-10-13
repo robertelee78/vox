@@ -212,6 +212,9 @@ pub struct Dag {
     /// Bumped whenever an already-stored entry's clock moves (a late parent arrived),
     /// so a timeline can tell a re-sort is due without recomputing anything.
     reorder_generation: u64,
+    /// Body presence changed without replacing a signed skeleton. Display projections must
+    /// notice this even if the caller's later persistence or rendering step fails.
+    body_generation: u64,
     /// The room's genesis time in ms, the anchor for an entry with no parent
     /// ([`Dag::for_room`]).
     origin_ms: Option<u64>,
@@ -376,9 +379,14 @@ impl Dag {
         let Some((author, seq)) = self.by_hash.get(hash).copied() else {
             return false;
         };
-        self.feeds
+        let dropped = self
+            .feeds
             .get_mut(&author)
-            .is_some_and(|f| f.prune_payload(seq))
+            .is_some_and(|f| f.prune_payload(seq));
+        if dropped {
+            self.body_generation = self.body_generation.wrapping_add(1);
+        }
+        dropped
     }
 
     /// **A body that arrives for a skeleton held without one is put back** (V030-10). A skeleton
@@ -418,7 +426,13 @@ impl Dag {
             }
         }
         self.filled.push(hash);
+        self.body_generation = self.body_generation.wrapping_add(1);
         true
+    }
+
+    /// Revision of existing entries' body presence, independent of durable sync credit.
+    pub(crate) fn body_generation(&self) -> u64 {
+        self.body_generation
     }
 
     /// The entries whose body [`Dag::fill_body`] put back since the last call.
