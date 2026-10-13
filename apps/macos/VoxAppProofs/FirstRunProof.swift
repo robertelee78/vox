@@ -194,6 +194,7 @@ enum Key: ExpressibleByStringLiteral, CustomStringConvertible {
     case id(String)
     case idPrefix(String)
     case showing(String)
+    case timelineRow(String)
     case menuItem(String)
     case child(of: String, button: String)
 
@@ -205,7 +206,7 @@ enum Key: ExpressibleByStringLiteral, CustomStringConvertible {
     var sibling: Key {
         switch self {
         case .id, .idPrefix, .child: return .id("status")
-        case .showing: return .showing("node ")
+        case .showing, .timelineRow: return .showing("node ")
         case .menuItem: return .menuItem("Quit Vox")
         }
     }
@@ -215,6 +216,7 @@ enum Key: ExpressibleByStringLiteral, CustomStringConvertible {
         case let .id(i): return "\"\(i)\""
         case let .idPrefix(p): return "an element whose identifier starts \"\(p)\""
         case let .showing(w): return "an element showing \"\(w)\""
+        case let .timelineRow(w): return "the timeline row saying \(w)"
         case let .menuItem(t): return "the menu item \"\(t)\""
         case let .child(of, button): return "\"\(button)\" in \"\(of)\""
         }
@@ -248,6 +250,8 @@ enum Key: ExpressibleByStringLiteral, CustomStringConvertible {
             // snapshot evaluator, leaving XCTest waiting for a reply until timeout.
             return container.descendants(matching: .any)
                 .matching(NSPredicate(format: "label CONTAINS %@ OR CAST(value, 'NSString') CONTAINS %@", w, w))
+        case let .timelineRow(w):
+            return container.descendants(matching: .any).matching(rowSays(w))
         case let .menuItem(t):
             return container.descendants(matching: .menuItem)
                 .matching(NSPredicate(format: "title == %@ OR label == %@", t, t))
@@ -2968,12 +2972,26 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("tagged root post returned no entry hash: \(taggedPost)")
         }
         try staged(vox, ["room", "post", "--node", "bob", "--re", taggedRoot, room, "TAGGED-THREAD-MIDDLE"], env: voxEnv)
-        words(ui, Key.showing(": TAGGED-THREAD-MIDDLE"), timeout: 30,
+        words(ui, Key.timelineRow("bob: TAGGED-THREAD-MIDDLE"), timeout: 30,
               "the app must receive the tagged thread's middle reply", until: { $0.contains("TAGGED-THREAD-MIDDLE") })
         guard let fromBob = entry("TAGGED-THREAD-MIDDLE") else {
             throw Apparatus("the staged tagged middle reply has no entry hash")
         }
-        tap(ui, Key.showing(": TAGGED-THREAD-MIDDLE"), "bob's reply to select it")
+        let middleKey = Key.timelineRow("bob: TAGGED-THREAD-MIDDLE")
+        let middle = el(ui, middleKey)
+        if !inView(ui, middle) { scrollTo(ui, middle) }
+        guard let timeline = locate(ui, Key.id("timeline")),
+              timeline.frame.contains(middle.frame), inView(ui, middle) else {
+            keepTree(ui, "the tagged middle reply was not inside its timeline")
+            throw Apparatus("the tagged middle reply could not be staged wholly inside the timeline")
+        }
+        guard tap(ui, middleKey, "bob's reply to select it") else { return }
+        let selectedUntil = Date().addingTimeInterval(5)
+        while Date() < selectedUntil && !middle.isSelected { Thread.sleep(forTimeInterval: 0.2) }
+        guard middle.isSelected else {
+            keepTree(ui, "the clicked tagged middle reply was not selected")
+            throw Product("clicking bob's visible middle reply must select that timeline row before Reply in Thread")
+        }
         ui.menuBars.menuBarItems["Room"].click()
         let replyInThread = ui.menuBars.menuItems["Reply in Thread"]
         guard replyInThread.waitForExistence(timeout: 5), replyInThread.isEnabled else {
