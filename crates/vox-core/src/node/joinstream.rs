@@ -603,8 +603,74 @@ pub async fn run_initiator(
     root: &(dyn RootSigner + Send + Sync),
     ik: &X25519IdentityKey,
 ) -> Result<JoinOutcome> {
+    let streams = open_typed(conn, StreamKind::Join).await?;
+    initiator_exchange(
+        conn,
+        streams,
+        ctx,
+        passphrase,
+        root,
+        ik,
+        JoinPurpose::Admission,
+    )
+    .await?
+    .ok_or(Error::MalformedJoin("join stopped before admission"))
+}
+
+/// Check a held room's passphrase through the production join authentication exchange.
+///
+/// The caller must own an exact local validation permit for the responder connection and
+/// stream before calling: `streams` is an already opened, typed Join stream on `conn`. This
+/// allows the caller to register its actual stream ID and await the registration before WANT
+/// is sent; predicting the next ID would race other streams. Both ends prove the same node's
+/// identity; this exchange creates no membership,
+/// consumes no prekey and stops before INIT. It does not authorize writing a room map itself.
+pub async fn run_initiator_validation(
+    conn: &VoxConnection,
+    streams: (SendStream, RecvStream),
+    ctx: JoinContext,
+    passphrase: &[u8],
+    root: &(dyn RootSigner + Send + Sync),
+    ik: &X25519IdentityKey,
+) -> Result<()> {
+    if conn.peer_id() != root.fingerprint() {
+        return Err(Error::MalformedJoin(
+            "validation requires this node's own responder",
+        ));
+    }
+    match initiator_exchange(
+        conn,
+        streams,
+        ctx,
+        passphrase,
+        root,
+        ik,
+        JoinPurpose::PassphraseValidation,
+    )
+    .await?
+    {
+        None => Ok(()),
+        Some(_) => Err(Error::MalformedJoin("validation performed an admission")),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JoinPurpose {
+    Admission,
+    PassphraseValidation,
+}
+
+async fn initiator_exchange(
+    conn: &VoxConnection,
+    streams: (SendStream, RecvStream),
+    ctx: JoinContext,
+    passphrase: &[u8],
+    root: &(dyn RootSigner + Send + Sync),
+    ik: &X25519IdentityKey,
+    purpose: JoinPurpose,
+) -> Result<Option<JoinOutcome>> {
     let responder_fp = conn.peer_id();
-    let (mut send, mut recv) = open_typed(conn, StreamKind::Join).await?;
+    let (mut send, mut recv) = streams;
 
     // 0. WANT — the responder holds many channels; say which one.
     send_frame(
@@ -789,6 +855,10 @@ pub async fn run_initiator(
         _ => return Err(Error::MalformedJoin("expected proof")),
     };
     let peer = pending.verify_peer_sealed(&sealed_peer, &responder_fp)?;
+    if purpose == JoinPurpose::PassphraseValidation {
+        let _ = send.finish();
+        return Ok(None);
+    }
 
     // 6. INIT — PQXDH against the responder's verified bundle.
     if let Some(drip) = test_drip() {
@@ -836,14 +906,14 @@ pub async fn run_initiator(
     let sealed = session.encrypt(&[])?.to_wire();
     send_frame(&mut send, &JoinFrame::Open { sealed }).await?;
     let _ = send.finish();
-    Ok(JoinOutcome {
+    Ok(Some(JoinOutcome {
         session,
         peer,
         witness,
         last_resort_grade: false,
         room_name,
         solved_in,
-    })
+    }))
 }
 
 /// The responder's side inputs that are not on the wire.
@@ -945,7 +1015,19 @@ where
     ) -> Fut,
     Fut: std::future::Future<Output = Result<Option<String>>>,
 {
-    let exchange = responder_exchange(&mut send, &mut recv, peer_fp, cfg, store, ring);
+    let exchange = async {
+        responder_exchange(
+            &mut send,
+            &mut recv,
+            peer_fp,
+            cfg,
+            store,
+            ring,
+            JoinPurpose::Admission,
+        )
+        .await?
+        .ok_or(Error::MalformedJoin("join stopped before admission"))
+    };
     // **Ended for a newcomer, and told so** (V210-92). The slot this exchange holds can be given
     // to a joiner from a lighter source; the exchange stops where it is and the joiner hears the
     // member is busy, not the refusal a wrong passphrase gets. A sender dropped without a word is
@@ -1030,6 +1112,60 @@ where
     result
 }
 
+/// Answer a locally authorized held-room passphrase check without admitting a member.
+///
+/// The actor must consume its one-shot permit, bound to the owned connection, room, epoch
+/// and stream, before calling this. A same-identity peer alone is not that permit. The shared
+/// exchange verifies the initiator's sealed proof before disclosing the responder's proof;
+/// prekey consumption, witness creation, admission callbacks and Session adoption never run.
+pub async fn run_responder_validation(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    peer_fp: Digest32,
+    cfg: &ResponderConfig<'_>,
+    store: &Store,
+    ring: &tokio::sync::Mutex<PrekeyRing>,
+    ended: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> Result<()> {
+    if peer_fp != cfg.root.fingerprint() {
+        let _ = send_frame(&mut send, &JoinFrame::Rejected(JoinReject::Refused)).await;
+        let _ = send.finish();
+        return Err(Error::MalformedJoin(
+            "validation requires this node's own initiator",
+        ));
+    }
+    let exchange = responder_exchange(
+        &mut send,
+        &mut recv,
+        peer_fp,
+        cfg,
+        store,
+        ring,
+        JoinPurpose::PassphraseValidation,
+    );
+    let result = match ended {
+        Some(ended) => tokio::select! {
+            r = exchange => r,
+            Ok(()) = ended => Err(Error::JoinEndedForNewcomer),
+        },
+        None => exchange.await,
+    };
+    if let Err(e) = &result {
+        let reason = match e {
+            Error::JoinPowInvalid => JoinReject::PowInvalid,
+            Error::MalformedJoin(_) | Error::Cbor(_) => JoinReject::Malformed,
+            Error::JoinEndedForNewcomer => JoinReject::Busy,
+            _ => JoinReject::Refused,
+        };
+        let _ = send_frame(&mut send, &JoinFrame::Rejected(reason)).await;
+    }
+    let _ = send.finish();
+    match result? {
+        None => Ok(()),
+        Some(_) => Err(Error::MalformedJoin("validation performed an admission")),
+    }
+}
+
 async fn responder_exchange(
     send: &mut SendStream,
     recv: &mut RecvStream,
@@ -1037,7 +1173,8 @@ async fn responder_exchange(
     cfg: &ResponderConfig<'_>,
     store: &Store,
     ring: &tokio::sync::Mutex<PrekeyRing>,
-) -> Result<JoinOutcome> {
+    purpose: JoinPurpose,
+) -> Result<Option<JoinOutcome>> {
     // 1. CHALLENGE — difficulty adapts to the responder's live join load and is
     //    capped by `adapted_for_load` at `Difficulty::MAX`.
     let difficulty = cfg.base_difficulty.adapted_for_load(cfg.pending_joins);
@@ -1102,6 +1239,7 @@ async fn responder_exchange(
             responder,
             own_share,
             joiner_share,
+            purpose,
         ),
     )
     .await
@@ -1120,7 +1258,8 @@ async fn responder_after_work(
     responder: crate::join::session::JoinResponder<'_>,
     own_share: [u8; CPACE_SHARE_LEN],
     joiner_share: [u8; CPACE_SHARE_LEN],
-) -> Result<JoinOutcome> {
+    purpose: JoinPurpose,
+) -> Result<Option<JoinOutcome>> {
     // 3. SHARE, then CPace completes and this side's proof is built.
     send_frame(send, &JoinFrame::Share { share: own_share }).await?;
     let (pending, bootstrap) = responder.complete_cpace(&joiner_share)?;
@@ -1137,6 +1276,10 @@ async fn responder_after_work(
         },
     )
     .await?;
+
+    if purpose == JoinPurpose::PassphraseValidation {
+        return Ok(None);
+    }
 
     // 6. INIT — resolve our own prekeys for the message, consuming the one-time
     //    prekey durably before the session is completed.
@@ -1197,12 +1340,12 @@ async fn responder_after_work(
         &peer.fingerprint,
         cfg.now_ms,
     )?;
-    Ok(JoinOutcome {
+    Ok(Some(JoinOutcome {
         session,
         peer,
         witness,
         last_resort_grade,
         room_name: None,
         solved_in: std::time::Duration::ZERO,
-    })
+    }))
 }

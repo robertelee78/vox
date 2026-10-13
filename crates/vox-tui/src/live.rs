@@ -2401,6 +2401,7 @@ fn wipe(request: &mut Request) {
     match request {
         Request::Create { passphrase, .. }
         | Request::OpenRoom { passphrase, .. }
+        | Request::CheckRoomPassphrase { passphrase, .. }
         | Request::Join { passphrase, .. } => passphrase.zeroize(),
         Request::Trust {
             identity_passphrase,

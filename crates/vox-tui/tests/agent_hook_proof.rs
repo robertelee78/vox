@@ -3126,16 +3126,20 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     eprintln!("[proof] (2) a session started in loose was told: {told:?}");
     assert!(
         told.contains("isn't tied to a Vox room")
-            && told.contains("Vox has asked the operator which room it works in")
+            && told.contains("You can create one for it")
+            && !told.contains("Vox has asked the operator")
+            && told.contains(&format!(
+                "vox room create --name '<name>' --node default --bind {}",
+                loose.display()
+            ))
             && told.contains("do not ask again on later turns")
             && told.contains(&format!(
                 "vox room join '<link>' --node default --bind {}",
                 loose.display()
             ))
             && told.contains("vox agent room --none --node default"),
-        "PRODUCT: a session started in a directory the room map does not name must be told that \
-         Vox has asked the operator, to say so once, and what to do with a link or a no given in \
-         the session; it was told {told:?}"
+        "PRODUCT: an unmapped repo's hook must give terminal create-and-bind, pasted-link and no \
+         choices once, without claiming an app asked; it was told {told:?}"
     );
     assert!(
         !sessions(&home).iter().any(|r| r["id"] == below),
@@ -3651,6 +3655,94 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
          {joined}, and `vox room list` lists:\n{}",
         rooms()
     );
+    // RM-4: with no app on this scratch data root, the notice gives both terminal choices.
+    // Paste its entire create command into zsh, including a repository's shell metacharacters.
+    let create_dir = tmp.path().join("create repo & 'co!");
+    std::fs::create_dir_all(&create_dir).expect("APPARATUS: cannot make create repository");
+    let create_dir = std::fs::canonicalize(&create_dir).unwrap_or(create_dir);
+    let create_hook = turn("5f5f5f5f-aaaa-4bbb-8ccc-0000000005f1", &create_dir);
+    let create_context: serde_json::Value =
+        serde_json::from_str(&create_hook).unwrap_or_else(|e| {
+            panic!("PRODUCT: the hook's Claude output is malformed: {e}: {create_hook}")
+        });
+    let create_notice = create_context["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let command_for = |verb: &str| {
+        create_notice
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with(verb) && line.contains("--bind"))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let create_template = command_for("vox room create ");
+    let join_template = command_for("vox room join ");
+    assert!(
+        create_template.contains("'<name>'") && join_template.contains("'<link>'"),
+        "PRODUCT: an unmapped repo's hook must give both create-and-bind and pasted-link commands; \
+         it said:\n{create_notice}"
+    );
+    let create_pasted = create_template.replace("<name>", "createpaste");
+    let create_words = words_in("zsh", &create_pasted);
+    let create_path = create_dir.to_string_lossy();
+    assert_eq!(
+        create_words,
+        [
+            "room",
+            "create",
+            "--name",
+            "createpaste",
+            "--node",
+            "default",
+            "--bind",
+            &*create_path
+        ],
+        "PRODUCT: `{create_pasted}`, pasted into zsh, must preserve the complete repository path; \
+         zsh read {create_words:?}"
+    );
+    let created = in_shell(
+        "zsh",
+        &create_pasted,
+        &data,
+        &cfg,
+        &[
+            ("passphrase", "created room passphrase\r"),
+            ("again", "created room passphrase\r"),
+        ],
+    );
+    assert!(
+        created.contains(&format!("vox: bound {}", create_dir.display()))
+            && rooms().contains("createpaste"),
+        "PRODUCT: printed `{create_pasted}` pasted into zsh must create and bind this repo; \
+         it said {created}; rooms:\n{}",
+        rooms()
+    );
+    let next_id = "5f5f5f5f-aaaa-4bbb-8ccc-0000000005f2";
+    let next_turn = turn(next_id, &create_dir);
+    assert!(
+        !next_turn.contains("isn't tied to a Vox room"),
+        "PRODUCT: the next session in the created-and-bound repo must not be asked again; \
+         hook said {next_turn}"
+    );
+    let created_room = rooms()
+        .lines()
+        .find(|line| line.contains("createpaste"))
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or_default()
+        .to_owned();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !open_in(&created_room, next_id) {
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: the next session must work in the created-and-bound room {created_room}; \
+             sessions: {:?}; hook: {next_turn}",
+            sessions(&created_room)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!("[proof] (5f) printed create command pasted into zsh creates and binds; next session works there");
     // A directory nobody bound: its ask's bind command, with `--bind` and the directory, the
     // person putting their link in place of `<link>`, inside its quotes, as the command says.
     let (bind_room, bind_link) = make_room("bindpaste", "bind passphrase");
