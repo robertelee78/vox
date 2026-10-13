@@ -1499,7 +1499,7 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str
                 env.re.as_deref().map(shown_name).unwrap_or_default(),
                 env.thread
                     .as_deref()
-                    .and_then(|root| b32_decode(root.trim(), "thread").ok())
+                    .and_then(|root| vox_core::node::link::b32_decode(root.trim(), "thread").ok())
                     .map(|root| b32_encode(&root))
                     .unwrap_or_default(),
                 env.urgent,

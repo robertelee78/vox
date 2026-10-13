@@ -5402,7 +5402,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             }
             let more = authors.len() > PAGE_ENTRIES;
             if more { authors.pop_last(); }
-            let next_author = more.then(|| *authors.last().expect("nonempty author page"));
+            let next_author = if more { authors.last().copied() } else { None };
             Frame::ThreadSummary {
                 reply_count, last_reply_millis, authors: authors.into_iter().collect(), next_author,
             }
