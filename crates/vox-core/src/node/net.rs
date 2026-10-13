@@ -183,6 +183,9 @@ impl PeerPolicy {
     ///   `WHOAMI`.
     #[must_use]
     pub fn allows(class: PeerClass, kind: StreamKind) -> bool {
+        if kind == StreamKind::Computer {
+            return false;
+        }
         // **Any peer may say it is stopping** (V210-93): it speaks only of the connection it
         // arrives on, which the peer is about to close anyway.
         if matches!(kind, StreamKind::Goodbye | StreamKind::Presentation) {

@@ -922,6 +922,9 @@ impl NodeNet {
             StreamKind::Presentation => Ok(Inbound::Presentation { peer, send, recv }),
             // Closed at the gate (`net::refuse_second_exchange`) before any stream is dispatched: one more
             // identity stream is a second exchange on one connection (ADR-011 requirement 33).
+            StreamKind::Computer => Err(Error::StreamRefused(
+                "computer management is not a node stream",
+            )),
             StreamKind::Identity => Err(Error::StreamRefused(
                 "an identity stream after the identity exchange",
             )),
