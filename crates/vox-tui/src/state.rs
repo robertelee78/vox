@@ -1,6 +1,6 @@
 //! The navigation / input state machine (ADR-015 §"Navigation & input").
 //!
-//! This is pure interaction logic — no terminal, no core. It owns *UI* state
+//! This is interaction logic — no terminal, no core. It owns *UI* state
 //! (which screen/pane has focus, the command-palette overlay, selection indices)
 //! and translates input into either a navigation mutation or a [`Command`] for the
 //! core. The authoritative data (members, timeline, trust) lives in the
@@ -650,7 +650,7 @@ impl UiState {
             // **An offer is accepted or dismissed where it waits** (ADR-028 K-16, K-18).
             KeyCode::Enter if self.screen == Screen::ChannelList && self.offer(vm).is_some() => {
                 let member = self.offer(vm).map(|o| o.member);
-                self.mode = Mode::Prompt(Prompt::new(PromptKind::AcceptOffer, member));
+                self.start_prompt(PromptKind::AcceptOffer, member);
                 Action::Redraw
             }
             KeyCode::Char('x')
@@ -948,6 +948,13 @@ impl UiState {
     /// Open a masked prompt (also used by the loop for onboarding: no identity ⇒
     /// create; not attached ⇒ attach).
     pub fn start_prompt(&mut self, kind: PromptKind, target: Option<Digest32>) {
+        if matches!(kind, PromptKind::Trust | PromptKind::AcceptOffer) {
+            if let Some(why) = crate::coord::trust_widening_refusal() {
+                self.mode = Mode::Normal;
+                self.status_message = Some(why.into());
+                return;
+            }
+        }
         self.mode = Mode::Prompt(Prompt::new(kind, target));
     }
 
@@ -1176,7 +1183,7 @@ impl UiState {
             ));
             return Action::Redraw;
         }
-        self.mode = Mode::Prompt(Prompt::new(PromptKind::Trust, Some(fp)));
+        self.start_prompt(PromptKind::Trust, Some(fp));
         Action::Redraw
     }
 
