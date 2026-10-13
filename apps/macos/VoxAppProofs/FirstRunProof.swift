@@ -3087,12 +3087,22 @@ final class FirstRunProof: XCTestCase {
         reaches("⌘↑ with the reply selected") { ui.typeKey(.upArrow, modifierFlags: .command) }
         print("[proof] bob's reply quotes \"re you: FROM-ALICE\", and its quote and ⌘↑ go to it")
 
-        // (4c1) Reply in Thread answers bob's reply but stays under the original General root
-        // (ADR-033 TH-1, TH-3, #753). Exercise the app action and read what the other node gets.
-        guard let fromBob = entry("REPLY-TO-ALICE") else {
-            throw Apparatus("the staged REPLY-TO-ALICE has no entry hash to reply to")
+        // (4c1) Reply in Thread stays under its General root and inherits its three tags
+        // (ADR-033 TH-1, TH-3, TH-5, #753/#756). No tags are typed in the app reply.
+        let taggedPost = try staged(vox, ["room", "post", "--node", "bob", "--json",
+                                         "--task", "#756", "--project", "literal-project",
+                                         "--milestone", "literal-milestone", room, "TAGGED-THREAD-ROOT"], env: voxEnv)
+        guard let posted = try JSONSerialization.jsonObject(with: Data(taggedPost.utf8)) as? [String: Any],
+              let taggedRoot = posted["entry_hash"] as? String else {
+            throw Apparatus("tagged root post returned no entry hash: \(taggedPost)")
         }
-        tap(ui, Key.showing(": REPLY-TO-ALICE"), "bob's reply to select it")
+        try staged(vox, ["room", "post", "--node", "bob", "--re", taggedRoot, room, "TAGGED-THREAD-MIDDLE"], env: voxEnv)
+        words(ui, Key.showing(": TAGGED-THREAD-MIDDLE"), timeout: 30,
+              "the app must receive the tagged thread's middle reply", until: { $0.contains("TAGGED-THREAD-MIDDLE") })
+        guard let fromBob = entry("TAGGED-THREAD-MIDDLE") else {
+            throw Apparatus("the staged tagged middle reply has no entry hash")
+        }
+        tap(ui, Key.showing(": TAGGED-THREAD-MIDDLE"), "bob's reply to select it")
         ui.menuBars.menuBarItems["Room"].click()
         let replyInThread = ui.menuBars.menuItems["Reply in Thread"]
         guard replyInThread.waitForExistence(timeout: 5), replyInThread.isEnabled else {
@@ -3114,8 +3124,11 @@ final class FirstRunProof: XCTestCase {
             if threadReply.isEmpty { Thread.sleep(forTimeInterval: 0.5) }
         }
         XCTAssertTrue(threadReply["re"] as? String == fromBob
-                      && threadReply["thread"] as? String == fromAlice,
-                      "PRODUCT: Reply in Thread must reach bob answering his reply \(fromBob) in General root \(fromAlice); bob read \(threadReply)")
+                      && threadReply["thread"] as? String == taggedRoot,
+                      "PRODUCT: Reply in Thread must reach bob answering his reply \(fromBob) in General root \(taggedRoot); bob read \(threadReply)")
+        XCTAssertEqual((threadReply["tags"] as? [String])?.sorted(),
+                       ["milestone:literal-milestone", "project:literal-project", "task:#756"],
+                       "PRODUCT: an untagged app reply must inherit its General starting message's three tags; bob read \(threadReply)")
         print("[proof] Reply in Thread: bob reads the app's nested reply in the original General thread")
 
         // (4d) To: offers bob's open Session under him, and a message to it alone is addressed to

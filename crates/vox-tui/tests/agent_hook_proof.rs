@@ -120,8 +120,10 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
-#[path = "support/typed.rs"]
-mod typed;
+use thread_room::typed;
+
+#[path = "support/room.rs"]
+mod thread_room;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -1430,7 +1432,7 @@ fn a_reply_shows_what_it_answers_and_cannot_forge_it() {
     let answer = entry("ANSWER:");
     let got = turn("asker");
     let want = format!(
-        "{}[{} from you] ANSWER: 7443\n  \u{21b3} in reply to [{} from you] {preview}\n",
+        "{}[{} from you] ANSWER: 7443\n  \u{21b3} in reply to [{} from you] {preview}\n  ↳ thread: QUESTION: which port does the staging relay listen on,\n",
         opening(1, &label, 1),
         &answer[..8],
         &question[..8],
@@ -1543,6 +1545,204 @@ fn a_reply_shows_what_it_answers_and_cannot_forge_it() {
         got_previews[0]
     );
     eprintln!("[proof] V030-19 (4) hostile: {}", got_previews[0]);
+
+    // ADR-033 TH-4/6 (#755): three real nodes, two participating and a third counting.
+    // Each reader consumes the starting post before the reply, so participation must be
+    // recovered from the room's history, not inferred from this turn's page.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("APPARATUS: thread room runtime");
+    let thread_tmp = tempfile::tempdir().expect("APPARATUS: thread room directory");
+    let room = rt.block_on(thread_room::room(
+        thread_tmp.path(),
+        &["alice", "bob", "carol"],
+    ));
+    let (alice, bob, carol) = (&room.workers[0], &room.workers[1], &room.workers[2]);
+    let r = room.id.as_str();
+    let post = |who: &thread_room::Worker, session: &str, flags: &[&str], body: &str| {
+        let mut args = vec!["room", "post", r, "--json"];
+        args.extend_from_slice(flags);
+        args.push(body);
+        let out = who.vox(Some(session), &args);
+        assert!(out.ok, "PRODUCT: thread post refused: {out:?}");
+        let hash = out.json()["entry_hash"]
+            .as_str()
+            .expect("PRODUCT: post hash")
+            .to_owned();
+        // Stage receipt on every reader once, with a bounded product wait.
+        for peer in [&room.workers[0], &room.workers[1], &room.workers[2]] {
+            let until = Instant::now() + Duration::from_secs(30);
+            loop {
+                let rows = peer.vox(None, &["room", "read", r, "--json"]);
+                assert!(rows.ok, "PRODUCT: thread read failed: {rows:?}");
+                if rows.stdout.contains(&hash) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < until,
+                    "PRODUCT: {} never received {hash}: {rows:?}",
+                    peer.name
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        hash
+    };
+    let turn = |who: &thread_room::Worker, session: &str| {
+        let out = who.vox_in(
+            None,
+            &[
+                "agent", "hook", "--node", "default", "--room", r, "--format", "text",
+            ],
+            Some(&codex_input(session)),
+        );
+        assert!(out.ok, "PRODUCT: thread hook failed: {out:?}");
+        out.stdout
+    };
+    let bob_fp = vox_core::node::link::b32_encode(&bob.fp);
+    let root = post(
+        alice,
+        "starter",
+        &["--to", &bob_fp],
+        "THREAD-ROOT first line\nSECOND-LINE must not label",
+    );
+    for (who, session) in [
+        (alice, "starter"),
+        (alice, "sibling"),
+        (bob, "reader"),
+        (bob, "other"),
+        (carol, "observer"),
+    ] {
+        let out = turn(who, session);
+        if who.name != "alice" {
+            assert!(
+                out.contains("THREAD-ROOT"),
+                "PRODUCT: General's starting message must reach every node: {out}"
+            );
+        }
+    }
+    let first = post(bob, "writer", &["--re", &root], "PARTICIPANT-REPLY");
+    for (who, session, full) in [
+        (alice, "starter", true),
+        (alice, "sibling", false),
+        (bob, "reader", true),
+        (bob, "other", true),
+        (carol, "observer", false),
+    ] {
+        let out = turn(who, session);
+        eprintln!("[proof] thread news {}/{session}: {out}", who.name);
+        if full {
+            assert!(out.contains("PARTICIPANT-REPLY") && out.contains("  ↳ thread: THREAD-ROOT first line\n")
+                && !out.lines().any(|l| l.starts_with("  ↳ thread:") && l.contains("SECOND-LINE")),
+                "PRODUCT: a participant must receive the reply labelled by the starting message's first line: {out}");
+        } else {
+            assert!(
+                !out.contains("PARTICIPANT-REPLY")
+                    && out.contains("1 reply(s) in other threads, not shown"),
+                "PRODUCT: a nonparticipant must count the thread reply without its words: {out}"
+            );
+        }
+        let again = turn(who, session);
+        assert!(
+            !again.contains("PARTICIPANT-REPLY") && !again.contains("reply(s) in other threads"),
+            "PRODUCT: shown and counted replies must advance the session cursor: {again}"
+        );
+    }
+    let joined = post(
+        carol,
+        "observer",
+        &["--re", &first],
+        "CAROL joins this thread",
+    );
+    turn(carol, "observer");
+    post(alice, "starter", &["--re", &joined], "REPLY-AFTER-JOIN");
+    let out = turn(carol, "observer");
+    assert!(
+        out.contains("REPLY-AFTER-JOIN") && out.contains("  ↳ thread: THREAD-ROOT first line\n"),
+        "PRODUCT: a session's earlier post joins the whole thread, including nested replies: {out}"
+    );
+
+    // A valid envelope may address a particular session. Its sibling is not named by that.
+    // Session names are private to drive readers (ADR-031 SA-1/2). Alice must hold that
+    // ordinary operator grant before her CLI can resolve Bob's exact Session recipient.
+    let drive = bob.vox(
+        None,
+        &[
+            "trust",
+            "add",
+            &vox_core::node::link::b32_encode(&alice.fp),
+            "--drive",
+            "--name",
+            "alice",
+            "--identity-passphrase-file",
+            bob.pass.to_str().expect("APPARATUS: pass path"),
+        ],
+    );
+    assert!(
+        drive.ok,
+        "PRODUCT: operator drive grant for the named-session fixture failed: {drive:?}"
+    );
+    let exact_session = "3f0c25bf-aaaa-4bbb-8ccc-dddddddddddd";
+    let transcript = thread_tmp.path().join("named-session.jsonl");
+    std::fs::write(
+        &transcript,
+        "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n",
+    )
+    .expect("APPARATUS: write Claude-shaped transcript");
+    let opened = bob.vox_env(
+        None,
+        &[("CLAUDE_CODE_ENTRYPOINT", "cli")],
+        &[
+            "agent", "hook", "--node", "default", "--room", r, "--format", "text",
+        ],
+        Some(&claude_event_at(
+            exact_session,
+            "UserPromptSubmit",
+            r#","prompt":"hi""#,
+            &transcript,
+        )),
+    );
+    assert!(opened.ok, "PRODUCT: named session hook failed: {opened:?}");
+    let local = bob.vox(None, &["room", "sessions", r, "--json"]);
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        let sessions = alice.vox(None, &["room", "sessions", r, "--json"]);
+        if sessions.ok && sessions.stdout.contains(exact_session) {
+            break;
+        }
+        assert!(Instant::now() < until,
+            "APPARATUS: named-session staging was not achieved; local={local:?}; peer={sessions:?}; hook={opened:?}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let exact = serde_json::json!({"v":1,"type":"say","from":"starter", "to":[format!("{bob_fp}/{exact_session}")], "body":"SESSION-ROOT"}).to_string();
+    let posted = alice.vox_in(None, &["room", "post", r, "-"], Some(&exact));
+    assert!(
+        posted.ok,
+        "PRODUCT: exact-session starting post failed: {posted:?}"
+    );
+    let rows = alice.vox(None, &["room", "read", r, "--json"]).ndjson();
+    let exact_root = rows
+        .iter()
+        .find(|r| {
+            r["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("SESSION-ROOT"))
+        })
+        .and_then(|r| r["entry_hash"].as_str())
+        .expect("PRODUCT: starting entry absent");
+    post(
+        alice,
+        "starter",
+        &["--re", exact_root],
+        "EXACT-SESSION-REPLY",
+    );
+    let named = turn(bob, exact_session);
+    let sibling = turn(bob, "not-bob");
+    assert!(named.contains("EXACT-SESSION-REPLY") && !sibling.contains("EXACT-SESSION-REPLY")
+        && sibling.contains("reply(s) in other threads, not shown"),
+        "PRODUCT: naming one session must not enroll its node's sibling: named={named} sibling={sibling}");
 }
 
 /// **Nothing hidden reaches an agent unseen** (#331): a person posts a message that carries
