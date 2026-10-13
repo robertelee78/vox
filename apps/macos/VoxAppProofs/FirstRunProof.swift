@@ -2314,13 +2314,32 @@ final class FirstRunProof: XCTestCase {
         let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("keyring-pending")
         let data = root.appendingPathComponent("data").path
         let config = root.appendingPathComponent("config").path
-        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        guard let knobs = env["VOX_PROOF_KNOBS_VOX"], !knobs.isEmpty else {
+            throw Apparatus("VOX_PROOF_KNOBS_VOX is required for this journey's isolated Keychains")
+        }
+        let aliceKeychain = root.appendingPathComponent("alice.keychain-db").path
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0",
+                      "VOX_TEST_KEYCHAIN": aliceKeychain]
         // Attached nodes on Alice's daemon can become trusted automatically (#724). Bob and
         // Carol must both be peers on another daemon for this manual-trust journey.
         let carolRoot = root.appendingPathComponent("carol-host")
+        let carolKeychain = carolRoot.appendingPathComponent("carol-host.keychain-db").path
         let carolEnv = ["VOX_DATA_DIR": carolRoot.appendingPathComponent("data").path,
                         "VOX_CONFIG_DIR": carolRoot.appendingPathComponent("config").path,
-                        "VOX_PROXY": "127.0.0.1:0"]
+                        "VOX_PROXY": "127.0.0.1:0", "VOX_TEST_KEYCHAIN": carolKeychain]
+        let hasKnob = stager.run(["/usr/bin/python3", "-c",
+            "import sys; sys.exit(0 if b'VOX_TEST_KEYCHAIN' in open(sys.argv[1],'rb').read() else 1)", knobs], env: [:])
+        guard hasKnob.status == 0 else {
+            throw Apparatus("cannot stage private Keychains: the daemon test knob is missing")
+        }
+        for (directory, keychain) in [(root.path, aliceKeychain), (carolRoot.path, carolKeychain)] {
+            let madeRoot = stager.run(["/bin/mkdir", "-p", directory], env: [:])
+            let madeKeychain = stager.run(["/usr/bin/security", "create-keychain", "-p", "", keychain],
+                                         env: ["HOME": directory])
+            guard madeRoot.status == 0, madeKeychain.status == 0 else {
+                throw Apparatus("cannot create this account's private Keychain: \(madeKeychain.out)")
+            }
+        }
         let pass = { (name: String) in root.appendingPathComponent("\(name).pass").path }
         for name in ["alice", "bob", "carol"] {
             try stager.write(Data("\(name) identity\n".utf8), to: pass(name))
@@ -2328,9 +2347,11 @@ final class FirstRunProof: XCTestCase {
         try stager.write(Data("pending room\n".utf8), to: pass("room"))
         try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
         try stager.write(Data("alice\n".utf8), to: config + "/app/node")
-        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+        // Only owned apparatus daemons use the existing knob to target these private Keychains.
+        // The app and every CLI command remain the ordinary bundled binary.
+        daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
-        let carolDaemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: carolEnv,
+        let carolDaemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: carolEnv,
                                     until: "vox daemon: control socket")
         defer { carolDaemon.terminate() }
         for name in ["alice", "bob", "carol"] {
