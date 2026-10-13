@@ -652,10 +652,24 @@ final class FirstRunProof: XCTestCase {
         words(ui, Key.id("machine-plain"), timeout: 60,
               "the app must recover the passphraseless node Ready after restart",
               until: { $0 == "plain Ready" })
+        // Query metadata only in this owned Keychain: never ask Security to print a secret.
+        let keychainAccount = resolved(data + "/nodes/alice")
+        func storedCredential() -> (status: Int32, out: String) {
+            let result = stager.run(["/usr/bin/security", "find-generic-password", "-s", "us.vox.node",
+                                     "-a", keychainAccount, keychain], env: ["HOME": home])
+            return (result.status, result.out)
+        }
+        guard storedCredential().status == 0 else {
+            throw Apparatus("the protected node's credential was not staged in this private Keychain")
+        }
         ui.menuBars.menuBarItems["Node"].click()
         tap(ui, Key.menuItem("Forget"), "Forget this window's protected node")
         guard present(ui, Key.showing("Node alice is Locked."), timeout: 30,
                       "Forget must keep this window's identity and say Locked") else { return }
+        let removedCredential = storedCredential()
+        XCTAssertTrue(removedCredential.status == 44
+                        && removedCredential.out.contains("could not be found"),
+                      "PRODUCT: Forget must remove the stored credential from this private Keychain; Security status \(removedCredential.status), \(removedCredential.out)")
         daemon?.terminate()
         daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
@@ -1653,8 +1667,7 @@ final class FirstRunProof: XCTestCase {
               "a node without a passphrase must be Ready and remembered",
               until: { $0.contains("opencode-app") && $0.contains("Ready and remembered") })
         let unprotected = run(vox, ["node", "list"], env: voxEnv).out
-        XCTAssertTrue(nodeLine(unprotected, "opencode-app")?.contains(" attached ") == true
-                        && nodeLine(unprotected, "opencode-app")?.hasSuffix("(kept)") == true,
+        XCTAssertTrue(nodeLine(unprotected, "opencode-app")?.contains("Ready") == true,
                       "PRODUCT: setup with no passphrase must make a remembered Ready node; got \(unprotected)")
         ui.typeKey(",", modifierFlags: .command)
         tap(ui, Key.id("settings-agent-setup-opencode"), "Reopen already-Ready OpenCode setup")
@@ -1694,7 +1707,7 @@ final class FirstRunProof: XCTestCase {
         present(ui, Key.id("attached"), timeout: 90,
                 "made in the app, node alice must be attached in its window")
         let listed = run(vox, ["node", "list"], env: voxEnv).out
-        XCTAssertTrue(nodeLine(listed, "alice")?.contains(" attached ") ?? false,
+        XCTAssertTrue(nodeLine(listed, "alice")?.contains("Ready") ?? false,
                       "PRODUCT: the app's new node must be alice, attached, as `vox node list` lists it; it says \(listed)")
 
         // Choosing a node can install its harness hooks and publish another paths notice.
@@ -3024,7 +3037,7 @@ final class FirstRunProof: XCTestCase {
         present(ui, Key.id("attached"), timeout: 60,
                 "the right passphrase must attach node alice")
         listed = run(vox, ["node", "list"], env: voxEnv).out
-        XCTAssertTrue(nodeLine(listed, "alice")?.contains(" attached ") ?? false,
+        XCTAssertTrue(nodeLine(listed, "alice")?.contains("Ready") ?? false,
                       "PRODUCT: `vox node list` must say alice is attached; it said: \(listed)")
 
         // (3) The main window groups the room by what it needs from alice. Bob is a second node of
@@ -3834,33 +3847,38 @@ final class FirstRunProof: XCTestCase {
               "vox://attach-node?node=bob, with Vox in front, must open the Attach sheet for node bob",
               until: { $0.contains("node bob") })
         tap(ui, Key.id("attach-node-cancel"), "Cancel on bob's Attach sheet")
-        // Forget Passphrase in place of `vox node forget-passphrase` (#666): Node > Forget
-        // Passphrase ends the keep of alice, the node this window acts as, kept here by a
-        // supplied passphrase, remembered on this account's private scratch Keychain.
-        try staged(vox, ["node", "attach", "alice", "--keep", "--passphrase-file", alicePass], env: voxEnv)
-        let keptUntil = Date().addingTimeInterval(15)
-        while Date() < keptUntil && !(nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "alice")?.contains("(kept)") ?? false) {
-            Thread.sleep(forTimeInterval: 0.3)
+        // CW-4: Forget replaces the old credential-only action, preserving identity and drafts.
+        try staged(vox, ["node", "unlock", "alice", "--passphrase-file", alicePass], env: voxEnv)
+        let readyBeforeForget = try staged(vox, ["node", "list"], env: voxEnv)
+        guard nodeLine(readyBeforeForget, "alice")?.contains("Ready") == true else {
+            throw Apparatus("alice must be Ready before Forget; \(readyBeforeForget)")
         }
-        let keptBefore = nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "alice") ?? ""
-        guard keptBefore.contains("(kept)") else {
-            throw Apparatus("alice must be kept before Forget Passphrase is chosen, so that its end can be seen; `vox node list` says \(keptBefore)")
-        }
+        type(ui, Key.id("compose"), "DRAFT-KEPT-FORGET-666", "draft before Forget")
         ui.menuBars.menuBarItems["Node"].click()
-        tap(ui, Key.menuItem("Forget Passphrase"), "Node > Forget Passphrase")
-        let forgotUntil = Date().addingTimeInterval(15)
-        var bobLine = ""
-        repeat {
-            bobLine = nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "alice") ?? ""
-            if !bobLine.contains("(kept)") { break }
-            Thread.sleep(forTimeInterval: 0.3)
-        } while Date() < forgotUntil
-        XCTAssertFalse(bobLine.contains("(kept)"),
-                       "PRODUCT: Node > Forget Passphrase must stop keeping alice; `vox node list` says \(bobLine)")
-        ui.typeKey(.return, modifierFlags: []) // the Forget Passphrase alert's OK
+        tap(ui, Key.menuItem("Forget"), "Node > Forget")
+        guard present(ui, Key.showing("Node alice is Locked."), timeout: 30,
+                      "Forget must say alice Locked in the same window") else { return }
+        let forgotten = try staged(vox, ["node", "list"], env: voxEnv)
+        let normalizeFingerprint = { (value: String) in value.lowercased().filter { $0.isLetter || $0.isNumber } }
+        XCTAssertTrue(nodeLine(forgotten, "alice")?.contains("Locked") == true
+                      && normalizeFingerprint(nodeLine(forgotten, "alice") ?? "").contains(normalizeFingerprint(aliceFp)),
+                      "PRODUCT: Forget must preserve alice's Locked fingerprint; \(forgotten)")
+        tap(ui, Key.id("attach-again"), "Unlock alice after Forget")
+        guard present(ui, Key.id("attach-node-passphrase"), timeout: 20,
+                      "Unlock must show alice's passphrase sheet") else { return }
+        type(ui, Key.id("attach-node-passphrase"), "alice identity", "alice's Unlock passphrase")
+        tap(ui, Key.id("attach-node"), "Unlock alice")
+        guard words(ui, Key.id("attached"), timeout: 60,
+                    "Unlock must restore the same node Ready",
+                    until: { $0 == "node alice, Ready" }) != nil else { return }
+        XCTAssertEqual(el(ui, Key.id("compose")).value as? String, "DRAFT-KEPT-FORGET-666",
+                       "PRODUCT: Unlock must retain the draft preserved by Forget")
+        tap(ui, Key.id("compose"), "clear the retained draft for later Session claims")
+        ui.typeKey("a", modifierFlags: .command)
+        ui.typeKey(.delete, modifierFlags: [])
         // Back to General, as 4f expects to find bob's Session not yet shown.
         tap(ui, Key.id("session-general"), "General in mission's Sessions")
-        print("[proof] #666: drive command \(grant) copied; attach-node opened bob's sheet; Node > Forget Passphrase: \(bobLine)")
+        print("[proof] #666: drive command \(grant) copied; bob's Unlock sheet; alice Forget/Locked/Unlock/Ready preserved fingerprint and draft")
 
         // (4f) ↑/↓ reach a Session's entries (P14): bob grants alice drive, so she reads inside his
         // Session; with it shown, View > Focus Timeline selects its newest entry and ↑ the one
@@ -5020,35 +5038,30 @@ final class FirstRunProof: XCTestCase {
                            "once bob's node is back and holds WHERE-15, it must say it is on 1 of the members' nodes, \"on 1 of N members' nodes\"",
                            until: { $0.hasPrefix("on 1 of ") && $0.hasSuffix(" members' nodes") }) ?? ""
         print("[proof] whereabouts: \(alone) → \(spread)")
-        // (15d, D17) Node > Detach leaves the window alice's: Attach again (or Quit), never another
-        // node of this Mac's.
+        // CW-4 supersedes Detach: Forget keeps this window alice's and preserves the draft.
+        type(ui, Key.id("compose"), "DRAFT-KEPT-FORGET-D17", "draft before Forget")
         ui.menuBars.menuBarItems["Node"].click()
-        tap(ui, Key.menuItem("Detach"), "Node > Detach")
-        var offered = ""
-        let detachedUntil = Date().addingTimeInterval(30)
-        while Date() < detachedUntil && offered.isEmpty {
-            if locate(ui, Key.id("node-carol")) != nil || locate(ui, Key.id("node-bob")) != nil {
-                offered = "another node"
-            } else if locate(ui, Key.id("attach-again")) != nil {
-                offered = "attach again"
-            } else {
-                Thread.sleep(forTimeInterval: 0.25)
-            }
-        }
-        XCTAssertEqual(offered, "attach again",
-                       "PRODUCT: after Node > Detach the window must offer only to attach alice again (E-4); it offered \(offered.isEmpty ? "neither within 30 s" : offered): \(onScreen(ui))")
-        tap(ui, Key.id("attach-again"), "Attach alice Again")
-        let again = Key.id("passphrase")
-        if present(ui, again, timeout: 15, "Attach alice Again must ask for her passphrase") {
-            type(ui, again, "alice identity", "the passphrase field")
-            noKeychain(ui)
-            tap(ui, Key.id("attach"), "Attach")
-        }
-        present(ui, Key.id("attached"), timeout: 60, "attached again, the window must be alice's")
-        let fp = run(vox, ["node", "list"], env: voxEnv).out
-        XCTAssertTrue(nodeLine(fp, "alice")?.contains(" attached ") ?? false,
-                      "PRODUCT: attached again, `vox node list` must say alice is attached: \(fp)")
-        print("[proof] after Detach: \(offered); attached again")
+        tap(ui, Key.menuItem("Forget"), "Node > Forget")
+        guard present(ui, Key.showing("Node alice is Locked."), timeout: 30,
+                      "Forget must leave this window alice's and say Locked") else { return }
+        XCTAssertNil(locate(ui, Key.id("node-carol")),
+                     "PRODUCT: Forget must not offer a different node for this window")
+        XCTAssertNil(locate(ui, Key.id("node-bob")),
+                     "PRODUCT: Forget must not offer bob for this window")
+        tap(ui, Key.id("attach-again"), "Unlock alice in the same window")
+        guard present(ui, Key.id("attach-node-passphrase"), timeout: 20,
+                      "Unlock must ask for alice's passphrase in its sheet") else { return }
+        type(ui, Key.id("attach-node-passphrase"), "alice identity", "alice's Unlock passphrase")
+        tap(ui, Key.id("attach-node"), "Unlock alice")
+        guard words(ui, Key.id("attached"), timeout: 60,
+                    "Unlock must restore alice Ready in this window",
+                    until: { $0 == "node alice, Ready" }) != nil else { return }
+        let fp = try staged(vox, ["node", "list"], env: voxEnv)
+        XCTAssertTrue(nodeLine(fp, "alice")?.contains("Ready") == true,
+                      "PRODUCT: Unlock must restore alice Ready; \(fp)")
+        XCTAssertEqual(el(ui, Key.id("compose")).value as? String, "DRAFT-KEPT-FORGET-D17",
+                       "PRODUCT: Forget and Unlock must preserve the original draft")
+        print("[proof] Forget and Unlock kept the window alice's and preserved its draft")
         handOff(ui, "q")
         _ = ui.wait(for: .notRunning, timeout: 30)
         _ = run(vox, ["node", "detach", "alice"], env: voxEnv)
