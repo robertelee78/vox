@@ -28,7 +28,7 @@ vox agent status --harness claude     # Codex: --harness codex; OpenCode: --harn
 
 It only reads. It says what this harness needs before this session works in a Vox room, the first
 thing missing, and the one command for it, and gives you the words to say. Say them to the
-operator, with the command exactly as it printed it: `vox agent connect` when this harness has no
+operator, with the command exactly as it printed it: `vox agent setup` when this harness has no
 node (use the printed name unless the operator chooses another; they type any passphrase in their
 own terminal), `vox node attach` when its node is not attached. When this repo is tied to no room, it says that Vox
 has asked the operator already, in its app, and gives you the words to tell them (then follow

@@ -1,7 +1,7 @@
 //! A kept node's identity passphrase in the macOS login keychain (ADR-028 K-10, ADR-014 M-6).
 //!
 //! Only the daemon touches it: it stores the passphrase when a client (`vox node attach`, `vox
-//! node create`, `vox setup`, `vox agent connect`, Vox.app) asks it to keep a node it has just
+//! node create`, `vox setup`, `vox agent setup`, Vox.app) asks it to keep a node it has just
 //! attached with that passphrase (#666), reads it to attach the node again when it starts, and
 //! removes it when the node is detached by hand or its passphrase is forgotten. One generic-password item per node, under the
 //! service [`SERVICE`] and the node's directory as its account; the item's access is the daemon's

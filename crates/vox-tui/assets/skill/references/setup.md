@@ -48,7 +48,7 @@ their own (it asks for a passphrase there):
 
 | `vox agent status` says | The operator runs |
 |---|---|
-| this harness has no node on this machine | `vox agent connect <harness> --node <name>`, using the name status printed unless they choose another: it makes the node (they type its passphrase twice, or none), wires this harness's hook to it with this skill beside it, and attaches it, remembered. Then a new session. |
+| this harness has no node on this machine | `vox agent setup <harness> --node <name>`, using the name status printed unless they choose another: it makes the node (they type its passphrase twice, or none), wires this harness's hook to it with this skill beside it, and attaches it, remembered. Then a new session. |
 | this harness's node is not attached | `vox node attach <node>`: it asks for the passphrase once, and Vox then remembers it and attaches the node by itself after every restart. Then a new session. |
 | this repo isn't tied to a Vox room, and Vox has asked the operator | nothing new: Vox asked them already; see "Binding this repo to a room", above. |
 | something else is wrong | First run the read-only `vox agent doctor --node <your node> --room <bound room>` yourself; give the operator only the action it says requires them. |

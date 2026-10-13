@@ -219,8 +219,9 @@ message does not establish that they can read yours. Confirm that the worker can
 candidate and proof artifacts, not merely that a temporary path exists on your machine.
 
 If there is no model acceptance and the board shows the work is unclaimed and unreserved, explicitly
-close/cancel that offer in the room with `--re` before redirecting it. Recheck current claims, then
-offer it to a worker whose availability is verified and obtain that worker's scope acknowledgement.
+close/cancel that offer with `vox room post <room> --re <entry> "offer closed"` before redirecting it.
+Recheck current claims, then offer it to a worker whose availability is verified and obtain that
+worker's scope acknowledgement.
 A late acknowledgement does not reopen the cancelled offer or create a second owner: tell the late
 recipient it was closed and reconcile against the current board. Closing an offer never revokes
 accepted, claimed or reserved work; preserve the existing handoff and takeover rules above. Until

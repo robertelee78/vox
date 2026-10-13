@@ -51,8 +51,8 @@
 //! hook, only the pack. The stand-in plays a model doing what the pack's description says
 //! (`model_standin.py --run-status`): it runs `vox agent status --harness <harness>` through the
 //! harness's own shell tool, and repeats what it printed. Each harness's first session prints
-//! that it has no node and the `vox agent connect <harness> --node <name>` command. The
-//! operator's command is then run, with the passphrase from a file (`--passphrase-file`): it
+//! that it has no node and the `vox agent setup <harness> --node <name>` command. The
+//! operator's command is then run in a pty, with the passphrase typed at its prompts: it
 //! makes the node, wires the hook, attaches the node. The next session is given the RB-5 ask by
 //! the hook (above), and prints the status saying the node is attached and the repo is tied to
 //! no room, with the `vox room join <link> --node <node> --bind <repo>` command. Mutants, each
@@ -746,21 +746,16 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
         .take(60)
         .collect();
     // What the operator runs when the session says so: the node made, the harness wired to it,
-    // the node attached. The passphrase comes from a file here; at a terminal it is typed.
-    let connect = |harness: &str, node: &str| {
-        let (ok, out, err) = vox(&[
-            "agent",
-            "connect",
-            harness,
-            "--node",
-            node,
-            "--passphrase-file",
-            pass_arg,
-        ]);
-        println!("[proof] vox agent connect {harness} --node {node}:\n{out}{err}");
+    // the node attached. The passphrase is typed at the terminal's two prompts.
+    let setup = |harness: &str, node: &str| {
+        let mut command = Command::new(&vox_bin);
+        env(&mut command);
+        command.args(["agent", "setup", harness, "--node", node]);
+        let (ok, out) = typed::typed(&command, "identity passphrase");
+        println!("[proof] vox agent setup {harness} --node {node}:\n{out}");
         assert!(
             ok,
-            "PRODUCT: `vox agent connect {harness} --node {node}` failed: {out}{err}"
+            "PRODUCT: `vox agent setup {harness} --node {node}` failed: {out}"
         );
     };
 
@@ -925,7 +920,7 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
         let want = [
             "VOX STATUS SAID:".to_owned(),
             format!("{name} has no node on this machine"),
-            format!("vox agent connect {key} --node {key}-"),
+            format!("vox agent setup {key} --node {key}-"),
         ];
         assert!(
             want.iter().all(|w| said.contains(w.as_str())),
@@ -933,7 +928,7 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
              `vox agent status --harness {key}`, run as the pack says, was to print {want:?}; the \
              session printed:\n{said}"
         );
-        println!("[proof] {name}: with no node, the session said so and named `vox agent connect`");
+        println!("[proof] {name}: with no node, the session said so and named `vox agent setup`");
     };
     // A session with its node attached and no room: the hook's ask, and the status's.
     let no_room = |name: &str, node: &str, text: &str, said: &str| {
@@ -985,7 +980,7 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
     let (sent, said) = turn("Claude Code", &claude, &claude_args, &claude_env);
     loaded("Claude Code", &sent, std::slice::from_ref(&skill_line));
     no_node("Claude Code", "claude", &said);
-    connect("claude", "claude-proof");
+    setup("claude", "claude-proof");
     let (sent, said) = turn("Claude Code", &claude, &claude_args, &claude_env);
     loaded("Claude Code", &sent, std::slice::from_ref(&skill_line));
     no_room("Claude Code", "claude-proof", &sent, &said);
@@ -1007,7 +1002,7 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
     let (sent, said) = turn("Codex", &codex, &codex_args, &codex_env);
     loaded("Codex", &sent, std::slice::from_ref(&skill_line));
     no_node("Codex", "codex", &said);
-    connect("codex", "codex-proof");
+    setup("codex", "codex-proof");
     // Codex runs a hook only once it is trusted; `vox agent trust codex` is how an operator
     // trusts Vox's, through Codex's own app-server, in the same sandbox.
     let mut c = Command::new("/usr/bin/sandbox-exec");
@@ -1058,7 +1053,7 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
     let (sent, said) = turn("OpenCode", &opencode, &opencode_args, &opencode_env);
     loaded("OpenCode", &sent, &opencode_listed);
     no_node("OpenCode", "opencode", &said);
-    connect("opencode", "opencode-proof");
+    setup("opencode", "opencode-proof");
     let (sent, said) = turn("OpenCode", &opencode, &opencode_args, &opencode_env);
     loaded("OpenCode", &sent, &opencode_listed);
     no_room("OpenCode", "opencode-proof", &sent, &said);
