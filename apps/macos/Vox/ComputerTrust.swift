@@ -102,23 +102,7 @@ struct ComputerTrustView: View {
                                                 .fixedSize(horizontal: false, vertical: true)
                                             Text(node.personal ? "Personal node · can drive non-personal nodes" : "Managed node · read access")
                                                 .secondaryText()
-                                            if node.computer == status.thisComputer.fingerprint && !node.personal {
-                                                Button("Use as Personal Node") {
-                                                    let name = node.name
-                                                    Task { await model.perform { try await $0.selectPersonalNode(node: name) } }
-                                                }
-                                                .disabled(model.busy || !model.reachable)
-                                                .accessibilityIdentifier("computer-personal-" + node.fingerprint)
-                                            }
                                         }
-                                    }
-                                    if application.computer.fingerprint == status.thisComputer.fingerprint,
-                                       status.selectedNode != nil {
-                                        Button("Clear Personal Selection") {
-                                            Task { await model.perform { try await $0.selectPersonalNode(node: "") } }
-                                        }
-                                        .disabled(model.busy || !model.reachable)
-                                        .accessibilityIdentifier("computer-personal-clear")
                                     }
                                     Button(application.computer.fingerprint == status.thisComputer.fingerprint
                                            ? "Remove This Computer" : "Remove Computer") {
