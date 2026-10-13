@@ -500,6 +500,50 @@ pub fn addressable(
     resolve(&mine, typed, false, label).map(|s| s.id.clone())
 }
 
+/// Refuse a registered session's operation outside its saved working room (ADR-029 RB-3/RB-4).
+/// A person may still name an unregistered coordination session at a terminal. Once the hook has
+/// registered it, only the deliberate session-room move changes this boundary, never cwd, another
+/// session's room or a caller's cached target. Unreadable registrations cannot authorize a post.
+///
+/// # Errors
+/// The registered session works in another room or none, or its registration cannot be read.
+pub fn check_working_room(
+    paths: &crate::node::paths::Paths,
+    session: &str,
+    target: &Digest32,
+) -> Result<(), String> {
+    let session = session.trim();
+    if session.is_empty() {
+        return Ok(());
+    }
+    let bytes = match std::fs::read(paths.session_file(session)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "cannot read session {session}'s saved working room: {e}; nothing was posted"
+            ))
+        }
+    };
+    let record: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+        format!("cannot read session {session}'s saved working room: {e}; nothing was posted")
+    })?;
+    let target = crate::node::link::b32_encode(target);
+    match record.get("room").and_then(serde_json::Value::as_str) {
+        Some(room) if room == target => Ok(()),
+        room => {
+            let working = room.map_or_else(
+                || "no room".to_owned(),
+                |r| format!("room {}", vox_agentcomms::envelope::shown(r, 64)),
+            );
+            Err(format!(
+                "session {session} works in {working}, not target room {target}; nothing was \
+                 posted. Use vox agent room to deliberately move this session"
+            ))
+        }
+    }
+}
+
 /// `text` with its session's current name in `at.session_name` (ADR-029 MD-1, MD-2): when it is an
 /// envelope from a session registered on this node (`from` names it) and carries no name yet, the
 /// name that session's harness last gave, from its registration. Anything else is `text` as it is.

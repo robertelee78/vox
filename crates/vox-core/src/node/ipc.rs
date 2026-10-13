@@ -4897,6 +4897,17 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             text,
             card,
         } => {
+            // A stale or explicit target cannot publish this session into another repository's
+            // room, including an automatic coordination hello. Check before any append or fetch.
+            if let Ok(env) = vox_agentcomms::envelope::Envelope::parse(&text) {
+                if let Err(reason) = crate::node::sessions::check_working_room(
+                    handle.paths(),
+                    &env.from,
+                    &channel_id,
+                ) {
+                    return Frame::Error { reason };
+                }
+            }
             // **A link card is fetched here, by the sender's node, once** (ADR-028 F-10), and
             // travels in the message: no reader's node ever contacts the linked site.
             let text = if card {

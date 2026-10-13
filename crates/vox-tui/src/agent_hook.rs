@@ -1328,7 +1328,7 @@ pub async fn run(
             drain(
                 paths,
                 room_arg,
-                answer.room.is_some(),
+                answer.room.as_deref(),
                 &input,
                 &raw,
                 format,
@@ -1927,7 +1927,7 @@ fn offers_said(paths: &Paths, offered: &[(String, String)]) -> String {
 async fn drain(
     paths: &Paths,
     room_arg: Option<&str>,
-    session_has_room: bool,
+    working_room: Option<&str>,
     input: &HookInput,
     raw_input: &str,
     format: Format,
@@ -1950,17 +1950,21 @@ async fn drain(
         Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
-    let rooms: Vec<(Digest32, String, bool, String)> = match room_arg {
-        Some(arg) => {
-            let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _, _)| *id).collect();
-            let id = resolve_prefix(arg, &ids)?;
-            rooms.into_iter().filter(|(r, _, _, _)| *r == id).collect()
-        }
-        // The daemon's registration is authoritative: it also preserves a room
-        // deliberately selected for an existing session. With none, another
-        // room's news is not this session's news (ADR-031 RM-6).
-        None if !session_has_room => Vec::new(),
-        None => rooms,
+    // The daemon returns this session's saved room, not merely whether it has one. A shared
+    // node may hold several repositories' rooms; none of those selects news for another session.
+    // Even an explicit hook --room cannot move an existing session: `vox agent room` does that.
+    if let Some(arg) = room_arg {
+        let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _, _)| *id).collect();
+        let target = resolve_prefix(arg, &ids)?;
+        vox_core::node::sessions::check_working_room(paths, &input.session_id, &target)
+            .map_err(AppError::Usage)?;
+    }
+    let rooms: Vec<(Digest32, String, bool, String)> = match working_room {
+        Some(room) => rooms
+            .into_iter()
+            .filter(|(id, _, _, _)| b32_encode(id) == room)
+            .collect(),
+        None => Vec::new(),
     };
 
     let mut drains = Vec::new();
