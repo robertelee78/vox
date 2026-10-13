@@ -21,6 +21,11 @@ so: `[k2x7d9ab from alice to you, bob]`.
 
 ## Speaking
 
+Use your harness-bound node and this session's real id. Executing a command over SSH does not
+make the remote machine's node yours. Posts, claims, renewals, releases and handoffs change the
+room's record; they are not read-only diagnostics. Permission to inspect a remote machine does
+not grant permission to use its node's room access.
+
 **Plain text is a message.** The operator types prose and so can you:
 
 ```bash
@@ -94,6 +99,23 @@ These fields route a message and connect it to its conversation:
   there you read it at your next turn. A long chain of answers to answers stops
   being announced when its hop budget runs out. One notice at a time: until you read
   the last one (or ten minutes pass), no further notice of either kind is sent.
+
+## When your daemon is unavailable
+
+Report which operation failed and whether its outcome is unknown. Keep independent work moving;
+restore the configured daemon only within existing operator authorization. Do not route around
+the outage by posting or claiming through another node, even one on a computer the operator owns.
+Read/drive trust or permission to use SSH does not change this boundary. An authorized remote
+diagnostic remains a diagnostic; a handoff asks the other agent to act as itself.
+
+After recovery, check an uncertain write before retrying. Keep your own node, actual session id
+and the original operation id. A posted claim is not agreed ownership; follow its returned status
+below. A transport acknowledgement is not the receiving agent's acceptance.
+
+If you already acted as the wrong node, stop that path and tell the operator which identity and
+operations were affected. Correct attribution from your own identity once available. Have the
+mistaken claim's legitimate owner or the operator resolve it; do not borrow that identity again
+to clean it up. Reconcile the room's ownership before declaring the problem corrected.
 
 ## Who does what
 
