@@ -1246,13 +1246,13 @@ final class FirstRunProof: XCTestCase {
         let roomList = roomListElement.frame
         let nodeScroll = nodeScrollElement.frame
         let footer = locate(ui, Key.id("machine-footer"))?.frame ?? .null
-        let window = ui.windows.firstMatch.frame
-        guard [roomList, nodeScroll, foot, footer, window].allSatisfy({ frame in
+        let windowBounds = ui.windows.firstMatch.frame
+        guard [roomList, nodeScroll, foot, footer, windowBounds].allSatisfy({ frame in
             frame.minX.isFinite && frame.minY.isFinite && frame.width.isFinite && frame.height.isFinite
                 && frame.width > 0 && frame.height > 0
         }) else { throw Apparatus("the sidebar's public geometry was not finite and positive") }
         XCTAssertTrue(foot.minY >= roomList.maxY && nodeScroll.minY >= foot.maxY
-                      && footer.minY >= nodeScroll.maxY && window.contains(foot) && window.contains(footer),
+                      && footer.minY >= nodeScroll.maxY && windowBounds.contains(foot) && windowBounds.contains(footer),
                       "PRODUCT: the machine title and footer must remain visible below the room list, around the bounded node scroll; rooms=\(roomList), title=\(foot), rows=\(nodeScroll), footer=\(footer)")
 
         // CW-4 supersedes Sign Out: Forget keeps this window's identity and all data.
