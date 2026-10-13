@@ -292,6 +292,24 @@ impl MembershipOracle for SharedMembership {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Inbound {
+    /// A peer asks for identity-authenticated presentation metadata.
+    Presentation {
+        /// Authenticated requester.
+        peer: Digest32,
+        /// Reply stream.
+        send: SendStream,
+        /// Nonce request stream.
+        recv: RecvStream,
+    },
+    /// A member requests a page of privately held Session records.
+    Session {
+        /// The authenticated peer.
+        peer: Digest32,
+        /// The stream's send half.
+        send: SendStream,
+        /// The stream's receive half.
+        recv: RecvStream,
+    },
     /// The peer is starting an ADR-005 join; the actor answers with the channel's
     /// retained passphrase and its prekey ring.
     Join {
@@ -538,11 +556,12 @@ impl NodeNet {
         clock: Clock,
     ) -> Self {
         let membership = SharedMembership::new();
-        let service = RendezvousService::new(
+        let mut service = RendezvousService::new(
             Arc::new(Mutex::new(RendezvousStore::new())),
             Arc::new(membership.clone()),
             Arc::clone(&clock),
         );
+        service.computer_anchor(endpoint.local_id());
         Self {
             manager: Arc::new(ConnectionManager::new(endpoint, Arc::clone(&clock))),
             anchor_scopes: Mutex::new(AnchorScopes::default()),
@@ -662,6 +681,97 @@ impl NodeNet {
         &self.service
     }
 
+    /// Register or renew this computer's transport capability at a configured anchor.
+    pub async fn register_computer_transport(
+        &self,
+        anchor: &VoxConnection,
+        registration: Digest32,
+        token: &Digest32,
+        expires_ms: u64,
+        peer: Option<Digest32>,
+    ) -> Result<()> {
+        self.require_computer_anchor(anchor)?;
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            RendezvousClient::open(anchor)
+                .await?
+                .register_computer_transport(
+                    anchor.peer_id(),
+                    anchor.local_id(),
+                    registration,
+                    token,
+                    expires_ms,
+                    peer,
+                )
+                .await
+        })
+        .await
+        .map_err(|_| Error::Unreachable("computer transport registration timed out"))?
+    }
+
+    /// Redeem only the exact owner's capability over the authenticated anchor connection.
+    pub async fn redeem_computer_transport(
+        &self,
+        anchor: &VoxConnection,
+        owner: Digest32,
+        registration: Digest32,
+        token: &Digest32,
+    ) -> Result<()> {
+        self.require_computer_anchor(anchor)?;
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            RendezvousClient::open(anchor)
+                .await?
+                .redeem_computer_transport(owner, registration, token)
+                .await
+        })
+        .await
+        .map_err(|_| Error::Unreachable("computer transport redemption timed out"))?
+    }
+
+    /// Revoke this computer's own registration, including any relays using it.
+    pub async fn revoke_computer_transport(
+        &self,
+        anchor: &VoxConnection,
+        registration: Digest32,
+    ) -> Result<()> {
+        self.require_computer_anchor(anchor)?;
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            RendezvousClient::open(anchor)
+                .await?
+                .revoke_computer_transport(registration)
+                .await
+        })
+        .await
+        .map_err(|_| Error::Unreachable("computer transport revocation timed out"))?
+    }
+
+    /// Read this computer's exact redeemed counterpart before accepting an introduction.
+    pub async fn computer_transport_peer(
+        &self,
+        anchor: &VoxConnection,
+        registration: Digest32,
+    ) -> Result<Option<Digest32>> {
+        self.require_computer_anchor(anchor)?;
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            RendezvousClient::open(anchor)
+                .await?
+                .computer_transport_peer(registration)
+                .await
+        })
+        .await
+        .map_err(|_| Error::Unreachable("computer transport peer lookup timed out"))?
+    }
+
+    fn require_computer_anchor(&self, anchor: &VoxConnection) -> Result<()> {
+        if !self.policy.snapshot().is_anchor(&anchor.peer_id())
+            || anchor.local_id() != self.local_id()
+        {
+            return Err(Error::StreamRefused(
+                "computer transport requires a configured anchor",
+            ));
+        }
+        Ok(())
+    }
+
     /// This node's identity fingerprint.
     #[must_use]
     pub fn local_id(&self) -> Digest32 {
@@ -774,7 +884,9 @@ impl NodeNet {
     ) -> Result<(StreamKind, SendStream, RecvStream)> {
         crate::node::net::refuse_second_exchange(conn, kind)?;
         let class = self.classify(&peer);
-        if !PeerPolicy::allows(class, kind) {
+        if !(PeerPolicy::allows(class, kind)
+            || kind == StreamKind::Circuit && self.service.computer_transport_peer(&peer))
+        {
             crate::node::net::refuse_disallowed(class, kind, &mut send, &mut recv);
             // A refused stream is a refused dial (ADR-028 D-1). A joiner not yet a member here
             // is refused every few seconds until it is, so repeats are folded, once an hour.
@@ -812,7 +924,8 @@ impl NodeNet {
     /// through the genesis it holds, any other through a record the genesis-backed
     /// oracle admitted. Consulting the board here keeps all of that possible without
     /// the actor being told about every PUT; an identity with no record stays
-    /// `Unknown`, so it reaches the board and `WHOAMI` and nothing else.
+    /// `Unknown`, so it reaches the board and `WHOAMI`; a separately redeemed computer
+    /// capability permits only its exact pair's coord/circuit transport, without reclassification.
     #[must_use]
     pub fn classify(&self, peer: &Digest32) -> PeerClass {
         let class = self.policy.snapshot().classify(peer);
@@ -944,7 +1057,54 @@ impl NodeNet {
         send: SendStream,
         recv: RecvStream,
     ) -> Result<Inbound> {
+        self.dispatch_with_origins(conn, kind, send, recv, None)
+            .await
+    }
+
+    /// Serve only configured-anchor introductions of the exact computer peers the caller
+    /// established or read from its authenticated registration. Never act as a relay here.
+    pub async fn dispatch_computer_transport(
+        &self,
+        conn: &Arc<VoxConnection>,
+        kind: StreamKind,
+        send: SendStream,
+        recv: RecvStream,
+        origins: &[Digest32],
+    ) -> Result<Inbound> {
+        self.require_computer_anchor(conn)?;
+        if !matches!(kind, StreamKind::Coord | StreamKind::Circuit) {
+            return Err(Error::StreamRefused(
+                "not a computer transport introduction",
+            ));
+        }
+        self.dispatch_with_origins(conn, kind, send, recv, Some(origins))
+            .await
+    }
+
+    async fn dispatch_with_origins(
+        &self,
+        conn: &Arc<VoxConnection>,
+        kind: StreamKind,
+        send: SendStream,
+        recv: RecvStream,
+        computer_origins: Option<&[Digest32]>,
+    ) -> Result<Inbound> {
         let peer = conn.peer_id();
+        let accepts_origin = |relay: &Digest32, origin: &Digest32| {
+            computer_origins.map_or_else(
+                || coordstream::accepts_relayed(self.classify(relay), self.classify(origin)),
+                |origins| self.policy.snapshot().is_anchor(relay) && origins.contains(origin),
+            )
+        };
+        let shares_room =
+            |a: &Digest32, b: &Digest32| computer_origins.is_none() && self.relays_between(a, b);
+        let transport = |a: &Digest32, b: &Digest32| {
+            if computer_origins.is_none() {
+                self.service.computer_transport(a, b)
+            } else {
+                None
+            }
+        };
         match kind {
             StreamKind::Rendezvous => {
                 // Where the records came from, for a full board to share itself by
@@ -971,8 +1131,13 @@ impl NodeNet {
             StreamKind::Sync => Ok(Inbound::Sync { peer, send, recv }),
             StreamKind::Agree => Ok(Inbound::Agree { peer, send, recv }),
             StreamKind::Seat => Ok(Inbound::Seat { peer, send, recv }),
+            StreamKind::Session => Ok(Inbound::Session { peer, send, recv }),
+            StreamKind::Presentation => Ok(Inbound::Presentation { peer, send, recv }),
             // Closed at the gate (`net::refuse_second_exchange`) before any stream is dispatched: one more
             // identity stream is a second exchange on one connection (ADR-011 requirement 33).
+            StreamKind::Computer => Err(Error::StreamRefused(
+                "computer management is not a node stream",
+            )),
             StreamKind::Identity => Err(Error::StreamRefused(
                 "an identity stream after the identity exchange",
             )),
@@ -1002,7 +1167,9 @@ impl NodeNet {
                     peer,
                     observed,
                     &|p| self.classify(p),
-                    &|a, b| self.relays_between(a, b),
+                    &shares_room,
+                    &transport,
+                    &accepts_origin,
                     send,
                     recv,
                     move |p| manager.existing(p),
@@ -1027,7 +1194,9 @@ impl NodeNet {
                 let served = circuitstream::serve_circuit(
                     conn,
                     &|p| self.classify(p),
-                    &|a, b| self.relays_between(a, b),
+                    &shares_room,
+                    &transport,
+                    &accepts_origin,
                     send,
                     recv,
                     move |p| manager.existing(p),

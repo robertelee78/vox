@@ -314,9 +314,10 @@ final class NodeModel: ObservableObject {
     @Published private(set) var trusted: [TrustedNode] = []
     /// Trust offers waiting on this node: newcomers, and nodes that trust it (ADR-028 K-15, K-17).
     @Published private(set) var offers: [OfferInfo] = []
-    /// Directories harness sessions started in with no room bound to them, not said no to
-    /// (ADR-029 RB-5): what Vox asks the person, under needs you.
+    /// Canonical repositories waiting for an answer (ADR-031 RM-1, RM-5).
     @Published private(set) var roomAsks: [RoomAskInfo] = []
+    /// The one repository being answered. Other repositories wait for this dialog to finish.
+    @Published private(set) var roomAskDialog: RoomAskInfo?
     /// What the last answer to an ask did, or why it was not done: for the ask's view.
     @Published private(set) var roomAskSaid: RoomAnswerInfo?
     /// The directories already notified, so each ask notifies once (M-23).
@@ -842,8 +843,50 @@ final class NodeModel: ObservableObject {
 
     /// Trust `fingerprint` as `alias`, granting read, and drive as well when `drive` (K-14,
     /// K-16). Whether it was done.
+    /// Self-names are ephemeral metadata, never keyring or grants.
+    @Published var presentedNames: [String: String] = [:]
+
+    private func rememberPresentation(_ fingerprint: String, _ name: String) {
+        if presentedNames[fingerprint] == nil, presentedNames.count >= 4096, let oldest = presentedNames.keys.sorted().first { presentedNames.removeValue(forKey: oldest) }
+        presentedNames[fingerprint] = name
+    }
+
+    func presentedDisplayName(_ fingerprint: String, _ name: String) -> String {
+        let otherNames = presentedNames.filter { $0.key != fingerprint }.map { $0.value }
+            + trusted.filter { $0.fingerprint != fingerprint }.map { $0.name }
+            + offers.filter { $0.fingerprint != fingerprint }.map { $0.presentedName }
+        return clashingAlias(others: otherNames, alias: name) == nil ? name : name + "#" + fingerprint.prefix(6)
+    }
+
+    func identityInput(_ text: String) -> CopiedIdentity? {
+        let raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if raw.hasSuffix(">"), let start = raw.range(of: " <", options: .backwards) {
+            let name = String(raw[..<start.lowerBound])
+            let tail = raw[start.upperBound...].dropLast()
+            let fp = tail.filter { !$0.isWhitespace && $0 != "-" && $0 != "·" }.lowercased()
+            return try? parseCopiedIdentity(text: "\(name) <\(fp)>")
+        }
+        return try? parseCopiedIdentity(text: raw.filter { !$0.isWhitespace && $0 != "-" && $0 != "·" }.lowercased())
+    }
+
+    func presentedName(_ fingerprint: String) async -> String? {
+        guard let identity = identityInput(fingerprint) else { return nil }
+        if let name = try? await client.presentedName(fingerprint: identity.fingerprint) {
+            rememberPresentation(identity.fingerprint, name)
+            return name
+        }
+        return nil
+    }
+
+    func suggestedName(_ identity: String) async -> String? {
+        guard let parsed = identityInput(identity) else { return nil }
+        if let name = parsed.name { return name }
+        return await presentedName(parsed.fingerprint)
+    }
+
     func trust(_ fingerprint: String, as alias: String, drive: Bool) async -> Bool {
-        let fp = fingerprint.filter { !$0.isWhitespace && $0 != "-" && $0 != "·" }.lowercased()
+        guard let parsed = identityInput(fingerprint) else { return false }
+        let fp = parsed.fingerprint
         return await keyringChange(fingerprint: fp, alias: alias,
                                    words: "trust \(alias), \(Capability.words(drive))",
                                    action: "Trust") { [client] pass in
@@ -941,6 +984,49 @@ final class NodeModel: ObservableObject {
             for gone in roomAsksNotified.subtracting(dirs) { notifier.withdrawRoomAsk(dir: gone) }
         }
         roomAsksNotified = dirs
+        if let current = roomAskDialog {
+            if let fresh = asks.first(where: { $0.dir == current.dir }) {
+                roomAskDialog = fresh
+            } else if !activeOperations.values.contains("bind-room")
+                        && !activeOperations.values.contains("decline-room") {
+                finishRoomAsk()
+            }
+        }
+        if sheet == nil, card == nil, lanAsking == nil, let ask = asks.first {
+            roomAskDialog = ask
+            roomAskSaid = nil
+            clearOutcome(of: "bind-room")
+            clearOutcome(of: "decline-room")
+            sheet = .repoRoom
+        }
+    }
+
+    /// Creation uses the app's selected (person's) node. The room secret is reused only for the
+    /// verified bind; no identity passphrase or keyring change is involved (RM-2, KP-1).
+    func createRepoRoom(_ dir: String, name: String,
+                        passphrase secret: Secret) async -> (room: String?, bound: Bool) {
+        let operation = "bind-room"
+        let attempt = begin(operation)
+        defer { end(attempt) }
+        roomAskSaid = nil
+        var created: String?
+        do {
+            let passphrase = try secret.passphrase()
+            defer { passphrase.wipe() }
+            let room = try await client.createRoom(name: name, passphrase: passphrase)
+            created = room
+            let link = try await client.link(room: room).url
+            roomAskSaid = try await client.bindRoom(dir: dir, link: link, passphrase: passphrase)
+            await refresh()
+            await readRoomAsks()
+            await show(.room(room))
+            return (room, roomAskSaid?.done == true)
+        } catch {
+            secret.wipe()
+            report(error, operation: operation)
+            await refresh()
+            return (created, false)
+        }
     }
 
     /// Bind `dir` to the room this node holds by `room`'s id, or to the room `link` names (one of
@@ -988,11 +1074,24 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// Take down what the last answer to an ask said.
-    func clearRoomAskSaid() { roomAskSaid = nil }
+    /// The answered repository leaves the dialog. The usual status bar keeps its result.
+    func finishRoomAsk() {
+        if let answer = roomAskSaid, answer.done {
+            report(operation: "bind-room", done: answer.said.joined(separator: "\n"))
+        }
+        roomAskDialog = nil
+        roomAskSaid = nil
+        if sheet == .repoRoom { sheet = nil }
+    }
+
+    func clearRoomAskFailure() {
+        roomAskSaid = nil
+        clearOutcome(of: "bind-room")
+        clearOutcome(of: "decline-room")
+    }
 
     /// Say no for `dir` (RB-7): it stays tied to no room, and nothing started there is asked again.
-    func declineRoom(_ dir: String) async {
+    func declineRoom(_ dir: String) async -> Bool {
         let operation = "decline-room"
         let attempt = begin(operation)
         defer { end(attempt) }
@@ -1000,8 +1099,10 @@ final class NodeModel: ObservableObject {
         do {
             roomAskSaid = try await client.declineRoom(dir: dir)
             await readRoomAsks()
+            return roomAskSaid?.done == true
         } catch {
             report(error, operation: operation)
+            return false
         }
     }
 
@@ -1491,21 +1592,6 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// The next room that needs the person, if any (W-2).
-    func nextNeedingYou() async {
-        if let room = orderedRooms.first(where: { $0.need == .needsYou }) {
-            // A request waiting in one of its Sessions: that Session, that request (P1).
-            if let waiting = await firstWaiting(in: room.id) {
-                await openRequest(room: room.id, node: waiting.node, session: waiting.session,
-                                  reference: waiting.reference)
-            } else {
-                await show(.room(room.id))
-            }
-        } else if let offer = offers.first {
-            await show(.offer(offer.fingerprint))
-        }
-    }
-
     /// Share the file or folder at `url` in the room on screen, addressed to `to` (members'
     /// fingerprints; none: the room) with `note`, in one message (ADR-028 F-1). Whether it was.
     func attach(_ url: URL, to: [String], note: String, urgent: Bool = false) async -> Bool {
@@ -1641,11 +1727,16 @@ final class NodeModel: ObservableObject {
         let back = Set(consents.inbound)
         // Their trust in this node, whether or not this node trusts them (D4): both directions.
         if back != trustsMe { trustsMe = back }
+        for member in roster where !member.presentedName.isEmpty { rememberPresentation(member.fingerprint, member.presentedName) }
+        let displayNames = roster.map { m in (m.fingerprint, m.name.isEmpty ? m.presentedName : m.name) }
         return roster.filter { $0.fingerprint != me }.map { m in
             let trust = Trust.of(inKeyring: keyring[m.fingerprint] != nil,
                                  trustsYou: back.contains(m.fingerprint))
+            let rawName = m.name.isEmpty ? m.presentedName : m.name
+            let clash = clashingAlias(others: displayNames.filter { $0.0 != m.fingerprint }.map { $0.1 }, alias: rawName) != nil
+            let shown = rawName.isEmpty ? String(m.fingerprint.prefix(12)) : rawName + (clash ? "#" + m.fingerprint.prefix(6) : "")
             return MemberRow(id: m.fingerprint,
-                             name: m.name.isEmpty ? String(m.fingerprint.prefix(12)) : m.name,
+                             name: m.name.isEmpty && !m.presentedName.isEmpty ? "\(shown) · \(m.fingerprint.prefix(12))" : shown,
                              trust: trust, drive: keyring[m.fingerprint] ?? false,
                              trustsYou: back.contains(m.fingerprint),
                              keyWaits: m.keyWaits)

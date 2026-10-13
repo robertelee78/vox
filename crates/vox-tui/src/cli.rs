@@ -129,12 +129,15 @@ where
 /// The name `vox trust add` files an identity under: `--name`, or asked for on a
 /// terminal. With neither it is refused at once: every identity under one default name could
 /// not be told apart, nor addressed.
-fn trust_name(a: &TrustAddArgs) -> Result<String, crate::app::AppError> {
+fn trust_name(a: &TrustAddArgs, default: Option<&str>) -> Result<String, crate::app::AppError> {
     use std::io::{BufRead as _, IsTerminal as _, Write as _};
     if let Some(n) = a.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
         return Ok(n.to_owned());
     }
     if !std::io::stdin().is_terminal() {
+        if let Some(name) = default {
+            return Ok(name.to_owned());
+        }
         return Err(crate::app::AppError::Usage(
             "name it: run it again with --name and your name for it, or at a terminal, where \
              it asks"
@@ -142,30 +145,34 @@ fn trust_name(a: &TrustAddArgs) -> Result<String, crate::app::AppError> {
         ));
     }
     let mut err = std::io::stderr();
-    let _ = write!(err, "Your name for {}: ", a.fingerprint.trim());
+    let _ = write!(
+        err,
+        "Your name for {}{}: ",
+        a.fingerprint.trim(),
+        default
+            .map(|n| format!(" [{n}] (Enter accepts)"))
+            .unwrap_or_default()
+    );
     let _ = err.flush();
     let mut line = String::new();
     let _ = std::io::stdin().lock().read_line(&mut line);
     match line.trim() {
-        "" => Err(crate::app::AppError::Usage(
-            "no name given; nothing was trusted".into(),
-        )),
+        "" => default.map(str::to_owned).ok_or_else(|| {
+            crate::app::AppError::Usage("no name given; nothing was trusted".into())
+        }),
         n => Ok(n.to_owned()),
     }
 }
 
 /// Run a trust verb against the daemon already holding this node.
 fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
-    let name = match &sub {
-        TrustCmd::Add(a) => match trust_name(a) {
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!("vox: {e}");
-                return ExitCode::FAILURE;
-            }
-        },
-        _ => String::new(),
-    };
+    // Refuse a marked agent before naming prompts or daemon access (ADR-031 LT-8).
+    if matches!(sub, TrustCmd::Add(_) | TrustCmd::Drive(_)) {
+        if let Some(why) = crate::coord::trust_widening_refusal() {
+            eprintln!("vox: {why}");
+            return ExitCode::FAILURE;
+        }
+    }
     let (profile, pass, pass_file) = match &sub {
         TrustCmd::Offers(a) => (
             a.profile.clone(),
@@ -243,7 +250,12 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
             TrustCmd::Offers(_) => crate::room_cli::trust_offers(&paths).await,
             TrustCmd::Dismiss(a) => crate::room_cli::trust_dismiss(&paths, &a.fingerprint).await,
             TrustCmd::Add(a) => {
-                let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
+                let (target, hint) = vox_core::node::link::copied_identity(&a.fingerprint)?;
+                let presented = crate::room_cli::presented_name(&paths, target)
+                    .await
+                    .unwrap_or_default();
+                let default = hint.as_deref().or(presented.as_deref());
+                let name = trust_name(&a, default)?;
                 crate::room_cli::trust_add(&paths, target, &name, a.history == "full", a.drive)
                     .await
             }
@@ -945,7 +957,7 @@ enum AgentCmd {
     /// can be announced, and prints nothing; on `SessionEnd` it removes the session's
     /// registration.
     Hook(AgentHookArgs),
-    /// Print the integration a harness needs to run `vox agent hook` every turn.
+    /// Print a node's harness integration, or install missing light hooks with `--install`.
     ///
     /// Whatever the harness wants, this prints it: Claude Code and Codex take a
     /// hook entry in their own settings, so they get a JSON snippet; OpenCode has
@@ -992,8 +1004,8 @@ enum AgentCmd {
     ///
     /// Run from a harness session at its start (the agent skill says to), when no hook has
     /// brought Vox's news: it only reads, and says the first thing missing with the one command
-    /// the operator runs for it in a terminal of their own — `vox agent connect` when no node is
-    /// wired to the harness, `vox node attach` when its node is not attached, the room ask with
+    /// the operator runs for it in a terminal of their own — `vox agent setup` when no node is
+    /// wired to the harness, `vox node unlock` when its node is not attached, the room ask with
     /// `vox room join … --bind` when the directory is bound to no room — or that nothing is.
     ///
     /// For example:
@@ -1002,16 +1014,17 @@ enum AgentCmd {
     Status(AgentStatusArgs),
     /// Make a node for a harness (or take one that exists), wire the harness to it, and attach it.
     ///
-    /// What `vox setup` does for one harness, by the name you choose: the node is made with a
-    /// passphrase you type twice at this terminal (or `--passphrase-file`), the harness's hook
+    /// What `vox setup` does for one harness: the suggested name is <harness>-<host>, or the
+    /// name you choose with --node. Type the passphrase twice in your own terminal, outside an
+    /// agent session; it is never read from a file or environment variable. The harness's hook
     /// goes in its own settings with the agent skill beside it (other Vox hook entries there are
     /// replaced, nothing else), and the node is attached. It says what it is to do first. Start
     /// a new session of the harness afterwards.
     ///
     /// For example:
     ///
-    /// vox agent connect claude --node claude-mbp
-    Connect(AgentConnectArgs),
+    /// vox agent setup claude --node claude-mbp
+    Setup(AgentSetupArgs),
     /// Check that this node's agent sessions are wired up, and say how to fix what is not.
     ///
     /// One line per check, `ok`, `warn` or `fail`, each with a one-line fix: the node answers;
@@ -1054,20 +1067,22 @@ pub struct AgentStatusArgs {
     pub dir: Option<PathBuf>,
 }
 
-/// `vox agent connect`
+/// `vox agent setup`
 #[derive(Args, Debug, Clone)]
-pub struct AgentConnectArgs {
+pub struct AgentSetupArgs {
     #[command(flatten)]
     pub profile: AccountArgs,
     /// The harness to wire: `claude`, `codex` or `opencode`.
     pub harness: String,
-    /// The node's name: made if there is none, as `vox node create` makes it.
-    #[arg(long, required = true)]
-    pub node: String,
-    /// Read a new node's passphrase (or an existing one's, to attach it) from this file instead
-    /// of asking at the terminal (first line; `-` reads stdin).
+    /// The node's name; defaults to <harness>-<host>, folded to a valid node name.
     #[arg(long)]
-    pub passphrase_file: Option<PathBuf>,
+    pub node: Option<String>,
+    /// Complete only the hook wiring for a node the app already made and kept.
+    #[arg(long, hide = true, requires = "node")]
+    pub finish: bool,
+    /// Check app setup's name and harness before making its node; writes nothing.
+    #[arg(long, hide = true, requires = "finish")]
+    pub check: bool,
 }
 
 /// `vox agent doctor`
@@ -1150,11 +1165,14 @@ pub struct AgentTrustArgs {
 pub struct AgentPluginArgs {
     /// The harness to print an integration for. Only `opencode` needs one today;
     /// Claude Code and Codex are configured with a hook command instead.
-    pub harness: String,
+    #[arg(required_unless_present = "install", conflicts_with = "install")]
+    pub harness: Option<String>,
     /// The agent's own node, which the printed hooks act as (`vox agent hook --node <name>`).
-    /// Required: an agent never uses a person's node.
-    #[arg(long, required = true)]
-    pub node: String,
+    #[arg(long, required_unless_present = "install", conflicts_with = "install")]
+    pub node: Option<String>,
+    /// Install a quiet, node-free hook in every harness here without a Vox hook.
+    #[arg(long)]
+    pub install: bool,
 }
 
 /// `vox agent send`
@@ -1201,10 +1219,12 @@ pub struct AgentRoomArgs {
 pub struct AgentHookArgs {
     #[command(flatten)]
     pub profile: AccountArgs,
-    /// The node this hook acts as: the agent's own node. Required, and
-    /// never taken from the environment or any other node: a hook without it refuses.
-    #[arg(long, required = true)]
-    pub node: String,
+    /// The agent's own node. Never inferred from the environment or another node.
+    #[arg(long, required_unless_present = "light", conflicts_with = "light")]
+    pub node: Option<String>,
+    /// A quiet onboarding hook: no node, no daemon, and no room drain.
+    #[arg(long, value_parser = ["claude", "codex", "opencode"])]
+    pub light: Option<String>,
     /// Drain only this room (its id, or a unique prefix). Without it the hook drains every
     /// room the node holds, each under its own heading.
     #[arg(long)]
@@ -1555,6 +1575,16 @@ pub struct IdentityArgs {
     pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
+/// Public identity output; the default stdout remains the bare fingerprint.
+#[derive(Args, Debug, Clone)]
+pub struct IdArgs {
+    #[command(flatten)]
+    pub identity: IdentityArgs,
+    /// Copy a supported name-plus-fingerprint representation.
+    #[arg(long)]
+    pub with_name: bool,
+}
+
 /// Which rooms `vox node` serves (`--serve`).
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Serve {
@@ -1598,7 +1628,7 @@ impl AccountArgs {
 #[derive(Subcommand, Debug, Clone)]
 pub enum NodeCmd {
     /// Make a new node: an identity with its own rooms, trust and services. Its files are
-    /// written here, and it is attached and remembered at once, as `vox node attach` does. The
+    /// written here, and it is attached and remembered at once, as `vox node unlock` does. The
     /// passphrase comes from `--passphrase-file`, `VOX_IDENTITY_PASSPHRASE`, or is asked twice;
     /// an empty one gives the node none, and says that its key is then kept unencrypted.
     Create {
@@ -1614,22 +1644,26 @@ pub enum NodeCmd {
         #[command(flatten)]
         account: AccountArgs,
     },
-    /// Attach a node to the daemon by hand (starting the daemon if none runs), until `vox node
-    /// detach`. It is remembered: its passphrase is stored in the Keychain (none is needed for a
-    /// node made with none), and the daemon attaches it again by itself whenever it starts, after
-    /// an update or a reboot too. `--no-remember` stores nothing; `vox node forget-passphrase`
-    /// forgets it later. Where there is no Keychain, `--keep --passphrase-file` keeps it.
+    /// Unlock a node and always remember it for daemon restarts, updates and reboots.
+    /// On a Mac its passphrase is stored in the Keychain; elsewhere a nonempty passphrase
+    /// requires a persistent --passphrase-file. A node with no passphrase needs no secret stored.
+    Unlock {
+        /// The node.
+        name: String,
+        /// Read the identity passphrase from this file (first line; `-` reads stdin on a Mac).
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+        #[command(flatten)]
+        account: AccountArgs,
+    },
+    /// Renamed to `vox node unlock`; unlock always remembers the node.
     Attach {
         /// The node.
         name: String,
-        /// With `--passphrase-file`: keep it by that file, read by the daemon at each start,
-        /// instead of the Keychain.
-        #[arg(long, requires = "passphrase_file", conflicts_with = "no_remember")]
-        keep: bool,
-        /// Attach it until it is detached or the daemon stops, and store nothing.
+        /// Accepted with no effect: unlock always remembers the node.
         #[arg(long)]
-        no_remember: bool,
-        /// Read the identity passphrase from this file (first line).
+        keep: bool,
+        /// Read the identity passphrase from this file (first line; `-` reads stdin on a Mac).
         #[arg(long)]
         passphrase_file: Option<PathBuf>,
         #[command(flatten)]
@@ -1654,7 +1688,15 @@ pub enum NodeCmd {
         #[command(flatten)]
         account: AccountArgs,
     },
-    /// Detach a node: its connections close and its keys are wiped from memory.
+    /// Lock a node and forget what brings it back: its remembered passphrase and restart state.
+    /// Its rooms, messages and keys stay on disk. It stays Locked until unlocked again.
+    Lock {
+        /// The node.
+        name: String,
+        #[command(flatten)]
+        account: AccountArgs,
+    },
+    /// Renamed to `vox node lock`; lock also forgets what brings the node back.
     Detach {
         /// The node.
         name: String,
@@ -1663,7 +1705,7 @@ pub enum NodeCmd {
     },
     /// Sign a node out: detach it, stop keeping it (its `.daemon/attach` line and Keychain
     /// passphrase go), and forget the app's choice of it, so nothing brings it back without you.
-    /// Its rooms and messages stay on disk; `vox node attach` uses it again.
+    /// Its rooms and messages stay on disk; `vox node unlock` uses it again.
     Signout {
         /// The node.
         name: String,
@@ -1689,21 +1731,21 @@ fn run_node_cmd(cmd: NodeCmd) -> ExitCode {
             crate::client::node_create(&account.as_node_args(), &name, passphrase_file, headless)
                 .await
         }),
-        NodeCmd::Attach {
+        NodeCmd::Unlock {
             name,
-            keep,
-            no_remember,
             passphrase_file,
             account,
         } => block_on_client(async move {
-            crate::client::node_attach(
-                &account.as_node_args(),
-                &name,
-                keep,
-                no_remember,
-                passphrase_file,
-            )
-            .await
+            crate::client::node_unlock(&account.as_node_args(), &name, passphrase_file).await
+        }),
+        NodeCmd::Attach {
+            name,
+            keep: _,
+            passphrase_file,
+            account,
+        } => block_on_client(async move {
+            eprintln!("`vox node attach` is now `vox node unlock`");
+            crate::client::node_unlock(&account.as_node_args(), &name, passphrase_file).await
         }),
         NodeCmd::Rename { old, new, account } => block_on_client(async move {
             crate::client::node_rename(&account.as_node_args(), &old, &new).await
@@ -1711,8 +1753,12 @@ fn run_node_cmd(cmd: NodeCmd) -> ExitCode {
         NodeCmd::ForgetPassphrase { name, account } => block_on_client(async move {
             crate::client::node_forget_passphrase(&account.as_node_args(), &name).await
         }),
+        NodeCmd::Lock { name, account } => block_on_client(async move {
+            crate::client::node_lock(&account.as_node_args(), &name).await
+        }),
         NodeCmd::Detach { name, account } => block_on_client(async move {
-            crate::client::node_detach(&account.as_node_args(), &name).await
+            eprintln!("`vox node detach` is now `vox node lock`");
+            crate::client::node_lock(&account.as_node_args(), &name).await
         }),
         NodeCmd::Signout { name, account } => block_on_client(async move {
             crate::client::node_signout(&account.as_node_args(), &name).await
@@ -2165,7 +2211,7 @@ enum Cmd {
     /// control socket every other `vox` command talks to (`<data root>/.daemon/vox.sock`) and
     /// the nodes that are attached. It is not a node itself and can run with none attached.
     /// A node is an identity; while attached it runs in full, and it stops only when it is
-    /// detached (`vox node detach`) or the daemon stops.
+    /// detached (`vox node lock`) or the daemon stops.
     ///
     /// With `--node`, or when the data root holds exactly one node, that node is attached in
     /// the foreground once its passphrase is given: from `--passphrase-file`, else
@@ -2180,7 +2226,7 @@ enum Cmd {
     /// for this data root, a `vox daemon --node <name>` attaches the node to it instead.
     ///
     /// You rarely need to start it by hand: `vox serve`, `connect`, `up`, `forward`,
-    /// `lan up`, `vox node attach` and the TUI start one in the background when none runs, and
+    /// `lan up`, `vox node unlock` and the TUI start one in the background when none runs, and
     /// that one exits when it has no node and no client left. One started here runs until
     /// stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each detaches every node cleanly
     /// and stops it.
@@ -2221,7 +2267,7 @@ enum Cmd {
     /// recorded on the GitHub issue through awa; `--work` carries awa's work key.
     ///
     /// These never attach a node: they ask the vox daemon as a node that is already
-    /// attached (`vox node attach`, or a verb or agent session holding it), which is how
+    /// attached (`vox node unlock`, or a verb or agent session holding it), which is how
     /// several agent sessions share one identity per machine. None of them takes the
     /// identity passphrase; `join` and `create` take the room passphrase at a terminal, or
     /// from stdin with `--passphrase-file -`.
@@ -2260,6 +2306,9 @@ enum Cmd {
     /// turn) and `vox agent skill <harness>` (the agent text, and where it goes).
     #[command(subcommand)]
     Agent(AgentCmd),
+    /// Pair Vox installations once, or inspect their fixed computer trust policy.
+    #[command(subcommand)]
+    Computer(crate::computer_cli::ComputerCmd),
     /// Say where the local entry point for rooms' services is: the vox daemon's SOCKS5 proxy,
     /// which resolves `.vox` names and runs while any node is attached.
     ///
@@ -2289,7 +2338,7 @@ enum Cmd {
     /// It is the whole 52-character base32 fingerprint, on its own line, so it can be
     /// piped or pasted without editing. Compare it out of band, the way you would a PGP
     /// fingerprint: nothing registers it and nothing looks it up.
-    Id(IdentityArgs),
+    Id(IdArgs),
     /// Decide which identities this node trusts.
     #[command(subcommand)]
     Trust(TrustCmd),
@@ -2345,7 +2394,7 @@ enum Cmd {
     ///
     /// On a Mac, Vox.app is replaced whole. A running vox daemon is then restarted onto the new
     /// version: a node whose passphrase the daemon keeps is attached again, and any other node
-    /// it had attached is named, with the `vox node attach` that attaches it again. A daemon
+    /// it had attached is named, with the `vox node unlock` that attaches it again. A daemon
     /// run by hand (`vox daemon` in a terminal) is left running, and you are told.
     Update {
         /// Report whether a newer release exists, and change nothing.
@@ -2976,6 +3025,13 @@ pub fn run() -> ExitCode {
                 }
             }
         }
+        Cmd::Computer(args) => match block_on_client(crate::computer_cli::run(args)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("vox computer: {e}");
+                e.exit_code()
+            }
+        },
         Cmd::Agent(AgentCmd::Send(args)) => {
             let outcome = vox_core::node::paths::NodeName::parse(&args.node)
                 .map_err(AppError::from)
@@ -3039,7 +3095,14 @@ pub fn run() -> ExitCode {
             }
         }
         Cmd::Agent(AgentCmd::Hook(args)) => {
-            let node = match vox_core::node::paths::NodeName::parse(&args.node) {
+            // HK-2/3: only account configuration and a one-line notice; no node or daemon.
+            if let Some(harness) = args.light.as_deref() {
+                crate::agent_hook::light(&args, harness);
+                return ExitCode::SUCCESS;
+            }
+            let node = match vox_core::node::paths::NodeName::parse(
+                args.node.as_deref().unwrap_or_default(),
+            ) {
                 Ok(n) => n,
                 Err(e) => {
                     eprintln!("vox: --node: {e}");
@@ -3186,12 +3249,20 @@ pub fn run() -> ExitCode {
                 }
             }
         }
-        Cmd::Agent(AgentCmd::Connect(args)) => match block_on_client(async move {
-            crate::agent_setup::connect(
+        Cmd::Agent(AgentCmd::Setup(args)) => match block_on_client(async move {
+            if args.finish {
+                return crate::agent_setup::finish(
+                    &args.profile.as_node_args(),
+                    &args.harness,
+                    args.node.as_deref().unwrap_or_default(),
+                    args.check,
+                )
+                .await;
+            }
+            crate::agent_setup::setup(
                 &args.profile.as_node_args(),
                 &args.harness,
-                &args.node,
-                args.passphrase_file.clone(),
+                args.node.as_deref(),
             )
             .await
         }) {
@@ -3240,14 +3311,33 @@ pub fn run() -> ExitCode {
             }
         },
         Cmd::Agent(AgentCmd::Plugin(args)) => {
-            let node = match vox_core::node::paths::NodeName::parse(&args.node) {
+            if args.install {
+                let installed = crate::setup::install_light_hooks();
+                if let Ok(account) = vox_core::node::paths::Account::of(None, None) {
+                    crate::agent_onboarding::discover(&account);
+                }
+                return if installed {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                };
+            }
+            let node = match vox_core::node::paths::NodeName::parse(
+                args.node.as_deref().unwrap_or_default(),
+            ) {
                 Ok(n) => n,
                 Err(e) => {
                     eprintln!("vox: --node: {e}");
                     return ExitCode::FAILURE;
                 }
             };
-            match args.harness.to_ascii_lowercase().as_str() {
+            match args
+                .harness
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str()
+            {
                 "opencode" => {
                     print!("{}", crate::agent_hook::opencode_plugin(&node));
                     eprintln!(
@@ -3357,7 +3447,7 @@ pub fn run() -> ExitCode {
         // from the daemon when the node is attached, else from the node's files, which hold it
         // in the clear. A node with no identity has one made here first (C-5).
         Cmd::Id(args) => {
-            let paths = match args.profile.paths_creating() {
+            let paths = match args.identity.profile.paths_creating() {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("vox: {e}");
@@ -3366,8 +3456,9 @@ pub fn run() -> ExitCode {
             };
             match crate::room_cli::print_identity(
                 &paths,
-                args.identity_passphrase.clone(),
-                args.identity_passphrase_file.clone(),
+                args.identity.identity_passphrase.clone(),
+                args.identity.identity_passphrase_file.clone(),
+                args.with_name,
             ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {

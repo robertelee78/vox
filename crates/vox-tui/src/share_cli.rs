@@ -133,7 +133,7 @@ pub(crate) async fn offer(
     // **A share is a post, and follows a post's hop rule** (ADR-020 §9, V210-121): it answers
     // what woke the session, and spends a hop of that budget. An urgent share with a fresh one
     // would let two agents wake each other for ever by sharing.
-    let (re, hops) = crate::room_cli::answers(
+    let (re, hops, thread) = crate::room_cli::answers(
         &mut client,
         channel_id,
         paths,
@@ -143,11 +143,15 @@ pub(crate) async fn offer(
         opts.urgent,
     )
     .await?;
+    let thread = thread.or_else(|| re.clone());
+    let tags = crate::room_cli::reply_tags(&mut client, channel_id, thread.as_deref(), &[]).await?;
     let env = {
         // The note is the message's body; with none, the daemon says what is shared.
         let mut e = Envelope::new(FILE, note);
         e.to = to;
         e.urgent = opts.urgent;
+        e.thread = thread;
+        e.tags = tags;
         e.re = re;
         if let Some(h) = hops {
             e.hops = h;

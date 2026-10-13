@@ -29,6 +29,7 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             lines. Bob selects q-mid (Up), presses Ctrl-R and sends q-answer: his post's `re` names
             q-mid, and the TUI shows it under "┆ alice: q-mid…", one level, not q-root, with q-mid
             itself off screen (ADR-028 R-9, #485);
+  thread    An @alice reply to q-mid stays in q-root's thread and addresses Alice (#753).
   jump      Bob selects q-answer and presses Enter: the view moves to q-mid, selected;
   address   a canonical address Alice posts reads as Bob's node writes it: "open
             nas-web.alice.family.vox please" (ADR-028 S-1a, #488);
@@ -108,13 +109,9 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             still acts as default: its status bar and sidebar say so (ADR-028 E-4, #470);
   to        `:to alice` and `:urgent` show on the composer as "To: alice · urgent", and the
             message Bob then sends reaches Alice with `to` naming her and `urgent` (W-4, #513);
-  sessions  Alice's node, through Claude Code's hook in a session a person is at, opens two
-            Sessions and ends one: Bob's Sessions pane lists the open one by `vox room sessions`'s
-            label and the ended one apart under "Ended (1)"; `:all` shows each opening and end
-            among the room's messages; `:session <short id>`, without drive, shows only that it
-            exists, "<label> — name and id as alice says" (MD-3) and "Only members alice trusts
-            with drive see inside this Session.", with no
-            composer, and `:send` there is refused, reaching nobody (ADR-029 CL-2, CL-3, #553);
+  sessions  Alice's hooks open two Sessions and end one. Bob sees neither without drive;
+            after Alice's terminal grant he sees the open/ended Sessions and their lifecycle,
+            and the open Session offers its composer (ADR-031 SA-1–SA-3).
   session-order  Alice posts, then her hook opens a new Session, within one second: in Bob's All the
             post reads first and "<label> opened" under it (#562: times in milliseconds);
   drive     once Alice gives Bob drive (`vox trust drive`, at a terminal) and her open Session
@@ -546,8 +543,8 @@ try:
         p = run("alice", "room", "post", room, "--json", "--session", "quote-proof", *args)
         if p.returncode != 0: product(f"alice's `vox room post {' '.join(args)}` failed: {p.stderr.strip()}")
         return json.loads(p.stdout.strip().splitlines()[-1])["entry_hash"]
-    q_root = alice_posts("q-root what shall we build")
-    q_mid = alice_posts("--re", q_root, "--thread", q_root, "q-mid the lexer first")
+    q_root = alice_posts("--to", fp["bob"], "q-root @bob what shall we build")
+    q_mid = alice_posts("--re", q_root, "q-mid the lexer first")
     FILL = 50  # more lines than the pane holds, so q-mid is off screen under the reply
     for i in range(1, FILL + 1):
         p = run("alice", "room", "post", room, f"f-{i:03d}")
@@ -581,7 +578,7 @@ try:
     shown = rows()
     at = next(i for i, r in enumerate(shown) if "you: q-answer" in r)
     above = shown[at - 1] if at else ""
-    def bob_reply_re():
+    def bob_message(body):
         r = run("bob", "room", "read", room, "--json", "--limit", "500")
         for line in r.stdout.splitlines():
             try:
@@ -589,14 +586,17 @@ try:
             except ValueError:
                 continue
             env = row.get("envelope") or {}
-            if env.get("body") == "q-answer on it":
-                return env.get("re")
-        return None
-    wrote = bob_reply_re()
+            if env.get("body") == body:
+                return env
+        return {}
+    wrote = bob_message("q-answer on it")
+    mid = bob_message("q-mid the lexer first")
     mid_off = not any("alice: q-mid" in r and "┆" not in r for r in shown)
-    claim("quote", wrote == q_mid and "┆ alice: q-mid the lexer first" in above and "q-root" not in above
+    claim("quote", wrote.get("re") == q_mid and wrote.get("thread") == q_root
+          and mid.get("thread") == q_root and "┆ alice: q-mid the lexer first" in above and "q-root" not in above
           and mid_off,
-          f"bob's reply's re names q-mid: {wrote == q_mid} (re {wrote!r}); the row above it: "
+          f"bob's reply: re {wrote.get('re')!r}, thread {wrote.get('thread')!r}; "
+          f"q-mid's thread {mid.get('thread')!r}, expected root {q_root!r}; the row above it: "
           f"{above.strip()!r}; q-mid itself off screen: {mid_off}")
 
     stage("jump")
@@ -607,6 +607,18 @@ try:
     jumped = tui.until(lambda: "alice: q-mid" in selected() and "┆" not in selected(), 5, 0.2)
     claim("jump", "q-answer" in sel_reply and jumped,
           f"selected before Enter: {sel_reply.strip()!r}; after: {selected().strip()!r}")
+    # An @addressed reply uses the same rule as the plain reply, even to a reply rather than
+    # General's root. Its To: addresses Alice but does not create a separate/private thread.
+    stage("thread")
+    tui.key("\x12", 0.3)
+    tui.key("@alice q-addressed on it", 0.3)
+    tui.key("\r", 1)
+    tui.key("\x1b[F", 0.5)
+    tui.until(lambda: bool(bob_message("@alice q-addressed on it")), 30, 0.5)
+    addressed = bob_message("@alice q-addressed on it")
+    claim("thread", addressed.get("re") == q_mid and addressed.get("thread") == q_root
+          and addressed.get("to") == [fp["alice"]],
+          f"@alice reply must answer q-mid in q-root's thread and address alice; got {addressed!r}")
     tui.key("\x1b[F", 0)  # End
     tui.until(lambda: has(timeline(), f"f-{FILL:03d}"), 5, 0.2)
     focus("Timeline")  # where the stages below begin
@@ -638,7 +650,7 @@ try:
     def label_of(who):
         """The state line under `who`'s name in the members pane, and whether the marker is on it."""
         rows = members_pane()
-        key = who if who in ("alice", "dave") else fp[who][:26]
+        key = who if who in ("alice", "dave") else fp[who][:12]
         for i, r in enumerate(rows):
             if key in r:
                 return (rows[i + 1] if i + 1 < len(rows) else ""), "▶" in r, i
@@ -667,7 +679,7 @@ try:
         weight and colour, and whether the accent strays off the focused pane's border:
         (ok, detail)."""
         want = {"alice": (glyphs[0], "alice", True), "dave": (glyphs[1], "dave", True),
-                "carol": (glyphs[2], fp["carol"][:26], False)}
+                "carol": (glyphs[2], "default", False)}
         ok, said = True, []
         for who, (glyph, name, strong) in want.items():
             y = at(t, who)
@@ -1060,13 +1072,20 @@ try:
         heads = [i for i, r in enumerate(s) if r.startswith("needs you (")]
         rows = s[heads[0] + 1:] if heads else []
         offers = [r for r in rows if r.lstrip("▶ ").startswith("offer: ")]
-        under = next((r for r in rows if not r.lstrip("▶ ").startswith("offer: ")), "")
+        under = next((r for r in rows if not r.lstrip("▶ ").startswith(("offer: ", "not in keyring"))), "")
         return (bool(heads) and s[heads[0]] == f"needs you ({1 + len(offers)})"
                 and under.lstrip("▶ ").startswith("family ") and "to you 1" in under
                 and "spare  detached" in s and "default  attached" in s
                 and bool(s) and s[0] == "node default · attached")
     tui.until(regions, 30, 1)
-    claim("regions", regions(), f"sidebar: {side()!r}")
+    before_ctrl_n = "\n".join(tui.display())
+    if "Rooms (Enter: open" not in before_ctrl_n:
+        apparatus("removed-next staging needs the real room list on screen with an addressed room")
+    tui.key("\x0e", 1)  # Ctrl-N must not jump away from this room list.
+    after_ctrl_n = "\n".join(tui.display())
+    claim("regions", regions() and "Rooms (Enter: open" in after_ctrl_n
+          and "Ctrl-N: next room" not in after_ctrl_n,
+          f"room list must retain marks/counts without a next-room control or Ctrl-N jump: {side()!r}; screen: {after_ctrl_n!r}")
 
     stage("newcomer")
     # Frank joins through Alice's link while Bob's TUI is open. Bob trusts Alice; nobody trusts Frank
@@ -1110,6 +1129,8 @@ try:
                 return True
             tui.key("\x1b[A", 0.5)  # Up
         return False
+    offer_identity = tui.until(lambda: any(offer_row("frank") in row and "default" in row for row in side()), 90, 1)
+    offer_state = any("not in keyring" in row for row in side())
     card = select_offer("frank")
     art = any(c in whole() for c in "◢◣◤◥")
     # Nothing reaches the room: what Alice holds of it is unchanged.
@@ -1141,9 +1162,9 @@ try:
     tui.key("\x1b", 1)
     carol_kept = tui.until(lambda: offered("carol"), 60, 1)
     frank_kept_out = not offered("frank")
-    claim("offer", listed_frank and card and art and dismissed_said and frank_gone
+    claim("offer", listed_frank and offer_identity and offer_state and card and art and dismissed_said and frank_gone
           and rows_after == rows_before > 0 and carol_kept and frank_kept_out,
-          f"frank offered under needs you: {listed_frank}; selected, his card with art: {card} "
+          f"frank offered under needs you: {listed_frank}; presented name/fingerprint: {offer_identity}; visible not-in-keyring state: {offer_state}; selected, his card with art: {card} "
           f"{art}; x: said {dismissed_said}, gone {frank_gone}; the room's rows as alice holds them {rows_before} → "
           f"{rows_after}; after bob's node was detached and attached again: carol still offered {carol_kept}, frank "
           f"still dismissed {frank_kept_out}; sidebar {side()!r}")
@@ -1197,7 +1218,7 @@ try:
     tui.key("t", 2)
     prompt_seen = "Trust this node?" in flat() and grouped(fp["frank"])[:24] in flat_ws()
     tui.key(grouped(fp["dave"]).upper() + "\r", 1)
-    tui.key("frank\r", 1)
+    tui.key("\x7f" * 64 + "frank\r", 1)
     tui.key("\r", 3)
     mismatch_said = (f"given: {grouped(fp['dave'])}" in flat_ws()
                      and f"this node: {grouped(fp['frank'])}" in flat_ws()
@@ -1207,14 +1228,14 @@ try:
     closed = tui.until(lambda: "keyring asks for the passphrase" in run("bob", "status").stdout, 90, 2)
     tui.key(":" + hint[1:] + "\r", 2)
     tui.key(grouped(fp["frank"]).upper() + "\r", 1)
-    tui.key("frank\r", 1)
+    tui.key("\x7f" * 64 + "frank\r", 1)
     tui.key("not the pass\r", 3)
     wrong_pass_added = in_ring()
     wrong_pass_said = [l for l in tui.display()[-6:] if l.strip()]
     shown_secret = "not the pass" in flat()
     tui.key(":" + hint[1:] + "\r", 2)
     tui.key(grouped(fp["frank"]).upper() + "\r", 1)
-    tui.key("frank\r", 1)
+    tui.key("\x7f" * 64 + "frank\r", 1)
     tui.key("id pass\r", 3)
     matched = tui.until(in_ring, 30, 1)
     match_said = "you now trust frank" in flat_ws()
@@ -1294,8 +1315,8 @@ try:
     # session a person is at, opens two Sessions in the room and ends one with a real `SessionEnd`.
     # Bob's TUI lists the open one by the label `vox room sessions` gives it, the ended one apart
     # under "Ended (1)"; All merges each Session's opening and end among the room's messages; a
-    # Session opened without drive (Alice gives Bob none) shows only that it exists and why
-    # nothing more, and offers no composer: `:send` there is refused.
+    # Before drive neither Session is visible (ADR-031 SA-1–SA-3); after drive both are listed
+    # and the open Session offers its composer.
     def hook(w, payload):
         e = env(w)
         e["CLAUDE_CODE_ENTRYPOINT"] = "cli"  # a session a person is at, not a headless run
@@ -1310,10 +1331,25 @@ try:
     hook("alice", claude(OPEN_ID, "UserPromptSubmit", prompt="port the codec"))
     hook("alice", claude(ENDED_ID, "UserPromptSubmit", prompt="look at the tests"))
     hook("alice", claude(ENDED_ID, "SessionEnd", reason="prompt_input_exit"))
-    def cli_labels():
-        r = run("bob", "room", "sessions", room, "--json")
+    def cli_labels(w="bob"):
+        r = run(w, "room", "sessions", room, "--json")
+        if r.returncode != 0:
+            product(f"{w}'s room sessions refused: {r.stderr.strip()}")
         rows = [json.loads(l) for l in r.stdout.splitlines() if l.strip()]
         return {x["id"]: x for x in rows}
+    if not until(lambda: {OPEN_ID, ENDED_ID} <= set(cli_labels("alice")), 60):
+        product(f"alice's own Sessions never opened: {cli_labels('alice')!r}")
+    # SA-1–SA-3 supersede the old read-only Session listing. Both the CLI and the TUI must
+    # hide these Sessions until Alice grants Bob drive. The existing drive action moves here.
+    private = not ({OPEN_ID, ENDED_ID} & set(cli_labels()))
+    private = private and not any(OPEN_ID[:8] in row or ENDED_ID[:8] in row for row in tui.display())
+    t = Tui([VOX, "trust", "drive", fp["bob"]], env("alice"))
+    t.until(lambda: t.closed or "passphrase" in t.text().lower(), 20, 0.5)
+    if not t.closed and "passphrase" in t.text().lower():
+        t.key("id pass\r", 0.5)
+    t.until(lambda: t.closed, 60, 0.5)
+    granted = t.text()
+    t.stop()
     if not until(lambda: {OPEN_ID, ENDED_ID} <= set(cli_labels()) and not cli_labels()[ENDED_ID]["open"], 60):
         product(f"bob's `vox room sessions --json` never listed alice's two Sessions, one ended, within 60 s: "
                 f"{cli_labels()!r}")
@@ -1336,29 +1372,12 @@ try:
     titled = any(f"Timeline — {open_label} · open" in r for r in screen)
     # The Session's name and id are alice's node's claim, and the TUI says so (ADR-029 MD-3).
     claimed = any(f"{open_label} — name and id as alice says" in r for r in screen)
-    # The pane wraps its lines: read it as one text without the spaces a wrap took.
-    nodrive = ("Only members alice trusts with drive see inside this Session.".replace(" ", "")
-               in inside.replace(" ", ""))
-    no_composer = not any("Composer" in r for r in screen)
-    tui.key(":send DRIVE-WITHOUT-DRIVE\r", 1)
-    refused = " ".join(r.strip() for r in tui.display()[-3:])
-    told = f"not sent: this is {open_label}; :general writes to the room" in refused
-    # A file sent into a Session is driving it (DR-1.7): without drive, refused, and nothing sent.
-    with open(f"{S}/nodrive-file.txt", "w") as f:
-        f.write("NODRIVE-FILE\n")
-    tui.key(f":share {S}/nodrive-file.txt\r", 2)
-    share_refused = " ".join(r.strip() for r in tui.display()[-3:])
-    share_told = "you cannot drive this Session: alice has not given you drive" in share_refused
+    composer = any("Composer" in row for row in screen)
+    claim("sessions", private and listed and apart and merged and titled and claimed and composer,
+          f"Sessions hidden before drive: {private}; after drive, Sessions pane: {listed_rows!r} "
+          f"(open listed: {listed}, ended apart: {apart}); All merged openings/end: {merged}; "
+          f"selected Session titled: {titled}, source named: {claimed}, composer offered: {composer}")
     tui.key(":general\r", 2)
-    leaked = "DRIVE-WITHOUT-DRIVE" in run("alice", "room", "read", room).stdout
-    claim("sessions", listed and apart and merged and titled and claimed and nodrive and no_composer and told
-          and not leaked and share_told,
-          f"Sessions pane: {listed_rows!r} (open listed: {listed}, ended apart: {apart}); All merged the "
-          f"openings and end among the messages: {merged}; `:session` titled {titled}, said whose claim its "
-          f"name and id are {claimed}, said no drive "
-          f"{nodrive}, no composer {no_composer}; `:send` there said {refused!r}, reached the room: "
-          f"{leaked}; `:share` there said {share_refused!r}" + ("" if merged else f"; All showed: {all_rows!r}")
-          + ("" if titled and nodrive else "; screen:\n" + "\n".join(screen)))
 
     stage("session-order")
     # A Session that opens just after a post, within the same second, reads after it in All (#562,
@@ -1397,18 +1416,11 @@ try:
           f"{'precedes' if in_order else 'does not precede'} the opened line: {tail_rows!r}")
 
     stage("drive")
-    # A Session read from inside (ADR-029 SC-1, CL-1, #553): Alice gives Bob drive, as a person
-    # does at a terminal, and her open Session runs one turn through Claude Code's hook: a tool
+    # A Session read from inside (ADR-029 SC-1, CL-1, #553): Alice gave Bob drive at the terminal
+    # above, and her open Session runs one turn through Claude Code's hook: a tool
     # call, its result in the transcript, the reply. Bob's `:session` then shows the turn, line for
     # line as his `vox room session` prints it, and no "Only members …" sentence; the tool call's
     # Details (`d` on its line) hold its whole output.
-    t = Tui([VOX, "trust", "drive", fp["bob"]], env("alice"))
-    t.until(lambda: t.closed or "passphrase" in t.text().lower(), 20, 0.5)
-    if not t.closed and "passphrase" in t.text().lower():
-        t.key("id pass\r", 0.5)
-    t.until(lambda: t.closed, 60, 0.5)
-    granted = t.text()
-    t.stop()
     work = f"{S}/alice-work"
     os.makedirs(work, exist_ok=True)
     transcript = f"{work}/{OPEN_ID}.jsonl"
@@ -1775,7 +1787,7 @@ try:
             ya, yd, yc = at(tui, "alice"), at(tui, "dave"), at(tui, "carol")
             a = span(tui, ya, glyphs[0] + "alice")
             dv = span(tui, yd, glyphs[1] + "dave")
-            c = span(tui, yc, glyphs[2] + fp["carol"][:26])
+            c = span(tui, yc, glyphs[2] + "default")
             bold = a is not None and dv is not None and all(x.bold for x in a[3:] + dv[3:])
             ok = bold and c is not None and not drawn
             detail = (f"alice {in_box(tui, ya)!r}, dave {in_box(tui, yd)!r}, bold {bold}; carol "
@@ -1817,17 +1829,18 @@ try:
     tui.key("\r", 2)
     prompt = re.sub(r"\s+", " ", whole())
     asked_name = "your name for them" in prompt and grouped(fp["carol"])[:24] in prompt
+    default_shown = "default" in prompt
     asked_compare = "as they gave it to you" in prompt
-    tui.key("carol\r", 1)
+    tui.key("\r", 1)   # accept the authenticated presented-name default
     asked_cap = "read, or read + drive" in re.sub(r"\s+", " ", whole())
     tui.key("\r", 1)   # read, the default
     tui.key("id pass\r", 3)
     in_ring_carol = until(lambda: fp["carol"] in run("bob", "trust", "list").stdout, 30, 1)
-    said_trust = "you now trust carol" in re.sub(r"\s+", " ", whole())
-    claim("accept", carol_card and asked_name and asked_cap and not asked_compare and in_ring_carol
+    said_trust = "you now trust default" in re.sub(r"\s+", " ", whole())
+    claim("accept", carol_card and asked_name and default_shown and asked_cap and not asked_compare and in_ring_carol
           and said_trust and not offered("carol"),
           f"carol's offer selected: {carol_card}; the prompt asked her name with her fingerprint "
-          f"shown: {asked_name}, read or read + drive: {asked_cap}, a fingerprint to compare: "
+          f"shown: {asked_name}, presented default accepted without typing: {default_shown}, read or read + drive: {asked_cap}, a fingerprint to compare: "
           f"{asked_compare}; carol in bob's keyring: {in_ring_carol}; said so: {said_trust}; "
           f"still offered: {offered('carol')}")
     if not tui.stop():

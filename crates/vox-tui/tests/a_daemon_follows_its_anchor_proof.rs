@@ -40,6 +40,9 @@ mod watchdog;
 #[path = "support/typed.rs"]
 mod typed;
 
+#[path = "support/attach.rs"]
+mod attach;
+
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 
@@ -73,7 +76,9 @@ fn vox_stdin(
     input: Option<&str>,
 ) -> (bool, String, String) {
     let mut cmd = Command::new(VOX);
-    cmd.args(args)
+    cmd.args(attach::persistent_args(data, args, IDENTITY))
+        .env("HOME", data)
+        .env("VOX_TEST_KEYCHAIN", attach::keychain(data))
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", cfg)
         .env("VOX_NODE", "default")
@@ -125,6 +130,8 @@ fn start_anchor(root: &std::path::Path, name: &str) -> (Proc, String) {
     let anchor = Proc(
         Command::new(VOX)
             .args(["node", "--listen", "127.0.0.1:0"])
+            .env("HOME", &anchor_data)
+            .env("VOX_TEST_KEYCHAIN", attach::keychain(&anchor_data))
             .env("VOX_DATA_DIR", &anchor_data)
             .env("VOX_CONFIG_DIR", &anchor_cfg)
             .env("VOX_NODE", "default")
@@ -218,6 +225,8 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     // ---- the daemon starts against the address that is wrong ----
     let mut daemon = Command::new(VOX)
         .args(["daemon", "--listen", "127.0.0.1:0"])
+        .env("HOME", &data)
+        .env("VOX_TEST_KEYCHAIN", attach::keychain(&data))
         .env("VOX_DATA_DIR", &data)
         .env("VOX_CONFIG_DIR", &cfg)
         .env("VOX_NODE", "default")
@@ -263,7 +272,12 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         Some(IDENTITY),
     );
     assert!(ok, "PRODUCT: creating the second node failed: {err}");
-    let (ok, _, err) = vox(&data, &cfg, &["node", "attach", "carol", "--no-remember"]);
+    let (ok, _, err) = vox_stdin(
+        &data,
+        &cfg,
+        &["node", "unlock", "carol", "--passphrase-file", "-"],
+        Some(IDENTITY),
+    );
     assert!(ok, "PRODUCT: attaching the second node failed: {err}");
 
     // ---- the anchor moves: the configuration is rewritten under the running daemon ----
@@ -444,6 +458,8 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     let bob_err = tmp.path().join("bob.daemon.err");
     let mut bob = Command::new(VOX)
         .args(["daemon", "--listen", "127.0.0.1:0"])
+        .env("HOME", &bob_data)
+        .env("VOX_TEST_KEYCHAIN", attach::keychain(&bob_data))
         .env("VOX_DATA_DIR", &bob_data)
         .env("VOX_CONFIG_DIR", &bob_cfg)
         .env("VOX_NODE", "default")
@@ -544,10 +560,11 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         Some(IDENTITY),
     );
     assert!(ok, "PRODUCT: creating Bob's second node failed: {err}");
-    let (ok, _, err) = vox(
+    let (ok, _, err) = vox_stdin(
         &bob_data,
         &bob_cfg,
-        &["node", "attach", "dave", "--no-remember"],
+        &["node", "unlock", "dave", "--passphrase-file", "-"],
+        Some(IDENTITY),
     );
     assert!(ok, "PRODUCT: attaching Bob's second node failed: {err}");
     let (ok, _, err) = vox_stdin(

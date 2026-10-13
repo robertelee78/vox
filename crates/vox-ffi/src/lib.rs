@@ -36,12 +36,14 @@ use vox_core::node::paths::Paths;
 uniffi::setup_scaffolding!();
 
 mod client;
+mod computer;
 pub use client::{
     config_dir, room_group, room_group_words, ClientListener, DecisionEvent, FileOffer, FileShare,
     Member, NodeSummary, NodeView, OfferedService, Passphrase, PulledFile, ReadBy, RoomConsents,
     RoomGroup, RoomLink, RoomMessage, RoomServices, RoomSummary, SharedService, TrustedNode,
     UnreadLevel, VoxClient,
 };
+pub use computer::{ComputerIdentity, ComputerStatus, PairingPreview};
 
 /// Anything that went wrong, with the core's reason.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -108,7 +110,13 @@ fn outcome(_what: &str, out: Outcome) -> Result<(), VoxError> {
 }
 
 fn digest(text: &str, what: &'static str) -> Result<Digest32, VoxError> {
-    b32_decode(text.trim(), what).map_err(|e| failed(e.to_string()))
+    if what == "fingerprint" {
+        vox_core::node::link::copied_identity(text)
+            .map(|(fp, _)| fp)
+            .map_err(|e| failed(e.to_string()))
+    } else {
+        b32_decode(text.trim(), what).map_err(|e| failed(e.to_string()))
+    }
 }
 
 /// A node's fingerprint as a person reads it (ADR-028 K-1, L-9): what the app draws wherever it
@@ -755,4 +763,23 @@ impl AppStream {
             .ok()
             .flatten()
     }
+}
+
+/// Parsed supported copied identity; its name is only a user-editable hint.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct CopiedIdentity {
+    /// The whole bare fingerprint.
+    pub fingerprint: String,
+    /// An editable user-supplied hint; never authenticated metadata.
+    pub name: Option<String>,
+}
+/// Read a copied name-plus-fingerprint or bare fingerprint.
+#[uniffi::export]
+pub fn parse_copied_identity(text: String) -> Result<CopiedIdentity, VoxError> {
+    let (fp, name) =
+        vox_core::node::link::copied_identity(&text).map_err(|e| failed(e.to_string()))?;
+    Ok(CopiedIdentity {
+        fingerprint: b32_encode(&fp),
+        name,
+    })
 }

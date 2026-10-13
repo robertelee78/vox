@@ -21,6 +21,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/attach.rs"]
+mod unlock_staging;
+
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -36,7 +39,8 @@ const IDPASS: &str = "the right identity passphrase";
 
 fn vox(dir: &std::path::Path, pass: &str, args: &[&str], stdin: &str) -> (bool, String) {
     let mut child = Command::new(VOX)
-        .args(args)
+        .args(crate::unlock_staging::persistent_args(dir, args, pass))
+        .env("VOX_TEST_KEYCHAIN", crate::unlock_staging::keychain(dir))
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env("VOX_IDENTITY_PASSPHRASE", pass)

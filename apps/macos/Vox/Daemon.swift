@@ -102,39 +102,67 @@ enum Daemon {
     /// **The agent skill pack, installed or refreshed for every harness here** (#586): once per
     /// build of Vox.app, at launch, so a first run and every update of the app put the pack the
     /// bundle's `vox` carries in each harness's skills folder, as `install.sh` and `vox update` do.
-    /// A file the operator changed is kept. `vox agent skill --install` does it, in the background;
-    /// a launch where it fails tries again. In a proof build its HOME is
+    /// A file the operator changed is kept. The skill and missing light hooks are installed in the
+    /// background; changed hook files and failures are reported to the window.
+    /// A launch where it fails tries again. In a proof build its HOME is
     /// `<config dir>/app/home` and no harness variable reaches it, so no proof touches the
     /// person's own harness folders, and it runs at every launch.
-    static func refreshSkillPack() {
+    static func refreshSkillPack(reportHooks: @escaping @MainActor @Sendable (String) -> Void) {
         let build = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "")
             + " " + (Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "")
         let key = "skillPackInstalledFor"
-        var env = ProcessInfo.processInfo.environment
-        #if VOX_PROOF_STUB_SERVICES
-        guard let dir = try? configDir(dataRoot: "") else { return }
-        env["HOME"] = URL(fileURLWithPath: dir).appendingPathComponent("app/home").path
-        for name in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME"] {
-            env[name] = nil
-        }
-        #else
+        let env = harnessEnvironment()
+        #if !VOX_PROOF_STUB_SERVICES
         if UserDefaults.standard.string(forKey: key) == build { return }
         #endif
         let environment = env
         Task.detached {
-            let p = Process()
-            p.executableURL = vox
-            p.arguments = ["agent", "skill", "--install"]
-            p.environment = environment
-            p.standardOutput = FileHandle.nullDevice
-            p.standardError = FileHandle.nullDevice
-            p.standardInput = FileHandle.nullDevice
-            guard (try? p.run()) != nil else { return }
-            p.waitUntilExit()
-            if p.terminationStatus == 0 {
-                UserDefaults.standard.set(build, forKey: key)
+            var succeeded = true
+            for command in ["skill", "plugin"] {
+                let p = Process()
+                p.executableURL = vox
+                p.arguments = ["agent", command, "--install"]
+                p.environment = environment
+                let output = Pipe()
+                p.standardOutput = output
+                p.standardError = output
+                p.standardInput = FileHandle.nullDevice
+                do {
+                    try p.run()
+                    let bytes = output.fileHandleForReading.readDataToEndOfFile()
+                    p.waitUntilExit()
+                    succeeded = succeeded && p.terminationStatus == 0
+                    if command == "plugin" {
+                        let said = String(decoding: bytes, as: UTF8.self)
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !said.isEmpty { await reportHooks(said) }
+                    }
+                } catch {
+                    succeeded = false
+                    if command == "plugin" {
+                        await reportHooks("Vox could not install harness hooks: \(error.localizedDescription)")
+                    }
+                }
             }
+            if succeeded { UserDefaults.standard.set(build, forKey: key) }
         }
+    }
+
+    /// Commands the app owns carry no agent-session mark or secret. Proof builds wire only
+    /// their scratch harness HOME, exactly as first-run hook installation does.
+    static func harnessEnvironment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        for name in ["VOX_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "VOX_NODE",
+                     "VOX_IDENTITY_PASSPHRASE"] { env[name] = nil }
+        #if VOX_PROOF_STUB_SERVICES
+        if let dir = try? configDir(dataRoot: "") {
+            env["HOME"] = URL(fileURLWithPath: dir).appendingPathComponent("app/home").path
+        }
+        for name in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME"] {
+            env[name] = nil
+        }
+        #endif
+        return env
     }
 
     /// A client of the account's daemon. When none answers, the bundle's `vox` starts one as
@@ -170,7 +198,16 @@ enum Daemon {
     /// `vox daemon --detach`: started in the background, its output in `<data root>/.daemon/log`,
     /// returning once it answers. A failure is its own sentence (M-7).
     private static func startAsVoxDoes() async throws {
-        _ = try await command(["daemon", "--detach"], patience: patience)
+        do {
+            _ = try await command(["daemon", "--detach"], patience: patience)
+        } catch let error as VoxError {
+            // Only the startup command's refusal belongs to the can't-start card. Ordinary
+            // IPC failures and a command deadline retain their own classification.
+            if case .Failed = error, !versionMismatch(sentence(error)) {
+                throw StartFailure(kind: .startRefused, said: sentence(error))
+            }
+            throw error
+        }
     }
 
     /// The local Hello refusal includes both versions and this exact recovery command.
@@ -181,7 +218,8 @@ enum Daemon {
 
     /// Run the bundled command with an independent process deadline. Output goes to a private
     /// temporary file so a full pipe cannot deadlock the command or this app.
-    static func command(_ arguments: [String], patience: TimeInterval) async throws -> String {
+    static func command(_ arguments: [String], patience: TimeInterval,
+                        environment: [String: String]? = nil) async throws -> String {
         try await Task.detached {
             let output = FileManager.default.temporaryDirectory
                 .appendingPathComponent("vox-app-\(UUID().uuidString)")
@@ -195,6 +233,7 @@ enum Daemon {
             let process = Process()
             process.executableURL = vox
             process.arguments = arguments
+            process.environment = environment
             process.standardInput = FileHandle.nullDevice
             process.standardOutput = file
             process.standardError = file

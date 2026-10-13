@@ -176,6 +176,8 @@ pub struct DecisionLog {
     /// Decisions taken while locked, `(day, event)`, written when the key returns.
     pending: Arc<std::sync::Mutex<Vec<(i64, String)>>>,
     pruned: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
+    /// Keep migration evidence until its manual removals have reached the durable keyring.
+    hold_for_local_trust: Arc<std::sync::atomic::AtomicBool>,
     /// This node's names for the members it trusts, as last published: what an event names
     /// someone as when the decision was taken where the keyring is not at hand.
     aliases: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<Digest32, String>>>,
@@ -211,9 +213,17 @@ impl DecisionLog {
             key: Arc::default(),
             pending: Arc::default(),
             pruned: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            hold_for_local_trust: Arc::default(),
             aliases: std::sync::Arc::default(),
             folded: std::sync::Arc::default(),
         }
+    }
+
+    /// Suspend retention while older removal history still needs importing. A damaged history
+    /// disables automatic grants without making the person's identity or manual keyring unusable.
+    pub fn hold_for_local_trust_import(&self, hold: bool) {
+        self.hold_for_local_trust
+            .store(hold, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The identity `signer` is unlocked: take the record's key from it, seal any plaintext day an
@@ -413,7 +423,11 @@ impl DecisionLog {
             .pruned
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *pruned != Some(day) {
+        if *pruned != Some(day)
+            && !self
+                .hold_for_local_trust
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
             *pruned = Some(day);
             self.prune(day);
         }
@@ -473,6 +487,118 @@ impl DecisionLog {
             }
         }
         out
+    }
+
+    /// Import retained manual trust decisions before local trust is enabled (ADR-031 LT-9).
+    /// Unlike display history, this must not mistake unreadable evidence for no removal.
+    ///
+    /// # Errors
+    /// The record is locked, unreadable, torn or cannot be authenticated.
+    pub fn local_trust_removals(
+        &self,
+    ) -> crate::error::Result<std::collections::BTreeSet<Digest32>> {
+        use crate::error::Error;
+        let key = self.key().ok_or(Error::AtRestLocked)?;
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+            Err(e) => {
+                return Err(Error::Storage {
+                    op: "read local trust history",
+                    detail: e.to_string(),
+                })
+            }
+        };
+        let mut latest = std::collections::BTreeMap::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| Error::Storage {
+                op: "read local trust history",
+                detail: e.to_string(),
+            })?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let (day, sealed) = if let Some(day) = name.strip_suffix(".sealed").and_then(day_of) {
+                (day, true)
+            } else if let Some(day) = name.strip_suffix(".jsonl").and_then(day_of) {
+                (day, false)
+            } else {
+                continue;
+            };
+            let bytes = std::fs::read(entry.path()).map_err(|e| Error::Storage {
+                op: "read local trust history",
+                detail: e.to_string(),
+            })?;
+            let events = if sealed {
+                Self::read_day_for_local_trust(&key, day, &bytes)?
+            } else {
+                std::str::from_utf8(&bytes)
+                    .map_err(|_| Error::MalformedAtRest("local trust history"))?
+                    .lines()
+                    .map(|line| {
+                        Event::of(line).ok_or(Error::MalformedAtRest("local trust history"))
+                    })
+                    .collect::<crate::error::Result<Vec<_>>>()?
+            };
+            for event in events {
+                let removed = if event.decided == Decided::Untrusted.as_str() {
+                    true
+                } else if event.decided == Decided::Trusted.as_str() {
+                    false
+                } else {
+                    continue;
+                };
+                let fp =
+                    crate::node::link::b32_decode(&event.by, "local trust history fingerprint")?;
+                let held = latest.entry(fp).or_insert((event.at_ms, removed));
+                if event.at_ms >= held.0 {
+                    *held = (event.at_ms, removed);
+                }
+            }
+        }
+        Ok(latest
+            .into_iter()
+            .filter_map(|(fp, (_, removed))| removed.then_some(fp))
+            .collect())
+    }
+
+    fn read_day_for_local_trust(
+        key: &Sek,
+        day: i64,
+        bytes: &[u8],
+    ) -> crate::error::Result<Vec<Event>> {
+        use crate::error::Error;
+        let mut events = Vec::new();
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            let prefix: [u8; 4] = remaining
+                .get(..4)
+                .ok_or(Error::MalformedAtRest("torn local trust history"))?
+                .try_into()
+                .map_err(|_| Error::MalformedAtRest("local trust history length"))?;
+            let length = u32::from_be_bytes(prefix) as usize;
+            let body = remaining
+                .get(4..)
+                .and_then(|rest| rest.get(..length))
+                .ok_or(Error::MalformedAtRest("torn local trust history"))?;
+            let nonce = body
+                .get(..NONCE_LEN)
+                .ok_or(Error::MalformedAtRest("local trust history nonce"))?
+                .try_into()
+                .map_err(|_| Error::MalformedAtRest("local trust history nonce"))?;
+            let sealed = SealedSegment {
+                nonce,
+                ciphertext: body[NONCE_LEN..].to_vec(),
+            };
+            let plain = open_segment(key, SEALED_KIND, day_id(day), &sealed)?;
+            events.push(
+                std::str::from_utf8(&plain)
+                    .ok()
+                    .and_then(Event::of)
+                    .ok_or(Error::MalformedAtRest("local trust history event"))?,
+            );
+            remaining = &remaining[4 + length..];
+        }
+        Ok(events)
     }
 
     /// The newest `limit` events of the record, newest first, those `decided` when it is given

@@ -49,6 +49,71 @@ pub const KIND_SESSION: u64 = 3;
 /// The longest session id a Session entry carries, in bytes: a harness's own id is far shorter.
 pub const MAX_SESSION_ID_LEN: usize = 256;
 
+/// Authenticated exact hashes of the author's legacy Session steps (#804, #787).
+/// Sent under the ordinary sender key: it carries no Session body or drive permission.
+pub const KIND_LEGACY_SESSION_INDEX: u64 = 5;
+/// A declaration is bounded like a read record; an author emits several for more steps.
+pub const MAX_LEGACY_SESSION_HASHES: usize = 1024;
+
+/// An author's declaration of its own legacy Session steps in one room.
+/// The receiver must match the room and author to the verified outer entry, and authenticate
+/// each target skeleton before using this declaration. It proves no generation eligibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacySessionIndex {
+    /// Milliseconds since the Unix epoch, as recorded by the author.
+    pub created_millis: u64,
+    /// The ordinary room, never the private drive channel.
+    pub channel_id: Digest32,
+    /// The author of the declaration and of every target entry.
+    pub author: Digest32,
+    /// Exact entry hashes, nonempty and strictly ascending.
+    pub steps: Vec<Digest32>,
+}
+
+impl LegacySessionIndex {
+    /// Check the declaration's bound and canonical ordering without silently dropping hashes.
+    ///
+    /// # Errors
+    /// Empty, oversized, duplicated or unsorted hash lists.
+    pub fn new(
+        created_millis: u64,
+        channel_id: Digest32,
+        author: Digest32,
+        steps: Vec<Digest32>,
+    ) -> Result<Self> {
+        if steps.is_empty() || steps.len() > MAX_LEGACY_SESSION_HASHES {
+            return Err(Error::MalformedBundle("legacy Session index length"));
+        }
+        if steps.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(Error::MalformedBundle("legacy Session index order"));
+        }
+        Ok(Self {
+            created_millis,
+            channel_id,
+            author,
+            steps,
+        })
+    }
+
+    /// `[2, 5, created_millis, [room, author, [hash, …]]]` inside signed Content.
+    #[must_use]
+    pub fn to_canonical_vec(&self) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(4)
+            .uint(VERSION)
+            .uint(KIND_LEGACY_SESSION_INDEX)
+            .uint(self.created_millis)
+            .array(3)
+            .bytes(&self.channel_id)
+            .bytes(&self.author)
+            .array(self.steps.len());
+        for hash in &self.steps {
+            e.bytes(hash);
+        }
+        e.finish()
+    }
+}
+
 /// A decoded Session entry (ADR-029 SC-1): one item of a harness session's activity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEntry {
@@ -204,6 +269,8 @@ pub enum Decoded {
     Read(ReadRecord),
     /// A Session entry ([`KIND_SESSION`]).
     Session(SessionEntry),
+    /// Exact legacy Session-step hashes, never a timeline row.
+    LegacySessionIndex(LegacySessionIndex),
 }
 
 /// Strict decode of either kind of content envelope.
@@ -250,6 +317,35 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded> {
             let body = d.text()?;
             d.finish()?;
             SessionEntry::new(created_millis, session_id, body).map(Decoded::Session)
+        }
+        KIND_LEGACY_SESSION_INDEX => {
+            let created_millis = d.uint()?;
+            if d.array()? != 3 {
+                return Err(Error::MalformedBundle("legacy Session index arity"));
+            }
+            let channel_id = d
+                .bytes()?
+                .try_into()
+                .map_err(|_| Error::MalformedBundle("legacy Session index room"))?;
+            let author = d
+                .bytes()?
+                .try_into()
+                .map_err(|_| Error::MalformedBundle("legacy Session index author"))?;
+            let n = d.array()?;
+            if n == 0 || n > MAX_LEGACY_SESSION_HASHES {
+                return Err(Error::MalformedBundle("legacy Session index length"));
+            }
+            let mut steps = Vec::with_capacity(n);
+            for _ in 0..n {
+                steps.push(
+                    d.bytes()?
+                        .try_into()
+                        .map_err(|_| Error::MalformedBundle("legacy Session index hash"))?,
+                );
+            }
+            d.finish()?;
+            LegacySessionIndex::new(created_millis, channel_id, author, steps)
+                .map(Decoded::LegacySessionIndex)
         }
         _ => Err(Error::MalformedBundle("content envelope kind")),
     }

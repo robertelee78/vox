@@ -292,7 +292,11 @@ fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
             } else {
                 "joined"
             };
-            items.push(ListItem::new(format!("{marker}offer: {short}… {why}")));
+            let presented = crate::ident::alias_of(&vm.presented, &o.member).unwrap_or_default();
+            items.push(ListItem::new(vec![
+                Line::from(format!("{marker}offer: {short}… {presented}")),
+                Line::from(format!("    not in keyring · {why}")),
+            ]));
         }
         for a in &vm.room_asks {
             let mut lines = vec![Line::from(format!("  {}", a.sentence))];
@@ -361,7 +365,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
     }
     let listing = ui.screen == Screen::ChannelList;
     let title = if listing {
-        "Rooms (Enter: open · Ctrl-N: next room to you · : command)"
+        "Rooms (Enter: open · : command)"
     } else {
         "Rooms"
     };
@@ -1297,7 +1301,7 @@ fn render_composer(
     // What a reply answers (ADR-028 R-9), and whom it is to and whether it is urgent (W-4).
     let mut said: Vec<String> = Vec::new();
     if let Some(r) = replying {
-        said.push(format!("replying to {r} (Esc: not a reply)"));
+        said.push(format!("reply in thread · to {r} (Esc: not a reply)"));
     }
     if !about.is_empty() {
         said.push(about.to_owned());
@@ -1497,7 +1501,7 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
             " Tab switch pane · ↑/↓ select · Enter show · :general · :all · :session <name> · : command · Esc back"
         }
         Screen::Channel => {
-            " Tab switch pane · ↑/↓ select · Ctrl-R reply · Enter send, or go to the quoted · PgUp/PgDn scroll · :to <name> · :urgent · :share <path> · :link · :general · :all · :session <name> · :tag <tag> · : command · Esc back"
+            " Tab switch pane · ↑/↓ select · Ctrl-R reply in thread · Enter send, or go to the quoted · PgUp/PgDn scroll · :to <name> · :urgent · :share <path> · :link · :general · :all · :session <name> · :tag <tag> · : command · Esc back"
         }
         Screen::Tunnels => " ↑/↓ select · x close the selected tunnel · : command · Esc back",
         Screen::Serve if vm.serve_preview.is_some() => " Enter share it · Esc back to the list",

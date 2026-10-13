@@ -265,6 +265,8 @@ pub struct StructuredIndex {
     /// from rendered rows, so only from messages this node can read: a tag is part of its
     /// message, and a node that cannot open the message holds no tag of it.
     pub by_tag: std::collections::BTreeMap<String, Chunks<u32>>,
+    /// Reply positions by the General message they name (ADR-033 TH-4). Readable rows only.
+    pub by_thread: std::collections::BTreeMap<Digest32, Chunks<u32>>,
 }
 
 impl std::fmt::Debug for StructuredIndex {
@@ -280,6 +282,7 @@ impl std::fmt::Debug for StructuredIndex {
             )
             .field("by_op", &self.by_op.len())
             .field("by_tag", &self.by_tag.len())
+            .field("by_thread", &self.by_thread.len())
             .finish()
     }
 }
@@ -428,9 +431,18 @@ impl StructuredIndex {
             std::collections::BTreeMap::new();
         let mut by_tag: std::collections::BTreeMap<String, Vec<u32>> =
             std::collections::BTreeMap::new();
+        let mut by_thread: std::collections::BTreeMap<Digest32, Vec<u32>> =
+            std::collections::BTreeMap::new();
         let mut ops = Vec::new();
         for (i, text) in texts.into_iter().enumerate() {
             let at = u32::try_from(start + i).unwrap_or(u32::MAX);
+            if let Some(root) = vox_agentcomms::envelope::Envelope::parse(text)
+                .ok()
+                .and_then(|e| e.thread)
+                .and_then(|h| crate::node::link::b32_decode(h.trim(), "thread").ok())
+            {
+                by_thread.entry(root).or_default().push(at);
+            }
             for tag in message_tags(text) {
                 by_tag.entry(tag).or_default().push(at);
             }
@@ -449,6 +461,10 @@ impl StructuredIndex {
         }
         for (tag, at) in by_tag {
             let entry = next.by_tag.entry(tag).or_default();
+            *entry = entry.appended(at);
+        }
+        for (root, at) in by_thread {
+            let entry = next.by_thread.entry(root).or_default();
             *entry = entry.appended(at);
         }
         next.by_op = next.by_op.appended(ops);
@@ -640,6 +656,8 @@ pub struct ChannelDetail {
     /// The files other members' Sessions sent out here that this node can open (ADR-029
     /// DR-1.8): what it pulls by itself, as a room share addressed to it.
     pub session_files: Vec<crate::node::drive::SessionRow>,
+    /// Drive-sealed lifecycle records, kept separate from public chat and activity steps.
+    pub session_records: Vec<crate::node::drive::SessionRow>,
 }
 
 /// The node's latest-wins view (published over a `watch`).
@@ -676,6 +694,8 @@ pub struct NodeView {
     /// The trust keyring: `(fingerprint, petname)` in fingerprint order, empty
     /// while locked because the keyring is sealed under the identity (ADR-020 §3).
     pub trusted: Vec<(Digest32, String)>,
+    /// Authenticated remote self-names, held only in memory; never keyring or authority.
+    pub presented: Vec<(Digest32, String)>,
     /// The keyring entries that carry drive (ADR-028 K-14), in fingerprint order; every other
     /// entry in [`NodeView::trusted`] grants read.
     pub drive: Vec<Digest32>,
@@ -1105,6 +1125,8 @@ pub enum NodeCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Fault {
+    /// Individual permissions cannot contradict an active computer policy.
+    ComputerPolicy,
     /// The profile has no identity yet.
     NoIdentity,
     /// The profile already has an identity.
@@ -1315,7 +1337,7 @@ impl Fault {
                 "this node has no identity yet\n       create one with `vox id` (or start `vox tui`)"
             }
             Fault::IdentityExists => {
-                "this node already has an identity\n       use it: `vox node attach` unlocks it; for another node, vox node create and a name for it"
+                "this node already has an identity\n       use it: `vox node unlock` unlocks it; for another node, vox node create and a name for it"
             }
             Fault::Locked => {
                 "the identity is locked\n       unlock it: pipe the identity passphrase to `vox daemon`, or run `vox tui`"
@@ -1323,6 +1345,7 @@ impl Fault {
             Fault::WrongPassphrase => {
                 "the passphrase is wrong\n       check it and type it again"
             }
+            Fault::ComputerPolicy => "trust comes from computer mode; stop trusting the computer before choosing individual node permissions",
             Fault::PassphraseNeeded => {
                 "changing who you trust needs your identity passphrase: it was not entered for a keyring change in the last 30 minutes\n       type it, and the change is made: `vox trust` asks for it at a terminal"
             }
@@ -1368,10 +1391,10 @@ impl Fault {
                  or copied from another node's data directory"
             }
             Fault::ShuttingDown => {
-                "the node is shutting down\n       attach it again (`vox node attach`), then try again"
+                "the node is shutting down\n       attach it again (`vox node unlock`), then try again"
             }
             Fault::NotNetworked => {
-                "this node is not on the network: it is locked, or was started without a listen address\n       attach it with `vox node attach`, which unlocks it and puts it on the network"
+                "this node is not on the network: it is locked, or was started without a listen address\n       attach it with `vox node unlock`, which unlocks it and puts it on the network"
             }
             Fault::BadLink => {
                 "that address will not parse, or names a room this node cannot use\n       check you copied the whole vox:// address"
@@ -1557,6 +1580,7 @@ macro_rules! fault_names {
 }
 
 fault_names!(
+    ComputerPolicy,
     NoIdentity,
     IdentityExists,
     Locked,

@@ -155,7 +155,12 @@ Say you and your mom want a room. The first time, it takes six steps:
 4. **Send the room link and the passphrase** — each a different way (in person, a call, a
    different app).
 5. **Join.** The other runs `:join` (or `vox room join`).
-6. **Trust each other.** Each runs `vox trust add <the other's fingerprint> --name <a name>`.
+6. **Trust each other.** Each runs `vox trust add <the other's fingerprint>` and accepts the name
+   that node presents, or edits it; `--name <a name>` chooses an explicit local name. That local
+   name stays yours when the other node renames itself. Older peers ask you to type a name.
+
+   `vox id --with-name` copies `name <fingerprint>`; quote that whole value when passing it to
+   `vox trust add`. Plain `vox id` still prints only the fingerprint. A presented name never grants trust.
 
 From then on you read each other. **Every later room you share needs only steps 2–5**: trust
 carries over.

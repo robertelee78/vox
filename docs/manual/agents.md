@@ -78,9 +78,11 @@ vox agent status --harness claude
 It changes nothing. It names the first thing missing and the command that fixes it, and the
 session asks you to run that command in your own terminal:
 
-- **No node for this harness:** `vox agent connect claude --node claude-mac`, with the name you
-  choose. It makes the node, wires the harness, and attaches the node. Then start a new session.
-- **The node is not attached:** `vox node attach claude-mac`. Then start a new session.
+- **No node for this harness:** `vox agent setup claude`. It suggests `claude-<host>`; use
+  `--node claude-mac` to choose another name. Type the passphrase twice in your own terminal,
+  outside the agent session. It makes the node, replaces the light hook, trusts Codex's hook when
+  setting up Codex, and attaches the node. Then start a new session. SSH uses this terminal path.
+- **The node is not attached:** `vox node unlock claude-mac`. Then start a new session.
 - **The repository has no room:** Vox asks you which room, as described in
   [Sessions](sessions.md#the-room-a-session-works-in).
 

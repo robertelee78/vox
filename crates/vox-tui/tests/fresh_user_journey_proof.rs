@@ -105,6 +105,9 @@
 #![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
 
+#[path = "support/attach.rs"]
+mod unlock_staging;
+
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -561,6 +564,18 @@ mod journey {
         /// passphrase for a room's question, and yes to a yes/no question about what they ran.
         pub fn person(&self, args: &[&str], node: &str) -> Out {
             let passes = self.passes.lock().unwrap().clone();
+            let platform_args;
+            let args = if cfg!(target_os = "macos") {
+                args
+            } else {
+                platform_args = crate::unlock_staging::persistent_args(
+                    &self.data,
+                    args,
+                    passes.get(node).map(String::as_str).unwrap_or_default(),
+                );
+                // The terminal still answers all other prompts as the person does.
+                &platform_args.iter().map(String::as_str).collect::<Vec<_>>()
+            };
             let mut last = String::new();
             let mut answer = |q: &str, _all: &str| -> Option<String> {
                 let lq = q.to_ascii_lowercase();
@@ -1758,7 +1773,7 @@ mod journey {
                      room list --node {0}` to see its rooms",
                     h.node
                 );
-                let is_attach = cmd == format!("vox node attach {}", h.node);
+                let is_attach = cmd == format!("vox node unlock {}", h.node);
                 l.claim(
                     &format!(
                         "J8.{}.{}",
@@ -2645,10 +2660,8 @@ mod journey {
             let (ok, want) = match *path {
                 "detached" => {
                     let want = format!(
-                        "Vox could not read your rooms because node {node} is not attached; ask \
-                         the operator to run `vox node attach {node}` in a terminal outside this \
-                         session (it asks for the passphrase once and then remembers it; Vox says \
-                         this once per session)."
+                        "Vox node {node} is Locked; ask the operator to run \
+                         `vox node unlock {node}` in a terminal outside this session."
                     );
                     (text == want, want)
                 }

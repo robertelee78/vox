@@ -295,6 +295,9 @@ const T_INVITE: u64 = 13;
 const T_TRUST: u64 = 14;
 const T_UNTRUST: u64 = 15;
 const T_TRUST_LIST: u64 = 16;
+const T_PRESENTATION: u64 = 7960;
+const T_PRESENTATIONS: u64 = 7961;
+const T_PRESENTED: u64 = 7962;
 // Setting a room's retention deletes what is already stored (ADR-023 decision 2), so it is an
 // operator decision like the keyring and carries the identity passphrase the same way.
 const T_RETENTION: u64 = 23;
@@ -320,6 +323,8 @@ const T_FIND: u64 = 121;
 const T_COUNT_REQ: u64 = 122;
 // #636: a room's messages by tag, and by tag and sender. Numbered by its story.
 const T_TAGGED: u64 = 636;
+/// A thread's readable replies, by its root (ADR-033 TH-4).
+const T_THREAD: u64 = 755;
 // ADR-028 RR-1: entries shown or drained, for a read record. Numbered by its story (#503).
 const T_MARK_READ: u64 = 503;
 // V210-164: leaving a room over the socket, as joining and creating one are. Numbered by its item,
@@ -830,6 +835,17 @@ pub enum Request {
     },
     /// Read the trust keyring: who this node trusts and the name it gave each. A read, so the
     /// node checks no passphrase.
+    /// One authenticated remote self-name; empty when not known. No trust change.
+    Presentation {
+        /// The fingerprint to look up.
+        target: Digest32,
+    },
+    /// Paged remote presentation metadata, independent of the sealed keyring.
+    Presentations {
+        /// Last fingerprint of the previous page.
+        after: Option<Digest32>,
+    },
+    /// Read sealed local aliases and grants, distinct from remote presentations.
     TrustList {
         /// Carried on the wire and not checked.
         identity_passphrase: zeroize::Zeroizing<String>,
@@ -866,6 +882,16 @@ pub enum Request {
         /// Only this author's rows, when named.
         from: Option<Digest32>,
         /// Return only matching rows **after** this one. Absent reads from the first.
+        since: Option<Digest32>,
+    },
+    /// A thread's replies, indexed by its General message, in arrival order. The root is
+    /// read with `Find`. Existing row pages bound each reply; nothing reads another room.
+    Thread {
+        /// The room.
+        channel_id: Digest32,
+        /// The General message's entry hash.
+        root: Digest32,
+        /// Only replies after this matching row.
         since: Option<Digest32>,
     },
     /// How many rows of a room follow `since` (all of them when absent), as [`Frame::Count`]
@@ -963,6 +989,17 @@ impl Request {
                 }
                 e.bytes(from.as_ref().map_or(&[][..], |d| &d[..]));
                 e.bytes(since.as_ref().map_or(&[][..], |d| &d[..]));
+            }
+            Request::Thread {
+                channel_id,
+                root,
+                since,
+            } => {
+                e.array(4)
+                    .uint(T_THREAD)
+                    .bytes(channel_id)
+                    .bytes(root)
+                    .bytes(since.as_ref().map_or(&[][..], |d| &d[..]));
             }
             Request::Count { channel_id, since } => {
                 e.array(3)
@@ -1321,6 +1358,14 @@ impl Request {
                     .bytes(target)
                     .text(identity_passphrase);
             }
+            Request::Presentation { target } => {
+                e.array(2).uint(T_PRESENTATION).bytes(target);
+            }
+            Request::Presentations { after } => {
+                e.array(2)
+                    .uint(T_PRESENTATIONS)
+                    .bytes(after.as_ref().map_or(&[][..], |d| &d[..]));
+            }
             Request::TrustList {
                 identity_passphrase,
                 after,
@@ -1498,6 +1543,18 @@ impl Request {
                     since,
                 })
             }
+            (T_THREAD, 4) => {
+                let channel_id = digest(&mut d)?;
+                let root = digest(&mut d)?;
+                let since = optional_digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Thread {
+                    channel_id,
+                    root,
+                    since,
+                })
+            }
             (T_COUNT_REQ, 3) => {
                 let channel_id = digest(&mut d)?;
                 let since = optional_digest(&mut d)?;
@@ -1639,6 +1696,16 @@ impl Request {
                     target,
                     identity_passphrase,
                 })
+            }
+            (T_PRESENTATION, 2) => {
+                let target = digest(&mut d)?;
+                d.finish()?;
+                Ok(Request::Presentation { target })
+            }
+            (T_PRESENTATIONS, 2) => {
+                let after = optional_digest(&mut d)?;
+                d.finish()?;
+                Ok(Request::Presentations { after })
             }
             // The unpaged form, as for `Rooms` above.
             (T_TRUST_LIST, 2) => {
@@ -2084,6 +2151,12 @@ pub enum Frame {
         note: String,
     },
     /// The trust keyring a [`Request::TrustList`] asked for.
+    /// Authenticated remote metadata, never a keyring entry.
+    Presented {
+        /// Fingerprints and authenticated self-names in fingerprint order.
+        entries: Vec<(Digest32, String)>,
+    },
+    /// Sealed local aliases and their grants.
     Trusted {
         /// `(fingerprint, petname, capability)` in fingerprint order (ADR-028 K-14).
         entries: Vec<(Digest32, String, crate::node::trust::Capability)>,
@@ -2275,6 +2348,12 @@ impl Frame {
                             .uint(u64::from(*open))
                             .text(over);
                     }
+                }
+            }
+            Frame::Presented { entries } => {
+                e.array(2).uint(T_PRESENTED).array(entries.len());
+                for (id, name) in entries {
+                    e.array(2).bytes(id).text(name);
                 }
             }
             Frame::Trusted { entries } => {
@@ -3186,6 +3265,20 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let offers = crate::node::offers::read_offers(d)?;
             return Ok(Frame::Offers { offers });
         }
+        (T_PRESENTED, 2) => {
+            let n = d.array()?;
+            if n > 4096 {
+                return Err(Error::MalformedIpc("too many presented names"));
+            }
+            let mut entries = Vec::with_capacity(n);
+            for _ in 0..n {
+                if d.array()? != 2 {
+                    return Err(Error::MalformedIpc("presented name"));
+                }
+                entries.push((digest(d)?, d.text()?.to_owned()));
+            }
+            return Ok(Frame::Presented { entries });
+        }
         (T_TRUSTED, 2) => {
             let count = d
                 .array()
@@ -4080,6 +4173,7 @@ async fn serve_requests(
                 | Frame::KeyWaits { .. }
                 | Frame::Consents { .. }
                 | Frame::Trusted { .. }
+                | Frame::Presented { .. }
                 | Frame::Rooms { .. }
                 | Frame::Services { .. }
                 | Frame::Shares { .. }
@@ -4230,7 +4324,7 @@ impl Drop for Counted {
 /// If the socket cannot be placed.
 pub fn bind_account<D: Dispatch>(dispatch: std::sync::Arc<D>, path: PathBuf) -> Result<IpcServer> {
     // `.daemon/` is the daemon's own, made private here if the lock has not made it yet. **Not
-    // the shared fallback** (`<tmp>/vox-<uid>`, for a data root whose socket path is too long):
+    // the shared fallback** (`/tmp/vox-<uid>-<16 hex>`, for a data root whose socket path is too long):
     // `create_private_dir` follows a symlink and changes the mode of whatever it points at, and
     // anyone can plant one there. `place_socket` creates or refuses that one itself, by lstat.
     if let Some(dir) = path.parent() {
@@ -4829,6 +4923,12 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         // **A read, so no passphrase** (V210-162, V210-165): the names this node gave its
         // members are how every surface on this account names an author, the agent drain
         // included, and the OS account is the boundary. Only a change to the keyring is gated.
+        Request::Presentation { target } => {
+            Frame::Presented { entries: handle.view().presented.into_iter().filter(|(fp, _)| *fp == target).collect() }
+        }
+        Request::Presentations { after } => {
+            Frame::Presented { entries: page(handle.view().presented, after, |(fp, name)| (*fp, name.len())) }
+        }
         Request::TrustList { after, .. } => {
             let view = handle.view();
             let rows = view
@@ -4897,6 +4997,17 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             text,
             card,
         } => {
+            // A stale or explicit target cannot publish this session into another repository's
+            // room, including an automatic coordination hello. Check before any append or fetch.
+            if let Ok(env) = vox_agentcomms::envelope::Envelope::parse(&text) {
+                if let Err(reason) = crate::node::sessions::check_working_room(
+                    handle.paths(),
+                    &env.from,
+                    &channel_id,
+                ) {
+                    return Frame::Error { reason };
+                }
+            }
             // **A link card is fetched here, by the sender's node, once** (ADR-028 F-10), and
             // travels in the message: no reader's node ever contacts the linked site.
             let text = if card {
@@ -5107,6 +5218,32 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 if !rows.is_empty() && bytes + cost > rows_budget() {
                     break;
                 }
+                bytes += cost;
+                rows.push(r.clone());
+            }
+            Frame::Rows { rows }
+        }
+        Request::Thread { channel_id, root, since } => {
+            let view = handle.view();
+            let Some(detail) = view.open_channels.iter().find(|d| d.channel_id == channel_id) else {
+                return Frame::Error { reason: "room not open".into() };
+            };
+            let mut matched: Vec<&MessageRow> = detail.structured.by_thread.get(&root)
+                .into_iter().flat_map(|positions| positions.iter())
+                .filter_map(|i| detail.timeline.get(*i as usize)).collect();
+            matched.sort_by_key(|r| r.arrival);
+            if let Some(cursor) = since {
+                let Some(mark) = matched.iter().find(|r| r.entry_hash == cursor && !r.owed)
+                    .map(|r| r.arrival) else {
+                    return Frame::Error { reason: "cursor not among this room's thread replies".into() };
+                };
+                matched.retain(|r| r.arrival > mark);
+            }
+            let mut rows = Vec::new();
+            let mut bytes = 0usize;
+            for r in matched {
+                let cost = r.text.len() + ROW_OVERHEAD;
+                if !rows.is_empty() && bytes + cost > rows_budget() { break; }
                 bytes += cost;
                 rows.push(r.clone());
             }
@@ -6476,6 +6613,37 @@ impl IpcClient {
         }
     }
 
+    /// Read the replies of one thread through the room's index, across bounded row pages.
+    ///
+    /// # Errors
+    /// If the daemon refuses, disconnects, or does not advance its page.
+    pub async fn read_thread(&mut self, channel_id: Digest32, root: Digest32) -> Result<Frame> {
+        let mut all = Vec::new();
+        let mut cursor = None;
+        loop {
+            match self
+                .request(&Request::Thread {
+                    channel_id,
+                    root,
+                    since: cursor,
+                })
+                .await?
+            {
+                Frame::Rows { rows } => {
+                    let Some(last) = rows.last() else {
+                        return Ok(Frame::Rows { rows: all });
+                    };
+                    if cursor == Some(last.entry_hash) {
+                        return Err(Error::MalformedIpc("ipc rows page did not advance"));
+                    }
+                    cursor = Some(last.entry_hash);
+                    all.extend(rows);
+                }
+                other => return Ok(other),
+            }
+        }
+    }
+
     /// A room's messages carrying every tag in `tags`, only `from`'s when named, however many
     /// replies that takes ([`Request::Tagged`], #636).
     ///
@@ -6648,6 +6816,27 @@ impl IpcClient {
                     all.extend(entries);
                 }
                 other => return Ok(other),
+            }
+        }
+    }
+
+    /// Read the bounded remote presentation cache in pages. Older daemons return an error.
+    pub async fn presented_names(&mut self) -> Result<Vec<(Digest32, String)>> {
+        let mut all = Vec::new();
+        let mut after = None;
+        loop {
+            match self.request(&Request::Presentations { after }).await? {
+                Frame::Presented { entries } => {
+                    let Some(last) = entries.last() else {
+                        return Ok(all);
+                    };
+                    if after.is_some_and(|a| last.0 <= a) {
+                        return Err(Error::MalformedIpc("presented page did not advance"));
+                    }
+                    after = Some(last.0);
+                    all.extend(entries);
+                }
+                _ => return Ok(Vec::new()),
             }
         }
     }

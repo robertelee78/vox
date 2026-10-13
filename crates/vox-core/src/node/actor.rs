@@ -44,6 +44,8 @@ use crate::node::network::{Inbound, NodeNet};
 use crate::node::open_rooms::OpenRooms;
 use crate::node::paths::Paths;
 
+mod computer;
+mod local_trust;
 mod recovery;
 use crate::node::prekeys::{self, PrekeyRing};
 use crate::node::profile::Profile;
@@ -404,6 +406,7 @@ fn detail_of(
         unread: ch.unread(),
         drive_from: ch.drive_from(),
         session_files: ch.session_files(),
+        session_records: ch.session_records(),
     }
 }
 
@@ -564,6 +567,8 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::HelloUndelivered { .. } => "owing a hello that could not be written",
         NetEvent::ReopenUndelivered { .. } => "owing a reopen that could not be written",
         NetEvent::Stream { .. } => "serving a stream",
+        NetEvent::PresentationAsk { .. } => "signing node presentation",
+        NetEvent::PresentationDone { .. } => "receiving node presentation",
         NetEvent::Connected { .. } => "filing a new connection",
         NetEvent::BetterPath { .. } => "adopting a connection",
         NetEvent::ReachFailed { .. } => "filing a failed dial",
@@ -573,6 +578,8 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::NetworkChanged(_) => "acting on a change of the machine's network",
         NetEvent::Stranded(_) => "dialling again peers a network change stranded",
         NetEvent::SyncDone { .. } => "filing a sync that finished",
+        NetEvent::PrivateSessionAsk { .. } => "authorizing private Session records",
+        NetEvent::PrivateSessionDone { .. } => "filing private Session records",
         NetEvent::RoomStored { .. } => "evaluating a room whose log grew",
         NetEvent::SlotFreed => "starting a queued sync",
         NetEvent::BackoffExpired { .. } => "retrying a sync whose backoff is due",
@@ -619,6 +626,9 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::Names(_) => "resolving a .vox name",
         NetEvent::SessionPage { .. } => "reading a page of a room's Session entries",
         NetEvent::MemberDialer(_) => "lending the proxy its dialer",
+        NetEvent::ComputerPolicy(_) => "applying computer trust",
+        NetEvent::LocalTrustBlacklist(_) => "reading local trust removal decisions",
+        NetEvent::TrustLocalNode { .. } => "applying the daemon's local trust policy",
     }
 }
 
@@ -689,6 +699,8 @@ pub struct NodeConfig {
     pub argon2: Argon2Profile,
     /// Where to bind, or `None` for a node that does not network.
     pub bind: Option<Bind>,
+    /// Owning daemon's durable computer policy, consulted before networking.
+    pub computer: Option<Arc<crate::node::computer::Computer>>,
     /// An override for the ADR-005 PoW parameters a join binds (tests reduce them).
     pub pow_params: Option<crate::join::pow::PowParams>,
     /// The anchors, if any, that bridge this node to peers it cannot reach directly
@@ -772,6 +784,7 @@ impl NodeConfig {
             millis_clock: crate::time::millis_clock_with_test_skew(),
             argon2: Argon2Profile::default(),
             bind: None,
+            computer: None,
             pow_params: None,
             anchors: BootstrapSet::new(),
             headless: None,
@@ -972,6 +985,19 @@ async fn run_session_worker(
 /// Work the network produced that only the actor can handle, because it needs
 /// channel state (ADR-016: the actor stays the single writer).
 enum NetEvent {
+    PrivateSessionAsk {
+        peer: Digest32,
+        ask: crate::node::sessionstream::Ask,
+        send: quinn::SendStream,
+        recv: quinn::RecvStream,
+        conn: Arc<crate::transport::quic::VoxConnection>,
+    },
+    PrivateSessionDone {
+        channel_id: Digest32,
+        peer: Digest32,
+        room: SharedChannel,
+        page: crate::error::Result<crate::node::sessionstream::Page>,
+    },
     /// A program asked, through the app API, to open an app stream to `peer`: reach it
     /// through the ladder and hand the connection back (ADR-022 decision 7).
     AppDial(crate::node::app::AppDial),
@@ -1001,6 +1027,15 @@ enum NetEvent {
     /// The daemon's proxy (ADR-028 S-5) wants this node's way of reaching a member, to carry a
     /// name that resolved to one of this node's rooms.
     MemberDialer(oneshot::Sender<crate::error::Result<MemberDialer>>),
+    /// Daemon-internal only: no IPC request maps to these policy operations.
+    LocalTrustBlacklist(oneshot::Sender<crate::error::Result<Option<BTreeSet<Digest32>>>>),
+    ComputerPolicy(oneshot::Sender<crate::error::Result<()>>),
+    TrustLocalNode {
+        fingerprint: Digest32,
+        name: String,
+        capability: crate::node::trust::Capability,
+        reply: oneshot::Sender<Outcome>,
+    },
     /// A held room's address was given again and a member it names answered there (V210-167):
     /// keep what it names as the room's, dial its anchors, and answer the join.
     AddressReached {
@@ -1122,6 +1157,15 @@ enum NetEvent {
         peer: Digest32,
     },
     /// A peer connected inbound: it gets a sync schedule, due immediately.
+    PresentationAsk {
+        nonce: Digest32,
+        send: quinn::SendStream,
+    },
+    PresentationDone {
+        peer: Digest32,
+        serial: u64,
+        name: Option<String>,
+    },
     Connected {
         /// The authenticated peer.
         peer: Digest32,
@@ -1850,6 +1894,39 @@ async fn serve_typed(
                     return;
                 };
                 let _ = tx.send(NetEvent::AgreeAsk { peer, ask, send }).await;
+            });
+        }
+        Ok(Inbound::Presentation {
+            peer: _,
+            send,
+            mut recv,
+        }) => {
+            state.failures = 0;
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                if let Ok(nonce) = crate::node::presentation::read_ask(&mut recv).await {
+                    let _ = tx.send(NetEvent::PresentationAsk { nonce, send }).await;
+                }
+            });
+        }
+        Ok(Inbound::Session { peer, send, recv }) => {
+            state.failures = 0;
+            let tx = tx.clone();
+            let conn = Arc::clone(&conn);
+            tokio::spawn(async move {
+                let mut recv = recv;
+                let Ok(ask) = crate::node::sessionstream::read_ask(&mut recv).await else {
+                    return;
+                };
+                let _ = tx
+                    .send(NetEvent::PrivateSessionAsk {
+                        peer,
+                        ask,
+                        send,
+                        recv,
+                        conn,
+                    })
+                    .await;
             });
         }
         Ok(Inbound::Sync { peer, send, recv }) => {
@@ -3741,6 +3818,8 @@ const fn worth_another_responder(fault: Fault) -> bool {
 /// and none of them can starve another (ADR-020 §7).
 #[derive(Debug, Clone)]
 pub struct NodeHandle {
+    computer: Option<Arc<crate::node::computer::Computer>>,
+    computer_revision: Arc<std::sync::atomic::AtomicU64>,
     cmd_tx: mpsc::Sender<(NodeCommand, oneshot::Sender<Outcome>)>,
     view_rx: watch::Receiver<NodeView>,
     /// Kept so a client may subscribe at any time after the node started.
@@ -3920,7 +3999,17 @@ impl NodeHandle {
     /// The latest view (cheap clone of the watch value).
     #[must_use]
     pub fn view(&self) -> NodeView {
-        self.view_rx.borrow().clone()
+        let mut view = self.view_rx.borrow().clone();
+        if let Some(c) = &self.computer {
+            if !c.policy_current(
+                self.computer_revision
+                    .load(std::sync::atomic::Ordering::Acquire),
+            ) {
+                // Fail closed while the actor reconciles the newly durable policy.
+                view.drive.clear();
+            }
+        }
+        view
     }
 
     /// A receiver that resolves whenever the view changes.
@@ -4142,6 +4231,8 @@ pub struct Node {
     net_tx: mpsc::Sender<NetEvent>,
     /// Where the endpoint binds, if this node networks at all.
     bind: Option<Bind>,
+    computer: Option<Arc<crate::node::computer::Computer>>,
+    computer_revision: Arc<std::sync::atomic::AtomicU64>,
     /// The headless transport identity, if this node runs without a vault.
     headless: Option<Arc<crate::identity::composite::SoftwareRootSigner>>,
     /// See [`NodeConfig::anchor_boards`].
@@ -4155,6 +4246,9 @@ pub struct Node {
     /// (ADR-012, ADR-016 M15.1): dialled when the network starts, given the `Anchor`
     /// class, published to, and named in invite links beside this node's own addresses.
     anchors: BootstrapSet,
+    /// Remote self-names remain separate from sealed local aliases (#796).
+    presented: BTreeMap<Digest32, (String, std::time::Instant)>,
+    presentation_due: BTreeMap<Digest32, (u64, std::time::Instant)>,
     /// Every identity this node treats as an anchor: the configured set plus the
     /// anchors of each open channel. The peer policy is rebuilt from channel
     /// membership whenever channels change, and these are carried into it.
@@ -4791,6 +4885,7 @@ impl Node {
             millis_clock,
             argon2,
             bind,
+            computer,
             pow_params,
             anchors,
             headless,
@@ -4837,9 +4932,13 @@ impl Node {
             presence: None,
             net_tx,
             bind,
+            computer,
+            computer_revision: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             anchor_ids: anchors.nodes().iter().map(|n| n.id).collect(),
             room_anchors: BTreeMap::new(),
             anchors,
+            presented: BTreeMap::new(),
+            presentation_due: BTreeMap::new(),
             headless,
             anchor_boards,
             serve_only,
@@ -5026,6 +5125,9 @@ impl Node {
             cmd_tx.downgrade(),
             node.view_tx.subscribe(),
             handle_event_tx.clone(),
+            node.computer
+                .clone()
+                .map(|c| (c, Arc::clone(&node.computer_revision))),
         );
         let pulls = crate::node::pulls::Pulls::spawn(
             node.paths.clone(),
@@ -5035,8 +5137,12 @@ impl Node {
         );
         let paths = node.paths.clone();
         let decisions = node.decisions.clone();
+        let computer = node.computer.clone();
+        let computer_revision = Arc::clone(&node.computer_revision);
         let actor = tokio::spawn(node.run(cmd_rx, net_rx));
         let handle = NodeHandle {
+            computer,
+            computer_revision,
             cmd_tx,
             view_rx,
             event_tx: handle_event_tx,
@@ -5072,6 +5178,14 @@ impl Node {
                 received = cmd_rx.recv() => {
                     let Some((command, reply)) = received else { break };
                     let shutdown = matches!(command, NodeCommand::Shutdown);
+                    // Creating/unlocking the identity must reach start_network(), which applies
+                    // computer policy before registering an endpoint. A locked store cannot be
+                    // reconciled before Unlock has opened it.
+                    let opens_identity = matches!(command, NodeCommand::Unlock { .. } | NodeCommand::CreateIdentity { .. });
+                    if !shutdown && !opens_identity && self.apply_computer_keyring().await.is_err() {
+                        let _=reply.send(Outcome::Failed(Fault::Storage));
+                        continue;
+                    }
                     let name = command_name(&command);
                     let started = std::time::Instant::now();
                     // Proof the actor is taking commands (V210-83): it changes nothing, so nothing
@@ -5238,6 +5352,7 @@ impl Node {
                     self.schedule().await;
                 }
                 Some(event) = net_rx.recv() => {
+                    if !matches!(&event, NetEvent::ComputerPolicy(_)) && self.apply_computer_keyring().await.is_err() { continue; }
                     let name = net_event_name(&event);
                     let started = std::time::Instant::now();
                     self.handle_net(event).await;
@@ -5246,6 +5361,7 @@ impl Node {
                     self.schedule().await;
                 }
                 _ = ticker.tick() => {
+                    if self.apply_computer_keyring().await.is_err() { continue; }
                     if let Some(net) = self.net.as_ref() {
                         // Connections a better path displaced are closed once their
                         // grace is up (M15.1b).
@@ -5277,6 +5393,9 @@ impl Node {
                     // Drive keys too (ADR-029 SC-2a, SC-2b): changed if a holder lost drive,
                     // and released to whoever is owed one.
                     self.tend_drive_keys().await;
+                    self.tend_private_sessions().await;
+                    let peers: Vec<_> = self.net.as_ref().map(|n| n.manager().peers()).unwrap_or_default();
+                    for peer in peers { self.pull_presentation(peer); }
                     // R14: a superseded generation's key goes once no full-history grant
                     // still has to release it.
                     let pruned = self.prune_superseded_keys().await;
@@ -5342,6 +5461,9 @@ impl Node {
 
     /// [`Self::handle`], unboxed: see [`Boxed`].
     async fn handle_unboxed(&mut self, command: NodeCommand) -> Outcome {
+        if self.computer_change_refused(&command) {
+            return Outcome::Failed(Fault::ComputerPolicy);
+        }
         match command {
             NodeCommand::CreateIdentity { passphrase } => self.create_identity(&passphrase),
             NodeCommand::Unlock { passphrase } => self.unlock(&passphrase).await,
@@ -5731,6 +5853,23 @@ impl Node {
     /// identity and spawn the accept loop. A no-op when this node does not network,
     /// or when it is already up.
     fn start_network(&mut self) -> crate::error::Result<()> {
+        self.prepare_computer_binding()?;
+        for attempt in 0..8 {
+            self.apply_computer_keyring_at(0)?;
+            if self.computer.as_ref().is_none_or(|c| {
+                c.policy_current(
+                    self.computer_revision
+                        .load(std::sync::atomic::Ordering::Acquire),
+                )
+            }) {
+                break;
+            }
+            if attempt == 7 {
+                return Err(Error::Profile(
+                    "computer policy is still changing; attach again after it settles",
+                ));
+            }
+        }
         let Some(bind) = self.bind.as_ref() else {
             return Ok(());
         };
@@ -7114,7 +7253,7 @@ impl Node {
                     // unlock is the same room, and a restart is exactly when its members have to
                     // be dialled from where they were last reached (`node::peer_book`).
                     let mut channel = *channel;
-                    if let Err(e) = self.retention_before_publication(&mut channel) {
+                    if let Err(e) = self.retention_before_publication(&mut channel).await {
                         let _ = self.event_tx.send(NodeEvent::NodeNote {
                             note: format!(
                                 "room {} did not reopen: {e}; it stays closed",
@@ -7826,6 +7965,49 @@ impl Node {
             NetEvent::BetterPath { conn } => {
                 self.adopt_connection(conn);
             }
+            NetEvent::PresentationAsk { nonce, send } => {
+                let name = self
+                    .paths
+                    .profile_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("default");
+                if let Some(profile) = self.profile.as_ref() {
+                    if let Ok(signer) = profile.signer() {
+                        if let Ok(frame) = crate::node::presentation::signed_answer(
+                            nonce,
+                            name,
+                            (self.millis_clock)(),
+                            signer,
+                        ) {
+                            tokio::spawn(crate::node::presentation::answer(send, frame));
+                        }
+                    }
+                }
+            }
+            NetEvent::PresentationDone { peer, serial, name } => {
+                if self
+                    .net
+                    .as_ref()
+                    .and_then(|n| n.manager().existing(&peer))
+                    .is_some_and(|c| c.serial() == serial)
+                {
+                    if let Some(name) = name {
+                        if self.presented.len() >= 4096 && !self.presented.contains_key(&peer) {
+                            if let Some(oldest) = self
+                                .presented
+                                .iter()
+                                .min_by_key(|(_, (_, age))| *age)
+                                .map(|(p, _)| *p)
+                            {
+                                self.presented.remove(&oldest);
+                            }
+                        }
+                        self.presented
+                            .insert(peer, (name, std::time::Instant::now()));
+                    }
+                }
+            }
             NetEvent::Connected { peer } => {
                 if let Some(conn) = self
                     .net
@@ -7833,6 +8015,7 @@ impl Node {
                     .and_then(|net| net.manager().existing(&peer))
                 {
                     self.note_peer_endpoint(&conn);
+                    self.pull_presentation(peer);
                 }
                 // A fresh connection syncs at once (ADR-016): a request on every port it shares,
                 // with any backoff cleared (ADR-025 D2, D5).
@@ -8279,6 +8462,58 @@ impl Node {
                     }
                 }
             }
+            NetEvent::PrivateSessionAsk {
+                peer,
+                ask,
+                mut send,
+                mut recv,
+                conn,
+            } => {
+                let Some(shared) = self.channels.get(&ask.room).map(Arc::clone) else {
+                    crate::transport::streams::refuse(&mut send, &mut recv);
+                    return;
+                };
+                let holders = self.drive_holders();
+                let page = shared.lock().await.private_page(&ask, &peer, &holders);
+                match page {
+                    Ok(page) => {
+                        tokio::spawn(async move {
+                            let _connection = conn;
+                            let _ = crate::node::sessionstream::answer(send, page).await;
+                        });
+                    }
+                    Err(_) => crate::transport::streams::refuse(&mut send, &mut recv),
+                }
+            }
+            NetEvent::PrivateSessionDone {
+                channel_id,
+                peer,
+                room,
+                page,
+            } => {
+                let (Some(shared), Some(store)) = (
+                    self.channels.get(&channel_id).map(Arc::clone),
+                    self.log_store(),
+                ) else {
+                    return;
+                };
+                // A result for a room closed and reopened while the network task ran belongs
+                // to the old state, never the freshly loaded keys or recovery cursors.
+                if !Arc::ptr_eq(&shared, &room) {
+                    return;
+                }
+                let result = shared.lock().await.finish_private_pull(
+                    &store,
+                    peer,
+                    page,
+                    (self.millis_clock)(),
+                );
+                self.say_session_news(&channel_id).await;
+                self.refresh_network_view().await;
+                if result.is_ok_and(|more| more) {
+                    self.pull_private_sessions(channel_id, peer).await;
+                }
+            }
             NetEvent::SyncDone {
                 channel_id,
                 peer,
@@ -8290,6 +8525,7 @@ impl Node {
                 // outcome, current or not: a session that failed late may have applied some entries
                 // first.
                 self.install_key_packages(&channel_id).await;
+                self.pull_private_sessions(channel_id, peer).await;
                 // A session that sent this node's HAVE from at least the generation its departure
                 // was written at, and ended cleanly, handed that peer the departure (V210-164).
                 let heard = report.out.gen_have.filter(|_| report.fail.is_none());
@@ -8427,6 +8663,29 @@ impl Node {
             NetEvent::Names(reply) => {
                 let _ = reply.send(self.resolver_snapshot().await);
             }
+            NetEvent::ComputerPolicy(reply) => {
+                let result = match self.prepare_computer_binding() {
+                    Ok(()) => self.apply_computer_keyring().await,
+                    Err(e) => Err(e),
+                };
+                if result.is_ok() {
+                    self.refresh_reachers().await;
+                    self.tend_drive_keys().await;
+                }
+                let _ = reply.send(result);
+            }
+            NetEvent::LocalTrustBlacklist(reply) => {
+                let _ = reply.send(self.local_trust_blacklist());
+            }
+            NetEvent::TrustLocalNode {
+                fingerprint,
+                name,
+                capability,
+                reply,
+            } => {
+                let outcome = self.trust_local_node(fingerprint, &name, capability).await;
+                let _ = reply.send(outcome);
+            }
             NetEvent::MemberDialer(reply) => {
                 let _ = reply.send(
                     self.net
@@ -8484,6 +8743,7 @@ impl Node {
                 // opened on it, or the peer sees it close mid-exchange.
                 let connection = conn;
                 match inbound {
+                    Inbound::Presentation { .. } => {} // preamble handled off the actor above
                     Inbound::Join { .. } => {
                         // Unreachable: the stream loop turns these into
                         // `NetEvent::JoinRequest` once the request is read.
@@ -8491,6 +8751,9 @@ impl Node {
                     Inbound::Pairwise { .. } => {
                         // Unreachable: the stream loop reads these and sends
                         // `NetEvent::Pairwise` once the frames are in hand.
+                    }
+                    Inbound::Session { .. } => {
+                        // The stream loop reads the bounded preamble off the actor.
                     }
                     Inbound::Sync { .. } => {
                         // Unreachable: the stream loop converts these into
@@ -14453,7 +14716,13 @@ impl Node {
             crate::node::pending_consent::PendingConsents::load(profile.store(), signer)?;
         // The decision record is sealed under this identity too (#563): from now it is written,
         // what was decided while locked with it.
+        self.decisions.hold_for_local_trust_import(true);
         self.decisions.unlock(signer)?;
+        // Import before a new decision can prune an older release's retained manual removals.
+        // An unreadable old diary stops automation, not ordinary use of the person's identity.
+        if let Err(e) = self.import_local_trust_history() {
+            eprintln!("vox: automatic local trust waits for its removal history: {e}");
+        }
         Ok(())
     }
 
@@ -15100,7 +15369,36 @@ impl Node {
 
     /// Apply this node's shorter limits after opening under the room policy, before a cached
     /// row can be read or relayed. Failure follows the caller's ordinary open/recovery error path.
-    fn retention_before_publication(&mut self, ch: &mut ChannelState) -> crate::error::Result<()> {
+    async fn retention_before_publication(
+        &mut self,
+        ch: &mut ChannelState,
+    ) -> crate::error::Result<()> {
+        // Resolve stored packages before deciding which pre-upgrade Session copies the node
+        // may keep. The room is not published or available to readers/sync yet. This uses the
+        // usual prekey-consumption path and trust check, never a new source of permission.
+        if ch.needs_session_upgrade() {
+            let ctx = ch.join_context()?;
+            let now = self.now_ms();
+            for package in ch.take_inbound_packages() {
+                let Ok(init) = package.initial_message() else {
+                    continue;
+                };
+                let Some(mut session) = self.respond_to_initial(&init, &ctx).await else {
+                    continue;
+                };
+                let Ok(skdm) = package.open(&mut session, now.get()) else {
+                    continue;
+                };
+                if !self.trust.is_trusted(&skdm.body.author_id) {
+                    ch.hold_package(package);
+                    continue;
+                }
+                let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+                // A malformed package is skipped just as during ordinary delivery. A failed
+                // durable write poisons the room, which finish_session_upgrade refuses below.
+                let _ = ch.accept_skdm(profile.store(), &skdm, now);
+            }
+        }
         let id = ch.channel_id();
         ch.set_node_retention(self.node_retention_for(&id));
         ch.set_node_step_retention(self.node_step_retention.for_room(&id));
@@ -15108,13 +15406,15 @@ impl Node {
             .profile
             .as_ref()
             .ok_or(crate::error::Error::AtRestLocked)?;
+        ch.finish_session_upgrade(profile.store(), self.now_ms().get())?;
+        ch.refresh_session_records(profile, &self.drive_holders(), &[], self.now_ms().get())?;
         ch.sweep_retention(profile.store(), self.now_ms())?;
         Ok(())
     }
 
     /// [`Self::finish_open_channel`], unboxed: see [`Boxed`].
     async fn finish_open_channel_unboxed(&mut self, mut ch: ChannelState) -> Outcome {
-        if let Err(e) = self.retention_before_publication(&mut ch) {
+        if let Err(e) = self.retention_before_publication(&mut ch).await {
             let _ = self.event_tx.send(NodeEvent::NodeNote {
                 note: format!(
                     "room {} could not apply retention before opening: {e}",
@@ -16435,7 +16735,16 @@ impl Node {
                 .or_insert_with(crate::node::tunnel::empty_reachers);
             // A recompute is not a decision: this wakes the serving tasks only if the set
             // really moved. The rule and its reason live in `publish_reachers`.
-            crate::node::tunnel::publish_reachers(slot, next);
+            if let Some(computer) = &self.computer {
+                computer.publish_reachers(
+                    slot,
+                    next,
+                    self.computer_revision
+                        .load(std::sync::atomic::Ordering::Acquire),
+                );
+            } else {
+                crate::node::tunnel::publish_reachers(slot, next);
+            }
             let offer = self
                 .offered
                 .entry(*cid)
@@ -16789,6 +17098,101 @@ impl Node {
             .collect()
     }
 
+    fn pull_presentation(&mut self, peer: Digest32) {
+        let Some(conn) = self.net.as_ref().and_then(|n| n.manager().existing(&peer)) else {
+            return;
+        };
+        let serial = conn.serial();
+        let now = std::time::Instant::now();
+        if self
+            .presentation_due
+            .get(&peer)
+            .is_some_and(|(s, due)| *s == serial && now < *due)
+        {
+            return;
+        }
+        let Some(slot) = crate::node::ports::Slots::take(&self.slots, peer, Box::new(|| {})) else {
+            return;
+        };
+        self.presentation_due
+            .insert(peer, (serial, now + Duration::from_secs(60)));
+        let live: BTreeSet<_> = self
+            .net
+            .as_ref()
+            .map(|n| n.manager().peers().into_iter().collect())
+            .unwrap_or_default();
+        self.presentation_due.retain(|p, _| live.contains(p));
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            let name = tokio::time::timeout(
+                Duration::from_secs(4),
+                crate::node::presentation::pull(&conn),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok);
+            let _ = tx
+                .send(NetEvent::PresentationDone { peer, serial, name })
+                .await;
+        });
+    }
+
+    async fn tend_private_sessions(&mut self) {
+        let rooms: Vec<_> = self
+            .channels
+            .iter()
+            .map(|(id, room)| (*id, Arc::clone(room)))
+            .collect();
+        for (room, shared) in rooms {
+            let members = shared.lock().await.drive_members();
+            for peer in members {
+                self.pull_private_sessions(room, peer).await;
+            }
+        }
+    }
+
+    /// Pull through the separate typed stream. No network wait holds the actor or room lock.
+    /// It shares the ordinary outbound slot budget, and retries only while a connection exists.
+    async fn pull_private_sessions(&mut self, channel_id: Digest32, peer: Digest32) {
+        let Some(conn) = self
+            .net
+            .as_ref()
+            .and_then(|net| net.manager().existing(&peer))
+        else {
+            return;
+        };
+        let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
+            return;
+        };
+        let Some(slot) = crate::node::ports::Slots::take(&self.slots, peer, Box::new(|| {})) else {
+            return;
+        };
+        let Some(ask) = shared.lock().await.start_private_pull(peer) else {
+            return;
+        };
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            let page = tokio::time::timeout(
+                Duration::from_secs(10),
+                crate::node::sessionstream::pull(&conn, ask),
+            )
+            .await
+            .unwrap_or(Err(crate::error::Error::Unreachable(
+                "private Session page timed out",
+            )));
+            let _ = tx
+                .send(NetEvent::PrivateSessionDone {
+                    channel_id,
+                    peer,
+                    room: shared,
+                    page,
+                })
+                .await;
+        });
+    }
+
     /// Append one Session entry under this node's drive key (ADR-029 SC-1, SC-2), then release
     /// that key to whoever with drive is owed it, so a member owed it from the entry reads it.
     async fn append_session(
@@ -16880,6 +17284,14 @@ impl Node {
                 return;
             };
             let mut ch = shared.lock().await;
+            // Ordinary-key declarations name only this node's authenticated legacy hashes.
+            // They let read-only peers identify withheld steps without granting drive.
+            if ch.announce_legacy_sessions(profile, now_millis).is_err() {
+                return;
+            }
+            if ch.announce_private_support(profile, now_millis).is_err() {
+                return;
+            }
             if ch
                 .rotate_drive_if_lost(profile.store(), holders, now_ms)
                 .is_err()
@@ -16892,6 +17304,13 @@ impl Node {
             let Ok(owed) = ch.owed_drive(profile, holders, now_ms) else {
                 return;
             };
+            if !owed.is_empty()
+                && ch
+                    .refresh_session_records(profile, holders, &owed, now_millis)
+                    .is_err()
+            {
+                return;
+            }
             let mut releases = Vec::new();
             for member in owed {
                 if let Ok((skdm, generation)) = ch.drive_skdm_for(profile, &member) {
@@ -17039,6 +17458,7 @@ impl Node {
             open_channels: Vec::new(),
             forwards: Vec::new(),
             trusted: self.trust_rows(),
+            presented: Vec::new(),
             drive: self
                 .trust
                 .iter()
@@ -17268,6 +17688,14 @@ impl Node {
                 })
                 .collect(),
             trusted,
+            presented: if locked {
+                Vec::new()
+            } else {
+                self.presented
+                    .iter()
+                    .map(|(fp, (name, _))| (*fp, name.clone()))
+                    .collect()
+            },
             drive,
             relayed_peers,
             relaying,

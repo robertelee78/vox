@@ -37,7 +37,7 @@ use vox_core::node::daemonipc::{
     UseNode,
 };
 use vox_core::node::ipc::{Frame, IpcClient, Request};
-use vox_core::node::link::{b32_decode, b32_encode};
+use vox_core::node::link::b32_decode;
 use vox_core::node::paths::{Account, NodeName};
 use vox_core::node::snapshot::{NodeSnapshot, OpenRoomSnap};
 use zeroize::Zeroizing;
@@ -121,6 +121,7 @@ pub struct DaemonCore {
     /// The daemon's event task.
     daemon_events: tokio::task::JoinHandle<()>,
     snapshot: NodeSnapshot,
+    presented: Vec<(Digest32, String)>,
     /// Storage failures by room id; a recovery replaces the failure with a notice.
     room_save_errors: BTreeMap<Digest32, String>,
     recovered_rooms: BTreeSet<String>,
@@ -433,6 +434,7 @@ impl DaemonCore {
             rx,
             daemon_events,
             snapshot: NodeSnapshot::default(),
+            presented: Vec::new(),
             room_save_errors: BTreeMap::new(),
             recovered_rooms: BTreeSet::new(),
             asked: None,
@@ -983,7 +985,10 @@ impl DaemonCore {
     /// A member as the TUI names it: its keyring petname, else its fingerprint marked as not in
     /// the keyring (`crate::ident`, #198).
     fn member_name(&self, fp: &Digest32) -> String {
-        crate::ident::member_name(&self.snapshot.trusted, fp)
+        crate::ident::member_name(
+            &crate::ident::display_names(&self.snapshot.trusted, &self.presented),
+            fp,
+        )
     }
 
     /// Ask for the snapshot when an event said something changed, or a second has passed.
@@ -1010,6 +1015,10 @@ impl DaemonCore {
         let Some(answer) = until_stopped(&self.rt, &self.stop, conn.client.exchange(&body)) else {
             return;
         };
+        if let Some(Ok(names)) = until_stopped(&self.rt, &self.stop, conn.client.presented_names())
+        {
+            self.presented = names;
+        }
         match answer {
             Ok(reply) => match NodeSnapshot::from_bytes(&reply) {
                 Ok(Some(s)) => {
@@ -1283,6 +1292,7 @@ impl DaemonCore {
         use crate::viewmodel::DriveAct;
         let names = SessionNames {
             trusted: &self.snapshot.trusted,
+            presented: &self.presented,
             me: self.snapshot.me,
         };
         let alias = names.alias_of(&node);
@@ -1441,6 +1451,7 @@ impl DaemonCore {
         let me = self.snapshot.me;
         let names = SessionNames {
             trusted: &self.snapshot.trusted,
+            presented: &self.presented,
             me,
         };
         let label = self
@@ -1615,6 +1626,7 @@ impl DaemonCore {
         own: &Own,
         names: &vox_core::node::resolver::VoxResolver,
     ) -> std::sync::Arc<Vec<MessageView>> {
+        let shown_names = crate::ident::display_names(trusted, &self.presented);
         let images = &self.images;
         let Some(t) = self.timeline.as_mut() else {
             return std::sync::Arc::default();
@@ -1642,7 +1654,7 @@ impl DaemonCore {
             if me == Some(*author) {
                 "you".to_owned()
             } else {
-                crate::ident::member_name(trusted, author)
+                crate::ident::member_name(&shown_names, author)
             }
         };
         // **One level** (ADR-028 R-9, #485): the entry `re` names, as this room holds it.
@@ -1680,7 +1692,7 @@ impl DaemonCore {
             };
             let mut names: Vec<String> = who
                 .iter()
-                .map(|fp| crate::ident::member_name(trusted, fp))
+                .map(|fp| crate::ident::member_name(&shown_names, fp))
                 .collect();
             names.sort();
             names.join(", ")
@@ -1695,7 +1707,7 @@ impl DaemonCore {
             };
             let mut names: Vec<String> = who
                 .iter()
-                .map(|fp| crate::ident::member_name(trusted, fp))
+                .map(|fp| crate::ident::member_name(&shown_names, fp))
                 .collect();
             names.sort();
             names.join(", ")
@@ -1720,7 +1732,7 @@ impl DaemonCore {
                 // A node not in the keyring is offered the one trust action (ADR-028 K-5).
                 format!(
                     "{} (not in keyring · {})",
-                    crate::ident::author_id(&r.author),
+                    name_of(&r.author),
                     crate::ident::trust_hint(&r.author)
                 )
             },
@@ -1728,7 +1740,7 @@ impl DaemonCore {
             addressed: if r.owed {
                 String::new()
             } else {
-                crate::agent_hook::addressed(&r.text, me.as_ref(), trusted)
+                crate::agent_hook::addressed(&r.text, me.as_ref(), &shown_names)
             },
             // Milliseconds: the timeline orders by it (a whole second put a room's change made
             // just after a post above it); only a display rounds it.
@@ -1760,7 +1772,7 @@ impl DaemonCore {
             Some(p)
                 if p.me == me
                     && p.verified == images.len()
-                    && p.trusted.as_slice() == trusted
+                    && p.trusted == shown_names
                     && p.names == *names
                     && p.len <= held.len()
                     && !quoted_late(p) =>
@@ -1819,7 +1831,7 @@ impl DaemonCore {
                 *projected = Some(Projected {
                     verified: images.len(),
                     me,
-                    trusted: trusted.to_vec(),
+                    trusted: shown_names.clone(),
                     own: own.clone(),
                     names: names.clone(),
                     len: held.len(),
@@ -1829,35 +1841,6 @@ impl DaemonCore {
                 rows
             }
         }
-    }
-
-    /// **A reply, as the CLI's `--re` writes one** (ADR-028 R-9, #485): a `say` whose `re` names
-    /// the entry replied to, in the thread that entry is in (or begins), spending a hop of its
-    /// parent's budget (ADR-020 §9). Its parents are the room on screen's rows.
-    fn reply_text(&self, channel_id: Digest32, re: &Digest32, text: &str) -> String {
-        use vox_agentcomms::envelope::{reply_hops_by, Envelope};
-        let held: &[MessageRow] = self
-            .timeline
-            .as_ref()
-            .filter(|t| t.channel_id == channel_id)
-            .map_or(&[], |t| t.rows.as_slice());
-        let text_of = |h: &str| {
-            let h = b32_decode(&h.trim().to_ascii_lowercase(), "re").ok()?;
-            held.iter()
-                .find(|r| r.entry_hash == h)
-                .map(|r| r.text.clone())
-        };
-        let re_b32 = b32_encode(re);
-        let mut reply = Envelope::say(text);
-        reply.thread = Some(
-            text_of(&re_b32)
-                .and_then(|t| Envelope::parse(&t).ok())
-                .and_then(|p| p.thread)
-                .unwrap_or_else(|| re_b32.clone()),
-        );
-        reply.hops = reply_hops_by(&re_b32, text_of);
-        reply.re = Some(re_b32);
-        reply.to_text()
     }
 
     fn project(&mut self) -> ViewModel {
@@ -1972,7 +1955,13 @@ impl DaemonCore {
                                 if me == Some(n.author) {
                                     "you".to_owned()
                                 } else {
-                                    crate::ident::member_name(&snap.trusted, &n.author)
+                                    crate::ident::member_name(
+                                        &crate::ident::display_names(
+                                            &snap.trusted,
+                                            &self.presented,
+                                        ),
+                                        &n.author,
+                                    )
                                 },
                                 n.what
                             ),
@@ -2005,8 +1994,14 @@ impl DaemonCore {
                                 nickname: if is_me {
                                     "you".to_owned()
                                 } else {
-                                    crate::ident::alias_of(&snap.trusted, m)
-                                        .unwrap_or_else(|| crate::ident::author_id(m))
+                                    crate::ident::alias_of(
+                                        &crate::ident::display_names(
+                                            &snap.trusted,
+                                            &self.presented,
+                                        ),
+                                        m,
+                                    )
+                                    .unwrap_or_else(|| crate::ident::author_id(m))
                                 },
                                 // Off the keyring and the room's log: this node releases its key
                                 // only to a member its keyring trusts (V210-148), and takes a
@@ -2157,7 +2152,10 @@ impl DaemonCore {
                         .into_iter()
                         .chain(d.equivocations.iter().map(|(author, seq)| {
                             crate::ident::equivocation_notice(
-                                &crate::ident::member_name(&snap.trusted, author),
+                                &crate::ident::member_name(
+                                    &crate::ident::display_names(&snap.trusted, &self.presented),
+                                    author,
+                                ),
                                 *seq,
                             )
                         }))
@@ -2190,6 +2188,7 @@ impl DaemonCore {
             tunnels: snap.tunnels,
             closed_tunnels: snap.closed_tunnels,
             keyring: snap.trusted.clone(),
+            presented: self.presented.clone(),
             offers: snap.offers.clone(),
             room_asks: self.room_asks(),
             decisions: self.decisions(),
@@ -2263,9 +2262,15 @@ impl DaemonCore {
         let (mut can, mut cannot) = (Vec::new(), Vec::new());
         for m in members.iter().filter(|m| Some(**m) != me) {
             if snap.trusted.iter().any(|(t, _)| t == m) {
-                can.push(crate::ident::member_name(&snap.trusted, m));
+                can.push(crate::ident::member_name(
+                    &crate::ident::display_names(&snap.trusted, &self.presented),
+                    m,
+                ));
             } else {
-                cannot.push(crate::ident::member_name(&snap.trusted, m));
+                cannot.push(crate::ident::member_name(
+                    &crate::ident::display_names(&snap.trusted, &self.presented),
+                    m,
+                ));
             }
         }
         let address = me.map_or_else(
@@ -2532,6 +2537,12 @@ impl CoreHandle for DaemonCore {
     }
 
     fn apply_noting(&mut self, command: Command, waiting: &mut dyn FnMut()) -> CommandStatus {
+        // The TUI refuses before prompting too; keep dispatch itself behind the same mark check.
+        if matches!(command, Command::Trust { .. } | Command::AcceptOffer { .. }) {
+            if let Some(why) = crate::coord::trust_widening_refusal() {
+                return CommandStatus::Said(why.into());
+            }
+        }
         let secret = |s: &SecretString| s.expose_secret().to_owned();
         match command {
             Command::ProbeListening => {
@@ -2776,12 +2787,19 @@ impl CoreHandle for DaemonCore {
                             )
                         }];
                         if !o.to.is_empty() {
-                            let names: Vec<String> = o
-                                .to
-                                .iter()
-                                .filter_map(|fp| crate::ident::recipient(fp))
-                                .map(|fp| crate::ident::member_name(&self.snapshot.trusted, &fp))
-                                .collect();
+                            let names: Vec<String> =
+                                o.to.iter()
+                                    .filter_map(|fp| crate::ident::recipient(fp))
+                                    .map(|fp| {
+                                        crate::ident::member_name(
+                                            &crate::ident::display_names(
+                                                &self.snapshot.trusted,
+                                                &self.presented,
+                                            ),
+                                            &fp,
+                                        )
+                                    })
+                                    .collect();
                             said.push(format!("for {}", names.join(", ")));
                         }
                         said.extend(o.notes);
@@ -2838,8 +2856,15 @@ impl CoreHandle for DaemonCore {
                 re,
                 text,
             } => {
-                let text = self.reply_text(channel_id, &re, &text);
-                self.apply(Command::SendText { channel_id, text })
+                // The same lookup and thread rule as addressed replies and `room post --re`,
+                // even when the parent has scrolled out of the loaded timeline (ADR-033 TH-3).
+                self.apply(Command::PostAddressed {
+                    channel_id,
+                    text,
+                    to: Vec::new(),
+                    urgent: false,
+                    re: Some(re),
+                })
             }
             Command::SendText { channel_id, text } => {
                 // A link card, fetched by this node (ADR-028 F-10).
@@ -2878,12 +2903,17 @@ impl CoreHandle for DaemonCore {
 /// name for it, or its fingerprint marked not in the keyring (ADR-029 CL-1).
 struct SessionNames<'a> {
     trusted: &'a [(Digest32, String)],
+    presented: &'a [(Digest32, String)],
     me: Option<Digest32>,
 }
 
 impl SessionNames<'_> {
     fn alias_of(&self, fp: &Digest32) -> String {
-        crate::ident::author_for(self.trusted, self.me.as_ref(), fp)
+        crate::ident::author_for(
+            &crate::ident::display_names(self.trusted, self.presented),
+            self.me.as_ref(),
+            fp,
+        )
     }
 }
 

@@ -111,10 +111,13 @@ impl Node {
         // A storage reopen initially knows the room policy. Apply this node's shorter limits
         // before success is reported or the replacement is exposed; retain the original OS
         // cause and retry state if that additional write fails.
-        let opened = opened.and_then(|mut channel| {
-            self.retention_before_publication(&mut channel)?;
-            Ok(channel)
-        });
+        let opened = match opened {
+            Ok(mut channel) => self
+                .retention_before_publication(&mut channel)
+                .await
+                .map(|()| channel),
+            Err(error) => Err(error),
+        };
         match opened {
             Ok(channel) => {
                 let name = self

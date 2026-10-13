@@ -1,5 +1,5 @@
 //! What a harness session needs before it can work in a Vox room, found and said from the
-//! session itself, with no hook yet (#666): `vox agent status` and `vox agent connect`.
+//! session itself, with no hook yet (#666): `vox agent status` and `vox agent setup`.
 //!
 //! A session's hook is what brings it Vox's news, and a harness has a hook only once it is wired
 //! to a node. So a harness Vox was installed beside, and never set up, has no hook to say so: the
@@ -8,15 +8,16 @@
 //! thing missing and the one command the operator runs for it in a terminal of their own (it is
 //! where a passphrase is typed):
 //!
-//! 1. no node wired to this harness here: `vox agent connect <harness> --node <name>`, which makes
+//! 1. no node wired to this harness here: `vox agent setup <harness> --node <name>`, which makes
 //!    the node (its passphrase typed twice), wires the harness's hook to it and the agent skill
 //!    beside it, as `vox setup` does for that one harness, and attaches the node; or, for a node
 //!    that exists, wires it and attaches it;
-//! 2. the node not attached: `vox node attach <node>`;
+//! 2. the node not attached: `vox node unlock <node>`;
 //! 3. the session's directory not bound to a room: the ask the hook gives (ADR-029 RB-5), with
 //!    `vox room join <link> --node <node> --bind <dir>`.
 //!
-//! Neither command changes trust, and the session never runs them: they take a passphrase.
+//! The terminal setup path takes its passphrase only from the operator and trusts only Vox's
+//! own Codex hook; it does not grant any node read or drive trust.
 
 use std::path::Path;
 
@@ -50,6 +51,10 @@ fn harness(key: &str) -> Result<&'static Harness, AppError> {
 /// An unknown harness, or a data root that cannot be used.
 pub async fn status(args: &NodeArgs, key: &str, dir: &Path) -> Result<String, AppError> {
     let said = first_missing(args, key, dir).await?;
+    let account = args.account()?;
+    if crate::setup::connected(&account, &Wiring::of(harness(key)?.key)?).is_none() {
+        return Ok(said);
+    }
     // **What Vox asks the person, here too** (ADR-029 RB-5): on a machine with no app, this and
     // the TUI are where a person reads that a repo waits for a room.
     let asks = crate::room_ask::fetch(&args.account()?).await?;
@@ -61,16 +66,25 @@ async fn first_missing(args: &NodeArgs, key: &str, dir: &Path) -> Result<String,
     let h = harness(key)?;
     let account = args.account()?;
     let wiring = Wiring::of(h.key)?;
-    let suggested = format!("{}-{}", h.key, crate::setup::host_name());
+    let suggested = crate::setup::suggested_name(h.key, &crate::setup::host_name());
     let hook = wiring.hook_file();
     let wired = wiring.wired_node().and_then(|n| NodeName::parse(&n).ok());
-    let connect = |name: &str, what: &str| {
+    let setup = |name: &str, what: &str| {
+        if crate::agent_onboarding::declined(&account, h.key) {
+            return String::new();
+        }
+        if crate::agent_onboarding::local_app(&account).is_some() {
+            return format!(
+                "Vox: {} has no Vox node on this machine. Vox offers Set Up in its app; you may start `vox agent setup {} --node {name}` to ask there. Never ask for a passphrase in this session.\n",
+                h.name, h.key
+            );
+        }
         format!(
             "Vox: {what}, so this session is in no Vox room. Tell the operator, in these words: \
              \"{} has no Vox node on this machine. Choose a name for it and run this in a \
              terminal of your own; it asks there for the new node's passphrase, makes the node, \
              wires {}'s hook to it in {} with the agent skill beside it, and attaches it. Then \
-             start a new session.\"\n    vox agent connect {} --node {name}\n\
+             start a new session.\"\n    vox agent setup {} --node {name}\n\
              Never run it yourself, and never ask for the passphrase here.\n",
             h.name,
             h.name,
@@ -79,13 +93,13 @@ async fn first_missing(args: &NodeArgs, key: &str, dir: &Path) -> Result<String,
         )
     };
     let Some(node) = wired else {
-        return Ok(connect(
+        return Ok(setup(
             &suggested,
             &format!("{} has no node on this machine", h.name),
         ));
     };
     if !account.nodes_on_disk().contains(&node) {
-        return Ok(connect(
+        return Ok(setup(
             node.as_str(),
             &format!(
                 "{}'s hook names node {node}, which is not on this machine",
@@ -99,7 +113,7 @@ async fn first_missing(args: &NodeArgs, key: &str, dir: &Path) -> Result<String,
              Vox room. Tell the operator, in these words: \"Node {node} is not attached. Run \
              this in a terminal of your own; it asks there for the node's passphrase once, and \
              Vox then remembers it and attaches the node by itself after every restart. Then \
-             start a new session.\"\n    vox node attach {node}\n\
+             start a new session.\"\n    vox node unlock {node}\n\
              Never run it yourself, and never ask for the passphrase here.\n",
             h.name
         ));
@@ -165,7 +179,7 @@ async fn in_bound_room(
             "Vox: {harness} is node {node}, attached; this repo ({}) is bound to room {short}, \
              and {node} is not in it, so this session cannot post there. {node} joins it by \
              itself, with the room map's passphrase, when a session starts here; if that failed, \
-             Vox asks the operator (Vox.app banner), or they run at a terminal: {}\n",
+             Vox asks the operator (Vox.app dialog), or they run at a terminal: {}\n",
             dir.display(),
             vox_text::shell::command(&["vox", "room", "join", link, "--node", node.as_str()]),
         ),
@@ -177,46 +191,71 @@ async fn in_bound_room(
     }
 }
 
-/// `vox agent connect <harness> --node <name>`: make node `name` if there is none (its
-/// passphrase typed twice at this terminal, or read from `passphrase_file`), wire the harness's
-/// hook to it with the agent skill beside it, as `vox setup` does, and attach it. What it is to do
-/// is said first (ADR-028 E-5).
+/// `vox agent setup <harness> [--node <name>]`: the operator's terminal path (also over SSH).
+/// Make a node if needed, replace the light hook, trust Codex's hook, and attach the node. The
+/// passphrase is typed here, never taken from the agent, a file or an environment variable.
+/// Vox.app's request/dialog path is handled separately (ADR-031 NC-2).
 ///
 /// # Errors
-/// An unknown harness, a name `vox node create` refuses, no terminal to type a passphrase at, or a
-/// file or the daemon refusing.
-pub async fn connect(
-    args: &NodeArgs,
-    key: &str,
-    name: &str,
-    passphrase_file: Option<std::path::PathBuf>,
-) -> Result<(), AppError> {
+/// An unknown harness, an agent-marked process, no terminal for the passphrase, an invalid name,
+/// or a file, harness or daemon refusing.
+pub async fn setup(args: &NodeArgs, key: &str, name: Option<&str>) -> Result<(), AppError> {
     let h = harness(key)?;
-    let name = NodeName::parse(name)?;
     let account = args.account()?;
     let wiring = Wiring::of(h.key)?;
-    // **A harness connected already is left as it is** (#666): to another node, nothing changes;
-    // to this one, it is attached and remembered below, and nothing else is made.
-    if let Some(wired) = crate::setup::connected(&account, &wiring) {
-        if wired == name {
+    let wired = crate::setup::connected(&account, &wiring);
+    let suggested = name.is_none() && wired.is_none();
+    let name = match name {
+        Some(name) => NodeName::parse(name)?,
+        None => match &wired {
+            Some(name) => name.clone(),
+            None => NodeName::parse(&crate::setup::suggested_name(
+                h.key,
+                &crate::setup::host_name(),
+            ))?,
+        },
+    };
+    // A harness already wired to another node stays there; this read-only outcome needs no
+    // passphrase. Running setup for its own node below also repairs Codex's hook trust.
+    if let Some(wired) = &wired {
+        if wired != &name {
             println!(
-                "vox: {} is connected to node {name}; left as it is, and node {name} is to be \
-                 attached with its passphrase and remembered",
+                "vox: {} is connected to node {wired}; left as it is. `vox node unlock {wired}` \
+                 attaches it",
                 h.name
             );
-            let typed =
-                passphrase_file.is_none() && std::env::var_os("VOX_IDENTITY_PASSPHRASE").is_none();
-            let passphrase = crate::client::attach_passphrase(None, passphrase_file)?;
-            return crate::client::attach_with(args, &name, passphrase, typed).await;
+            return Ok(());
         }
-        println!(
-            "vox: {} is connected to node {wired}; left as it is. `vox node attach {wired}` \
-             attaches it",
-            h.name
-        );
+    }
+    if crate::agent_onboarding::request_in_app(args, h.key, &name)? {
         return Ok(());
     }
+    if crate::coord::agent_marked() {
+        return Err(AppError::Usage(format!(
+            "run `vox agent setup {}` in a terminal of your own outside the agent session; \
+             the node's passphrase is asked only there.",
+            h.key
+        )));
+    }
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Err(AppError::Usage(format!(
+            "vox agent setup {} asks for the node's passphrase only in a terminal of your own; \
+             run it there, outside the agent session",
+            h.key
+        )));
+    }
+    // Setup cannot leave Codex's new hook waiting for a separate manual trust command.
+    let codex = if h.key == "codex" {
+        Some(crate::setup::on_path(h.program).ok_or_else(|| {
+            AppError::Usage("Codex is not on PATH; install Codex before setting up its node".into())
+        })?)
+    } else {
+        None
+    };
     let exists = account.nodes_on_disk().contains(&name);
+    if suggested {
+        println!("vox: suggested node name {name}; use --node to choose another");
+    }
     println!(
         "vox: {} is to be wired to {} node {name}{}:",
         h.name,
@@ -230,30 +269,12 @@ pub async fn connect(
     for line in wiring.effects(&name) {
         println!("  {line}");
     }
-    // A new node's passphrase is typed unless it comes from a file; an existing node's, unless
-    // from a file or VOX_IDENTITY_PASSPHRASE, as `vox node attach` takes it.
-    let typed = passphrase_file.is_none()
-        && (!exists || std::env::var_os("VOX_IDENTITY_PASSPHRASE").is_none());
     let passphrase = if exists {
-        crate::client::attach_passphrase(None, passphrase_file)?
+        zeroize::Zeroizing::new(crate::tunnel_cli::prompt_passphrase(&format!(
+            "passphrase for {name}"
+        ))?)
     } else {
-        let passphrase = match passphrase_file {
-            Some(f) => zeroize::Zeroizing::new(crate::tunnel_cli::new_identity_passphrase(
-                None,
-                Some(f),
-                "",
-            )?),
-            None => {
-                if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                    return Err(AppError::Usage(
-                        "vox agent connect asks for the new node's passphrase, and there is no \
-                         terminal to ask at; run it in a terminal of your own"
-                            .into(),
-                    ));
-                }
-                crate::setup::ask_new_passphrase(&name)?
-            }
-        };
+        let passphrase = crate::setup::ask_new_passphrase(&name)?;
         let paths = account.node_paths(&name)?;
         let fp = crate::client::create_identity(&paths, &passphrase)?;
         println!("vox: created node {name}");
@@ -261,29 +282,79 @@ pub async fn connect(
         eprintln!("vox: {}", crate::ident::NO_BACKUP);
         passphrase
     };
-    for line in wiring.install(&name)? {
-        println!("  {line}");
-    }
-    if h.key == "codex" {
-        if let Some(program) = crate::setup::on_path(h.program) {
-            match crate::codex_app_server::ensure(&program, &wiring.dir) {
-                Ok(_) => println!("  Codex's app-server is running"),
-                Err(why) => println!(
-                    "  Codex's app-server did not start ({why}): Codex sessions are followed \
-                     through their hooks only"
-                ),
-            }
+    if wired.is_none() {
+        for line in wiring.install(&name)? {
+            println!("  {line}");
         }
-        println!(
-            "vox: next, run `vox agent trust codex`: Codex runs a hook only once it is trusted"
-        );
     }
-    // Attached already or not, it is attached and remembered (#666): an attach of an attached
-    // node checks the passphrase, and keeps it.
-    crate::client::attach_with(args, &name, passphrase, typed).await?;
+    if let Some(program) = codex {
+        crate::setup::trust_codex_hook(&program)?;
+        match crate::codex_app_server::ensure(&program, &wiring.dir) {
+            Ok(_) => println!("  Codex's app-server is running"),
+            Err(why) => println!(
+                "  Codex's app-server did not start ({why}): Codex sessions are followed \
+                 through their hooks only"
+            ),
+        }
+    }
+    crate::client::attach_with(args, &name, passphrase, true).await?;
+    crate::agent_onboarding::completed(&account, h.key, &name)?;
     println!(
         "vox: {} is wired to node {name}; start a new {} session",
         h.name, h.name
     );
+    Ok(())
+}
+
+/// The app has made and kept the node using its secure fields. Finish only the harness wiring;
+/// this secret-free child command cannot make, attach, select or unlock a node.
+pub(crate) async fn finish(
+    args: &NodeArgs,
+    key: &str,
+    name: &str,
+    check_only: bool,
+) -> Result<(), AppError> {
+    if crate::coord::agent_marked() {
+        return Err(AppError::Usage(
+            "only the person in Vox.app or their own terminal can finish node setup".into(),
+        ));
+    }
+    let h = harness(key)?;
+    let name = NodeName::parse(name)?;
+    let account = args.account()?;
+    let wiring = Wiring::of(h.key)?;
+    if let Some(wired) = crate::setup::connected(&account, &wiring) {
+        if wired != name {
+            return Err(AppError::Usage(format!(
+                "{} is already set up as node {wired}; left unchanged",
+                h.name
+            )));
+        }
+    }
+    let codex = if h.key == "codex" {
+        Some(crate::setup::on_path(h.program).ok_or_else(|| {
+            AppError::Usage("Codex is not on PATH; install Codex before setting up its node".into())
+        })?)
+    } else {
+        None
+    };
+    // The app checks the edited name before creating anything. Repeat the same guard above
+    // when finishing, so another setup cannot silently replace existing wiring.
+    if check_only {
+        return Ok(());
+    }
+    if !account.nodes_on_disk().contains(&name) || !crate::client::attached(&account, &name).await?
+    {
+        return Err(AppError::Usage(format!(
+            "node {name} must already be made and Ready before its hook is wired"
+        )));
+    }
+    for line in wiring.install(&name)? {
+        println!("vox: {line}");
+    }
+    if let Some(program) = codex {
+        crate::setup::trust_codex_hook(&program)?;
+    }
+    println!("vox: {} is wired to Ready node {name}", h.name);
     Ok(())
 }

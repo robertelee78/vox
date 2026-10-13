@@ -10,8 +10,8 @@
 //! It is the sender-key machinery (ADR-006) over its own namespace: the chain, its SKDMs and its
 //! messages are bound to [`drive_channel`] rather than the room's id, so its AEAD data, its
 //! cross-signature and its receiver slots can never be taken for the sender key's, nor the sender
-//! key's for it. Its entries are ordinary content entries of the room's log (the skeleton is the
-//! room's), so they sync, age and prune as messages do (SE-5).
+//! key's for it. New steps use the private Session stream and store outside the room log (SA-7).
+//! Published older writers' ordinary drive-sealed entries remain readable during upgrade.
 //!
 //! - **Release** (SC-2a): to each member admitted to the room whose keyring entry carries drive,
 //!   from where it became owed the key, so it reads from then onward: a member that had drive when
@@ -167,6 +167,7 @@ pub struct SessionLog {
     by_session: std::collections::HashMap<String, Vec<usize>>,
     /// The positions of rows announcing a file out of a Session.
     files_out: Vec<usize>,
+    lifecycle: Vec<usize>,
     /// Entry hash → its position.
     at: std::collections::HashMap<Digest32, usize>,
     requests: std::collections::HashMap<(String, String), Vec<usize>>,
@@ -195,7 +196,9 @@ impl SessionLog {
     pub fn push(&mut self, row: SessionRow) {
         let at = self.rows.len();
         self.at.insert(row.entry_hash, at);
-        if !is_key_changed(&row.session_id) {
+        if crate::node::sessions::is_record(&row.body) {
+            self.lifecycle.push(at);
+        } else if !is_key_changed(&row.session_id) {
             self.all.push(at);
             self.by_session
                 .entry(row.session_id.clone())
@@ -348,6 +351,11 @@ impl SessionLog {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+
+    /// Retained opening, rename and end records, never activity steps.
+    pub fn lifecycle(&self) -> impl Iterator<Item = &SessionRow> {
+        self.lifecycle.iter().map(|&at| &self.rows[at])
     }
 
     /// The rows announcing a file out of a Session, in order.

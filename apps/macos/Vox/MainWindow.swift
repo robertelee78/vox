@@ -18,8 +18,6 @@ struct MainWindow: View {
                 NodeStopped(model: model)
                 Divider()
             }
-            // A repo with no room (ADR-029 RB-5): one banner across the window.
-            RoomAskBanner(model: model)
             if model.daemonReachable && (!model.health.isEmpty || !model.recovered.isEmpty) {
                 VStack(alignment: .leading, spacing: Space.s4) {
                     ForEach(model.health) { issue in
@@ -104,15 +102,17 @@ struct MainWindow: View {
         .onChange(of: model.needsYouCount) { DockBadge.show($0) }
         .onDisappear { DockBadge.show(0) }
         .sheet(item: $model.sheet) { NodeSheets(model: model, sheet: $0).textSelection(.enabled) }
+        .sheet(isPresented: Binding(get: { model.lanAsking != nil },
+                                    set: { if !$0 { model.cancelLanAsk() } })) {
+            if let room = model.lanAsking {
+                LanHelperSheet(model: model, room: room).panelSurface()
+            }
+        }
         .sheet(item: $model.card) { node in
             NodeCard(model: model, node: node) { model.card = nil }.textSelection(.enabled)
                 .panelSurface()
         }
         .toolbar {
-            // W-2: a key moves to the next room that needs the person; Control-N, as in the TUI.
-            Button("Next Room That Needs You") { Task { await model.nextNeedingYou() } }
-                .keyboardShortcut("n", modifiers: .control)
-                .accessibilityIdentifier("next-needs-you")
             // The inspector, shown or hidden, as the sidebar's own button does for the sidebar.
             Button { model.inspectorShown.toggle() } label: {
                 Label(model.inspectorShown ? "Hide Inspector" : "Show Inspector",
@@ -154,7 +154,7 @@ private struct Sidebar: View {
                 ForEach(model.offers.filter { o in
                     !model.rooms.contains { r in o.rooms.contains { $0.id == r.id } }
                 }, id: \.fingerprint) { offer in
-                    OfferRow(offer: offer).tag(NodeModel.Selection.offer(offer.fingerprint))
+                    OfferRow(model: model, offer: offer).tag(NodeModel.Selection.offer(offer.fingerprint))
                         .sidebarRow(model.selection == .offer(offer.fingerprint))
                         .copyMenu([("Copy Fingerprint", offer.fingerprint)])
                 }
@@ -332,6 +332,7 @@ private struct OnThisMachine: View {
                         Button("Copy Name") { Self.copy(node.name) }
                         if !node.fingerprint.isEmpty {
                             Button("Copy Fingerprint") { Self.copy(node.fingerprint) }
+                            Button("Copy Name and Fingerprint") { Self.copy("\(node.name) <\(node.fingerprint)>") }
                         }
                         // #666: in place of printing `vox node forget-passphrase`.
                         if node.keep {
@@ -2215,9 +2216,7 @@ enum Platform {
     }
 }
 
-/// The room's family LAN (ADR-013): a toggle. The LAN helper it needs is asked for only when the
-/// LAN is turned on, in a sheet that says where to allow it and goes on by itself once it is
-/// (ADR-014 M-12).
+/// The room's family LAN status (ADR-013). Controls live in the Room menu (ADR-033 LY-7).
 private struct FamilyLan: View {
     @ObservedObject var model: NodeModel
     let room: String
@@ -2225,17 +2224,8 @@ private struct FamilyLan: View {
     var body: some View {
         Text("FAMILY LAN").eyebrow().secondaryText()
             .accessibilityAddTraits(.isHeader)
-        Toggle("On this room's LAN", isOn: Binding(
-            get: { model.lanOn.contains(room) },
-            set: { on in
-                Task { if on { await model.turnLanOn(room) } else { await model.setLan(room, on: false) } }
-            }))
-            .accessibilityIdentifier("family-lan")
-            .sheet(isPresented: Binding(get: { model.lanAsking == room },
-                                        set: { if !$0 { model.cancelLanAsk() } })) {
-                LanHelperSheet(model: model, room: room)
-                    .panelSurface()
-            }
+        Text(model.lanOn.contains(room) ? "On" : "Off")
+            .accessibilityIdentifier("family-lan-status")
         if let said = model.lanSaid[room] {
             Text(said).font(Theme.mono).secondaryText().textSelection(.enabled)
                 .accessibilityIdentifier("family-lan-said")
@@ -2244,10 +2234,7 @@ private struct FamilyLan: View {
             StateMark(kind: .danger, words: failed).textSelection(.enabled)
                 .accessibilityIdentifier("family-lan-failed")
         }
-        if model.lanHelperReady {
-            Button("Remove the LAN Helper") { Task { await model.removeLanHelper() } }
-                .accessibilityIdentifier("family-lan-remove")
-        }
+
     }
 }
 

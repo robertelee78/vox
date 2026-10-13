@@ -31,6 +31,9 @@ struct NodeActions: ViewModifier {
             Button("Show Node…") { model.openCard(fingerprint, name: name) }
             Button("Copy Name") { copyWords(name) }
             Button("Copy Fingerprint") { copyWords(fingerprint) }
+            if let presented = model.presentedNames[fingerprint] {
+                Button("Copy Name and Fingerprint") { copyWords("\(presented) <\(fingerprint)>") }
+            }
             if !trust.inKeyring {
                 Button("Trust…") { model.openCard(fingerprint, name: name, act: .trust) }
             }
@@ -76,6 +79,11 @@ struct NodeCard: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Space.s12) {
                 Text(name).title()
+                if let entry { Text("Your name: \(entry.name)").accessibilityIdentifier("card-your-name") }
+                if let presented = model.presentedNames[node.fingerprint] {
+                    Text("Name it presents: \(presented)").accessibilityIdentifier("card-presented-name")
+                    Button("Copy Name and Fingerprint") { copyWords("\(presented) <\(node.fingerprint)>") }.accessibilityIdentifier("card-copy-identity")
+                }
                 HStack(alignment: .top, spacing: Space.s16) {
                     VStack(spacing: 0) {
                         ForEach(Array(card.art.enumerated()), id: \.offset) { Text($0.element) }
@@ -153,6 +161,9 @@ struct NodeCard: View {
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("node-card")
         .onAppear { act = node.act }
+        .task(id: node.fingerprint) {
+            if let name = await model.presentedName(node.fingerprint), alias.isEmpty { alias = name }
+        }
     }
 
     /// Trust it: an alias, and it is given read, the only grant here (the decider, v0.4.1: no

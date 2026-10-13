@@ -18,6 +18,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod agent_hook;
+mod agent_onboarding;
 pub mod agent_room;
 pub mod agent_send;
 pub mod agent_setup;
@@ -30,6 +31,7 @@ pub mod client;
 pub mod codex_app_server;
 pub mod codex_mirror;
 pub mod codex_trust;
+pub mod computer_cli;
 pub mod coord;
 pub mod daemon;
 pub mod daemon_client;

@@ -216,8 +216,8 @@ pub fn no_helper(socket: &Path) -> String {
         if let Some(app) = vox_app() {
             return format!(
                 "no LAN helper is answering on {}. On this Mac the helper is Vox.app's: open Vox \
-                 ({}), choose the room, and turn on \"On this room's LAN\" under FAMILY LAN \
-                 beside its timeline; then open System Settings › General › Login Items & \
+                 ({}), choose the room, and choose Room › Turn On Family LAN \
+                 in the menu; then open System Settings › General › Login Items & \
                  Extensions and, under \"Allow in the Background\", turn on Vox. Then run `vox lan \
                  up` again (as yourself, not with sudo).",
                 socket.display(),

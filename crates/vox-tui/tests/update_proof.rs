@@ -27,6 +27,9 @@
 //! test, `VOX_PROOF_ALLOW_UNPROVEN=<id-or-prefix>[,…]` accepts a named CANNOT MEASURE gap; the
 //! optional one reads no such variable.
 
+#[path = "support/attach.rs"]
+mod unlock_staging;
+
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -546,7 +549,11 @@ fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
         let dir = install_dir(home, "stable");
         copy(Path::new(VOX), &dir.join(".vox-previous"));
         write(&home.join(".zshrc"), "export VOX_PROOF_USER_LINE=kept\n");
+        for d in [".claude", ".codex", ".config/opencode"] {
+            std::fs::create_dir_all(home.join(d)).expect("APPARATUS: harness config directory");
+        }
         let out = vox(&dir.join("vox"), home, &["update", "--rollback"], &[]);
+        assert_light_hooks(home, &said(&out));
         let rc = std::fs::read_to_string(home.join(".zshrc")).unwrap_or_default();
         claims.push(claim(
             "rollback.refreshes_completions",
@@ -811,12 +818,13 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
         let tmp = tmpdir();
         let home = tmp.path();
         let link = bundle_install(home, Some("stable"));
-        // Claude Code is here (its settings folder): the update gives it the agent skill pack.
-        std::fs::create_dir_all(home.join(".claude"))
-            .unwrap_or_else(|e| panic!("APPARATUS: a harness folder: {e}"));
+        for d in [".claude", ".codex", ".config/opencode"] {
+            std::fs::create_dir_all(home.join(d)).expect("APPARATUS: harness config directory");
+        }
         let apps = home.join("Apps");
         let out = vox(&link, home, &["update"], &base);
         let text = said(&out);
+        assert_light_hooks(home, &text);
         let cli = reports(&link);
         let app = app_says(&apps.join("Vox.app"));
         let prev_cli = reports(&apps.join(".Vox.app.previous/Contents/Helpers/vox"));
@@ -899,8 +907,10 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
                 let tmp = tmpdir();
                 let home = tmp.path();
                 let link = bundle_install(home, Some("stable"));
-                std::fs::create_dir_all(home.join(".claude"))
-                    .unwrap_or_else(|e| panic!("APPARATUS: a harness folder: {e}"));
+                for d in [".claude", ".codex", ".config/opencode"] {
+                    std::fs::create_dir_all(home.join(d))
+                        .expect("APPARATUS: harness config directory");
+                }
                 let mut env = base;
                 env[0] = ("VOX_TEST_RELEASE_BASE", current_server.base.as_str());
                 let pack = home.join(".claude/skills/vox-agent-comms/SKILL.md");
@@ -908,6 +918,7 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
                 let after_check = pack.is_file();
                 let out = vox(&link, home, &["update"], &env);
                 let text = said(&out);
+                assert_light_hooks(home, &text);
                 let current = format!("Vox {VERSION} is current");
                 let refreshed = format!(
                     "Vox {VERSION} is current; the agent skill is installed for Claude Code"
@@ -1314,7 +1325,12 @@ fn daemon_restart_claim(
     let config = home.join("config");
     let pass = home.join("pass");
     write(&pass, "update proof passphrase\n");
+    let private_keychain = crate::unlock_staging::keychain(&data);
     let env = [
+        (
+            "VOX_TEST_KEYCHAIN",
+            private_keychain.to_str().expect("APPARATUS: Keychain path"),
+        ),
         ("VOX_TEST_RELEASE_BASE", server.base.as_str()),
         ("VOX_NO_SHELL_SETUP", "1"),
         (
@@ -1370,7 +1386,6 @@ fn daemon_restart_claim(
             "--passphrase-file",
             pass_arg,
         ],
-        &["node", "attach", "plain", "--passphrase-file", pass_arg],
     ] {
         let out = vox(&link, home, args, &env);
         if !out.status.success() {
@@ -1402,6 +1417,7 @@ fn daemon_restart_claim(
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .env("VOX_PROXY", "127.0.0.1:0")
         .envs(env.iter().copied())
+        .env("VOX_IDENTITY_PASSPHRASE", "update proof passphrase")
         .args([
             "serve",
             &service_arg,
@@ -1572,7 +1588,7 @@ fn daemon_restart_claim(
             && text.contains(&restarted)
             && text.contains("held sessions plain/update-held/echo ended")
             && text.contains("node plain is detached")
-            && text.contains("vox node attach plain")
+            && text.contains("vox node unlock plain")
             && !text.contains("node kept is detached")
             && kept_after
             && !plain_after
@@ -1704,4 +1720,19 @@ fn an_older_release_updates_itself_and_refuses_a_bad_download() {
     }
 
     dispose("vox update journey (optional)", &claims, &receipts, false);
+}
+
+/// Read the configuration the updated binary installed, as each harness does (HK-1).
+fn assert_light_hooks(home: &Path, said: &str) {
+    for (harness, rel) in [
+        ("claude", ".claude/settings.json"),
+        ("codex", ".codex/hooks.json"),
+        ("opencode", ".config/opencode/plugin/vox.js"),
+    ] {
+        let path = home.join(rel);
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(content.contains(&format!("agent hook --light {harness}"))
+            && said.contains(path.to_str().expect("APPARATUS: UTF-8 scratch path")),
+            "PRODUCT: vox update must install {harness}'s light hook and name {path:?}; file={content:?}; output={said}");
+    }
 }

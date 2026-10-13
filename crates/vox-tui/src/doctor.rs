@@ -114,9 +114,9 @@ pub async fn doctor(paths: &Paths, room: Option<&str>, json: bool) -> Result<(),
                 match paths.profile_dir.file_name() {
                     Some(n) => format!(
                         "attach this node: {} (it starts the daemon if none runs)",
-                        vox_text::shell::command(&["vox", "node", "attach", &n.to_string_lossy()])
+                        vox_text::shell::command(&["vox", "node", "unlock", &n.to_string_lossy()])
                     ),
-                    None => "attach this node with vox node attach and its name (it starts the \
+                    None => "attach this node with vox node unlock and its name (it starts the \
                              daemon if none runs)"
                         .to_owned(),
                 },
@@ -790,7 +790,7 @@ async fn sessions(paths: &Paths) -> Vec<Check> {
         return vec![warn(
             "sessions",
             "no agent session has drained on this node yet: a session registers on its first turn",
-            "open a session in a harness wired to this node (vox agent connect wires one)",
+            "open a session in a harness wired to this node (vox agent setup wires one)",
         )];
     }
     let busy_idle = crate::wake::Settings::load(paths).0.busy_idle;

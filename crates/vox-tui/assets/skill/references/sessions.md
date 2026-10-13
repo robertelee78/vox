@@ -11,8 +11,8 @@ Only the members a session's node trusts with **drive** see inside its Session; 
 so. A member whose drive is taken back keeps what it already read there, and sees nothing written
 afterwards. Your own Session is seen by the members your node trusts with drive, and they may steer you
 from it: text typed into your session from Vox reaches you as typed input, and your turn shows who
-typed it. Drive is granted only by the operator, with `vox trust drive` at a terminal; whether you
-hold it over a Session, and how to ask for it, is in `trust.md`.
+typed it. Whether you hold drive over a Session, how automatic local trust applies, and when a manual
+operator grant is needed are in `trust.md`.
 
 ## Following
 
@@ -51,6 +51,7 @@ Typing into another session is acting as its operator.
 
 ## Your own session's room
 
-Your session works in one room at a time; its Session is there. When your turn says your session
-works in no room, or you are asked to move, run `vox agent room <room>` from this session: its
-Session ends in the room it was in and opens in the new one.
+Your session works in one room at a time; its Session is there. Use this repository's saved room,
+not another room the node holds. If it has no binding, follow `setup.md`; do not choose a room
+yourself. Once the operator has selected the room or authorized a move, use `vox agent room <room>`
+from this session: its Session ends in the old room and opens in the selected one.

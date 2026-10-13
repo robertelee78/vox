@@ -485,6 +485,8 @@ pub fn room_group_words(group: RoomGroup) -> String {
 /// A member of a room.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct Member {
+    /// Authenticated remote self-name, independent of the local keyring alias.
+    pub presented_name: String,
     /// Its fingerprint, base32.
     pub fingerprint: String,
     /// This node's name for it, from the keyring; empty when it has none.
@@ -528,6 +530,8 @@ pub struct OfferRoom {
 /// [`VoxClient::trust_add`], dismissed with [`VoxClient::dismiss_offer`].
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct OfferInfo {
+    /// Authenticated remote self-name; empty for older or unreachable peers.
+    pub presented_name: String,
     /// Its fingerprint, base32; the app groups it and draws its art.
     pub fingerprint: String,
     /// The rooms it is offered from.
@@ -1674,6 +1678,21 @@ impl VoxClient {
         })
     }
 
+    async fn computer_request(
+        &self,
+        request: DaemonRequest,
+    ) -> Result<crate::ComputerStatus, VoxError> {
+        match self.daemon(request).await? {
+            DaemonFrame::ComputerStatus(json) => {
+                serde_json::from_str::<vox_core::node::computer::ComputerStatus>(&json)
+                    .map(Into::into)
+                    .map_err(|_| failed("the daemon's computer status could not be read"))
+            }
+            DaemonFrame::ComputerFailed(why) => Err(failed(why)),
+            _ => Err(failed("the daemon did not answer computer management")),
+        }
+    }
+
     /// Run `fut` on the client's runtime and await it from the caller's executor.
     async fn on_rt<T, F>(&self, fut: F) -> Result<T, VoxError>
     where
@@ -1866,6 +1885,49 @@ impl VoxClient {
     #[must_use]
     pub fn config_dir(&self) -> String {
         self.config_dir.to_string_lossy().into_owned()
+    }
+
+    /// Read daemon-wide computer trust without selecting or unlocking a chat node.
+    pub async fn computer_status(&self) -> Result<crate::ComputerStatus, VoxError> {
+        self.computer_request(DaemonRequest::ComputerStatus).await
+    }
+    /// Produce one expiring invitation for an operator.
+    pub async fn begin_computer_pairing(&self) -> Result<crate::ComputerStatus, VoxError> {
+        vox_core::node::computer::operator_only().map_err(|e| failed(e.to_string()))?;
+        self.computer_request(DaemonRequest::ComputerBegin).await
+    }
+    /// Authenticate a peer before the app displays its approval choice.
+    pub async fn preview_computer_pairing(
+        &self,
+        link: String,
+    ) -> Result<crate::ComputerStatus, VoxError> {
+        vox_core::node::computer::operator_only().map_err(|e| failed(e.to_string()))?;
+        self.computer_request(DaemonRequest::ComputerPreview {
+            link: zeroize::Zeroizing::new(link),
+        })
+        .await
+    }
+    /// Approve exactly the authenticated preview the person saw.
+    pub async fn approve_computer_pairing(
+        &self,
+        operation_id: String,
+    ) -> Result<crate::ComputerStatus, VoxError> {
+        vox_core::node::computer::operator_only().map_err(|e| failed(e.to_string()))?;
+        self.computer_request(DaemonRequest::ComputerApprove {
+            operation: operation_id,
+        })
+        .await
+    }
+    /// Cancel an uncommitted invitation or preview.
+    pub async fn cancel_computer_pairing(
+        &self,
+        operation_id: String,
+    ) -> Result<crate::ComputerStatus, VoxError> {
+        vox_core::node::computer::operator_only().map_err(|e| failed(e.to_string()))?;
+        self.computer_request(DaemonRequest::ComputerCancel {
+            operation: operation_id,
+        })
+        .await
     }
 
     /// The nodes on this machine, as the daemon lists them.
@@ -2132,6 +2194,12 @@ impl VoxClient {
         let channel_id = digest(&room, "room id")?;
         on_held!(self, |c| {
             let names = names(c).await?;
+            let presented: HashMap<_, _> = c
+                .presented_names()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
             let members = match ask(c, &Request::Roster { channel_id }).await? {
                 Frame::Members { members } => members,
                 other => return Err(unexpected(&other)),
@@ -2144,6 +2212,7 @@ impl VoxClient {
             Ok(members
                 .into_iter()
                 .map(|m| Member {
+                    presented_name: presented.get(&m).cloned().unwrap_or_default(),
                     fingerprint: b32_encode(&m),
                     name: names.get(&m).cloned().unwrap_or_default(),
                     key_waits: waits.get(&m).cloned(),
@@ -2302,10 +2371,37 @@ impl VoxClient {
             // parent's budget less one, read up the `re` chain from the log.
             if let Some(re) = env.re.clone() {
                 let chain = reply_chain(c, channel_id, &re).await?;
-                env.hops = vox_agentcomms::envelope::reply_hops_by(&re, |h| {
+                let parent = |h: &str| {
                     let hash = vox_core::node::link::b32_decode(h.trim(), "re").ok()?;
                     chain.get(&hash).cloned()
-                });
+                };
+                env.hops = vox_agentcomms::envelope::reply_hops_by(&re, parent);
+                env.thread =
+                    Some(vox_agentcomms::envelope::reply_thread_by(&re, parent).unwrap_or(re));
+                if let Some(root) = env.thread.as_deref().and_then(|h| digest(h, "thread").ok()) {
+                    match ask(
+                        c,
+                        &Request::Find {
+                            channel_id,
+                            entries: vec![root],
+                        },
+                    )
+                    .await?
+                    {
+                        Frame::Rows { rows } => {
+                            if let Some(starting) =
+                                rows.iter().find(|r| r.entry_hash == root && !r.owed)
+                            {
+                                env.tags = vox_agentcomms::envelope::inherit_thread_tags(
+                                    &env.tags,
+                                    &starting.text,
+                                )
+                                .map_err(failed)?;
+                            }
+                        }
+                        other => return Err(unexpected(&other)),
+                    }
+                }
             }
             let text = env.to_text();
             // A link card, fetched by this node (ADR-028 F-10).
@@ -2488,6 +2584,21 @@ impl VoxClient {
         on_held!(self, |c| done(c, &req).await)
     }
 
+    /// A remote name authenticated by this node's current connection, or missing-name fallback.
+    pub async fn presented_name(&self, fingerprint: String) -> Result<Option<String>, VoxError> {
+        let target = digest(&fingerprint, "fingerprint")?;
+        on_held!(
+            self,
+            |c| match ask(c, &Request::Presentation { target }).await? {
+                Frame::Presented { entries } => Ok(entries
+                    .into_iter()
+                    .find(|(fp, _)| *fp == target)
+                    .map(|(_, name)| name)),
+                _ => Ok(None),
+            }
+        )
+    }
+
     /// Trust `fingerprint` under `name`, granting read, and drive as well when `drive` (ADR-028
     /// K-14, K-16). The identity passphrase is needed unless one was given for a keyring change
     /// within the keyring window; attaching opens no window (ADR-028 K-12).
@@ -2501,8 +2612,21 @@ impl VoxClient {
         drive: bool,
         identity_passphrase: Option<Arc<Passphrase>>,
     ) -> Result<(), VoxError> {
+        let (target, hint) = vox_core::node::link::copied_identity(&fingerprint)
+            .map_err(|e| failed(e.to_string()))?;
+        let name = if name.trim().is_empty() {
+            match hint {
+                Some(name) => name,
+                None => self
+                    .presented_name(b32_encode(&target))
+                    .await?
+                    .unwrap_or_default(),
+            }
+        } else {
+            name
+        };
         let req = Request::Trust {
-            target: digest(&fingerprint, "fingerprint")?,
+            target,
             petname: name,
             identity_passphrase: copy_of(identity_passphrase.as_ref()),
             full_history: false,
@@ -2534,32 +2658,41 @@ impl VoxClient {
     /// # Errors
     /// The node's refusal.
     pub async fn pending_offers(&self) -> Result<Vec<OfferInfo>, VoxError> {
-        on_held!(self, |c| match ask(c, &Request::Offers).await? {
-            Frame::Offers { offers } => Ok(offers
+        on_held!(self, |c| {
+            let presented: HashMap<_, _> = c
+                .presented_names()
+                .await
+                .unwrap_or_default()
                 .into_iter()
-                .map(|o| OfferInfo {
-                    fingerprint: b32_encode(&o.member),
-                    rooms: o
-                        .rooms
-                        .into_iter()
-                        .map(|r| OfferRoom {
-                            id: b32_encode(&r.id),
-                            name: r.name,
-                        })
-                        .collect(),
-                    why: o
-                        .why
-                        .into_iter()
-                        .map(|w| match w {
-                            vox_core::node::api::OfferWhy::Joined => OfferWhy::Joined,
-                            vox_core::node::api::OfferWhy::TrustsYou => OfferWhy::TrustsYou,
-                        })
-                        .collect(),
-                    trusted_by: o.trusted_by.iter().map(b32_encode).collect(),
-                    said: o.said,
-                })
-                .collect()),
-            other => Err(unexpected(&other)),
+                .collect();
+            match ask(c, &Request::Offers).await? {
+                Frame::Offers { offers } => Ok(offers
+                    .into_iter()
+                    .map(|o| OfferInfo {
+                        presented_name: presented.get(&o.member).cloned().unwrap_or_default(),
+                        fingerprint: b32_encode(&o.member),
+                        rooms: o
+                            .rooms
+                            .into_iter()
+                            .map(|r| OfferRoom {
+                                id: b32_encode(&r.id),
+                                name: r.name,
+                            })
+                            .collect(),
+                        why: o
+                            .why
+                            .into_iter()
+                            .map(|w| match w {
+                                vox_core::node::api::OfferWhy::Joined => OfferWhy::Joined,
+                                vox_core::node::api::OfferWhy::TrustsYou => OfferWhy::TrustsYou,
+                            })
+                            .collect(),
+                        trusted_by: o.trusted_by.iter().map(b32_encode).collect(),
+                        said: o.said,
+                    })
+                    .collect()),
+                other => Err(unexpected(&other)),
+            }
         })
     }
 
@@ -3019,10 +3152,37 @@ impl VoxClient {
             // **A share is a post, and follows a post's hop rule** (ADR-020 §9), as `vox share`.
             if let Some(re) = env.re.clone() {
                 let chain = reply_chain(c, channel_id, &re).await?;
-                env.hops = vox_agentcomms::envelope::reply_hops_by(&re, |h| {
+                let parent = |h: &str| {
                     let hash = vox_core::node::link::b32_decode(h.trim(), "re").ok()?;
                     chain.get(&hash).cloned()
-                });
+                };
+                env.hops = vox_agentcomms::envelope::reply_hops_by(&re, parent);
+                env.thread =
+                    Some(vox_agentcomms::envelope::reply_thread_by(&re, parent).unwrap_or(re));
+                if let Some(root) = env.thread.as_deref().and_then(|h| digest(h, "thread").ok()) {
+                    match ask(
+                        c,
+                        &Request::Find {
+                            channel_id,
+                            entries: vec![root],
+                        },
+                    )
+                    .await?
+                    {
+                        Frame::Rows { rows } => {
+                            if let Some(starting) =
+                                rows.iter().find(|r| r.entry_hash == root && !r.owed)
+                            {
+                                env.tags = vox_agentcomms::envelope::inherit_thread_tags(
+                                    &env.tags,
+                                    &starting.text,
+                                )
+                                .map_err(failed)?;
+                            }
+                        }
+                        other => return Err(unexpected(&other)),
+                    }
+                }
             }
             let req = Request::Share {
                 channel_id,

@@ -1210,15 +1210,15 @@ fn binary_version(path: &Path) -> Option<String> {
 /// `VOX_NO_SKILL_INSTALL` itself, each for its own part.
 fn run_shell_setup(active: &Path) {
     match Command::new(active).arg("shell-setup").output() {
-        Ok(o) if o.status.success() => print!("{}", String::from_utf8_lossy(&o.stdout)),
         Ok(o) => {
             print!("{}", String::from_utf8_lossy(&o.stdout));
-            println!(
-                "         note: run `vox shell-setup` to refresh completions and the agent skill"
-            );
+            eprint!("{}", String::from_utf8_lossy(&o.stderr));
+            if !o.status.success() {
+                println!("         note: run `vox shell-setup` to refresh completions, the agent skill and hooks");
+            }
         }
         Err(_) => println!(
-            "         note: run `vox shell-setup` to refresh completions and the agent skill"
+            "         note: run `vox shell-setup` to refresh completions, the agent skill and hooks"
         ),
     }
 }
@@ -1244,20 +1244,30 @@ fn skill_said() -> String {
     }
 }
 
-/// The agent skill pack alone, where `vox shell-setup` is not run (a Vox.app update run from
-/// inside the bundle): the binary now in place installs or refreshes it for every harness here,
-/// keeping any file the operator changed. `VOX_NO_SKILL_INSTALL` skips it.
+/// The agent skill pack and missing light hooks, where `vox shell-setup` is not run (a Vox.app
+/// update run from inside the bundle). The binary now in place refreshes every harness here,
+/// keeping operator changes. `VOX_NO_SKILL_INSTALL` skips only the skill pack.
 #[cfg(target_os = "macos")]
 fn run_skill_install(active: &Path) {
-    if std::env::var_os("VOX_NO_SKILL_INSTALL").is_some() {
-        return;
-    }
-    match Command::new(active)
-        .args(["agent", "skill", "--install"])
-        .output()
-    {
-        Ok(o) if o.status.success() => print!("{}", String::from_utf8_lossy(&o.stdout)),
-        _ => println!("         note: run `vox agent skill --install` to refresh the agent skill"),
+    for command in ["skill", "plugin"] {
+        if command == "skill" && std::env::var_os("VOX_NO_SKILL_INSTALL").is_some() {
+            continue;
+        }
+        match Command::new(active)
+            .args(["agent", command, "--install"])
+            .output()
+        {
+            Ok(o) => {
+                print!("{}", String::from_utf8_lossy(&o.stdout));
+                eprint!("{}", String::from_utf8_lossy(&o.stderr));
+                if !o.status.success() {
+                    println!("         note: run `vox agent {command} --install` to finish harness setup");
+                }
+            }
+            Err(_) => println!(
+                "         note: run `vox agent {command} --install` to finish harness setup"
+            ),
+        }
     }
 }
 

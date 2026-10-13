@@ -9,9 +9,24 @@ import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var app: AppModel
+    @State private var showingComputers = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s20) {
+            if !app.agentSetups.isEmpty {
+                setting {
+                    ForEach(app.agentSetups) { request in
+                        HStack {
+                            Text(request.name)
+                            Spacer()
+                            Button("Set Up") { app.offerAgentSetup(request) }
+                                .accessibilityIdentifier("settings-agent-setup-\(request.harness)")
+                        }
+                    }
+                } said: {
+                    Text("Set up a harness for Vox here, including one you chose Not Now for.")
+                }
+            }
             setting {
                 // The one Keep Running switch: the same call as Vox > Keep Running While Logged In
                 // (#571), so the two always agree.
@@ -56,6 +71,12 @@ struct SettingsView: View {
                         .accessibilityIdentifier("settings-update-said")
                 }
             }
+            setting {
+                Button("Add Computer…") { showingComputers = true }
+                    .accessibilityIdentifier("settings-add-computer")
+            } said: {
+                Text("Trust the nodes on your computers together, or keep choosing individual nodes.")
+            }
             if let node = app.node { DaemonLogSetting(node: node) }
             setting {
                 Picker("Conversation text size", selection: Binding(
@@ -75,6 +96,7 @@ struct SettingsView: View {
         .padding(Space.s24)
         .frame(width: Theme.scaled(460), alignment: .topLeading)
         .contentSurface()
+        .sheet(isPresented: $showingComputers) { ComputerTrustView() }
     }
 
     /// One setting: its control, then what it does in secondary text.

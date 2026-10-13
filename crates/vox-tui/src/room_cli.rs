@@ -266,8 +266,9 @@ fn body_of(text: Option<&str>) -> Result<String, AppError> {
     }
 }
 
-/// Append raw text, exactly as given. The internal path for verbs that build their
-/// own envelope (a file offer), and what `vox room post` does with no structured flag.
+/// Append prose or a caller-built envelope, filling session and inherited thread tags.
+/// The internal path for verbs that build their own envelope (a file offer), and what
+/// `vox room post` does with no structured flag.
 pub(crate) async fn post(
     paths: &Paths,
     room: &str,
@@ -279,6 +280,14 @@ pub(crate) async fn post(
     if body.trim().is_empty() {
         return Err(AppError::Usage("refusing to post an empty message".into()));
     }
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    // A raw envelope may name another authoring session. The command still acts inside the
+    // caller's registered working room; its supplied `from` cannot bypass that boundary.
+    if let Some(session) = session.as_deref() {
+        vox_core::node::sessions::check_working_room(paths, session, &channel_id)
+            .map_err(AppError::Usage)?;
+    }
     // **A message from a harness session says which** (ADR-029 MD-1, MD-2): its `from` is the
     // session's id, whatever the agent wrote, and the node fills in its name. A message that
     // already names a session, and one no session sends (a person's), is posted as given.
@@ -289,8 +298,33 @@ pub(crate) async fn post(
         }
         _ => body,
     };
-    let mut client = attach(paths).await?;
-    let channel_id = room_of(&mut client, room).await?;
+    // Pasted envelopes are a supported posting verb too. Keep their metadata, while adding
+    // the same starting tags as the flag-built reply; no tag is resolved outside this room.
+    let body = if let Ok(mut env) = Envelope::parse(&body) {
+        if env.re.is_some() || env.thread.is_some() {
+            let root = match (&env.thread, &env.re) {
+                (Some(root), _) => Some(root.clone()),
+                (None, Some(re)) => {
+                    let chain = coord::reply_chain(&mut client, channel_id, re).await?;
+                    vox_agentcomms::envelope::reply_thread_by(re, |h| {
+                        let hash = b32_decode(h.trim(), "re").ok()?;
+                        chain
+                            .iter()
+                            .find(|r| r.entry_hash == hash)
+                            .map(|r| r.text.clone())
+                    })
+                    .or_else(|| Some(re.clone()))
+                }
+                _ => None,
+            };
+            env.tags = reply_tags(&mut client, channel_id, root.as_deref(), &env.tags).await?;
+            env.to_text()
+        } else {
+            body
+        }
+    } else {
+        body
+    };
     match client
         .request(&Request::Post {
             channel_id,
@@ -462,6 +496,9 @@ impl PostReport {
     }
 }
 
+/// The first operation owns this snapshot, even when the root was not available yet.
+const THREAD_TAGS_KEY: &str = "thread_tags";
+
 /// **The one way a structured message is posted** (ADR-020 §9, ADR-028 W-4): `vox room post`
 /// with a structured flag, and the TUI's composer with To: or urgent set. It checks the type,
 /// the data and the addressees, applies the hop rule and the urgent limits (V210-121), and posts
@@ -495,6 +532,7 @@ pub(crate) async fn post_structured(
     for reserved in [
         vox_agentcomms::version::VOX_KEY,
         vox_agentcomms::ops::OP_KEY,
+        THREAD_TAGS_KEY,
     ] {
         if data.contains_key(reserved) {
             return Err(AppError::Usage(format!(
@@ -599,7 +637,7 @@ pub(crate) async fn post_structured(
             data.insert("attempt".into(), a);
         }
     }
-    let (re, hops_of_reply) = answers(
+    let (re, hops_of_reply, known_thread) = answers(
         &mut client,
         cid,
         paths,
@@ -609,12 +647,67 @@ pub(crate) async fn post_structured(
         opts.urgent,
     )
     .await?;
+    // An operation keeps the root its first post used even if a missing parent arrives, or
+    // retention removes one, before a retry. Changed --re/--thread still goes through normal
+    // refusal and semantic conflict checks; post_once checks every other semantic field.
+    let prior = if re.is_some() || opts.thread.is_some() {
+        coord::op_group(&mut client, cid, &op)
+            .await?
+            .into_iter()
+            .find(|p| p.author == snap.me && p.envelope.re == re)
+    } else {
+        None
+    };
+    let retry = prior.as_ref().filter(|p| {
+        opts.thread.as_deref().is_none_or(|explicit| {
+            p.envelope
+                .thread
+                .as_deref()
+                .is_some_and(|old| old.eq_ignore_ascii_case(explicit.trim()))
+        })
+    });
+    let thread = if let Some(original) = retry {
+        original.envelope.thread.clone()
+    } else {
+        match (known_thread, &opts.thread) {
+            (Some(root), Some(explicit)) if !root.eq_ignore_ascii_case(explicit.trim()) => {
+                return Err(AppError::Usage(format!(
+                    "--thread {explicit} contradicts the message being replied to: its thread is {root}"
+                )));
+            }
+            (Some(root), _) => Some(root),
+            (None, Some(explicit)) => Some(explicit.clone()),
+            (None, None) => re.clone(),
+        }
+    };
+    let tags = if thread.is_some() {
+        let inherited: Vec<String> = match retry {
+            Some(previous) => serde_json::from_value(
+                previous
+                    .envelope
+                    .data
+                    .get(THREAD_TAGS_KEY)
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+            .map_err(|_| {
+                AppError::Usage("the recorded operation has no inherited tag snapshot".into())
+            })?,
+            None => reply_tags(&mut client, cid, thread.as_deref(), &[]).await?,
+        };
+        let merged = vox_agentcomms::envelope::merge_thread_tags(&tags, &inherited)
+            .map_err(AppError::Usage)?;
+        data.insert(THREAD_TAGS_KEY.into(), serde_json::json!(inherited));
+        merged
+    } else {
+        tags
+    };
     let draft = Draft {
         kind,
         to,
         urgent: opts.urgent,
         re: re.clone(),
-        thread: opts.thread.clone(),
+        thread,
         // **A reply spends a hop** (ADR-020 §9): what it may still travel is its parent's
         // budget less one, so an urgent reply chain ends at zero instead of looping.
         hops: hops_of_reply,
@@ -744,8 +837,8 @@ pub(crate) async fn post_structured(
 
 /// `vox room post` — append a message.
 ///
-/// With no structured flag, the text is posted exactly as given: prose is a `say`, and
-/// an agent may paste an envelope. **Except a claim-protocol operation**, which is
+/// With no structured flag, prose is a `say`, and an agent may paste an envelope;
+/// a reply inherits its starting message's tags. **Except a claim-protocol operation**, which is
 /// refused: it would lack the session, the operation id and the version stamp that
 /// make it valid, and the dedicated verbs exist to set them.
 ///
@@ -774,6 +867,11 @@ pub async fn post_cmd(
             return Err(AppError::Usage(format!("refusing to post it: {e}")));
         }
         if let Ok(env) = Envelope::parse(&body) {
+            if env.data.get(THREAD_TAGS_KEY).is_some() {
+                return Err(AppError::Usage(format!(
+                    "{THREAD_TAGS_KEY:?} is reserved for this binary's inherited tag snapshot"
+                )));
+            }
             // **A raw envelope addresses members by fingerprint** (V210-161), as `--to` writes
             // them: a name in `to` would read as addressed to nobody on every node.
             if !env.to.is_empty() {
@@ -1349,7 +1447,7 @@ pub(crate) fn shown_tags(tags: &[String]) -> String {
         .join(" ")
 }
 
-/// What a post answers and the hop budget it starts with, by the one rule `vox room post` and
+/// What a post answers, its hop budget and its known thread root, by the rule `vox room post` and
 /// `vox share` follow (V210-121, ADR-020 §9): `re` if given, else the one unanswered message that
 /// woke `session`; and that parent's budget less one.
 ///
@@ -1364,7 +1462,7 @@ pub(crate) async fn answers(
     me: &Digest32,
     re: Option<&str>,
     urgent: bool,
-) -> Result<(Option<String>, Option<u32>), AppError> {
+) -> Result<(Option<String>, Option<u32>, Option<String>), AppError> {
     // **A woken session's post answers what woke it** (V210-121). With no `--re` it started a
     // chain of its own with a fresh hop budget, and two agents answering each other urgently
     // that way woke each other for ever. When exactly one wake is unanswered, that is the reply;
@@ -1405,14 +1503,39 @@ pub(crate) async fn answers(
     };
     // **A reply spends a hop** (ADR-020 §9): what it may still travel is its parent's budget
     // less one. Its parents are fetched by entry hash (V210-120), not by reading the room.
-    let hops_of_reply = match &re {
-        Some(re) => Some(crate::wake::reply_hops(
-            re,
-            &coord::reply_chain(client, cid, re).await?,
-        )),
-        None => None,
+    let (hops_of_reply, thread) = match &re {
+        Some(re) => {
+            let chain = coord::reply_chain(client, cid, re).await?;
+            let thread = vox_agentcomms::envelope::reply_thread_by(re, |h| {
+                let hash = vox_core::node::link::b32_decode(h.trim(), "re").ok()?;
+                chain
+                    .iter()
+                    .find(|r| r.entry_hash == hash)
+                    .map(|r| r.text.clone())
+            });
+            (Some(crate::wake::reply_hops(re, &chain)), thread)
+        }
+        None => (None, None),
     };
-    Ok((re, hops_of_reply))
+    Ok((re, hops_of_reply, thread))
+}
+
+/// Inherit only the canonical starting message's tags, even when a reply answers another reply.
+/// A missing root cannot supply tags; the existing missing-parent behavior is unchanged.
+pub(crate) async fn reply_tags(
+    client: &mut IpcClient,
+    cid: Digest32,
+    thread: Option<&str>,
+    tags: &[String],
+) -> Result<Vec<String>, AppError> {
+    let Some(root) = thread.and_then(|h| b32_decode(h.trim(), "thread").ok()) else {
+        return Ok(tags.to_vec());
+    };
+    let found = coord::find(client, cid, &[root]).await?;
+    let Some(starting) = found.iter().find(|r| r.entry_hash == root && !r.owed) else {
+        return Ok(tags.to_vec());
+    };
+    vox_agentcomms::envelope::inherit_thread_tags(tags, &starting.text).map_err(AppError::Usage)
 }
 
 /// What `vox room read --tag` filters a room by (#636): the tags every message shown carries,
@@ -1787,8 +1910,20 @@ pub async fn roster(paths: &Paths, room: &str) -> Result<(), AppError> {
     let channel_id = room_of(&mut client, room).await?;
     match client.request(&Request::Roster { channel_id }).await {
         Ok(Frame::Members { members }) => {
+            let presented = client.presented_names().await.unwrap_or_default();
+            let trusted = match client.trusted("").await {
+                Ok(Frame::Trusted { entries }) => crate::ident::names_of(entries),
+                _ => Vec::new(),
+            };
+            let shown = crate::ident::display_names(&trusted, &presented);
             for m in members {
                 println!("{}", id(&m));
+                if let Some((_, name)) = shown.iter().find(|(fp, _)| *fp == m) {
+                    eprintln!("vox: {} {name}", id(&m));
+                }
+                if let Some((_, name)) = presented.iter().find(|(fp, _)| *fp == m) {
+                    eprintln!("vox: {} Name it presents: {name}", id(&m));
+                }
             }
             // What is to be said of a member about this node's key (ADR-030 D-5, W-4): that it
             // waits, and why, or that the member runs an older Vox. Said beside the list, on
@@ -5489,6 +5624,7 @@ pub async fn trust_offers(paths: &Paths) -> Result<(), AppError> {
         .unwrap_or_default();
     let mut client = attach(paths).await?;
     let offers = offers_of(&mut client).await?;
+    let presented = client.presented_names().await.unwrap_or_default();
     if offers.is_empty() {
         println!(
             "no offers: every node you share a room with is in your keyring, or was dismissed"
@@ -5505,6 +5641,9 @@ pub async fn trust_offers(paths: &Paths) -> Result<(), AppError> {
         }
         // Word for word what the TUI and the app say of it (ADR-028 CL-1).
         let in_rooms: Vec<String> = o.rooms.iter().map(|r| format!("{:?}", r.name)).collect();
+        if let Some((_, name)) = presented.iter().find(|(fp, _)| *fp == o.member) {
+            println!("  Name it presents: {name} · {fp} (not in keyring)");
+        }
         println!("  {}", o.said);
         println!("  in {}", listed(&in_rooms, ""));
         // Whole commands, each pasted as it stands: `vox trust add` asks there for a name and the
@@ -5572,7 +5711,12 @@ pub async fn trust_list(paths: &Paths) -> Result<(), AppError> {
                 return Ok(());
             }
             // What each entry grants, read or read + drive (ADR-028 K-14).
+            let names: Vec<_> = entries
+                .iter()
+                .map(|(id, name, _)| (*id, name.clone()))
+                .collect();
             for (id, petname, capability) in entries {
+                let petname = crate::ident::alias_of(&names, &id).unwrap_or(petname);
                 println!(
                     "{}  {petname}  {}",
                     vox_core::node::link::b32_encode(&id),
@@ -5600,6 +5744,7 @@ pub fn print_identity(
     paths: &Paths,
     flag: Option<String>,
     file: Option<std::path::PathBuf>,
+    with_name: bool,
 ) -> Result<(), AppError> {
     let fingerprint = if vox_core::node::profile::Profile::exists(paths) {
         let attached = tokio::runtime::Builder::new_current_thread()
@@ -5629,7 +5774,19 @@ pub fn print_identity(
         made
     };
     // The whole fingerprint, alone on the line, so it pipes and pastes without editing.
-    println!("{}", vox_core::node::link::b32_encode(&fingerprint));
+    if with_name {
+        let name = paths
+            .profile_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("default");
+        println!(
+            "{name} <{}>",
+            vox_core::node::link::b32_encode(&fingerprint)
+        );
+    } else {
+        println!("{}", vox_core::node::link::b32_encode(&fingerprint));
+    }
     Ok(())
 }
 
@@ -5801,5 +5958,17 @@ pub async fn admin(
         ))),
         Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+/// A known authenticated default. Reading it never changes grants or local aliases.
+pub async fn presented_name(paths: &Paths, target: Digest32) -> Result<Option<String>, AppError> {
+    let mut c = attach(paths).await?;
+    match c.request(&Request::Presentation { target }).await {
+        Ok(Frame::Presented { entries }) => Ok(entries
+            .into_iter()
+            .find(|(fp, _)| *fp == target)
+            .map(|(_, n)| n)),
+        _ => Ok(None),
     }
 }

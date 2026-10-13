@@ -11,7 +11,7 @@ extension Notification.Name {
 
 /// A sheet a menu, key or palette action opens.
 enum NodeSheet: String, Identifiable {
-    case palette, newRoom, joinRoom, fingerprint, rename, retention, admins, leave, end
+    case palette, newRoom, joinRoom, repoRoom, fingerprint, rename, retention, admins, leave, end
     var id: String { rawValue }
 }
 
@@ -48,6 +48,7 @@ extension VoxAction {
         // A detached node acts on nothing until it is attached again.
         let live = node != nil && node?.ended == nil
         let inRoom = live && node?.roomOnScreen != nil
+        let lanOn = node?.roomOnScreen.map { node?.lanOn.contains($0) == true } ?? false
         // What the room's commands act on: the Session on screen, when one is, never the room
         // behind it (D2).
         let inSession = node?.showingSession ?? false
@@ -80,7 +81,7 @@ extension VoxAction {
             VoxAction("Room", "Rename…", enabled: inRoom) { node?.sheet = .rename },
             VoxAction("Room", "Retention…", enabled: inRoom) { node?.sheet = .retention },
             VoxAction("Room", "Admins…", enabled: inRoom) { node?.sheet = .admins },
-            VoxAction("Room", "Reply to Selected Message", "r",
+            VoxAction("Room", "Reply in Thread", "r",
                       enabled: inRoom && node?.messages.contains { $0.id == node?.selectedMessage } == true) {
                 node?.replyTo = node?.messages.first { $0.id == node?.selectedMessage }
             },
@@ -108,8 +109,13 @@ extension VoxAction {
             },
             VoxAction("Room", "Copy Selected Service's Address", "c", [.command, .shift],
                       enabled: node?.selectedService != nil) { node?.copyServiceCommand() },
-            VoxAction("Room", "Next Room That Needs You", "j", enabled: live) {
-                Task { await node?.nextNeedingYou() }
+            VoxAction("Room", lanOn ? "Turn Off Family LAN" : "Turn On Family LAN", enabled: inRoom) {
+                guard let node, let room = node.roomOnScreen else { return }
+                let on = !node.lanOn.contains(room)
+                Task { if on { await node.turnLanOn(room) } else { await node.setLan(room, on: false) } }
+            },
+            VoxAction("Room", "Remove the LAN Helper", enabled: node?.lanHelperReady == true) {
+                Task { await node?.removeLanHelper() }
             },
             VoxAction("Room", "Leave…", enabled: inRoom) { node?.sheet = .leave },
             VoxAction("Room", "End for Everyone…", enabled: inRoom) { node?.sheet = .end },
@@ -263,6 +269,10 @@ struct NodeSheets: View {
             case .palette: Palette(model: model)
             case .newRoom: RoomForm(model: model, joining: false)
             case .joinRoom: RoomForm(model: model, joining: true)
+            case .repoRoom:
+                if let ask = model.roomAskDialog {
+                    RoomAskDialog(model: model, ask: ask).id(ask.dir)
+                }
             case .fingerprint: FingerprintSheet(model: model)
             case .rename: RenameSheet(model: model)
             case .retention: RetentionSheet(model: model)
@@ -383,6 +393,10 @@ private struct FingerprintSheet: View {
                     NSPasteboard.general.setString(model.me, forType: .string)
                 }
                 .accessibilityLabel("Copy this node's fingerprint")
+                Button("Copy Name and Fingerprint") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString("\(model.node) <\(model.me)>", forType: .string)
+                }.accessibilityIdentifier("my-copy-identity")
                 Button("Done") { model.sheet = nil }.keyboardShortcut(.defaultAction)
             }
         }

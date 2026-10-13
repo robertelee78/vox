@@ -103,7 +103,12 @@ impl VoxProc {
         input: Option<&str>,
     ) -> Self {
         let mut child = Command::new(exe)
-            .args(args)
+            .args(attach::persistent_args(
+                data,
+                &args.iter().map(String::as_str).collect::<Vec<_>>(),
+                IDENTITY,
+            ))
+            .env("VOX_TEST_KEYCHAIN", attach::keychain(data))
             .env("VOX_PROXY", proxy())
             .envs(env.iter().copied())
             .env("VOX_DATA_DIR", data)
@@ -400,12 +405,17 @@ pub fn vox_once(data: &Path, args: &[String]) -> (bool, String, String) {
 /// [`vox_once`] exactly as given, attaching nothing.
 pub fn vox_once_plain(data: &Path, args: &[String]) -> (bool, String, String) {
     let mut cmd = Command::new(VOX);
-    cmd.args(args)
-        .env("VOX_PROXY", proxy())
-        .env("VOX_DATA_DIR", data)
-        .env("VOX_CONFIG_DIR", data.join("cfg"))
-        .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
-        .env_remove("VOX_ROOM_PASSPHRASE");
+    cmd.args(attach::persistent_args(
+        data,
+        &args.iter().map(String::as_str).collect::<Vec<_>>(),
+        IDENTITY,
+    ))
+    .env("VOX_TEST_KEYCHAIN", attach::keychain(data))
+    .env("VOX_PROXY", proxy())
+    .env("VOX_DATA_DIR", data)
+    .env("VOX_CONFIG_DIR", data.join("cfg"))
+    .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
+    .env_remove("VOX_ROOM_PASSPHRASE");
     // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
     if typed::is_keyring_change(args) {
         let (ok, shown) = typed::keyring(&cmd);

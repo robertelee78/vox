@@ -382,6 +382,8 @@ pub struct ViewModel {
     pub closed_tunnels: Vec<vox_core::transport::quic::ClosedTunnel>,
     /// The trust keyring, `(fingerprint, alias)`, for the keyring view (ADR-028 W-1, K-1).
     pub keyring: Vec<(vox_core::hash::Digest32, String)>,
+    /// Authenticated remote self-names, independent of keyring/drive state.
+    pub presented: Vec<(vox_core::hash::Digest32, String)>,
     /// The members offered to the keyring (ADR-028 K-15 – K-18), in fingerprint order.
     pub offers: Vec<vox_core::node::api::Offer>,
     /// The directories harness sessions started in with no room bound to them (ADR-029 RB-5):

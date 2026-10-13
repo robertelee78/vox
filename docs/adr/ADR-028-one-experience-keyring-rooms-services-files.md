@@ -65,10 +65,16 @@ decider named: read records, the room's shared name, the decision record and the
   with the iOS app.
 - **K-2.** There MUST be exactly one trust state: **in my keyring**, or not. There MUST be no
   "verified", "unverified", TOFU or "key changed" state. A different key is a different node.
-- **K-3.** Adding a fingerprint to the keyring MUST ask for an alias, and the alias MUST be
-  changeable later (`vox trust rename`). Wherever a node is named — author, member, recipient,
-  service address, notification, decision record — a node in the keyring MUST be shown by its
-  alias and any other node by a short fingerprint marked "not in keyring".
+- **K-3.** Adding a fingerprint to the keyring MUST offer the authenticated name the node
+  presents as an editable default, available before trust through optional identity-authenticated
+  metadata independent of room, chat and drive permissions (the decider, 2026-10-12; #796).
+  The person MAY accept that default without typing, override it, or change the local alias later
+  (`vox trust rename`). A local alias remains separate from the remote name and MUST survive a
+  remote rename, reconnect, rejoin or rediscovery. Wherever a node is named, a keyring node is
+  shown by its local alias; a remote-only name MUST carry its fingerprint and "not in keyring".
+  A name never selects an identity or grants authority. Missing names and older peers retain
+  fingerprint/manual-name fallback. Remote metadata is bounded and presentation-safe, held only
+  in memory and refreshed after restart; existing sealed aliases and grants remain unchanged.
 - **K-4.** Addressing MUST accept `@alias` in the composer; the client MUST write the whole
   fingerprint into `to` (ADR-020 4.6). Two members whose aliases are equal or differ only in case
   MUST be shown with a fingerprint suffix.
@@ -91,7 +97,7 @@ decider named: read records, the room's shared name, the decision record and the
   decider, 2026-10-09: "vox is unusable"; "if it need a passphrase it should tell me what to do",
   "not silently fail". Attaching a node with its identity passphrase (`vox node attach`, the app's
   attach) MUST store that passphrase in the macOS Keychain, keyed per node, once the daemon has
-  proved it, and a node made by `vox node create`, `vox setup` or `vox agent connect` MUST be
+  proved it, and a node made by `vox node create`, `vox setup` or `vox agent setup` MUST be
   attached at once and remembered the same way. At its start the daemon MUST attach every node
   whose passphrase is stored, and every remembered node that has none, with nobody typing: after a
   daemon restart, `vox update`, the app's quit and a reboot. `vox node attach --no-remember`
@@ -110,7 +116,7 @@ by any of them (ADR-001: there is no typed agent or human).
 
 - **K-11. An identity passphrase is optional.** *Amended 2026-10-10:* ADR-005 J-2 (V030-36) is
   restored, by the decider's ruling of 2026-10-09 ("passphrases are optional"; "we talked about
-  this"). Creating a node (`vox node create`, `vox setup`, `vox agent connect`, the TUI's or the
+  this"). Creating a node (`vox node create`, `vox setup`, `vox agent setup`, the TUI's or the
   app's onboarding) MUST accept an empty identity passphrase, and MUST say once, where it is given,
   what it means: the node's identity key is kept on that machine unencrypted, so anyone who can
   read its data folder can act as the node. Attaching or unlocking a node made with none MUST
@@ -139,7 +145,7 @@ by any of them (ADR-001: there is no typed agent or human).
   with its art (K-1) and what K-7 says about it. The offer MUST be derived from the join on the log;
   it MUST NOT add an entry type.
 - **K-16. Accepting.** Accepting an offer is ADR-020 3.7's second entry point, `vox trust add` with
-  the offered fingerprint. It MUST ask for an alias (K-3) and for **read** or **read + drive**, with
+  the offered fingerprint. It MUST ask for an editable local alias with its known presented name as the default (K-3) and for **read** or **read + drive**, with
   read the default, and MUST pass ADR-020 3.1's passphrase gate as amended by K-12. It MUST NOT
   require comparing the
   fingerprint: the client shows it, and the person accepting does whatever check their threat model
@@ -499,7 +505,7 @@ Each line below is amended as stated. Where code already matches, the ADR text i
 | ADR-026 S-6 | `vox daemon install` deferred | On macOS, a login item via `SMAppService` (A-5); Linux unchanged |
 | ADR-005 J-1 | "the two people swap fingerprints … each then runs `vox trust add` for the other" | Swapping fingerprints first is optional; each accepts the other's offer (K-15–K-17) |
 | ADR-005 J-2 | An identity passphrase is OPTIONAL (V030-36) | Restored (K-11 as amended 2026-10-10): optional, and an empty one says the key is kept unencrypted; a room passphrase stays optional |
-| ADR-020 2.1 | The skill pack's setup creates the agent's node | The operator makes it, at a terminal of their own (`vox setup` or `vox agent connect`), with a passphrase they type or none (K-11 as amended) |
+| ADR-020 2.1 | The skill pack's setup creates the agent's node | The operator makes it, at a terminal of their own (`vox setup` or `vox agent setup`), with a passphrase they type or none (K-11 as amended) |
 | ADR-020 3.1 | The keyring window runs from when the passphrase "was last entered" | From when it was last entered for a keyring change; attaching does not open it (K-12) |
 | ADR-020 3.7 | Entry point 2, in-room approval, not built | Specified as offers on join (K-15–K-19) |
 | ADR-020 3.8 | A provision-time import MAY be provided | No import (K-20) |

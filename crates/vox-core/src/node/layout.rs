@@ -135,7 +135,10 @@ pub fn refuse_old_layout(account: &Account) -> Result<()> {
 // Format 2 adds separate Session retention and version-3 age records. Opening a
 // supported older root decodes its version-1/2 records and classifies stored drive
 // envelopes before the first retention sweep; no identity or room is rewritten.
-pub const DATA_ROOT_FORMAT: u32 = 2;
+// Format 3 is v0.4.5's shared target (#741). Its first contribution adds version-4 keyrings
+// with durable manual-removal history for local trust. Other v0.4.5 storage contributions
+// extend this target; they must not each raise it. Their combined upgrade remains #741's proof.
+pub const DATA_ROOT_FORMAT: u32 = 3;
 
 /// Read the supported format before opening or writing anything in the data root (ADR-026 F-3).
 /// A missing marker is format 1, written by v0.4.0; an existing but unreadable marker is not.

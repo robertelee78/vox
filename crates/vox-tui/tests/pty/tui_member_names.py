@@ -188,6 +188,43 @@ try:
     tui.key("room pass\r", 4)
     tui.key("\r", 2)
     tui.key("\t", 1)   # timeline -> composer
+    stage("typed composer addressing and urgency")
+    # These are typed into the real field, not :send or an internal parser. Alice's public
+    # room history is the verdict, including the exact body and full recipient fingerprint.
+    def message(marker):
+        r = run("alice", "room", "read", room, "--json")
+        if r.returncode != 0:
+            product(f"alice's room read failed: {r.stdout}{r.stderr}")
+        rows = [json.loads(line) for line in r.stdout.splitlines() if line.strip()]
+        return next((row for row in rows if marker in (row.get("text") or "")), None)
+    def posted(marker, body, recipients, urgent):
+        if not until(lambda: message(marker) is not None, 30):
+            product(f"typed composer message {marker} never appeared in alice's room history")
+        row = message(marker)
+        envelope = row.get("envelope") or {}
+        actual_body = envelope.get("body", row.get("text"))
+        if (actual_body != body or envelope.get("to", []) != recipients
+                or envelope.get("urgent", False) != urgent):
+            product(f"typed composer {marker} has wrong body, recipients or urgency: {row!r}")
+        print(f"{TAG} typed composer {marker}: {row!r}")
+    tui.key("@alice !TOKENS-762-COMBINED\r", 1)
+    posted("TOKENS-762-COMBINED", "@alice TOKENS-762-COMBINED", [fp["alice"]], True)
+    tui.key("TOKENS-762-NEXT\r", 1)
+    posted("TOKENS-762-NEXT", "TOKENS-762-NEXT", [], False)
+    tui.key("!TOKENS-762-URGENT\r", 1)
+    posted("TOKENS-762-URGENT", "TOKENS-762-URGENT", [], True)
+    tui.key("TOKENS-762-LITERAL !keep this!\r", 1)
+    posted("TOKENS-762-LITERAL", "TOKENS-762-LITERAL !keep this!", [], False)
+    tui.key("!\x7fTOKENS-762-REMOVED\r", 1)
+    posted("TOKENS-762-REMOVED", "TOKENS-762-REMOVED", [], False)
+    tui.key("@alice " + "\x7f" * len("@alice ") + "TOKENS-762-UNADDRESSED\r", 1)
+    posted("TOKENS-762-UNADDRESSED", "TOKENS-762-UNADDRESSED", [], False)
+    draft = "@zz-nobody !TOKENS-762-RETRY"
+    tui.key(draft + "\r", 1)
+    if message("TOKENS-762-RETRY") is not None or draft not in "\n".join(tui.display()):
+        product("unknown typed recipient was posted or the refused draft was lost")
+    tui.key("\x7f" * len(draft) + "@alice !TOKENS-762-RETRY\r", 1)
+    posted("TOKENS-762-RETRY", "@alice TOKENS-762-RETRY", [fp["alice"]], True)
     tui.key("\t", 1)   # composer -> members
     # The members pane, found by its title; read every row of it from the emulated screen.
     def members():

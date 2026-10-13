@@ -10,15 +10,41 @@ struct RootView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        Group {
-            if case .attached = model.phase, let node = model.node {
-                MainWindow(model: node)
-                    .font(Theme.text)
-            } else {
-                setup
+        // Reserve actual layout space: NavigationSplitView can draw its sidebar controls
+        // through safe-area insets. Setup offers and hook paths must never cover them.
+        VStack(spacing: 0) {
+            AgentSetupOffers(model: model)
+                .fixedSize(horizontal: false, vertical: true)
+            Group {
+                if case .attached = model.phase, let node = model.node {
+                    MainWindow(model: node)
+                        .font(Theme.text)
+                } else {
+                    // Keep a tall setup form scrollable in the space between the notices.
+                    ScrollView { setup }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            if let said = model.agentSetupSaid {
+                HStack(alignment: .top) {
+                    Text(said).font(Theme.text).textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("agent-hooks-installed")
+                    Spacer()
+                    Button("Dismiss") { model.agentSetupSaid = nil }
+                        .accessibilityIdentifier("agent-hooks-dismiss")
+                }
+                .padding(Space.s16)
+                .panelSurface()
+                .fixedSize(horizontal: false, vertical: true)
             }
         }
         // Node › Sign Out…: what it does, said first (E-5), done only when confirmed.
+        .sheet(item: $model.agentSetupAsk) { request in
+            AgentSetupSheet(request: request, model: model)
+                .id(request.id)
+                .interactiveDismissDisabled(model.agentSetupBusy)
+        }
         .sheet(isPresented: $model.signingOut) {
             if let node = model.signedInAs {
                 SignOutSheet(node: node, model: model)

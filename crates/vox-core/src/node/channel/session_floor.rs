@@ -268,6 +268,7 @@ impl ChannelState {
             .collect::<Vec<_>>();
         for entry in &verified {
             self.learn_session_floor(entry);
+            self.observe_legacy_drive_generation(entry);
         }
         let me = self.me();
         for entry in verified {

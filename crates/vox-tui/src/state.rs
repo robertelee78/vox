@@ -1,6 +1,6 @@
 //! The navigation / input state machine (ADR-015 §"Navigation & input").
 //!
-//! This is pure interaction logic — no terminal, no core. It owns *UI* state
+//! This is interaction logic — no terminal, no core. It owns *UI* state
 //! (which screen/pane has focus, the command-palette overlay, selection indices)
 //! and translates input into either a navigation mutation or a [`Command`] for the
 //! core. The authoritative data (members, timeline, trust) lives in the
@@ -509,23 +509,6 @@ impl UiState {
             Mode::Prompt(_) => return self.on_prompt_key(key),
             Mode::Normal => {}
         }
-        // **Ctrl-N: the next room with a message addressed to this node** (ADR-028 R-8, #484),
-        // from the room list or a room, after the one selected and round again: a room with only
-        // new messages is passed over.
-        if key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            let n = vm.channels.len();
-            let next = (1..=n)
-                .map(|k| (self.selected_channel + k) % n.max(1))
-                .find(|i| vm.channels.get(*i).is_some_and(|c| c.to_you > 0));
-            return match next {
-                Some(i) => {
-                    self.selected_channel = i;
-                    self.selected_room = vm.channels.get(i).map(|c| c.channel_id);
-                    self.open_selected(vm)
-                }
-                None => Action::Redraw,
-            };
-        }
         // The composer, when focused, owns printable keys, Backspace and Enter.
         if self.screen == Screen::Channel && self.focus == Focus::Composer {
             match key.code {
@@ -560,6 +543,12 @@ impl UiState {
                             act,
                         });
                     }
+                    // The typed tokens stay visible and editable until Enter. A leading `!`,
+                    // also after leading @names, marks urgency rather than message text (CO-3).
+                    let (text, typed_urgent) = composer_message(&text);
+                    if text.is_empty() {
+                        return Action::Redraw;
+                    }
                     // `@alias` addresses a member (ADR-028 K-4): the whole fingerprint goes into
                     // `to`. One that names nobody, or more than one, keeps the text to fix.
                     let members: Vec<Digest32> = vm
@@ -586,9 +575,9 @@ impl UiState {
                     let re = self.replying.take();
                     // Addressed or urgent, the message goes the one way a structured message is
                     // posted, as `vox room post --to … --urgent` posts it (ADR-028 W-4).
-                    if !self.to.is_empty() || self.urgent {
+                    if !self.to.is_empty() || self.urgent || typed_urgent {
                         let to = std::mem::take(&mut self.to);
-                        let urgent = std::mem::replace(&mut self.urgent, false);
+                        let urgent = std::mem::replace(&mut self.urgent, false) || typed_urgent;
                         return Action::Dispatch(Command::PostAddressed {
                             channel_id,
                             text,
@@ -644,7 +633,13 @@ impl UiState {
             // **An offer is accepted or dismissed where it waits** (ADR-028 K-16, K-18).
             KeyCode::Enter if self.screen == Screen::ChannelList && self.offer(vm).is_some() => {
                 let member = self.offer(vm).map(|o| o.member);
-                self.mode = Mode::Prompt(Prompt::new(PromptKind::AcceptOffer, member));
+                self.start_prompt(PromptKind::AcceptOffer, member);
+                if let Mode::Prompt(prompt) = &mut self.mode {
+                    if let Some((_, name)) = vm.presented.iter().find(|(fp, _)| Some(*fp) == member)
+                    {
+                        prompt.fields[0] = Zeroizing::new(name.clone());
+                    }
+                }
                 Action::Redraw
             }
             KeyCode::Char('x')
@@ -942,6 +937,13 @@ impl UiState {
     /// Open a masked prompt (also used by the loop for onboarding: no identity ⇒
     /// create; not attached ⇒ attach).
     pub fn start_prompt(&mut self, kind: PromptKind, target: Option<Digest32>) {
+        if matches!(kind, PromptKind::Trust | PromptKind::AcceptOffer) {
+            if let Some(why) = crate::coord::trust_widening_refusal() {
+                self.mode = Mode::Normal;
+                self.status_message = Some(why.into());
+                return;
+            }
+        }
         self.mode = Mode::Prompt(Prompt::new(kind, target));
     }
 
@@ -1170,7 +1172,12 @@ impl UiState {
             ));
             return Action::Redraw;
         }
-        self.mode = Mode::Prompt(Prompt::new(PromptKind::Trust, Some(fp)));
+        self.start_prompt(PromptKind::Trust, Some(fp));
+        if let Mode::Prompt(prompt) = &mut self.mode {
+            if let Some((_, name)) = vm.presented.iter().find(|(id, _)| *id == fp) {
+                prompt.fields[1] = Zeroizing::new(name.clone());
+            }
+        }
         Action::Redraw
     }
 
@@ -1960,6 +1967,29 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
         _ => return None,
     };
     Some(Parsed::Core(cmd))
+}
+
+/// Normal room composition only: Session input is delivered verbatim before this is called.
+/// Keep @names in the message, as before; consume only the leading urgency marker. Punctuation
+/// later in the message remains text, and deleting the marker in the field removes urgency.
+fn composer_message(text: &str) -> (String, bool) {
+    let mut content = text;
+    while content.starts_with('@') {
+        let Some(end) = content.find(char::is_whitespace) else {
+            break;
+        };
+        content = content[end..].trim_start();
+    }
+    match content.strip_prefix('!') {
+        Some(body) => {
+            let prefix = &text[..text.len() - content.len()];
+            (
+                format!("{prefix}{}", body.trim_start()).trim().to_owned(),
+                true,
+            )
+        }
+        None => (text.to_owned(), false),
+    }
 }
 
 /// The status line for a room passphrase left empty: it is accepted, and one is encouraged
