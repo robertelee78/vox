@@ -2027,18 +2027,21 @@ final class FirstRunProof: XCTestCase {
         defer { ui.terminate() }
         present(ui, Key.id("attached"), timeout: 60, "the app must open attached as alice")
 
-        // P1: ⌘J lands on S1, its waiting request selected.
-        ui.typeKey("j", modifierFlags: .command)
+        // P1: the room's mark leads to its Session; the waiting request is selected by a click.
+        // Next Room That Needs You and its shortcut were removed by the decider (#766).
+        tap(ui, Key.id("room-work"), "work, marked as needing alice", premise: inRoom(vox, voxEnv, "work"))
+        tap(ui, Key.id("session-\(s1.prefix(8))"), "S1 in work's Sessions")
         let requestRow = Key.idPrefix("request-row-")
         present(ui, requestRow, timeout: 30,
-                "⌘J must open S1, the Session waiting on alice, with its request",
+                "opening S1 must show its request waiting on alice",
                 premise: Premise("S1 has a request waiting on alice") {
                     let now = s1Read()
                     return (now.contains("\"waiting\":true"), "`vox room session --json` said \(now.debugDescription)")
                 })
+        tap(ui, requestRow, "S1's waiting request")
         if let row = locate(ui, requestRow), !row.isSelected {
-            keepTree(ui, "the request ⌘J landed on was not selected")
-            XCTFail("PRODUCT: ⌘J must select the waiting request in S1; its row is not selected")
+            keepTree(ui, "the waiting request clicked in S1 was not selected")
+            XCTFail("PRODUCT: clicking the waiting request in S1 must select it; its row is not selected")
         }
         // ⌥⌘Y approves the selected request: the hook gets allow.
         ui.typeKey("y", modifierFlags: [.command, .option])
