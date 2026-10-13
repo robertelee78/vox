@@ -603,18 +603,31 @@ pub async fn run_initiator(
     root: &(dyn RootSigner + Send + Sync),
     ik: &X25519IdentityKey,
 ) -> Result<JoinOutcome> {
-    initiator_exchange(conn, ctx, passphrase, root, ik, JoinPurpose::Admission)
-        .await?
-        .ok_or(Error::MalformedJoin("join stopped before admission"))
+    let streams = open_typed(conn, StreamKind::Join).await?;
+    initiator_exchange(
+        conn,
+        streams,
+        ctx,
+        passphrase,
+        root,
+        ik,
+        JoinPurpose::Admission,
+    )
+    .await?
+    .ok_or(Error::MalformedJoin("join stopped before admission"))
 }
 
 /// Check a held room's passphrase through the production join authentication exchange.
 ///
 /// The caller must own an exact local validation permit for the responder connection and
-/// stream. Both ends prove the same node's identity; this exchange creates no membership,
+/// stream before calling: `streams` is an already opened, typed Join stream on `conn`. This
+/// allows the caller to register its actual stream ID and await the registration before WANT
+/// is sent; predicting the next ID would race other streams. Both ends prove the same node's
+/// identity; this exchange creates no membership,
 /// consumes no prekey and stops before INIT. It does not authorize writing a room map itself.
 pub async fn run_initiator_validation(
     conn: &VoxConnection,
+    streams: (SendStream, RecvStream),
     ctx: JoinContext,
     passphrase: &[u8],
     root: &(dyn RootSigner + Send + Sync),
@@ -627,6 +640,7 @@ pub async fn run_initiator_validation(
     }
     match initiator_exchange(
         conn,
+        streams,
         ctx,
         passphrase,
         root,
@@ -648,6 +662,7 @@ enum JoinPurpose {
 
 async fn initiator_exchange(
     conn: &VoxConnection,
+    streams: (SendStream, RecvStream),
     ctx: JoinContext,
     passphrase: &[u8],
     root: &(dyn RootSigner + Send + Sync),
@@ -655,7 +670,7 @@ async fn initiator_exchange(
     purpose: JoinPurpose,
 ) -> Result<Option<JoinOutcome>> {
     let responder_fp = conn.peer_id();
-    let (mut send, mut recv) = open_typed(conn, StreamKind::Join).await?;
+    let (mut send, mut recv) = streams;
 
     // 0. WANT — the responder holds many channels; say which one.
     send_frame(
