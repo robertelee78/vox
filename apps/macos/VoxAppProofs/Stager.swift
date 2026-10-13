@@ -81,6 +81,10 @@ final class Stager {
         return (a["id"] as? Int ?? -1, a["line"] as? String, a["out"] as? String ?? "")
     }
 
+    func signal(_ id: Int, _ signal: String) throws {
+        _ = try ask(["op": "signal", "id": id, "signal": signal], within: 5)
+    }
+
     func stop(_ id: Int) { _ = try? ask(["op": "stop", "id": id]) }
 
     func write(_ data: Data, to path: String) throws {
@@ -100,6 +104,8 @@ final class Stager {
 struct Started {
     let stager: Stager
     let id: Int
+    func pause() throws { try stager.signal(id, "STOP") }
+    func resume() throws { try stager.signal(id, "CONT") }
     func terminate() { stager.stop(id) }
     func waitUntilExit() {}
 }

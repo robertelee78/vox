@@ -2191,6 +2191,40 @@ final class FirstRunProof: XCTestCase {
         guard present(ui, Key.id("member-bob"), timeout: 10,
                       "the recovered room's inspector must still show its remote member") else { return }
         print("[proof] timeline: displayed OLD; shipped CLI confirmed OLD pruned and KEPT complete; resumed same app without another post; KEPT and bob visible")
+        // Interrupt only the daemon this journey started, keeping the same app and room open.
+        guard let local = daemon else { throw Apparatus("the started Alice daemon handle is absent") }
+        try local.pause()
+        defer { try? local.resume() }
+        // A suspended daemon answers only when its 60-second IPC deadline expires.
+        guard words(ui, Key.id("room-header-meta"), timeout: 90,
+                    "an interrupted daemon must make the room's members unavailable, not authoritative",
+                    until: { $0.contains("members unavailable") }) != nil else { return }
+        guard timelineBody("RECOVERY-KEPT", timeout: 10,
+                           "a transport interruption must preserve the displayed retained timeline") else { return }
+        try local.resume()
+        guard words(ui, Key.id("room-header-meta"), timeout: 45,
+                    "the same room must recover its authoritative two-member roster without reopening",
+                    until: { $0.contains("2 members") && $0.contains("forever") }) != nil else { return }
+        guard present(ui, Key.id("member-bob"), timeout: 10,
+                      "the recovered room must retain its actual remote member") else { return }
+        guard timelineBody("RECOVERY-KEPT", timeout: 10,
+                           "the recovered transport must retain the complete timeline") else { return }
+        // This later header update is supplied by the room watcher, not message polling.
+        try staged(vox, ["room", "retention", "--node", "bob", room, "3600"], env: bob)
+        let retentionUntil = Date().addingTimeInterval(30)
+        var retentionSaid = ""
+        while Date() < retentionUntil {
+            retentionSaid = run(vox, ["room", "read", "--node", "alice", room, "--notices"], env: alice).out
+            if retentionSaid.contains("1 hour") { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        guard retentionSaid.contains("1 hour") else {
+            throw Apparatus("the remote owner's changed retention did not reach Alice before checking the watcher: \(retentionSaid)")
+        }
+        guard words(ui, Key.id("room-header-meta"), timeout: 15,
+                    "the recovered room's live watcher must show Bob's later retention change without reopening",
+                    until: { $0.contains("2 members") && $0.contains("1 hour") }) != nil else { return }
+        print("[proof] transport: unavailable retained timeline; same room recovered roster; later remote retention reached header")
     }
 
     func testFirstRunAttachesTheNodeAndQuitDetachesIt() throws {
