@@ -45,8 +45,7 @@ mod watchdog;
 #[path = "support/world.rs"]
 mod world;
 
-#[path = "support/attach.rs"]
-mod local_attach;
+use world::attach as local_attach;
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
