@@ -6422,24 +6422,30 @@ impl Node {
         });
     }
 
-    /// Answer a create or join once the room's first publish rounds have ended.
+    /// Answer a create or join once the room can be found through this node's own route, or
+    /// its first publish rounds have ended.
     ///
     /// **`Done` has always meant "others can find it".** A create or join awaited its first publish
     /// to the anchors before answering. Once that round moved onto its own task, `vox room create`
     /// answered before the room was on any anchor's board, and a join straight after the invite
     /// found nothing: perf_r40_relayed_chat_gate, `bob's join failed: Failed(BadLink)`, 2 of 2.
-    /// The reply now waits for the room's rounds, bounded by `ANCHOR_PUBLISH_PATIENCE` each, and
-    /// the actor serves everyone else meanwhile.
+    /// Without a route of this node's own, the reply waits for the room's rounds, bounded by
+    /// `ANCHOR_PUBLISH_PATIENCE` each, and the actor serves everyone else meanwhile.
     ///
-    /// **A node with no anchor answers at once:** it has no round to wait for, and its own board
-    /// holds the room for anyone who reaches it directly (V210-107).
+    /// **A directly reachable node never waits for an unnecessary anchor** (ADR-032 AN-1): its
+    /// own board already holds the room. Publishing to an anchor still runs in the background,
+    /// even if that anchor's held connection has gone silent. A node with no anchor also answers
+    /// at once, since it has no round to wait for (V210-107).
     async fn answer_when_published(
         &mut self,
         room: Digest32,
         reply: oneshot::Sender<Outcome>,
         outcome: Outcome,
     ) {
-        if outcome.is_done() && self.publishing.iter().any(|(r, _)| *r == room) {
+        if outcome.is_done()
+            && self.own_routes().is_empty()
+            && self.publishing.iter().any(|(r, _)| *r == room)
+        {
             self.publish_waiters.push((room, reply, outcome));
             return;
         }
