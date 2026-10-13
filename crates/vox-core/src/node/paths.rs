@@ -500,17 +500,16 @@ impl Paths {
     /// what to do, and the feature is simply unavailable on a path they chose for
     /// unrelated reasons.
     ///
-    /// The fallback is `<tmp>/vox-<uid>/<16 hex>.sock`, where the hex is a digest of the
-    /// profile directory. **Deterministic**, so a client computes the same path the
+    /// The Unix fallback is `/tmp/vox-<uid>-<16 hex>/vox.sock`, where the hex is a digest of the
+    /// profile directory. Independent of `TMPDIR`, so a client computes the same path the
     /// daemon bound without being told, and distinct per profile, so two nodes never
     /// collide. It is only used when the natural path does not fit, so an ordinary
     /// profile keeps the socket beside its vault where the trust boundary already is.
     ///
     /// **The fallback is a directory private to this user, never the shared temp
-    /// directory itself** (V210-72). It was `<tmp>/vox-<hex>.sock`, and on Linux `<tmp>` is
-    /// `/tmp`, which every local user can write: another user could bind that predictable
+    /// directory itself** (V210-72). Every local user can write `/tmp`: another user could bind a predictable
     /// name first and be handed every passphrase a client sends, or plant a file there so
-    /// the daemon could not start. [`prepare_socket_dir`] creates `vox-<uid>` `0700` and
+    /// the daemon could not start. [`prepare_socket_dir`] creates `vox-<uid>-<16 hex>` `0700` and
     /// refuses one that is a symlink or belongs to someone else, and a client refuses a
     /// socket that is not this user's ([`check_socket_owner`]).
     #[must_use]
@@ -727,7 +726,7 @@ pub fn roots(
 }
 
 /// The control socket `file` in `dir`, or its short fallback when that path does not fit a Unix
-/// socket address (see [`Paths::socket_file`]): `<tmp>/vox-<uid>/<16 hex>.sock`, the hex a digest
+/// socket address (see [`Paths::socket_file`]): `/tmp/vox-<uid>-<16 hex>/vox.sock`, the hex a digest
 /// of `dir`, so it is deterministic and distinct per directory.
 #[must_use]
 pub fn socket_path_in(dir: &Path, file: &str) -> PathBuf {
@@ -744,13 +743,12 @@ pub fn socket_path_in(dir: &Path, file: &str) -> PathBuf {
 pub(crate) fn fallback_socket_for(dir: &Path) -> PathBuf {
     let digest =
         crate::hash::domain_hash("vox/control-socket/v1", dir.as_os_str().as_encoded_bytes());
-    let mut name = String::new();
+    let mut name = format!("vox-{}-", socket_uid());
     for byte in &digest[..8] {
         use std::fmt::Write as _;
         let _ = write!(name, "{byte:02x}");
     }
-    name.push_str(".sock");
-    socket_fallback_dir().join(name)
+    socket_fallback_root().join(name).join("vox.sock")
 }
 
 fn home_dir() -> Result<PathBuf> {
@@ -808,22 +806,47 @@ pub fn my_uid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
-/// Whether `dir` is the shared temp directory's per-user socket directory (`<tmp>/vox-<uid>`),
+/// Whether `dir` is a fixed temporary directory's private fallback socket directory,
 /// which only [`prepare_socket_dir`] may create or check: it is in a directory other users can
 /// write, so it is never followed through a symlink or changed by a path.
 #[must_use]
 pub fn is_socket_fallback_dir(dir: &Path) -> bool {
-    dir == socket_fallback_dir()
+    let prefix = format!("vox-{}-", socket_uid());
+    dir.parent() == Some(socket_fallback_root().as_path())
+        && dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|name| {
+                name.strip_prefix(&prefix).is_some_and(|hash| {
+                    hash.len() == 16
+                        && hash
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
+            })
 }
 
-/// The directory a control socket goes in when the profile's own path is too long:
-/// `<tmp>/vox-<uid>` (see [`Paths::socket_file`]).
-fn socket_fallback_dir() -> PathBuf {
+fn socket_uid() -> u32 {
     #[cfg(unix)]
-    let uid = my_uid();
+    {
+        my_uid()
+    }
     #[cfg(not(unix))]
-    let uid = 0;
-    std::env::temp_dir().join(format!("vox-{uid}"))
+    {
+        0
+    }
+}
+
+/// Unix socket endpoints must fit regardless of the caller's temporary-directory environment.
+fn socket_fallback_root() -> PathBuf {
+    #[cfg(unix)]
+    {
+        PathBuf::from("/tmp")
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir()
+    }
 }
 
 /// Make the directory `socket` is to be bound in private to this user, before binding.
@@ -845,7 +868,7 @@ pub fn prepare_socket_dir(socket: &Path) -> Result<()> {
             detail: format!("{} has no parent directory", socket.display()),
         });
     };
-    let fallback = dir == socket_fallback_dir();
+    let fallback = is_socket_fallback_dir(dir);
     if fallback {
         match std::fs::DirBuilder::new().mode(0o700).create(dir) {
             Ok(()) => {}
