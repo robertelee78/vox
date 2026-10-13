@@ -60,30 +60,42 @@ impl Node {
         {
             return Ok(());
         }
-        let mut floor = 0;
-        for room in self.channels.values() {
-            floor = floor.max(room.lock().await.newest_mint_seq());
-        }
-        let changes = self.apply_computer_keyring_at(floor)?;
-        for (id, stamp) in changes {
-            self.mark_trust_decision(id, stamp).await;
-        }
-        // The existing room machinery performs pending removals, sender-key rotation, and
-        // consent delivery. Computer policy does not create a second room authorization path.
-        self.refresh_reachers().await;
-        let rooms: Vec<_> = self.channels.keys().copied().collect();
-        for room in rooms {
-            self.act_on_removals_while_closed(&room).await;
-            self.mark_decisions_on_open(&room).await;
-            if let Some(channel) = self.channels.get(&room) {
-                channel.lock().await.release_held_packages();
+        for _ in 0..8 {
+            let mut floor = 0;
+            for room in self.channels.values() {
+                floor = floor.max(room.lock().await.newest_mint_seq());
             }
-            self.install_key_packages(&room).await;
+            let changes = self.apply_computer_keyring_at(floor)?;
+            for (id, stamp) in changes {
+                self.mark_trust_decision(id, stamp).await;
+            }
+            // The existing room machinery performs pending removals, sender-key rotation, and
+            // consent delivery. Computer policy does not create a second room authorization path.
+            self.refresh_reachers().await;
+            let rooms: Vec<_> = self.channels.keys().copied().collect();
+            for room in rooms {
+                self.act_on_removals_while_closed(&room).await;
+                self.mark_decisions_on_open(&room).await;
+                if let Some(channel) = self.channels.get(&room) {
+                    channel.lock().await.release_held_packages();
+                }
+                self.install_key_packages(&room).await;
+            }
+            self.deliver_owed_consents(None).await;
+            self.tend_drive_keys().await;
+            self.publish().await;
+            if self.computer.as_ref().is_none_or(|c| {
+                c.revision()
+                    == self
+                        .computer_revision
+                        .load(std::sync::atomic::Ordering::Acquire)
+            }) {
+                return Ok(());
+            }
         }
-        self.deliver_owed_consents(None).await;
-        self.tend_drive_keys().await;
-        self.publish().await;
-        Ok(())
+        Err(Error::Profile(
+            "computer policy is still changing; this node is not ready to authorize requests",
+        ))
     }
 
     pub(super) fn apply_computer_keyring_at(

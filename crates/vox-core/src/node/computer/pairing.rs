@@ -86,6 +86,7 @@ struct Link {
     target: Digest32,
     invite: Digest32,
     secret: Zeroizing<[u8; 16]>,
+    transport: Zeroizing<Digest32>,
     expires: u64,
     endpoints: EndpointList,
     anchors: BootstrapSet,
@@ -93,7 +94,7 @@ struct Link {
 impl Link {
     fn url(&self) -> String {
         let mut e = Encoder::for_secrets();
-        e.array(7)
+        e.array(8)
             .uint(PROTOCOL)
             .bytes(&self.target)
             .bytes(&self.invite)
@@ -103,7 +104,8 @@ impl Link {
         for a in self.endpoints.addrs() {
             e.text(&a.to_string());
         }
-        e.bytes(&self.anchors.to_bytes());
+        e.bytes(&self.anchors.to_bytes())
+            .bytes(self.transport.as_ref());
         format!(
             "vox-computer://{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(e.finish())
@@ -121,7 +123,7 @@ impl Link {
                 .map_err(|_| fail())?,
         );
         let mut d = Decoder::new(&bytes);
-        arity(&mut d, 7)?;
+        arity(&mut d, 8)?;
         if d.uint()? != PROTOCOL {
             return Err(fail());
         }
@@ -139,16 +141,34 @@ impl Link {
         }
         let endpoints = EndpointList::new(addrs)?;
         let anchors = BootstrapSet::from_bytes(d.bytes()?)?;
+        let transport = Zeroizing::new(digest(&mut d)?);
         d.finish()?;
         Ok(Self {
             target,
             invite,
             secret,
+            transport,
             expires,
             endpoints,
             anchors,
         })
     }
+}
+
+#[derive(Clone)]
+struct TransportLease {
+    registration: Digest32,
+    token: Zeroizing<Digest32>,
+    expires: u64,
+    peer: Option<Digest32>,
+    anchors: BootstrapSet,
+}
+
+#[derive(Clone, Copy)]
+struct RegisteredLease {
+    connection: u64,
+    expires: u64,
+    peer: Option<Digest32>,
 }
 
 /// Management network and ceremony. It never dispatches room streams, even for enrolled peers.
@@ -162,6 +182,8 @@ pub struct Management {
     slots: Arc<tokio::sync::Semaphore>,
     problem: Mutex<Option<String>>,
     pending_nodes: Mutex<Vec<String>>,
+    transport_cache: Mutex<BTreeMap<(Digest32, Digest32), RegisteredLease>>,
+    revoked_transport: Mutex<std::collections::BTreeSet<(Digest32, Digest32, u64)>>,
 }
 impl Management {
     /// Sign a receipt only for the exact locally applied policy and authenticated roster frontier.
@@ -175,7 +197,7 @@ impl Management {
             let Some(g) = &s.genesis else {
                 return Ok(());
             };
-            if !s.quarantined.is_empty() {
+            if !s.quarantined.is_empty() || !s.history_complete() {
                 return Ok(());
             }
             if s.rosters.len() != 2 {
@@ -234,6 +256,8 @@ impl Management {
             slots: Arc::new(tokio::sync::Semaphore::new(8)),
             problem: Mutex::new(None),
             pending_nodes: Mutex::new(Vec::new()),
+            transport_cache: Mutex::new(BTreeMap::new()),
+            revoked_transport: Mutex::new(Default::default()),
         });
         let weak = Arc::downgrade(&me);
         tokio::spawn(async move {
@@ -262,6 +286,19 @@ impl Management {
                 }
             }
         });
+        let weak = Arc::downgrade(&me);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let Some(me) = weak.upgrade() else {
+                    return;
+                };
+                // An optional unreachable anchor never holds up direct pairing, status or retry.
+                let _ = me.refresh_transport().await;
+            }
+        });
         Ok(me)
     }
     fn serve(self: &Arc<Self>, conn: Arc<VoxConnection>) {
@@ -281,6 +318,24 @@ impl Management {
                     conn.mark_peer_stopped();
                     conn.close(crate::wire::WireError::ShuttingDown);
                     break;
+                }
+                if matches!(kind, StreamKind::Coord | StreamKind::Circuit)
+                    && me.net.policy().snapshot().is_anchor(&conn.peer_id())
+                {
+                    let Ok(slot) = Arc::clone(&me.slots).try_acquire_owned() else {
+                        streams::refuse(&mut send, &mut recv);
+                        continue;
+                    };
+                    let c = Arc::clone(&conn);
+                    tokio::spawn(async move {
+                        let _slot = slot;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(45),
+                            me.transport_incoming(&c, kind, send, recv),
+                        )
+                        .await;
+                    });
+                    continue;
                 }
                 if kind != StreamKind::Computer {
                     streams::refuse(&mut send, &mut recv);
@@ -325,6 +380,7 @@ impl Management {
         let endpoints = self.net.local_endpoints()?;
         let id = random_array()?;
         let secret = Zeroizing::new(random_array()?);
+        let transport = Zeroizing::new(random_array()?);
         let expires = now().saturating_add(INVITE_LIFETIME_MS);
         let nonce = random_array()?;
         let grants = [random_array()?, random_array()?];
@@ -349,6 +405,7 @@ impl Management {
             s.invitations.push(Invitation {
                 id,
                 secret: secret.clone(),
+                transport: transport.clone(),
                 expires,
                 nonce,
                 grants,
@@ -363,6 +420,7 @@ impl Management {
                 target: self.computer.signer.fingerprint(),
                 invite: id,
                 secret,
+                transport,
                 expires,
                 endpoints,
                 anchors: self.anchors.clone(),
@@ -390,11 +448,9 @@ impl Management {
             }
             let mut found = pending;
             for i in &mut s.invitations {
-                if i.id == id || pending {
-                    if !i.cancelled {
-                        found = true;
-                        i.cancelled = true;
-                    }
+                if (i.id == id || pending) && !i.cancelled {
+                    found = true;
+                    i.cancelled = true;
                 }
             }
             if !found {
@@ -403,7 +459,9 @@ impl Management {
             if let Some(g) = s.pending.take() {
                 s.cancelled.insert(g.incarnation(), g);
             }
-            s.pair_link = None;
+            if let Some(link) = s.pair_link.take() {
+                s.cancelled_links.push(link);
+            }
             s.pending_expires = 0;
             s.rosters.clear();
             Ok(())
@@ -521,6 +579,7 @@ impl Management {
                         target: local,
                         invite: i.id,
                         secret: i.secret.clone(),
+                        transport: i.transport.clone(),
                         expires: i.expires,
                         endpoints,
                         anchors: self.anchors.clone(),
@@ -576,21 +635,290 @@ impl Management {
     pub fn pending_nodes(&self, nodes: Vec<String>) {
         *lock(&self.pending_nodes) = nodes;
     }
+    fn transport_lease(&self, supplied: Option<&Link>) -> Result<Option<TransportLease>> {
+        let s = lock(&self.computer.state);
+        let local = s.description.fingerprint()?;
+        let group = s.genesis.as_ref().or(s.pending.as_ref());
+        let stored = s.pair_link.as_ref().map(|l| Link::parse(l)).transpose()?;
+        let link = supplied.or(stored.as_ref());
+        let mut anchors = self.anchors.clone();
+        if let Some(link) = link {
+            for a in link.anchors.nodes() {
+                anchors.add(a.clone())?;
+            }
+        }
+        let established = s.genesis.is_some();
+        let peer = group
+            .map(|g| side(g, &local).and_then(|at| g.computers[1 - at].fingerprint()))
+            .transpose()?;
+        let (registration, token, expires, peer) = if let Some(link) = link {
+            (
+                link.invite,
+                link.transport.clone(),
+                link.expires,
+                Some(peer.unwrap_or(link.target)),
+            )
+        } else if let Some(invite) = s
+            .invitations
+            .iter()
+            .rev()
+            .find(|i| !i.cancelled && group.map_or(i.expires > now(), |g| i.nonce == g.nonce))
+        {
+            (
+                invite.id,
+                invite.transport.clone(),
+                invite.expires,
+                peer.or(invite.target),
+            )
+        } else {
+            return Ok(None);
+        };
+        if !established && expires <= now() {
+            return Ok(None);
+        }
+        let expires = if established {
+            now().saturating_add(crate::nat::service::COMPUTER_TRANSPORT_TTL_MS / 2)
+        } else {
+            expires
+        };
+        Ok(Some(TransportLease {
+            registration,
+            token,
+            expires,
+            peer,
+            anchors,
+        }))
+    }
+
+    fn configure_transport_anchors(&self, anchors: &BootstrapSet) {
+        let mut policy = self.net.policy().snapshot();
+        for a in anchors.nodes() {
+            policy.add_anchor(a.id);
+        }
+        self.net.policy().replace(policy);
+    }
+
+    async fn transport_at(
+        self: &Arc<Self>,
+        anchor: crate::nat::bootstrap::BootstrapNode,
+        lease: TransportLease,
+        redeem: bool,
+    ) -> Result<Arc<VoxConnection>> {
+        let conn = self
+            .net
+            .manager()
+            .connect(anchor.id, &anchor.endpoints)
+            .await?;
+        self.serve(Arc::clone(&conn));
+        let cached = lock(&self.transport_cache)
+            .get(&(anchor.id, lease.registration))
+            .copied();
+        if cached.is_none_or(|old| {
+            old.connection != conn.serial()
+                || old.expires <= now().saturating_add(60_000)
+                || old.peer != lease.peer
+        }) {
+            self.net
+                .register_computer_transport(
+                    &conn,
+                    lease.registration,
+                    &lease.token,
+                    lease.expires,
+                    lease.peer,
+                )
+                .await?;
+            lock(&self.transport_cache).insert(
+                (anchor.id, lease.registration),
+                RegisteredLease {
+                    connection: conn.serial(),
+                    expires: lease.expires,
+                    peer: lease.peer,
+                },
+            );
+        }
+        if redeem {
+            if let Some(peer) = lease.peer {
+                let until = tokio::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    match self
+                        .net
+                        .redeem_computer_transport(&conn, peer, lease.registration, &lease.token)
+                        .await
+                    {
+                        Ok(()) => break,
+                        Err(Error::RendezvousRejected(_))
+                            if tokio::time::Instant::now() < until =>
+                        {
+                            tokio::time::sleep(Duration::from_millis(200)).await
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
+        Ok(conn)
+    }
+
+    async fn refresh_transport(self: &Arc<Self>) -> Result<()> {
+        let mut work = tokio::task::JoinSet::new();
+        if let Some(lease) = self.transport_lease(None)? {
+            self.configure_transport_anchors(&lease.anchors);
+            for anchor in lease.anchors.nodes() {
+                let me = Arc::clone(self);
+                let anchor = anchor.clone();
+                let lease = lease.clone();
+                work.spawn(async move { me.transport_at(anchor, lease, true).await.map(|_| ()) });
+            }
+        }
+        // Cancellation remains retryable after either daemon or anchor restarts. These are
+        // retained tombstones in the same management state, not another credential store.
+        let revoked = {
+            let s = lock(&self.computer.state);
+            let mut revoked: Vec<_> = s
+                .invitations
+                .iter()
+                .filter(|i| i.cancelled && i.expires > now())
+                .map(|i| (i.id, self.anchors.clone()))
+                .collect();
+            for url in &s.cancelled_links {
+                let link = Link::parse(url)?;
+                if link.expires <= now() {
+                    continue;
+                }
+                let mut anchors = self.anchors.clone();
+                for a in link.anchors.nodes() {
+                    anchors.add(a.clone())?;
+                }
+                revoked.push((link.invite, anchors));
+            }
+            revoked
+        };
+        for (registration, anchors) in revoked {
+            self.configure_transport_anchors(&anchors);
+            for anchor in anchors.nodes() {
+                let me = Arc::clone(self);
+                let anchor = anchor.clone();
+                work.spawn(async move {
+                    let conn = me
+                        .net
+                        .manager()
+                        .connect(anchor.id, &anchor.endpoints)
+                        .await?;
+                    me.serve(Arc::clone(&conn));
+                    let key = (anchor.id, registration, conn.serial());
+                    if !lock(&me.revoked_transport).contains(&key) {
+                        me.net
+                            .revoke_computer_transport(&conn, registration)
+                            .await?;
+                        lock(&me.revoked_transport).insert(key);
+                    }
+                    Ok(())
+                });
+            }
+        }
+        while work.join_next().await.is_some() {}
+        Ok(())
+    }
+
+    async fn transport_incoming(
+        self: &Arc<Self>,
+        conn: &Arc<VoxConnection>,
+        kind: StreamKind,
+        send: SendStream,
+        recv: RecvStream,
+    ) -> Result<()> {
+        let lease = self.transport_lease(None)?.ok_or(Error::StreamRefused(
+            "no current computer transport invitation or enrolled pair",
+        ))?;
+        if lease.anchors.get(&conn.peer_id()).is_none() {
+            return Err(Error::StreamRefused(
+                "not this computer pairing's configured anchor",
+            ));
+        }
+        let mut origins = Vec::new();
+        if let Some(peer) = lease.peer {
+            origins.push(peer);
+        }
+        if let Some(peer) = self
+            .net
+            .computer_transport_peer(conn, lease.registration)
+            .await?
+        {
+            if lease.peer.is_none_or(|expected| expected == peer) {
+                origins.push(peer);
+            }
+        }
+        let result = self
+            .net
+            .dispatch_computer_transport(conn, kind, send, recv, &origins)
+            .await?;
+        if let crate::node::network::Inbound::Punch {
+            peer,
+            coordinator,
+            send,
+            recv,
+        } = result
+        {
+            let reached = self.net.answer_punch(peer, coordinator, send, recv).await?;
+            self.serve(reached);
+        }
+        Ok(())
+    }
+
     async fn connect(
         self: &Arc<Self>,
         target: Digest32,
         endpoints: &EndpointList,
+        supplied: Option<&Link>,
     ) -> Result<Arc<VoxConnection>> {
-        let c = self.net.reach(target, endpoints).await.map_err(|e| {
+        if let Some(conn) = self.net.manager().existing(&target) {
+            return Ok(conn);
+        }
+        // The direct dial starts immediately. Anchor registration is a separate raced path and
+        // neither its absence nor its refusal can delay or fail a directly reachable computer.
+        let direct = self.net.manager().connect(target, endpoints);
+        let relay = async {
+            let lease = self.transport_lease(supplied)?.ok_or(Error::Unreachable(
+                "no current computer transport invitation or enrolled pair",
+            ))?;
+            self.configure_transport_anchors(&lease.anchors);
+            let mut attempts = tokio::task::JoinSet::new();
+            for anchor in lease.anchors.nodes() {
+                let me = Arc::clone(self);
+                let anchor = anchor.clone();
+                let lease = lease.clone();
+                attempts.spawn(async move {
+                    me.transport_at(anchor, lease, true).await?;
+                    me.net.reach(target, &EndpointList::default()).await
+                });
+            }
+            let mut last = Error::Unreachable("no anchor configured for this computer pairing");
+            while let Some(result) = attempts.join_next().await {
+                match result {
+                    Ok(Ok(conn)) => return Ok(conn),
+                    Ok(Err(e)) => last = e,
+                    Err(_) => {}
+                }
+            }
+            Err(last)
+        };
+        tokio::pin!(direct, relay);
+        let result = tokio::select! {
+            d = &mut direct => match d { Ok(c) => Ok(c), Err(d) => relay.await.map_err(|r| Error::Handshake(format!("direct: {d}; computer relay: {r}"))) },
+            r = &mut relay => match r { Ok(c) => Ok(c), Err(r) => direct.await.map_err(|d| Error::Handshake(format!("direct: {d}; computer relay: {r}"))) },
+        };
+        let conn = result.map_err(|e| {
             Error::Handshake(format!(
                 "computer could not be reached; the pairing code was not checked: {e}"
             ))
         })?;
-        self.serve(Arc::clone(&c));
-        Ok(c)
+        self.serve(Arc::clone(&conn));
+        Ok(conn)
     }
     async fn pair(self: &Arc<Self>, link: &Link, url: &str) -> Result<()> {
-        let conn = self.connect(link.target, &link.endpoints).await?;
+        let conn = self
+            .connect(link.target, &link.endpoints, Some(link))
+            .await?;
         let (mut send, mut recv) = streams::open_typed(&conn, StreamKind::Computer).await?;
         write_frame(
             &mut send,
@@ -615,7 +943,7 @@ impl Management {
         {
             return Err(bad());
         }
-        let ci = context(&link.invite, &g);
+        let ci = context(&link.invite, &link.transport, &g);
         let (state, share) = cpace::CpaceState::start_with_context(
             link.secret.as_ref(),
             &ci,
@@ -706,7 +1034,7 @@ impl Management {
             (i.clone(), g)
         };
         let sid = cpace::fresh_sid()?;
-        let ci = context(&id, &g);
+        let ci = context(&id, &invite.transport, &g);
         let (state, share) = cpace::CpaceState::start_with_context(
             invite.secret.as_ref(),
             &ci,
@@ -782,9 +1110,9 @@ impl Management {
             c
         } else if let Some(url) = link {
             let l = Link::parse(&url)?;
-            self.connect(peer, &l.endpoints).await?
+            self.connect(peer, &l.endpoints, Some(&l)).await?
         } else {
-            return Ok(());
+            self.connect(peer, &EndpointList::default(), None).await?
         };
         self.serve(Arc::clone(&conn));
         let payload = exchange(&lock(&self.computer.state))?;
@@ -808,10 +1136,11 @@ fn side(g: &Genesis, id: &Digest32) -> Result<usize> {
         .position(|d| d.fingerprint().ok() == Some(*id))
         .ok_or(Error::SignatureInvalid)
 }
-fn context(invite: &Digest32, g: &Genesis) -> Vec<u8> {
+fn context(invite: &Digest32, transport: &Digest32, g: &Genesis) -> Vec<u8> {
     let mut e = Encoder::new();
-    e.array(4)
+    e.array(5)
         .bytes(invite)
+        .bytes(&sha256(transport))
         .bytes(&g.body())
         .uint(u64::from(crate::suite::VOX_SUITE_1.id))
         .uint(PROTOCOL);
@@ -983,6 +1312,9 @@ fn receipt_body(s: &State, revision: u64) -> Result<Vec<u8>> {
 }
 fn valid_receipt(s: &State, author: &Digest32, r: &Signed) -> Result<bool> {
     r.verify(b"vox/computer-applied/v1\0", author)?;
+    if !s.history_complete() || !s.quarantined.is_empty() {
+        return Ok(false);
+    }
     let Some(g) = s.genesis.as_ref() else {
         return Ok(false);
     };

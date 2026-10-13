@@ -5825,7 +5825,23 @@ impl Node {
     /// or when it is already up.
     fn start_network(&mut self) -> crate::error::Result<()> {
         self.prepare_computer_binding()?;
-        self.apply_computer_keyring_at(0)?;
+        for attempt in 0..8 {
+            self.apply_computer_keyring_at(0)?;
+            if self.computer.as_ref().is_none_or(|c| {
+                !c.grouped()
+                    || c.revision()
+                        == self
+                            .computer_revision
+                            .load(std::sync::atomic::Ordering::Acquire)
+            }) {
+                break;
+            }
+            if attempt == 7 {
+                return Err(Error::Profile(
+                    "computer policy is still changing; attach again after it settles",
+                ));
+            }
+        }
         let Some(bind) = self.bind.as_ref() else {
             return Ok(());
         };

@@ -509,6 +509,7 @@ struct RosterEvent {
 pub(crate) struct Invitation {
     pub id: Digest32,
     pub secret: Zeroizing<[u8; 16]>,
+    pub transport: Zeroizing<Digest32>,
     pub expires: u64,
     pub nonce: Digest32,
     pub grants: [Digest32; 2],
@@ -518,9 +519,10 @@ pub(crate) struct Invitation {
 impl Invitation {
     fn encode(&self) -> Vec<u8> {
         let mut e = Encoder::for_secrets();
-        e.array(8)
+        e.array(9)
             .bytes(&self.id)
             .bytes(self.secret.as_ref())
+            .bytes(self.transport.as_ref())
             .uint(self.expires)
             .bytes(&self.nonce)
             .bytes(&self.grants[0])
@@ -536,9 +538,10 @@ impl Invitation {
     }
     fn decode(b: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(b);
-        arity(&mut d, 8)?;
+        arity(&mut d, 9)?;
         let id = digest(&mut d)?;
         let secret = Zeroizing::new(d.bytes()?.try_into().map_err(|_| bad())?);
+        let transport = Zeroizing::new(digest(&mut d)?);
         let expires = d.uint()?;
         let nonce = digest(&mut d)?;
         let grants = [digest(&mut d)?, digest(&mut d)?];
@@ -557,6 +560,7 @@ impl Invitation {
         Ok(Self {
             id,
             secret,
+            transport,
             expires,
             nonce,
             grants,
@@ -577,6 +581,7 @@ pub(crate) struct AppliedPolicy {
 
 #[derive(Clone)]
 pub(crate) struct State {
+    pub cancelled_links: Vec<Zeroizing<String>>,
     pub cancelled: BTreeMap<Digest32, Genesis>,
     pub history: BTreeMap<Digest32, Roster>,
     pub quarantined: std::collections::BTreeSet<Digest32>,
@@ -615,6 +620,40 @@ impl State {
             }
         }
         heads.into_keys().collect()
+    }
+
+    fn history_complete(&self) -> bool {
+        let Some(g) = self.genesis.as_ref().or(self.pending.as_ref()) else {
+            return true;
+        };
+        let mut known = std::collections::BTreeSet::from([g.incarnation()]);
+        let mut pending: Vec<_> = self
+            .history
+            .iter()
+            .filter_map(|(id, r)| {
+                r.event()
+                    .ok()
+                    .filter(|e| e.group == g.incarnation())
+                    .map(|e| (*id, e))
+            })
+            .collect();
+        loop {
+            let before = pending.len();
+            pending.retain(|(id, event)| {
+                if event.heads.iter().all(|h| known.contains(h)) {
+                    known.insert(*id);
+                    false
+                } else {
+                    true
+                }
+            });
+            if pending.is_empty() {
+                return true;
+            }
+            if pending.len() == before {
+                return false;
+            }
+        }
     }
 
     /// Retain evidence before folding it. A missing causal parent gives no authority; conflicting
@@ -740,7 +779,7 @@ impl State {
     }
     fn body(&self) -> Vec<u8> {
         let mut e = Encoder::for_secrets();
-        e.array(14)
+        e.array(15)
             .bytes(&self.description.encode())
             .uint(self.revision)
             .array(self.invitations.len());
@@ -800,11 +839,15 @@ impl State {
         for (id, g) in &self.cancelled {
             e.array(2).bytes(id).bytes(&g.encode());
         }
+        e.array(self.cancelled_links.len());
+        for link in &self.cancelled_links {
+            e.text(link);
+        }
         e.finish()
     }
     fn read(vault: Vec<u8>, body: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(body);
-        arity(&mut d, 14)?;
+        arity(&mut d, 15)?;
         let description = Description::decode(d.bytes()?)?;
         let revision = d.uint()?;
         let n = count(&mut d)?;
@@ -918,8 +961,14 @@ impl State {
                 return Err(bad());
             }
         }
+        let n = count(&mut d)?;
+        let mut cancelled_links = Vec::with_capacity(n);
+        for _ in 0..n {
+            cancelled_links.push(Zeroizing::new(d.text()?.to_owned()));
+        }
         d.finish()?;
         let mut s = Self {
+            cancelled_links,
             cancelled,
             history,
             quarantined,
@@ -1175,11 +1224,12 @@ impl Computer {
     /// node store protection. A crash before this write repeats reconciliation before networking.
     pub fn mark_applied(&self, node: Digest32, revision: u64, covered: &[Digest32]) -> Result<()> {
         self.change(|s| {
-            if s.revision != revision {
-                return Err(Error::Profile(
-                    "computer policy changed during reconciliation",
-                ));
+            if revision > s.revision {
+                return Err(bad());
             }
+            // Another authenticated roster may have arrived during the node store write.
+            // Record the exact revision actually applied; the actor retries before authorizing.
+
             let interval = s.genesis.as_ref().ok_or_else(bad)?.incarnation();
             let applied = s.applied.entry(node).or_insert_with(|| AppliedPolicy {
                 revision,
@@ -1272,6 +1322,7 @@ impl Computer {
         };
         Description::decode(&description.encode())?;
         let state = State {
+            cancelled_links: Vec::new(),
             cancelled: BTreeMap::new(),
             history: BTreeMap::new(),
             quarantined: std::collections::BTreeSet::new(),
