@@ -992,7 +992,7 @@ enum AgentCmd {
     /// Run from a harness session at its start (the agent skill says to), when no hook has
     /// brought Vox's news: it only reads, and says the first thing missing with the one command
     /// the operator runs for it in a terminal of their own — `vox agent setup` when no node is
-    /// wired to the harness, `vox node attach` when its node is not attached, the room ask with
+    /// wired to the harness, `vox node unlock` when its node is not attached, the room ask with
     /// `vox room join … --bind` when the directory is bound to no room — or that nothing is.
     ///
     /// For example:
@@ -1615,7 +1615,7 @@ impl AccountArgs {
 #[derive(Subcommand, Debug, Clone)]
 pub enum NodeCmd {
     /// Make a new node: an identity with its own rooms, trust and services. Its files are
-    /// written here, and it is attached and remembered at once, as `vox node attach` does. The
+    /// written here, and it is attached and remembered at once, as `vox node unlock` does. The
     /// passphrase comes from `--passphrase-file`, `VOX_IDENTITY_PASSPHRASE`, or is asked twice;
     /// an empty one gives the node none, and says that its key is then kept unencrypted.
     Create {
@@ -1631,22 +1631,26 @@ pub enum NodeCmd {
         #[command(flatten)]
         account: AccountArgs,
     },
-    /// Attach a node to the daemon by hand (starting the daemon if none runs), until `vox node
-    /// detach`. It is remembered: its passphrase is stored in the Keychain (none is needed for a
-    /// node made with none), and the daemon attaches it again by itself whenever it starts, after
-    /// an update or a reboot too. `--no-remember` stores nothing; `vox node forget-passphrase`
-    /// forgets it later. Where there is no Keychain, `--keep --passphrase-file` keeps it.
+    /// Unlock a node and always remember it for daemon restarts, updates and reboots.
+    /// On a Mac its passphrase is stored in the Keychain; elsewhere a nonempty passphrase
+    /// requires a persistent --passphrase-file. A node with no passphrase needs no secret stored.
+    Unlock {
+        /// The node.
+        name: String,
+        /// Read the identity passphrase from this file (first line; `-` reads stdin on a Mac).
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+        #[command(flatten)]
+        account: AccountArgs,
+    },
+    /// Renamed to `vox node unlock`; unlock always remembers the node.
     Attach {
         /// The node.
         name: String,
-        /// With `--passphrase-file`: keep it by that file, read by the daemon at each start,
-        /// instead of the Keychain.
-        #[arg(long, requires = "passphrase_file", conflicts_with = "no_remember")]
-        keep: bool,
-        /// Attach it until it is detached or the daemon stops, and store nothing.
+        /// Accepted with no effect: unlock always remembers the node.
         #[arg(long)]
-        no_remember: bool,
-        /// Read the identity passphrase from this file (first line).
+        keep: bool,
+        /// Read the identity passphrase from this file (first line; `-` reads stdin on a Mac).
         #[arg(long)]
         passphrase_file: Option<PathBuf>,
         #[command(flatten)]
@@ -1671,7 +1675,15 @@ pub enum NodeCmd {
         #[command(flatten)]
         account: AccountArgs,
     },
-    /// Detach a node: its connections close and its keys are wiped from memory.
+    /// Lock a node and forget what brings it back: its remembered passphrase and restart state.
+    /// Its rooms, messages and keys stay on disk. It stays Locked until unlocked again.
+    Lock {
+        /// The node.
+        name: String,
+        #[command(flatten)]
+        account: AccountArgs,
+    },
+    /// Renamed to `vox node lock`; lock also forgets what brings the node back.
     Detach {
         /// The node.
         name: String,
@@ -1680,7 +1692,7 @@ pub enum NodeCmd {
     },
     /// Sign a node out: detach it, stop keeping it (its `.daemon/attach` line and Keychain
     /// passphrase go), and forget the app's choice of it, so nothing brings it back without you.
-    /// Its rooms and messages stay on disk; `vox node attach` uses it again.
+    /// Its rooms and messages stay on disk; `vox node unlock` uses it again.
     Signout {
         /// The node.
         name: String,
@@ -1706,21 +1718,21 @@ fn run_node_cmd(cmd: NodeCmd) -> ExitCode {
             crate::client::node_create(&account.as_node_args(), &name, passphrase_file, headless)
                 .await
         }),
-        NodeCmd::Attach {
+        NodeCmd::Unlock {
             name,
-            keep,
-            no_remember,
             passphrase_file,
             account,
         } => block_on_client(async move {
-            crate::client::node_attach(
-                &account.as_node_args(),
-                &name,
-                keep,
-                no_remember,
-                passphrase_file,
-            )
-            .await
+            crate::client::node_unlock(&account.as_node_args(), &name, passphrase_file).await
+        }),
+        NodeCmd::Attach {
+            name,
+            keep: _,
+            passphrase_file,
+            account,
+        } => block_on_client(async move {
+            eprintln!("`vox node attach` is now `vox node unlock`");
+            crate::client::node_unlock(&account.as_node_args(), &name, passphrase_file).await
         }),
         NodeCmd::Rename { old, new, account } => block_on_client(async move {
             crate::client::node_rename(&account.as_node_args(), &old, &new).await
@@ -1728,8 +1740,12 @@ fn run_node_cmd(cmd: NodeCmd) -> ExitCode {
         NodeCmd::ForgetPassphrase { name, account } => block_on_client(async move {
             crate::client::node_forget_passphrase(&account.as_node_args(), &name).await
         }),
+        NodeCmd::Lock { name, account } => block_on_client(async move {
+            crate::client::node_lock(&account.as_node_args(), &name).await
+        }),
         NodeCmd::Detach { name, account } => block_on_client(async move {
-            crate::client::node_detach(&account.as_node_args(), &name).await
+            eprintln!("`vox node detach` is now `vox node lock`");
+            crate::client::node_lock(&account.as_node_args(), &name).await
         }),
         NodeCmd::Signout { name, account } => block_on_client(async move {
             crate::client::node_signout(&account.as_node_args(), &name).await
@@ -2179,7 +2195,7 @@ enum Cmd {
     /// control socket every other `vox` command talks to (`<data root>/.daemon/vox.sock`) and
     /// the nodes that are attached. It is not a node itself and can run with none attached.
     /// A node is an identity; while attached it runs in full, and it stops only when it is
-    /// detached (`vox node detach`) or the daemon stops.
+    /// detached (`vox node lock`) or the daemon stops.
     ///
     /// With `--node`, or when the data root holds exactly one node, that node is attached in
     /// the foreground once its passphrase is given: from `--passphrase-file`, else
@@ -2194,7 +2210,7 @@ enum Cmd {
     /// for this data root, a `vox daemon --node <name>` attaches the node to it instead.
     ///
     /// You rarely need to start it by hand: `vox serve`, `connect`, `up`, `forward`,
-    /// `lan up`, `vox node attach` and the TUI start one in the background when none runs, and
+    /// `lan up`, `vox node unlock` and the TUI start one in the background when none runs, and
     /// that one exits when it has no node and no client left. One started here runs until
     /// stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each detaches every node cleanly
     /// and stops it.
@@ -2235,7 +2251,7 @@ enum Cmd {
     /// recorded on the GitHub issue through awa; `--work` carries awa's work key.
     ///
     /// These never attach a node: they ask the vox daemon as a node that is already
-    /// attached (`vox node attach`, or a verb or agent session holding it), which is how
+    /// attached (`vox node unlock`, or a verb or agent session holding it), which is how
     /// several agent sessions share one identity per machine. None of them takes the
     /// identity passphrase; `join` and `create` take the room passphrase at a terminal, or
     /// from stdin with `--passphrase-file -`.
@@ -2359,7 +2375,7 @@ enum Cmd {
     ///
     /// On a Mac, Vox.app is replaced whole. A running vox daemon is then restarted onto the new
     /// version: a node whose passphrase the daemon keeps is attached again, and any other node
-    /// it had attached is named, with the `vox node attach` that attaches it again. A daemon
+    /// it had attached is named, with the `vox node unlock` that attaches it again. A daemon
     /// run by hand (`vox daemon` in a terminal) is left running, and you are told.
     Update {
         /// Report whether a newer release exists, and change nothing.

@@ -71,6 +71,9 @@
 #![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
 
+#[path = "support/attach.rs"]
+mod unlock_staging;
+
 #[path = "support/optional_proof.rs"]
 mod optional_proof;
 optional_proof::not_run!(
@@ -150,7 +153,12 @@ fn vox(data: &Path, cfg: &Path, args: &[&str], input: Option<&str>) -> (bool, St
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", &home)
         .env("VOX_PROXY", "127.0.0.1:0")
-        .args(args)
+        .args(crate::unlock_staging::persistent_args(
+            data,
+            args,
+            "the agent node's identity passphrase",
+        ))
+        .env("VOX_TEST_KEYCHAIN", crate::unlock_staging::keychain(data))
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", cfg)
         // Every node has a passphrase (ADR-028 K-11); the operator attaches the agent's node
@@ -805,7 +813,12 @@ fn vox_as(
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", &home)
         .env("LANG", "en_US.UTF-8")
-        .args(args)
+        .args(crate::unlock_staging::persistent_args(
+            data,
+            args,
+            &format!("the {node} node's identity passphrase"),
+        ))
+        .env("VOX_TEST_KEYCHAIN", crate::unlock_staging::keychain(data))
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", cfg)
         .env(

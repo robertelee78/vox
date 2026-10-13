@@ -160,7 +160,7 @@ struct Attached {
 
 /// How a node is wanted, and so how its attach counts.
 enum Want {
-    /// `vox node attach` (or `--keep` at start): stays until detached by hand (L-3).
+    /// `vox node unlock` (or `--keep` at start): stays until detached by hand (L-3).
     Explicit(Option<KeepSource>),
     /// A held connection: attached implicitly if need be, and held while the connection is open.
     Hold,
@@ -405,7 +405,7 @@ impl Router {
             .collect()
     }
 
-    /// Attach `node` by hand (`vox node attach`), recording it in the attach file when `keep` is
+    /// Attach `node` by hand (`vox node unlock`), recording it in the attach file when `keep` is
     /// given (L-4). Idempotent: an attached node stays as it is, and is now held by hand.
     ///
     /// # Errors
@@ -508,6 +508,10 @@ impl Router {
                     if stored.is_ok() {
                         a.implicit = false;
                         a.keep = Some(KeepSource::Keychain(account.clone()));
+                    } else {
+                        // The failed store removes its Keychain item below. Do not retain a
+                        // stale restart entry or tell the client this node is still remembered.
+                        a.keep = None;
                     }
                     g.info = info_of_attached(node, a);
                     true
@@ -1815,9 +1819,17 @@ impl Router {
             KeepSource::File(path) => match crate::tunnel_cli::passphrase_file_text(path) {
                 Ok(text) => split_passphrases(&text),
                 Err(e) => {
+                    let command = vox_text::shell::command(&[
+                        "vox",
+                        "node",
+                        "unlock",
+                        node.as_str(),
+                        "--passphrase-file",
+                        &path.to_string_lossy(),
+                    ]);
                     eprintln!(
-                        "vox daemon: could not attach kept node {node}: its passphrase file {}: \
-                         {e}",
+                        "vox daemon: node {node} is Locked: its remembered passphrase file {} \
+                         is unavailable: {e}; restore the file, then run `{command}`",
                         path.display()
                     );
                     return;
@@ -1853,7 +1865,7 @@ impl Router {
             crate::notify::needs_passphrase(
                 &paths,
                 node.as_str(),
-                &format!("It did not attach by itself. Run in a terminal: vox node attach {node}"),
+                &format!("It did not attach by itself. Run in a terminal: vox node unlock {node}"),
             );
         })
         .await;

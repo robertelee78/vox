@@ -30,6 +30,9 @@
 
 #![cfg(unix)]
 
+#[path = "support/attach.rs"]
+mod unlock_staging;
+
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -110,7 +113,15 @@ impl World {
                 "VOX_TEST_HOLD_PACKAGES_FILE",
                 self.root.join("hold-packages"),
             )
-            .args(args);
+            .args(crate::unlock_staging::persistent_args(
+                &self.data,
+                args,
+                &format!("pass of {node}"),
+            ))
+            .env(
+                "VOX_TEST_KEYCHAIN",
+                crate::unlock_staging::keychain(&self.data),
+            );
         c
     }
 

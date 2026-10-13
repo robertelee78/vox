@@ -12,6 +12,9 @@
 
 #![allow(clippy::unwrap_used)]
 
+#[path = "support/attach.rs"]
+mod unlock_staging;
+
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -76,11 +79,17 @@ impl Account {
                 c.env(key, v);
             }
         }
-        c.args(args)
-            .env("VOX_DATA_DIR", &self.data)
-            .env("VOX_CONFIG_DIR", &self.cfg)
-            .env("VOX_LISTEN", "127.0.0.1:0")
-            .env("VOX_IDENTITY_PASSPHRASE", PASS);
+        c.args(crate::unlock_staging::persistent_args(
+            &self.data, args, PASS,
+        ))
+        .env(
+            "VOX_TEST_KEYCHAIN",
+            crate::unlock_staging::keychain(&self.data),
+        )
+        .env("VOX_DATA_DIR", &self.data)
+        .env("VOX_CONFIG_DIR", &self.cfg)
+        .env("VOX_LISTEN", "127.0.0.1:0")
+        .env("VOX_IDENTITY_PASSPHRASE", PASS);
         c
     }
 
