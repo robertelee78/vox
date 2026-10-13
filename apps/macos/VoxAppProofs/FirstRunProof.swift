@@ -1575,7 +1575,10 @@ final class FirstRunProof: XCTestCase {
         func quitComputerAccount() throws {
             let computerView = pairingUI.scrollViews.matching(identifier: "computer-trust-sheet").firstMatch
             if computerView.exists {
-                let done = pairingUI.buttons.matching(identifier: "computer-done").firstMatch
+                // SwiftUI propagates the sheet's identifier onto its Done button.
+                // Scope the visible action to the actual sheet and its button label.
+                let done = pairingUI.sheets.buttons.matching(NSPredicate(
+                    format: "identifier == %@ AND label == %@", "computer-trust-sheet", "Done")).firstMatch
                 guard done.exists, done.isHittable, inView(pairingUI, done) else {
                     keepTree(pairingUI, "the computer account's Done action could not be delivered")
                     XCTFail("APPARATUS: the visible computer view’s Done button could not be staged for account switching")
