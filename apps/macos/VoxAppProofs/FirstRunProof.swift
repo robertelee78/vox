@@ -4425,6 +4425,10 @@ final class FirstRunProof: XCTestCase {
         tree.name = "Vox's UI tree when \(why)"
         tree.lifetime = .keepAlways
         add(tree)
+        let screen = XCTAttachment(screenshot: ui.screenshot())
+        screen.name = "Vox's screen when \(why)"
+        screen.lifetime = .keepAlways
+        add(screen)
     }
 
     /// The element `key` names, where it is now (else a query that finds nothing): for reading
@@ -4466,6 +4470,10 @@ final class FirstRunProof: XCTestCase {
         }
         let anywhere = key.query(in: ui.descendants(matching: .any)).firstMatch
         if anywhere.exists {
+            let found = XCTAttachment(string: anywhere.debugDescription)
+            found.name = "The matching element outside the searched containers"
+            found.lifetime = .keepAlways
+            add(found)
             XCTFail("APPARATUS: \(key) is in the app only outside its windows, dialogs, sheets, popovers and menus (\(anywhere.elementType.rawValue)); the proof's search missed it",
                     file: file, line: line)
             return
