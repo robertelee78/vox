@@ -5332,15 +5332,8 @@ impl Node {
                 // on a stale address.
                 self.anchor_backoff.clear();
                 self.redial_anchors_if_due();
-                // And give the rooms the new address too. A channel keeps the anchor set
-                // it adopted when it was created or joined, and that set is what an
-                // invite link carries — so without this a room minted before the move
-                // would go on handing out an address nobody can dial.
-                let open: Vec<Digest32> = self.channels.keys().copied().collect();
-                for channel_id in open {
-                    self.adopt_channel_anchors(&channel_id, Some(&anchors))
-                        .await;
-                }
+                // Machine configuration does not write room provenance. The room's own
+                // anchor statement and its addresses remain independent of this refresh.
                 Outcome::Done
             }
             NodeCommand::VerifyPassphrase { passphrase } => match self.profile.as_ref() {
@@ -6800,7 +6793,7 @@ impl Node {
     }
 
     /// Make a channel's anchors this node's: record `more` on the channel (persisted
-    /// under its SEK) and the configured set with it, treat every one as an anchor,
+    /// under its SEK), treat every one as an anchor,
     /// and dial any not yet connected. Called when a channel is created, opened or
     /// joined.
     async fn adopt_channel_anchors(&mut self, channel_id: &Digest32, more: Option<&BootstrapSet>) {
@@ -6809,12 +6802,8 @@ impl Node {
         };
         let (anchors, own, members, settled) = {
             let mut channel = shared.lock().await;
-            if let Some(profile) = self.profile.as_ref() {
-                let mut add = self.anchors.clone();
-                if let Some(more) = more {
-                    let _ = add.merge_endpoints(more);
-                }
-                let _ = channel.add_anchors(profile.store(), &add);
+            if let (Some(profile), Some(more)) = (self.profile.as_ref(), more) {
+                let _ = channel.add_anchors(profile.store(), more);
             }
             // A link names the member who issued it too, last; a member is reached at the
             // addresses its board record gives, not kept like an anchor at the link's.
@@ -6847,7 +6836,13 @@ impl Node {
                 continue;
             }
             self.anchor_ids.insert(anchor.id);
-            self.dial_anchor(&net, anchor.id, anchor.endpoints.direct_candidates());
+            let addresses = self
+                .anchors
+                .get(&anchor.id)
+                .unwrap_or(anchor)
+                .endpoints
+                .direct_candidates();
+            self.dial_anchor(&net, anchor.id, addresses);
         }
         // **A member the room's address names is reached as a member** (V030-51): left out of the
         // anchors' dial above, it must still be dialled, through the member ladder, which asks a
@@ -9127,17 +9122,12 @@ impl Node {
         let Some(net) = self.net.as_ref() else {
             return Vec::new();
         };
-        // The link names the swarm's anchors — the channel's own, then the configured
-        // set — and this node last: an anchor is reachable by design, this node's own
+        // The link names the room's own anchors and this node last. Machine hand-added
+        // anchors do not become the room's merely because this node uses them. This node's own
         // addresses may not be, and a joiner tries them in this order.
         let mut anchors: Vec<BootstrapNode> = Vec::new();
         if let Some(shared) = self.channels.get(channel_id) {
             for n in shared.lock().await.anchors().nodes() {
-                anchors.push(n.clone());
-            }
-        }
-        for n in self.anchors.nodes() {
-            if !anchors.iter().any(|a| a.id == n.id) {
                 anchors.push(n.clone());
             }
         }
@@ -10297,16 +10287,13 @@ impl Node {
             }
         }
         // The link's anchors are this channel's anchors from now on (persisted, so a
-        // restart still knows where the swarm's board is), together with our own.
+        // restart still knows where the room's board is).
         let mut learned = BootstrapSet::new();
         for a in parsed.anchors.iter().filter(|a| a.id != me) {
             let _ = learned.add(a.clone());
         }
-        // `merge_endpoints`, not `merge`: the link's anchors went in first, so with
-        // keep-first semantics a link minted before the anchor moved would win and this
-        // node's freshly resolved address for the same identity would be discarded —
-        // the joiner would adopt the stale address and keep it.
-        let _ = learned.merge_endpoints(&self.anchors);
+        // Locally configured anchors remain a separate machine source. Their addresses
+        // take precedence for local dials, without rewriting the room's statement.
         self.adopt_channel_anchors(&parsed.channel_id, Some(&learned))
             .await;
         self.refresh_network_view().await;
