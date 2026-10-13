@@ -273,6 +273,13 @@ fn serve_board(
                         }
                         Ok(RendezvousRequest::Get { .. }) => vec![RendezvousResponse::End],
                         Ok(RendezvousRequest::Put { .. }) => vec![RendezvousResponse::Accepted],
+                        // This room-board apparatus provides no computer transport service.
+                        Ok(
+                            RendezvousRequest::ComputerRegister { .. }
+                            | RendezvousRequest::ComputerRedeem { .. }
+                            | RendezvousRequest::ComputerRevoke { .. }
+                            | RendezvousRequest::ComputerPeer { .. },
+                        ) => break,
                         Err(_) => break,
                     };
                     let whole = replies.len() > 1;

@@ -150,6 +150,7 @@ fn sample_overflow(
 
 /// One node on a [`SharedEndpoint`].
 struct Registered {
+    management: bool,
     local: Arc<LocalNode>,
     signer: Arc<dyn RootSigner + Send + Sync>,
     /// Where the node's accepted connections go, when something routes them by node
@@ -880,7 +881,17 @@ impl SharedEndpoint {
         signer: Arc<dyn RootSigner + Send + Sync>,
         inbound: Option<tokio::sync::mpsc::Sender<VoxConnection>>,
     ) -> Result<VoxEndpoint> {
-        self.register_as(signer, inbound, false)
+        self.register_as(signer, inbound, false, false)
+    }
+
+    /// Register the daemon management identity in a separate dispatch role. It is never
+    /// reported as a node; its sink must refuse node and room stream kinds.
+    pub fn register_management(
+        self: &Arc<Self>,
+        signer: Arc<dyn RootSigner + Send + Sync>,
+        inbound: tokio::sync::mpsc::Sender<VoxConnection>,
+    ) -> Result<VoxEndpoint> {
+        self.register_as(signer, Some(inbound), false, true)
     }
 
     fn register_as(
@@ -888,6 +899,7 @@ impl SharedEndpoint {
         signer: Arc<dyn RootSigner + Send + Sync>,
         inbound: Option<tokio::sync::mpsc::Sender<VoxConnection>>,
         solo: bool,
+        management: bool,
     ) -> Result<VoxEndpoint> {
         let id = signer.fingerprint();
         let local = LocalNode::new(id)?;
@@ -899,6 +911,7 @@ impl SharedEndpoint {
             reg.insert(
                 id,
                 Registered {
+                    management,
                     local: Arc::clone(&local),
                     signer: Arc::clone(&signer),
                     inbound,
@@ -956,7 +969,10 @@ impl SharedEndpoint {
     /// The fingerprints of the nodes registered now.
     #[must_use]
     pub fn registered(&self) -> Vec<Digest32> {
-        lock(&self.registry).keys().copied().collect()
+        lock(&self.registry)
+            .iter()
+            .filter_map(|(id, r)| (!r.management).then_some(*id))
+            .collect()
     }
 
     /// The bound local socket address.
@@ -1130,7 +1146,7 @@ impl VoxEndpoint {
     /// # Errors
     /// As [`SharedEndpoint::bind`].
     pub fn bind(signer: Arc<dyn RootSigner + Send + Sync>, addr: SocketAddr) -> Result<Self> {
-        SharedEndpoint::bind(addr)?.register_as(signer, None, true)
+        SharedEndpoint::bind(addr)?.register_as(signer, None, true, false)
     }
 
     /// [`Self::bind`] on a caller-supplied datagram socket ([`SharedEndpoint::bind_abstract`]).
@@ -1141,7 +1157,7 @@ impl VoxEndpoint {
         signer: Arc<dyn RootSigner + Send + Sync>,
         socket: Arc<dyn quinn::AsyncUdpSocket>,
     ) -> Result<Self> {
-        SharedEndpoint::bind_abstract(socket)?.register_as(signer, None, true)
+        SharedEndpoint::bind_abstract(socket)?.register_as(signer, None, true, false)
     }
 
     /// The shared endpoint this view is on.
