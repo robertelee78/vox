@@ -672,6 +672,9 @@ final class AppModel: ObservableObject {
     func declineAgentSetup(_ request: AgentSetupRequest) {
         guard !agentSetupBusy else { return }
         do {
+            let held = try AgentSetupStore.lock(request)
+            defer { try? held.close() }
+            guard currentAgentSetup(request) else { return }
             try AgentSetupStore.answer(request, outcome: "declined", node: request.node)
             agentSetupAsk = nil
             agentSetupSaid = "\(request.name) setup is declined. You can choose Set Up in Vox Settings later."
@@ -682,11 +685,37 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// An open sheet can outlive an unsolicited offer being replaced by an agent's request.
+    /// Show that new request for a fresh click; never answer a window the person has not read.
+    private func currentAgentSetup(_ shown: AgentSetupRequest) -> Bool {
+        guard let current = AgentSetupStore.requests().first(where: { $0.harness == shown.harness })
+        else {
+            agentSetupFailed = "This setup request is no longer available. Open Set Up again."
+            return false
+        }
+        guard current.request == shown.request && current.dir == shown.dir && current.node == shown.node
+        else {
+            offerAgentSetup(current)
+            agentSetupFailed = "A newer setup request arrived. Review it before choosing Set Up or Not Now."
+            return false
+        }
+        return true
+    }
+
     /// Only the app creates and remembers the node. It never selects the agent's node as the
     /// person's node, and its passphrase never enters a command, environment, file or reply.
     func setUpAgent(_ request: AgentSetupRequest, name: String, passphrase secret: Secret,
                     again: Secret) async {
         guard !agentSetupBusy else { secret.wipe(); again.wipe(); return }
+        let held: FileHandle
+        do { held = try AgentSetupStore.lock(request) }
+        catch {
+            secret.wipe(); again.wipe()
+            agentSetupFailed = sentence(error)
+            return
+        }
+        defer { try? held.close() }
+        guard currentAgentSetup(request) else { secret.wipe(); again.wipe(); return }
         let same = secret.matches(again)
         again.wipe()
         guard same else {
@@ -700,6 +729,9 @@ final class AppModel: ObservableObject {
         do {
             let passphrase = try secret.passphrase()
             defer { passphrase.wipe() }
+            _ = try await Daemon.command(["agent", "setup", request.harness, "--node", name,
+                                          "--finish", "--check"],
+                                         patience: 30, environment: Daemon.harnessEnvironment())
             let client: VoxClient
             if let existing = self.client { client = existing }
             else { client = try await Daemon.reach() }

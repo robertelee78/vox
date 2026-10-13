@@ -1062,6 +1062,9 @@ pub struct AgentSetupArgs {
     /// Complete only the hook wiring for a node the app already made and kept.
     #[arg(long, hide = true, requires = "node")]
     pub finish: bool,
+    /// Check app setup's name and harness before making its node; writes nothing.
+    #[arg(long, hide = true, requires = "finish")]
+    pub check: bool,
 }
 
 /// `vox agent doctor`
@@ -3184,6 +3187,7 @@ pub fn run() -> ExitCode {
                     &args.profile.as_node_args(),
                     &args.harness,
                     args.node.as_deref().unwrap_or_default(),
+                    args.check,
                 )
                 .await;
             }

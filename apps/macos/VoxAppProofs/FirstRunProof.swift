@@ -1519,6 +1519,36 @@ final class FirstRunProof: XCTestCase {
         }
         tap(ui, Key.id("agent-hooks-dismiss"), "Dismiss the installed hook paths")
 
+        // Setup may precede the person's own node. Choosing none is permitted; declining a
+        // later setup must not erase the fact that this node belongs to harness setup.
+        ui.typeKey(",", modifierFlags: .command)
+        tap(ui, Key.id("settings-agent-setup-opencode"), "Set Up OpenCode before choosing a personal node")
+        words(ui, Key.id("agent-setup-no-passphrase"), timeout: 10,
+              "an empty passphrase must show the consequence before setup",
+              until: { $0.contains("identity key is kept on this machine unencrypted")
+                  && $0.contains("anyone who can read its data folder can act as this node")
+                  && $0.contains("passphrase is encouraged") })
+        if tap(ui, Key.id("agent-setup-name"), "OpenCode node name") {
+            ui.typeKey("a", modifierFlags: .command)
+            el(ui, Key.id("agent-setup-name")).typeText("opencode-app")
+        }
+        tap(ui, Key.id("agent-setup-make"), "Set Up with no passphrase")
+        words(ui, Key.id("agent-hooks-installed"), timeout: 90,
+              "a node without a passphrase must be Ready and remembered",
+              until: { $0.contains("opencode-app") && $0.contains("Ready and remembered") })
+        let unprotected = run(vox, ["node", "list"], env: voxEnv).out
+        XCTAssertTrue(nodeLine(unprotected, "opencode-app")?.contains(" attached ") == true
+                        && nodeLine(unprotected, "opencode-app")?.hasSuffix("(kept)") == true,
+                      "PRODUCT: setup with no passphrase must make a remembered Ready node; got \(unprotected)")
+        ui.typeKey(",", modifierFlags: .command)
+        tap(ui, Key.id("settings-agent-setup-opencode"), "Reopen already-Ready OpenCode setup")
+        tap(ui, Key.id("agent-setup-decline"), "Not Now after the node is already Ready")
+        ui.terminate()
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        present(ui, Key.id("node-opencode-app"), timeout: 30,
+                "the sole harness node must remain an explicit choice after restart and a later Not Now")
+        tap(ui, Key.id("new-node"), "New Node for the person, leaving the harness node unselected")
+
         // The welcome: the node is made here.
         let name = Key.id("new-node-name")
         present(ui, name, timeout: 30,
@@ -1657,6 +1687,10 @@ final class FirstRunProof: XCTestCase {
         let setupSession = "app-setup-claude-session"
         let agentEnv = voxEnv.merging(["HOME": skillHome.path,
                                       "CLAUDE_CODE_SESSION_ID": setupSession]) { $1 }
+        tap(ui, Key.id("agent-setup-offer-claude"), "Open the unsolicited Claude setup offer")
+        present(ui, Key.id("agent-setup-name"), timeout: 10, "the initial offer must have its own window")
+        // An explicit request arrives while that offer is open. Its actual directory/name must
+        // replace the old offer before the person answers; the requesting session gets the answer.
         let setupRequest = stager.run(["/bin/sh", "-c", "cd \"$1\" && exec \"$2\" agent setup claude --node claude-app",
                                       "agent-setup", root.path, vox],
                                      env: agentEnv)
@@ -1720,6 +1754,23 @@ final class FirstRunProof: XCTestCase {
         let stillPersonal = stager.run(["/bin/cat", config + "/app/node"], env: [:]).out
         XCTAssertEqual(stillPersonal.trimmingCharacters(in: .whitespacesAndNewlines), "bob",
                        "PRODUCT: making the agent node must not select it as the person's app node")
+        let otherRequest = run(vox, ["agent", "setup", "claude", "--node", "unwanted"], env: agentEnv)
+        XCTAssertTrue(otherRequest.status == 0 && otherRequest.out.contains("left as it is"),
+                      "PRODUCT: an already-wired harness must refuse another node before opening setup; got \(otherRequest.out)")
+        ui.typeKey(",", modifierFlags: .command)
+        tap(ui, Key.id("settings-agent-setup-claude"), "Reopen Claude setup to check its edited name")
+        if tap(ui, Key.id("agent-setup-name"), "Edit the already-wired harness's node name") {
+            ui.typeKey("a", modifierFlags: .command)
+            el(ui, Key.id("agent-setup-name")).typeText("unwanted")
+        }
+        tap(ui, Key.id("agent-setup-make"), "Set Up with a conflicting harness node")
+        words(ui, Key.id("agent-setup-failed"), timeout: 15,
+              "the app must refuse an already-wired harness before making another node",
+              until: { $0.contains("already set up as node claude-app") })
+        let refusedSetup = run(vox, ["node", "list"], env: voxEnv).out
+        XCTAssertNil(nodeLine(refusedSetup, "unwanted"),
+                     "PRODUCT: refused setup must not leave a new remembered node; got \(refusedSetup)")
+        tap(ui, Key.id("agent-setup-decline"), "Close the refused setup")
         let leaks = stager.run(["/usr/bin/python3", "-c",
             "import os,sys; needle=sys.argv[1].encode(); hits=[]\nfor root,dirs,files in os.walk(sys.argv[2]):\n for name in files:\n  p=os.path.join(root,name)\n  if os.path.isfile(p) and needle in open(p,'rb').read(): hits.append(p)\nprint('\\n'.join(hits)); sys.exit(1 if hits else 0)",
             setupSecret, root.path], env: [:])
@@ -1728,25 +1779,6 @@ final class FirstRunProof: XCTestCase {
                         && !ready.contains(setupSecret) && !agentEnv.values.contains(setupSecret),
                       "PRODUCT: the app's passphrase must appear in no agent output, environment or plaintext file; leaks: \(leaks.out)")
 
-        // The same window permits no passphrase, with the required consequence visible.
-        tap(ui, Key.id("agent-setup-offer-opencode"), "Set Up OpenCode without a passphrase")
-        words(ui, Key.id("agent-setup-no-passphrase"), timeout: 10,
-              "an empty passphrase must show the consequence before setup",
-              until: { $0.contains("identity key is kept on this machine unencrypted")
-                  && $0.contains("anyone who can read its data folder can act as this node")
-                  && $0.contains("passphrase is encouraged") })
-        if tap(ui, Key.id("agent-setup-name"), "OpenCode node name") {
-            ui.typeKey("a", modifierFlags: .command)
-            el(ui, Key.id("agent-setup-name")).typeText("opencode-app")
-        }
-        tap(ui, Key.id("agent-setup-make"), "Set Up with no passphrase")
-        words(ui, Key.id("agent-hooks-installed"), timeout: 90,
-              "a node without a passphrase must also be Ready and remembered",
-              until: { $0.contains("opencode-app") && $0.contains("Ready and remembered") })
-        let unprotected = run(vox, ["node", "list"], env: voxEnv).out
-        XCTAssertTrue(nodeLine(unprotected, "opencode-app")?.contains(" attached ") == true
-                        && nodeLine(unprotected, "opencode-app")?.hasSuffix("(kept)") == true,
-                      "PRODUCT: setup with no passphrase must make a remembered Ready node; got \(unprotected)")
         _ = run(vox, ["node", "detach", "opencode-app"], env: voxEnv)
         _ = run(vox, ["node", "detach", "claude-app"], env: voxEnv)
         print("[proof] agent setup: returned before answer; pending/declined/Ready hook outcomes; persistent Not Now; app-only passphrase; node kept; personal node unchanged")

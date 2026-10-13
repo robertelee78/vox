@@ -3,6 +3,7 @@
 
 import Foundation
 import SwiftUI
+import Darwin
 
 struct AgentSetupRequest: Codable, Equatable, Identifiable {
     let harness: String
@@ -11,7 +12,7 @@ struct AgentSetupRequest: Codable, Equatable, Identifiable {
     let request: String
     let sessions: [String]
     let explicit: Bool
-    var id: String { harness }
+    var id: String { "\(harness)-\(request)" }
     var name: String {
         switch harness { case "claude": "Claude Code"; case "codex": "Codex"; default: "OpenCode" }
     }
@@ -22,6 +23,17 @@ struct AgentSetupRequest: Codable, Equatable, Identifiable {
 }
 
 enum AgentSetupStore {
+    /// The CLI uses this same flock. Hold it only while applying the person's choice, never
+    /// while the sheet waits for input, so the approved request cannot be replaced mid-action.
+    static func lock(_ request: AgentSetupRequest) throws -> FileHandle {
+        let handle = try FileHandle(forUpdating: file(request.harness, ".lock"))
+        guard flock(handle.fileDescriptor, LOCK_EX | LOCK_NB) == 0 else {
+            try? handle.close()
+            throw VoxError.Failed(reason: "Another setup request is being recorded. Try again.")
+        }
+        return handle
+    }
+
     static func file(_ harness: String, _ suffix: String) throws -> URL {
         let config = try configDir(dataRoot: "")
         return URL(fileURLWithPath: config).appendingPathComponent("agent-setup/\(harness)\(suffix)")
@@ -56,7 +68,7 @@ enum AgentSetupStore {
                   let bytes = try? Data(contentsOf: at),
                   let answer = try? JSONSerialization.jsonObject(with: bytes) as? [String: String]
             else { return false }
-            return answer["outcome"] == "ready" && answer["node"] == name
+            return answer["made_node"] == name
         }
     }
 
@@ -72,8 +84,14 @@ enum AgentSetupStore {
         if outcome == "declined" {
             try write(["outcome": "declined"], to: muted)
         }
-        try write(["request": request.request, "outcome": outcome, "node": node],
-                  to: file(request.harness, ".answer.json"))
+        let at = try file(request.harness, ".answer.json")
+        var answer = ["request": request.request, "outcome": outcome, "node": node]
+        if outcome == "ready" { answer["made_node"] = node }
+        else if let bytes = try? Data(contentsOf: at),
+                let previous = try? JSONSerialization.jsonObject(with: bytes) as? [String: String] {
+            answer["made_node"] = previous["made_node"]
+        }
+        try write(answer, to: at)
         if outcome == "ready", FileManager.default.fileExists(atPath: muted.path) {
             try FileManager.default.removeItem(at: muted)
         }

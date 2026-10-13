@@ -426,6 +426,48 @@ fn a_hook_never_attaches_its_node_and_says_how_to() {
         "PRODUCT (staging): vox node attach default failed: {err}"
     );
     let (ok, told) = turn("k13-2");
+    // NC-2: the app's guarded preflight refuses changing an existing harness before it makes
+    // another node. Finish the operator's already-Ready node through the shipped completion.
+    let home = tmp.path().to_str().expect("APPARATUS: UTF-8 HOME");
+    let (wired, out, err) = hook_env(
+        &data,
+        &cfg,
+        &["agent", "setup", "claude", "--node", "default", "--finish"],
+        "",
+        &[("HOME", home)],
+    );
+    assert!(
+        wired,
+        "APPARATUS: could not stage the already-wired harness: {out}{err}"
+    );
+    let (accepted, out, err) = hook_env(
+        &data,
+        &cfg,
+        &[
+            "agent", "setup", "claude", "--node", "unwanted", "--finish", "--check",
+        ],
+        "",
+        &[("HOME", home)],
+    );
+    assert!(
+        !accepted
+            && err.contains("already set up as node default")
+            && !node_list()
+                .lines()
+                .any(|line| line.starts_with("unwanted ")),
+        "PRODUCT: app preflight must refuse a different node before creating it; got {out}{err}"
+    );
+    let (accepted, out, err) = hook_env(
+        &data,
+        &cfg,
+        &[
+            "agent", "setup", "claude", "--node", "default", "--finish", "--check",
+        ],
+        "",
+        &[("HOME", home), ("VOX_SESSION", "ordinary-agent")],
+    );
+    assert!(!accepted && err.contains("only the person"),
+        "PRODUCT: setup completion preflight must retain the ordinary agent-process guard; got {out}{err}");
     let (_, _, _) = hook(&data, &cfg, &["node", "detach", "default"], "");
     assert!(
         ok && !told.contains("not attached") && !told.contains("could not read"),

@@ -215,16 +215,6 @@ pub async fn setup(args: &NodeArgs, key: &str, name: Option<&str>) -> Result<(),
             ))?,
         },
     };
-    if crate::agent_onboarding::request_in_app(args, h.key, &name)? {
-        return Ok(());
-    }
-    if crate::coord::agent_marked() {
-        return Err(AppError::Usage(format!(
-            "run `vox agent setup {}` in a terminal of your own outside the agent session; \
-             the node's passphrase is asked only there.",
-            h.key
-        )));
-    }
     // A harness already wired to another node stays there; this read-only outcome needs no
     // passphrase. Running setup for its own node below also repairs Codex's hook trust.
     if let Some(wired) = &wired {
@@ -236,6 +226,16 @@ pub async fn setup(args: &NodeArgs, key: &str, name: Option<&str>) -> Result<(),
             );
             return Ok(());
         }
+    }
+    if crate::agent_onboarding::request_in_app(args, h.key, &name)? {
+        return Ok(());
+    }
+    if crate::coord::agent_marked() {
+        return Err(AppError::Usage(format!(
+            "run `vox agent setup {}` in a terminal of your own outside the agent session; \
+             the node's passphrase is asked only there.",
+            h.key
+        )));
     }
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         return Err(AppError::Usage(format!(
@@ -308,7 +308,12 @@ pub async fn setup(args: &NodeArgs, key: &str, name: Option<&str>) -> Result<(),
 
 /// The app has made and kept the node using its secure fields. Finish only the harness wiring;
 /// this secret-free child command cannot make, attach, select or unlock a node.
-pub(crate) async fn finish(args: &NodeArgs, key: &str, name: &str) -> Result<(), AppError> {
+pub(crate) async fn finish(
+    args: &NodeArgs,
+    key: &str,
+    name: &str,
+    check_only: bool,
+) -> Result<(), AppError> {
     if crate::coord::agent_marked() {
         return Err(AppError::Usage(
             "only the person in Vox.app or their own terminal can finish node setup".into(),
@@ -317,12 +322,6 @@ pub(crate) async fn finish(args: &NodeArgs, key: &str, name: &str) -> Result<(),
     let h = harness(key)?;
     let name = NodeName::parse(name)?;
     let account = args.account()?;
-    if !account.nodes_on_disk().contains(&name) || !crate::client::attached(&account, &name).await?
-    {
-        return Err(AppError::Usage(format!(
-            "node {name} must already be made and Ready before its hook is wired"
-        )));
-    }
     let wiring = Wiring::of(h.key)?;
     if let Some(wired) = crate::setup::connected(&account, &wiring) {
         if wired != name {
@@ -339,6 +338,17 @@ pub(crate) async fn finish(args: &NodeArgs, key: &str, name: &str) -> Result<(),
     } else {
         None
     };
+    // The app checks the edited name before creating anything. Repeat the same guard above
+    // when finishing, so another setup cannot silently replace existing wiring.
+    if check_only {
+        return Ok(());
+    }
+    if !account.nodes_on_disk().contains(&name) || !crate::client::attached(&account, &name).await?
+    {
+        return Err(AppError::Usage(format!(
+            "node {name} must already be made and Ready before its hook is wired"
+        )));
+    }
     for line in wiring.install(&name)? {
         println!("vox: {line}");
     }

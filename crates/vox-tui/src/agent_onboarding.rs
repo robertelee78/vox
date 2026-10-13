@@ -25,6 +25,8 @@ struct Answer {
     request: String,
     outcome: String,
     node: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    made_node: Option<String>,
 }
 
 pub(crate) fn key(harness: &str) -> Option<&'static str> {
@@ -127,6 +129,7 @@ pub(crate) fn discover(account: &Account) {
 /// Terminal setup can finish an offer too; the app must stop offering a harness now wired to a
 /// Ready node. Like the app's answer, this contains only the outcome and node name.
 pub(crate) fn completed(account: &Account, harness: &str, node: &NodeName) -> Result<(), AppError> {
+    let _lock = request_lock(account, harness)?;
     let Some(request) = request(account, harness) else {
         return Ok(());
     };
@@ -134,6 +137,7 @@ pub(crate) fn completed(account: &Account, harness: &str, node: &NodeName) -> Re
         request: request.id,
         outcome: "ready".into(),
         node: node.to_string(),
+        made_node: Some(node.to_string()),
     })
     .map_err(|e| AppError::Usage(e.to_string()))?;
     vox_core::node::paths::write_private_file_unique(
