@@ -130,7 +130,8 @@ final class NodeModel: ObservableObject {
     private var roomReadGeneration = UUID()
     private var rejectedRoomMark: String?
     private var roomMessageRevision = UUID()
-    private var roomNeedsPage = false
+    @Published private var roomNeedsPage = false
+    var roomMembersPending: Bool { roomNeedsPage }
     /// The first message that was unread when the room came on screen, and how many were: where
     /// the timeline draws its unread line. It stays while the room is on screen; what arrives
     /// meanwhile is read as it is shown.
@@ -551,7 +552,7 @@ final class NodeModel: ObservableObject {
                 recovery = page
             }
             guard generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
-            var recoveredMembers: [MemberRow]?
+            var recoveredMembers: (rows: [MemberRow], trustsMe: Set<String>)?
             if recovery != nil { recoveredMembers = try await memberRows(id) }
             guard generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
             // An event may have delivered a new body or row while the page or roster awaited.
@@ -564,10 +565,14 @@ final class NodeModel: ObservableObject {
                 roomOlder = page.older
                 roomBefore = page.before
                 messages = page.messages
-                if let recoveredMembers { members = recoveredMembers }
+                if let recoveredMembers {
+                    members = recoveredMembers.rows
+                    trustsMe = recoveredMembers.trustsMe
+                }
                 rejectedRoomMark = nil
                 roomNeedsPage = false
                 lastRead[id] = page.messages.last?.id
+                watchReads(id)
             }
             for message in new { arrived(message, in: id) }
         } catch {
@@ -629,6 +634,16 @@ final class NodeModel: ObservableObject {
                 ended = nil
             }
             if recovering {
+                // A live connection does not establish that the selected room's snapshot
+                // or its watcher survived the interruption. Preserve its visible content
+                // until an authoritative page and roster replace it together.
+                if case .room = selection {
+                    roomReadGeneration = UUID()
+                    roomNeedsPage = true
+                    watching?.cancel()
+                    stepRetentionRead = UUID()
+                    stepRetentionLoading = false
+                }
                 if outcome?.operation == "" { outcome = nil }
                 try await client.subscribe(listener: Listener(model: self))
                 lastRead.removeAll()
@@ -859,7 +874,8 @@ final class NodeModel: ObservableObject {
             messages = read
             roomNeedsPage = false
             roomServices = services
-            members = rows
+            members = rows.rows
+            trustsMe = rows.trustsMe
             retention = kept
             retentionSecs = keptSecs
             notices = done
@@ -1376,6 +1392,7 @@ final class NodeModel: ObservableObject {
     /// change the room rule. Failures stay in the Retention sheet with a retry.
     func loadStepRetention() async {
         guard let id = roomOnScreen, !stepRetentionLoading else { return }
+        let generation = roomReadGeneration
         let token = UUID()
         stepRetentionRead = token
         stepRetentionLoading = true
@@ -1386,12 +1403,14 @@ final class NodeModel: ObservableObject {
                 let admins = try await client.admins(room: id)
                 return (value, admins)
             }
-            guard roomOnScreen == id, stepRetentionRead == token else { return }
+            guard !Task.isCancelled, roomReadGeneration == generation, ended == nil,
+                  roomOnScreen == id, stepRetentionRead == token else { return }
             stepRetention = value
             stepRetentionAdmin = admins.contains(me)
             stepRetentionError = nil
         } catch {
-            guard roomOnScreen == id, stepRetentionRead == token else { return }
+            guard !Task.isCancelled, roomReadGeneration == generation, ended == nil,
+                  roomOnScreen == id, stepRetentionRead == token else { return }
             stepRetentionError = sentence(error)
         }
     }
@@ -1698,14 +1717,13 @@ final class NodeModel: ObservableObject {
     private var flushing: Task<Void, Never>?
 
     /// The members of `room` other than this node, with the trust each has here.
-    private func memberRows(_ room: String) async throws -> [MemberRow] {
+    private func memberRows(_ room: String) async throws -> (rows: [MemberRow], trustsMe: Set<String>) {
         let roster = try await client.roster(room: room)
         let consents = try await client.consents(room: room)
         let keyring = Dictionary(trusted.map { ($0.fingerprint, $0.drive) }) { $1 }
         let back = Set(consents.inbound)
         // Their trust in this node, whether or not this node trusts them (D4): both directions.
-        if back != trustsMe { trustsMe = back }
-        return roster.filter { $0.fingerprint != me }.map { m in
+        let rows = roster.filter { $0.fingerprint != me }.map { m in
             let trust = Trust.of(inKeyring: keyring[m.fingerprint] != nil,
                                  trustsYou: back.contains(m.fingerprint))
             return MemberRow(id: m.fingerprint,
@@ -1714,6 +1732,7 @@ final class NodeModel: ObservableObject {
                              trustsYou: back.contains(m.fingerprint),
                              keyWaits: m.keyWaits)
         }
+        return (rows, back)
     }
 
     /// The room on screen, read again every few seconds while it is there, each part published
@@ -1722,10 +1741,12 @@ final class NodeModel: ObservableObject {
     /// shared, and the members with their trust (one who joins while the room is on screen).
     private func watchReads(_ room: String) {
         watching?.cancel()
+        let generation = roomReadGeneration
         watching = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
-                guard let self, case .room(room) = self.selection else { return }
+                guard !Task.isCancelled, let self, self.roomReadGeneration == generation,
+                      self.selection == .room(room), self.ended == nil else { return }
                 let reads = try? await self.client.readBy(room: room)
                 let where_ = try? await self.client.whereabouts(room: room)
                 let pulls = try? await self.client.pulledBy(room: room)
@@ -1736,14 +1757,17 @@ final class NodeModel: ObservableObject {
                 let kept = try? await self.client.retention(room: room)
                 let keptSecs = try? await self.client.retentionSecs(room: room)
                 let done = try? await self.client.notices(room: room)
-                guard case .room(room) = self.selection else { return }
+                guard !Task.isCancelled, self.roomReadGeneration == generation,
+                      self.selection == .room(room), self.ended == nil else { return }
                 if let kept, kept != self.retention { self.retention = kept }
                 if let keptSecs, keptSecs != self.retentionSecs { self.retentionSecs = keptSecs }
                 await self.loadStepRetention()
-                guard case .room(room) = self.selection else { return }
+                guard !Task.isCancelled, self.roomReadGeneration == generation,
+                      self.selection == .room(room), self.ended == nil else { return }
                 if let done, done != self.notices { self.notices = done }
                 let listed = try? await self.client.sessions(room: room)
-                guard case .room(room) = self.selection else { return }
+                guard !Task.isCancelled, self.roomReadGeneration == generation,
+                      self.selection == .room(room), self.ended == nil else { return }
                 if let listed, listed != self.sessions { self.sessions = listed }
                 if let reads {
                     let now = Dictionary(uniqueKeysWithValues: reads.map { ($0.id, $0.names) })
@@ -1766,15 +1790,18 @@ final class NodeModel: ObservableObject {
                     if now != self.pulling { self.pulling = now }
                 }
                 if let services, services != self.roomServices { self.roomServices = services }
-                if let rows, rows != self.members {
-                    // A member not listed before joined while the room was on screen (K-7).
-                    let before = Set(self.members.map(\.id))
-                    let came = rows.filter { !before.contains($0.id) }
-                    self.members = rows
-                    if !before.isEmpty || !came.isEmpty {
-                        let at = UInt64(Date().timeIntervalSince1970 * 1000)
-                        for m in came where !self.joins.contains(where: { $0.fingerprint == m.id }) {
-                            self.joins.append(JoinLine(fingerprint: m.id, at: at, said: ""))
+                if let rows {
+                    if rows.trustsMe != self.trustsMe { self.trustsMe = rows.trustsMe }
+                    if rows.rows != self.members {
+                        // A member not listed before joined while the room was on screen (K-7).
+                        let before = Set(self.members.map(\.id))
+                        let came = rows.rows.filter { !before.contains($0.id) }
+                        self.members = rows.rows
+                        if !before.isEmpty || !came.isEmpty {
+                            let at = UInt64(Date().timeIntervalSince1970 * 1000)
+                            for m in came where !self.joins.contains(where: { $0.fingerprint == m.id }) {
+                                self.joins.append(JoinLine(fingerprint: m.id, at: at, said: ""))
+                            }
                         }
                     }
                 }
@@ -1782,7 +1809,8 @@ final class NodeModel: ObservableObject {
                 // keyring's nodes trusting the newcomer.
                 for (i, line) in self.joins.enumerated() {
                     if let said = try? await self.client.joinSaid(room: room, member: line.fingerprint),
-                       case .room(room) = self.selection, i < self.joins.count,
+                       !Task.isCancelled, self.roomReadGeneration == generation,
+                       self.selection == .room(room), self.ended == nil, i < self.joins.count,
                        self.joins[i].said != said {
                         self.joins[i].said = said
                     }
