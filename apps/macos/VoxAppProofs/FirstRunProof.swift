@@ -2972,8 +2972,14 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("tagged root post returned no entry hash: \(taggedPost)")
         }
         try staged(vox, ["room", "post", "--node", "bob", "--re", taggedRoot, room, "TAGGED-THREAD-MIDDLE"], env: voxEnv)
-        guard let fromBob = entry("TAGGED-THREAD-MIDDLE") else {
-            throw Apparatus("the staged tagged middle reply has no entry hash")
+        let deliveredUntil = Date().addingTimeInterval(30)
+        var receivedMiddle: String?
+        repeat {
+            receivedMiddle = entry("TAGGED-THREAD-MIDDLE")
+            if receivedMiddle == nil { Thread.sleep(forTimeInterval: 0.25) }
+        } while receivedMiddle == nil && Date() < deliveredUntil
+        guard let fromBob = receivedMiddle else {
+            throw Apparatus("Alice's public room history did not receive the staged tagged middle reply within 30 seconds")
         }
         let middleKey = Key.timelineRow("bob: TAGGED-THREAD-MIDDLE")
         guard let replyTimeline = locate(ui, Key.id("timeline")) else {
