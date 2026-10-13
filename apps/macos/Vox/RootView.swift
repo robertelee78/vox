@@ -10,18 +10,21 @@ struct RootView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        Group {
-            if case .attached = model.phase, let node = model.node {
-                MainWindow(model: node)
-                    .font(Theme.text)
-            } else {
-                // The setup form can be taller than the first-run window. Let it scroll
-                // inside the space left by the hook notice, keeping Dismiss in the window.
-                ScrollView { setup }
+        // Reserve actual layout space: NavigationSplitView can draw its sidebar controls
+        // through safe-area insets. Setup offers and hook paths must never cover them.
+        VStack(spacing: 0) {
+            AgentSetupOffers(model: model)
+                .fixedSize(horizontal: false, vertical: true)
+            Group {
+                if case .attached = model.phase, let node = model.node {
+                    MainWindow(model: node)
+                        .font(Theme.text)
+                } else {
+                    // Keep a tall setup form scrollable in the space between the notices.
+                    ScrollView { setup }
+                }
             }
-        }
-        .safeAreaInset(edge: .top) { AgentSetupOffers(model: model) }
-        .safeAreaInset(edge: .bottom) {
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             if let said = model.agentSetupSaid {
                 HStack(alignment: .top) {
                     Text(said).font(Theme.text).textSelection(.enabled)
@@ -33,6 +36,7 @@ struct RootView: View {
                 }
                 .padding(Space.s16)
                 .panelSurface()
+                .fixedSize(horizontal: false, vertical: true)
             }
         }
         // Node › Sign Out…: what it does, said first (E-5), done only when confirmed.
