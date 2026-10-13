@@ -545,12 +545,16 @@ final class NodeModel: ObservableObject {
                 recovery = page
             }
             guard generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
+            var recoveredMembers: [MemberRow]?
+            if recovery != nil { recoveredMembers = try await memberRows(id) }
+            guard generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
             let new = rows.filter { byID[$0.id] == nil && !$0.owed }
             if let page = recovery {
                 // Keep the valid view until this same selection's replacement is ready.
                 roomOlder = page.older
                 roomBefore = page.before
                 messages = page.messages
+                if let recoveredMembers { members = recoveredMembers }
                 rejectedRoomMark = nil
                 lastRead[id] = page.messages.last?.id
             }
@@ -574,17 +578,19 @@ final class NodeModel: ObservableObject {
             await readOlderSession()
             return
         }
-        guard let room = roomOnScreen, let before = roomBefore, !roomReadingOlder else { return }
+        guard let room = roomOnScreen, let before = roomBefore, !roomReadingOlder, ended == nil else { return }
+        let generation = roomReadGeneration
         roomReadingOlder = true
-        defer { roomReadingOlder = false }
+        defer { if generation == roomReadGeneration { roomReadingOlder = false } }
         do {
             let page = try await client.roomReadOlder(room: room, before: before)
-            guard roomOnScreen == room, roomBefore == before else { return }
+            guard generation == roomReadGeneration, roomOnScreen == room, roomBefore == before, ended == nil else { return }
             let held = Set(messages.map(\.id))
             messages = page.messages.filter { !held.contains($0.id) } + messages
             roomOlder = page.older
             roomBefore = page.before
         } catch {
+            guard generation == roomReadGeneration, roomOnScreen == room, ended == nil else { return }
             reportBackground(error)
         }
     }
@@ -761,6 +767,7 @@ final class NodeModel: ObservableObject {
         }
         guard case .room = selection else { return }
         messages = []
+        roomReadingOlder = false
         roomOlder = 0
         roomBefore = nil
         unreadFrom = nil
@@ -806,7 +813,8 @@ final class NodeModel: ObservableObject {
         if case .decisions = selection {
             decisionEvents = await decisions()
         }
-        guard case let .room(id) = selection else { return }
+        guard case let .room(id) = selection, ended == nil else { return }
+        let generation = roomReadGeneration
         if !seeded.contains(id), let rows = try? await client.unread(room: id) {
             seeded.insert(id)
             for message in rows { count(message, in: id) }
@@ -819,20 +827,22 @@ final class NodeModel: ObservableObject {
             let unread = ((try? await client.unread(room: id)) ?? []).filter { $0.author != me }
             let page = try await client.roomRead(room: id)
             let read = page.messages
-            guard case .room(id) = self.selection else { return }
-            roomOlder = page.older
-            roomBefore = page.before
+            guard generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
             let unreadIDs = Set(unread.map(\.id))
-            unreadFrom = read.first { unreadIDs.contains($0.id) }?.id
-            unreadCount = unread.count
-            messages = read
             let services = (try? await client.services(room: id).shared) ?? []
             let rows = try await memberRows(id)
             let kept = (try? await client.retention(room: id)) ?? ""
             let keptSecs = try? await client.retentionSecs(room: id)
             let done = (try? await client.notices(room: id)) ?? []
             let listed = (try? await client.sessions(room: id)) ?? []
-            guard case .room(id) = self.selection else { return }
+            guard generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
+            // The page and its inspector replace the prior view together, after both reads
+            // have succeeded. An ordinary refresh must not publish a half-empty room.
+            roomOlder = page.older
+            roomBefore = page.before
+            unreadFrom = read.first { unreadIDs.contains($0.id) }?.id
+            unreadCount = unread.count
+            messages = read
             roomServices = services
             members = rows
             retention = kept
@@ -840,11 +850,12 @@ final class NodeModel: ObservableObject {
             notices = done
             sessions = listed
             await loadStepRetention()
-            guard case .room(id) = self.selection else { return }
+            guard generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
             // A Session restored as this room's last view is read once the room lists it (D12).
             if showingSession { await readSession() }
             watchReads(id)
         } catch {
+            guard generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
             reportBackground(error)
         }
     }
