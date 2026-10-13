@@ -1527,7 +1527,8 @@ final class FirstRunProof: XCTestCase {
               "an empty passphrase must show the consequence before setup",
               until: { $0.contains("identity key is kept on this machine unencrypted")
                   && $0.contains("anyone who can read its data folder can act as this node")
-                  && $0.contains("passphrase is encouraged") })
+                  && $0.contains("passphrase is encouraged") },
+              sibling: Key.id("settings-agent-setup-opencode"))
         if tap(ui, Key.id("agent-setup-name"), "OpenCode node name") {
             ui.typeKey("a", modifierFlags: .command)
             el(ui, Key.id("agent-setup-name")).typeText("opencode-app")
@@ -4840,6 +4841,7 @@ final class FirstRunProof: XCTestCase {
     /// person, or when `premise` (what the daemon holds that it is drawn from) does not hold;
     /// PRODUCT otherwise, quoting everything shown and what the daemon said.
     private func missing(_ ui: XCUIApplication, _ key: Key, _ product: String, premise: Premise? = nil,
+                         sibling: Key? = nil,
                          file: StaticString, line: UInt) {
         keepTree(ui, "\(key) was not shown")
         // Startup failure has its own screen, before the normal status field exists.
@@ -4852,8 +4854,9 @@ final class FirstRunProof: XCTestCase {
         }
         // Premise: the same search finds a known sibling of the same kind; if not, the search is
         // what failed, not the app.
-        if locateEverywhere(ui, key.sibling) == nil {
-            XCTFail("APPARATUS: \(key) not found, and the same search finds not even \(key.sibling), which is always shown: the search, not the app, is at fault",
+        let knownSibling = sibling ?? key.sibling
+        if locateEverywhere(ui, knownSibling) == nil {
+            XCTFail("APPARATUS: \(key) not found, and the same search finds not even \(knownSibling), the known sibling for this phase: the search, not the app, is at fault",
                     file: file, line: line)
             return
         }
@@ -4905,6 +4908,7 @@ final class FirstRunProof: XCTestCase {
 
     private func words(_ ui: XCUIApplication, _ key: Key, timeout: TimeInterval, _ product: String,
                        until holds: (String) -> Bool = { _ in true }, field: Bool = false,
+                       sibling: Key? = nil,
                        file: StaticString = #filePath, line: UInt = #line) -> String? {
         let read = field ? typed : shown
         guard windowReadable(ui, file: file, line: line) else { return nil }
@@ -4925,7 +4929,7 @@ final class FirstRunProof: XCTestCase {
             if (field || !last.isEmpty) && holds(last) { return last }
         }
         if !seen {
-            missing(ui, key, product, file: file, line: line)
+            missing(ui, key, product, sibling: sibling, file: file, line: line)
         } else if last.isEmpty && !field {
             keepTree(ui, "\(key) could not be read")
             XCTFail("APPARATUS: \(key) is shown and XCTest reads neither its label nor its value",
