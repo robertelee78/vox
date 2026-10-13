@@ -645,6 +645,9 @@ pub struct ChannelDetail {
 /// The node's latest-wins view (published over a `watch`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NodeView {
+    /// Anchors belonging to this node's open rooms, kept separate from manual machine inputs.
+    /// Closed rooms disclose neither their names nor their sealed anchor configuration.
+    pub room_anchors: Vec<RoomAnchorView>,
     /// The profile's identity, or `None` before one is created.
     pub identity: Option<IdentityInfo>,
     /// `(room, member, said)`: what is said of a member about this identity's key, after its name
@@ -708,6 +711,17 @@ pub struct NodeView {
     /// can say about itself: which rooms it serves and how many members it knows of
     /// each, never what any of them said.
     pub anchoring: Vec<AnchoredChannel>,
+}
+
+/// One open room's anchor provenance, for the daemon's shared list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomAnchorView {
+    /// The room identity.
+    pub room: Digest32,
+    /// Its current shared name, if it has one.
+    pub name: Option<String>,
+    /// The room's own anchors, excluding member addresses carried by a link.
+    pub anchors: crate::nat::bootstrap::BootstrapSet,
 }
 
 /// A live local port forwarded to a member's service (ADR-013).

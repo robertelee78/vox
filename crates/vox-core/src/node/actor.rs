@@ -16945,6 +16945,7 @@ impl Node {
             .map(|eps| eps.addrs().iter().map(ToString::to_string).collect())
             .unwrap_or_default();
         self.view_tx.send_replace(NodeView {
+            room_anchors: Vec::new(),
             identity,
             locked,
             locking: self.locking > 0,
@@ -17151,6 +17152,19 @@ impl Node {
             &self.dismissed_offers,
         );
         let view = NodeView {
+            room_anchors: self
+                .room_anchors
+                .iter()
+                .filter(|(room, _)| self.channels.contains_key(*room))
+                .map(|(room, anchors)| crate::node::api::RoomAnchorView {
+                    room: *room,
+                    name: channels
+                        .iter()
+                        .find(|channel| channel.channel_id == *room)
+                        .and_then(|channel| channel.name.clone()),
+                    anchors: anchors.clone(),
+                })
+                .collect(),
             identity,
             locked,
             locking: self.locking > 0,

@@ -21,6 +21,7 @@ pub mod agent_hook;
 pub mod agent_room;
 pub mod agent_send;
 pub mod agent_setup;
+pub mod anchor_cli;
 pub mod app;
 pub mod app_cli;
 pub mod claude_injector;

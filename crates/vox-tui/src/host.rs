@@ -34,8 +34,8 @@ use vox_core::nat::bootstrap::BootstrapSet;
 use vox_core::node::actor::{ActorEnd, Bind, Node, NodeConfig, NodeHandle};
 use vox_core::node::api::{Fault, NodeCommand, Outcome, Secret};
 use vox_core::node::daemonipc::{
-    DaemonEvent, DaemonFrame, DaemonRequest, DaemonStatus, DetachCause, KeepSource, NodeInfo,
-    NodeState, Refusal, UseNode,
+    AnchorInfo, AnchorSource, DaemonEvent, DaemonFrame, DaemonRequest, DaemonStatus, DetachCause,
+    KeepSource, NodeInfo, NodeState, Refusal, UseNode,
 };
 use vox_core::node::ipc::{Dispatch, Lease};
 use vox_core::node::paths::{Account, NodeName, Paths};
@@ -434,6 +434,62 @@ impl Router {
             .filter_map(|(n, s)| match s {
                 Slot::Attached(a) => Some((n.as_str().to_owned(), a.handle.clone())),
                 _ => None,
+            })
+            .collect()
+    }
+
+    /// The shared manual inputs beside each attached node's open-room provenance. Room names
+    /// and configuration remain sealed when the room is closed or its node is detached.
+    async fn anchor_list(&self) -> Vec<AnchorInfo> {
+        let manual = self.inner.manual_anchors.lock().await;
+        let mut all = BTreeMap::new();
+        for anchor in manual.set.nodes() {
+            all.insert(
+                anchor.id,
+                AnchorInfo {
+                    fingerprint: anchor.id,
+                    addresses: anchor
+                        .endpoints
+                        .addrs()
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    sources: vec![AnchorSource::AddedByHand],
+                },
+            );
+        }
+        for (_, node) in self.attached_handles() {
+            for room in node.view().room_anchors {
+                for anchor in room.anchors.nodes() {
+                    let entry = all.entry(anchor.id).or_insert_with(|| AnchorInfo {
+                        fingerprint: anchor.id,
+                        addresses: Vec::new(),
+                        sources: Vec::new(),
+                    });
+                    for address in anchor.endpoints.addrs().iter().map(ToString::to_string) {
+                        if !entry.addresses.contains(&address) {
+                            entry.addresses.push(address);
+                        }
+                    }
+                    let name = room.name.clone().unwrap_or_default();
+                    if let Some(AnchorSource::Room { name: recorded, .. }) = entry.sources.iter_mut().find(
+                        |source| matches!(source, AnchorSource::Room { room: id, .. } if *id == room.room),
+                    ) {
+                        if recorded.is_empty() {
+                            *recorded = name;
+                        }
+                    } else {
+                        entry.sources.push(AnchorSource::Room { room: room.room, name });
+                    }
+                }
+            }
+        }
+        all.into_values()
+            .map(|mut anchor| {
+                anchor.addresses.sort();
+                anchor.addresses.dedup();
+                anchor.sources.sort();
+                anchor
             })
             .collect()
     }
@@ -2622,6 +2678,7 @@ impl Dispatch for Router {
     async fn daemon(&self, request: DaemonRequest) -> DaemonFrame {
         let refused = DaemonFrame::Refused;
         match request {
+            DaemonRequest::Anchors => DaemonFrame::Anchors(self.anchor_list().await),
             DaemonRequest::Nodes => DaemonFrame::Nodes(self.nodes()),
             DaemonRequest::Attach {
                 node,

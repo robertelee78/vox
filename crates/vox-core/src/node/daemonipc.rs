@@ -47,6 +47,7 @@ const T_SESSION_ENDED: u64 = 4010;
 const T_SESSION_REGISTERED: u64 = 4011;
 const T_ROOM_ASKS: u64 = 4012;
 const T_ROOM_ANSWER: u64 = 4013;
+const T_ANCHORS: u64 = 4014;
 /// 4020–4029: the Session activity sink (ADR-029 §2, §3).
 const T_SESSION_ANSWER: u64 = 4020;
 
@@ -67,6 +68,7 @@ const T_REQ_ROOM_ASKS: u64 = 4112;
 const T_REQ_ROOM_BIND: u64 = 4113;
 const T_REQ_ROOM_DECLINE: u64 = 4114;
 const T_REQ_DETACH_FOR_RENAME: u64 = 4115;
+const T_REQ_ANCHORS: u64 = 4116;
 /// 4120–4129: the Session activity sink (ADR-029 §2, §3).
 const T_REQ_SESSION_ACTIVITY: u64 = 4120;
 const T_REQ_SESSION_ASK: u64 = 4121;
@@ -177,6 +179,8 @@ pub enum KeepSource {
 /// A request to the daemon itself, with no `Use` (ADR-026 C-2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonRequest {
+    /// The daemon's manual and open-room anchor list, with provenance. Needs no node.
+    Anchors,
     /// Every node on disk, with its state: answered [`DaemonFrame::Nodes`].
     Nodes,
     /// Attach `node` explicitly (`vox node attach`): it stays attached until `Detach` or the
@@ -478,6 +482,32 @@ pub struct DaemonStatus {
     pub panics: u64,
 }
 
+/// One identity in the machine's anchor list. Sources are recorded configuration, never a
+/// network discovery guess. Reach projections are supplied separately by the daemon's dials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorInfo {
+    /// The authenticated anchor fingerprint.
+    pub fingerprint: Digest32,
+    /// Configured addresses from its sources, deduplicated.
+    pub addresses: Vec<String>,
+    /// Why this machine uses it.
+    pub sources: Vec<AnchorSource>,
+}
+
+/// Why an anchor belongs in the machine's list.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AnchorSource {
+    /// Manual configuration or a command-line anchor.
+    AddedByHand,
+    /// An open room's own anchor configuration.
+    Room {
+        /// Room identity, distinguishing rooms even if their names match.
+        room: Digest32,
+        /// The current shared name; empty for an unnamed room.
+        name: String,
+    },
+}
+
 /// A directory harness sessions started in that they cannot work in a room from (ADR-029 RB-5a):
 /// no room is bound to it, or one is and their node is not in it. What Vox asks the person, and
 /// the sessions that wait on the answer.
@@ -559,6 +589,8 @@ pub struct AskingSession {
 /// a [`DaemonRequest`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonFrame {
+    /// The shared anchor list, in fingerprint order.
+    Anchors(Vec<AnchorInfo>),
     /// Sent once on connect, before anything else (C-4).
     Hello {
         /// The IPC protocol this daemon speaks: [`crate::node::ipc::PROTOCOL_VERSION`].
@@ -989,6 +1021,9 @@ impl Opening {
                 DaemonRequest::Status => {
                     e.array(1).uint(T_REQ_STATUS);
                 }
+                DaemonRequest::Anchors => {
+                    e.array(1).uint(T_REQ_ANCHORS);
+                }
                 DaemonRequest::Metrics => {
                     e.array(1).uint(T_REQ_METRICS);
                 }
@@ -1142,6 +1177,7 @@ impl Opening {
                 dir: text(&mut d, "ipc room decline dir")?,
             }),
             (T_REQ_STATUS, 1) => Opening::Daemon(DaemonRequest::Status),
+            (T_REQ_ANCHORS, 1) => Opening::Daemon(DaemonRequest::Anchors),
             (T_REQ_METRICS, 1) => Opening::Daemon(DaemonRequest::Metrics),
             (T_REQ_SUBSCRIBE, 1) => Opening::Daemon(DaemonRequest::Subscribe),
             (T_REQ_STOP, 1) => Opening::Daemon(DaemonRequest::Stop),
@@ -1270,6 +1306,24 @@ impl DaemonFrame {
                 put_infos(&mut e, &s.nodes);
                 e.uint(s.panics);
             }
+            DaemonFrame::Anchors(anchors) => {
+                e.array(2).uint(T_ANCHORS).array(anchors.len());
+                for anchor in anchors {
+                    e.array(3).bytes(&anchor.fingerprint);
+                    put_texts(&mut e, &anchor.addresses);
+                    e.array(anchor.sources.len());
+                    for source in &anchor.sources {
+                        match source {
+                            AnchorSource::AddedByHand => {
+                                e.array(1).uint(0);
+                            }
+                            AnchorSource::Room { room, name } => {
+                                e.array(3).uint(1).bytes(room).text(name);
+                            }
+                        }
+                    }
+                }
+            }
             DaemonFrame::Metrics(text) => {
                 e.array(2).uint(T_METRICS).text(text);
             }
@@ -1320,6 +1374,39 @@ impl DaemonFrame {
             },
             (T_REFUSED, 2) => DaemonFrame::Refused(refusal(&mut d)?),
             (T_NODES, 2) => DaemonFrame::Nodes(infos(&mut d)?),
+            (T_ANCHORS, 2) => {
+                let n = d.array().map_err(malformed("ipc anchors"))?;
+                let mut anchors = Vec::with_capacity(n.min(256));
+                for _ in 0..n {
+                    if d.array().map_err(malformed("ipc anchor"))? != 3 {
+                        return Err(Error::MalformedIpc("ipc anchor arity"));
+                    }
+                    let fingerprint = fp(&mut d, "ipc anchor fingerprint")?
+                        .ok_or(Error::MalformedIpc("ipc anchor fingerprint"))?;
+                    let addresses = texts(&mut d, "ipc anchor addresses")?;
+                    let m = d.array().map_err(malformed("ipc anchor sources"))?;
+                    let mut sources = Vec::with_capacity(m.min(256));
+                    for _ in 0..m {
+                        let arity = d.array().map_err(malformed("ipc anchor source"))?;
+                        let tag = d.uint().map_err(malformed("ipc anchor source tag"))?;
+                        sources.push(match (tag, arity) {
+                            (0, 1) => AnchorSource::AddedByHand,
+                            (1, 3) => AnchorSource::Room {
+                                room: fp(&mut d, "ipc anchor source room")?
+                                    .ok_or(Error::MalformedIpc("ipc anchor source room"))?,
+                                name: text(&mut d, "ipc anchor source room name")?,
+                            },
+                            _ => return Err(Error::MalformedIpc("ipc anchor source")),
+                        });
+                    }
+                    anchors.push(AnchorInfo {
+                        fingerprint,
+                        addresses,
+                        sources,
+                    });
+                }
+                DaemonFrame::Anchors(anchors)
+            }
             (T_ATTACHED_INFO, 3) => {
                 DaemonFrame::Attached(info(&mut d)?, texts(&mut d, "ipc attached notes")?)
             }

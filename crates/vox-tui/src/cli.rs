@@ -786,6 +786,19 @@ pub struct StatusArgs {
     pub json: bool,
 }
 
+/// Inspect the daemon's machine anchor list without choosing or attaching a node.
+#[derive(Subcommand, Debug, Clone)]
+pub enum AnchorCmd {
+    /// List manual anchors and open rooms' own anchors, with their sources.
+    List {
+        #[command(flatten)]
+        account: AccountArgs,
+        /// Print JSON, for machines.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// Session, operation id and output shape, shared by every coordinating verb.
 #[derive(Args, Debug, Clone, Default)]
 pub struct CoordArgs {
@@ -2132,6 +2145,9 @@ pub struct Cli {
 /// Top-level subcommands.
 #[derive(Subcommand)]
 enum Cmd {
+    /// Inspect this machine's anchor configuration and its sources.
+    #[command(subcommand)]
+    Anchor(AnchorCmd),
     /// Run the interactive terminal client (the default).
     Tui(NodeArgs),
     /// Run a headless node: the always-on anchor that serves the board, coordinates
@@ -2484,6 +2500,17 @@ pub fn run() -> ExitCode {
                 )
                 .await
             })
+        }
+        Cmd::Anchor(AnchorCmd::List { account, json }) => {
+            match block_on_client(async move {
+                crate::anchor_cli::list(&account.as_node_args().account()?, json).await
+            }) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("vox anchor: {error}");
+                    error.exit_code()
+                }
+            }
         }
         Cmd::Room(sub) => {
             // These attach to a running node rather than starting one, so they need
