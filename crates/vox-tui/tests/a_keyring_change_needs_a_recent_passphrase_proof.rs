@@ -8,6 +8,10 @@
 //! 1. right after the attach, a `vox trust add` with no passphrase and no terminal is refused at
 //!    once saying the passphrase is needed, nothing changes, and `vox status` says the keyring asks
 //!    for the passphrase (K-12: the attach's passphrase opens no window);
+//!    with both nodes' windows closed, Alice creates a room and Bob joins, binds a repository to
+//!    it, and leaves, giving only the distinct room passphrase. Each command has stdin open and
+//!    unwritten, and must finish without identity authorization (ADR-031 KP-1, #734). Room lists
+//!    and `vox agent status` show the results; neither node's keyring window opens;
 //! 2. **the passphrase is typed, and taken from nothing else** (K-13): a `vox trust add` with
 //!    `VOX_IDENTITY_PASSPHRASE` set, and one with `--identity-passphrase-file`, are refused and
 //!    change nothing; the same add typed at a terminal (a pty) is made; then `vox status` says
@@ -37,6 +41,8 @@
 //! — red, PRODUCT (it is refused as needing the passphrase it was given). The window reported open after it closed —
 //! red, PRODUCT. The capability dropped when the keyring is saved — red, PRODUCT (6: carol reads
 //! `read` after the restart).
+//! Adding an identity-passphrase requirement to room create, join, bind or leave — red, PRODUCT:
+//! the room command is refused or waits instead of completing with only the room passphrase.
 
 #![cfg(unix)]
 
@@ -76,7 +82,12 @@ fn vox_cmd(dir: &Path, args: &[&str]) -> Command {
     let mut c = Command::new(VOX);
     c.args(args);
     for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("VOX_") {
+        if k.to_string_lossy().starts_with("VOX_")
+            || matches!(
+                k.to_str(),
+                Some("CLAUDE_CODE_SESSION_ID" | "CODEX_THREAD_ID")
+            )
+        {
             c.env_remove(k);
         }
     }
@@ -89,6 +100,13 @@ fn vox_cmd(dir: &Path, args: &[&str]) -> Command {
 /// (succeeded, what it said). Red past [`ANSWERS_WITHIN`] (plus [`PROVED_DELAY`], which a
 /// change given its passphrase waits by design).
 fn run(cmd: &mut Command) -> (bool, String) {
+    // A real join may do the production proof of work. Give it the product's patience, as the
+    // other room journeys do; ordinary commands retain the short no-input bound.
+    let bound = if cmd.get_args().any(|a| a == "join") {
+        Duration::from_secs(540)
+    } else {
+        ANSWERS_WITHIN + PROVED_DELAY
+    };
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -102,12 +120,13 @@ fn run(cmd: &mut Command) -> (bool, String) {
     let mut child = cmd.spawn().expect("APPARATUS: spawn vox");
     let held = child.stdin.take();
     while child.try_wait().expect("APPARATUS: wait").is_none() {
-        if t0.elapsed() > ANSWERS_WITHIN + PROVED_DELAY {
+        if t0.elapsed() > bound {
             let _ = child.kill();
             let _ = child.wait();
             panic!(
-                "PRODUCT: a trust command was still waiting after {:?}",
-                ANSWERS_WITHIN + PROVED_DELAY
+                "PRODUCT: `vox {:?}` was still waiting with stdin open and unwritten after \
+                 {bound:?}",
+                cmd.get_args().collect::<Vec<_>>()
             );
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -145,9 +164,19 @@ fn entry<'a>(list: &'a str, fp: &str) -> &'a str {
     list.lines().find(|l| l.starts_with(fp)).unwrap_or_default()
 }
 
+/// Reap every scratch daemon even when a product assertion fails.
+struct Daemon(std::process::Child);
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// `vox daemon` on `dir`, unlocked from the environment with the shortened window, and where its
 /// control socket is, if it said.
-fn start_daemon(dir: &Path) -> (std::process::Child, Option<std::path::PathBuf>) {
+fn start_daemon(dir: &Path) -> (Daemon, Option<std::path::PathBuf>) {
     let mut daemon = vox_cmd(dir, &["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_IDENTITY_PASSPHRASE", IDPASS)
         .env(KNOB, WINDOW.as_secs().to_string())
@@ -157,7 +186,6 @@ fn start_daemon(dir: &Path) -> (std::process::Child, Option<std::path::PathBuf>)
         .stderr(Stdio::null())
         .spawn()
         .expect("APPARATUS: spawn vox daemon");
-    std::mem::forget(daemon.stdin.take());
     let mut out = std::io::BufReader::new(daemon.stdout.take().expect("APPARATUS: stdout"));
     let mut line = String::new();
     while out.read_line(&mut line).is_ok_and(|n| n > 0) {
@@ -165,11 +193,130 @@ fn start_daemon(dir: &Path) -> (std::process::Child, Option<std::path::PathBuf>)
             let sock = std::path::PathBuf::from(at);
             // Drained, so the daemon never blocks on a full pipe.
             std::thread::spawn(move || std::io::copy(&mut out, &mut std::io::sink()));
-            return (daemon, Some(sock));
+            return (Daemon(daemon), Some(sock));
         }
         line.clear();
     }
-    (daemon, None)
+    (Daemon(daemon), None)
+}
+
+/// Room commands do not borrow the identity authorization of a keyring change (ADR-031 KP-1).
+/// Both identities are protected, already unlocked, and have never authorized a keyring change.
+fn rooms_with_closed_keyrings(root: &Path, alice: &Path, bob: &Path, carol: &str) {
+    let (_peer, sock) = start_daemon(bob);
+    assert!(
+        sock.is_some(),
+        "APPARATUS: Bob's daemon did not announce its control socket"
+    );
+    let room_pass = root.join("room-passphrase");
+    std::fs::write(&room_pass, "a separate room pass phrase\n")
+        .expect("APPARATUS: room passphrase file");
+    let pass_file = room_pass.to_str().expect("APPARATUS: path");
+    let repo = root.join("bound-repo");
+    let home = root.join("harness-home");
+    std::fs::create_dir_all(&repo).expect("APPARATUS: repository directory");
+    std::fs::create_dir_all(home.join(".claude")).expect("APPARATUS: harness directory");
+    std::fs::write(
+        home.join(".claude/settings.json"),
+        r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"vox agent hook --node default"}]}]}}"#,
+    )
+    .expect("APPARATUS: wire the scratch harness to Bob's node");
+    let repo = std::fs::canonicalize(repo).expect("APPARATUS: canonical repository");
+    let dir = repo.to_str().expect("APPARATUS: path");
+    let closed = |node: &Path| {
+        let (ok, said) = run(&mut vox_cmd(node, &["status"]));
+        assert!(
+            ok && said.lines().any(|l| l == "keyring asks for the passphrase")
+                && !said.contains("keyring open"),
+            "PRODUCT: room commands must leave the keyring window closed; status said: {said}"
+        );
+    };
+    let room_command = |node: &Path, args: &[&str], expected: &str| {
+        closed(node);
+        let (ok, said) = run(&mut vox_cmd(node, args));
+        assert!(
+            ok && said.contains(expected) && !said.contains("identity passphrase"),
+            "PRODUCT: `vox {args:?}` with the keyring window closed must complete without \
+             identity-passphrase authorization; succeeded {ok}, said:\n{said}"
+        );
+        closed(node);
+        eprintln!("[proof] closed keyring, `vox {args:?}`: {said}");
+    };
+
+    room_command(
+        alice,
+        &[
+            "room",
+            "create",
+            "--name",
+            "keyring-scope",
+            "--passphrase-file",
+            pass_file,
+        ],
+        "vox: created keyring-scope",
+    );
+    let (ok, invite) = run(&mut vox_cmd(alice, &["room", "link", "keyring-scope"]));
+    assert!(ok, "PRODUCT: the created room must be invitable: {invite}");
+    let link = invite
+        .lines()
+        .find(|l| l.starts_with("vox://"))
+        .unwrap_or_else(|| panic!("PRODUCT: room invite gave no room address: {invite}"));
+    let room = link
+        .trim_start_matches("vox://")
+        .split('?')
+        .next()
+        .unwrap_or_else(|| panic!("PRODUCT: room invite gave no room ID: {invite}"));
+    let short: String = room.chars().take(12).collect();
+    room_command(
+        bob,
+        &["room", "join", link, "--passphrase-file", pass_file],
+        "vox: joined keyring-scope",
+    );
+    for node in [alice, bob] {
+        let (ok, listed) = run(&mut vox_cmd(node, &["room", "list"]));
+        assert!(
+            ok && listed.contains("keyring-scope"),
+            "PRODUCT: each node must list the created and joined room: {listed}"
+        );
+    }
+    room_command(
+        bob,
+        &[
+            "room",
+            "join",
+            link,
+            "--passphrase-file",
+            pass_file,
+            "--bind",
+            dir,
+        ],
+        &format!("vox: bound {dir}"),
+    );
+    let (ok, binding) = run(vox_cmd(
+        bob,
+        &["agent", "status", "--harness", "claude", "--dir", dir],
+    )
+    .env("HOME", &home)
+    .env("CLAUDE_CONFIG_DIR", home.join(".claude")));
+    assert!(
+        ok && binding.contains(&format!("this repo ({dir}) works in room {short}.")),
+        "PRODUCT: the bound repository must work in the joined room: {binding}"
+    );
+    room_command(bob, &["room", "leave", "keyring-scope"], "vox: left room");
+    let (ok, listed) = run(&mut vox_cmd(bob, &["room", "list"]));
+    assert!(
+        ok && !listed.contains("keyring-scope"),
+        "PRODUCT: leaving must remove the room from Bob's room list: {listed}"
+    );
+    let (ok, said) = run(&mut vox_cmd(
+        bob,
+        &["trust", "add", carol, "--name", "control"],
+    ));
+    assert!(
+        !ok && said.contains("identity passphrase") && !trusted(bob).contains(carol),
+        "PRODUCT: after the room commands a keyring change must still need the identity \
+         passphrase and leave the keyring unchanged: {said}"
+    );
 }
 
 fn trusted(dir: &Path) -> String {
@@ -218,41 +365,18 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
     let needed_first = needed.lines().next().unwrap_or_default();
     let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let (alice, _) = profile(tmp.path(), "alice");
-    let (_, bob) = profile(tmp.path(), "bob");
+    let (bob_dir, bob) = profile(tmp.path(), "bob");
     let (_, carol) = profile(tmp.path(), "carol");
     let (_, dave) = profile(tmp.path(), "dave");
     let (_, erin) = profile(tmp.path(), "erin");
     let pass_file = tmp.path().join("idpass");
     std::fs::write(&pass_file, format!("{IDPASS}\n")).expect("APPARATUS: passphrase file");
 
-    let mut daemon = vox_cmd(&alice, &["daemon", "--listen", "127.0.0.1:0"])
-        .env("VOX_IDENTITY_PASSPHRASE", IDPASS)
-        .env(KNOB, WINDOW.as_secs().to_string())
-        .env(DELAY_KNOB, PROVED_DELAY.as_millis().to_string())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("APPARATUS: spawn vox daemon");
-    let _held = daemon.stdin.take();
-    let mut out = std::io::BufReader::new(daemon.stdout.take().expect("APPARATUS: stdout"));
-    let mut sock = None;
-    let mut line = String::new();
-    while out.read_line(&mut line).is_ok_and(|n| n > 0) {
-        if let Some(at) = line.trim().strip_prefix("vox daemon: control socket ") {
-            sock = Some(std::path::PathBuf::from(at));
-            break;
-        }
-        line.clear();
-    }
+    let (daemon, sock) = start_daemon(&alice);
     let Some(sock) = sock else {
-        let _ = daemon.kill();
         panic!("CANNOT MEASURE: the daemon never said where its control socket is");
     };
-    let kill = |mut d: std::process::Child| {
-        let _ = d.kill();
-        let _ = d.wait();
-    };
+    let kill = drop;
 
     // 1. Right after the attach: the attach's passphrase opened no window (K-12).
     let (ok, said) = run(&mut vox_cmd(
@@ -281,6 +405,9 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
              passphrase (ADR-028 K-12); it said:\n{attach_said}"
         );
     }
+
+    // KP-1: only changing the keyring needs this authorization, never room work.
+    rooms_with_closed_keyrings(tmp.path(), &alice, &bob_dir, &carol);
 
     // 2. K-13: the passphrase is typed, never taken from the environment or a file.
     let add_bob = ["trust", "add", bob.as_str(), "--name", "bob", "--drive"];
