@@ -1554,6 +1554,15 @@ final class FirstRunProof: XCTestCase {
                           "Add Computer must open its account-owned view") else { throw Product("Add Computer did not open") }
         }
         try openComputers(computerA)
+        tap(pairingUI, Key.id("computer-pairing-begin"), "Create an unused invitation")
+        guard present(pairingUI, Key.id("computer-pairing-code"), timeout: 20,
+                      "an unused invitation must be shown before cancellation") else { return }
+        tap(pairingUI, Key.id("computer-pairing-cancel"), "Cancel Pairing before approval")
+        guard present(pairingUI, Key.id("computer-pairing-begin"), timeout: 20,
+                      "cancelling an unused invitation must permit a new one") else { return }
+        let cancelledA = try computerStatus(computerA)
+        XCTAssertTrue(cancelledA["invite_link"] is NSNull && cancelledA["pairing"] is NSNull,
+                      "PRODUCT: Cancel Pairing must retire the unused invitation; \(cancelledA)")
         tap(pairingUI, Key.id("computer-pairing-begin"), "Create Pairing Code with zero nodes")
         guard let code = words(pairingUI, Key.id("computer-pairing-code"), timeout: 20,
                                "a node-free computer must create a pairing code", until: { $0.hasPrefix("vox") }) else { return }
@@ -1626,7 +1635,104 @@ final class FirstRunProof: XCTestCase {
         XCTAssertEqual(appliedB["state"] as? String, "confirmed", "PRODUCT: reviewing computer must be applied")
         pairingUI.terminate()
         print("[proof] Add Computer: zero-node invitation; authenticated review; one-sided waiting; protected-node pending; ordinary attach; both confirmed; existing room and repo binding retained")
-        print("[scope] Add Computer cancellation, wall-clock expiry and storage-failure app legs remain OUTSTANDING")
+        // The ordinary app must explain a real storage refusal, not retain its old confirmation.
+        try staged(vox, ["node", "create", "storage-failure"],
+                   env: computerB.merging(["VOX_IDENTITY_PASSPHRASE": "protected pairing identity"]) { $1 })
+        try openComputers(computerB)
+        let managementDirectory = computerB["VOX_DATA_DIR"]! + "/.daemon/computer"
+        do {
+            let restricted = stager.run(["/bin/chmod", "0500", managementDirectory], env: [:])
+            guard restricted.status == 0 else { throw Apparatus("cannot restrict scratch computer storage: \(restricted.out)") }
+            defer { _ = stager.run(["/bin/chmod", "0700", managementDirectory], env: [:]) }
+            let refused = run(vox, ["node", "attach", "storage-failure", "--passphrase-file", computerPass], env: computerB)
+            XCTAssertNotEqual(refused.status, 0,
+                              "PRODUCT: a new managed node must not attach when its computer policy cannot be saved; \(refused.out)")
+        }
+        let repairedMode = stager.run(["/bin/chmod", "0700", managementDirectory], env: [:])
+        guard repairedMode.status == 0 else { throw Apparatus("cannot restore scratch computer storage: \(repairedMode.out)") }
+        guard present(pairingUI, Key.id("computer-trust-quarantined"), timeout: 30,
+                      "failed computer storage must visibly suspend trust") else { return }
+        guard words(pairingUI, Key.id("computer-pairing-problem"), timeout: 20,
+                    "storage suspension must explain the storage problem", until: { $0.contains("storage") }) != nil else { return }
+        XCTAssertNil(locateEverywhere(pairingUI, Key.id("computer-trust-confirmed")),
+                     "PRODUCT: a storage failure must not leave the app claiming confirmed")
+        pairingUI.terminate()
+
+        // Existing clock apparatus writes a past authenticated deadline. Restarting with normal
+        // clocks makes it genuinely expired to the ordinary app and both ordinary daemons.
+        let computerC = computerEnv("c"), computerD = computerEnv("d")
+        for environment in [computerC, computerD] {
+            let madeHome = stager.run(["/bin/mkdir", "-p", environment["HOME"]!], env: [:])
+            guard madeHome.status == 0 else { throw Apparatus("cannot create expiry account HOME: \(madeHome.out)") }
+            try stager.write(Data("no\n".utf8), to: environment["VOX_CONFIG_DIR"]! + "/app/login-item")
+        }
+        let behind = ["VOX_TEST_CLOCK_STEP_MS": "-700000"]
+        let pastC = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"],
+                              env: computerC.merging(behind) { $1 }, until: "vox daemon: control socket")
+        defer { pastC.terminate() }
+        let pastD = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"],
+                              env: computerD.merging(behind) { $1 }, until: "vox daemon: control socket")
+        defer { pastD.terminate() }
+        let invitedC = try staged(vox, ["computer", "invite", "--json"], env: computerC)
+        guard let inviteRecord = try JSONSerialization.jsonObject(with: Data(invitedC.utf8)) as? [String: Any],
+              let expiredCode = inviteRecord["invite_link"] as? String else {
+            throw Apparatus("expiry fixture has no public invitation: \(invitedC)")
+        }
+        let previewD = try staged(vox, ["computer", "pair", expiredCode, "--preview", "--json"], env: computerD)
+        guard let previewRecord = try JSONSerialization.jsonObject(with: Data(previewD.utf8)) as? [String: Any],
+              let expiredPairing = previewRecord["pairing"] as? [String: Any],
+              let expiredOperation = expiredPairing["operation_id"] as? String else {
+            throw Apparatus("expiry fixture has no authenticated proposal: \(previewD)")
+        }
+        try staged(vox, ["computer", "approve", expiredOperation, "--json"], env: computerC)
+        let receiptDeadline = Date().addingTimeInterval(20)
+        var remoteReceipt = try computerStatus(computerD)
+        while (remoteReceipt["pairing"] as? [String: Any])?["approved_there"] as? Bool != true,
+              Date() < receiptDeadline {
+            Thread.sleep(forTimeInterval: 0.2)
+            remoteReceipt = try computerStatus(computerD)
+        }
+        guard (remoteReceipt["pairing"] as? [String: Any])?["approved_there"] as? Bool == true else {
+            throw Apparatus("expiry peer has not received the one-sided signed approval: \(remoteReceipt)")
+        }
+        pastC.terminate(); pastD.terminate()
+        let normalC = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: computerC,
+                                until: "vox daemon: control socket")
+        defer { normalC.terminate() }
+        let normalD = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: computerD,
+                                until: "vox daemon: control socket")
+        defer { normalD.terminate() }
+        let expiredStatus = try computerStatus(computerC)
+        guard let persistedPairing = expiredStatus["pairing"] as? [String: Any],
+              let expiredMillis = persistedPairing["expires_ms"] as? NSNumber,
+              expiredMillis.doubleValue / 1000 < Date().timeIntervalSince1970,
+              persistedPairing["approved_here"] as? Bool == true else {
+            throw Apparatus("ordinary-clock expired signed attempt was not staged: \(expiredStatus)")
+        }
+        try openComputers(computerC)
+        guard words(pairingUI, Key.id("computer-pairing-expired"), timeout: 20,
+                    "expired signed intent must explain its local-only closure",
+                    until: { $0.contains("closing here does not remove its trust") }) != nil else { return }
+        guard words(pairingUI, Key.id("computer-pairing-cancel"), timeout: 15,
+                    "expired signed intent must offer Close Expired Attempt",
+                    until: { $0 == "Close Expired Attempt" }) != nil else { return }
+        tap(pairingUI, Key.id("computer-pairing-cancel"), "Close Expired Attempt locally")
+        guard present(pairingUI, Key.id("computer-pairing-begin"), timeout: 20,
+                      "closing expired intent must allow a fresh invitation") else { return }
+        tap(pairingUI, Key.id("computer-pairing-begin"), "Create a fresh invitation after expiry")
+        guard present(pairingUI, Key.id("computer-pairing-code"), timeout: 20,
+                      "fresh invitation must be displayed after local expiry closure") else { return }
+        let freshC = try computerStatus(computerC)
+        XCTAssertNotEqual(freshC["invite_id"] as? String, inviteRecord["invite_id"] as? String,
+                          "PRODUCT: after closing expired intent the new invitation must be distinct")
+        try staged(vox, ["computer", "cancel", expiredOperation, "--json"], env: computerC)
+        let afterOldClose = try computerStatus(computerC)
+        XCTAssertEqual(afterOldClose["invite_id"] as? String, freshC["invite_id"] as? String,
+                       "PRODUCT: retrying closure of the expired intent must not cancel or replace the fresh invitation")
+        XCTAssertTrue(afterOldClose["pairing"] is NSNull,
+                      "PRODUCT: retired expired intent must not replace the fresh invitation's state; \(afterOldClose)")
+        pairingUI.terminate()
+        print("[proof] Add Computer: unused invitation cancelled; signed expiry closed with local-only warning and fresh invitation preserved; storage refusal visibly suspends confirmation")
 
         let ui = voxApp(appPath)
         ui.launchEnvironment = voxEnv
