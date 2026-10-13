@@ -607,6 +607,19 @@ fn pair_computers(
         assert!(ok, "PRODUCT: {node}'s keyring was unavailable: {out}{err}");
         out
     };
+    // A stronger individual grant must be consumed before this protected node comes online
+    // under computer policy, even when its remote computer is offline at that moment.
+    let (ok, out, err) = a.run(&["trust", "drive", &local[2], "--node", late], "");
+    assert!(
+        ok,
+        "APPARATUS: stage the late node's stronger manual drive: {out}{err}"
+    );
+    assert!(
+        ring(a, late)
+            .lines()
+            .any(|line| line.contains(&local[2]) && line.contains("read + drive")),
+        "APPARATUS: the late node did not retain the stronger manual grant"
+    );
     let individual = ring(a, "agent-one");
     let rooms_before = a.run(&["room", "list", "--node", "personal"], "").1;
     let foreign_rooms_before = b.run(&["room", "list", "--node", "remote"], "").1;
@@ -704,11 +717,48 @@ fn pair_computers(
                 .contains(late)),
         "PRODUCT: protected node was silently unlocked or reported applied"
     );
+    // Observe the complete current roster on an already attached node, then take the remote
+    // computer offline. Neither a later remote roster nor a late local binding can repair an
+    // attach that falsely reports its policy applied. This is staging, not a timing assertion.
+    let current_peers = [
+        ("personal", local[0].as_str(), true),
+        ("agent-one", local[1].as_str(), false),
+        ("agent-two", local[2].as_str(), false),
+        ("agent-three", local[3].as_str(), false),
+        ("remote", remote, true),
+        ("remote-agent", other_agent.as_str(), false),
+    ];
+    assert!(wait_until(Duration::from_secs(45), || {
+        let (ok, shown, _) = a.run(&["trust", "list", "--node", "agent-one"], "");
+        ok && current_peers.iter().filter(|(_, fp, _)| *fp != local[1]).all(|(_, fp, drive)| shown.lines().any(|line| line.contains(fp) && line.contains("read + drive") == *drive))
+    }), "APPARATUS: the complete current local/remote roster was not visible before offline attach; agent-one: {}", ring(a, "agent-one"));
+    let remote_pid = b
+        .lock_pid()
+        .expect("APPARATUS: remote scratch daemon before offline attach");
+    stop_pid(remote_pid);
+    assert!(
+        !alive(remote_pid),
+        "APPARATUS: remote scratch daemon did not stop before offline attach"
+    );
     let (ok, out, err) = a.run(&["node", "attach", late, "--passphrase-file", "-"], PASS);
     assert!(
         ok,
         "PRODUCT: ordinary attach could not apply pending computer trust: {out}{err}"
     );
+    // Read the attached node's actual effective keyring now, without polling for a later repair.
+    // A skipped keyring application can neither omit a managed peer nor keep manual drive to a
+    // non-personal peer behind a successful attach/receipt.
+    let attached = ring(a, late);
+    for (name, fp, drive) in current_peers {
+        assert!(attached.lines().any(|line| line.contains(fp) && line.contains("read + drive") == drive), "PRODUCT: {late} attached while its paired computer was offline but its effective grant for {name} was not read with drive={drive}: {attached}");
+    }
+    for node in ["remote", "remote-agent"] {
+        let (ok, out, err) = b.run(&["node", "attach", node, "--passphrase-file", "-"], PASS);
+        assert!(
+            ok,
+            "APPARATUS: restore the paired computer after the offline attach assertion: {out}{err}"
+        );
+    }
     assert!(
         wait_until(Duration::from_secs(60), || computer(a, &["status"])
             ["state"]
