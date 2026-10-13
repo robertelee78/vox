@@ -1964,8 +1964,8 @@ final class FirstRunProof: XCTestCase {
         try staged(vox, ["trust", "add", "--node", "claude-a", aliceFp, "--name", "alice", "--drive",
                          "--identity-passphrase-file", pass("claude-a")], env: voxEnv)
         // Room work must not borrow the authorization window opened by trust above (KP-1).
-        try staged(vox, ["node", "detach", "alice"], env: voxEnv)
-        try staged(vox, ["node", "attach", "alice", "--no-remember", "--passphrase-file", pass("alice")], env: voxEnv)
+        try staged(vox, ["node", "lock", "alice"], env: voxEnv)
+        try staged(vox, ["node", "unlock", "alice", "--passphrase-file", pass("alice")], env: voxEnv)
         let closedKeyring = run(vox, ["status", "--node", "alice"], env: voxEnv).out
         guard closedKeyring.contains("keyring asks for the passphrase") else {
             throw Apparatus("alice's keyring window did not close before room work: \(closedKeyring)")
