@@ -58,6 +58,8 @@ pub enum StreamKind {
     /// promised it a place, so a room never exceeds its member cap. See `node::seatstream`.
     /// Members only.
     Seat = 12,
+    /// Drive-authorized Session records outside the public room log (ADR-031 SA-7).
+    Session = 13,
 }
 
 /// The largest kind frame we will read: `[kind]` is 2 bytes; anything bigger is
@@ -81,6 +83,7 @@ impl StreamKind {
             10 => Some(Self::Agree),
             11 => Some(Self::Identity),
             12 => Some(Self::Seat),
+            13 => Some(Self::Session),
             _ => None,
         }
     }

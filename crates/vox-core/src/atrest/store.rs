@@ -79,6 +79,8 @@ pub enum SegmentKind {
     PrekeyRing,
     /// Authenticated legacy Session subtype evidence, scoped to one room (#804).
     SessionClassification,
+    /// Drive-authorized Session wire and cache, independent of the public log (SA-7).
+    PrivateSession,
 }
 
 impl SegmentKind {
@@ -92,6 +94,7 @@ impl SegmentKind {
             SegmentKind::PrekeyRing => b"vox/seg/prekey-ring/v1",
             SegmentKind::Trust => b"vox/seg/trust-keyring/v1",
             SegmentKind::SessionClassification => b"vox/seg/session-classification/v1",
+            SegmentKind::PrivateSession => b"vox/seg/private-session/v1",
         }
     }
 }

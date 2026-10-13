@@ -135,7 +135,109 @@ pub fn refuse_old_layout(account: &Account) -> Result<()> {
 // Format 2 adds separate Session retention and version-3 age records. Opening a
 // supported older root decodes its version-1/2 records and classifies stored drive
 // envelopes before the first retention sweep; no identity or room is rewritten.
-pub const DATA_ROOT_FORMAT: u32 = 2;
+// Format 3 is v0.4.5's shared target (#741). Its first contribution adds version-4 keyrings
+// with durable manual-removal history for local trust. Other v0.4.5 storage contributions
+// extend this target; they must not each raise it. Their combined upgrade remains #741's proof.
+pub const DATA_ROOT_FORMAT: u32 = 3;
+
+/// Read the supported format before opening or writing anything in the data root (ADR-026 F-3).
+/// A missing marker is format 1, written by v0.4.0; an existing but unreadable marker is not.
+/// The writer's version is descriptive: the format number decides whether this build can read it.
+///
+/// # Errors
+/// [`Error::DataRootNotRead`] when the marker cannot be read, is malformed, or names a format
+/// newer than this build. Refusing it preserves the person's data instead of silently downgrading
+/// the marker and opening stores with incompatible code.
+pub fn data_root_format(account: &Account) -> Result<u32> {
+    read_data_root_format(account).map(|(format, _)| format)
+}
+
+/// Keep the admitted marker's text so stamping never reopens an unchecked path to compare it.
+fn read_data_root_format(account: &Account) -> Result<(u32, Option<String>)> {
+    const MAX_MARKER_BYTES: u64 = 4096;
+    let path = account.daemon_dir().join(FORMAT_FILE);
+    let refused = |why: String| Error::DataRootNotRead {
+        root: account.data_root.display().to_string(),
+        why,
+    };
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(refused(
+                "its format marker could not be read: it is not a regular file; \
+                 nothing in it was changed"
+                    .into(),
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((1, None)),
+        Err(e) => {
+            return Err(refused(format!(
+                "its format marker could not be read: {e}; nothing in it was changed"
+            )));
+        }
+    }
+    // A pre-open path check alone races a replacement by a FIFO or symlink. Open without
+    // following a link or waiting for a pipe's writer, then check the descriptor itself before
+    // reading. A changed or unreadable marker is never treated as the missing v0.4.0 marker.
+    #[cfg(unix)]
+    let opened = rustix::fs::open(
+        &path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map(std::fs::File::from)
+    .map_err(std::io::Error::from);
+    #[cfg(not(unix))]
+    let opened = std::fs::File::open(&path);
+    let file = opened.map_err(|e| {
+        refused(format!(
+            "its format marker could not be read: {e}; nothing in it was changed"
+        ))
+    })?;
+    let metadata = file.metadata().map_err(|e| {
+        refused(format!(
+            "its format marker could not be read: {e}; nothing in it was changed"
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(refused(
+            "its format marker could not be read: it is not a regular file; \
+             nothing in it was changed"
+                .into(),
+        ));
+    }
+    let mut text = String::new();
+    file.take(MAX_MARKER_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| {
+            refused(format!(
+                "its format marker could not be read: {e}; nothing in it was changed"
+            ))
+        })?;
+    let format = text
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("format "))
+        .filter(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|number| number.parse::<u32>().ok())
+        .filter(|number| *number > 0);
+    let Some(format) = format.filter(|_| text.len() as u64 <= MAX_MARKER_BYTES) else {
+        return Err(refused(
+            "its format marker is not valid; nothing in it was changed".into(),
+        ));
+    };
+    if format > DATA_ROOT_FORMAT {
+        return Err(refused(format!(
+            "data format {format} needs a newer Vox (this build reads through format \
+             {DATA_ROOT_FORMAT}); use the version that last opened it or a newer one; \
+             nothing in it was changed"
+        )));
+    }
+    Ok((format, Some(text)))
+}
 
 /// Read the supported format before opening or writing anything in the data root (ADR-026 F-3).
 /// A missing marker is format 1, written by v0.4.0; an existing but unreadable marker is not.
