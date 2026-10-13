@@ -907,8 +907,12 @@ private struct RoomView: View {
         // kept from last time.
         HStack(spacing: 0) {
             VStack(spacing: 0) {
-                RoomHeader(model: model, room: room)
-                Divider()
+                Color.clear.frame(height: 0)
+                    .navigationTitle(model.roomName(room))
+                    .navigationSubtitle("")
+                    .toolbar {
+                        ToolbarItem(placement: .principal) { RoomTabs(model: model, room: room) }
+                    }
                 // A trust offer from one of its members, at the top of its conversation (the
                 // decider, v0.4.3: offers are in the room they concern, not a sidebar section).
                 if model.showing == .general {
@@ -1931,60 +1935,6 @@ enum DockBadge {
 /// The room's own header, pinned above its timeline: its name, how many members it has, what the
 /// timeline shows (General, All, or a Session), and its retention, which is always said (R-7).
 /// The window takes the room's name as its title, so the Window menu and ⌘` say which room it is.
-private struct RoomHeader: View {
-    @ObservedObject var model: NodeModel
-    let room: String
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 8) {
-            facts
-            // The room by tag (#636): a thread of one task, project or milestone, from the tags of
-            // the messages this node can read.
-            if !model.roomTags.isEmpty || tagShown != nil {
-                Menu {
-                    Button("All messages") { model.showing = .general }
-                        .disabled(tagShown == nil)
-                    Divider()
-                    ForEach(model.roomTags, id: \.self) { tag in
-                        Button(tag) { model.showing = .tag(tag) }
-                    }
-                } label: {
-                    Label(tagShown ?? "Tags", systemImage: "tag")
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .help("Show only the messages carrying a tag")
-                .accessibilityIdentifier("room-tag-filter")
-            }
-        }
-        .padding(.horizontal, 12).padding(.vertical, 8)
-        .navigationTitle(model.roomName(room))
-        .navigationSubtitle(model.roomHeaderMeta)
-    }
-
-    /// The tag whose thread is on screen, if one is.
-    private var tagShown: String? {
-        if case .tag(let tag) = model.showing { return tag }
-        return nil
-    }
-
-    private var facts: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text("ROOM").eyebrow().secondaryText()
-            Text(model.roomName(room)).fontWeight(.semibold)
-                .lineLimit(1).truncationMode(.middle)
-                .textSelection(.enabled)
-                .accessibilityIdentifier("room-header-name")
-                .accessibilityAddTraits(.isHeader)
-            Text(model.roomHeaderMeta)
-                .secondaryText()
-                .lineLimit(1).truncationMode(.middle)
-                .accessibilityIdentifier("room-header-meta")
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
 /// Where a new day starts in the timeline: its words between two hairlines.
 private struct DayDivider: View {
     /// The day, "2026-10-04", as the divider's identifier says it.
@@ -2242,11 +2192,6 @@ private struct Inspector: View {
         // LAN section with it. Each section's heading stays in view while its rows scroll.
         ScrollView {
             LazyVStack(alignment: .leading, spacing: Space.s8, pinnedViews: [.sectionHeaders]) {
-                Section {
-                    SessionsList(model: model, heading: false)
-                } header: {
-                    heading("SESSIONS")
-                }
                 Section {
                     ForEach(model.members) { member in
                         TrustMark(name: member.name, trust: member.trust)

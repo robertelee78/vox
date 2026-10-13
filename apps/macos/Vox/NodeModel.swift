@@ -218,7 +218,14 @@ final class NodeModel: ObservableObject {
     private var knownWaiting: Set<String> = []
     private var waitingSeen = false
     /// The room on screen's Sessions, open and ended (ADR-029 CL-2).
-    @Published private(set) var sessions: [FfiSession] = []
+    @Published private(set) var sessions: [FfiSession] = [] {
+        didSet {
+            if case let .session(node, id) = showing,
+               !sessions.contains(where: { $0.nodeFingerprint == node && $0.sessionId == id && $0.canDrive }) {
+                showing = .general
+            }
+        }
+    }
     /// The Session on screen's entries, oldest first, to a member with drive (SC-1): its newest
     /// page, and the older pages the person scrolled up to (ADR-034 FR-4); never its whole
     /// history.
@@ -2250,6 +2257,7 @@ extension NodeModel {
 
     /// A Session in `room` opened, ended or was renamed, or what waits on this node changed.
     fileprivate func sessionsChanged(in room: String) async {
+        let generation = roomReadGeneration
         if let listed = try? await client.sessions(room: room),
            let i = rooms.firstIndex(where: { $0.id == room }) {
             let n = listed.reduce(0) { $0 + Int($1.pending) }
@@ -2257,7 +2265,7 @@ extension NodeModel {
         }
         await noteWaiting()
         guard roomOnScreen == room, let listed = try? await client.sessions(room: room),
-              roomOnScreen == room else { return }
+              roomOnScreen == room, generation == roomReadGeneration, ended == nil else { return }
         if listed != sessions { sessions = listed }
         await readSession()
     }
