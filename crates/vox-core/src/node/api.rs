@@ -663,6 +663,10 @@ pub struct ChannelDetail {
 /// The node's latest-wins view (published over a `watch`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NodeView {
+    /// Display-only last-known anchors of every saved room, separate from dialing authority.
+    pub room_anchors: Vec<RoomAnchorView>,
+    /// Why the saved-room inventory could not be read or kept. Never an empty-list success.
+    pub anchor_inventory_error: Option<String>,
     /// The profile's identity, or `None` before one is created.
     pub identity: Option<IdentityInfo>,
     /// `(room, member, said)`: what is said of a member about this identity's key, after its name
@@ -730,6 +734,21 @@ pub struct NodeView {
     pub anchoring: Vec<AnchoredChannel>,
 }
 
+/// One saved room's last-known anchor provenance, for the daemon's shared list only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomAnchorView {
+    /// The room identity.
+    pub room: Digest32,
+    /// Its last observed shared name, if it has one.
+    pub name: Option<String>,
+    /// The room's own anchors, excluding member addresses carried by a link.
+    pub anchors: crate::nat::bootstrap::BootstrapSet,
+    /// This observation could not be refreshed: the room is closed, locked or busy.
+    pub stale: bool,
+    /// When this node last observed a change to the displayed name or anchor set, in Unix ms.
+    pub observed_at: u64,
+}
+
 /// A live local port forwarded to a member's service (ADR-013).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardInfo {
@@ -788,15 +807,15 @@ pub enum NodeCommand {
         /// The keyring change. Anything else is refused as an internal fault.
         change: Box<NodeCommand>,
     },
-    /// Merge more anchors into the configured set, and dial any not yet connected.
+    /// Replace this node's manual anchors with the daemon's current machine set.
     ///
     /// The set is resolved when configuration is read, so a long-running node holds the
     /// addresses it got at startup. An anchor named by hostname — which is the point of
     /// naming one by hostname — moves when its ISP decides, and the node would keep
     /// redialling the old address for ever. This is how a re-resolved set reaches a node
     /// that is already running.
-    AddAnchors {
-        /// The freshly resolved anchors to merge in.
+    SetAnchors {
+        /// The complete freshly resolved machine set, including an empty set after removal.
         anchors: crate::nat::bootstrap::BootstrapSet,
     },
     /// Unlock the identity.

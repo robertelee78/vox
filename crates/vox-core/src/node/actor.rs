@@ -1415,6 +1415,8 @@ enum NetEvent {
         endpoints: crate::nat::multiaddr::EndpointList,
         /// Whether it is the board the join reads from (and so an anchor of ours).
         board: bool,
+        /// Scope of the operation that dialled it, retained for a later direct-path upgrade.
+        helpers: crate::node::network::HelperContext,
     },
     /// A room this node held open before it stopped has been reopened off the actor (#208):
     /// hold it, unless it was closed or the identity locked while it was opening.
@@ -2942,6 +2944,12 @@ impl JoinSteps {
 }
 
 impl Joiner {
+    fn helper_context(&self) -> crate::node::network::HelperContext {
+        crate::node::network::HelperContext {
+            room: Some(self.parsed.channel_id),
+            extra_helpers: self.routes.iter().map(|(peer, _)| *peer).collect(),
+        }
+    }
     /// A board holding the room, when the boards in `tried` — starting with the one
     /// `reach_a_board` chose — had nothing for it, could not be read, or took no pre-join record:
     /// every other board the join's routes name, asked at once, and the first that holds it.
@@ -2965,6 +2973,7 @@ impl Joiner {
     ) -> std::result::Result<(Arc<VoxConnection>, crate::nat::service::RecordSet), JoinerLost> {
         use crate::node::network::short_id;
         let room = self.parsed.channel_id;
+        let helpers = self.helper_context();
         let t = std::time::Instant::now();
         self.begin(format!(
             "asking the address's other boards for room {}",
@@ -2982,8 +2991,9 @@ impl Joiner {
                 *id,
                 endpoints.clone(),
             );
+            let helpers = helpers.clone();
             asked.spawn(async move {
-                let said = match Self::dial_with(&net, &tx, id, &endpoints, true).await {
+                let said = match Self::dial_with(&net, &tx, id, &endpoints, true, &helpers).await {
                     Err(e) => Err(format!("board {} was not reached: {e}", short_id(id))),
                     Ok(conn) => match net.fetch_channel(&conn, &room, 0).await {
                         Err(e) => Err(match went_offline(&conn) {
@@ -3049,7 +3059,15 @@ impl Joiner {
         endpoints: &crate::nat::multiaddr::EndpointList,
         board: bool,
     ) -> crate::error::Result<Arc<VoxConnection>> {
-        Self::dial_with(&self.net, &self.tx, peer, endpoints, board).await
+        Self::dial_with(
+            &self.net,
+            &self.tx,
+            peer,
+            endpoints,
+            board,
+            &self.helper_context(),
+        )
+        .await
     }
 
     /// [`Self::dial`] with what it needs passed in, so several can run on tasks of their own.
@@ -3059,13 +3077,15 @@ impl Joiner {
         peer: Digest32,
         endpoints: &crate::nat::multiaddr::EndpointList,
         board: bool,
+        helpers: &crate::node::network::HelperContext,
     ) -> crate::error::Result<Arc<VoxConnection>> {
-        let conn = net.reach(peer, endpoints).await?;
+        let conn = net.reach(peer, endpoints, helpers).await?;
         let _ = tx
             .send(NetEvent::Dialed {
                 conn: Arc::clone(&conn),
                 endpoints: endpoints.clone(),
                 board,
+                helpers: helpers.clone(),
             })
             .await;
         Ok(conn)
@@ -3088,6 +3108,7 @@ impl Joiner {
     /// answered is taken and the slower ones are dropped.
     async fn reach_a_board(&self) -> Option<Arc<VoxConnection>> {
         let deadline = tokio::time::Instant::now() + Node::BOARD_PATIENCE;
+        let helpers = self.helper_context();
         loop {
             let mut dials = tokio::task::JoinSet::new();
             for (at, (id, endpoints)) in self.routes.iter().enumerate() {
@@ -3097,10 +3118,13 @@ impl Joiner {
                     *id,
                     endpoints.clone(),
                 );
+                let helpers = helpers.clone();
                 dials.spawn(async move {
                     (
                         at,
-                        Self::dial_with(&net, &tx, id, &endpoints, true).await.ok(),
+                        Self::dial_with(&net, &tx, id, &endpoints, true, &helpers)
+                            .await
+                            .ok(),
                     )
                 });
             }
@@ -4184,6 +4208,12 @@ impl EventStream {
     }
 }
 
+/// A signed room withdrawal awaiting anchors, including routes that outlive room purge.
+struct PendingWithdrawal {
+    wire: Vec<u8>,
+    routes: BTreeMap<Digest32, Vec<std::net::SocketAddr>>,
+}
+
 /// The node actor's state (owned by its task).
 pub struct Node {
     paths: Paths,
@@ -4229,6 +4259,10 @@ pub struct Node {
     /// anchor once and never again lost its board and its relay the first time the anchor
     /// restarted. Entries for rooms no longer open are ignored and dropped at the next redial.
     room_anchors: BTreeMap<Digest32, BootstrapSet>,
+    /// Durable display observations, never fed into network anchor selection.
+    anchor_inventory: Vec<crate::node::api::RoomAnchorView>,
+    /// A malformed or unsupported cache is preserved and reported, never silently replaced.
+    anchor_inventory_load_error: Option<String>,
     /// An override for the ADR-005 PoW parameters a join binds. `None` means the
     /// channel's own (production `(200,9)`); tests reduce them so the debug suite
     /// does not grind, exactly as they reduce the Argon2 profile.
@@ -4484,7 +4518,9 @@ pub struct Node {
     winding: BTreeMap<Digest32, Winding>,
     /// Rooms this node took off boards (V030-14) — left, or ended — with the signed withdraw, put
     /// again on every anchor that connects. Nothing of these rooms is published again.
-    withdrawn: BTreeMap<Digest32, Vec<u8>>,
+    // Wire and the room's effective anchor identities at withdrawal. The room may be
+    // purged before an offline anchor returns, so its scope must survive that purge.
+    withdrawn: BTreeMap<Digest32, PendingWithdrawal>,
     /// Per room, the members that had left as of the last tend (V030-08), to see one come back.
     departed_seen: BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
     /// Per `(room, member)`: consecutive keys not taken, and the unix millisecond before which the
@@ -4889,6 +4925,11 @@ impl Node {
         let handle_event_tx = event_tx.clone();
         let (net_tx, net_rx) = mpsc::channel(NET_QUEUE);
         let decisions = crate::node::decisions::DecisionLog::new(&paths.profile_dir);
+        let (anchor_inventory, anchor_inventory_load_error) =
+            match crate::node::anchor_inventory::load(&paths) {
+                Ok(rooms) => (rooms, None),
+                Err(error) => (Vec::new(), Some(error.to_string())),
+            };
         let node = Self {
             paths,
             decisions,
@@ -4904,6 +4945,8 @@ impl Node {
             computer_revision: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             anchor_ids: anchors.nodes().iter().map(|n| n.id).collect(),
             room_anchors: BTreeMap::new(),
+            anchor_inventory,
+            anchor_inventory_load_error,
             anchors,
             presented: BTreeMap::new(),
             presentation_due: BTreeMap::new(),
@@ -5435,26 +5478,21 @@ impl Node {
         match command {
             NodeCommand::CreateIdentity { passphrase } => self.create_identity(&passphrase),
             NodeCommand::Unlock { passphrase } => self.unlock(&passphrase).await,
-            NodeCommand::AddAnchors { anchors } => {
-                // `merge` keeps the first entry per identity, so it would discard exactly
-                // the thing a refresh carries: the same anchor at its new address.
-                if self.anchors.merge_endpoints(&anchors).is_err() {
-                    return Outcome::Failed(Fault::TooLong);
+            NodeCommand::SetAnchors { anchors } => {
+                if self.anchors == anchors {
+                    return Outcome::Done;
                 }
+                // A removal and a moved address both replace the previous machine input.
+                // Room provenance remains independent, including a room that also names a
+                // removed manual anchor.
+                self.anchors = anchors;
                 // Dial straight away rather than waiting for the throttle: the caller
                 // refreshed because something changed, and the whole point is not to sit
                 // on a stale address.
                 self.anchor_backoff.clear();
                 self.redial_anchors_if_due();
-                // And give the rooms the new address too. A channel keeps the anchor set
-                // it adopted when it was created or joined, and that set is what an
-                // invite link carries — so without this a room minted before the move
-                // would go on handing out an address nobody can dial.
-                let open: Vec<Digest32> = self.channels.keys().copied().collect();
-                for channel_id in open {
-                    self.adopt_channel_anchors(&channel_id, Some(&anchors))
-                        .await;
-                }
+                // Machine configuration does not write room provenance. The room's own
+                // anchor statement and its addresses remain independent of this refresh.
                 Outcome::Done
             }
             NodeCommand::VerifyPassphrase { passphrase } => match self.profile.as_ref() {
@@ -5875,6 +5913,7 @@ impl Node {
         // How long a stuck tunnel is given (V030-11): this node's setting, on this node.
         endpoint.local().set_stuck_after(self.stuck_after);
         let mut net = NodeNet::new(endpoint, Arc::clone(&presence), Arc::clone(&self.clock));
+        self.sync_anchor_scopes(&net);
         // Only an anchor keeps a board for a room it does not hold, and `--serve trusted`
         // narrows that to rooms its operator's trust list created (V210-70).
         net.serve_rooms(match (self.anchor_boards, self.serve_only.as_ref()) {
@@ -6162,6 +6201,24 @@ impl Node {
         conn: &Arc<VoxConnection>,
         cause: PublishCause,
     ) {
+        // A connection to one room's anchor is not permission to publish every room
+        // this node holds there (ADR-032 AN-2). Check here as well as in the caller:
+        // reconnect publication invokes this path directly.
+        if !self.anchor_serves_room(channel_id, &conn.peer_id()) {
+            // The authenticated member that answered a join also needs the newcomer's
+            // board record. It remains a member, never a machine or room anchor.
+            let member_join = if matches!(cause, PublishCause::Join) {
+                match self.channels.get(channel_id) {
+                    Some(room) => room.lock().await.is_known_member(&conn.peer_id()),
+                    None => false,
+                }
+            } else {
+                false
+            };
+            if !member_join {
+                return;
+            }
+        }
         // Taken off boards (V030-14): published nowhere again.
         if self.withdrawn.contains_key(channel_id) {
             return;
@@ -6542,6 +6599,26 @@ impl Node {
         self.profile.as_ref().map(Profile::store_handle)
     }
 
+    /// Hand-added anchors serve every room; a room's own anchors serve only that room.
+    /// `anchor_ids` classifies connections, and must not determine room scope.
+    fn anchor_serves_room(&self, room: &Digest32, anchor: &Digest32) -> bool {
+        self.anchors.get(anchor).is_some()
+            || self
+                .room_anchors
+                .get(room)
+                .is_some_and(|anchors| anchors.get(anchor).is_some())
+    }
+
+    fn sync_anchor_scopes(&self, net: &NodeNet) {
+        let open = self
+            .room_anchors
+            .iter()
+            .filter(|(room, _)| self.channels.contains_key(*room))
+            .map(|(room, anchors)| (*room, anchors.clone()))
+            .collect();
+        net.set_anchor_scopes(&self.anchors, &open);
+    }
+
     /// Every anchor this node keeps a connection to, with the addresses its next dial tries:
     /// the configured set first, then each open room's own that is not configured (V210-75).
     /// One identity appears once: at the addresses the configured set gives it if it is there,
@@ -6572,6 +6649,19 @@ impl Node {
                 }
             }
         }
+        // A room can be purged while its anchor is offline. Its signed withdrawal still
+        // needs the original route, even though no open room keeps that anchor now.
+        for pending in self.withdrawn.values() {
+            for (id, addresses) in &pending.routes {
+                if all.iter().any(|(configured, _)| configured == id) {
+                    continue;
+                }
+                match shared.iter_mut().find(|(anchor, _)| anchor == id) {
+                    Some((_, rooms)) => rooms.push(addresses.clone()),
+                    None => shared.push((*id, vec![addresses.clone()])),
+                }
+            }
+        }
         for (id, rooms) in shared {
             let mut union: Vec<std::net::SocketAddr> = Vec::new();
             let deepest = rooms.iter().map(Vec::len).max().unwrap_or(0);
@@ -6599,6 +6689,10 @@ impl Node {
                 .room_anchors
                 .iter()
                 .any(|(room, set)| self.channels.contains_key(room) && set.get(peer).is_some())
+            || self
+                .withdrawn
+                .values()
+                .any(|pending| pending.routes.contains_key(peer))
     }
 
     /// **Act on a change of the machine's network** (ADR-012 N-51, N-52), after the presence has
@@ -6675,6 +6769,7 @@ impl Node {
         };
         let open = &self.channels;
         self.room_anchors.retain(|room, _| open.contains_key(room));
+        self.sync_anchor_scopes(&net);
         let known = self.kept_anchors();
         // **A loss is noticed however the anchor went** (V210-93), in every build. A clean stop
         // closes the connection; a kill or a crash closes nothing, so the connection held is also
@@ -6886,7 +6981,7 @@ impl Node {
     }
 
     /// Make a channel's anchors this node's: record `more` on the channel (persisted
-    /// under its SEK) and the configured set with it, treat every one as an anchor,
+    /// under its SEK), treat every one as an anchor,
     /// and dial any not yet connected. Called when a channel is created, opened or
     /// joined.
     async fn adopt_channel_anchors(&mut self, channel_id: &Digest32, more: Option<&BootstrapSet>) {
@@ -6895,12 +6990,8 @@ impl Node {
         };
         let (anchors, own, members, settled) = {
             let mut channel = shared.lock().await;
-            if let Some(profile) = self.profile.as_ref() {
-                let mut add = self.anchors.clone();
-                if let Some(more) = more {
-                    let _ = add.merge_endpoints(more);
-                }
-                let _ = channel.add_anchors(profile.store(), &add);
+            if let (Some(profile), Some(more)) = (self.profile.as_ref(), more) {
+                let _ = channel.add_anchors(profile.store(), more);
             }
             // A link names the member who issued it too, last; a member is reached at the
             // addresses its board record gives, not kept like an anchor at the link's.
@@ -6924,6 +7015,7 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
+        self.sync_anchor_scopes(&net);
         for anchor in anchors.nodes() {
             // **A member is never dialled as an anchor** (V030-51, AGENTS.md "Anchors"): an
             // anchor's dial is direct only, and its failure backed off the member's sync, so a
@@ -6933,7 +7025,13 @@ impl Node {
                 continue;
             }
             self.anchor_ids.insert(anchor.id);
-            self.dial_anchor(&net, anchor.id, anchor.endpoints.direct_candidates());
+            let addresses = self
+                .anchors
+                .get(&anchor.id)
+                .unwrap_or(anchor)
+                .endpoints
+                .direct_candidates();
+            self.dial_anchor(&net, anchor.id, addresses);
         }
         // **A member the room's address names is reached as a member** (V030-51): left out of the
         // anchors' dial above, it must still be dialled, through the member ladder, which asks a
@@ -6968,6 +7066,7 @@ impl Node {
         let anchors: Vec<Arc<VoxConnection>> = self
             .anchor_ids
             .iter()
+            .filter(|id| self.anchor_serves_room(channel_id, id))
             .filter_map(|id| net.manager().existing(id))
             .collect();
         for conn in anchors {
@@ -7064,6 +7163,7 @@ impl Node {
     /// one tick stale, which is the safe side of that trade.
     async fn refresh_network_view(&self) {
         let Some(net) = self.net.as_ref() else { return };
+        self.sync_anchor_scopes(net);
         let mut policy = PeerPolicy::new();
         let mut departed: std::collections::BTreeSet<Digest32> = std::collections::BTreeSet::new();
         for (cid, shared) in &self.channels {
@@ -7380,6 +7480,7 @@ impl Node {
                 conn,
                 endpoints,
                 board,
+                helpers,
             } => {
                 let peer = conn.peer_id();
                 self.sync_dials.remove(&peer);
@@ -7397,10 +7498,17 @@ impl Node {
                     if crate::node::net::path_class(net.manager().endpoint(), &conn)
                         == crate::node::net::PathClass::Relayed
                     {
+                        // Link hints authorize the joiner's original reach only. A queued
+                        // Dialed event may outlive that join, so its independent upgrade must
+                        // use current room/manual authority without the temporary hints.
+                        let helpers = crate::node::network::HelperContext {
+                            room: helpers.room,
+                            ..crate::node::network::HelperContext::default()
+                        };
                         let tx = self.net_tx.clone();
                         self.last_upgrade.insert(peer, self.now_ms().get());
                         tokio::spawn(async move {
-                            match net.upgrade(peer, &endpoints).await {
+                            match net.upgrade(peer, &endpoints, &helpers).await {
                                 Ok(better) => {
                                     let _ = tx.send(NetEvent::BetterPath { conn: better }).await;
                                 }
@@ -7821,11 +7929,9 @@ impl Node {
                 // A node with no room to publish (one still joining, say) has nothing to wait for:
                 // the board knows it as far as it ever will before the join (`PublishDone` tells
                 // a board otherwise).
-                if !self
-                    .channels
-                    .keys()
-                    .any(|room| !self.withdrawn.contains_key(room))
-                {
+                if !self.channels.keys().any(|room| {
+                    !self.withdrawn.contains_key(room) && self.anchor_serves_room(room, &peer)
+                }) {
                     if let Some(net) = self.net.as_ref() {
                         net.board_told(&peer);
                     }
@@ -7835,11 +7941,21 @@ impl Node {
                 let mut puts: Vec<Vec<u8>> = Vec::new();
                 let rooms: Vec<Digest32> = self.channels.keys().copied().collect();
                 for room in rooms {
+                    if !self.anchor_serves_room(&room, &peer) {
+                        continue;
+                    }
                     if let Some(r) = self.admin_roster(&room).await {
                         puts.push(r);
                     }
                 }
-                puts.extend(self.withdrawn.values().cloned());
+                puts.extend(
+                    self.withdrawn
+                        .values()
+                        .filter(|pending| {
+                            pending.routes.contains_key(&peer) || self.anchors.get(&peer).is_some()
+                        })
+                        .map(|pending| pending.wire.clone()),
+                );
                 Self::put_withdraws(&conn, puts);
                 self.read_anchor_boards(Some(peer)).await;
                 // A room that has not had its first sync reaches its members now that a relay is
@@ -8588,7 +8704,6 @@ impl Node {
                         .map(|net| {
                             MemberDialer(NodeDialer {
                                 net: Arc::clone(net),
-                                channel_id: None,
                             })
                         })
                         .ok_or(crate::error::Error::Unreachable(
@@ -8614,13 +8729,20 @@ impl Node {
                 let endpoints = net.board_endpoints(&channel_id, &peer);
                 let tx = self.net_tx.clone();
                 tokio::spawn(async move {
-                    let reached = net.reach(peer, &endpoints).await;
+                    let reached = net
+                        .reach(
+                            peer,
+                            &endpoints,
+                            &crate::node::network::HelperContext::room(channel_id),
+                        )
+                        .await;
                     if let Ok(conn) = &reached {
                         let _ = tx
                             .send(NetEvent::Dialed {
                                 conn: Arc::clone(conn),
                                 endpoints,
                                 board: false,
+                                helpers: crate::node::network::HelperContext::room(channel_id),
                             })
                             .await;
                     }
@@ -9168,7 +9290,7 @@ impl Node {
         let endpoint = Arc::clone(net.manager().endpoint());
         // Collected first: the borrow of `self.channels` cannot outlive the mutation of
         // `self.last_upgrade` below.
-        let mut due: Vec<(Digest32, crate::nat::multiaddr::EndpointList)> = Vec::new();
+        let mut due: Vec<(Digest32, Digest32, crate::nat::multiaddr::EndpointList)> = Vec::new();
         for (cid, shared) in &self.channels {
             let authors: Vec<Digest32> = {
                 let ch = shared.lock().await;
@@ -9187,7 +9309,7 @@ impl Node {
                 if u128::from(now.saturating_sub(last)) < UPGRADE_RETRY.as_millis() {
                     continue;
                 }
-                due.push((peer, net.board_endpoints(cid, &peer)));
+                due.push((*cid, peer, net.board_endpoints(cid, &peer)));
             }
         }
         if !due.is_empty() {
@@ -9195,12 +9317,19 @@ impl Node {
             // reuses a stale one asks the same failed question again.
             net.refresh_observed();
         }
-        for (peer, endpoints) in due {
+        for (room, peer, endpoints) in due {
             self.last_upgrade.insert(peer, now);
             let net = Arc::clone(&net);
             let tx = self.net_tx.clone();
             tokio::spawn(async move {
-                match net.upgrade(peer, &endpoints).await {
+                match net
+                    .upgrade(
+                        peer,
+                        &endpoints,
+                        &crate::node::network::HelperContext::room(room),
+                    )
+                    .await
+                {
                     Ok(better) => {
                         let _ = tx.send(NetEvent::BetterPath { conn: better }).await;
                     }
@@ -9328,17 +9457,12 @@ impl Node {
         let Some(net) = self.net.as_ref() else {
             return Vec::new();
         };
-        // The link names the swarm's anchors — the channel's own, then the configured
-        // set — and this node last: an anchor is reachable by design, this node's own
+        // The link names the room's own anchors and this node last. Machine hand-added
+        // anchors do not become the room's merely because this node uses them. This node's own
         // addresses may not be, and a joiner tries them in this order.
         let mut anchors: Vec<BootstrapNode> = Vec::new();
         if let Some(shared) = self.channels.get(channel_id) {
             for n in shared.lock().await.anchors().nodes() {
-                anchors.push(n.clone());
-            }
-        }
-        for n in self.anchors.nodes() {
-            if !anchors.iter().any(|a| a.id == n.id) {
                 anchors.push(n.clone());
             }
         }
@@ -10147,7 +10271,8 @@ impl Node {
         let now = now_ms.get();
         let me = net.local_id();
         // The boards to try, in the order `reach_a_board` tried them: the link's anchors, this
-        // node's own, then any anchor it already holds a live connection to.
+        // machine's hand-added anchors. A live connection assigned to another room is
+        // not a route for this room.
         //
         // **One route per board, with every address known for it.** The link and this node can
         // name the same anchor by different addresses — the host that minted the link reached it on
@@ -10176,15 +10301,6 @@ impl Node {
                 all.truncate(crate::nat::multiaddr::MAX_ENDPOINTS);
                 if let Ok(merged) = crate::nat::multiaddr::EndpointList::new(all) {
                     *known = merged;
-                }
-            }
-        }
-        let live: std::collections::BTreeSet<Digest32> =
-            net.manager().peers().into_iter().collect();
-        if let Ok(empty) = crate::nat::multiaddr::EndpointList::new(Vec::new()) {
-            for id in self.anchor_ids.iter().copied() {
-                if live.contains(&id) && seen.insert(id) {
-                    routes.push((id, empty.clone()));
                 }
             }
         }
@@ -10313,6 +10429,7 @@ impl Node {
                                 conn,
                                 endpoints,
                                 board: false,
+                                helpers: crate::node::network::HelperContext::room(room),
                             })
                             .await;
                     }
@@ -10376,6 +10493,7 @@ impl Node {
             }
         }
         if let Some(net) = self.net.clone() {
+            self.sync_anchor_scopes(&net);
             for (id, candidates) in anchors {
                 self.anchor_ids.insert(id);
                 self.dial_anchor(&net, id, candidates);
@@ -10506,16 +10624,13 @@ impl Node {
             }
         }
         // The link's anchors are this channel's anchors from now on (persisted, so a
-        // restart still knows where the swarm's board is), together with our own.
+        // restart still knows where the room's board is).
         let mut learned = BootstrapSet::new();
         for a in parsed.anchors.iter().filter(|a| a.id != me) {
             let _ = learned.add(a.clone());
         }
-        // `merge_endpoints`, not `merge`: the link's anchors went in first, so with
-        // keep-first semantics a link minted before the anchor moved would win and this
-        // node's freshly resolved address for the same identity would be discarded —
-        // the joiner would adopt the stale address and keep it.
-        let _ = learned.merge_endpoints(&self.anchors);
+        // Locally configured anchors remain a separate machine source. Their addresses
+        // take precedence for local dials, without rewriting the room's statement.
         self.adopt_channel_anchors(&parsed.channel_id, Some(&learned))
             .await;
         self.refresh_network_view().await;
@@ -12263,11 +12378,13 @@ impl Node {
         for (cid, shared) in &self.channels {
             let (anchors, known) = {
                 let ch = shared.lock().await;
-                let anchors: Vec<Digest32> = ch
+                let anchors: BTreeSet<Digest32> = ch
                     .anchors()
                     .nodes()
                     .iter()
                     .map(|a| a.id)
+                    .chain(self.anchors.nodes().iter().map(|a| a.id))
+                    .filter(|a| self.anchor_serves_room(cid, a))
                     .filter(|a| !ch.is_member(a))
                     .filter(|a| only.is_none_or(|o| o == *a))
                     .collect();
@@ -13936,13 +14053,21 @@ impl Node {
                 } else {
                     endpoints
                 };
-                match net.reach(target, &endpoints).await {
+                match net
+                    .reach(
+                        target,
+                        &endpoints,
+                        &crate::node::network::HelperContext::room(room),
+                    )
+                    .await
+                {
                     Ok(conn) => {
                         let _ = tx
                             .send(NetEvent::Dialed {
                                 conn,
                                 endpoints,
                                 board: false,
+                                helpers: crate::node::network::HelperContext::room(room),
                             })
                             .await;
                     }
@@ -14055,6 +14180,7 @@ impl Node {
                                 conn,
                                 endpoints,
                                 board: false,
+                                helpers: crate::node::network::HelperContext::default(),
                             })
                             .await;
                     }
@@ -14100,13 +14226,21 @@ impl Node {
             // This node's board record, or a connected board's when it holds none yet (V210-122,
             // V030-22).
             let endpoints = net.member_endpoints(&room, peer).await;
-            match net.reach(peer, &endpoints).await {
+            match net
+                .reach(
+                    peer,
+                    &endpoints,
+                    &crate::node::network::HelperContext::room(room),
+                )
+                .await
+            {
                 Ok(conn) => {
                     let _ = tx
                         .send(NetEvent::Dialed {
                             conn,
                             endpoints,
                             board: false,
+                            helpers: crate::node::network::HelperContext::room(room),
                         })
                         .await;
                 }
@@ -15534,10 +15668,28 @@ impl Node {
         };
         let wire = w.to_wire();
         let _ = net.publish_local(&wire);
-        self.withdrawn.insert(*channel_id, wire.clone());
+        let mut assigned = BTreeMap::new();
+        for anchor in self.anchors.nodes().iter().chain(
+            self.room_anchors
+                .get(channel_id)
+                .into_iter()
+                .flat_map(|anchors| anchors.nodes().iter()),
+        ) {
+            assigned
+                .entry(anchor.id)
+                .or_insert_with(|| anchor.endpoints.direct_candidates());
+        }
+        self.withdrawn.insert(
+            *channel_id,
+            PendingWithdrawal {
+                wire: wire.clone(),
+                routes: assigned,
+            },
+        );
         let anchors: Vec<Arc<VoxConnection>> = self
             .anchor_ids
             .iter()
+            .filter(|id| self.anchor_serves_room(channel_id, id))
             .filter_map(|id| net.manager().existing(id))
             .collect();
         for conn in &anchors {
@@ -15581,6 +15733,7 @@ impl Node {
         for conn in self
             .anchor_ids
             .iter()
+            .filter(|id| self.anchor_serves_room(channel_id, id))
             .filter_map(|id| net.manager().existing(id))
         {
             Self::put_withdraws(&conn, vec![wire.clone()]);
@@ -15782,6 +15935,9 @@ impl Node {
         // Kept: an anchor away now is still told when it connects. A join of the room again
         // (`begin_join_channel`) takes it out.
         self.room_anchors.remove(channel_id);
+        if let Some(net) = self.net.as_ref() {
+            self.sync_anchor_scopes(net);
+        }
         self.reachers.remove(channel_id);
         crate::node::status::SyncBook::forget_room(&self.sync_book, channel_id);
         self.sched_rooms.remove(channel_id);
@@ -16118,10 +16274,7 @@ impl Node {
         // No dial here: the host is reached per request (see `up::HostDialer`). Dialling
         // first would refuse to start on a race — a node that has just joined has not read
         // the board — and retrying here would block the actor tick that reads it.
-        let dialer = Arc::new(NodeDialer {
-            net,
-            channel_id: None,
-        });
+        let dialer = Arc::new(NodeDialer { net });
         // The proxy is a library and cannot print, so a session cut by a withdrawal of
         // reach comes back as an event (M17.11). A broadcast send never blocks and drops
         // when nobody is listening, which is the right trade for a notice.
@@ -16235,7 +16388,14 @@ impl Node {
             } else {
                 endpoints
             };
-            let result = match net.reach(host, &endpoints).await {
+            let result = match net
+                .reach(
+                    host,
+                    &endpoints,
+                    &crate::node::network::HelperContext::room(channel_id),
+                )
+                .await
+            {
                 Ok(conn) => {
                     // A forward whose every connection would be refused is refused now, in
                     // words, rather than bound and then resetting each connection (V210-81).
@@ -16245,6 +16405,7 @@ impl Node {
                             conn,
                             endpoints,
                             board: false,
+                            helpers: crate::node::network::HelperContext::room(channel_id),
                         })
                         .await;
                     room
@@ -16297,10 +16458,7 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return Outcome::Failed(Fault::NotNetworked);
         };
-        let dialer = Arc::new(NodeDialer {
-            net,
-            channel_id: Some(*channel_id),
-        });
+        let dialer = Arc::new(NodeDialer { net });
         let events = self.event_tx.clone();
         let report = move |note: crate::node::tunnel::TunnelNote| {
             let _ = events.send(note_event(note));
@@ -17300,6 +17458,8 @@ impl Node {
             .map(|eps| eps.addrs().iter().map(ToString::to_string).collect())
             .unwrap_or_default();
         self.view_tx.send_replace(NodeView {
+            room_anchors: self.anchor_inventory.clone(),
+            anchor_inventory_error: self.anchor_inventory_load_error.clone(),
             identity,
             locked,
             locking: self.locking > 0,
@@ -17372,7 +17532,21 @@ impl Node {
                 self.cancel_room_validations(Some(&room), fault);
             }
         }
-        let (view, read) = self.view_of().await;
+        let (mut view, read) = self.view_of().await;
+        if view.anchor_inventory_error.is_none() {
+            let mut saved = view.room_anchors.clone();
+            for room in &mut saved {
+                room.stale = true;
+            }
+            // A busy or closed room keeps its last observation; a removed room is pruned only
+            // after the authoritative store enumeration succeeded. Only changed content writes.
+            if saved != self.anchor_inventory {
+                match crate::node::anchor_inventory::save(&self.paths, &saved) {
+                    Ok(()) => self.anchor_inventory = saved,
+                    Err(error) => view.anchor_inventory_error = Some(error.to_string()),
+                }
+            }
+        }
         self.fresh_details
             .retain(|id, _| self.channels.contains_key(id) && !read.contains(id));
         self.view_tx.send_replace(view);
@@ -17413,11 +17587,29 @@ impl Node {
             .and_then(|n| n.local_endpoints().ok())
             .map(|eps| eps.addrs().iter().map(ToString::to_string).collect())
             .unwrap_or_default();
-        let mut known: Vec<Digest32> = self
+        let saved_rooms = self
             .profile
             .as_ref()
-            .and_then(|p| p.store().channels().ok())
-            .unwrap_or_else(|| prev.channels.iter().map(|c| c.channel_id).collect());
+            .map(|p| p.store().channels())
+            .transpose();
+        let mut anchor_inventory_error = self.anchor_inventory_load_error.clone();
+        let mut inventory: BTreeMap<_, _> = self
+            .anchor_inventory
+            .iter()
+            .cloned()
+            .map(|room| (room.room, room))
+            .collect();
+        let mut known: Vec<Digest32> = match saved_rooms {
+            Ok(Some(saved)) => {
+                inventory.retain(|room, _| saved.contains(room));
+                saved
+            }
+            Ok(None) => Vec::new(),
+            Err(error) => {
+                anchor_inventory_error = Some(format!("cannot read saved rooms: {error}"));
+                prev.channels.iter().map(|c| c.channel_id).collect()
+            }
+        };
         // A store being recovered may not answer reads yet. Its open rooms and the last
         // saved list remain visible, with their cannot-save cause, throughout that retry.
         known.extend(self.channels.keys().copied());
@@ -17453,6 +17645,33 @@ impl Node {
                 continue;
             };
             read.insert(*id);
+            let mut anchors = BootstrapSet::new();
+            for anchor in ch.anchors().nodes() {
+                if !ch.is_known_member(&anchor.id) {
+                    let _ = anchors.add(anchor.clone());
+                }
+            }
+            let name = ch.name().map(str::to_owned);
+            let previous = inventory.get(id);
+            let observed_at = match previous {
+                Some(previous) if previous.name == name && previous.anchors == anchors => {
+                    previous.observed_at
+                }
+                _ => self
+                    .now_ms()
+                    .get()
+                    .max(previous.map_or(0, |r| r.observed_at.saturating_add(1))),
+            };
+            inventory.insert(
+                *id,
+                crate::node::api::RoomAnchorView {
+                    room: *id,
+                    name,
+                    anchors,
+                    stale: false,
+                    observed_at,
+                },
+            );
             summaries.insert(*id, summary_of(&ch));
             mlock_active &= ch.mlock_active();
             open_channels.push(detail_of(
@@ -17506,7 +17725,15 @@ impl Node {
             &trusted,
             &self.dismissed_offers,
         );
+        if known.iter().any(|room| !inventory.contains_key(room)) {
+            anchor_inventory_error.get_or_insert_with(|| {
+                "a saved room has no anchor observation yet; open it to refresh the inventory"
+                    .into()
+            });
+        }
         let view = NodeView {
+            room_anchors: inventory.into_values().collect(),
+            anchor_inventory_error,
             identity,
             locked,
             locking: self.locking > 0,
@@ -17738,34 +17965,30 @@ fn row_of(r: &Rendered) -> MessageRow {
 /// Map a library error to the closed, redaction-safe [`Fault`] set.
 /// The node's answer to "give me a connection to this member", for the `vox up` proxy.
 ///
-/// The proxy never dials: reaching a member is the ADR-012 ladder's job and the ladder
-/// lives in the node. This hands over a connection the node already has, and answers
-/// `None` otherwise — so a proxy request for an unreachable host is refused rather than
-/// blocked.
+/// The proxy delegates reaching a member to the node's ADR-012 ladder, using the room of each
+/// request for both endpoint lookup and helper eligibility.
 struct NodeDialer {
     net: Arc<NodeNet>,
-    /// The room whose board names the host's endpoints; `None` for a proxy across every
-    /// room, which looks the host up on whichever board has it.
-    channel_id: Option<Digest32>,
 }
 
 impl crate::node::up::HostDialer for NodeDialer {
     async fn connection(
         &self,
         host: &Digest32,
-        _channel_id: &Digest32,
+        channel_id: &Digest32,
     ) -> crate::error::Result<Arc<VoxConnection>> {
         // `reach` returns a live connection when there is one and otherwise runs the whole
         // ADR-012 ladder, so this is both "give me the connection" and "make one". The
         // endpoint hints come from the board, which is also why this must happen per
         // request: a node that has only just joined has not read the board yet.
-        let endpoints = match &self.channel_id {
-            // A connected board's record when this node's board holds none yet (V210-122,
-            // V030-22).
-            Some(cid) => self.net.member_endpoints(cid, *host).await,
-            None => self.net.board_endpoints_any(host),
-        };
-        self.net.reach(*host, &endpoints).await
+        let endpoints = self.net.member_endpoints(channel_id, *host).await;
+        self.net
+            .reach(
+                *host,
+                &endpoints,
+                &crate::node::network::HelperContext::room(*channel_id),
+            )
+            .await
     }
 }
 
@@ -18222,13 +18445,25 @@ async fn agree_round(
                     deadline,
                     tokio::time::Instant::now() + agree::REACH_PATIENCE,
                 );
-                match tokio::time::timeout_at(by, net.reach(member, &endpoints)).await {
+                match tokio::time::timeout_at(
+                    by,
+                    net.reach(
+                        member,
+                        &endpoints,
+                        &crate::node::network::HelperContext::room(question.channel_id),
+                    ),
+                )
+                .await
+                {
                     Ok(Ok(conn)) => {
                         let _ = tx
                             .send(NetEvent::Dialed {
                                 conn: Arc::clone(&conn),
                                 endpoints,
                                 board: false,
+                                helpers: crate::node::network::HelperContext::room(
+                                    question.channel_id,
+                                ),
                             })
                             .await;
                         conn
