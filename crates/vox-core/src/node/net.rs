@@ -569,6 +569,12 @@ impl ConnectionManager {
         !lock(&self.dialling).is_empty()
     }
 
+    /// Identities whose direct dials are under way, so a room waits only for eligible helpers.
+    #[must_use]
+    pub fn direct_dial_peers(&self) -> Vec<Digest32> {
+        lock(&self.dialling).keys().copied().collect()
+    }
+
     /// Say what happens to this manager's connections on `events`, as
     /// [`NodeEvent::ConnectionNote`](crate::node::api::NodeEvent::ConnectionNote)s.
     pub fn report_to(&self, events: tokio::sync::broadcast::Sender<crate::node::api::NodeEvent>) {

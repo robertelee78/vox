@@ -1371,6 +1371,8 @@ enum NetEvent {
         endpoints: crate::nat::multiaddr::EndpointList,
         /// Whether it is the board the join reads from (and so an anchor of ours).
         board: bool,
+        /// Scope of the operation that dialled it, retained for a later direct-path upgrade.
+        helpers: crate::node::network::HelperContext,
     },
     /// A room this node held open before it stopped has been reopened off the actor (#208):
     /// hold it, unless it was closed or the identity locked while it was opening.
@@ -2865,6 +2867,12 @@ impl JoinSteps {
 }
 
 impl Joiner {
+    fn helper_context(&self) -> crate::node::network::HelperContext {
+        crate::node::network::HelperContext {
+            room: Some(self.parsed.channel_id),
+            extra_helpers: self.routes.iter().map(|(peer, _)| *peer).collect(),
+        }
+    }
     /// A board holding the room, when the boards in `tried` — starting with the one
     /// `reach_a_board` chose — had nothing for it, could not be read, or took no pre-join record:
     /// every other board the join's routes name, asked at once, and the first that holds it.
@@ -2888,6 +2896,7 @@ impl Joiner {
     ) -> std::result::Result<(Arc<VoxConnection>, crate::nat::service::RecordSet), JoinerLost> {
         use crate::node::network::short_id;
         let room = self.parsed.channel_id;
+        let helpers = self.helper_context();
         let t = std::time::Instant::now();
         self.begin(format!(
             "asking the address's other boards for room {}",
@@ -2905,8 +2914,9 @@ impl Joiner {
                 *id,
                 endpoints.clone(),
             );
+            let helpers = helpers.clone();
             asked.spawn(async move {
-                let said = match Self::dial_with(&net, &tx, id, &endpoints, true).await {
+                let said = match Self::dial_with(&net, &tx, id, &endpoints, true, &helpers).await {
                     Err(e) => Err(format!("board {} was not reached: {e}", short_id(id))),
                     Ok(conn) => match net.fetch_channel(&conn, &room, 0).await {
                         Err(e) => Err(match went_offline(&conn) {
@@ -2972,7 +2982,15 @@ impl Joiner {
         endpoints: &crate::nat::multiaddr::EndpointList,
         board: bool,
     ) -> crate::error::Result<Arc<VoxConnection>> {
-        Self::dial_with(&self.net, &self.tx, peer, endpoints, board).await
+        Self::dial_with(
+            &self.net,
+            &self.tx,
+            peer,
+            endpoints,
+            board,
+            &self.helper_context(),
+        )
+        .await
     }
 
     /// [`Self::dial`] with what it needs passed in, so several can run on tasks of their own.
@@ -2982,13 +3000,15 @@ impl Joiner {
         peer: Digest32,
         endpoints: &crate::nat::multiaddr::EndpointList,
         board: bool,
+        helpers: &crate::node::network::HelperContext,
     ) -> crate::error::Result<Arc<VoxConnection>> {
-        let conn = net.reach(peer, endpoints).await?;
+        let conn = net.reach(peer, endpoints, helpers).await?;
         let _ = tx
             .send(NetEvent::Dialed {
                 conn: Arc::clone(&conn),
                 endpoints: endpoints.clone(),
                 board,
+                helpers: helpers.clone(),
             })
             .await;
         Ok(conn)
@@ -3011,6 +3031,7 @@ impl Joiner {
     /// answered is taken and the slower ones are dropped.
     async fn reach_a_board(&self) -> Option<Arc<VoxConnection>> {
         let deadline = tokio::time::Instant::now() + Node::BOARD_PATIENCE;
+        let helpers = self.helper_context();
         loop {
             let mut dials = tokio::task::JoinSet::new();
             for (at, (id, endpoints)) in self.routes.iter().enumerate() {
@@ -3020,10 +3041,13 @@ impl Joiner {
                     *id,
                     endpoints.clone(),
                 );
+                let helpers = helpers.clone();
                 dials.spawn(async move {
                     (
                         at,
-                        Self::dial_with(&net, &tx, id, &endpoints, true).await.ok(),
+                        Self::dial_with(&net, &tx, id, &endpoints, true, &helpers)
+                            .await
+                            .ok(),
                     )
                 });
             }
@@ -5739,6 +5763,7 @@ impl Node {
         // How long a stuck tunnel is given (V030-11): this node's setting, on this node.
         endpoint.local().set_stuck_after(self.stuck_after);
         let mut net = NodeNet::new(endpoint, Arc::clone(&presence), Arc::clone(&self.clock));
+        self.sync_anchor_scopes(&net);
         // Only an anchor keeps a board for a room it does not hold, and `--serve trusted`
         // narrows that to rooms its operator's trust list created (V210-70).
         net.serve_rooms(match (self.anchor_boards, self.serve_only.as_ref()) {
@@ -6434,6 +6459,16 @@ impl Node {
                 .is_some_and(|anchors| anchors.get(anchor).is_some())
     }
 
+    fn sync_anchor_scopes(&self, net: &NodeNet) {
+        let open = self
+            .room_anchors
+            .iter()
+            .filter(|(room, _)| self.channels.contains_key(*room))
+            .map(|(room, anchors)| (*room, anchors.clone()))
+            .collect();
+        net.set_anchor_scopes(&self.anchors, &open);
+    }
+
     /// Every anchor this node keeps a connection to, with the addresses its next dial tries:
     /// the configured set first, then each open room's own that is not configured (V210-75).
     /// One identity appears once: at the addresses the configured set gives it if it is there,
@@ -6584,6 +6619,7 @@ impl Node {
         };
         let open = &self.channels;
         self.room_anchors.retain(|room, _| open.contains_key(room));
+        self.sync_anchor_scopes(&net);
         let known = self.kept_anchors();
         // **A loss is noticed however the anchor went** (V210-93), in every build. A clean stop
         // closes the connection; a kill or a crash closes nothing, so the connection held is also
@@ -6829,6 +6865,7 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
+        self.sync_anchor_scopes(&net);
         for anchor in anchors.nodes() {
             // **A member is never dialled as an anchor** (V030-51, AGENTS.md "Anchors"): an
             // anchor's dial is direct only, and its failure backed off the member's sync, so a
@@ -6976,6 +7013,7 @@ impl Node {
     /// one tick stale, which is the safe side of that trade.
     async fn refresh_network_view(&self) {
         let Some(net) = self.net.as_ref() else { return };
+        self.sync_anchor_scopes(net);
         let mut policy = PeerPolicy::new();
         let mut departed: std::collections::BTreeSet<Digest32> = std::collections::BTreeSet::new();
         for (cid, shared) in &self.channels {
@@ -7292,6 +7330,7 @@ impl Node {
                 conn,
                 endpoints,
                 board,
+                helpers,
             } => {
                 let peer = conn.peer_id();
                 self.sync_dials.remove(&peer);
@@ -7309,10 +7348,17 @@ impl Node {
                     if crate::node::net::path_class(net.manager().endpoint(), &conn)
                         == crate::node::net::PathClass::Relayed
                     {
+                        // Link hints authorize the joiner's original reach only. A queued
+                        // Dialed event may outlive that join, so its independent upgrade must
+                        // use current room/manual authority without the temporary hints.
+                        let helpers = crate::node::network::HelperContext {
+                            room: helpers.room,
+                            ..crate::node::network::HelperContext::default()
+                        };
                         let tx = self.net_tx.clone();
                         self.last_upgrade.insert(peer, self.now_ms().get());
                         tokio::spawn(async move {
-                            match net.upgrade(peer, &endpoints).await {
+                            match net.upgrade(peer, &endpoints, &helpers).await {
                                 Ok(better) => {
                                     let _ = tx.send(NetEvent::BetterPath { conn: better }).await;
                                 }
@@ -8388,7 +8434,6 @@ impl Node {
                         .map(|net| {
                             MemberDialer(NodeDialer {
                                 net: Arc::clone(net),
-                                channel_id: None,
                             })
                         })
                         .ok_or(crate::error::Error::Unreachable(
@@ -8414,13 +8459,20 @@ impl Node {
                 let endpoints = net.board_endpoints(&channel_id, &peer);
                 let tx = self.net_tx.clone();
                 tokio::spawn(async move {
-                    let reached = net.reach(peer, &endpoints).await;
+                    let reached = net
+                        .reach(
+                            peer,
+                            &endpoints,
+                            &crate::node::network::HelperContext::room(channel_id),
+                        )
+                        .await;
                     if let Ok(conn) = &reached {
                         let _ = tx
                             .send(NetEvent::Dialed {
                                 conn: Arc::clone(conn),
                                 endpoints,
                                 board: false,
+                                helpers: crate::node::network::HelperContext::room(channel_id),
                             })
                             .await;
                     }
@@ -8964,7 +9016,7 @@ impl Node {
         let endpoint = Arc::clone(net.manager().endpoint());
         // Collected first: the borrow of `self.channels` cannot outlive the mutation of
         // `self.last_upgrade` below.
-        let mut due: Vec<(Digest32, crate::nat::multiaddr::EndpointList)> = Vec::new();
+        let mut due: Vec<(Digest32, Digest32, crate::nat::multiaddr::EndpointList)> = Vec::new();
         for (cid, shared) in &self.channels {
             let authors: Vec<Digest32> = {
                 let ch = shared.lock().await;
@@ -8983,7 +9035,7 @@ impl Node {
                 if u128::from(now.saturating_sub(last)) < UPGRADE_RETRY.as_millis() {
                     continue;
                 }
-                due.push((peer, net.board_endpoints(cid, &peer)));
+                due.push((*cid, peer, net.board_endpoints(cid, &peer)));
             }
         }
         if !due.is_empty() {
@@ -8991,12 +9043,19 @@ impl Node {
             // reuses a stale one asks the same failed question again.
             net.refresh_observed();
         }
-        for (peer, endpoints) in due {
+        for (room, peer, endpoints) in due {
             self.last_upgrade.insert(peer, now);
             let net = Arc::clone(&net);
             let tx = self.net_tx.clone();
             tokio::spawn(async move {
-                match net.upgrade(peer, &endpoints).await {
+                match net
+                    .upgrade(
+                        peer,
+                        &endpoints,
+                        &crate::node::network::HelperContext::room(room),
+                    )
+                    .await
+                {
                     Ok(better) => {
                         let _ = tx.send(NetEvent::BetterPath { conn: better }).await;
                     }
@@ -10096,6 +10155,7 @@ impl Node {
                                 conn,
                                 endpoints,
                                 board: false,
+                                helpers: crate::node::network::HelperContext::room(room),
                             })
                             .await;
                     }
@@ -10159,6 +10219,7 @@ impl Node {
             }
         }
         if let Some(net) = self.net.clone() {
+            self.sync_anchor_scopes(&net);
             for (id, candidates) in anchors {
                 self.anchor_ids.insert(id);
                 self.dial_anchor(&net, id, candidates);
@@ -13718,13 +13779,21 @@ impl Node {
                 } else {
                     endpoints
                 };
-                match net.reach(target, &endpoints).await {
+                match net
+                    .reach(
+                        target,
+                        &endpoints,
+                        &crate::node::network::HelperContext::room(room),
+                    )
+                    .await
+                {
                     Ok(conn) => {
                         let _ = tx
                             .send(NetEvent::Dialed {
                                 conn,
                                 endpoints,
                                 board: false,
+                                helpers: crate::node::network::HelperContext::room(room),
                             })
                             .await;
                     }
@@ -13837,6 +13906,7 @@ impl Node {
                                 conn,
                                 endpoints,
                                 board: false,
+                                helpers: crate::node::network::HelperContext::default(),
                             })
                             .await;
                     }
@@ -13882,13 +13952,21 @@ impl Node {
             // This node's board record, or a connected board's when it holds none yet (V210-122,
             // V030-22).
             let endpoints = net.member_endpoints(&room, peer).await;
-            match net.reach(peer, &endpoints).await {
+            match net
+                .reach(
+                    peer,
+                    &endpoints,
+                    &crate::node::network::HelperContext::room(room),
+                )
+                .await
+            {
                 Ok(conn) => {
                     let _ = tx
                         .send(NetEvent::Dialed {
                             conn,
                             endpoints,
                             board: false,
+                            helpers: crate::node::network::HelperContext::room(room),
                         })
                         .await;
                 }
@@ -15546,6 +15624,9 @@ impl Node {
         // Kept: an anchor away now is still told when it connects. A join of the room again
         // (`begin_join_channel`) takes it out.
         self.room_anchors.remove(channel_id);
+        if let Some(net) = self.net.as_ref() {
+            self.sync_anchor_scopes(net);
+        }
         self.reachers.remove(channel_id);
         crate::node::status::SyncBook::forget_room(&self.sync_book, channel_id);
         self.sched_rooms.remove(channel_id);
@@ -15882,10 +15963,7 @@ impl Node {
         // No dial here: the host is reached per request (see `up::HostDialer`). Dialling
         // first would refuse to start on a race — a node that has just joined has not read
         // the board — and retrying here would block the actor tick that reads it.
-        let dialer = Arc::new(NodeDialer {
-            net,
-            channel_id: None,
-        });
+        let dialer = Arc::new(NodeDialer { net });
         // The proxy is a library and cannot print, so a session cut by a withdrawal of
         // reach comes back as an event (M17.11). A broadcast send never blocks and drops
         // when nobody is listening, which is the right trade for a notice.
@@ -15999,7 +16077,14 @@ impl Node {
             } else {
                 endpoints
             };
-            let result = match net.reach(host, &endpoints).await {
+            let result = match net
+                .reach(
+                    host,
+                    &endpoints,
+                    &crate::node::network::HelperContext::room(channel_id),
+                )
+                .await
+            {
                 Ok(conn) => {
                     // A forward whose every connection would be refused is refused now, in
                     // words, rather than bound and then resetting each connection (V210-81).
@@ -16009,6 +16094,7 @@ impl Node {
                             conn,
                             endpoints,
                             board: false,
+                            helpers: crate::node::network::HelperContext::room(channel_id),
                         })
                         .await;
                     room
@@ -16061,10 +16147,7 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return Outcome::Failed(Fault::NotNetworked);
         };
-        let dialer = Arc::new(NodeDialer {
-            net,
-            channel_id: Some(*channel_id),
-        });
+        let dialer = Arc::new(NodeDialer { net });
         let events = self.event_tx.clone();
         let report = move |note: crate::node::tunnel::TunnelNote| {
             let _ = events.send(note_event(note));
@@ -17388,34 +17471,30 @@ fn row_of(r: &Rendered) -> MessageRow {
 /// Map a library error to the closed, redaction-safe [`Fault`] set.
 /// The node's answer to "give me a connection to this member", for the `vox up` proxy.
 ///
-/// The proxy never dials: reaching a member is the ADR-012 ladder's job and the ladder
-/// lives in the node. This hands over a connection the node already has, and answers
-/// `None` otherwise — so a proxy request for an unreachable host is refused rather than
-/// blocked.
+/// The proxy delegates reaching a member to the node's ADR-012 ladder, using the room of each
+/// request for both endpoint lookup and helper eligibility.
 struct NodeDialer {
     net: Arc<NodeNet>,
-    /// The room whose board names the host's endpoints; `None` for a proxy across every
-    /// room, which looks the host up on whichever board has it.
-    channel_id: Option<Digest32>,
 }
 
 impl crate::node::up::HostDialer for NodeDialer {
     async fn connection(
         &self,
         host: &Digest32,
-        _channel_id: &Digest32,
+        channel_id: &Digest32,
     ) -> crate::error::Result<Arc<VoxConnection>> {
         // `reach` returns a live connection when there is one and otherwise runs the whole
         // ADR-012 ladder, so this is both "give me the connection" and "make one". The
         // endpoint hints come from the board, which is also why this must happen per
         // request: a node that has only just joined has not read the board yet.
-        let endpoints = match &self.channel_id {
-            // A connected board's record when this node's board holds none yet (V210-122,
-            // V030-22).
-            Some(cid) => self.net.member_endpoints(cid, *host).await,
-            None => self.net.board_endpoints_any(host),
-        };
-        self.net.reach(*host, &endpoints).await
+        let endpoints = self.net.member_endpoints(channel_id, *host).await;
+        self.net
+            .reach(
+                *host,
+                &endpoints,
+                &crate::node::network::HelperContext::room(*channel_id),
+            )
+            .await
     }
 }
 
@@ -17872,13 +17951,25 @@ async fn agree_round(
                     deadline,
                     tokio::time::Instant::now() + agree::REACH_PATIENCE,
                 );
-                match tokio::time::timeout_at(by, net.reach(member, &endpoints)).await {
+                match tokio::time::timeout_at(
+                    by,
+                    net.reach(
+                        member,
+                        &endpoints,
+                        &crate::node::network::HelperContext::room(question.channel_id),
+                    ),
+                )
+                .await
+                {
                     Ok(Ok(conn)) => {
                         let _ = tx
                             .send(NetEvent::Dialed {
                                 conn: Arc::clone(&conn),
                                 endpoints,
                                 board: false,
+                                helpers: crate::node::network::HelperContext::room(
+                                    question.channel_id,
+                                ),
                             })
                             .await;
                         conn

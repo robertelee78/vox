@@ -29,7 +29,7 @@
 //! a member missing from the snapshot is refused (it retries), never wrongly
 //! admitted, because the key still has to verify the record's signature.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use quinn::{RecvStream, SendStream};
@@ -228,6 +228,15 @@ impl std::fmt::Debug for SharedMembership {
 }
 
 impl SharedMembership {
+    /// Membership of the latest authenticated epoch of this room. Older epochs must not turn
+    /// an anchor into an ordinary helper after that member left.
+    fn contains_current(&self, room: &Digest32, peer: &Digest32) -> bool {
+        lock(&self.inner)
+            .iter()
+            .filter(|((id, _), _)| id == room)
+            .max_by_key(|((_, epoch), _)| *epoch)
+            .is_some_and(|(_, members)| members.contains_key(peer))
+    }
     /// An empty snapshot.
     #[must_use]
     pub fn new() -> Self {
@@ -402,6 +411,7 @@ pub enum Inbound {
 /// The node's network surface.
 pub struct NodeNet {
     manager: Arc<ConnectionManager>,
+    anchor_scopes: Mutex<AnchorScopes>,
     /// The presence this node is on (ADR-026 D-3): what it advertises — composed by the ADR-012
     /// ladder's publish side once for the presence, since every node on it publishes the same
     /// ip:port (N-46) — the reflexive addresses peers report, and the one relay ledger, whose caps
@@ -430,6 +440,35 @@ pub struct NodeNet {
     /// invalid". **Such a refusal from a board still untold is asked again once it is told**
     /// ([`BOARD_TOLD_PATIENCE`]); a board that already knows this node is asked at once, as before.
     untold: Arc<Mutex<HashSet<Digest32>>>,
+}
+
+/// Which room a new helper operation serves. A join may use its exact link routes before
+/// authenticated room state exists; those hints do not become permanent anchor provenance.
+#[derive(Clone, Debug, Default)]
+pub struct HelperContext {
+    /// The room, or manual machine scope for a genuinely roomless operation.
+    pub room: Option<Digest32>,
+    /// Explicit routes of this join only, including its member-host board.
+    pub extra_helpers: BTreeSet<Digest32>,
+}
+
+impl HelperContext {
+    /// A normal operation in an authenticated room.
+    #[must_use]
+    pub fn room(room: Digest32) -> Self {
+        Self {
+            room: Some(room),
+            extra_helpers: BTreeSet::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct AnchorScopes {
+    manual: BTreeSet<Digest32>,
+    rooms: BTreeMap<Digest32, BTreeSet<Digest32>>,
+    // Removal does not turn a connected anchor into an unclassified ordinary helper.
+    known: BTreeSet<Digest32>,
 }
 
 /// Ends a [`NodeNet::reach`]'s ownership of its peer: the entry goes, and every waiter wakes.
@@ -506,6 +545,7 @@ impl NodeNet {
         );
         Self {
             manager: Arc::new(ConnectionManager::new(endpoint, Arc::clone(&clock))),
+            anchor_scopes: Mutex::new(AnchorScopes::default()),
             presence,
             reaching: Mutex::new(HashMap::new()),
             status: Mutex::new(None),
@@ -516,6 +556,37 @@ impl NodeNet {
             clock,
             untold: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Install current manual and room provenance before dialing or using an anchor.
+    pub fn set_anchor_scopes(
+        &self,
+        manual: &crate::nat::bootstrap::BootstrapSet,
+        rooms: &BTreeMap<Digest32, crate::nat::bootstrap::BootstrapSet>,
+    ) {
+        let mut scopes = lock(&self.anchor_scopes);
+        scopes.manual = manual.nodes().iter().map(|anchor| anchor.id).collect();
+        scopes.rooms = rooms
+            .iter()
+            .map(|(room, anchors)| {
+                (
+                    *room,
+                    anchors.nodes().iter().map(|anchor| anchor.id).collect(),
+                )
+            })
+            .collect();
+        let current: Vec<_> = scopes
+            .manual
+            .iter()
+            .copied()
+            .chain(
+                scopes
+                    .rooms
+                    .values()
+                    .flat_map(|anchors| anchors.iter().copied()),
+            )
+            .collect();
+        scopes.known.extend(current);
     }
 
     /// The board `id` is being dialled, or is connected and has not been given this node's
@@ -1081,6 +1152,7 @@ impl NodeNet {
         &self,
         peer: Digest32,
         endpoints: &EndpointList,
+        context: &HelperContext,
     ) -> Result<Arc<VoxConnection>> {
         #[cfg(feature = "test-knobs")]
         if let Some(ms) = std::env::var(TEST_HOLD_REACH_ENV)
@@ -1120,7 +1192,7 @@ impl NodeNet {
                     finished: false,
                     started: std::time::Instant::now(),
                 };
-                let result = self.reach_ladder(peer, endpoints).await;
+                let result = self.reach_ladder(peer, endpoints, context).await;
                 owner.finished = true;
                 return result;
             };
@@ -1161,6 +1233,7 @@ impl NodeNet {
         &self,
         peer: Digest32,
         endpoints: &EndpointList,
+        context: &HelperContext,
     ) -> Result<Arc<VoxConnection>> {
         if let Some(conn) = self.manager.existing(&peer) {
             return Ok(conn);
@@ -1242,14 +1315,16 @@ impl NodeNet {
         // helper, no dial-back and no circuit, and waited out its direct dial's 10 s, and every
         // other reach to the host waited on it (6 of 10 cold first connections at 10.1 s, R42). Its
         // direct rung runs meanwhile, and a win there ends the wait.
-        let mut helpers = self.helpers(peer);
+        let mut helpers = self.helpers(peer, context);
         if helpers.is_empty() {
-            self.wait_for_a_helper(peer, started + DIRECT_HEAD_START, &|| *won.borrow())
-                .await;
+            self.wait_for_a_helper(peer, context, started + DIRECT_HEAD_START, &|| {
+                *won.borrow()
+            })
+            .await;
             if let Some(conn) = self.manager.existing(&peer) {
                 return Ok(conn);
             }
-            helpers = self.helpers(peer);
+            helpers = self.helpers(peer, context);
         }
         // **Then ask the peer to dial back** (V030-22): a reach with no direct path of its own — no
         // candidate it can dial, or a direct rung that failed — asks the peer, through each
@@ -1624,6 +1699,7 @@ impl NodeNet {
         &self,
         peer: Digest32,
         endpoints: &EndpointList,
+        context: &HelperContext,
     ) -> Result<Arc<VoxConnection>> {
         let Some(current) = self.manager.existing(&peer) else {
             return Err(Error::Unreachable("no connection to upgrade"));
@@ -1658,7 +1734,7 @@ impl NodeNet {
                 .await
             });
         }
-        for coordinator in self.helpers(peer) {
+        for coordinator in self.helpers(peer, context) {
             // The observed address is asked for before the task starts, so the punch
             // has it to offer without touching `self` from the task.
             let observed = self.observed_or_ask(coordinator.peer_id()).await;
@@ -1704,32 +1780,60 @@ impl NodeNet {
         }))
     }
 
-    /// The connected peers that could help reach `peer`: every live connection but
-    /// the peer's own. Whether one *will* help is its policy's business.
-    fn helpers(&self, peer: Digest32) -> Vec<Arc<VoxConnection>> {
+    fn helper_allowed(&self, helper: &Digest32, context: &HelperContext) -> bool {
+        let scopes = lock(&self.anchor_scopes);
+        if context.extra_helpers.contains(helper)
+            || scopes.manual.contains(helper)
+            || context.room.is_some_and(|room| {
+                scopes
+                    .rooms
+                    .get(&room)
+                    .is_some_and(|anchors| anchors.contains(helper))
+            })
+        {
+            return true;
+        }
+        let anchor = scopes.known.contains(helper)
+            || lock(&self.policy.inner).classify(helper) == crate::node::net::PeerClass::Anchor;
+        drop(scopes);
+        !anchor
+            || context
+                .room
+                .is_some_and(|room| self.membership.contains_current(&room, helper))
+    }
+
+    /// Ordinary peers may help, but a configured anchor serves only its manual or room scope.
+    /// Whether an eligible peer will help is still its own policy's decision.
+    fn helpers(&self, peer: Digest32, context: &HelperContext) -> Vec<Arc<VoxConnection>> {
         self.manager
             .peers()
             .into_iter()
             .filter(|p| *p != peer)
+            .filter(|p| self.helper_allowed(p, context))
             .filter_map(|p| self.manager.existing(&p))
             .collect()
     }
 
     /// **Nobody connected to help reach `peer` yet, but somebody being dialled** (V210-57): wait,
-    /// until `until` at most, while a direct dial is under way anywhere in this node (an anchor's,
-    /// say) and neither a helper nor `peer` itself is connected, nor `done` true. Says how long it
-    /// waited.
+    /// until `until` at most, while a direct dial to the target or an eligible helper is under
+    /// way and neither a helper nor `peer` itself is connected, nor `done` true. Another room's
+    /// anchor dial cannot hold this room's reach. Says how long it waited.
     async fn wait_for_a_helper(
         &self,
         peer: Digest32,
+        context: &HelperContext,
         until: tokio::time::Instant,
         done: &(dyn Fn() -> bool + Sync),
     ) {
         let began = tokio::time::Instant::now();
-        while self.helpers(peer).is_empty()
+        while self.helpers(peer, context).is_empty()
             && self.manager.existing(&peer).is_none()
             && !done()
-            && self.manager.any_direct_dial_under_way()
+            && self
+                .manager
+                .direct_dial_peers()
+                .iter()
+                .any(|dial| *dial == peer || self.helper_allowed(dial, context))
             && tokio::time::Instant::now() < until
         {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1922,16 +2026,18 @@ impl NodeNet {
     /// board read, which takes milliseconds on a live board, and never more than the head start.
     /// The identity is pinned, so a stale or wrong address only fails its dial.
     pub async fn member_endpoints(&self, channel_id: &Digest32, member: Digest32) -> EndpointList {
+        let context = HelperContext::room(*channel_id);
         let local = self.board_endpoints(channel_id, &member);
         if !local.is_empty() || self.manager.existing(&member).is_some() {
             return local;
         }
         let began = tokio::time::Instant::now();
         let until = began + DIRECT_HEAD_START;
-        let mut boards = self.helpers(member);
+        let mut boards = self.helpers(member, &context);
         if boards.is_empty() {
-            self.wait_for_a_helper(member, until, &|| false).await;
-            boards = self.helpers(member);
+            self.wait_for_a_helper(member, &context, until, &|| false)
+                .await;
+            boards = self.helpers(member, &context);
         }
         if boards.is_empty() || self.manager.existing(&member).is_some() {
             return local;
