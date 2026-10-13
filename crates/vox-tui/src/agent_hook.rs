@@ -46,7 +46,7 @@ use vox_agentcomms::attention::CHATTER;
 use vox_core::hash::Digest32;
 use vox_core::node::ipc::{Frame, IpcClient, Request};
 use vox_core::node::link::{b32_decode, b32_encode};
-use vox_core::node::paths::Paths;
+use vox_core::node::paths::{Account, Paths};
 
 use crate::app::AppError;
 use crate::tunnel_cli::resolve_prefix;
@@ -1392,7 +1392,7 @@ pub async fn run(
             && crate::session_mirror::Event::parse(&raw)
                 .filter(|ev| crate::session_mirror::mirrors(&ev.name))
                 .is_none_or(|ev| ev.name == "UserPromptSubmit");
-        let words = Unregistered::NoNode(daemon.node.clone()).said(&input);
+        let words = Unregistered::NoNode(daemon.node.clone()).said(&input, &daemon.account);
         eprintln!("vox agent hook: {words}");
         if shown && first_in_session(&daemon.account, daemon.node.as_str(), &input.session_id) {
             emit(format, &raw, &input.event, &format!("{words}\n"), "");
@@ -1418,7 +1418,7 @@ pub async fn run(
             // it proves, is refreshed on each event, so a session first seen by a tool call is
             // known, and a session resumed in another pane is rebound at once.
             if let Err(e) = daemon.register(&input, room_arg).await {
-                eprintln!("vox agent hook: {}", e.said(&input));
+                eprintln!("vox agent hook: {}", e.said(&input, &daemon.account));
             }
             if ev.name == "Stop" {
                 crate::wake::record_idle(paths, &input.session_id);
@@ -1480,21 +1480,17 @@ pub async fn run(
             // **Said once per session, not every turn** (#666): the operator was told the
             // command, and a macOS notification tells the person too; each later turn reads
             // nothing until the node is attached, and says so only on stderr.
-            let words = Unregistered::NotAttached(node.clone()).said(&input);
+            let words = Unregistered::NotAttached(node.clone()).said(&input, &daemon.account);
             eprintln!("vox agent hook: {words}");
             if crate::wake::first_detached_notice(paths, &input.session_id) {
-                crate::notify::needs_passphrase(
-                    paths,
-                    node.as_str(),
-                    &format!("Run in a terminal: vox node attach {node}"),
-                );
+                crate::notify::needs_passphrase(paths, node.as_str(), &words);
                 emit(format, &raw, &input.event, &format!("{words}\n"), "");
             }
             return Ok(());
         }
         Err(Unregistered::NoNode(node)) => {
             // Said once per session too: nothing changes until the operator runs setup.
-            let words = Unregistered::NoNode(node.clone()).said(&input);
+            let words = Unregistered::NoNode(node.clone()).said(&input, &daemon.account);
             eprintln!("vox agent hook: {words}");
             if first_in_session(&daemon.account, node.as_str(), &input.session_id) {
                 emit(format, &raw, &input.event, &format!("{words}\n"), "");
@@ -1504,7 +1500,7 @@ pub async fn run(
         Err(
             u @ (Unregistered::NoDaemon(_) | Unregistered::Attaching(_) | Unregistered::Version(_)),
         ) => {
-            let words = u.said(&input);
+            let words = u.said(&input, &daemon.account);
             eprintln!("vox agent hook: {words}");
             emit(format, &raw, &input.event, &format!("{words}\n"), "");
             return Ok(());
@@ -1599,14 +1595,18 @@ impl From<AppError> for Unregistered {
 
 impl Unregistered {
     /// In one sentence, with the exact command the operator runs (#666).
-    fn said(&self, input: &HookInput) -> String {
+    fn said(&self, input: &HookInput, account: &Account) -> String {
         match self {
-            Self::NotAttached(node) => format!(
-                "Vox could not read your rooms because node {node} is not attached; ask the \
-                 operator to run `vox node attach {node}` in a terminal outside this session (it \
-                 asks for the passphrase once and then remembers it; Vox says this once per \
-                 session)."
-            ),
+            Self::NotAttached(node) => {
+                if crate::agent_onboarding::local_app(account).is_some() {
+                    format!("Vox node {node} is Locked; Open Vox to unlock {node}.")
+                } else {
+                    format!(
+                        "Vox node {node} is Locked; ask the operator to run \
+                         `vox node unlock {node}` in a terminal outside this session."
+                    )
+                }
+            }
             Self::NoNode(node) => format!(
                 "{} has no Vox node on this Mac (its hook names node {node}, which is not here); \
                  ask the operator to run `vox setup` in a terminal.",

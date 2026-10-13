@@ -65,6 +65,9 @@
 #![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 #![cfg(unix)]
 
+#[path = "support/attach.rs"]
+mod unlock_staging;
+
 #[path = "support/optional_proof.rs"]
 mod optional_proof;
 optional_proof::not_run!(
@@ -151,16 +154,21 @@ fn vox(
     input: Option<&str>,
 ) -> (bool, String, String) {
     let mut cmd = Command::new(VOX);
-    cmd.args(args)
-        .env("VOX_DATA_DIR", data)
-        .env("VOX_CONFIG_DIR", cfg)
-        // Every node has a passphrase (ADR-028 K-11); each is attached before Claude Code starts,
-        // and an agent's hook finds its node attached.
-        .env("VOX_IDENTITY_PASSPHRASE", "an identity passphrase")
-        .env("VOX_NODE", node)
-        .env("VOX_LISTEN", "127.0.0.1:0")
-        .env_remove("VOX_ROOM")
-        .env_remove("VOX_ROOM_PASSPHRASE");
+    cmd.args(crate::unlock_staging::persistent_args(
+        data,
+        args,
+        "an identity passphrase",
+    ))
+    .env("VOX_TEST_KEYCHAIN", crate::unlock_staging::keychain(data))
+    .env("VOX_DATA_DIR", data)
+    .env("VOX_CONFIG_DIR", cfg)
+    // Every node has a passphrase (ADR-028 K-11); each is attached before Claude Code starts,
+    // and an agent's hook finds its node attached.
+    .env("VOX_IDENTITY_PASSPHRASE", "an identity passphrase")
+    .env("VOX_NODE", node)
+    .env("VOX_LISTEN", "127.0.0.1:0")
+    .env_remove("VOX_ROOM")
+    .env_remove("VOX_ROOM_PASSPHRASE");
     // Nothing of a terminal or a harness session this proof did not make: a `vox` run from inside
     // the operator's own Claude Code session would otherwise inherit its tmux pane and sockets.
     for (k, _) in std::env::vars_os() {

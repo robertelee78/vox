@@ -39,7 +39,7 @@ your `PATH`.
 **Symptoms:**
 
 - `no vox daemon is running for this data root, so node robertgpt is not attached.`
-- `node robertgpt is not attached; attach it first: vox node attach robertgpt`
+- `node robertgpt is not attached; attach it first: vox node unlock robertgpt`
 - `no vox daemon answers at …; to start one, open Vox (or run `vox daemon` in a terminal)`
 - `there is no node in … yet; make one with vox node create and a name for it`
 
@@ -50,7 +50,7 @@ on disk.
 `VOX_NODE` and `VOX_DATA_DIR` with the terminal or agent that should hold the node. An agent's
 hook never attaches its node. You attach it, in your own terminal.
 
-**Fix:** run `vox node attach robertgpt`. Do not make a new node to get past the message: a new
+**Fix:** run `vox node unlock robertgpt`. Do not make a new node to get past the message: a new
 node is a new identity, with no rooms and no trust.
 
 **Confirm:** `vox room list` shows your rooms, or `no rooms`.

@@ -209,7 +209,7 @@ A node uses every anchor it learns from these three sources together:
   skipped, and named with its line number by the command that attached the node and in the
   daemon's log.
 - **`--anchor FINGERPRINT@ADDRESS`**, repeatable, on any command that attaches a node or starts the
-  daemon, such as `vox node attach`, `vox serve`, `vox connect`, `vox up`, `vox forward` and
+  daemon, such as `vox node unlock`, `vox serve`, `vox connect`, `vox up`, `vox forward` and
   `vox daemon`. `VOX_ANCHORS` takes a comma-separated list.
 - **The room link.** A link names the anchors its sharer uses. Joining with it keeps them for that
   room.

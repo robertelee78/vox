@@ -56,9 +56,9 @@ A command acts as the first of these that names a node: `--node`, then `VOX_NODE
 attached node, then the only node on disk. If none settles it, the command refuses and lists the
 nodes. Name the node explicitly in scripts and agent setups.
 
-`vox node attach`, `serve`, `connect`, `up`, `forward` and `lan up` start the daemon if none runs,
+`vox node unlock`, `serve`, `connect`, `up`, `forward` and `lan up` start the daemon if none runs,
 and attach their node. Other commands only ask an attached node, and say so if it is not attached,
-with the `vox node attach` that attaches it.
+with the `vox node unlock` that attaches it.
 
 The data root is chosen by `--data-dir`, then `VOX_DATA_DIR`, then the platform default. The
 config directory by `--config-dir`, then `VOX_CONFIG_DIR`, then `XDG_CONFIG_HOME`, then the
@@ -116,7 +116,7 @@ passphrase lets anyone with the link join.
 
 At a terminal, Vox asks with a hidden prompt. Without one:
 
-- `vox node create` and `vox node attach` read the identity passphrase from `--passphrase-file`,
+- `vox node create` and `vox node unlock` read the identity passphrase from `--passphrase-file`,
   or from `VOX_IDENTITY_PASSPHRASE`.
 - `vox room create` and `vox room join` read the room passphrase from `--passphrase-file`. `-`
   reads standard input.
@@ -127,11 +127,11 @@ Vox refuses a passphrase on the command line, because other processes can read i
 `VOX_ROOM_PASSPHRASE` too. `VOX_IDENTITY_PASSPHRASE` works for attaching, but other processes of
 your user can read it.
 
-On a Mac, `vox node attach` remembers the passphrase in the Keychain. On Linux, keep a node with a
+On a Mac, `vox node unlock` remembers the passphrase in the Keychain. On Linux, keep a node with a
 file instead, readable only by you:
 
 ```sh
-vox node attach robertgpt --keep --passphrase-file ~/.vox-robertgpt-passphrase
+vox node unlock robertgpt --passphrase-file ~/.vox-robertgpt-passphrase
 ```
 
 The daemon reads that file at each start. `vox daemon --node robertgpt --passphrase-file

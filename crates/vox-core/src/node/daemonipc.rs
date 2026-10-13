@@ -466,7 +466,7 @@ impl std::fmt::Display for Refusal {
         match self {
             Self::NotAttached { node } => write!(
                 f,
-                "node {node} is not attached; attach it first: vox node attach {node}"
+                "node {node} is not attached; unlock it first: vox node unlock {node}"
             ),
             Self::NoSuchNode { node } => write!(f, "there is no node {node}"),
             Self::WrongPassphrase { node } => {
@@ -1691,7 +1691,7 @@ pub fn unreached(socket: &std::path::Path, node: Option<&str>, e: crate::error::
             let (detached, attach) = node.map_or((String::new(), String::new()), |n| {
                 (
                     format!(", so node {n} is not attached"),
-                    format!(", or `vox node attach {n}`"),
+                    format!(", or `vox node unlock {n}`"),
                 )
             });
             format!(

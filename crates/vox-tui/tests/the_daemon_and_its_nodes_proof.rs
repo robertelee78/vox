@@ -55,6 +55,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -85,6 +88,21 @@ impl Account {
         let data = tmp.path().join("d");
         let cfg = tmp.path().join("c");
         std::fs::create_dir_all(&cfg).unwrap();
+        // Every new unlock remembers: use only this proof's private Keychain on a Mac.
+        if cfg!(target_os = "macos") {
+            test_knobs::require(&["VOX_TEST_KEYCHAIN"]);
+            let status = Command::new("/usr/bin/security")
+                .args(["create-keychain", "-p", ""])
+                .arg(tmp.path().join("k.keychain-db"))
+                .status()
+                .expect("APPARATUS: create scratch Keychain");
+            assert!(
+                status.success(),
+                "APPARATUS: scratch Keychain creation failed: {status}"
+            );
+        }
+        std::fs::write(tmp.path().join("identity.pass"), format!("{PASS}\n"))
+            .expect("APPARATUS: persistent identity passphrase file");
         // Notifications go to a file of this test's, never to the desktop (`VOX_NOTIFY_COMMAND`).
         let notify = tmp.path().join("notify");
         std::fs::write(
@@ -117,7 +135,16 @@ impl Account {
                 c.env(key, v);
             }
         }
-        c.args(args)
+        c.args(args);
+        // Existing staging callers use the persistent file on platforms without a Keychain.
+        if !cfg!(target_os = "macos")
+            && args.starts_with(&["node", "attach"])
+            && !args.contains(&"--passphrase-file")
+        {
+            c.arg("--passphrase-file")
+                .arg(self._tmp.path().join("identity.pass"));
+        }
+        c.env("VOX_TEST_KEYCHAIN", self._tmp.path().join("k.keychain-db"))
             .env("VOX_NOTIFY_COMMAND", self._tmp.path().join("notify"))
             .env("VOX_DATA_DIR", &self.data)
             .env("VOX_CONFIG_DIR", &self.cfg)
@@ -366,19 +393,6 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
     watchdog::arm();
     let a = Account::new();
     a.make_node("agent");
-    // **No daemon: the way to start one is said, Vox first on a Mac** (#666): a person opens Vox
-    // before they open a terminal.
-    let (ok, out, err) = a.run(&["node", "detach", "agent"], "");
-    let start = if cfg!(target_os = "macos") {
-        "to start one, open Vox (or run `vox daemon` in a terminal)"
-    } else {
-        "to start one, run `vox daemon` in a terminal"
-    };
-    assert!(
-        !ok && format!("{out}{err}").contains(start),
-        "PRODUCT: with no daemon running, `vox node detach` must say how to start one: \
-         \"{start}\"; it said: {out}{err}"
-    );
     let (h1, h2) = std::thread::scope(|s| {
         let one = s.spawn(|| a.hook("agent", "s-1", "UserPromptSubmit"));
         let two = s.spawn(|| a.hook("agent", "s-2", "UserPromptSubmit"));
@@ -386,8 +400,7 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
     });
     for (n, (ok, out, err)) in [(1, &h1), (2, &h2)] {
         assert!(
-            *ok && out.contains("node agent is not attached")
-                && out.contains("vox node attach agent"),
+            *ok && out.contains("node agent is Locked") && out.contains("vox node unlock agent"),
             "PRODUCT: hook {n} must exit 0 telling the agent its node is not attached and the \
              command for the operator (ADR-028 K-13): {out}{err}\nlog:\n{}",
             a.log()
@@ -414,7 +427,7 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
     // nothing more, and the person was told once per session, with the command.
     let (ok, out, err) = a.hook("agent", "s-1", "UserPromptSubmit");
     assert!(
-        ok && !out.contains("not attached") && !out.contains("could not read your rooms"),
+        ok && !out.contains("Locked") && !out.contains("could not read your rooms"),
         "PRODUCT: a session's second turn must not say again that its node is not attached \
          (once per session): {out}{err}"
     );
@@ -423,7 +436,7 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
         notified
             .lines()
             .filter(|l| l.contains("node agent needs its passphrase")
-                && l.contains("vox node attach agent"))
+                && l.contains("vox node unlock agent"))
             .count()
             == 2,
         "PRODUCT: the person must be notified once per session (two sessions, three turns) that \
@@ -446,6 +459,41 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
         "PRODUCT: a hook attached its node (ADR-028 K-13)\nlog:\n{}",
         a.log()
     );
+    if cfg!(target_os = "macos") {
+        // Presence is staged; no app is launched. The shipped hook chooses the actual wording.
+        let bundle = a._tmp.path().join("Vox.app");
+        std::fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+        std::fs::write(bundle.join("Contents/MacOS/Vox"), b"not executed").unwrap();
+        std::fs::create_dir_all(a.cfg.join("app")).unwrap();
+        std::fs::write(
+            a.cfg.join("app/bundle.json"),
+            serde_json::json!({"bundle":bundle}).to_string(),
+        )
+        .unwrap();
+        let (ok, out, err) = a.hook("agent", "locked-app", "UserPromptSubmit");
+        assert!(ok && out.contains("Open Vox to unlock agent") && !out.contains("vox node unlock"),
+            "PRODUCT: the Locked hook on a Mac with Vox must direct the operator to Vox: {out}{err}");
+        let mut ssh = a.cmd(&["agent", "hook", "--node", "agent"]);
+        ssh.env("SSH_CONNECTION", "127.0.0.1 1 127.0.0.1 2")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = ssh.spawn().expect("APPARATUS: SSH hook");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"hook_event_name":"UserPromptSubmit","session_id":"locked-ssh"}"#)
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let words = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success()
+                && words.contains("vox node unlock agent")
+                && !words.contains("Open Vox"),
+            "PRODUCT: the SSH hook must give the terminal unlock command: {words}"
+        );
+    }
     // The operator attaches it, outside the sessions.
     let (ok, out, err) = a.run(&["node", "attach", "agent"], "");
     assert!(
@@ -500,30 +548,187 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
 #[test]
 #[ignore = "real binaries with production Argon2id; run in release"]
 fn a_kept_node_and_its_room_come_back_after_a_restart() {
+    // Keep the old attach file readable while refusing atomic replacement on a Mac. Elsewhere
+    // a directory at the destination stages unreadable-record refusal; its old file is restored
+    // before retry. Drop restores either fixture even if a PRODUCT assertion panics.
+    struct UnwritableAttach {
+        path: PathBuf,
+        backup: Option<PathBuf>,
+    }
+    impl UnwritableAttach {
+        fn new(path: PathBuf, unreadable: bool) -> Self {
+            let fixture = if cfg!(target_os = "macos") && !unreadable {
+                let status = Command::new("chflags")
+                    .arg("uchg")
+                    .arg(&path)
+                    .status()
+                    .expect("APPARATUS: make scratch attach file immutable");
+                assert!(status.success(), "APPARATUS: cannot protect attach fixture");
+                Self { path, backup: None }
+            } else {
+                let backup = path.with_extension("saved");
+                std::fs::rename(&path, &backup).expect("APPARATUS: save attach fixture");
+                let fixture = Self {
+                    path,
+                    backup: Some(backup),
+                };
+                std::fs::create_dir(&fixture.path).expect("APPARATUS: block attach destination");
+                fixture
+            };
+            let probe = fixture.path.with_extension("probe");
+            std::fs::write(&probe, "probe").expect("APPARATUS: attach replacement probe");
+            let blocked = std::fs::rename(&probe, &fixture.path).is_err();
+            let _ = std::fs::remove_file(&probe);
+            assert!(
+                blocked,
+                "APPARATUS: attach destination accepted replacement; write failure was not staged"
+            );
+            fixture
+        }
+    }
+    impl Drop for UnwritableAttach {
+        fn drop(&mut self) {
+            if let Some(backup) = &self.backup {
+                let _ = std::fs::remove_dir(&self.path);
+                std::fs::rename(backup, &self.path)
+                    .expect("APPARATUS: restore scratch attach file");
+            } else {
+                let status = Command::new("chflags")
+                    .arg("nouchg")
+                    .arg(&self.path)
+                    .status()
+                    .expect("APPARATUS: clear scratch immutable flag");
+                assert!(
+                    status.success(),
+                    "APPARATUS: cannot clear scratch immutable flag"
+                );
+            }
+        }
+    }
     watchdog::arm();
     let a = Account::new();
     a.make_node("default");
     let pass = a.data.with_extension("pass");
     std::fs::write(&pass, format!("{PASS}\n")).unwrap();
-    let d = Daemon::start(&a, &["--passphrase-file", pass.to_str().unwrap()], &[]);
-    d.expect("its identity", Duration::from_secs(60), |l| {
-        l.starts_with("vox daemon: identity")
-    });
-    let room = make_room(&a, "default");
-    d.stop();
-    // Kept, with the room's passphrase in its file.
-    std::fs::write(&pass, format!("{PASS}\n{ROOM_PASS}\n")).unwrap();
-    let d = Daemon::start(
-        &a,
-        &["--keep", "--passphrase-file", pass.to_str().unwrap()],
-        &[],
+    let (ok, out, err) = a.run(&["daemon", "--detach"], "");
+    assert!(
+        ok,
+        "APPARATUS: daemon before persistence failure: {out}{err}"
     );
-    d.expect("the room held open", Duration::from_secs(60), |l| {
-        l.starts_with("vox daemon: holding room")
-    });
-    let (ok, _, _) = a.run(&["room", "post", &room, "before the restart"], "");
-    assert!(ok, "APPARATUS: post before the restart");
-    d.stop();
+    let attach_file = a.data.join(".daemon/attach");
+    std::fs::write(&attach_file, "").expect("APPARATUS: empty remembered-state file");
+    {
+        let _blocked = UnwritableAttach::new(attach_file.clone(), false);
+        let (ok, out, err) = a.run(
+            &[
+                "node",
+                "unlock",
+                "default",
+                "--passphrase-file",
+                pass.to_str().unwrap(),
+            ],
+            "",
+        );
+        let truthful = if cfg!(target_os = "macos") {
+            err.contains("Ready, but remembering could not be confirmed")
+                && err.contains("could not write")
+        } else {
+            err.contains("could not read remembered state") && err.contains("it was not changed")
+        };
+        assert!(
+            !ok && truthful && !out.contains("Ready and remembered"),
+            "PRODUCT: failed persistence must fail unlock and name its partial state: {out}{err}"
+        );
+        let (_, shown, err) = a.run(&["node", "list"], "");
+        assert!(
+            shown.lines().any(|l| l.starts_with("default ")
+                && l.contains("attached")
+                && !l.contains("(kept)")),
+            "PRODUCT: a failed first remember must not appear kept: {shown}{err}"
+        );
+    }
+    // The ordinary successful unlock below is also the retry after storage is restored.
+    let (ok, out, err) = a.run(
+        &[
+            "node",
+            "unlock",
+            "default",
+            "--passphrase-file",
+            pass.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert!(
+        ok && out.contains("Ready and remembered"),
+        "PRODUCT: unlock must make the node Ready and remembered: {out}{err}"
+    );
+    let room = make_room(&a, "default");
+    let (ok, out, err) = a.run(&["room", "post", &room, "before the restart"], "");
+    assert!(ok, "APPARATUS: post before restart: {out}{err}");
+    let (ok, out, err) = a.run(&["node", "forget-passphrase", "default"], "");
+    assert!(
+        ok,
+        "APPARATUS: temporarily forget the Ready node: {out}{err}"
+    );
+    let (_, listed, err) = a.run(&["node", "list"], "");
+    assert!(listed.lines().any(|l| l.starts_with("default ") && l.contains("attached") && !l.contains("(kept)")),
+        "APPARATUS: empty-input refusal needs a protected Ready but unremembered node: {listed}{err}");
+    let empty = pass.with_extension("empty");
+    std::fs::write(&empty, "\n").expect("APPARATUS: empty passphrase input");
+    let (ok, out, err) = a.run(
+        &[
+            "node",
+            "unlock",
+            "default",
+            "--passphrase-file",
+            empty.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert!(!ok && err.contains("identity passphrase") && !out.contains("Ready and remembered"),
+        "PRODUCT: a Ready protected node must reject empty input instead of remembering no passphrase: {out}{err}");
+    let (_, listed, err) = a.run(&["node", "list"], "");
+    assert!(
+        listed
+            .lines()
+            .any(|l| l.starts_with("default ") && l.contains("attached") && !l.contains("(kept)")),
+        "PRODUCT: rejected empty input must leave the Ready node unremembered: {listed}{err}"
+    );
+    let (ok, out, err) = a.run(
+        &[
+            "node",
+            "unlock",
+            "default",
+            "--passphrase-file",
+            pass.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert!(
+        ok && out.contains("Ready and remembered"),
+        "PRODUCT: correct passphrase retry must remember the Ready node: {out}{err}"
+    );
+    let wrong = pass.with_extension("wrong");
+    std::fs::write(&wrong, "wrong identity passphrase\n")
+        .expect("APPARATUS: wrong persistent input");
+    let (ok, out, err) = a.run(
+        &[
+            "node",
+            "unlock",
+            "default",
+            "--passphrase-file",
+            wrong.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert!(!ok && err.contains("identity passphrase") && !out.contains("Ready and remembered"),
+        "PRODUCT: wrong input must not replace an already-Ready node's usable restart secret: {out}{err}");
+    // The restart and room read below prove the rejected replacement left usable material.
+    stop_pid(a.lock_pid().expect("APPARATUS: unlocked node's daemon"));
+    let supplied = pass.with_extension("supplied");
+    if cfg!(target_os = "macos") {
+        std::fs::rename(&pass, &supplied).expect("APPARATUS: remove one-time input file");
+    }
     let (ok, out, err) = a.run(&["daemon", "--detach"], "");
     assert!(ok, "PRODUCT: vox daemon --detach failed: {out}{err}");
     let pid = a.lock_pid().expect("PRODUCT: no daemon holds the lock");
@@ -542,6 +747,242 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         "PRODUCT: the restart did not say it attached the kept node\nlog:\n{log}"
     );
 
+    if cfg!(target_os = "macos") {
+        std::fs::rename(&supplied, &pass).expect("APPARATUS: restore one-time input file");
+    }
+    // Lock must forget restart state without deleting the room, message or app selection.
+    let (ok, out, err) = a.run(&["node", "lock", "default"], "");
+    assert!(
+        ok && out.contains("Locked and forgotten"),
+        "PRODUCT: lock must forget the node and close it: {out}{err}"
+    );
+    stop_pid(pid);
+    let (ok, out, err) = a.run(&["daemon", "--detach"], "");
+    assert!(ok, "APPARATUS: restart after lock: {out}{err}");
+    let (_, listed, err) = a.run(&["node", "list"], "");
+    assert!(
+        listed
+            .lines()
+            .any(|l| l.starts_with("default ") && l.contains("detached") && !l.contains("(kept)")),
+        "PRODUCT: lock must survive a daemon restart: {listed}{err}"
+    );
+    let (ok, out, err) = a.run(
+        &[
+            "node",
+            "attach",
+            "default",
+            "--keep",
+            "--passphrase-file",
+            pass.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert!(
+        ok && err.contains("`vox node attach` is now `vox node unlock`")
+            && out.contains("Ready and remembered"),
+        "PRODUCT: attach --keep must be the remembering unlock alias: {out}{err}"
+    );
+    let (ok, out, err) = a.run(&["room", "read", &room], "");
+    assert!(
+        ok && out.contains("before the restart"),
+        "PRODUCT: lock/unlock must preserve the room and its messages: {out}{err}"
+    );
+
+    // A remembered node whose secret is unavailable is already stopped. Lock must still forget
+    // its restart entry; restoring that secret later must not bring it back.
+    stop_pid(
+        a.lock_pid()
+            .expect("APPARATUS: daemon before missing secret"),
+    );
+    let remembered = if cfg!(target_os = "macos") {
+        a._tmp.path().join("k.keychain-db")
+    } else {
+        pass.clone()
+    };
+    let away = remembered.with_extension("away");
+    std::fs::rename(&remembered, &away).expect("APPARATUS: temporarily remove remembered secret");
+    let (ok, out, err) = a.run(&["daemon", "--detach"], "");
+    assert!(
+        ok,
+        "APPARATUS: restart with missing remembered secret: {out}{err}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            let (_, shown, _) = a.run(&["node", "list"], "");
+            shown.lines().any(|l| {
+                l.starts_with("default ") && l.contains("detached") && l.contains("(kept)")
+            })
+        }),
+        "APPARATUS: the missing secret did not leave a remembered, stopped node: {}",
+        a.log()
+    );
+    if !cfg!(target_os = "macos") {
+        assert!(
+            a.log()
+                .contains("restore the file, then run `vox node unlock default --passphrase-file"),
+            "PRODUCT: a missing remembered file must say how to recover: {}",
+            a.log()
+        );
+    }
+    let (ok, out, err) = a.run(&["node", "detach", "default"], "");
+    assert!(
+        ok && err.contains("`vox node detach` is now `vox node lock`")
+            && out.contains("Locked and forgotten"),
+        "PRODUCT: detach must forget an already-stopped node and print the lock alias: {out}{err}"
+    );
+    stop_pid(a.lock_pid().expect("APPARATUS: stopped node's daemon"));
+    std::fs::rename(&away, &remembered).expect("APPARATUS: restore remembered secret");
+    let (ok, out, err) = a.run(&["daemon", "--detach"], "");
+    assert!(ok, "APPARATUS: restart after restoring secret: {out}{err}");
+    let (_, shown, err) = a.run(&["node", "list"], "");
+    assert!(shown.lines().any(|l| l.starts_with("default ") && l.contains("detached") && !l.contains("(kept)")),
+        "PRODUCT: locking an already-stopped node must survive secret restoration and restart: {shown}{err}");
+    let (ok, out, err) = a.run(
+        &[
+            "node",
+            "unlock",
+            "default",
+            "--passphrase-file",
+            pass.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert!(
+        ok,
+        "PRODUCT: unlock after locking a stopped node: {out}{err}"
+    );
+    let (ok, out, err) = a.run(&["room", "read", &room], "");
+    assert!(
+        ok && out.contains("before the restart"),
+        "PRODUCT: locking an already-stopped node must preserve messages: {out}{err}"
+    );
+    {
+        let _blocked = UnwritableAttach::new(attach_file.clone(), true);
+        for args in [
+            vec![
+                "node",
+                "unlock",
+                "default",
+                "--passphrase-file",
+                pass.to_str().unwrap(),
+            ],
+            vec!["node", "lock", "default"],
+        ] {
+            let (ok, out, err) = a.run(&args, "");
+            assert!(!ok && err.contains("could not read remembered state") && err.contains("it was not changed")
+                && !out.contains("Ready and remembered") && !out.contains("Locked and forgotten"),
+                "PRODUCT: unreadable remembered state must be refused without claiming a change: {out}{err}");
+        }
+        let (_, shown, err) = a.run(&["node", "list"], "");
+        assert!(shown.lines().any(|l| l.starts_with("default ") && l.contains("attached") && l.contains("(kept)")),
+            "PRODUCT: an unreadable file must not erase the last known remembered state: {shown}{err}");
+    }
+    {
+        let _blocked = UnwritableAttach::new(attach_file.clone(), false);
+        let (ok, out, err) = a.run(&["node", "lock", "default"], "");
+        let truthful = if cfg!(target_os = "macos") {
+            err.contains("could not forget") && err.contains("could not write")
+        } else {
+            err.contains("could not read remembered state") && err.contains("it was not changed")
+        };
+        assert!(
+            !ok && truthful && !out.contains("Locked and forgotten"),
+            "PRODUCT: failed persistence must not claim lock forgot the node: {out}{err}"
+        );
+        let (_, shown, err) = a.run(&["node", "list"], "");
+        assert!(shown.lines().any(|l| l.starts_with("default ") && l.contains("attached")
+            && (!cfg!(target_os = "macos") || l.contains("(kept)"))),
+            "PRODUCT: failed forgetting must leave the node Ready and show its surviving remembered state: {shown}{err}");
+    }
+    stop_pid(a.lock_pid().expect("APPARATUS: daemon after failed lock"));
+    let (ok, out, err) = a.run(&["daemon", "--detach"], "");
+    assert!(ok, "APPARATUS: restart after failed lock: {out}{err}");
+    assert!(wait_until(Duration::from_secs(60), || a.run(&["room", "read", &room], "").1.contains("before the restart")),
+        "PRODUCT: failed forgetting must preserve the saved secret needed by the surviving entry: {}", a.log());
+    let (ok, out, err) = a.run(&["node", "lock", "default"], "");
+    assert!(
+        ok && out.contains("Locked and forgotten"),
+        "PRODUCT: restoring storage must let lock retry succeed: {out}{err}"
+    );
+    let (ok, out, err) = a.run(
+        &[
+            "node",
+            "unlock",
+            "default",
+            "--passphrase-file",
+            pass.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert!(
+        ok && out.contains("Ready and remembered"),
+        "PRODUCT: unlock after the repaired lock must succeed: {out}{err}"
+    );
+    let (ok, out, err) = a.run(&["node", "attach", "default", "--no-remember"], "");
+    assert!(
+        !ok && err.contains("--no-remember"),
+        "PRODUCT: attach must not offer an unremembered unlock exception: {out}{err}"
+    );
+    if cfg!(target_os = "macos") {
+        // A store failure on an already-remembered Ready node must not retain stale keep state.
+        std::fs::rename(&remembered, &away).expect("APPARATUS: make scratch Keychain unavailable");
+        let (ok, out, err) = a.run(
+            &[
+                "node",
+                "unlock",
+                "default",
+                "--passphrase-file",
+                pass.to_str().unwrap(),
+            ],
+            "",
+        );
+        assert!(
+            !ok && err.contains("Ready but not remembered")
+                && !out.contains("Ready and remembered"),
+            "PRODUCT: a failed remember must fail unlock and name its partial state: {out}{err}"
+        );
+        let (_, listed, err) = a.run(&["node", "list"], "");
+        assert!(listed.lines().any(|l| l.starts_with("default ") && l.contains("attached") && !l.contains("(kept)")),
+            "PRODUCT: failed Keychain storage must clear the previous remembered state: {listed}{err}");
+        stop_pid(
+            a.lock_pid()
+                .expect("APPARATUS: daemon after failed remember"),
+        );
+        std::fs::rename(&away, &remembered).expect("APPARATUS: restore scratch Keychain");
+        let (ok, out, err) = a.run(&["daemon", "--detach"], "");
+        assert!(ok, "APPARATUS: restart after failed remember: {out}{err}");
+        let (_, listed, err) = a.run(&["node", "list"], "");
+        assert!(
+            listed.lines().any(|l| l.starts_with("default ")
+                && l.contains("detached")
+                && !l.contains("(kept)")),
+            "PRODUCT: the cleared remembered state must survive restart: {listed}{err}"
+        );
+        let (ok, out, err) = a.run(
+            &[
+                "node",
+                "unlock",
+                "default",
+                "--passphrase-file",
+                pass.to_str().unwrap(),
+            ],
+            "",
+        );
+        assert!(
+            ok,
+            "PRODUCT: correcting the Keychain problem must permit unlock: {out}{err}"
+        );
+    } else {
+        let (ok, out, err) = a.run(
+            &["node", "unlock", "default", "--passphrase-file", "-"],
+            PASS,
+        );
+        assert!(
+            !ok && err.contains("stdin") && err.contains("persistent"),
+            "PRODUCT: stdin must not be recorded as a persistent passphrase file: {out}{err}"
+        );
+    }
+    let pid = a.lock_pid().expect("APPARATUS: daemon before signout");
     // **Sign out (ADR-028 E-4).** The app remembers the node it opens; `vox node signout` detaches
     // the node and forgets all that would bring it back without the person: its keep line and the
     // app's choice. Its rooms and messages stay.
@@ -1210,7 +1651,7 @@ fn a_hook_answers_within_a_second_while_the_daemon_attaches_its_kept_nodes() {
     let (took, ok, said) = timed("plain", "s-plain");
     println!("[proof] cold hook as plain (not attached): {took:?}");
     assert!(
-        ok && took < Duration::from_secs(1) && said.contains("node plain is not attached"),
+        ok && took < Duration::from_secs(1) && said.contains("node plain is Locked"),
         "PRODUCT: with no daemon running and 8 kept nodes to attach, a hook as a node not \
          attached must answer within 1 s, saying so; it took {took:?} and said: {said}\nlog:\n{}",
         a.log()
@@ -1314,7 +1755,7 @@ fn a_hooks_output_closes_while_the_daemon_it_started_runs() {
                     // Its node is not attached, and a hook never attaches it (ADR-028 K-13): the
                     // hook answers with the command for the operator, and ends.
                     assert!(
-                        out.contains("vox node attach agent"),
+                        out.contains("vox node unlock agent"),
                         "PRODUCT (staging): round {round}, hook {}: {out}",
                         i + 1
                     );
