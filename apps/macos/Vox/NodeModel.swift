@@ -128,6 +128,7 @@ final class NodeModel: ObservableObject {
     }
     private var roomReadGeneration = UUID()
     private var rejectedRoomMark: String?
+    private var roomMessageRevision = UUID()
     /// The first message that was unread when the room came on screen, and how many were: where
     /// the timeline draws its unread line. It stays while the room is on screen; what arrives
     /// meanwhile is read as it is shown.
@@ -135,6 +136,7 @@ final class NodeModel: ObservableObject {
     @Published private(set) var unreadCount = 0
     @Published private(set) var messages: [RoomMessage] = [] {
         didSet {
+            roomMessageRevision = UUID()
             byID = Dictionary(messages.map { ($0.id, $0) }) { $1 }
             var said: [String: NodePlatform] = [:]
             for message in messages { if let p = message.platform { said[message.author] = p } }
@@ -526,6 +528,7 @@ final class NodeModel: ObservableObject {
     private func readNewOnScreen() async {
         guard case let .room(id) = selection, ended == nil else { return }
         let generation = roomReadGeneration
+        let messageRevision = roomMessageRevision
         do {
             let rows: [RoomMessage]
             var recovery: FfiRoomRead?
@@ -548,6 +551,10 @@ final class NodeModel: ObservableObject {
             var recoveredMembers: [MemberRow]?
             if recovery != nil { recoveredMembers = try await memberRows(id) }
             guard generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
+            // An event may have delivered a new body or row while the page or roster awaited.
+            // Keep that visible result and retry reanchoring instead of replacing it with an
+            // earlier snapshot. IDs alone cannot detect an owed row gaining its body.
+            if recovery != nil && messageRevision != roomMessageRevision { return }
             let new = rows.filter { byID[$0.id] == nil && !$0.owed }
             if let page = recovery {
                 // Keep the valid view until this same selection's replacement is ready.
