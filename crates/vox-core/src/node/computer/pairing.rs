@@ -1,4 +1,4 @@
-//! The bounded two-computer ceremony on the daemon's existing authenticated QUIC presence.
+//! The bounded computer-group enrollment ceremony on the daemon's existing authenticated QUIC presence.
 use super::*;
 use crate::join::{cpace, pop};
 use crate::nat::bootstrap::BootstrapSet;
@@ -60,6 +60,14 @@ pub struct PairingPreview {
     /// Invitation expiry, Unix milliseconds.
     pub expires_ms: u64,
 }
+/// Signed application of the exact current group frontier, independent of present reachability.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ComputerApplication {
+    /// Enrolled installation.
+    pub computer: ComputerIdentity,
+    /// This member signed a complete applied receipt for the current frontier.
+    pub confirmed: bool,
+}
 /// Daemon-wide public state. A failed reach is not a rejection of the pairing code.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ComputerStatus {
@@ -79,6 +87,8 @@ pub struct ComputerStatus {
     pub pairing: Option<PairingPreview>,
     /// Explicitly enrolled computers.
     pub computers: Vec<ComputerIdentity>,
+    /// Per-member application; unreachable members never get a fabricated acknowledgement.
+    pub applications: Vec<ComputerApplication>,
     /// Managed nodes still needing attach/unlock or policy reconciliation.
     pub pending_nodes: Vec<String>,
     /// Last reach or protocol failure, without any secret or full link.
@@ -196,14 +206,33 @@ impl Management {
             return Ok(());
         }
         let local = self.computer.signer.fingerprint();
+        let endpoints = self.net.local_endpoints()?;
         self.computer.change(|s| {
+            if s.genesis.is_some() && s.grant(&local).is_some() && s.quarantined.is_empty() {
+                let reach = Reach {
+                    endpoints,
+                    anchors: self.anchors.clone(),
+                    token: s
+                        .reaches
+                        .get(&local)
+                        .map(|r| r.token)
+                        .unwrap_or(random_array()?),
+                };
+                if s.reaches.get(&local) != Some(&reach) {
+                    let mut body = Encoder::new();
+                    body.array(1).bytes(&reach.encode());
+                    let event =
+                        Control::sign(s, "reach", body.finish(), self.computer.signer.as_ref())?;
+                    s.retain_roster(event)?;
+                }
+            }
             let Some(g) = &s.genesis else {
                 return Ok(());
             };
             if !s.quarantined.is_empty() || !s.history_complete() {
                 return Ok(());
             }
-            if s.rosters.len() != 2 {
+            if s.rosters.len() != s.descriptions().len() {
                 return Ok(());
             }
             let Some(roster) = s.rosters.get(&local) else {
@@ -388,13 +417,18 @@ impl Management {
         let nonce = random_array()?;
         let grants = [random_array()?, random_array()?];
         self.computer.change(|s| {
-            if s.genesis.is_some() {
-                return Err(Error::Profile("this computer is already paired"));
+            if s.genesis.is_some()
+                && (s.grant(&self.computer.signer.fingerprint()).is_none()
+                    || !s.quarantined.is_empty())
+            {
+                return Err(Error::Profile(
+                    "this computer cannot enroll another member while its authority is suspended",
+                ));
             }
-            if s.pending.is_some()
+            if s.pending.as_ref().is_some_and(|p| !enrolled(s, p))
                 || s.invitations
                     .iter()
-                    .any(|i| !i.cancelled && i.expires > now())
+                    .any(|i| !i.cancelled && i.expires > now() && i.target.is_none())
             {
                 return Err(Error::Profile(
                     "a computer pairing is already pending; cancel it before making another code",
@@ -405,6 +439,12 @@ impl Management {
                     "retained computer invitation history is full",
                 ));
             }
+            if let Some(link) = s.pair_link.take() {
+                s.links.push(link);
+            }
+            s.pending = None;
+            s.group_genesis = None;
+            s.pending_expires = 0;
             s.invitations.push(Invitation {
                 id,
                 secret: secret.clone(),
@@ -437,16 +477,14 @@ impl Management {
     pub fn cancel(&self, operation: &str) -> Result<ComputerStatus> {
         let id = crate::node::link::b32_decode(operation, "computer pairing operation")?;
         let closed_expired = self.computer.change(|s| {
-            if s.genesis.is_some() {
-                return Err(Error::Profile(
-                    "this pairing is established; cancellation does not remove computer trust",
-                ));
+            if s.pending.as_ref().is_some_and(|g| (g.operation()==id || s.invitations.iter().any(|i| i.id==id && i.nonce==g.nonce)) && enrolled(s,g)) || s.genesis.as_ref().is_some_and(|g|g.operation()==id) {
+                return Err(Error::Profile("this pairing is established; cancellation does not remove computer trust"));
             }
             if s.cancelled.contains_key(&id) {
                 return Ok(false);
             }
             let pending_nonce = s.pending.as_ref().and_then(|g| {
-                (g.incarnation() == id || s.invitations.iter().any(|i| i.id == id && i.nonce == g.nonce))
+                (g.operation() == id || s.invitations.iter().any(|i| i.id == id && i.nonce == g.nonce))
                     .then_some(g.nonce)
             });
             let pending = pending_nonce.is_some();
@@ -472,17 +510,16 @@ impl Management {
             }
             if pending {
                 if let Some(g) = s.pending.take() {
-                    s.cancelled.insert(g.incarnation(), g);
+                    s.cancelled.insert(g.operation(), g);
                 }
                 if let Some(link) = s.pair_link.take() {
                     s.cancelled_links.push(link);
                 }
                 s.pending_expires = 0;
-                s.rosters.clear();
+                if s.genesis.is_none() { s.rosters.clear(); s.members.clear(); s.reaches.clear(); s.group_genesis=None; }
                 // Fault exclusion is permanent within this retired incarnation. Retain its
                 // signed evidence, but do not carry its derived fault into a fresh enrollment.
-                s.quarantined.clear();
-                s.receipts.clear();
+                if s.genesis.is_none() { s.quarantined.clear(); s.receipts.clear(); }
             }
             Ok(locally_approved)
         })?;
@@ -534,11 +571,18 @@ impl Management {
         let id = crate::node::link::b32_decode(operation, "computer pairing operation")?;
         let local = self.computer.signer.fingerprint();
         self.computer.change(|s| {
-            if s.genesis.as_ref().is_some_and(|g| g.incarnation() == id) {
+            if s.genesis.as_ref().is_some_and(|g| g.operation() == id)
+                || s.history.values().any(|r| {
+                    r.event()
+                        .ok()
+                        .and_then(|e| e.addition)
+                        .is_some_and(|a| a.operation() == id)
+                })
+            {
                 return Ok(());
             }
             if s.pending.as_ref().is_some_and(|g| {
-                g.incarnation() == id
+                g.operation() == id
                     && side(g, &local)
                         .ok()
                         .is_some_and(|at| g.approvals[at].is_some())
@@ -553,7 +597,7 @@ impl Management {
             let g = s.pending.as_mut().ok_or(Error::Profile(
                 "no authenticated computer pairing is awaiting approval",
             ))?;
-            if g.incarnation() != id {
+            if g.operation() != id {
                 return Err(Error::Profile(
                     "the displayed computer pairing has changed; review it again",
                 ));
@@ -566,7 +610,7 @@ impl Management {
                     self.computer.signer.as_ref(),
                 )?);
             }
-            activate(s)?;
+            activate(s, self.computer.signer.as_ref())?;
             Ok(())
         })?;
         self.status()
@@ -575,26 +619,27 @@ impl Management {
     pub fn status(&self) -> Result<ComputerStatus> {
         let s = lock(&self.computer.state);
         let local = self.computer.signer.fingerprint();
-        let g = s.genesis.as_ref().or(s.pending.as_ref());
-        let pairing = if let Some(g) = g {
-            let at = side(g, &local)?;
-            Some(PairingPreview {
-                operation_id: text_id(&g.incarnation()),
-                peer: ComputerIdentity::of(&g.computers[1 - at])?,
-                approved_here: g.approvals[at].is_some(),
-                approved_there: g.approvals[1 - at].is_some(),
-                expires_ms: s.pending_expires,
+        let pairing = s
+            .pending
+            .as_ref()
+            .filter(|g| !enrolled(&s, g))
+            .map(|g| -> Result<PairingPreview> {
+                let at = side(g, &local)?;
+                Ok(PairingPreview {
+                    operation_id: text_id(&g.operation()),
+                    peer: ComputerIdentity::of(&g.computers[1 - at])?,
+                    approved_here: g.approvals[at].is_some(),
+                    approved_there: g.approvals[1 - at].is_some(),
+                    expires_ms: g.expires,
+                })
             })
-        } else {
-            None
-        };
-        let invitation = s.invitations.iter().rev().find(|i| {
-            s.genesis.is_none()
-                && s.pending.is_none()
-                && !i.cancelled
-                && i.expires > now()
-                && i.target.is_none()
-        });
+            .transpose()?;
+        let busy = s.pending.as_ref().is_some_and(|g| !enrolled(&s, g));
+        let invitation = s
+            .invitations
+            .iter()
+            .rev()
+            .find(|i| !busy && !i.cancelled && i.expires > now() && i.target.is_none());
         let invite_link = invitation
             .map(|i| {
                 self.net.local_endpoints().map(|endpoints| {
@@ -613,40 +658,54 @@ impl Management {
             .transpose()?;
         let pending_nodes = lock(&self.pending_nodes).clone();
         let storage_failed = self.computer.storage_ready().is_err();
+        let descriptions = if s.genesis.is_some() {
+            s.descriptions()
+        } else {
+            BTreeMap::new()
+        };
+        let applications: Vec<_> = descriptions
+            .iter()
+            .map(|(id, d)| {
+                Ok(ComputerApplication {
+                    computer: ComputerIdentity::of(d)?,
+                    confirmed: !storage_failed
+                        && s.receipts
+                            .get(id)
+                            .is_some_and(|r| valid_receipt(&s, id, r).unwrap_or(false)),
+                })
+            })
+            .collect::<Result<_>>()?;
         let state = if storage_failed || !s.quarantined.is_empty() {
             "quarantined"
+        } else if busy && pairing.as_ref().is_some_and(|p| !p.approved_here) {
+            "needs-approval"
+        } else if busy || invitation.is_some() {
+            "waiting"
         } else if s.genesis.is_some() {
-            if s.receipts.len() == 2
+            if !applications.is_empty()
+                && applications.iter().all(|a| a.confirmed)
                 && pending_nodes.is_empty()
-                && s.receipts
-                    .iter()
-                    .all(|(author, r)| valid_receipt(&s, author, r).unwrap_or(false))
             {
                 "confirmed"
             } else {
                 "applying"
             }
-        } else if pairing.as_ref().is_some_and(|p| !p.approved_here) {
-            "needs-approval"
-        } else if pairing.is_some() || invitation.is_some() {
-            "waiting"
         } else {
             "individual"
         };
         Ok(ComputerStatus {
             this_computer: ComputerIdentity::of(&s.description)?,
-            policy: POLICY.to_owned(),
-            state: state.to_owned(),
+            policy: POLICY.into(),
+            state: state.into(),
             invite_link,
             invite_id: invitation.map(|i| text_id(&i.id)),
             invite_expires_ms: invitation.map(|i| i.expires),
             pairing,
-            computers: s
-                .genesis
-                .as_ref()
-                .map(|g| g.computers.iter().map(ComputerIdentity::of).collect())
-                .transpose()?
-                .unwrap_or_default(),
+            computers: descriptions
+                .values()
+                .map(ComputerIdentity::of)
+                .collect::<Result<_>>()?,
+            applications,
             pending_nodes,
             problem: if storage_failed {
                 Some(STORAGE_FAILED.into())
@@ -661,61 +720,107 @@ impl Management {
     pub fn pending_nodes(&self, nodes: Vec<String>) {
         *lock(&self.pending_nodes) = nodes;
     }
-    fn transport_lease(&self, supplied: Option<&Link>) -> Result<Option<TransportLease>> {
+    fn transport_leases(&self, supplied: Option<&Link>) -> Result<Vec<TransportLease>> {
         let s = lock(&self.computer.state);
         let local = s.description.fingerprint()?;
-        let group = s.genesis.as_ref().or(s.pending.as_ref());
-        let stored = s.pair_link.as_ref().map(|l| Link::parse(l)).transpose()?;
-        let link = supplied.or(stored.as_ref());
-        let mut anchors = self.anchors.clone();
-        if let Some(link) = link {
+        let mut leases = Vec::new();
+        if let (Some(group), Some(here)) = (s.group(), s.reaches.get(&local)) {
+            for (peer, there) in &s.reaches {
+                if *peer == local
+                    || s.grant(peer).is_none()
+                    || s.grant(&local).is_none()
+                    || s.quarantined.contains(peer)
+                {
+                    continue;
+                }
+                let (first, second, t1, t2) = if local < *peer {
+                    (local, *peer, here.token, there.token)
+                } else {
+                    (*peer, local, there.token, here.token)
+                };
+                let registration =
+                    sha256_concat(&[b"vox/computer-transport-pair/v1\0", &group, &first, &second]);
+                let token = Zeroizing::new(sha256_concat(&[
+                    b"vox/computer-transport-capability/v1\0",
+                    &group,
+                    &first,
+                    &second,
+                    &t1,
+                    &t2,
+                ]));
+                let mut anchors = here.anchors.clone();
+                for a in there.anchors.nodes() {
+                    anchors.add(a.clone())?;
+                }
+                leases.push(TransportLease {
+                    registration,
+                    token,
+                    expires: now()
+                        .saturating_add(crate::nat::service::COMPUTER_TRANSPORT_TTL_MS / 2),
+                    peer: Some(*peer),
+                    anchors,
+                });
+            }
+        }
+        let mut links: Vec<_> = s
+            .links
+            .iter()
+            .chain(s.pair_link.iter())
+            .map(|l| Link::parse(l))
+            .collect::<Result<_>>()?;
+        if let Some(l) = supplied {
+            links.push(Link::parse(&l.url())?);
+        }
+        for link in links {
+            if leases.iter().any(|l| l.peer == Some(link.target)) {
+                continue;
+            }
+            let established = s.grant(&link.target).is_some() && s.genesis.is_some();
+            if !established && link.expires <= now() {
+                continue;
+            }
+            let mut anchors = self.anchors.clone();
             for a in link.anchors.nodes() {
                 anchors.add(a.clone())?;
             }
+            leases.push(TransportLease {
+                registration: link.invite,
+                token: link.transport,
+                expires: if established {
+                    now().saturating_add(crate::nat::service::COMPUTER_TRANSPORT_TTL_MS / 2)
+                } else {
+                    link.expires
+                },
+                peer: Some(link.target),
+                anchors,
+            });
         }
-        let established = s.genesis.is_some();
-        let peer = group
-            .map(|g| side(g, &local).and_then(|at| g.computers[1 - at].fingerprint()))
-            .transpose()?;
-        let (registration, token, expires, peer) = if let Some(link) = link {
-            (
-                link.invite,
-                link.transport.clone(),
-                link.expires,
-                Some(peer.unwrap_or(link.target)),
-            )
-        } else if let Some(invite) = s
-            .invitations
-            .iter()
-            .rev()
-            .find(|i| !i.cancelled && group.map_or(i.expires > now(), |g| i.nonce == g.nonce))
-        {
-            (
-                invite.id,
-                invite.transport.clone(),
-                invite.expires,
-                peer.or(invite.target),
-            )
-        } else {
-            return Ok(None);
-        };
-        if !established && expires <= now() {
-            return Ok(None);
+        for i in &s.invitations {
+            if i.cancelled
+                || i.target
+                    .is_some_and(|p| leases.iter().any(|l| l.peer == Some(p)))
+            {
+                continue;
+            }
+            let established =
+                i.target.is_some_and(|p| s.grant(&p).is_some()) && s.genesis.is_some();
+            if !established && i.expires <= now() {
+                continue;
+            }
+            leases.push(TransportLease {
+                registration: i.id,
+                token: i.transport.clone(),
+                expires: if established {
+                    now().saturating_add(crate::nat::service::COMPUTER_TRANSPORT_TTL_MS / 2)
+                } else {
+                    i.expires
+                },
+                peer: i.target,
+                anchors: self.anchors.clone(),
+            });
         }
-        let expires = if established {
-            now().saturating_add(crate::nat::service::COMPUTER_TRANSPORT_TTL_MS / 2)
-        } else {
-            expires
-        };
-        Ok(Some(TransportLease {
-            registration,
-            token,
-            expires,
-            peer,
-            anchors,
-        }))
+        Ok(leases)
     }
-
     fn configure_transport_anchors(&self, anchors: &BootstrapSet) {
         let mut policy = self.net.policy().snapshot();
         for a in anchors.nodes() {
@@ -787,7 +892,7 @@ impl Management {
 
     async fn refresh_transport(self: &Arc<Self>) -> Result<()> {
         let mut work = tokio::task::JoinSet::new();
-        if let Some(lease) = self.transport_lease(None)? {
+        for lease in self.transport_leases(None)? {
             self.configure_transport_anchors(&lease.anchors);
             for anchor in lease.anchors.nodes() {
                 let me = Arc::clone(self);
@@ -853,27 +958,26 @@ impl Management {
         send: SendStream,
         recv: RecvStream,
     ) -> Result<()> {
-        let lease = self.transport_lease(None)?.ok_or(Error::StreamRefused(
-            "no current computer transport invitation or enrolled pair",
-        ))?;
-        if lease.anchors.get(&conn.peer_id()).is_none() {
-            return Err(Error::StreamRefused(
-                "not this computer pairing's configured anchor",
-            ));
-        }
         let mut origins = Vec::new();
-        if let Some(peer) = lease.peer {
-            origins.push(peer);
-        }
-        if let Some(peer) = self
-            .net
-            .computer_transport_peer(conn, lease.registration)
-            .await?
-        {
-            if lease.peer.is_none_or(|expected| expected == peer) {
+        for lease in self.transport_leases(None)? {
+            if lease.anchors.get(&conn.peer_id()).is_none() {
+                continue;
+            }
+            if let Some(peer) = lease.peer {
                 origins.push(peer);
             }
+            if let Some(peer) = self
+                .net
+                .computer_transport_peer(conn, lease.registration)
+                .await?
+            {
+                if lease.peer.is_none_or(|expected| expected == peer) {
+                    origins.push(peer);
+                }
+            }
         }
+        origins.sort();
+        origins.dedup();
         let result = self
             .net
             .dispatch_computer_transport(conn, kind, send, recv, &origins)
@@ -904,9 +1008,13 @@ impl Management {
         // neither its absence nor its refusal can delay or fail a directly reachable computer.
         let direct = self.net.manager().connect(target, endpoints);
         let relay = async {
-            let lease = self.transport_lease(supplied)?.ok_or(Error::Unreachable(
-                "no current computer transport invitation or enrolled pair",
-            ))?;
+            let lease = self
+                .transport_leases(supplied)?
+                .into_iter()
+                .find(|l| l.peer == Some(target))
+                .ok_or(Error::Unreachable(
+                    "no current computer transport invitation or enrolled pair",
+                ))?;
             self.configure_transport_anchors(&lease.anchors);
             let mut attempts = tokio::task::JoinSet::new();
             for anchor in lease.anchors.nodes() {
@@ -959,7 +1067,7 @@ impl Management {
         if sid.len() != 16 {
             return Err(bad());
         }
-        let mut g = Genesis::decode(d.bytes()?)?;
+        let mut g = Enrollment::decode(d.bytes()?)?;
         let remote_share: [u8; 32] = d.bytes()?.try_into().map_err(|_| bad())?;
         d.finish()?;
         if g.expires != link.expires
@@ -1008,7 +1116,7 @@ impl Management {
             s.pending = Some(g);
             s.pending_expires = link.expires;
             s.pair_link = Some(Zeroizing::new(url.to_owned()));
-            merge(s, &exchange, link.target)?;
+            merge(s, &exchange, link.target, self.computer.signer.as_ref())?;
             Ok(())
         })?;
         let _ = send.finish();
@@ -1025,7 +1133,7 @@ impl Management {
         if op == 2 {
             let payload = frame(recv).await?;
             self.computer
-                .change(|s| merge(s, &payload, conn.peer_id()))?;
+                .change(|s| merge(s, &payload, conn.peer_id(), self.computer.signer.as_ref()))?;
             let payload = exchange(&lock(&self.computer.state))?;
             write_frame(send, &payload).await?;
             return Ok(());
@@ -1041,17 +1149,21 @@ impl Management {
                     "computer pairing code was already consumed by another identity",
                 ));
             }
-            let g = Genesis {
+            let g = Enrollment {
+                group: s.genesis.as_ref().map(Enrollment::incarnation),
                 expires: i.expires,
                 nonce: i.nonce,
                 computers: [s.description.clone(), peer],
-                grants: i.grants,
+                grants: [
+                    s.grant(&self.computer.signer.fingerprint())
+                        .unwrap_or(i.grants[0]),
+                    i.grants[1],
+                ],
                 approvals: [None, None],
             };
-            if s.genesis
+            if s.pending
                 .as_ref()
-                .or(s.pending.as_ref())
-                .is_some_and(|p| p.body() != g.body())
+                .is_some_and(|p| p.body() != g.body() && !enrolled(&s, p))
             {
                 return Err(Error::Profile(
                     "another computer enrollment is already recorded",
@@ -1096,15 +1208,11 @@ impl Management {
             if i.target.is_some_and(|t| t != conn.peer_id()) {
                 return Err(Error::Profile("computer pairing code was already consumed"));
             }
-            if s.genesis
-                .as_ref()
-                .or(s.pending.as_ref())
-                .is_some_and(|p| p.body() != g.body())
-            {
+            if s.pending.as_ref().is_some_and(|p| p.body() != g.body()) {
                 return Err(Error::Profile("another enrollment is already recorded"));
             }
             i.target = Some(conn.peer_id());
-            if let Some(p) = s.genesis.as_ref().or(s.pending.as_ref()) {
+            if let Some(p) = s.pending.as_ref() {
                 g.approvals = p.approvals.clone();
             }
             s.pending = Some(g);
@@ -1124,22 +1232,65 @@ impl Management {
         let Ok(_exchange) = self.exchanges.try_lock() else {
             return Ok(());
         };
-        let (peer, link) = {
+        let peers = {
             let s = lock(&self.computer.state);
-            let Some(g) = s.genesis.as_ref().or(s.pending.as_ref()) else {
-                return Ok(());
-            };
-            let at = side(g, &self.computer.signer.fingerprint())?;
-            (g.computers[1 - at].fingerprint()?, s.pair_link.clone())
+            let local = self.computer.signer.fingerprint();
+            let mut peers: std::collections::BTreeSet<_> = s
+                .descriptions()
+                .into_keys()
+                .filter(|p| *p != local)
+                .collect();
+            if let Some(g) = &s.pending {
+                peers.insert(g.computers[1 - side(g, &local)?].fingerprint()?);
+            }
+            peers
+                .into_iter()
+                .map(|peer| {
+                    let endpoints = s
+                        .reaches
+                        .get(&peer)
+                        .map(|r| r.endpoints.clone())
+                        .unwrap_or_default();
+                    let url = s
+                        .pair_link
+                        .as_ref()
+                        .filter(|l| Link::parse(l).ok().is_some_and(|l| l.target == peer))
+                        .cloned()
+                        .or_else(|| {
+                            s.links
+                                .iter()
+                                .find(|l| Link::parse(l).ok().is_some_and(|l| l.target == peer))
+                                .cloned()
+                        });
+                    (peer, endpoints, url)
+                })
+                .collect::<Vec<_>>()
         };
-        let conn = if let Some(c) = self.net.manager().existing(&peer) {
-            c
-        } else if let Some(url) = link {
-            let l = Link::parse(&url)?;
-            self.connect(peer, &l.endpoints, Some(&l)).await?
-        } else {
-            self.connect(peer, &EndpointList::default(), None).await?
-        };
+        let mut tasks = tokio::task::JoinSet::new();
+        for (peer, endpoints, url) in peers {
+            let me = Arc::clone(self);
+            tasks.spawn(async move { me.sync_peer(peer, endpoints, url).await });
+        }
+        let mut problem = None;
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok(Err(e)) => problem = Some(e.to_string()),
+                Err(e) => problem = Some(e.to_string()),
+                _ => {}
+            }
+        }
+        *lock(&self.problem) = problem;
+        Ok(())
+    }
+    async fn sync_peer(
+        self: &Arc<Self>,
+        peer: Digest32,
+        endpoints: EndpointList,
+        url: Option<Zeroizing<String>>,
+    ) -> Result<()> {
+        let link = url.as_ref().map(|l| Link::parse(l)).transpose()?;
+        let endpoints = link.as_ref().map(|l| &l.endpoints).unwrap_or(&endpoints);
+        let conn = self.connect(peer, endpoints, link.as_ref()).await?;
         self.serve(Arc::clone(&conn));
         let payload = exchange(&lock(&self.computer.state))?;
         let (mut send, mut recv) = streams::open_typed(&conn, StreamKind::Computer).await?;
@@ -1150,19 +1301,19 @@ impl Management {
         }
         write_frame(&mut send, &payload).await?;
         let f = frame(&mut recv).await?;
-        self.computer.change(|s| merge(s, &f, peer))?;
-        *lock(&self.problem) = None;
+        self.computer
+            .change(|s| merge(s, &f, peer, self.computer.signer.as_ref()))?;
         let _ = send.finish();
         Ok(())
     }
 }
-fn side(g: &Genesis, id: &Digest32) -> Result<usize> {
+fn side(g: &Enrollment, id: &Digest32) -> Result<usize> {
     g.computers
         .iter()
         .position(|d| d.fingerprint().ok() == Some(*id))
         .ok_or(Error::SignatureInvalid)
 }
-fn context(invite: &Digest32, transport: &Digest32, g: &Genesis) -> Vec<u8> {
+fn context(invite: &Digest32, transport: &Digest32, g: &Enrollment) -> Vec<u8> {
     let mut e = Encoder::new();
     e.array(5)
         .bytes(invite)
@@ -1219,36 +1370,83 @@ async fn frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
     }
     Ok(f)
 }
-fn activate(s: &mut State) -> Result<()> {
-    let Some(g) = s.pending.as_ref() else {
+fn enrolled(s: &State, g: &Enrollment) -> bool {
+    if g.group.is_none() {
+        s.genesis
+            .as_ref()
+            .is_some_and(|v| v.operation() == g.operation())
+    } else {
+        s.history.values().any(|r| {
+            r.event()
+                .ok()
+                .and_then(|e| e.addition)
+                .is_some_and(|a| a.operation() == g.operation())
+        })
+    }
+}
+fn activate(s: &mut State, signer: &dyn RootSigner) -> Result<()> {
+    let Some(g) = s.pending.clone() else {
         return Ok(());
     };
-    if s.cancelled.contains_key(&g.incarnation()) {
+    if s.cancelled.contains_key(&g.operation()) {
         return Err(Error::Profile(
-            "this computer pairing attempt was closed locally; its retained intent cannot activate",
+            "this enrollment attempt was closed locally; its retained intent cannot activate",
         ));
     }
-    if g.approvals.iter().all(Option::is_some) && s.genesis.is_none() {
-        g.verify(true)?;
-        s.genesis = Some(g.clone());
-        s.revision = s.revision.checked_add(1).ok_or_else(bad)?;
-        s.receipts.clear();
+    if g.approvals.iter().any(Option::is_none) {
+        return Ok(());
+    }
+    g.verify(true)?;
+    if g.group.is_none() {
+        if s.genesis.is_none() {
+            s.genesis = Some(g);
+            s.fold_history()?;
+            s.revision = s.revision.checked_add(1).ok_or_else(bad)?;
+            s.receipts.clear();
+        }
+    } else {
+        if !enrolled(s, &g) && signer.fingerprint() == g.computers[0].fingerprint()? {
+            let mut body = Encoder::new();
+            body.array(1).bytes(&g.encode());
+            let event = Control::sign(s, "add", body.finish(), signer)?;
+            s.retain_roster(event)?;
+        }
+        if enrolled(s, &g) && s.genesis.is_none() {
+            s.genesis = s.group_genesis.take();
+            if s.genesis.is_none() {
+                return Err(bad());
+            }
+            s.revision = s.revision.checked_add(1).ok_or_else(bad)?;
+            s.receipts.clear();
+        }
     }
     Ok(())
 }
 fn exchange(s: &State) -> Result<Vec<u8>> {
-    let g = s
-        .genesis
-        .as_ref()
-        .or(s.pending.as_ref())
+    let group = s
+        .group()
         .ok_or(Error::Profile("no computer pairing intent"))?;
     let mut e = Encoder::new();
+    e.array(4)
+        .bytes(
+            &s.genesis
+                .as_ref()
+                .or(s.group_genesis.as_ref())
+                .map(Enrollment::encode)
+                .unwrap_or_default(),
+        )
+        .bytes(
+            &s.pending
+                .as_ref()
+                .map(Enrollment::encode)
+                .unwrap_or_default(),
+        );
     let current: Vec<_> = s
         .history
         .iter()
-        .filter(|(_, r)| r.event().ok().is_some_and(|e| e.group == g.incarnation()))
+        .filter(|(_, r)| r.event().ok().is_some_and(|v| v.group == group))
         .collect();
-    e.array(3).bytes(&g.encode()).array(current.len());
+    e.array(current.len());
     for (id, r) in current {
         e.array(2).bytes(id).bytes(&r.signed.encode());
     }
@@ -1258,69 +1456,116 @@ fn exchange(s: &State) -> Result<Vec<u8>> {
     }
     Ok(e.finish())
 }
-fn merge(s: &mut State, bytes: &[u8], peer: Digest32) -> Result<()> {
+fn merge(s: &mut State, bytes: &[u8], peer: Digest32, signer: &dyn RootSigner) -> Result<()> {
     let mut d = Decoder::new(bytes);
-    arity(&mut d, 3)?;
-    let incoming = Genesis::decode(d.bytes()?)?;
-    if s.cancelled.contains_key(&incoming.incarnation()) {
+    arity(&mut d, 4)?;
+    let read = |bytes: &[u8]| -> Result<Option<Enrollment>> {
+        if bytes.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(Enrollment::decode(bytes)?))
+        }
+    };
+    let genesis = read(d.bytes()?)?;
+    let incoming = read(d.bytes()?)?;
+    // A fresh invitation has no current intent to compare with. Recognize an exact retired
+    // operation before the group/current-intent checks so its late result keeps the truthful
+    // local-close outcome instead of turning into an unexplained authentication refusal.
+    if genesis
+        .iter()
+        .chain(incoming.iter())
+        .any(|g| s.cancelled.contains_key(&g.operation()))
+    {
         return Err(Error::Profile(
-            "this computer pairing attempt was closed locally; its retained intent cannot activate",
+            "this enrollment attempt was closed locally; its retained intent cannot activate",
         ));
     }
     let local = s.description.fingerprint()?;
-    let current = s
-        .genesis
-        .as_ref()
-        .or(s.pending.as_ref())
-        .ok_or(Error::Profile("no authenticated computer pairing intent"))?;
-    if incoming.body() != current.body() {
-        return Err(Error::SignatureInvalid);
-    }
-    let at = side(current, &peer)?;
-    let here = side(current, &local)?;
-    let mut g = current.clone();
-    if let Some(a) = &incoming.approvals[at] {
-        if g.approvals[at].is_none() && g.expires <= now() {
-            return Err(Error::Profile(
-                "computer pairing expired before approval arrived; no new trust was established",
-            ));
+    let candidate = s.pending.as_ref().is_some_and(|p| side(p, &peer).is_ok());
+    let previously_enrolled = s.grant(&peer).is_some();
+    if let Some(g) = genesis {
+        g.verify(true)?;
+        if g.group.is_some() || Some(g.incarnation()) != s.group() {
+            return Err(Error::SignatureInvalid);
         }
-        g.approvals[at] = Some(a.clone());
+        if let Some(current) = &s.genesis {
+            if current != &g {
+                return Err(Error::SignatureInvalid);
+            }
+        } else if s
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.group == Some(g.incarnation()))
+        {
+            s.group_genesis = Some(g);
+        }
     }
-    if incoming.approvals[here].is_some() && incoming.approvals[here] != g.approvals[here] {
-        return Err(Error::SignatureInvalid);
+    if let (Some(current), Some(incoming)) = (s.pending.clone(), incoming) {
+        if incoming.operation() == current.operation() {
+            if s.cancelled.contains_key(&incoming.operation()) {
+                return Err(Error::Profile("this enrollment attempt was closed locally"));
+            }
+            let at = side(&current, &peer)?;
+            let here = side(&current, &local)?;
+            let mut g = current;
+            if let Some(a) = &incoming.approvals[at] {
+                if g.approvals[at].is_none() && g.expires <= now() {
+                    return Err(Error::Profile("computer pairing expired before approval arrived; no new trust was established"));
+                }
+                g.approvals[at] = Some(a.clone());
+            }
+            if incoming.approvals[here].is_some() && incoming.approvals[here] != g.approvals[here] {
+                return Err(Error::SignatureInvalid);
+            }
+            g.verify(false)?;
+            s.pending = Some(g);
+        }
     }
-    g.verify(false)?;
-    s.pending = Some(g.clone());
-    let n = count(&mut d)?;
-    for _ in 0..n {
+    // Union first, then fold once: wire order is not causal order.
+    let group = s.group().ok_or_else(bad)?;
+    for _ in 0..count(&mut d)? {
         arity(&mut d, 2)?;
         let id = digest(&mut d)?;
-        let r = Roster {
+        let r = Control {
             signed: Signed::decode(d.bytes()?)?,
         };
         if id != r.id() {
             return Err(bad());
         }
-        s.retain_roster(r)?;
+        r.verify(&group)?;
+        if !s.history.contains_key(&id) && s.history.len() >= MAX_RECORDS {
+            return Err(Error::Profile(if previously_enrolled {
+                HISTORY_FULL
+            } else {
+                "incoming computer history exceeds admission limit"
+            }));
+        }
+        s.history.insert(id, r);
     }
-    let n = count(&mut d)?;
-    for _ in 0..n {
+    s.fold_history()?;
+    if s.grant(&peer).is_none() && !candidate && !previously_enrolled {
+        return Err(Error::SignatureInvalid);
+    }
+    // An unrelated active member may carry another member's signed receipt verbatim.
+    let mut receipts = Vec::new();
+    for _ in 0..count(&mut d)? {
         arity(&mut d, 2)?;
-        let author = digest(&mut d)?;
-        let receipt = Signed::decode(d.bytes()?)?;
-        if author == peer {
-            receipt.verify(b"vox/computer-applied/v1\0", &peer)?;
-            if valid_receipt(s, &peer, &receipt)? {
-                s.receipts.insert(peer, receipt);
-            }
-        } else if author != local {
+        receipts.push((digest(&mut d)?, Signed::decode(d.bytes()?)?));
+    }
+    d.finish()?;
+    activate(s, signer)?;
+    for (author, receipt) in receipts {
+        if author != local && valid_receipt(s, &author, &receipt)? {
+            s.receipts.insert(author, receipt);
+        }
+    }
+    // Receiving the retained genesis is not enrollment: require the local operator's exact ADD.
+    if let Some(p) = &s.pending {
+        if p.group.is_some() && p.approvals[side(p, &local)?].is_none() && s.grant(&local).is_some()
+        {
             return Err(Error::SignatureInvalid);
         }
     }
-    d.finish()?;
-    s.pending = Some(g);
-    activate(s)?;
     Ok(())
 }
 
@@ -1354,7 +1599,9 @@ fn valid_receipt(s: &State, author: &Digest32, r: &Signed) -> Result<bool> {
     let Some(g) = s.genesis.as_ref() else {
         return Ok(false);
     };
-    side(g, author)?;
+    if s.grant(author).is_none() {
+        return Ok(false);
+    }
     let mut d = Decoder::new(&r.body);
     arity(&mut d, 7)?;
     if d.uint()? != PROTOCOL
@@ -1364,7 +1611,7 @@ fn valid_receipt(s: &State, author: &Digest32, r: &Signed) -> Result<bool> {
         return Ok(false);
     }
     let n = count(&mut d)?;
-    if n != s.rosters.len() || n != 2 {
+    if n != s.rosters.len() || n != s.descriptions().len() {
         return Ok(false);
     }
     for (id, roster) in &s.rosters {

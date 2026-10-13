@@ -715,6 +715,84 @@ private struct LiveScroll: NSViewRepresentable {
     }
 }
 
+/// Native selectable text can consume a drag before SwiftUI's ancestor gesture sees it.
+/// Observe that same input without intercepting text selection; a completed cross-row drag
+/// selects the message range after AppKit finishes delivering its mouse-up event.
+private struct CrossRowDrag: NSViewRepresentable {
+    let completed: (CGPoint, CGPoint) -> Void
+
+    func makeNSView(context: Context) -> Probe {
+        let probe = Probe()
+        probe.completed = completed
+        return probe
+    }
+
+    func updateNSView(_ probe: Probe, context: Context) { probe.completed = completed }
+
+    static func dismantleNSView(_ probe: Probe, coordinator: ()) { probe.retire() }
+
+    final class Probe: NSView {
+        var completed: ((CGPoint, CGPoint) -> Void)?
+        private var monitor: Any?
+        private var start: CGPoint?
+        private var moved = false
+        private var generation = UUID()
+        override var isFlipped: Bool { true }
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        deinit { if let monitor { NSEvent.removeMonitor(monitor) } }
+
+        func retire() {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
+            start = nil
+            moved = false
+            generation = UUID()
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            retire()
+            guard window != nil else { return }
+            setAccessibilityElement(false)
+            monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]) { [weak self] event in
+                guard let self, event.window === self.window else { return event }
+                guard let window = self.window, window.attachedSheet == nil,
+                      !(window.childWindows ?? []).contains(where: \.isVisible) else {
+                    self.start = nil
+                    self.moved = false
+                    return event
+                }
+                // This flipped probe fills the viewport, the same origin and downward y axis
+                // as the named timeline coordinate space used by RowFrames.
+                let point = self.convert(event.locationInWindow, from: nil)
+                switch event.type {
+                case .leftMouseDown:
+                    self.start = self.bounds.contains(point) ? point : nil
+                    self.moved = false
+                case .leftMouseDragged:
+                    if let start = self.start,
+                       hypot(point.x - start.x, point.y - start.y) >= 6 { self.moved = true }
+                case .leftMouseUp:
+                    let start = self.start
+                    let moved = self.moved
+                    let generation = self.generation
+                    self.start = nil
+                    self.moved = false
+                    if let start, moved, self.bounds.contains(point) {
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self, self.window != nil, self.generation == generation else { return }
+                            self.completed?(start, point)
+                        }
+                    }
+                default: break
+                }
+                return event
+            }
+        }
+    }
+}
+
 /// A trust offer in its room's General (v0.4.3): one line, "<fingerprint>… joined — trust?",
 /// and its card, Trust or Dismiss, opened from it.
 private struct OfferBanner: View {
@@ -976,6 +1054,11 @@ private struct RoomView: View {
                                     }))
                             }
                             .coordinateSpace(name: "timeline")
+                            .background(CrossRowDrag(completed: { start, end in
+                                if dragged(from: start, to: end) {
+                                    NotificationCenter.default.post(name: .voxFocusTimeline, object: nil)
+                                }
+                            }))
                             // A scroll view of its own for each destination (General, All, each
                             // Session): one kept across a switch kept its offset, and from far
                             // down a long Session, General's few rows lay above it and none was
