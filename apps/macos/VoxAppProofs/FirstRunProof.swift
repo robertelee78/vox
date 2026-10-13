@@ -2526,6 +2526,13 @@ final class FirstRunProof: XCTestCase {
         if windowReadable(ui) {
             if let body = textSaying(ui, "NEEDS-YOU") {
                 let copied = selectAndCopy(ui, body, "bob's message NEEDS-YOU")
+                if copied != "NEEDS-YOU" {
+                    keepTree(ui, "message copy did not put NEEDS-YOU on the pasteboard")
+                    let selected = XCTAttachment(string: body.debugDescription)
+                    selected.name = "NEEDS-YOU copy target after selection"
+                    selected.lifetime = .keepAlways
+                    add(selected)
+                }
                 XCTAssertEqual(copied, "NEEDS-YOU",
                                "PRODUCT: bob's message, selected by dragging across it and copied with ⌘C, must put NEEDS-YOU on the pasteboard; it holds \(copied.debugDescription)")
             } else {
