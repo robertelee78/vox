@@ -567,9 +567,12 @@ fn local_nodes_trust_each_other_without_a_prompt_and_remember_removals() {
         "PRODUCT: the person could not restore a removed local peer by hand: {}",
         ring(names[1])
     );
+    // A held daemon verb reconnects after a daemon restart. Stop those exact foreground
+    // children before the computer journeys stage a host going offline; attached nodes remain
+    // held by the account daemon, and subsequent restarts use finite `node attach` commands.
+    drop(daemons);
     pair_computers(&a, &elsewhere, &fps, &remote, fresh, &fresh_fp, &room);
     close_expired_pairing();
-    drop(daemons);
 }
 
 /// #799 extends the same real account/keyring/room journey: computer mode is explicit, consumes
