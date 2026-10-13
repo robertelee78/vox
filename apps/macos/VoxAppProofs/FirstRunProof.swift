@@ -4312,6 +4312,17 @@ final class FirstRunProof: XCTestCase {
         for container in key.containers(ui, all: containers(ui)) {
             if let found = find(key, in: container) { return found }
         }
+        if case .showing = key {
+            // XCTest can omit a SwiftUI timeline row from its window-scoped query while its
+            // application query finds the very same row inside that window. The failing
+            // screen and the element's recorded window ancestry establish this (#684).
+            // Accept only text drawn within a real window, never a zero-area Touch Bar match.
+            let windows = ui.windows.allElementsBoundByIndex.map(\.frame).filter { !$0.isEmpty }
+            for found in key.query(in: ui.descendants(matching: .any)).allElementsBoundByIndex {
+                let frame = found.frame
+                if !frame.isEmpty, windows.contains(where: { $0.contains(frame) }) { return found }
+            }
+        }
         return nil
     }
 
