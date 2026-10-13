@@ -6023,6 +6023,24 @@ impl Node {
         conn: &Arc<VoxConnection>,
         cause: PublishCause,
     ) {
+        // A connection to one room's anchor is not permission to publish every room
+        // this node holds there (ADR-032 AN-2). Check here as well as in the caller:
+        // reconnect publication invokes this path directly.
+        if !self.anchor_serves_room(channel_id, &conn.peer_id()) {
+            // The authenticated member that answered a join also needs the newcomer's
+            // board record. It remains a member, never a machine or room anchor.
+            let member_join = if matches!(cause, PublishCause::Join) {
+                match self.channels.get(channel_id) {
+                    Some(room) => room.lock().await.is_known_member(&conn.peer_id()),
+                    None => false,
+                }
+            } else {
+                false
+            };
+            if !member_join {
+                return;
+            }
+        }
         // Taken off boards (V030-14): published nowhere again.
         if self.withdrawn.contains_key(channel_id) {
             return;
@@ -6401,6 +6419,16 @@ impl Node {
     /// keeps no store for one (ADR-023 decision 6).
     fn log_store(&self) -> Option<Arc<crate::node::store::Store>> {
         self.profile.as_ref().map(Profile::store_handle)
+    }
+
+    /// Hand-added anchors serve every room; a room's own anchors serve only that room.
+    /// `anchor_ids` classifies connections, and must not determine room scope.
+    fn anchor_serves_room(&self, room: &Digest32, anchor: &Digest32) -> bool {
+        self.anchors.get(anchor).is_some()
+            || self
+                .room_anchors
+                .get(room)
+                .is_some_and(|anchors| anchors.get(anchor).is_some())
     }
 
     /// Every anchor this node keeps a connection to, with the addresses its next dial tries:
@@ -6829,6 +6857,7 @@ impl Node {
         let anchors: Vec<Arc<VoxConnection>> = self
             .anchor_ids
             .iter()
+            .filter(|id| self.anchor_serves_room(channel_id, id))
             .filter_map(|id| net.manager().existing(id))
             .collect();
         for conn in anchors {
@@ -7682,11 +7711,9 @@ impl Node {
                 // A node with no room to publish (one still joining, say) has nothing to wait for:
                 // the board knows it as far as it ever will before the join (`PublishDone` tells
                 // a board otherwise).
-                if !self
-                    .channels
-                    .keys()
-                    .any(|room| !self.withdrawn.contains_key(room))
-                {
+                if !self.channels.keys().any(|room| {
+                    !self.withdrawn.contains_key(room) && self.anchor_serves_room(room, &peer)
+                }) {
                     if let Some(net) = self.net.as_ref() {
                         net.board_told(&peer);
                     }
