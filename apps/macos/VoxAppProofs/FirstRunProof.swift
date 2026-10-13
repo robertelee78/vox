@@ -296,6 +296,7 @@ final class FirstRunProof: XCTestCase {
     /// Set while the proof itself has hidden or quit Vox (⌘H, ⌘Q), until Vox is active again:
     /// what takes the foreground meanwhile was handed it by the proof, not taken.
     private var handedOff = false
+    private var readingNonUIOutcome = false
     /// The person's clipboard as it was before the case: every item, every type, restored exactly
     /// in tearDown, red or green (app-proofs.sh restores it too, should the runner itself die).
     private var keptPasteboard: [[NSPasteboard.PasteboardType: Data]] = []
@@ -367,6 +368,8 @@ final class FirstRunProof: XCTestCase {
     /// foreground, and a click or key in that time went elsewhere. It is recorded as APPARATUS,
     /// naming when and to what, with the read it would have been.
     override func record(_ issue: XCTIssue) {
+        // CLI and recipient outcomes do not depend on which app owns the desktop.
+        if readingNonUIOutcome { super.record(issue); return }
         let words = issue.compactDescription
         let product = words.range(of: "PRODUCT")
         let apparatus = words.range(of: "APPARATUS")
@@ -385,6 +388,12 @@ final class FirstRunProof: XCTestCase {
             return
         }
         super.record(moved)
+    }
+
+    private func checkNonUI(_ assertion: () -> Void) {
+        readingNonUIOutcome = true
+        defer { readingNonUIOutcome = false }
+        assertion()
     }
 
     /// Another app's window in front of Vox's main window and over a quarter of it (a person's
@@ -1834,13 +1843,34 @@ final class FirstRunProof: XCTestCase {
             keepTree(pairingUI, "native returned step could not be brought inside its timeline")
             throw Apparatus("cannot stage the native returned step visibly: entry \(nativeReplyLine.frame), timeline \(nativeTimeline.frame), window \(pairingUI.windows.firstMatch.frame)")
         }
+        let ordinaryGrantUntil = Date().addingTimeInterval(30)
+        var ordinaryGrant = ""
+        while Date() < ordinaryGrantUntil {
+            let grants = try staged(vox, ["trust", "list", "--node", "protected"], env: computerB)
+            ordinaryGrant = grants.split(whereSeparator: \.isNewline).map(String.init)
+                .first { $0.split(whereSeparator: \.isWhitespace).first.map(String.init) == ordinaryFp } ?? ""
+            if ordinaryGrant.split(whereSeparator: \.isWhitespace).last == "read", !ordinaryGrant.contains("drive") { break }
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        guard ordinaryGrant.split(whereSeparator: \.isWhitespace).last == "read", !ordinaryGrant.contains("drive") else {
+            throw Apparatus("the exact covered ordinary member's Read without drive grant was not established: \(ordinaryGrant)")
+        }
+        let ordinarySessions = try staged(vox, ["room", "sessions", "--node", "paired-ordinary", keptRoom], env: computerA)
+        checkNonUI {
+            XCTAssertFalse(ordinarySessions.contains(nativeSession.prefix(8)) || ordinarySessions.contains("Pairing native OpenCode"),
+                           "PRODUCT: Read without drive must not discover the native Session; \(ordinarySessions)")
+        }
         let ordinarySay = run(vox, ["room", "session", "--node", "paired-ordinary", keptRoom, nativeSession,
                                    "--say", "NATIVE-799-ORDINARY-MUST-NOT-ARRIVE"], env: computerA)
-        XCTAssertTrue(ordinarySay.status != 0 && ordinarySay.out.contains("does not trust you with drive"),
-                      "PRODUCT: a covered ordinary room member must actually be refused native Session drive; \(ordinarySay.out)")
+        checkNonUI {
+            XCTAssertTrue(ordinarySay.status != 0 && ordinarySay.out.contains("no Session in this room is named " + nativeSession),
+                          "PRODUCT: a Read-only member must be refused without disclosing the native Session; \(ordinarySay.out)")
+        }
         let callsAfterRefusal = try nativeHost.command("calls 2 2", within: 5)
-        XCTAssertEqual((callsAfterRefusal["calls"] as? [[String: Any]])?.count, acceptedCalls.count,
-                       "PRODUCT: refused ordinary-node input must not reach the native recipient; \(callsAfterRefusal)")
+        checkNonUI {
+            XCTAssertEqual((callsAfterRefusal["calls"] as? [[String: Any]])?.count, acceptedCalls.count,
+                           "PRODUCT: refused ordinary-node input must not reach the native recipient; \(callsAfterRefusal)")
+        }
         nativeHost.terminate()
         try quitComputerAccount()
         print("[proof] paired selected personal node drove the repo-bound native OpenCode Session through app say; recipient received exact prompt and returned visible step; joined ordinary node refused with no recipient call")
