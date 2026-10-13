@@ -283,6 +283,8 @@ fn run_installer_env(
         .arg(install_sh())
         .env_clear()
         .env("HOME", home)
+        .env("VOX_DATA_DIR", home.join("vox-data"))
+        .env("VOX_CONFIG_DIR", home.join("vox-config"))
         .env("VOX_APPLICATIONS_DIR", system_apps(home))
         .env("SHELL", "/bin/zsh")
         .env("TERM", "dumb")
@@ -325,6 +327,81 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
             return;
         }
     };
+
+    // HK-1/2: the installed binary gives each harness a quiet hook before any node exists.
+    // Mutant: skip Codex in install_light_hooks -> PRODUCT at its missing hooks.json below.
+    {
+        let tmp = tempfile::tempdir().staged();
+        let home = tmp.path();
+        for dir in [".claude", ".codex", ".config/opencode"] {
+            std::fs::create_dir_all(home.join(dir)).staged();
+        }
+        let (ok, said) = run_installer(&server, home, "stable");
+        assert!(
+            ok,
+            "PRODUCT: install.sh must install the light hooks: {said}"
+        );
+        let configs = [
+            ("claude", ".claude/settings.json"),
+            ("codex", ".codex/hooks.json"),
+            ("opencode", ".config/opencode/plugin/vox.js"),
+        ];
+        let bin = home.join("bin/vox");
+        let mut before = Vec::new();
+        for (harness, rel) in configs {
+            let path = home.join(rel);
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            assert!(content.contains(&format!("agent hook --light {harness}"))
+                && said.contains(path.to_str().expect("APPARATUS: UTF-8 scratch path")),
+                "PRODUCT: install.sh must install {harness}'s light hook and name {path:?}; file={content:?}; output={said}");
+            before.push((path, content));
+            let out = Command::new(&bin)
+                .args(["agent", "hook", "--light", harness, "--format", "text"])
+                .env_clear()
+                .env("HOME", home)
+                .env("PATH", SYSTEM_PATH)
+                .env("VOX_DATA_DIR", home.join("vox-data"))
+                .env("VOX_CONFIG_DIR", home.join("vox-config"))
+                .env("VOX_NODE", "must-not-be-used")
+                .output()
+                .staged();
+            let output = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success() && output.lines().count() <= 1,
+                "PRODUCT: {harness}'s light hook must exit 0 with at most one line: {:?}, {output:?}", out.status);
+        }
+        assert!(
+            !home.join("vox-data").exists() && !home.join("vox-config").exists(),
+            "PRODUCT: node-free hooks must not create a profile or start its daemon"
+        );
+        assert!(
+            data_holders(&home.join("vox-data")).is_empty(),
+            "PRODUCT: light hooks must leave no daemon running for the scratch data root"
+        );
+        let (again, repeated) = run_installer(&server, home, "stable");
+        assert!(
+            again
+                && before
+                    .iter()
+                    .all(|(p, text)| std::fs::read_to_string(p).ok().as_ref() == Some(text)),
+            "PRODUCT: a second installation must preserve existing Vox hooks: {repeated}"
+        );
+        // A node hook also survives installation byte for byte; no node need be made to wire it.
+        let node_hook = r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"vox agent hook --node kept"}]}]},"env":{"VOX_NODE":"kept"}}"#;
+        std::fs::write(home.join(".claude/settings.json"), node_hook).staged();
+        let (again, said) = run_installer(&server, home, "stable");
+        assert!(
+            again
+                && std::fs::read_to_string(home.join(".claude/settings.json")).staged()
+                    == node_hook,
+            "PRODUCT: installation must preserve an existing node hook: {said}"
+        );
+        receipts.insert("install.light_hooks".into(), said);
+        claims.push(claim("install.light_hooks", true, "All three hooks installed and named; exit 0, at most one line, no node or daemon; existing light and node hooks preserved."));
+    }
 
     // ---- the happy path, observed the way a user observes it -------------------------
     {

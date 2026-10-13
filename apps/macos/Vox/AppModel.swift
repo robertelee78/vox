@@ -83,6 +83,8 @@ final class AppModel: ObservableObject {
     /// The node acted as, once attached: what the main window shows.
     @Published private(set) var node: NodeModel?
     private var client: VoxClient?
+    /// Changed harness configuration files, reported by the launch's light-hook installation.
+    @Published var agentSetupSaid: String?
 
     /// Whether the person chose Keep Running at first run: then a node is kept attached when the
     /// app quits, once its passphrase is in the Keychain or it needs none (ADR-014 M-6, M-8).
@@ -99,7 +101,7 @@ final class AppModel: ObservableObject {
     /// Ask about the login item at first run; then reach the daemon, and attach the node chosen at
     /// first run, or ask which.
     func start() async {
-        Daemon.refreshSkillPack()
+        Daemon.refreshSkillPack { [weak self] said in self?.agentSetupSaid = said }
         if Daemon.kept() == nil {
             phase = .askingLoginItem
             return

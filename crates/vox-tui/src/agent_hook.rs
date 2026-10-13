@@ -2676,3 +2676,35 @@ pub const OPENCODE_PLUGIN: &str = include_str!("../assets/opencode-plugin.js");
 /// the part a hook cannot: the conventions, the vocabulary, and the manners a room
 /// full of agents needs to stay readable by the person in it.
 pub const AGENT_SKILL: &str = crate::skill_pack::FILES[0].1;
+
+/// Node-free turn hook entries (ADR-031 HK-1/2). No environment names a node.
+#[must_use]
+pub fn light_hooks(harness: &str) -> String {
+    let v = serde_json::json!({"hooks": {"UserPromptSubmit": [{"hooks": [{
+        "type": "command", "command": format!("vox agent hook --light {harness}"), "async": false
+    }]}]}});
+    format!("{}\n", serde_json::to_string_pretty(&v).unwrap_or_default())
+}
+
+/// OpenCode's node-free shim: no wake socket, room drain, model or daemon is started.
+/// The same file is replaced by the node plugin when setup finishes (HK-5).
+pub const LIGHT_OPENCODE_PLUGIN: &str = r#"// vox — light hook (ADR-031 HK-1/2)
+export default async function vox({ $ }) {
+  return {
+    "shell.env": async (input, output) => {
+      if (input?.sessionID && output?.env) output.env.VOX_SESSION = input.sessionID
+    },
+    "chat.message": async (input, output) => {
+      try {
+        const session = output.message?.sessionID || input.sessionID
+        if (!session) return
+        const bin = process.env.VOX_BIN || "vox"
+        const result = await $`${bin} agent hook --light opencode --session ${session}`.quiet().nothrow()
+        const line = result.stdout.toString().split(/\r?\n/).find(s => s.trim())
+        const part = output.parts?.find(p => p.type === "text" && typeof p.text === "string")
+        if (line && part) part.text = line + "\n" + part.text
+      } catch {}
+    },
+  }
+}
+"#;
