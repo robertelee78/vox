@@ -2908,7 +2908,7 @@ impl VoxClient {
         &self,
         fingerprint: String,
     ) -> Result<IndividualTrustEligibility, VoxError> {
-        let member = digest(&fingerprint, "node fingerprint")?
+        let member = digest(&fingerprint, "node fingerprint")?;
         on_held!(self, |c| {
             match ask(c, &Request::IndividualTrustEligibility { member }).await? {
                 Frame::IndividualTrustEligibility { can_manage, reason } => {
