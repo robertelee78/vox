@@ -935,10 +935,14 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
                 && !out.contains("Ready and remembered") && !out.contains("Locked and forgotten"),
                 "PRODUCT: unreadable remembered state must be refused without claiming a change: {out}{err}");
         }
-        let (_, shown, err) = a.run(&["node", "list"], "");
-        assert!(shown.lines().any(|l| l.starts_with("default ") && l.contains("Ready") && l.contains("(remembered)")),
-            "PRODUCT: an unreadable file must not erase the last known remembered state: {shown}{err}");
+        let (ok, shown, err) = a.run(&["node", "list"], "");
+        assert!(!ok && err.contains("cannot read remembered nodes")
+            && err.contains("the saved file was not changed") && !shown.contains("Ready"),
+            "PRODUCT: an unreadable remembered-state file must refuse a public listing rather than guess: {shown}{err}");
     }
+    let (ok, shown, err) = a.run(&["node", "list"], "");
+    assert!(ok && shown.lines().any(|l| l.starts_with("default ") && l.contains("Ready") && l.contains("(remembered)")),
+        "PRODUCT: restoring the unreadable fixture must show the unchanged Ready and remembered node: {shown}{err}");
     {
         let _blocked = UnwritableAttach::new(attach_file.clone(), false);
         let (ok, out, err) = a.run(&["node", "lock", "default"], "");
