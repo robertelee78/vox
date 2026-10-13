@@ -4095,6 +4095,12 @@ impl EventStream {
     }
 }
 
+/// A signed room withdrawal awaiting anchors, including routes that outlive room purge.
+struct PendingWithdrawal {
+    wire: Vec<u8>,
+    routes: BTreeMap<Digest32, Vec<std::net::SocketAddr>>,
+}
+
 /// The node actor's state (owned by its task).
 pub struct Node {
     paths: Paths,
@@ -4390,7 +4396,9 @@ pub struct Node {
     winding: BTreeMap<Digest32, Winding>,
     /// Rooms this node took off boards (V030-14) — left, or ended — with the signed withdraw, put
     /// again on every anchor that connects. Nothing of these rooms is published again.
-    withdrawn: BTreeMap<Digest32, Vec<u8>>,
+    // Wire and the room's effective anchor identities at withdrawal. The room may be
+    // purged before an offline anchor returns, so its scope must survive that purge.
+    withdrawn: BTreeMap<Digest32, PendingWithdrawal>,
     /// Per room, the members that had left as of the last tend (V030-08), to see one come back.
     departed_seen: BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
     /// Per `(room, member)`: consecutive keys not taken, and the unix millisecond before which the
@@ -6461,6 +6469,19 @@ impl Node {
                 }
             }
         }
+        // A room can be purged while its anchor is offline. Its signed withdrawal still
+        // needs the original route, even though no open room keeps that anchor now.
+        for pending in self.withdrawn.values() {
+            for (id, addresses) in &pending.routes {
+                if all.iter().any(|(configured, _)| configured == id) {
+                    continue;
+                }
+                match shared.iter_mut().find(|(anchor, _)| anchor == id) {
+                    Some((_, rooms)) => rooms.push(addresses.clone()),
+                    None => shared.push((*id, vec![addresses.clone()])),
+                }
+            }
+        }
         for (id, rooms) in shared {
             let mut union: Vec<std::net::SocketAddr> = Vec::new();
             let deepest = rooms.iter().map(Vec::len).max().unwrap_or(0);
@@ -6488,6 +6509,10 @@ impl Node {
                 .room_anchors
                 .iter()
                 .any(|(room, set)| self.channels.contains_key(room) && set.get(peer).is_some())
+            || self
+                .withdrawn
+                .values()
+                .any(|pending| pending.routes.contains_key(peer))
     }
 
     /// **Act on a change of the machine's network** (ADR-012 N-51, N-52), after the presence has
@@ -7730,7 +7755,14 @@ impl Node {
                         puts.push(r);
                     }
                 }
-                puts.extend(self.withdrawn.values().cloned());
+                puts.extend(
+                    self.withdrawn
+                        .values()
+                        .filter(|pending| {
+                            pending.routes.contains_key(&peer) || self.anchors.get(&peer).is_some()
+                        })
+                        .map(|pending| pending.wire.clone()),
+                );
                 Self::put_withdraws(&conn, puts);
                 self.read_anchor_boards(Some(peer)).await;
                 // A room that has not had its first sync reaches its members now that a relay is
@@ -9914,7 +9946,8 @@ impl Node {
         let now = now_ms.get();
         let me = net.local_id();
         // The boards to try, in the order `reach_a_board` tried them: the link's anchors, this
-        // node's own, then any anchor it already holds a live connection to.
+        // machine's hand-added anchors. A live connection assigned to another room is
+        // not a route for this room.
         //
         // **One route per board, with every address known for it.** The link and this node can
         // name the same anchor by different addresses — the host that minted the link reached it on
@@ -9943,15 +9976,6 @@ impl Node {
                 all.truncate(crate::nat::multiaddr::MAX_ENDPOINTS);
                 if let Ok(merged) = crate::nat::multiaddr::EndpointList::new(all) {
                     *known = merged;
-                }
-            }
-        }
-        let live: std::collections::BTreeSet<Digest32> =
-            net.manager().peers().into_iter().collect();
-        if let Ok(empty) = crate::nat::multiaddr::EndpointList::new(Vec::new()) {
-            for id in self.anchor_ids.iter().copied() {
-                if live.contains(&id) && seen.insert(id) {
-                    routes.push((id, empty.clone()));
                 }
             }
         }
@@ -15266,10 +15290,28 @@ impl Node {
         };
         let wire = w.to_wire();
         let _ = net.publish_local(&wire);
-        self.withdrawn.insert(*channel_id, wire.clone());
+        let mut assigned = BTreeMap::new();
+        for anchor in self.anchors.nodes().iter().chain(
+            self.room_anchors
+                .get(channel_id)
+                .into_iter()
+                .flat_map(|anchors| anchors.nodes().iter()),
+        ) {
+            assigned
+                .entry(anchor.id)
+                .or_insert_with(|| anchor.endpoints.direct_candidates());
+        }
+        self.withdrawn.insert(
+            *channel_id,
+            PendingWithdrawal {
+                wire: wire.clone(),
+                routes: assigned,
+            },
+        );
         let anchors: Vec<Arc<VoxConnection>> = self
             .anchor_ids
             .iter()
+            .filter(|id| self.anchor_serves_room(channel_id, id))
             .filter_map(|id| net.manager().existing(id))
             .collect();
         for conn in &anchors {
