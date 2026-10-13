@@ -2757,12 +2757,15 @@ final class FirstRunProof: XCTestCase {
         try staged(vox, ["room", "retention", "--node", "bob", room, "3600"], env: bob)
         let retentionUntil = Date().addingTimeInterval(30)
         var retentionSaid = ""
+        var retentionStatus: Int32 = -1
         while Date() < retentionUntil {
-            retentionSaid = run(vox, ["room", "read", "--node", "alice", room, "--notices"], env: alice).out
-            if retentionSaid.contains("1 hour") { break }
+            let read = run(vox, ["room", "read", "--node", "alice", room, "--notices", "--json"], env: alice)
+            retentionSaid = read.out
+            retentionStatus = read.status
+            if retentionStatus == 0 && retentionSaid.contains("1 hour") { break }
             Thread.sleep(forTimeInterval: 0.5)
         }
-        guard retentionSaid.contains("1 hour") else {
+        guard retentionStatus == 0 && retentionSaid.contains("1 hour") else {
             throw Apparatus("the remote owner's changed retention did not reach Alice before checking the watcher: \(retentionSaid)")
         }
         guard words(ui, Key.id("room-header-meta"), timeout: 15,
