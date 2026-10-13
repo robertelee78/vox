@@ -1,21 +1,13 @@
-//! Sessions (ADR-029): a room's Session per interactive harness session working in it, as its node
-//! says on the room's log.
-//!
-//! **A Session is two records on the log**, posted by the session's node, its author key proving
-//! the node and `from` claiming the session (ADR-029 MD-3): a `session` entry when the session
-//! first works in the room ([`open_when_member`]), and a `session-end` entry on the harness's real
-//! end ([`end`]). Both are room messages, so every member of the room reads that the Session
-//! exists, its label and whether it is open (SC-3); what the session does lives elsewhere, sealed
-//! to members with drive (SC-2). A Session's name is the `at.session_name` its node last gave.
-//!
-//! Everything here is read from the room's own log ([`fold`]), so a node that restarts, or a member
-//! that joins later, knows the same Sessions.
+//! Session lifecycle records (ADR-031 SA-3) share the private, drive-sealed Session stream.
+//! Opening, rename and end records are not activity steps: a new drive grant receives their
+//! retained state, with original times, without receiving earlier activity. Legacy room records
+//! remain readable in copies already held (SA-5).
 
 use vox_agentcomms::envelope::{Envelope, SESSION, SESSION_END};
 
 use crate::hash::Digest32;
 use crate::node::actor::NodeHandle;
-use crate::node::api::{ChannelDetail, NodeCommand, Outcome};
+use crate::node::api::{ChannelDetail, MessageRow, NodeCommand, Outcome};
 
 /// One Session of a room, as its log says.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,19 +42,51 @@ pub struct SessionRow {
 /// renamed session's label changes with its next message.
 #[must_use]
 pub fn fold(detail: &ChannelDetail) -> Vec<SessionRow> {
-    let types = [SESSION.to_owned(), SESSION_END.to_owned()];
+    // Keep the public timeline separate. Only Session folding merges private lifecycle
+    // records with legacy records and room messages that can rename a Session. Stable ordering
+    // preserves multipart order when records have the same millisecond timestamp.
+    let private: Vec<_> = detail
+        .session_records
+        .iter()
+        .map(|r| MessageRow {
+            entry_hash: r.entry_hash,
+            author: r.author,
+            created_millis: r.created_millis,
+            text: r.body.clone(),
+            arrival: 0,
+            late: false,
+            owed: false,
+        })
+        .collect();
+    let mut timeline: Vec<_> = detail
+        .timeline
+        .iter()
+        .filter(|r| is_record(&r.text) || r.text.contains("session_name"))
+        .chain(private.iter())
+        .collect();
+    // A refreshed ciphertext is the same logical lifecycle record. Keep its newest wire
+    // identity, so replaying an ended Session cannot manufacture another opening.
+    let mut seen = std::collections::HashSet::new();
+    timeline.reverse();
+    timeline.retain(|r| {
+        !is_record(&r.text) || seen.insert((r.author, r.created_millis, r.text.as_str()))
+    });
+    timeline.reverse();
+    timeline.sort_by_key(|r| r.created_millis);
     let mut rows: Vec<SessionRow> = Vec::new();
     // Per row: the position that last named it, and the one that ended it.
     let mut spans: Vec<(u32, Option<u32>)> = Vec::new();
-    // Large metadata is ordinary retained Session records, split without changing the store
+    // Large metadata is retained Session records, split without changing the store
     // encoding. Only a complete, hash-matching bundle supplies a Session's fields.
     let mut parts: std::collections::HashMap<(Digest32, String), (u32, u64, String)> =
         std::collections::HashMap::new();
-    let mut positions = detail.structured.positions(&types, &[]);
-    positions.sort_unstable();
+    let positions = 0..timeline.len();
     let mut records = Vec::new();
-    for mut i in positions {
-        let Some(mut r) = detail.timeline.get(i as usize) else {
+    for i in positions {
+        let Ok(mut i) = u32::try_from(i) else {
+            continue;
+        };
+        let Some(mut r) = timeline.get(i as usize).copied() else {
             continue;
         };
         if r.owed {
@@ -71,6 +95,9 @@ pub fn fold(detail: &ChannelDetail) -> Vec<SessionRow> {
         let Ok(mut env) = Envelope::parse(&r.text) else {
             continue;
         };
+        if !matches!(env.kind.as_str(), SESSION | SESSION_END) {
+            continue;
+        }
         if let Some(tag) = env.data["session_parts"].as_str() {
             let Ok(value) = serde_json::from_str::<serde_json::Value>(&r.text) else {
                 continue;
@@ -115,7 +142,7 @@ pub fn fold(detail: &ChannelDetail) -> Vec<SessionRow> {
             if joined.kind != SESSION {
                 continue;
             }
-            let Some(origin) = detail.timeline.get(first as usize) else {
+            let Some(origin) = timeline.get(first as usize).copied() else {
                 continue;
             };
             i = first;
@@ -136,6 +163,11 @@ pub fn fold(detail: &ChannelDetail) -> Vec<SessionRow> {
             .rposition(|s| s.node == r.author && s.id == env.from);
         match (env.kind.as_str(), at) {
             (SESSION, Some(k)) if rows[k].open => {
+                // A grant refresh is the same logical opening at its original time. Keep
+                // the latest sealed record identity for pagination and direct readback.
+                if rows[k].opened_millis == r.created_millis {
+                    rows[k].opening = r.entry_hash;
+                }
                 if env.at.session_name.is_some() {
                     rows[k].name.clone_from(&env.at.session_name);
                     spans[k].0 = i;
@@ -167,24 +199,27 @@ pub fn fold(detail: &ChannelDetail) -> Vec<SessionRow> {
                 rows[k].ended_millis = Some(r.created_millis);
                 rows[k].ended = Some(r.entry_hash);
             }
+            (SESSION_END, Some(k)) if rows[k].ended_millis == Some(r.created_millis) => {
+                rows[k].ended = Some(r.entry_hash);
+            }
             _ => {}
         }
     }
-    renamed(detail, &mut rows, &spans);
+    renamed(&timeline, &mut rows, &spans);
     rows
 }
 
 /// Each row's name from the newest message its session posted after the record that last named
 /// it, and before its end: one pass from the room's newest entry back, parsing only entries that
 /// carry a session name, by a node with a Session, until every row has its newest name.
-fn renamed(detail: &ChannelDetail, rows: &mut [SessionRow], spans: &[(u32, Option<u32>)]) {
+fn renamed(timeline: &[&MessageRow], rows: &mut [SessionRow], spans: &[(u32, Option<u32>)]) {
     let Some(floor) = spans.iter().map(|s| s.0).min() else {
         return;
     };
     let mut left: Vec<bool> = vec![true; rows.len()];
     let mut pending = rows.len();
-    let newest = (0..detail.timeline.len()).rev();
-    for (i, r) in newest.zip(detail.timeline.iter().rev()) {
+    let newest = (0..timeline.len()).rev();
+    for (i, r) in newest.zip(timeline.iter().rev()) {
         let Ok(i) = u32::try_from(i) else { continue };
         if pending == 0 || i <= floor {
             break;
@@ -275,13 +310,18 @@ pub async fn open_when_member(
         return Ok(());
     }
     for part in opening_parts(session) {
-        post(handle, room, part).await?;
+        post(handle, room, &session.id, part).await?;
     }
     Ok(())
 }
 
-/// The same ordinary public metadata is used by a hook and when a new reader needs to learn
-/// which Sessions are still open. This carries neither a Session step nor a drive grant.
+/// Whether this envelope is a lifecycle record, including a part of a large opening.
+/// Classification is inside the authenticated, sealed content; it never grants permission.
+pub(crate) fn is_record(body: &str) -> bool {
+    Envelope::parse(body).is_ok_and(|env| matches!(env.kind.as_str(), SESSION | SESSION_END))
+}
+
+/// Opening metadata is sent privately; it carries neither an activity step nor a drive grant.
 pub(crate) fn opening_parts(session: &Opening) -> Vec<String> {
     let mut env = Envelope::new(SESSION, "");
     env.from.clone_from(&session.id);
@@ -333,7 +373,7 @@ pub async fn end(
     let mut env = Envelope::new(SESSION_END, "");
     session.clone_into(&mut env.from);
     env.data = serde_json::json!({ "reason": reason });
-    post(handle, room, env.to_text()).await
+    post(handle, room, session, env.to_text()).await
 }
 
 /// Whether the harness's `reason` for a `SessionEnd` keeps the session open (ADR-029 SE-4).
@@ -342,19 +382,25 @@ pub fn keeps_open(reason: &str) -> bool {
     reason.trim() == "resume"
 }
 
-async fn post(handle: &NodeHandle, room: Digest32, text: String) -> Result<(), String> {
+async fn post(
+    handle: &NodeHandle,
+    room: Digest32,
+    session: &str,
+    text: String,
+) -> Result<(), String> {
     // A room just joined is written to once its first sync with another member has ended
     // (V210-164), usually within a second.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         match handle
-            .apply(NodeCommand::SendText {
+            .apply(NodeCommand::AppendSession {
                 channel_id: room,
-                text: text.clone(),
+                session_id: session.to_owned(),
+                body: text.clone(),
             })
             .await
         {
-            Outcome::Done => return Ok(()),
+            Outcome::Appended(_) => return Ok(()),
             Outcome::Failed(crate::node::api::Fault::RoomNotSynced)
                 if tokio::time::Instant::now() < deadline =>
             {

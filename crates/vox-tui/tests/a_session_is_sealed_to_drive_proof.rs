@@ -6,8 +6,9 @@
 //!    and carol with read only. Bob's node opens every Session entry; carol's opens none, though it reads
 //!    alice's messages to the room written before and after them. Neither shows Session activity
 //!    in the room's timeline (`vox room read`).
-//!    `vox room sessions --json` says so too: alice's Session is listed for both, `can_drive`
-//!    true for bob and false for carol.
+//!    Opening/end records are sealed too (ADR-031 SA-3, #740): Bob discovers the Session;
+//!    Carol cannot find its lifecycle records in her own data root, including after restart.
+//!    A driver reads the real end; a revoked reader receives no end record.
 //! 3. **A file out of a Session reaches only drive** (DR-1.8, #546). Alice's session runs
 //!    `vox agent send`: bob's node pulls the file by itself, byte for byte, into its files
 //!    directory; carol's pulls nothing. Carol, given the share's tag by a member that has it (an
@@ -72,7 +73,9 @@
 //! - **No rotation on losing drive** (claim 2): `rotate_drive_if_lost` in
 //!   `crates/vox-core/src/node/channel.rs` returns the lost members without changing the key. Bob's
 //!   node opens the entries written after his downgrade: red PRODUCT.
-//! - **No opening refresh on a new reader's consent** (claim 6): Dave reads fresh chat but the
+//! - **Write an opening/end as ordinary room text** (#740): the read-only/revoked member's
+//!   `vox room read --json` exposes that lifecycle record: red PRODUCT.
+//! - **No lifecycle refresh on a new drive grant** (claim 6): Dave reads fresh chat but the
 //!   ongoing Session is missing from `vox room sessions`: red PRODUCT.
 //! - **Regrant treated as continuous permission** (claim 6): ignore the start of a recipient's
 //!   grant in later generations in `private_permitted`. The author returns old ciphertext to
@@ -607,9 +610,9 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
          entries: she opened {carol_opened:?}"
     );
     assert!(
-        bob_lists && carol_lists == Some(false),
+        bob_lists && carol_lists.is_none(),
         "PRODUCT: `vox room sessions --json` must list alice's Session with can_drive true for bob \
-         and false for carol: bob {:?}, carol {carol_lists:?}",
+         and no new Session for read-only carol: bob {:?}, carol {carol_lists:?}",
         can_drive(&bob, &room)
     );
     assert!(
@@ -617,7 +620,14 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         "PRODUCT: Session activity must not show in the room's timeline (SC-4): bob's read: \
          {timeline_bob}\ncarol's read: {timeline_carol}"
     );
+    assert_no_lifecycle(&carol, &room, SESSION);
     private_wire_refused(&mut carol, &[&alice, &bob], id, &spec);
+    assert_no_lifecycle(&carol, &room, SESSION);
+    assert_eq!(
+        can_drive(&carol, &room),
+        None,
+        "PRODUCT: read-only member reopened sealed lifecycle metadata from its own data root"
+    );
 
     // ---- claim 3: alice's session sends a file out of its Session; it reaches bob alone ----
     let file = tmp.path().join("for-drive.bin");
@@ -1129,11 +1139,115 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         before,
         "PRODUCT: another member's join and regrant changed Bob's already-read history"
     );
+    // End through the real harness hook. Dave and Carol still have drive; Bob no longer does.
+    let (ok, out, err) = alice.vox_with(
+        &["agent", "hook", "--node", "default", "--room", &room],
+        Some(&format!(r#"{{"session_id":"{SESSION}","hook_event_name":"SessionEnd","reason":"exit","cwd":"/tmp"}}"#)),
+        &[("CLAUDE_CODE_ENTRYPOINT", "cli")],
+    );
+    assert!(ok, "PRODUCT: the real SessionEnd hook failed: {out}{err}");
+    assert!(
+        until(Duration::from_secs(60), || session_state(
+            &dave, &room, SESSION
+        ) == Some(false)),
+        "PRODUCT: current driver did not open the sealed Session end"
+    );
+    assert!(
+        posts_until_read(&alice, &bob, &room, "AFTER-SEALED-END"),
+        "APPARATUS: revoked reader did not read the end's ordinary control message"
+    );
+    assert_no_lifecycle(&bob, &room, SESSION);
+    assert_eq!(
+        session_state(&bob, &room, SESSION),
+        Some(true),
+        "PRODUCT: revoked reader opened a new end record after losing drive"
+    );
+    // A new grant after the end receives retained lifecycle state, never the missed steps.
+    let (ok, out, err) = alice.vox(
+        &[
+            "trust",
+            "drive",
+            &bob.fp,
+            "--identity-passphrase-file",
+            alice.pass(),
+        ],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: granting drive after the Session ended failed: {out}{err}"
+    );
+    assert!(
+        until(Duration::from_secs(60), || session_state(
+            &bob, &room, SESSION
+        ) == Some(false)),
+        "PRODUCT: newly granted driver could not discover an already ended Session"
+    );
+    assert_eq!(
+        opened(&bob, &room),
+        before,
+        "PRODUCT: granting access to an ended Session backfilled its activity"
+    );
+    private_wire_refused(&mut bob, &[&alice, &carol], id, &spec);
+    // Stop/reopen Dave's own store using the existing probe cleanup without requesting history.
+    private_wire_refused(&mut dave, &[], id, &spec);
+    assert_eq!(
+        session_state(&dave, &room, SESSION),
+        Some(false),
+        "PRODUCT: driver lost the sealed end after reopening its own data root"
+    );
+    // The existing legacy-classification arm stages Bob as a read-only receiver. Restore that
+    // precondition after the additional ended-Session grant case above.
+    let (ok, out, err) = alice.vox(
+        &[
+            "trust",
+            "read",
+            &bob.fp,
+            "--identity-passphrase-file",
+            alice.pass(),
+        ],
+        None,
+    );
+    assert!(
+        ok,
+        "APPARATUS: could not restore the legacy arm's read-only receiver: {out}{err}"
+    );
+    assert!(
+        until(Duration::from_secs(60), || can_drive(&bob, &room)
+            == Some(false)),
+        "APPARATUS: legacy arm's read-only permission boundary was not staged"
+    );
     legacy_placeholder_journey(&mut alice, &mut bob, id, &room, &spec);
 }
 
-/// An authenticated but unauthorized member asks the actual owner and an actual holder for
-/// their private wire pages. Verdicts come from the shipped daemons' responses, not store data.
+fn session_state(member: &Member, room: &str, session: &str) -> Option<bool> {
+    let (ok, out, err) = member.vox(&["room", "sessions", room, "--json"], None);
+    assert!(ok, "PRODUCT: Session listing failed: {out}{err}");
+    out.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|row| row["id"] == session)
+        .and_then(|row| row["open"].as_bool())
+}
+
+/// Read the actual member's public log through its shipped CLI, not a UI visibility filter.
+/// An accidentally unsealed record is readable here even when a Session list hides it.
+fn assert_no_lifecycle(member: &Member, room: &str, session: &str) {
+    let (ok, out, err) = member.vox(&["room", "read", room, "--json"], None);
+    assert!(
+        ok,
+        "PRODUCT: member could not read its own room data: {out}{err}"
+    );
+    assert!(
+        !out.contains(session),
+        "PRODUCT: {} opened a Session lifecycle record from its own public log: {out}",
+        member.name
+    );
+}
+
+/// An authenticated member asks the actual owner and an actual holder for
+/// their private wire pages. A fresh grant may return only exact lifecycle record hashes the
+/// shipped daemon reports; every older step ciphertext remains forbidden. Verdicts come from
+/// real daemon responses, not store data.
 fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32], anchor: &str) {
     use vox_core::cbor::{Decoder, Encoder};
     use vox_core::node::link::b32_decode;
@@ -1154,6 +1268,21 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
             )
         })
         .collect();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("APPARATUS: lifecycle readback runtime");
+    let allowed = match rt.block_on(member.socket(&rt).sessions(room)) {
+        Ok(Frame::SessionsPage { sessions, .. }) => sessions
+            .into_iter()
+            .filter(|s| s.can_drive)
+            .flat_map(|s| std::iter::once(s.opening).chain(s.ended))
+            .collect::<std::collections::BTreeSet<_>>(),
+        other => {
+            panic!("PRODUCT: daemon did not report its lifecycle record identities: {other:?}")
+        }
+    };
+    drop(rt);
     drop(member._daemon.take());
     let paths = Paths::resolve(
         "default",
@@ -1225,8 +1354,12 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
             after = d.uint().expect("PRODUCT: private Session page integer");
             let more = d.uint().expect("PRODUCT: private Session page integer");
             let records = d.array().expect("PRODUCT: private Session page array");
-            assert_eq!(records, 0,
-                "PRODUCT: {name} served {records} encrypted Session records to {} outside its current grant", member.name);
+            for _ in 0..records {
+                let wire = d.bytes().expect("PRODUCT: private Session record bytes");
+                let hash = vox_core::hash::sha256(wire);
+                assert!(allowed.contains(&hash),
+                    "PRODUCT: {name} served earlier step ciphertext or an unreported lifecycle record to {} outside its current grant", member.name);
+            }
             d.finish()
                 .expect("PRODUCT: extra bytes in private Session page");
             if more == 0 {
@@ -1240,7 +1373,7 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
             "APPARATUS: bounded private wire probe did not finish the staged history"
         );
         eprintln!(
-            "[proof] {name} served no private Session record to {}",
+            "[proof] {name} served no earlier step ciphertext or unreported lifecycle record to {}",
             member.name
         );
     }

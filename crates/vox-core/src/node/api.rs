@@ -640,6 +640,8 @@ pub struct ChannelDetail {
     /// The files other members' Sessions sent out here that this node can open (ADR-029
     /// DR-1.8): what it pulls by itself, as a room share addressed to it.
     pub session_files: Vec<crate::node::drive::SessionRow>,
+    /// Drive-sealed lifecycle records, kept separate from public chat and activity steps.
+    pub session_records: Vec<crate::node::drive::SessionRow>,
 }
 
 /// The node's latest-wins view (published over a `watch`).

@@ -167,6 +167,7 @@ pub struct SessionLog {
     by_session: std::collections::HashMap<String, Vec<usize>>,
     /// The positions of rows announcing a file out of a Session.
     files_out: Vec<usize>,
+    lifecycle: Vec<usize>,
     /// Entry hash → its position.
     at: std::collections::HashMap<Digest32, usize>,
     requests: std::collections::HashMap<(String, String), Vec<usize>>,
@@ -195,7 +196,9 @@ impl SessionLog {
     pub fn push(&mut self, row: SessionRow) {
         let at = self.rows.len();
         self.at.insert(row.entry_hash, at);
-        if !is_key_changed(&row.session_id) {
+        if crate::node::sessions::is_record(&row.body) {
+            self.lifecycle.push(at);
+        } else if !is_key_changed(&row.session_id) {
             self.all.push(at);
             self.by_session
                 .entry(row.session_id.clone())
@@ -348,6 +351,11 @@ impl SessionLog {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+
+    /// Retained opening, rename and end records, never activity steps.
+    pub fn lifecycle(&self) -> impl Iterator<Item = &SessionRow> {
+        self.lifecycle.iter().map(|&at| &self.rows[at])
     }
 
     /// The rows announcing a file out of a Session, in order.

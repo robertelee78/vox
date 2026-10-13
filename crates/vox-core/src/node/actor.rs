@@ -405,35 +405,8 @@ fn detail_of(
         unread: ch.unread(),
         drive_from: ch.drive_from(),
         session_files: ch.session_files(),
+        session_records: ch.session_records(),
     }
-}
-
-/// Publish the owner's currently open Session metadata after the new reader's key position
-/// has been chosen, before its consent commits. Forward-only keys cannot open an earlier
-/// Session opening. Republishing metadata makes the ongoing Session discoverable without
-/// releasing any old step or ordinary message. A crash before consent retries this snapshot;
-/// once consent commits, its retained key already covers every part written here.
-fn refresh_session_openings(
-    channel: &mut ChannelState,
-    profile: &Profile,
-    now: crate::time::Ms,
-) -> crate::error::Result<()> {
-    let me = channel.me();
-    let detail = detail_of(channel, None, now);
-    for row in crate::node::sessions::fold(&detail)
-        .into_iter()
-        .filter(|row| row.node == me && row.open)
-    {
-        let opening = crate::node::sessions::Opening {
-            id: row.id,
-            harness: row.harness,
-            name: row.name,
-        };
-        for part in crate::node::sessions::opening_parts(&opening) {
-            channel.append_text(profile, &part, now.get())?;
-        }
-    }
-    Ok(())
 }
 
 /// A room's lock if it can be had by `deadline`. A free lock is taken even once the deadline has
@@ -10556,9 +10529,6 @@ impl Node {
                 .unwrap_or((skdm.body.chain_id, skdm.body.iteration));
             // The generations before the live one that the decision — or a full-history grant —
             // covers (V210-45, PRD-001 R12) are owed in the grant's own transaction (V210-88).
-            if let Err(e) = refresh_session_openings(&mut channel, profile, now_ms) {
-                return Outcome::Failed(fault_of(&e));
-            }
             match channel.issue_consent(profile, target, &skdm, full, entitled_from, now_ms) {
                 Ok((_, history_owed)) => history_owed,
                 Err(e) => return Outcome::Failed(fault_of(&e)),
@@ -13140,10 +13110,9 @@ impl Node {
                         .and_then(|p| p.first().copied())
                         .unwrap_or((skdm.body.chain_id, skdm.body.iteration));
                     let mut channel = shared.lock().await;
-                    refresh_session_openings(&mut channel, profile, now_ms).is_ok()
-                        && channel
-                            .issue_consent(profile, peer, &skdm, full, entitled_from, now_ms)
-                            .is_ok()
+                    channel
+                        .issue_consent(profile, peer, &skdm, full, entitled_from, now_ms)
+                        .is_ok()
                         && (entitled_from.0 >= skdm.body.chain_id
                             || channel
                                 .owe_history(profile.store(), peer, entitled_from.0)
@@ -15168,6 +15137,7 @@ impl Node {
             .as_ref()
             .ok_or(crate::error::Error::AtRestLocked)?;
         ch.finish_session_upgrade(profile.store(), self.now_ms().get())?;
+        ch.refresh_session_records(profile, &self.drive_holders(), &[], self.now_ms().get())?;
         ch.sweep_retention(profile.store(), self.now_ms())?;
         Ok(())
     }
@@ -16991,6 +16961,13 @@ impl Node {
             let Ok(owed) = ch.owed_drive(profile, holders, now_ms) else {
                 return;
             };
+            if !owed.is_empty()
+                && ch
+                    .refresh_session_records(profile, holders, &owed, now_millis)
+                    .is_err()
+            {
+                return;
+            }
             let mut releases = Vec::new();
             for member in owed {
                 if let Ok((skdm, generation)) = ch.drive_skdm_for(profile, &member) {
