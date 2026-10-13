@@ -980,6 +980,7 @@ enum NetEvent {
     PrivateSessionDone {
         channel_id: Digest32,
         peer: Digest32,
+        room: SharedChannel,
         page: crate::error::Result<crate::node::sessionstream::Page>,
     },
     /// A program asked, through the app API, to open an app stream to `peer`: reach it
@@ -8059,6 +8060,7 @@ impl Node {
             NetEvent::PrivateSessionDone {
                 channel_id,
                 peer,
+                room,
                 page,
             } => {
                 let (Some(shared), Some(store)) = (
@@ -8067,6 +8069,11 @@ impl Node {
                 ) else {
                     return;
                 };
+                // A result for a room closed and reopened while the network task ran belongs
+                // to the old state, never the freshly loaded keys or recovery cursors.
+                if !Arc::ptr_eq(&shared, &room) {
+                    return;
+                }
                 let result = shared.lock().await.finish_private_pull(
                     &store,
                     peer,
@@ -16159,6 +16166,7 @@ impl Node {
                 .send(NetEvent::PrivateSessionDone {
                     channel_id,
                     peer,
+                    room: shared,
                     page,
                 })
                 .await;

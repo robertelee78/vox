@@ -176,9 +176,11 @@ impl ChannelState {
 
     fn keep_private(&mut self, store: &Store, saved: Stored) -> Result<Digest32> {
         let id = self.private_sessions.next.max(1);
-        let next = id
-            .checked_add(1)
-            .ok_or(Error::SizeLimitExceeded("private Session records"))?;
+        let Some(next) = id.checked_add(1) else {
+            let error = Error::SizeLimitExceeded("private Session records");
+            self.private_save_failed(&error);
+            return Err(error);
+        };
         let hash = saved.row.entry_hash;
         let result = (|| {
             let segment = seal_segment(&self.sek, SegmentKind::PrivateSession, id, &saved.bytes())?;

@@ -514,7 +514,7 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     let (_anchor, spec) = anchor(tmp.path());
     let mut alice = member(tmp.path(), "alice", &spec);
     let mut bob = member(tmp.path(), "bob", &spec);
-    let carol = member(tmp.path(), "carol", &spec);
+    let mut carol = member(tmp.path(), "carol", &spec);
 
     // ---- one room; alice trusts bob with drive and carol with read; they trust her back ----
     let (ok, _, e) = alice.vox(
@@ -607,6 +607,7 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         "PRODUCT: Session activity must not show in the room's timeline (SC-4): bob's read: \
          {timeline_bob}\ncarol's read: {timeline_carol}"
     );
+    private_wire_refused(&mut carol, &[&alice, &bob], id, &spec);
 
     // ---- claim 3: alice's session sends a file out of its Session; it reaches bob alone ----
     let file = tmp.path().join("for-drive.bin");
@@ -951,7 +952,173 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         "APPARATUS (precondition unmet): carol was not connected to alice when her keys went, so \
          they went to her signed prekey as a member away's do: {away:?}"
     );
+    // Carol's later grant discovers the already-open Session, without earlier step backfill.
+    let late = "AFTER-LATE-DRIVE-GRANT";
+    assert!(
+        matches!(
+            rt.block_on(alice.socket(&rt).request(&Request::AppendSession {
+                channel_id: id,
+                session_id: SESSION.to_owned(),
+                body: reply(100, late),
+            })),
+            Ok(Frame::Appended { .. })
+        ),
+        "PRODUCT: owner could not append after Carol's late drive grant"
+    );
+    assert!(
+        until(Duration::from_secs(60), || opened(&carol, &room) == [late]),
+        "PRODUCT: newly drive-enabled Carol must read only the post-grant step; got {:?}",
+        opened(&carol, &room)
+    );
+    assert_eq!(
+        can_drive(&carol, &room),
+        Some(true),
+        "PRODUCT: Carol's late grant did not make the ongoing Session driveable"
+    );
+    // Carol demonstrably holds the new ciphertext now. Bob cannot get it from her or its owner.
+    private_wire_refused(&mut bob, &[&alice, &carol], id, &spec);
+    assert_eq!(
+        opened(&bob, &room),
+        before,
+        "PRODUCT: Bob's restart after drive loss changed the steps he had already read"
+    );
     legacy_placeholder_journey(&mut alice, &mut bob, id, &room, &spec);
+}
+
+/// An authenticated but unauthorized member asks the actual owner and an actual holder for
+/// their private wire pages. Verdicts come from the shipped daemons' responses, not store data.
+fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32], anchor: &str) {
+    use vox_core::cbor::{Decoder, Encoder};
+    use vox_core::node::link::b32_decode;
+    use vox_core::node::paths::Paths;
+    use vox_core::node::profile::Profile;
+    use vox_core::transport::framing::{read_frame, write_frame};
+    use vox_core::transport::quic::VoxEndpoint;
+    use vox_core::transport::streams::{open_typed, StreamKind};
+
+    let targets: Vec<_> = holders
+        .iter()
+        .map(|h| {
+            let (_, status, _) = h.vox(&["status", "--json"], None);
+            (
+                h.name,
+                ports::loopback_listen(&status).expect("APPARATUS: holder address"),
+                b32_decode(&h.fp, "private wire holder").expect("APPARATUS: holder fingerprint"),
+            )
+        })
+        .collect();
+    drop(member._daemon.take());
+    let paths = Paths::resolve(
+        "default",
+        Some(&member.data),
+        Some(&member.data.join("cfg")),
+    )
+    .expect("APPARATUS: stopped scratch member paths");
+    let mut profile = Profile::open(paths).expect("APPARATUS: stopped scratch member opens");
+    profile
+        .unlock(ID_PASS.as_bytes())
+        .expect("APPARATUS: scratch member unlocks");
+    let signer = profile
+        .signer_arc()
+        .expect("APPARATUS: scratch member signs");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("APPARATUS: private wire peer runtime");
+    let endpoint = rt.block_on(async {
+        VoxEndpoint::bind(signer, "127.0.0.1:0".parse().unwrap())
+            .expect("APPARATUS: private wire peer binds")
+    });
+    for (name, addr, fingerprint) in targets {
+        let connection = rt
+            .block_on(endpoint.connect(addr, fingerprint, raw_sync::now()))
+            .expect("APPARATUS: private wire peer connects to holder");
+        let mut incarnation = [0u8; 32];
+        let mut after = 0;
+        let mut finished = false;
+        for _ in 0..32 {
+            let bytes = rt.block_on(async {
+                let (mut send, mut recv) = open_typed(&connection, StreamKind::Session)
+                    .await
+                    .expect("APPARATUS: private wire peer opens stream");
+                let mut e = Encoder::new();
+                e.array(5)
+                    .uint(1)
+                    .bytes(&room)
+                    .uint(0)
+                    .bytes(&incarnation)
+                    .uint(after);
+                write_frame(&mut send, &e.finish())
+                    .await
+                    .expect("APPARATUS: private wire peer asks");
+                send.finish()
+                    .expect("APPARATUS: private wire peer finishes request");
+                read_frame(&mut recv, 4 * 1024 * 1024)
+                    .await
+                    .expect("PRODUCT: member's private Session page exchange failed")
+                    .expect("PRODUCT: member received no private Session response")
+            });
+            let mut d = Decoder::new(&bytes);
+            assert_eq!(
+                d.array().expect("PRODUCT: private Session page array"),
+                5,
+                "PRODUCT: malformed private Session page"
+            );
+            assert_eq!(
+                d.uint().expect("PRODUCT: private Session page integer"),
+                1,
+                "PRODUCT: wrong private Session page version"
+            );
+            incarnation = d
+                .bytes()
+                .expect("PRODUCT: private Session page incarnation")
+                .try_into()
+                .expect("PRODUCT: invalid private Session incarnation");
+            after = d.uint().expect("PRODUCT: private Session page integer");
+            let more = d.uint().expect("PRODUCT: private Session page integer");
+            let records = d.array().expect("PRODUCT: private Session page array");
+            assert_eq!(records, 0,
+                "PRODUCT: {name} served {records} encrypted Session records to {} without current drive", member.name);
+            d.finish()
+                .expect("PRODUCT: extra bytes in private Session page");
+            if more == 0 {
+                finished = true;
+                break;
+            }
+            assert_eq!(more, 1, "PRODUCT: invalid private Session continuation");
+        }
+        assert!(
+            finished,
+            "APPARATUS: bounded private wire probe did not finish the staged history"
+        );
+        eprintln!(
+            "[proof] {name} served no private Session record to {}",
+            member.name
+        );
+    }
+    drop(endpoint);
+    drop(rt);
+    drop(profile);
+    let child = vox_cmd()
+        .args(["daemon", "--listen", "127.0.0.1:0", "--anchor", anchor])
+        .arg("--passphrase-file")
+        .arg(&member.pass)
+        .env("VOX_DATA_DIR", &member.data)
+        .env("VOX_CONFIG_DIR", member.data.join("cfg"))
+        .env_remove("VOX_ROOM")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("APPARATUS: restart private wire probe member");
+    member._daemon = Some(Proc(child));
+    assert!(
+        until(Duration::from_secs(90), || member
+            .vox(&["room", "list"], None)
+            .0),
+        "APPARATUS: private wire probe member did not restart"
+    );
 }
 
 /// Raw signed input is apparatus; every verdict below is a real receiver CLI result.
