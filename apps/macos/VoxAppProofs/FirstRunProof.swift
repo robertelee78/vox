@@ -1900,11 +1900,10 @@ final class FirstRunProof: XCTestCase {
     ///   delivery), and ⌃C asks before stopping.
     /// - P1: ⌘J opens S1 with its waiting request selected, and ⌥⌘Y approves it: the hook gets
     ///   "allow" (mutant: ⌘J opening the room only).
-    /// - RB-5 (v0.4.3): Vox asks the person, not only the agent. S3, started in a directory the
-    ///   room map does not name, is asked about in a banner across the window ("Claude Code in …
-    ///   has no room"); Choose a room…, other, the room's passphrase typed here, and Bind write the
-    ///   directory's block to the room map, put S3 in other, and the ask leaves the banner (mutant:
-    ///   the banner never shown).
+    /// - RM-1/2/3/5 (#727): a main repo and its worktree raise one dialog. A wrong room
+    ///   passphrase leaves the map unchanged; Choose binds both waiting sessions. Create uses
+    ///   alice with her keyring window closed, no identity prompt, and both next turns follow.
+    ///   Not This Repo silences both paths. Mutant: write the map before checking the passphrase.
     func testSessionsAreDrivenWhereTheyAreShown() throws {
         let env = ProcessInfo.processInfo.environment
         guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
@@ -1926,6 +1925,12 @@ final class FirstRunProof: XCTestCase {
         // The first run answered (Not Now) and the node chosen: the app opens as alice.
         try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
         try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+        // An ordinary empty room map is the known baseline for the wrong-passphrase check.
+        try stager.write(Data(), to: data + "/rooms")
+        let mapMode = stager.run(["/bin/chmod", "600", data + "/rooms"], env: [:])
+        guard mapMode.status == 0 else {
+            throw Apparatus("the scratch room map's private permissions could not be staged: \(mapMode.out)")
+        }
         daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
         for (name, words) in [("alice", "alice identity"), ("claude-a", "agent identity")] {
@@ -1954,6 +1959,13 @@ final class FirstRunProof: XCTestCase {
                          "--identity-passphrase-file", pass("alice")], env: voxEnv)
         try staged(vox, ["trust", "add", "--node", "claude-a", aliceFp, "--name", "alice", "--drive",
                          "--identity-passphrase-file", pass("claude-a")], env: voxEnv)
+        // Room work must not borrow the authorization window opened by trust above (KP-1).
+        try staged(vox, ["node", "detach", "alice"], env: voxEnv)
+        try staged(vox, ["node", "attach", "alice", "--no-remember", "--passphrase-file", pass("alice")], env: voxEnv)
+        let closedKeyring = run(vox, ["status", "--node", "alice"], env: voxEnv).out
+        guard closedKeyring.contains("keyring asks for the passphrase") else {
+            throw Apparatus("alice's keyring window did not close before room work: \(closedKeyring)")
+        }
         // Claude Code's two sessions, opened by its hook as it runs it.
         let hookEnv = voxEnv.merging(["HOME": home, "VOX_NODE": "claude-a",
                                       "VOX_IDENTITY_PASSPHRASE": "agent identity",
@@ -2087,57 +2099,156 @@ final class FirstRunProof: XCTestCase {
         ui.typeKey(.escape, modifierFlags: [])
         print("[proof] sessions: ⌘J landed on S1's request and ⌥⌘Y approved it; work's draft kept; ⌘↩ in S1 sent nothing; S1's draft stayed in S1; S2 said \(said.debugDescription) and kept the prompt; ⌃C asked")
 
-        // RB-5: S3 starts in a directory with no room, its hook naming none; Vox asks alice.
+        // RM-1/3/5: two sessions in a repo and its worktree raise one dialog, not a banner.
         try staged(vox, ["node", "attach", "claude-a", "--passphrase-file", pass("claude-a")], env: voxEnv)
-        let repo = root.appendingPathComponent("repo").path
-        try stager.write(Data("keep\n".utf8), to: repo + "/.keep")
-        let s3 = "53cccccc-4c0e-4f00-9a1b-0c0ffee54003"
-        try stager.write(Data(), to: work + "/\(s3).jsonl")
-        let unbound = stager.run(["/bin/sh", "-c", "cd \"$1\" && exec \"$2\" agent hook --node claude-a",
-                                  "hook", repo, vox],
-                                 env: hookEnv, input: event(s3, "UserPromptSubmit", ["prompt": "S3", "cwd": repo]))
-        guard unbound.status == 0, unbound.out.contains("isn't tied to a Vox room") else {
-            throw Apparatus("staging not achieved: S3's hook was not told its repo has no room: \(unbound.out)")
+        func repository(_ name: String) throws -> (String, String) {
+            let repo = root.appendingPathComponent(name).path
+            let tree = root.appendingPathComponent(name + "-worktree").path
+            try stager.write(Data("keep\n".utf8), to: repo + "/.keep")
+            for args in [["init", "-q", repo], ["-C", repo, "commit", "-q", "--allow-empty", "-m", "first"],
+                         ["-C", repo, "worktree", "add", "-q", tree, "-b", "linked"]] {
+                let r = stager.run(["/usr/bin/git", "-c", "user.name=proof", "-c", "user.email=proof@example.invalid"] + args, env: [:])
+                guard r.status == 0 else { throw Apparatus("scratch git repository failed: \(r.out)") }
+            }
+            let physical = stager.run(["/bin/sh", "-c", "cd \"$1\" && pwd -P", "repo", repo], env: [:])
+            let canonical = physical.out.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard physical.status == 0, canonical.hasPrefix("/") else {
+                throw Apparatus("scratch repository's physical directory could not be staged: \(physical.out)")
+            }
+            return (canonical, tree)
         }
-        let map = data + "/rooms"
-        let asked3 = Premise("S3 works in no room and the room map does not name \(repo)") {
-            let status = self.run(vox, ["agent", "status", "--harness", "claude", "--dir", repo],
-                                  env: hookEnv).out
-            return (status.contains("has no room") && status.contains("/repo"), "`vox agent status` said \(status.debugDescription)")
+        func repoTurn(_ session: String, _ dir: String, _ prompt: String) throws -> String {
+            try stager.write(Data(), to: work + "/\(session).jsonl")
+            let r = stager.run(["/bin/sh", "-c", "cd \"$1\" && exec \"$2\" agent hook --node claude-a",
+                                "hook", dir, vox], env: hookEnv,
+                               input: event(session, "UserPromptSubmit", ["prompt": prompt, "cwd": dir]))
+            guard r.status == 0 else { throw Apparatus("room hook could not run: \(r.out)") }
+            return r.out
         }
-        let askRow = Key.id("room-ask-sentence")
-        present(ui, askRow, timeout: 30,
-                "a session started in a directory with no room must be asked about in the window",
-                premise: asked3)
-        words(ui, askRow, timeout: 10, "the ask must name the harness and the directory",
-              until: { $0.contains("Claude Code in ") && $0.contains("/repo has no room") })
-        tap(ui, Key.id("room-ask-choose"), "Choose a room…", premise: asked3)
+        func oneDialog(_ repo: String) {
+            present(ui, Key.id("room-ask-dialog"), timeout: 30,
+                    "an unmapped repository must open a dialog, not a banner")
+            words(ui, Key.id("room-ask-sentence"), timeout: 10, "the dialog must name the harness and main repository",
+                  until: { $0.contains("Claude Code in ") && $0.contains(repo + " has no room") })
+            let inSheet = ui.sheets.descendants(matching: .any).matching(identifier: "room-ask-sentence")
+            XCTAssertEqual(inSheet.count, 1,
+                           "PRODUCT: the repository and worktree must have one room dialog sheet; there are \(inSheet.count) ask sentences in sheets")
+            XCTAssertNil(locate(ui, Key.id("room-ask-banner")), "PRODUCT: the repository ask must be a dialog, not a banner")
+            XCTAssertNil(locate(ui, Key.id("keyring-passphrase")), "PRODUCT: room work must not ask for the identity passphrase")
+        }
+        func leftDialog() {
+            let until = Date().addingTimeInterval(15)
+            while Date() < until && locate(ui, Key.id("room-ask-dialog")) != nil { Thread.sleep(forTimeInterval: 0.5) }
+            XCTAssertNil(locate(ui, Key.id("room-ask-dialog")), "PRODUCT: an answered repository must leave no room dialog")
+        }
+        func follows(_ session: String, _ dir: String, _ room: String) throws {
+            let next = try repoTurn(session, dir, "NEXT-ROOM-TURN-" + session)
+            XCTAssertFalse(next.contains("isn't tied to a Vox room"), "PRODUCT: a waiting session's next turn still has no room: \(next)")
+            let until = Date().addingTimeInterval(30)
+            var read = ""
+            repeat {
+                read = run(vox, ["room", "session", "--node", "alice", room, session], env: voxEnv).out
+                if read.contains("NEXT-ROOM-TURN-" + session) { break }
+                Thread.sleep(forTimeInterval: 0.5)
+            } while Date() < until
+            XCTAssertTrue(read.contains("NEXT-ROOM-TURN-" + session),
+                          "PRODUCT: the session's next real hook turn must be in the chosen room: \(read)")
+        }
+        let (repo, tree) = try repository("repo")
+        let s3 = "53cccccc-4c0e-4f00-9a1b-0c0ffee54003", s4 = "54dddddd-4c0e-4f00-9a1b-0c0ffee54004"
+        for (session, dir) in [(s3, repo), (s4, tree)] {
+            let first = try repoTurn(session, dir, "waiting for repo room")
+            XCTAssertTrue(first.contains("isn't tied to a Vox room"), "PRODUCT: an unmapped repo turn did not say it has no room: \(first)")
+        }
+        oneDialog(repo)
+        tap(ui, Key.id("room-ask-choose"), "Choose a Room…")
         let other = ui.radioButtons["other"]
         guard other.waitForExistence(timeout: 10) else {
             keepTree(ui, "no room other to choose")
-            XCTFail("PRODUCT: Choose a room… must list alice's rooms; other is not among them: \(onScreen(ui))")
+            XCTFail("PRODUCT: Choose a Room must list alice's held rooms; other is missing: \(onScreen(ui))")
             return
         }
         other.click()
-        type(ui, Key.id("room-ask-passphrase"), "work room", "the room's passphrase field")
-        tap(ui, Key.id("room-ask-bind"), "Bind")
-        words(ui, Key.id("room-ask-said"), timeout: 30, "Bind must say the directory was bound",
-              until: { $0.contains("bound ") && $0.contains("/repo") })
-        let otherRoom = rooms["other"] ?? ""
-        let mapText = stager.run(["/bin/cat", map], env: [:]).out
-        XCTAssertTrue(mapText.contains("/repo\n") && mapText.contains("room       vox://")
-                          && mapText.contains("passphrase work room"),
-                      "PRODUCT: Bind must write the directory's block to the room map, with the room's link and passphrase; the map reads \(mapText.debugDescription)")
-        let inOther = run(vox, ["room", "sessions", "--node", "alice", otherRoom, "--json"], env: voxEnv).out
-        XCTAssertTrue(inOther.contains(s3),
-                      "PRODUCT: Bind must put the session that asked in the room chosen; other's Sessions are \(inOther.debugDescription)")
-        let leaveBy = Date().addingTimeInterval(15)
-        while Date() < leaveBy && locate(ui, askRow) != nil { Thread.sleep(forTimeInterval: 0.5) }
-        if locate(ui, askRow) != nil {
-            keepTree(ui, "the ask stayed after Bind")
-            XCTFail("PRODUCT: once bound, the directory must no longer be asked about; its ask is still shown")
+        let map = data + "/rooms"
+        func readMap() throws -> String {
+            let read = stager.run(["/bin/cat", map], env: [:])
+            guard read.status == 0 else {
+                throw Apparatus("the scratch room map could not be read: \(read.out)")
+            }
+            return read.out
         }
-        print("[proof] room ask: S3's directory was asked about in the window's banner; bound to other in the app; the map holds its block; S3 is in other; the ask left")
+        let before = try readMap()
+        type(ui, Key.id("room-ask-passphrase"), "wrong room passphrase", "the room's passphrase field")
+        tap(ui, Key.id("room-ask-bind"), "Bind with the wrong passphrase")
+        words(ui, Key.id("room-ask-failed"), timeout: 60, "a wrong passphrase must be named and refused before map write",
+              until: { $0.contains("passphrase") && $0.contains("not bound") })
+        XCTAssertEqual(try readMap(), before,
+                       "PRODUCT: a wrong passphrase must leave the room map unchanged, even when the waiting node holds the room")
+        tap(ui, Key.id("room-ask-passphrase"), "the refused room passphrase")
+        ui.typeKey("a", modifierFlags: .command)
+        el(ui, Key.id("room-ask-passphrase")).typeText("work room")
+        tap(ui, Key.id("room-ask-bind"), "Bind")
+        leftDialog()
+        let mapText = try readMap()
+        XCTAssertTrue(mapText.components(separatedBy: "repo " + repo + "\n").count == 2
+                          && !mapText.contains("repo " + tree + "\n") && mapText.contains("passphrase work room"),
+                      "PRODUCT: Bind must save one canonical repository block and its verified passphrase: \(mapText)")
+        let otherRoom = rooms["other"] ?? ""
+        try follows(s3, repo, otherRoom)
+        try follows(s4, tree, otherRoom)
+
+        // RM-2: Create Room makes it as the person, with no room passphrase and no keyring sheet.
+        let (createRepo, createTree) = try repository("Create Repo_727")
+        let s5 = "55eeeeee-4c0e-4f00-9a1b-0c0ffee54005", s6 = "56ffffff-4c0e-4f00-9a1b-0c0ffee54006"
+        _ = try repoTurn(s5, createRepo, "create for main")
+        _ = try repoTurn(s6, createTree, "create for worktree")
+        oneDialog(createRepo)
+        words(ui, Key.id("room-ask-create"), timeout: 10, "Create must suggest the repository's valid room name",
+              until: { $0.contains("create-repo-727") })
+        tap(ui, Key.id("room-ask-create"), "Create Room for this repository")
+        tap(ui, Key.id("room-ask-bind"), "Create Room with no room passphrase")
+        // Joining the new room can take the product's normal join time.
+        let createdUntil = Date().addingTimeInterval(540)
+        var created = ""
+        repeat {
+            XCTAssertNil(locate(ui, Key.id("keyring-passphrase")), "PRODUCT: Create Room asked for the identity passphrase")
+            created = run(vox, ["room", "list", "--node", "alice"], env: voxEnv).out
+            if created.contains("create-repo-727") && locate(ui, Key.id("room-ask-dialog")) == nil { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        } while Date() < createdUntil
+        leftDialog()
+        let createdRoom = created.split(separator: "\n").first(where: { $0.contains("create-repo-727") })?
+            .split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        XCTAssertFalse(createdRoom.isEmpty, "PRODUCT: Create Room did not create the proposed room on alice: \(created)")
+        guard !createdRoom.isEmpty else { return }
+        let admins = run(vox, ["room", "admin", "list", "--node", "alice", createdRoom], env: voxEnv).out
+        XCTAssertTrue(admins.contains(String(aliceFp.prefix(12))) && !admins.contains(String(agentFp.prefix(12))),
+                      "PRODUCT: the created room's founding admin must be alice, not the harness node: \(admins)")
+        let createdMap = try readMap()
+        XCTAssertTrue(createdMap.components(separatedBy: "repo " + createRepo + "\n").count == 2
+                          && !createdMap.contains("repo " + createTree + "\n"),
+                      "PRODUCT: Create Room must bind the canonical repository once in the room map: \(createdMap)")
+        try follows(s5, createRepo, createdRoom)
+        try follows(s6, createTree, createdRoom)
+        let stillClosed = run(vox, ["status", "--node", "alice"], env: voxEnv).out
+        XCTAssertTrue(stillClosed.contains("keyring asks for the passphrase"),
+                      "PRODUCT: room creation/binding must leave alice's keyring window closed: \(stillClosed)")
+
+        // Not This Repo is saved for the repository and suppresses later worktree sessions too.
+        let (noRepo, noTree) = try repository("no-room-repo")
+        _ = try repoTurn("57000000-4c0e-4f00-9a1b-0c0ffee54007", noRepo, "decline main")
+        _ = try repoTurn("58000000-4c0e-4f00-9a1b-0c0ffee54008", noTree, "decline worktree")
+        oneDialog(noRepo)
+        tap(ui, Key.id("room-ask-decline"), "Not This Repo")
+        leftDialog()
+        let declined = try repoTurn("59000000-4c0e-4f00-9a1b-0c0ffee54009", noTree, "later session")
+        XCTAssertFalse(declined.contains("isn't tied to a Vox room"), "PRODUCT: a declined repository asked a later worktree session again: \(declined)")
+        let noMap = try readMap()
+        XCTAssertTrue(noMap.contains("repo " + noRepo + "\n    room       none"),
+                      "PRODUCT: Not This Repo must save the canonical repository's no: \(noMap)")
+        leftDialog()
+        print("[proof] RM-1/2/3/5: one repo/worktree dialog; wrong passphrase left map unchanged; Choose and Create moved both next turns; alice created with keyring closed; Not This Repo suppressed later worktree asks")
+
     }
 
     /// A keyring change waiting for the passphrase is bound to what it changes (D1). Alice is

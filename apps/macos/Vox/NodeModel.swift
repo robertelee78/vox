@@ -326,9 +326,10 @@ final class NodeModel: ObservableObject {
     @Published private(set) var trusted: [TrustedNode] = []
     /// Trust offers waiting on this node: newcomers, and nodes that trust it (ADR-028 K-15, K-17).
     @Published private(set) var offers: [OfferInfo] = []
-    /// Directories harness sessions started in with no room bound to them, not said no to
-    /// (ADR-029 RB-5): what Vox asks the person, under needs you.
+    /// Canonical repositories waiting for an answer (ADR-031 RM-1, RM-5).
     @Published private(set) var roomAsks: [RoomAskInfo] = []
+    /// The one repository being answered. Other repositories wait for this dialog to finish.
+    @Published private(set) var roomAskDialog: RoomAskInfo?
     /// What the last answer to an ask did, or why it was not done: for the ask's view.
     @Published private(set) var roomAskSaid: RoomAnswerInfo?
     /// The directories already notified, so each ask notifies once (M-23).
@@ -1065,6 +1066,49 @@ final class NodeModel: ObservableObject {
             for gone in roomAsksNotified.subtracting(dirs) { notifier.withdrawRoomAsk(dir: gone) }
         }
         roomAsksNotified = dirs
+        if let current = roomAskDialog {
+            if let fresh = asks.first(where: { $0.dir == current.dir }) {
+                roomAskDialog = fresh
+            } else if !activeOperations.values.contains("bind-room")
+                        && !activeOperations.values.contains("decline-room") {
+                finishRoomAsk()
+            }
+        }
+        if sheet == nil, card == nil, lanAsking == nil, let ask = asks.first {
+            roomAskDialog = ask
+            roomAskSaid = nil
+            clearOutcome(of: "bind-room")
+            clearOutcome(of: "decline-room")
+            sheet = .repoRoom
+        }
+    }
+
+    /// Creation uses the app's selected (person's) node. The room secret is reused only for the
+    /// verified bind; no identity passphrase or keyring change is involved (RM-2, KP-1).
+    func createRepoRoom(_ dir: String, name: String,
+                        passphrase secret: Secret) async -> (room: String?, bound: Bool) {
+        let operation = "bind-room"
+        let attempt = begin(operation)
+        defer { end(attempt) }
+        roomAskSaid = nil
+        var created: String?
+        do {
+            let passphrase = try secret.passphrase()
+            defer { passphrase.wipe() }
+            let room = try await client.createRoom(name: name, passphrase: passphrase)
+            created = room
+            let link = try await client.link(room: room).url
+            roomAskSaid = try await client.bindRoom(dir: dir, link: link, passphrase: passphrase)
+            await refresh()
+            await readRoomAsks()
+            await show(.room(room))
+            return (room, roomAskSaid?.done == true)
+        } catch {
+            secret.wipe()
+            report(error, operation: operation)
+            await refresh()
+            return (created, false)
+        }
     }
 
     /// Bind `dir` to the room this node holds by `room`'s id, or to the room `link` names (one of
@@ -1112,11 +1156,24 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// Take down what the last answer to an ask said.
-    func clearRoomAskSaid() { roomAskSaid = nil }
+    /// The answered repository leaves the dialog. The usual status bar keeps its result.
+    func finishRoomAsk() {
+        if let answer = roomAskSaid, answer.done {
+            report(operation: "bind-room", done: answer.said.joined(separator: "\n"))
+        }
+        roomAskDialog = nil
+        roomAskSaid = nil
+        if sheet == .repoRoom { sheet = nil }
+    }
+
+    func clearRoomAskFailure() {
+        roomAskSaid = nil
+        clearOutcome(of: "bind-room")
+        clearOutcome(of: "decline-room")
+    }
 
     /// Say no for `dir` (RB-7): it stays tied to no room, and nothing started there is asked again.
-    func declineRoom(_ dir: String) async {
+    func declineRoom(_ dir: String) async -> Bool {
         let operation = "decline-room"
         let attempt = begin(operation)
         defer { end(attempt) }
@@ -1124,8 +1181,10 @@ final class NodeModel: ObservableObject {
         do {
             roomAskSaid = try await client.declineRoom(dir: dir)
             await readRoomAsks()
+            return roomAskSaid?.done == true
         } catch {
             report(error, operation: operation)
+            return false
         }
     }
 

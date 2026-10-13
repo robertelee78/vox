@@ -11,7 +11,7 @@
 //! ran) cannot work there either, and is asked about the same way (RB-5a): one bind then serves
 //! every harness's node in that directory.
 //!
-//! Vox.app shows an ask as a banner across its window with what to do about it; the TUI and `vox agent status`
+//! Vox.app shows an ask as a dialog with what to do about it; the TUI and `vox agent status`
 //! show it with the commands that answer it at a terminal.
 
 use std::collections::BTreeMap;
@@ -66,8 +66,7 @@ pub fn asks(account: &Account, outside: &dyn Fn(&NodeName, &str) -> bool) -> Vec
                     room
                 }
             };
-            // As the map holds it: the directory itself, a symlink to it resolved.
-            let dir = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+            let dir = crate::room_map::ask_directory(&entries, start);
             by_dir
                 .entry((dir.display().to_string(), room))
                 .or_default()

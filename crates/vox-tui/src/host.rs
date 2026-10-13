@@ -907,7 +907,8 @@ impl Router {
     ///
     /// With a `link`: bind `dir` to the room it names, what `vox room join <link> --node <node>
     /// --bind <dir>` does: each node of a session that asked joins the room, which checks the
-    /// passphrase, unless it is in it already; the room map then binds `dir`, replacing a no or
+    /// passphrase; an already-held room checks it through a separate real join. The map then
+    /// binds `dir`, replacing a no or
     /// another room. With `link` empty: the room map binds `dir` already, to a room the sessions'
     /// nodes are not in, and they join it with the map's own link and passphrase. Either way every
     /// session that asked is then put in the room.
@@ -964,6 +965,22 @@ impl Router {
                 .iter()
                 .any(|c| c.channel_id == parsed.channel_id);
             if member {
+                // Holding a room is not proof of the passphrase just typed (ADR-031 RM-3).
+                // This validates through a real Join stream without admitting another member.
+                let checked = handle
+                    .apply(vox_core::node::api::NodeCommand::CheckRoomPassphrase {
+                        channel_id: parsed.channel_id,
+                        passphrase: vox_core::node::api::Secret::new(
+                            passphrase.as_bytes().to_vec(),
+                        ),
+                    })
+                    .await;
+                if checked != vox_core::node::api::Outcome::Done {
+                    return no(format!(
+                        "the room passphrase was not authenticated by node {node}, so {dir} was \
+                         not bound: {checked}"
+                    ));
+                }
                 continue;
             }
             match handle
