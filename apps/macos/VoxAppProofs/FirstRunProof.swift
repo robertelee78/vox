@@ -536,7 +536,7 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("cannot create this journey's private Keychain: \(madeKeychain.out)")
         }
         let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0",
-                      "VOX_TEST_KEYCHAIN": keychain]
+                      "VOX_TEST_KEYCHAIN": keychain, "HOME": home]
         // The owned apparatus daemon stores supplied secrets in this scratch Keychain through
         // real Security APIs. The app and CLI remain ordinary; the first-run question is unanswered.
         daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
@@ -545,8 +545,10 @@ final class FirstRunProof: XCTestCase {
         try stager.write(Data("alice identity\n".utf8), to: pass)
         try staged(vox, ["node", "create", "alice", "--passphrase-file", pass], env: voxEnv)
         try staged(vox, ["node", "attach", "alice", "--keep", "--passphrase-file", pass], env: voxEnv)
-        try staged(vox, ["node", "create", "plain"], env: voxEnv)
-        try staged(vox, ["node", "unlock", "plain"], env: voxEnv)
+        let plainPass = root.appendingPathComponent("plain-empty.pass").path
+        try stager.write(Data(), to: plainPass)
+        try staged(vox, ["node", "create", "plain", "--passphrase-file", plainPass], env: voxEnv)
+        try staged(vox, ["node", "unlock", "plain", "--passphrase-file", plainPass], env: voxEnv)
         let roomPass = root.appendingPathComponent("room.pass").path
         try stager.write(Data("lifecycle room\n".utf8), to: roomPass)
         try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", roomPass,
@@ -710,6 +712,34 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("room-lifecycle"), "Open the retained room after the app's remembered Unlock and restart")
         present(ui, Key.showing("LIFECYCLE-BODY-PRESERVED"), timeout: 30,
                 "alice's original complete message must remain visible after remembered Unlock and restart")
+        handOff(ui, "q")
+        guard ui.wait(for: .notRunning, timeout: 15) else {
+            throw Product("public Quit must stop Alice's window before staging the plain-node client")
+        }
+        // As in the initial fixture, select the next scratch client's saved node before launch.
+        // This stages the acting identity; it does not claim Forget changes a window's identity.
+        try stager.write(Data("plain\n".utf8), to: config + "/app/node")
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        guard words(ui, Key.id("attached"), timeout: 60,
+                    "the next client must actually act as the passphraseless node Ready",
+                    until: { $0 == "node plain, Ready" }) != nil else { return }
+        ui.menuBars.menuBarItems["Node"].click()
+        tap(ui, Key.menuItem("Forget"), "Forget the acting passphraseless node")
+        guard words(ui, Key.id("attached"), timeout: 30,
+                    "native Forget must keep the same passphraseless node's usable Ready window",
+                    until: { $0 == "node plain, Ready" }) != nil else { return }
+        guard present(ui, Key.id("sidebar-add"), timeout: 10,
+                      "the passphraseless Ready window must retain its room controls") else { return }
+        tap(ui, Key.id("sidebar-add"), "Use the passphraseless window after Forget")
+        tap(ui, Key.id("sidebar-new-room"), "New Room after Forget")
+        guard present(ui, Key.id("room-form-name"), timeout: 20,
+                      "native Forget must leave the passphraseless node's room workflow usable") else { return }
+        ui.typeKey(.escape, modifierFlags: [])
+        XCTAssertNil(locate(ui, Key.showing("Node plain is Locked.")),
+                     "PRODUCT: a passphraseless node must never become Locked after native Forget")
+        let nativePlain = try staged(vox, ["node", "list"], env: voxEnv)
+        XCTAssertTrue(nodeLine(nativePlain, "plain")?.contains("Ready") == true,
+                      "PRODUCT: native Forget must leave the acting passphraseless node Ready; \(nativePlain)")
         // Nothing here registered a real login item: none is loaded for this user.
         let uid = stager.run(["/usr/bin/id", "-u"], env: [:]).out.trimmingCharacters(in: .whitespacesAndNewlines)
         // Only the proof build's own: the person's own Vox (us.vox.app) may have its login item

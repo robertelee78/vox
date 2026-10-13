@@ -1820,6 +1820,7 @@ private struct MessageRow: View {
 /// picks up where it was. Start Over goes back to reaching the daemon, as at launch.
 private struct NodeStopped: View {
     @ObservedObject var model: NodeModel
+    @ObservedObject private var app = AppModel.shared
     @State private var field = SecureFieldHolder()
 
     var body: some View {
@@ -1843,6 +1844,10 @@ private struct NodeStopped: View {
                         .accessibilityLabel("Identity passphrase for node \(model.node)")
                     Button("Unlock…") { again() }
                         .accessibilityIdentifier("node-stopped-attach")
+                }
+                if let said = app.keepNodeSaid {
+                    Text(said).foregroundStyle(.red)
+                        .accessibilityIdentifier("node-stopped-unlock-error")
                 }
             } else {
                 Button("Try Again") { Task { await model.refreshMachineState() } }

@@ -625,9 +625,11 @@ final class NodeModel: ObservableObject {
     func refreshMachineState() async { await readFacts() }
 
     private func readFacts() async {
+        let epoch = nodeObservationEpoch
         // Reachability first: failed reads must not leave stale node/peer states visible.
         do {
             let fresh = try await client.nodes()
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             let recovering = !daemonReachable
             machineStateKnown = true
             daemonFailure = nil
@@ -641,6 +643,7 @@ final class NodeModel: ObservableObject {
                 return
             }
             let view = try await client.view()
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             daemonReachable = true
             if Int(view.peers) != peers { peers = Int(view.peers) }
             if view.keyring != keyring { keyring = view.keyring }
@@ -660,11 +663,15 @@ final class NodeModel: ObservableObject {
                 }
                 if outcome?.operation == "" { outcome = nil }
                 try await client.subscribe(listener: Listener(model: self))
+                guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
                 lastRead.removeAll()
                 await refresh()
+                guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
                 await reconcileUnread()
+                guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             }
         } catch {
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             daemonReachable = false
             machineStateKnown = false
             nodeObservationEpoch = UUID()
@@ -672,9 +679,14 @@ final class NodeModel: ObservableObject {
             reportBackground(error)
             return
         }
-        if let keyring = try? await client.trustList(), keyring != trusted { trusted = keyring }
-        if let waiting = try? await client.pendingOffers(), waiting != offers { offers = waiting }
+        let currentTrust = try? await client.trustList()
+        guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+        if let currentTrust, currentTrust != trusted { trusted = currentTrust }
+        let currentOffers = try? await client.pendingOffers()
+        guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+        if let currentOffers, currentOffers != offers { offers = currentOffers }
         await readRoomAsks()
+        guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
         // Each room counts the offers from its members (K-15), shown in it.
         for i in rooms.indices {
             let here = offers.filter { $0.rooms.contains { $0.id == rooms[i].id } }
