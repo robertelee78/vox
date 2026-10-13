@@ -519,7 +519,13 @@ impl Router {
                 Some(Slot::Attached(a)) if a.generation == g.generation => {
                     g.info = self.grant(node, a, Want::Explicit(keep)).info;
                 }
-                _ => return Err(Refusal::NotAttached { node: node.clone() }),
+                _ => {
+                    return Err(Refusal::Failed {
+                        node: node.clone(),
+                        why: "its work ended before the unlock could be remembered; try again"
+                            .into(),
+                    })
+                }
             }
         }
         self.write_attach_file_held(None, was)
@@ -994,9 +1000,9 @@ impl Router {
             .account
             .node_paths(node)
             .map_err(|e| failed(e.to_string()))?;
-        let handle = self
-            .handle_of(node)
-            .ok_or_else(|| Refusal::NotAttached { node: node.clone() })?;
+        let handle = self.handle_of(node).ok_or_else(|| {
+            failed("its work is not running; try again when the node is Ready".into())
+        })?;
         vox_core::node::link::b32_decode(room, "room").map_err(|e| failed(e.to_string()))?;
         let before = crate::wake::store_room(&paths, session, room)
             .ok_or_else(|| failed(format!("no session {session} is registered")))?;
@@ -1013,7 +1019,9 @@ impl Router {
                 .nodes()
                 .into_iter()
                 .find(|n| n.name == *node)
-                .ok_or_else(|| Refusal::NotAttached { node: node.clone() })?,
+                .ok_or_else(|| {
+                    failed("its record disappeared before the session could be moved".into())
+                })?,
             room: Some(room.to_owned()),
             new: false,
             joining,
@@ -1914,7 +1922,10 @@ impl Router {
                     return if matches!(cause, DetachCause::Requested) {
                         Ok(()) // Lock is already satisfied; its verified protected identity is stopped.
                     } else {
-                        Err(Refusal::NotAttached { node: node.clone() })
+                        Err(Refusal::Failed {
+                            node: node.clone(),
+                            why: "its work was already stopped".into(),
+                        })
                     };
                 }
             }
