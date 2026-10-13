@@ -1342,6 +1342,16 @@ fn a_link_card_is_fetched_by_the_senders_node_alone() {
         "THREAD-LATE-REPLY",
     ];
     let queued = thread_post(bob, &args);
+    let explicit_args = [
+        "--re",
+        &late_parent,
+        "--thread",
+        &late_parent,
+        "--op",
+        "thread-explicit-retry-753",
+        "THREAD-EXPLICIT-LATE-REPLY",
+    ];
+    let explicit_queued = thread_post(bob, &explicit_args);
     drop(frozen);
     support::until(
         bob,
@@ -1359,6 +1369,8 @@ fn a_link_card_is_fetched_by_the_senders_node_alone() {
         queued,
         "PRODUCT: the same --op reply must stay a retry when its previously missing parent arrives"
     );
+    assert_eq!(thread_post(bob, &explicit_args), explicit_queued,
+               "PRODUCT: an identical explicit --thread retry must keep its original entry after the parent arrives");
     let after = bob.vox(None, &["room", "read", &room, "--json"]);
     let rows = after.expect_ok("read the retried reply").ndjson();
     let replies: Vec<_> = rows

@@ -615,28 +615,41 @@ pub(crate) async fn post_structured(
         opts.urgent,
     )
     .await?;
-    let mut thread = match (known_thread, &opts.thread) {
-        (Some(root), Some(explicit)) if !root.eq_ignore_ascii_case(explicit.trim()) => {
-            return Err(AppError::Usage(format!(
-                "--thread {explicit} contradicts the message being replied to: its thread is {root}"
-            )));
-        }
-        (Some(root), _) => Some(root),
-        (None, Some(explicit)) => Some(explicit.clone()),
-        (None, None) => re.clone(),
-    };
     // An operation keeps the root its first post used even if a missing parent arrives, or
-    // retention removes one, before a retry. Only the automatic root is inherited: a changed
-    // --re or explicit --thread still goes through the normal semantic conflict/refusal checks.
-    if re.is_some() && opts.thread.is_none() {
-        if let Some(prior) = coord::op_group(&mut client, cid, &op)
+    // retention removes one, before a retry. Changed --re/--thread still goes through normal
+    // refusal and semantic conflict checks; post_once checks every other semantic field.
+    let prior = if re.is_some() {
+        coord::op_group(&mut client, cid, &op)
             .await?
             .into_iter()
             .find(|p| p.author == snap.me && p.envelope.re == re)
-        {
-            thread = prior.envelope.thread;
+    } else {
+        None
+    };
+    let retry_thread = prior
+        .filter(|p| {
+            opts.thread.as_deref().is_none_or(|explicit| {
+                p.envelope
+                    .thread
+                    .as_deref()
+                    .is_some_and(|old| old.eq_ignore_ascii_case(explicit.trim()))
+            })
+        })
+        .map(|p| p.envelope.thread);
+    let thread = if let Some(original) = retry_thread {
+        original
+    } else {
+        match (known_thread, &opts.thread) {
+            (Some(root), Some(explicit)) if !root.eq_ignore_ascii_case(explicit.trim()) => {
+                return Err(AppError::Usage(format!(
+                    "--thread {explicit} contradicts the message being replied to: its thread is {root}"
+                )));
+            }
+            (Some(root), _) => Some(root),
+            (None, Some(explicit)) => Some(explicit.clone()),
+            (None, None) => re.clone(),
         }
-    }
+    };
     let draft = Draft {
         kind,
         to,
