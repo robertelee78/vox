@@ -9,6 +9,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var app: AppModel
+    @State private var showingComputers = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s20) {
@@ -70,6 +71,12 @@ struct SettingsView: View {
                         .accessibilityIdentifier("settings-update-said")
                 }
             }
+            setting {
+                Button("Add Computer…") { showingComputers = true }
+                    .accessibilityIdentifier("settings-add-computer")
+            } said: {
+                Text("Trust the nodes on your computers together, or keep choosing individual nodes.")
+            }
             if let node = app.node { DaemonLogSetting(node: node) }
             setting {
                 Picker("Conversation text size", selection: Binding(
@@ -89,6 +96,7 @@ struct SettingsView: View {
         .padding(Space.s24)
         .frame(width: Theme.scaled(460), alignment: .topLeading)
         .contentSurface()
+        .sheet(isPresented: $showingComputers) { ComputerTrustView() }
     }
 
     /// One setting: its control, then what it does in secondary text.

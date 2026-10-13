@@ -1678,6 +1678,21 @@ impl VoxClient {
         })
     }
 
+    async fn computer_request(
+        &self,
+        request: DaemonRequest,
+    ) -> Result<crate::ComputerStatus, VoxError> {
+        match self.daemon(request).await? {
+            DaemonFrame::ComputerStatus(json) => {
+                serde_json::from_str::<vox_core::node::computer::ComputerStatus>(&json)
+                    .map(Into::into)
+                    .map_err(|_| failed("the daemon's computer status could not be read"))
+            }
+            DaemonFrame::ComputerFailed(why) => Err(failed(why)),
+            _ => Err(failed("the daemon did not answer computer management")),
+        }
+    }
+
     /// Run `fut` on the client's runtime and await it from the caller's executor.
     async fn on_rt<T, F>(&self, fut: F) -> Result<T, VoxError>
     where
@@ -1870,6 +1885,49 @@ impl VoxClient {
     #[must_use]
     pub fn config_dir(&self) -> String {
         self.config_dir.to_string_lossy().into_owned()
+    }
+
+    /// Read daemon-wide computer trust without selecting or unlocking a chat node.
+    pub async fn computer_status(&self) -> Result<crate::ComputerStatus, VoxError> {
+        self.computer_request(DaemonRequest::ComputerStatus).await
+    }
+    /// Produce one expiring invitation for an operator.
+    pub async fn begin_computer_pairing(&self) -> Result<crate::ComputerStatus, VoxError> {
+        vox_core::node::computer::operator_only().map_err(|e| failed(e.to_string()))?;
+        self.computer_request(DaemonRequest::ComputerBegin).await
+    }
+    /// Authenticate a peer before the app displays its approval choice.
+    pub async fn preview_computer_pairing(
+        &self,
+        link: String,
+    ) -> Result<crate::ComputerStatus, VoxError> {
+        vox_core::node::computer::operator_only().map_err(|e| failed(e.to_string()))?;
+        self.computer_request(DaemonRequest::ComputerPreview {
+            link: zeroize::Zeroizing::new(link),
+        })
+        .await
+    }
+    /// Approve exactly the authenticated preview the person saw.
+    pub async fn approve_computer_pairing(
+        &self,
+        operation_id: String,
+    ) -> Result<crate::ComputerStatus, VoxError> {
+        vox_core::node::computer::operator_only().map_err(|e| failed(e.to_string()))?;
+        self.computer_request(DaemonRequest::ComputerApprove {
+            operation: operation_id,
+        })
+        .await
+    }
+    /// Cancel an uncommitted invitation or preview.
+    pub async fn cancel_computer_pairing(
+        &self,
+        operation_id: String,
+    ) -> Result<crate::ComputerStatus, VoxError> {
+        vox_core::node::computer::operator_only().map_err(|e| failed(e.to_string()))?;
+        self.computer_request(DaemonRequest::ComputerCancel {
+            operation: operation_id,
+        })
+        .await
     }
 
     /// The nodes on this machine, as the daemon lists them.

@@ -6,7 +6,7 @@
 //! reads from. It is a request/response protocol on one bi-stream typed
 //! [`StreamKind::Rendezvous`]: length-prefixed canonical-CBOR frames
 //! ([`crate::transport::framing`]), each request answered in order, the client
-//! half-closing when done. Two requests:
+//! half-closing when done. The room-board requests:
 //!
 //! - **`PUT <record>`** for any of the three record kinds — member address
 //!   (`0x0007`), pre-join (`0x0008`), member bundle (`0x0012`) — identified by the
@@ -25,6 +25,11 @@
 //!   parsed-but-unverified: a member verifies them against its membership view
 //!   and a joiner against the fingerprint it was given out of band.
 //!
+//! Computer managers use this same authenticated stream to register, redeem, revoke and
+//! query a bounded pair-specific transport capability. These entries are ephemeral, separate
+//! from room records, and confer neither room membership nor computer trust. After an anchor
+//! restarts the managers re-register retained credentials; ordinary direct reach is independent.
+//!
 //! Frames are capped at [`MAX_RENDEZVOUS_FRAME`] (measured: a member bundle
 //! record with a full one-time prekey is 18 084 bytes, a pre-join record with
 //! eight IPv6 endpoints 20 211; the hard bundle cap is
@@ -34,14 +39,18 @@
 //! ([`wire_error_for`]); a record it can parse but must refuse is answered, not
 //! reset, because refusal is the protocol's normal outcome.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+use subtle::ConstantTimeEq;
 
 use quinn::{RecvStream, SendStream};
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::governance::genesis::Genesis;
-use crate::hash::Digest32;
+use crate::hash::{sha256_concat, Digest32};
 use crate::identity::composite::CompositePublicKey;
 use crate::log::sync::wire_error_for;
 use crate::nat::record::{
@@ -111,8 +120,40 @@ impl RecordKinds {
 }
 
 /// A client → server request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum RendezvousRequest {
+    /// Register this authenticated computer's bounded transport invitation, never room authority.
+    ComputerRegister {
+        /// Anchor identity to which this registration is bound.
+        anchor: Digest32,
+        /// Stable random registration identifier, retained by the computer.
+        registration: Digest32,
+        /// Domain-separated hash of the independent transport token.
+        verifier: Digest32,
+        /// Absolute expiry, bounded by the anchor's current clock.
+        expires_ms: u64,
+        /// Established counterpart, or the first authenticated redeemer for an invitation.
+        peer: Option<Digest32>,
+    },
+    /// Prove the independent transport token as this connection's authenticated identity.
+    ComputerRedeem {
+        /// The registered inviter, and the only destination this token authorizes.
+        owner: Digest32,
+        /// Exact registration.
+        registration: Digest32,
+        /// Secret transport capability, never the pairing PAKE secret.
+        token: Digest32,
+    },
+    /// Cancel this authenticated computer's registration, including live capability relays.
+    ComputerRevoke {
+        /// Exact registration to revoke; absent is an idempotent success.
+        registration: Digest32,
+    },
+    /// Read only this authenticated owner's current redeemed counterpart.
+    ComputerPeer {
+        /// Exact registration owned by the caller.
+        registration: Digest32,
+    },
     /// Publish one framed record (`0x0007`, `0x0008` or `0x0012`).
     Put {
         /// The record's wire bytes (its struct tag says which kind).
@@ -127,6 +168,34 @@ pub enum RendezvousRequest {
         /// The kinds wanted.
         kinds: RecordKinds,
     },
+}
+
+impl std::fmt::Debug for RendezvousRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Put { record } => f.debug_struct("Put").field("record", record).finish(),
+            Self::Get {
+                channel_id,
+                epoch,
+                kinds,
+            } => f
+                .debug_struct("Get")
+                .field("channel_id", channel_id)
+                .field("epoch", epoch)
+                .field("kinds", kinds)
+                .finish(),
+            Self::ComputerRegister { .. } => f.write_str("ComputerRegister(<redacted>)"),
+            Self::ComputerRedeem { .. } => f.write_str("ComputerRedeem(<redacted>)"),
+            Self::ComputerPeer { registration } => f
+                .debug_struct("ComputerPeer")
+                .field("registration", registration)
+                .finish(),
+            Self::ComputerRevoke { registration } => f
+                .debug_struct("ComputerRevoke")
+                .field("registration", registration)
+                .finish(),
+        }
+    }
 }
 
 /// Why the server refused a `PUT` — closed and coded, never free text.
@@ -209,21 +278,59 @@ pub enum RendezvousResponse {
     Record(Vec<u8>),
     /// End of a `GET` reply.
     End,
+    /// Exact redeemed counterpart, absent until redemption or after expiry/revocation.
+    ComputerPeer(Option<Digest32>),
 }
 
 const OP_PUT: u64 = 1;
 const OP_GET: u64 = 2;
+const OP_COMPUTER_REGISTER: u64 = 3;
+const OP_COMPUTER_REDEEM: u64 = 4;
+const OP_COMPUTER_REVOKE: u64 = 5;
+const OP_COMPUTER_PEER: u64 = 6;
 const OP_ACCEPTED: u64 = 1;
 const OP_REJECTED: u64 = 2;
 const OP_RECORD: u64 = 3;
 const OP_END: u64 = 4;
 
 impl RendezvousRequest {
-    /// Canonical frame: `[1, record]` or `[2, channel_id, epoch, kinds]`.
+    /// Canonical room-board requests (1–2) and scoped computer transport requests (3–6).
     #[must_use]
     pub fn to_frame(&self) -> Vec<u8> {
-        let mut e = Encoder::new();
+        let mut e = Encoder::for_secrets();
         match self {
+            Self::ComputerRegister {
+                anchor,
+                registration,
+                verifier,
+                expires_ms,
+                peer,
+            } => {
+                e.array(6)
+                    .uint(OP_COMPUTER_REGISTER)
+                    .bytes(anchor)
+                    .bytes(registration)
+                    .bytes(verifier)
+                    .uint(*expires_ms)
+                    .bytes(peer.as_ref().map_or(&[][..], |p| &p[..]));
+            }
+            Self::ComputerRedeem {
+                owner,
+                registration,
+                token,
+            } => {
+                e.array(4)
+                    .uint(OP_COMPUTER_REDEEM)
+                    .bytes(owner)
+                    .bytes(registration)
+                    .bytes(token);
+            }
+            Self::ComputerPeer { registration } => {
+                e.array(2).uint(OP_COMPUTER_PEER).bytes(registration);
+            }
+            Self::ComputerRevoke { registration } => {
+                e.array(2).uint(OP_COMPUTER_REVOKE).bytes(registration);
+            }
             Self::Put { record } => {
                 e.array(2).uint(OP_PUT).bytes(record);
             }
@@ -242,12 +349,55 @@ impl RendezvousRequest {
         e.finish()
     }
 
+    fn clear_transport_secret(&mut self) {
+        if let Self::ComputerRedeem { token, .. } = self {
+            zeroize::Zeroize::zeroize(token);
+        }
+    }
+
     /// Parse a request frame.
     pub fn from_frame(frame: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(frame);
         let n = d.array()?;
         let op = d.uint()?;
+        let id = |d: &mut Decoder<'_>| -> Result<Digest32> {
+            d.bytes()?
+                .try_into()
+                .map_err(|_| Error::MalformedRendezvous("computer transport identity length"))
+        };
         let req = match (op, n) {
+            (OP_COMPUTER_REGISTER, 6) => {
+                let anchor = id(&mut d)?;
+                let registration = id(&mut d)?;
+                let verifier = id(&mut d)?;
+                let expires_ms = d.uint()?;
+                let bytes = d.bytes()?;
+                let peer = if bytes.is_empty() {
+                    None
+                } else {
+                    Some(bytes.try_into().map_err(|_| {
+                        Error::MalformedRendezvous("computer transport peer length")
+                    })?)
+                };
+                Self::ComputerRegister {
+                    anchor,
+                    registration,
+                    verifier,
+                    expires_ms,
+                    peer,
+                }
+            }
+            (OP_COMPUTER_REDEEM, 4) => Self::ComputerRedeem {
+                owner: id(&mut d)?,
+                registration: id(&mut d)?,
+                token: id(&mut d)?,
+            },
+            (OP_COMPUTER_PEER, 2) => Self::ComputerPeer {
+                registration: id(&mut d)?,
+            },
+            (OP_COMPUTER_REVOKE, 2) => Self::ComputerRevoke {
+                registration: id(&mut d)?,
+            },
             (OP_PUT, 2) => Self::Put {
                 record: d.bytes()?.to_vec(),
             },
@@ -272,11 +422,16 @@ impl RendezvousRequest {
 }
 
 impl RendezvousResponse {
-    /// Canonical frame: `[1]`, `[2, reason]`, `[3, record]` or `[4]`.
+    /// Canonical board response (1–4), or exact registered computer peer (6).
     #[must_use]
     pub fn to_frame(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         match self {
+            Self::ComputerPeer(peer) => {
+                e.array(2)
+                    .uint(OP_COMPUTER_PEER)
+                    .bytes(peer.as_ref().map_or(&[][..], |p| p.as_slice()));
+            }
             Self::Accepted => {
                 e.array(1).uint(OP_ACCEPTED);
             }
@@ -299,6 +454,16 @@ impl RendezvousResponse {
         let n = d.array()?;
         let op = d.uint()?;
         let resp = match (op, n) {
+            (OP_COMPUTER_PEER, 2) => {
+                let bytes = d.bytes()?;
+                Self::ComputerPeer(if bytes.is_empty() {
+                    None
+                } else {
+                    Some(bytes.try_into().map_err(|_| {
+                        Error::MalformedRendezvous("computer transport peer length")
+                    })?)
+                })
+            }
             (OP_ACCEPTED, 1) => Self::Accepted,
             (OP_REJECTED, 2) => {
                 let v = u8::try_from(d.uint()?)
@@ -392,6 +557,61 @@ impl AnchorRooms {
 /// node installs one that turns the call into an event on its actor's queue.
 pub type AdmittedHook = Arc<dyn Fn(Digest32) + Send + Sync>;
 
+/// Maximum life of one transport registration. Established pairs renew the same exact record;
+/// invitation approval expiry is independently enforced by the computer ceremony.
+pub const COMPUTER_TRANSPORT_TTL_MS: u64 = 600_000;
+const MAX_COMPUTER_REGISTRATIONS: usize = 256;
+const MAX_COMPUTER_REGISTRATIONS_PER_OWNER: usize = 4;
+const MAX_COMPUTER_REGISTRATIONS_PER_SOURCE: usize = 16;
+
+struct ComputerRegistration {
+    verifier: Digest32,
+    peer: Option<Digest32>,
+    redeemed: bool,
+    expires_ms: u64,
+    source: Source,
+    expiry: tokio::sync::watch::Sender<Option<u64>>,
+}
+
+/// A pair-specific transport permit. Revocation/expiry ends its live relays; renewal of the
+/// same authenticated pair extends them. It is not room membership or computer trust.
+pub struct ComputerTransportPermit {
+    expiry: tokio::sync::watch::Receiver<Option<u64>>,
+    clock: Clock,
+}
+impl ComputerTransportPermit {
+    /// Wait until the exact capability expires, is revoked, or its anchor state disappears.
+    pub async fn revoked(mut self) {
+        loop {
+            let until = *self.expiry.borrow_and_update();
+            let Some(until) = until else { return };
+            let remaining = until.saturating_sub((self.clock)());
+            if remaining == 0 {
+                return;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(remaining)) => {},
+                changed = self.expiry.changed() => { if changed.is_err() { return; } },
+            }
+        }
+    }
+}
+
+fn computer_verifier(
+    anchor: &Digest32,
+    owner: &Digest32,
+    registration: &Digest32,
+    token: &Digest32,
+) -> Digest32 {
+    sha256_concat(&[
+        b"vox/computer-transport/v1\0",
+        anchor,
+        owner,
+        registration,
+        token,
+    ])
+}
+
 /// The server side: a [`RendezvousStore`] behind a lock, the membership oracle
 /// and a clock. Clone-cheap (`Arc`s) so one service serves every connection.
 #[derive(Clone)]
@@ -405,6 +625,8 @@ pub struct RendezvousService {
     withdrawn: Option<AdmittedHook>,
     /// See [`RendezvousService::serve_rooms`].
     rooms: AnchorRooms,
+    computer_anchor: Option<Digest32>,
+    computer_registrations: Arc<Mutex<BTreeMap<(Digest32, Digest32), ComputerRegistration>>>,
 }
 
 /// Whether a record by `author` that the board took credits its room to the source it came from
@@ -439,6 +661,8 @@ impl RendezvousService {
             admitted: None,
             withdrawn: None,
             rooms: AnchorRooms::Held,
+            computer_anchor: None,
+            computer_registrations: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -453,6 +677,17 @@ impl RendezvousService {
     /// node's status. A node that holds rooms files their geneses itself (see
     /// [`RendezvousService::handle_local`]); a peer never needs to give it one.
     pub fn serve_rooms(&mut self, rooms: AnchorRooms) {
+        lock(&self.computer_registrations).retain(|(owner, _), record| {
+            let permitted = match &rooms {
+                AnchorRooms::Anyone => true,
+                AnchorRooms::CreatedBy(identities) => identities.contains(owner),
+                AnchorRooms::Held => false,
+            };
+            if !permitted {
+                record.expiry.send_replace(None);
+            }
+            permitted
+        });
         self.rooms = rooms;
     }
 
@@ -460,6 +695,149 @@ impl RendezvousService {
     #[must_use]
     pub fn may_anchor(&self, genesis: &Genesis) -> bool {
         self.rooms.may_anchor(genesis)
+    }
+
+    /// Bind transport registrations to this authenticated network identity.
+    pub(crate) fn computer_anchor(&mut self, identity: Digest32) {
+        self.computer_anchor = Some(identity);
+    }
+
+    /// Whether this identity may open a circuit stream for its already-redeemed pair.
+    /// The circuit's destination is still checked separately, and no other stream is admitted.
+    pub(crate) fn computer_transport_peer(&self, peer: &Digest32) -> bool {
+        let now = (self.clock)();
+        lock(&self.computer_registrations)
+            .iter()
+            .any(|((owner, _), r)| {
+                r.expires_ms > now && r.redeemed && (owner == peer || r.peer.as_ref() == Some(peer))
+            })
+    }
+
+    /// Only the exact authenticated owner and redeemer may use this alternative relay gate.
+    pub(crate) fn computer_transport(
+        &self,
+        a: &Digest32,
+        b: &Digest32,
+    ) -> Option<ComputerTransportPermit> {
+        let now = (self.clock)();
+        lock(&self.computer_registrations)
+            .iter()
+            .find_map(|((owner, _), r)| {
+                (r.expires_ms > now
+                    && r.redeemed
+                    && ((owner == a && r.peer.as_ref() == Some(b))
+                        || (owner == b && r.peer.as_ref() == Some(a))))
+                .then(|| ComputerTransportPermit {
+                    expiry: r.expiry.subscribe(),
+                    clock: Arc::clone(&self.clock),
+                })
+            })
+    }
+
+    fn computer_request(
+        &self,
+        publisher: Option<&Digest32>,
+        source: Option<Source>,
+        request: &RendezvousRequest,
+    ) -> std::result::Result<(), RejectReason> {
+        let owner = *publisher.ok_or(RejectReason::Policy)?;
+        let anchor = self.computer_anchor.ok_or(RejectReason::Policy)?;
+        let now = (self.clock)();
+        let mut records = lock(&self.computer_registrations);
+        records.retain(|_, r| {
+            if r.expires_ms <= now {
+                r.expiry.send_replace(None);
+                false
+            } else {
+                true
+            }
+        });
+        match request {
+            RendezvousRequest::ComputerRegister {
+                anchor: expected,
+                registration,
+                verifier,
+                expires_ms,
+                peer,
+            } => {
+                let permitted = match &self.rooms {
+                    AnchorRooms::Anyone => true,
+                    AnchorRooms::CreatedBy(identities) => identities.contains(&owner),
+                    AnchorRooms::Held => false,
+                };
+                if !permitted
+                    || *expected != anchor
+                    || peer.as_ref() == Some(&owner)
+                    || *expires_ms <= now
+                    || *expires_ms > now.saturating_add(COMPUTER_TRANSPORT_TTL_MS)
+                {
+                    return Err(RejectReason::Policy);
+                }
+                if let Some(r) = records.get_mut(&(owner, *registration)) {
+                    if !bool::from(r.verifier.ct_eq(verifier))
+                        || (r.peer.is_some() && peer.is_some() && r.peer != *peer)
+                    {
+                        return Err(RejectReason::Policy);
+                    }
+                    if r.peer.is_none() {
+                        r.peer = *peer;
+                    }
+                    r.expires_ms = *expires_ms;
+                    r.expiry.send_replace(Some(*expires_ms));
+                    return Ok(());
+                }
+                let source = source.ok_or(RejectReason::Policy)?;
+                if records.len() >= MAX_COMPUTER_REGISTRATIONS
+                    || records.keys().filter(|(id, _)| *id == owner).count()
+                        >= MAX_COMPUTER_REGISTRATIONS_PER_OWNER
+                    || records
+                        .values()
+                        .filter(|r| r.source.level(0) == source.level(0))
+                        .count()
+                        >= MAX_COMPUTER_REGISTRATIONS_PER_SOURCE
+                {
+                    return Err(RejectReason::Capacity);
+                }
+                records.insert(
+                    (owner, *registration),
+                    ComputerRegistration {
+                        verifier: *verifier,
+                        peer: *peer,
+                        redeemed: false,
+                        expires_ms: *expires_ms,
+                        source,
+                        expiry: tokio::sync::watch::channel(Some(*expires_ms)).0,
+                    },
+                );
+                Ok(())
+            }
+            RendezvousRequest::ComputerRedeem {
+                owner: target,
+                registration,
+                token,
+            } => {
+                if owner == *target {
+                    return Err(RejectReason::Policy);
+                }
+                let r = records
+                    .get_mut(&(*target, *registration))
+                    .ok_or(RejectReason::Policy)?;
+                let verifier = computer_verifier(&anchor, target, registration, token);
+                if !bool::from(r.verifier.ct_eq(&verifier)) || r.peer.is_some_and(|p| p != owner) {
+                    return Err(RejectReason::Policy);
+                }
+                r.peer = Some(owner);
+                r.redeemed = true;
+                Ok(())
+            }
+            RendezvousRequest::ComputerRevoke { registration } => {
+                if let Some(r) = records.remove(&(owner, *registration)) {
+                    r.expiry.send_replace(None);
+                }
+                Ok(())
+            }
+            _ => Err(RejectReason::Malformed),
+        }
     }
 
     /// Be told when a record by an author **other than this node** is admitted.
@@ -523,6 +901,24 @@ impl RendezvousService {
     ) -> Vec<RendezvousResponse> {
         let now = (self.clock)();
         match request {
+            RendezvousRequest::ComputerPeer { registration } => {
+                let Some(owner) = publisher else {
+                    return vec![RendezvousResponse::Rejected(RejectReason::Policy)];
+                };
+                let peer = lock(&self.computer_registrations)
+                    .get(&(*owner, *registration))
+                    .filter(|r| r.expires_ms > now && r.redeemed)
+                    .and_then(|r| r.peer);
+                vec![RendezvousResponse::ComputerPeer(peer)]
+            }
+            RendezvousRequest::ComputerRegister { .. }
+            | RendezvousRequest::ComputerRedeem { .. }
+            | RendezvousRequest::ComputerRevoke { .. } => {
+                vec![match self.computer_request(publisher, source, request) {
+                    Ok(()) => RendezvousResponse::Accepted,
+                    Err(reason) => RendezvousResponse::Rejected(reason),
+                }]
+            }
             RendezvousRequest::Put { record } => {
                 vec![match self.put(publisher, source, record, now, local) {
                     Ok(()) => RendezvousResponse::Accepted,
@@ -883,14 +1279,17 @@ impl RendezvousService {
                     return Err(e);
                 }
             };
-            let request = match RendezvousRequest::from_frame(&frame) {
+            let frame = zeroize::Zeroizing::new(frame);
+            let mut request = match RendezvousRequest::from_frame(&frame) {
                 Ok(r) => r,
                 Err(e) => {
                     reset(&mut send, &mut recv, &e);
                     return Err(e);
                 }
             };
-            for response in self.handle(Some(&publisher), Some(source), &request) {
+            let responses = self.handle(Some(&publisher), Some(source), &request);
+            request.clear_transport_secret();
+            for response in responses {
                 if let Err(e) = write_frame(&mut send, &response.to_frame()).await {
                     reset(&mut send, &mut recv, &e);
                     return Err(e);
@@ -925,6 +1324,79 @@ impl RendezvousClient {
             .await?
             .ok_or(Error::MalformedRendezvous("rendezvous stream closed early"))?;
         RendezvousResponse::from_frame(&frame)
+    }
+
+    /// Register/renew only this authenticated connection's computer identity at this anchor.
+    pub async fn register_computer_transport(
+        &mut self,
+        anchor: Digest32,
+        owner: Digest32,
+        registration: Digest32,
+        token: &Digest32,
+        expires_ms: u64,
+        peer: Option<Digest32>,
+    ) -> Result<()> {
+        self.computer_transport_request(RendezvousRequest::ComputerRegister {
+            anchor,
+            registration,
+            verifier: computer_verifier(&anchor, &owner, &registration, token),
+            expires_ms,
+            peer,
+        })
+        .await
+    }
+
+    /// Redeem the separate transport secret for exactly the registered owner.
+    pub async fn redeem_computer_transport(
+        &mut self,
+        owner: Digest32,
+        registration: Digest32,
+        token: &Digest32,
+    ) -> Result<()> {
+        self.computer_transport_request(RendezvousRequest::ComputerRedeem {
+            owner,
+            registration,
+            token: *token,
+        })
+        .await
+    }
+
+    /// Revoke this authenticated connection's own registration and any relays using it.
+    pub async fn revoke_computer_transport(&mut self, registration: Digest32) -> Result<()> {
+        self.computer_transport_request(RendezvousRequest::ComputerRevoke { registration })
+            .await
+    }
+
+    /// Read the counterpart of this connection's own registration, never another owner's.
+    pub async fn computer_transport_peer(
+        &mut self,
+        registration: Digest32,
+    ) -> Result<Option<Digest32>> {
+        write_frame(
+            &mut self.send,
+            &RendezvousRequest::ComputerPeer { registration }.to_frame(),
+        )
+        .await?;
+        match self.next_response().await? {
+            RendezvousResponse::ComputerPeer(peer) => Ok(peer),
+            RendezvousResponse::Rejected(r) => Err(Error::RendezvousRejected(r.as_str())),
+            _ => Err(Error::MalformedRendezvous(
+                "computer transport: unexpected peer response",
+            )),
+        }
+    }
+
+    async fn computer_transport_request(&mut self, mut request: RendezvousRequest) -> Result<()> {
+        let bytes = zeroize::Zeroizing::new(request.to_frame());
+        request.clear_transport_secret();
+        write_frame(&mut self.send, &bytes).await?;
+        match self.next_response().await? {
+            RendezvousResponse::Accepted => Ok(()),
+            RendezvousResponse::Rejected(r) => Err(Error::RendezvousRejected(r.as_str())),
+            _ => Err(Error::MalformedRendezvous(
+                "computer transport: unexpected response",
+            )),
+        }
     }
 
     /// Publish one framed record. A refusal surfaces as
