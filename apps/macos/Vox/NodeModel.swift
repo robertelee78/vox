@@ -529,6 +529,7 @@ final class NodeModel: ObservableObject {
         guard case let .room(id) = selection, ended == nil else { return }
         let generation = roomReadGeneration
         let messageRevision = roomMessageRevision
+        let loaded = messages.map(\.id)
         do {
             let rows: [RoomMessage]
             var recovery: FfiRoomRead?
@@ -538,12 +539,12 @@ final class NodeModel: ObservableObject {
                 } catch where Self.rejectedForwardMark(error) {
                     guard generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
                     rejectedRoomMark = after
-                    let page = try await client.roomRead(room: id)
+                    let page = try await client.roomReadRetaining(room: id, loaded: loaded)
                     rows = page.messages
                     recovery = page
                 }
             } else {
-                let page = try await client.roomRead(room: id)
+                let page = try await client.roomReadRetaining(room: id, loaded: loaded)
                 rows = page.messages
                 recovery = page
             }

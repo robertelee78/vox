@@ -2160,6 +2160,75 @@ impl VoxClient {
         self.room_page_read(room, None).await
     }
 
+    /// Reanchor a room while retaining the history extent already loaded by its reader.
+    /// Missing captured entries are pruned; a refused lookup keeps its own error. No cached
+    /// message body is reused: all returned rows come from authoritative history pages.
+    pub async fn room_read_retaining(
+        &self,
+        room: String,
+        loaded: Vec<String>,
+    ) -> Result<FfiRoomRead, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let entries = loaded
+            .iter()
+            .map(|id| digest(id, "entry"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let boundary = on_held!(self, |c| {
+            let mut boundary = None;
+            for chunk in entries.chunks(vox_core::node::ipc::MAX_FIND) {
+                let rows = match ask(
+                    c,
+                    &Request::Find {
+                        channel_id,
+                        entries: chunk.to_vec(),
+                    },
+                )
+                .await?
+                {
+                    Frame::Rows { rows } => rows,
+                    other => return Err(unexpected(&other)),
+                };
+                if let Some(id) = chunk
+                    .iter()
+                    .find(|id| rows.iter().any(|r| r.entry_hash == **id))
+                {
+                    boundary = Some(b32_encode(id));
+                    break;
+                }
+            }
+            Ok(boundary)
+        })?;
+        let mut page = self.room_read(room.clone()).await?;
+        if let Some(boundary) = boundary {
+            let mut cursors = std::collections::HashSet::new();
+            while !page.messages.iter().any(|row| row.id == boundary) {
+                let Some(before) = page.before.clone() else {
+                    break;
+                };
+                if !cursors.insert(before.clone()) {
+                    return Err(VoxError::Failed {
+                        reason: "Room history did not advance while recovering its page.".into(),
+                    });
+                }
+                let older = self.room_read_older(room.clone(), before).await?;
+                let held: std::collections::HashSet<_> =
+                    page.messages.iter().map(|row| row.id.clone()).collect();
+                let mut rows: Vec<_> = older
+                    .messages
+                    .into_iter()
+                    .filter(|row| !held.contains(&row.id))
+                    .collect();
+                rows.extend(page.messages);
+                page = FfiRoomRead {
+                    messages: rows,
+                    older: older.older,
+                    before: older.before,
+                };
+            }
+        }
+        Ok(page)
+    }
+
     /// Load the room-history page before `before`, when the person scrolls up (ADR-034 FR-4).
     ///
     /// # Errors
