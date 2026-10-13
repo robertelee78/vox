@@ -154,7 +154,7 @@ private struct Sidebar: View {
                 ForEach(model.offers.filter { o in
                     !model.rooms.contains { r in o.rooms.contains { $0.id == r.id } }
                 }, id: \.fingerprint) { offer in
-                    OfferRow(offer: offer).tag(NodeModel.Selection.offer(offer.fingerprint))
+                    OfferRow(model: model, offer: offer).tag(NodeModel.Selection.offer(offer.fingerprint))
                         .sidebarRow(model.selection == .offer(offer.fingerprint))
                         .copyMenu([("Copy Fingerprint", offer.fingerprint)])
                 }
@@ -332,6 +332,7 @@ private struct OnThisMachine: View {
                         Button("Copy Name") { Self.copy(node.name) }
                         if !node.fingerprint.isEmpty {
                             Button("Copy Fingerprint") { Self.copy(node.fingerprint) }
+                            Button("Copy Name and Fingerprint") { Self.copy("\(node.name) <\(node.fingerprint)>") }
                         }
                         // #666: in place of printing `vox node forget-passphrase`.
                         if node.keep {

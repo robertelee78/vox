@@ -651,6 +651,12 @@ impl UiState {
             KeyCode::Enter if self.screen == Screen::ChannelList && self.offer(vm).is_some() => {
                 let member = self.offer(vm).map(|o| o.member);
                 self.start_prompt(PromptKind::AcceptOffer, member);
+                if let Mode::Prompt(prompt) = &mut self.mode {
+                    if let Some((_, name)) = vm.presented.iter().find(|(fp, _)| Some(*fp) == member)
+                    {
+                        prompt.fields[0] = Zeroizing::new(name.clone());
+                    }
+                }
                 Action::Redraw
             }
             KeyCode::Char('x')
@@ -1184,6 +1190,11 @@ impl UiState {
             return Action::Redraw;
         }
         self.start_prompt(PromptKind::Trust, Some(fp));
+        if let Mode::Prompt(prompt) = &mut self.mode {
+            if let Some((_, name)) = vm.presented.iter().find(|(id, _)| *id == fp) {
+                prompt.fields[1] = Zeroizing::new(name.clone());
+            }
+        }
         Action::Redraw
     }
 

@@ -283,6 +283,15 @@ impl MembershipOracle for SharedMembership {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Inbound {
+    /// A peer asks for identity-authenticated presentation metadata.
+    Presentation {
+        /// Authenticated requester.
+        peer: Digest32,
+        /// Reply stream.
+        send: SendStream,
+        /// Nonce request stream.
+        recv: RecvStream,
+    },
     /// A member requests a page of privately held Session records.
     Session {
         /// The authenticated peer.
@@ -910,6 +919,7 @@ impl NodeNet {
             StreamKind::Agree => Ok(Inbound::Agree { peer, send, recv }),
             StreamKind::Seat => Ok(Inbound::Seat { peer, send, recv }),
             StreamKind::Session => Ok(Inbound::Session { peer, send, recv }),
+            StreamKind::Presentation => Ok(Inbound::Presentation { peer, send, recv }),
             // Closed at the gate (`net::refuse_second_exchange`) before any stream is dispatched: one more
             // identity stream is a second exchange on one connection (ADR-011 requirement 33).
             StreamKind::Identity => Err(Error::StreamRefused(
