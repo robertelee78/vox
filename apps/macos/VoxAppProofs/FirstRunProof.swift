@@ -296,6 +296,7 @@ final class FirstRunProof: XCTestCase {
     /// Set while the proof itself has hidden or quit Vox (⌘H, ⌘Q), until Vox is active again:
     /// what takes the foreground meanwhile was handed it by the proof, not taken.
     private var handedOff = false
+    private var immutableScratchFiles: [String] = []
     /// The person's clipboard as it was before the case: every item, every type, restored exactly
     /// in tearDown, red or green (app-proofs.sh restores it too, should the runner itself die).
     private var keptPasteboard: [[NSPasteboard.PasteboardType: Data]] = []
@@ -342,6 +343,12 @@ final class FirstRunProof: XCTestCase {
     }
 
     override func tearDown() {
+        // Restore owned immutable fixtures even when XCTest stops before Swift defers run.
+        for path in immutableScratchFiles {
+            let cleared = stager.run(["/bin/chflags", "nouchg", path], env: [:])
+            if cleared.status != 0 { XCTFail("APPARATUS: cannot restore scratch attach-file flags: \(cleared.out)") }
+        }
+        immutableScratchFiles = []
         // A red stops a case without running its `defer`s (continueAfterFailure is false), so the
         // Vox it started would still run into the next case: quit here each Vox this case started.
         for ui in launched where ui.state != .notRunning { ui.terminate() }
@@ -711,6 +718,53 @@ final class FirstRunProof: XCTestCase {
         let preserved = try staged(vox, ["room", "read", "--node", "alice", room], env: voxEnv)
         XCTAssertTrue(preserved.contains("LIFECYCLE-BODY-PRESERVED"),
                       "PRODUCT: Forget and Unlock must preserve the original room body; \(preserved)")
+        // A real storage refusal after Unlock leaves live keys Ready, but must never hide
+        // the failure to remember them. Only this owned scratch attach file is immutable.
+        try staged(vox, ["node", "lock", "alice"], env: voxEnv)
+        guard words(ui, Key.id("node-stopped"), timeout: 30,
+                    "external lock must stage the initiating inline Unlock surface",
+                    until: { $0.contains("Locked") }) != nil else { return }
+        let attachFile = data + "/.daemon/attach"
+        guard stager.run(["/bin/test", "-f", attachFile], env: [:]).status == 0 else {
+            throw Apparatus("the owned scratch attach file is absent")
+        }
+        immutableScratchFiles.append(attachFile)
+        guard stager.run(["/bin/chflags", "uchg", attachFile], env: [:]).status == 0 else {
+            throw Apparatus("cannot make the owned scratch attach file immutable")
+        }
+        defer { _ = stager.run(["/bin/chflags", "nouchg", attachFile], env: [:]) }
+        let blocked = stager.run(["/usr/bin/python3", "-c",
+            "import os,sys; p=sys.argv[1]; probe=p+'.proof-probe'; open(probe,'w').write('probe')\ntry:\n os.replace(probe,p)\nexcept OSError:\n print('REPLACEMENT-BLOCKED'); sys.exit(0)\nfinally:\n if os.path.exists(probe): os.unlink(probe)\nsys.exit(1)", attachFile], env: [:])
+        guard blocked.status == 0 && blocked.out.contains("REPLACEMENT-BLOCKED") else {
+            throw Apparatus("atomic replacement refusal was not staged for the scratch attach file: \(blocked.out)")
+        }
+        type(ui, Key.id("node-stopped-passphrase"), "alice identity", "correct inline Unlock during storage refusal")
+        tap(ui, Key.id("node-stopped-attach"), "Unlock while remembering is refused")
+        let refusedRemember = try restoredNodes { nodeLine($0, "alice")?.contains("Ready") == true }
+        XCTAssertTrue(nodeLine(refusedRemember, "alice")?.contains("Ready") == true
+                      && nodeLine(refusedRemember, "alice")?.contains("(remembered)") == false,
+                      "PRODUCT: failed remembering must leave alice Ready without claiming remembered credentials; \(refusedRemember)")
+        guard words(ui, Key.id("node-stopped-unlock-error"), timeout: 30,
+                    "Ready must not hide the initiating Unlock's remembering refusal",
+                    until: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) != nil else { return }
+        guard present(ui, Key.id("node-unlock-retry"), timeout: 20,
+                      "the Ready node's remembering refusal must offer Retry Unlock") else { return }
+        let writable = stager.run(["/bin/chflags", "nouchg", attachFile], env: [:])
+        guard writable.status == 0 else { throw Apparatus("cannot restore scratch attach-file writability: \(writable.out)") }
+        immutableScratchFiles.removeAll { $0 == attachFile }
+        tap(ui, Key.id("node-unlock-retry"), "Retry Unlock after restoring writable storage")
+        guard present(ui, Key.id("attach-node-passphrase"), timeout: 20,
+                      "Ready Retry must open the same node's Unlock sheet") else { return }
+        type(ui, Key.id("attach-node-passphrase"), "alice identity", "remember alice after repairing storage")
+        tap(ui, Key.id("attach-node"), "Retry remembered Unlock")
+        guard words(ui, Key.id("attached"), timeout: 60,
+                    "Retry must leave the same alice window Ready", until: { $0 == "node alice, Ready" }) != nil else { return }
+        missingWithin(ui, Key.id("node-stopped-unlock-error"), 15,
+                      "successful Retry must retire the remembering refusal")
+        let rememberedAgain = try staged(vox, ["node", "list"], env: voxEnv)
+        XCTAssertTrue(nodeLine(rememberedAgain, "alice")?.contains("Ready") == true
+                      && nodeLine(rememberedAgain, "alice")?.contains("(remembered)") == true,
+                      "PRODUCT: repaired Retry Unlock must remember alice; \(rememberedAgain)")
         try staged(vox, ["node", "lock", "plain"], env: voxEnv)
         daemon?.terminate()
         daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
