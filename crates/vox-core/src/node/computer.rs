@@ -18,6 +18,9 @@ use crate::identity::rng::random_array;
 use crate::node::paths::{create_private_dir, write_private_file, Account};
 use zeroize::Zeroizing;
 
+mod pairing;
+pub use pairing::{ComputerIdentity, ComputerStatus, Management, PairingPreview};
+
 /// The one fixed policy, displayed before either operator approves an enrollment.
 pub const POLICY: &str = "Every managed node can read every other managed node. Each computer's selected personal node can drive the non-personal nodes. Earlier individual grants are replaced by this policy; there are no per-node exceptions. Pairing does not join rooms or change repository bindings.";
 /// Typed computer-management protocol version, checked before pairing payloads.
@@ -469,6 +472,9 @@ impl Invitation {
 
 #[derive(Clone)]
 pub(crate) struct State {
+    pub pair_link: Option<Zeroizing<String>>,
+    pub pending_expires: u64,
+    pub receipts: BTreeMap<Digest32, Signed>,
     pub vault: Vec<u8>,
     pub description: Description,
     pub revision: u64,
@@ -483,7 +489,7 @@ pub(crate) struct State {
 impl State {
     fn body(&self) -> Vec<u8> {
         let mut e = Encoder::for_secrets();
-        e.array(8)
+        e.array(11)
             .bytes(&self.description.encode())
             .uint(self.revision)
             .array(self.invitations.len());
@@ -512,12 +518,23 @@ impl State {
         for (id, r) in &self.applied {
             e.array(2).bytes(id).uint(*r);
         }
-        e.uint(PROTOCOL);
+        e.uint(PROTOCOL)
+            .text(
+                self.pair_link
+                    .as_deref()
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            )
+            .uint(self.pending_expires)
+            .array(self.receipts.len());
+        for (id, r) in &self.receipts {
+            e.array(2).bytes(id).bytes(&r.encode());
+        }
         e.finish()
     }
     fn read(vault: Vec<u8>, body: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(body);
-        arity(&mut d, 8)?;
+        arity(&mut d, 11)?;
         let description = Description::decode(d.bytes()?)?;
         let revision = d.uint()?;
         let n = count(&mut d)?;
@@ -568,8 +585,23 @@ impl State {
         if d.uint()? != PROTOCOL {
             return Err(bad());
         }
+        let link = d.text()?.to_owned();
+        let pair_link = (!link.is_empty()).then(|| Zeroizing::new(link));
+        let pending_expires = d.uint()?;
+        let n = count(&mut d)?;
+        let mut receipts = BTreeMap::new();
+        for _ in 0..n {
+            arity(&mut d, 2)?;
+            let id = digest(&mut d)?;
+            if receipts.insert(id, Signed::decode(d.bytes()?)?).is_some() {
+                return Err(bad());
+            }
+        }
         d.finish()?;
         let s = Self {
+            pair_link,
+            pending_expires,
+            receipts,
             vault,
             description,
             revision,
@@ -611,6 +643,173 @@ pub struct Computer {
     pub(crate) state: Mutex<State>,
 }
 impl Computer {
+    /// Local durable policy revision.
+    pub fn revision(&self) -> u64 {
+        lock(&self.state).revision
+    }
+
+    /// A computer with no attached nodes still has an authenticated empty roster.
+    pub fn ensure_roster(&self) -> Result<()> {
+        let Some(group) = self.binding_group() else {
+            return Ok(());
+        };
+        let local = self.signer.fingerprint();
+        self.change(|s| {
+            if let std::collections::btree_map::Entry::Vacant(slot) = s.rosters.entry(local) {
+                slot.insert(Roster::create(group, 1, &[], None, self.signer.as_ref())?);
+                s.revision = s.revision.checked_add(1).ok_or_else(bad)?;
+                s.receipts.clear();
+            }
+            Ok(())
+        })
+    }
+
+    /// The signed group whose local operator has approved management bindings.
+    pub fn binding_group(&self) -> Option<Digest32> {
+        let s = lock(&self.state);
+        let g = s.genesis.as_ref().or(s.pending.as_ref())?;
+        let at = g
+            .computers
+            .iter()
+            .position(|d| d.fingerprint().ok() == Some(self.signer.fingerprint()))?;
+        g.approvals[at].as_ref()?;
+        Some(g.incarnation())
+    }
+
+    /// Bind an already unlocked local node. The signer never crosses the daemon's actor boundary.
+    /// This does not unlock or create a node, enroll a computer, or authorize an unapproved group.
+    pub fn bind_node(&self, signer: &dyn RootSigner, name: &str, personal: bool) -> Result<()> {
+        let Some(group) = self.binding_group() else {
+            return Ok(());
+        };
+        let local = self.signer.fingerprint();
+        let key = signer.fingerprint();
+        self.change(|s| {
+            let (old_revision, old_personal, mut bindings) = match s.rosters.get(&local) {
+                Some(r) => r.read(&local, &group)?,
+                None => (0, None, Vec::new()),
+            };
+            let mut changed = false;
+            if !bindings
+                .iter()
+                .any(|b| b.verify(&local, &group).ok() == Some(key))
+            {
+                let body = Binding::body(
+                    &signer.public_key(),
+                    &self.signer.public_key(),
+                    &group,
+                    &random_array()?,
+                );
+                bindings.push(Binding {
+                    node: Signed::create(b"vox/computer-binding/v1\0", body.clone(), signer)?,
+                    computer: Signed::create(
+                        b"vox/computer-binding/v1\0",
+                        body,
+                        self.signer.as_ref(),
+                    )?,
+                    name: name.to_owned(),
+                });
+                changed = true;
+            }
+            let selection = if personal { Some(key) } else { old_personal };
+            changed |= selection != old_personal;
+            if changed {
+                bindings.sort_by_key(|b| sha256(&b.node.public));
+                s.rosters.insert(
+                    local,
+                    Roster::create(
+                        group,
+                        old_revision.checked_add(1).ok_or_else(bad)?,
+                        &bindings,
+                        selection,
+                        self.signer.as_ref(),
+                    )?,
+                );
+                s.revision = s.revision.checked_add(1).ok_or_else(bad)?;
+                s.receipts.clear();
+            }
+            Ok(())
+        })
+    }
+
+    /// Exact policy for an attached node, from verified durable rosters. No roster grants room
+    /// membership. The revision is local journal order, not a distributed membership clock.
+    pub fn plan(
+        &self,
+        node: Digest32,
+    ) -> Result<Option<(u64, Vec<(Digest32, String, crate::node::trust::Capability)>)>> {
+        let s = lock(&self.state);
+        let Some(g) = &s.genesis else {
+            return Ok(None);
+        };
+        let mut nodes = BTreeMap::new();
+        for (manager, r) in &s.rosters {
+            for b in r.read(manager, &g.incarnation())?.2 {
+                let id = b.verify(manager, &g.incarnation())?;
+                let personal = r.read(manager, &g.incarnation())?.1 == Some(id);
+                if nodes.insert(id, (b.name, personal)).is_some() {
+                    return Err(Error::Profile(
+                        "conflicting node management claims: computer policy is quarantined",
+                    ));
+                }
+            }
+        }
+        let Some((_, personal)) = nodes.get(&node) else {
+            return Err(Error::Profile(
+                "this managed node has no authenticated binding yet",
+            ));
+        };
+        let personal = *personal;
+        let plan = nodes
+            .into_iter()
+            .filter(|(id, _)| *id != node)
+            .map(|(id, (name, p))| {
+                (
+                    id,
+                    name,
+                    if !personal && p {
+                        crate::node::trust::Capability::ReadDrive
+                    } else {
+                        crate::node::trust::Capability::Read
+                    },
+                )
+            })
+            .collect();
+        Ok(Some((s.revision, plan)))
+    }
+
+    /// Is this exact local policy revision durably applied to this node's keyring?
+    pub fn applied(&self, node: &Digest32, revision: u64) -> bool {
+        lock(&self.state).applied.get(node) == Some(&revision)
+    }
+
+    /// Record application only after the actor saved the complete keyring under the ordinary
+    /// node store protection. A crash before this write repeats reconciliation before networking.
+    pub fn mark_applied(&self, node: Digest32, revision: u64) -> Result<()> {
+        self.change(|s| {
+            if s.revision != revision {
+                return Err(Error::Profile(
+                    "computer policy changed during reconciliation",
+                ));
+            }
+            s.applied.insert(node, revision);
+            Ok(())
+        })
+    }
+
+    /// The policy replaces a covered individual entry, including stronger drive. Aliases remain
+    /// local metadata. Callers use `None` only when this pair is outside computer mode.
+    pub fn capability(
+        &self,
+        node: Digest32,
+        peer: &Digest32,
+    ) -> Result<Option<crate::node::trust::Capability>> {
+        Ok(self.plan(node)?.and_then(|(_, p)| {
+            p.into_iter()
+                .find(|(id, _, _)| id == peer)
+                .map(|(_, _, c)| c)
+        }))
+    }
     /// Open or atomically create the separate unattended software vault. Corrupt, unsupported,
     /// wrongly owned or symlinked state is refused unchanged. Call outside async runtime workers.
     pub fn open(account: &Account, name: &str) -> Result<Arc<Self>> {
@@ -664,6 +863,9 @@ impl Computer {
         };
         Description::decode(&description.encode())?;
         let state = State {
+            pair_link: None,
+            pending_expires: 0,
+            receipts: BTreeMap::new(),
             vault,
             description,
             revision: 0,
@@ -705,9 +907,10 @@ impl Computer {
         let mut held = lock(&self.state);
         let mut next = held.clone();
         let value = f(&mut next)?;
-        next.revision = next.revision.checked_add(1).ok_or_else(bad)?;
-        self.save(&next)?;
-        *held = next;
+        if held.body() != next.body() {
+            self.save(&next)?;
+            *held = next;
+        }
         Ok(value)
     }
     /// Persistent authenticated installation presentation.
@@ -737,6 +940,26 @@ fn secure(path: &Path, directory: bool) -> Result<()> {
         return Err(Error::Profile(
             "computer management path must be owned by this account, private, and not a symlink",
         ));
+    }
+    Ok(())
+}
+
+impl std::fmt::Debug for Computer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Computer")
+            .field("fingerprint", &self.signer.fingerprint())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The existing operator boundary, shared by the app's FFI and the terminal pairing client.
+/// A malformed session mark still denotes an agent process. This is not OS-account isolation.
+pub fn operator_only() -> Result<()> {
+    if ["VOX_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
+    {
+        return Err(Error::Profile("computer pairing is the person's action: use your own terminal or Vox.app outside the agent session"));
     }
     Ok(())
 }

@@ -1095,6 +1095,8 @@ pub enum NodeCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Fault {
+    /// Individual permissions cannot contradict an active computer policy.
+    ComputerPolicy,
     /// The profile has no identity yet.
     NoIdentity,
     /// The profile already has an identity.
@@ -1313,6 +1315,7 @@ impl Fault {
             Fault::WrongPassphrase => {
                 "the passphrase is wrong\n       check it and type it again"
             }
+            Fault::ComputerPolicy => "trust comes from computer mode; stop trusting the computer before choosing individual node permissions",
             Fault::PassphraseNeeded => {
                 "changing who you trust needs your identity passphrase: it was not entered for a keyring change in the last 30 minutes\n       type it, and the change is made: `vox trust` asks for it at a terminal"
             }
@@ -1547,6 +1550,7 @@ macro_rules! fault_names {
 }
 
 fault_names!(
+    ComputerPolicy,
     NoIdentity,
     IdentityExists,
     Locked,
