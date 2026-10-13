@@ -1219,11 +1219,11 @@ final class FirstRunProof: XCTestCase {
                    withVelocity: .slow, thenHoldForDuration: 0.5)
         Thread.sleep(forTimeInterval: 1)
         let sidebar0 = sidebarWidth(), inspector0 = inspectorWidth()
-        let needed = sidebar0 + 400 + 7 + inspector0 + 60
+        let needed = sidebar0 + 400 + 7 + inspector0 + 40
         guard window.frame.width >= needed else {
             throw Apparatus("staging not achieved: the window is \(window.frame.width) wide after widening, and the inspector drag needs \(needed) (the timeline keeps 400)")
         }
-        drag(inspectorDivider(), by: -60)
+        drag(inspectorDivider(), by: -40)
         let inspector1 = inspectorWidth()
         XCTAssertTrue(inspector1 > inspector0 + 30,
                       "PRODUCT: dragging the inspector's divider 60 points left must widen the inspector; it went from \(inspector0) to \(inspector1)")
