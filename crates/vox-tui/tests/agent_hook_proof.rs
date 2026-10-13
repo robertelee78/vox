@@ -4846,7 +4846,11 @@ fn room_ask_step() {
     let repo = tmp.path().join("unbound repo");
     std::fs::create_dir_all(&repo).expect("APPARATUS: cannot stage unbound repo");
     let home = tmp.path().join("home");
-    std::fs::create_dir_all(&home).expect("APPARATUS: cannot stage HOME");
+    std::fs::create_dir_all(home.join(".claude")).expect("APPARATUS: cannot stage HOME");
+    std::fs::write(
+        home.join(".claude/settings.json"),
+        r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"vox agent hook --node default"}]}]}}"#,
+    ).expect("APPARATUS: cannot wire scratch Claude Code");
     let first = "68500000-aaaa-4bbb-8ccc-000000000001";
     let turn = |id: &str| {
         let payload = serde_json::json!({"session_id":id,"cwd":repo,
@@ -4883,7 +4887,7 @@ fn room_ask_step() {
         offered.contains("isn't tied to a Vox room"),
         "PRODUCT: unmapped repo must ask which room it works in: {offered}"
     );
-    let (ok, asks, err) = hook(
+    let (ok, asks, err) = hook_env(
         &actor.data,
         &actor.cfg,
         &[
@@ -4895,6 +4899,7 @@ fn room_ask_step() {
             repo.to_str().expect("APPARATUS: scratch repo is not UTF-8"),
         ],
         "",
+        &[("HOME", &home.to_string_lossy())],
     );
     assert!(ok, "APPARATUS: public agent status command failed: {err}");
     assert!(
@@ -4906,7 +4911,11 @@ fn room_ask_step() {
         &actor.cfg,
         &["agent", "room", "--none"],
         "",
-        &[("VOX_SESSION", first), ("VOX_NODE", "default")],
+        &[
+            ("VOX_SESSION", first),
+            ("VOX_NODE", "default"),
+            ("HOME", &home.to_string_lossy()),
+        ],
     );
     assert!(ok, "APPARATUS: public agent room command failed: {err}");
     assert!(
@@ -4914,7 +4923,7 @@ fn room_ask_step() {
         "PRODUCT: Not This Repo must be saved: {answer}{err}"
     );
     let next = turn("68500000-aaaa-4bbb-8ccc-000000000002");
-    let (ok, asks, err) = hook(
+    let (ok, asks, err) = hook_env(
         &actor.data,
         &actor.cfg,
         &[
@@ -4926,6 +4935,7 @@ fn room_ask_step() {
             repo.to_str().expect("APPARATUS: scratch repo is not UTF-8"),
         ],
         "",
+        &[("HOME", &home.to_string_lossy())],
     );
     assert!(ok, "APPARATUS: public agent status command failed: {err}");
     assert!(
