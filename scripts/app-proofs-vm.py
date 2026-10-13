@@ -132,7 +132,7 @@ expect {
     run(["scp", *options, str(bundle), destination + ":" + guest + "/source.bundle"])
     args = " ".join(shlex.quote(arg) for arg in sys.argv[1:])
     controls = " ".join(name + "=" + shlex.quote(os.environ[name]) for name in
-                        ("VOX_PROOF_FROM", "VOX_PROOF_CONTINUE", "VOX_PROOF_SHA") if name in os.environ)
+                        ("VOX_PROOF_FROM", "VOX_PROOF_CONTINUE", "VOX_PROOF_SHA", "VOX_PROOF_STEP") if name in os.environ)
     remote = f'''set -eu
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
 cd {shlex.quote(guest)}

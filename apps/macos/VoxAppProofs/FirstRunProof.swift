@@ -2203,6 +2203,9 @@ final class FirstRunProof: XCTestCase {
     ///   Not This Repo silences both paths. Mutant: write the map before checking the passphrase.
     func testSessionsAreDrivenWhereTheyAreShown() throws {
         let env = ProcessInfo.processInfo.environment
+        let selectedStep = env["VOX_PROOF_STEP"] ?? ""
+        guard selectedStep.isEmpty || selectedStep == "room-ask" else { throw Apparatus("unsupported Sessions journey step: \(selectedStep)") }
+        if !selectedStep.isEmpty { print("SELECTED PROOF STEP: \(selectedStep)") }
         guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
             throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are set by scripts/app-proofs.sh")
         }
@@ -2298,188 +2301,201 @@ final class FirstRunProof: XCTestCase {
                                 "hook", work, vox, room], env: hookEnv, input: json)
             guard r.status == 0 else { throw Apparatus("`vox agent hook` exited \(r.status): \(r.out)") }
         }
-        for (session, words) in [(s1, "S1-WORDS"), (s2, "S2-WORDS")] {
-            try stager.write(Data(("{\"type\":\"custom-title\",\"customTitle\":\"" + words + "\"}\n").utf8), to: work + "/\(session).jsonl")
-            try hook(event(session, "UserPromptSubmit", ["prompt": words]))
-        }
-        // S1 asks an approval: its hook waits for the answer, in the background, its pid kept.
-        // Only the hook itself goes to the background, with its own output in a file, so nothing
-        // left running holds the stager's pipe open; `&&` would background a subshell holding it.
-        let touch: [String: Any] = ["command": "touch p1", "description": "Make p1"]
-        try hook(event(s1, "PreToolUse", ["tool_name": "Bash", "tool_input": touch, "tool_use_id": "toolu_P1"]))
-        let asked = root.appendingPathComponent("asked")
-        try stager.write(Data(event(s1, "PermissionRequest", ["tool_name": "Bash", "tool_input": touch,
-                                                               "permission_suggestions": []]).utf8),
-                         to: asked.path + ".json")
-        let started = stager.run(["/bin/sh", "-c",
-                                  "cd \"$1\" || exit 1; \"$2\" agent hook --node claude-a --room \"$3\" < \"$4.json\" > \"$4.out\" 2>&1 & echo $!",
-                                  "hook", work, vox, room, asked.path], env: hookEnv)
-        let hookPid = started.out.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard started.status == 0, Int32(hookPid) != nil else {
-            throw Apparatus("the waiting PermissionRequest hook did not start: \(started.out)")
-        }
-        defer { _ = stager.run(["/bin/kill", hookPid], env: [:]) }
-        // The request is waiting on alice once S1's read marks it so (`"waiting":true`); the
-        // room's Sessions list never says "waiting", so it cannot tell.
-        let s1Read = { self.run(vox, ["room", "session", "--node", "alice", "--json", room, s1], env: voxEnv).out }
-        let waitingUntil = Date().addingTimeInterval(20)
-        var s1Now = ""
-        while Date() < waitingUntil && !s1Now.contains("\"waiting\":true") {
-            s1Now = s1Read()
-            if !s1Now.contains("\"waiting\":true") { Thread.sleep(forTimeInterval: 0.5) }
-        }
-        guard s1Now.contains("\"waiting\":true") else {
-            throw Apparatus("staging not achieved: S1's request is not waiting on alice within 20 s; `vox room session --json` said \(s1Now.debugDescription)")
-        }
 
+        let asked = root.appendingPathComponent("asked")
+        var pendingHookPid: String?
+        defer { if let pendingHookPid { _ = stager.run(["/bin/kill", pendingHookPid], env: [:]) } }
+        if selectedStep.isEmpty {
+            for (session, words) in [(s1, "S1-WORDS"), (s2, "S2-WORDS")] {
+                try stager.write(Data(("{\"type\":\"custom-title\",\"customTitle\":\"" + words + "\"}\n").utf8), to: work + "/\(session).jsonl")
+                try hook(event(session, "UserPromptSubmit", ["prompt": words]))
+            }
+            // S1 asks an approval: its hook waits for the answer, in the background, its pid kept.
+            // Only the hook itself goes to the background, with its own output in a file, so nothing
+            // left running holds the stager's pipe open; `&&` would background a subshell holding it.
+            let touch: [String: Any] = ["command": "touch p1", "description": "Make p1"]
+            try hook(event(s1, "PreToolUse", ["tool_name": "Bash", "tool_input": touch, "tool_use_id": "toolu_P1"]))
+            try stager.write(Data(event(s1, "PermissionRequest", ["tool_name": "Bash", "tool_input": touch,
+                                                                   "permission_suggestions": []]).utf8),
+                             to: asked.path + ".json")
+            let started = stager.run(["/bin/sh", "-c",
+                                      "cd \"$1\" || exit 1; \"$2\" agent hook --node claude-a --room \"$3\" < \"$4.json\" > \"$4.out\" 2>&1 & echo $!",
+                                      "hook", work, vox, room, asked.path], env: hookEnv)
+            let hookPid = started.out.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard started.status == 0, Int32(hookPid) != nil else {
+                throw Apparatus("the waiting PermissionRequest hook did not start: \(started.out)")
+            }
+            pendingHookPid = hookPid
+            // The request is waiting on alice once S1's read marks it so (`"waiting":true`); the
+            // room's Sessions list never says "waiting", so it cannot tell.
+            let s1Read = { self.run(vox, ["room", "session", "--node", "alice", "--json", room, s1], env: voxEnv).out }
+            let waitingUntil = Date().addingTimeInterval(20)
+            var s1Now = ""
+            while Date() < waitingUntil && !s1Now.contains("\"waiting\":true") {
+                s1Now = s1Read()
+                if !s1Now.contains("\"waiting\":true") { Thread.sleep(forTimeInterval: 0.5) }
+            }
+            guard s1Now.contains("\"waiting\":true") else {
+                throw Apparatus("staging not achieved: S1's request is not waiting on alice within 20 s; `vox room session --json` said \(s1Now.debugDescription)")
+            }
+
+        }
         let ui = voxApp(appPath)
         ui.launchEnvironment = voxEnv
         try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
         defer { ui.terminate() }
         present(ui, Key.id("attached"), timeout: 60, "the app must open attached as alice")
 
-        // P1: the room's mark leads to its Session; the waiting request is selected by a click.
-        // Next Room That Needs You and its shortcut were removed by the decider (#766).
-        tap(ui, Key.id("room-work"), "work, marked as needing alice", premise: inRoom(vox, voxEnv, "work"))
-        guard present(ui, Key.id("room-tabs"), timeout: 20,
-                      "the principal top line must expose the room tabs") else { return }
-        words(ui, Key.id("session-\(s1.prefix(8))"), timeout: 20,
-              "two Sessions of one node must label its first tab with alias and name",
-              until: { $0.contains("claude-a · S1-WORDS") && $0.contains("waiting on you") })
-        words(ui, Key.id("session-\(s2.prefix(8))"), timeout: 20,
-              "two Sessions of one node must label its second tab with alias and name",
-              until: { $0 == "claude-a · S2-WORDS" })
-        for obsolete in ["room-header-name", "room-header-meta", "sessions", "session-all"] {
-            XCTAssertNil(locate(ui, Key.id(obsolete)), "PRODUCT: duplicate header, Sessions list and All must be absent: \(obsolete)")
-        }
-        tap(ui, Key.id("session-\(s1.prefix(8))"), "S1 in work's Sessions")
-        let requestRow = Key.idPrefix("request-row-")
-        present(ui, requestRow, timeout: 30,
-                "opening S1 must show its request waiting on alice",
-                premise: Premise("S1 has a request waiting on alice") {
-                    let now = s1Read()
-                    return (now.contains("\"waiting\":true"), "`vox room session --json` said \(now.debugDescription)")
-                })
-        guard let waitingRow = locate(ui, requestRow),
-              let requestTimeline = locate(ui, Key.id("timeline")) else {
-            throw Apparatus("the waiting request and its timeline could not be located for selection")
-        }
-        // The row's center is inside Why; select its blank padding, not an editable child.
-        let interactive = waitingRow.descendants(matching: .any).allElementsBoundByIndex.filter {
-            [.button, .textField, .secureTextField, .textView].contains($0.elementType)
-                && $0.identifier != waitingRow.identifier
-        }.map(\.frame)
-        let frame = waitingRow.frame
-        let points = [CGPoint(x: frame.maxX - 2, y: frame.minY + 2),
-                      CGPoint(x: frame.minX + 2, y: frame.minY + 2),
-                      CGPoint(x: frame.maxX - 2, y: frame.maxY - 2)]
-        guard waitingRow.isHittable, let point = points.first(where: { point in
-            point.x.isFinite && point.y.isFinite && frame.contains(point)
-                && requestTimeline.frame.contains(point) && ui.windows.firstMatch.frame.contains(point)
-                && !interactive.contains(where: { $0.contains(point) })
-        }), systemOverlayOver(point, targetHittable: waitingRow.isHittable) == nil else {
-            keepTree(ui, "no exposed request-row padding for selection")
-            throw Apparatus("the waiting request has no visible click point outside its interactive children")
-        }
-        waitingRow.coordinate(withNormalizedOffset: .zero)
-            .withOffset(CGVector(dx: point.x - frame.minX, dy: point.y - frame.minY)).click()
-        if let row = locate(ui, requestRow), !row.isSelected {
-            keepTree(ui, "the waiting request clicked in S1 was not selected")
-            XCTFail("PRODUCT: clicking the waiting request in S1 must select it; its row is not selected")
-        }
-        // ⌥⌘Y approves the selected request: the hook gets allow.
-        ui.typeKey("y", modifierFlags: [.command, .option])
-        let answerUntil = Date().addingTimeInterval(20)
-        var answered = ""
-        while Date() < answerUntil && !answered.contains("behavior") {
-            answered = stager.run(["/bin/cat", asked.path + ".out"], env: [:]).out
-            if !answered.contains("behavior") { Thread.sleep(forTimeInterval: 0.5) }
-        }
-        XCTAssertTrue(answered.contains("\"allow\""),
-                      "PRODUCT: ⌥⌘Y must approve the selected request: S1's hook must get allow; it printed \(answered.debugDescription)")
-
-        // D12: work's draft survives going to other and back.
-        tap(ui, Key.id("session-general"), "General in work's Sessions")
-        let compose = Key.id("compose")
-        type(ui, compose, "KEEP-ROOM-DRAFT", "work's composer")
-        tap(ui, Key.id("room-other"), "other in the sidebar", premise: inRoom(vox, voxEnv, "other"))
-        tap(ui, Key.id("room-work"), "work in the sidebar", premise: inRoom(vox, voxEnv, "work"))
-        tap(ui, Key.id("session-general"), "General in work's Sessions")
-        words(ui, compose, timeout: 10, "work's draft must be kept when another room is opened and work again",
-              until: { $0.contains("KEEP-ROOM-DRAFT") }, field: true)
-
-        // D2: with S1 shown, ⌘↩ sends nothing to the room, and Send Urgent is disabled.
-        let s1Row = Key.id("session-\(s1.prefix(8))"), s2Row = Key.id("session-\(s2.prefix(8))")
-        tap(ui, s1Row, "S1 in work's Sessions")
-        ui.typeKey(.return, modifierFlags: .command)
-        Thread.sleep(forTimeInterval: 3)
-        let roomRead = run(vox, ["room", "read", "--node", "alice", room], env: voxEnv).out
-        XCTAssertFalse(roomRead.contains("KEEP-ROOM-DRAFT"),
-                       "PRODUCT: ⌘↩ while S1 is shown must not send work's General draft to the room; the room reads it")
-        let urgent = ui.menuBars.menuItems["Send Urgent"]
-        if urgent.exists && urgent.isEnabled {
-            XCTFail("PRODUCT: Send Urgent must be disabled while a Session is shown; it is enabled")
-        }
-
-        // D12: S1's draft never shows in S2, and comes back in S1.
-        let sessionCompose = Key.id("session-compose")
-        type(ui, sessionCompose, "S1-DRAFT", "S1's composer")
-        tap(ui, s2Row, "S2 in work's Sessions")
-        Thread.sleep(forTimeInterval: 1)
-        if let e = locate(ui, sessionCompose), typed(e).contains("S1-DRAFT") {
-            keepTree(ui, "S1's draft showed in S2")
-            XCTFail("PRODUCT: S1's draft must not show in S2's composer; it shows \"\(typed(e))\"")
-        }
-        tap(ui, s1Row, "S1 in work's Sessions")
-        words(ui, sessionCompose, timeout: 10, "S1's draft must come back in S1",
-              until: { $0.contains("S1-DRAFT") }, field: true)
-
-        // D13: a prompt S2 does not take stays. claude-a is detached first, so nothing can take
-        // it: refused or unanswered, the text must stay.
-        try staged(vox, ["node", "detach", "claude-a"], env: voxEnv)
-        tap(ui, s2Row, "S2 in work's Sessions")
-        type(ui, sessionCompose, "S2-PROMPT\r", "S2's composer")
-        let said = words(ui, Key.id("session-said"), timeout: 30, "S2 must say what came of the prompt",
-                         until: { !$0.isEmpty }) ?? ""
-        words(ui, sessionCompose, timeout: 5,
-              "a prompt S2 did not take must stay in its composer (S2 said \"\(said)\")",
-              until: { $0.contains("S2-PROMPT") }, field: true)
-        ui.typeKey("c", modifierFlags: .control)
-        present(ui, Key.showing("It ends the session."), timeout: 10,
-                "⌃C must ask before stopping the Session")
-        ui.typeKey(.escape, modifierFlags: [])
-        print("[proof] sessions: clicking S1's waiting request selected it and ⌥⌘Y approved it; work's draft kept; ⌘↩ in S1 sent nothing; S1's draft stayed in S1; S2 said \(said.debugDescription) and kept the prompt; ⌃C asked")
-
-        // Ended authorized Sessions remain reachable only through the top-row menu.
-        try hook(event(s2, "SessionEnd", ["reason": "prompt_input_exit"]))
-        let endedDeadline = Date().addingTimeInterval(20)
-        var endedPublic = ""
-        func endedS2(_ output: String) -> Bool {
-            output.split(separator: "\n").contains { line in
-                guard let value = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { return false }
-                return value["id"] as? String == s2 && value["node"] as? String == agentFp
-                    && value["open"] as? Bool == false && value["can_drive"] as? Bool == true
+        if selectedStep.isEmpty {
+            let s1Read = { self.run(vox, ["room", "session", "--node", "alice", "--json", room, s1], env: voxEnv).out }
+            // P1: the room's mark leads to its Session; the waiting request is selected by a click.
+            // Next Room That Needs You and its shortcut were removed by the decider (#766).
+            tap(ui, Key.id("room-work"), "work, marked as needing alice", premise: inRoom(vox, voxEnv, "work"))
+            guard present(ui, Key.id("room-tabs"), timeout: 20,
+                          "the principal top line must expose the room tabs") else { return }
+            words(ui, Key.id("session-\(s1.prefix(8))"), timeout: 20,
+                  "two Sessions of one node must label its first tab with alias and name",
+                  until: { $0.contains("claude-a · S1-WORDS") && $0.contains("waiting on you") })
+            words(ui, Key.id("session-\(s2.prefix(8))"), timeout: 20,
+                  "two Sessions of one node must label its second tab with alias and name",
+                  until: { $0 == "claude-a · S2-WORDS" })
+            for obsolete in ["room-header-name", "room-header-meta", "sessions", "session-all"] {
+                XCTAssertNil(locate(ui, Key.id(obsolete)), "PRODUCT: duplicate header, Sessions list and All must be absent: \(obsolete)")
             }
-        }
-        repeat {
-            endedPublic = try staged(vox, ["room", "sessions", room, "--node", "alice", "--json"], env: voxEnv)
-            if endedS2(endedPublic) { break }
-            Thread.sleep(forTimeInterval: 0.25)
-        } while Date() < endedDeadline
-        guard endedS2(endedPublic) else {
-            throw Apparatus("the real hook did not publish the ended Session: \(endedPublic)")
-        }
-        tap(ui, Key.id("session-general"), "General in the top row")
-        guard present(ui, compose, timeout: 10, "General must restore the room composer") else { return }
-        tap(ui, Key.id("sessions-ended"), "Ended menu in the top row")
-        tap(ui, Key.menuItem("claude-a · S2-WORDS"), "S2 from the Ended menu")
-        guard words(ui, Key.id("timeline-title"), timeout: 20,
-                    "choosing an ended Session must switch the centre to its ended history",
-                    until: { $0.contains("S2-WORDS") && $0.contains("ended") }) != nil else { return }
-        XCTAssertNil(locate(ui, sessionCompose), "PRODUCT: an ended Session must not offer a drive composer")
+            tap(ui, Key.id("session-\(s1.prefix(8))"), "S1 in work's Sessions")
+            let requestRow = Key.idPrefix("request-row-")
+            present(ui, requestRow, timeout: 30,
+                    "opening S1 must show its request waiting on alice",
+                    premise: Premise("S1 has a request waiting on alice") {
+                        let now = s1Read()
+                        return (now.contains("\"waiting\":true"), "`vox room session --json` said \(now.debugDescription)")
+                    })
+            guard let waitingRow = locate(ui, requestRow),
+                  let requestTimeline = locate(ui, Key.id("timeline")) else {
+                throw Apparatus("the waiting request and its timeline could not be located for selection")
+            }
+            // The row's center is inside Why; select its blank padding, not an editable child.
+            let interactive = waitingRow.descendants(matching: .any).allElementsBoundByIndex.filter {
+                [.button, .textField, .secureTextField, .textView].contains($0.elementType)
+                    && $0.identifier != waitingRow.identifier
+            }.map(\.frame)
+            let frame = waitingRow.frame
+            let points = [CGPoint(x: frame.maxX - 2, y: frame.minY + 2),
+                          CGPoint(x: frame.minX + 2, y: frame.minY + 2),
+                          CGPoint(x: frame.maxX - 2, y: frame.maxY - 2)]
+            guard waitingRow.isHittable, let point = points.first(where: { point in
+                point.x.isFinite && point.y.isFinite && frame.contains(point)
+                    && requestTimeline.frame.contains(point) && ui.windows.firstMatch.frame.contains(point)
+                    && !interactive.contains(where: { $0.contains(point) })
+            }), systemOverlayOver(point, targetHittable: waitingRow.isHittable) == nil else {
+                keepTree(ui, "no exposed request-row padding for selection")
+                throw Apparatus("the waiting request has no visible click point outside its interactive children")
+            }
+            waitingRow.coordinate(withNormalizedOffset: .zero)
+                .withOffset(CGVector(dx: point.x - frame.minX, dy: point.y - frame.minY)).click()
+            if let row = locate(ui, requestRow), !row.isSelected {
+                keepTree(ui, "the waiting request clicked in S1 was not selected")
+                XCTFail("PRODUCT: clicking the waiting request in S1 must select it; its row is not selected")
+            }
+            // ⌥⌘Y approves the selected request: the hook gets allow.
+            ui.typeKey("y", modifierFlags: [.command, .option])
+            let answerUntil = Date().addingTimeInterval(20)
+            var answered = ""
+            while Date() < answerUntil && !answered.contains("behavior") {
+                answered = stager.run(["/bin/cat", asked.path + ".out"], env: [:]).out
+                if !answered.contains("behavior") { Thread.sleep(forTimeInterval: 0.5) }
+            }
+            XCTAssertTrue(answered.contains("\"allow\""),
+                          "PRODUCT: ⌥⌘Y must approve the selected request: S1's hook must get allow; it printed \(answered.debugDescription)")
+
+
+            // D12: work's draft survives going to other and back.
+            tap(ui, Key.id("session-general"), "General in work's Sessions")
+            let compose = Key.id("compose")
+            type(ui, compose, "KEEP-ROOM-DRAFT", "work's composer")
+            tap(ui, Key.id("room-other"), "other in the sidebar", premise: inRoom(vox, voxEnv, "other"))
+            tap(ui, Key.id("room-work"), "work in the sidebar", premise: inRoom(vox, voxEnv, "work"))
+            tap(ui, Key.id("session-general"), "General in work's Sessions")
+            words(ui, compose, timeout: 10, "work's draft must be kept when another room is opened and work again",
+                  until: { $0.contains("KEEP-ROOM-DRAFT") }, field: true)
+
+            // D2: with S1 shown, ⌘↩ sends nothing to the room, and Send Urgent is disabled.
+            let s1Row = Key.id("session-\(s1.prefix(8))"), s2Row = Key.id("session-\(s2.prefix(8))")
+            tap(ui, s1Row, "S1 in work's Sessions")
+            ui.typeKey(.return, modifierFlags: .command)
+            Thread.sleep(forTimeInterval: 3)
+            let roomRead = run(vox, ["room", "read", "--node", "alice", room], env: voxEnv).out
+            XCTAssertFalse(roomRead.contains("KEEP-ROOM-DRAFT"),
+                           "PRODUCT: ⌘↩ while S1 is shown must not send work's General draft to the room; the room reads it")
+            let urgent = ui.menuBars.menuItems["Send Urgent"]
+            if urgent.exists && urgent.isEnabled {
+                XCTFail("PRODUCT: Send Urgent must be disabled while a Session is shown; it is enabled")
+            }
+
+            // D12: S1's draft never shows in S2, and comes back in S1.
+            let sessionCompose = Key.id("session-compose")
+            type(ui, sessionCompose, "S1-DRAFT", "S1's composer")
+            tap(ui, s2Row, "S2 in work's Sessions")
+            Thread.sleep(forTimeInterval: 1)
+            if let e = locate(ui, sessionCompose), typed(e).contains("S1-DRAFT") {
+                keepTree(ui, "S1's draft showed in S2")
+                XCTFail("PRODUCT: S1's draft must not show in S2's composer; it shows \"\(typed(e))\"")
+            }
+            tap(ui, s1Row, "S1 in work's Sessions")
+            words(ui, sessionCompose, timeout: 10, "S1's draft must come back in S1",
+                  until: { $0.contains("S1-DRAFT") }, field: true)
+
+            // D13: a prompt S2 does not take stays. claude-a is detached first, so nothing can take
+            // it: refused or unanswered, the text must stay.
+            try staged(vox, ["node", "detach", "claude-a"], env: voxEnv)
+            tap(ui, s2Row, "S2 in work's Sessions")
+            type(ui, sessionCompose, "S2-PROMPT\r", "S2's composer")
+            let said = words(ui, Key.id("session-said"), timeout: 30, "S2 must say what came of the prompt",
+                             until: { !$0.isEmpty }) ?? ""
+            words(ui, sessionCompose, timeout: 5,
+                  "a prompt S2 did not take must stay in its composer (S2 said \"\(said)\")",
+                  until: { $0.contains("S2-PROMPT") }, field: true)
+            ui.typeKey("c", modifierFlags: .control)
+            present(ui, Key.showing("It ends the session."), timeout: 10,
+                    "⌃C must ask before stopping the Session")
+            ui.typeKey(.escape, modifierFlags: [])
+            print("[proof] sessions: clicking S1's waiting request selected it and ⌥⌘Y approved it; work's draft kept; ⌘↩ in S1 sent nothing; S1's draft stayed in S1; S2 said \(said.debugDescription) and kept the prompt; ⌃C asked")
+
+            // Ended authorized Sessions remain reachable only through the top-row menu.
+            try staged(vox, ["node", "attach", "claude-a", "--passphrase-file", pass("claude-a")], env: voxEnv)
+            try hook(event(s2, "SessionEnd", ["reason": "prompt_input_exit"]))
+            let endedDeadline = Date().addingTimeInterval(20)
+            var endedPublic = ""
+            func endedS2(_ output: String) -> Bool {
+                output.split(separator: "\n").contains { line in
+                    guard let value = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { return false }
+                    return value["id"] as? String == s2 && value["node"] as? String == agentFp
+                        && value["open"] as? Bool == false && value["can_drive"] as? Bool == true
+                }
+            }
+            repeat {
+                endedPublic = try staged(vox, ["room", "sessions", room, "--node", "alice", "--json"], env: voxEnv)
+                if endedS2(endedPublic) { break }
+                Thread.sleep(forTimeInterval: 0.25)
+            } while Date() < endedDeadline
+            guard endedS2(endedPublic) else {
+                throw Apparatus("the real hook did not publish the ended Session: \(endedPublic)")
+            }
+            tap(ui, Key.id("session-general"), "General in the top row")
+            guard present(ui, compose, timeout: 10, "General must restore the room composer") else { return }
+            tap(ui, Key.id("sessions-ended"), "Ended menu in the top row")
+            tap(ui, Key.menuItem("claude-a · S2-WORDS"), "S2 from the Ended menu")
+            guard words(ui, Key.id("timeline-title"), timeout: 20,
+                        "choosing an ended Session must switch the centre to its ended history",
+                        until: { $0.contains("S2-WORDS") && $0.contains("ended") }) != nil else { return }
+            XCTAssertNil(locate(ui, sessionCompose), "PRODUCT: an ended Session must not offer a drive composer")
+
+        } else { print("NOT RUN: Sessions approval/composer/draft/stop flows; selected room-ask only") }
 
         // RM-1/3/5: two sessions in a repo and its worktree raise one dialog, not a banner.
-        try staged(vox, ["node", "attach", "claude-a", "--passphrase-file", pass("claude-a")], env: voxEnv)
+        if selectedStep.isEmpty {
+            try staged(vox, ["node", "attach", "claude-a", "--passphrase-file", pass("claude-a")], env: voxEnv)
+        }
         func repository(_ name: String) throws -> (String, String) {
             let repo = root.appendingPathComponent(name).path
             let tree = root.appendingPathComponent(name + "-worktree").path
@@ -2627,6 +2643,11 @@ final class FirstRunProof: XCTestCase {
                       "PRODUCT: Not This Repo must save the canonical repository's no: \(noMap)")
         leftDialog()
         print("[proof] RM-1/2/3/5: one repo/worktree dialog; wrong passphrase left map unchanged; Choose and Create moved both next turns; alice created with keyring closed; Not This Repo suppressed later worktree asks")
+
+        if !selectedStep.isEmpty {
+            print("[proof] selected room-ask step complete; Session privacy flow NOT RUN")
+            return
+        }
 
         // SA-1/2/4: the Session owner is on a genuinely separate, unpaired daemon.
         let ownerRoot = root.appendingPathComponent("remote-owner")
