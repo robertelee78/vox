@@ -4883,9 +4883,22 @@ fn room_ask_step() {
         offered.contains("isn't tied to a Vox room"),
         "PRODUCT: unmapped repo must ask which room it works in: {offered}"
     );
-    let (ok, asks, err) = hook(&actor.data, &actor.cfg, &["agent", "status"], "");
+    let (ok, asks, err) = hook(
+        &actor.data,
+        &actor.cfg,
+        &[
+            "agent",
+            "status",
+            "--harness",
+            "claude",
+            "--dir",
+            repo.to_str().expect("APPARATUS: scratch repo is not UTF-8"),
+        ],
+        "",
+    );
+    assert!(ok, "APPARATUS: public agent status command failed: {err}");
     assert!(
-        ok && asks.contains(&repo.to_string_lossy().to_string()),
+        asks.contains(&repo.to_string_lossy().to_string()),
         "PRODUCT: public agent status must list the waiting repo: {asks}{err}"
     );
     let (ok, answer, err) = hook_env(
@@ -4895,14 +4908,28 @@ fn room_ask_step() {
         "",
         &[("VOX_SESSION", first), ("VOX_NODE", "default")],
     );
+    assert!(ok, "APPARATUS: public agent room command failed: {err}");
     assert!(
-        ok && answer.contains("is to stay tied to no room"),
+        answer.contains("is to stay tied to no room"),
         "PRODUCT: Not This Repo must be saved: {answer}{err}"
     );
     let next = turn("68500000-aaaa-4bbb-8ccc-000000000002");
-    let (ok, asks, err) = hook(&actor.data, &actor.cfg, &["agent", "status"], "");
+    let (ok, asks, err) = hook(
+        &actor.data,
+        &actor.cfg,
+        &[
+            "agent",
+            "status",
+            "--harness",
+            "claude",
+            "--dir",
+            repo.to_str().expect("APPARATUS: scratch repo is not UTF-8"),
+        ],
+        "",
+    );
+    assert!(ok, "APPARATUS: public agent status command failed: {err}");
     assert!(
-        ok && !asks.contains(&repo.to_string_lossy().to_string())
+        !asks.contains(&repo.to_string_lossy().to_string())
             && !next.contains("isn't tied to a Vox room"),
         "PRODUCT: declined repo must not ask the next Session again: {next}; {asks}{err}"
     );

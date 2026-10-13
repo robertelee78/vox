@@ -18,7 +18,8 @@ A room-ask-only diff selects two supported portions of existing journeys:
   minimum owned daemon, actual unmapped hook, public pending ask, decline, and next-session
   suppression. Other mapping, join and room-news portions are not replayed.
 
-Use `--only EXACT_ID` for an explicit supported flow. Unsupported step names fail before a
+Use `--changed HEAD --only EXACT_ID` for an explicit supported flow. `--only`
+requires an explicit mode (`--changed BASE` or `--full`); it is not a standalone mode. Unsupported step names fail before a
 run; a whole journey is never advertised as a single step. Other existing journeys remain
 whole-flow selections until an actual minimum-staging adapter exists. Unmapped source changes
 select conservatively and print the unknown paths; this is not a precise dependency graph.
