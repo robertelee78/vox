@@ -121,7 +121,6 @@ struct AgentSetupOffers: View {
             }
             .padding(Space.s16)
             .panelSurface()
-            .accessibilityIdentifier("agent-setup-offer")
         }
     }
 }
