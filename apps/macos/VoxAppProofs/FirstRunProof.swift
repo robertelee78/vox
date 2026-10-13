@@ -5483,7 +5483,7 @@ final class FirstRunProof: XCTestCase {
                     button.click()
                     openedComputerView = true
                 }
-                let sheet = ui.descendants(matching: .any).matching(identifier: "computer-trust-sheet").firstMatch
+                let sheet = ui.scrollViews.matching(identifier: "computer-trust-sheet").firstMatch
                 let identity = sheet.descendants(matching: .staticText)
                     .matching(NSPredicate(format: "label == %@ OR CAST(value, 'NSString') == %@", fingerprint, fingerprint)).firstMatch
                 if sheet.exists, identity.exists {
@@ -5504,7 +5504,7 @@ final class FirstRunProof: XCTestCase {
             Thread.sleep(forTimeInterval: 0.5)
         }
         keepTree(ui, "Vox.app could not be shown on the scratch profile")
-        ui.terminate()
+        // Report the staging fault before teardown attempts to terminate a possibly stalled app.
         let missingClue = computerFingerprint.map { "the read-only Add Computer view did not show the required scratch computer fingerprint \($0)" }
             ?? "no scratch path, no node staged here, nor a first-run question the account has answered"
         throw Apparatus("Vox.app could not be shown to be on this run's scratch profile within 30 s (\(missingClue)); stopped before any pairing or other product step")
