@@ -186,7 +186,7 @@ pub enum KeepSource {
 /// A request to the daemon itself, with no `Use` (ADR-026 C-2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonRequest {
-    /// The daemon's manual and open-room anchor list, with provenance. Needs no node.
+    /// The daemon's manual and saved-room anchor list, with provenance. Needs no node.
     Anchors,
     /// Read this installation's computer trust and pending approval.
     ComputerStatus,
@@ -525,12 +525,14 @@ pub struct AnchorInfo {
 pub enum AnchorSource {
     /// Manual configuration or a command-line anchor.
     AddedByHand,
-    /// An open room's own anchor configuration.
+    /// A saved room's own anchor configuration, last-known when it cannot be refreshed.
     Room {
         /// Room identity, distinguishing rooms even if their names match.
         room: Digest32,
-        /// The current shared name; empty for an unnamed room.
+        /// The last observed shared name; empty for an unnamed room.
         name: String,
+        /// The room could not be read now (closed, locked or busy).
+        stale: bool,
     },
 }
 
@@ -1379,8 +1381,12 @@ impl DaemonFrame {
                             AnchorSource::AddedByHand => {
                                 e.array(1).uint(0);
                             }
-                            AnchorSource::Room { room, name } => {
-                                e.array(3).uint(1).bytes(room).text(name);
+                            AnchorSource::Room { room, name, stale } => {
+                                e.array(4)
+                                    .uint(1)
+                                    .bytes(room)
+                                    .text(name)
+                                    .uint(u64::from(*stale));
                             }
                         }
                     }
@@ -1453,10 +1459,22 @@ impl DaemonFrame {
                         let tag = d.uint().map_err(malformed("ipc anchor source tag"))?;
                         sources.push(match (tag, arity) {
                             (0, 1) => AnchorSource::AddedByHand,
-                            (1, 3) => AnchorSource::Room {
+                            (1, 4) => AnchorSource::Room {
                                 room: fp(&mut d, "ipc anchor source room")?
                                     .ok_or(Error::MalformedIpc("ipc anchor source room"))?,
                                 name: text(&mut d, "ipc anchor source room name")?,
+                                stale: match d
+                                    .uint()
+                                    .map_err(malformed("ipc anchor source freshness"))?
+                                {
+                                    0 => false,
+                                    1 => true,
+                                    _ => {
+                                        return Err(Error::MalformedIpc(
+                                            "ipc anchor source freshness",
+                                        ))
+                                    }
+                                },
                             },
                             _ => return Err(Error::MalformedIpc("ipc anchor source")),
                         });

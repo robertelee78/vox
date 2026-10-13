@@ -26,7 +26,8 @@
 //! show only the separate machine anchor and no live connection to Bob’s room anchor, and the machine list must
 //! retain only the original room source. This is an observed status claim, not a claim
 //! that no future helper traffic can occur. It does not prove live DNS-record changes, helper
-//! isolation, canonical migration or all #779 requirements. Those remain separate claims.
+//! isolation or previous-release migration. The same journey then checks a renamed room’s
+//! provenance through node lock and daemon restart, and removes it when Bob leaves.
 //!
 //! Mutants must fail the corresponding product assertion: disable refresh, retain old
 //! addresses, fail the whole file on its bad line, carry manual anchors in issued room links,
@@ -475,7 +476,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     pipe.write_all(format!("{IDENTITY}\n").as_bytes())
         .expect("APPARATUS: write bob's passphrase");
     drop(pipe);
-    let _bob = Proc(bob);
+    let mut bob_daemon = Proc(bob);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !vox(&bob_data, &bob_cfg, &["room", "list"]).0 {
         assert!(
@@ -637,8 +638,13 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
                 .find(|anchor| anchor["fingerprint"] == anchor_id)
         })
         .unwrap_or_else(|| panic!("PRODUCT: machine list lost Bob's joined-room anchor: {after}"));
-    assert_eq!(
-        recorded["sources"], learned["sources"],
+    let recorded_sources = recorded["sources"]
+        .as_array()
+        .expect("PRODUCT: the room anchor has no source list");
+    assert!(
+        recorded_sources.len() == 1
+            && recorded_sources[0]["kind"] == "room"
+            && recorded_sources[0]["room"] == learned["sources"][0]["room"],
         "PRODUCT: unrelated room acquired Bob's joined-room anchor source: {after}"
     );
     let manual = after["anchors"]
@@ -714,6 +720,128 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         std::fs::read_to_string(&bob_err).unwrap_or_default()
     );
 
+    // The inventory is a machine display of saved rooms, including a room whose node is
+    // locked. Rename on the creator first so a stale initial name cannot satisfy the proof.
+    let renamed = "mission-renamed";
+    let (ok, out, err) = vox(&data, &cfg, &["room", "rename", &room, renamed]);
+    assert!(ok, "PRODUCT: renaming the shared room failed: {out}{err}");
+    let deadline = std::time::Instant::now() + READ_PATIENCE;
+    loop {
+        let inventory = machine_list(&bob_data, &bob_cfg);
+        if room_source(&inventory, anchor_id).is_some_and(|source| source["name"] == renamed) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "PRODUCT: the machine inventory did not follow the room's shared name: {inventory}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    for node in ["default", "dave"] {
+        let (ok, out, err) = vox(&bob_data, &bob_cfg, &["node", "lock", node]);
+        assert!(ok, "PRODUCT: locking {node} failed: {out}{err}");
+    }
+    let locked = machine_list(&bob_data, &bob_cfg);
+    assert_saved_source(&locked, anchor_id, &room, renamed, true);
+    let (ok, shown, err) = vox(&bob_data, &bob_cfg, &["anchor", "list"]);
+    assert!(
+        ok && shown.contains(renamed) && shown.contains("last known"),
+        "PRODUCT: anchor list did not show the locked room's last-known provenance: {shown}{err}"
+    );
+    println!("[proof] room provenance and renamed label remain visible with both nodes locked");
+
+    // A fresh daemon starts with no node: the observation must come from saved display data,
+    // and must not unlock a node or make a room-only anchor a machine input.
+    bob_daemon
+        .0
+        .kill()
+        .expect("APPARATUS: stop the scratch Bob daemon for restart");
+    bob_daemon
+        .0
+        .wait()
+        .expect("APPARATUS: reap the scratch Bob daemon");
+    bob_daemon = Proc(
+        Command::new(VOX)
+            .args(["daemon", "--no-node", "--listen", "127.0.0.1:0"])
+            .env("HOME", &bob_data)
+            .env("VOX_TEST_KEYCHAIN", attach::keychain(&bob_data))
+            .env("VOX_DATA_DIR", &bob_data)
+            .env("VOX_CONFIG_DIR", &bob_cfg)
+            .env_remove("VOX_NODE")
+            .env_remove("VOX_ANCHORS")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(
+                std::fs::File::create(&bob_err).expect("APPARATUS: restart log"),
+            ))
+            .spawn()
+            .expect("APPARATUS: restart the scratch Bob daemon"),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let (ok, _, err) = vox(&bob_data, &bob_cfg, &["anchor", "list", "--json"]);
+        if ok {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "PRODUCT: the restarted daemon did not expose its saved anchor list: {err}; {:?}",
+            std::fs::read_to_string(&bob_err).unwrap_or_default()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let restarted = machine_list(&bob_data, &bob_cfg);
+    assert_saved_source(&restarted, anchor_id, &room, renamed, true);
+    let (ok, nodes, err) = vox(&bob_data, &bob_cfg, &["node", "list"]);
+    assert!(
+        ok && ["default", "dave"].iter().all(|node| nodes
+            .lines()
+            .any(|line| line.split_whitespace().take(2).eq([*node, "detached"]))),
+        "PRODUCT: reading saved anchor provenance unlocked a node: {nodes}{err}"
+    );
+    println!("[proof] a restarted daemon lists the saved room while its node stays locked");
+
+    let (ok, out, err) = vox(&bob_data, &bob_cfg, &["node", "unlock", "default"]);
+    assert!(
+        ok,
+        "PRODUCT: unlocking Bob after restart failed: {out}{err}"
+    );
+    let deadline = std::time::Instant::now() + READ_PATIENCE;
+    loop {
+        let inventory = machine_list(&bob_data, &bob_cfg);
+        if room_source(&inventory, anchor_id).is_some_and(|source| source["stale"] == false) {
+            assert_saved_source(&inventory, anchor_id, &room, renamed, false);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "PRODUCT: the reopened room's anchor observation stayed stale: {inventory}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let (ok, out, err) = vox(&bob_data, &bob_cfg, &["room", "leave", &room]);
+    assert!(
+        ok,
+        "PRODUCT: Bob could not leave the room after reopening: {out}{err}"
+    );
+    let left = machine_list(&bob_data, &bob_cfg);
+    assert!(
+        left["anchors"].as_array().is_some_and(|anchors| anchors
+            .iter()
+            .all(|anchor| anchor["fingerprint"] != anchor_id)),
+        "PRODUCT: a removed saved room left its anchor/provenance in the machine list: {left}"
+    );
+    assert!(
+        left["anchors"].as_array().is_some_and(|anchors| anchors
+            .iter()
+            .any(|anchor| anchor["fingerprint"] == machine_id
+                && anchor["sources"] == serde_json::json!([{"kind": "added-by-hand"}]))),
+        "PRODUCT: leaving a room removed the independent hand-added anchor: {left}"
+    );
+    println!("[proof] leaving removes room provenance and preserves the independent manual input");
+    // Keep the restarted process guard alive through the whole journey.
+    let _bob_daemon = bob_daemon;
+
     // The anchor must still be the one serving: a join that went anywhere else would
     // not be the claim.
     let alive = anchor
@@ -730,6 +858,58 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         alive,
         "PRODUCT (staging): the anchor exited during the run. stdout: {anchor_out:?} stderr: {:?}",
         std::fs::read_to_string(tmp.path().join("anchor.err")).unwrap_or_default()
+    );
+}
+
+/// The actual public machine-list output, not the cache format.
+fn machine_list(data: &std::path::Path, cfg: &std::path::Path) -> serde_json::Value {
+    let (ok, shown, err) = vox(data, cfg, &["anchor", "list", "--json"]);
+    assert!(ok, "PRODUCT: machine anchor list failed: {shown}{err}");
+    serde_json::from_str(&shown).unwrap_or_else(|error| {
+        panic!("PRODUCT: machine anchor list returned invalid JSON: {error}: {shown}")
+    })
+}
+
+fn room_source<'a>(
+    inventory: &'a serde_json::Value,
+    anchor: &str,
+) -> Option<&'a serde_json::Value> {
+    inventory["anchors"]
+        .as_array()?
+        .iter()
+        .find(|row| row["fingerprint"] == anchor)?["sources"]
+        .as_array()?
+        .iter()
+        .find(|source| source["kind"] == "room")
+}
+
+fn assert_saved_source(
+    inventory: &serde_json::Value,
+    anchor: &str,
+    room: &str,
+    name: &str,
+    stale: bool,
+) {
+    let source = room_source(inventory, anchor)
+        .unwrap_or_else(|| panic!("PRODUCT: saved room's anchor disappeared: {inventory}"));
+    assert!(
+        source["room"]
+            .as_str()
+            .is_some_and(|id| id.starts_with(room))
+            && source["name"] == name
+            && source["stale"] == stale,
+        "PRODUCT: saved room's provenance/name/freshness is wrong: {inventory}"
+    );
+    let row = inventory["anchors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["fingerprint"] == anchor)
+        .unwrap();
+    assert_eq!(
+        row["sources"].as_array().unwrap().len(),
+        1,
+        "PRODUCT: saved room anchor acquired machine dialing provenance: {inventory}"
     );
 }
 

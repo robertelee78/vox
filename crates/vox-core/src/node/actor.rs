@@ -4259,6 +4259,10 @@ pub struct Node {
     /// anchor once and never again lost its board and its relay the first time the anchor
     /// restarted. Entries for rooms no longer open are ignored and dropped at the next redial.
     room_anchors: BTreeMap<Digest32, BootstrapSet>,
+    /// Durable display observations, never fed into network anchor selection.
+    anchor_inventory: Vec<crate::node::api::RoomAnchorView>,
+    /// A malformed or unsupported cache is preserved and reported, never silently replaced.
+    anchor_inventory_load_error: Option<String>,
     /// An override for the ADR-005 PoW parameters a join binds. `None` means the
     /// channel's own (production `(200,9)`); tests reduce them so the debug suite
     /// does not grind, exactly as they reduce the Argon2 profile.
@@ -4921,6 +4925,11 @@ impl Node {
         let handle_event_tx = event_tx.clone();
         let (net_tx, net_rx) = mpsc::channel(NET_QUEUE);
         let decisions = crate::node::decisions::DecisionLog::new(&paths.profile_dir);
+        let (anchor_inventory, anchor_inventory_load_error) =
+            match crate::node::anchor_inventory::load(&paths) {
+                Ok(rooms) => (rooms, None),
+                Err(error) => (Vec::new(), Some(error.to_string())),
+            };
         let node = Self {
             paths,
             decisions,
@@ -4936,6 +4945,8 @@ impl Node {
             computer_revision: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             anchor_ids: anchors.nodes().iter().map(|n| n.id).collect(),
             room_anchors: BTreeMap::new(),
+            anchor_inventory,
+            anchor_inventory_load_error,
             anchors,
             presented: BTreeMap::new(),
             presentation_due: BTreeMap::new(),
@@ -17447,7 +17458,8 @@ impl Node {
             .map(|eps| eps.addrs().iter().map(ToString::to_string).collect())
             .unwrap_or_default();
         self.view_tx.send_replace(NodeView {
-            room_anchors: Vec::new(),
+            room_anchors: self.anchor_inventory.clone(),
+            anchor_inventory_error: self.anchor_inventory_load_error.clone(),
             identity,
             locked,
             locking: self.locking > 0,
@@ -17520,7 +17532,21 @@ impl Node {
                 self.cancel_room_validations(Some(&room), fault);
             }
         }
-        let (view, read) = self.view_of().await;
+        let (mut view, read) = self.view_of().await;
+        if view.anchor_inventory_error.is_none() {
+            let mut saved = view.room_anchors.clone();
+            for room in &mut saved {
+                room.stale = true;
+            }
+            // A busy or closed room keeps its last observation; a removed room is pruned only
+            // after the authoritative store enumeration succeeded. Only changed content writes.
+            if saved != self.anchor_inventory {
+                match crate::node::anchor_inventory::save(&self.paths, &saved) {
+                    Ok(()) => self.anchor_inventory = saved,
+                    Err(error) => view.anchor_inventory_error = Some(error.to_string()),
+                }
+            }
+        }
         self.fresh_details
             .retain(|id, _| self.channels.contains_key(id) && !read.contains(id));
         self.view_tx.send_replace(view);
@@ -17561,11 +17587,29 @@ impl Node {
             .and_then(|n| n.local_endpoints().ok())
             .map(|eps| eps.addrs().iter().map(ToString::to_string).collect())
             .unwrap_or_default();
-        let mut known: Vec<Digest32> = self
+        let saved_rooms = self
             .profile
             .as_ref()
-            .and_then(|p| p.store().channels().ok())
-            .unwrap_or_else(|| prev.channels.iter().map(|c| c.channel_id).collect());
+            .map(|p| p.store().channels())
+            .transpose();
+        let mut anchor_inventory_error = self.anchor_inventory_load_error.clone();
+        let mut inventory: BTreeMap<_, _> = self
+            .anchor_inventory
+            .iter()
+            .cloned()
+            .map(|room| (room.room, room))
+            .collect();
+        let mut known: Vec<Digest32> = match saved_rooms {
+            Ok(Some(saved)) => {
+                inventory.retain(|room, _| saved.contains(room));
+                saved
+            }
+            Ok(None) => Vec::new(),
+            Err(error) => {
+                anchor_inventory_error = Some(format!("cannot read saved rooms: {error}"));
+                prev.channels.iter().map(|c| c.channel_id).collect()
+            }
+        };
         // A store being recovered may not answer reads yet. Its open rooms and the last
         // saved list remain visible, with their cannot-save cause, throughout that retry.
         known.extend(self.channels.keys().copied());
@@ -17601,6 +17645,33 @@ impl Node {
                 continue;
             };
             read.insert(*id);
+            let mut anchors = BootstrapSet::new();
+            for anchor in ch.anchors().nodes() {
+                if !ch.is_known_member(&anchor.id) {
+                    let _ = anchors.add(anchor.clone());
+                }
+            }
+            let name = ch.name().map(str::to_owned);
+            let previous = inventory.get(id);
+            let observed_at = match previous {
+                Some(previous) if previous.name == name && previous.anchors == anchors => {
+                    previous.observed_at
+                }
+                _ => self
+                    .now_ms()
+                    .get()
+                    .max(previous.map_or(0, |r| r.observed_at.saturating_add(1))),
+            };
+            inventory.insert(
+                *id,
+                crate::node::api::RoomAnchorView {
+                    room: *id,
+                    name,
+                    anchors,
+                    stale: false,
+                    observed_at,
+                },
+            );
             summaries.insert(*id, summary_of(&ch));
             mlock_active &= ch.mlock_active();
             open_channels.push(detail_of(
@@ -17654,20 +17725,15 @@ impl Node {
             &trusted,
             &self.dismissed_offers,
         );
+        if known.iter().any(|room| !inventory.contains_key(room)) {
+            anchor_inventory_error.get_or_insert_with(|| {
+                "a saved room has no anchor observation yet; open it to refresh the inventory"
+                    .into()
+            });
+        }
         let view = NodeView {
-            room_anchors: self
-                .room_anchors
-                .iter()
-                .filter(|(room, _)| self.channels.contains_key(*room))
-                .map(|(room, anchors)| crate::node::api::RoomAnchorView {
-                    room: *room,
-                    name: channels
-                        .iter()
-                        .find(|channel| channel.channel_id == *room)
-                        .and_then(|channel| channel.name.clone()),
-                    anchors: anchors.clone(),
-                })
-                .collect(),
+            room_anchors: inventory.into_values().collect(),
+            anchor_inventory_error,
             identity,
             locked,
             locking: self.locking > 0,

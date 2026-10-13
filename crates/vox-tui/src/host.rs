@@ -445,9 +445,9 @@ impl Router {
             .collect()
     }
 
-    /// The shared manual inputs beside each attached node's open-room provenance. Room names
-    /// and configuration remain sealed when the room is closed or its node is detached.
-    async fn anchor_list(&self) -> Vec<AnchorInfo> {
+    /// One machine display list, including last-known provenance from locked nodes and closed
+    /// rooms. Saved observations never enter the manual set delivered to node actors.
+    async fn anchor_list(&self) -> Result<Vec<AnchorInfo>, Refusal> {
         let manual = self.inner.manual_anchors.lock().await;
         let mut all = BTreeMap::new();
         for anchor in manual.set.nodes() {
@@ -465,40 +465,64 @@ impl Router {
                 },
             );
         }
-        for (_, node) in self.attached_handles() {
-            for room in node.view().room_anchors {
-                for anchor in room.anchors.nodes() {
-                    let entry = all.entry(anchor.id).or_insert_with(|| AnchorInfo {
-                        fingerprint: anchor.id,
-                        addresses: Vec::new(),
-                        sources: Vec::new(),
+        drop(manual);
+        let attached: BTreeMap<_, _> = self.attached_handles().into_iter().collect();
+        let mut rooms = BTreeMap::<Digest32, vox_core::node::api::RoomAnchorView>::new();
+        for node in self.nodes() {
+            let inventory = if let Some(handle) = attached.get(node.name.as_str()) {
+                let view = handle.view();
+                if let Some(why) = view.anchor_inventory_error {
+                    return Err(Refusal::Failed {
+                        node: node.name,
+                        why: format!("cannot read the anchor inventory: {why}"),
                     });
-                    for address in anchor.endpoints.addrs().iter().map(ToString::to_string) {
-                        if !entry.addresses.contains(&address) {
-                            entry.addresses.push(address);
-                        }
-                    }
-                    let name = room.name.clone().unwrap_or_default();
-                    if let Some(AnchorSource::Room { name: recorded, .. }) = entry.sources.iter_mut().find(
-                        |source| matches!(source, AnchorSource::Room { room: id, .. } if *id == room.room),
-                    ) {
-                        if recorded.is_empty() {
-                            *recorded = name;
-                        }
-                    } else {
-                        entry.sources.push(AnchorSource::Room { room: room.room, name });
-                    }
+                }
+                view.room_anchors
+            } else {
+                let paths = self.inner.account.node_paths_as_they_are(&node.name);
+                vox_core::node::anchor_inventory::load(&paths).map_err(|error| Refusal::Failed {
+                    node: node.name,
+                    why: format!("cannot read the anchor inventory: {error}"),
+                })?
+            };
+            for room in inventory {
+                // Several local nodes can hold one room. Prefer an opened observation, then
+                // the latest recorded change, so a stale copy cannot resurrect removed anchors
+                // or an old shared name beside a current room on this daemon.
+                let replace = rooms.get(&room.room).is_none_or(|old| {
+                    (!room.stale, room.observed_at) > (!old.stale, old.observed_at)
+                });
+                if replace {
+                    rooms.insert(room.room, room);
                 }
             }
         }
-        all.into_values()
+        for room in rooms.into_values() {
+            for anchor in room.anchors.nodes() {
+                let entry = all.entry(anchor.id).or_insert_with(|| AnchorInfo {
+                    fingerprint: anchor.id,
+                    addresses: Vec::new(),
+                    sources: Vec::new(),
+                });
+                entry
+                    .addresses
+                    .extend(anchor.endpoints.addrs().iter().map(ToString::to_string));
+                entry.sources.push(AnchorSource::Room {
+                    room: room.room,
+                    name: room.name.clone().unwrap_or_default(),
+                    stale: room.stale,
+                });
+            }
+        }
+        Ok(all
+            .into_values()
             .map(|mut anchor| {
                 anchor.addresses.sort();
                 anchor.addresses.dedup();
                 anchor.sources.sort();
                 anchor
             })
-            .collect()
+            .collect())
     }
 
     /// Every node: each on disk, and any slot besides, with its state.
@@ -2842,7 +2866,10 @@ impl Dispatch for Router {
     async fn daemon(&self, request: DaemonRequest) -> DaemonFrame {
         let refused = DaemonFrame::Refused;
         match request {
-            DaemonRequest::Anchors => DaemonFrame::Anchors(self.anchor_list().await),
+            DaemonRequest::Anchors => match self.anchor_list().await {
+                Ok(anchors) => DaemonFrame::Anchors(anchors),
+                Err(why) => refused(why),
+            },
             DaemonRequest::ComputerStatus
             | DaemonRequest::ComputerBegin
             | DaemonRequest::ComputerPreview { .. }

@@ -6,7 +6,7 @@ use vox_core::node::paths::Account;
 
 use crate::app::AppError;
 
-/// List the running daemon's recorded manual and open-room anchor sources. Never starts a
+/// List the running daemon's recorded manual and saved-room anchor sources. Never starts a
 /// daemon or attaches a node, and never guesses whether an anchor was reached.
 ///
 /// # Errors
@@ -18,10 +18,14 @@ pub async fn list(account: &Account, json: bool) -> Result<(), AppError> {
             .map_err(|error| {
                 AppError::Usage(format!("could not read the machine anchor list: {error}"))
             })?;
-    let DaemonFrame::Anchors(anchors) = client.request(DaemonRequest::Anchors).await? else {
-        return Err(AppError::Usage(
-            "the daemon did not return its anchor list".into(),
-        ));
+    let anchors = match client.request(DaemonRequest::Anchors).await? {
+        DaemonFrame::Anchors(anchors) => anchors,
+        DaemonFrame::Refused(why) => return Err(AppError::Usage(why.to_string())),
+        _ => {
+            return Err(AppError::Usage(
+                "the daemon did not return its anchor list".into(),
+            ))
+        }
     };
     if json {
         let anchors: Vec<_> = anchors
@@ -32,8 +36,8 @@ pub async fn list(account: &Account, json: bool) -> Result<(), AppError> {
                     .iter()
                     .map(|source| match source {
                         AnchorSource::AddedByHand => serde_json::json!({"kind": "added-by-hand"}),
-                        AnchorSource::Room { room, name } => serde_json::json!({
-                            "kind": "room", "room": b32_encode(room), "name": name,
+                        AnchorSource::Room { room, name, stale } => serde_json::json!({
+                            "kind": "room", "room": b32_encode(room), "name": name, "stale": stale,
                         }),
                     })
                     .collect();
@@ -49,7 +53,7 @@ pub async fn list(account: &Account, json: bool) -> Result<(), AppError> {
             serde_json::json!({"schema": "vox.anchor.list/1", "anchors": anchors})
         );
     } else if anchors.is_empty() {
-        println!("No manual or open-room anchors on this machine.");
+        println!("No manual or saved-room anchors on this machine.");
     } else {
         for anchor in anchors {
             let sources: Vec<_> = anchor
@@ -57,12 +61,17 @@ pub async fn list(account: &Account, json: bool) -> Result<(), AppError> {
                 .iter()
                 .map(|source| match source {
                     AnchorSource::AddedByHand => "added by hand".to_owned(),
-                    AnchorSource::Room { room, name } => format!(
-                        "from room {}",
+                    AnchorSource::Room { room, name, stale } => format!(
+                        "from room {}{}",
                         if name.is_empty() {
                             b32_encode(room).chars().take(12).collect::<String>()
                         } else {
                             name.clone()
+                        },
+                        if *stale {
+                            " (last known; room closed, node locked or awaiting refresh)"
+                        } else {
+                            ""
                         }
                     ),
                 })
