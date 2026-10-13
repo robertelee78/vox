@@ -537,11 +537,26 @@ final class FirstRunProof: XCTestCase {
         let data = root.appendingPathComponent("data").path
         let config = root.appendingPathComponent("config").path
         let home = root.appendingPathComponent("home").path
-        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
-        // The account's daemon, from the bundle, stopped by this case; node alice kept as Keep
-        // Running keeps a node (`--keep`, its passphrase from a scratch file: the Keychain is the
-        // person's, never a proof's), and chosen; the first-run question not answered yet.
-        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+        guard let knobs = env["VOX_PROOF_KNOBS_VOX"], !knobs.isEmpty else {
+            throw Apparatus("VOX_PROOF_KNOBS_VOX is required for this journey's isolated Keychain")
+        }
+        let keychain = root.appendingPathComponent("identity.keychain-db").path
+        let madeRoot = stager.run(["/bin/mkdir", "-p", root.path], env: [:])
+        let hasKnob = stager.run(["/usr/bin/python3", "-c",
+            "import sys; sys.exit(0 if b'VOX_TEST_KEYCHAIN' in open(sys.argv[1],'rb').read() else 1)", knobs], env: [:])
+        guard madeRoot.status == 0, hasKnob.status == 0 else {
+            throw Apparatus("cannot stage a scratch Keychain: the directory or daemon test knob is missing")
+        }
+        let madeKeychain = stager.run(["/usr/bin/security", "create-keychain", "-p", "", keychain],
+                                     env: ["HOME": root.path])
+        guard madeKeychain.status == 0 else {
+            throw Apparatus("cannot create this journey's private Keychain: \(madeKeychain.out)")
+        }
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0",
+                      "VOX_TEST_KEYCHAIN": keychain]
+        // The owned apparatus daemon stores supplied secrets in this scratch Keychain through
+        // real Security APIs. The app and CLI remain ordinary; the first-run question is unanswered.
+        daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
         let pass = root.appendingPathComponent("alice.pass").path
         try stager.write(Data("alice identity\n".utf8), to: pass)
@@ -698,8 +713,24 @@ final class FirstRunProof: XCTestCase {
         let data = root.appendingPathComponent("data").path
         let config = root.appendingPathComponent("config").path
         let home = root.appendingPathComponent("home").path
-        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
-        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+        guard let knobs = env["VOX_PROOF_KNOBS_VOX"], !knobs.isEmpty else {
+            throw Apparatus("VOX_PROOF_KNOBS_VOX is required for this journey's isolated Keychain")
+        }
+        let keychain = root.appendingPathComponent("identity.keychain-db").path
+        let madeRoot = stager.run(["/bin/mkdir", "-p", root.path], env: [:])
+        let hasKnob = stager.run(["/usr/bin/python3", "-c",
+            "import sys; sys.exit(0 if b'VOX_TEST_KEYCHAIN' in open(sys.argv[1],'rb').read() else 1)", knobs], env: [:])
+        guard madeRoot.status == 0, hasKnob.status == 0 else {
+            throw Apparatus("cannot stage a scratch Keychain: the directory or daemon test knob is missing")
+        }
+        let madeKeychain = stager.run(["/usr/bin/security", "create-keychain", "-p", "", keychain],
+                                     env: ["HOME": root.path])
+        guard madeKeychain.status == 0 else {
+            throw Apparatus("cannot create this journey's private Keychain: \(madeKeychain.out)")
+        }
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0",
+                      "VOX_TEST_KEYCHAIN": keychain]
+        daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
         // Alice kept as Keep Running keeps a node (`--keep`, its passphrase from a scratch file: the
         // Keychain is the person's, never a proof's), so the app opens acting as her.
@@ -817,8 +848,24 @@ final class FirstRunProof: XCTestCase {
         let data = root.appendingPathComponent("data").path
         let config = root.appendingPathComponent("config").path
         let home = root.appendingPathComponent("home").path
-        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
-        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+        guard let knobs = env["VOX_PROOF_KNOBS_VOX"], !knobs.isEmpty else {
+            throw Apparatus("VOX_PROOF_KNOBS_VOX is required for this journey's isolated Keychain")
+        }
+        let keychain = root.appendingPathComponent("identity.keychain-db").path
+        let madeRoot = stager.run(["/bin/mkdir", "-p", root.path], env: [:])
+        let hasKnob = stager.run(["/usr/bin/python3", "-c",
+            "import sys; sys.exit(0 if b'VOX_TEST_KEYCHAIN' in open(sys.argv[1],'rb').read() else 1)", knobs], env: [:])
+        guard madeRoot.status == 0, hasKnob.status == 0 else {
+            throw Apparatus("cannot stage a scratch Keychain: the directory or daemon test knob is missing")
+        }
+        let madeKeychain = stager.run(["/usr/bin/security", "create-keychain", "-p", "", keychain],
+                                     env: ["HOME": root.path])
+        guard madeKeychain.status == 0 else {
+            throw Apparatus("cannot create this journey's private Keychain: \(madeKeychain.out)")
+        }
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0",
+                      "VOX_TEST_KEYCHAIN": keychain]
+        daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
         let idPass = root.appendingPathComponent("alice.pass").path
         let roomPass = root.appendingPathComponent("room.pass").path
@@ -909,9 +956,25 @@ final class FirstRunProof: XCTestCase {
         let data = root.appendingPathComponent("data").path
         let config = root.appendingPathComponent("config").path
         let home = root.appendingPathComponent("home").path
-        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        guard let knobs = env["VOX_PROOF_KNOBS_VOX"], !knobs.isEmpty else {
+            throw Apparatus("VOX_PROOF_KNOBS_VOX is required for this journey's isolated Keychain")
+        }
+        let keychain = root.appendingPathComponent("identity.keychain-db").path
+        let madeRoot = stager.run(["/bin/mkdir", "-p", root.path], env: [:])
+        let hasKnob = stager.run(["/usr/bin/python3", "-c",
+            "import sys; sys.exit(0 if b'VOX_TEST_KEYCHAIN' in open(sys.argv[1],'rb').read() else 1)", knobs], env: [:])
+        guard madeRoot.status == 0, hasKnob.status == 0 else {
+            throw Apparatus("cannot stage a scratch Keychain: the directory or daemon test knob is missing")
+        }
+        let madeKeychain = stager.run(["/usr/bin/security", "create-keychain", "-p", "", keychain],
+                                     env: ["HOME": root.path])
+        guard madeKeychain.status == 0 else {
+            throw Apparatus("cannot create this journey's private Keychain: \(madeKeychain.out)")
+        }
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0",
+                      "VOX_TEST_KEYCHAIN": keychain]
         let pass = { (name: String) in root.appendingPathComponent("\(name).pass").path }
-        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+        daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
         try stager.write(Data("alice identity\n".utf8), to: pass("alice"))
         try stager.write(Data("bob identity\n".utf8), to: pass("bob"))
@@ -1158,8 +1221,24 @@ final class FirstRunProof: XCTestCase {
         let data = root.appendingPathComponent("data").path
         let config = root.appendingPathComponent("config").path
         let home = root.appendingPathComponent("home").path
-        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
-        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+        guard let knobs = env["VOX_PROOF_KNOBS_VOX"], !knobs.isEmpty else {
+            throw Apparatus("VOX_PROOF_KNOBS_VOX is required for this journey's isolated Keychain")
+        }
+        let keychain = root.appendingPathComponent("identity.keychain-db").path
+        let madeRoot = stager.run(["/bin/mkdir", "-p", root.path], env: [:])
+        let hasKnob = stager.run(["/usr/bin/python3", "-c",
+            "import sys; sys.exit(0 if b'VOX_TEST_KEYCHAIN' in open(sys.argv[1],'rb').read() else 1)", knobs], env: [:])
+        guard madeRoot.status == 0, hasKnob.status == 0 else {
+            throw Apparatus("cannot stage a scratch Keychain: the directory or daemon test knob is missing")
+        }
+        let madeKeychain = stager.run(["/usr/bin/security", "create-keychain", "-p", "", keychain],
+                                     env: ["HOME": root.path])
+        guard madeKeychain.status == 0 else {
+            throw Apparatus("cannot create this journey's private Keychain: \(madeKeychain.out)")
+        }
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0",
+                      "VOX_TEST_KEYCHAIN": keychain]
+        daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
         let idPass = root.appendingPathComponent("alice.pass").path
         let roomPass = root.appendingPathComponent("room.pass").path
@@ -1181,10 +1260,17 @@ final class FirstRunProof: XCTestCase {
         // Keep these members remote: nine local identities expose the separate sidebar
         // clipping defect tracked by #767, before this inspector journey can open its room.
         let membersRoot = root.appendingPathComponent("members")
+        let membersKeychain = membersRoot.appendingPathComponent("identity.keychain-db").path
+        let madeMembersRoot = stager.run(["/bin/mkdir", "-p", membersRoot.path], env: [:])
+        let madeMembersKeychain = stager.run(["/usr/bin/security", "create-keychain", "-p", "", membersKeychain],
+                                            env: ["HOME": membersRoot.path])
+        guard madeMembersRoot.status == 0, madeMembersKeychain.status == 0 else {
+            throw Apparatus("cannot create the remote roster account's private Keychain: \(madeMembersKeychain.out)")
+        }
         let membersEnv = ["VOX_DATA_DIR": membersRoot.appendingPathComponent("data").path,
                           "VOX_CONFIG_DIR": membersRoot.appendingPathComponent("config").path,
-                          "VOX_PROXY": "127.0.0.1:0"]
-        let membersDaemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"],
+                          "VOX_PROXY": "127.0.0.1:0", "VOX_TEST_KEYCHAIN": membersKeychain]
+        let membersDaemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"],
                                       env: membersEnv, until: "vox daemon: control socket")
         defer { membersDaemon.terminate() }
         var expectedMembers = [try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }]
@@ -1338,7 +1424,23 @@ final class FirstRunProof: XCTestCase {
         let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("notify")
         let data = root.appendingPathComponent("data").path
         let config = root.appendingPathComponent("config").path
-        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        guard let knobs = env["VOX_PROOF_KNOBS_VOX"], !knobs.isEmpty else {
+            throw Apparatus("VOX_PROOF_KNOBS_VOX is required for this journey's isolated Keychain")
+        }
+        let keychain = root.appendingPathComponent("identity.keychain-db").path
+        let madeRoot = stager.run(["/bin/mkdir", "-p", root.path], env: [:])
+        let hasKnob = stager.run(["/usr/bin/python3", "-c",
+            "import sys; sys.exit(0 if b'VOX_TEST_KEYCHAIN' in open(sys.argv[1],'rb').read() else 1)", knobs], env: [:])
+        guard madeRoot.status == 0, hasKnob.status == 0 else {
+            throw Apparatus("cannot stage a scratch Keychain: the directory or daemon test knob is missing")
+        }
+        let madeKeychain = stager.run(["/usr/bin/security", "create-keychain", "-p", "", keychain],
+                                     env: ["HOME": root.path])
+        guard madeKeychain.status == 0 else {
+            throw Apparatus("cannot create this journey's private Keychain: \(madeKeychain.out)")
+        }
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0",
+                      "VOX_TEST_KEYCHAIN": keychain]
         let bobSession = voxEnv.merging(["VOX_SESSION": "bob-proof"]) { $1 }
         let pass = { (name: String) in root.appendingPathComponent("\(name).pass").path }
         try stager.write(Data("alice identity\n".utf8), to: pass("alice"))
@@ -1347,7 +1449,7 @@ final class FirstRunProof: XCTestCase {
         // The first-run question is left unanswered, so the menu bar toggle is clicked as a
         // person does (the path that once did nothing); the node is chosen before.
         try stager.write(Data("alice\n".utf8), to: config + "/app/node")
-        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+        daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
         for (name, words) in [("alice", "alice identity"), ("bob", "bob identity")] {
             try staged(vox, ["node", "create", name],
@@ -2784,14 +2886,30 @@ final class FirstRunProof: XCTestCase {
         let scratch = URL(fileURLWithPath: scratchPath)
         let data = scratch.appendingPathComponent("data").path
         let config = scratch.appendingPathComponent("config").path
+        guard let knobs = env["VOX_PROOF_KNOBS_VOX"], !knobs.isEmpty else {
+            throw Apparatus("VOX_PROOF_KNOBS_VOX is required for this journey's isolated Keychain")
+        }
+        let keychain = scratch.appendingPathComponent("first-run.keychain-db").path
+        let madeRoot = stager.run(["/bin/mkdir", "-p", scratch.path], env: [:])
+        let hasKnob = stager.run(["/usr/bin/python3", "-c",
+            "import sys; sys.exit(0 if b'VOX_TEST_KEYCHAIN' in open(sys.argv[1],'rb').read() else 1)", knobs], env: [:])
+        guard madeRoot.status == 0, hasKnob.status == 0 else {
+            throw Apparatus("cannot stage a scratch Keychain: the directory or daemon test knob is missing")
+        }
+        let madeKeychain = stager.run(["/usr/bin/security", "create-keychain", "-p", "", keychain],
+                                     env: ["HOME": scratch.path])
+        guard madeKeychain.status == 0 else {
+            throw Apparatus("cannot create this journey's private Keychain: \(madeKeychain.out)")
+        }
         // The daemon's .vox proxy on a free port, never another daemon's 1080.
-        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0",
+                      "VOX_TEST_KEYCHAIN": keychain]
         // `vox room post --to` speaks for an agent session, and refuses without one: bob's, named.
         let bobSession = voxEnv.merging(["VOX_SESSION": "bob-proof"]) { $1 }
 
-        // The account's daemon, from the bundle, before any node exists, so nothing but the app
-        // attaches the node.
-        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+        // Only this owned apparatus daemon targets the private Keychain through real Security APIs.
+        // The app and its bundled CLI remain ordinary; no node is attached before the app.
+        daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
         let made = run(vox, ["node", "create", "alice"],
                        env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "alice identity"]) { $1 })
@@ -3723,7 +3841,7 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("attach-node-cancel"), "Cancel on bob's Attach sheet")
         // Forget Passphrase in place of `vox node forget-passphrase` (#666): Node > Forget
         // Passphrase ends the keep of alice, the node this window acts as, kept here by a
-        // passphrase file (never the Keychain, in a proof).
+        // supplied passphrase, remembered on this account's private scratch Keychain.
         try staged(vox, ["node", "attach", "alice", "--keep", "--passphrase-file", alicePass], env: voxEnv)
         let keptUntil = Date().addingTimeInterval(15)
         while Date() < keptUntil && !(nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "alice")?.contains("(kept)") ?? false) {
@@ -4047,13 +4165,17 @@ final class FirstRunProof: XCTestCase {
         // daemon of her own whose clock is two days behind: apparatus, a `vox` built with
         // test-knobs (VOX_TEST_CLOCK_SKEW_MS), never the app's. She joins, she and alice trust each
         // other, and she posts until alice reads one; it claims a time two days ago.
-        guard let knobs = env["VOX_PROOF_KNOBS_VOX"], !knobs.isEmpty else {
-            throw Apparatus("VOX_PROOF_KNOBS_VOX (a vox built with test-knobs, for dora's clock) is set by scripts/app-proofs.sh")
+        let doraKeychain = scratch.appendingPathComponent("dora.keychain-db").path
+        let madeDoraKeychain = stager.run(["/usr/bin/security", "create-keychain", "-p", "", doraKeychain],
+                                         env: ["HOME": scratch.path])
+        guard madeDoraKeychain.status == 0 else {
+            throw Apparatus("cannot create Dora's private Keychain: \(madeDoraKeychain.out)")
         }
         let doraEnv = ["VOX_DATA_DIR": scratch.appendingPathComponent("dora-data").path,
                        "VOX_CONFIG_DIR": scratch.appendingPathComponent("dora-config").path,
                        "VOX_PROXY": "127.0.0.1:0",
-                       "VOX_TEST_CLOCK_SKEW_MS": String(-2 * 86_400_000)]
+                       "VOX_TEST_CLOCK_SKEW_MS": String(-2 * 86_400_000),
+                       "VOX_TEST_KEYCHAIN": doraKeychain]
         let doraPass = scratch.appendingPathComponent("dora.pass").path
         try stager.write(Data("dora identity\n".utf8), to: doraPass)
         peer = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: doraEnv,
@@ -4742,19 +4864,48 @@ final class FirstRunProof: XCTestCase {
         print("[proof] keyboard: Space and Return opened Quick Look; ↑ ↑ ↓ selected KEYS-B, KEYS-A, KEYS-B; Tab reached the composer in \(tabs)")
 
         // (15) Who trusts whom, from a member (ADR-028 K-5, K-7, R-5, R-6, E-4; D4, D9, D10, D17).
-        // Dave, a node made here, is trusted by bob before he joins, so bob's grant to him is on
-        // mission's log once he is in.
+        // Dave is remote and unpaired: the local automatic trust policy cannot pretrust him.
+        // Bob trusts him before he joins, so Bob's grant is on mission's log once he is in.
+        let daveRoot = scratch.appendingPathComponent("dave-host")
+        let daveHome = daveRoot.appendingPathComponent("home").path
+        let daveKeychain = daveRoot.appendingPathComponent("identity.keychain-db").path
+        let madeDaveHome = stager.run(["/bin/mkdir", "-p", daveHome], env: [:])
+        let madeDaveKeychain = stager.run(["/usr/bin/security", "create-keychain", "-p", "", daveKeychain],
+                                         env: ["HOME": daveHome])
+        guard madeDaveHome.status == 0, madeDaveKeychain.status == 0 else {
+            throw Apparatus("the remote Dave account's private HOME/Keychain could not be staged")
+        }
+        let daveEnv = ["VOX_DATA_DIR": daveRoot.appendingPathComponent("data").path,
+                       "VOX_CONFIG_DIR": daveRoot.appendingPathComponent("config").path,
+                       "VOX_PROXY": "127.0.0.1:0", "HOME": daveHome, "VOX_TEST_KEYCHAIN": daveKeychain]
+        let daveDaemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: daveEnv,
+                                   until: "vox daemon: control socket")
+        defer { daveDaemon.terminate() }
         let davePass = scratch.appendingPathComponent("dave.pass").path
         try stager.write(Data("dave identity\n".utf8), to: davePass)
         try staged(vox, ["node", "create", "dave"],
-                   env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "dave identity"]) { $1 })
-        try staged(vox, ["node", "attach", "dave", "--passphrase-file", davePass], env: voxEnv)
-        let daveFp = try line(staged(vox, ["id", "--node", "dave"], env: voxEnv)) { $0.count == 52 }
+                   env: daveEnv.merging(["VOX_IDENTITY_PASSPHRASE": "dave identity"]) { $1 })
+        try staged(vox, ["node", "attach", "dave", "--passphrase-file", davePass], env: daveEnv)
+        let daveFp = try line(staged(vox, ["id", "--node", "dave"], env: daveEnv)) { $0.count == 52 }
         try staged(vox, ["trust", "add", "--node", "bob", daveFp, "--name", "dave",
                          "--identity-passphrase-file", bobPass], env: voxEnv)
         tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         try staged(vox, ["room", "join", "--node", "dave", "--passphrase-file", roomPass, missionLink],
-                   env: voxEnv)
+                   env: daveEnv)
+        let davePremiseUntil = Date().addingTimeInterval(30)
+        var daveOffers = ""
+        var aliceTrustBeforeDave = ""
+        while Date() < davePremiseUntil {
+            aliceTrustBeforeDave = try staged(vox, ["trust", "list", "--node", "alice"], env: voxEnv)
+            daveOffers = try staged(vox, ["trust", "offers", "--node", "alice"], env: voxEnv)
+            if !aliceTrustBeforeDave.split(separator: "\n").contains(where: { $0.hasPrefix(daveFp + " ") })
+                && daveOffers.contains("Name it presents: dave · \(daveFp) (not in keyring)") { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        guard !aliceTrustBeforeDave.split(separator: "\n").contains(where: { $0.hasPrefix(daveFp + " ") }),
+              daveOffers.contains("Name it presents: dave · \(daveFp) (not in keyring)") else {
+            throw Apparatus("remote Dave must be genuinely untrusted with authenticated name/full fingerprint before the app claims: trust=\(aliceTrustBeforeDave); offers=\(daveOffers)")
+        }
         // (15a, D10) The join is said in mission's timeline with who alice trusts that trusts dave.
         let daveNamed = "\(daveFp.prefix(26)) (not in keyring)"
         let joinSaid = words(ui, Key.id("join-\(daveFp)"), timeout: 90,
@@ -4765,7 +4916,7 @@ final class FirstRunProof: XCTestCase {
         // each direction and trusts him from there; the room's banner naming who does not read
         // her yet is P2's TrustBanner, proved at 5d.
         try staged(vox, ["trust", "add", "--node", "dave", aliceFp, "--name", "alice",
-                         "--identity-passphrase-file", davePass], env: voxEnv)
+                         "--identity-passphrase-file", davePass], env: daveEnv)
         let daveRow = Key.id("member-dave · \(daveFp.prefix(12))")
         let rowSaid = words(ui, daveRow, timeout: 60,
                             "dave trusts alice and she has not trusted him: her member pane must say \"not in keyring, trusts you\"",
@@ -4857,7 +5008,7 @@ final class FirstRunProof: XCTestCase {
         print("[proof] keyring card: \(ringHead); \(theirs); \(rooms); \(removal.prefix(40))…")
         // (15c, D9) A message of alice's no member's node holds says so, then where it is.
         try staged(vox, ["node", "detach", "bob"], env: voxEnv)
-        try staged(vox, ["node", "detach", "dave"], env: voxEnv)
+        try staged(vox, ["node", "detach", "dave"], env: daveEnv)
         // erin and fay joined in (5) and hold what alice posts; detached too, no member's node is
         // up to take WHERE-15.
         try staged(vox, ["node", "detach", "erin"], env: voxEnv)
