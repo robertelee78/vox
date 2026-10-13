@@ -4,6 +4,12 @@
 //! Run on demand, with the `test-knobs` feature: `VOX_TEST_KEYRING_WINDOW_SECS` shortens the
 //! window to [`WINDOW`].
 //!
+//! **An agent-marked CLI cannot widen trust** (ADR-031 LT-8, #677): with an empty identity
+//! passphrase and within a protected node's open window, each existing harness marker makes
+//! `trust add` and `trust drive` refuse with the operator-only sentence and leave the keyring
+//! unchanged. The same unmarked commands succeed. Refusal precedes naming and passphrase prompts,
+//! including at a terminal. These marks are staged apparatus, not a live-harness observation.
+//!
 //! Asserted, against a `vox daemon` given its passphrase in `VOX_IDENTITY_PASSPHRASE`:
 //! 1. right after the attach, a `vox trust add` with no passphrase and no terminal is refused at
 //!    once saying the passphrase is needed, nothing changes, and `vox status` says the keyring asks
@@ -43,6 +49,8 @@
 //! `read` after the restart).
 //! Adding an identity-passphrase requirement to room create, join, bind or leave — red, PRODUCT:
 //! the room command is refused or waits instead of completing with only the room passphrase.
+//! Removing the agent-session refusal — red, PRODUCT: a marked `trust add` succeeds on the
+//! empty-passphrase node instead of refusing.
 
 #![cfg(unix)]
 
@@ -77,6 +85,7 @@ const ANSWERS_WITHIN: Duration = Duration::from_secs(10);
 /// check restarted already gone, and must be made anyway.
 const PROVED_DELAY: Duration = Duration::from_secs(8);
 const DELAY_KNOB: &str = "VOX_TEST_PROVED_CHANGE_DELAY_MS";
+const AGENT_REFUSAL: &str = "vox: to grant trust or drive, run this command in your own terminal or in Vox.app outside the agent session.";
 
 fn vox_cmd(dir: &Path, args: &[&str]) -> Command {
     let mut c = Command::new(VOX);
@@ -143,11 +152,11 @@ fn run(cmd: &mut Command) -> (bool, String) {
     )
 }
 
-fn profile(root: &Path, name: &str) -> (std::path::PathBuf, String) {
+fn profile(root: &Path, name: &str, passphrase: &str) -> (std::path::PathBuf, String) {
     let dir = root.join(name);
     std::fs::create_dir_all(&dir).expect("APPARATUS: profile dir");
     let out = vox_cmd(&dir, &["id"])
-        .env("VOX_IDENTITY_PASSPHRASE", IDPASS)
+        .env("VOX_IDENTITY_PASSPHRASE", passphrase)
         .stdin(Stdio::null())
         .output()
         .expect("APPARATUS: spawn vox id");
@@ -176,9 +185,9 @@ impl Drop for Daemon {
 
 /// `vox daemon` on `dir`, unlocked from the environment with the shortened window, and where its
 /// control socket is, if it said.
-fn start_daemon(dir: &Path) -> (Daemon, Option<std::path::PathBuf>) {
+fn start_daemon(dir: &Path, passphrase: &str) -> (Daemon, Option<std::path::PathBuf>) {
     let mut daemon = vox_cmd(dir, &["daemon", "--listen", "127.0.0.1:0"])
-        .env("VOX_IDENTITY_PASSPHRASE", IDPASS)
+        .env("VOX_IDENTITY_PASSPHRASE", passphrase)
         .env(KNOB, WINDOW.as_secs().to_string())
         .env(DELAY_KNOB, PROVED_DELAY.as_millis().to_string())
         .stdin(Stdio::piped())
@@ -203,7 +212,7 @@ fn start_daemon(dir: &Path) -> (Daemon, Option<std::path::PathBuf>) {
 /// Room commands do not borrow the identity authorization of a keyring change (ADR-031 KP-1).
 /// Both identities are protected, already unlocked, and have never authorized a keyring change.
 fn rooms_with_closed_keyrings(root: &Path, alice: &Path, bob: &Path, carol: &str) {
-    let (_peer, sock) = start_daemon(bob);
+    let (_peer, sock) = start_daemon(bob, IDPASS);
     assert!(
         sock.is_some(),
         "APPARATUS: Bob's daemon did not announce its control socket"
@@ -357,6 +366,52 @@ fn raw_trust(sock: &Path, target: &str, petname: &str, passphrase: &str, drive: 
     })
 }
 
+/// Every supported shell marker refuses both widening verbs, regardless of keyring authorization.
+fn marked_refusals(dir: &Path, newcomer: &str, read_only: &str) {
+    let before = trusted(dir);
+    for marker in ["VOX_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"] {
+        for args in [
+            vec!["trust", "add", newcomer, "--name", "newcomer"],
+            vec!["trust", "add", newcomer, "--name", "newcomer", "--drive"],
+            vec!["trust", "drive", read_only],
+        ] {
+            let (ok, said) = run(vox_cmd(dir, &args).env(marker, "keyring-agent"));
+            assert!(
+                !ok && said.trim() == AGENT_REFUSAL,
+                "PRODUCT: {marker}-marked `vox {args:?}` must refuse a trust widening with the \
+                 operator-only sentence; succeeded {ok}, said:\n{said}"
+            );
+        }
+    }
+    let after = trusted(dir);
+    assert_eq!(
+        after, before,
+        "PRODUCT: refused agent-marked trust commands must leave the visible keyring unchanged"
+    );
+    eprintln!("[proof] all three harness markers refused trust add/drive: {AGENT_REFUSAL}");
+}
+
+/// The original LT-8 failure: an empty passphrase must not authorize a marked agent's grants.
+fn empty_passphrase_refusals(root: &Path, bob: &str, carol: &str) {
+    let (dir, _) = profile(root, "no-passphrase", "");
+    let (_daemon, sock) = start_daemon(&dir, "");
+    assert!(
+        sock.is_some(),
+        "APPARATUS: empty-passphrase daemon did not start"
+    );
+    let (ok, said) = run(&mut vox_cmd(&dir, &["trust", "add", bob, "--name", "bob"]));
+    assert!(
+        ok && entry(&trusted(&dir), bob).ends_with("bob  read"),
+        "PRODUCT: the person's unmarked trust add must work with an empty passphrase: {said}"
+    );
+    marked_refusals(&dir, carol, bob);
+    let (ok, said) = run(&mut vox_cmd(&dir, &["trust", "drive", bob]));
+    assert!(
+        ok && entry(&trusted(&dir), bob).ends_with("bob  read + drive"),
+        "PRODUCT: the person's unmarked trust drive must work with an empty passphrase: {said}"
+    );
+}
+
 #[test]
 fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
     watchdog::arm();
@@ -364,19 +419,46 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
     let needed = vox_core::node::api::Fault::PassphraseNeeded.explain();
     let needed_first = needed.lines().next().unwrap_or_default();
     let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
-    let (alice, _) = profile(tmp.path(), "alice");
-    let (bob_dir, bob) = profile(tmp.path(), "bob");
-    let (_, carol) = profile(tmp.path(), "carol");
-    let (_, dave) = profile(tmp.path(), "dave");
-    let (_, erin) = profile(tmp.path(), "erin");
+    let (alice, _) = profile(tmp.path(), "alice", IDPASS);
+    let (bob_dir, bob) = profile(tmp.path(), "bob", IDPASS);
+    let (_, carol) = profile(tmp.path(), "carol", IDPASS);
+    let (_, dave) = profile(tmp.path(), "dave", IDPASS);
+    let (_, erin) = profile(tmp.path(), "erin", IDPASS);
     let pass_file = tmp.path().join("idpass");
     std::fs::write(&pass_file, format!("{IDPASS}\n")).expect("APPARATUS: passphrase file");
 
-    let (daemon, sock) = start_daemon(&alice);
+    empty_passphrase_refusals(tmp.path(), &bob, &carol);
+
+    // Refuse even before selecting a node or asking for the missing trust name.
+    let (ok, said) = run(
+        vox_cmd(&tmp.path().join("not-attached"), &["trust", "add", &bob])
+            .env("VOX_SESSION", "keyring-agent"),
+    );
+    assert!(
+        !ok && said.trim() == AGENT_REFUSAL,
+        "PRODUCT: a marked trust add must refuse before naming or daemon access: {said}"
+    );
+
+    let (daemon, sock) = start_daemon(&alice, IDPASS);
     let Some(sock) = sock else {
         panic!("CANNOT MEASURE: the daemon never said where its control socket is");
     };
     let kill = drop;
+
+    // A terminal and a correct passphrase do not make an agent-marked process the person.
+    for args in [
+        vec!["trust", "add", bob.as_str()],
+        vec!["trust", "add", bob.as_str(), "--name", "bob"],
+    ] {
+        let (ok, said) = typed::typed(
+            vox_cmd(&alice, &args).env("CODEX_THREAD_ID", "keyring-agent"),
+            IDPASS,
+        );
+        assert!(
+            !ok && said.trim() == AGENT_REFUSAL,
+            "PRODUCT: a marked terminal must refuse before naming or passphrase prompts: {said}"
+        );
+    }
 
     // 1. Right after the attach: the attach's passphrase opened no window (K-12).
     let (ok, said) = run(&mut vox_cmd(
@@ -472,6 +554,17 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
              second change (succeeded {again_ok}):\n{again_said}"
         );
     }
+
+    marked_refusals(&alice, &dave, &erin);
+    let (drive_ok, drive_said) = run(&mut vox_cmd(&alice, &["trust", "drive", &erin]));
+    assert!(
+        entered.elapsed() < WINDOW,
+        "APPARATUS: the marked-refusal controls ran past the open {WINDOW:?} keyring window"
+    );
+    assert!(
+        drive_ok && entry(&trusted(&alice), &erin).ends_with("erin  read + drive"),
+        "PRODUCT: the person's unmarked trust drive must work inside the keyring window: {drive_said}"
+    );
 
     // 3. Past the window, the CLI with nothing to give: refused at once, nothing changed.
     std::thread::sleep((WINDOW + Duration::from_secs(2)).saturating_sub(entered.elapsed()));
@@ -574,7 +667,7 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
 
     // 6. K-14: what an entry grants is saved with it. The daemon starts again and reads the
     // keyring back from the disk: carol, trusted with drive over the socket, still has it.
-    let (again, sock_again) = start_daemon(&alice);
+    let (again, sock_again) = start_daemon(&alice, IDPASS);
     if sock_again.is_none() {
         kill(again);
         panic!("CANNOT MEASURE: the restarted daemon never said where its control socket is");

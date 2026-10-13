@@ -156,6 +156,20 @@ fn trust_name(a: &TrustAddArgs) -> Result<String, crate::app::AppError> {
 
 /// Run a trust verb against the daemon already holding this node.
 fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
+    // ADR-031 LT-8: a harness-marked process cannot grant trust, even when the keyring
+    // needs no passphrase. Refuse before naming prompts or daemon access. These are the
+    // markers used by coord::session; a malformed mark is still an agent mark here.
+    if matches!(sub, TrustCmd::Add(_) | TrustCmd::Drive(_))
+        && ["VOX_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+    {
+        eprintln!(
+            "vox: to grant trust or drive, run this command in your own terminal or in Vox.app \
+             outside the agent session."
+        );
+        return ExitCode::FAILURE;
+    }
     let name = match &sub {
         TrustCmd::Add(a) => match trust_name(a) {
             Ok(n) => n,
