@@ -87,6 +87,18 @@ pub fn session_if_named() -> Option<String> {
         .filter(|s| is_valid_name(s, MAX_NAME))
 }
 
+/// ADR-031 LT-8: an agent-marked process cannot widen trust, regardless of keyring authorization.
+/// A malformed mark is still an agent mark; this is not the validation of a displayed session name.
+pub(crate) fn trust_widening_refusal() -> Option<&'static str> {
+    ["VOX_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+        .then_some(
+            "to grant trust or drive, run this command in your own terminal or in Vox.app \
+             outside the agent session.",
+        )
+}
+
 /// The session, or a refusal that says how to name one.
 ///
 /// # Errors

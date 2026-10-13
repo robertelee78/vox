@@ -156,6 +156,13 @@ fn trust_name(a: &TrustAddArgs) -> Result<String, crate::app::AppError> {
 
 /// Run a trust verb against the daemon already holding this node.
 fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
+    // Refuse a marked agent before naming prompts or daemon access (ADR-031 LT-8).
+    if matches!(sub, TrustCmd::Add(_) | TrustCmd::Drive(_)) {
+        if let Some(why) = crate::coord::trust_widening_refusal() {
+            eprintln!("vox: {why}");
+            return ExitCode::FAILURE;
+        }
+    }
     let name = match &sub {
         TrustCmd::Add(a) => match trust_name(a) {
             Ok(n) => n,
