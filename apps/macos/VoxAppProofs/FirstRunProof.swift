@@ -2988,7 +2988,9 @@ final class FirstRunProof: XCTestCase {
         // The prior quote jump deliberately leaves an earlier message selected and in view.
         // Scroll to the newer reply before asking the virtualized timeline for its row.
         let visibleUntil = Date().addingTimeInterval(20)
-        while Date() < visibleUntil && locate(ui, middleKey) == nil {
+        while Date() < visibleUntil {
+            if let row = locate(ui, middleKey),
+               replyTimeline.frame.contains(row.frame), inView(ui, row) { break }
             replyTimeline.scroll(byDeltaX: 0, deltaY: -200)
             Thread.sleep(forTimeInterval: 0.25)
         }
@@ -2996,7 +2998,6 @@ final class FirstRunProof: XCTestCase {
             keepTree(ui, "the tagged middle reply could not be staged by scrolling")
             throw Apparatus("the timeline could not be scrolled to the CLI-held tagged middle reply")
         }
-        if !inView(ui, middle) { scrollTo(ui, middle) }
         guard let timeline = locate(ui, Key.id("timeline")),
               timeline.frame.contains(middle.frame), inView(ui, middle) else {
             keepTree(ui, "the tagged middle reply was not inside its timeline")
