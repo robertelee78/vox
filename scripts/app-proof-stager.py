@@ -11,6 +11,7 @@ test asks it, one JSON line per request, to:
   {"op": "start", "args": [...], "env": {...}, "until": "...", "within": s}
                                                                     -> {"id": n, "line": "..."}
   {"op": "stop",  "id": n}                                          -> {}
+  {"op": "signal", "id": n, "signal": "STOP"|"CONT"}                   -> {}
   {"op": "write", "path": "...", "base64": "..."}                   -> {}
   {"op": "echo"}                                                    -> {"port": n}
 
@@ -83,6 +84,19 @@ def stop(req):
     return {}
 
 
+def signal_child(req):
+    # An opaque handle addresses only this stager's still-live child, never an arbitrary PID.
+    kind = req.get("signal")
+    if kind not in ("STOP", "CONT"):
+        raise ValueError("only STOP and CONT are supported")
+    with lock:
+        p = started.get(req["id"])
+        if p is None or p.poll() is not None:
+            raise ValueError("the tracked child is not live")
+        p.send_signal(signal.SIGSTOP if kind == "STOP" else signal.SIGCONT)
+    return {}
+
+
 def write(req):
     os.makedirs(os.path.dirname(req["path"]), exist_ok=True)
     with open(req["path"], "wb") as f:
@@ -112,7 +126,7 @@ def echo(_req):
     return {"port": listener.getsockname()[1]}
 
 
-OPS = {"run": run, "start": start, "stop": stop, "write": write, "echo": echo}
+OPS = {"run": run, "start": start, "stop": stop, "signal": signal_child, "write": write, "echo": echo}
 
 
 def handle(conn):
