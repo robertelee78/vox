@@ -7,6 +7,46 @@ use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
 /// Computer trust commands do not take a node or any identity/room passphrase.
 #[derive(Debug, Clone, Subcommand)]
 pub enum ComputerCmd {
+    /// Release this node to one enrolled computer, or approve its transfer/recovery here.
+    Binding {
+        /// release requires --destination; transfer accepts its signed release; recover requires removal/fault evidence.
+        #[arg(value_parser = ["release", "transfer", "recover"])]
+        action: String,
+        /// Full node fingerprint from the authenticated computer roster.
+        node: String,
+        #[arg(long, default_value = "")]
+        destination: String,
+        /// Exact frontier from computer status; confirms the identity and causal operation.
+        #[arg(long)]
+        confirm: String,
+        #[command(flatten)]
+        account: AccountArgs,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Save the app's personal-node selection; use --clear for a headless computer.
+    Personal {
+        /// A Ready local node; its actor proves the selected identity.
+        node: Option<String>,
+        #[arg(long, conflicts_with = "node", required_unless_present = "node")]
+        clear: bool,
+        #[command(flatten)]
+        account: AccountArgs,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove all trust in a computer's nodes, including earlier individual grants.
+    Remove {
+        /// Full computer fingerprint from computer status.
+        computer: String,
+        /// Exact frontier from computer status, confirming its computer and affected nodes.
+        #[arg(long)]
+        confirm: String,
+        #[command(flatten)]
+        account: AccountArgs,
+        #[arg(long)]
+        json: bool,
+    },
     /// Read computer identity, effective policy and pending confirmations.
     Status {
         #[command(flatten)]
@@ -58,6 +98,51 @@ pub async fn run(command: ComputerCmd) -> Result<(), AppError> {
         operator_only()?;
     }
     let (account, json, request, prompt) = match command {
+        ComputerCmd::Binding {
+            action,
+            node,
+            destination,
+            confirm,
+            account,
+            json,
+        } => (
+            account,
+            json,
+            DaemonRequest::ComputerBinding {
+                action,
+                node,
+                destination,
+                frontier: confirm,
+            },
+            false,
+        ),
+        ComputerCmd::Personal {
+            node,
+            clear: _,
+            account,
+            json,
+        } => (
+            account,
+            json,
+            DaemonRequest::ComputerPersonal {
+                node: node.unwrap_or_default(),
+            },
+            false,
+        ),
+        ComputerCmd::Remove {
+            computer,
+            confirm,
+            account,
+            json,
+        } => (
+            account,
+            json,
+            DaemonRequest::ComputerRemove {
+                computer,
+                frontier: confirm,
+            },
+            false,
+        ),
         ComputerCmd::Status { account, json } => {
             (account, json, DaemonRequest::ComputerStatus, false)
         }
@@ -194,6 +279,32 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
             }
         );
     }
+    for node in &status.nodes {
+        println!(
+            "{}  {}  computer {}  {}",
+            node.name,
+            node.fingerprint,
+            node.computer,
+            if node.personal {
+                "personal; drives non-personal nodes"
+            } else {
+                "read; no automatic drive"
+            }
+        );
+    }
+    for binding in &status.binding_actions {
+        println!(
+            "binding {}: {}  {}  manager {}",
+            binding.action, binding.name, binding.node, binding.computer
+        );
+    }
+    for removed in &status.removed {
+        println!(
+            "removed: {}  {}; no claim that unreachable data or keyrings were erased",
+            removed.name, removed.fingerprint
+        );
+    }
+    println!("Removal confirmation frontier: {}", status.frontier);
     for pending in &status.pending_nodes {
         println!("pending: {pending}");
     }

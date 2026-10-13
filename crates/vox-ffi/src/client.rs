@@ -1926,6 +1926,42 @@ impl VoxClient {
     pub async fn computer_status(&self) -> Result<crate::ComputerStatus, VoxError> {
         self.computer_request(DaemonRequest::ComputerStatus).await
     }
+    /// Explicit operator release, destination transfer approval, or recovery after removal/fault.
+    pub async fn change_computer_binding(
+        &self,
+        action: String,
+        node: String,
+        destination: String,
+        frontier: String,
+    ) -> Result<crate::ComputerStatus, VoxError> {
+        vox_core::node::computer::operator_only().map_err(|e| failed(e.to_string()))?;
+        self.computer_request(DaemonRequest::ComputerBinding {
+            action,
+            node,
+            destination,
+            frontier,
+        })
+        .await
+    }
+    /// Save the personal selection using a Ready node's authenticated local identity.
+    pub async fn select_personal_node(
+        &self,
+        node: String,
+    ) -> Result<crate::ComputerStatus, VoxError> {
+        vox_core::node::computer::operator_only().map_err(|e| failed(e.to_string()))?;
+        self.computer_request(DaemonRequest::ComputerPersonal { node })
+            .await
+    }
+    /// Remove the exact displayed computer and policy frontier after operator confirmation.
+    pub async fn remove_computer(
+        &self,
+        computer: String,
+        frontier: String,
+    ) -> Result<crate::ComputerStatus, VoxError> {
+        vox_core::node::computer::operator_only().map_err(|e| failed(e.to_string()))?;
+        self.computer_request(DaemonRequest::ComputerRemove { computer, frontier })
+            .await
+    }
     /// Produce one expiring invitation for an operator.
     pub async fn begin_computer_pairing(&self) -> Result<crate::ComputerStatus, VoxError> {
         vox_core::node::computer::operator_only().map_err(|e| failed(e.to_string()))?;

@@ -3091,7 +3091,10 @@ impl Dispatch for Router {
             | DaemonRequest::ComputerBegin
             | DaemonRequest::ComputerPreview { .. }
             | DaemonRequest::ComputerApprove { .. }
-            | DaemonRequest::ComputerCancel { .. } => self.computer_request(request).await,
+            | DaemonRequest::ComputerCancel { .. }
+            | DaemonRequest::ComputerPersonal { .. }
+            | DaemonRequest::ComputerBinding { .. }
+            | DaemonRequest::ComputerRemove { .. } => self.computer_request(request).await,
             DaemonRequest::Nodes => match self.public_nodes().await {
                 Ok(nodes) => DaemonFrame::Nodes(nodes),
                 Err(r) => refused(r),

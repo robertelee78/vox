@@ -30,16 +30,13 @@ impl Node {
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or(Error::Profile("managed node name is unreadable"))?;
-        let personal = std::fs::read_to_string(self.paths.account().config_dir.join("app/node"))
-            .ok()
-            .is_some_and(|s| s.trim() == name);
         if let Some(p) = &self.profile {
             if p.is_unlocked() {
-                return computer.bind_node(p.signer()?, name, personal);
+                return computer.bind_node(p.signer()?, name);
             }
         }
         if let Some(s) = &self.headless {
-            return computer.bind_node(s.as_ref(), name, false);
+            return computer.bind_node(s.as_ref(), name);
         }
         Err(Error::Profile(
             "managed node needs its passphrase to become Ready",
@@ -142,6 +139,15 @@ impl Node {
             .map(|(id, _, _)| *id)
             .chain(plan.denied.iter().copied())
             .collect();
+        let aliases: Vec<_> = covered
+            .iter()
+            .filter_map(|peer| {
+                self.trust
+                    .petname(peer)
+                    .map(|name| (*peer, name.to_owned()))
+            })
+            .collect();
+        computer.retain_aliases(me, &aliases)?;
         let mut next = self.trust.clone();
         let mut newly = Vec::new();
         let mut changed_drive = Vec::new();
@@ -179,7 +185,12 @@ impl Node {
                 newly.push(id);
             }
             changed_drive.push((id, self.trust.has_drive(&id)));
-            let name = self.trust.petname(&id).unwrap_or(&name).to_owned();
+            let name = self
+                .trust
+                .petname(&id)
+                .map(str::to_owned)
+                .or_else(|| computer.alias(&me, &id))
+                .unwrap_or(name);
             let history = if self.trust.is_trusted(&id) {
                 self.trust.history(&id)
             } else {

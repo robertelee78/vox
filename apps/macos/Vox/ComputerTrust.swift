@@ -47,6 +47,20 @@ struct ComputerTrustView: View {
     @StateObject private var model = ComputerTrustModel()
     @State private var link = ""
     @State private var copied: String?
+    @State private var removal: RemovalChoice?
+    @State private var bindingChoice: BindingChoice?
+
+    private struct BindingChoice {
+        let binding: ComputerBindingAction
+        let destination: String
+        let frontier: String
+    }
+
+    private struct RemovalChoice {
+        let computer: ComputerIdentity
+        let frontier: String
+        let nodes: [ComputerNode]
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s16) {
@@ -81,11 +95,80 @@ struct ComputerTrustView: View {
                             ForEach(status.applications, id: \.computer.fingerprint) { application in
                                 VStack(alignment: .leading, spacing: Space.s4) {
                                     identity(application.computer, title: application.computer.name)
+                                    ForEach(status.nodes.filter { $0.computer == application.computer.fingerprint }, id: \.fingerprint) { node in
+                                        VStack(alignment: .leading, spacing: Space.s4) {
+                                            Text(node.name).font(.headline)
+                                            Text(node.fingerprint).font(Theme.mono).textSelection(.enabled)
+                                                .fixedSize(horizontal: false, vertical: true)
+                                            Text(node.personal ? "Personal node · can drive non-personal nodes" : "Managed node · read access")
+                                                .secondaryText()
+                                            if node.computer == status.thisComputer.fingerprint && !node.personal {
+                                                Button("Use as Personal Node") {
+                                                    let name = node.name
+                                                    Task { await model.perform { try await $0.selectPersonalNode(node: name) } }
+                                                }
+                                                .disabled(model.busy || !model.reachable)
+                                                .accessibilityIdentifier("computer-personal-" + node.fingerprint)
+                                            }
+                                        }
+                                    }
+                                    if application.computer.fingerprint == status.thisComputer.fingerprint,
+                                       status.selectedNode != nil {
+                                        Button("Clear Personal Selection") {
+                                            Task { await model.perform { try await $0.selectPersonalNode(node: "") } }
+                                        }
+                                        .disabled(model.busy || !model.reachable)
+                                        .accessibilityIdentifier("computer-personal-clear")
+                                    }
+                                    Button(application.computer.fingerprint == status.thisComputer.fingerprint
+                                           ? "Remove This Computer" : "Remove Computer") {
+                                        removal = RemovalChoice(computer: application.computer, frontier: status.frontier,
+                                            nodes: status.nodes.filter { $0.computer == application.computer.fingerprint })
+                                    }
+                                    .disabled(model.busy || !model.reachable || status.state == "removed" || status.state == "quarantined")
+                                    .accessibilityIdentifier("computer-remove-" + application.computer.fingerprint)
                                     Text(applicationState(application, status: status))
                                         .secondaryText()
                                         .accessibilityIdentifier("computer-application-" + application.computer.fingerprint)
                                 }
                             }
+                        }
+                        if !status.bindingActions.isEmpty {
+                            Divider()
+                            Text("Node management").eyebrow()
+                            ForEach(status.bindingActions, id: \.node) { binding in
+                                VStack(alignment: .leading, spacing: Space.s4) {
+                                    Text(binding.name).font(.headline)
+                                    Text(binding.node).font(Theme.mono).textSelection(.enabled)
+                                    Text("Manager: " + binding.computer).font(Theme.mono).secondaryText()
+                                    if binding.action == "release" {
+                                        Menu("Transfer Node To…") {
+                                            ForEach(status.computers.filter { $0.fingerprint != status.thisComputer.fingerprint }, id: \.fingerprint) { destination in
+                                                Button(destination.name + " · " + destination.fingerprint) {
+                                                    bindingChoice = BindingChoice(binding: binding, destination: destination.fingerprint, frontier: status.frontier)
+                                                }
+                                            }
+                                        }
+                                        .disabled(model.busy || !model.reachable)
+                                    } else {
+                                        Button(binding.action == "transfer" ? "Accept Transfer Here" : "Recover Node Here") {
+                                            bindingChoice = BindingChoice(binding: binding, destination: "", frontier: status.frontier)
+                                        }
+                                        .disabled(model.busy || !model.reachable)
+                                    }
+                                }
+                            }
+                            Text("A transfer needs a signed release from its previous manager. Recovery needs retained removal or fault evidence. After approving here, unlock the node's local vault normally to sign its new binding. A copied name or fingerprint is never proof of management.")
+                                .secondaryText()
+                        }
+                        if !status.removed.isEmpty {
+                            Divider()
+                            Text("Removed computers").eyebrow()
+                            ForEach(status.removed, id: \.fingerprint) { computer in
+                                identity(computer, title: computer.name)
+                            }
+                            Text("Removal stops new read and drive access when each remaining computer applies it. Unreachable computers remain pending; already received data is not erased. Rejoining requires a new approval. You can deliberately trust an individual node afterward.")
+                                .secondaryText()
                         }
                     } else if model.busy {
                         ProgressView("Reading computer trust…")
@@ -125,11 +208,42 @@ struct ComputerTrustView: View {
                 await model.refresh()
             }
         }
-        .onDisappear { link = ""; copied = nil }
+        .alert("Remove Computer?", isPresented: Binding(get: { removal != nil }, set: { if !$0 { removal = nil } }), presenting: removal) { choice in
+            Button("Remove Computer", role: .destructive) {
+                let computer = choice.computer.fingerprint
+                let frontier = choice.frontier
+                removal = nil
+                Task { await model.perform { try await $0.removeComputer(computer: computer, frontier: frontier) } }
+            }
+            Button("Cancel", role: .cancel) { removal = nil }
+        } message: { choice in
+            Text("Remove \(choice.computer.name) (\(choice.computer.fingerprint)) and all trust in its nodes, including individual grants made before pairing?\n\n"
+                 + (choice.nodes.isEmpty ? "No authenticated nodes are currently listed." : choice.nodes.map { "\($0.name) · \($0.fingerprint)" }.joined(separator: "\n"))
+                 + "\n\nOffline computers remain pending until they apply this removal. Data already received is not erased.")
+        }
+        .alert("Change Node Management?", isPresented: Binding(get: { bindingChoice != nil }, set: { if !$0 { bindingChoice = nil } }), presenting: bindingChoice) { choice in
+            Button(choice.binding.action == "release" ? "Release Node" : "Approve Here") {
+                bindingChoice = nil
+                Task { await model.perform {
+                    try await $0.changeComputerBinding(action: choice.binding.action, node: choice.binding.node,
+                        destination: choice.destination, frontier: choice.frontier)
+                } }
+            }
+            Button("Cancel", role: .cancel) { bindingChoice = nil }
+        } message: { choice in
+            Text("Node: \(choice.binding.name)\n\(choice.binding.node)\nPrevious manager: \(choice.binding.computer)\n"
+                 + (choice.binding.action == "release"
+                    ? "Release only to \(choice.destination). This computer relinquishes the binding and automatic policy for this node. The destination must approve and unlock it."
+                    : "Approve \(choice.binding.action) to this computer using the retained signed evidence. No trust is applied until the node signs with its unlocked local vault. If its key was compromised, create a fresh node instead."))
+        }
+        .onDisappear { link = ""; copied = nil; removal = nil; bindingChoice = nil }
     }
 
     @ViewBuilder private func pairing(_ status: ComputerStatus) -> some View {
-        if status.state == "quarantined" {
+        if status.state == "removed" {
+            Text("This computer was removed. Its automatic group trust is being revoked. To rejoin, use a new pairing code from a remaining member and approve again.")
+                .accessibilityIdentifier("computer-trust-removed")
+        } else if status.state == "quarantined" {
             Text("Computer trust is suspended.")
                 .accessibilityIdentifier("computer-trust-quarantined")
         } else if status.state == "confirmed", model.reachable {
@@ -198,6 +312,7 @@ struct ComputerTrustView: View {
             }
             .buttonStyle(.voxPrimary)
             .disabled(model.busy || !model.reachable)
+            .disabled(status.state == "removed")
             .accessibilityIdentifier("computer-pairing-begin")
             Text("Or use a code from your other computer").eyebrow()
             TextField("Pairing code", text: $link)

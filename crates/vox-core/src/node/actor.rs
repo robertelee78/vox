@@ -5587,6 +5587,19 @@ impl Node {
                 fingerprint,
                 petname,
             } => {
+                if let Some(c) = &self.computer {
+                    if c.grouped() {
+                        if let Err(e) = c.individual_choice(
+                            self.profile
+                                .as_ref()
+                                .map(Profile::fingerprint)
+                                .unwrap_or([0; 32]),
+                            fingerprint,
+                        ) {
+                            return Outcome::Failed(fault_of(&e));
+                        }
+                    }
+                }
                 let was = self.trust.is_trusted(&fingerprint);
                 let out = self
                     .trust_identity(
@@ -5605,6 +5618,19 @@ impl Node {
                 history,
                 capability,
             } => {
+                if let Some(c) = &self.computer {
+                    if c.grouped() {
+                        if let Err(e) = c.individual_choice(
+                            self.profile
+                                .as_ref()
+                                .map(Profile::fingerprint)
+                                .unwrap_or([0; 32]),
+                            fingerprint,
+                        ) {
+                            return Outcome::Failed(fault_of(&e));
+                        }
+                    }
+                }
                 let was = self.trust.is_trusted(&fingerprint);
                 let out = self
                     .trust_identity(fingerprint, &petname, history, capability)

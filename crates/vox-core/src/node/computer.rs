@@ -2,7 +2,7 @@
 //! This is separate from node identities, rooms, and their passphrases. The account daemon is
 //! the sole writer; one atomic file contains its vault and retained management transaction.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -20,7 +20,8 @@ use zeroize::Zeroizing;
 
 mod pairing;
 pub use pairing::{
-    ComputerApplication, ComputerIdentity, ComputerStatus, Management, PairingPreview,
+    ComputerApplication, ComputerBindingAction, ComputerIdentity, ComputerNode, ComputerStatus,
+    Management, PairingPreview,
 };
 
 /// The one fixed policy, displayed before either operator approves an enrollment.
@@ -303,6 +304,27 @@ pub struct Binding {
     pub name: String,
 }
 impl Binding {
+    fn id(&self) -> Digest32 {
+        sha256_concat(&[&self.node.encode(), &self.computer.encode()])
+    }
+    fn approval(&self) -> Result<Option<BindingApproval>> {
+        let mut d = Decoder::new(&self.node.body);
+        arity(&mut d, 6)?;
+        d.uint()?;
+        d.bytes()?;
+        d.bytes()?;
+        d.bytes()?;
+        d.bytes()?;
+        let bytes = d.bytes()?;
+        let result = if bytes.is_empty() {
+            None
+        } else {
+            Some(BindingApproval::decode(bytes)?)
+        };
+        d.finish()?;
+        Ok(result)
+    }
+
     /// Initial binding input, signed inside the already-unlocked node actor.
     pub fn body(
         node: &CompositePublicKey,
@@ -336,8 +358,9 @@ impl Binding {
             return Err(bad());
         }
         let _nonce = digest(&mut d)?;
-        if !d.bytes()?.is_empty() {
-            return Err(bad());
+        let previous = d.bytes()?;
+        if !previous.is_empty() {
+            BindingApproval::decode(previous)?;
         }
         d.finish()?;
         self.node
@@ -370,6 +393,55 @@ impl Binding {
     }
 }
 
+/// A destination operator's exact approved causal transfer/recovery context. The node signs
+/// this context only when its ordinary protected vault is successfully unlocked locally.
+#[derive(Clone)]
+struct BindingApproval {
+    kind: u64, // 1: signed source release; 2: explicit recovery after removal/fault.
+    previous: Digest32,
+    proof: Digest32,
+    heads: Vec<Digest32>,
+}
+impl BindingApproval {
+    fn encode(&self) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(4)
+            .uint(self.kind)
+            .bytes(&self.previous)
+            .bytes(&self.proof)
+            .array(self.heads.len());
+        for head in &self.heads {
+            e.bytes(head);
+        }
+        e.finish()
+    }
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut d = Decoder::new(bytes);
+        arity(&mut d, 4)?;
+        let kind = d.uint()?;
+        let previous = digest(&mut d)?;
+        let proof = digest(&mut d)?;
+        let mut heads = Vec::new();
+        for _ in 0..count(&mut d)? {
+            heads.push(digest(&mut d)?);
+        }
+        d.finish()?;
+        if !matches!(kind, 1 | 2)
+            || previous == [0; 32]
+            || heads.is_empty()
+            || heads.windows(2).any(|w| w[0] >= w[1])
+        {
+            return Err(bad());
+        }
+        Ok(Self {
+            kind,
+            previous,
+            proof,
+            heads,
+        })
+    }
+}
+
 /// One signed roster, including the saved app selection. Headless installations have none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Control {
@@ -384,7 +456,15 @@ impl Control {
         signer: &dyn RootSigner,
     ) -> Result<Self> {
         let author = signer.fingerprint();
-        let previous = s.rosters.get(&author);
+        let previous = s
+            .history
+            .values()
+            .filter(|r| {
+                r.event().ok().is_some_and(|e| {
+                    e.author == author && Some(e.group) == s.group() && e.roster_revision > 0
+                })
+            })
+            .max_by_key(|r| r.event().map(|e| e.sequence).unwrap_or(0));
         let revision = previous
             .map(|r| r.event().map(|e| e.roster_revision))
             .transpose()?
@@ -477,6 +557,8 @@ impl Control {
         let kind = d.text()?;
         let mut body = Decoder::new(d.bytes()?);
         let (mut personal, mut bindings, mut addition, mut reach) = (None, Vec::new(), None, None);
+        let mut removal = None;
+        let mut release = None;
         let (mut roster_revision, mut previous_roster) = (0, [0; 32]);
         match kind {
             "roster" => {
@@ -500,6 +582,32 @@ impl Control {
                 arity(&mut body, 1)?;
                 addition = Some(Enrollment::decode(body.bytes()?)?);
             }
+            "release" => {
+                arity(&mut body, 4)?;
+                release = Some(Release {
+                    node: digest(&mut body)?,
+                    previous: digest(&mut body)?,
+                    destination: digest(&mut body)?,
+                    nonce: digest(&mut body)?,
+                });
+            }
+            "remove" => {
+                arity(&mut body, 3)?;
+                let target = digest(&mut body)?;
+                let mut grants = Vec::new();
+                for _ in 0..count(&mut body)? {
+                    grants.push(digest(&mut body)?);
+                }
+                if grants.is_empty() || grants.windows(2).any(|w| w[0] >= w[1]) {
+                    return Err(bad());
+                }
+                let roster = digest(&mut body)?;
+                removal = Some(Removal {
+                    target,
+                    grants,
+                    roster,
+                });
+            }
             "reach" => {
                 arity(&mut body, 1)?;
                 reach = Some(Reach::decode(body.bytes()?)?);
@@ -521,6 +629,8 @@ impl Control {
             roster_revision,
             previous_roster,
             addition,
+            removal,
+            release,
             reach,
         })
     }
@@ -577,8 +687,24 @@ struct ControlEvent {
     roster_revision: u64,
     previous_roster: Digest32,
     addition: Option<Enrollment>,
+    removal: Option<Removal>,
+    release: Option<Release>,
     reach: Option<Reach>,
 }
+#[derive(Clone)]
+struct Release {
+    node: Digest32,
+    previous: Digest32,
+    destination: Digest32,
+    nonce: Digest32,
+}
+#[derive(Clone)]
+struct Removal {
+    target: Digest32,
+    grants: Vec<Digest32>,
+    roster: Digest32,
+}
+
 /// Current authenticated contact facts, carried by the same author chain as membership.
 /// The independent token authorizes exact management transport pairs, never room access.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -699,6 +825,13 @@ pub(crate) struct AppliedPolicy {
 }
 
 #[derive(Clone)]
+struct MembershipInterval {
+    activation: u64,
+    retirement: Option<u64>,
+    grants: BTreeSet<Digest32>,
+}
+
+#[derive(Clone)]
 pub(crate) struct State {
     links: Vec<Zeroizing<String>>,
     group_genesis: Option<Enrollment>,
@@ -721,6 +854,13 @@ pub(crate) struct State {
     pub pending: Option<Enrollment>,
     /// Exact local policy application revision for each attached node; never a distributed clock.
     pub applied: BTreeMap<Digest32, AppliedPolicy>,
+    intervals: BTreeMap<Digest32, Vec<MembershipInterval>>,
+    retired_nodes: BTreeMap<Digest32, u64>,
+    individual: BTreeMap<Digest32, BTreeMap<Digest32, u64>>,
+    aliases: BTreeMap<Digest32, BTreeMap<Digest32, String>>,
+    selected: Option<Digest32>,
+    selected_name: String,
+    binding_approvals: BTreeMap<Digest32, BindingApproval>,
 }
 impl State {
     fn group(&self) -> Option<Digest32> {
@@ -761,6 +901,24 @@ impl State {
             })
             .collect()
     }
+    fn terminal_bindings(&self) -> Result<Vec<(Digest32, Binding)>> {
+        let authority = self.derive()?;
+        let mut bindings = BTreeMap::new();
+        let mut previous = BTreeSet::new();
+        for id in &authority.accepted {
+            let event = self.history[id].event()?;
+            for binding in event.bindings {
+                if let Some(approval) = binding.approval()? {
+                    previous.insert(approval.previous);
+                }
+                bindings.insert(binding.id(), (event.author, binding));
+            }
+        }
+        Ok(bindings
+            .into_iter()
+            .filter_map(|(id, binding)| (!previous.contains(&id)).then_some(binding))
+            .collect())
+    }
     fn heads(&self) -> Vec<Digest32> {
         let current: Vec<_> = self
             .history
@@ -792,7 +950,13 @@ impl State {
             return Err(Error::Profile(HISTORY_FULL));
         }
         self.history.insert(r.id(), r);
-        self.fold_history()
+        let before = self.revision;
+        self.fold_history()?;
+        if self.revision == before {
+            self.revision = self.revision.checked_add(1).ok_or_else(bad)?;
+            self.receipts.clear();
+        }
+        Ok(())
     }
     fn derive(&self) -> Result<Authority> {
         let Some(g) = self
@@ -859,11 +1023,60 @@ impl State {
                     .filter(|(_, v)| v.event == group || prefix.contains(&v.event))
                     .map(|(k, v)| (*k, v.clone()))
                     .collect();
-                let (active, _) = exclude_forks(&events, &ancestry, &prefix, available)?;
+                let (active, _) = exclude_retired(&events, &ancestry, &prefix, available)?;
+                if let Some(release) = &e.release {
+                    let prior = prefix
+                        .iter()
+                        .filter_map(|h| {
+                            let record = &events[h];
+                            (record.author == e.author && record.roster_revision > 0)
+                                .then_some(record)
+                        })
+                        .max_by_key(|record| record.sequence)
+                        .and_then(|record| {
+                            record.bindings.iter().find(|b| b.id() == release.previous)
+                        });
+                    if release.nonce == [0; 32]
+                        || release.destination == e.author
+                        || !active.iter().any(|(_, g)| {
+                            g.computer.fingerprint().ok() == Some(release.destination)
+                        })
+                        || prior
+                            .is_none_or(|b| b.verify(&e.author, &group).ok() != Some(release.node))
+                    {
+                        return Err(Error::SignatureInvalid);
+                    }
+                }
+                for binding in &e.bindings {
+                    verify_binding_context(binding, e, &prefix, &events, &ancestry, &grants)?;
+                }
                 if !active.iter().any(|(id, a)| {
                     *id == e.grant && a.computer.fingerprint().ok() == Some(e.author)
                 }) {
                     return Err(Error::SignatureInvalid);
+                }
+                if let Some(remove) = &e.removal {
+                    let mut observed: Vec<_> = active
+                        .iter()
+                        .filter_map(|(id, grant)| {
+                            (grant.computer.fingerprint().ok() == Some(remove.target))
+                                .then_some(*id)
+                        })
+                        .collect();
+                    observed.sort();
+                    observed.dedup();
+                    let roster = prefix
+                        .iter()
+                        .filter(|h| {
+                            let p = &events[*h];
+                            p.author == remove.target && p.roster_revision > 0
+                        })
+                        .max_by_key(|h| events[*h].sequence)
+                        .copied()
+                        .unwrap_or([0; 32]);
+                    if observed != remove.grants || roster != remove.roster {
+                        return Err(Error::SignatureInvalid);
+                    }
                 }
                 if let Some(add) = &e.addition {
                     let target = add.computers[1].fingerprint()?;
@@ -907,7 +1120,8 @@ impl State {
                 break;
             }
         }
-        let (mut members, mut quarantined) = exclude_forks(&events, &ancestry, &accepted, grants)?;
+        let (mut members, mut quarantined) =
+            exclude_retired(&events, &ancestry, &accepted, grants)?;
         // Closing an expired local intent cannot withdraw a signature elsewhere. Retain that
         // signed ADD and its ancestry, but its exact grant cannot activate on this installation.
         // A different fresh operation/grant is unaffected by replay of this local close.
@@ -965,15 +1179,91 @@ impl State {
                 reaches.insert(e.author, *id);
             }
         }
-        let mut managers = BTreeMap::new();
-        for (manager, id) in &rosters {
-            for b in &events[id].bindings {
-                let node = b.verify(manager, &group)?;
-                if let Some(other) = managers.insert(node, *manager) {
-                    if other != *manager {
-                        quarantined.insert(other);
-                        quarantined.insert(*manager);
+        let mut bindings: BTreeMap<Digest32, (Digest32, Digest32, Binding)> = BTreeMap::new();
+        let mut successors: BTreeMap<(Digest32, Digest32), BTreeSet<Digest32>> = BTreeMap::new();
+        let mut releases: BTreeMap<Digest32, Vec<(Digest32, Release)>> = BTreeMap::new();
+        let all_grants: EventGrants = initial
+            .into_iter()
+            .chain(events.iter().filter_map(|(id, e)| {
+                e.addition.as_ref().map(|add| {
+                    (
+                        add.grants[1],
+                        Grant {
+                            computer: add.computers[1].clone(),
+                            sponsor: Some(e.grant),
+                            event: *id,
+                        },
+                    )
+                })
+            }))
+            .collect();
+        let positive = |id: &Digest32| -> Result<bool> {
+            let remaining: BTreeSet<_> = accepted
+                .iter()
+                .filter(|other| !ancestry[*other].contains(id))
+                .copied()
+                .collect();
+            Ok(
+                exclude_retired(&events, &ancestry, &remaining, all_grants.clone())?
+                    .0
+                    .iter()
+                    .any(|(grant, _)| *grant == events[id].grant),
+            )
+        };
+        let mut released = BTreeSet::new();
+        let mut valid_releases = BTreeSet::new();
+        for id in &accepted {
+            let event = &events[id];
+            if let Some(release) = &event.release {
+                if positive(id)? {
+                    released.insert(release.previous);
+                    valid_releases.insert(*id);
+                    releases
+                        .entry(release.previous)
+                        .or_default()
+                        .push((*id, release.clone()));
+                }
+            }
+            for binding in &event.bindings {
+                let node = binding.verify(&event.author, &group)?;
+                let approval = binding.approval()?;
+                let previous = approval.as_ref().map(|a| a.previous).unwrap_or([0; 32]);
+                if let Some(approval) = &approval {
+                    if approval.kind == 1 && !positive(&approval.proof)? {
+                        quarantined.insert(event.author);
                     }
+                }
+                successors
+                    .entry((node, previous))
+                    .or_default()
+                    .insert(binding.id());
+                bindings.insert(binding.id(), (node, event.author, binding.clone()));
+            }
+        }
+        for children in successors.values().filter(|v| v.len() > 1) {
+            for id in children {
+                quarantined.insert(bindings[id].1);
+            }
+        }
+        for (previous, values) in &releases {
+            if values.len() > 1 {
+                if let Some((_, manager, _)) = bindings.get(previous) {
+                    quarantined.insert(*manager);
+                }
+                for (_, release) in values {
+                    quarantined.insert(release.destination);
+                }
+            }
+        }
+        let mut binding_owners = BTreeMap::new();
+        for (id, (node, manager, _)) in &bindings {
+            if !released.contains(id)
+                && !successors.contains_key(&(*node, *id))
+                && !quarantined.contains(manager)
+            {
+                if let Some(old) = binding_owners.insert(*node, *id) {
+                    quarantined.insert(bindings[&old].1);
+                    quarantined.insert(*manager);
                 }
             }
         }
@@ -989,6 +1279,9 @@ impl State {
                 .filter_map(|(k, id)| events[&id].reach.clone().map(|reach| (k, reach)))
                 .collect(),
             complete: pending.is_empty(),
+            accepted,
+            binding_owners,
+            valid_releases,
         })
     }
     fn fold_history(&mut self) -> Result<()> {
@@ -998,11 +1291,93 @@ impl State {
             || self.quarantined != next.quarantined
             || self.reaches != next.reaches
         {
+            let revision = self.revision.checked_add(1).ok_or_else(bad)?;
+            let mut active: BTreeMap<Digest32, BTreeSet<Digest32>> = BTreeMap::new();
+            for (id, grant) in &next.members {
+                let manager = grant.computer.fingerprint()?;
+                if !next.quarantined.contains(&manager) {
+                    active.entry(manager).or_default().insert(*id);
+                }
+            }
+            // A retirement boundary is local and immutable. Replayed or concurrent negative
+            // evidence cannot move it over a later deliberate individual trust decision.
+            for (manager, intervals) in &mut self.intervals {
+                if let Some(last) = intervals.last_mut().filter(|i| i.retirement.is_none()) {
+                    if let Some(grants) = active.get(manager) {
+                        last.grants.extend(grants.iter().copied());
+                    } else {
+                        last.retirement = Some(revision);
+                    }
+                }
+            }
+            for (manager, grants) in active {
+                let intervals = self.intervals.entry(manager).or_default();
+                if intervals.last().is_none_or(|i| i.retirement.is_some()) {
+                    intervals.push(MembershipInterval {
+                        activation: revision,
+                        retirement: None,
+                        grants,
+                    });
+                }
+            }
+            // A removed member may first be learned together with its removal. Retain a
+            // retirement boundary even when this installation never activated its grants;
+            // later binding evidence then uses this boundary, not the later arrival revision.
+            let mut known: BTreeMap<Digest32, BTreeSet<Digest32>> = BTreeMap::new();
+            if let Some(g) = self
+                .genesis
+                .as_ref()
+                .or(self.group_genesis.as_ref())
+                .or(self.pending.as_ref())
+            {
+                for (grant, description) in g.grants.iter().zip(&g.computers) {
+                    known
+                        .entry(description.fingerprint()?)
+                        .or_default()
+                        .insert(*grant);
+                }
+                for (id, record) in &self.history {
+                    if !next.accepted.contains(id) {
+                        continue;
+                    }
+                    let e = record.event()?;
+                    if e.group == g.incarnation() {
+                        if let Some(add) = e.addition {
+                            known
+                                .entry(add.computers[1].fingerprint()?)
+                                .or_default()
+                                .insert(add.grants[1]);
+                        }
+                    }
+                }
+            }
+            for (manager, grants) in known {
+                self.intervals.entry(manager).or_insert_with(|| {
+                    vec![MembershipInterval {
+                        activation: revision,
+                        retirement: Some(revision),
+                        grants,
+                    }]
+                });
+            }
+            let nodes = |rosters: &BTreeMap<Digest32, Control>| -> Result<BTreeSet<Digest32>> {
+                let mut ids = BTreeSet::new();
+                for roster in rosters.values() {
+                    let e = roster.event()?;
+                    for b in e.bindings {
+                        ids.insert(b.verify(&e.author, &e.group)?);
+                    }
+                }
+                Ok(ids)
+            };
+            for node in nodes(&self.rosters)?.difference(&nodes(&next.rosters)?) {
+                self.retired_nodes.insert(*node, revision);
+            }
             self.members = next.members;
             self.rosters = next.rosters;
             self.quarantined = next.quarantined;
             self.reaches = next.reaches;
-            self.revision = self.revision.checked_add(1).ok_or_else(bad)?;
+            self.revision = revision;
             self.receipts.clear();
         }
         Ok(())
@@ -1010,7 +1385,7 @@ impl State {
 
     fn body(&self) -> Vec<u8> {
         let mut e = Encoder::for_secrets();
-        e.array(17)
+        e.array(24)
             .bytes(&self.description.encode())
             .uint(self.revision)
             .array(self.invitations.len());
@@ -1085,11 +1460,53 @@ impl State {
         for link in &self.links {
             e.text(link);
         }
+        e.array(self.intervals.len());
+        for (manager, intervals) in &self.intervals {
+            e.array(2).bytes(manager).array(intervals.len());
+            for interval in intervals {
+                e.array(3)
+                    .uint(interval.activation)
+                    .uint(interval.retirement.unwrap_or(0))
+                    .array(interval.grants.len());
+                for grant in &interval.grants {
+                    e.bytes(grant);
+                }
+            }
+        }
+        e.array(self.retired_nodes.len());
+        for (node, revision) in &self.retired_nodes {
+            e.array(2).bytes(node).uint(*revision);
+        }
+        e.array(self.individual.len());
+        for (node, peers) in &self.individual {
+            e.array(2).bytes(node).array(peers.len());
+            for (peer, revision) in peers {
+                e.array(2).bytes(peer).uint(*revision);
+            }
+        }
+        e.array(self.aliases.len());
+        for (node, peers) in &self.aliases {
+            e.array(2).bytes(node).array(peers.len());
+            for (peer, name) in peers {
+                e.array(2).bytes(peer).text(name);
+            }
+        }
+        e.bytes(
+            self.selected
+                .as_ref()
+                .map(|v| v.as_slice())
+                .unwrap_or_default(),
+        )
+        .text(&self.selected_name);
+        e.array(self.binding_approvals.len());
+        for (node, approval) in &self.binding_approvals {
+            e.array(2).bytes(node).bytes(&approval.encode());
+        }
         e.finish()
     }
     fn read(vault: Vec<u8>, body: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(body);
-        arity(&mut d, 17)?;
+        arity(&mut d, 24)?;
         let description = Description::decode(d.bytes()?)?;
         let revision = d.uint()?;
         let n = count(&mut d)?;
@@ -1226,8 +1643,113 @@ impl State {
         for _ in 0..count(&mut d)? {
             links.push(Zeroizing::new(d.text()?.to_owned()));
         }
+        let mut intervals = BTreeMap::new();
+        for _ in 0..count(&mut d)? {
+            arity(&mut d, 2)?;
+            let manager = digest(&mut d)?;
+            let mut values = Vec::new();
+            for _ in 0..count(&mut d)? {
+                arity(&mut d, 3)?;
+                let activation = d.uint()?;
+                let retirement = d.uint()?;
+                let mut grants = BTreeSet::new();
+                for _ in 0..count(&mut d)? {
+                    if !grants.insert(digest(&mut d)?) {
+                        return Err(bad());
+                    }
+                }
+                if activation == 0
+                    || activation > revision
+                    || retirement > revision
+                    || (retirement != 0 && retirement < activation)
+                    || grants.is_empty()
+                    || values.last().is_some_and(|v: &MembershipInterval| {
+                        v.retirement.is_none_or(|r| r >= activation)
+                    })
+                {
+                    return Err(bad());
+                }
+                values.push(MembershipInterval {
+                    activation,
+                    retirement: (retirement != 0).then_some(retirement),
+                    grants,
+                });
+            }
+            if intervals.insert(manager, values).is_some() {
+                return Err(bad());
+            }
+        }
+        let mut retired_nodes = BTreeMap::new();
+        for _ in 0..count(&mut d)? {
+            arity(&mut d, 2)?;
+            let node = digest(&mut d)?;
+            let at = d.uint()?;
+            if at == 0 || at > revision || retired_nodes.insert(node, at).is_some() {
+                return Err(bad());
+            }
+        }
+        let mut individual = BTreeMap::new();
+        for _ in 0..count(&mut d)? {
+            arity(&mut d, 2)?;
+            let node = digest(&mut d)?;
+            let mut peers = BTreeMap::new();
+            for _ in 0..count(&mut d)? {
+                arity(&mut d, 2)?;
+                let peer = digest(&mut d)?;
+                let at = d.uint()?;
+                if at == 0 || at > revision || peers.insert(peer, at).is_some() {
+                    return Err(bad());
+                }
+            }
+            if individual.insert(node, peers).is_some() {
+                return Err(bad());
+            }
+        }
+        let mut aliases = BTreeMap::new();
+        for _ in 0..count(&mut d)? {
+            arity(&mut d, 2)?;
+            let node = digest(&mut d)?;
+            let mut peers = BTreeMap::new();
+            for _ in 0..count(&mut d)? {
+                arity(&mut d, 2)?;
+                let peer = digest(&mut d)?;
+                let name = d.text()?.to_owned();
+                if !super::presentation::safe_name(&name) || peers.insert(peer, name).is_some() {
+                    return Err(bad());
+                }
+            }
+            if aliases.insert(node, peers).is_some() {
+                return Err(bad());
+            }
+        }
+        let bytes = d.bytes()?;
+        let selected = if bytes.is_empty() {
+            None
+        } else {
+            Some(bytes.try_into().map_err(|_| bad())?)
+        };
+        let selected_name = d.text()?.to_owned();
+        if selected.is_some() && !super::presentation::safe_name(&selected_name) {
+            return Err(bad());
+        }
+        let mut binding_approvals = BTreeMap::new();
+        for _ in 0..count(&mut d)? {
+            arity(&mut d, 2)?;
+            let node = digest(&mut d)?;
+            let approval = BindingApproval::decode(d.bytes()?)?;
+            if binding_approvals.insert(node, approval).is_some() {
+                return Err(bad());
+            }
+        }
         d.finish()?;
         let mut s = Self {
+            binding_approvals,
+            intervals,
+            retired_nodes,
+            individual,
+            aliases,
+            selected,
+            selected_name,
             links,
             group_genesis,
             members: BTreeMap::new(),
@@ -1277,6 +1799,74 @@ impl State {
     }
 }
 
+fn verify_binding_context(
+    binding: &Binding,
+    event: &ControlEvent,
+    prefix: &BTreeSet<Digest32>,
+    events: &BTreeMap<Digest32, ControlEvent>,
+    ancestry: &BTreeMap<Digest32, BTreeSet<Digest32>>,
+    grants: &EventGrants,
+) -> Result<()> {
+    let Some(approval) = binding.approval()? else {
+        return Ok(());
+    };
+    let prior = prefix
+        .iter()
+        .flat_map(|id| events[id].bindings.iter().map(move |b| (&events[id], b)))
+        .find(|(_, b)| b.id() == approval.previous)
+        .ok_or(Error::SignatureInvalid)?;
+    let node = binding.verify(&event.author, &event.group)?;
+    if prior.1.verify(&prior.0.author, &event.group)? != node || prior.0.author == event.author {
+        return Err(Error::SignatureInvalid);
+    }
+    let mut context = BTreeSet::new();
+    for head in &approval.heads {
+        if *head == event.group {
+            continue;
+        }
+        if !prefix.contains(head) {
+            return Err(Error::SignatureInvalid);
+        }
+        context.insert(*head);
+        context.extend(ancestry[head].iter().copied());
+    }
+    match approval.kind {
+        1 => {
+            let release = events
+                .get(&approval.proof)
+                .filter(|_| context.contains(&approval.proof))
+                .and_then(|e| e.release.as_ref())
+                .ok_or(Error::SignatureInvalid)?;
+            if release.previous != approval.previous
+                || release.node != node
+                || release.destination != event.author
+            {
+                return Err(Error::SignatureInvalid);
+            }
+        }
+        2 => {
+            let available = grants
+                .iter()
+                .filter(|(_, g)| g.event == event.group || context.contains(&g.event))
+                .cloned()
+                .collect();
+            let (active, faults) = exclude_retired(events, ancestry, &context, available)?;
+            if active
+                .iter()
+                .any(|(_, g)| g.computer.fingerprint().ok() == Some(prior.0.author))
+                && !faults.contains(&prior.0.author)
+            {
+                return Err(Error::SignatureInvalid);
+            }
+            if approval.proof != [0; 32] {
+                return Err(bad());
+            }
+        }
+        _ => return Err(bad()),
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct Authority {
     members: BTreeMap<Digest32, Grant>,
@@ -1284,11 +1874,14 @@ struct Authority {
     reaches: BTreeMap<Digest32, Reach>,
     quarantined: std::collections::BTreeSet<Digest32>,
     complete: bool,
+    accepted: BTreeSet<Digest32>,
+    binding_owners: BTreeMap<Digest32, Digest32>,
+    valid_releases: BTreeSet<Digest32>,
 }
 type EventGrants = Vec<(Digest32, Grant)>;
 
 /// Fork exclusion follows sponsor edges, preserving additions on the shared safe prefix.
-fn exclude_forks(
+fn exclude_retired(
     events: &BTreeMap<Digest32, ControlEvent>,
     ancestry: &BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
     selected: &std::collections::BTreeSet<Digest32>,
@@ -1324,6 +1917,37 @@ fn exclude_forks(
             let before = invalid.len();
             for (id, g) in &grants {
                 if g.sponsor.is_some_and(|s| invalid.contains(&s)) && !safe.contains(&g.event) {
+                    invalid.insert(*id);
+                }
+            }
+            if before == invalid.len() {
+                break;
+            }
+        }
+        denied.extend(invalid);
+    }
+    // Each authorized REMOVE is permanent negative evidence. Its causal cutoff preserves
+    // independently enrolled descendants from before removal, never concurrent descendants.
+    for removal_id in selected {
+        let Some(removal) = &events[removal_id].removal else {
+            continue;
+        };
+        let mut invalid: BTreeSet<_> = grants
+            .iter()
+            .filter_map(|(id, grant)| {
+                (grant.computer.fingerprint().ok() == Some(removal.target)
+                    && !ancestry
+                        .get(&grant.event)
+                        .is_some_and(|a| a.contains(removal_id)))
+                .then_some(*id)
+            })
+            .collect();
+        loop {
+            let before = invalid.len();
+            for (id, grant) in &grants {
+                if grant.sponsor.is_some_and(|s| invalid.contains(&s))
+                    && !ancestry[removal_id].contains(&grant.event)
+                {
                     invalid.insert(*id);
                 }
             }
@@ -1409,19 +2033,7 @@ impl Computer {
         let local = self.signer.fingerprint();
         self.change(|s| {
             if !s.rosters.contains_key(&local) {
-                if s.quarantined.contains(&local)
-                    || s.history.values().any(|r| {
-                        r.event().ok().is_some_and(|e| {
-                            e.author == local
-                                && e.roster_revision > 0
-                                && Some(e.group)
-                                    == s.genesis
-                                        .as_ref()
-                                        .or(s.pending.as_ref())
-                                        .map(Enrollment::incarnation)
-                        })
-                    })
-                {
+                if s.grant(&local).is_none() {
                     return Ok(());
                 }
                 let r = Control::create(s, &[], None, self.signer.as_ref())?;
@@ -1452,7 +2064,7 @@ impl Computer {
 
     /// Bind an already unlocked local node. The signer never crosses the daemon's actor boundary.
     /// This does not unlock or create a node, enroll a computer, or authorize an unapproved group.
-    pub fn bind_node(&self, signer: &dyn RootSigner, name: &str, personal: bool) -> Result<()> {
+    pub fn bind_node(&self, signer: &dyn RootSigner, name: &str) -> Result<()> {
         let Some(group) = self.binding_group() else {
             return Ok(());
         };
@@ -1466,34 +2078,82 @@ impl Computer {
                 Some(r) => r.read(&local, &group)?,
                 None => (0, None, Vec::new()),
             };
+            let authority = s.derive()?;
+            let approval = s.binding_approvals.get(&key).cloned();
+            let mut retained = None;
+            let mut was_local = false;
+            let mut known = false;
+            for id in &authority.accepted {
+                let e = s.history[id].event()?;
+                for binding in e.bindings {
+                    if binding.verify(&e.author, &group)? != key { continue; }
+                    known = true;
+                    was_local |= e.author == local;
+                    if e.author == local && authority.binding_owners.get(&key) == Some(&binding.id()) {
+                        retained = Some(binding);
+                    }
+                }
+            }
+            if known && retained.is_none() && approval.is_none() {
+                if was_local { return Ok(()); } // Released: never silently reclaim an old vault.
+                return Err(Error::Profile("this node is bound to another computer; explicitly approve its signed transfer or recovery before unlocking it"));
+            }
+            if approval.is_some() { bindings.retain(|b| b.verify(&local, &group).ok() != Some(key)); }
             let mut changed = false;
+            if let Some(binding) = bindings
+                .iter_mut()
+                .find(|b| b.verify(&local, &group).ok() == Some(key))
+            {
+                if binding.name != name {
+                    binding.name = name.to_owned();
+                    changed = true;
+                }
+            }
             if !bindings
                 .iter()
                 .any(|b| b.verify(&local, &group).ok() == Some(key))
             {
-                let body = Binding::body(
-                    &signer.public_key(),
-                    &self.signer.public_key(),
-                    &group,
-                    &random_array()?,
-                );
-                bindings.push(Binding {
-                    node: Signed::create(b"vox/computer-binding/v1\0", body.clone(), signer)?,
-                    computer: Signed::create(
-                        b"vox/computer-binding/v1\0",
-                        body,
-                        self.signer.as_ref(),
-                    )?,
-                    name: name.to_owned(),
-                });
+                // Reuse this node's own signed binding after local roster removal or rename.
+                // A copied fingerprint file or name cannot construct this proof.
+                let body = if let Some(approval) = &approval {
+                    let mut body = Encoder::new();
+                    body.array(6).uint(PROTOCOL).bytes(&signer.public_key().to_bytes())
+                        .bytes(&self.signer.public_key().to_bytes()).bytes(&group)
+                        .bytes(&random_array::<32>()?).bytes(&approval.encode());
+                    body.finish()
+                } else { Binding::body(&signer.public_key(), &self.signer.public_key(), &group, &random_array()?) };
+                if approval.is_some() { retained = None; }
+                let mut binding = if let Some(binding) = retained {
+                    binding
+                } else {
+                    Binding {
+                        node: Signed::create(b"vox/computer-binding/v1\0", body.clone(), signer)?,
+                        computer: Signed::create(
+                            b"vox/computer-binding/v1\0",
+                            body,
+                            self.signer.as_ref(),
+                        )?,
+                        name: name.to_owned(),
+                    }
+                };
+                binding.name = name.to_owned();
+                bindings.push(binding);
                 changed = true;
             }
-            let selection = if personal { Some(key) } else { old_personal };
+            if s.selected == Some(key) {
+                s.selected_name = name.to_owned();
+            }
+            let selection = s.selected.filter(|selected| {
+                bindings
+                    .iter()
+                    .any(|b| b.verify(&local, &group).ok() == Some(*selected))
+            });
             changed |= selection != old_personal;
             if changed {
                 bindings.sort_by_key(|b| sha256(&b.node.public));
                 let r = Control::create(s, &bindings, selection, self.signer.as_ref())?;
                 s.retain_roster(r)?;
+                s.binding_approvals.remove(&key);
             }
             Ok(())
         })
@@ -1507,17 +2167,24 @@ impl Computer {
             return Ok(None);
         };
         self.storage_ready()?;
-        let mut covered = std::collections::BTreeSet::new();
+        let mut covered = BTreeMap::new();
         let mut owner = None;
-        for r in s.history.values() {
+        let authority = s.derive()?;
+        for (record_id, r) in &s.history {
+            if !authority.accepted.contains(record_id) {
+                continue;
+            }
             let e = r.event()?;
             if e.group != g.incarnation() {
                 continue;
             }
             for b in &e.bindings {
                 let id = b.verify(&e.author, &e.group)?;
-                covered.insert(id);
-                if id == node {
+                covered
+                    .entry(id)
+                    .or_insert_with(BTreeSet::new)
+                    .insert(e.author);
+                if id == node && e.author == self.signer.fingerprint() {
                     owner = Some(e.author);
                 }
             }
@@ -1533,16 +2200,26 @@ impl Computer {
             let (_, personal, bindings) = r.read(manager, &g.incarnation())?;
             for b in bindings {
                 let id = b.verify(manager, &g.incarnation())?;
-                if nodes.insert(id, (b.name, personal == Some(id))).is_some() {
+                if authority.binding_owners.get(&id) != Some(&b.id()) {
+                    continue;
+                }
+                if nodes
+                    .insert(id, (b.name, personal == Some(id), *manager))
+                    .is_some()
+                {
                     return Err(bad());
                 }
             }
         }
-        let own_personal = nodes.get(&node).is_some_and(|(_, personal)| *personal);
+        let own_active = s.grant(&owner).is_some()
+            && nodes
+                .get(&node)
+                .is_some_and(|(_, _, manager)| *manager == owner);
+        let own_personal = nodes.get(&node).is_some_and(|(_, personal, _)| *personal);
         let grants: Vec<_> = nodes
             .into_iter()
-            .filter(|(id, _)| *id != node && !s.quarantined.contains(&owner))
-            .map(|(id, (name, personal))| {
+            .filter(|(id, _)| *id != node && own_active && !s.quarantined.contains(&owner))
+            .map(|(id, (name, personal, _))| {
                 (
                     id,
                     name,
@@ -1558,10 +2235,42 @@ impl Computer {
         for (id, _, _) in &grants {
             covered.remove(id);
         }
+        let boundary = |manager: &Digest32| {
+            s.intervals
+                .get(manager)
+                .and_then(|v| v.last())
+                .map(|i| i.retirement.unwrap_or(i.activation))
+                .unwrap_or(s.revision)
+        };
+        let denied = covered
+            .into_iter()
+            .filter_map(|(peer, managers)| {
+                let created = s
+                    .individual
+                    .get(&node)
+                    .and_then(|v| v.get(&peer))
+                    .copied()
+                    .unwrap_or(0);
+                let cutoff = managers
+                    .iter()
+                    .map(&boundary)
+                    .chain([
+                        boundary(&owner),
+                        s.retired_nodes.get(&peer).copied().unwrap_or(0),
+                        s.retired_nodes.get(&node).copied().unwrap_or(0),
+                    ])
+                    .max()
+                    .unwrap_or(s.revision);
+                (created <= cutoff
+                    || s.quarantined.contains(&owner)
+                    || managers.iter().any(|m| s.quarantined.contains(m)))
+                .then_some(peer)
+            })
+            .collect();
         Ok(Some(PolicyPlan {
             revision: s.revision,
             grants,
-            denied: covered.into_iter().collect(),
+            denied,
         }))
     }
 
@@ -1610,10 +2319,8 @@ impl Computer {
         let Some(plan) = self.plan(node)? else {
             return Ok(None);
         };
-        if plan.denied.contains(peer) {
-            return Err(Error::Profile(
-                "this computer authority is quarantined or retired",
-            ));
+        if plan.denied.contains(peer) && !self.individual_permitted(node, peer)? {
+            return Err(Error::Profile("this computer authority is quarantined"));
         }
         Ok(plan
             .grants
@@ -1621,6 +2328,115 @@ impl Computer {
             .find(|(id, _, _)| id == peer)
             .map(|(_, _, c)| c))
     }
+    /// Save an explicit local selection, identified by an already-unlocked actor's identity.
+    pub fn select_personal(&self, node: Option<Digest32>, name: &str) -> Result<()> {
+        let local = self.signer.fingerprint();
+        self.change(|s| {
+            s.selected = node;
+            s.selected_name = name.to_owned();
+            if let (Some(group), Some(roster)) = (s.group(), s.rosters.get(&local)) {
+                if s.grant(&local).is_some() {
+                    let (_, old, bindings) = roster.read(&local, &group)?;
+                    if node.is_some_and(|n| !bindings.iter().any(|b| b.verify(&local, &group).ok() == Some(n))) {
+                        return Err(Error::Profile("make the selected node Ready so its management binding can be authenticated"));
+                    }
+                    if old != node {
+                        let event = Control::create(s, &bindings, node, self.signer.as_ref())?;
+                        s.retain_roster(event)?;
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Remove only bindings whose local directories no longer exist. Names never create a binding.
+    pub fn retain_local_nodes(&self, names: &BTreeSet<String>) -> Result<()> {
+        let local = self.signer.fingerprint();
+        self.change(|s| {
+            let Some(group) = s.group() else {
+                return Ok(());
+            };
+            if s.grant(&local).is_none() {
+                return Ok(());
+            }
+            let Some(roster) = s.rosters.get(&local) else {
+                return Ok(());
+            };
+            let (_, personal, mut bindings) = roster.read(&local, &group)?;
+            let was = bindings.len();
+            bindings.retain(|b| names.contains(&b.name));
+            let selected = personal.filter(|id| {
+                bindings
+                    .iter()
+                    .any(|b| b.verify(&local, &group).ok() == Some(*id))
+            });
+            if was != bindings.len() {
+                let event = Control::create(s, &bindings, selected, self.signer.as_ref())?;
+                s.retain_roster(event)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Capture alias metadata before automatic grant consumption or removal.
+    pub fn retain_aliases(&self, node: Digest32, aliases: &[(Digest32, String)]) -> Result<()> {
+        self.change(|s| {
+            s.aliases
+                .entry(node)
+                .or_default()
+                .extend(aliases.iter().cloned());
+            Ok(())
+        })
+    }
+    /// A local alias survives a revoked permission.
+    pub fn alias(&self, node: &Digest32, peer: &Digest32) -> Option<String> {
+        lock(&self.state)
+            .aliases
+            .get(node)
+            .and_then(|m| m.get(peer))
+            .cloned()
+    }
+    fn individual_permitted(&self, node: Digest32, peer: &Digest32) -> Result<bool> {
+        let s = lock(&self.state);
+        let Some(group) = s.group() else {
+            return Ok(true);
+        };
+        let mut managers = BTreeSet::new();
+        for record in s.history.values() {
+            let e = record.event()?;
+            if e.group != group {
+                continue;
+            }
+            for binding in e.bindings {
+                let id = binding.verify(&e.author, &group)?;
+                if id == node || id == *peer {
+                    managers.insert(e.author);
+                }
+            }
+        }
+        Ok(!managers.iter().any(|m| s.quarantined.contains(m)))
+    }
+    /// The ordinary explicit Trust command after retirement chooses individual mode. Journal
+    /// that choice before its keyring write; a failed write grants nothing and can be retried.
+    pub fn individual_choice(&self, node: Digest32, peer: Digest32) -> Result<()> {
+        if self.capability(node, &peer)?.is_some() {
+            return Ok(());
+        }
+        if !self.individual_permitted(node, &peer)? {
+            return Err(Error::SignatureInvalid);
+        }
+        self.change(|s| {
+            s.revision = s.revision.checked_add(1).ok_or_else(bad)?;
+            s.individual
+                .entry(node)
+                .or_default()
+                .insert(peer, s.revision);
+            s.receipts.clear();
+            Ok(())
+        })
+    }
+
     /// Open or atomically create the separate unattended software vault. Corrupt, unsupported,
     /// wrongly owned or symlinked state is refused unchanged. Call outside async runtime workers.
     pub fn open(account: &Account, name: &str) -> Result<Arc<Self>> {
@@ -1684,6 +2500,13 @@ impl Computer {
         };
         Description::decode(&description.encode())?;
         let state = State {
+            intervals: BTreeMap::new(),
+            retired_nodes: BTreeMap::new(),
+            individual: BTreeMap::new(),
+            aliases: BTreeMap::new(),
+            selected: None,
+            selected_name: String::new(),
+            binding_approvals: BTreeMap::new(),
             links: Vec::new(),
             group_genesis: None,
             members: BTreeMap::new(),
