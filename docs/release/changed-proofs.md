@@ -65,3 +65,11 @@ visible room creation and room notices; this deletion does not claim a new notic
 Rust commands use features actually declared by their selected package. An optional result's
 receipt must name the expanded `optional-proofs` command that executed the real proof, rather
 than its stand-in.
+
+Room-ask retention binds CLI and app inputs separately. Native Swift and VM-driver changes
+do not invalidate the CLI-only step; Rust dependencies name the hook/status/decline boundaries, rather than every Rust source. An explicit
+room-ask diff still selects both adapters, and each decides whether its prior pass is retained.
+
+Product dependencies use module-level granularity: an unrelated function in a reached
+host, actor, or channel module can invalidate the observation. This is not a claim of
+function-precise product dependency analysis; proof methods and local apparatus are isolated.

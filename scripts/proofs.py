@@ -14,11 +14,20 @@ import sys
 ROOT = Path(__file__).resolve().parent.parent
 ASK = ['crates/vox-tui/src/room_ask.rs',
        'apps/macos/Vox/RoomAsk.swift']
-ASK_SHARED = ['crates/vox-tui/src/room_map.rs', 'crates/vox-tui/src/host.rs', 'crates/vox-tui/src/cli.rs',
-              'crates/vox-core/src/node/daemonipc.rs', 'apps/macos/Vox/AppModel.swift',
-              'apps/macos/Vox/NodeModel.swift', 'apps/macos/VoxAppProofs/Stager.swift',
-              'scripts/app-proof-stager.py', 'scripts/app-proofs.sh', 'scripts/app-proofs-vm.py',
-              'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml']
+# Concrete boundaries of the unmapped hook/status/decline fixture. It never joins
+# a room, posts a body, forwards a service, or drives a Session.
+ASK_CLI = [
+    'crates/vox-tui/src/' + name + '.rs' for name in
+    ['room_ask', 'room_map', 'host', 'cli', 'agent_hook', 'agent_setup', 'agent_room',
+     'setup', 'wake', 'coord', 'client', 'daemon', 'daemon_client', 'node_tasks', 'app']
+]
+ASK_CLI += ['crates/vox-core/src/node/' + name + '.rs' for name in
+            ['daemonipc', 'paths', 'api', 'app', 'actor', 'channel']]
+ASK_CLI += ['Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml',
+            'crates/vox-tui/Cargo.toml', 'crates/vox-core/Cargo.toml']
+ASK_APP = ASK_CLI + ['apps/macos/Vox/RoomAsk.swift', 'apps/macos/Vox/AppModel.swift',
+                    'apps/macos/Vox/NodeModel.swift', 'apps/macos/VoxAppProofs/Stager.swift',
+                    'scripts/app-proof-stager.py', 'scripts/app-proofs.sh', 'scripts/app-proofs-vm.py']
 
 def git(*args):
     return subprocess.check_output(['git', *args], cwd=ROOT, text=True).strip()
@@ -63,7 +72,7 @@ def discover():
     cli='rust:vox-tui:agent_hook_proof:a_session_works_in_the_room_its_start_directory_is_mapped_to'
     for key in [app, cli]:
         if key not in rows: raise RuntimeError('room-ask adapter has no existing proof: '+key)
-        row=dict(rows[key]); row.update(id=key+'#room-ask', parent=key, step='room-ask', dependencies=ASK+ASK_SHARED)
+        row=dict(rows[key]); row.update(id=key+'#room-ask', parent=key, step='room-ask', dependencies=list(ASK_APP if row['kind']=='app' else ASK_CLI))
         rows[row['id']]=row
     return rows
 
@@ -193,7 +202,7 @@ def fingerprint(row, commit=None):
     paths=row.get('dependencies') or [str(p.relative_to(ROOT)) for p in ROOT.glob('crates/*/src/**/*.rs')]
     if row['kind']=='app' and not row.get('step'):
         paths += [str(p.relative_to(ROOT)) for p in ROOT.glob('apps/macos/Vox/*.swift')]
-        paths += ASK_SHARED
+        paths += ASK_APP
     if row['kind']=='rust':
         support=ROOT/Path(row['source']).parent/'support'
         paths += [str(p.relative_to(ROOT)) for p in support.glob('**/*.rs')]
