@@ -1,9 +1,8 @@
-//! The tasks an attached node runs beside its actor (ADR-026 L-2): anchor follow, the notifier,
+//! The tasks an attached node runs beside its actor (ADR-026 L-2): the notifier,
 //! and the interrupt path (wake, ping and tend). Each is cancellable, so a node can be detached
 //! without stopping the daemon: [`NodeTasks::stop`] ends them before the node's own stop.
 //!
-//! Moved here from `vox daemon` (`app::run_daemon`) unchanged: what each task does, and every
-//! line it prints, is what the single-node daemon did.
+//! Manual anchor refresh belongs to the daemon's machine registry, rather than these node tasks.
 
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
@@ -17,10 +16,9 @@ pub struct NodeTasks {
 }
 
 impl NodeTasks {
-    /// Start `node`'s tasks on `rt`: anchor follow (re-reading `paths`' anchors file and
-    /// `anchor_specs`), the notifier, and the interrupt path.
+    /// Start `node`'s tasks on `rt`: the notifier, and the interrupt path.
     #[must_use]
-    pub fn start(rt: &Handle, node: &NodeHandle, paths: &Paths, anchor_specs: Vec<String>) -> Self {
+    pub fn start(rt: &Handle, node: &NodeHandle, paths: &Paths) -> Self {
         let cancel = CancellationToken::new();
         let mut set = tokio::task::JoinSet::new();
         let mut spawn = |task: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>| {
@@ -35,11 +33,6 @@ impl NodeTasks {
                 rt,
             );
         };
-        spawn(Box::pin(follow_anchors(
-            node.clone(),
-            paths.clone(),
-            anchor_specs,
-        )));
         // Tell the operator when `vox status` would flag something, and when it clears
         // (PRD-001 R37). Off with `notify = off` in the profile's config file.
         spawn(Box::pin(crate::notify::watch(node.clone(), paths.clone())));
@@ -52,70 +45,6 @@ impl NodeTasks {
     pub async fn stop(mut self) {
         self.cancel.cancel();
         while self.set.join_next().await.is_some() {}
-    }
-}
-
-/// How often a daemon re-reads its anchor configuration and re-resolves it.
-///
-/// Short enough that a moved anchor is followed within a minute, long enough that it is
-/// not a resolver load: the node only acts when something actually changed, because
-/// merging an address it already holds is a no-op.
-const ANCHOR_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// **Follow the anchor when it moves.**
-///
-/// An anchor spec may name a host rather than an address, and the reason it may is
-/// that a home connection's address changes whenever the ISP decides — the point
-/// being that a person should not have to re-issue it to every client. Resolution
-/// happened once, when this process read its configuration, so a daemon that runs for
-/// days held whatever the name meant at startup and redialled that address for ever.
-/// The failure attributes badly: the anchor is up, the name is right, and the client
-/// says only that it cannot reach a peer.
-///
-/// So re-read the configuration and re-resolve every spec on a timer, and hand the
-/// node anything new. Re-reading is what makes this provable without a DNS record to
-/// move: the same `merge_anchor_spec` runs again, so a name is resolved again whether
-/// it was the file or the record that changed.
-async fn follow_anchors(node: NodeHandle, paths: Paths, specs: Vec<String>) {
-    // What the last read skipped, so a bad line is said when it appears, not every 30 s. The
-    // attach said what the file skipped then (host.rs), so that is the first read's.
-    let first = paths.clone();
-    let mut said: Vec<String> = tokio::task::spawn_blocking(move || {
-        let mut set = vox_core::nat::bootstrap::BootstrapSet::new();
-        vox_core::node::link::merge_machine_anchors(&mut set, &first.account()).unwrap_or_default()
-    })
-    .await
-    .unwrap_or_default();
-    loop {
-        tokio::time::sleep(ANCHOR_REFRESH).await;
-        // On a blocking thread: a name is resolved here, and a slow resolver must not
-        // hold a runtime worker (V210-75).
-        let (paths, specs) = (paths.clone(), specs.clone());
-        let Ok((set, skipped)) = tokio::task::spawn_blocking(move || {
-            let mut set = vox_core::nat::bootstrap::BootstrapSet::new();
-            // A bad line is skipped, not a reason to skip every anchor (V210-75).
-            let skipped = vox_core::node::link::merge_machine_anchors(&mut set, &paths.account())
-                .unwrap_or_default();
-            for spec in &specs {
-                let _ = vox_core::node::link::merge_anchor_spec(&mut set, spec);
-            }
-            (set, skipped)
-        })
-        .await
-        else {
-            continue;
-        };
-        if skipped != said {
-            for line in &skipped {
-                eprintln!("vox daemon: {line}");
-            }
-            said = skipped;
-        }
-        if !set.is_empty() {
-            let _ = node
-                .apply(vox_core::node::api::NodeCommand::AddAnchors { anchors: set })
-                .await;
-        }
     }
 }
 

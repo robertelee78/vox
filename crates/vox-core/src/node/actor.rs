@@ -5321,12 +5321,14 @@ impl Node {
         match command {
             NodeCommand::CreateIdentity { passphrase } => self.create_identity(&passphrase),
             NodeCommand::Unlock { passphrase } => self.unlock(&passphrase).await,
-            NodeCommand::AddAnchors { anchors } => {
-                // `merge` keeps the first entry per identity, so it would discard exactly
-                // the thing a refresh carries: the same anchor at its new address.
-                if self.anchors.merge_endpoints(&anchors).is_err() {
-                    return Outcome::Failed(Fault::TooLong);
+            NodeCommand::SetAnchors { anchors } => {
+                if self.anchors == anchors {
+                    return Outcome::Done;
                 }
+                // A removal and a moved address both replace the previous machine input.
+                // Room provenance remains independent, including a room that also names a
+                // removed manual anchor.
+                self.anchors = anchors;
                 // Dial straight away rather than waiting for the throttle: the caller
                 // refreshed because something changed, and the whole point is not to sit
                 // on a stale address.
