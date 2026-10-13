@@ -430,7 +430,7 @@ impl ChannelState {
         self.render_pending_private(store, now)
     }
 
-    fn supports_private(&mut self, peer: &Digest32) -> bool {
+    pub(super) fn supports_private(&mut self, peer: &Digest32) -> bool {
         let seq = self.dag.verified_head(peer);
         if let Some((known, supported)) = self.private_sessions.supports.get(peer) {
             if *known == seq {

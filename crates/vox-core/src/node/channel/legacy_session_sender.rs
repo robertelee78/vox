@@ -9,17 +9,26 @@ use crate::node::content::{LegacySessionIndex, MAX_LEGACY_SESSION_HASHES};
 const SEG_LEGACY_ANNOUNCED: u64 = 18;
 const SCAN_PER_TURN: u64 = 4096;
 
+#[derive(Clone, Default)]
+pub(super) struct Announcements {
+    through: u64,
+    // Reader -> (membership, epoch, ordinary grant generation, ordinary grant iteration).
+    // A v0.4.4 reader consumes an unknown declaration's message key without caching its body.
+    // Once it advertises support, resend metadata at its current grant, never an old key.
+    readers: BTreeMap<Digest32, (u64, u64, u64, u64)>,
+}
+
 impl ChannelState {
-    fn legacy_announced_through(&mut self, store: &Store) -> Result<u64> {
-        if let Some(seq) = self.legacy_announced {
-            return Ok(seq);
+    fn legacy_announced_through(&mut self, store: &Store) -> Result<Announcements> {
+        if let Some(state) = &self.legacy_announced {
+            return Ok(state.clone());
         }
-        let seq = match store.get_segment(
+        let state = match store.get_segment(
             &self.channel_id,
             SegmentKind::KeyMaterial,
             SEG_LEGACY_ANNOUNCED,
         )? {
-            None => 0,
+            None => Announcements::default(),
             Some(segment) => {
                 let bytes = open_segment(
                     &self.sek,
@@ -28,16 +37,42 @@ impl ChannelState {
                     &segment,
                 )?;
                 let mut d = Decoder::new(&bytes);
-                if d.array()? != 3 || d.uint()? != 1 || d.bytes()? != self.me() {
+                let (arity, version) = (d.array()?, d.uint()?);
+                if !matches!((arity, version), (3, 1) | (4, 2)) || d.bytes()? != self.me() {
                     return Err(Error::MalformedAtRest("legacy Session announcement cursor"));
                 }
-                let seq = d.uint()?;
+                let through = d.uint()?;
+                let mut readers = BTreeMap::new();
+                if version == 2 {
+                    let count = d.array()?;
+                    if count > AUTHORS_HARD_LIMIT {
+                        return Err(Error::MalformedAtRest(
+                            "legacy Session announcement readers",
+                        ));
+                    }
+                    for _ in 0..count {
+                        if d.array()? != 5 {
+                            return Err(Error::MalformedAtRest(
+                                "legacy Session announcement reader",
+                            ));
+                        }
+                        let peer: Digest32 = d.bytes()?.try_into().map_err(|_| {
+                            Error::MalformedAtRest("legacy Session announcement reader")
+                        })?;
+                        let grant = (d.uint()?, d.uint()?, d.uint()?, d.uint()?);
+                        if readers.insert(peer, grant).is_some() {
+                            return Err(Error::MalformedAtRest(
+                                "duplicate Session announcement reader",
+                            ));
+                        }
+                    }
+                }
                 d.finish()?;
-                seq
+                Announcements { through, readers }
             }
         };
-        self.legacy_announced = Some(seq);
-        Ok(seq)
+        self.legacy_announced = Some(state.clone());
+        Ok(state)
     }
 
     /// Announce at most one bounded page per maintenance turn, so a large legacy transcript
@@ -52,9 +87,29 @@ impl ChannelState {
         if !self.settled || self.has_left(&me) || !self.authors.contains_key(&me) {
             return Ok(0);
         }
-        let through = self.legacy_announced_through(profile.store())?;
+        let previous = self.legacy_announced_through(profile.store())?;
+        let mut readers = BTreeMap::new();
+        for peer in self.consented() {
+            if peer == me || self.has_left(&peer) || !self.supports_private(&peer) {
+                continue;
+            }
+            if let Some((generation, iteration)) = self.entitled.get(&peer) {
+                readers.insert(
+                    peer,
+                    (self.admission(&peer).0, self.epoch, *generation, *iteration),
+                );
+            }
+        }
+        // A published reader may already have consumed every earlier declaration. Its newly
+        // authenticated capability or a new ordinary grant needs a fresh bounded scan. Keep
+        // this audience in the same transaction as the cursor so restarting does not repeat
+        // the entire history, or skip pages of a scan that had not committed.
+        let new_reader = readers
+            .iter()
+            .any(|(peer, grant)| previous.readers.get(peer) != Some(grant));
+        let through = if new_reader { 0 } else { previous.through };
         let verified = self.dag.verified_head(&me);
-        if through >= verified {
+        if through >= verified && readers == previous.readers {
             return Ok(0);
         }
         let mut scanned = through;
@@ -74,7 +129,7 @@ impl ChannelState {
                 }
             }
         }
-        if scanned == through {
+        if scanned == through && readers == previous.readers {
             return Ok(0);
         }
         steps.sort_unstable();
@@ -87,7 +142,21 @@ impl ChannelState {
             ))
         };
         let mut cursor = Encoder::new();
-        cursor.array(3).uint(1).bytes(&me).uint(scanned);
+        cursor
+            .array(4)
+            .uint(2)
+            .bytes(&me)
+            .uint(scanned)
+            .array(readers.len());
+        for (peer, (membership, epoch, generation, iteration)) in &readers {
+            cursor
+                .array(5)
+                .bytes(peer)
+                .uint(*membership)
+                .uint(*epoch)
+                .uint(*generation)
+                .uint(*iteration);
+        }
         let cursor = seal_segment(
             &self.sek,
             SegmentKind::KeyMaterial,
@@ -153,7 +222,10 @@ impl ChannelState {
                 return Err(e);
             }
         };
-        self.legacy_announced = Some(scanned);
+        self.legacy_announced = Some(Announcements {
+            through: scanned,
+            readers,
+        });
         if let Some((hash, id)) = posted {
             self.log_ids.insert(hash, id);
             self.next_log_id = id.saturating_add(1);

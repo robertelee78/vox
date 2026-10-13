@@ -878,8 +878,8 @@ pub struct ChannelState {
     pending_reads: Vec<(ReadRow, u64)>,
     /// Sealed exact-hash subtype evidence; never a permission or recovery eligibility decision.
     legacy_sessions: legacy_session::LegacySessions,
-    /// Last verified own-feed sequence covered by emitted legacy Session declarations.
-    legacy_announced: Option<u64>,
+    /// Own-feed declaration cursor and the capable readers covered by that scan.
+    legacy_announced: Option<legacy_session_sender::Announcements>,
     private_sessions: private_session::PrivateSessions,
     /// How far each other member's node holds this identity's feed here, by its own word in its
     /// last sync with this node (ADR-028 R-6): the highest seq of the feed its frontier named.

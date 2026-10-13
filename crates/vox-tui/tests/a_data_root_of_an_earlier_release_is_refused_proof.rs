@@ -435,6 +435,11 @@ fn seen(w: &room::Worker, room: &str, others: &[String], side: &str) -> Seen {
     let rows = ok(&["room", "read", room, "--json", "--limit", "1000"])
         .ndjson()
         .iter()
+        // A v0.4.4 read-only member displays withheld Session bodies as unread placeholders.
+        // Their removal is required by #787. Compare received content, including every staged
+        // message/share/opening and its original hash, author and time; do not require an
+        // intentionally removed placeholder to survive the upgrade as though it were data.
+        .filter(|r| r["owed"] != true)
         .map(|r| {
             (
                 r["entry_hash"].as_str().unwrap_or_default().to_owned(),
@@ -871,7 +876,11 @@ fn session_copies_as_owner(
     use vox_core::transport::framing::{read_frame, write_frame};
     use vox_core::transport::streams::{open_typed, StreamKind};
 
-    let side = if upgraded { "PRODUCT" } else { "APPARATUS" };
+    let side = if r.workers[0].exe == VOX {
+        "PRODUCT"
+    } else {
+        "APPARATUS"
+    };
     let targets: Vec<_> = r.workers[1..]
         .iter()
         .map(|w| {
@@ -987,6 +996,8 @@ fn session_copies_as_owner(
 /// Mutants: skip the public rewrite -> the author's public wire request receives old ciphertext;
 /// keep revoked legacy copies -> its private request recovers them; drop authorized copies ->
 /// the current driver loses readable history and/or the original signed private record.
+/// During the rolling upgrade, published drive and read-only peers must still exchange chat
+/// with the upgraded author, without receiving its new private steps or extra placeholders.
 fn legacy_session_copies_upgrade(root: &Path, old: &str, rt: &tokio::runtime::Runtime) {
     use vox_core::cbor::Decoder;
     use vox_core::group::message::GroupMessage;
@@ -1001,8 +1012,10 @@ fn legacy_session_copies_upgrade(root: &Path, old: &str, rt: &tokio::runtime::Ru
         old,
     ));
     let session = "legacy-upgrade-session";
+    let room_id = r.id.clone();
     let first = "LEGACY-BEFORE-REVOCATION";
     let second = "LEGACY-AFTER-REVOCATION";
+    let rolling = "PRIVATE-WHILE-PEERS-STILL-PUBLISHED";
     let new = "PRIVATE-AFTER-UPGRADE-REVOCATION";
     let hook = |w: &room::Worker, text: &str, side: &str| {
         let transcript = tmp.join("session.jsonl");
@@ -1017,7 +1030,7 @@ fn legacy_session_copies_upgrade(root: &Path, old: &str, rt: &tokio::runtime::Ru
         let o = w.vox_env(
             None,
             &[("CLAUDE_CODE_ENTRYPOINT", "cli")],
-            &["agent", "hook", "--node", node.as_str(), "--room", &r.id],
+            &["agent", "hook", "--node", node.as_str(), "--room", &room_id],
             Some(&payload),
         );
         assert!(o.ok, "{side}: Session hook failed: {o:?}");
@@ -1025,7 +1038,7 @@ fn legacy_session_copies_upgrade(root: &Path, old: &str, rt: &tokio::runtime::Ru
     let history = |w: &room::Worker| {
         w.vox(
             None,
-            &["room", "session", &r.id, session, "--details", "--json"],
+            &["room", "session", &room_id, session, "--details", "--json"],
         )
     };
     let wait_old_history = |w: &room::Worker, wanted: &[&str]| {
@@ -1122,17 +1135,88 @@ fn legacy_session_copies_upgrade(root: &Path, old: &str, rt: &tokio::runtime::Ru
         legacy[1].len(),
         legacy[2].len()
     );
+    let old_general: Vec<_> = r.workers[1..]
+        .iter()
+        .map(|w| {
+            let o = w.vox(None, &["room", "read", &r.id, "--limit", "1000"]);
+            assert!(
+                o.ok,
+                "APPARATUS: published reader failed before rolling upgrade: {o:?}"
+            );
+            o.stdout.matches("not received yet").count()
+        })
+        .collect();
+    r.workers[0].exe = VOX.to_owned();
+    r.restart(0);
+    hook(&r.workers[0], rolling, "PRODUCT");
+    let compatibility = "CHAT-AFTER-PRIVATE-STEP-WITH-PUBLISHED-PEERS";
+    let o = r.workers[0].vox(None, &["room", "post", &r.id, compatibility]);
+    assert!(
+        o.ok,
+        "PRODUCT: upgraded author could not post beside its private step: {o:?}"
+    );
+    for (i, w) in r.workers[1..].iter().enumerate() {
+        await_upgrade_post(w, &r.id, compatibility);
+        let o = w.vox(None, &["room", "read", &r.id, "--limit", "1000"]);
+        assert!(o.ok && !o.stdout.contains(rolling)
+            && o.stdout.matches("not received yet").count() == old_general[i],
+            "PRODUCT: published {} received new private activity or new missing-body placeholders: {o:?}", w.name);
+        let o = history(w);
+        assert!(o.ok && !o.stdout.contains(rolling)
+            && o.stdout.contains(first) == (i < 2)
+            && o.stdout.contains(second) == (i == 0),
+            "PRODUCT: published {}'s existing Session history changed during rolling upgrade: {o:?}", w.name);
+        let response = format!("PUBLISHED-{}-ANSWERS-UPGRADED-OWNER", w.name);
+        let o = w.vox(None, &["room", "post", &r.id, &response]);
+        assert!(
+            o.ok,
+            "PRODUCT: published {} could not answer upgraded owner: {o:?}",
+            w.name
+        );
+        await_upgrade_post(&r.workers[0], &r.id, &response);
+    }
+    let mixed = session_copies_as_owner(&mut r, rt, false);
+    for (i, copies) in mixed.iter().enumerate() {
+        let encrypted: BTreeMap<_, _> = copies
+            .public
+            .iter()
+            .filter(|entry| {
+                entry
+                    .payload
+                    .as_deref()
+                    .and_then(|p| GroupMessage::from_wire(p).ok())
+                    .is_some_and(|m| m.header.channel_id == drive_channel(&r.cid))
+            })
+            .map(|entry| (entry.entry_hash(), entry.to_wire()))
+            .collect();
+        assert_eq!(
+            encrypted,
+            legacy[i],
+            "PRODUCT: published {} received new encrypted Session records during rolling upgrade",
+            r.workers[i + 1].name
+        );
+    }
+    println!("[proof] published drive, revoked and read-only peers exchange chat with upgraded owner; no new private ciphertext or placeholders");
     r.upgrade(VOX);
     for w in &r.workers {
         await_upgrade_post(w, &r.id, control);
     }
+    room::until(
+        &r.workers[1],
+        None,
+        "authorized private step after completing rolling upgrade",
+        &["room", "session", &r.id, session, "--details", "--json"],
+        |o| o.ok && o.stdout.contains(rolling),
+    );
     for i in [0, 1] {
         let o = r.workers[i].vox(
             None,
             &["room", "session", &r.id, session, "--details", "--json"],
         );
         assert!(
-            o.ok && o.stdout.contains(first) && o.stdout.contains(second),
+            o.ok && o.stdout.contains(first)
+                && o.stdout.contains(second)
+                && o.stdout.contains(rolling),
             "PRODUCT: {} lost authorized legacy Session history: {o:?}",
             r.workers[i].name
         );
@@ -1143,7 +1227,9 @@ fn legacy_session_copies_upgrade(root: &Path, old: &str, rt: &tokio::runtime::Ru
             &["room", "session", &r.id, session, "--details", "--json"],
         );
         assert!(
-            o.ok && !o.stdout.contains(first) && !o.stdout.contains(second),
+            o.ok && !o.stdout.contains(first)
+                && !o.stdout.contains(second)
+                && !o.stdout.contains(rolling),
             "PRODUCT: {} retained forbidden legacy Session cache: {o:?}",
             r.workers[i].name
         );
@@ -1243,7 +1329,8 @@ fn legacy_session_copies_upgrade(root: &Path, old: &str, rt: &tokio::runtime::Ru
                 |o| o.ok && o.stdout.contains(&online) && !o.stdout.contains("not received yet"),
             );
             assert!(o.ok && o.stdout.contains(control) && !o.stdout.contains("not received yet")
-                && !o.stdout.contains(first) && !o.stdout.contains(second) && !o.stdout.contains(new),
+                && !o.stdout.contains(first) && !o.stdout.contains(second) && !o.stdout.contains(new)
+                && !o.stdout.contains(rolling),
                 "PRODUCT: {}'s General lost ordinary chat or exposed private activity/placeholder: {o:?}", w.name);
             let o = w.vox(
                 None,
@@ -1252,6 +1339,7 @@ fn legacy_session_copies_upgrade(root: &Path, old: &str, rt: &tokio::runtime::Ru
             assert!(
                 o.ok && o.stdout.contains(first) == (i == 0)
                     && o.stdout.contains(second) == (i == 0)
+                    && o.stdout.contains(rolling) == (i == 0)
                     && !o.stdout.contains(new),
                 "PRODUCT: {}'s retained Session history changed, restart={restart}: {o:?}",
                 w.name
