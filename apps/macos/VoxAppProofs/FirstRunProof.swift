@@ -1257,9 +1257,10 @@ final class FirstRunProof: XCTestCase {
                      withVelocity: .slow, thenHoldForDuration: 0.5)
         Thread.sleep(forTimeInterval: 1)
         let inspector = ui.descendants(matching: .any).matching(identifier: "inspector").firstMatch
-        // The section's last control: Allow the LAN Helper, or Remove it once it is allowed.
+        // The LAN toggle, or the helper removal control when the helper is already allowed.
+        // Turning the LAN on now asks for the helper in a sheet; there is no inline Allow button.
         let lan = ui.descendants(matching: .any).matching(NSPredicate(
-            format: "identifier == 'family-lan-allow' OR identifier == 'family-lan-remove'")).firstMatch
+            format: "identifier == 'family-lan' OR identifier == 'family-lan-remove'")).firstMatch
         func lanInView() -> Bool {
             lan.exists && lan.frame.maxY <= inspector.frame.maxY + 1 && lan.frame.minY >= inspector.frame.minY
         }
