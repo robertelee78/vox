@@ -1188,18 +1188,12 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("room-columns"), "the room columns in the sidebar")
         present(ui, Key.id("inspector"), timeout: 10, "a room on screen must show its inspector")
 
-        /// The sidebar's divider: the window's split view's (NavigationSplitView).
-        func sidebarDivider() -> XCUIElement? {
-            ui.windows.firstMatch.splitters.allElementsBoundByIndex
-                .filter { $0.exists && $0.frame.width > 0 }
-                .min { $0.frame.minX < $1.frame.minX }
-        }
         func inspectorDivider() -> XCUIElement {
             ui.descendants(matching: .any).matching(identifier: "inspector-divider").firstMatch
         }
         func sidebarWidth() -> CGFloat {
-            guard let d = sidebarDivider() else { return -1 }
-            return d.frame.minX - ui.windows.firstMatch.frame.minX
+            let timeline = el(ui, Key.id("timeline"))
+            return timeline.frame.minX - ui.windows.firstMatch.frame.minX
         }
         func inspectorWidth() -> CGFloat {
             let e = ui.descendants(matching: .any).matching(identifier: "inspector").firstMatch
@@ -1212,14 +1206,11 @@ final class FirstRunProof: XCTestCase {
                      withVelocity: .slow, thenHoldForDuration: 0.5)
             Thread.sleep(forTimeInterval: 1)
         }
-        guard let side = sidebarDivider() else {
-            throw Apparatus("XCTest finds no split view divider in the window for the sidebar")
-        }
         guard inspectorDivider().waitForExistence(timeout: 10) else {
             throw Apparatus("XCTest finds no \"inspector-divider\" beside the inspector")
         }
-        // Room to widen both: the timeline keeps 400 points (its minimum), so a window only as
-        // wide as the three columns need leaves the sidebar nowhere to go. Widen the window first,
+        // Room to widen the inspector: the timeline keeps 400 points (its minimum).
+        // Widen the window first,
         // from its right edge, as a person would.
         let window = ui.windows.firstMatch
         let edge = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.5))
@@ -1228,27 +1219,10 @@ final class FirstRunProof: XCTestCase {
                    withVelocity: .slow, thenHoldForDuration: 0.5)
         Thread.sleep(forTimeInterval: 1)
         let sidebar0 = sidebarWidth(), inspector0 = inspectorWidth()
-        let needed = sidebar0 + 80 + 400 + 7 + inspector0 + 60
+        let needed = sidebar0 + 400 + 7 + inspector0 + 60
         guard window.frame.width >= needed else {
-            throw Apparatus("staging not achieved: the window is \(window.frame.width) wide after widening, and both drags need \(needed) (the timeline keeps 400)")
+            throw Apparatus("staging not achieved: the window is \(window.frame.width) wide after widening, and the inspector drag needs \(needed) (the timeline keeps 400)")
         }
-        // The sidebar's own resize is not driven here: XCTest's drag does not reach the split
-        // view's resize area (the sidebar-resize spike, 2026-10-09: 13 grips around the separator,
-        // with and without a hover and a long press; and this case's hover +5 point grip, 233 →
-        // 233 on 2026-10-09). A person's drag there resizes it (the decider, by hand, on a proof
-        // build without remembersWidth). That claim rests on the hand test and on 9f0559f6, which
-        // keeps the width out of the live resize; this case says what XCTest's drag did, as
-        // information, and asserts nothing about it.
-        let grip = window.coordinate(withNormalizedOffset: .zero)
-            .withOffset(CGVector(dx: side.frame.midX + 5 - window.frame.minX,
-                                 dy: side.frame.midY - window.frame.minY))
-        grip.hover()
-        Thread.sleep(forTimeInterval: 0.5)
-        grip.press(forDuration: 0.5, thenDragTo: grip.withOffset(CGVector(dx: 80, dy: 0)),
-                   withVelocity: .slow, thenHoldForDuration: 0.5)
-        Thread.sleep(forTimeInterval: 1)
-        let sidebar1 = sidebarWidth()
-        print("[proof] columns: XCTest's sidebar drag (not asserted): \(sidebar0) → \(sidebar1)")
         drag(inspectorDivider(), by: -60)
         let inspector1 = inspectorWidth()
         XCTAssertTrue(inspector1 > inspector0 + 30,
@@ -1262,9 +1236,9 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("room-columns"), "after a new launch, the room columns")
         present(ui, Key.id("inspector"), timeout: 10, "after a new launch, the room's inspector")
         Thread.sleep(forTimeInterval: 1)
-        let sidebar2 = sidebarWidth(), inspector2 = inspectorWidth()
+        let inspector2 = inspectorWidth()
         XCTAssertTrue(abs(inspector2 - inspector1) <= 4,
-                      "PRODUCT: the inspector's width must be the same after a new launch; it was \(inspector1) and is \(inspector2) (the sidebar was \(sidebar1) and is \(sidebar2))")
+                      "PRODUCT: the inspector's width must be the same after a new launch; it was \(inspector1) and is \(inspector2)")
 
         // Hide the inspector, then show it again, with ⌥⌘I.
         ui.typeKey("i", modifierFlags: [.command, .option])
@@ -1299,7 +1273,7 @@ final class FirstRunProof: XCTestCase {
                       "PRODUCT: the inspector must scroll (P13): in a window \(window.frame.height) high, scrolled down, its family LAN section is still out of view (\(lan.exists ? "\(lan.frame)" : "not shown") in \(inspector.frame))")
         XCTAssertTrue(!members.isNull && members.minY >= inspector.frame.minY - 1 && members.maxY <= inspector.frame.maxY,
                       "PRODUCT: scrolled, the inspector's MEMBERS heading must stay in view (P13); it is at \(members) in \(inspector.frame)")
-        print("[proof] columns: sidebar \(sidebar0) → \(sidebar1) → after relaunch \(sidebar2); inspector \(inspector0) → \(inspector1) → \(inspector2); hide \(hidden), show \(back); scrolled, LAN in view \(lanInView()), MEMBERS at \(members.minY)")
+        print("[proof] columns: inspector \(inspector0) → \(inspector1) → \(inspector2); hide \(hidden), show \(back); scrolled, LAN in view \(lanInView()), MEMBERS at \(members.minY)")
     }
 
     /// (8) Notifications (ADR-014 M-23, ADR-028 R-10, #448), alone: the one step that needs a
