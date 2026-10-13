@@ -343,6 +343,7 @@ fi
 # Every red names its side: a red the suite reports is the product's or the proof's own, said in
 # its failure message (PRODUCT: or APPARATUS:); a runner that never started is the machine's.
 status=0
+TEST_RUNNER_VOX_PROOF_STEP="${VOX_PROOF_STEP:-}" \
 TEST_RUNNER_VOX_PROOF_APP="$APP" TEST_RUNNER_VOX_PROOF_SCRATCH="$SCRATCH" \
     TEST_RUNNER_VOX_PROOF_STAGER_PORT="$(cat "$SCRATCH/stager.port")" \
     TEST_RUNNER_VOX_PROOF_STAGER_TOKEN="$TOKEN" \
