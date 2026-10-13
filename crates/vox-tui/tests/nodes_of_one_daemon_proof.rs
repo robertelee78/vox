@@ -567,11 +567,16 @@ fn local_nodes_trust_each_other_without_a_prompt_and_remember_removals() {
         "PRODUCT: the person could not restore a removed local peer by hand: {}",
         ring(names[1])
     );
-    // A held daemon verb reconnects after a daemon restart. Stop those exact foreground
-    // children before the computer journeys stage a host going offline; attached nodes remain
-    // held by the account daemon, and subsequent restarts use finite `node attach` commands.
-    drop(daemons);
-    pair_computers(&a, &elsewhere, &fps, &remote, fresh, &fresh_fp, &room);
+    pair_computers(
+        &a,
+        &elsewhere,
+        &fps,
+        &remote,
+        fresh,
+        &fresh_fp,
+        &room,
+        &mut daemons,
+    );
     close_expired_pairing();
 }
 
@@ -589,6 +594,7 @@ fn computer(a: &Account, args: &[&str]) -> serde_json::Value {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pair_computers(
     a: &Account,
     b: &Account,
@@ -597,6 +603,7 @@ fn pair_computers(
     late: &str,
     late_fp: &str,
     room: &str,
+    daemons: &mut Vec<Daemon>,
 ) {
     let other_agent = b.make_node("remote-agent");
     for node in ["remote", "remote-agent"] {
@@ -878,7 +885,17 @@ fn pair_computers(
     let retried = computer(a, &["approve", operation]);
     assert!(retried["state"]=="confirmed" && retried["pairing"].is_null(),
         "PRODUCT: retrying the completed approval reopened a ceremony or lost confirmation: {retried}");
-    enroll_third(a, b, local, remote, late, late_fp, &other_agent, room);
+    enroll_third(
+        a,
+        b,
+        local,
+        remote,
+        late,
+        late_fp,
+        &other_agent,
+        room,
+        daemons,
+    );
     // A policy write failure must stop previously working computer-derived authority, not leave
     // the old receipt looking confirmed. Make only this scratch management directory unwritable.
     a.make_node("storage-failure-node");
@@ -926,8 +943,9 @@ fn pair_computers(
 // the daemon's log if SIGTERM does not establish staging, then use the existing scratch crash
 // helper and verify that no daemon holds this account's lock before continuing.
 fn offline_for_enrollment(account: &Account, label: &str) {
-    let pid = layout::daemon_pid(&account.data).expect("APPARATUS: scratch daemon to take offline");
-    stop_pid(pid);
+    if let Some(pid) = layout::daemon_pid(&account.data) {
+        stop_pid(pid);
+    }
     if layout::daemon_pid(&account.data).is_some() {
         eprintln!("APPARATUS: {label} did not release its lock after SIGTERM; staging a scratch host loss. Daemon log: {}",account.log());
         layout::kill_daemon(&account.data);
@@ -950,6 +968,7 @@ fn enroll_third(
     late_fp: &str,
     other_agent: &str,
     room: &str,
+    daemons: &mut Vec<Daemon>,
 ) {
     let c = Account::new();
     let beast = c.make_node("codex-beast");
@@ -973,6 +992,10 @@ fn enroll_third(
         .as_str()
         .unwrap()
         .to_owned();
+    // Retire every owned foreground holder only after the founder's last command. A holder
+    // takes over when its daemon stops; dropping it can also stop the daemon if it now owns it.
+    // Nothing starts on this account again until the explicit catch-up attach below.
+    daemons.clear();
     offline_for_enrollment(a, "founder");
     let invite = computer(b, &["invite"]);
     let link = invite["invite_link"]
