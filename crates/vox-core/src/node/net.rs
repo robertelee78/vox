@@ -97,6 +97,12 @@ impl PeerPolicy {
         self.anchors.insert(anchor);
     }
 
+    /// Whether this exact identity is a configured anchor, even if it is also a member.
+    #[must_use]
+    pub fn is_anchor(&self, peer: &Digest32) -> bool {
+        self.anchors.contains(peer)
+    }
+
     /// Expect a join from `joiner` (until [`PeerPolicy::forget_joiner`]).
     pub fn expect_joiner(&mut self, joiner: Digest32) {
         self.pending_joiners.insert(joiner);
@@ -183,6 +189,9 @@ impl PeerPolicy {
     ///   `WHOAMI`.
     #[must_use]
     pub fn allows(class: PeerClass, kind: StreamKind) -> bool {
+        if kind == StreamKind::Computer {
+            return false;
+        }
         // **Any peer may say it is stopping** (V210-93): it speaks only of the connection it
         // arrives on, which the peer is about to close anyway.
         if matches!(kind, StreamKind::Goodbye | StreamKind::Presentation) {

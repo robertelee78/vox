@@ -2274,6 +2274,9 @@ enum Cmd {
     /// turn) and `vox agent skill <harness>` (the agent text, and where it goes).
     #[command(subcommand)]
     Agent(AgentCmd),
+    /// Pair Vox installations once, or inspect their fixed computer trust policy.
+    #[command(subcommand)]
+    Computer(crate::computer_cli::ComputerCmd),
     /// Say where the local entry point for rooms' services is: the vox daemon's SOCKS5 proxy,
     /// which resolves `.vox` names and runs while any node is attached.
     ///
@@ -2979,6 +2982,13 @@ pub fn run() -> ExitCode {
                 }
             }
         }
+        Cmd::Computer(args) => match block_on_client(crate::computer_cli::run(args)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("vox computer: {e}");
+                e.exit_code()
+            }
+        },
         Cmd::Agent(AgentCmd::Send(args)) => {
             let outcome = vox_core::node::paths::NodeName::parse(&args.node)
                 .map_err(AppError::from)

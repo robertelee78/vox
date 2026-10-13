@@ -451,10 +451,23 @@ pub(crate) fn take_account(
             "vox daemon: {why}; a move to another network is noticed only when a peer is lost"
         );
     }
+    let computer_identity =
+        vox_core::node::computer::Computer::open(account, &crate::setup::host_name())
+            .map_err(|e| AppError::Usage(format!("computer identity: {e}")))?;
+    let computer = rt
+        .block_on(async {
+            vox_core::node::computer::Management::start(
+                computer_identity,
+                Arc::clone(&presence),
+                anchors.clone(),
+            )
+        })
+        .map_err(|e| AppError::Usage(format!("computer management: {e}")))?;
     let router = Router::new(
         account.clone(),
         rt.handle().clone(),
         Defaults {
+            computer,
             bind: shared_presence(&presence),
             anchors,
             anchor_specs: anchor_specs.to_vec(),

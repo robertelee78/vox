@@ -40,6 +40,13 @@ pub(crate) const T_NODE_DETACHED: u64 = 4003;
 const T_NODES: u64 = 4004;
 const T_ATTACHED_INFO: u64 = 4005;
 const T_DAEMON_OK: u64 = 4006;
+const T_COMPUTER_STATUS: u64 = 4040;
+const T_COMPUTER_FAILED: u64 = 4041;
+const T_REQ_COMPUTER_STATUS: u64 = 4140;
+const T_REQ_COMPUTER_BEGIN: u64 = 4141;
+const T_REQ_COMPUTER_PREVIEW: u64 = 4142;
+const T_REQ_COMPUTER_APPROVE: u64 = 4143;
+const T_REQ_COMPUTER_CANCEL: u64 = 4144;
 const T_DAEMON_EVENT: u64 = 4007;
 const T_METRICS: u64 = 4008;
 const T_DAEMON_STATUS: u64 = 4009;
@@ -177,6 +184,25 @@ pub enum KeepSource {
 /// A request to the daemon itself, with no `Use` (ADR-026 C-2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonRequest {
+    /// Read this installation's computer trust and pending approval.
+    ComputerStatus,
+    /// Operator starts an expiring one-time invitation.
+    ComputerBegin,
+    /// Prove a pairing secret before offering the peer for approval.
+    ComputerPreview {
+        /// Secret-bearing one-time link; never logged.
+        link: Zeroizing<String>,
+    },
+    /// Sign precisely the authenticated operation displayed by the app or terminal.
+    ComputerApprove {
+        /// Displayed immutable operation identity.
+        operation: String,
+    },
+    /// Cancel the displayed, uncommitted invitation or operation.
+    ComputerCancel {
+        /// Displayed invitation or operation identity.
+        operation: String,
+    },
     /// Every node on disk, with its state: answered [`DaemonFrame::Nodes`].
     Nodes,
     /// Attach `node` explicitly (`vox node attach`): it stays attached until `Detach` or the
@@ -559,6 +585,10 @@ pub struct AskingSession {
 /// a [`DaemonRequest`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonFrame {
+    /// Typed computer status encoded as public JSON, including the local one-time link.
+    ComputerStatus(String),
+    /// A computer operation failed; no node identity is involved.
+    ComputerFailed(String),
     /// Sent once on connect, before anything else (C-4).
     Hello {
         /// The IPC protocol this daemon speaks: [`crate::node::ipc::PROTOCOL_VERSION`].
@@ -995,6 +1025,21 @@ impl Opening {
                 DaemonRequest::Subscribe => {
                     e.array(1).uint(T_REQ_SUBSCRIBE);
                 }
+                DaemonRequest::ComputerStatus => {
+                    e.array(1).uint(T_REQ_COMPUTER_STATUS);
+                }
+                DaemonRequest::ComputerBegin => {
+                    e.array(1).uint(T_REQ_COMPUTER_BEGIN);
+                }
+                DaemonRequest::ComputerPreview { link } => {
+                    e.array(2).uint(T_REQ_COMPUTER_PREVIEW).text(link);
+                }
+                DaemonRequest::ComputerApprove { operation } => {
+                    e.array(2).uint(T_REQ_COMPUTER_APPROVE).text(operation);
+                }
+                DaemonRequest::ComputerCancel { operation } => {
+                    e.array(2).uint(T_REQ_COMPUTER_CANCEL).text(operation);
+                }
                 DaemonRequest::Stop => {
                     e.array(1).uint(T_REQ_STOP);
                 }
@@ -1144,6 +1189,17 @@ impl Opening {
             (T_REQ_STATUS, 1) => Opening::Daemon(DaemonRequest::Status),
             (T_REQ_METRICS, 1) => Opening::Daemon(DaemonRequest::Metrics),
             (T_REQ_SUBSCRIBE, 1) => Opening::Daemon(DaemonRequest::Subscribe),
+            (T_REQ_COMPUTER_STATUS, 1) => Opening::Daemon(DaemonRequest::ComputerStatus),
+            (T_REQ_COMPUTER_BEGIN, 1) => Opening::Daemon(DaemonRequest::ComputerBegin),
+            (T_REQ_COMPUTER_PREVIEW, 2) => Opening::Daemon(DaemonRequest::ComputerPreview {
+                link: Zeroizing::new(text(&mut d, "computer pairing link")?),
+            }),
+            (T_REQ_COMPUTER_APPROVE, 2) => Opening::Daemon(DaemonRequest::ComputerApprove {
+                operation: text(&mut d, "computer approval")?,
+            }),
+            (T_REQ_COMPUTER_CANCEL, 2) => Opening::Daemon(DaemonRequest::ComputerCancel {
+                operation: text(&mut d, "computer cancellation")?,
+            }),
             (T_REQ_STOP, 1) => Opening::Daemon(DaemonRequest::Stop),
             (T_REQ_SESSION_ACTIVITY, 5) => {
                 let node = name(&mut d, "ipc session activity node")?;
@@ -1211,6 +1267,12 @@ impl DaemonFrame {
                 e.array(3).uint(T_ATTACHED_INFO);
                 put_info(&mut e, i);
                 put_texts(&mut e, notes);
+            }
+            DaemonFrame::ComputerStatus(json) => {
+                e.array(2).uint(T_COMPUTER_STATUS).text(json);
+            }
+            DaemonFrame::ComputerFailed(why) => {
+                e.array(2).uint(T_COMPUTER_FAILED).text(why);
             }
             DaemonFrame::Ok => {
                 e.array(1).uint(T_DAEMON_OK);
@@ -1322,6 +1384,10 @@ impl DaemonFrame {
             (T_NODES, 2) => DaemonFrame::Nodes(infos(&mut d)?),
             (T_ATTACHED_INFO, 3) => {
                 DaemonFrame::Attached(info(&mut d)?, texts(&mut d, "ipc attached notes")?)
+            }
+            (T_COMPUTER_STATUS, 2) => DaemonFrame::ComputerStatus(text(&mut d, "computer status")?),
+            (T_COMPUTER_FAILED, 2) => {
+                DaemonFrame::ComputerFailed(text(&mut d, "computer refusal")?)
             }
             (T_DAEMON_OK, 1) => DaemonFrame::Ok,
             (T_SESSION_REGISTERED, 5) => {
