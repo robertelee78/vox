@@ -126,6 +126,9 @@ fn handed(h: crate::session_sink::Handed) -> Result<String, String> {
     }
 }
 
+/// A detach is pending until its actor and remembered-state cleanup have an outcome.
+type DetachOutcome = Option<Result<(), Refusal>>;
+
 /// One node's place in its life (L-1). A node with no slot is detached.
 enum Slot {
     /// Being attached; the outcome arrives here.
@@ -133,7 +136,7 @@ enum Slot {
     /// Running.
     Attached(Box<Attached>),
     /// Being detached; the outcome arrives after its remembered-state cleanup finishes.
-    Detaching(watch::Receiver<Option<Result<(), Refusal>>>),
+    Detaching(watch::Receiver<DetachOutcome>),
 }
 
 /// An attached node.
@@ -247,7 +250,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 fn begin_detach(
     slots: &mut BTreeMap<NodeName, Slot>,
     node: &NodeName,
-) -> Option<(Box<Attached>, watch::Sender<Option<Result<(), Refusal>>>)> {
+) -> Option<(Box<Attached>, watch::Sender<DetachOutcome>)> {
     let (tx, rx) = watch::channel(None);
     match slots.insert(node.clone(), Slot::Detaching(rx)) {
         Some(Slot::Attached(a)) => Some((a, tx)),
@@ -2503,7 +2506,7 @@ impl Router {
         &self,
         node: NodeName,
         mut a: Box<Attached>,
-        done: watch::Sender<Option<Result<(), Refusal>>>,
+        done: watch::Sender<DetachOutcome>,
         cause: DetachCause,
     ) -> Result<(), Refusal> {
         let _ = a.detached.send(true);
@@ -2567,7 +2570,7 @@ impl Router {
     async fn finish_forgetting(
         &self,
         node: &NodeName,
-        done: watch::Sender<Option<Result<(), Refusal>>>,
+        done: watch::Sender<DetachOutcome>,
     ) -> Result<(), Refusal> {
         let result = self.write_attach_file(Some(node)).await.map_err(|why| Refusal::Failed {
             node: node.clone(),
@@ -2715,16 +2718,16 @@ async fn forget_in_keychain(account: String) -> Result<(), String> {
 }
 
 enum DStep {
-    Go((Box<Attached>, watch::Sender<Option<Result<(), Refusal>>>)),
-    Forget(watch::Sender<Option<Result<(), Refusal>>>),
+    Go((Box<Attached>, watch::Sender<DetachOutcome>)),
+    Forget(watch::Sender<DetachOutcome>),
     WaitAttach(watch::Receiver<Option<Result<(), Refusal>>>),
-    WaitDetach(watch::Receiver<Option<Result<(), Refusal>>>),
+    WaitDetach(watch::Receiver<DetachOutcome>),
     NotAttached,
 }
 
 enum Step {
     WaitAttach(watch::Receiver<Option<Result<(), Refusal>>>),
-    WaitDetach(watch::Receiver<Option<Result<(), Refusal>>>),
+    WaitDetach(watch::Receiver<DetachOutcome>),
     NotAttached,
     Mine(watch::Sender<Option<Result<(), Refusal>>>),
 }
