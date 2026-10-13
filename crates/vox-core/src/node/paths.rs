@@ -211,6 +211,37 @@ impl Account {
         self.daemon_dir().join(CONFIG_FILE)
     }
 
+    /// The machine's hand-added anchor list. Room sources remain in their sealed stores.
+    #[must_use]
+    pub fn anchors_file(&self) -> PathBuf {
+        self.daemon_dir().join(ANCHORS_FILE)
+    }
+
+    /// Read inputs for the machine list before the shared upgrade has consolidated legacy
+    /// files. Once the canonical file exists, even empty, it is the sole manual source.
+    /// This reader neither migrates nor creates files; the upgrade owns that transaction.
+    #[must_use]
+    pub fn anchor_input_files(&self) -> Vec<PathBuf> {
+        let canonical = self.anchors_file();
+        if !matches!(
+            std::fs::symlink_metadata(&canonical),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ) {
+            return vec![canonical];
+        }
+        let mut files = vec![self.config_dir.join(ANCHORS_FILE)];
+        for node in self.nodes_on_disk() {
+            let own = self
+                .node_paths_as_they_are(&node)
+                .node_config_dir()
+                .join(ANCHORS_FILE);
+            if !files.contains(&own) {
+                files.push(own);
+            }
+        }
+        files
+    }
+
     /// `<data root>/nodes`.
     #[must_use]
     pub fn nodes_dir(&self) -> PathBuf {

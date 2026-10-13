@@ -82,8 +82,7 @@ async fn follow_anchors(node: NodeHandle, paths: Paths, specs: Vec<String>) {
     let first = paths.clone();
     let mut said: Vec<String> = tokio::task::spawn_blocking(move || {
         let mut set = vox_core::nat::bootstrap::BootstrapSet::new();
-        vox_core::node::link::merge_anchors_file(&mut set, &first.anchors_file())
-            .unwrap_or_default()
+        vox_core::node::link::merge_machine_anchors(&mut set, &first.account()).unwrap_or_default()
     })
     .await
     .unwrap_or_default();
@@ -95,7 +94,7 @@ async fn follow_anchors(node: NodeHandle, paths: Paths, specs: Vec<String>) {
         let Ok((set, skipped)) = tokio::task::spawn_blocking(move || {
             let mut set = vox_core::nat::bootstrap::BootstrapSet::new();
             // A bad line is skipped, not a reason to skip every anchor (V210-75).
-            let skipped = vox_core::node::link::merge_anchors_file(&mut set, &paths.anchors_file())
+            let skipped = vox_core::node::link::merge_machine_anchors(&mut set, &paths.account())
                 .unwrap_or_default();
             for spec in &specs {
                 let _ = vox_core::node::link::merge_anchor_spec(&mut set, spec);

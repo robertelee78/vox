@@ -2043,8 +2043,14 @@ impl Router {
         // wholly-bad anchors file proof). It is logged, and kept as the attach's notes, which go
         // back to the verb that attached the node, to print in its person's own terminal (R23).
         let mut set = self.inner.defaults.anchors.clone();
-        let file = paths.anchors_file();
-        let mut notes = vox_core::node::link::merge_anchors_file(&mut set, &file)
+        let files = paths
+            .account()
+            .anchor_input_files()
+            .iter()
+            .map(|file| file.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut notes = vox_core::node::link::merge_machine_anchors(&mut set, &paths.account())
             .unwrap_or_else(|e| vec![e.to_string()]);
         let skipped = notes.len();
         for spec in anchors {
@@ -2056,7 +2062,7 @@ impl Router {
             notes.push(format!(
                 "node {node}: {}; {}",
                 vox_core::error::Error::AnchorsFileUnusable {
-                    path: file.display().to_string(),
+                    path: files,
                     skipped,
                 },
                 if is_anchor {

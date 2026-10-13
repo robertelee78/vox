@@ -275,6 +275,33 @@ pub fn merge_anchors_file(
     Ok(skipped)
 }
 
+/// Read this data root's manual anchors, independently of the node requesting them.
+/// Legacy inputs are projected as one machine list until the upgrade consolidates them.
+/// Invalid inputs are reported and skipped, preserving directly reachable peers.
+///
+/// # Errors
+/// As [`merge_anchors_file`]. Host-name resolution blocks; async callers use a blocking task.
+pub fn merge_machine_anchors(
+    set: &mut crate::nat::bootstrap::BootstrapSet,
+    account: &crate::node::paths::Account,
+) -> Result<Vec<String>> {
+    let mut skipped = Vec::new();
+    for file in account.anchor_input_files() {
+        if file == account.anchors_file()
+            && std::fs::symlink_metadata(&file).is_ok()
+            && matches!(std::fs::metadata(&file), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            skipped.push(format!(
+                "{} is skipped whole: its symlink target does not exist",
+                file.display()
+            ));
+            continue;
+        }
+        skipped.extend(merge_anchors_file(set, &file)?);
+    }
+    Ok(skipped)
+}
+
 /// Add an anchor spec to a set, merging its address into an anchor already named.
 pub fn merge_anchor_spec(set: &mut crate::nat::bootstrap::BootstrapSet, text: &str) -> Result<()> {
     let node = parse_anchor_spec(text)?;

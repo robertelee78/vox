@@ -27,7 +27,7 @@ use vox_core::node::daemonipc::{
     UseNode,
 };
 use vox_core::node::ipc::{Frame, IpcClient, NodeSocket};
-use vox_core::node::link::{merge_anchor_spec, merge_anchors_file};
+use vox_core::node::link::{merge_anchor_spec, merge_machine_anchors};
 use vox_core::node::paths::{Account, NodeName, Paths, DEFAULT_PROFILE};
 use zeroize::Zeroizing;
 
@@ -145,14 +145,20 @@ impl NodeArgs {
         paths: &Paths,
     ) -> vox_core::error::Result<(BootstrapSet, Option<vox_core::error::Error>)> {
         let mut set = BootstrapSet::new();
-        // The node's anchors file first, then `--anchor` on top (ADR-017 decision 7, M17.4). Both
+        // The machine's manual anchors first, then `--anchor` on top. Both
         // merge into one set rather than one replacing the other: an anchor is additive — more
         // introducers is strictly better reachability — and a person who adds one on the command
-        // line almost never means "and forget the one I configured". `vox node` writes its own
-        // spec into that file, so a client on the same machine as its anchor needs no flag at
-        // all. A line that cannot be used is skipped and said, and the others still count.
-        let file = paths.anchors_file();
-        let skipped = merge_anchors_file(&mut set, &file)?;
+        // line almost never means "and forget the one I configured". Legacy inputs remain
+        // readable until the upgrade consolidates them. A line that cannot be used is skipped
+        // and said, and the others still count.
+        let files = paths
+            .account()
+            .anchor_input_files()
+            .iter()
+            .map(|file| file.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let skipped = merge_machine_anchors(&mut set, &paths.account())?;
         for line in &skipped {
             eprintln!("vox: {line}");
         }
@@ -161,8 +167,8 @@ impl NodeArgs {
         let unusable = (set.is_empty()
             && !skipped.is_empty()
             && self.anchors.iter().all(|a| a.trim().is_empty()))
-        .then(|| vox_core::error::Error::AnchorsFileUnusable {
-            path: file.display().to_string(),
+        .then_some(vox_core::error::Error::AnchorsFileUnusable {
+            path: files,
             skipped: skipped.len(),
         });
         for spec in &self.anchors {
