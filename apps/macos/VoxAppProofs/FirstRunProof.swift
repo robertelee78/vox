@@ -2618,37 +2618,6 @@ final class FirstRunProof: XCTestCase {
         }
         XCTAssertTrue(readByAlice.contains("alice"),
                       "PRODUCT: bob's message drawn in alice's timeline must be read: bob's `vox room read --json` must say alice read it; it says read_by \(readByAlice)")
-        // Bob's message, selected by dragging across it and copied, as a person copies what a
-        // member wrote (v0.4.1).
-        if windowReadable(ui) {
-            if let body = textSaying(ui, "NEEDS-YOU") {
-                try stageTimelineCopy(ui, body, "bob's message NEEDS-YOU")
-                let copied = selectAndCopy(ui, body, "bob's message NEEDS-YOU")
-                if copied != "NEEDS-YOU" {
-                    keepTree(ui, "message copy did not put NEEDS-YOU on the pasteboard")
-                    let selected = XCTAttachment(string: body.debugDescription)
-                    selected.name = "NEEDS-YOU copy target after selection"
-                    selected.lifetime = .keepAlways
-                    add(selected)
-                }
-                XCTAssertEqual(copied, "NEEDS-YOU",
-                               "PRODUCT: bob's message, selected by dragging across it and copied with ⌘C, must put NEEDS-YOU on the pasteboard; it holds \(copied.debugDescription)")
-            } else {
-                keepTree(ui, "no Text says exactly NEEDS-YOU")
-                XCTFail("APPARATUS: XCTest finds no element whose words are exactly NEEDS-YOU, though bob's message was read on alice's screen")
-            }
-        }
-        // A sidebar row's name, whose words a drag cannot select (it selects the row): copied
-        // from its right-click Copy Name (v0.4.1).
-        let missionRow = Key.id("room-mission")
-        if present(ui, missionRow, timeout: 10, "the sidebar must list mission") {
-            let named = copiedBy(ui, {
-                self.el(ui, missionRow).rightClick()
-                self.tap(ui, Key.menuItem("Copy Name"), "Copy Name in mission's right-click menu")
-            })
-            XCTAssertEqual(named, "mission",
-                           "PRODUCT: Copy Name in the right-click menu of mission's sidebar row must put mission on the pasteboard; it holds \(named.debugDescription)")
-        }
         // Hidden (⌘H), alice's app shows nobody bob's next message: it is not read.
         handOff(ui, "h")
         XCTAssertTrue(ui.wait(for: .runningBackground, timeout: 10),
@@ -2710,87 +2679,6 @@ final class FirstRunProof: XCTestCase {
                               "alice's message read by bob must show \"read by bob\" under it",
                               until: { $0 == "read by bob" }) ?? ""
         print("[proof] bob's message read by \(readByAlice); alice's message: \(readWords)")
-
-        // (4b) Several messages copied at once (v0.4.1): three of bob's, by a drag from the first
-        // to the last, by ⇧-click, by ⌘-click with Edit › Copy, and by ⇧↑ from the keyboard. Each
-        // copies "<author>, <time>: <text>" lines, oldest first, the times as alice's node has them.
-        let three = ["COPY ONE", "COPY TWO", "COPY THREE"]
-        for text in three {
-            try staged(vox, ["room", "post", "--node", "bob", room, text], env: voxEnv)
-        }
-        var postedAt: [String: UInt64] = [:]
-        let postedUntil = Date().addingTimeInterval(60)
-        while Date() < postedUntil && postedAt.count < three.count {
-            let rows = run(vox, ["room", "read", "--node", "alice", "--json", room], env: voxEnv).out
-            for line in rows.split(separator: "\n") {
-                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                      let text = row["text"] as? String, three.contains(text),
-                      let at = (row["created_millis"] as? NSNumber)?.uint64Value else { continue }
-                postedAt[text] = at
-            }
-            if postedAt.count < three.count { Thread.sleep(forTimeInterval: 0.5) }
-        }
-        guard postedAt.count == three.count else {
-            throw Apparatus("alice's `vox room read --json` holds \(postedAt.count) of bob's three COPY posts after 60 s")
-        }
-        let want = three.sorted { postedAt[$0]! < postedAt[$1]! }
-            .map { "bob, \(copiedTime(postedAt[$0]!)): \($0)" }.joined(separator: "\n")
-        var shownRows: [XCUIElement] = []
-        for text in three {
-            let until = Date().addingTimeInterval(30)
-            var row: XCUIElement?
-            while Date() < until && row == nil {
-                row = rowSaying(ui, "bob: \(text)")
-                if row == nil { Thread.sleep(forTimeInterval: 0.25) }
-            }
-            guard let row else {
-                keepTree(ui, "no row says bob: \(text)")
-                XCTFail("PRODUCT: alice's timeline must show bob's \(text) as its own row within 30 s")
-                return
-            }
-            shownRows.append(row)
-        }
-        // A click on a row's empty right side selects the row, never its words.
-        func click(_ row: XCUIElement, _ keys: XCUIElement.KeyModifierFlags = []) {
-            if !inView(ui, row) { scrollTo(ui, row) }
-            let at = row.coordinate(withNormalizedOffset: CGVector(dx: 0.97, dy: 0.5))
-            XCUIElement.perform(withKeyModifiers: keys) { at.click() }
-        }
-        func check(_ how: String, _ copied: String) {
-            XCTAssertEqual(copied, want,
-                           "PRODUCT: bob's three messages, \(how), must copy as \(want.debugDescription); the pasteboard holds \(copied.debugDescription)")
-        }
-        // A drag from the first message's words to the last's.
-        if let first = textSaying(ui, three[0]), let last = textSaying(ui, three[2]) {
-            check("selected by a drag from the first to the last and copied with ⌘C", copiedBy(ui, {
-                let from = first.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.5)).withOffset(CGVector(dx: 1, dy: 0))
-                let to = last.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.5)).withOffset(CGVector(dx: -1, dy: 0))
-                from.click(forDuration: 0.3, thenDragTo: to)
-                ui.typeKey("c", modifierFlags: .command)
-            }))
-        } else {
-            keepTree(ui, "no Text says exactly a COPY post")
-            XCTFail("APPARATUS: XCTest finds no element whose words are exactly COPY ONE and COPY THREE, though their rows are shown")
-        }
-        check("the first clicked and the last ⇧-clicked, copied with ⌘C", copiedBy(ui, {
-            click(shownRows[0])
-            click(shownRows[2], .shift)
-            ui.typeKey("c", modifierFlags: .command)
-        }))
-        check("the first clicked and the others ⌘-clicked, copied with Edit › Copy", copiedBy(ui, {
-            click(shownRows[0])
-            click(shownRows[1], .command)
-            click(shownRows[2], .command)
-            ui.menuBars.menuBarItems["Edit"].click()
-            self.tap(ui, Key.menuItem("Copy"), "Edit › Copy")
-        }))
-        check("the last clicked and ⇧↑ pressed twice, copied with ⌘C", copiedBy(ui, {
-            click(shownRows[2])
-            ui.typeKey(.upArrow, modifierFlags: .shift)
-            ui.typeKey(.upArrow, modifierFlags: .shift)
-            ui.typeKey("c", modifierFlags: .command)
-        }))
-        print("[proof] three messages copied four ways: \(want.debugDescription)")
 
         // (4c) A reply quotes what it answers, and the quote goes to it (ADR-028 R-9, D6): bob
         // replies to FROM-ALICE; alice's timeline shows "re you: FROM-ALICE" above his reply, and
@@ -2872,6 +2760,118 @@ final class FirstRunProof: XCTestCase {
                       && threadReply["thread"] as? String == fromAlice,
                       "PRODUCT: Reply in Thread must reach bob answering his reply \(fromBob) in General root \(fromAlice); bob read \(threadReply)")
         print("[proof] Reply in Thread: bob reads the app's nested reply in the original General thread")
+
+        // Bob's message, selected by dragging across it and copied, as a person copies what a
+        // member wrote (v0.4.1).
+        if windowReadable(ui) {
+            if let body = textSaying(ui, "NEEDS-YOU") {
+                try stageTimelineCopy(ui, body, "bob's message NEEDS-YOU")
+                let copied = selectAndCopy(ui, body, "bob's message NEEDS-YOU")
+                if copied != "NEEDS-YOU" {
+                    keepTree(ui, "message copy did not put NEEDS-YOU on the pasteboard")
+                    let selected = XCTAttachment(string: body.debugDescription)
+                    selected.name = "NEEDS-YOU copy target after selection"
+                    selected.lifetime = .keepAlways
+                    add(selected)
+                }
+                XCTAssertEqual(copied, "NEEDS-YOU",
+                               "PRODUCT: bob's message, selected by dragging across it and copied with ⌘C, must put NEEDS-YOU on the pasteboard; it holds \(copied.debugDescription)")
+            } else {
+                keepTree(ui, "no Text says exactly NEEDS-YOU")
+                XCTFail("APPARATUS: XCTest finds no element whose words are exactly NEEDS-YOU, though bob's message was read on alice's screen")
+            }
+        }
+        // A sidebar row's name, whose words a drag cannot select (it selects the row): copied
+        // from its right-click Copy Name (v0.4.1).
+        let missionRow = Key.id("room-mission")
+        if present(ui, missionRow, timeout: 10, "the sidebar must list mission") {
+            let named = copiedBy(ui, {
+                self.el(ui, missionRow).rightClick()
+                self.tap(ui, Key.menuItem("Copy Name"), "Copy Name in mission's right-click menu")
+            })
+            XCTAssertEqual(named, "mission",
+                           "PRODUCT: Copy Name in the right-click menu of mission's sidebar row must put mission on the pasteboard; it holds \(named.debugDescription)")
+        }
+        // (4b) Several messages copied at once (v0.4.1): three of bob's, by a drag from the first
+        // to the last, by ⇧-click, by ⌘-click with Edit › Copy, and by ⇧↑ from the keyboard. Each
+        // copies "<author>, <time>: <text>" lines, oldest first, the times as alice's node has them.
+        let three = ["COPY ONE", "COPY TWO", "COPY THREE"]
+        for text in three {
+            try staged(vox, ["room", "post", "--node", "bob", room, text], env: voxEnv)
+        }
+        var postedAt: [String: UInt64] = [:]
+        let postedUntil = Date().addingTimeInterval(60)
+        while Date() < postedUntil && postedAt.count < three.count {
+            let rows = run(vox, ["room", "read", "--node", "alice", "--json", room], env: voxEnv).out
+            for line in rows.split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      let text = row["text"] as? String, three.contains(text),
+                      let at = (row["created_millis"] as? NSNumber)?.uint64Value else { continue }
+                postedAt[text] = at
+            }
+            if postedAt.count < three.count { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        guard postedAt.count == three.count else {
+            throw Apparatus("alice's `vox room read --json` holds \(postedAt.count) of bob's three COPY posts after 60 s")
+        }
+        let want = three.sorted { postedAt[$0]! < postedAt[$1]! }
+            .map { "bob, \(copiedTime(postedAt[$0]!)): \($0)" }.joined(separator: "\n")
+        var shownRows: [XCUIElement] = []
+        for text in three {
+            let until = Date().addingTimeInterval(30)
+            var row: XCUIElement?
+            while Date() < until && row == nil {
+                row = rowSaying(ui, "bob: \(text)")
+                if row == nil { Thread.sleep(forTimeInterval: 0.25) }
+            }
+            guard let row else {
+                keepTree(ui, "no row says bob: \(text)")
+                XCTFail("PRODUCT: alice's timeline must show bob's \(text) as its own row within 30 s")
+                return
+            }
+            shownRows.append(row)
+        }
+        // A click on a row's empty right side selects the row, never its words.
+        func click(_ row: XCUIElement, _ keys: XCUIElement.KeyModifierFlags = []) {
+            if !inView(ui, row) { scrollTo(ui, row) }
+            let at = row.coordinate(withNormalizedOffset: CGVector(dx: 0.97, dy: 0.5))
+            XCUIElement.perform(withKeyModifiers: keys) { at.click() }
+        }
+        func check(_ how: String, _ copied: String) {
+            XCTAssertEqual(copied, want,
+                           "PRODUCT: bob's three messages, \(how), must copy as \(want.debugDescription); the pasteboard holds \(copied.debugDescription)")
+        }
+        // A drag from the first message's words to the last's.
+        if let first = textSaying(ui, three[0]), let last = textSaying(ui, three[2]) {
+            check("selected by a drag from the first to the last and copied with ⌘C", copiedBy(ui, {
+                let from = first.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.5)).withOffset(CGVector(dx: 1, dy: 0))
+                let to = last.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.5)).withOffset(CGVector(dx: -1, dy: 0))
+                from.click(forDuration: 0.3, thenDragTo: to)
+                ui.typeKey("c", modifierFlags: .command)
+            }))
+        } else {
+            keepTree(ui, "no Text says exactly a COPY post")
+            XCTFail("APPARATUS: XCTest finds no element whose words are exactly COPY ONE and COPY THREE, though their rows are shown")
+        }
+        check("the first clicked and the last ⇧-clicked, copied with ⌘C", copiedBy(ui, {
+            click(shownRows[0])
+            click(shownRows[2], .shift)
+            ui.typeKey("c", modifierFlags: .command)
+        }))
+        check("the first clicked and the others ⌘-clicked, copied with Edit › Copy", copiedBy(ui, {
+            click(shownRows[0])
+            click(shownRows[1], .command)
+            click(shownRows[2], .command)
+            ui.menuBars.menuBarItems["Edit"].click()
+            self.tap(ui, Key.menuItem("Copy"), "Edit › Copy")
+        }))
+        check("the last clicked and ⇧↑ pressed twice, copied with ⌘C", copiedBy(ui, {
+            click(shownRows[2])
+            ui.typeKey(.upArrow, modifierFlags: .shift)
+            ui.typeKey(.upArrow, modifierFlags: .shift)
+            ui.typeKey("c", modifierFlags: .command)
+        }))
+        print("[proof] three messages copied four ways: \(want.debugDescription)")
 
         // (4d) To: offers bob's open Session under him, and a message to it alone is addressed to
         // that Session (MADR W-4, ADR-029 TA-1, D7): bob's Claude Code session opens a Session in
