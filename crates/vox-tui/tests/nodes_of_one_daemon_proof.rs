@@ -731,7 +731,7 @@ fn pair_computers(
     assert!(wait_until(Duration::from_secs(45), || {
         let (ok, shown, _) = a.run(&["trust", "list", "--node", "agent-one"], "");
         ok && current_peers.iter().filter(|(_, fp, _)| *fp != local[1]).all(|(_, fp, drive)| shown.lines().any(|line| line.contains(fp) && line.contains("read + drive") == *drive))
-    }), "APPARATUS: the complete current local/remote roster was not visible before offline attach; agent-one: {}", ring(a, "agent-one"));
+    }), "PRODUCT: the complete current local/remote roster was not visible before offline attach; agent-one: {}", ring(a, "agent-one"));
     let remote_pid = b
         .lock_pid()
         .expect("APPARATUS: remote scratch daemon before offline attach");
