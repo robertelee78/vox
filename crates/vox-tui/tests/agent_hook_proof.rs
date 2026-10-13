@@ -3208,6 +3208,15 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
 #[test]
 #[ignore = "production Argon2id at setup + two real daemons and a join; CI runs it in release"]
 fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
+    if let Ok(step) = std::env::var("VOX_PROOF_STEP") {
+        assert_eq!(
+            step, "room-ask",
+            "APPARATUS: unsupported mapping journey step: {step}"
+        );
+        eprintln!("SELECTED PROOF STEP: {step}");
+        room_ask_step();
+        return;
+    }
     // The join in (1) is bounded by the product's own patience (below), and the rest of the arm
     // takes a few minutes more.
     watchdog::arm_for(Duration::from_secs(1200));
@@ -4829,6 +4838,115 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
 
 /// Run `vox args` on a pseudo-terminal, as an operator types at one, answering each prompt that
 /// `answers` names (a piece of the question, the keys) in order: everything it printed.
+// A selected portion of the existing mapping journey, not another test or shipped knob.
+fn room_ask_step() {
+    watchdog::arm_for(Duration::from_secs(180));
+    let tmp = tempfile::tempdir().expect("APPARATUS: no scratch directory");
+    let actor = Daemon::start_bare(&tmp.path().join("actor"));
+    let repo = tmp.path().join("unbound repo");
+    std::fs::create_dir_all(&repo).expect("APPARATUS: cannot stage unbound repo");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(home.join(".claude")).expect("APPARATUS: cannot stage HOME");
+    std::fs::write(
+        home.join(".claude/settings.json"),
+        r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"vox agent hook --node default"}]}]}}"#,
+    ).expect("APPARATUS: cannot wire scratch Claude Code");
+    let first = "68500000-aaaa-4bbb-8ccc-000000000001";
+    let turn = |id: &str| {
+        let payload = serde_json::json!({"session_id":id,"cwd":repo,
+            "hook_event_name":"UserPromptSubmit","prompt":"room ask step"})
+        .to_string();
+        let mut command = vox(&actor.data, &actor.cfg);
+        command
+            .current_dir(&repo)
+            .args(["agent", "hook", "--node", "default"])
+            .env("HOME", &home)
+            .env("CLAUDE_CODE_ENTRYPOINT", "cli")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("APPARATUS: cannot start real hook");
+        child
+            .stdin
+            .take()
+            .expect("APPARATUS: no hook input")
+            .write_all(payload.as_bytes())
+            .expect("APPARATUS: cannot send hook payload");
+        let out = child
+            .wait_with_output()
+            .expect("APPARATUS: cannot wait for hook");
+        assert!(
+            out.status.success(),
+            "PRODUCT: actual unmapped hook refused: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let offered = turn(first);
+    assert!(
+        offered.contains("isn't tied to a Vox room"),
+        "PRODUCT: unmapped repo must ask which room it works in: {offered}"
+    );
+    let (ok, asks, err) = hook_env(
+        &actor.data,
+        &actor.cfg,
+        &[
+            "agent",
+            "status",
+            "--harness",
+            "claude",
+            "--dir",
+            repo.to_str().expect("APPARATUS: scratch repo is not UTF-8"),
+        ],
+        "",
+        &[("HOME", &home.to_string_lossy())],
+    );
+    assert!(ok, "APPARATUS: public agent status command failed: {err}");
+    assert!(
+        asks.contains(&repo.to_string_lossy().to_string()),
+        "PRODUCT: public agent status must list the waiting repo: {asks}{err}"
+    );
+    let (ok, answer, err) = hook_env(
+        &actor.data,
+        &actor.cfg,
+        &["agent", "room", "--none"],
+        "",
+        &[
+            ("VOX_SESSION", first),
+            ("VOX_NODE", "default"),
+            ("HOME", &home.to_string_lossy()),
+        ],
+    );
+    assert!(ok, "APPARATUS: public agent room command failed: {err}");
+    assert!(
+        answer.contains("is to stay tied to no room"),
+        "PRODUCT: Not This Repo must be saved: {answer}{err}"
+    );
+    let next = turn("68500000-aaaa-4bbb-8ccc-000000000002");
+    let (ok, asks, err) = hook_env(
+        &actor.data,
+        &actor.cfg,
+        &[
+            "agent",
+            "status",
+            "--harness",
+            "claude",
+            "--dir",
+            repo.to_str().expect("APPARATUS: scratch repo is not UTF-8"),
+        ],
+        "",
+        &[("HOME", &home.to_string_lossy())],
+    );
+    assert!(ok, "APPARATUS: public agent status command failed: {err}");
+    assert!(
+        asks.contains("the operator said no to a room for this repo")
+            && asks.contains("so nothing is to be asked")
+            && !next.contains("isn't tied to a Vox room"),
+        "PRODUCT: declined repo must not ask the next Session again: {next}; {asks}{err}"
+    );
+    eprintln!("[proof] room-ask selected step passed; unrelated mapping/news/join flows NOT RUN");
+}
+
 fn in_terminal(data: &Path, cfg: &Path, args: &[&str], answers: &[(&str, &str)]) -> String {
     on_pty(VOX, args, data, cfg, answers)
 }
