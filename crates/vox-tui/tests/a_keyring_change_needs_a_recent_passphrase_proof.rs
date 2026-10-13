@@ -9,6 +9,9 @@
 //! `trust add` and `trust drive` refuse with the operator-only sentence and leave the keyring
 //! unchanged. The same unmarked commands succeed. Refusal precedes naming and passphrase prompts,
 //! including at a terminal. These marks are staged apparatus, not a live-harness observation.
+//! The same marked `vox tui`, driven with the existing `vox_pty`/pyte apparatus, refuses member
+//! trust and offer acceptance before either prompt; an unmarked TUI opens both prompts normally.
+//! This needs pyte importable by `python3` (for example, through `PYTHONPATH`).
 //!
 //! Asserted, against a `vox daemon` given its passphrase in `VOX_IDENTITY_PASSPHRASE`:
 //! 1. right after the attach, a `vox trust add` with no passphrase and no terminal is refused at
@@ -51,6 +54,7 @@
 //! the room command is refused or waits instead of completing with only the room passphrase.
 //! Removing the agent-session refusal — red, PRODUCT: a marked `trust add` succeeds on the
 //! empty-passphrase node instead of refusing.
+//! Removing the TUI guards — red, PRODUCT: its trust prompt opens instead of the refusal.
 
 #![cfg(unix)]
 
@@ -65,6 +69,9 @@ mod test_knobs;
 
 #[path = "support/typed.rs"]
 mod typed;
+
+#[path = "support/pty_driver.rs"]
+mod pty_driver;
 
 use std::io::BufRead as _;
 use std::path::Path;
@@ -211,7 +218,13 @@ fn start_daemon(dir: &Path, passphrase: &str) -> (Daemon, Option<std::path::Path
 
 /// Room commands do not borrow the identity authorization of a keyring change (ADR-031 KP-1).
 /// Both identities are protected, already unlocked, and have never authorized a keyring change.
-fn rooms_with_closed_keyrings(root: &Path, alice: &Path, bob: &Path, carol: &str) {
+fn rooms_with_closed_keyrings(
+    root: &Path,
+    alice: &Path,
+    bob: &Path,
+    bob_fingerprint: &str,
+    carol: &str,
+) {
     let (_peer, sock) = start_daemon(bob, IDPASS);
     assert!(
         sock.is_some(),
@@ -311,6 +324,7 @@ fn rooms_with_closed_keyrings(root: &Path, alice: &Path, bob: &Path, carol: &str
         ok && binding.contains(&format!("this repo ({dir}) works in room {short}.")),
         "PRODUCT: the bound repository must work in the joined room: {binding}"
     );
+    marked_tui_refusals(alice, bob_fingerprint);
     room_command(bob, &["room", "leave", "keyring-scope"], "vox: left room");
     let (ok, listed) = run(&mut vox_cmd(bob, &["room", "list"]));
     assert!(
@@ -326,6 +340,92 @@ fn rooms_with_closed_keyrings(root: &Path, alice: &Path, bob: &Path, carol: &str
         "PRODUCT: after the room commands a keyring change must still need the identity \
          passphrase and leave the keyring unchanged: {said}"
     );
+}
+
+/// Both TUI trust routes are refused before asking anything, using the existing PTY apparatus.
+fn marked_tui_refusals(dir: &Path, target: &str) {
+    const DRIVER: &str = r#"
+import os, sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, sys.argv[1])
+from vox_pty import Tui, Gone, Hung, arm, disarm, pyte, is_attached
+if pyte is None:
+    print('marked-trust APPARATUS: pyte is not importable; set PYTHONPATH')
+    sys.exit(2)
+library, vox, data, target, refusal = sys.argv[1:]
+arm(90, 'marked-trust')
+tui = None
+try:
+    for marked in (True, False):
+        env = {k: os.environ[k] for k in ('PATH', 'HOME', 'TMPDIR') if k in os.environ}
+        env.update(VOX_DATA_DIR=data, VOX_CONFIG_DIR=data + '/cfg', TERM='xterm-256color', VOX_PROXY='127.0.0.1:0')
+        if marked:
+            env['CODEX_THREAD_ID'] = 'keyring-agent'
+        tui = Tui([vox, 'tui'], env, cols=200)
+        flat = lambda: ' '.join(tui.text().split())
+        assert tui.until(lambda: is_attached(tui.text()), 20), 'TUI did not show the attached node: ' + flat()
+        tui.key(':open\r', 0.3)
+        assert tui.until(lambda: 'Members' in tui.text() and target[:8] in tui.text().replace(' ', ''), 20), 'TUI did not show the joined member: ' + flat()
+        tui.key(':trust ' + target + '\r', 0.3)
+        if marked:
+            assert tui.until(lambda: refusal in flat(), 5) and 'Trust this node?' not in flat(), 'marked member trust opened a prompt or omitted its refusal: ' + flat()
+        else:
+            assert tui.until(lambda: 'Trust this node?' in flat(), 5), 'unmarked member trust did not open its prompt: ' + flat()
+            tui.key('\x1b', 0.3)
+        tui.key('\x1b', 0.3)
+        assert tui.until(lambda: 'offer:' in tui.text(), 10), 'TUI did not list the joined member offer: ' + flat()
+        for _ in range(4):
+            if 'Trust offer' in flat():
+                break
+            tui.key('\x1b[A', 0.3)
+        assert 'Trust offer' in flat(), 'TUI did not select the offer: ' + flat()
+        tui.key('\r', 0.3)
+        if marked:
+            assert tui.until(lambda: refusal in flat(), 5) and 'your name for them' not in flat(), 'marked offer acceptance opened a prompt or omitted its refusal: ' + flat()
+        else:
+            assert tui.until(lambda: 'your name for them' in flat(), 5), 'unmarked offer acceptance did not open its prompt: ' + flat()
+        print('marked-trust observed:', 'marked refusal' if marked else 'unmarked prompts', flush=True)
+        assert tui.stop(), 'TUI outlived stop'
+        tui = None
+    print('marked-trust PASS')
+except (AssertionError, Gone, Hung) as e:
+    print('marked-trust PRODUCT:', e)
+    sys.exit(1)
+finally:
+    if tui is not None:
+        tui.stop()
+    disarm()
+"#;
+    let before = trusted(dir);
+    let out = pty_driver::run_within(
+        "-c",
+        &[
+            DRIVER,
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty"),
+            VOX,
+            dir.to_str().expect("APPARATUS: scratch data path"),
+            target,
+            AGENT_REFUSAL.trim_start_matches("vox: "),
+        ],
+        Duration::from_secs(120),
+    );
+    let said = &out.stdout;
+    assert!(
+        !said.contains("marked-trust PRODUCT:") && !said.contains("marked-trust HUNG at"),
+        "PRODUCT: marked TUI trust routes must refuse before prompts: {said}"
+    );
+    assert!(
+        out.code == Some(0)
+            && out.has_verdict("marked-trust")
+            && said.contains("marked-trust PASS"),
+        "APPARATUS: the TUI driver ended without completing its observations: {said}"
+    );
+    assert_eq!(
+        trusted(dir),
+        before,
+        "PRODUCT: the marked TUI and cancelled person prompts must leave the keyring unchanged"
+    );
+    eprintln!("[proof] {said}");
 }
 
 fn trusted(dir: &Path) -> String {
@@ -489,7 +589,7 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
     }
 
     // KP-1: only changing the keyring needs this authorization, never room work.
-    rooms_with_closed_keyrings(tmp.path(), &alice, &bob_dir, &carol);
+    rooms_with_closed_keyrings(tmp.path(), &alice, &bob_dir, &bob, &carol);
 
     // 2. K-13: the passphrase is typed, never taken from the environment or a file.
     let add_bob = ["trust", "add", bob.as_str(), "--name", "bob", "--drive"];

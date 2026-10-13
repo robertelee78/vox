@@ -2532,6 +2532,12 @@ impl CoreHandle for DaemonCore {
     }
 
     fn apply_noting(&mut self, command: Command, waiting: &mut dyn FnMut()) -> CommandStatus {
+        // The TUI refuses before prompting too; keep dispatch itself behind the same mark check.
+        if matches!(command, Command::Trust { .. } | Command::AcceptOffer { .. }) {
+            if let Some(why) = crate::coord::trust_widening_refusal() {
+                return CommandStatus::Said(why.into());
+            }
+        }
         let secret = |s: &SecretString| s.expose_secret().to_owned();
         match command {
             Command::ProbeListening => {
