@@ -194,6 +194,7 @@ enum Key: ExpressibleByStringLiteral, CustomStringConvertible {
     case id(String)
     case idPrefix(String)
     case showing(String)
+    case timelineRow(String)
     case menuItem(String)
     case child(of: String, button: String)
 
@@ -205,7 +206,7 @@ enum Key: ExpressibleByStringLiteral, CustomStringConvertible {
     var sibling: Key {
         switch self {
         case .id, .idPrefix, .child: return .id("status")
-        case .showing: return .showing("node ")
+        case .showing, .timelineRow: return .showing("node ")
         case .menuItem: return .menuItem("Quit Vox")
         }
     }
@@ -215,6 +216,7 @@ enum Key: ExpressibleByStringLiteral, CustomStringConvertible {
         case let .id(i): return "\"\(i)\""
         case let .idPrefix(p): return "an element whose identifier starts \"\(p)\""
         case let .showing(w): return "an element showing \"\(w)\""
+        case let .timelineRow(w): return "the timeline row saying \(w)"
         case let .menuItem(t): return "the menu item \"\(t)\""
         case let .child(of, button): return "\"\(button)\" in \"\(of)\""
         }
@@ -248,6 +250,8 @@ enum Key: ExpressibleByStringLiteral, CustomStringConvertible {
             // snapshot evaluator, leaving XCTest waiting for a reply until timeout.
             return container.descendants(matching: .any)
                 .matching(NSPredicate(format: "label CONTAINS %@ OR CAST(value, 'NSString') CONTAINS %@", w, w))
+        case let .timelineRow(w):
+            return container.descendants(matching: .any).matching(rowSays(w))
         case let .menuItem(t):
             return container.descendants(matching: .menuItem)
                 .matching(NSPredicate(format: "title == %@ OR label == %@", t, t))
@@ -1898,8 +1902,8 @@ final class FirstRunProof: XCTestCase {
     ///   Send Urgent enabled in a Session).
     /// - D13: a prompt the Session does not take stays in its composer (mutant: cleared before
     ///   delivery), and ⌃C asks before stopping.
-    /// - P1: ⌘J opens S1 with its waiting request selected, and ⌥⌘Y approves it: the hook gets
-    ///   "allow" (mutant: ⌘J opening the room only).
+    /// - P1: selecting S1 and clicking its waiting request selects that request; ⌥⌘Y approves
+    ///   it and the hook gets "allow" (mutant: request-row selection omitted).
     /// - RM-1/2/3/5 (#727): a main repo and its worktree raise one dialog. A wrong room
     ///   passphrase leaves the map unchanged; Choose binds both waiting sessions. Create uses
     ///   alice with her keyring window closed, no identity prompt, and both next turns follow.
@@ -1915,7 +1919,23 @@ final class FirstRunProof: XCTestCase {
         let config = root.appendingPathComponent("config").path
         let work = root.appendingPathComponent("work").path
         let home = root.appendingPathComponent("home").path
-        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        guard let knobs = env["VOX_PROOF_KNOBS_VOX"], !knobs.isEmpty else {
+            throw Apparatus("VOX_PROOF_KNOBS_VOX is required for this journey's isolated Keychain")
+        }
+        let keychain = root.appendingPathComponent("sessions.keychain-db").path
+        let madeRoot = stager.run(["/bin/mkdir", "-p", root.path], env: [:])
+        let hasKnob = stager.run(["/usr/bin/python3", "-c",
+            "import sys; sys.exit(0 if b'VOX_TEST_KEYCHAIN' in open(sys.argv[1],'rb').read() else 1)", knobs], env: [:])
+        guard madeRoot.status == 0, hasKnob.status == 0 else {
+            throw Apparatus("cannot stage a scratch Keychain: the directory or daemon test knob is missing")
+        }
+        let madeKeychain = stager.run(["/usr/bin/security", "create-keychain", "-p", "", keychain],
+                                     env: ["HOME": root.path])
+        guard madeKeychain.status == 0 else {
+            throw Apparatus("cannot create this journey's private Keychain: \(madeKeychain.out)")
+        }
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0",
+                      "VOX_TEST_KEYCHAIN": keychain]
         let pass = { (name: String) in root.appendingPathComponent("\(name).pass").path }
         try stager.write(Data("alice identity\n".utf8), to: pass("alice"))
         try stager.write(Data("agent identity\n".utf8), to: pass("claude-a"))
@@ -1931,7 +1951,9 @@ final class FirstRunProof: XCTestCase {
         guard mapMode.status == 0 else {
             throw Apparatus("the scratch room map's private permissions could not be staged: \(mapMode.out)")
         }
-        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+        // Only this owned apparatus daemon targets the scratch Keychain through real Security APIs.
+        // The app and every CLI invocation still use the ordinary bundled binary.
+        daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
         for (name, words) in [("alice", "alice identity"), ("claude-a", "agent identity")] {
             try staged(vox, ["node", "create", name],
@@ -1960,8 +1982,8 @@ final class FirstRunProof: XCTestCase {
         try staged(vox, ["trust", "add", "--node", "claude-a", aliceFp, "--name", "alice", "--drive",
                          "--identity-passphrase-file", pass("claude-a")], env: voxEnv)
         // Room work must not borrow the authorization window opened by trust above (KP-1).
-        try staged(vox, ["node", "detach", "alice"], env: voxEnv)
-        try staged(vox, ["node", "attach", "alice", "--no-remember", "--passphrase-file", pass("alice")], env: voxEnv)
+        try staged(vox, ["node", "lock", "alice"], env: voxEnv)
+        try staged(vox, ["node", "unlock", "alice", "--passphrase-file", pass("alice")], env: voxEnv)
         let closedKeyring = run(vox, ["status", "--node", "alice"], env: voxEnv).out
         guard closedKeyring.contains("keyring asks for the passphrase") else {
             throw Apparatus("alice's keyring window did not close before room work: \(closedKeyring)")
@@ -2023,18 +2045,43 @@ final class FirstRunProof: XCTestCase {
         defer { ui.terminate() }
         present(ui, Key.id("attached"), timeout: 60, "the app must open attached as alice")
 
-        // P1: ⌘J lands on S1, its waiting request selected.
-        ui.typeKey("j", modifierFlags: .command)
+        // P1: the room's mark leads to its Session; the waiting request is selected by a click.
+        // Next Room That Needs You and its shortcut were removed by the decider (#766).
+        tap(ui, Key.id("room-work"), "work, marked as needing alice", premise: inRoom(vox, voxEnv, "work"))
+        tap(ui, Key.id("session-\(s1.prefix(8))"), "S1 in work's Sessions")
         let requestRow = Key.idPrefix("request-row-")
         present(ui, requestRow, timeout: 30,
-                "⌘J must open S1, the Session waiting on alice, with its request",
+                "opening S1 must show its request waiting on alice",
                 premise: Premise("S1 has a request waiting on alice") {
                     let now = s1Read()
                     return (now.contains("\"waiting\":true"), "`vox room session --json` said \(now.debugDescription)")
                 })
+        guard let waitingRow = locate(ui, requestRow),
+              let requestTimeline = locate(ui, Key.id("timeline")) else {
+            throw Apparatus("the waiting request and its timeline could not be located for selection")
+        }
+        // The row's center is inside Why; select its blank padding, not an editable child.
+        let interactive = waitingRow.descendants(matching: .any).allElementsBoundByIndex.filter {
+            [.button, .textField, .secureTextField, .textView].contains($0.elementType)
+                && $0.identifier != waitingRow.identifier
+        }.map(\.frame)
+        let frame = waitingRow.frame
+        let points = [CGPoint(x: frame.maxX - 2, y: frame.minY + 2),
+                      CGPoint(x: frame.minX + 2, y: frame.minY + 2),
+                      CGPoint(x: frame.maxX - 2, y: frame.maxY - 2)]
+        guard waitingRow.isHittable, let point = points.first(where: { point in
+            point.x.isFinite && point.y.isFinite && frame.contains(point)
+                && requestTimeline.frame.contains(point) && ui.windows.firstMatch.frame.contains(point)
+                && !interactive.contains(where: { $0.contains(point) })
+        }), systemOverlayOver(point, targetHittable: waitingRow.isHittable) == nil else {
+            keepTree(ui, "no exposed request-row padding for selection")
+            throw Apparatus("the waiting request has no visible click point outside its interactive children")
+        }
+        waitingRow.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: point.x - frame.minX, dy: point.y - frame.minY)).click()
         if let row = locate(ui, requestRow), !row.isSelected {
-            keepTree(ui, "the request ⌘J landed on was not selected")
-            XCTFail("PRODUCT: ⌘J must select the waiting request in S1; its row is not selected")
+            keepTree(ui, "the waiting request clicked in S1 was not selected")
+            XCTFail("PRODUCT: clicking the waiting request in S1 must select it; its row is not selected")
         }
         // ⌥⌘Y approves the selected request: the hook gets allow.
         ui.typeKey("y", modifierFlags: [.command, .option])
@@ -2097,7 +2144,7 @@ final class FirstRunProof: XCTestCase {
         present(ui, Key.showing("It ends the session."), timeout: 10,
                 "⌃C must ask before stopping the Session")
         ui.typeKey(.escape, modifierFlags: [])
-        print("[proof] sessions: ⌘J landed on S1's request and ⌥⌘Y approved it; work's draft kept; ⌘↩ in S1 sent nothing; S1's draft stayed in S1; S2 said \(said.debugDescription) and kept the prompt; ⌃C asked")
+        print("[proof] sessions: clicking S1's waiting request selected it and ⌥⌘Y approved it; work's draft kept; ⌘↩ in S1 sent nothing; S1's draft stayed in S1; S2 said \(said.debugDescription) and kept the prompt; ⌃C asked")
 
         // RM-1/3/5: two sessions in a repo and its worktree raise one dialog, not a banner.
         try staged(vox, ["node", "attach", "claude-a", "--passphrase-file", pass("claude-a")], env: voxEnv)
@@ -2267,13 +2314,32 @@ final class FirstRunProof: XCTestCase {
         let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("keyring-pending")
         let data = root.appendingPathComponent("data").path
         let config = root.appendingPathComponent("config").path
-        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        guard let knobs = env["VOX_PROOF_KNOBS_VOX"], !knobs.isEmpty else {
+            throw Apparatus("VOX_PROOF_KNOBS_VOX is required for this journey's isolated Keychains")
+        }
+        let aliceKeychain = root.appendingPathComponent("alice.keychain-db").path
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0",
+                      "VOX_TEST_KEYCHAIN": aliceKeychain]
         // Attached nodes on Alice's daemon can become trusted automatically (#724). Bob and
         // Carol must both be peers on another daemon for this manual-trust journey.
         let carolRoot = root.appendingPathComponent("carol-host")
+        let carolKeychain = carolRoot.appendingPathComponent("carol-host.keychain-db").path
         let carolEnv = ["VOX_DATA_DIR": carolRoot.appendingPathComponent("data").path,
                         "VOX_CONFIG_DIR": carolRoot.appendingPathComponent("config").path,
-                        "VOX_PROXY": "127.0.0.1:0"]
+                        "VOX_PROXY": "127.0.0.1:0", "VOX_TEST_KEYCHAIN": carolKeychain]
+        let hasKnob = stager.run(["/usr/bin/python3", "-c",
+            "import sys; sys.exit(0 if b'VOX_TEST_KEYCHAIN' in open(sys.argv[1],'rb').read() else 1)", knobs], env: [:])
+        guard hasKnob.status == 0 else {
+            throw Apparatus("cannot stage private Keychains: the daemon test knob is missing")
+        }
+        for (directory, keychain) in [(root.path, aliceKeychain), (carolRoot.path, carolKeychain)] {
+            let madeRoot = stager.run(["/bin/mkdir", "-p", directory], env: [:])
+            let madeKeychain = stager.run(["/usr/bin/security", "create-keychain", "-p", "", keychain],
+                                         env: ["HOME": directory])
+            guard madeRoot.status == 0, madeKeychain.status == 0 else {
+                throw Apparatus("cannot create this account's private Keychain: \(madeKeychain.out)")
+            }
+        }
         let pass = { (name: String) in root.appendingPathComponent("\(name).pass").path }
         for name in ["alice", "bob", "carol"] {
             try stager.write(Data("\(name) identity\n".utf8), to: pass(name))
@@ -2281,9 +2347,11 @@ final class FirstRunProof: XCTestCase {
         try stager.write(Data("pending room\n".utf8), to: pass("room"))
         try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
         try stager.write(Data("alice\n".utf8), to: config + "/app/node")
-        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+        // Only owned apparatus daemons use the existing knob to target these private Keychains.
+        // The app and every CLI command remain the ordinary bundled binary.
+        daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
-        let carolDaemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: carolEnv,
+        let carolDaemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: carolEnv,
                                     until: "vox daemon: control socket")
         defer { carolDaemon.terminate() }
         for name in ["alice", "bob", "carol"] {
@@ -2957,37 +3025,6 @@ final class FirstRunProof: XCTestCase {
         }
         XCTAssertTrue(readByAlice.contains("alice"),
                       "PRODUCT: bob's message drawn in alice's timeline must be read: bob's `vox room read --json` must say alice read it; it says read_by \(readByAlice)")
-        // Bob's message, selected by dragging across it and copied, as a person copies what a
-        // member wrote (v0.4.1).
-        if windowReadable(ui) {
-            if let body = textSaying(ui, "NEEDS-YOU") {
-                try stageTimelineCopy(ui, body, "bob's message NEEDS-YOU")
-                let copied = selectAndCopy(ui, body, "bob's message NEEDS-YOU")
-                if copied != "NEEDS-YOU" {
-                    keepTree(ui, "message copy did not put NEEDS-YOU on the pasteboard")
-                    let selected = XCTAttachment(string: body.debugDescription)
-                    selected.name = "NEEDS-YOU copy target after selection"
-                    selected.lifetime = .keepAlways
-                    add(selected)
-                }
-                XCTAssertEqual(copied, "NEEDS-YOU",
-                               "PRODUCT: bob's message, selected by dragging across it and copied with ⌘C, must put NEEDS-YOU on the pasteboard; it holds \(copied.debugDescription)")
-            } else {
-                keepTree(ui, "no Text says exactly NEEDS-YOU")
-                XCTFail("APPARATUS: XCTest finds no element whose words are exactly NEEDS-YOU, though bob's message was read on alice's screen")
-            }
-        }
-        // A sidebar row's name, whose words a drag cannot select (it selects the row): copied
-        // from its right-click Copy Name (v0.4.1).
-        let missionRow = Key.id("room-mission")
-        if present(ui, missionRow, timeout: 10, "the sidebar must list mission") {
-            let named = copiedBy(ui, {
-                self.el(ui, missionRow).rightClick()
-                self.tap(ui, Key.menuItem("Copy Name"), "Copy Name in mission's right-click menu")
-            })
-            XCTAssertEqual(named, "mission",
-                           "PRODUCT: Copy Name in the right-click menu of mission's sidebar row must put mission on the pasteboard; it holds \(named.debugDescription)")
-        }
         // Hidden (⌘H), alice's app shows nobody bob's next message: it is not read.
         handOff(ui, "h")
         XCTAssertTrue(ui.wait(for: .runningBackground, timeout: 10),
@@ -3050,87 +3087,6 @@ final class FirstRunProof: XCTestCase {
                               until: { $0 == "read by bob" }) ?? ""
         print("[proof] bob's message read by \(readByAlice); alice's message: \(readWords)")
 
-        // (4b) Several messages copied at once (v0.4.1): three of bob's, by a drag from the first
-        // to the last, by ⇧-click, by ⌘-click with Edit › Copy, and by ⇧↑ from the keyboard. Each
-        // copies "<author>, <time>: <text>" lines, oldest first, the times as alice's node has them.
-        let three = ["COPY ONE", "COPY TWO", "COPY THREE"]
-        for text in three {
-            try staged(vox, ["room", "post", "--node", "bob", room, text], env: voxEnv)
-        }
-        var postedAt: [String: UInt64] = [:]
-        let postedUntil = Date().addingTimeInterval(60)
-        while Date() < postedUntil && postedAt.count < three.count {
-            let rows = run(vox, ["room", "read", "--node", "alice", "--json", room], env: voxEnv).out
-            for line in rows.split(separator: "\n") {
-                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                      let text = row["text"] as? String, three.contains(text),
-                      let at = (row["created_millis"] as? NSNumber)?.uint64Value else { continue }
-                postedAt[text] = at
-            }
-            if postedAt.count < three.count { Thread.sleep(forTimeInterval: 0.5) }
-        }
-        guard postedAt.count == three.count else {
-            throw Apparatus("alice's `vox room read --json` holds \(postedAt.count) of bob's three COPY posts after 60 s")
-        }
-        let want = three.sorted { postedAt[$0]! < postedAt[$1]! }
-            .map { "bob, \(copiedTime(postedAt[$0]!)): \($0)" }.joined(separator: "\n")
-        var shownRows: [XCUIElement] = []
-        for text in three {
-            let until = Date().addingTimeInterval(30)
-            var row: XCUIElement?
-            while Date() < until && row == nil {
-                row = rowSaying(ui, "bob: \(text)")
-                if row == nil { Thread.sleep(forTimeInterval: 0.25) }
-            }
-            guard let row else {
-                keepTree(ui, "no row says bob: \(text)")
-                XCTFail("PRODUCT: alice's timeline must show bob's \(text) as its own row within 30 s")
-                return
-            }
-            shownRows.append(row)
-        }
-        // A click on a row's empty right side selects the row, never its words.
-        func click(_ row: XCUIElement, _ keys: XCUIElement.KeyModifierFlags = []) {
-            if !inView(ui, row) { scrollTo(ui, row) }
-            let at = row.coordinate(withNormalizedOffset: CGVector(dx: 0.97, dy: 0.5))
-            XCUIElement.perform(withKeyModifiers: keys) { at.click() }
-        }
-        func check(_ how: String, _ copied: String) {
-            XCTAssertEqual(copied, want,
-                           "PRODUCT: bob's three messages, \(how), must copy as \(want.debugDescription); the pasteboard holds \(copied.debugDescription)")
-        }
-        // A drag from the first message's words to the last's.
-        if let first = textSaying(ui, three[0]), let last = textSaying(ui, three[2]) {
-            check("selected by a drag from the first to the last and copied with ⌘C", copiedBy(ui, {
-                let from = first.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.5)).withOffset(CGVector(dx: 1, dy: 0))
-                let to = last.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.5)).withOffset(CGVector(dx: -1, dy: 0))
-                from.click(forDuration: 0.3, thenDragTo: to)
-                ui.typeKey("c", modifierFlags: .command)
-            }))
-        } else {
-            keepTree(ui, "no Text says exactly a COPY post")
-            XCTFail("APPARATUS: XCTest finds no element whose words are exactly COPY ONE and COPY THREE, though their rows are shown")
-        }
-        check("the first clicked and the last ⇧-clicked, copied with ⌘C", copiedBy(ui, {
-            click(shownRows[0])
-            click(shownRows[2], .shift)
-            ui.typeKey("c", modifierFlags: .command)
-        }))
-        check("the first clicked and the others ⌘-clicked, copied with Edit › Copy", copiedBy(ui, {
-            click(shownRows[0])
-            click(shownRows[1], .command)
-            click(shownRows[2], .command)
-            ui.menuBars.menuBarItems["Edit"].click()
-            self.tap(ui, Key.menuItem("Copy"), "Edit › Copy")
-        }))
-        check("the last clicked and ⇧↑ pressed twice, copied with ⌘C", copiedBy(ui, {
-            click(shownRows[2])
-            ui.typeKey(.upArrow, modifierFlags: .shift)
-            ui.typeKey(.upArrow, modifierFlags: .shift)
-            ui.typeKey("c", modifierFlags: .command)
-        }))
-        print("[proof] three messages copied four ways: \(want.debugDescription)")
-
         // (4c) A reply quotes what it answers, and the quote goes to it (ADR-028 R-9, D6): bob
         // replies to FROM-ALICE; alice's timeline shows "re you: FROM-ALICE" above his reply, and
         // clicking it, or ⌘↑ with the reply selected, selects FROM-ALICE.
@@ -3191,12 +3147,50 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("tagged root post returned no entry hash: \(taggedPost)")
         }
         try staged(vox, ["room", "post", "--node", "bob", "--re", taggedRoot, room, "TAGGED-THREAD-MIDDLE"], env: voxEnv)
-        words(ui, Key.showing(": TAGGED-THREAD-MIDDLE"), timeout: 30,
-              "the app must receive the tagged thread's middle reply", until: { $0.contains("TAGGED-THREAD-MIDDLE") })
-        guard let fromBob = entry("TAGGED-THREAD-MIDDLE") else {
-            throw Apparatus("the staged tagged middle reply has no entry hash")
+        let deliveredUntil = Date().addingTimeInterval(30)
+        var receivedMiddle: String?
+        repeat {
+            receivedMiddle = entry("TAGGED-THREAD-MIDDLE")
+            if receivedMiddle == nil { Thread.sleep(forTimeInterval: 0.25) }
+        } while receivedMiddle == nil && Date() < deliveredUntil
+        guard let fromBob = receivedMiddle else {
+            throw Apparatus("Alice's public room history did not receive the staged tagged middle reply within 30 seconds")
         }
-        tap(ui, Key.showing(": TAGGED-THREAD-MIDDLE"), "bob's reply to select it")
+        let middleKey = Key.timelineRow("bob: TAGGED-THREAD-MIDDLE")
+        guard let replyTimeline = locate(ui, Key.id("timeline")) else {
+            throw Apparatus("the timeline could not be found to scroll to the staged middle reply")
+        }
+        // The prior quote jump deliberately leaves an earlier message selected and in view.
+        // Scroll to the newer reply before asking the virtualized timeline for its row.
+        func middleVisible(_ row: XCUIElement, in bounds: CGRect) -> Bool {
+            guard let body = textSaying(ui, "TAGGED-THREAD-MIDDLE") else { return false }
+            return bounds.contains(body.frame)
+                && bounds.contains(CGPoint(x: row.frame.midX, y: row.frame.midY))
+                && inView(ui, row)
+        }
+        let visibleUntil = Date().addingTimeInterval(20)
+        while Date() < visibleUntil {
+            if let row = locate(ui, middleKey),
+               middleVisible(row, in: replyTimeline.frame) { break }
+            replyTimeline.scroll(byDeltaX: 0, deltaY: -200)
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        guard let middle = locate(ui, middleKey) else {
+            keepTree(ui, "the tagged middle reply could not be staged by scrolling")
+            throw Apparatus("the timeline could not be scrolled to the CLI-held tagged middle reply")
+        }
+        guard let timeline = locate(ui, Key.id("timeline")),
+              middleVisible(middle, in: timeline.frame) else {
+            keepTree(ui, "the tagged middle reply was not inside its timeline")
+            throw Apparatus("the tagged middle reply's body and click point could not be staged inside the timeline")
+        }
+        guard tap(ui, middleKey, "bob's reply to select it") else { return }
+        let selectedUntil = Date().addingTimeInterval(5)
+        while Date() < selectedUntil && !middle.isSelected { Thread.sleep(forTimeInterval: 0.2) }
+        guard middle.isSelected else {
+            keepTree(ui, "the clicked tagged middle reply was not selected")
+            throw Product("clicking bob's visible middle reply must select that timeline row before Reply in Thread")
+        }
         ui.menuBars.menuBarItems["Room"].click()
         let replyInThread = ui.menuBars.menuItems["Reply in Thread"]
         guard replyInThread.waitForExistence(timeout: 5), replyInThread.isEnabled else {
@@ -3225,6 +3219,142 @@ final class FirstRunProof: XCTestCase {
                        "PRODUCT: an untagged app reply must inherit its General starting message's three tags; bob read \(threadReply)")
         print("[proof] Reply in Thread: bob reads the app's nested reply in the original General thread")
 
+        // Bob's message, selected by dragging across it and copied, as a person copies what a
+        // member wrote (v0.4.1).
+        if windowReadable(ui) {
+            guard let copyTimeline = locate(ui, Key.id("timeline")) else {
+                throw Apparatus("the timeline could not be found to return to the earlier copy target")
+            }
+            let copyVisibleUntil = Date().addingTimeInterval(20)
+            while Date() < copyVisibleUntil && textSaying(ui, "NEEDS-YOU") == nil {
+                copyTimeline.scroll(byDeltaX: 0, deltaY: 200)
+                Thread.sleep(forTimeInterval: 0.25)
+            }
+            if let body = textSaying(ui, "NEEDS-YOU") {
+                try stageTimelineCopy(ui, body, "bob's message NEEDS-YOU")
+                body.click()
+                let copied = selectAndCopy(ui, body, "bob's message NEEDS-YOU")
+                if copied != "NEEDS-YOU" {
+                    keepTree(ui, "message copy did not put NEEDS-YOU on the pasteboard")
+                    let selected = XCTAttachment(string: body.debugDescription)
+                    selected.name = "NEEDS-YOU copy target after selection"
+                    selected.lifetime = .keepAlways
+                    add(selected)
+                }
+                XCTAssertEqual(copied, "NEEDS-YOU",
+                               "PRODUCT: bob's message, selected by dragging across it and copied with ⌘C, must put NEEDS-YOU on the pasteboard; it holds \(copied.debugDescription)")
+            } else {
+                keepTree(ui, "no Text says exactly NEEDS-YOU")
+                XCTFail("APPARATUS: XCTest finds no element whose words are exactly NEEDS-YOU, though bob's message was read on alice's screen")
+            }
+        }
+        // A sidebar row's name, whose words a drag cannot select (it selects the row): copied
+        // from its right-click Copy Name (v0.4.1).
+        let missionRow = Key.id("room-mission")
+        if present(ui, missionRow, timeout: 10, "the sidebar must list mission") {
+            let named = copiedBy(ui, {
+                self.el(ui, missionRow).rightClick()
+                self.tap(ui, Key.menuItem("Copy Name"), "Copy Name in mission's right-click menu")
+            })
+            XCTAssertEqual(named, "mission",
+                           "PRODUCT: Copy Name in the right-click menu of mission's sidebar row must put mission on the pasteboard; it holds \(named.debugDescription)")
+        }
+        // (4b) Several messages copied at once (v0.4.1): three of bob's, by a drag from the first
+        // to the last, by ⇧-click, by ⌘-click with Edit › Copy, and by ⇧↑ from the keyboard. Each
+        // copies "<author>, <time>: <text>" lines, oldest first, the times as alice's node has them.
+        let three = ["COPY ONE", "COPY TWO", "COPY THREE"]
+        for text in three {
+            try staged(vox, ["room", "post", "--node", "bob", room, text], env: voxEnv)
+        }
+        var postedAt: [String: UInt64] = [:]
+        let postedUntil = Date().addingTimeInterval(60)
+        while Date() < postedUntil && postedAt.count < three.count {
+            let rows = run(vox, ["room", "read", "--node", "alice", "--json", room], env: voxEnv).out
+            for line in rows.split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      let text = row["text"] as? String, three.contains(text),
+                      let at = (row["created_millis"] as? NSNumber)?.uint64Value else { continue }
+                postedAt[text] = at
+            }
+            if postedAt.count < three.count { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        guard postedAt.count == three.count else {
+            throw Apparatus("alice's `vox room read --json` holds \(postedAt.count) of bob's three COPY posts after 60 s")
+        }
+        let want = three.sorted { postedAt[$0]! < postedAt[$1]! }
+            .map { "bob, \(copiedTime(postedAt[$0]!)): \($0)" }.joined(separator: "\n")
+        // The preceding copy deliberately leaves an older reading position selected.
+        // Use the public window control and scroll before attempting a three-body drag.
+        ui.menuBars.menuBarItems["Window"].click()
+        self.tap(ui, Key.menuItem("Fill"), "Window › Fill")
+        let multiCopyTimeline = ui.scrollViews.matching(identifier: "timeline").firstMatch
+        guard multiCopyTimeline.exists else {
+            throw Apparatus("cannot stage three-message copying: no timeline scroll view")
+        }
+        func copyRowsVisible() -> Bool {
+            let clip = multiCopyTimeline.frame
+            return three.allSatisfy { text in
+                guard let body = textSaying(ui, text), let row = rowSaying(ui, "bob: \(text)") else { return false }
+                let point = CGPoint(x: row.frame.minX + row.frame.width * 0.97, y: row.frame.midY)
+                return !body.frame.isEmpty && !clip.isEmpty && clip.contains(body.frame)
+                    && ui.windows.firstMatch.frame.contains(body.frame) && clip.contains(point) && body.isHittable && row.isHittable
+            }
+        }
+        let copyRowsUntil = Date().addingTimeInterval(30)
+        while Date() < copyRowsUntil && !copyRowsVisible() {
+            multiCopyTimeline.scroll(byDeltaX: 0, deltaY: -200)
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        guard copyRowsVisible() else {
+            keepTree(ui, "three COPY bodies are not visible together inside their timeline")
+            throw Apparatus("cannot stage three-message copying: COPY ONE, TWO and THREE bodies and row click points must be visible together; no clipboard assertion was attempted")
+        }
+        let shownRows = three.compactMap { rowSaying(ui, "bob: \($0)") }
+        guard shownRows.count == three.count else {
+            throw Apparatus("three COPY rows disappeared while preparing selection")
+        }
+        // A click on a row's empty right side selects the row, never its words.
+        func click(_ row: XCUIElement, _ keys: XCUIElement.KeyModifierFlags = []) {
+            if !inView(ui, row) { scrollTo(ui, row) }
+            let at = row.coordinate(withNormalizedOffset: CGVector(dx: 0.97, dy: 0.5))
+            XCUIElement.perform(withKeyModifiers: keys) { at.click() }
+        }
+        func check(_ how: String, _ copied: String) {
+            XCTAssertEqual(copied, want,
+                           "PRODUCT: bob's three messages, \(how), must copy as \(want.debugDescription); the pasteboard holds \(copied.debugDescription)")
+        }
+        // A drag from the first message's words to the last's.
+        if let first = textSaying(ui, three[0]), let last = textSaying(ui, three[2]) {
+            check("selected by a drag from the first to the last and copied with ⌘C", copiedBy(ui, {
+                let from = first.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.5)).withOffset(CGVector(dx: 1, dy: 0))
+                let to = last.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.5)).withOffset(CGVector(dx: -1, dy: 0))
+                from.click(forDuration: 0.3, thenDragTo: to)
+                ui.typeKey("c", modifierFlags: .command)
+            }))
+        } else {
+            keepTree(ui, "no Text says exactly a COPY post")
+            XCTFail("APPARATUS: XCTest finds no element whose words are exactly COPY ONE and COPY THREE, though their rows are shown")
+        }
+        check("the first clicked and the last ⇧-clicked, copied with ⌘C", copiedBy(ui, {
+            click(shownRows[0])
+            click(shownRows[2], .shift)
+            ui.typeKey("c", modifierFlags: .command)
+        }))
+        check("the first clicked and the others ⌘-clicked, copied with Edit › Copy", copiedBy(ui, {
+            click(shownRows[0])
+            click(shownRows[1], .command)
+            click(shownRows[2], .command)
+            ui.menuBars.menuBarItems["Edit"].click()
+            self.tap(ui, Key.menuItem("Copy"), "Edit › Copy")
+        }))
+        check("the last clicked and ⇧↑ pressed twice, copied with ⌘C", copiedBy(ui, {
+            click(shownRows[2])
+            ui.typeKey(.upArrow, modifierFlags: .shift)
+            ui.typeKey(.upArrow, modifierFlags: .shift)
+            ui.typeKey("c", modifierFlags: .command)
+        }))
+        print("[proof] three messages copied four ways: \(want.debugDescription)")
+
         // (4d) To: offers bob's open Session under him, and a message to it alone is addressed to
         // that Session (MADR W-4, ADR-029 TA-1, D7): bob's Claude Code session opens a Session in
         // mission by its hook, as a person's does; alice ticks it in To: and posts; bob's node holds
@@ -3236,24 +3366,38 @@ final class FirstRunProof: XCTestCase {
         guard opened.status == 0 else {
             throw Apparatus("bob's Claude Code hook, to open a Session in mission, exited \(opened.status): \(opened.out)")
         }
+        func d7IsOpen() -> (Bool, String) {
+            let result = run(vox, ["room", "sessions", "--node", "alice", "--json", room], env: voxEnv)
+            let exact = result.out.split(separator: "\n").contains { line in
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { return false }
+                return row["node"] as? String == bobFp && row["id"] as? String == d7Session
+                    && row["open"] as? Bool == true
+            }
+            return (result.status == 0 && exact, result.out)
+        }
         let sessionsUntil = Date().addingTimeInterval(30)
-        var listed = ""
-        while Date() < sessionsUntil && !listed.contains(d7Session.prefix(8)) {
-            listed = run(vox, ["room", "sessions", "--node", "alice", room], env: voxEnv).out
-            if !listed.contains(d7Session.prefix(8)) { Thread.sleep(forTimeInterval: 0.5) }
+        var listed = d7IsOpen()
+        while Date() < sessionsUntil && !listed.0 {
+            Thread.sleep(forTimeInterval: 0.5)
+            listed = d7IsOpen()
         }
-        guard listed.contains(d7Session.prefix(8)) else {
-            throw Apparatus("alice's `vox room sessions` never listed bob's Session \(d7Session) in 30 s: \(listed)")
+        guard listed.0 else {
+            throw Apparatus("alice's public Session JSON did not list bob's exact open Session \(d7Session) in 30 s: \(listed.1)")
         }
-        // Its opening is a line of the room, said as every reader says it (#406): "<name · short
-        // id> opened", as `vox room read` prints it, never a blank row under bob's name.
-        let openedLine = Key.showing("\(d7Session.prefix(8)) opened")
-        present(ui, openedLine, timeout: 30,
-                "bob's Session's opening must read in alice's timeline as `vox room read` says it, \"\(d7Session.prefix(8)) opened\", not as a blank row",
-                premise: Premise("alice's `vox room read` says bob's Session \(d7Session) opened") {
-                    let read = self.run(vox, ["room", "read", "--node", "alice", room], env: voxEnv).out
-                    return (read.contains("\(d7Session.prefix(8)) opened"), String(read.suffix(800)))
-                })
+        // ADR-029 CL-2: Session openings belong in Sessions/All, never General. The real
+        // Session panel must identify the exact open Session before its To: recipient is used.
+        let sessionsPanel = ui.windows.firstMatch.descendants(matching: .any)
+            .matching(identifier: "sessions").firstMatch
+        let d7PanelRow = sessionsPanel.descendants(matching: .button)
+            .matching(identifier: "session-\(d7Session.prefix(8))").firstMatch
+        let panelUntil = Date().addingTimeInterval(30)
+        while Date() < panelUntil && !(d7PanelRow.exists && d7PanelRow.label.contains("bob · \(d7Session.prefix(8))")) {
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        guard d7PanelRow.exists && d7PanelRow.label.contains("bob · \(d7Session.prefix(8))") else {
+            keepTree(ui, "bob's exact open Session missing from its Sessions panel")
+            throw Product("the Sessions panel must show bob · \(d7Session.prefix(8)) for the exact open Session alice's public JSON lists; \(listed.1)")
+        }
         let toBox = Key.id("compose-to")
         tap(ui, toBox, "To:")
         // By its own id: bob has another Session open in mission (bob-proof, his hook's from step 4).
