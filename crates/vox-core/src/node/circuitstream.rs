@@ -61,7 +61,8 @@ use quinn::{RecvStream, SendStream};
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
-use crate::node::coordstream::{accepts_relayed, relays_for};
+use crate::nat::service::ComputerTransportPermit;
+use crate::node::coordstream::relays_for;
 use crate::node::net::PeerClass;
 use crate::transport::framing::{read_frame, write_frame};
 use crate::transport::mux::CircuitPort;
@@ -443,6 +444,8 @@ pub async fn serve_circuit<F>(
     carrier: &Arc<VoxConnection>,
     classify: &(dyn Fn(&Digest32) -> PeerClass + Sync),
     shares_room: &(dyn Fn(&Digest32, &Digest32) -> bool + Sync),
+    transport: &(dyn Fn(&Digest32, &Digest32) -> Option<ComputerTransportPermit> + Sync),
+    accepts_origin: &(dyn Fn(&Digest32, &Digest32) -> bool + Sync),
     mut send: SendStream,
     mut recv: RecvStream,
     connected: F,
@@ -455,10 +458,15 @@ where
     let peer = carrier.peer_id();
     match opening_answer(&mut recv).await? {
         CircuitFrame::Open { peer: target } => {
-            if !relays_for(classify(&peer))
-                || !relays_for(classify(&target))
-                || !shares_room(&peer, &target)
-            {
+            let ordinary = relays_for(classify(&peer))
+                && relays_for(classify(&target))
+                && shares_room(&peer, &target);
+            let permit = if ordinary {
+                None
+            } else {
+                transport(&peer, &target)
+            };
+            if !ordinary && permit.is_none() {
                 refuse(&mut send, CircuitRefusal::NotAuthorized).await;
                 return Err(Error::StreamRefused(
                     "circuit: peer may not ask for a relay",
@@ -490,7 +498,7 @@ where
             send_frame(&mut send, &CircuitFrame::Opened).await?;
             let asker_flow = carrier.bind_forwarding_flow(send, recv)?;
             let carriers = [Arc::clone(carrier), target_conn];
-            tokio::spawn(relay(slot, carriers, asker_flow, target_flow));
+            tokio::spawn(relay(slot, carriers, asker_flow, target_flow, permit));
             Ok(())
         }
         CircuitFrame::Incoming {
@@ -500,7 +508,7 @@ where
             // The same rule as a relayed punch session, anchor's vouching included:
             // a circuit is how an anchor introduces a peer nothing else can reach.
             let relay = classify(&peer);
-            if !accepts_relayed(relay, classify(&origin)) {
+            if !accepts_origin(&peer, &origin) {
                 refuse(&mut send, CircuitRefusal::NotAuthorized).await;
                 return Err(Error::StreamRefused("circuit: peer may not relay to us"));
             }
@@ -713,9 +721,18 @@ async fn relay(
     _carriers: [Arc<VoxConnection>; 2],
     mut asker: DatagramFlow,
     mut target: DatagramFlow,
+    permit: Option<ComputerTransportPermit>,
 ) {
     let idle = tokio::time::sleep(CIRCUIT_IDLE_TIMEOUT);
     tokio::pin!(idle);
+    let revoked = async {
+        if let Some(permit) = permit {
+            permit.revoked().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(revoked);
     loop {
         tokio::select! {
             up = asker.recv() => {
@@ -731,6 +748,7 @@ async fn relay(
                 }
             }
             () = &mut idle => break,
+            () = &mut revoked => break,
         }
         idle.as_mut()
             .reset(tokio::time::Instant::now() + CIRCUIT_IDLE_TIMEOUT);

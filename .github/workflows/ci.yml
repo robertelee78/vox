@@ -31,6 +31,9 @@ jobs:
     name: every commit builds
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # Historical commits must compile; strict warnings are checked on the candidate below.
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v4
         with:
@@ -63,7 +66,7 @@ jobs:
           for c in $commits; do
             echo "::group::$c $(git log -1 --format=%s "$c")"
             git checkout --quiet --detach "$c"
-            # RUSTFLAGS is not set here: a commit that builds with warnings still builds,
+            # This job clears the workflow's strict warnings: historical commits must compile,
             # and clippy/fmt are the tip's business. This asks one question only.
             cargo check --workspace --all-targets
             echo "::endgroup::"

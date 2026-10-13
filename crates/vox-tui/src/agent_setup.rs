@@ -179,7 +179,7 @@ async fn in_bound_room(
             "Vox: {harness} is node {node}, attached; this repo ({}) is bound to room {short}, \
              and {node} is not in it, so this session cannot post there. {node} joins it by \
              itself, with the room map's passphrase, when a session starts here; if that failed, \
-             Vox asks the operator (Vox.app banner), or they run at a terminal: {}\n",
+             Vox asks the operator (Vox.app dialog), or they run at a terminal: {}\n",
             dir.display(),
             vox_text::shell::command(&["vox", "room", "join", link, "--node", node.as_str()]),
         ),

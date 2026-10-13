@@ -24,6 +24,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+mod computer;
 mod local_trust;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -54,6 +55,8 @@ pub type BindFor = Arc<dyn Fn(&NodeName) -> Option<Bind> + Send + Sync>;
 
 /// What the daemon attaches every node with.
 pub struct Defaults {
+    /// Account-owned management role and durable computer policy.
+    pub computer: Arc<vox_core::node::computer::Management>,
     /// Where a node binds when it attaches (ADR-026 D-3): the daemon's one presence once it is
     /// shared; `None` attaches a node off the network.
     pub bind: BindFor,
@@ -307,6 +310,7 @@ impl Router {
         };
         router.follow_attached_with_the_proxy();
         router.follow_local_trust();
+        router.follow_computer_trust();
         router
     }
 
@@ -971,7 +975,8 @@ impl Router {
     ///
     /// With a `link`: bind `dir` to the room it names, what `vox room join <link> --node <node>
     /// --bind <dir>` does: each node of a session that asked joins the room, which checks the
-    /// passphrase, unless it is in it already; the room map then binds `dir`, replacing a no or
+    /// passphrase; an already-held room checks it through a separate real join. The map then
+    /// binds `dir`, replacing a no or
     /// another room. With `link` empty: the room map binds `dir` already, to a room the sessions'
     /// nodes are not in, and they join it with the map's own link and passphrase. Either way every
     /// session that asked is then put in the room.
@@ -1028,6 +1033,22 @@ impl Router {
                 .iter()
                 .any(|c| c.channel_id == parsed.channel_id);
             if member {
+                // Holding a room is not proof of the passphrase just typed (ADR-031 RM-3).
+                // This validates through a real Join stream without admitting another member.
+                let checked = handle
+                    .apply(vox_core::node::api::NodeCommand::CheckRoomPassphrase {
+                        channel_id: parsed.channel_id,
+                        passphrase: vox_core::node::api::Secret::new(
+                            passphrase.as_bytes().to_vec(),
+                        ),
+                    })
+                    .await;
+                if checked != vox_core::node::api::Outcome::Done {
+                    return no(format!(
+                        "the room passphrase was not authenticated by node {node}, so {dir} was \
+                         not bound: {checked}"
+                    ));
+                }
                 continue;
             }
             match handle
@@ -1809,7 +1830,9 @@ impl Router {
     /// Whether the daemon has no node in any state and no client connected (L-8).
     #[must_use]
     pub fn idle(&self) -> bool {
-        lock(&self.inner.slots).is_empty() && self.inner.connections.load(Ordering::SeqCst) == 0
+        lock(&self.inner.slots).is_empty()
+            && self.inner.connections.load(Ordering::SeqCst) == 0
+            && !self.inner.defaults.computer.keeps_daemon_alive()
     }
 
     /// Detach every node, the daemon stopping (S-1): nothing attaches after this. Whether every
@@ -2176,6 +2199,7 @@ impl Router {
             let mut cfg = NodeConfig::new()
                 .anchors(set.clone())
                 .on_profile_wait(crate::tunnel_cli::say_waiting);
+            cfg.computer = Some(Arc::clone(&self.inner.defaults.computer.computer));
             if let Some(bind) = &bind {
                 cfg = cfg.bind(bind.clone());
             }
@@ -2623,6 +2647,11 @@ impl Dispatch for Router {
     async fn daemon(&self, request: DaemonRequest) -> DaemonFrame {
         let refused = DaemonFrame::Refused;
         match request {
+            DaemonRequest::ComputerStatus
+            | DaemonRequest::ComputerBegin
+            | DaemonRequest::ComputerPreview { .. }
+            | DaemonRequest::ComputerApprove { .. }
+            | DaemonRequest::ComputerCancel { .. } => self.computer_request(request).await,
             DaemonRequest::Nodes => DaemonFrame::Nodes(self.nodes()),
             DaemonRequest::Attach {
                 node,

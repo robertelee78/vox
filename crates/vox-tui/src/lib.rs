@@ -30,6 +30,7 @@ pub mod client;
 pub mod codex_app_server;
 pub mod codex_mirror;
 pub mod codex_trust;
+pub mod computer_cli;
 pub mod coord;
 pub mod daemon;
 pub mod daemon_client;
