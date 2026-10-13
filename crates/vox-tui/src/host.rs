@@ -1745,7 +1745,9 @@ impl Router {
     /// Whether the daemon has no node in any state and no client connected (L-8).
     #[must_use]
     pub fn idle(&self) -> bool {
-        lock(&self.inner.slots).is_empty() && self.inner.connections.load(Ordering::SeqCst) == 0
+        lock(&self.inner.slots).is_empty()
+            && self.inner.connections.load(Ordering::SeqCst) == 0
+            && !self.inner.defaults.computer.keeps_daemon_alive()
     }
 
     /// Detach every node, the daemon stopping (S-1): nothing attaches after this. Whether every

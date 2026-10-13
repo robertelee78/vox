@@ -175,6 +175,9 @@ impl Management {
             let Some(g) = &s.genesis else {
                 return Ok(());
             };
+            if !s.quarantined.is_empty() {
+                return Ok(());
+            }
             if s.rosters.len() != 2 {
                 return Ok(());
             }
@@ -182,7 +185,11 @@ impl Management {
                 return Ok(());
             };
             for b in roster.read(&local, &g.incarnation())?.2 {
-                if s.applied.get(&b.verify(&local, &g.incarnation())?) != Some(&s.revision) {
+                if !s
+                    .applied
+                    .get(&b.verify(&local, &g.incarnation())?)
+                    .is_some_and(|a| a.revision == s.revision && a.interval == g.incarnation())
+                {
                     return Ok(());
                 }
             }
@@ -304,6 +311,15 @@ impl Management {
             }
         });
     }
+    /// An active invitation or enrolled management endpoint keeps a zero-node daemon available.
+    pub fn keeps_daemon_alive(&self) -> bool {
+        let s = lock(&self.computer.state);
+        s.genesis.is_some()
+            || s.pending.is_some()
+            || s.invitations
+                .iter()
+                .any(|i| !i.cancelled && i.expires > now())
+    }
     /// Begin one bounded invitation. Existing pending approval must be cancelled explicitly first.
     pub fn begin(&self) -> Result<ComputerStatus> {
         let endpoints = self.net.local_endpoints()?;
@@ -365,7 +381,13 @@ impl Management {
                     "this pairing is established; cancellation does not remove computer trust",
                 ));
             }
+            if s.cancelled.contains_key(&id) {
+                return Ok(());
+            }
             let pending = s.pending.as_ref().is_some_and(|g| g.incarnation() == id);
+            if s.invitations.iter().any(|i| i.id == id && i.cancelled) {
+                return Ok(());
+            }
             let mut found = pending;
             for i in &mut s.invitations {
                 if i.id == id || pending {
@@ -378,7 +400,9 @@ impl Management {
             if !found {
                 return Err(Error::Profile("that computer pairing is no longer current"));
             }
-            s.pending = None;
+            if let Some(g) = s.pending.take() {
+                s.cancelled.insert(g.incarnation(), g);
+            }
             s.pair_link = None;
             s.pending_expires = 0;
             s.rosters.clear();
@@ -389,6 +413,13 @@ impl Management {
     /// Authenticate a supplied code before exposing the peer as an approval candidate.
     pub async fn preview(self: &Arc<Self>, url: &str) -> Result<ComputerStatus> {
         let link = Link::parse(url)?;
+        if lock(&self.computer.state)
+            .pair_link
+            .as_ref()
+            .is_some_and(|l| l.as_str() == url)
+        {
+            return self.status();
+        }
         if link.expires <= now() {
             return Err(Error::Profile(
                 "computer pairing code expired; no trust was established",
@@ -423,6 +454,14 @@ impl Management {
         let local = self.computer.signer.fingerprint();
         self.computer.change(|s| {
             if s.genesis.as_ref().is_some_and(|g| g.incarnation() == id) {
+                return Ok(());
+            }
+            if s.pending.as_ref().is_some_and(|g| {
+                g.incarnation() == id
+                    && side(g, &local)
+                        .ok()
+                        .is_some_and(|at| g.approvals[at].is_some())
+            }) {
                 return Ok(());
             }
             if s.pending_expires <= now() {
@@ -468,11 +507,13 @@ impl Management {
         } else {
             None
         };
-        let invitation = s
-            .invitations
-            .iter()
-            .rev()
-            .find(|i| !i.cancelled && i.expires > now() && i.target.is_none());
+        let invitation = s.invitations.iter().rev().find(|i| {
+            s.genesis.is_none()
+                && s.pending.is_none()
+                && !i.cancelled
+                && i.expires > now()
+                && i.target.is_none()
+        });
         let invite_link = invitation
             .map(|i| {
                 self.net.local_endpoints().map(|endpoints| {
@@ -489,7 +530,9 @@ impl Management {
             })
             .transpose()?;
         let pending_nodes = lock(&self.pending_nodes).clone();
-        let state = if s.genesis.is_some() {
+        let state = if !s.quarantined.is_empty() {
+            "quarantined"
+        } else if s.genesis.is_some() {
             if s.receipts.len() == 2
                 && pending_nodes.is_empty()
                 && s.receipts
@@ -522,7 +565,11 @@ impl Management {
                 .transpose()?
                 .unwrap_or_default(),
             pending_nodes,
-            problem: lock(&self.problem).clone(),
+            problem: if !s.quarantined.is_empty() {
+                Some("Conflicting computer authority is quarantined; retained signed evidence requires operator recovery.".into())
+            } else {
+                lock(&self.problem).clone()
+            },
         })
     }
     /// Report outstanding current-node application, never claiming success for detached vaults.
@@ -561,7 +608,8 @@ impl Management {
         let mut g = Genesis::decode(d.bytes()?)?;
         let remote_share: [u8; 32] = d.bytes()?.try_into().map_err(|_| bad())?;
         d.finish()?;
-        if g.computers[0] != peer
+        if g.expires != link.expires
+            || g.computers[0] != peer
             || g.computers[1] != self.computer.description()
             || g.approvals.iter().any(Option::is_some)
         {
@@ -640,6 +688,7 @@ impl Management {
                 ));
             }
             let g = Genesis {
+                expires: i.expires,
                 nonce: i.nonce,
                 computers: [s.description.clone(), peer],
                 grants: i.grants,
@@ -834,8 +883,13 @@ fn exchange(s: &State) -> Result<Vec<u8>> {
         .or(s.pending.as_ref())
         .ok_or(Error::Profile("no computer pairing intent"))?;
     let mut e = Encoder::new();
-    e.array(3).bytes(&g.encode()).array(s.rosters.len());
-    for (id, r) in &s.rosters {
+    let current: Vec<_> = s
+        .history
+        .iter()
+        .filter(|(_, r)| r.event().ok().is_some_and(|e| e.group == g.incarnation()))
+        .collect();
+    e.array(3).bytes(&g.encode()).array(current.len());
+    for (id, r) in current {
         e.array(2).bytes(id).bytes(&r.signed.encode());
     }
     e.array(s.receipts.len());
@@ -861,43 +915,29 @@ fn merge(s: &mut State, bytes: &[u8], peer: Digest32) -> Result<()> {
     let here = side(current, &local)?;
     let mut g = current.clone();
     if let Some(a) = &incoming.approvals[at] {
+        if g.approvals[at].is_none() && g.expires <= now() {
+            return Err(Error::Profile(
+                "computer pairing expired before approval arrived; no new trust was established",
+            ));
+        }
         g.approvals[at] = Some(a.clone());
     }
     if incoming.approvals[here].is_some() && incoming.approvals[here] != g.approvals[here] {
         return Err(Error::SignatureInvalid);
     }
     g.verify(false)?;
+    s.pending = Some(g.clone());
     let n = count(&mut d)?;
-    let mut changed = false;
     for _ in 0..n {
         arity(&mut d, 2)?;
-        let manager = digest(&mut d)?;
+        let id = digest(&mut d)?;
         let r = Roster {
             signed: Signed::decode(d.bytes()?)?,
         };
-        if manager != peer {
-            if manager == local {
-                continue;
-            }
-            return Err(Error::SignatureInvalid);
+        if id != r.id() {
+            return Err(bad());
         }
-        let revision = r.read(&manager, &g.incarnation())?.0;
-        if let Some(old) = s.rosters.get(&manager) {
-            let old_revision = old.read(&manager, &g.incarnation())?.0;
-            if revision < old_revision {
-                continue;
-            }
-            if revision == old_revision && r != *old {
-                return Err(Error::Profile(
-                    "conflicting computer roster: both computers are quarantined",
-                ));
-            }
-            if revision == old_revision {
-                continue;
-            }
-        }
-        s.rosters.insert(manager, r);
-        changed = true;
+        s.retain_roster(r)?;
     }
     let n = count(&mut d)?;
     for _ in 0..n {
@@ -916,10 +956,6 @@ fn merge(s: &mut State, bytes: &[u8], peer: Digest32) -> Result<()> {
     d.finish()?;
     s.pending = Some(g);
     activate(s)?;
-    if changed {
-        s.revision = s.revision.checked_add(1).ok_or_else(bad)?;
-        s.receipts.clear();
-    }
     Ok(())
 }
 
@@ -929,13 +965,18 @@ fn receipt_body(s: &State, revision: u64) -> Result<Vec<u8>> {
         .as_ref()
         .ok_or(Error::Profile("computer enrollment is not established"))?;
     let mut e = Encoder::new();
-    e.array(6)
+    e.array(7)
         .uint(PROTOCOL)
         .bytes(&g.incarnation())
         .bytes(&sha256(&g.encode()))
         .array(s.rosters.len());
     for (id, r) in &s.rosters {
         e.array(2).bytes(id).bytes(&sha256(&r.signed.encode()));
+    }
+    let heads = s.heads();
+    e.array(heads.len());
+    for h in heads {
+        e.bytes(&h);
     }
     e.uint(revision).array(0);
     Ok(e.finish())
@@ -947,7 +988,7 @@ fn valid_receipt(s: &State, author: &Digest32, r: &Signed) -> Result<bool> {
     };
     side(g, author)?;
     let mut d = Decoder::new(&r.body);
-    arity(&mut d, 6)?;
+    arity(&mut d, 7)?;
     if d.uint()? != PROTOCOL
         || digest(&mut d)? != g.incarnation()
         || digest(&mut d)? != sha256(&g.encode())
@@ -961,6 +1002,15 @@ fn valid_receipt(s: &State, author: &Digest32, r: &Signed) -> Result<bool> {
     for (id, roster) in &s.rosters {
         arity(&mut d, 2)?;
         if digest(&mut d)? != *id || digest(&mut d)? != sha256(&roster.signed.encode()) {
+            return Ok(false);
+        }
+    }
+    let heads = s.heads();
+    if count(&mut d)? != heads.len() {
+        return Ok(false);
+    }
+    for head in heads {
+        if digest(&mut d)? != head {
             return Ok(false);
         }
     }

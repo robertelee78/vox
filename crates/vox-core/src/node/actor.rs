@@ -5095,6 +5095,9 @@ impl Node {
             cmd_tx.downgrade(),
             node.view_tx.subscribe(),
             handle_event_tx.clone(),
+            node.computer
+                .clone()
+                .map(|c| (c, Arc::clone(&node.computer_revision))),
         );
         let pulls = crate::node::pulls::Pulls::spawn(
             node.paths.clone(),
@@ -16568,7 +16571,16 @@ impl Node {
                 .or_insert_with(crate::node::tunnel::empty_reachers);
             // A recompute is not a decision: this wakes the serving tasks only if the set
             // really moved. The rule and its reason live in `publish_reachers`.
-            crate::node::tunnel::publish_reachers(slot, next);
+            if let Some(computer) = &self.computer {
+                computer.publish_reachers(
+                    slot,
+                    next,
+                    self.computer_revision
+                        .load(std::sync::atomic::Ordering::Acquire),
+                );
+            } else {
+                crate::node::tunnel::publish_reachers(slot, next);
+            }
             let offer = self
                 .offered
                 .entry(*cid)
