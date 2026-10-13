@@ -42,6 +42,7 @@ struct RootView: View {
         // Node › Sign Out…: what it does, said first (E-5), done only when confirmed.
         .sheet(item: $model.agentSetupAsk) { request in
             AgentSetupSheet(request: request, model: model)
+                .id(request.id)
                 .interactiveDismissDisabled(model.agentSetupBusy)
         }
         .sheet(isPresented: $model.signingOut) {
