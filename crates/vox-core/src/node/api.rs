@@ -1410,7 +1410,7 @@ impl Fault {
                 "the node is shutting down\n       make it Ready again (`vox node unlock`), then try again"
             }
             Fault::NotNetworked => {
-                "this node is not on the network: it is Locked, or was started without a listen address\n       make it Ready with `vox node unlock`, which unlocks it and puts it on the network"
+                "this node is not on the network\n       make it Ready with `vox node unlock`, which unlocks it and puts it on the network"
             }
             Fault::BadLink => {
                 "that address will not parse, or names a room this node cannot use\n       check you copied the whole vox:// address"
