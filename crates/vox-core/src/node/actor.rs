@@ -5880,7 +5880,7 @@ impl Node {
             }
             if attempt == 7 {
                 return Err(Error::Profile(
-                    "computer policy is still changing; attach again after it settles",
+                    "computer policy is still changing; try Unlock again after it settles",
                 ));
             }
         }

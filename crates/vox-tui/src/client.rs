@@ -421,7 +421,7 @@ pub async fn hold(
         Some(identity_for_attach(paths, pass, creates).await?)
     };
     if let Some(w) = waiting {
-        w.on("the daemon to attach this node");
+        w.on("the daemon to make this node Ready");
     }
     let at = NodeSocket {
         path: account.socket(),
@@ -479,7 +479,7 @@ pub async fn attach_to_stay(
     }
     let passphrase = identity_for_attach(paths, pass, false).await?;
     if let Some(w) = waiting {
-        w.on("the daemon to attach this node");
+        w.on("the daemon to make this node Ready");
     }
     match d
         .request(DaemonRequest::Attach {
@@ -1027,7 +1027,7 @@ pub async fn node_rename(args: &NodeArgs, old: &str, new: &str) -> Result<(), Ap
         if let Err(e) = forgotten {
             let restored = restore_rename_source(&account, args, &old, was_attached, &again).await;
             let recovery = match restored {
-                Ok(()) => "its previous attachment and remembered state were restored".to_owned(),
+                Ok(()) => "its previous node state and remembered state were restored".to_owned(),
                 Err(restore) => format!(
                     "restoring its previous state failed: {restore}; run {}",
                     command(&["node", "unlock", old.as_str()])
@@ -1042,7 +1042,7 @@ pub async fn node_rename(args: &NodeArgs, old: &str, new: &str) -> Result<(), Ap
     if let Err(error) = std::fs::rename(account.node_dir(&old), account.node_dir(&new)) {
         let restored = restore_rename_source(&account, args, &old, was_attached, &again).await;
         let recovery = match restored {
-            Ok(()) => "its previous attachment and remembered state were restored".to_owned(),
+            Ok(()) => "its previous node state and remembered state were restored".to_owned(),
             Err(e) => format!(
                 "restoring its previous state failed: {e}; run {}",
                 command(&["node", "unlock", old.as_str()])

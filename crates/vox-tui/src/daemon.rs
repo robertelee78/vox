@@ -284,7 +284,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
         }
         None if !args.as_detached && !args.no_node && account.nodes_on_disk().is_empty() => {
             eprintln!(
-                "vox daemon: no node here yet, so it runs with none; nodes attach to it as they \
+                "vox daemon: no node here yet, so it runs with none; nodes become Ready as they \
                  are made and used"
             );
             println!("vox daemon: control socket {}", account.socket().display());
@@ -602,7 +602,7 @@ fn attach_foreground(
     // Named and not here: refused before any passphrase is asked for.
     if !account.nodes_on_disk().contains(node) {
         return Err(AppError::Usage(format!(
-            "there is no node {node} here, so there is nothing to attach.\n\
+            "there is no node {node} here, so there is no node to make Ready.\n\
              \x20      Make one:  vox node create {node}\n\
              \x20      Then start the daemon again."
         )));
@@ -830,7 +830,7 @@ fn already_running(
         None => {
             return Err(AppError::Refused {
                 code: 1,
-                message: running("; name a node with --node to attach it there"),
+                message: running("; name a node with --node to make it Ready"),
             })
         }
     };

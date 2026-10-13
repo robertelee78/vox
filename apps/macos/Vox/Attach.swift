@@ -112,7 +112,7 @@ final class ServicesProvider: NSObject {
             return
         }
         guard let node = app.node else {
-            error.pointee = "Open Vox and attach its node first." as NSString
+            error.pointee = "Open Vox to choose or unlock a node first." as NSString
             return
         }
         node.incoming = url

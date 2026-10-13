@@ -737,8 +737,8 @@ pub fn run_node(
         return Err(AppError::Refused {
             code: 1,
             message: format!(
-                "a vox daemon is already running for {}; attach the anchor to it: vox node \
-                 attach {node}",
+                "a vox daemon is already running for {}; make the anchor Ready: vox node \
+                 unlock {node}",
                 account.data_root.display()
             ),
         });

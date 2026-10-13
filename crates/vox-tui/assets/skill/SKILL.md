@@ -29,7 +29,7 @@ It only reads and names the first thing missing. Repeat its guidance once. If it
 Set Up in its app, you may run the printed `vox agent setup` command: it asks the person in Vox's
 own window and returns before they answer. The hook reports pending, declined or Ready on the
 next turn. Never ask for a passphrase in the session. On SSH or a machine without the app, give
-the exact setup command to the operator for their own terminal; do not run it. A node's attach
+the exact setup command to the operator for their own terminal; do not run it. A node's unlock
 command likewise belongs to the operator. When this repo has no room, follow
 `references/setup.md` → "Binding this repo to a room". A quiet result or Not Now needs no repeat
 prompt; continue the turn.
@@ -41,7 +41,7 @@ prompt; continue the turn.
 | this repo isn't tied to a Vox room | Vox has asked the operator itself, in its app. Tell them once, in the words your turn gives, and do not ask again; then follow `references/setup.md` → "Binding this repo to a room". |
 | your harness has no node and Vox offers Set Up | You may run the printed `vox agent setup` command to open Vox's own setup window. See `references/setup.md`. |
 | setup is pending or declined | Report that outcome once; do not repeat setup or ask for a passphrase. Not Now stays silent until the person uses Set Up in Vox Settings. |
-| your node is not attached, or a terminal command is offered | Give the operator that exact command for their own terminal. See `references/setup.md`. |
+| your node is Locked, or a terminal command is offered | Give the operator that exact command for their own terminal. See `references/setup.md`. |
 | an addressed question, or an open question about your presence or work | Answer in this room during this turn, briefly, with `vox room post <room> --re <entry> "…"`. Follow the reply rule below. |
 | "You no longer hold …" | Stop work on that item, or claim it again if it is free. |
 | a file landed, and where | Read it from that path; it is verified. See `references/files.md`. |

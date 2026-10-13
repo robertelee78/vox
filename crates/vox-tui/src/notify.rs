@@ -200,7 +200,7 @@ pub fn needs_passphrase(paths: &Paths, node: &str, body: &str) {
             .status()
             .is_ok_and(|s| s.success());
         if asked {
-            eprintln!("vox daemon: {title} — asked Vox.app to offer Attach…");
+            eprintln!("vox daemon: {title} — asked Vox.app to offer Unlock…");
             return;
         }
     }

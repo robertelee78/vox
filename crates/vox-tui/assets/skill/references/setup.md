@@ -46,15 +46,15 @@ The node-free light hook reports missing setup once per session. On a Mac with V
 start `vox agent setup <harness>`: it returns immediately, and Vox's own window names the harness,
 directory and proposed node. Only the person enters a passphrase or chooses none there. The hook
 reports pending, declined or Ready on the next turn; do not poll or ask again. Not Now is remembered
-for this harness; the person can reopen Set Up in Vox Settings. Never make or attach a node by hand.
+for this harness; the person can reopen Set Up in Vox Settings. Never make or unlock a node by hand.
 
 If no notice arrived, `vox agent status --harness <claude|codex|opencode>` only reads and names the
 first thing missing. On SSH or a machine without the app, setup belongs to the operator's terminal:
 
 | `vox agent status` says | The operator runs |
 |---|---|
-| this harness has no node on this machine | `vox agent setup <harness> --node <name>`, using the name status printed unless they choose another: it makes the node (they type its passphrase twice, or none), wires this harness's hook to it with this skill beside it, and attaches it, remembered. Then a new session. |
-| this harness's node is not attached | `vox node unlock <node>`: it asks for the passphrase once, and Vox then remembers it and attaches the node by itself after every restart. Then a new session. |
+| this harness has no node on this machine | `vox agent setup <harness> --node <name>`, using the name status printed unless they choose another: it makes the node (they type its passphrase twice, or none), wires this harness's hook to it with this skill beside it, makes it Ready and remembers it. Then a new session. |
+| this harness's node is Locked | `vox node unlock <node>`: it asks for the passphrase once, and Vox then remembers it and makes the node Ready by itself after every restart. Then a new session. |
 | this repo isn't tied to a Vox room, and Vox has asked the operator | nothing new: Vox asked them already; see "Binding this repo to a room", above. |
 | something else is wrong | First run the read-only `vox agent doctor --node <your node> --room <bound room>` yourself; give the operator only the action it says requires them. |
 

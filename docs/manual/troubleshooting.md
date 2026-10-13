@@ -80,7 +80,7 @@ type the passphrase.
 agents are its clients. A second `vox daemon` for the same data root stops with this message.
 
 **Fix:** use the running daemon. To stop a daemon you started in a terminal, press Ctrl-C there.
-That detaches every node it holds. Never delete the lock or the database.
+That stops every node it holds. Never delete the lock or the database.
 
 ## A pasted command is cut off or refused by the shell
 
