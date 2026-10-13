@@ -4163,13 +4163,25 @@ final class FirstRunProof: XCTestCase {
         present(ui, Key.id("detached"), timeout: 10, "the sidebar must say node alice is Locked")
         XCTAssertEqual(el(ui, Key.id("compose")).value as? String, "DRAFT-KEPT-P12",
                        "PRODUCT: what was typed must stay while the node is Locked")
-        ui.menuBars.menuBarItems["Node"].click()
-        tap(ui, Key.menuItem("Unlock…"), "Unlock the Locked node")
-        guard present(ui, Key.id("attach-node-passphrase"), timeout: 20,
-                      "Unlock must open the node's passphrase sheet") else { return }
-        type(ui, Key.id("attach-node-passphrase"), "alice identity", "the Unlock passphrase field")
-        tap(ui, Key.id("attach-node"), "Unlock alice")
-        present(ui, Key.id("attached"), timeout: 60, "Unlock must restore alice Ready")
+        type(ui, Key.id("node-stopped-passphrase"), "wrong identity", "wrong inline Unlock passphrase")
+        tap(ui, Key.id("node-stopped-attach"), "Unlock with the wrong inline passphrase")
+        guard words(ui, Key.id("node-stopped-unlock-error"), timeout: 20,
+                    "wrong inline Unlock must explain its refusal on the initiating surface",
+                    until: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) != nil else { return }
+        let wrongInline = try staged(vox, ["node", "list"], env: voxEnv)
+        XCTAssertTrue(nodeLine(wrongInline, "alice")?.contains("Locked") == true,
+                      "PRODUCT: wrong inline Unlock must leave alice Locked; \(wrongInline)")
+        XCTAssertEqual(el(ui, Key.id("compose")).value as? String, "DRAFT-KEPT-P12",
+                       "PRODUCT: failed inline Unlock must preserve the original draft")
+        tap(ui, Key.id("node-stopped-passphrase"), "replace the wrong inline passphrase")
+        ui.typeKey("a", modifierFlags: .command)
+        el(ui, Key.id("node-stopped-passphrase")).typeText("alice identity")
+        tap(ui, Key.id("node-stopped-attach"), "Unlock with the correct inline passphrase")
+        guard words(ui, Key.id("attached"), timeout: 60,
+                    "correct inline Unlock must restore alice Ready",
+                    until: { $0 == "node alice, Ready" }) != nil else { return }
+        missingWithin(ui, Key.id("node-stopped-unlock-error"), 10,
+                      "successful inline Unlock must retire its previous refusal")
         XCTAssertEqual(el(ui, Key.id("compose")).value as? String, "DRAFT-KEPT-P12",
                        "PRODUCT: what was typed must still be there once the node is Ready again")
         // The draft goes, so later steps start from an empty composer.
