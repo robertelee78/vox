@@ -69,6 +69,13 @@
 //! later working in another mapped directory, stays where it is: its Session stays open and its
 //! node joins nothing else. Mutant: a start path matched as a prefix.
 //!
+//! **The first turn after joining says who reads whom** (ADR-031 JL-4, #737, same journey):
+//! the room already holds a local personal node and an untrusted remote member. After real
+//! messages prove the local nodes read each other, the next hook turn names the saved room,
+//! local mutual reader and remote member not reading yet. Tool events do not consume the notice;
+//! later turns and a daemon restart do not repeat it. Mutant: omit members not reading yet;
+//! the remote-member sentence assertion turns PRODUCT red.
+//!
 //! **`vox agent room` sets or moves a session's room** (ADR-029 RB-5, #551, the same test): run as
 //! the session in no room, it says what it is to do, sets the room, and opens the session's
 //! Session there, and its next turn is no longer told it works in no room. Run again for another
@@ -929,6 +936,10 @@ fn a_turn_spends_its_tokens_on_what_is_for_the_agent() {
             e["body"].as_str().unwrap_or("")
         )
     };
+
+    // The once-per-session membership notice precedes the conversation whose token cost
+    // this journey measures. Let its actual first hook turn deliver it before anyone posts.
+    turn();
 
     // ---- (1) chatter counted, what is for the reader and prose in full ----
     run(&[
@@ -2318,7 +2329,14 @@ fn restart(d: &mut Daemon, root: &Path) {
     let _ = d.child.wait();
     let err_file = root.join("daemon-2.err");
     d.child = vox(&d.data, &d.cfg)
-        .args(["daemon", "--listen", "127.0.0.1:0", "--passphrase-file"])
+        .args([
+            "daemon",
+            "--node",
+            "default",
+            "--listen",
+            "127.0.0.1:0",
+            "--passphrase-file",
+        ])
         .arg(root.join("identity.pass"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2947,6 +2965,49 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     let mut agent = Daemon::start_bare(&tmp.path().join("agent"));
     let (data, cfg) = (agent.data.clone(), agent.cfg.clone());
 
+    // JL-4 (#737): a person's node on this daemon shares the mapped room. Alice is a remote
+    // member neither local node trusts. The app's saved personal-node choice is apparatus;
+    // attachment, joining, automatic local trust and readable messages use the real CLI.
+    let hook = |data: &Path, cfg: &Path, args: &[&str], stdin: &str| {
+        let mut args = args.to_vec();
+        if !args.contains(&"--node") {
+            args.extend(["--node", "default"]);
+        }
+        crate::hook(data, cfg, &args, stdin)
+    };
+    let pass = tmp.path().join("agent/identity.pass");
+    let pass = pass.to_str().expect("APPARATUS: a UTF-8 path");
+    for args in [
+        vec!["node", "create", "personal", "--passphrase-file", pass],
+        vec![
+            "node",
+            "attach",
+            "personal",
+            "--no-remember",
+            "--passphrase-file",
+            pass,
+        ],
+        vec![
+            "room",
+            "join",
+            &link_home,
+            "--node",
+            "personal",
+            "--passphrase-file",
+            "-",
+        ],
+    ] {
+        // Create/attach select the positional node, not the one-shot default.
+        let (ok, out, err) = crate::hook(&data, &cfg, &args, "channel passphrase");
+        assert!(
+            ok,
+            "PRODUCT (staging): local person's node {args:?}: {out}{err}"
+        );
+    }
+    std::fs::create_dir_all(cfg.join("app")).expect("APPARATUS: app settings directory");
+    std::fs::write(cfg.join("app/node"), "personal\n")
+        .expect("APPARATUS: save the app's personal-node choice");
+
     // The agent's data root maps two directories: the repository to Alice's first room, and
     // another repository to her second.
     let repo = tmp.path().join("repo");
@@ -3050,8 +3111,6 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     // and a 120 s bound read a join still under way as one that never worked. A join still
     // running past the product's own patience is the product's.
     let deadline = Instant::now() + Duration::from_secs(540);
-    let mut turns = 1;
-    let mut last = first.clone();
     while !(rooms().contains(&home) && open_in(&home, mapped)) {
         // What a red quotes: the first line each turn was told (the join's status), and both
         // daemons' own words.
@@ -3080,21 +3139,18 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
             Instant::now() < deadline,
             "PRODUCT: a session started in {} (mapped to room {home}) never worked there within \
              540 s: the node's rooms {:?}, the room's Sessions {:?}; its first turn was told \
-             {:?}, its last ({turns} turns) {:?}; the map's link {link_home}; the agent's daemon said:\n{}\nAlice's daemon \
+             {:?}; the map's link {link_home}; the agent's daemon said:\n{}\nAlice's daemon \
              said:\n{}",
             repo.display(),
             rooms(),
             sessions(&home),
             said(&first),
-            said(&last),
             tail("agent"),
             tail("alice")
         );
         std::thread::sleep(Duration::from_secs(2));
-        last = turn(mapped, &repo);
-        turns += 1;
     }
-    eprintln!("[proof] (1) first turn told: {first:?}; working in {home} after {turns} turns");
+    eprintln!("[proof] (1) first turn told: {first:?}; its room {home} opened in the background");
     // Where the join's time went, as the agent's daemon said it.
     let agent_log =
         std::fs::read_to_string(tmp.path().join("agent").join("daemon.err")).unwrap_or_default();
@@ -3121,6 +3177,93 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         std::thread::sleep(Duration::from_secs(1));
     };
     eprintln!("[proof] (1) its Session, read once open:\n{read_before}");
+
+    // Establish the local relationship by what each person can read, without consuming the
+    // agent's next hook turn. The remote Alice remains untrusted until the later two-room arm.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (_, ours, _) = hook(&data, &cfg, &["trust", "list"], "");
+        let (_, theirs, _) = hook(&data, &cfg, &["trust", "list", "--node", "personal"], "");
+        if ours.contains("personal") && theirs.contains(&agent.fingerprint) {
+            break;
+        }
+        assert!(Instant::now() < deadline,
+            "PRODUCT (staging): automatic local trust did not appear in both keyrings: agent {ours}; personal {theirs}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let (ok, out, err) = hook(
+        &data,
+        &cfg,
+        &[
+            "room",
+            "post",
+            &home,
+            "LOCAL-PERSON-READY",
+            "--node",
+            "personal",
+        ],
+        "",
+    );
+    assert!(ok, "PRODUCT (staging): local person's message: {out}{err}");
+    let (ok, out, err) = hook(
+        &data,
+        &cfg,
+        &["room", "post", &home, "LOCAL-AGENT-READY"],
+        "",
+    );
+    assert!(ok, "PRODUCT: agent's local conversation: {out}{err}");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (_, agent_reads, _) = hook(&data, &cfg, &["room", "read", &home], "");
+        let (_, person_reads, _) = hook(
+            &data,
+            &cfg,
+            &["room", "read", &home, "--node", "personal"],
+            "",
+        );
+        if agent_reads.contains("LOCAL-PERSON-READY") && person_reads.contains("LOCAL-AGENT-READY")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline,
+            "PRODUCT: local nodes did not read each other before the next agent turn: agent {agent_reads}; personal {person_reads}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    // A tool event while idle must not swallow the notice meant for the next model turn.
+    let tool = serde_json::json!({"session_id":mapped,"cwd":repo,"hook_event_name":"PostToolUse", "tool_name":"Bash", "tool_input":{"command":"true"},"tool_response":""}).to_string();
+    let (ok, out, err) = hook_env(
+        &data,
+        &cfg,
+        &["agent", "hook", "--node", "default"],
+        &tool,
+        &person,
+    );
+    assert!(
+        ok && !out.contains("Your node joined room"),
+        "PRODUCT: a tool event consumed the next-turn join notice: {out}{err}"
+    );
+    let joined = turn(mapped, &repo);
+    let remote: String = alice.fingerprint.chars().take(26).collect();
+    assert!(
+        joined.contains(&format!("Your node joined room agents ({home})")),
+        "PRODUCT: the next turn after joining did not name the saved room: {joined}"
+    );
+    assert!(
+        joined.contains("personal (on this machine): reads you; you read it"),
+        "PRODUCT: the next turn did not name its local reader and whom it reads: {joined}"
+    );
+    assert!(
+        joined.contains(&format!(
+            "{remote}: does not read you yet; you do not read it yet"
+        )),
+        "PRODUCT: the next turn omitted the remote member not reading it yet: {joined}"
+    );
+    let again = turn(mapped, &repo);
+    assert!(
+        !again.contains("Your node joined room"),
+        "PRODUCT: a later turn repeated the already delivered join notice: {again}"
+    );
+    eprintln!("[proof] (1/JL-4) next turn named room, local mutual reader, and remote not reading yet: {joined}");
 
     // (2) A session started in a directory the map does not name, at or above it: no room.
     let below = "22222222-aaaa-4bbb-8ccc-000000000002";
@@ -3544,6 +3687,10 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     }
     let a_restart = turn(mapped, &other_repo);
     let b_restart = turn(other_session, &worktree);
+    assert!(
+        !a_restart.contains("Your node joined room"),
+        "PRODUCT: restarting the daemon repeated the delivered join notice: {a_restart}"
+    );
     assert!(
         a_restart.contains("RESTART-NEWS-A")
             && !a_restart.contains("RESTART-NEWS-B")
