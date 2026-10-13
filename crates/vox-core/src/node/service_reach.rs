@@ -63,7 +63,7 @@ pub fn needs(
         });
     }
     needs.push((
-        "node attached".to_owned(),
+        "node Ready".to_owned(),
         true,
         "`vox node unlock`".to_owned(),
     ));

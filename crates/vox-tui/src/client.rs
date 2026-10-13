@@ -1214,13 +1214,22 @@ async fn restore_rename_source(
 /// running to do it.
 fn forget_kept(account: &Account, node: &NodeName) -> Result<(), AppError> {
     let path = account.attach_file();
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(AppError::Usage(format!(
+                "{}: {e}; it was not changed",
+                path.display()
+            )))
+        }
+    };
     let mut left = String::new();
     for line in text.lines() {
         match line.split_once('\t') {
             Some((name, source)) if name == node.as_str() => {
                 if let Some(at) = source.strip_prefix("keychain:") {
-                    crate::keychain::forget(at);
+                    crate::keychain::forget(at).map_err(AppError::Usage)?;
                 }
             }
             _ => {
@@ -1362,13 +1371,15 @@ pub async fn node_lock(args: &NodeArgs, name: &str) -> Result<(), AppError> {
             if nodes.iter().any(|n| {
                 n.name == name && n.status == Some(vox_core::node::daemonipc::NodeStatus::Ready)
             }) {
-                println!("vox: node {name} has no passphrase and stays Ready; its remembered credentials are forgotten");
+                println!("vox: node {name} is Ready after the lock request; run `vox node list` to see its current remembered state");
                 return Ok(());
             }
             if !nodes.iter().any(|n| {
-                n.name == name && n.status == Some(vox_core::node::daemonipc::NodeStatus::Locked)
+                n.name == name
+                    && n.status == Some(vox_core::node::daemonipc::NodeStatus::Locked)
+                    && !n.keep
             }) {
-                return Err(AppError::Usage(format!("node {name}'s credentials are forgotten, but its status is not yet known; run `vox node list`")));
+                return Err(AppError::Usage(format!("node {name}'s state changed after the lock request; run `vox node list` to see its current status")));
             }
             println!(
                 "vox: node {name} is Locked and forgotten; its rooms and messages stay here; \

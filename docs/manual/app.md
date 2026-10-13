@@ -227,7 +227,7 @@ sound. Clicking a notification opens the room, Session or request.
 
 Two notifications ask something of you:
 
-- `Node NAME needs its passphrase`, when a node on this Mac waits for it. **Attach…** opens the
+- `Node NAME needs its passphrase`, when a node on this Mac waits for it. **Unlock…** opens the
   sheet that unlocks it.
 - `Which room is this repo in?`, when an agent session starts in a repository with no room.
 
