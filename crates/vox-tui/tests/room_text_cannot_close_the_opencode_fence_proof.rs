@@ -622,11 +622,13 @@ fn room_text_cannot_close_the_plugins_fence_nor_pass_as_the_user() {
     post_in(
         other_room,
         "person",
-        &["--type", "ask", "--to", &to_a, "--urgent"],
+        &["--type", "ask", "--to", &fp, "--urgent"],
         "B-BEFORE-A-MOVED",
     );
-    host.quiet("an explicit session address in another room must not interrupt it or mark an implicit reply");
-    other.quiet("a session-specific foreign-room ask must not wake other sessions of the node");
+    other.room_wake(other_room, "B-BEFORE-A-MOVED", "A-QUESTION-BEFORE-MOVE");
+    host.quiet(
+        "a node-wide ask in another room must not interrupt this session or mark an implicit reply",
+    );
 
     post_in(
         &room,
