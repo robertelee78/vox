@@ -43,7 +43,7 @@ def is_attached(text):
     There is no locked state any more (N-2): this is what "unlocked" was."""
     import re
     # Any run of spaces: a driver may read the status bar with its spacing collapsed.
-    return re.search(r"node [a-z0-9._-]+\s+·\s+attached: ", text) is not None
+    return re.search(r"node [a-z0-9._-]+\s+·\s+Ready: ", text) is not None
 
 
 def pane(rows, title):

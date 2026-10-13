@@ -1117,7 +1117,7 @@ fn ok_or(reply: vox_core::error::Result<Frame>, doing: &str) -> Result<(), AppEr
         Ok(Frame::Ok) => Ok(()),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("{doing}: {reason}"))),
         Ok(Frame::NodeDetached { node }) => Err(AppError::Usage(format!(
-            "{doing}: node {node} was detached from the vox daemon while it waited"
+            "{doing}: the connection to node {node} ended while this operation waited"
         ))),
         Ok(other) => Err(AppError::Usage(format!(
             "{doing}: {}",
@@ -1597,7 +1597,7 @@ pub async fn connect(
         }
         Ok(Frame::NodeDetached { node }) => {
             return Err(AppError::Usage(format!(
-                "node {node} was detached from the vox daemon while it joined"
+                "the connection to node {node} ended during the join"
             )))
         }
         Ok(other) => return Err(crate::client::unexpected(&other)),
@@ -1612,7 +1612,7 @@ pub async fn connect(
     );
     println!(
         "        reach a service as <service>.<node>.<room>.vox through the daemon's proxy, \
-         running while a node is attached (`vox up` says where)"
+         running while a node is Ready (`vox up` says where)"
     );
     Ok(())
 }
@@ -1656,7 +1656,7 @@ pub async fn up(
             other => crate::client::said(&held.at, other),
         })?;
     println!(
-        "vox up on {bound} — the vox daemon's proxy, carrying every room its attached nodes hold"
+        "vox up on {bound} — the vox daemon's proxy, carrying every room its Ready nodes hold"
     );
     println!();
     println!("add this to ~/.ssh/config, once, for every room there will ever be:");
@@ -1670,9 +1670,7 @@ pub async fn up(
     );
     println!("other tools:  ALL_PROXY=socks5h://{bound}");
     if !watch {
-        println!(
-            "it runs while a node is attached; `vox up --watch` shows what it refuses or cuts"
-        );
+        println!("it runs while a node is Ready; `vox up --watch` shows what it refuses or cuts");
         return Ok(());
     }
     println!("watching what the proxy refuses or cuts; Ctrl-C stops watching, not the proxy");

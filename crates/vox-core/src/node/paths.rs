@@ -488,6 +488,38 @@ impl Paths {
         (lines.next()? == beside).then_some(fingerprint)
     }
 
+    /// The passphrase fact recorded after creating or successfully opening this vault. Like
+    /// the fingerprint, it is bound to the vault's hash. `false` is only permission to TRY an
+    /// empty credential: it never unlocks a node or establishes its identity by itself.
+    pub fn requires_passphrase(&self) -> Result<bool> {
+        let file = self.fingerprint_file();
+        let failed = |detail: String| crate::error::Error::Path {
+            op: "read the node's verified identity facts",
+            detail: format!(
+                "{}: {detail}; unlock this node to refresh its identity facts",
+                file.display()
+            ),
+        };
+        let text = std::fs::read_to_string(&file).map_err(|e| failed(e.to_string()))?;
+        let mut lines = text.lines();
+        crate::node::link::b32_decode(lines.next().unwrap_or_default(), "fingerprint file")
+            .map_err(|e| failed(e.to_string()))?;
+        let vault = std::fs::read(self.vault_file()).map_err(|e| failed(e.to_string()))?;
+        let beside = format!("{:?}", crate::hash::Hex(&crate::hash::sha256(&vault)));
+        if lines.next() != Some(beside.as_str()) {
+            return Err(failed("the facts do not name this vault".into()));
+        }
+        let required = match lines.next() {
+            Some("passphrase") => true,
+            Some("none") => false,
+            _ => return Err(failed("the passphrase fact is missing or malformed".into())),
+        };
+        if lines.next().is_some() {
+            return Err(failed("unexpected identity facts".into()));
+        }
+        Ok(required)
+    }
+
     /// `<profile_dir>/node.sock` — the ADR-020 §7 local control socket.
     ///
     /// Per profile, so several nodes on one machine never contend for it, and

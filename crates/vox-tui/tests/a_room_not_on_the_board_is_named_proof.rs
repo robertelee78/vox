@@ -179,7 +179,7 @@ fn a_join_to_a_board_without_the_room_names_the_board_and_the_remedy() {
         let t = Instant::now();
         drop(host);
         let detached = wait_for(Duration::from_secs(20), || {
-            world::log_tail(&host_dir, 40).contains("node default detached")
+            world::log_tail(&host_dir, 40).contains("node default finished its work")
         });
         let stopped_in_time = held && detached && t.elapsed() < HOLD_BOARD_READ;
         (

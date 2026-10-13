@@ -118,7 +118,7 @@ fn two_nodes_answer_at_one_address_and_a_detach_leaves_the_other() {
         "PRODUCT (staging): vox node attach b failed: {out}{err}"
     );
     daemon.expect_staging("node b attached", |l| {
-        l.contains("vox daemon: node b attached")
+        l.contains("vox daemon: node b is Ready")
     });
     let port: u16 = std::fs::read_to_string(home.join(".daemon/port"))
         .ok()
@@ -153,8 +153,8 @@ fn two_nodes_answer_at_one_address_and_a_detach_leaves_the_other() {
         ok,
         "PRODUCT (staging): vox node detach b failed: {out}{err}"
     );
-    daemon.expect_staging("node b detached", |l| {
-        l.contains("vox daemon: node b detached")
+    daemon.expect_staging("node b finished its work", |l| {
+        l.contains("vox daemon: node b finished its work")
     });
     let t0 = Instant::now();
     let mut r2 = remote(&tmp.path().join("r2"), &at, &fa, &fb);

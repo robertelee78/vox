@@ -292,7 +292,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
         None if !args.as_detached && !args.no_node => {
             let nodes = account.nodes_on_disk();
             eprintln!(
-                "vox daemon: {} node(s) here and none named, so none is attached: name one with \
+                "vox daemon: {} node(s) here and none named, so none is Ready: name one with \
                  --node ({})",
                 nodes.len(),
                 nodes
@@ -625,9 +625,7 @@ fn attach_foreground(
         return Err(AppError::Usage(refusal_words(&r, account, node)));
     }
     let Some(handle) = router.handle_of(node) else {
-        return Err(AppError::Usage(format!(
-            "node {node} detached as it attached"
-        )));
+        return Err(AppError::Usage(format!("node {node} could not stay Ready")));
     };
     // **At a terminal, the rooms still closed are asked for** (V210-153), one passphrase at a
     // time, as a piped line would give them; an empty one starts the daemon without them.

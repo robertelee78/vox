@@ -159,10 +159,20 @@ async fn restart_checked(
     } else {
         Vec::new()
     };
-    let kept = crate::host::read_attach_file(&account.attach_file())
+    let mut kept = crate::host::read_attach_file(&account.attach_file())
         .into_iter()
         .map(|(name, _)| name)
         .collect::<Vec<_>>();
+    // No-passphrase nodes also start themselves, even after Forget. Wait for their actual
+    // startup before reporting the update complete.
+    for name in account.nodes_on_disk() {
+        let paths = account.node_paths_as_they_are(&name);
+        let headless = !paths.vault_file().is_file()
+            && vox_core::node::headless::identity_file(&paths).is_file();
+        if (headless || !paths.requires_passphrase()?) && !kept.contains(&name) {
+            kept.push(name);
+        }
+    }
 
     // A normal termination signal follows the daemon's own bounded shutdown path. Its pid
     // came from this user's authenticated control socket, never a stale lock-file pid.
@@ -329,7 +339,7 @@ async fn held_names(
 fn say_detached(nodes: &[NodeName]) {
     for node in nodes {
         println!(
-            "node {node} is detached, as the daemon remembers no passphrase for it; attach it \
+            "node {node} is Locked, as the daemon remembers no passphrase for it; unlock it \
              again with `vox node unlock {node}`"
         );
     }
@@ -345,7 +355,7 @@ pub(super) fn say_next(detached: &[NodeName]) {
              remembers it"
         ),
         nodes => println!(
-            "Next: attach each: {}; each asks for its passphrase once and then remembers it",
+            "Next: unlock each: {}; each asks for its passphrase once and then remembers it",
             nodes
                 .iter()
                 .map(|n| vox_text::shell::command(&["vox", "node", "unlock", n.as_str()]))

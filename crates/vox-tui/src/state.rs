@@ -110,7 +110,7 @@ impl PromptKind {
     #[must_use]
     pub fn title(self) -> &'static str {
         match self {
-            PromptKind::Attach => "Attach node",
+            PromptKind::Attach => "Unlock node",
             PromptKind::CreateIdentity => "Create identity",
             PromptKind::CreateChannel => "Create room",
             PromptKind::OpenChannel => "Open room",
@@ -1758,7 +1758,7 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
     // Channel-independent verbs first — these must not require an open channel.
     match verb {
         "quit" | "q" => return Some(Parsed::Quit),
-        "attach" => return Some(Parsed::Prompt(PromptKind::Attach, None)),
+        "unlock" | "attach" => return Some(Parsed::Prompt(PromptKind::Attach, None)),
         // **One node per client** (ADR-028 E-4, #470): this TUI acts only as the node it was
         // opened with. Another node is a member of the rooms it shares with this one, never a
         // node to act as.

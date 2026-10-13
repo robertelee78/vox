@@ -365,7 +365,7 @@ pub struct ViewModel {
     /// when the next one will ask for it (ADR-028 K-9).
     pub keyring_open_secs: Option<u64>,
     /// Every node on this machine, by name, and whether it is attached (ADR-028 W-1, #511).
-    pub machine_nodes: Vec<(String, bool)>,
+    pub machine_nodes: Vec<(String, Option<String>)>,
     /// Whether `mlock` is in effect; `false` surfaces the documented zeroize-only
     /// degradation warning (ADR-015 memory-protection honesty).
     pub mlock_active: bool,
@@ -446,9 +446,9 @@ impl UiError {
     pub fn message(self) -> &'static str {
         match self {
             UiError::IdentityMadeElsewhere => {
-                "another vox created this node's identity at the same time; nothing was created here — :attach with its passphrase"
+                "another vox created this node's identity at the same time; nothing was created here — :unlock with its passphrase"
             }
-            UiError::NotAttached => "this node is not attached — :attach and give its passphrase",
+            UiError::NotAttached => "this action needs a Ready node — choose one, or :unlock a Locked node",
             UiError::NoSuchTunnel => "that tunnel is no longer open — the tunnels pane lists those that are",
             UiError::Internal => "internal error — the node's log says what failed",
         }
@@ -489,7 +489,7 @@ impl CommandStatus {
     pub fn message(&self) -> String {
         match self {
             CommandStatus::Done => "done".to_owned(),
-            CommandStatus::NeedsNode => "needs a running node (attach one to proceed)".to_owned(),
+            CommandStatus::NeedsNode => "needs a Ready node (unlock one to proceed)".to_owned(),
             CommandStatus::NotConnected => "not connected: action not performed".to_owned(),
             CommandStatus::Queued => "queued".to_owned(),
             CommandStatus::Failed(e) => e.message().to_owned(),

@@ -10,8 +10,8 @@ and not a device: your identity and each agent's identity are separate nodes, an
 hold several. No central operator can reset a node. If its keys are lost, it is gone, and you
 make a new one.
 
-One daemon on the machine runs every node that is attached. A command names the node it acts as
-with `--node`, and with only one node attached it acts as that one.
+One daemon on the machine runs every node that is Ready. A command names the node it acts as
+with `--node`, and with only one node Ready it acts as that one.
 
 ## A room is a shared space
 

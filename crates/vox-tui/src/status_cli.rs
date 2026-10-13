@@ -14,7 +14,49 @@ use crate::app::AppError;
 
 /// `vox status`.
 pub async fn status(paths: &Paths, json: bool) -> Result<(), AppError> {
+    use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest, NodeStatus};
     let at = crate::client::one_shot(paths)?;
+    let mut daemon = DaemonClient::open(&paths.account().socket())
+        .await
+        .map_err(|e| crate::client::said(&at, e))?;
+    let nodes = match daemon.request(DaemonRequest::Nodes).await? {
+        DaemonFrame::Nodes(nodes) => nodes,
+        DaemonFrame::Refused(r) => return Err(AppError::Usage(r.to_string())),
+        other => return Err(crate::client::unexpected_daemon(&other)),
+    };
+    let name = crate::client::name_of(paths)?;
+    if nodes.iter().any(|n| n.name == name && n.status.is_none()) {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"node": name.as_str(), "status": null})
+            );
+        } else {
+            println!("node {name}  …");
+        }
+        return Ok(());
+    }
+    if let Some(info) = nodes
+        .iter()
+        .find(|n| n.name == name && n.status == Some(NodeStatus::Locked))
+    {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "node": name.as_str(), "status": "Locked",
+                    "identity": info.fingerprint.map(|f| vox_core::node::link::b32_encode(&f)),
+                })
+            );
+        } else {
+            println!("node {name}  Locked");
+            println!(
+                "Unlock with {}",
+                vox_text::shell::command(&["vox", "node", "unlock", name.as_str()])
+            );
+        }
+        return Ok(());
+    }
     let report = vox_core::node::status::request(&at)
         .await
         .map_err(|e| crate::client::said(&at, e))?;
@@ -50,7 +92,7 @@ fn render(v: &Value) -> String {
     let mut o = String::new();
     let _ = writeln!(
         o,
-        "node {}  {}",
+        "node {}  Ready  {}",
         short(s(v, "identity")),
         if v.get("networked").and_then(Value::as_bool) == Some(true) {
             "on the network"

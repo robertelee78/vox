@@ -350,7 +350,7 @@ fn one_nodes_panic_detaches_it_and_the_other_node_goes_on() {
         "PRODUCT (staging): vox node attach b failed: {out}{err}"
     );
     d.expect("node b attached", Duration::from_secs(30), |l| {
-        l.starts_with("vox daemon: node b attached")
+        l.starts_with("vox daemon: node b is Ready")
     });
     let (ok, _, err) = a.hook("b", "s-b", "UserPromptSubmit");
     assert!(ok, "PRODUCT: b's hook failed: {err}");
@@ -367,9 +367,9 @@ fn one_nodes_panic_detaches_it_and_the_other_node_goes_on() {
     );
     eprintln!("[proof] the post that panics node a exited ok={posted}");
     d.expect(
-        "that node a detached because its actor panicked",
+        "that node a finished its work because its actor panicked",
         Duration::from_secs(20),
-        |l| l.starts_with("vox daemon: node a detached (its actor panicked"),
+        |l| l.starts_with("vox daemon: node a finished its work (its actor panicked"),
     );
     let (b_ok, b_out, b_err) = a.run(&["room", "list", "--node", "b"], "");
     assert!(
@@ -455,7 +455,7 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
     assert!(
         !a.log()
             .lines()
-            .any(|l| l.starts_with("vox daemon: node agent attached")),
+            .any(|l| l.starts_with("vox daemon: node agent is Ready")),
         "PRODUCT: a hook attached its node (ADR-028 K-13)\nlog:\n{}",
         a.log()
     );
@@ -642,8 +642,8 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         let (_, shown, err) = a.run(&["node", "list"], "");
         assert!(
             shown.lines().any(|l| l.starts_with("default ")
-                && l.contains("attached")
-                && !l.contains("(kept)")),
+                && l.contains("Ready")
+                && !l.contains("(remembered)")),
             "PRODUCT: a failed first remember must not appear kept: {shown}{err}"
         );
     }
@@ -671,7 +671,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         "APPARATUS: temporarily forget the Ready node: {out}{err}"
     );
     let (_, listed, err) = a.run(&["node", "list"], "");
-    assert!(listed.lines().any(|l| l.starts_with("default ") && l.contains("attached") && !l.contains("(kept)")),
+    assert!(listed.lines().any(|l| l.starts_with("default ") && l.contains("Ready") && !l.contains("(remembered)")),
         "APPARATUS: empty-input refusal needs a protected Ready but unremembered node: {listed}{err}");
     let empty = pass.with_extension("empty");
     std::fs::write(&empty, "\n").expect("APPARATUS: empty passphrase input");
@@ -689,9 +689,9 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         "PRODUCT: a Ready protected node must reject empty input instead of remembering no passphrase: {out}{err}");
     let (_, listed, err) = a.run(&["node", "list"], "");
     assert!(
-        listed
-            .lines()
-            .any(|l| l.starts_with("default ") && l.contains("attached") && !l.contains("(kept)")),
+        listed.lines().any(|l| l.starts_with("default ")
+            && l.contains("Ready")
+            && !l.contains("(remembered)")),
         "PRODUCT: rejected empty input must leave the Ready node unremembered: {listed}{err}"
     );
     let (ok, out, err) = a.run(
@@ -743,7 +743,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         "PRODUCT: the kept node's room did not come back after the restart\nlog:\n{log}"
     );
     assert!(
-        log.contains("vox daemon: attached kept node default"),
+        log.contains("vox daemon: node default is Ready"),
         "PRODUCT: the restart did not say it attached the kept node\nlog:\n{log}"
     );
 
@@ -761,9 +761,9 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
     assert!(ok, "APPARATUS: restart after lock: {out}{err}");
     let (_, listed, err) = a.run(&["node", "list"], "");
     assert!(
-        listed
-            .lines()
-            .any(|l| l.starts_with("default ") && l.contains("detached") && !l.contains("(kept)")),
+        listed.lines().any(|l| l.starts_with("default ")
+            && l.contains("Locked")
+            && !l.contains("(remembered)")),
         "PRODUCT: lock must survive a daemon restart: {listed}{err}"
     );
     let (ok, out, err) = a.run(
@@ -810,7 +810,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         wait_until(Duration::from_secs(30), || {
             let (_, shown, _) = a.run(&["node", "list"], "");
             shown.lines().any(|l| {
-                l.starts_with("default ") && l.contains("detached") && l.contains("(kept)")
+                l.starts_with("default ") && l.contains("Locked") && l.contains("(remembered)")
             })
         }),
         "APPARATUS: the missing secret did not leave a remembered, stopped node: {}",
@@ -835,7 +835,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
     let (ok, out, err) = a.run(&["daemon", "--detach"], "");
     assert!(ok, "APPARATUS: restart after restoring secret: {out}{err}");
     let (_, shown, err) = a.run(&["node", "list"], "");
-    assert!(shown.lines().any(|l| l.starts_with("default ") && l.contains("detached") && !l.contains("(kept)")),
+    assert!(shown.lines().any(|l| l.starts_with("default ") && l.contains("Locked") && !l.contains("(remembered)")),
         "PRODUCT: locking an already-stopped node must survive secret restoration and restart: {shown}{err}");
     let (ok, out, err) = a.run(
         &[
@@ -874,7 +874,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
                 "PRODUCT: unreadable remembered state must be refused without claiming a change: {out}{err}");
         }
         let (_, shown, err) = a.run(&["node", "list"], "");
-        assert!(shown.lines().any(|l| l.starts_with("default ") && l.contains("attached") && l.contains("(kept)")),
+        assert!(shown.lines().any(|l| l.starts_with("default ") && l.contains("Ready") && l.contains("(remembered)")),
             "PRODUCT: an unreadable file must not erase the last known remembered state: {shown}{err}");
     }
     {
@@ -890,8 +890,8 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
             "PRODUCT: failed persistence must not claim lock forgot the node: {out}{err}"
         );
         let (_, shown, err) = a.run(&["node", "list"], "");
-        assert!(shown.lines().any(|l| l.starts_with("default ") && l.contains("attached")
-            && (!cfg!(target_os = "macos") || l.contains("(kept)"))),
+        assert!(shown.lines().any(|l| l.starts_with("default ") && l.contains("Ready")
+            && (!cfg!(target_os = "macos") || l.contains("(remembered)"))),
             "PRODUCT: failed forgetting must leave the node Ready and show its surviving remembered state: {shown}{err}");
     }
     stop_pid(a.lock_pid().expect("APPARATUS: daemon after failed lock"));
@@ -942,7 +942,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
             "PRODUCT: a failed remember must fail unlock and name its partial state: {out}{err}"
         );
         let (_, listed, err) = a.run(&["node", "list"], "");
-        assert!(listed.lines().any(|l| l.starts_with("default ") && l.contains("attached") && !l.contains("(kept)")),
+        assert!(listed.lines().any(|l| l.starts_with("default ") && l.contains("Ready") && !l.contains("(remembered)")),
             "PRODUCT: failed Keychain storage must clear the previous remembered state: {listed}{err}");
         stop_pid(
             a.lock_pid()
@@ -954,8 +954,8 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         let (_, listed, err) = a.run(&["node", "list"], "");
         assert!(
             listed.lines().any(|l| l.starts_with("default ")
-                && l.contains("detached")
-                && !l.contains("(kept)")),
+                && l.contains("Locked")
+                && !l.contains("(remembered)")),
             "PRODUCT: the cleared remembered state must survive restart: {listed}{err}"
         );
         let (ok, out, err) = a.run(
@@ -1006,7 +1006,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
          {attach}"
     );
     assert!(
-        !line.contains(" attached") && !line.contains("(kept)"),
+        !line.contains(" Ready") && !line.contains("(remembered)"),
         "PRODUCT: signed out, `vox node list` must say default is detached and not kept: {line:?}"
     );
     assert!(
@@ -1047,7 +1047,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
     let log = a.log();
     stop_pid(pid);
     assert!(
-        !again.contains(" attached"),
+        !again.contains(" Ready"),
         "PRODUCT: signed out, node default must not be attached again by a daemon's start: \
          {again:?}\nlog:\n{log}"
     );
@@ -1433,7 +1433,7 @@ fn a_detach_answers_only_after_the_seal_in_flight_ends() {
     assert!(
         a.log()
             .lines()
-            .any(|l| l.starts_with("vox daemon: node agent detached (asked to)")),
+            .any(|l| l.starts_with("vox daemon: node agent finished its work (asked to)")),
         "PRODUCT: the detach was not said\nlog:\n{}",
         a.log()
     );
@@ -1523,7 +1523,7 @@ fn a_hook_is_answered_within_its_bound_while_its_node_detaches() {
             a.log()
         );
         assert!(
-            out.contains("node agent is still detaching; this turn reads nothing"),
+            out.contains("node agent's work is still stopping; this turn reads nothing"),
             "PRODUCT: the hook's one line does not say the node is still detaching: {out}"
         );
         let (_, _, _) = seal.join().unwrap();
@@ -1669,8 +1669,7 @@ fn a_hook_answers_within_a_second_while_the_daemon_attaches_its_kept_nodes() {
     assert!(
         ok && took < Duration::from_secs(1)
             && said.contains(
-                "Vox: node kept1 is attaching (the vox daemon has just started); this session \
-                 joins it once it is attached, and your rooms show from your next turn."
+                "Vox is preparing node kept1; this session joins it once it is Ready, and your rooms show from your next turn."
             ),
         "PRODUCT: with no daemon running, a hook as a kept node must answer within 1 s, saying \
          the node is attaching and the rooms show from the next turn; it took {took:?} and \
@@ -1681,7 +1680,7 @@ fn a_hook_answers_within_a_second_while_the_daemon_attaches_its_kept_nodes() {
         a.run(&["node", "list"], "")
             .1
             .lines()
-            .any(|l| l.starts_with("kept1 ") && l.contains(" attached"))
+            .any(|l| l.starts_with("kept1 ") && l.contains(" Ready"))
     });
     assert!(
         attached,
@@ -1942,7 +1941,7 @@ fn the_daemons_log_is_bounded_counted_and_named_in_status() {
     );
     let detached: Vec<_> = log
         .lines()
-        .filter(|l| l.contains("node default detached"))
+        .filter(|l| l.contains("node default finished its work"))
         .collect();
     assert_eq!(
         detached.len(),

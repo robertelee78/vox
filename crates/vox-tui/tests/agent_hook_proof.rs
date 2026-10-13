@@ -415,8 +415,8 @@ fn a_hook_never_attaches_its_node_and_says_how_to() {
                 "ask the operator to run `vox node unlock default` in a terminal outside this \
                  session"
             )
-            && listed.lines().any(|l| l.starts_with("default detached")),
-        "PRODUCT: with node default detached, the hook must leave it detached and tell the agent \
+            && listed.lines().any(|l| l.starts_with("default Locked")),
+        "PRODUCT: with node default Locked, the hook must leave it Locked and tell the agent \
          the command for the operator, `vox node unlock default` (ADR-028 K-13); it exited ok \
          {ok}, told the agent {told:?}, and `vox node list` says {listed:?}"
     );
@@ -476,7 +476,7 @@ fn a_hook_never_attaches_its_node_and_says_how_to() {
         "PRODUCT: setup completion preflight must retain the ordinary agent-process guard; got {out}{err}");
     let (_, _, _) = hook(&data, &cfg, &["node", "detach", "default"], "");
     assert!(
-        ok && !told.contains("not attached") && !told.contains("could not read"),
+        ok && !told.contains("Locked") && !told.contains("could not read"),
         "PRODUCT: once the operator attached node default, the hook must read its rooms; it told \
          the agent {told:?}"
     );

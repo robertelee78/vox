@@ -28,8 +28,8 @@ a node for Claude Code [claude-mac] (Enter keeps it, or type another name; skip 
 ```
 
 Press Return to keep the name, type another, or type `skip`. Vox asks for the node's passphrase
-twice (Return alone, twice, for none), installs the hook and the agent skill, then attaches the
-node and remembers it. A harness already wired to a node is left as it is. On a Mac, setup also
+twice (Return alone, twice, for none), installs the hook and the agent skill, then makes the
+node Ready and remembers it. A harness already wired to a node is left as it is. On a Mac, setup also
 offers a node for you. Type `skip` if you already have one, such as `robertgpt`.
 
 At the end, setup prints each node it made: its fingerprint beside its picture, then its name,
@@ -45,7 +45,7 @@ asks you which room that repository works in, and puts the agent's node in it
 An agent's node trusts and is trusted like any other node, and each direction is a separate
 decision. For the agent `claude-mac` to work with you, `robertgpt`, in `family`:
 
-Do this right after `vox setup`; it needs no room. With two nodes attached, each command names
+Do this right after `vox setup`; it needs no room. With two nodes Ready, each command names
 the node it acts as.
 
 1. Your node trusts the agent's node, with the fingerprint `vox setup` printed for it:
@@ -81,18 +81,18 @@ session asks you to run that command in your own terminal:
 - **No node for this harness:** `vox agent setup claude`. It suggests `claude-<host>`; use
   `--node claude-mac` to choose another name. Type the passphrase twice in your own terminal,
   outside the agent session. It makes the node, replaces the light hook, trusts Codex's hook when
-  setting up Codex, and attaches the node. Then start a new session. SSH uses this terminal path.
-- **The node is not attached:** `vox node unlock claude-mac`. Then start a new session.
+  setting up Codex, and makes the node Ready. Then start a new session. SSH uses this terminal path.
+- **The node is Locked:** `vox node unlock claude-mac`. Then start a new session.
 - **The repository has no room:** Vox asks you which room, as described in
   [Sessions](sessions.md#the-room-a-session-works-in).
 
-The agent's hook never attaches a node and never asks for a passphrase. You type every passphrase
+The agent's hook never makes a node Ready and never asks for a passphrase. You type every passphrase
 in your own terminal, outside the agent's session, including for keyring changes
 ([an agent's node](keyring.md#an-agents-node)).
 
 ## Wire a harness by hand
 
-`vox setup` does this for you. To do it yourself, make the node, which also attaches it at a
+`vox setup` does this for you. To do it yourself, make the node, which also makes it Ready at a
 terminal, and join the room:
 
 ```sh
@@ -144,7 +144,7 @@ vox room ping family claude-mac
 ```
 
 The agent node's daemon answers, not a model, such as `claude-mac's node answered: it holds no
-agent session`. If nothing answers, the node may be offline, detached, or missing trust: a ping
+agent session`. If nothing answers, the node may be offline, Locked, or missing trust: a ping
 cannot tell which.
 
 ## Confirm that a message reaches the agent

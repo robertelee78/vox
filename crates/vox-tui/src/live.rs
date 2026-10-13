@@ -115,7 +115,7 @@ pub struct DaemonCore {
     /// The nodes attached to the daemon now, by name (the header's list).
     attached: Vec<String>,
     /// Every node on this machine's disk, by name, read with each snapshot (ADR-028 W-1, #511).
-    on_disk: Vec<String>,
+    machine_nodes: Vec<(String, Option<String>)>,
     tx: mpsc::Sender<Ev>,
     rx: mpsc::Receiver<Ev>,
     /// The daemon's event task.
@@ -429,7 +429,7 @@ impl DaemonCore {
             node,
             conn: None,
             attached,
-            on_disk: Vec::new(),
+            machine_nodes: Vec::new(),
             tx,
             rx,
             daemon_events,
@@ -473,7 +473,13 @@ impl DaemonCore {
             ended: None,
             stop,
         };
-        if core.attached.iter().any(|n| n == core.node.as_str()) {
+        let no_passphrase = core.has_identity
+            && core
+                .account
+                .node_paths_as_they_are(&core.node)
+                .requires_passphrase()
+                .is_ok_and(|required| !required);
+        if no_passphrase || core.attached.iter().any(|n| n == core.node.as_str()) {
             // Attached already: it took its passphrase when it attached, and is used as it is.
             let status = core.attach(None);
             if !matches!(status, CommandStatus::Done) {
@@ -492,6 +498,12 @@ impl DaemonCore {
     /// Take the node with a `Use` that holds it (L-2), attaching it with `passphrase` if it is
     /// not attached, and start its event stream.
     fn attach(&mut self, passphrase: Option<Zeroizing<String>>) -> CommandStatus {
+        if !cfg!(target_os = "macos") && passphrase.as_ref().is_some_and(|p| !p.is_empty()) {
+            return CommandStatus::Said(format!(
+                "Unlock node {} with vox node unlock and --passphrase-file naming a private persistent file; this system has no Keychain to remember a typed passphrase",
+                self.node
+            ));
+        }
         let socket = self.account.socket();
         let using = |passphrase| UseNode {
             node: self.node.clone(),
@@ -499,7 +511,7 @@ impl DaemonCore {
             passphrase,
             anchors: self.anchors.clone(),
         };
-        let first = using(passphrase);
+        let first = using(None);
         let tx = self.tx.clone();
         // The event stream does not hold the node: the request connection does, and a node is
         // let go when that one closes, however the TUI ends.
@@ -507,7 +519,41 @@ impl DaemonCore {
             attach: AttachMode::No,
             ..using(None)
         };
+        let mut unlock_notes = Vec::new();
         let opened = until_stopped(&self.rt, &self.stop, async {
+            if let Some(passphrase) = passphrase {
+                let keep = if passphrase.is_empty() {
+                    vox_core::node::daemonipc::KeepSource::None
+                } else {
+                    vox_core::node::daemonipc::KeepSource::Keychain(String::new())
+                };
+                let mut daemon = DaemonClient::open(&socket).await?;
+                match daemon
+                    .request(DaemonRequest::Attach {
+                        node: self.node.clone(),
+                        passphrase: Some(passphrase),
+                        keep: Some(keep),
+                        rooms: Vec::new(),
+                        anchors: self.anchors.clone(),
+                    })
+                    .await?
+                {
+                    DaemonFrame::Attached(info, notes) if info.keep => unlock_notes = notes,
+                    DaemonFrame::Attached(_, notes) => {
+                        return Ok(Err(Refusal::Failed {
+                            node: self.node.clone(),
+                            why: format!("Ready but not remembered: {}", notes.join("; ")),
+                        }))
+                    }
+                    DaemonFrame::Refused(r) => return Ok(Err(r)),
+                    _ => {
+                        return Ok(Err(Refusal::Failed {
+                            node: self.node.clone(),
+                            why: "the daemon did not confirm the unlock".into(),
+                        }))
+                    }
+                }
+            }
             let client = match IpcClient::open_node(&socket, first).await {
                 Ok(Ok(c)) => c,
                 Ok(Err(refusal)) => return Ok(Err(refusal)),
@@ -547,7 +593,8 @@ impl DaemonCore {
             Ok(Ok(conn)) => {
                 // What attaching the node said (a skipped anchors line, carrying on with no
                 // anchor), in the TUI's notice line: the daemon writes it only to its log (R23).
-                let notes = conn.client.attach_notes().to_vec();
+                let mut notes = unlock_notes;
+                notes.extend_from_slice(conn.client.attach_notes());
                 self.conn = Some(conn);
                 self.has_identity = true;
                 self.asked = None;
@@ -715,7 +762,7 @@ impl DaemonCore {
         self.room_save_errors.clear();
         self.recovered_rooms.clear();
         self.notice = Some(format!(
-            "node {} was detached — give its passphrase to attach it again",
+            "the connection to node {} ended; Vox is reading its current status",
             self.node
         ));
     }
@@ -815,7 +862,7 @@ impl DaemonCore {
                         }
                         if let DetachCause::Panicked(_) = cause {
                             self.notice = Some(format!(
-                                "node {} stopped: its actor failed, and the daemon detached it",
+                                "node {} could not stay Ready: its work failed",
                                 self.node
                             ));
                         }
@@ -993,21 +1040,46 @@ impl DaemonCore {
 
     /// Ask for the snapshot when an event said something changed, or a second has passed.
     fn refresh(&mut self) {
-        if self.conn.is_none() {
-            return;
-        }
         if self.asked.is_some_and(|at| at.elapsed() < SNAPSHOT_EVERY) {
             return;
         }
         self.asked = Some(Instant::now());
+        let listed = until_stopped(&self.rt, &self.stop, async {
+            let mut daemon = DaemonClient::open(&self.account.socket()).await?;
+            daemon.request(DaemonRequest::Nodes).await
+        });
+        match listed {
+            Some(Ok(DaemonFrame::Nodes(nodes))) => {
+                self.machine_nodes = nodes
+                    .into_iter()
+                    .map(|n| (n.name.to_string(), n.status.map(|s| s.as_str().to_owned())))
+                    .collect();
+                if self.conn.is_none()
+                    && self.machine_nodes.iter().any(|(name, status)| {
+                        name == self.node.as_str() && status.as_deref() == Some("Ready")
+                    })
+                {
+                    let result = self.attach(None);
+                    if !matches!(result, CommandStatus::Done) {
+                        self.notice = Some(result.message());
+                    }
+                }
+            }
+            Some(Ok(DaemonFrame::Refused(r))) => {
+                self.machine_nodes.clear();
+                self.notice = Some(r.to_string());
+            }
+            Some(Err(e)) => {
+                self.machine_nodes.clear();
+                self.notice = Some(format!("cannot read the nodes: {e}"));
+            }
+            _ => {}
+        }
+        if self.conn.is_none() {
+            return;
+        }
         self.ask_proxy();
         self.ask_storage_health();
-        self.on_disk = self
-            .account
-            .nodes_on_disk()
-            .iter()
-            .map(|n| n.as_str().to_owned())
-            .collect();
         let body = vox_core::node::snapshot::request_body();
         let Some(conn) = self.conn.as_mut() else {
             return;
@@ -1912,14 +1984,7 @@ impl DaemonCore {
             .collect();
         // Grouped as the sidebar lists them (ADR-028 W-2, #511): what needs the person first.
         channels.sort_by_key(|c| c.group);
-        let mut machine_nodes: Vec<(String, bool)> = self
-            .on_disk
-            .iter()
-            .chain(&self.attached)
-            .map(|n| (n.clone(), self.attached.contains(n)))
-            .collect();
-        machine_nodes.sort();
-        machine_nodes.dedup();
+        let machine_nodes = self.machine_nodes.clone();
         // This node's names, for every address the views write readable (ADR-028 S-1a).
         let names = vox_core::node::resolver::VoxResolver::of_snapshot(&snap);
         let timeline = self.active.and_then(|cid| {

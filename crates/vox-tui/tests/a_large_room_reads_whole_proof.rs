@@ -689,9 +689,10 @@ fn delayed_app_reply(fault: AppReplyFault) {
     let nodes = alice.vox(None, &["node", "list"]);
     assert!(
         nodes.ok
-            && nodes.stdout.lines().any(|l| l.contains(node.as_str())
-                && (l.contains("Ready") || l.contains("ready") || l.contains("attached"))
-                && !l.contains("detached")),
+            && nodes
+                .stdout
+                .lines()
+                .any(|l| l.contains(node.as_str()) && l.contains("Ready") && !l.contains("Locked")),
         "PRODUCT: the app's node did not stay Ready: {nodes:?}"
     );
     rt.block_on(client.close());

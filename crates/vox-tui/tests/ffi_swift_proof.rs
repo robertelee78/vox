@@ -1279,7 +1279,7 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
         after = mine.run(&["node", "list"], "");
         if after
             .lines()
-            .any(|l| l.starts_with("alice") && l.contains("detached"))
+            .any(|l| l.starts_with("alice") && l.contains("Locked"))
         {
             break;
         }
@@ -1303,7 +1303,7 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
     assert!(
         listed
             .lines()
-            .any(|l| l.starts_with("alice") && l.contains("attached") && !l.contains("detached")),
+            .any(|l| l.starts_with("alice") && l.contains("Ready") && !l.contains("Locked")),
         "PRODUCT: the app's attach must show in `vox node list` as attached; it said: {listed}"
     );
     assert_eq!(
@@ -1371,7 +1371,7 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
     assert!(
         after
             .lines()
-            .any(|l| l.starts_with("alice") && l.contains("detached")),
+            .any(|l| l.starts_with("alice") && l.contains("Locked")),
         "PRODUCT: once the app closed, its node must be detached; `vox node list` said: {after}"
     );
 }
