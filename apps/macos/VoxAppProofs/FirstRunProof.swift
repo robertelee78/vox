@@ -1984,8 +1984,8 @@ final class FirstRunProof: XCTestCase {
         let data = root.appendingPathComponent("data").path
         let config = root.appendingPathComponent("config").path
         let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
-        // Attached nodes on Alice's daemon can become trusted automatically (#724). Carol
-        // must really be a peer on another daemon for this manual-offer journey.
+        // Attached nodes on Alice's daemon can become trusted automatically (#724). Bob and
+        // Carol must both be peers on another daemon for this manual-trust journey.
         let carolRoot = root.appendingPathComponent("carol-host")
         let carolEnv = ["VOX_DATA_DIR": carolRoot.appendingPathComponent("data").path,
                         "VOX_CONFIG_DIR": carolRoot.appendingPathComponent("config").path,
@@ -2003,13 +2003,13 @@ final class FirstRunProof: XCTestCase {
                                     until: "vox daemon: control socket")
         defer { carolDaemon.terminate() }
         for name in ["alice", "bob", "carol"] {
-            let nodeEnv = name == "carol" ? carolEnv : voxEnv
+            let nodeEnv = name == "alice" ? voxEnv : carolEnv
             try staged(vox, ["node", "create", name],
                        env: nodeEnv.merging(["VOX_IDENTITY_PASSPHRASE": "\(name) identity"]) { $1 })
             try staged(vox, ["node", "attach", name, "--passphrase-file", pass(name)], env: nodeEnv)
         }
         let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
-        let bobFp = try line(staged(vox, ["id", "--node", "bob"], env: voxEnv)) { $0.count == 52 }
+        let bobFp = try line(staged(vox, ["id", "--node", "bob"], env: carolEnv)) { $0.count == 52 }
         let carolFp = try line(staged(vox, ["id", "--node", "carol"], env: carolEnv)) { $0.count == 52 }
         try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", pass("room"),
                          "--name", "pending"], env: voxEnv)
@@ -2020,7 +2020,7 @@ final class FirstRunProof: XCTestCase {
             $0.hasPrefix("vox://")
         }
         // Bob and Carol are connected but untrusted: presentation must be available before trust.
-        try staged(vox, ["room", "join", "--node", "bob", "--passphrase-file", pass("room"), link], env: voxEnv)
+        try staged(vox, ["room", "join", "--node", "bob", "--passphrase-file", pass("room"), link], env: carolEnv)
         // Carol joins: alice is offered carol (K-15).
         try staged(vox, ["room", "join", "--node", "carol", "--passphrase-file", pass("room"), link],
                    env: carolEnv)
@@ -2085,6 +2085,11 @@ final class FirstRunProof: XCTestCase {
         print("[proof] offer: \(explain.debugDescription); one Trust while the form was open; empty passphrase said needed; Cancel brought Trust back")
 
         // Bob's change, waiting for the passphrase, named.
+        let beforeBobTrust = try staged(vox, ["trust", "list", "--node", "alice"], env: voxEnv)
+        guard !beforeBobTrust.contains(bobFp) else {
+            throw Apparatus("staging not achieved: Bob must be outside Alice's keyring before manual Trust; `vox trust list` said \(beforeBobTrust)")
+        }
+        print("[proof] before manual Trust, Alice's public trust list excludes Bob: \(beforeBobTrust.debugDescription)")
         tap(ui, Key.id("keyring"), "Keyring in the sidebar")
         type(ui, Key.id("keyring-add-fingerprint"), bobFp, "the fingerprint field")
         words(ui, Key.id("keyring-add-alias"), timeout: 90,
