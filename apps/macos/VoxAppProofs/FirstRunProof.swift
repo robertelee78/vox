@@ -573,6 +573,18 @@ final class FirstRunProof: XCTestCase {
             return got
         }
 
+        // The control socket serves while remembered nodes are still restoring. Read the
+        // public result until it settles, within the same bound as the app's Ready recovery.
+        func restoredNodes(_ want: (String) -> Bool) throws -> String {
+            let until = Date().addingTimeInterval(90)
+            var listed = try staged(vox, ["node", "list"], env: voxEnv)
+            while !want(listed) && Date() < until {
+                Thread.sleep(forTimeInterval: 0.25)
+                listed = try staged(vox, ["node", "list"], env: voxEnv)
+            }
+            return listed
+        }
+
         let ui = voxApp(appPath)
         ui.launchEnvironment = voxEnv.merging(["HOME": home]) { $1 }
         try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
@@ -644,10 +656,13 @@ final class FirstRunProof: XCTestCase {
         daemon?.terminate()
         daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
-        let restarted = try staged(vox, ["node", "list"], env: voxEnv)
+        let restarted = try restoredNodes {
+            nodeLine($0, "alice")?.contains("Ready") == true
+                && nodeLine($0, "plain")?.contains("Ready") == true
+        }
         XCTAssertTrue(nodeLine(restarted, "alice")?.contains("Ready") == true
                       && nodeLine(restarted, "plain")?.contains("Ready") == true,
-                      "PRODUCT: remembered nodes must return Ready after restart; \(restarted)")
+                      "PRODUCT: remembered nodes must return Ready within 90 s after restart; \(restarted)")
         words(ui, Key.id("machine-alice"), timeout: 90,
               "the app must recover alice Ready after restart with Keep Running Off",
               until: { $0 == "alice Ready" })
@@ -675,7 +690,7 @@ final class FirstRunProof: XCTestCase {
         daemon?.terminate()
         daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
-        let forgotten = try staged(vox, ["node", "list"], env: voxEnv)
+        let forgotten = try restoredNodes { nodeLine($0, "alice")?.contains("Locked") == true }
         XCTAssertTrue(nodeLine(forgotten, "alice")?.contains("Locked") == true,
                       "PRODUCT: Forget must remain Locked across restart; \(forgotten)")
         tap(ui, Key.id("attach-again"), "Unlock the same node")
@@ -700,7 +715,10 @@ final class FirstRunProof: XCTestCase {
         daemon?.terminate()
         daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
-        let plainAfterForget = try staged(vox, ["node", "list"], env: voxEnv)
+        let plainAfterForget = try restoredNodes {
+            nodeLine($0, "plain")?.contains("Ready") == true
+                && nodeLine($0, "alice")?.contains("Ready") == true
+        }
         XCTAssertTrue(nodeLine(plainAfterForget, "plain")?.contains("Ready") == true,
                       "PRODUCT: a passphraseless node must remain Ready through Forget and restart; \(plainAfterForget)")
         XCTAssertTrue(nodeLine(plainAfterForget, "alice")?.contains("Ready") == true,
