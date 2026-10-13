@@ -1430,13 +1430,15 @@ final class FirstRunProof: XCTestCase {
         guard before.status == 0, nodeLine(before.out, "alice") == nil else {
             throw Apparatus("staging not achieved: the data root is to hold no node; `vox node list` said \(before.out)")
         }
-        // Claude Code is here: its settings folder, in the HOME a proof build gives the launch's
-        // `vox agent skill --install` (`<config dir>/app/home`, never the person's own).
+        // All three harnesses are here, in the HOME a proof build gives skill/hook installation
+        // (`<config dir>/app/home`, never the person's own), with no Vox hooks yet.
         let skillHome = URL(fileURLWithPath: config).appendingPathComponent("app/home")
         // Made by the stager: the test runner's sandbox may not write in the scratch (513).
-        let made = stager.run(["/bin/mkdir", "-p", skillHome.appendingPathComponent(".claude").path], env: [:])
-        guard made.status == 0 else {
-            throw Apparatus("staging not achieved: Claude Code's settings folder under \(skillHome.path): \(made.out)")
+        for folder in [".claude", ".codex", ".config/opencode"] {
+            let made = stager.run(["/bin/mkdir", "-p", skillHome.appendingPathComponent(folder).path], env: [:])
+            guard made.status == 0 else {
+                throw Apparatus("staging not achieved: \(folder) under \(skillHome.path): \(made.out)")
+            }
         }
 
         let ui = voxApp(appPath)
@@ -1460,6 +1462,23 @@ final class FirstRunProof: XCTestCase {
                       "PRODUCT: Vox.app must install the agent skill at launch: 10 s after its window, \(skill) is not there")
         present(ui, Key.id("login-item-why"), timeout: 30, "at first run the app must ask about Keep Running")
         tap(ui, Key.id("login-item-not-now"), "Not Now")
+
+        // HK-1: first run wires every missing hook and tells the person which files changed.
+        // Mutant: skip Codex in install_light_hooks -> PRODUCT at its missing config below.
+        let hookPaths = [("claude", ".claude/settings.json"), ("codex", ".codex/hooks.json"),
+                         ("opencode", ".config/opencode/plugin/vox.js")]
+        let hookSaid = words(ui, Key.id("agent-hooks-installed"), timeout: 30,
+                             "first run must name every harness hook file it changed",
+                             until: { text in hookPaths.allSatisfy {
+                                 text.contains(skillHome.appendingPathComponent($0.1).path)
+                             } }) ?? ""
+        for (harness, relative) in hookPaths {
+            let path = skillHome.appendingPathComponent(relative).path
+            let content = stager.run(["/bin/cat", path], env: [:])
+            XCTAssertTrue(content.status == 0 && content.out.contains("agent hook --light \(harness)"),
+                          "PRODUCT: first run must install \(harness)'s light hook at \(path); it reads \(content.out), window said \(hookSaid)")
+        }
+        tap(ui, Key.id("agent-hooks-dismiss"), "Dismiss the installed hook paths")
 
         // The welcome: the node is made here.
         let name = Key.id("new-node-name")
