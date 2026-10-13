@@ -124,14 +124,17 @@ struct ComputerTrustView: View {
     }
 
     @ViewBuilder private func pairing(_ status: ComputerStatus) -> some View {
-        if status.state == "confirmed", model.reachable {
+        if status.state == "quarantined" {
+            Text("Computer trust is suspended because signed computer records conflict.")
+                .accessibilityIdentifier("computer-trust-quarantined")
+        } else if status.state == "confirmed", model.reachable {
             Text("Computer trust is confirmed.")
                 .accessibilityIdentifier("computer-trust-confirmed")
         } else if status.state == "applying" {
             Text("Computer trust was approved. Waiting for it to be applied on both computers.")
                 .accessibilityIdentifier("computer-trust-applying")
         }
-        if let preview = status.pairing, status.state != "confirmed" {
+        if let preview = status.pairing, status.state != "confirmed", status.state != "quarantined" {
             Divider()
             identity(preview.peer, title: "Computer to add")
             if expired(preview.expiresMs), !preview.approvedHere || !preview.approvedThere {
@@ -155,7 +158,7 @@ struct ComputerTrustView: View {
                 .disabled(model.busy || !model.reachable || expired(preview.expiresMs))
                 .accessibilityIdentifier("computer-pairing-approve")
             }
-        } else if let invitation = status.inviteLink {
+        } else if let invitation = status.inviteLink, status.state == "waiting" {
             Divider()
             Text("On your other Mac, open Add Computer and paste this pairing code.")
             Text(invitation).font(Theme.mono).textSelection(.enabled)
@@ -200,7 +203,7 @@ struct ComputerTrustView: View {
             .disabled(model.busy || !model.reachable || link.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             .accessibilityIdentifier("computer-pairing-preview")
         }
-        if status.state != "confirmed", status.state != "applying",
+        if status.state != "confirmed", status.state != "applying", status.state != "quarantined",
            let operation = status.pairing?.operationId ?? status.inviteId {
             Button("Cancel Pairing") {
                 Task { await model.perform { try await $0.cancelComputerPairing(operationId: operation) } }
