@@ -43,10 +43,10 @@
 //!
 //! ## Who is woken (V210-161, V210-163)
 //!
-//! An urgent message addressed to a node wakes the sessions of that node, in whichever room it
-//! lands: `to` names nodes, and every session hears every room its node holds. The node the
-//! message is for decides, on its own daemon, so a session on another node is woken by that
-//! node's daemon once the message reaches it. Not the session that posted it, and not one that
+//! An urgent message addressed to a node wakes its sessions working in that room: `to` names
+//! nodes, but each session hears only its saved room (ADR-029 RB-4, RB-5). A session with no room
+//! receives no room wakes. The node the message is for decides, on its own daemon, so a session
+//! on another node is woken by that node's daemon once the message reaches it. Not the session that posted it, and not one that
 //! already spoke in the reply chain it answers (V210-121).
 //!
 //! ## What a wake says, and when (V030-15, V030-20)
@@ -54,7 +54,7 @@
 //! A wake is a **notice**: how many urgent messages and replies wait, from whom, in which room,
 //! and never a byte of any of them (`agent_hook::render_wake`). The messages arrive once, in the
 //! drain of the turn the notice starts. The daemon counts what is owed just before it sends
-//! ([`unread`], [`tend`]), keeps at most one notice outstanding per session, across every room,
+//! ([`unread`], [`tend`]), keeps at most one notice outstanding per session in its saved room,
 //! and announces an unread reply to an idle session on a schedule ([`Settings`]). What it owes
 //! each session is kept in [`Notices`], beside the registration, so a restart resumes it.
 
@@ -334,13 +334,14 @@ impl Session {
                 >= u64::try_from(busy_idle.as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// Whether `other` is this same registration: the same session at the same endpoint. What the
+    /// Whether `other` is this same registration: the same session, room and endpoint. What the
     /// harness says about its turns does not make it another one.
     fn same(&self, other: &Session) -> bool {
         self.session == other.session
             && self.harness == other.harness
             && self.endpoint == other.endpoint
             && self.token == other.token
+            && self.room == other.room
     }
 }
 
@@ -386,8 +387,8 @@ pub fn reachability(paths: &Paths, session: &str) -> &'static str {
 /// Best effort on purpose: a session that cannot be woken should still be able to
 /// read its room, so every failure here is silent and leaves the drain working.
 ///
-/// A session is woken for an urgent message addressed to its node, in any room: it hears every
-/// room its node holds (V210-161, V210-163).
+/// A session is woken for an urgent message addressed to its node in its saved room. Node
+/// membership in another room does not make that room part of the session (ADR-029 RB-4, RB-5).
 ///
 /// `codex` says the hook's input is Codex's ([`codex_input`]). It is checked first: a Codex
 /// started from a Claude Code terminal inherits that terminal's messaging socket, and a Codex
@@ -914,6 +915,8 @@ where
 /// Why a wake did not arrive.
 #[derive(Debug)]
 pub enum WakeError {
+    /// Its saved room or endpoint changed while delivery was queued. The old notice is retired.
+    Moved,
     /// The session is gone: nothing listens at its endpoint any more, or its server no
     /// longer knows it. Its registration can be forgotten.
     Gone(String),
@@ -924,6 +927,7 @@ pub enum WakeError {
 impl std::fmt::Display for WakeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            WakeError::Moved => f.write_str("the session's saved room or endpoint changed"),
             WakeError::Gone(e) | WakeError::Failed(e) => f.write_str(e),
         }
     }
@@ -934,18 +938,11 @@ impl std::fmt::Display for WakeError {
 ///
 /// # Errors
 /// If the harness has no implemented wake path, or delivery fails.
-pub async fn wake(session: &Session, text: &str) -> Result<(), WakeError> {
+pub async fn wake(paths: &Paths, session: &Session, text: &str) -> Result<(), WakeError> {
+    check_wake_registration(paths, session)?;
     match session.harness.as_str() {
-        "claude" => wake_claude(Path::new(&session.endpoint), &session.token, text).await,
-        "opencode" => {
-            wake_opencode(
-                Path::new(&session.endpoint),
-                &session.token,
-                &session.session,
-                text,
-            )
-            .await
-        }
+        "claude" => wake_claude(paths, session, text).await,
+        "opencode" => wake_opencode(paths, session, text).await,
         // Never woken (V210-169): Codex keeps a quit session's thread loaded, so a turn started
         // there could run with nobody in the session.
         "codex" => Err(WakeError::Failed(
@@ -955,6 +952,17 @@ pub async fn wake(session: &Session, text: &str) -> Result<(), WakeError> {
         other => Err(WakeError::Failed(format!(
             "no wake path for harness {other:?}"
         ))),
+    }
+}
+
+/// Recheck after asynchronous connection too, immediately before handing text to the harness.
+fn check_wake_registration(paths: &Paths, session: &Session) -> Result<(), WakeError> {
+    if session.room.is_some()
+        && registration(paths, &session.session).is_some_and(|s| s.same(session))
+    {
+        Ok(())
+    } else {
+        Err(WakeError::Moved)
     }
 }
 
@@ -991,9 +999,10 @@ async fn send(
 
 /// NDJSON over Claude Code's messaging socket: an `auth` frame, then a user
 /// message. Verified against a live session.
-async fn wake_claude(socket: &Path, token: &str, text: &str) -> Result<(), WakeError> {
-    let mut stream = connect(socket).await?;
-    let auth = serde_json::json!({ "type": "auth", "token": token });
+async fn wake_claude(paths: &Paths, session: &Session, text: &str) -> Result<(), WakeError> {
+    let mut stream = connect(Path::new(&session.endpoint)).await?;
+    check_wake_registration(paths, session)?;
+    let auth = serde_json::json!({ "type": "auth", "token": session.token });
     let message = serde_json::json!({
         "type": "user",
         "message": { "role": "user", "content": text },
@@ -1003,18 +1012,14 @@ async fn wake_claude(socket: &Path, token: &str, text: &str) -> Result<(), WakeE
 
 /// The Vox OpenCode plugin's wake socket: an `auth` frame, then a `prompt` frame for
 /// `session`, answered with one line saying whether OpenCode took it.
-async fn wake_opencode(
-    socket: &Path,
-    token: &str,
-    session: &str,
-    text: &str,
-) -> Result<(), WakeError> {
+async fn wake_opencode(paths: &Paths, session: &Session, text: &str) -> Result<(), WakeError> {
     use tokio::io::AsyncBufReadExt as _;
-    let mut stream = connect(socket).await?;
-    let auth = serde_json::json!({ "type": "auth", "token": token });
+    let mut stream = connect(Path::new(&session.endpoint)).await?;
+    check_wake_registration(paths, session)?;
+    let auth = serde_json::json!({ "type": "auth", "token": session.token });
     let prompt = serde_json::json!({
         "type": "prompt",
-        "session": session,
+        "session": session.session,
         "text": text,
     });
     send(&mut stream, &[auth, prompt]).await?;
@@ -1241,6 +1246,10 @@ fn duration(v: &str) -> Option<std::time::Duration> {
 /// that a daemon restart resumes where it was.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Notices {
+    /// The saved room these notices belong to. A deliberate move starts a fresh notice series;
+    /// an outstanding send or retry for the previous room cannot become owed in the new room.
+    #[serde(default)]
+    pub room: Option<String>,
     /// An urgent message addressed to this session's node landed and has not been announced yet.
     #[serde(default)]
     pub urgent_due: bool,
@@ -1283,6 +1292,9 @@ impl Notices {
 /// dropped; the hold bounds how often an endpoint that keeps failing is tried.
 pub fn undelivered(paths: &Paths, session: &str, before: &Notices, after: &Notices, hold_ms: u64) {
     let mut now = notices(paths, session);
+    if now.room.is_none() || now.room != after.room {
+        return;
+    }
     if now == *after {
         now = before.clone();
         now.sent_at = after.sent_at;
@@ -1309,10 +1321,21 @@ fn notices_file(paths: &Paths, session: &str) -> std::path::PathBuf {
 /// What the daemon owes `session` in notices; nothing when it has no record.
 #[must_use]
 pub fn notices(paths: &Paths, session: &str) -> Notices {
+    let room = registration(paths, session).and_then(|s| s.room);
+    notices_in(paths, session, room.as_deref())
+}
+
+/// Notices for this captured binding only: held wakes and reply series cannot cross a move.
+#[must_use]
+pub fn notices_in(paths: &Paths, session: &str, room: Option<&str>) -> Notices {
     std::fs::read(notices_file(paths, session))
         .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+        .and_then(|b| serde_json::from_slice::<Notices>(&b).ok())
+        .filter(|n| room.is_some() && n.room.as_deref() == room)
+        .unwrap_or_else(|| Notices {
+            room: room.map(str::to_owned),
+            ..Notices::default()
+        })
 }
 
 /// Record what the daemon owes `session` in notices.
@@ -1320,6 +1343,9 @@ pub fn notices(paths: &Paths, session: &str) -> Notices {
 /// # Errors
 /// If the record cannot be written.
 pub fn save_notices(paths: &Paths, session: &str, n: &Notices) -> std::io::Result<()> {
+    if n.room.is_none() || registration(paths, session).and_then(|s| s.room) != n.room {
+        return Ok(());
+    }
     std::fs::create_dir_all(paths.session_dir().join(NOTICES_DIR))?;
     let body = serde_json::to_vec(n).map_err(std::io::Error::other)?;
     vox_core::node::paths::write_private_file_unique(&notices_file(paths, session), &body)

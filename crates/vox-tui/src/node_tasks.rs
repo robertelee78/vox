@@ -277,8 +277,8 @@ fn may_answer(text: &str) -> bool {
 
 /// The interrupt decision for one entry that just landed in `channel_id`: when it addresses
 /// this node and is marked urgent (ADR-020 §6), and has hops left (§9), every session registered
-/// on this node but the one that posted it, and but one already in its reply chain (V210-121), is
-/// owed a notice. [`tend`] sends it. Everything else waits for the session's next turn.
+/// in this room on this node but the one that posted it, and but one already in its reply chain
+/// (V210-121), is owed a notice. [`tend`] sends it. Other rooms cannot interrupt the session.
 ///
 /// `view` is the node's view as the entry is judged: the room's log, for the hop budget and the
 /// reply chain.
@@ -312,13 +312,16 @@ fn judge(
         return;
     }
     // **A message wakes the agents of the nodes it addresses** (V210-161): `to` names nodes by
-    // fingerprint, and every session of this node hears every room it holds; an entry
-    // `<fingerprint>/<session id>` wakes that one session alone (ADR-029 TA-3).
+    // fingerprint, within each session's saved room (ADR-029 RB-4, RB-5); an entry
+    // `<fingerprint>/<session id>` narrows that to one session (ADR-029 TA-3).
     let Some(me) = view.identity.as_ref().map(|i| i.fingerprint) else {
         return;
     };
     let me_fp = vox_core::node::link::b32_encode(&me);
     for session in crate::wake::registered(paths) {
+        if session.room.as_deref() != Some(room.as_str()) {
+            continue;
+        }
         if !crate::wake::wakes(&envelope, &me_fp, &session.session) {
             continue;
         }
@@ -346,7 +349,7 @@ fn judge(
         if !crate::wake::wakeable(&session.harness) {
             continue;
         }
-        let mut n = crate::wake::notices(paths, &session.session);
+        let mut n = crate::wake::notices_in(paths, &session.session, Some(&room));
         if !n.urgent_due {
             n.urgent_due = true;
             if let Err(e) = crate::wake::save_notices(paths, &session.session, &n) {
@@ -361,12 +364,10 @@ fn judge(
 
 /// Send each session the notice it is owed now, if any (ADR-020 §6; V030-15, V030-20).
 ///
-/// A session hears every room its node holds (V210-163), so it is owed one notice across all of
-/// them. It is looked at when it is owed an urgent notice, while a reply to it is unread, and
-/// when an answer to anything landed in one of its rooms (`answered`). What it is owed is
-/// **counted here, just before sending**, from each room and the session's cursor there, so a
-/// message its drain already read is never announced. [`crate::wake::tend`] has the rules; the
-/// notice carries counts and senders, never a message.
+/// A session works in its saved room alone (ADR-029 RB-4, RB-5). Its notices, unread replies and
+/// answer-triggered checks are confined to that room. What it is owed is **counted here, just
+/// before sending**, from that room and its cursor, so a message its drain already read is never
+/// announced. [`crate::wake::tend`] has the rules; notices carry counts and senders, never a message.
 fn tend(
     paths: &vox_core::node::paths::Paths,
     view: &vox_core::node::api::NodeView,
@@ -387,43 +388,37 @@ fn tend(
     let said_held = &mut t.said_held;
     let me = view.identity.as_ref().map(|i| i.fingerprint);
     let starting = std::mem::take(&mut t.starting);
-    let any_answered = view
-        .open_channels
-        .iter()
-        .any(|d| answered.contains(&d.channel_id));
     for session in crate::wake::registered(paths) {
         if !crate::wake::wakeable(&session.harness) {
             continue;
         }
-        let mut n = crate::wake::notices(paths, &session.session);
-        // Looked at only when something may be owed: every room is read to count it.
-        if !(starting || n.active(&settings) || any_answered) {
+        let Some(room) = session.room.as_deref() else {
+            continue;
+        };
+        let Some(d) = view
+            .open_channels
+            .iter()
+            .find(|d| vox_core::node::link::b32_encode(&d.channel_id) == room)
+        else {
+            continue;
+        };
+        let mut n = crate::wake::notices_in(paths, &session.session, Some(room));
+        if !(starting || n.active(&settings) || answered.contains(&d.channel_id)) {
             continue;
         }
-        // Each room's unread, and the session's read position across all of them: the notice
-        // is outstanding until any of its cursors moves.
-        let mut rooms = Vec::new();
-        let mut cursors = Vec::new();
-        for d in &view.open_channels {
-            let room = vox_core::node::link::b32_encode(&d.channel_id);
-            let cursor = crate::agent_hook::load_cursor(paths, &room, &session.session);
-            let ahead = crate::agent_hook::delivered_ahead(paths, &room, &session.session);
-            cursors.push(format!(
-                "{room}={}",
-                cursor
-                    .as_ref()
-                    .map(vox_core::node::link::b32_encode)
-                    .unwrap_or_default()
-            ));
-            let (urgent, replies) = crate::wake::unread(&d.timeline, me, &session, cursor, &ahead);
-            if !urgent.is_empty() || !replies.is_empty() {
-                rooms.push((d, urgent, replies));
-            }
-        }
-        let urgent: usize = rooms.iter().map(|(_, u, _)| u.len()).sum();
-        let newest_reply = rooms
+        // Only the saved room can contribute unread, a cursor, or reply eligibility.
+        let cursor = crate::agent_hook::load_cursor(paths, room, &session.session);
+        let ahead = crate::agent_hook::delivered_ahead(paths, room, &session.session);
+        let sent_cursor = format!(
+            "{room}={}",
+            cursor
+                .as_ref()
+                .map(vox_core::node::link::b32_encode)
+                .unwrap_or_default()
+        );
+        let (urgent, replies) = crate::wake::unread(&d.timeline, me, &session, cursor, &ahead);
+        let newest_reply = replies
             .iter()
-            .flat_map(|(_, _, r)| r.iter())
             .max_by_key(|r| r.arrival)
             .map(|r| vox_core::node::link::b32_encode(&r.entry_hash));
         let before = n.clone();
@@ -433,13 +428,13 @@ fn tend(
         // marks it. Rows that land while the daemon is down arrive by sync after it starts and are
         // judged as new without this. The window is staged with the test-only `VOX_TEST_WAKE_DEAF`
         // (remote_interrupt_proof, a wake owed when the daemon died; V030-31, #368).
-        if starting && urgent > 0 {
+        if starting && !urgent.is_empty() {
             n.urgent_due = true;
         }
         let outcome = crate::wake::tend(
             &mut n,
-            Some(cursors.join(" ")),
-            urgent,
+            Some(sent_cursor),
+            urgent.len(),
             newest_reply,
             session.idle(now, settings.busy_idle),
             now,
@@ -478,25 +473,19 @@ fn tend(
                 let name = |r: &&vox_core::node::api::MessageRow| {
                     crate::ident::author_for(&view.trusted, me.as_ref(), &r.author)
                 };
-                let owed: Vec<crate::agent_hook::Owed> = rooms
+                let room_name = view
+                    .channels
                     .iter()
-                    .map(|(d, urgent, replies)| {
-                        let label = vox_core::node::link::b32_encode(&d.channel_id);
-                        let room_name = view
-                            .channels
-                            .iter()
-                            .find(|c| c.channel_id == d.channel_id)
-                            .and_then(|c| c.name.clone())
-                            .unwrap_or_default();
-                        crate::agent_hook::Owed {
-                            room_label: label[..12.min(label.len())].to_owned(),
-                            room_name,
-                            urgent: urgent.iter().map(name).collect(),
-                            replies: replies.iter().map(name).collect(),
-                        }
-                    })
-                    .collect();
-                let text = crate::agent_hook::render_wake(&owed);
+                    .find(|c| c.channel_id == d.channel_id)
+                    .and_then(|c| c.name.clone())
+                    .unwrap_or_default();
+                let owed = crate::agent_hook::Owed {
+                    room_label: room[..12.min(room.len())].to_owned(),
+                    room_name,
+                    urgent: urgent.iter().map(name).collect(),
+                    replies: replies.iter().map(name).collect(),
+                };
+                let text = crate::agent_hook::render_wake(&[owed]);
                 let hold = u64::try_from(settings.wake_hold.as_millis()).unwrap_or(u64::MAX);
                 deliver(paths.clone(), session, text, (before, n, hold));
             }
@@ -534,9 +523,10 @@ fn deliver(
         let failed = |paths: &vox_core::node::paths::Paths| {
             crate::wake::undelivered(paths, &session.session, &undo.0, &undo.1, undo.2);
         };
-        let woke = crate::wake::wake(&session, &text);
+        let woke = crate::wake::wake(&paths, &session, &text);
         match tokio::time::timeout(WAKE_DEADLINE, woke).await {
             Ok(Ok(())) => eprintln!("vox daemon: woke session {}", session.session),
+            Ok(Err(crate::wake::WakeError::Moved)) => {}
             // A session that has ended is forgotten, so its name's later messages are
             // not tried against it for ever.
             Ok(Err(crate::wake::WakeError::Gone(e))) => {
