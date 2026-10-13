@@ -1500,7 +1500,61 @@ final class FirstRunProof: XCTestCase {
             XCTAssertTrue(content.status == 0 && content.out.contains("agent hook --light \(harness)"),
                           "PRODUCT: first run must install \(harness)'s light hook at \(path); it reads \(content.out), window said \(hookSaid)")
         }
-        tap(ui, Key.id("agent-hooks-dismiss"), "Dismiss the installed hook paths")
+        // The footer is drawn outside the setup scroll area. XCTest can report its
+        // visible button as non-hittable; drive the actual mouse and prove dismissal.
+        let dismiss = el(ui, Key.id("agent-hooks-dismiss"))
+        let button = dismiss.frame
+        func drawn(_ frame: CGRect) -> Bool {
+            frame.minX.isFinite && frame.minY.isFinite && frame.maxX.isFinite
+                && frame.maxY.isFinite && frame.width > 0 && frame.height > 0
+        }
+        guard drawn(button), let window = ui.windows.allElementsBoundByIndex.first(where: {
+            drawn($0.frame) && $0.frame.contains(button)
+        }) else {
+            keepTree(ui, "the installed-hook Dismiss button was not inside the window")
+            throw Apparatus("the installed-hook Dismiss button has no visible window-contained click point: \(button)")
+        }
+        let at = CGPoint(x: button.midX, y: button.midY)
+        let clearBy = Date().addingTimeInterval(20)
+        var overlay = systemOverlayOver(at, targetHittable: dismiss.isHittable)
+        while overlay?.hasPrefix("Screenshot,") == true, Date() < clearBy {
+            Thread.sleep(forTimeInterval: 0.5)
+            overlay = systemOverlayOver(at, targetHittable: dismiss.isHittable)
+        }
+        guard overlay?.hasPrefix("Screenshot,") != true else {
+            keepTree(ui, "a screenshot overlay covered the installed-hook Dismiss button")
+            throw Apparatus("\(overlay!) covered the installed-hook Dismiss click for 20 s")
+        }
+        // Notification Center's transparent container may cover this point in its
+        // window list. Its bounds alone cannot establish interception; the result
+        // of the real click decides, with an ambiguous interception named separately.
+        let currentButton = dismiss.frame
+        let currentWindow = window.frame
+        guard drawn(currentButton), drawn(currentWindow), currentWindow.contains(currentButton) else {
+            throw Apparatus("the installed-hook Dismiss button moved outside its window before the click")
+        }
+        let clickAt = CGPoint(x: currentButton.midX, y: currentButton.midY)
+        overlay = systemOverlayOver(clickAt, targetHittable: dismiss.isHittable)
+        guard overlay?.hasPrefix("Screenshot,") != true else {
+            throw Apparatus("\(overlay!) covers the installed-hook Dismiss button's current click point")
+        }
+        print("[apparatus] hook Dismiss: id=\(dismiss.identifier), frame=\(currentButton), hittable=\(dismiss.isHittable), overlay=\(overlay ?? "none")")
+        let origin = currentWindow.origin
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
+            .withOffset(CGVector(dx: clickAt.x - origin.x, dy: clickAt.y - origin.y)).click()
+        let dismissedBy = Date().addingTimeInterval(5)
+        func panelGone() -> Bool {
+            locateEverywhere(ui, Key.id("agent-hooks-dismiss")) == nil
+                && locateEverywhere(ui, Key.id("agent-hooks-installed")) == nil
+        }
+        while !panelGone() && Date() < dismissedBy { Thread.sleep(forTimeInterval: 0.25) }
+        guard panelGone() else {
+            keepTree(ui, "the installed-hook panel remained after the actual Dismiss click")
+            if let overlay {
+                throw Apparatus("the physical Dismiss click left the panel open with possible interception by \(overlay)")
+            }
+            throw Product("clicking the visible installed-hook Dismiss button must remove the button and paths panel; both did not disappear")
+        }
 
         // The welcome: the node is made here.
         let name = Key.id("new-node-name")
@@ -4765,12 +4819,6 @@ final class FirstRunProof: XCTestCase {
         // under it on screen (XCTest also found it among the sidebar's descendants); a target
         // with no identifier, or in no scroll view, is clicked where it is.
         let id = e.identifier
-        // XCTest reports the persistent hook footer among the setup scroll view's
-        // descendants even though the rendered footer is its sibling. Its button
-        // must be hittable and wholly inside the actual window, not that scroll area.
-        if id == "agent-hooks-dismiss" {
-            return ui.windows.allElementsBoundByIndex.contains { $0.frame.contains(f) }
-        }
         guard !id.isEmpty, let view = ui.windows.firstMatch.scrollViews.allElementsBoundByIndex.first(where: {
             $0.frame.minX <= f.midX && f.midX <= $0.frame.maxX
                 && $0.descendants(matching: .any).matching(identifier: id).firstMatch.exists
