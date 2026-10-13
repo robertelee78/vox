@@ -44,6 +44,7 @@ use crate::node::network::{Inbound, NodeNet};
 use crate::node::open_rooms::OpenRooms;
 use crate::node::paths::Paths;
 
+mod local_trust;
 mod recovery;
 use crate::node::prekeys::{self, PrekeyRing};
 use crate::node::profile::Profile;
@@ -649,6 +650,8 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::Names(_) => "resolving a .vox name",
         NetEvent::SessionPage { .. } => "reading a page of a room's Session entries",
         NetEvent::MemberDialer(_) => "lending the proxy its dialer",
+        NetEvent::LocalTrustBlacklist(_) => "reading local trust removal decisions",
+        NetEvent::TrustLocalNode { .. } => "applying the daemon's local trust policy",
     }
 }
 
@@ -1044,6 +1047,14 @@ enum NetEvent {
     /// The daemon's proxy (ADR-028 S-5) wants this node's way of reaching a member, to carry a
     /// name that resolved to one of this node's rooms.
     MemberDialer(oneshot::Sender<crate::error::Result<MemberDialer>>),
+    /// Daemon-internal only: no IPC request maps to these policy operations.
+    LocalTrustBlacklist(oneshot::Sender<crate::error::Result<Option<BTreeSet<Digest32>>>>),
+    TrustLocalNode {
+        fingerprint: Digest32,
+        name: String,
+        capability: crate::node::trust::Capability,
+        reply: oneshot::Sender<Outcome>,
+    },
     /// A held room's address was given again and a member it names answered there (V210-167):
     /// keep what it names as the room's, dial its anchors, and answer the join.
     AddressReached {
@@ -8439,6 +8450,18 @@ impl Node {
             NetEvent::Names(reply) => {
                 let _ = reply.send(self.resolver_snapshot().await);
             }
+            NetEvent::LocalTrustBlacklist(reply) => {
+                let _ = reply.send(self.local_trust_blacklist());
+            }
+            NetEvent::TrustLocalNode {
+                fingerprint,
+                name,
+                capability,
+                reply,
+            } => {
+                let outcome = self.trust_local_node(fingerprint, &name, capability).await;
+                let _ = reply.send(outcome);
+            }
             NetEvent::MemberDialer(reply) => {
                 let _ = reply.send(
                     self.net
@@ -14454,7 +14477,13 @@ impl Node {
             crate::node::pending_consent::PendingConsents::load(profile.store(), signer)?;
         // The decision record is sealed under this identity too (#563): from now it is written,
         // what was decided while locked with it.
+        self.decisions.hold_for_local_trust_import(true);
         self.decisions.unlock(signer)?;
+        // Import before a new decision can prune an older release's retained manual removals.
+        // An unreadable old diary stops automation, not ordinary use of the person's identity.
+        if let Err(e) = self.import_local_trust_history() {
+            eprintln!("vox: automatic local trust waits for its removal history: {e}");
+        }
         Ok(())
     }
 
