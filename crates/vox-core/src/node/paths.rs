@@ -233,7 +233,7 @@ impl Account {
 
     /// Node `name`'s paths, **creating nothing** (#666): for a reader, such as an agent's hook,
     /// that may be naming a node that is not on this machine. Only making a node (`vox node
-    /// create`, `vox setup`, `vox agent connect`) makes its directory.
+    /// create`, `vox setup`, `vox agent setup`) makes its directory.
     #[must_use]
     pub fn node_paths_as_they_are(&self, name: &NodeName) -> Paths {
         Paths {

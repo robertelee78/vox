@@ -33,7 +33,7 @@ pub(crate) struct Harness {
     pub(crate) program: &'static str,
 }
 
-/// The harnesses `vox setup` and `vox agent connect` wire.
+/// The harnesses `vox setup` and `vox agent setup` wire.
 pub(crate) const HARNESSES: [Harness; 3] = [
     Harness {
         key: "claude",
@@ -78,7 +78,6 @@ pub fn run(args: &NodeArgs) -> Result<(), AppError> {
     let host = host_name();
     let os = os_name();
     let mut made: Vec<Made> = Vec::new();
-    let mut steps: Vec<String> = Vec::new();
 
     println!("vox setup: looking for harnesses on this machine (their programs on PATH)");
     let found: Vec<(&Harness, PathBuf)> = HARNESSES
@@ -96,7 +95,7 @@ pub fn run(args: &NodeArgs) -> Result<(), AppError> {
         .collect();
 
     for (h, program) in &found {
-        let suggested = NodeName::parse(&format!("{}-{host}", h.key))?;
+        let suggested = NodeName::parse(&suggested_name(h.key, &host))?;
         let wiring = Wiring::of(h.key)?;
         // **A harness wired already is left as it is** (#666): the node its hook names is the
         // one it is, whatever its name, and a second node would only split it in two.
@@ -144,6 +143,7 @@ pub fn run(args: &NodeArgs) -> Result<(), AppError> {
         }
         attach(args, &name, passphrase);
         if h.key == "codex" {
+            trust_codex_hook(program)?;
             match crate::codex_app_server::ensure(program, &wiring.dir) {
                 Ok(_) => println!("  Codex's app-server is running"),
                 Err(why) => println!(
@@ -151,9 +151,6 @@ pub fn run(args: &NodeArgs) -> Result<(), AppError> {
                      through their hooks only"
                 ),
             }
-            steps.push(
-                "run `vox agent trust codex`: Codex runs a hook only once it is trusted".into(),
-            );
         }
         made.push(Made {
             name,
@@ -221,8 +218,19 @@ pub fn run(args: &NodeArgs) -> Result<(), AppError> {
     }
     println!();
     println!("vox setup: {}", crate::ident::NO_BACKUP);
-    for s in steps {
-        println!("vox setup: next, {s}");
+    Ok(())
+}
+
+/// Finish node setup with Codex's own strict hook-trust operation, on either terminal path.
+pub(crate) fn trust_codex_hook(program: &Path) -> Result<(), AppError> {
+    let report = crate::codex_trust::trust(&program.to_string_lossy()).map_err(AppError::Usage)?;
+    if report.found == 0 {
+        return Err(AppError::Usage(
+            "Codex did not report the node hook; setup has not finished".into(),
+        ));
+    }
+    for (_, command) in report.entries {
+        println!("  trusted {command:?}");
     }
     Ok(())
 }
@@ -500,6 +508,13 @@ fn node_word(s: &str) -> String {
     }
 }
 
+/// A valid harness-host suggestion even when the machine's host name fills its own limit.
+pub(crate) fn suggested_name(harness: &str, host: &str) -> String {
+    let mut name = format!("{harness}-{host}");
+    name.truncate(vox_core::node::paths::NODE_NAME_MAX);
+    name
+}
+
 /// This machine's short host name, as a node name holds it.
 pub(crate) fn host_name() -> String {
     let out = std::process::Command::new("hostname")
@@ -626,8 +641,8 @@ impl Wiring {
             ),
             "codex" => format!(
                 "its hook, `vox agent hook --node {node}`, is to go in {}; other Vox hook \
-                 entries there are replaced, nothing else; and Codex's app-server is to be kept \
-                 running (`codex app-server daemon start`), so a plain `codex` session can be \
+                 entries there are replaced, nothing else; the hook is to be trusted; and Codex's \
+                 app-server is to be kept running (`codex app-server daemon start`), so a plain `codex` session can be \
                  followed and driven from Vox: it runs no model",
                 self.hook_file().display()
             ),

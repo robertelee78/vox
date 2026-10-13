@@ -986,7 +986,7 @@ enum AgentCmd {
     ///
     /// Run from a harness session at its start (the agent skill says to), when no hook has
     /// brought Vox's news: it only reads, and says the first thing missing with the one command
-    /// the operator runs for it in a terminal of their own — `vox agent connect` when no node is
+    /// the operator runs for it in a terminal of their own — `vox agent setup` when no node is
     /// wired to the harness, `vox node attach` when its node is not attached, the room ask with
     /// `vox room join … --bind` when the directory is bound to no room — or that nothing is.
     ///
@@ -996,16 +996,17 @@ enum AgentCmd {
     Status(AgentStatusArgs),
     /// Make a node for a harness (or take one that exists), wire the harness to it, and attach it.
     ///
-    /// What `vox setup` does for one harness, by the name you choose: the node is made with a
-    /// passphrase you type twice at this terminal (or `--passphrase-file`), the harness's hook
+    /// What `vox setup` does for one harness: the suggested name is <harness>-<host>, or the
+    /// name you choose with --node. Type the passphrase twice in your own terminal, outside an
+    /// agent session; it is never read from a file or environment variable. The harness's hook
     /// goes in its own settings with the agent skill beside it (other Vox hook entries there are
     /// replaced, nothing else), and the node is attached. It says what it is to do first. Start
     /// a new session of the harness afterwards.
     ///
     /// For example:
     ///
-    /// vox agent connect claude --node claude-mbp
-    Connect(AgentConnectArgs),
+    /// vox agent setup claude --node claude-mbp
+    Setup(AgentSetupArgs),
     /// Check that this node's agent sessions are wired up, and say how to fix what is not.
     ///
     /// One line per check, `ok`, `warn` or `fail`, each with a one-line fix: the node answers;
@@ -1048,20 +1049,16 @@ pub struct AgentStatusArgs {
     pub dir: Option<PathBuf>,
 }
 
-/// `vox agent connect`
+/// `vox agent setup`
 #[derive(Args, Debug, Clone)]
-pub struct AgentConnectArgs {
+pub struct AgentSetupArgs {
     #[command(flatten)]
     pub profile: AccountArgs,
     /// The harness to wire: `claude`, `codex` or `opencode`.
     pub harness: String,
-    /// The node's name: made if there is none, as `vox node create` makes it.
-    #[arg(long, required = true)]
-    pub node: String,
-    /// Read a new node's passphrase (or an existing one's, to attach it) from this file instead
-    /// of asking at the terminal (first line; `-` reads stdin).
+    /// The node's name; defaults to <harness>-<host>, folded to a valid node name.
     #[arg(long)]
-    pub passphrase_file: Option<PathBuf>,
+    pub node: Option<String>,
 }
 
 /// `vox agent doctor`
@@ -3178,12 +3175,11 @@ pub fn run() -> ExitCode {
                 }
             }
         }
-        Cmd::Agent(AgentCmd::Connect(args)) => match block_on_client(async move {
-            crate::agent_setup::connect(
+        Cmd::Agent(AgentCmd::Setup(args)) => match block_on_client(async move {
+            crate::agent_setup::setup(
                 &args.profile.as_node_args(),
                 &args.harness,
-                &args.node,
-                args.passphrase_file.clone(),
+                args.node.as_deref(),
             )
             .await
         }) {

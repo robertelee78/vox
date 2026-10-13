@@ -42,7 +42,7 @@
 //!
 //! And **a harness connected already is left as it is** (#666): `vox setup` run again says Claude
 //! Code is connected to node my-claude and OpenCode to its node, each left as it is, and offers no
-//! second node; `vox agent connect claude --node another` says the same and makes no node.
+//! second node; `vox agent setup claude --node another` says the same and makes no node.
 //! Mutant: the hook's node not looked at (`Wiring::wired_node` ignored); red as PRODUCT.
 //!
 //! And **the doctor judges each harness against its own node** (#666): `vox agent doctor --node
@@ -771,16 +771,16 @@ fn setup_makes_a_node_for_each_installed_harness() {
         "PRODUCT: `vox setup` run again must say each harness is connected to its node and leave \
          it as it is, offering no second node ({status:?}):\n{second}\n`vox node list`:\n{listed}"
     );
-    let (ok, out, err) = d.vox(&["agent", "connect", "claude", "--node", "another"]);
+    let (ok, out, err) = d.vox(&["agent", "setup", "claude", "--node", "another"]);
     let (_, listed, _) = d.vox(&["node", "list"]);
-    println!("[proof] vox agent connect claude --node another said: {out}{err}");
+    println!("[proof] vox agent setup claude --node another said: {out}{err}");
     assert!(
         ok && out.contains("Claude Code is connected to node my-claude; left as it is")
             && !listed.contains("another")
             && std::fs::read_to_string(d.claude_settings())
                 .unwrap_or_default()
                 .contains("--node my-claude"),
-        "PRODUCT: `vox agent connect claude --node another` must say Claude Code is connected to \
+        "PRODUCT: `vox agent setup claude --node another` must say Claude Code is connected to \
          node my-claude and leave it as it is, making no node: {out}{err}\n`vox node list`:\n\
          {listed}"
     );
@@ -1129,11 +1129,34 @@ fn setup_makes_a_node_for_each_installed_harness() {
 /// `app-server daemon start` it leaves a process listening on the app-server's control socket, its
 /// pid in `$CODEX_HOME/listener.pid`, as Codex's daemon would. Never the real Codex.
 const CODEX_STANDIN: &str = r#"#!/usr/bin/env python3
-import os, socket, sys, time
+import hashlib, json, os, socket, sys, time
 home = os.environ.get("CODEX_HOME") or os.path.join(os.environ["HOME"], ".codex")
 os.makedirs(home, exist_ok=True)
 with open(os.path.join(home, "asked"), "a") as f:
     f.write(" ".join(sys.argv[1:]) + "\n")
+if sys.argv[1:] == ["app-server"]:
+    # The existing daemon stand-in also answers setup's hook-trust calls. The real Codex trust
+    # verdict belongs to codex_trust_proof; this caller proves setup reaches its daemon step.
+    trusted = False
+    for line in sys.stdin:
+        request = json.loads(line)
+        result = {}
+        if request.get("method") == "config/batchWrite":
+            trusted = True
+        if request.get("method") == "hooks/list":
+            with open(os.path.join(home, "hooks.json")) as f:
+                groups = json.load(f)["hooks"]["UserPromptSubmit"]
+            hooks = []
+            for group in groups:
+                for hook in group["hooks"]:
+                    command = hook["command"]
+                    hooks.append({"key": "setup-hook", "command": command,
+                        "currentHash": hashlib.sha256(command.encode()).hexdigest(),
+                        "trustStatus": "trusted" if trusted else "untrusted"})
+            result = {"data": [{"hooks": hooks}]}
+        if "id" in request:
+            print(json.dumps({"id": request["id"], "result": result}), flush=True)
+    sys.exit(0)
 if sys.argv[1:4] == ["app-server", "daemon", "start"]:
     d = os.path.join(home, "app-server-control")
     os.makedirs(d, exist_ok=True)
@@ -1186,8 +1209,8 @@ fn setup_keeps_codex_app_server_running() {
     }
     println!("[proof] vox setup said:\n{said}\n[proof] the stand-in codex was asked:\n{asked}");
     assert!(
-        status.success(),
-        "PRODUCT: `vox setup` failed ({status:?}):\n{said}"
+        status.success() && !said.contains("next, run `vox agent trust"),
+        "PRODUCT: `vox setup` must finish without a separate Codex trust step ({status:?}):\n{said}"
     );
     let before = said.find("Codex's app-server is to be kept running");
     let after = said.find("Codex's app-server is running");

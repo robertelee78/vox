@@ -790,7 +790,7 @@ async fn sessions(paths: &Paths) -> Vec<Check> {
         return vec![warn(
             "sessions",
             "no agent session has drained on this node yet: a session registers on its first turn",
-            "open a session in a harness wired to this node (vox agent connect wires one)",
+            "open a session in a harness wired to this node (vox agent setup wires one)",
         )];
     }
     let busy_idle = crate::wake::Settings::load(paths).0.busy_idle;
