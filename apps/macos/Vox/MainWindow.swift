@@ -18,8 +18,6 @@ struct MainWindow: View {
                 NodeStopped(model: model)
                 Divider()
             }
-            // A repo with no room (ADR-029 RB-5): one banner across the window.
-            RoomAskBanner(model: model)
             if model.daemonReachable && (!model.health.isEmpty || !model.recovered.isEmpty) {
                 VStack(alignment: .leading, spacing: Space.s4) {
                     ForEach(model.health) { issue in

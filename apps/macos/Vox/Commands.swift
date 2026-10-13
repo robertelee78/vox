@@ -11,7 +11,7 @@ extension Notification.Name {
 
 /// A sheet a menu, key or palette action opens.
 enum NodeSheet: String, Identifiable {
-    case palette, newRoom, joinRoom, fingerprint, rename, retention, admins, leave, end
+    case palette, newRoom, joinRoom, repoRoom, fingerprint, rename, retention, admins, leave, end
     var id: String { rawValue }
 }
 
@@ -269,6 +269,10 @@ struct NodeSheets: View {
             case .palette: Palette(model: model)
             case .newRoom: RoomForm(model: model, joining: false)
             case .joinRoom: RoomForm(model: model, joining: true)
+            case .repoRoom:
+                if let ask = model.roomAskDialog {
+                    RoomAskDialog(model: model, ask: ask).id(ask.dir)
+                }
             case .fingerprint: FingerprintSheet(model: model)
             case .rename: RenameSheet(model: model)
             case .retention: RetentionSheet(model: model)
