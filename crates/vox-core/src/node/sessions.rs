@@ -35,8 +35,10 @@ pub struct SessionRow {
     pub can_drive: bool,
 }
 
-/// The Sessions a room's log holds, oldest opening first: each `session` entry opens one, and a
-/// later `session-end` from the same node and session ends it. A `session` from a session already
+/// The room's currently visible Sessions, oldest opening first: this node's own and those of
+/// authors granting it drive (ADR-031 SA-1/SA-2). Retained records alone never grant discovery.
+/// Each `session` entry opens one; a later `session-end` from the same node and session ends it.
+/// A `session` from a session already
 /// open names it again and changes nothing else. A Session's name is the newest its node gave, on
 /// those records or on any message the session posted while open (ADR-029 SE-3, MD-1), so a
 /// renamed session's label changes with its next message.
@@ -206,6 +208,9 @@ pub fn fold(detail: &ChannelDetail) -> Vec<SessionRow> {
         }
     }
     renamed(&timeline, &mut rows, &spans);
+    // Current drive authority includes this node itself. Keep previously read data (SA-7),
+    // but do not expose a revoked author's retained Session metadata or addressing targets.
+    rows.retain(|row| row.can_drive);
     rows
 }
 
