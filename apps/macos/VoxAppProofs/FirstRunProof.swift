@@ -1951,6 +1951,12 @@ final class FirstRunProof: XCTestCase {
         let data = root.appendingPathComponent("data").path
         let config = root.appendingPathComponent("config").path
         let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        // Attached nodes on Alice's daemon can become trusted automatically (#724). Carol
+        // must really be a peer on another daemon for this manual-offer journey.
+        let carolRoot = root.appendingPathComponent("carol-host")
+        let carolEnv = ["VOX_DATA_DIR": carolRoot.appendingPathComponent("data").path,
+                        "VOX_CONFIG_DIR": carolRoot.appendingPathComponent("config").path,
+                        "VOX_PROXY": "127.0.0.1:0"]
         let pass = { (name: String) in root.appendingPathComponent("\(name).pass").path }
         for name in ["alice", "bob", "carol"] {
             try stager.write(Data("\(name) identity\n".utf8), to: pass(name))
@@ -1960,13 +1966,17 @@ final class FirstRunProof: XCTestCase {
         try stager.write(Data("alice\n".utf8), to: config + "/app/node")
         daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
+        let carolDaemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: carolEnv,
+                                    until: "vox daemon: control socket")
+        defer { carolDaemon.terminate() }
         for name in ["alice", "bob", "carol"] {
+            let nodeEnv = name == "carol" ? carolEnv : voxEnv
             try staged(vox, ["node", "create", name],
-                       env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "\(name) identity"]) { $1 })
-            try staged(vox, ["node", "attach", name, "--passphrase-file", pass(name)], env: voxEnv)
+                       env: nodeEnv.merging(["VOX_IDENTITY_PASSPHRASE": "\(name) identity"]) { $1 })
+            try staged(vox, ["node", "attach", name, "--passphrase-file", pass(name)], env: nodeEnv)
         }
         let bobFp = try line(staged(vox, ["id", "--node", "bob"], env: voxEnv)) { $0.count == 52 }
-        let carolFp = try line(staged(vox, ["id", "--node", "carol"], env: voxEnv)) { $0.count == 52 }
+        let carolFp = try line(staged(vox, ["id", "--node", "carol"], env: carolEnv)) { $0.count == 52 }
         try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", pass("room"),
                          "--name", "pending"], env: voxEnv)
         let room = try line(staged(vox, ["room", "list", "--node", "alice"], env: voxEnv)) {
@@ -1977,7 +1987,7 @@ final class FirstRunProof: XCTestCase {
         }
         // Carol joins: alice is offered carol (K-15).
         try staged(vox, ["room", "join", "--node", "carol", "--passphrase-file", pass("room"), link],
-                   env: voxEnv)
+                   env: carolEnv)
         let offerUntil = Date().addingTimeInterval(30)
         var offers = ""
         while Date() < offerUntil && !offers.contains(String(carolFp.prefix(12))) {
@@ -2001,9 +2011,14 @@ final class FirstRunProof: XCTestCase {
         // In the room she joined, at the top of its General (v0.4.3: a trust offer is in the room
         // it concerns; the sidebar lists rooms only).
         tap(ui, Key.id("room-pending"), "pending in the sidebar")
+        offers = run(vox, ["trust", "offers", "--node", "alice"], env: voxEnv).out
+        guard offers.contains(String(carolFp.prefix(12))) else {
+            throw Apparatus("staging no longer holds after opening the app: alice is not offered carol; `vox trust offers` said \(offers)")
+        }
         tap(ui, Key.id("offer-\(carolFp.prefix(12))"), "carol's offer at the top of pending's General",
             premise: Premise("carol is offered to alice") {
-                (offers.contains(String(carolFp.prefix(12))), "`vox trust offers` said \(offers.debugDescription)")
+                offers = self.run(vox, ["trust", "offers", "--node", "alice"], env: voxEnv).out
+                return (offers.contains(String(carolFp.prefix(12))), "`vox trust offers` said \(offers.debugDescription)")
             })
         let explain = words(ui, Key.id("offer-explain"), timeout: 10,
                             "carol's offer must say what trusting her gives") ?? ""
@@ -2043,7 +2058,8 @@ final class FirstRunProof: XCTestCase {
         let offer = Key.id("offer-\(carolFp.prefix(12))")
         tap(ui, offer, "carol's offer at the top of pending's General",
             premise: Premise("carol is offered to alice") {
-                (offers.contains(String(carolFp.prefix(12))), "`vox trust offers` said \(offers.debugDescription)")
+                offers = self.run(vox, ["trust", "offers", "--node", "alice"], env: voxEnv).out
+                return (offers.contains(String(carolFp.prefix(12))), "`vox trust offers` said \(offers.debugDescription)")
             })
         present(ui, Key.id("offer-alias"), timeout: 10, "carol's offer must open")
         if locate(ui, Key.id("keyring-passphrase")) != nil {
