@@ -2228,7 +2228,7 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("cannot create this journey's private Keychain: \(madeKeychain.out)")
         }
         let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0",
-                      "VOX_TEST_KEYCHAIN": keychain]
+                      "VOX_TEST_KEYCHAIN": keychain, "HOME": home]
         let pass = { (name: String) in root.appendingPathComponent("\(name).pass").path }
         try stager.write(Data("alice identity\n".utf8), to: pass("alice"))
         try stager.write(Data("agent identity\n".utf8), to: pass("claude-a"))
@@ -2588,6 +2588,149 @@ final class FirstRunProof: XCTestCase {
                       "PRODUCT: Not This Repo must save the canonical repository's no: \(noMap)")
         leftDialog()
         print("[proof] RM-1/2/3/5: one repo/worktree dialog; wrong passphrase left map unchanged; Choose and Create moved both next turns; alice created with keyring closed; Not This Repo suppressed later worktree asks")
+
+        // SA-1/2/4: the Session owner is on a genuinely separate, unpaired daemon.
+        let ownerRoot = root.appendingPathComponent("remote-owner")
+        let ownerHome = ownerRoot.appendingPathComponent("home").path
+        let ownerKeychain = ownerRoot.appendingPathComponent("identity.keychain-db").path
+        let ownerEnv = ["VOX_DATA_DIR": ownerRoot.appendingPathComponent("data").path,
+                        "VOX_CONFIG_DIR": ownerRoot.appendingPathComponent("config").path,
+                        "HOME": ownerHome, "VOX_PROXY": "127.0.0.1:0", "VOX_TEST_KEYCHAIN": ownerKeychain]
+        guard stager.run(["/bin/mkdir", "-p", ownerHome], env: [:]).status == 0,
+              stager.run(["/usr/bin/security", "create-keychain", "-p", "", ownerKeychain],
+                         env: ["HOME": ownerHome]).status == 0 else {
+            throw Apparatus("cannot stage the remote Session owner's private HOME and Keychain")
+        }
+        let ownerDaemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: ownerEnv,
+                                    until: "vox daemon: control socket")
+        defer { ownerDaemon.terminate() }
+        let ownerPass = ownerRoot.appendingPathComponent("owner.pass").path
+        try stager.write(Data("owner identity\n".utf8), to: ownerPass)
+        try staged(vox, ["node", "create", "remote-owner", "--passphrase-file", ownerPass], env: ownerEnv)
+        try staged(vox, ["node", "unlock", "remote-owner", "--passphrase-file", ownerPass], env: ownerEnv)
+        let ownerFp = try line(staged(vox, ["id", "--node", "remote-owner"], env: ownerEnv)) { $0.count == 52 }
+        let privacyRoom = rooms["work"] ?? ""
+        let ownerLink = try line(staged(vox, ["room", "link", "--node", "alice", privacyRoom], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        try staged(vox, ["room", "join", "--node", "remote-owner", "--passphrase-file", pass("room"), ownerLink], env: ownerEnv)
+        try staged(vox, ["node", "unlock", "claude-a", "--passphrase-file", pass("claude-a")], env: voxEnv)
+        for (name, fp) in [("alice", aliceFp), ("claude-a", agentFp)] {
+            try staged(vox, ["trust", "add", "--node", name, ownerFp, "--name", "remote-owner",
+                             "--identity-passphrase-file", pass(name)], env: voxEnv)
+            var grant = ["trust", "add", "--node", "remote-owner", fp, "--name", name,
+                         "--identity-passphrase-file", ownerPass]
+            if name == "claude-a" { grant.append("--drive") }
+            try staged(vox, grant, env: ownerEnv)
+        }
+        let grants = try staged(vox, ["trust", "list", "--node", "remote-owner"], env: ownerEnv)
+        guard grants.split(separator: "\n").contains(where: { $0.hasPrefix(aliceFp + "  ") && $0.hasSuffix("  read") }),
+              grants.split(separator: "\n").contains(where: { $0.hasPrefix(agentFp + "  ") && $0.hasSuffix("  read + drive") }) else {
+            throw Apparatus("the independent owner must grant Alice Read and claude-a Read + Drive: \(grants)")
+        }
+        let privateSession = "73973973-aaaa-4bbb-8ccc-000000000739"
+        let hookInput = "{\"session_id\":\"\(privateSession)\",\"hook_event_name\":\"UserPromptSubmit\",\"cwd\":\"\(ownerHome)\",\"transcript_path\":\"\(ownerHome)/transcript.jsonl\",\"prompt\":\"OWNER-SESSION-739\"}"
+        let ownerHook = run(vox, ["agent", "hook", "--node", "remote-owner", "--room", privacyRoom, "--format", "text"],
+                            env: ownerEnv.merging(["CLAUDE_CODE_ENTRYPOINT": "cli"]) { $1 }, input: hookInput)
+        guard ownerHook.status == 0 else { throw Apparatus("the real owner hook failed: \(ownerHook.out)") }
+        let ownSessions = try staged(vox, ["room", "sessions", "--node", "remote-owner", "--json", privacyRoom], env: ownerEnv)
+        guard ownSessions.contains(privateSession) else { throw Apparatus("the owner's real hook did not open its own Session: \(ownSessions)") }
+        try staged(vox, ["room", "post", "--node", "remote-owner", privacyRoom, "READ-CHAT-739"], env: ownerEnv)
+        let chatUntil = Date().addingTimeInterval(60)
+        var chat = ""
+        repeat {
+            chat = try staged(vox, ["room", "read", "--node", "alice", privacyRoom], env: voxEnv)
+            if chat.contains("READ-CHAT-739") { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        } while Date() < chatUntil
+        guard chat.contains("READ-CHAT-739") else { throw Apparatus("Read-only Alice did not receive the ordinary owner chat: \(chat)") }
+        tap(ui, Key.id("room-work"), "Read-only Alice's work room")
+        tap(ui, Key.id("session-general"), "General before Session privacy assertions")
+        guard present(ui, Key.showing("READ-CHAT-739"), timeout: 30,
+                      "Read-only trust must preserve ordinary chat") else { return }
+        let privateRow = Key.id("session-\(privateSession.prefix(8))")
+        XCTAssertNil(locate(ui, privateRow), "PRODUCT: Read-only Alice must see no remote owner's Session row")
+        let aliceSessions = try staged(vox, ["room", "sessions", "--node", "alice", "--json", privacyRoom], env: voxEnv)
+        XCTAssertFalse(aliceSessions.contains(privateSession), "PRODUCT: Read-only Alice must discover no owner Session; \(aliceSessions)")
+        tap(ui, Key.id("compose-to"), "Alice's General To options")
+        XCTAssertNil(locate(ui, Key.id("to-remote-owner-\(privateSession.prefix(8))")),
+                     "PRODUCT: Read-only Alice must not be offered the owner's Session in To")
+        ui.typeKey(.escape, modifierFlags: [])
+        handOff(ui, "q")
+        guard ui.wait(for: .notRunning, timeout: 15) else { throw Product("Quit must stop Alice's client before staging the Drive viewer") }
+        // The next client's acting identity is an initial fixture, never a claim that Forget switches nodes.
+        try stager.write(Data("claude-a\n".utf8), to: config + "/app/node")
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        guard words(ui, Key.id("attached"), timeout: 60, "the authorized viewer must actually act as claude-a",
+                    until: { $0 == "node claude-a, Ready" }) != nil else { return }
+        tap(ui, Key.id("room-work"), "Drive-authorized viewer's work room")
+        guard present(ui, privateRow, timeout: 60, "the Drive member must see the owner's Session") else { return }
+        tap(ui, privateRow, "Read the authorized owner's Session")
+        let receiptUntil = Date().addingTimeInterval(60)
+        var ownerReceipt = run(vox, ["room", "session", "--node", "claude-a", "--json", privacyRoom, privateSession], env: voxEnv)
+        while Date() < receiptUntil && !(ownerReceipt.status == 0 && ownerReceipt.out.contains("OWNER-SESSION-739")) {
+            Thread.sleep(forTimeInterval: 0.5)
+            ownerReceipt = run(vox, ["room", "session", "--node", "claude-a", "--json", privacyRoom, privateSession], env: voxEnv)
+        }
+        guard ownerReceipt.status == 0 && ownerReceipt.out.contains("OWNER-SESSION-739") else {
+            throw Apparatus("the authorized viewer's public Session read did not hold the actual owner entry: \(ownerReceipt.out)")
+        }
+        let ownerTimeline = ui.scrollViews.matching(identifier: "timeline").firstMatch
+        guard ownerTimeline.waitForExistence(timeout: 10) else {
+            throw Apparatus("the selected owner Session's public timeline is absent")
+        }
+        let ownerLines = ownerTimeline.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND (label CONTAINS %@ OR CAST(value, 'NSString') CONTAINS %@)",
+            "entry-line-", "OWNER-SESSION-739", "OWNER-SESSION-739"))
+        func positiveFinite(_ frame: CGRect) -> Bool {
+            frame.minX.isFinite && frame.minY.isFinite && frame.width.isFinite && frame.height.isFinite
+                && frame.width > 0 && frame.height > 0
+        }
+        func ownerLineVisible(_ line: XCUIElement) -> Bool {
+            let body = line.frame, clip = ownerTimeline.frame, window = ui.windows.firstMatch.frame
+            return positiveFinite(body) && positiveFinite(clip) && positiveFinite(window)
+                && clip.contains(body) && window.contains(body)
+        }
+        let lineUntil = Date().addingTimeInterval(30)
+        while Date() < lineUntil {
+            let line = ownerLines.firstMatch
+            if line.exists && ownerLineVisible(line) { break }
+            let clip = ownerTimeline.frame
+            guard positiveFinite(clip), positiveFinite(ui.windows.firstMatch.frame) else {
+                throw Apparatus("the authorized Session's public viewport is not finite and positive: \(clip)")
+            }
+            if line.exists && positiveFinite(line.frame) {
+                ownerTimeline.scroll(byDeltaX: 0, deltaY: max(-200, min(200, clip.midY - line.frame.midY)))
+            } else {
+                ownerTimeline.scroll(byDeltaX: 0, deltaY: -min(200, clip.height * 0.75))
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        let ownerLine = ownerLines.firstMatch
+        guard ownerLine.exists else {
+            keepTree(ui, "publicly received owner Session entry absent from its selected timeline")
+            throw Product("the authorized owner Session must show its received OWNER-SESSION-739 entry in its own timeline")
+        }
+        guard ownerLineVisible(ownerLine) else {
+            keepTree(ui, "owner Session entry could not be realized inside its actual viewport")
+            throw Apparatus("cannot stage the owner entry visibly: entry \(ownerLine.frame), timeline \(ownerTimeline.frame), window \(ui.windows.firstMatch.frame)")
+        }
+        tap(ui, Key.id("session-general"), "General for the authorized To option")
+        tap(ui, Key.id("compose-to"), "Drive-authorized To options")
+        guard present(ui, Key.id("to-remote-owner-\(privateSession.prefix(8))"), timeout: 15,
+                      "the Drive member must be offered the owner's Session in To") else { return }
+        ui.typeKey(.escape, modifierFlags: [])
+        try staged(vox, ["trust", "read", "--node", "remote-owner", agentFp,
+                         "--identity-passphrase-file", ownerPass], env: ownerEnv)
+        missingWithin(ui, privateRow, 60, "downgrade to Read must remove the retained owner's Session row")
+        tap(ui, Key.id("compose-to"), "To options after revocation")
+        XCTAssertNil(locate(ui, Key.id("to-remote-owner-\(privateSession.prefix(8))")),
+                     "PRODUCT: revoked drive must remove the owner's Session To option")
+        ui.typeKey(.escape, modifierFlags: [])
+        try staged(vox, ["trust", "drive", "--node", "remote-owner", agentFp,
+                         "--identity-passphrase-file", ownerPass], env: ownerEnv)
+        guard present(ui, privateRow, timeout: 60, "regrant must restore discovery of the retained owner's Session") else { return }
+        print("[proof] SA-1/2/4: three identities; Read-only chat without Session/To; authorized entry and To; revocation removes discovery; regrant restores")
 
     }
 
