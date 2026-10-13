@@ -19,7 +19,7 @@ use std::time::Duration;
 pub const BOUND: Duration = Duration::from_secs(120);
 
 /// The driver: reads the passphrase on stdin, runs the verb under a pty, types the passphrase at
-/// the first prompt that asks for one, and prints everything the terminal showed, then
+/// first prompt that asks for one (and at a new node's confirmation), then prints the terminal and
 /// `TYPED-EXIT <code> PROMPTED <True|False>`.
 const DRIVER: &str = r#"
 import os, select, signal, sys, time
@@ -32,7 +32,7 @@ pid, fd = os.forkpty()
 if pid == 0:
     os.execv(argv[0], argv)
 name_sent = False
-out, sent, deadline, killed = b"", False, time.time() + bound, False
+out, sent, confirmed, deadline, killed = b"", False, False, time.time() + bound, False
 while True:
     if time.time() > deadline and not killed:
         os.kill(pid, signal.SIGKILL)
@@ -52,10 +52,16 @@ while True:
     if name is not None and not name_sent and b"Your name for " in out and out.rstrip().endswith(b":"):
         os.write(fd, name + b"\r")
         name_sent = True
-    if not sent and out.rstrip().endswith(b"passphrase:"):
+    prompt = out.rstrip().rsplit(b"\n", 1)[-1]
+    if not sent and (prompt.endswith(b"passphrase:") or
+                     (prompt.startswith(b"passphrase for ") and prompt.endswith(b":"))):
         time.sleep(0.5)  # as a person reads the prompt: never before its terminal is raw
         os.write(fd, secret + b"\r")
         sent = True
+    elif sent and not confirmed and prompt == b"again:":
+        time.sleep(0.5)
+        os.write(fd, secret + b"\r")
+        confirmed = True
 _, st = os.waitpid(pid, 0)
 sys.stdout.write(out.decode("utf-8", "replace"))
 code = os.waitstatus_to_exitcode(st)

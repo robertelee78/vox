@@ -46,7 +46,7 @@ command, give the exact arguments of the `vox` you run. `vox man` prints the sam
 | Close tunnels | `vox tunnel close` | `vox status` lists them |
 | Share and pull files | `vox share`, `vox share list`, `vox share stop`, `vox room get` | an attached node |
 | A room's local network | `vox lan up` | the LAN helper |
-| Wire a harness | `vox agent connect`, `plugin`, `skill`, `trust`, `doctor`, `status` | `--node` |
+| Wire a harness | `vox agent setup`, `plugin`, `skill`, `trust`, `doctor`, `status` | `--node` |
 | Sessions | `vox room sessions`, `vox room session`, `vox agent room`, `vox agent send` | read + drive, to drive |
 | Install, update, remove | `vox update`, `vox uninstall`, `vox shell-setup` | |
 

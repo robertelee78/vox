@@ -69,6 +69,13 @@
 //! later working in another mapped directory, stays where it is: its Session stays open and its
 //! node joins nothing else. Mutant: a start path matched as a prefix.
 //!
+//! **The first turn after joining says who reads whom** (ADR-031 JL-4, #737, same journey):
+//! the room already holds a local personal node and an untrusted remote member. After real
+//! messages prove the local nodes read each other, the next hook turn names the saved room,
+//! local mutual reader and remote member not reading yet. Tool events do not consume the notice;
+//! later turns and a daemon restart do not repeat it. Mutant: omit members not reading yet;
+//! the remote-member sentence assertion turns PRODUCT red.
+//!
 //! **`vox agent room` sets or moves a session's room** (ADR-029 RB-5, #551, the same test): run as
 //! the session in no room, it says what it is to do, sets the room, and opens the session's
 //! Session there, and its next turn is no longer told it works in no room. Run again for another
@@ -136,6 +143,8 @@ const HARNESS_VARS: &[&str] = &[
     "VOX_NODE",
     "VOX_ANCHORS",
     "VOX_LISTEN",
+    "CLAUDE_CODE_SESSION_ID",
+    "CODEX_THREAD_ID",
     "CLAUDE_CODE_MESSAGING_SOCKET",
     "CLAUDE_CODE_MESSAGING_TOKEN",
     "CLAUDE_CODE_ENTRYPOINT",
@@ -927,6 +936,10 @@ fn a_turn_spends_its_tokens_on_what_is_for_the_agent() {
             e["body"].as_str().unwrap_or("")
         )
     };
+
+    // The once-per-session membership notice precedes the conversation whose token cost
+    // this journey measures. Let its actual first hook turn deliver it before anyone posts.
+    turn();
 
     // ---- (1) chatter counted, what is for the reader and prose in full ----
     run(&[
@@ -2316,7 +2329,14 @@ fn restart(d: &mut Daemon, root: &Path) {
     let _ = d.child.wait();
     let err_file = root.join("daemon-2.err");
     d.child = vox(&d.data, &d.cfg)
-        .args(["daemon", "--listen", "127.0.0.1:0", "--passphrase-file"])
+        .args([
+            "daemon",
+            "--node",
+            "default",
+            "--listen",
+            "127.0.0.1:0",
+            "--passphrase-file",
+        ])
         .arg(root.join("identity.pass"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2942,8 +2962,51 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         .unwrap_or_else(|| panic!("PRODUCT (staging): alice lists no second room: {listed}"))
         .to_owned();
     let (link_home, link_other) = (alice.link(&home), alice.link(&other));
-    let agent = Daemon::start_bare(&tmp.path().join("agent"));
+    let mut agent = Daemon::start_bare(&tmp.path().join("agent"));
     let (data, cfg) = (agent.data.clone(), agent.cfg.clone());
+
+    // JL-4 (#737): a person's node on this daemon shares the mapped room. Alice is a remote
+    // member neither local node trusts. The app's saved personal-node choice is apparatus;
+    // attachment, joining, automatic local trust and readable messages use the real CLI.
+    let hook = |data: &Path, cfg: &Path, args: &[&str], stdin: &str| {
+        let mut args = args.to_vec();
+        if !args.contains(&"--node") {
+            args.extend(["--node", "default"]);
+        }
+        crate::hook(data, cfg, &args, stdin)
+    };
+    let pass = tmp.path().join("agent/identity.pass");
+    let pass = pass.to_str().expect("APPARATUS: a UTF-8 path");
+    for args in [
+        vec!["node", "create", "personal", "--passphrase-file", pass],
+        vec![
+            "node",
+            "attach",
+            "personal",
+            "--no-remember",
+            "--passphrase-file",
+            pass,
+        ],
+        vec![
+            "room",
+            "join",
+            &link_home,
+            "--node",
+            "personal",
+            "--passphrase-file",
+            "-",
+        ],
+    ] {
+        // Create/attach select the positional node, not the one-shot default.
+        let (ok, out, err) = crate::hook(&data, &cfg, &args, "channel passphrase");
+        assert!(
+            ok,
+            "PRODUCT (staging): local person's node {args:?}: {out}{err}"
+        );
+    }
+    std::fs::create_dir_all(cfg.join("app")).expect("APPARATUS: app settings directory");
+    std::fs::write(cfg.join("app/node"), "personal\n")
+        .expect("APPARATUS: save the app's personal-node choice");
 
     // The agent's data root maps two directories: the repository to Alice's first room, and
     // another repository to her second.
@@ -3048,8 +3111,6 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     // and a 120 s bound read a join still under way as one that never worked. A join still
     // running past the product's own patience is the product's.
     let deadline = Instant::now() + Duration::from_secs(540);
-    let mut turns = 1;
-    let mut last = first.clone();
     while !(rooms().contains(&home) && open_in(&home, mapped)) {
         // What a red quotes: the first line each turn was told (the join's status), and both
         // daemons' own words.
@@ -3078,21 +3139,18 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
             Instant::now() < deadline,
             "PRODUCT: a session started in {} (mapped to room {home}) never worked there within \
              540 s: the node's rooms {:?}, the room's Sessions {:?}; its first turn was told \
-             {:?}, its last ({turns} turns) {:?}; the map's link {link_home}; the agent's daemon said:\n{}\nAlice's daemon \
+             {:?}; the map's link {link_home}; the agent's daemon said:\n{}\nAlice's daemon \
              said:\n{}",
             repo.display(),
             rooms(),
             sessions(&home),
             said(&first),
-            said(&last),
             tail("agent"),
             tail("alice")
         );
         std::thread::sleep(Duration::from_secs(2));
-        last = turn(mapped, &repo);
-        turns += 1;
     }
-    eprintln!("[proof] (1) first turn told: {first:?}; working in {home} after {turns} turns");
+    eprintln!("[proof] (1) first turn told: {first:?}; its room {home} opened in the background");
     // Where the join's time went, as the agent's daemon said it.
     let agent_log =
         std::fs::read_to_string(tmp.path().join("agent").join("daemon.err")).unwrap_or_default();
@@ -3119,6 +3177,93 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         std::thread::sleep(Duration::from_secs(1));
     };
     eprintln!("[proof] (1) its Session, read once open:\n{read_before}");
+
+    // Establish the local relationship by what each person can read, without consuming the
+    // agent's next hook turn. The remote Alice remains untrusted until the later two-room arm.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (_, ours, _) = hook(&data, &cfg, &["trust", "list"], "");
+        let (_, theirs, _) = hook(&data, &cfg, &["trust", "list", "--node", "personal"], "");
+        if ours.contains("personal") && theirs.contains(&agent.fingerprint) {
+            break;
+        }
+        assert!(Instant::now() < deadline,
+            "PRODUCT (staging): automatic local trust did not appear in both keyrings: agent {ours}; personal {theirs}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let (ok, out, err) = hook(
+        &data,
+        &cfg,
+        &[
+            "room",
+            "post",
+            &home,
+            "LOCAL-PERSON-READY",
+            "--node",
+            "personal",
+        ],
+        "",
+    );
+    assert!(ok, "PRODUCT (staging): local person's message: {out}{err}");
+    let (ok, out, err) = hook(
+        &data,
+        &cfg,
+        &["room", "post", &home, "LOCAL-AGENT-READY"],
+        "",
+    );
+    assert!(ok, "PRODUCT: agent's local conversation: {out}{err}");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (_, agent_reads, _) = hook(&data, &cfg, &["room", "read", &home], "");
+        let (_, person_reads, _) = hook(
+            &data,
+            &cfg,
+            &["room", "read", &home, "--node", "personal"],
+            "",
+        );
+        if agent_reads.contains("LOCAL-PERSON-READY") && person_reads.contains("LOCAL-AGENT-READY")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline,
+            "PRODUCT: local nodes did not read each other before the next agent turn: agent {agent_reads}; personal {person_reads}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    // A tool event while idle must not swallow the notice meant for the next model turn.
+    let tool = serde_json::json!({"session_id":mapped,"cwd":repo,"hook_event_name":"PostToolUse", "tool_name":"Bash", "tool_input":{"command":"true"},"tool_response":""}).to_string();
+    let (ok, out, err) = hook_env(
+        &data,
+        &cfg,
+        &["agent", "hook", "--node", "default"],
+        &tool,
+        &person,
+    );
+    assert!(
+        ok && !out.contains("Your node joined room"),
+        "PRODUCT: a tool event consumed the next-turn join notice: {out}{err}"
+    );
+    let joined = turn(mapped, &repo);
+    let remote: String = alice.fingerprint.chars().take(26).collect();
+    assert!(
+        joined.contains(&format!("Your node joined room agents ({home})")),
+        "PRODUCT: the next turn after joining did not name the saved room: {joined}"
+    );
+    assert!(
+        joined.contains("personal (on this machine): reads you; you read it"),
+        "PRODUCT: the next turn did not name its local reader and whom it reads: {joined}"
+    );
+    assert!(
+        joined.contains(&format!(
+            "{remote}: does not read you yet; you do not read it yet"
+        )),
+        "PRODUCT: the next turn omitted the remote member not reading it yet: {joined}"
+    );
+    let again = turn(mapped, &repo);
+    assert!(
+        !again.contains("Your node joined room"),
+        "PRODUCT: a later turn repeated the already delivered join notice: {again}"
+    );
+    eprintln!("[proof] (1/JL-4) next turn named room, local mutual reader, and remote not reading yet: {joined}");
 
     // (2) A session started in a directory the map does not name, at or above it: no room.
     let below = "22222222-aaaa-4bbb-8ccc-000000000002";
@@ -3266,6 +3411,310 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         sessions(&home),
         rooms()
     );
+
+    // (3b) Two sessions of the same node work in different repositories concurrently (#795).
+    // The second joins its own room; the first's saved room still selects every read and post.
+    let other_session = "3b3b3b3b-aaaa-4bbb-8ccc-000000000032";
+    let first_other = turn(other_session, &other_repo);
+    let deadline = Instant::now() + Duration::from_secs(540);
+    while !open_in(&other, other_session) {
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: the second repository session never opened in {other}; first turn \
+             {first_other:?}, rooms {:?}, Sessions {:?}",
+            rooms(),
+            sessions(&other)
+        );
+        std::thread::sleep(Duration::from_secs(1));
+        turn(other_session, &other_repo);
+    }
+    for (who, peer, name) in [(&agent, &alice, "alice"), (&alice, &agent, "agent")] {
+        let pass = who
+            .data
+            .parent()
+            .expect("APPARATUS: a root")
+            .join("identity.pass");
+        let (ok, out, err) = hook(
+            &who.data,
+            &who.cfg,
+            &[
+                "trust",
+                "add",
+                &peer.fingerprint,
+                "--name",
+                name,
+                "--identity-passphrase-file",
+                pass.to_str().expect("APPARATUS: a UTF-8 path"),
+            ],
+            "",
+        );
+        assert!(
+            ok,
+            "PRODUCT: trust for the two-room conversation failed: {out}{err}"
+        );
+    }
+    let as_session = |session: &str, args: &[&str]| {
+        hook_env(
+            &data,
+            &cfg,
+            args,
+            "",
+            &[("VOX_SESSION", session), ("VOX_NODE", "default")],
+        )
+    };
+    let read_room = |room: &str| -> Vec<serde_json::Value> {
+        let (ok, out, err) = hook(&data, &cfg, &["room", "read", room, "--json"], "");
+        assert!(ok, "PRODUCT: reading room {room} failed: {out}{err}");
+        out.lines()
+            .map(|line| {
+                serde_json::from_str(line).unwrap_or_else(|e| {
+                    panic!("PRODUCT: room {room} printed invalid row JSON: {e}: {line}")
+                })
+            })
+            .collect()
+    };
+    let posted = |session: &str, args: &[&str]| {
+        let (ok, out, err) = as_session(session, args);
+        assert!(
+            ok,
+            "PRODUCT: session {session} command {args:?} failed: {out}{err}"
+        );
+        out
+    };
+    for (session, room, marker) in [
+        (mapped, home.as_str(), "ONLY-REPO-A"),
+        (other_session, other.as_str(), "ONLY-REPO-B"),
+    ] {
+        posted(
+            session,
+            &[
+                "room",
+                "post",
+                room,
+                &format!("{marker} ordinary conversation"),
+            ],
+        );
+        let resource = format!("work:{marker}");
+        posted(session, &["room", "claim", room, &resource]);
+        posted(
+            session,
+            &[
+                "room",
+                "post",
+                room,
+                "--type",
+                "ask",
+                &format!("{marker} work question"),
+            ],
+        );
+        let question = read_room(room)
+            .into_iter()
+            .find(|row| {
+                row["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains(&format!("{marker} work question")))
+            })
+            .and_then(|row| row["entry_hash"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| {
+                panic!("PRODUCT: room {room} did not show the posted {marker} question")
+            });
+        posted(
+            session,
+            &[
+                "room",
+                "post",
+                room,
+                "--type",
+                "reply",
+                "--re",
+                &question,
+                &format!("{marker} reply"),
+            ],
+        );
+        posted(
+            session,
+            &[
+                "room",
+                "handoff",
+                room,
+                &resource,
+                "--to",
+                &alice.fingerprint,
+            ],
+        );
+    }
+    for (room, own, foreign, session, other_id) in [
+        (&home, "ONLY-REPO-A", "ONLY-REPO-B", mapped, other_session),
+        (&other, "ONLY-REPO-B", "ONLY-REPO-A", other_session, mapped),
+    ] {
+        let rows = read_room(room);
+        let text = serde_json::to_string(&rows).expect("APPARATUS: serialize room output");
+        for word in ["ordinary conversation", "work question", "reply"] {
+            assert!(
+                text.contains(&format!("{own} {word}")),
+                "PRODUCT: room {room} lost its own {word}: {text}"
+            );
+        }
+        for kind in ["hello", "claim", "handoff"] {
+            assert!(
+                rows.iter().any(|row| {
+                    row["text"]
+                        .as_str()
+                        .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+                        .is_some_and(|e| e["type"] == kind && e["from"] == session)
+                }),
+                "PRODUCT: room {room} lacks its session's {kind}: {text}"
+            );
+        }
+        assert!(
+            !text.contains(foreign) && !text.contains(other_id),
+            "PRODUCT: room {room} contains another repository's conversation/coordination: {text}"
+        );
+        assert!(
+            open_in(room, session) && !open_in(room, other_id),
+            "PRODUCT: room {room} exposes the wrong repository's Session: {:?}",
+            sessions(room)
+        );
+    }
+
+    // A person's local posts are readable immediately, so no network/timing inference is needed
+    // to establish which room each hook actually delivered. Worktree/cwd changes do not move it.
+    for (room, text) in [(&home, "NEWS-FOR-REPO-A"), (&other, "NEWS-FOR-REPO-B")] {
+        let (ok, out, err) = hook(&data, &cfg, &["room", "post", room, text], "");
+        assert!(ok, "PRODUCT: the person's room message failed: {out}{err}");
+    }
+    let a_news = turn(mapped, &other_repo);
+    let b_news = turn(other_session, &worktree);
+    let no_news = turn(below, &other_repo);
+    assert!(
+        a_news.contains("NEWS-FOR-REPO-A") && !a_news.contains("NEWS-FOR-REPO-B"),
+        "PRODUCT: repository A's hook delivered the wrong room after cwd changed: {a_news}"
+    );
+    assert!(
+        b_news.contains("NEWS-FOR-REPO-B") && !b_news.contains("NEWS-FOR-REPO-A"),
+        "PRODUCT: repository B's hook delivered the wrong room from A's worktree: {b_news}"
+    );
+    assert!(
+        !no_news.contains("NEWS-FOR-REPO-A") && !no_news.contains("NEWS-FOR-REPO-B"),
+        "PRODUCT: an unbound session received another repository's news: {no_news}"
+    );
+
+    // Wrong-room commands must leave neither their requested entry nor an automatic hello.
+    // Comparing the actual room histories also catches a refusal printed after a partial post.
+    let before_home = read_room(&home);
+    let before_other = read_room(&other);
+    for (session, room, expected, args) in [
+        (
+            mapped,
+            other.as_str(),
+            home.as_str(),
+            vec!["room", "post", other.as_str(), "WRONG-ROOM-RAW"],
+        ),
+        (
+            mapped,
+            other.as_str(),
+            home.as_str(),
+            vec!["room", "claim", other.as_str(), "work:WRONG-ROOM-CLAIM"],
+        ),
+        (
+            other_session,
+            home.as_str(),
+            other.as_str(),
+            vec![
+                "room",
+                "post",
+                home.as_str(),
+                "--type",
+                "ask",
+                "WRONG-ROOM-ASK",
+            ],
+        ),
+        (
+            below,
+            home.as_str(),
+            "no room",
+            vec!["room", "claim", home.as_str(), "work:UNBOUND-CLAIM"],
+        ),
+    ] {
+        let (ok, out, err) = as_session(session, &args);
+        assert!(!ok && err.contains(expected) && err.contains(room) && err.contains("nothing was posted"),
+            "PRODUCT: {session}'s wrong-room command must refuse and name saved {expected} and target {room}: {out}{err}");
+    }
+    // Supplying B's id in raw metadata must not override A's actual caller context.
+    let disguised =
+        serde_json::json!({"v":1,"type":"say","from":other_session,"body":"WRONG-ROOM-DISGUISED"})
+            .to_string();
+    let (ok, out, err) = as_session(mapped, &["room", "post", &other, &disguised]);
+    assert!(
+        !ok && err.contains(&home) && err.contains(&other),
+        "PRODUCT: raw session metadata bypassed the caller's working room: {out}{err}"
+    );
+    assert_eq!(
+        read_room(&home),
+        before_home,
+        "PRODUCT: refused commands changed repository A's history"
+    );
+    assert_eq!(
+        read_room(&other),
+        before_other,
+        "PRODUCT: refused commands changed repository B's history or appended a hello"
+    );
+
+    let payload = serde_json::json!({"session_id":mapped,"hook_event_name":"UserPromptSubmit","cwd":other_repo,"prompt":"hi"}).to_string();
+    let (ok, out, err) = hook_env(
+        &data,
+        &cfg,
+        &["agent", "hook", "--node", "default", "--room", &other],
+        &payload,
+        &person,
+    );
+    assert!(
+        ok && out.contains(&home)
+            && out.contains(&other)
+            && out.contains("nothing was posted")
+            && !out.contains("NEWS-FOR-REPO-B"),
+        "PRODUCT: an explicit hook room must not override the saved room: {out}{err}"
+    );
+    eprintln!("[proof] (3b) concurrent repository messages, claims, replies, handoffs and hook news stay in their own rooms; explicit mismatches and unbound coordination refuse before posting");
+
+    restart(&mut agent, &tmp.path().join("agent"));
+    for (room, text) in [(&home, "RESTART-NEWS-A"), (&other, "RESTART-NEWS-B")] {
+        let (ok, out, err) = hook(&data, &cfg, &["room", "post", room, text], "");
+        assert!(
+            ok,
+            "PRODUCT: posting after daemon restart failed: {out}{err}"
+        );
+    }
+    let a_restart = turn(mapped, &other_repo);
+    let b_restart = turn(other_session, &worktree);
+    assert!(
+        !a_restart.contains("Your node joined room"),
+        "PRODUCT: restarting the daemon repeated the delivered join notice: {a_restart}"
+    );
+    assert!(
+        a_restart.contains("RESTART-NEWS-A")
+            && !a_restart.contains("RESTART-NEWS-B")
+            && b_restart.contains("RESTART-NEWS-B")
+            && !b_restart.contains("RESTART-NEWS-A"),
+        "PRODUCT: restart/cwd changes moved a saved session room: A {a_restart}; B {b_restart}"
+    );
+    posted(mapped, &["agent", "room", &other]);
+    let before = read_room(&home);
+    let (ok, out, err) = as_session(mapped, &["room", "post", &home, "STALE-TARGET-A"]);
+    assert!(
+        !ok && err.contains(&other) && err.contains(&home) && read_room(&home) == before,
+        "PRODUCT: a stale cached room still accepted a post after a deliberate move: {out}{err}"
+    );
+    posted(mapped, &["room", "post", &other, "DELIBERATELY-MOVED-TO-B"]);
+    assert!(
+        open_in(&other, mapped)
+            && !open_in(&home, mapped)
+            && read_room(&other).iter().any(|r| r["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("DELIBERATELY-MOVED-TO-B"))),
+        "PRODUCT: deliberate room move did not move the Session and its conversation"
+    );
+    eprintln!("[proof] (3b) restart preserves each saved room; a deliberate move works and rejects its old cached target");
 
     // (4) `vox agent room`, run as the session in no room, sets its room.
     let as_below = [("VOX_SESSION", below), ("VOX_NODE", "default")];
@@ -3418,7 +3867,7 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
          again; `vox agent room --none` said {no}{err}, and the next session was told {second_ask:?}"
     );
 
-    // (5c) The operator binds a repo to a room at a terminal of their own: the agent's node joins,
+    // (5c) The operator binds a repo to a room at a terminal of their own: its passphrase is checked,
     // the no recorded for that repo is replaced (and said), and every later session started there
     // works in that room, asked nothing.
     let bound_dir = std::fs::canonicalize(&declined_repo).unwrap_or(declined_repo.clone());
@@ -3459,13 +3908,13 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     let joined = bind(&link_other, "other passphrase");
     eprintln!("[proof] (5c) `vox room join --bind` at a terminal said: {joined}");
     assert!(
-        joined.contains("vox: joined")
+        joined.contains("vox: checked the passphrase for held room elsewhere")
             && joined.contains("every node of this data root can read the map")
             && joined.contains(&format!(
                 "vox: bound {}, replacing what the room map held for it: a no",
                 bound_dir.display()
             )),
-        "PRODUCT: `vox room join --bind` must join, say what binding changes, bind, and say it \
+        "PRODUCT: `vox room join --bind` must check the held room's passphrase, say what binding changes, bind, and say it \
          replaced the no recorded for the directory: {joined}"
     );
     lands_in(&other, "77777777-aaaa-4bbb-8ccc-000000000007");

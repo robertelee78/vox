@@ -16,6 +16,12 @@
 //!    hook` behind a pipe, a `;`, a `$(…)`, another binary, or an unknown flag — and a
 //!    trusted entry **tampered** into one (Codex lists it `modified`) is not re-trusted.
 //!
+//! **Agent setup replaces the light hook without a separate trust step** (ADR-031 NC-4–6,
+//! HK-5, #722): from an operator pty, including SSH, the suggested harness-host name is valid,
+//! the passphrase is typed twice, the node is attached and Codex reports its replacement hook
+//! trusted. Agent-marked ptys and non-terminal commands cannot make a node. Mutant: skip
+//! Wiring::install in agent setup, leaving the light hook; PRODUCT at the hook assertion below.
+//!
 //! **Not proved here:** that a trusted hook then fires in a live Codex turn. That needs a
 //! model login inside the isolated `CODEX_HOME`, and this proof does not take the
 //! operator's credentials; `codex_live_proof` does, sandboxed and on request (#169). Trust is
@@ -42,6 +48,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/typed.rs"]
+mod typed;
+
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -65,7 +74,9 @@ fn isolated(program: &str, home: &Path) -> Command {
     }
     c.env("HOME", &user_home)
         .env("TMPDIR", &user_home)
-        .env("CODEX_HOME", home);
+        .env("CODEX_HOME", home)
+        .env("VOX_DATA_DIR", home.join("vox-data"))
+        .env("VOX_CONFIG_DIR", home.join("vox-config"));
     c
 }
 
@@ -80,7 +91,10 @@ fn codex_present(home: &Path) -> bool {
 /// command replaced. The shape is the product's, not this file's: a hand-written shape is how a
 /// flat entry Codex ignores shipped while this proof stayed green (V210-133, #352).
 fn plugin_entry(command: &str) -> serde_json::Value {
+    let scratch = tempfile::tempdir().expect("APPARATUS: plugin scratch roots");
     let out = Command::new(VOX)
+        .env("VOX_DATA_DIR", scratch.path().join("data"))
+        .env("VOX_CONFIG_DIR", scratch.path().join("config"))
         .args(["agent", "plugin", "codex", "--node", "default"])
         .output()
         .expect("APPARATUS: cannot run vox agent plugin codex");
@@ -125,6 +139,10 @@ const HOSTILE: &[&str] = &[
     "vox agent hook --node default --profile default",
     // Two nodes: which one would it act as?
     "vox agent hook --node default --node other",
+    "vox agent hook --light codex --node default",
+    "vox agent hook --light claude",
+    "vox agent hook --light codex --data-dir /tmp/other",
+    "vox agent hook --light codex; echo changed",
 ];
 
 /// `command -> trustStatus`, asked of Codex's own app-server, independently of vox.
@@ -225,11 +243,144 @@ fn vox_trust_with(home: &Path, extra: &[&str]) -> (bool, String) {
     )
 }
 
+/// Setup starts only this scratch account's daemon and Codex app-server; reap both on a red too.
+struct SetupProcesses(std::path::PathBuf);
+
+impl Drop for SetupProcesses {
+    fn drop(&mut self) {
+        let _ = isolated("codex", &self.0)
+            .args(["app-server", "daemon", "stop"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if let Some(pid) = std::fs::read_to_string(self.0.join("vox-data/.daemon/lock"))
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+        {
+            let _ = Command::new("/bin/kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+        }
+    }
+}
+
+/// Continue the installation journey at the operator's terminal, never with a model login.
+fn setup_replaces_light_hook(home: &Path) {
+    let _processes = SetupProcesses(home.to_path_buf());
+    let light = std::fs::read(home.join("hooks.json"))
+        .expect("APPARATUS: installed light hook before setup");
+    for marker in ["VOX_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"] {
+        let mut command = isolated(VOX, home);
+        command
+            .args(["agent", "setup", "codex", "--node", "agent-must-not-create"])
+            .env(marker, "marked-session")
+            .env("SSH_CONNECTION", "127.0.0.1 1234 127.0.0.1 22");
+        let (ok, said) = typed::typed(&command, "not for the agent");
+        assert!(!ok && said.contains("terminal of your own outside the agent session")
+            && !said.contains("passphrase for ") && !home.join("vox-data").exists()
+            && std::fs::read(home.join("hooks.json")).ok().as_ref() == Some(&light),
+            "PRODUCT: {marker}-marked setup must refuse before a passphrase prompt or node/hook change: {said}");
+    }
+    let out = isolated(VOX, home)
+        .args(["agent", "setup", "codex"])
+        .env("VOX_IDENTITY_PASSPHRASE", "must not be used")
+        .stdin(Stdio::null())
+        .output()
+        .expect("APPARATUS: non-terminal setup");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success()
+            && said.contains("terminal of your own")
+            && !home.join("vox-data").exists(),
+        "PRODUCT: setup must refuse a non-terminal even with an environment passphrase: {said}"
+    );
+
+    // The host's real interface, with a long mixed-case host name supplied by the apparatus.
+    let bin = home.join("host-bin");
+    std::fs::create_dir_all(&bin).expect("APPARATUS: host program directory");
+    let hostname = bin.join("hostname");
+    std::fs::write(
+        &hostname,
+        format!("#!/bin/sh\nprintf '%s\\n' 'MiXeD_{}'\n", "H".repeat(70)),
+    )
+    .expect("APPARATUS: hostname stand-in");
+    std::fs::set_permissions(
+        &hostname,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("APPARATUS: executable hostname stand-in");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let node = format!("codex-mixed-{}", "h".repeat(52));
+    let mut setup = isolated(VOX, home);
+    setup
+        .args(["agent", "setup", "codex"])
+        .env("PATH", &path)
+        .env("SSH_CONNECTION", "127.0.0.1 1234 127.0.0.1 22");
+    let secret = "the operator types this";
+    let (ok, said) = typed::typed(&setup, secret);
+    println!("[proof] operator SSH terminal setup said:\n{said}");
+    assert!(ok && said.contains(&format!("suggested node name {node}"))
+        && said.contains(&format!("passphrase for {node} (Enter alone for none):"))
+        && said.contains("again:") && said.contains(&format!("node {node} attached"))
+        && !said.contains(secret) && !said.contains("vox agent connect")
+        && !said.contains("next, run `vox agent trust"),
+        "PRODUCT: terminal setup must suggest a valid harness-host name, ask for its passphrase twice without echoing it, and attach it with no extra trust step: {said}");
+    let commands = trust_status(home);
+    let hook = format!("vox agent hook --node {node}");
+    assert!(
+        commands
+            .iter()
+            .any(|(command, trust)| command == &hook && trust == "trusted")
+            && !commands
+                .iter()
+                .any(|(command, _)| command == "vox agent hook --light codex"),
+        "PRODUCT: setup must replace the light hook with its trusted node hook: {commands:?}"
+    );
+    let listed = isolated(VOX, home)
+        .args(["node", "list"])
+        .output()
+        .expect("APPARATUS: list the node setup made");
+    assert!(
+        listed.status.success() && String::from_utf8_lossy(&listed.stdout).contains(&node),
+        "PRODUCT: the node made at the terminal must appear in node list: {}{}",
+        String::from_utf8_lossy(&listed.stdout),
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    for args in [
+        vec!["agent", "--help"],
+        vec!["agent", "setup", "--help"],
+        vec!["agent", "status", "--harness", "claude"],
+    ] {
+        let out = isolated(VOX, home)
+            .args(&args)
+            .output()
+            .expect("APPARATUS: setup help/status");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success() && !text.contains("vox agent connect")
+            && !text.lines().any(|line| line.trim_start().starts_with("connect "))
+            && !text.contains("--passphrase-file"),
+            "PRODUCT: current agent help and status must name setup with terminal-only passphrases: {args:?}: {text}");
+    }
+    println!("[proof] OPTIONAL LIVE-MODEL OBSERVATION NOT RUN: Codex reports its node hook trusted; no model turn was started");
+}
+
 #[test]
 #[ignore = "drives the installed Codex's app-server; run where Codex is installed"]
 fn vox_trusts_its_own_codex_hook_and_nothing_else() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    // Short paths leave room for the account daemon's Unix socket on macOS.
+    let tmp = tempfile::Builder::new()
+        .prefix("vox-codex-")
+        .tempdir_in("/tmp")
+        .expect("APPARATUS: no temp dir");
     let home = tmp.path();
 
     // ---- (0) the programs this proof starts get none of its environment ----
@@ -280,6 +431,25 @@ fn vox_trusts_its_own_codex_hook_and_nothing_else() {
         "APPARATUS (precondition not met): this proof needs `codex` on PATH — an absent Codex is not a pass"
     );
     const HOOK: &str = "vox agent hook --node default";
+    const LIGHT: &str = "vox agent hook --light codex";
+
+    // HK-1: installation itself trusts the light hook; no manual trust command follows it.
+    let automatic = home.join("automatic-light");
+    std::fs::create_dir_all(&automatic).expect("APPARATUS: scratch Codex config");
+    let installed = isolated(VOX, &automatic)
+        .args(["agent", "plugin", "--install"])
+        .output()
+        .expect("APPARATUS: run hook installation");
+    let installed_said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&installed.stdout),
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    assert!(installed.status.success()
+        && installed_said.contains(automatic.join("hooks.json").to_str().expect("APPARATUS: UTF-8 path"))
+        && status_of(&automatic, LIGHT) == "trusted",
+        "PRODUCT: installing Codex's light hook must name its file and trust it without another step: {installed_said}");
+    setup_replaces_light_hook(&automatic);
 
     // ---- (1) before: both untrusted ----
     // A real file named `vox` that is not this vox: a path ending in `/vox` is not enough.
@@ -301,7 +471,7 @@ fn vox_trusts_its_own_codex_hook_and_nothing_else() {
         "{} agent hook --node default --room abcdef",
         this_vox.display()
     );
-    let mut all: Vec<&str> = vec![HOOK, &own_abs, &evil, &symlinked];
+    let mut all: Vec<&str> = vec![HOOK, LIGHT, &own_abs, &evil, &symlinked];
     all.extend_from_slice(HOSTILE);
     write_hooks(home, &all);
     assert_eq!(
@@ -318,8 +488,13 @@ fn vox_trusts_its_own_codex_hook_and_nothing_else() {
     // ---- (2) vox trusts its own entry, and only its own ----
     let (ok, said) = vox_trust(home);
     assert!(
-        ok && said.contains("2 newly trusted"),
-        "PRODUCT: `vox agent trust codex` must trust Vox's two entries: {said}"
+        ok && said.contains("3 newly trusted"),
+        "PRODUCT: `vox agent trust codex` must trust Vox's node entries and exact light hook: {said}"
+    );
+    assert_eq!(
+        status_of(home, LIGHT),
+        "trusted",
+        "PRODUCT: the installed Codex light hook must be trusted without a node"
     );
     assert_eq!(
         status_of(home, &own_abs),

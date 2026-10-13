@@ -23,6 +23,8 @@
 //! There is no locked state (N-2): a node takes its passphrase once, when it attaches.
 
 use std::collections::{BTreeMap, BTreeSet};
+
+mod local_trust;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
@@ -304,6 +306,7 @@ impl Router {
             }),
         };
         router.follow_attached_with_the_proxy();
+        router.follow_local_trust();
         router
     }
 

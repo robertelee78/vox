@@ -249,6 +249,311 @@ fn make_room(a: &Account, node: &str) -> String {
         .unwrap_or_else(|| panic!("APPARATUS: no room listed on {node}: {list}"))
 }
 
+/// LT-1–6 (#724): the app's saved personal-node choice is apparatus; every grant, join,
+/// displayed alias, decision and restart is exercised through the shipped binary. No app runs.
+/// Mutant: grant the personal node only Read; the personal-drive assertion must turn PRODUCT red.
+#[test]
+#[ignore = "real binaries with production Argon2id; run in release"]
+fn local_nodes_trust_each_other_without_a_prompt_and_remember_removals() {
+    watchdog::arm();
+    let a = Account::new();
+    let names = ["personal", "agent-one", "agent-two", "agent-three"];
+    let fps: Vec<String> = names.iter().map(|name| a.make_node(name)).collect();
+    let elsewhere = Account::new();
+    let remote = elsewhere.make_node("remote");
+    let start = || {
+        let mut daemons = Vec::new();
+        for name in names {
+            let daemon = Daemon::start(&a, &["--node", name], &[]);
+            daemon.expect("its node attached", Duration::from_secs(90), |line| {
+                line.starts_with("vox daemon: identity")
+                    || line.contains(&format!(
+                        "node {name} is held by the daemon already running"
+                    ))
+            });
+            daemons.push(daemon);
+        }
+        daemons
+    };
+    let mut daemons = start();
+    let person = names[0];
+    let manual = |args: &[&str]| {
+        let (ok, out, err) = a.run(args, "");
+        assert!(
+            ok,
+            "APPARATUS: staging manual keyring choice {args:?}: {out}{err}"
+        );
+    };
+    // Manual alias/capability and an alias collision must survive automation.
+    manual(&[
+        "trust",
+        "add",
+        &fps[2],
+        "--name",
+        "my-teammate",
+        "--drive",
+        "--node",
+        names[1],
+    ]);
+    manual(&[
+        "trust", "add", &remote, "--name", names[1], "--node", person,
+    ]);
+    manual(&[
+        "trust", "add", &fps[3], "--name", names[3], "--node", names[2],
+    ]);
+    manual(&["trust", "remove", &fps[3], "--node", names[2]]);
+
+    let room = make_room(&a, person);
+    let (ok, link, err) = a.run(&["room", "link", &room, "--node", person], "");
+    assert!(ok, "APPARATUS: personal node's invite: {err}");
+    let link = link
+        .lines()
+        .find(|line| line.starts_with("vox://"))
+        .expect("APPARATUS: the personal node printed a room link");
+    let join = |node: &str| {
+        let (ok, out, err) = a.run(
+            &[
+                "room",
+                "join",
+                link,
+                "--node",
+                node,
+                "--passphrase-file",
+                "-",
+            ],
+            ROOM_PASS,
+        );
+        assert!(ok, "PRODUCT: local node {node} could not join: {out}{err}");
+        assert!(
+            !out.contains("Your name for") && !err.contains("Your name for"),
+            "PRODUCT: a known local node asked for its name: {out}{err}"
+        );
+    };
+    join(names[1]);
+    join(names[2]);
+
+    let ring = |node: &str| {
+        let (ok, out, err) = a.run(&["trust", "list", "--node", node], "");
+        assert!(
+            ok,
+            "PRODUCT: {node}'s keyring could not be read: {out}{err}"
+        );
+        assert!(
+            !out.contains("Your name for") && !err.contains("passphrase:"),
+            "PRODUCT: local trust required a prompt: {out}{err}"
+        );
+        out
+    };
+    let absent = |node: &str, fp: &str| {
+        let shown = ring(node);
+        assert!(
+            !shown.contains(fp),
+            "PRODUCT: {node} unexpectedly trusts {fp}: {shown}"
+        );
+    };
+    let has = |node: &str, fp: &str, alias: &str, drive: bool| {
+        ring(node).lines().any(|line| {
+            line.contains(fp) && line.contains(alias) && line.contains("read + drive") == drive
+        })
+    };
+    // Joining rooms without any saved personal node must not enable local trust.
+    absent(person, &fps[1]);
+    absent(names[1], &fps[0]);
+    absent(names[2], &fps[1]);
+    absent(names[3], &fps[1]);
+    // A detached passphrase-protected node is Locked in the app's vocabulary (ADR-031 CW-1).
+    let (ok, out, err) = a.run(&["node", "detach", names[3]], "");
+    assert!(ok, "APPARATUS: locking the late local node: {out}{err}");
+
+    // Stage exactly the setting Vox.app persists when the person selects their node.
+    std::fs::create_dir_all(a.cfg.join("app")).expect("APPARATUS: app choice directory");
+    std::fs::write(a.cfg.join("app/node"), format!("{person}\n"))
+        .expect("APPARATUS: saved personal-node choice");
+    assert!(
+        wait_until(Duration::from_secs(45), || {
+            has(names[1], &fps[0], person, true) && has(names[2], &fps[0], person, true)
+        }),
+        "PRODUCT: personal drive was not granted; {} said: {}; {} said: {}; log: {}",
+        names[1],
+        ring(names[1]),
+        names[2],
+        ring(names[2]),
+        a.log()
+    );
+    assert!(
+        has(names[1], &fps[2], "my-teammate", true),
+        "PRODUCT: local trust overwrote a custom alias or stronger manual grant: {}",
+        ring(names[1])
+    );
+    let collision = format!("{}#{}", names[1], &fps[1][..6]);
+    assert!(
+        has(person, &fps[1], &collision, false),
+        "PRODUCT: the known local name did not get the displayed fingerprint suffix: {}",
+        ring(person)
+    );
+    absent(names[2], &fps[3]);
+    let (ok, out, err) = a.run(&["trust", "list", "--node", names[3]], "");
+    assert!(
+        !ok,
+        "PRODUCT: local trust unlocked a node by itself: {out}{err}"
+    );
+    let (ok, out, err) = a.run(
+        &["node", "attach", names[3], "--passphrase-file", "-"],
+        PASS,
+    );
+    assert!(
+        ok,
+        "PRODUCT: the person could not make their local node Ready: {out}{err}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(30), || has(
+            names[3], &fps[1], names[1], false
+        )),
+        "PRODUCT: a formerly Locked node did not receive its local trust when Ready: {}",
+        ring(names[3])
+    );
+    absent(names[3], &fps[2]);
+    absent(names[3], &fps[0]); // It reads another local node, but does not share the personal room yet.
+    join(names[3]);
+    assert!(
+        wait_until(Duration::from_secs(30), || has(
+            names[3], &fps[0], person, true
+        )),
+        "PRODUCT: joining the personal room did not grant personal drive: {}",
+        ring(names[3])
+    );
+    // This node has had no manual keyring operation. Its automatic grants must not open the
+    // passphrase window, which is a permission the person sees in status.
+    let (ok, out, err) = a.run(&["status", "--json", "--node", names[3]], "");
+    assert!(
+        ok,
+        "PRODUCT: could not inspect the node's keyring window: {out}{err}"
+    );
+    let status: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("PRODUCT: status was not JSON: {e}: {out}"));
+    assert!(
+        status
+            .get("keyring_open_secs")
+            .is_some_and(serde_json::Value::is_null),
+        "PRODUCT: automatic local trust opened the keyring passphrase window: {out}"
+    );
+    for (i, node) in names.iter().enumerate() {
+        for (j, other) in names.iter().enumerate() {
+            if i == j || matches!((i, j), (2, 3) | (3, 2)) {
+                continue;
+            }
+            let alias: &str = if (i, j) == (1, 2) {
+                "my-teammate"
+            } else if (i, j) == (0, 1) {
+                &collision
+            } else {
+                other
+            };
+            let drive = j == 0 || (i, j) == (1, 2);
+            assert!(
+                wait_until(Duration::from_secs(30), || has(node, &fps[j], alias, drive)),
+                "PRODUCT: {node}'s entry for {other} must say {alias} and drive={drive}: {}",
+                ring(node)
+            );
+        }
+        let (ok, out, err) = a.run(&["decisions", "--node", node, "--json"], "");
+        assert!(
+            ok && out.contains("local trust rule"),
+            "PRODUCT: {node}'s decision record omitted automatic local trust: {out}{err}"
+        );
+    }
+    // A public keyring entry is useful only if the nodes can read a real room message.
+    let text = "local trust lets us work together";
+    let (ok, out, err) = a.run(&["room", "post", &room, text, "--node", names[3]], "");
+    assert!(
+        ok,
+        "PRODUCT: automatically trusted node could not post: {out}{err}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            let (ok, out, _) = a.run(&["room", "read", &room, "--node", person], "");
+            ok && out.contains(text)
+        }),
+        "PRODUCT: personal node could not read its automatically trusted local member"
+    );
+
+    manual(&["trust", "remove", &fps[3], "--node", names[1]]);
+    absent(names[1], &fps[3]);
+    // Stop only this proof's daemon, then reopen the same identities, room and keyrings.
+    let pid = a.lock_pid().expect("APPARATUS: the scratch daemon pid");
+    stop_pid(pid);
+    daemons.clear();
+    daemons = start();
+    // A saved grant only proves the keyring loaded. Join a new local node and wait for its
+    // first personal-drive grant, so removal assertions run after automation has resumed.
+    let fresh = "new-after-restart";
+    let fresh_fp = a.make_node(fresh);
+    let daemon = Daemon::start(&a, &["--node", fresh], &[]);
+    daemon.expect("the new node attached", Duration::from_secs(90), |line| {
+        line.contains(&format!(
+            "node {fresh} is held by the daemon already running"
+        ))
+    });
+    daemons.push(daemon);
+    let (ok, link, err) = a.run(&["room", "link", &room, "--node", person], "");
+    assert!(ok, "APPARATUS: the restarted room's link: {link}{err}");
+    let link = link
+        .lines()
+        .find(|line| line.starts_with("vox://"))
+        .expect("APPARATUS: the restarted room printed no link");
+    let (ok, out, err) = a.run(
+        &[
+            "room",
+            "join",
+            link,
+            "--node",
+            fresh,
+            "--passphrase-file",
+            "-",
+        ],
+        ROOM_PASS,
+    );
+    assert!(ok, "PRODUCT: the new local node could not join: {out}{err}");
+    assert!(
+        wait_until(Duration::from_secs(45), || {
+            has(fresh, &fps[0], person, true) && has(person, &fresh_fp, fresh, false)
+        }),
+        "PRODUCT: local trust did not resume for the new node after restart: {}; {}",
+        ring(fresh),
+        ring(person)
+    );
+    assert!(
+        wait_until(Duration::from_secs(45), || has(
+            names[3], &fps[0], person, true
+        )),
+        "PRODUCT: personal drive was lost after restart: {}",
+        ring(names[3])
+    );
+    absent(names[1], &fps[3]);
+    absent(names[2], &fps[3]);
+    absent(names[3], &fps[2]);
+    assert!(
+        has(names[1], &fps[2], "my-teammate", true),
+        "PRODUCT: restart lost the pre-existing custom alias or drive grant: {}",
+        ring(names[1])
+    );
+    manual(&[
+        "trust",
+        "add",
+        &fps[3],
+        "--name",
+        "back-by-choice",
+        "--node",
+        names[1],
+    ]);
+    assert!(
+        has(names[1], &fps[3], "back-by-choice", false),
+        "PRODUCT: the person could not restore a removed local peer by hand: {}",
+        ring(names[1])
+    );
+    drop(daemons);
+}
+
 /// The addresses an room link gives for identity `fp` (its `b=` values after `a=<fp>`).
 fn addresses_for(link: &str, fp: &str) -> Vec<String> {
     let Some((_, query)) = link.split_once('?') else {

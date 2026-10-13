@@ -33,7 +33,7 @@ pub(crate) struct Harness {
     pub(crate) program: &'static str,
 }
 
-/// The harnesses `vox setup` and `vox agent connect` wire.
+/// The harnesses `vox setup` and `vox agent setup` wire.
 pub(crate) const HARNESSES: [Harness; 3] = [
     Harness {
         key: "claude",
@@ -78,7 +78,6 @@ pub fn run(args: &NodeArgs) -> Result<(), AppError> {
     let host = host_name();
     let os = os_name();
     let mut made: Vec<Made> = Vec::new();
-    let mut steps: Vec<String> = Vec::new();
 
     println!("vox setup: looking for harnesses on this machine (their programs on PATH)");
     let found: Vec<(&Harness, PathBuf)> = HARNESSES
@@ -96,7 +95,7 @@ pub fn run(args: &NodeArgs) -> Result<(), AppError> {
         .collect();
 
     for (h, program) in &found {
-        let suggested = NodeName::parse(&format!("{}-{host}", h.key))?;
+        let suggested = NodeName::parse(&suggested_name(h.key, &host))?;
         let wiring = Wiring::of(h.key)?;
         // **A harness wired already is left as it is** (#666): the node its hook names is the
         // one it is, whatever its name, and a second node would only split it in two.
@@ -144,6 +143,7 @@ pub fn run(args: &NodeArgs) -> Result<(), AppError> {
         }
         attach(args, &name, passphrase);
         if h.key == "codex" {
+            trust_codex_hook(program)?;
             match crate::codex_app_server::ensure(program, &wiring.dir) {
                 Ok(_) => println!("  Codex's app-server is running"),
                 Err(why) => println!(
@@ -151,9 +151,6 @@ pub fn run(args: &NodeArgs) -> Result<(), AppError> {
                      through their hooks only"
                 ),
             }
-            steps.push(
-                "run `vox agent trust codex`: Codex runs a hook only once it is trusted".into(),
-            );
         }
         made.push(Made {
             name,
@@ -221,10 +218,141 @@ pub fn run(args: &NodeArgs) -> Result<(), AppError> {
     }
     println!();
     println!("vox setup: {}", crate::ident::NO_BACKUP);
-    for s in steps {
-        println!("vox setup: next, {s}");
+    Ok(())
+}
+
+/// Finish node setup with Codex's own strict hook-trust operation, on either terminal path.
+pub(crate) fn trust_codex_hook(program: &Path) -> Result<(), AppError> {
+    let report = crate::codex_trust::trust(&program.to_string_lossy()).map_err(AppError::Usage)?;
+    if report.found == 0 {
+        return Err(AppError::Usage(
+            "Codex did not report the node hook; setup has not finished".into(),
+        ));
+    }
+    for (_, command) in report.entries {
+        println!("  trusted {command:?}");
     }
     Ok(())
+}
+
+/// Fill only missing Vox hooks, sharing discovery with the installed skill pack (HK-1).
+/// This does not create a node or start Vox's daemon. Every changed file is named.
+pub(crate) fn install_light_hooks() -> bool {
+    let mut ok = true;
+    for h in &crate::skill_pack::HARNESSES {
+        if !crate::skill_pack::present(h) {
+            continue;
+        }
+        let result = (|| -> Result<(), AppError> {
+            let wiring = Wiring::of(h.key)?;
+            let hook = wiring.hook_file();
+            let writable = || {
+                if std::fs::metadata(&hook).is_ok_and(|m| m.permissions().readonly()) {
+                    Err(AppError::Usage(format!(
+                        "{} is read-only; left unchanged",
+                        hook.display()
+                    )))
+                } else {
+                    Ok(())
+                }
+            };
+            let existing = match std::fs::read_to_string(&hook) {
+                Ok(s) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => return Err(AppError::Io(e)),
+            };
+            let light = if h.key == "opencode" {
+                if !existing.trim().is_empty() {
+                    // Do not replace a node's plugin or anything the operator put here.
+                    if existing != crate::agent_hook::LIGHT_OPENCODE_PLUGIN {
+                        if !existing.contains("vox agent hook") {
+                            return Err(AppError::Usage(format!(
+                                "{} holds another plugin; left unchanged",
+                                hook.display()
+                            )));
+                        }
+                        println!(
+                            "vox: {}: kept existing plugin in {}",
+                            h.name,
+                            hook.display()
+                        );
+                        return Ok(());
+                    }
+                    true
+                } else {
+                    writable()?;
+                    write(&hook, crate::agent_hook::LIGHT_OPENCODE_PLUGIN)?;
+                    println!(
+                        "vox: {}: installed light hook in {}",
+                        h.name,
+                        hook.display()
+                    );
+                    true
+                }
+            } else {
+                let value: serde_json::Value = if existing.trim().is_empty() {
+                    serde_json::json!({})
+                } else {
+                    serde_json::from_str(&existing).map_err(|e| {
+                        AppError::Usage(format!(
+                            "{} is not JSON ({e}); left unchanged",
+                            hook.display()
+                        ))
+                    })?
+                };
+                fn commands(v: &serde_json::Value, out: &mut Vec<String>) {
+                    match v {
+                        serde_json::Value::String(s) if runs_vox_hook(s) => out.push(s.clone()),
+                        serde_json::Value::Array(a) => a.iter().for_each(|v| commands(v, out)),
+                        serde_json::Value::Object(o) => o.values().for_each(|v| commands(v, out)),
+                        _ => {}
+                    }
+                }
+                let mut found = Vec::new();
+                commands(&value["hooks"], &mut found);
+                if found.is_empty() {
+                    writable()?;
+                    merge_hooks(&hook, &crate::agent_hook::light_hooks(h.key))?;
+                    println!(
+                        "vox: {}: installed light hook in {}",
+                        h.name,
+                        hook.display()
+                    );
+                    true
+                } else {
+                    found
+                        .iter()
+                        .all(|c| c == &format!("vox agent hook --light {}", h.key))
+                }
+            };
+            if light && h.key == "codex" {
+                if let Some(program) = on_path(h.program) {
+                    let report = crate::codex_trust::trust(&program.to_string_lossy())
+                        .map_err(AppError::Usage)?;
+                    if report.found == 0 {
+                        return Err(AppError::Usage(
+                            "Codex did not report the installed light hook; its trust is not set"
+                                .into(),
+                        ));
+                    }
+                    if report.trusted_now > 0 {
+                        println!(
+                            "vox: Codex: trusted light hook in {}",
+                            wiring.dir.join("config.toml").display()
+                        );
+                    }
+                } else {
+                    println!("vox: Codex: light hook installed; Codex is not on PATH, so hook trust could not be set yet");
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            eprintln!("vox: {}: light hook not installed: {e}", h.name);
+            ok = false;
+        }
+    }
+    ok
 }
 
 /// The node `wiring`'s harness is connected to here: the one its Vox hook names, when that node
@@ -380,6 +508,13 @@ fn node_word(s: &str) -> String {
     }
 }
 
+/// A valid harness-host suggestion even when the machine's host name fills its own limit.
+pub(crate) fn suggested_name(harness: &str, host: &str) -> String {
+    let mut name = format!("{harness}-{host}");
+    name.truncate(vox_core::node::paths::NODE_NAME_MAX);
+    name
+}
+
 /// This machine's short host name, as a node name holds it.
 pub(crate) fn host_name() -> String {
     let out = std::process::Command::new("hostname")
@@ -506,8 +641,8 @@ impl Wiring {
             ),
             "codex" => format!(
                 "its hook, `vox agent hook --node {node}`, is to go in {}; other Vox hook \
-                 entries there are replaced, nothing else; and Codex's app-server is to be kept \
-                 running (`codex app-server daemon start`), so a plain `codex` session can be \
+                 entries there are replaced, nothing else; the hook is to be trusted; and Codex's \
+                 app-server is to be kept running (`codex app-server daemon start`), so a plain `codex` session can be \
                  followed and driven from Vox: it runs no model",
                 self.hook_file().display()
             ),
@@ -656,9 +791,10 @@ pub(crate) fn unwire(account: &vox_core::node::paths::Account) -> Vec<Unwire> {
         let hook = w.hook_file();
         if h.key == "opencode" {
             if let Ok(text) = std::fs::read_to_string(&hook) {
-                if nodes
-                    .iter()
-                    .any(|n| crate::agent_hook::opencode_plugin(n) == text)
+                if text == crate::agent_hook::LIGHT_OPENCODE_PLUGIN
+                    || nodes
+                        .iter()
+                        .any(|n| crate::agent_hook::opencode_plugin(n) == text)
                 {
                     out.push(Unwire::Remove(hook.clone()));
                 } else if text.contains("vox agent hook") {

@@ -71,8 +71,8 @@
 //     you (1)" at once, from what her node recorded as read.
 // 14. The keyboard (WCAG 2.1.1, 2.4.7; #450), run with Full Keyboard Access on (set around the
 //     pass, never by the proof): View > Focus Timeline (⌃⌘T) puts the keyboard on mission's
-//     timeline with its newest message selected; ↑ and ↓ move the selection, as Reply to Selected
-//     Message (⌘R) then says; Space and Return on a row whose file alice pulled open it in Quick
+//     timeline with its newest message selected; ↑ and ↓ move the selection, as Reply in
+//     Thread (⌘R) then says; Space and Return on a row whose file alice pulled open it in Quick
 //     Look; Tab from the timeline reaches the composer.
 // 15. Who trusts whom (ADR-028 K-5, K-7, R-5, R-6, E-4). Dave, whom bob trusts, joins mission
 //     while it is on screen: its timeline says "<dave> (not in keyring) joined. bob trusts it."
@@ -244,8 +244,10 @@ enum Key: ExpressibleByStringLiteral, CustomStringConvertible {
             return container.descendants(matching: .any)
                 .matching(NSPredicate(format: "identifier BEGINSWITH %@", p))
         case let .showing(w):
+            // Checkbox values are numbers. CONTAINS on one throws inside the app's
+            // snapshot evaluator, leaving XCTest waiting for a reply until timeout.
             return container.descendants(matching: .any)
-                .matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", w, w))
+                .matching(NSPredicate(format: "label CONTAINS %@ OR CAST(value, 'NSString') CONTAINS %@", w, w))
         case let .menuItem(t):
             return container.descendants(matching: .menuItem)
                 .matching(NSPredicate(format: "title == %@ OR label == %@", t, t))
@@ -386,9 +388,10 @@ final class FirstRunProof: XCTestCase {
     /// and bounds only: never an image. Nil when nothing covers it, or Vox has no window.
     /// A window of the system's over the screen point `at` that takes clicks there and is no part
     /// of Vox: a Notification Center banner or panel, or the screenshot overlay (screencaptureui,
-    /// "Screenshot"), which may be the person's own. By the window list's owner, layer and bounds
-    /// only, never an image. Its owner, layer and bounds, else nil. Never stopped: waited out.
-    private func systemOverlayOver(_ at: CGPoint) -> String? {
+    /// "Screenshot"), which may be the person's own. Uses window ownership, layer and bounds,
+    /// plus target hittability for Notification Center's transparent container. Never an image.
+    /// Its owner, layer and bounds, else nil. Never stopped: waited out.
+    private func systemOverlayOver(_ at: CGPoint, targetHittable: Bool) -> String? {
         let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
                                                  kCGNullWindowID) as? [[String: Any]] ?? []
         for w in windows {
@@ -398,6 +401,11 @@ final class FirstRunProof: XCTestCase {
                   (w[kCGWindowAlpha as String] as? Double ?? 1) > 0,
                   let b = w[kCGWindowBounds as String] as? NSDictionary,
                   let r = CGRect(dictionaryRepresentation: b as CFDictionary), r.contains(at) else { continue }
+            // Notification Center can own a transparent full-screen container while its
+            // banner occupies only a corner. Its bounds alone do not show interception.
+            // XCTest's hit eligibility permits the click; the journey still proves its result.
+            // Screenshot overlays retain their existing guard regardless of hit eligibility.
+            if owner == "Notification Center", targetHittable { continue }
             return "\(owner), layer \(w[kCGWindowLayer as String] ?? "?"), \(Int(r.width))×\(Int(r.height)) at \(Int(r.minX)),\(Int(r.minY))"
         }
         return nil
@@ -1158,6 +1166,43 @@ final class FirstRunProof: XCTestCase {
         try staged(vox, ["node", "attach", "alice", "--passphrase-file", idPass], env: voxEnv)
         try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", roomPass,
                          "--name", "columns"], env: voxEnv)
+        let room = try line(staged(vox, ["room", "list", "--node", "alice"], env: voxEnv)) {
+            $0.contains(" columns")
+        }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        let link = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        // A single-member inspector fits even in the smallest supported window. Populate a
+        // real roster so scrolling is necessary rather than claiming a pass without overflow.
+        // Keep these members remote: nine local identities expose the separate sidebar
+        // clipping defect tracked by #767, before this inspector journey can open its room.
+        let membersRoot = root.appendingPathComponent("members")
+        let membersEnv = ["VOX_DATA_DIR": membersRoot.appendingPathComponent("data").path,
+                          "VOX_CONFIG_DIR": membersRoot.appendingPathComponent("config").path,
+                          "VOX_PROXY": "127.0.0.1:0"]
+        let membersDaemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"],
+                                      env: membersEnv, until: "vox daemon: control socket")
+        defer { membersDaemon.terminate() }
+        var expectedMembers = [try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }]
+        for index in 1...8 {
+            let name = "member-\(index)"
+            try staged(vox, ["node", "create", name],
+                       env: membersEnv.merging(["VOX_IDENTITY_PASSPHRASE": "alice identity"]) { $1 })
+            try staged(vox, ["node", "attach", name, "--passphrase-file", idPass], env: membersEnv)
+            try staged(vox, ["room", "join", "--node", name, "--passphrase-file", roomPass, link], env: membersEnv)
+            expectedMembers.append(try line(staged(vox, ["id", "--node", name], env: membersEnv)) { $0.count == 52 })
+        }
+        var roster = Set<String>()
+        let rosterDeadline = Date().addingTimeInterval(20)
+        while Date() < rosterDeadline {
+            let read = run(vox, ["room", "roster", room, "--node", "alice"], env: voxEnv)
+            if read.status == 0 { roster = Set(read.out.split(whereSeparator: \.isWhitespace).map(String.init)) }
+            if expectedMembers.allSatisfy({ roster.contains($0) }) { break }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        guard expectedMembers.allSatisfy({ roster.contains($0) }) else {
+            throw Apparatus("inspector staging not achieved: Alice's public roster is missing remote members")
+        }
         try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
         try stager.write(Data("alice\n".utf8), to: config + "/app/node")
         // The widths start from the standard ones: the column keys, in the bundle under proof's
@@ -1179,19 +1224,15 @@ final class FirstRunProof: XCTestCase {
         present(ui, Key.id("attached"), timeout: 60, "the app must open attached as alice")
         tap(ui, Key.id("room-columns"), "the room columns in the sidebar")
         present(ui, Key.id("inspector"), timeout: 10, "a room on screen must show its inspector")
+        guard present(ui, Key.showing("9 members"), timeout: 20,
+                      "the staged room must display its nine-member roster") else { return }
 
-        /// The sidebar's divider: the window's split view's (NavigationSplitView).
-        func sidebarDivider() -> XCUIElement? {
-            ui.windows.firstMatch.splitters.allElementsBoundByIndex
-                .filter { $0.exists && $0.frame.width > 0 }
-                .min { $0.frame.minX < $1.frame.minX }
-        }
         func inspectorDivider() -> XCUIElement {
             ui.descendants(matching: .any).matching(identifier: "inspector-divider").firstMatch
         }
         func sidebarWidth() -> CGFloat {
-            guard let d = sidebarDivider() else { return -1 }
-            return d.frame.minX - ui.windows.firstMatch.frame.minX
+            let timeline = el(ui, Key.id("timeline"))
+            return timeline.frame.minX - ui.windows.firstMatch.frame.minX
         }
         func inspectorWidth() -> CGFloat {
             let e = ui.descendants(matching: .any).matching(identifier: "inspector").firstMatch
@@ -1204,14 +1245,11 @@ final class FirstRunProof: XCTestCase {
                      withVelocity: .slow, thenHoldForDuration: 0.5)
             Thread.sleep(forTimeInterval: 1)
         }
-        guard let side = sidebarDivider() else {
-            throw Apparatus("XCTest finds no split view divider in the window for the sidebar")
-        }
         guard inspectorDivider().waitForExistence(timeout: 10) else {
             throw Apparatus("XCTest finds no \"inspector-divider\" beside the inspector")
         }
-        // Room to widen both: the timeline keeps 400 points (its minimum), so a window only as
-        // wide as the three columns need leaves the sidebar nowhere to go. Widen the window first,
+        // Room to widen the inspector: the timeline keeps 400 points (its minimum).
+        // Widen the window first,
         // from its right edge, as a person would.
         let window = ui.windows.firstMatch
         let edge = window.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.5))
@@ -1220,28 +1258,11 @@ final class FirstRunProof: XCTestCase {
                    withVelocity: .slow, thenHoldForDuration: 0.5)
         Thread.sleep(forTimeInterval: 1)
         let sidebar0 = sidebarWidth(), inspector0 = inspectorWidth()
-        let needed = sidebar0 + 80 + 400 + 7 + inspector0 + 60
+        let needed = sidebar0 + 400 + 7 + inspector0 + 40
         guard window.frame.width >= needed else {
-            throw Apparatus("staging not achieved: the window is \(window.frame.width) wide after widening, and both drags need \(needed) (the timeline keeps 400)")
+            throw Apparatus("staging not achieved: the window is \(window.frame.width) wide after widening, and the inspector drag needs \(needed) (the timeline keeps 400)")
         }
-        // The sidebar's own resize is not driven here: XCTest's drag does not reach the split
-        // view's resize area (the sidebar-resize spike, 2026-10-09: 13 grips around the separator,
-        // with and without a hover and a long press; and this case's hover +5 point grip, 233 →
-        // 233 on 2026-10-09). A person's drag there resizes it (the decider, by hand, on a proof
-        // build without remembersWidth). That claim rests on the hand test and on 9f0559f6, which
-        // keeps the width out of the live resize; this case says what XCTest's drag did, as
-        // information, and asserts nothing about it.
-        let grip = window.coordinate(withNormalizedOffset: .zero)
-            .withOffset(CGVector(dx: side.frame.midX + 5 - window.frame.minX,
-                                 dy: side.frame.midY - window.frame.minY))
-        grip.hover()
-        Thread.sleep(forTimeInterval: 0.5)
-        grip.press(forDuration: 0.5, thenDragTo: grip.withOffset(CGVector(dx: 80, dy: 0)),
-                   withVelocity: .slow, thenHoldForDuration: 0.5)
-        Thread.sleep(forTimeInterval: 1)
-        let sidebar1 = sidebarWidth()
-        print("[proof] columns: XCTest's sidebar drag (not asserted): \(sidebar0) → \(sidebar1)")
-        drag(inspectorDivider(), by: -60)
+        drag(inspectorDivider(), by: -40)
         let inspector1 = inspectorWidth()
         XCTAssertTrue(inspector1 > inspector0 + 30,
                       "PRODUCT: dragging the inspector's divider 60 points left must widen the inspector; it went from \(inspector0) to \(inspector1)")
@@ -1254,9 +1275,9 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("room-columns"), "after a new launch, the room columns")
         present(ui, Key.id("inspector"), timeout: 10, "after a new launch, the room's inspector")
         Thread.sleep(forTimeInterval: 1)
-        let sidebar2 = sidebarWidth(), inspector2 = inspectorWidth()
+        let inspector2 = inspectorWidth()
         XCTAssertTrue(abs(inspector2 - inspector1) <= 4,
-                      "PRODUCT: the inspector's width must be the same after a new launch; it was \(inspector1) and is \(inspector2) (the sidebar was \(sidebar1) and is \(sidebar2))")
+                      "PRODUCT: the inspector's width must be the same after a new launch; it was \(inspector1) and is \(inspector2)")
 
         // Hide the inspector, then show it again, with ⌥⌘I.
         ui.typeKey("i", modifierFlags: [.command, .option])
@@ -1275,9 +1296,10 @@ final class FirstRunProof: XCTestCase {
                      withVelocity: .slow, thenHoldForDuration: 0.5)
         Thread.sleep(forTimeInterval: 1)
         let inspector = ui.descendants(matching: .any).matching(identifier: "inspector").firstMatch
-        // The section's last control: Allow the LAN Helper, or Remove it once it is allowed.
+        // The LAN toggle, or the helper removal control when the helper is already allowed.
+        // Turning the LAN on now asks for the helper in a sheet; there is no inline Allow button.
         let lan = ui.descendants(matching: .any).matching(NSPredicate(
-            format: "identifier == 'family-lan-allow' OR identifier == 'family-lan-remove'")).firstMatch
+            format: "identifier == 'family-lan' OR identifier == 'family-lan-remove'")).firstMatch
         func lanInView() -> Bool {
             lan.exists && lan.frame.maxY <= inspector.frame.maxY + 1 && lan.frame.minY >= inspector.frame.minY
         }
@@ -1291,7 +1313,7 @@ final class FirstRunProof: XCTestCase {
                       "PRODUCT: the inspector must scroll (P13): in a window \(window.frame.height) high, scrolled down, its family LAN section is still out of view (\(lan.exists ? "\(lan.frame)" : "not shown") in \(inspector.frame))")
         XCTAssertTrue(!members.isNull && members.minY >= inspector.frame.minY - 1 && members.maxY <= inspector.frame.maxY,
                       "PRODUCT: scrolled, the inspector's MEMBERS heading must stay in view (P13); it is at \(members) in \(inspector.frame)")
-        print("[proof] columns: sidebar \(sidebar0) → \(sidebar1) → after relaunch \(sidebar2); inspector \(inspector0) → \(inspector1) → \(inspector2); hide \(hidden), show \(back); scrolled, LAN in view \(lanInView()), MEMBERS at \(members.minY)")
+        print("[proof] columns: inspector \(inspector0) → \(inspector1) → \(inspector2); hide \(hidden), show \(back); scrolled, LAN in view \(lanInView()), MEMBERS at \(members.minY)")
     }
 
     /// (8) Notifications (ADR-014 M-23, ADR-028 R-10, #448), alone: the one step that needs a
@@ -1385,7 +1407,7 @@ final class FirstRunProof: XCTestCase {
                    env: bobSession)
         let centre = XCUIApplication(bundleIdentifier: "com.apple.notificationcenterui")
         let banner = centre.descendants(matching: .any)
-            .matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", "bob wrote to you",
+            .matching(NSPredicate(format: "label CONTAINS %@ OR CAST(value, 'NSString') CONTAINS %@", "bob wrote to you",
                                   "bob wrote to you")).firstMatch
         if !banner.waitForExistence(timeout: 30) {
             let there = centre.descendants(matching: .any).allElementsBoundByIndex.prefix(30).map(shown)
@@ -1397,7 +1419,7 @@ final class FirstRunProof: XCTestCase {
             }
         }
         let leaked = centre.descendants(matching: .any)
-            .matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@",
+            .matching(NSPredicate(format: "label CONTAINS %@ OR CAST(value, 'NSString') CONTAINS %@",
                                   "SECRET-TEXT-8", "SECRET-TEXT-8")).firstMatch
         // Only where the banner itself was read: a query that reads nothing in Notification Center
         // would pass this for nothing.
@@ -1430,13 +1452,15 @@ final class FirstRunProof: XCTestCase {
         guard before.status == 0, nodeLine(before.out, "alice") == nil else {
             throw Apparatus("staging not achieved: the data root is to hold no node; `vox node list` said \(before.out)")
         }
-        // Claude Code is here: its settings folder, in the HOME a proof build gives the launch's
-        // `vox agent skill --install` (`<config dir>/app/home`, never the person's own).
+        // All three harnesses are here, in the HOME a proof build gives skill/hook installation
+        // (`<config dir>/app/home`, never the person's own), with no Vox hooks yet.
         let skillHome = URL(fileURLWithPath: config).appendingPathComponent("app/home")
         // Made by the stager: the test runner's sandbox may not write in the scratch (513).
-        let made = stager.run(["/bin/mkdir", "-p", skillHome.appendingPathComponent(".claude").path], env: [:])
-        guard made.status == 0 else {
-            throw Apparatus("staging not achieved: Claude Code's settings folder under \(skillHome.path): \(made.out)")
+        for folder in [".claude", ".codex", ".config/opencode"] {
+            let made = stager.run(["/bin/mkdir", "-p", skillHome.appendingPathComponent(folder).path], env: [:])
+            guard made.status == 0 else {
+                throw Apparatus("staging not achieved: \(folder) under \(skillHome.path): \(made.out)")
+            }
         }
 
         let ui = voxApp(appPath)
@@ -1460,6 +1484,23 @@ final class FirstRunProof: XCTestCase {
                       "PRODUCT: Vox.app must install the agent skill at launch: 10 s after its window, \(skill) is not there")
         present(ui, Key.id("login-item-why"), timeout: 30, "at first run the app must ask about Keep Running")
         tap(ui, Key.id("login-item-not-now"), "Not Now")
+
+        // HK-1: first run wires every missing hook and tells the person which files changed.
+        // Mutant: skip Codex in install_light_hooks -> PRODUCT at its missing config below.
+        let hookPaths = [("claude", ".claude/settings.json"), ("codex", ".codex/hooks.json"),
+                         ("opencode", ".config/opencode/plugin/vox.js")]
+        let hookSaid = words(ui, Key.id("agent-hooks-installed"), timeout: 30,
+                             "first run must name every harness hook file it changed",
+                             until: { text in hookPaths.allSatisfy {
+                                 text.contains(skillHome.appendingPathComponent($0.1).path)
+                             } }) ?? ""
+        for (harness, relative) in hookPaths {
+            let path = skillHome.appendingPathComponent(relative).path
+            let content = stager.run(["/bin/cat", path], env: [:])
+            XCTAssertTrue(content.status == 0 && content.out.contains("agent hook --light \(harness)"),
+                          "PRODUCT: first run must install \(harness)'s light hook at \(path); it reads \(content.out), window said \(hookSaid)")
+        }
+        tap(ui, Key.id("agent-hooks-dismiss"), "Dismiss the installed hook paths")
 
         // The welcome: the node is made here.
         let name = Key.id("new-node-name")
@@ -1608,6 +1649,9 @@ final class FirstRunProof: XCTestCase {
         }
         let shownNow = containers(ui).flatMap { $0.allElementsBoundByIndex }
             .compactMap { try? $0.snapshot() }
+            // XCTest includes closed system menus (including Apple Recent Items).
+            // Only an open container shows its words to the person.
+            .filter { !$0.frame.isEmpty }
             .flatMap(words)
         let words = ["Terminal", "terminal", "command line", "vox node", "vox room", "vox id", "vox trust", "`vox"]
         if let said = shownNow.first(where: { text in words.contains { text.contains($0) } }) {
@@ -1940,6 +1984,12 @@ final class FirstRunProof: XCTestCase {
         let data = root.appendingPathComponent("data").path
         let config = root.appendingPathComponent("config").path
         let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        // Attached nodes on Alice's daemon can become trusted automatically (#724). Carol
+        // must really be a peer on another daemon for this manual-offer journey.
+        let carolRoot = root.appendingPathComponent("carol-host")
+        let carolEnv = ["VOX_DATA_DIR": carolRoot.appendingPathComponent("data").path,
+                        "VOX_CONFIG_DIR": carolRoot.appendingPathComponent("config").path,
+                        "VOX_PROXY": "127.0.0.1:0"]
         let pass = { (name: String) in root.appendingPathComponent("\(name).pass").path }
         for name in ["alice", "bob", "carol"] {
             try stager.write(Data("\(name) identity\n".utf8), to: pass(name))
@@ -1949,14 +1999,18 @@ final class FirstRunProof: XCTestCase {
         try stager.write(Data("alice\n".utf8), to: config + "/app/node")
         daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
+        let carolDaemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: carolEnv,
+                                    until: "vox daemon: control socket")
+        defer { carolDaemon.terminate() }
         for name in ["alice", "bob", "carol"] {
+            let nodeEnv = name == "carol" ? carolEnv : voxEnv
             try staged(vox, ["node", "create", name],
-                       env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "\(name) identity"]) { $1 })
-            try staged(vox, ["node", "attach", name, "--passphrase-file", pass(name)], env: voxEnv)
+                       env: nodeEnv.merging(["VOX_IDENTITY_PASSPHRASE": "\(name) identity"]) { $1 })
+            try staged(vox, ["node", "attach", name, "--passphrase-file", pass(name)], env: nodeEnv)
         }
         let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
         let bobFp = try line(staged(vox, ["id", "--node", "bob"], env: voxEnv)) { $0.count == 52 }
-        let carolFp = try line(staged(vox, ["id", "--node", "carol"], env: voxEnv)) { $0.count == 52 }
+        let carolFp = try line(staged(vox, ["id", "--node", "carol"], env: carolEnv)) { $0.count == 52 }
         try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", pass("room"),
                          "--name", "pending"], env: voxEnv)
         let room = try line(staged(vox, ["room", "list", "--node", "alice"], env: voxEnv)) {
@@ -1969,7 +2023,7 @@ final class FirstRunProof: XCTestCase {
         try staged(vox, ["room", "join", "--node", "bob", "--passphrase-file", pass("room"), link], env: voxEnv)
         // Carol joins: alice is offered carol (K-15).
         try staged(vox, ["room", "join", "--node", "carol", "--passphrase-file", pass("room"), link],
-                   env: voxEnv)
+                   env: carolEnv)
         let offerUntil = Date().addingTimeInterval(30)
         var offers = ""
         while Date() < offerUntil && !offers.contains(String(carolFp.prefix(12))) {
@@ -1993,9 +2047,14 @@ final class FirstRunProof: XCTestCase {
         // In the room she joined, at the top of its General (v0.4.3: a trust offer is in the room
         // it concerns; the sidebar lists rooms only).
         tap(ui, Key.id("room-pending"), "pending in the sidebar")
+        offers = run(vox, ["trust", "offers", "--node", "alice"], env: voxEnv).out
+        guard offers.contains(String(carolFp.prefix(12))) else {
+            throw Apparatus("staging no longer holds after opening the app: alice is not offered carol; `vox trust offers` said \(offers)")
+        }
         tap(ui, Key.id("offer-\(carolFp.prefix(12))"), "carol's offer at the top of pending's General",
             premise: Premise("carol is offered to alice") {
-                (offers.contains(String(carolFp.prefix(12))), "`vox trust offers` said \(offers.debugDescription)")
+                offers = self.run(vox, ["trust", "offers", "--node", "alice"], env: voxEnv).out
+                return (offers.contains(String(carolFp.prefix(12))), "`vox trust offers` said \(offers.debugDescription)")
             })
         let explain = words(ui, Key.id("offer-explain"), timeout: 10,
                             "carol's offer must say what trusting her gives") ?? ""
@@ -2044,7 +2103,8 @@ final class FirstRunProof: XCTestCase {
         let offer = Key.id("offer-\(carolFp.prefix(12))")
         tap(ui, offer, "carol's offer at the top of pending's General",
             premise: Premise("carol is offered to alice") {
-                (offers.contains(String(carolFp.prefix(12))), "`vox trust offers` said \(offers.debugDescription)")
+                offers = self.run(vox, ["trust", "offers", "--node", "alice"], env: voxEnv).out
+                return (offers.contains(String(carolFp.prefix(12))), "`vox trust offers` said \(offers.debugDescription)")
             })
         present(ui, Key.id("offer-alias"), timeout: 10, "carol's offer must open")
         if locate(ui, Key.id("keyring-passphrase")) != nil {
@@ -2109,7 +2169,7 @@ final class FirstRunProof: XCTestCase {
         words(ui, Key.id("keyring-capability-local-carol"), timeout: 30,
               "the local override is accepted with read", until: { $0 == "read" })
         try staged(vox, ["trust", "add", "--node", "carol", aliceFp, "--name", "alice",
-                         "--identity-passphrase-file", pass("carol")], env: voxEnv)
+                         "--identity-passphrase-file", pass("carol")], env: carolEnv)
 
         // Both read and read + drive remain the person's choices through remote rename/reconnect/rejoin.
         var remoteName = "carol"
@@ -2119,10 +2179,10 @@ final class FirstRunProof: XCTestCase {
                                  "--identity-passphrase-file", pass("alice")], env: voxEnv)
             }
             try staged(vox, ["node", "rename", remoteName, newName],
-                       env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "carol identity"]) { $1 })
+                       env: carolEnv.merging(["VOX_IDENTITY_PASSPHRASE": "carol identity"]) { $1 })
             remoteName = newName
-            try staged(vox, ["room", "leave", "--node", remoteName, room], env: voxEnv)
-            try staged(vox, ["room", "join", "--node", remoteName, "--passphrase-file", pass("room"), link], env: voxEnv)
+            try staged(vox, ["room", "leave", "--node", remoteName, room], env: carolEnv)
+            try staged(vox, ["room", "join", "--node", remoteName, "--passphrase-file", pass("room"), link], env: carolEnv)
             tap(ui, Key.id("room-pending"), "pending after the remote node renamed and rejoined")
             words(ui, Key.id("member-local-carol"), timeout: 90,
                   "a remote rename/reconnect/rejoin must leave the member's local alias unchanged", until: { $0.hasPrefix("local-carol,") })
@@ -2146,7 +2206,7 @@ final class FirstRunProof: XCTestCase {
             var read = ""
             let untilRead = Date().addingTimeInterval(60)
             while Date() < untilRead && !read.contains(control) {
-                read = run(vox, ["room", "read", "--node", remoteName, room], env: voxEnv).out
+                read = run(vox, ["room", "read", "--node", remoteName, room], env: carolEnv).out
                 if !read.contains(control) { Thread.sleep(forTimeInterval: 0.5) }
             }
             XCTAssertTrue(read.contains(control), "PRODUCT: the retained \(capability) grant must still permit actual room communication: \(read)")
@@ -2600,6 +2660,13 @@ final class FirstRunProof: XCTestCase {
         if windowReadable(ui) {
             if let body = textSaying(ui, "NEEDS-YOU") {
                 let copied = selectAndCopy(ui, body, "bob's message NEEDS-YOU")
+                if copied != "NEEDS-YOU" {
+                    keepTree(ui, "message copy did not put NEEDS-YOU on the pasteboard")
+                    let selected = XCTAttachment(string: body.debugDescription)
+                    selected.name = "NEEDS-YOU copy target after selection"
+                    selected.lifetime = .keepAlways
+                    add(selected)
+                }
                 XCTAssertEqual(copied, "NEEDS-YOU",
                                "PRODUCT: bob's message, selected by dragging across it and copied with ⌘C, must put NEEDS-YOU on the pasteboard; it holds \(copied.debugDescription)")
             } else {
@@ -2810,6 +2877,37 @@ final class FirstRunProof: XCTestCase {
         reaches("clicking the reply's quote") { tap(ui, quote, "the reply's quote") }
         reaches("⌘↑ with the reply selected") { ui.typeKey(.upArrow, modifierFlags: .command) }
         print("[proof] bob's reply quotes \"re you: FROM-ALICE\", and its quote and ⌘↑ go to it")
+
+        // (4c1) Reply in Thread answers bob's reply but stays under the original General root
+        // (ADR-033 TH-1, TH-3, #753). Exercise the app action and read what the other node gets.
+        guard let fromBob = entry("REPLY-TO-ALICE") else {
+            throw Apparatus("the staged REPLY-TO-ALICE has no entry hash to reply to")
+        }
+        tap(ui, Key.showing(": REPLY-TO-ALICE"), "bob's reply to select it")
+        ui.menuBars.menuBarItems["Room"].click()
+        let replyInThread = ui.menuBars.menuItems["Reply in Thread"]
+        guard replyInThread.waitForExistence(timeout: 5), replyInThread.isEnabled else {
+            XCTFail("PRODUCT: Room > Reply in Thread must be available with bob's message selected")
+            return
+        }
+        replyInThread.click()
+        type(ui, Key.id("compose"), "APP-THREAD-REPLY\r", "the reply composer")
+        let threadUntil = Date().addingTimeInterval(30)
+        var threadReply: [String: Any] = [:]
+        while Date() < threadUntil && threadReply.isEmpty {
+            let rows = run(vox, ["room", "read", "--node", "bob", "--json", room], env: voxEnv).out
+            for line in rows.split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      let env = row["envelope"] as? [String: Any],
+                      env["body"] as? String == "APP-THREAD-REPLY" else { continue }
+                threadReply = env
+            }
+            if threadReply.isEmpty { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        XCTAssertTrue(threadReply["re"] as? String == fromBob
+                      && threadReply["thread"] as? String == fromAlice,
+                      "PRODUCT: Reply in Thread must reach bob answering his reply \(fromBob) in General root \(fromAlice); bob read \(threadReply)")
+        print("[proof] Reply in Thread: bob reads the app's nested reply in the original General thread")
 
         // (4d) To: offers bob's open Session under him, and a message to it alone is addressed to
         // that Session (MADR W-4, ADR-029 TA-1, D7): bob's Claude Code session opens a Session in
@@ -3954,7 +4052,7 @@ final class FirstRunProof: XCTestCase {
             XCTFail("PRODUCT: Escape must close the Quick Look that Return opened from the timeline; it stayed open, so the keyboard is trapped")
             return
         }
-        // ↑ to KEYS-B, ↑ to KEYS-A, ↓ back to KEYS-B: each said by Reply to Selected Message.
+        // ↑ to KEYS-B, ↑ to KEYS-A, ↓ back to KEYS-B: each said by Reply in Thread.
         for (key, want) in [(XCUIKeyboardKey.upArrow, "KEYS-B"), (.upArrow, "KEYS-A"),
                             (.downArrow, "KEYS-B")] {
             ui.typeKey(key, modifierFlags: [])
@@ -4395,6 +4493,17 @@ final class FirstRunProof: XCTestCase {
         for container in key.containers(ui, all: containers(ui)) {
             if let found = find(key, in: container) { return found }
         }
+        if case .showing = key {
+            // XCTest can omit a SwiftUI timeline row from its window-scoped query while its
+            // application query finds the very same row inside that window. The failing
+            // screen and the element's recorded window ancestry establish this (#684).
+            // Accept only text drawn within a real window, never a zero-area Touch Bar match.
+            let windows = ui.windows.allElementsBoundByIndex.map(\.frame).filter { !$0.isEmpty }
+            for found in key.query(in: ui.descendants(matching: .any)).allElementsBoundByIndex {
+                let frame = found.frame
+                if !frame.isEmpty, windows.contains(where: { $0.contains(frame) }) { return found }
+            }
+        }
         return nil
     }
 
@@ -4455,6 +4564,18 @@ final class FirstRunProof: XCTestCase {
         guard running.count == 1, let pid = running.first, executable(pid) == appExe else {
             throw Apparatus("after starting Vox Proof, the \(proofAppID) processes are \(running.map { "\($0) \(executable($0))" }), not one of \(appExe)")
         }
+        // Diagnose a missed long-path control socket without emitting the process's
+        // other environment values. XCTest and the unsandboxed stager may use
+        // different temporary directories, which would change its fallback address.
+        let temporary = stager.run(["/usr/bin/python3", "-c",
+            "import re, subprocess, tempfile; s = subprocess.check_output(['/bin/ps', 'e', '-p', '\(pid)', '-o', 'command='], text=True); m = re.search(r'(?:^| )TMPDIR=([^ ]+)', s); print('app TMPDIR=' + (m.group(1).strip() if m else '<unset>')); print('stager temporary=' + tempfile.gettempdir())"], env: [:])
+        print("[guard diagnostic] \(temporary.out.trimmingCharacters(in: .whitespacesAndNewlines))")
+        // Keep the guest's actual screen even when accessibility cannot produce a snapshot.
+        // This is a diagnostic artifact, never a product verdict or a new gate.
+        let screen = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        screen.name = "Screen after launching Vox Proof"
+        screen.lifetime = .keepAlways
+        add(screen)
         // The profile, positively, before any step. The account's own config has answered the
         // first-run question (checked here, by the stager), so an app asking it is not reading
         // the account's config: the launch environment, which comes whole or not at all, reached it.
@@ -4507,6 +4628,10 @@ final class FirstRunProof: XCTestCase {
         tree.name = "Vox's UI tree when \(why)"
         tree.lifetime = .keepAlways
         add(tree)
+        let screen = XCTAttachment(screenshot: ui.screenshot())
+        screen.name = "Vox's screen when \(why)"
+        screen.lifetime = .keepAlways
+        add(screen)
     }
 
     /// The element `key` names, where it is now (else a query that finds nothing): for reading
@@ -4539,6 +4664,14 @@ final class FirstRunProof: XCTestCase {
     private func missing(_ ui: XCUIApplication, _ key: Key, _ product: String, premise: Premise? = nil,
                          file: StaticString, line: UInt) {
         keepTree(ui, "\(key) was not shown")
+        // Startup failure has its own screen, before the normal status field exists.
+        // Reading that screen is a product refusal, not evidence that AX search failed.
+        if let failure = locateEverywhere(ui, Key.id("start-failure")),
+           let details = locateEverywhere(ui, Key.id("said")) {
+            XCTFail("PRODUCT: \(product); Vox instead shows \(shown(failure)) — \(shown(details))",
+                    file: file, line: line)
+            return
+        }
         // Premise: the same search finds a known sibling of the same kind; if not, the search is
         // what failed, not the app.
         if locateEverywhere(ui, key.sibling) == nil {
@@ -4548,6 +4681,10 @@ final class FirstRunProof: XCTestCase {
         }
         let anywhere = key.query(in: ui.descendants(matching: .any)).firstMatch
         if anywhere.exists {
+            let found = XCTAttachment(string: anywhere.debugDescription)
+            found.name = "The matching element outside the searched containers"
+            found.lifetime = .keepAlways
+            add(found)
             XCTFail("APPARATUS: \(key) is in the app only outside its windows, dialogs, sheets, popovers and menus (\(anywhere.elementType.rawValue)); the proof's search missed it",
                     file: file, line: line)
             return
@@ -4686,10 +4823,10 @@ final class FirstRunProof: XCTestCase {
                     // a person waits, and never stopped: it may be theirs.
                     let at = CGPoint(x: e.frame.midX, y: e.frame.midY)
                     let clearBy = Date().addingTimeInterval(20)
-                    while systemOverlayOver(at) != nil, Date() < clearBy {
+                    while systemOverlayOver(at, targetHittable: e.isHittable) != nil, Date() < clearBy {
                         Thread.sleep(forTimeInterval: 0.5)
                     }
-                    if let held = systemOverlayOver(at) {
+                    if let held = systemOverlayOver(at, targetHittable: e.isHittable) {
                         keepTree(ui, "a system window covered \(what)")
                         XCTFail("APPARATUS: \(held) covered \(what) (\(key)) for 20 s; not Vox's, and left alone",
                                 file: file, line: line)

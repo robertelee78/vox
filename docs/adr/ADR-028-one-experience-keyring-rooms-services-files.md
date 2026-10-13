@@ -97,7 +97,7 @@ decider named: read records, the room's shared name, the decision record and the
   decider, 2026-10-09: "vox is unusable"; "if it need a passphrase it should tell me what to do",
   "not silently fail". Attaching a node with its identity passphrase (`vox node attach`, the app's
   attach) MUST store that passphrase in the macOS Keychain, keyed per node, once the daemon has
-  proved it, and a node made by `vox node create`, `vox setup` or `vox agent connect` MUST be
+  proved it, and a node made by `vox node create`, `vox setup` or `vox agent setup` MUST be
   attached at once and remembered the same way. At its start the daemon MUST attach every node
   whose passphrase is stored, and every remembered node that has none, with nobody typing: after a
   daemon restart, `vox update`, the app's quit and a reboot. `vox node attach --no-remember`
@@ -116,7 +116,7 @@ by any of them (ADR-001: there is no typed agent or human).
 
 - **K-11. An identity passphrase is optional.** *Amended 2026-10-10:* ADR-005 J-2 (V030-36) is
   restored, by the decider's ruling of 2026-10-09 ("passphrases are optional"; "we talked about
-  this"). Creating a node (`vox node create`, `vox setup`, `vox agent connect`, the TUI's or the
+  this"). Creating a node (`vox node create`, `vox setup`, `vox agent setup`, the TUI's or the
   app's onboarding) MUST accept an empty identity passphrase, and MUST say once, where it is given,
   what it means: the node's identity key is kept on that machine unencrypted, so anyone who can
   read its data folder can act as the node. Attaching or unlocking a node made with none MUST
@@ -505,7 +505,7 @@ Each line below is amended as stated. Where code already matches, the ADR text i
 | ADR-026 S-6 | `vox daemon install` deferred | On macOS, a login item via `SMAppService` (A-5); Linux unchanged |
 | ADR-005 J-1 | "the two people swap fingerprints … each then runs `vox trust add` for the other" | Swapping fingerprints first is optional; each accepts the other's offer (K-15–K-17) |
 | ADR-005 J-2 | An identity passphrase is OPTIONAL (V030-36) | Restored (K-11 as amended 2026-10-10): optional, and an empty one says the key is kept unencrypted; a room passphrase stays optional |
-| ADR-020 2.1 | The skill pack's setup creates the agent's node | The operator makes it, at a terminal of their own (`vox setup` or `vox agent connect`), with a passphrase they type or none (K-11 as amended) |
+| ADR-020 2.1 | The skill pack's setup creates the agent's node | The operator makes it, at a terminal of their own (`vox setup` or `vox agent setup`), with a passphrase they type or none (K-11 as amended) |
 | ADR-020 3.1 | The keyring window runs from when the passphrase "was last entered" | From when it was last entered for a keyring change; attaching does not open it (K-12) |
 | ADR-020 3.7 | Entry point 2, in-room approval, not built | Specified as offers on join (K-15–K-19) |
 | ADR-020 3.8 | A provision-time import MAY be provided | No import (K-20) |

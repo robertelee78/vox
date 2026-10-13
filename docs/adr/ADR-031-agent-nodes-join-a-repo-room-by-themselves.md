@@ -7,7 +7,9 @@ which are accepted for v0.4.4 (the decider's release split, 2026-10-10, night: v
 fixes that let nodes join a room and work correctly, and the rest moves to v0.4.5). Accepted from the
 decider's Q&A, 2026-10-10, his answers to this ADR's open questions the same evening, his
 story-plan answers that night (LT-8, a Mac over ssh, one format step), and his Session history
-decisions and answers that night (SA-7–SA-13). Nothing in this ADR is built.
+decisions and answers that night (SA-7–SA-13). The decider's 2026-10-12 scope amendment
+removes prior-release data and wire compatibility and migration proofs from v0.4.5 (ADR-026 F-3).
+The remaining feature requirements retain their stated release targets.
 **Date**: 2026-10-10
 **Deciders**: Robert E. Lee
 **Tags**: agents, onboarding, hooks, keyring, trust, drive, sessions, macos
@@ -130,11 +132,11 @@ allow drive access for the node I'm using from the macOS app."
   used: the decider, 2026-10-10, "nodes are tied to pub/priv keys which is orthogonal to host level
   account auth". LT-1 is not such a widening: it is the person's standing rule, applied by the
   daemon, and grants drive only to the person's own node.
-- **LT-9. Existing pairs.** LT-1 MUST apply to pairs of this machine's nodes that already share a
-  room with the person's node when a release with this ADR first starts, not only to new joins.
-  The daemon MUST write their entries at that start (or when each node is next Ready). A pair whose removal by hand is in either node's decision record
-  (ADR-028 D-1, "a trust added or removed") MUST be treated as removed under LT-6 and left alone.
-  The release's notes MUST say that existing local pairs are trusted on upgrade.
+- **LT-9. Existing pairs from an earlier release — superseded for v0.4.5.** The 2026-10-12
+  compatibility scope decision (ADR-026 F-3) removes the previous-release automatic-trust
+  migration and its release-note/proof requirement. LT-1 and LT-6 still govern current-version
+  automatic trust and persistence of a person's removals across restart. No reconstruction of
+  decision history already pruned by an earlier release is required.
 
 ### 4. A repository with no room
 
@@ -215,19 +217,14 @@ allow drive access for the node I'm using from the macOS app."
 - **SA-3.** A Session's opening and end records MUST be sealed under its Session key (ADR-029 SC-2),
   so a member without drive cannot read them from its own copy of the log. This MUST ship in
   v0.4.5 (the decider's "do it now" was for v0.4.4; his release split moved it).
-- **SA-5. Upgrade.** Sealing these records is a format change (ADR-026 F-3): v0.4.5 MUST raise the
-  data root's format and MUST upgrade, automatically and before anything else is written, every
-  data root a release since v0.4.0 wrote. Every room, every Session and every entry an earlier
-  release wrote MUST open and read in full after the upgrade, and an open Session MUST continue;
-  nothing MAY be lost. Records an earlier release wrote unsealed stay as they were written in every
-  member's copy of the log; from the upgrade on, the daemon MUST NOT serve them to a member without
-  drive (SA-2), and the release's notes MUST say that earlier opening and end records stay readable
-  in a copy a member already holds. This is one format step with ADR-032 AN-14: v0.4.5 MUST raise
-  the format once, with one upgrade and one proof (SA-6) for both.
-- **SA-6. Proof of the upgrade.** The upgrade MUST be proved by real use, on a data root and rooms
-  the shipped v0.4.4 binary wrote, with Sessions open and ended, opened by the v0.4.5 binary
-  (extending `a_data_root_of_the_previous_release_opens_with_nothing_lost`, ADR-026 F-3), with a
-  mutant that turns it red on its own assertion (ADR-018 §7).
+- **SA-5. Prior-release upgrade — superseded for v0.4.5.** Under ADR-026 F-3's 2026-10-12
+  amendment, v0.4.5 has no requirement to migrate roots or Sessions written by an earlier
+  release. Current-version Session confidentiality, retention, data integrity and restart
+  behavior remain required. This does not authorize resetting real data or relaxing drive
+  checks, and does not require deleting compatibility code already landed.
+- **SA-6. Prior-release upgrade proof — withdrawn for v0.4.5.** No published-release fixture,
+  combined migration journey or upgrade-acceptance gate is required. Prove the remaining
+  current-version product behavior through its existing real-use journeys (ADR-018).
 - **SA-4.** A member without drive addresses the node (ADR-029 TA-4); the composer MUST NOT offer
   that node's Sessions.
 
@@ -245,10 +242,10 @@ on a point the decider left open).
   The decider: "Session steps are kept only on members with drive (the only ones who can read
   them)." The room's own messages are not affected: a member without drive MUST be able to hold,
   verify and sync the room's log complete without any Session step, so nothing a member without
-  drive holds MAY need a Session step to verify or to sync. At the upgrade to the release that
-  brings SA-7, a member without drive MUST delete the steps it holds. A member that loses drive
-  later MUST keep what it already read and MUST receive nothing newer (ADR-029 SC-2b holds). The
-  decider: "yes" to both.
+  drive holds MAY need a Session step to verify or to sync. A member that loses drive MUST keep what
+  it already read and MUST receive nothing newer (ADR-029 SC-2b holds). The former migration of
+  earlier-release stored steps is out of v0.4.5 scope (SA-5); current-version authorization is
+  unchanged.
 - **SA-8. Forward from the join.** A node that joins a room MUST get a Session's steps only from
   the later of its join and its gaining drive, going forward. No node MAY send it, and it MUST NOT
   fetch, a step written before then, whatever its trust. The decider: "A node that joins syncs a
@@ -269,20 +266,15 @@ on a point the decider left open).
   retention (ADR-010 AR-29) and the shorter-wins rule (AR-30) MUST apply to Session steps as they
   do to messages. `vox status --json` and the app's room settings MUST show it beside the message
   retention. An ended Session's steps age by it (ADR-029 SE-5 as amended).
-- **SA-10. Peers of earlier releases.** SA-7 and SA-8 change what peers send each other. A node of
-  the release that brings them MUST keep syncing the room's messages with a peer of an earlier
-  release (ADR-034 UP-2), and nothing it sends MAY poison that peer's room. A member of an earlier
-  release without drive receives no Session steps from a node with SA-7. What a member of an earlier
-  release with drive sees of a Session written by such a node, and what such a node does with steps
-  an earlier release still writes into the room's log, is to be measured with the shipped earlier
-  binary before SA-7 is built, and the release's notes MUST say it in one sentence.
-- **SA-11. The format step.** Whatever the store needs to hold steps apart from the room's log
-  (SA-7) is part of v0.4.5's one format step (SA-5): one raise of the format, one upgrade and one
-  proof (SA-6) with SA-3 and ADR-032 AN-14. After the upgrade, every step a member with drive held
-  and its retention still keeps MUST read in full, and an open Session MUST continue. SA-8 and
-  SA-9 ship in v0.4.4, before that step, and do not wait for it: where SA-9 needs a field the data
-  root lacks (the Session-step retention in the room's policy, ADR-007), v0.4.4 MUST carry its own
-  small upgrade for it, with nothing else in it.
+- **SA-10. Peers of earlier releases — superseded for v0.4.5.** Mixed-version wire
+  compatibility, a shipped-older-binary experiment and compatibility release notes are not
+  required by the 2026-10-12 scope decision (ADR-026 F-3). Current peers MUST still enforce
+  SA-1–SA-4 and SA-7–SA-9; a version difference never grants access.
+- **SA-11. The format step — superseded for v0.4.5.** A shared previous-release migration and
+  proof are no longer release prerequisites (SA-5, SA-6). Current-version storage must remain
+  coherent, and the data-integrity, restart, retention and access requirements still apply.
+  This does not undo the SA-8/SA-9 behavior already shipped in v0.4.4 or require its code to be
+  rewritten.
 - **SA-12. Proof.** SA-7, SA-8 and SA-9 MUST each be proved by real use of the shipped binary
   (ADR-018 §9), extending the drive journey where it fits, with a mutant that turns each proof red
   on its own assertion, labelled PRODUCT (ADR-018 §7):
@@ -342,12 +334,12 @@ on a point the decider left open).
 | ADR-028 K-12 | Every keyring change asks for the identity passphrase, with the 30-minute window | Except LT-1's entries, the person's standing rule applied by the daemon (LT-3) |
 | #677 | A widening is confirmed by the person (a Touch ID or password check was considered) | Refused inside an agent's session as its hook marks it; the passphrase and its window stay; no OS account check (LT-8) |
 | ADR-026 L-2; ADR-028 K-13 | `vox node attach <name> [--keep]`, `vox node detach <name>`; the hook shows the attach command | `vox node unlock <name>`, `vox node lock <name>`; the old verbs work and print the new ones (CW-7) |
-| ADR-026 F-3 | Format as of v0.4.3 | Sealed Session opening and end records raise the format, with an upgrade from every release since v0.4.0 (SA-5, SA-6) |
+| ADR-026 F-3; ADR-031 LT-9, SA-5, SA-6, SA-10, SA-11 | Prior-release data migration, mixed-version compatibility and a combined upgrade proof | Out of v0.4.5 scope by the decider, 2026-10-12; current-version data and access guarantees remain |
 | ADR-029 SC-1, SC-2 | A Session's steps are entries of the room's log, sealed, and every member holds them | Steps are sent, synced and stored only on the session's node and members with drive; members without drive never receive them (SA-7) |
 | ADR-029 SC-2a | A member reads a Session from the key's release onward; earlier sealed steps are in its copy of the log | A joining node gets steps only from the later of its join and its gaining drive; no backfill (SA-8) |
 | ADR-029 SE-5; ADR-010 AR-27, AR-28 | A Session's content follows the room's message retention, forever by default | Session steps have a retention of their own, by default 7 days or the message retention, whichever is shorter (SA-9) |
 | ADR-007 G-5 (the policy update) | A policy update changes the room's one retention | It also carries the Session-step retention (SA-9), set with `--steps` |
-| ADR-031 SA-3, SA-5, SA-6, SA-11 (as first written) | Ship in v0.4.4, with the Session-step retention in the one format step | Ship in v0.4.5; SA-8, SA-9, SA-13, RN-1, RN-2 ship in v0.4.4, SA-9 with its own small upgrade (the decider's release split, 2026-10-10) |
+| ADR-031 SA-3, SA-5, SA-6, SA-11 (as first written) | Ship in v0.4.4, with the Session-step retention in the one format step | Historical release split, 2026-10-10: moved to v0.4.5; the later 2026-10-12 amendment withdraws its prior-release migration and proof obligations |
 
 ## Consequences
 
@@ -361,11 +353,11 @@ on a point the decider left open).
 - A trust-widening verb run inside an agent's session is refused by the mark its hook sets (LT-8).
   An agent's process that drops that mark is not refused: LT-8 stops an agent's ordinary use of
   the verbs, and the OS account stays the boundary (ADR-026 C-6).
-- On upgrade, this machine's nodes that already share a room with the person's node trust each
-  other, and the person's node gains drive over them (LT-9).
+- Current-version local automatic trust and persistent removals remain required (LT-1, LT-6);
+  prior-release reconstruction and migration are out of scope (LT-9).
 - A member with read only no longer learns that a node has Sessions, or their names.
-- The Session opening and end records change on the wire and on disk, so v0.4.5 is to carry an
-  upgrade for data roots written by v0.4.0 or later, and its proof (SA-5, SA-6).
+- Session opening and end records change on the wire and on disk; v0.4.5 does not require
+  previous-release compatibility or a migration proof (SA-5, SA-6, SA-10).
 - Scripts and documents that use `vox node attach` or `detach` keep working, and are told the new
   verbs (CW-7).
 - A member without drive no longer stores or relays any Session's steps, and a member that joins
@@ -377,13 +369,9 @@ on a point the decider left open).
 
 ## Open questions
 
-- **A member of an earlier release in the room.** What a v0.4.4 node does when it receives a sealed
-  opening or end record (skips it, refuses the entry, or poisons the room) is not known. It is to be
-  measured with the shipped v0.4.4 binary before SA-3 is built. Peers of different releases keep
-  syncing (ADR-034 UP-2 refuses a version difference only between a client and its own daemon), so
-  a v0.4.4 member can receive sealed records from a v0.4.5 member, and the answer is to be brought
-  to the decider before SA-3 is built. Measuring compatibility between versions, so that peers of
-  different releases are handled safely, is planned for v0.4.5.
+- **Prior-release compatibility — resolved as out of scope for v0.4.5.** The decider's
+  2026-10-12 scope decision removes the old measurement prerequisite. Earlier measurements
+  remain historical evidence; they do not create a new release gate (ADR-026 F-3).
 
 ## Related ADRs
 

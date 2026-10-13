@@ -44,6 +44,7 @@ use crate::node::network::{Inbound, NodeNet};
 use crate::node::open_rooms::OpenRooms;
 use crate::node::paths::Paths;
 
+mod local_trust;
 mod recovery;
 use crate::node::prekeys::{self, PrekeyRing};
 use crate::node::profile::Profile;
@@ -404,35 +405,8 @@ fn detail_of(
         unread: ch.unread(),
         drive_from: ch.drive_from(),
         session_files: ch.session_files(),
+        session_records: ch.session_records(),
     }
-}
-
-/// Publish the owner's currently open Session metadata after the new reader's key position
-/// has been chosen, before its consent commits. Forward-only keys cannot open an earlier
-/// Session opening. Republishing metadata makes the ongoing Session discoverable without
-/// releasing any old step or ordinary message. A crash before consent retries this snapshot;
-/// once consent commits, its retained key already covers every part written here.
-fn refresh_session_openings(
-    channel: &mut ChannelState,
-    profile: &Profile,
-    now: crate::time::Ms,
-) -> crate::error::Result<()> {
-    let me = channel.me();
-    let detail = detail_of(channel, None, now);
-    for row in crate::node::sessions::fold(&detail)
-        .into_iter()
-        .filter(|row| row.node == me && row.open)
-    {
-        let opening = crate::node::sessions::Opening {
-            id: row.id,
-            harness: row.harness,
-            name: row.name,
-        };
-        for part in crate::node::sessions::opening_parts(&opening) {
-            channel.append_text(profile, &part, now.get())?;
-        }
-    }
-    Ok(())
 }
 
 /// A room's lock if it can be had by `deadline`. A free lock is taken even once the deadline has
@@ -651,6 +625,8 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::Names(_) => "resolving a .vox name",
         NetEvent::SessionPage { .. } => "reading a page of a room's Session entries",
         NetEvent::MemberDialer(_) => "lending the proxy its dialer",
+        NetEvent::LocalTrustBlacklist(_) => "reading local trust removal decisions",
+        NetEvent::TrustLocalNode { .. } => "applying the daemon's local trust policy",
     }
 }
 
@@ -1046,6 +1022,14 @@ enum NetEvent {
     /// The daemon's proxy (ADR-028 S-5) wants this node's way of reaching a member, to carry a
     /// name that resolved to one of this node's rooms.
     MemberDialer(oneshot::Sender<crate::error::Result<MemberDialer>>),
+    /// Daemon-internal only: no IPC request maps to these policy operations.
+    LocalTrustBlacklist(oneshot::Sender<crate::error::Result<Option<BTreeSet<Digest32>>>>),
+    TrustLocalNode {
+        fingerprint: Digest32,
+        name: String,
+        capability: crate::node::trust::Capability,
+        reply: oneshot::Sender<Outcome>,
+    },
     /// A held room's address was given again and a member it names answered there (V210-167):
     /// keep what it names as the room's, dial its anchors, and answer the join.
     AddressReached {
@@ -8514,6 +8498,18 @@ impl Node {
             NetEvent::Names(reply) => {
                 let _ = reply.send(self.resolver_snapshot().await);
             }
+            NetEvent::LocalTrustBlacklist(reply) => {
+                let _ = reply.send(self.local_trust_blacklist());
+            }
+            NetEvent::TrustLocalNode {
+                fingerprint,
+                name,
+                capability,
+                reply,
+            } => {
+                let outcome = self.trust_local_node(fingerprint, &name, capability).await;
+                let _ = reply.send(outcome);
+            }
             NetEvent::MemberDialer(reply) => {
                 let _ = reply.send(
                     self.net
@@ -10609,9 +10605,6 @@ impl Node {
                 .unwrap_or((skdm.body.chain_id, skdm.body.iteration));
             // The generations before the live one that the decision — or a full-history grant —
             // covers (V210-45, PRD-001 R12) are owed in the grant's own transaction (V210-88).
-            if let Err(e) = refresh_session_openings(&mut channel, profile, now_ms) {
-                return Outcome::Failed(fault_of(&e));
-            }
             match channel.issue_consent(profile, target, &skdm, full, entitled_from, now_ms) {
                 Ok((_, history_owed)) => history_owed,
                 Err(e) => return Outcome::Failed(fault_of(&e)),
@@ -13193,10 +13186,9 @@ impl Node {
                         .and_then(|p| p.first().copied())
                         .unwrap_or((skdm.body.chain_id, skdm.body.iteration));
                     let mut channel = shared.lock().await;
-                    refresh_session_openings(&mut channel, profile, now_ms).is_ok()
-                        && channel
-                            .issue_consent(profile, peer, &skdm, full, entitled_from, now_ms)
-                            .is_ok()
+                    channel
+                        .issue_consent(profile, peer, &skdm, full, entitled_from, now_ms)
+                        .is_ok()
                         && (entitled_from.0 >= skdm.body.chain_id
                             || channel
                                 .owe_history(profile.store(), peer, entitled_from.0)
@@ -14530,7 +14522,13 @@ impl Node {
             crate::node::pending_consent::PendingConsents::load(profile.store(), signer)?;
         // The decision record is sealed under this identity too (#563): from now it is written,
         // what was decided while locked with it.
+        self.decisions.hold_for_local_trust_import(true);
         self.decisions.unlock(signer)?;
+        // Import before a new decision can prune an older release's retained manual removals.
+        // An unreadable old diary stops automation, not ordinary use of the person's identity.
+        if let Err(e) = self.import_local_trust_history() {
+            eprintln!("vox: automatic local trust waits for its removal history: {e}");
+        }
         Ok(())
     }
 
@@ -15215,6 +15213,7 @@ impl Node {
             .as_ref()
             .ok_or(crate::error::Error::AtRestLocked)?;
         ch.finish_session_upgrade(profile.store(), self.now_ms().get())?;
+        ch.refresh_session_records(profile, &self.drive_holders(), &[], self.now_ms().get())?;
         ch.sweep_retention(profile.store(), self.now_ms())?;
         Ok(())
     }
@@ -17078,6 +17077,13 @@ impl Node {
             let Ok(owed) = ch.owed_drive(profile, holders, now_ms) else {
                 return;
             };
+            if !owed.is_empty()
+                && ch
+                    .refresh_session_records(profile, holders, &owed, now_millis)
+                    .is_err()
+            {
+                return;
+            }
             let mut releases = Vec::new();
             for member in owed {
                 if let Ok((skdm, generation)) = ch.drive_skdm_for(profile, &member) {

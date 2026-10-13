@@ -166,6 +166,13 @@ fn trust_name(a: &TrustAddArgs, default: Option<&str>) -> Result<String, crate::
 
 /// Run a trust verb against the daemon already holding this node.
 fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
+    // Refuse a marked agent before naming prompts or daemon access (ADR-031 LT-8).
+    if matches!(sub, TrustCmd::Add(_) | TrustCmd::Drive(_)) {
+        if let Some(why) = crate::coord::trust_widening_refusal() {
+            eprintln!("vox: {why}");
+            return ExitCode::FAILURE;
+        }
+    }
     let (profile, pass, pass_file) = match &sub {
         TrustCmd::Offers(a) => (
             a.profile.clone(),
@@ -937,7 +944,7 @@ enum AgentCmd {
     /// can be announced, and prints nothing; on `SessionEnd` it removes the session's
     /// registration.
     Hook(AgentHookArgs),
-    /// Print the integration a harness needs to run `vox agent hook` every turn.
+    /// Print a node's harness integration, or install missing light hooks with `--install`.
     ///
     /// Whatever the harness wants, this prints it: Claude Code and Codex take a
     /// hook entry in their own settings, so they get a JSON snippet; OpenCode has
@@ -984,7 +991,7 @@ enum AgentCmd {
     ///
     /// Run from a harness session at its start (the agent skill says to), when no hook has
     /// brought Vox's news: it only reads, and says the first thing missing with the one command
-    /// the operator runs for it in a terminal of their own — `vox agent connect` when no node is
+    /// the operator runs for it in a terminal of their own — `vox agent setup` when no node is
     /// wired to the harness, `vox node attach` when its node is not attached, the room ask with
     /// `vox room join … --bind` when the directory is bound to no room — or that nothing is.
     ///
@@ -994,16 +1001,17 @@ enum AgentCmd {
     Status(AgentStatusArgs),
     /// Make a node for a harness (or take one that exists), wire the harness to it, and attach it.
     ///
-    /// What `vox setup` does for one harness, by the name you choose: the node is made with a
-    /// passphrase you type twice at this terminal (or `--passphrase-file`), the harness's hook
+    /// What `vox setup` does for one harness: the suggested name is <harness>-<host>, or the
+    /// name you choose with --node. Type the passphrase twice in your own terminal, outside an
+    /// agent session; it is never read from a file or environment variable. The harness's hook
     /// goes in its own settings with the agent skill beside it (other Vox hook entries there are
     /// replaced, nothing else), and the node is attached. It says what it is to do first. Start
     /// a new session of the harness afterwards.
     ///
     /// For example:
     ///
-    /// vox agent connect claude --node claude-mbp
-    Connect(AgentConnectArgs),
+    /// vox agent setup claude --node claude-mbp
+    Setup(AgentSetupArgs),
     /// Check that this node's agent sessions are wired up, and say how to fix what is not.
     ///
     /// One line per check, `ok`, `warn` or `fail`, each with a one-line fix: the node answers;
@@ -1046,20 +1054,16 @@ pub struct AgentStatusArgs {
     pub dir: Option<PathBuf>,
 }
 
-/// `vox agent connect`
+/// `vox agent setup`
 #[derive(Args, Debug, Clone)]
-pub struct AgentConnectArgs {
+pub struct AgentSetupArgs {
     #[command(flatten)]
     pub profile: AccountArgs,
     /// The harness to wire: `claude`, `codex` or `opencode`.
     pub harness: String,
-    /// The node's name: made if there is none, as `vox node create` makes it.
-    #[arg(long, required = true)]
-    pub node: String,
-    /// Read a new node's passphrase (or an existing one's, to attach it) from this file instead
-    /// of asking at the terminal (first line; `-` reads stdin).
+    /// The node's name; defaults to <harness>-<host>, folded to a valid node name.
     #[arg(long)]
-    pub passphrase_file: Option<PathBuf>,
+    pub node: Option<String>,
 }
 
 /// `vox agent doctor`
@@ -1142,11 +1146,14 @@ pub struct AgentTrustArgs {
 pub struct AgentPluginArgs {
     /// The harness to print an integration for. Only `opencode` needs one today;
     /// Claude Code and Codex are configured with a hook command instead.
-    pub harness: String,
+    #[arg(required_unless_present = "install", conflicts_with = "install")]
+    pub harness: Option<String>,
     /// The agent's own node, which the printed hooks act as (`vox agent hook --node <name>`).
-    /// Required: an agent never uses a person's node.
-    #[arg(long, required = true)]
-    pub node: String,
+    #[arg(long, required_unless_present = "install", conflicts_with = "install")]
+    pub node: Option<String>,
+    /// Install a quiet, node-free hook in every harness here without a Vox hook.
+    #[arg(long)]
+    pub install: bool,
 }
 
 /// `vox agent send`
@@ -1193,10 +1200,12 @@ pub struct AgentRoomArgs {
 pub struct AgentHookArgs {
     #[command(flatten)]
     pub profile: AccountArgs,
-    /// The node this hook acts as: the agent's own node. Required, and
-    /// never taken from the environment or any other node: a hook without it refuses.
-    #[arg(long, required = true)]
-    pub node: String,
+    /// The agent's own node. Never inferred from the environment or another node.
+    #[arg(long, required_unless_present = "light", conflicts_with = "light")]
+    pub node: Option<String>,
+    /// A quiet onboarding hook: no node, no daemon, and no room drain.
+    #[arg(long, value_parser = ["claude", "codex", "opencode"])]
+    pub light: Option<String>,
     /// Drain only this room (its id, or a unique prefix). Without it the hook drains every
     /// room the node holds, each under its own heading.
     #[arg(long)]
@@ -3027,7 +3036,14 @@ pub fn run() -> ExitCode {
             }
         }
         Cmd::Agent(AgentCmd::Hook(args)) => {
-            let node = match vox_core::node::paths::NodeName::parse(&args.node) {
+            // HK-2: a light hook never resolves an account or enters node/daemon code.
+            // HK-3/4's onboarding notice and Not Now state are a separate outcome (#721).
+            if args.light.is_some() {
+                return ExitCode::SUCCESS;
+            }
+            let node = match vox_core::node::paths::NodeName::parse(
+                args.node.as_deref().unwrap_or_default(),
+            ) {
                 Ok(n) => n,
                 Err(e) => {
                     eprintln!("vox: --node: {e}");
@@ -3174,12 +3190,11 @@ pub fn run() -> ExitCode {
                 }
             }
         }
-        Cmd::Agent(AgentCmd::Connect(args)) => match block_on_client(async move {
-            crate::agent_setup::connect(
+        Cmd::Agent(AgentCmd::Setup(args)) => match block_on_client(async move {
+            crate::agent_setup::setup(
                 &args.profile.as_node_args(),
                 &args.harness,
-                &args.node,
-                args.passphrase_file.clone(),
+                args.node.as_deref(),
             )
             .await
         }) {
@@ -3228,14 +3243,29 @@ pub fn run() -> ExitCode {
             }
         },
         Cmd::Agent(AgentCmd::Plugin(args)) => {
-            let node = match vox_core::node::paths::NodeName::parse(&args.node) {
+            if args.install {
+                return if crate::setup::install_light_hooks() {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                };
+            }
+            let node = match vox_core::node::paths::NodeName::parse(
+                args.node.as_deref().unwrap_or_default(),
+            ) {
                 Ok(n) => n,
                 Err(e) => {
                     eprintln!("vox: --node: {e}");
                     return ExitCode::FAILURE;
                 }
             };
-            match args.harness.to_ascii_lowercase().as_str() {
+            match args
+                .harness
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str()
+            {
                 "opencode" => {
                     print!("{}", crate::agent_hook::opencode_plugin(&node));
                     eprintln!(

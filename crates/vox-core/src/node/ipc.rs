@@ -4289,7 +4289,7 @@ impl Drop for Counted {
 /// If the socket cannot be placed.
 pub fn bind_account<D: Dispatch>(dispatch: std::sync::Arc<D>, path: PathBuf) -> Result<IpcServer> {
     // `.daemon/` is the daemon's own, made private here if the lock has not made it yet. **Not
-    // the shared fallback** (`<tmp>/vox-<uid>`, for a data root whose socket path is too long):
+    // the shared fallback** (`/tmp/vox-<uid>-<16 hex>`, for a data root whose socket path is too long):
     // `create_private_dir` follows a symlink and changes the mode of whatever it points at, and
     // anyone can plant one there. `place_socket` creates or refuses that one itself, by lstat.
     if let Some(dir) = path.parent() {
@@ -4962,6 +4962,17 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             text,
             card,
         } => {
+            // A stale or explicit target cannot publish this session into another repository's
+            // room, including an automatic coordination hello. Check before any append or fetch.
+            if let Ok(env) = vox_agentcomms::envelope::Envelope::parse(&text) {
+                if let Err(reason) = crate::node::sessions::check_working_room(
+                    handle.paths(),
+                    &env.from,
+                    &channel_id,
+                ) {
+                    return Frame::Error { reason };
+                }
+            }
             // **A link card is fetched here, by the sender's node, once** (ADR-028 F-10), and
             // travels in the message: no reader's node ever contacts the linked site.
             let text = if card {
