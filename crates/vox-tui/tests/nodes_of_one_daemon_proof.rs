@@ -484,6 +484,44 @@ fn local_nodes_trust_each_other_without_a_prompt_and_remember_removals() {
     stop_pid(pid);
     daemons.clear();
     daemons = start();
+    // A saved grant only proves the keyring loaded. Join a new local node and wait for its
+    // first personal-drive grant, so removal assertions run after automation has resumed.
+    let fresh = "new-after-restart";
+    let fresh_fp = a.make_node(fresh);
+    let daemon = Daemon::start(&a, &["--node", fresh], &[]);
+    daemon.expect("the new node attached", Duration::from_secs(90), |line| {
+        line.contains(&format!(
+            "node {fresh} is held by the daemon already running"
+        ))
+    });
+    daemons.push(daemon);
+    let (ok, link, err) = a.run(&["room", "link", &room, "--node", person], "");
+    assert!(ok, "APPARATUS: the restarted room's link: {link}{err}");
+    let link = link
+        .lines()
+        .find(|line| line.starts_with("vox://"))
+        .expect("APPARATUS: the restarted room printed no link");
+    let (ok, out, err) = a.run(
+        &[
+            "room",
+            "join",
+            link,
+            "--node",
+            fresh,
+            "--passphrase-file",
+            "-",
+        ],
+        ROOM_PASS,
+    );
+    assert!(ok, "PRODUCT: the new local node could not join: {out}{err}");
+    assert!(
+        wait_until(Duration::from_secs(45), || {
+            has(fresh, &fps[0], person, true) && has(person, &fresh_fp, fresh, false)
+        }),
+        "PRODUCT: local trust did not resume for the new node after restart: {}; {}",
+        ring(fresh),
+        ring(person)
+    );
     assert!(
         wait_until(Duration::from_secs(45), || has(
             names[3], &fps[0], person, true
