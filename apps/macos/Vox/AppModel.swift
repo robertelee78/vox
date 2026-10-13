@@ -411,12 +411,31 @@ final class AppModel: ObservableObject {
             guard ownsNodeRequest(client, generation) else { return }
             nodeList = fresh
             if signedInAs == name {
-                await shown?.refreshMachineState()
-                guard ownsNodeRequest(client, generation), self.node === shown else { return }
-                if fresh.first(where: { $0.name == name })?.status == "Ready",
-                   shown?.nodeStatus == "Ready", let shown {
-                    phase = .attached(node: name, fingerprint: shown.me)
+                guard self.node === shown else { return }
+                if fresh.first(where: { $0.name == name })?.status == "Ready", let shown {
+                    // Requested detach leaves a passphraseless node Ready, but FFI detach
+                    // releases this client's Held connection. Restore only this same identity,
+                    // without remembering credentials again or replacing its window/drafts.
+                    let fingerprint = try await client.attach(node: name, passphrase: nil)
+                    guard ownsNodeRequest(client, generation), self.node === shown,
+                          signedInAs == name else { return }
+                    guard fingerprint == shown.me else {
+                        throw VoxError.Detached(reason: "The node's identity changed while forgetting it. Reopen its window.")
+                    }
+                    let resumed = try await shown.resumeAfterUnlock { [weak self, weak shown] in
+                        guard let self, let shown else { return false }
+                        return self.ownsNodeRequest(client, generation) && self.node === shown
+                            && self.signedInAs == name
+                    }
+                    guard ownsNodeRequest(client, generation), self.node === shown,
+                          signedInAs == name else { return }
+                    guard resumed else {
+                        throw VoxError.Detached(reason: "The node is unavailable after forgetting it. Try Again.")
+                    }
+                    phase = .attached(node: name, fingerprint: fingerprint)
                 } else {
+                    await shown?.refreshMachineState()
+                    guard ownsNodeRequest(client, generation), self.node === shown else { return }
                     phase = .detached(node: name)
                 }
             }

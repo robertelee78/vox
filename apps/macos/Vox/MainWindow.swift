@@ -147,6 +147,8 @@ private struct Sidebar: View {
 
     var body: some View {
         // Selected at once, then read: the list never sees the old selection come back.
+        GeometryReader { available in
+        VStack(spacing: 0) {
         List(selection: Binding(get: { model.selection },
                                 set: { s in
                                     model.select(s)
@@ -182,23 +184,9 @@ private struct Sidebar: View {
                         .copyMenu([("Copy Name", room.name)])
                 }
             }
-            Section {
-                Text("Keyring").tag(NodeModel.Selection.keyring)
-                    .sidebarRow(model.selection == .keyring)
-                    .accessibilityIdentifier("keyring")
-                Text("Decision record").tag(NodeModel.Selection.decisions)
-                    .sidebarRow(model.selection == .decisions)
-                    .accessibilityIdentifier("decisions")
-                Text("Services").tag(NodeModel.Selection.services)
-                    .sidebarRow(model.selection == .services)
-                    .accessibilityIdentifier("services")
-            }
         }
         .listStyle(.sidebar)
-        // The nodes on this Mac, at the sidebar's foot (G5), whatever the rooms above scroll to.
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            OnThisMachine(nodes: model.nodes, known: model.daemonReachable && model.machineStateKnown)
-        }
+        .accessibilityIdentifier("sidebar-rooms")
         // On bg.panel, not the system's sidebar material (L-6), drawn where the sidebar's
         // vibrancy cannot tint it (PanelFill).
         .scrollContentBackground(.hidden)
@@ -208,6 +196,11 @@ private struct Sidebar: View {
         // size), never the conversation's text size (the decider, v0.4.1).
         .font(nil)
         .environment(\.defaultMinListRowHeight, Theme.scaled(24))
+        // Keep rooms usable at every window size; only the node rows scroll within this foot.
+        OnThisMachine(nodes: model.nodes, known: model.daemonReachable && model.machineStateKnown)
+            .frame(maxHeight: available.size.height * 0.4)
+        }
+        }
     }
 }
 
@@ -337,6 +330,8 @@ private struct OnThisMachine: View {
                 .accessibilityAddTraits(.isHeader)
                 .accessibilityIdentifier("on-this-machine")
                 .padding(.top, Space.s8)
+            ScrollView {
+            VStack(alignment: .leading, spacing: Space.s8) {
             ForEach(nodes, id: \.name) { node in
                 HStack {
                     HStack {
@@ -372,7 +367,11 @@ private struct OnThisMachine: View {
                     }
                 }
             }
+            }
+            }
+            .accessibilityIdentifier("machine-nodes-scroll")
             Text("Separate identities. One daemon.").secondaryText()
+                .accessibilityIdentifier("machine-footer")
                 .padding(.top, Space.s4)
         }
         .padding(.horizontal, Space.s16)
