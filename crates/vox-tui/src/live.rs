@@ -37,7 +37,7 @@ use vox_core::node::daemonipc::{
     UseNode,
 };
 use vox_core::node::ipc::{Frame, IpcClient, Request};
-use vox_core::node::link::{b32_decode, b32_encode};
+use vox_core::node::link::b32_decode;
 use vox_core::node::paths::{Account, NodeName};
 use vox_core::node::snapshot::{NodeSnapshot, OpenRoomSnap};
 use zeroize::Zeroizing;
@@ -1831,35 +1831,6 @@ impl DaemonCore {
         }
     }
 
-    /// **A reply, as the CLI's `--re` writes one** (ADR-028 R-9, #485): a `say` whose `re` names
-    /// the entry replied to, in the thread that entry is in (or begins), spending a hop of its
-    /// parent's budget (ADR-020 §9). Its parents are the room on screen's rows.
-    fn reply_text(&self, channel_id: Digest32, re: &Digest32, text: &str) -> String {
-        use vox_agentcomms::envelope::{reply_hops_by, Envelope};
-        let held: &[MessageRow] = self
-            .timeline
-            .as_ref()
-            .filter(|t| t.channel_id == channel_id)
-            .map_or(&[], |t| t.rows.as_slice());
-        let text_of = |h: &str| {
-            let h = b32_decode(&h.trim().to_ascii_lowercase(), "re").ok()?;
-            held.iter()
-                .find(|r| r.entry_hash == h)
-                .map(|r| r.text.clone())
-        };
-        let re_b32 = b32_encode(re);
-        let mut reply = Envelope::say(text);
-        reply.thread = Some(
-            text_of(&re_b32)
-                .and_then(|t| Envelope::parse(&t).ok())
-                .and_then(|p| p.thread)
-                .unwrap_or_else(|| re_b32.clone()),
-        );
-        reply.hops = reply_hops_by(&re_b32, text_of);
-        reply.re = Some(re_b32);
-        reply.to_text()
-    }
-
     fn project(&mut self) -> ViewModel {
         let snap = self.snapshot.clone();
         let me = snap.me;
@@ -2838,8 +2809,15 @@ impl CoreHandle for DaemonCore {
                 re,
                 text,
             } => {
-                let text = self.reply_text(channel_id, &re, &text);
-                self.apply(Command::SendText { channel_id, text })
+                // The same lookup and thread rule as addressed replies and `room post --re`,
+                // even when the parent has scrolled out of the loaded timeline (ADR-033 TH-3).
+                self.apply(Command::PostAddressed {
+                    channel_id,
+                    text,
+                    to: Vec::new(),
+                    urgent: false,
+                    re: Some(re),
+                })
             }
             Command::SendText { channel_id, text } => {
                 // A link card, fetched by this node (ADR-028 F-10).

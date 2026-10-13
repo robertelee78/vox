@@ -309,10 +309,10 @@ pub struct Envelope {
     /// sender, never inferred from [`Envelope::kind`].
     #[serde(default, skip_serializing_if = "is_false")]
     pub urgent: bool,
-    /// The entry hash of the message this replies to, hex.
+    /// The entry hash of the message this replies to, base32.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub re: Option<String>,
-    /// The entry hash of the conversation root, hex. Distinct from
+    /// The entry hash of the General message that starts the thread, base32. Distinct from
     /// [`Envelope::re`]: one correlates a reply, the other names the thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,
@@ -616,4 +616,21 @@ pub fn reply_hops_by(re: &str, parent: impl FnMut(&str) -> Option<String>) -> u3
     let mut reply = Envelope::new(SAY, "");
     reply.re = Some(re.to_owned());
     hops_left_by(&reply, parent)
+}
+
+/// The thread a reply belongs to (ADR-033 TH-1, TH-3): the parent's thread, or the parent
+/// itself when it is a General message, including plain text. `None` means the parent is
+/// unavailable; callers keep their existing missing-parent behavior. This is resolved before
+/// assigning an operation's identity, so retrying a reply cannot change its meaning.
+#[must_use]
+pub fn reply_thread_by(re: &str, mut parent: impl FnMut(&str) -> Option<String>) -> Option<String> {
+    let text = parent(re)?;
+    Some(
+        Envelope::parse(&text)
+            .ok()
+            .and_then(|p| p.thread)
+            .unwrap_or_else(|| re.to_owned())
+            .trim()
+            .to_ascii_lowercase(),
+    )
 }

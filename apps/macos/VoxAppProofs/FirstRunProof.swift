@@ -71,8 +71,8 @@
 //     you (1)" at once, from what her node recorded as read.
 // 14. The keyboard (WCAG 2.1.1, 2.4.7; #450), run with Full Keyboard Access on (set around the
 //     pass, never by the proof): View > Focus Timeline (⌃⌘T) puts the keyboard on mission's
-//     timeline with its newest message selected; ↑ and ↓ move the selection, as Reply to Selected
-//     Message (⌘R) then says; Space and Return on a row whose file alice pulled open it in Quick
+//     timeline with its newest message selected; ↑ and ↓ move the selection, as Reply in
+//     Thread (⌘R) then says; Space and Return on a row whose file alice pulled open it in Quick
 //     Look; Tab from the timeline reaches the composer.
 // 15. Who trusts whom (ADR-028 K-5, K-7, R-5, R-6, E-4). Dave, whom bob trusts, joins mission
 //     while it is on screen: its timeline says "<dave> (not in keyring) joined. bob trusts it."
@@ -2745,6 +2745,37 @@ final class FirstRunProof: XCTestCase {
         reaches("⌘↑ with the reply selected") { ui.typeKey(.upArrow, modifierFlags: .command) }
         print("[proof] bob's reply quotes \"re you: FROM-ALICE\", and its quote and ⌘↑ go to it")
 
+        // (4c1) Reply in Thread answers bob's reply but stays under the original General root
+        // (ADR-033 TH-1, TH-3, #753). Exercise the app action and read what the other node gets.
+        guard let fromBob = entry("REPLY-TO-ALICE") else {
+            throw Apparatus("the staged REPLY-TO-ALICE has no entry hash to reply to")
+        }
+        tap(ui, Key.showing(": REPLY-TO-ALICE"), "bob's reply to select it")
+        ui.menuBars.menuBarItems["Room"].click()
+        let replyInThread = ui.menuBars.menuItems["Reply in Thread"]
+        guard replyInThread.waitForExistence(timeout: 5), replyInThread.isEnabled else {
+            XCTFail("PRODUCT: Room > Reply in Thread must be available with bob's message selected")
+            return
+        }
+        replyInThread.click()
+        type(ui, Key.id("compose"), "APP-THREAD-REPLY\r", "the reply composer")
+        let threadUntil = Date().addingTimeInterval(30)
+        var threadReply: [String: Any] = [:]
+        while Date() < threadUntil && threadReply.isEmpty {
+            let rows = run(vox, ["room", "read", "--node", "bob", "--json", room], env: voxEnv).out
+            for line in rows.split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      let env = row["envelope"] as? [String: Any],
+                      env["body"] as? String == "APP-THREAD-REPLY" else { continue }
+                threadReply = env
+            }
+            if threadReply.isEmpty { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        XCTAssertTrue(threadReply["re"] as? String == fromBob
+                      && threadReply["thread"] as? String == fromAlice,
+                      "PRODUCT: Reply in Thread must reach bob answering his reply \(fromBob) in General root \(fromAlice); bob read \(threadReply)")
+        print("[proof] Reply in Thread: bob reads the app's nested reply in the original General thread")
+
         // (4d) To: offers bob's open Session under him, and a message to it alone is addressed to
         // that Session (MADR W-4, ADR-029 TA-1, D7): bob's Claude Code session opens a Session in
         // mission by its hook, as a person's does; alice ticks it in To: and posts; bob's node holds
@@ -3888,7 +3919,7 @@ final class FirstRunProof: XCTestCase {
             XCTFail("PRODUCT: Escape must close the Quick Look that Return opened from the timeline; it stayed open, so the keyboard is trapped")
             return
         }
-        // ↑ to KEYS-B, ↑ to KEYS-A, ↓ back to KEYS-B: each said by Reply to Selected Message.
+        // ↑ to KEYS-B, ↑ to KEYS-A, ↓ back to KEYS-B: each said by Reply in Thread.
         for (key, want) in [(XCUIKeyboardKey.upArrow, "KEYS-B"), (.upArrow, "KEYS-A"),
                             (.downArrow, "KEYS-B")] {
             ui.typeKey(key, modifierFlags: [])
