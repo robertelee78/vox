@@ -1183,12 +1183,25 @@ final class FirstRunProof: XCTestCase {
         let membersDaemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"],
                                       env: membersEnv, until: "vox daemon: control socket")
         defer { membersDaemon.terminate() }
+        var expectedMembers = [try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }]
         for index in 1...8 {
             let name = "member-\(index)"
             try staged(vox, ["node", "create", name],
                        env: membersEnv.merging(["VOX_IDENTITY_PASSPHRASE": "alice identity"]) { $1 })
             try staged(vox, ["node", "attach", name, "--passphrase-file", idPass], env: membersEnv)
             try staged(vox, ["room", "join", "--node", name, "--passphrase-file", roomPass, link], env: membersEnv)
+            expectedMembers.append(try line(staged(vox, ["id", "--node", name], env: membersEnv)) { $0.count == 52 })
+        }
+        var roster = Set<String>()
+        let rosterDeadline = Date().addingTimeInterval(20)
+        while Date() < rosterDeadline {
+            let read = run(vox, ["room", "roster", room, "--node", "alice"], env: voxEnv)
+            if read.status == 0 { roster = Set(read.out.split(whereSeparator: \.isWhitespace).map(String.init)) }
+            if expectedMembers.allSatisfy({ roster.contains($0) }) { break }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        guard expectedMembers.allSatisfy({ roster.contains($0) }) else {
+            throw Apparatus("inspector staging not achieved: Alice's public roster is missing remote members")
         }
         try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
         try stager.write(Data("alice\n".utf8), to: config + "/app/node")
@@ -1211,6 +1224,8 @@ final class FirstRunProof: XCTestCase {
         present(ui, Key.id("attached"), timeout: 60, "the app must open attached as alice")
         tap(ui, Key.id("room-columns"), "the room columns in the sidebar")
         present(ui, Key.id("inspector"), timeout: 10, "a room on screen must show its inspector")
+        guard present(ui, Key.showing("9 members"), timeout: 20,
+                      "the staged room must display its nine-member roster") else { return }
 
         func inspectorDivider() -> XCUIElement {
             ui.descendants(matching: .any).matching(identifier: "inspector-divider").firstMatch
