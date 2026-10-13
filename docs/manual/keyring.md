@@ -33,7 +33,9 @@ without a Keychain, a protected node needs a private persistent passphrase file:
 `vox node unlock robertgpt --passphrase-file ~/.vox-robertgpt-passphrase`.
 Keep that file in place: the daemon reads it again at each start. Stdin (`-`) and an environment
 variable cannot supply a remembered file. There is no option to unlock without remembering.
-If remembering fails, unlock fails and says the node is Ready but not remembered.
+If remembering fails, unlock returns a failure and describes the resulting state. A previous
+remembered entry may remain; if Vox cannot read it, it reports that uncertainty. Correct the
+reported problem and retry.
 
 `vox node attach` is now `vox node unlock`; `vox node detach` is now `vox node lock`.
 The old names print the new name and do the same thing. `attach --keep` is accepted and has no
