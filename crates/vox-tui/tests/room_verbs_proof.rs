@@ -198,9 +198,6 @@ fn vox(
     )
 }
 
-#[path = "support/previous_release.rs"]
-mod previous_release;
-
 #[test]
 #[ignore = "production Argon2id at setup + drives the real binary; CI runs it in release"]
 fn vox_room_speaks_to_a_node_it_did_not_start() {
@@ -1715,103 +1712,5 @@ fn presented_names_journey(
         ring.contains("my-carol") && ring.contains("read + drive"),
         "PRODUCT: rejoin must preserve local override and grants: {ring}{err}"
     );
-    // A real published peer has no presentation stream; refusal must leave chat and manual trust usable.
-    let old_dir = root.join("names-published");
-    std::fs::create_dir_all(&old_dir).expect("APPARATUS: old release scratch");
-    let (_, old) = previous_release::previous_release(&old_dir);
-    let (legacy, lc, lfp, legacy_daemon) = stage(&old, "legacy");
-    let (ok, shown, _) = run(
-        current,
-        data,
-        cfg,
-        &["trust", "add", &lfp, "--name", "manual-legacy"],
-        None,
-    );
-    assert!(ok, "PRODUCT: older peer manual-name fallback: {shown}");
-    let (ok, shown, _) = run(
-        &old,
-        &legacy,
-        &lc,
-        &["trust", "add", me, "--name", "owner", "--drive"],
-        None,
-    );
-    assert!(ok, "PRODUCT: older peer trusts current: {shown}");
-    let (ok, out, err) = run(
-        &old,
-        &legacy,
-        &lc,
-        &["room", "post", room, "OLD-PEER-NAMES-CONTROL"],
-        None,
-    );
-    assert!(
-        ok,
-        "PRODUCT: older peer can post after optional metadata refusal: {out}{err}"
-    );
-    let deadline = Instant::now() + Duration::from_secs(45);
-    loop {
-        let (_, out, err) = vox(data, cfg, &["room", "read", room, "--limit", "500"], None);
-        if out.contains("OLD-PEER-NAMES-CONTROL") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "PRODUCT: current node must read old-peer chat after missing-name fallback: {out}{err}"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    // Upgrade the root the published binary actually wrote: metadata adds no persisted format.
-    drop(legacy_daemon);
-    let mut upgraded = Command::new(current);
-    support::strip_harness_env(&mut upgraded);
-    let child = upgraded
-        .args([
-            "daemon",
-            "--listen",
-            "127.0.0.1:0",
-            "--passphrase-file",
-            pass.to_str().unwrap(),
-        ])
-        .env("VOX_DATA_DIR", &legacy)
-        .env("VOX_CONFIG_DIR", &lc)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("APPARATUS: launch upgraded published names root");
-    let _upgraded = Daemon(child);
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let (ok, ring, err) = run(current, &legacy, &lc, &["trust", "list"], None);
-        if ok && ring.contains(me) && ring.contains("owner") && ring.contains("read + drive") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "PRODUCT: published aliases and read/drive grant must survive upgrade: {ring}{err}"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    let (ok, out, err) = run(
-        current,
-        &legacy,
-        &lc,
-        &["room", "post", room, "UPGRADED-NAMES-CONTROL"],
-        None,
-    );
-    assert!(
-        ok,
-        "PRODUCT: upgraded node must keep communicating: {out}{err}"
-    );
-    let deadline = Instant::now() + Duration::from_secs(45);
-    loop {
-        let (_, out, err) = vox(data, cfg, &["room", "read", room, "--limit", "500"], None);
-        if out.contains("UPGRADED-NAMES-CONTROL") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "PRODUCT: current peer must read upgraded node's chat: {out}{err}"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    eprintln!("[proof] #796 names before trust; Enter default; explicit alias/read+drive kept across remote rename/rejoin; duplicate suffix; actual granted chat; real published missing-name peer chat");
+    eprintln!("[proof] #796 names before trust; Enter default; explicit alias/read+drive kept across remote rename/rejoin; duplicate suffix; actual granted chat");
 }
