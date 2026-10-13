@@ -644,7 +644,11 @@ impl UiState {
             // **An offer is accepted or dismissed where it waits** (ADR-028 K-16, K-18).
             KeyCode::Enter if self.screen == Screen::ChannelList && self.offer(vm).is_some() => {
                 let member = self.offer(vm).map(|o| o.member);
-                self.mode = Mode::Prompt(Prompt::new(PromptKind::AcceptOffer, member));
+                let mut prompt = Prompt::new(PromptKind::AcceptOffer, member);
+                if let Some((_, name)) = vm.presented.iter().find(|(fp, _)| Some(*fp) == member) {
+                    prompt.fields[0] = Zeroizing::new(name.clone());
+                }
+                self.mode = Mode::Prompt(prompt);
                 Action::Redraw
             }
             KeyCode::Char('x')
@@ -1170,7 +1174,11 @@ impl UiState {
             ));
             return Action::Redraw;
         }
-        self.mode = Mode::Prompt(Prompt::new(PromptKind::Trust, Some(fp)));
+        let mut prompt = Prompt::new(PromptKind::Trust, Some(fp));
+        if let Some((_, name)) = vm.presented.iter().find(|(id, _)| *id == fp) {
+            prompt.fields[1] = Zeroizing::new(name.clone());
+        }
+        self.mode = Mode::Prompt(prompt);
         Action::Redraw
     }
 

@@ -167,7 +167,7 @@ fn vox(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
-    if support::typed::is_keyring_change(args) {
+    if support::typed::is_keyring_change(args) || args.starts_with(&["node", "rename"]) {
         let (ok, shown) = support::typed::keyring(&cmd);
         return (ok, shown.clone(), shown);
     }
@@ -191,6 +191,9 @@ fn vox(
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
 }
+
+#[path = "support/previous_release.rs"]
+mod previous_release;
 
 #[test]
 #[ignore = "production Argon2id at setup + drives the real binary; CI runs it in release"]
@@ -817,6 +820,7 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
         err.contains("empty"),
         "PRODUCT: an empty message's refusal must say it is empty, got: {err}"
     );
+    presented_names_journey(tmp.path(), &data, &cfg, &pass, &room_prefix, &me);
 }
 
 /// A debug `vox daemon` makes a room, takes a post into it, and is still running afterwards. A red
@@ -1199,4 +1203,351 @@ fn a_room_made_when_times_were_seconds_still_opens_reads_and_takes_a_post() {
         ok && read.contains("said while times were seconds") && read.contains("said after milliseconds"),
         "PRODUCT: the room must read its old post and the new one; `vox room read` said: {read}{err}"
     );
+}
+
+/// #796 continues the operator's room journey: names are available before trust, while the
+/// actual old/new communication and local keyring remain the authority for access.
+fn presented_names_journey(
+    root: &Path,
+    data: &Path,
+    cfg: &Path,
+    pass: &Path,
+    room: &str,
+    me: &str,
+) {
+    let run = |bin: &Path, d: &Path, c: &Path, args: &[&str], input: Option<&str>| {
+        let mut cmd = Command::new(bin);
+        support::strip_harness_env(&mut cmd);
+        cmd.args(args)
+            .env("VOX_DATA_DIR", d)
+            .env("VOX_CONFIG_DIR", c)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if support::typed::is_keyring_change(args) || args.starts_with(&["node", "rename"]) {
+            let (ok, said) = support::typed::typed_name(&cmd, "identity passphrase", Some(""));
+            return (ok, said.clone(), said);
+        }
+        cmd.stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+        let mut child = cmd.spawn().expect("APPARATUS: start names journey binary");
+        if let Some(text) = input {
+            child
+                .stdin
+                .take()
+                .expect("APPARATUS: piped input")
+                .write_all(text.as_bytes())
+                .expect("APPARATUS: type room passphrase");
+        }
+        let out = child
+            .wait_with_output()
+            .expect("APPARATUS: wait names journey command");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let current = Path::new(VOX);
+    let (_, link, err) = vox(data, cfg, &["room", "link", room], None);
+    let link = link.trim();
+    assert!(
+        link.starts_with("vox://"),
+        "PRODUCT: room link before names journey: {link}{err}"
+    );
+    let stage = |bin: &Path, label: &str| {
+        let d = root.join(format!("names-{label}-data"));
+        let c = root.join(format!("names-{label}-cfg"));
+        std::fs::create_dir_all(&c).expect("APPARATUS: names config");
+        let (ok, fp, said) = run(
+            bin,
+            &d,
+            &c,
+            &["id", "--identity-passphrase-file", pass.to_str().unwrap()],
+            None,
+        );
+        assert!(ok, "PRODUCT: {label} identity: {said}");
+        let fp = fp.trim().to_owned();
+        let mut cmd = Command::new(bin);
+        support::strip_harness_env(&mut cmd);
+        let child = cmd
+            .args([
+                "daemon",
+                "--listen",
+                "127.0.0.1:0",
+                "--passphrase-file",
+                pass.to_str().unwrap(),
+            ])
+            .env("VOX_DATA_DIR", &d)
+            .env("VOX_CONFIG_DIR", &c)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("APPARATUS: names daemon");
+        let daemon = Daemon(child);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !run(bin, &d, &c, &["room", "list"], None).0 {
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS: {label} daemon not ready"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let (ok, out, err) = run(
+            bin,
+            &d,
+            &c,
+            &["room", "join", link, "--passphrase-file", "-"],
+            Some("channel passphrase"),
+        );
+        assert!(ok, "PRODUCT: {label} joins for name discovery: {out}{err}");
+        (d, c, fp, daemon)
+    };
+    let (bob, bc, bfp, _bd) = stage(current, "bob");
+    let (carol, cc, cfp, _cd) = stage(current, "carol");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let offers = loop {
+        let (_, out, err) = vox(data, cfg, &["trust", "offers"], None);
+        if out.contains("Name it presents: default") && out.contains(&bfp) && out.contains(&cfp) {
+            break out;
+        }
+        assert!(Instant::now()<deadline,"PRODUCT: both connected, untrusted nodes must present their name with fingerprint and not-in-keyring before acceptance: {out}{err}");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(
+        offers.contains("not in keyring"),
+        "PRODUCT: presented names conceal trust state: {offers}"
+    );
+    let (_, roster, err) = vox(data, cfg, &["room", "roster", room], None);
+    assert!(err.contains(&format!("default#{}",&bfp[..6])),"PRODUCT: case-equivalent names must retain established fingerprint suffix when another node presents default: {roster}{err}");
+    let (ok, out, err) = vox(
+        data,
+        cfg,
+        &["room", "post", room, "NAMES-BEFORE-TRUST-PRIVATE"],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: current-generation message before trusting the presented peers: {out}{err}"
+    );
+    let (_, before, err) = run(current, &bob, &bc, &["room", "read", room], None);
+    assert!(
+        !before.contains("first from the cli") && !before.contains("NAMES-BEFORE-TRUST-PRIVATE"),
+        "PRODUCT: presented name alone granted room read: {before}{err}"
+    );
+    let (ok, copied, err) = run(current, &bob, &bc, &["id", "--with-name"], None);
+    assert!(
+        ok && copied.trim() == format!("default <{bfp}>"),
+        "PRODUCT: copied identity must carry own name and full fingerprint: {copied}{err}"
+    );
+    let (ok, shown, _) = run(current, data, cfg, &["trust", "add", &bfp], None);
+    assert!(ok && shown.contains("[default] (Enter accepts)"),"PRODUCT: Enter must accept the authenticated presented-name default with no typing: {shown}");
+    let (ok, shown, _) = run(
+        current,
+        data,
+        cfg,
+        &["trust", "add", &cfp, "--name", "my-carol", "--drive"],
+        None,
+    );
+    assert!(
+        ok && shown.contains("my-carol"),
+        "PRODUCT: explicit local alias must override the remote name: {shown}"
+    );
+    let (ok, shown, _) = run(
+        current,
+        &bob,
+        &bc,
+        &["trust", "add", me, "--name", "owner", "--drive"],
+        None,
+    );
+    assert!(ok, "PRODUCT: Bob grants the owner read: {shown}");
+    let (ok, out, err) = vox(
+        data,
+        cfg,
+        &["room", "post", room, "NAMES-GRANTED-CHAT"],
+        None,
+    );
+    assert!(ok, "PRODUCT: owner posts after the read grant: {out}{err}");
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        let (_, out, err) = run(
+            current,
+            &bob,
+            &bc,
+            &["room", "read", room, "--limit", "500"],
+            None,
+        );
+        if out.contains("NAMES-GRANTED-CHAT") {
+            assert!(!out.contains("NAMES-BEFORE-TRUST-PRIVATE"),
+                "PRODUCT: authenticated presentation must not silently grant read before explicit acceptance; granted traffic proves the wire works: {out}{err}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: accepting the name must permit ordinary granted chat: {out}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let (ok, out, err) = run(
+        current,
+        &carol,
+        &cc,
+        &["node", "rename", "default", "renamed-carol"],
+        None,
+    );
+    assert!(ok, "PRODUCT: rename presenting node: {out}{err}");
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        let (_, _, err) = vox(data, cfg, &["room", "roster", room], None);
+        let (_, name, _) = run(
+            current,
+            &carol,
+            &cc,
+            &["id", "--node", "renamed-carol", "--with-name"],
+            None,
+        );
+        if name.contains("renamed-carol")
+            && err.contains("my-carol")
+            && err.contains("Name it presents: renamed-carol")
+        {
+            break;
+        }
+        assert!(Instant::now()<deadline,"PRODUCT: remote rename/reconnect must leave local alias and grants intact: {name}{err}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let (_, ring, err) = vox(data, cfg, &["trust", "list"], None);
+    assert!(
+        ring.contains("my-carol") && ring.contains("read + drive") && ring.contains(&cfp),
+        "PRODUCT: remote rename must preserve chosen alias and read/drive grant: {ring}{err}"
+    );
+    let (ok, out, err) = run(
+        current,
+        &carol,
+        &cc,
+        &["room", "leave", room, "--node", "renamed-carol"],
+        None,
+    );
+    assert!(ok, "PRODUCT: named node leaves: {out}{err}");
+    let (ok, out, err) = run(
+        current,
+        &carol,
+        &cc,
+        &[
+            "room",
+            "join",
+            link,
+            "--node",
+            "renamed-carol",
+            "--passphrase-file",
+            "-",
+        ],
+        Some("channel passphrase"),
+    );
+    assert!(ok, "PRODUCT: named node rejoins: {out}{err}");
+    let (_, ring, err) = vox(data, cfg, &["trust", "list"], None);
+    assert!(
+        ring.contains("my-carol") && ring.contains("read + drive"),
+        "PRODUCT: rejoin must preserve local override and grants: {ring}{err}"
+    );
+    // A real published peer has no presentation stream; refusal must leave chat and manual trust usable.
+    let old_dir = root.join("names-published");
+    std::fs::create_dir_all(&old_dir).expect("APPARATUS: old release scratch");
+    let (_, old) = previous_release::previous_release(&old_dir);
+    let (legacy, lc, lfp, legacy_daemon) = stage(&old, "legacy");
+    let (ok, shown, _) = run(
+        current,
+        data,
+        cfg,
+        &["trust", "add", &lfp, "--name", "manual-legacy"],
+        None,
+    );
+    assert!(ok, "PRODUCT: older peer manual-name fallback: {shown}");
+    let (ok, shown, _) = run(
+        &old,
+        &legacy,
+        &lc,
+        &["trust", "add", me, "--name", "owner", "--drive"],
+        None,
+    );
+    assert!(ok, "PRODUCT: older peer trusts current: {shown}");
+    let (ok, out, err) = run(
+        &old,
+        &legacy,
+        &lc,
+        &["room", "post", room, "OLD-PEER-NAMES-CONTROL"],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: older peer can post after optional metadata refusal: {out}{err}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        let (_, out, err) = vox(data, cfg, &["room", "read", room, "--limit", "500"], None);
+        if out.contains("OLD-PEER-NAMES-CONTROL") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: current node must read old-peer chat after missing-name fallback: {out}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // Upgrade the root the published binary actually wrote: metadata adds no persisted format.
+    drop(legacy_daemon);
+    let mut upgraded = Command::new(current);
+    support::strip_harness_env(&mut upgraded);
+    let child = upgraded
+        .args([
+            "daemon",
+            "--listen",
+            "127.0.0.1:0",
+            "--passphrase-file",
+            pass.to_str().unwrap(),
+        ])
+        .env("VOX_DATA_DIR", &legacy)
+        .env("VOX_CONFIG_DIR", &lc)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("APPARATUS: launch upgraded published names root");
+    let _upgraded = Daemon(child);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (ok, ring, err) = run(current, &legacy, &lc, &["trust", "list"], None);
+        if ok && ring.contains(me) && ring.contains("owner") && ring.contains("read + drive") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: published aliases and read/drive grant must survive upgrade: {ring}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let (ok, out, err) = run(
+        current,
+        &legacy,
+        &lc,
+        &["room", "post", room, "UPGRADED-NAMES-CONTROL"],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: upgraded node must keep communicating: {out}{err}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        let (_, out, err) = vox(data, cfg, &["room", "read", room, "--limit", "500"], None);
+        if out.contains("UPGRADED-NAMES-CONTROL") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: current peer must read upgraded node's chat: {out}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    eprintln!("[proof] #796 names before trust; Enter default; explicit alias/read+drive kept across remote rename/rejoin; duplicate suffix; actual granted chat; real published missing-name peer chat");
 }

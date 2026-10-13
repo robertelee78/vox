@@ -506,3 +506,18 @@ impl std::fmt::Display for InviteLink {
         f.write_str(&self.to_url())
     }
 }
+
+/// A copied identity is `name <fingerprint>`. Its name is an editable user-supplied hint,
+/// never authenticated remote metadata or an identity selector on its own (#796).
+pub fn copied_identity(text: &str) -> Result<(Digest32, Option<String>)> {
+    let text = text.trim();
+    if let Some((name, tail)) = text.rsplit_once(" <") {
+        if let Some(fp) = tail.strip_suffix('>') {
+            if crate::node::presentation::safe_name(name) {
+                return Ok((b32_decode(fp, "fingerprint")?, Some(name.to_owned())));
+            }
+        }
+        return Err(Error::MalformedBundle("copied identity"));
+    }
+    Ok((b32_decode(text, "fingerprint")?, None))
+}

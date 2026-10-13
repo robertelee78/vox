@@ -295,6 +295,9 @@ const T_INVITE: u64 = 13;
 const T_TRUST: u64 = 14;
 const T_UNTRUST: u64 = 15;
 const T_TRUST_LIST: u64 = 16;
+const T_PRESENTATION: u64 = 7960;
+const T_PRESENTATIONS: u64 = 7961;
+const T_PRESENTED: u64 = 7962;
 // Setting a room's retention deletes what is already stored (ADR-023 decision 2), so it is an
 // operator decision like the keyring and carries the identity passphrase the same way.
 const T_RETENTION: u64 = 23;
@@ -830,6 +833,17 @@ pub enum Request {
     },
     /// Read the trust keyring: who this node trusts and the name it gave each. A read, so the
     /// node checks no passphrase.
+    /// One authenticated remote self-name; empty when not known. No trust change.
+    Presentation {
+        /// The fingerprint to look up.
+        target: Digest32,
+    },
+    /// Paged remote presentation metadata, independent of the sealed keyring.
+    Presentations {
+        /// Last fingerprint of the previous page.
+        after: Option<Digest32>,
+    },
+    /// Read sealed local aliases and grants, distinct from remote presentations.
     TrustList {
         /// Carried on the wire and not checked.
         identity_passphrase: zeroize::Zeroizing<String>,
@@ -1321,6 +1335,14 @@ impl Request {
                     .bytes(target)
                     .text(identity_passphrase);
             }
+            Request::Presentation { target } => {
+                e.array(2).uint(T_PRESENTATION).bytes(target);
+            }
+            Request::Presentations { after } => {
+                e.array(2)
+                    .uint(T_PRESENTATIONS)
+                    .bytes(after.as_ref().map_or(&[][..], |d| &d[..]));
+            }
             Request::TrustList {
                 identity_passphrase,
                 after,
@@ -1639,6 +1661,16 @@ impl Request {
                     target,
                     identity_passphrase,
                 })
+            }
+            (T_PRESENTATION, 2) => {
+                let target = digest(&mut d)?;
+                d.finish()?;
+                Ok(Request::Presentation { target })
+            }
+            (T_PRESENTATIONS, 2) => {
+                let after = optional_digest(&mut d)?;
+                d.finish()?;
+                Ok(Request::Presentations { after })
             }
             // The unpaged form, as for `Rooms` above.
             (T_TRUST_LIST, 2) => {
@@ -2084,6 +2116,12 @@ pub enum Frame {
         note: String,
     },
     /// The trust keyring a [`Request::TrustList`] asked for.
+    /// Authenticated remote metadata, never a keyring entry.
+    Presented {
+        /// Fingerprints and authenticated self-names in fingerprint order.
+        entries: Vec<(Digest32, String)>,
+    },
+    /// Sealed local aliases and their grants.
     Trusted {
         /// `(fingerprint, petname, capability)` in fingerprint order (ADR-028 K-14).
         entries: Vec<(Digest32, String, crate::node::trust::Capability)>,
@@ -2275,6 +2313,12 @@ impl Frame {
                             .uint(u64::from(*open))
                             .text(over);
                     }
+                }
+            }
+            Frame::Presented { entries } => {
+                e.array(2).uint(T_PRESENTED).array(entries.len());
+                for (id, name) in entries {
+                    e.array(2).bytes(id).text(name);
                 }
             }
             Frame::Trusted { entries } => {
@@ -3186,6 +3230,20 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let offers = crate::node::offers::read_offers(d)?;
             return Ok(Frame::Offers { offers });
         }
+        (T_PRESENTED, 2) => {
+            let n = d.array()?;
+            if n > 4096 {
+                return Err(Error::MalformedIpc("too many presented names"));
+            }
+            let mut entries = Vec::with_capacity(n);
+            for _ in 0..n {
+                if d.array()? != 2 {
+                    return Err(Error::MalformedIpc("presented name"));
+                }
+                entries.push((digest(d)?, d.text()?.to_owned()));
+            }
+            return Ok(Frame::Presented { entries });
+        }
         (T_TRUSTED, 2) => {
             let count = d
                 .array()
@@ -4080,6 +4138,7 @@ async fn serve_requests(
                 | Frame::KeyWaits { .. }
                 | Frame::Consents { .. }
                 | Frame::Trusted { .. }
+                | Frame::Presented { .. }
                 | Frame::Rooms { .. }
                 | Frame::Services { .. }
                 | Frame::Shares { .. }
@@ -4829,6 +4888,12 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         // **A read, so no passphrase** (V210-162, V210-165): the names this node gave its
         // members are how every surface on this account names an author, the agent drain
         // included, and the OS account is the boundary. Only a change to the keyring is gated.
+        Request::Presentation { target } => {
+            Frame::Presented { entries: handle.view().presented.into_iter().filter(|(fp, _)| *fp == target).collect() }
+        }
+        Request::Presentations { after } => {
+            Frame::Presented { entries: page(handle.view().presented, after, |(fp, name)| (*fp, name.len())) }
+        }
         Request::TrustList { after, .. } => {
             let view = handle.view();
             let rows = view
@@ -6648,6 +6713,27 @@ impl IpcClient {
                     all.extend(entries);
                 }
                 other => return Ok(other),
+            }
+        }
+    }
+
+    /// Read the bounded remote presentation cache in pages. Older daemons return an error.
+    pub async fn presented_names(&mut self) -> Result<Vec<(Digest32, String)>> {
+        let mut all = Vec::new();
+        let mut after = None;
+        loop {
+            match self.request(&Request::Presentations { after }).await? {
+                Frame::Presented { entries } => {
+                    let Some(last) = entries.last() else {
+                        return Ok(all);
+                    };
+                    if after.is_some_and(|a| last.0 <= a) {
+                        return Err(Error::MalformedIpc("presented page did not advance"));
+                    }
+                    after = Some(last.0);
+                    all.extend(entries);
+                }
+                _ => return Ok(Vec::new()),
             }
         }
     }

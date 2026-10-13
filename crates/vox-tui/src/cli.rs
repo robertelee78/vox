@@ -129,12 +129,15 @@ where
 /// The name `vox trust add` files an identity under: `--name`, or asked for on a
 /// terminal. With neither it is refused at once: every identity under one default name could
 /// not be told apart, nor addressed.
-fn trust_name(a: &TrustAddArgs) -> Result<String, crate::app::AppError> {
+fn trust_name(a: &TrustAddArgs, default: Option<&str>) -> Result<String, crate::app::AppError> {
     use std::io::{BufRead as _, IsTerminal as _, Write as _};
     if let Some(n) = a.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
         return Ok(n.to_owned());
     }
     if !std::io::stdin().is_terminal() {
+        if let Some(name) = default {
+            return Ok(name.to_owned());
+        }
         return Err(crate::app::AppError::Usage(
             "name it: run it again with --name and your name for it, or at a terminal, where \
              it asks"
@@ -142,30 +145,27 @@ fn trust_name(a: &TrustAddArgs) -> Result<String, crate::app::AppError> {
         ));
     }
     let mut err = std::io::stderr();
-    let _ = write!(err, "Your name for {}: ", a.fingerprint.trim());
+    let _ = write!(
+        err,
+        "Your name for {}{}: ",
+        a.fingerprint.trim(),
+        default
+            .map(|n| format!(" [{n}] (Enter accepts)"))
+            .unwrap_or_default()
+    );
     let _ = err.flush();
     let mut line = String::new();
     let _ = std::io::stdin().lock().read_line(&mut line);
     match line.trim() {
-        "" => Err(crate::app::AppError::Usage(
-            "no name given; nothing was trusted".into(),
-        )),
+        "" => default.map(str::to_owned).ok_or_else(|| {
+            crate::app::AppError::Usage("no name given; nothing was trusted".into())
+        }),
         n => Ok(n.to_owned()),
     }
 }
 
 /// Run a trust verb against the daemon already holding this node.
 fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
-    let name = match &sub {
-        TrustCmd::Add(a) => match trust_name(a) {
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!("vox: {e}");
-                return ExitCode::FAILURE;
-            }
-        },
-        _ => String::new(),
-    };
     let (profile, pass, pass_file) = match &sub {
         TrustCmd::Offers(a) => (
             a.profile.clone(),
@@ -243,7 +243,12 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
             TrustCmd::Offers(_) => crate::room_cli::trust_offers(&paths).await,
             TrustCmd::Dismiss(a) => crate::room_cli::trust_dismiss(&paths, &a.fingerprint).await,
             TrustCmd::Add(a) => {
-                let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
+                let (target, hint) = vox_core::node::link::copied_identity(&a.fingerprint)?;
+                let presented = crate::room_cli::presented_name(&paths, target)
+                    .await
+                    .unwrap_or_default();
+                let default = hint.as_deref().or(presented.as_deref());
+                let name = trust_name(&a, default)?;
                 crate::room_cli::trust_add(&paths, target, &name, a.history == "full", a.drive)
                     .await
             }
@@ -1542,6 +1547,16 @@ pub struct IdentityArgs {
     pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
+/// Public identity output; the default stdout remains the bare fingerprint.
+#[derive(Args, Debug, Clone)]
+pub struct IdArgs {
+    #[command(flatten)]
+    pub identity: IdentityArgs,
+    /// Copy a supported name-plus-fingerprint representation.
+    #[arg(long)]
+    pub with_name: bool,
+}
+
 /// Which rooms `vox node` serves (`--serve`).
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Serve {
@@ -2273,7 +2288,7 @@ enum Cmd {
     /// It is the whole 52-character base32 fingerprint, on its own line, so it can be
     /// piped or pasted without editing. Compare it out of band, the way you would a PGP
     /// fingerprint: nothing registers it and nothing looks it up.
-    Id(IdentityArgs),
+    Id(IdArgs),
     /// Decide which identities this node trusts.
     #[command(subcommand)]
     Trust(TrustCmd),
@@ -3330,7 +3345,7 @@ pub fn run() -> ExitCode {
         // from the daemon when the node is attached, else from the node's files, which hold it
         // in the clear. A node with no identity has one made here first (C-5).
         Cmd::Id(args) => {
-            let paths = match args.profile.paths_creating() {
+            let paths = match args.identity.profile.paths_creating() {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("vox: {e}");
@@ -3339,8 +3354,9 @@ pub fn run() -> ExitCode {
             };
             match crate::room_cli::print_identity(
                 &paths,
-                args.identity_passphrase.clone(),
-                args.identity_passphrase_file.clone(),
+                args.identity.identity_passphrase.clone(),
+                args.identity.identity_passphrase_file.clone(),
+                args.with_name,
             ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {

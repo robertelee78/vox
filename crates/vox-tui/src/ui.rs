@@ -292,7 +292,11 @@ fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
             } else {
                 "joined"
             };
-            items.push(ListItem::new(format!("{marker}offer: {short}… {why}")));
+            let presented = crate::ident::alias_of(&vm.presented, &o.member).unwrap_or_default();
+            items.push(ListItem::new(vec![
+                Line::from(format!("{marker}offer: {short}… {presented}")),
+                Line::from(format!("    not in keyring · {why}")),
+            ]));
         }
         for a in &vm.room_asks {
             let mut lines = vec![Line::from(format!("  {}", a.sentence))];

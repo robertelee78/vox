@@ -176,9 +176,12 @@ try:
 
     want_fp = fp["carol"][:26]
     bob_all, alice_all = "\n".join(bob_rows), "\n".join(alice_rows)
-    bob_ok = f"alice to {want_fp}:" in bob_all and "to mom" not in bob_all
+    # A name plus its fingerprint/state can wrap the message onto the next terminal row.
+    bob_ok = any("alice to " in row and want_fp in row
+                 and MARK in "".join(bob_rows[i:i + 3])
+                 for i, row in enumerate(bob_rows)) and "to mom" not in bob_all
     alice_ok = "you to mom:" in alice_all
-    print(f"{TAG} bob shown 'alice to <carol's fingerprint>:' and never 'to mom': {bob_ok}; "
+    print(f"{TAG} bob shown alice addressing carol by fingerprint with optional presented name/state across wrapped rows, never alice's mom alias: {bob_ok}; "
           f"alice shown 'you to mom:': {alice_ok}")
     if not (bob_ok and alice_ok):
         print(f"{TAG} PRODUCT: each node's TUI must show the addressee by its own name for her, or "

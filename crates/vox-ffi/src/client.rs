@@ -485,6 +485,8 @@ pub fn room_group_words(group: RoomGroup) -> String {
 /// A member of a room.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct Member {
+    /// Authenticated remote self-name, independent of the local keyring alias.
+    pub presented_name: String,
     /// Its fingerprint, base32.
     pub fingerprint: String,
     /// This node's name for it, from the keyring; empty when it has none.
@@ -528,6 +530,8 @@ pub struct OfferRoom {
 /// [`VoxClient::trust_add`], dismissed with [`VoxClient::dismiss_offer`].
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct OfferInfo {
+    /// Authenticated remote self-name; empty for older or unreachable peers.
+    pub presented_name: String,
     /// Its fingerprint, base32; the app groups it and draws its art.
     pub fingerprint: String,
     /// The rooms it is offered from.
@@ -2132,6 +2136,12 @@ impl VoxClient {
         let channel_id = digest(&room, "room id")?;
         on_held!(self, |c| {
             let names = names(c).await?;
+            let presented: HashMap<_, _> = c
+                .presented_names()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
             let members = match ask(c, &Request::Roster { channel_id }).await? {
                 Frame::Members { members } => members,
                 other => return Err(unexpected(&other)),
@@ -2144,6 +2154,7 @@ impl VoxClient {
             Ok(members
                 .into_iter()
                 .map(|m| Member {
+                    presented_name: presented.get(&m).cloned().unwrap_or_default(),
                     fingerprint: b32_encode(&m),
                     name: names.get(&m).cloned().unwrap_or_default(),
                     key_waits: waits.get(&m).cloned(),
@@ -2488,6 +2499,21 @@ impl VoxClient {
         on_held!(self, |c| done(c, &req).await)
     }
 
+    /// A remote name authenticated by this node's current connection, or missing-name fallback.
+    pub async fn presented_name(&self, fingerprint: String) -> Result<Option<String>, VoxError> {
+        let target = digest(&fingerprint, "fingerprint")?;
+        on_held!(
+            self,
+            |c| match ask(c, &Request::Presentation { target }).await? {
+                Frame::Presented { entries } => Ok(entries
+                    .into_iter()
+                    .find(|(fp, _)| *fp == target)
+                    .map(|(_, name)| name)),
+                _ => Ok(None),
+            }
+        )
+    }
+
     /// Trust `fingerprint` under `name`, granting read, and drive as well when `drive` (ADR-028
     /// K-14, K-16). The identity passphrase is needed unless one was given for a keyring change
     /// within the keyring window; attaching opens no window (ADR-028 K-12).
@@ -2501,8 +2527,21 @@ impl VoxClient {
         drive: bool,
         identity_passphrase: Option<Arc<Passphrase>>,
     ) -> Result<(), VoxError> {
+        let (target, hint) = vox_core::node::link::copied_identity(&fingerprint)
+            .map_err(|e| failed(e.to_string()))?;
+        let name = if name.trim().is_empty() {
+            match hint {
+                Some(name) => name,
+                None => self
+                    .presented_name(b32_encode(&target))
+                    .await?
+                    .unwrap_or_default(),
+            }
+        } else {
+            name
+        };
         let req = Request::Trust {
-            target: digest(&fingerprint, "fingerprint")?,
+            target,
             petname: name,
             identity_passphrase: copy_of(identity_passphrase.as_ref()),
             full_history: false,
@@ -2534,32 +2573,41 @@ impl VoxClient {
     /// # Errors
     /// The node's refusal.
     pub async fn pending_offers(&self) -> Result<Vec<OfferInfo>, VoxError> {
-        on_held!(self, |c| match ask(c, &Request::Offers).await? {
-            Frame::Offers { offers } => Ok(offers
+        on_held!(self, |c| {
+            let presented: HashMap<_, _> = c
+                .presented_names()
+                .await
+                .unwrap_or_default()
                 .into_iter()
-                .map(|o| OfferInfo {
-                    fingerprint: b32_encode(&o.member),
-                    rooms: o
-                        .rooms
-                        .into_iter()
-                        .map(|r| OfferRoom {
-                            id: b32_encode(&r.id),
-                            name: r.name,
-                        })
-                        .collect(),
-                    why: o
-                        .why
-                        .into_iter()
-                        .map(|w| match w {
-                            vox_core::node::api::OfferWhy::Joined => OfferWhy::Joined,
-                            vox_core::node::api::OfferWhy::TrustsYou => OfferWhy::TrustsYou,
-                        })
-                        .collect(),
-                    trusted_by: o.trusted_by.iter().map(b32_encode).collect(),
-                    said: o.said,
-                })
-                .collect()),
-            other => Err(unexpected(&other)),
+                .collect();
+            match ask(c, &Request::Offers).await? {
+                Frame::Offers { offers } => Ok(offers
+                    .into_iter()
+                    .map(|o| OfferInfo {
+                        presented_name: presented.get(&o.member).cloned().unwrap_or_default(),
+                        fingerprint: b32_encode(&o.member),
+                        rooms: o
+                            .rooms
+                            .into_iter()
+                            .map(|r| OfferRoom {
+                                id: b32_encode(&r.id),
+                                name: r.name,
+                            })
+                            .collect(),
+                        why: o
+                            .why
+                            .into_iter()
+                            .map(|w| match w {
+                                vox_core::node::api::OfferWhy::Joined => OfferWhy::Joined,
+                                vox_core::node::api::OfferWhy::TrustsYou => OfferWhy::TrustsYou,
+                            })
+                            .collect(),
+                        trusted_by: o.trusted_by.iter().map(b32_encode).collect(),
+                        said: o.said,
+                    })
+                    .collect()),
+                other => Err(unexpected(&other)),
+            }
         })
     }
 

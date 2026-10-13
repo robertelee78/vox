@@ -592,6 +592,8 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::HelloUndelivered { .. } => "owing a hello that could not be written",
         NetEvent::ReopenUndelivered { .. } => "owing a reopen that could not be written",
         NetEvent::Stream { .. } => "serving a stream",
+        NetEvent::PresentationAsk { .. } => "signing node presentation",
+        NetEvent::PresentationDone { .. } => "receiving node presentation",
         NetEvent::Connected { .. } => "filing a new connection",
         NetEvent::BetterPath { .. } => "adopting a connection",
         NetEvent::ReachFailed { .. } => "filing a failed dial",
@@ -1165,6 +1167,15 @@ enum NetEvent {
         peer: Digest32,
     },
     /// A peer connected inbound: it gets a sync schedule, due immediately.
+    PresentationAsk {
+        nonce: Digest32,
+        send: quinn::SendStream,
+    },
+    PresentationDone {
+        peer: Digest32,
+        serial: u64,
+        name: Option<String>,
+    },
     Connected {
         /// The authenticated peer.
         peer: Digest32,
@@ -1891,6 +1902,19 @@ async fn serve_typed(
                     return;
                 };
                 let _ = tx.send(NetEvent::AgreeAsk { peer, ask, send }).await;
+            });
+        }
+        Ok(Inbound::Presentation {
+            peer: _,
+            send,
+            mut recv,
+        }) => {
+            state.failures = 0;
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                if let Ok(nonce) = crate::node::presentation::read_ask(&mut recv).await {
+                    let _ = tx.send(NetEvent::PresentationAsk { nonce, send }).await;
+                }
             });
         }
         Ok(Inbound::Session { peer, send, recv }) => {
@@ -4188,6 +4212,9 @@ pub struct Node {
     /// (ADR-012, ADR-016 M15.1): dialled when the network starts, given the `Anchor`
     /// class, published to, and named in invite links beside this node's own addresses.
     anchors: BootstrapSet,
+    /// Remote self-names remain separate from sealed local aliases (#796).
+    presented: BTreeMap<Digest32, (String, std::time::Instant)>,
+    presentation_due: BTreeMap<Digest32, (u64, std::time::Instant)>,
     /// Every identity this node treats as an anchor: the configured set plus the
     /// anchors of each open channel. The peer policy is rebuilt from channel
     /// membership whenever channels change, and these are carried into it.
@@ -4871,6 +4898,8 @@ impl Node {
             anchor_ids: anchors.nodes().iter().map(|n| n.id).collect(),
             room_anchors: BTreeMap::new(),
             anchors,
+            presented: BTreeMap::new(),
+            presentation_due: BTreeMap::new(),
             headless,
             anchor_boards,
             serve_only,
@@ -5309,6 +5338,8 @@ impl Node {
                     // and released to whoever is owed one.
                     self.tend_drive_keys().await;
                     self.tend_private_sessions().await;
+                    let peers: Vec<_> = self.net.as_ref().map(|n| n.manager().peers()).unwrap_or_default();
+                    for peer in peers { self.pull_presentation(peer); }
                     // R14: a superseded generation's key goes once no full-history grant
                     // still has to release it.
                     let pruned = self.prune_superseded_keys().await;
@@ -7785,6 +7816,49 @@ impl Node {
             NetEvent::BetterPath { conn } => {
                 self.adopt_connection(conn);
             }
+            NetEvent::PresentationAsk { nonce, send } => {
+                let name = self
+                    .paths
+                    .profile_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("default");
+                if let Some(profile) = self.profile.as_ref() {
+                    if let Ok(signer) = profile.signer() {
+                        if let Ok(frame) = crate::node::presentation::signed_answer(
+                            nonce,
+                            name,
+                            (self.millis_clock)(),
+                            signer,
+                        ) {
+                            tokio::spawn(crate::node::presentation::answer(send, frame));
+                        }
+                    }
+                }
+            }
+            NetEvent::PresentationDone { peer, serial, name } => {
+                if self
+                    .net
+                    .as_ref()
+                    .and_then(|n| n.manager().existing(&peer))
+                    .is_some_and(|c| c.serial() == serial)
+                {
+                    if let Some(name) = name {
+                        if self.presented.len() >= 4096 && !self.presented.contains_key(&peer) {
+                            if let Some(oldest) = self
+                                .presented
+                                .iter()
+                                .min_by_key(|(_, (_, age))| *age)
+                                .map(|(p, _)| *p)
+                            {
+                                self.presented.remove(&oldest);
+                            }
+                        }
+                        self.presented
+                            .insert(peer, (name, std::time::Instant::now()));
+                    }
+                }
+            }
             NetEvent::Connected { peer } => {
                 if let Some(conn) = self
                     .net
@@ -7792,6 +7866,7 @@ impl Node {
                     .and_then(|net| net.manager().existing(&peer))
                 {
                     self.note_peer_endpoint(&conn);
+                    self.pull_presentation(peer);
                 }
                 // A fresh connection syncs at once (ADR-016): a request on every port it shares,
                 // with any backoff cleared (ADR-025 D2, D5).
@@ -8490,6 +8565,7 @@ impl Node {
                 // opened on it, or the peer sees it close mid-exchange.
                 let connection = conn;
                 match inbound {
+                    Inbound::Presentation { .. } => {} // preamble handled off the actor above
                     Inbound::Join { .. } => {
                         // Unreachable: the stream loop turns these into
                         // `NetEvent::JoinRequest` once the request is read.
@@ -16796,6 +16872,46 @@ impl Node {
             .collect()
     }
 
+    fn pull_presentation(&mut self, peer: Digest32) {
+        let Some(conn) = self.net.as_ref().and_then(|n| n.manager().existing(&peer)) else {
+            return;
+        };
+        let serial = conn.serial();
+        let now = std::time::Instant::now();
+        if self
+            .presentation_due
+            .get(&peer)
+            .is_some_and(|(s, due)| *s == serial && now < *due)
+        {
+            return;
+        }
+        let Some(slot) = crate::node::ports::Slots::take(&self.slots, peer, Box::new(|| {})) else {
+            return;
+        };
+        self.presentation_due
+            .insert(peer, (serial, now + Duration::from_secs(60)));
+        let live: BTreeSet<_> = self
+            .net
+            .as_ref()
+            .map(|n| n.manager().peers().into_iter().collect())
+            .unwrap_or_default();
+        self.presentation_due.retain(|p, _| live.contains(p));
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            let name = tokio::time::timeout(
+                Duration::from_secs(4),
+                crate::node::presentation::pull(&conn),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok);
+            let _ = tx
+                .send(NetEvent::PresentationDone { peer, serial, name })
+                .await;
+        });
+    }
+
     async fn tend_private_sessions(&mut self) {
         let rooms: Vec<_> = self
             .channels
@@ -17108,6 +17224,7 @@ impl Node {
             open_channels: Vec::new(),
             forwards: Vec::new(),
             trusted: self.trust_rows(),
+            presented: Vec::new(),
             drive: self
                 .trust
                 .iter()
@@ -17324,6 +17441,14 @@ impl Node {
                 })
                 .collect(),
             trusted,
+            presented: if locked {
+                Vec::new()
+            } else {
+                self.presented
+                    .iter()
+                    .map(|(fp, (name, _))| (*fp, name.clone()))
+                    .collect()
+            },
             drive,
             relayed_peers,
             relaying,

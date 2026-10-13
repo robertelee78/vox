@@ -673,6 +673,8 @@ pub struct NodeView {
     /// The trust keyring: `(fingerprint, petname)` in fingerprint order, empty
     /// while locked because the keyring is sealed under the identity (ADR-020 §3).
     pub trusted: Vec<(Digest32, String)>,
+    /// Authenticated remote self-names, held only in memory; never keyring or authority.
+    pub presented: Vec<(Digest32, String)>,
     /// The keyring entries that carry drive (ADR-028 K-14), in fingerprint order; every other
     /// entry in [`NodeView::trusted`] grants read.
     pub drive: Vec<Digest32>,

@@ -93,6 +93,10 @@ struct KeyringView: View {
                 .font(Theme.mono)
                 .focused($adding)
                 .accessibilityIdentifier("keyring-add-fingerprint")
+                .task(id: fingerprint) {
+                    let input = fingerprint
+                    if alias.isEmpty, let suggested = await model.suggestedName(input), fingerprint == input, alias.isEmpty { alias = suggested }
+                }
             TextField("Alias", text: $alias)
                 .accessibilityLabel("Alias")
                 .accessibilityIdentifier("keyring-add-alias")

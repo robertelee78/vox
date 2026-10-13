@@ -1787,8 +1787,20 @@ pub async fn roster(paths: &Paths, room: &str) -> Result<(), AppError> {
     let channel_id = room_of(&mut client, room).await?;
     match client.request(&Request::Roster { channel_id }).await {
         Ok(Frame::Members { members }) => {
+            let presented = client.presented_names().await.unwrap_or_default();
+            let trusted = match client.trusted("").await {
+                Ok(Frame::Trusted { entries }) => crate::ident::names_of(entries),
+                _ => Vec::new(),
+            };
+            let shown = crate::ident::display_names(&trusted, &presented);
             for m in members {
                 println!("{}", id(&m));
+                if let Some((_, name)) = shown.iter().find(|(fp, _)| *fp == m) {
+                    eprintln!("vox: {} {name}", id(&m));
+                }
+                if let Some((_, name)) = presented.iter().find(|(fp, _)| *fp == m) {
+                    eprintln!("vox: {} Name it presents: {name}", id(&m));
+                }
             }
             // What is to be said of a member about this node's key (ADR-030 D-5, W-4): that it
             // waits, and why, or that the member runs an older Vox. Said beside the list, on
@@ -5489,6 +5501,7 @@ pub async fn trust_offers(paths: &Paths) -> Result<(), AppError> {
         .unwrap_or_default();
     let mut client = attach(paths).await?;
     let offers = offers_of(&mut client).await?;
+    let presented = client.presented_names().await.unwrap_or_default();
     if offers.is_empty() {
         println!(
             "no offers: every node you share a room with is in your keyring, or was dismissed"
@@ -5505,6 +5518,9 @@ pub async fn trust_offers(paths: &Paths) -> Result<(), AppError> {
         }
         // Word for word what the TUI and the app say of it (ADR-028 CL-1).
         let in_rooms: Vec<String> = o.rooms.iter().map(|r| format!("{:?}", r.name)).collect();
+        if let Some((_, name)) = presented.iter().find(|(fp, _)| *fp == o.member) {
+            println!("  Name it presents: {name} · {fp} (not in keyring)");
+        }
         println!("  {}", o.said);
         println!("  in {}", listed(&in_rooms, ""));
         // Whole commands, each pasted as it stands: `vox trust add` asks there for a name and the
@@ -5600,6 +5616,7 @@ pub fn print_identity(
     paths: &Paths,
     flag: Option<String>,
     file: Option<std::path::PathBuf>,
+    with_name: bool,
 ) -> Result<(), AppError> {
     let fingerprint = if vox_core::node::profile::Profile::exists(paths) {
         let attached = tokio::runtime::Builder::new_current_thread()
@@ -5629,7 +5646,19 @@ pub fn print_identity(
         made
     };
     // The whole fingerprint, alone on the line, so it pipes and pastes without editing.
-    println!("{}", vox_core::node::link::b32_encode(&fingerprint));
+    if with_name {
+        let name = paths
+            .profile_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("default");
+        println!(
+            "{name} <{}>",
+            vox_core::node::link::b32_encode(&fingerprint)
+        );
+    } else {
+        println!("{}", vox_core::node::link::b32_encode(&fingerprint));
+    }
     Ok(())
 }
 
@@ -5801,5 +5830,17 @@ pub async fn admin(
         ))),
         Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+/// A known authenticated default. Reading it never changes grants or local aliases.
+pub async fn presented_name(paths: &Paths, target: Digest32) -> Result<Option<String>, AppError> {
+    let mut c = attach(paths).await?;
+    match c.request(&Request::Presentation { target }).await {
+        Ok(Frame::Presented { entries }) => Ok(entries
+            .into_iter()
+            .find(|(fp, _)| *fp == target)
+            .map(|(_, n)| n)),
+        _ => Ok(None),
     }
 }

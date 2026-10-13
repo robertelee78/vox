@@ -383,6 +383,10 @@ private struct FingerprintSheet: View {
                     NSPasteboard.general.setString(model.me, forType: .string)
                 }
                 .accessibilityLabel("Copy this node's fingerprint")
+                Button("Copy Name and Fingerprint") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString("\(model.node) <\(model.me)>", forType: .string)
+                }.accessibilityIdentifier("my-copy-identity")
                 Button("Done") { model.sheet = nil }.keyboardShortcut(.defaultAction)
             }
         }

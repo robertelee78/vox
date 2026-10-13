@@ -638,7 +638,7 @@ try:
     def label_of(who):
         """The state line under `who`'s name in the members pane, and whether the marker is on it."""
         rows = members_pane()
-        key = who if who in ("alice", "dave") else fp[who][:26]
+        key = who if who in ("alice", "dave") else fp[who][:12]
         for i, r in enumerate(rows):
             if key in r:
                 return (rows[i + 1] if i + 1 < len(rows) else ""), "▶" in r, i
@@ -667,7 +667,7 @@ try:
         weight and colour, and whether the accent strays off the focused pane's border:
         (ok, detail)."""
         want = {"alice": (glyphs[0], "alice", True), "dave": (glyphs[1], "dave", True),
-                "carol": (glyphs[2], fp["carol"][:26], False)}
+                "carol": (glyphs[2], "default", False)}
         ok, said = True, []
         for who, (glyph, name, strong) in want.items():
             y = at(t, who)
@@ -1060,7 +1060,7 @@ try:
         heads = [i for i, r in enumerate(s) if r.startswith("needs you (")]
         rows = s[heads[0] + 1:] if heads else []
         offers = [r for r in rows if r.lstrip("▶ ").startswith("offer: ")]
-        under = next((r for r in rows if not r.lstrip("▶ ").startswith("offer: ")), "")
+        under = next((r for r in rows if not r.lstrip("▶ ").startswith(("offer: ", "not in keyring"))), "")
         return (bool(heads) and s[heads[0]] == f"needs you ({1 + len(offers)})"
                 and under.lstrip("▶ ").startswith("family ") and "to you 1" in under
                 and "spare  detached" in s and "default  attached" in s
@@ -1110,6 +1110,8 @@ try:
                 return True
             tui.key("\x1b[A", 0.5)  # Up
         return False
+    offer_identity = tui.until(lambda: any(offer_row("frank") in row and "default" in row for row in side()), 90, 1)
+    offer_state = any("not in keyring" in row for row in side())
     card = select_offer("frank")
     art = any(c in whole() for c in "◢◣◤◥")
     # Nothing reaches the room: what Alice holds of it is unchanged.
@@ -1141,9 +1143,9 @@ try:
     tui.key("\x1b", 1)
     carol_kept = tui.until(lambda: offered("carol"), 60, 1)
     frank_kept_out = not offered("frank")
-    claim("offer", listed_frank and card and art and dismissed_said and frank_gone
+    claim("offer", listed_frank and offer_identity and offer_state and card and art and dismissed_said and frank_gone
           and rows_after == rows_before > 0 and carol_kept and frank_kept_out,
-          f"frank offered under needs you: {listed_frank}; selected, his card with art: {card} "
+          f"frank offered under needs you: {listed_frank}; presented name/fingerprint: {offer_identity}; visible not-in-keyring state: {offer_state}; selected, his card with art: {card} "
           f"{art}; x: said {dismissed_said}, gone {frank_gone}; the room's rows as alice holds them {rows_before} → "
           f"{rows_after}; after bob's node was detached and attached again: carol still offered {carol_kept}, frank "
           f"still dismissed {frank_kept_out}; sidebar {side()!r}")
@@ -1197,7 +1199,7 @@ try:
     tui.key("t", 2)
     prompt_seen = "Trust this node?" in flat() and grouped(fp["frank"])[:24] in flat_ws()
     tui.key(grouped(fp["dave"]).upper() + "\r", 1)
-    tui.key("frank\r", 1)
+    tui.key("\x7f" * 64 + "frank\r", 1)
     tui.key("\r", 3)
     mismatch_said = (f"given: {grouped(fp['dave'])}" in flat_ws()
                      and f"this node: {grouped(fp['frank'])}" in flat_ws()
@@ -1207,14 +1209,14 @@ try:
     closed = tui.until(lambda: "keyring asks for the passphrase" in run("bob", "status").stdout, 90, 2)
     tui.key(":" + hint[1:] + "\r", 2)
     tui.key(grouped(fp["frank"]).upper() + "\r", 1)
-    tui.key("frank\r", 1)
+    tui.key("\x7f" * 64 + "frank\r", 1)
     tui.key("not the pass\r", 3)
     wrong_pass_added = in_ring()
     wrong_pass_said = [l for l in tui.display()[-6:] if l.strip()]
     shown_secret = "not the pass" in flat()
     tui.key(":" + hint[1:] + "\r", 2)
     tui.key(grouped(fp["frank"]).upper() + "\r", 1)
-    tui.key("frank\r", 1)
+    tui.key("\x7f" * 64 + "frank\r", 1)
     tui.key("id pass\r", 3)
     matched = tui.until(in_ring, 30, 1)
     match_said = "you now trust frank" in flat_ws()
@@ -1775,7 +1777,7 @@ try:
             ya, yd, yc = at(tui, "alice"), at(tui, "dave"), at(tui, "carol")
             a = span(tui, ya, glyphs[0] + "alice")
             dv = span(tui, yd, glyphs[1] + "dave")
-            c = span(tui, yc, glyphs[2] + fp["carol"][:26])
+            c = span(tui, yc, glyphs[2] + "default")
             bold = a is not None and dv is not None and all(x.bold for x in a[3:] + dv[3:])
             ok = bold and c is not None and not drawn
             detail = (f"alice {in_box(tui, ya)!r}, dave {in_box(tui, yd)!r}, bold {bold}; carol "
@@ -1817,17 +1819,18 @@ try:
     tui.key("\r", 2)
     prompt = re.sub(r"\s+", " ", whole())
     asked_name = "your name for them" in prompt and grouped(fp["carol"])[:24] in prompt
+    default_shown = "default" in prompt
     asked_compare = "as they gave it to you" in prompt
-    tui.key("carol\r", 1)
+    tui.key("\r", 1)   # accept the authenticated presented-name default
     asked_cap = "read, or read + drive" in re.sub(r"\s+", " ", whole())
     tui.key("\r", 1)   # read, the default
     tui.key("id pass\r", 3)
     in_ring_carol = until(lambda: fp["carol"] in run("bob", "trust", "list").stdout, 30, 1)
-    said_trust = "you now trust carol" in re.sub(r"\s+", " ", whole())
-    claim("accept", carol_card and asked_name and asked_cap and not asked_compare and in_ring_carol
+    said_trust = "you now trust default" in re.sub(r"\s+", " ", whole())
+    claim("accept", carol_card and asked_name and default_shown and asked_cap and not asked_compare and in_ring_carol
           and said_trust and not offered("carol"),
           f"carol's offer selected: {carol_card}; the prompt asked her name with her fingerprint "
-          f"shown: {asked_name}, read or read + drive: {asked_cap}, a fingerprint to compare: "
+          f"shown: {asked_name}, presented default accepted without typing: {default_shown}, read or read + drive: {asked_cap}, a fingerprint to compare: "
           f"{asked_compare}; carol in bob's keyring: {in_ring_carol}; said so: {said_trust}; "
           f"still offered: {offered('carol')}")
     if not tui.stop():

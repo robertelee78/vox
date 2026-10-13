@@ -26,9 +26,12 @@ import os, select, signal, sys, time
 bound = float(sys.argv[1])
 argv = sys.argv[2:]
 secret = sys.stdin.readline().rstrip("\n").encode()
+name_line = sys.stdin.readline()
+name = name_line.rstrip("\n").encode() if name_line else None
 pid, fd = os.forkpty()
 if pid == 0:
     os.execv(argv[0], argv)
+name_sent = False
 out, sent, deadline, killed = b"", False, time.time() + bound, False
 while True:
     if time.time() > deadline and not killed:
@@ -46,6 +49,9 @@ while True:
     if not d:
         break
     out += d
+    if name is not None and not name_sent and b"Your name for " in out and out.rstrip().endswith(b":"):
+        os.write(fd, name + b"\r")
+        name_sent = True
     if not sent and out.rstrip().endswith(b"passphrase:"):
         time.sleep(0.5)  # as a person reads the prompt: never before its terminal is raw
         os.write(fd, secret + b"\r")
@@ -69,6 +75,11 @@ pub fn is_keyring_change<S: AsRef<str>>(args: &[S]) -> bool {
 /// succeeded, and everything the terminal showed (stdout and stderr together, as a person sees
 /// them). `VOX_IDENTITY_PASSPHRASE` is taken out of its environment: a person types it.
 pub fn typed(cmd: &Command, passphrase: &str) -> (bool, String) {
+    typed_name(cmd, passphrase, None)
+}
+
+/// Type an editable alias response when asked; an empty response accepts the shown default.
+pub fn typed_name(cmd: &Command, passphrase: &str, name: Option<&str>) -> (bool, String) {
     let mut child = driver(cmd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -79,7 +90,13 @@ pub fn typed(cmd: &Command, passphrase: &str) -> (bool, String) {
         .stdin
         .take()
         .expect("APPARATUS: the pty driver's stdin")
-        .write_all(format!("{passphrase}\n").as_bytes())
+        .write_all(
+            format!(
+                "{passphrase}\n{}",
+                name.map(|n| format!("{n}\n")).unwrap_or_default()
+            )
+            .as_bytes(),
+        )
         .unwrap_or_else(|e| panic!("APPARATUS: cannot give the pty driver the passphrase: {e}"));
     let out = child
         .wait_with_output()
