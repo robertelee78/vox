@@ -78,8 +78,13 @@ struct ComputerTrustView: View {
                         if !status.computers.isEmpty {
                             Divider()
                             Text("Enrolled computers").eyebrow()
-                            ForEach(status.computers, id: \.fingerprint) { computer in
-                                identity(computer, title: computer.name)
+                            ForEach(status.applications, id: \.computer.fingerprint) { application in
+                                VStack(alignment: .leading, spacing: Space.s4) {
+                                    identity(application.computer, title: application.computer.name)
+                                    Text(applicationState(application, status: status))
+                                        .secondaryText()
+                                        .accessibilityIdentifier("computer-application-" + application.computer.fingerprint)
+                                }
                             }
                         }
                     } else if model.busy {
@@ -131,10 +136,10 @@ struct ComputerTrustView: View {
             Text("Computer trust is confirmed.")
                 .accessibilityIdentifier("computer-trust-confirmed")
         } else if status.state == "applying" {
-            Text("Computer trust was approved. Waiting for it to be applied on both computers.")
+            Text("Computer trust was approved. Waiting for it to be applied across the group.")
                 .accessibilityIdentifier("computer-trust-applying")
         }
-        if let preview = status.pairing, status.state != "confirmed", status.state != "quarantined" {
+        if let preview = status.pairing, status.state != "quarantined" {
             Divider()
             identity(preview.peer, title: "Computer to add")
             if expired(preview.expiresMs), !preview.approvedHere || !preview.approvedThere {
@@ -160,7 +165,7 @@ struct ComputerTrustView: View {
                 .disabled(model.busy || !model.reachable || expired(preview.expiresMs))
                 .accessibilityIdentifier("computer-pairing-approve")
             }
-        } else if let invitation = status.inviteLink, status.state == "waiting" {
+        } else if let invitation = status.inviteLink, status.state != "quarantined" {
             Divider()
             Text("On your other Mac, open Add Computer and paste this pairing code.")
             Text(invitation).font(Theme.mono).textSelection(.enabled)
@@ -182,9 +187,11 @@ struct ComputerTrustView: View {
                     .secondaryText()
             }
             if let copied { Text(copied).secondaryText() }
-        } else if status.state == "individual" {
+        } else if status.state != "quarantined" {
             Divider()
-            Text("Individual node trust is active until you approve computer trust.")
+            Text(status.computers.isEmpty
+                 ? "Individual node trust is active until you approve computer trust."
+                 : "Add another computer to My Computers. Existing members will learn about it when they reconnect.")
                 .secondaryText()
             Button("Create Pairing Code") {
                 Task { await model.perform { try await $0.beginComputerPairing() } }
@@ -208,8 +215,7 @@ struct ComputerTrustView: View {
         let approvedHere = status.pairing?.approvedHere == true
         let closeExpired = approvedHere && status.pairing?.approvedThere != true
             && status.pairing.map { expired($0.expiresMs) } == true
-        if status.state != "confirmed", status.state != "applying", status.state != "quarantined",
-           !approvedHere || closeExpired,
+        if status.state != "quarantined", !approvedHere || closeExpired,
            let operation = status.pairing?.operationId ?? status.inviteId {
             Button(closeExpired ? "Close Expired Attempt" : "Cancel Pairing") {
                 Task { await model.perform { try await $0.cancelComputerPairing(operationId: operation) } }
@@ -220,10 +226,18 @@ struct ComputerTrustView: View {
                  ? "Closing this attempt lets you start a new pairing here. It cannot withdraw the approval already sent to the other computer."
                  : "Closing this window leaves the pairing pending. Cancel Pairing cancels this unused code.")
                 .secondaryText()
-        } else if approvedHere, status.state != "confirmed", status.state != "quarantined" {
+        } else if approvedHere, status.state != "quarantined" {
             Text("Your approval has been sent and cannot be withdrawn here. You can close this window while pairing finishes.")
                 .secondaryText()
         }
+    }
+
+    private func applicationState(_ application: ComputerApplication, status: ComputerStatus) -> String {
+        if status.state == "quarantined" { return "Trust suspended" }
+        if !model.reachable {
+            return application.confirmed ? "Last known: confirmed" : "Last known: awaiting confirmation"
+        }
+        return application.confirmed ? "Confirmed" : "Awaiting confirmation"
     }
 
     private func identity(_ computer: ComputerIdentity, title: String) -> some View {

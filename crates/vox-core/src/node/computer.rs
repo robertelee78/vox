@@ -19,7 +19,9 @@ use crate::node::paths::{create_private_dir, write_private_file, Account};
 use zeroize::Zeroizing;
 
 mod pairing;
-pub use pairing::{ComputerIdentity, ComputerStatus, Management, PairingPreview};
+pub use pairing::{
+    ComputerApplication, ComputerIdentity, ComputerStatus, Management, PairingPreview,
+};
 
 /// The one fixed policy, displayed before either operator approves an enrollment.
 pub const POLICY: &str = "Every managed node can read every other managed node. Each computer's selected personal node can drive the non-personal nodes. Earlier individual grants are replaced by this policy; there are no per-node exceptions. Pairing does not join rooms or change repository bindings.";
@@ -161,7 +163,9 @@ impl Description {
 
 /// The exact initial group intent approved by both operators. Neither founder has a special role.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Genesis {
+pub struct Enrollment {
+    /// Existing incarnation for an ADD; absent only for the initial two-party genesis.
+    pub group: Option<Digest32>,
     /// Inviter-authenticated deadline for fresh approvals, Unix milliseconds.
     pub expires: u64,
     /// Random incarnation nonce.
@@ -173,7 +177,7 @@ pub struct Genesis {
     /// Both signatures of the identical canonical body, when approved.
     pub approvals: [Option<Signed>; 2],
 }
-impl Genesis {
+impl Enrollment {
     /// The fixed policy digest binds its version and permission meaning.
     pub fn policy_digest() -> Digest32 {
         sha256_concat(&[b"vox/computer-policy/v1\0", POLICY.as_bytes()])
@@ -181,7 +185,7 @@ impl Genesis {
     /// Canonical genesis; presentation names are bound but do not identify a member.
     pub fn body(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(8)
+        e.array(9)
             .uint(PROTOCOL)
             .bytes(&self.nonce)
             .bytes(&Self::policy_digest())
@@ -189,12 +193,22 @@ impl Genesis {
             .bytes(&self.computers[1].encode())
             .bytes(&self.grants[0])
             .bytes(&self.grants[1])
-            .uint(self.expires);
+            .uint(self.expires)
+            .bytes(
+                self.group
+                    .as_ref()
+                    .map(|g| g.as_slice())
+                    .unwrap_or_default(),
+            );
         e.finish()
     }
-    /// Immutable group incarnation.
-    pub fn incarnation(&self) -> Digest32 {
+    /// Immutable pairing operation, distinct from the existing group for an ADD.
+    pub fn operation(&self) -> Digest32 {
         sha256_concat(&[b"vox/computer-genesis/v1\0", &self.body()])
+    }
+    /// The pinned group never changes when another equal member enrolls a computer.
+    pub fn incarnation(&self) -> Digest32 {
+        self.group.unwrap_or_else(|| self.operation())
     }
     /// Verify every approval present, or require both for an active group.
     pub fn verify(&self, complete: bool) -> Result<()> {
@@ -236,7 +250,7 @@ impl Genesis {
         let mut d = Decoder::new(b);
         arity(&mut d, 3)?;
         let mut body = Decoder::new(d.bytes()?);
-        arity(&mut body, 8)?;
+        arity(&mut body, 9)?;
         if body.uint()? != PROTOCOL {
             return Err(bad());
         }
@@ -250,6 +264,12 @@ impl Genesis {
         ];
         let grants = [digest(&mut body)?, digest(&mut body)?];
         let expires = body.uint()?;
+        let group = body.bytes()?;
+        let group = if group.is_empty() {
+            None
+        } else {
+            Some(group.try_into().map_err(|_| bad())?)
+        };
         body.finish()?;
         let mut approvals = [None, None];
         for a in &mut approvals {
@@ -260,6 +280,7 @@ impl Genesis {
         }
         d.finish()?;
         let g = Self {
+            group,
             expires,
             nonce,
             computers,
@@ -351,62 +372,73 @@ impl Binding {
 
 /// One signed roster, including the saved app selection. Headless installations have none.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Roster {
+pub struct Control {
     /// Signed canonical roster body, retained verbatim for receipts and replay checking.
     pub signed: Signed,
 }
-impl Roster {
-    /// Produce a control event from locally obtained bindings. Every event names its exact
-    /// author grant, predecessor and complete known causal frontier.
+impl Control {
     fn create(
-        g: &Genesis,
-        previous: Option<&Roster>,
-        mut heads: Vec<Digest32>,
+        s: &State,
         bindings: &[Binding],
         personal: Option<Digest32>,
         signer: &dyn RootSigner,
     ) -> Result<Self> {
         let author = signer.fingerprint();
-        let side = g
-            .computers
-            .iter()
-            .position(|c| c.fingerprint().ok() == Some(author))
-            .ok_or(Error::SignatureInvalid)?;
-        let (sequence, previous) = match previous {
-            Some(r) => (r.event()?.sequence.checked_add(1).ok_or_else(bad)?, r.id()),
-            None => (1, [0; 32]),
-        };
-        if previous != [0; 32] {
-            heads.push(previous);
-        }
-        if heads.is_empty() {
-            heads.push(g.incarnation());
-        }
-        heads.sort();
-        heads.dedup();
+        let previous = s.rosters.get(&author);
+        let revision = previous
+            .map(|r| r.event().map(|e| e.roster_revision))
+            .transpose()?
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(bad)?;
         let mut body = Encoder::new();
-        body.array(2)
+        body.array(4)
+            .uint(revision)
+            .bytes(&previous.map(Self::id).unwrap_or([0; 32]))
             .bytes(personal.as_ref().map(|v| v.as_slice()).unwrap_or_default())
             .array(bindings.len());
         for b in bindings {
-            b.verify(&author, &g.incarnation())?;
             body.bytes(&b.encode());
         }
+        Self::sign(s, "roster", body.finish(), signer)
+    }
+    fn sign(s: &State, kind: &str, body: Vec<u8>, signer: &dyn RootSigner) -> Result<Self> {
+        let group = s.group().ok_or_else(bad)?;
+        let author = signer.fingerprint();
+        let grant = s.grant(&author).ok_or(Error::SignatureInvalid)?;
+        let previous = s
+            .history
+            .values()
+            .filter_map(|r| {
+                r.event()
+                    .ok()
+                    .filter(|e| e.group == group && e.author == author)
+                    .map(|e| (e.sequence, r.id()))
+            })
+            .max()
+            .unwrap_or((0, [0; 32]));
+        let mut heads = s.heads();
+        if previous.1 != [0; 32] {
+            heads.push(previous.1);
+        }
+        if heads.is_empty() {
+            heads.push(group);
+        }
+        heads.sort();
+        heads.dedup();
         let mut e = Encoder::new();
         e.array(10)
             .uint(PROTOCOL)
-            .bytes(&g.incarnation())
+            .bytes(&group)
             .bytes(&signer.public_key().to_bytes())
-            .bytes(&g.grants[side])
-            .uint(sequence)
-            .bytes(&previous)
+            .bytes(&grant)
+            .uint(previous.0.checked_add(1).ok_or_else(bad)?)
+            .bytes(&previous.1)
             .array(heads.len());
         for head in heads {
             e.bytes(&head);
         }
-        e.text("roster")
-            .bytes(&body.finish())
-            .bytes(&random_array::<32>()?);
+        e.text(kind).bytes(&body).bytes(&random_array::<32>()?);
         Ok(Self {
             signed: Signed::create(b"vox/computer-control/v1\0", e.finish(), signer)?,
         })
@@ -414,7 +446,7 @@ impl Roster {
     fn id(&self) -> Digest32 {
         sha256(&self.signed.encode())
     }
-    fn event(&self) -> Result<RosterEvent> {
+    fn event(&self) -> Result<ControlEvent> {
         let mut d = Decoder::new(&self.signed.body);
         arity(&mut d, 10)?;
         if d.uint()? != PROTOCOL {
@@ -442,26 +474,42 @@ impl Roster {
         {
             return Err(bad());
         }
-        if d.text()? != "roster" {
-            return Err(bad());
-        }
+        let kind = d.text()?;
         let mut body = Decoder::new(d.bytes()?);
-        arity(&mut body, 2)?;
-        let p = body.bytes()?;
-        let personal = if p.is_empty() {
-            None
-        } else {
-            Some(p.try_into().map_err(|_| bad())?)
-        };
-        let n = count(&mut body)?;
-        let mut bindings = Vec::with_capacity(n);
-        for _ in 0..n {
-            bindings.push(Binding::decode(body.bytes()?)?);
+        let (mut personal, mut bindings, mut addition, mut reach) = (None, Vec::new(), None, None);
+        let (mut roster_revision, mut previous_roster) = (0, [0; 32]);
+        match kind {
+            "roster" => {
+                arity(&mut body, 4)?;
+                roster_revision = body.uint()?;
+                previous_roster = digest(&mut body)?;
+                let p = body.bytes()?;
+                personal = if p.is_empty() {
+                    None
+                } else {
+                    Some(p.try_into().map_err(|_| bad())?)
+                };
+                for _ in 0..count(&mut body)? {
+                    bindings.push(Binding::decode(body.bytes()?)?);
+                }
+                if roster_revision == 0 {
+                    return Err(bad());
+                }
+            }
+            "add" => {
+                arity(&mut body, 1)?;
+                addition = Some(Enrollment::decode(body.bytes()?)?);
+            }
+            "reach" => {
+                arity(&mut body, 1)?;
+                reach = Some(Reach::decode(body.bytes()?)?);
+            }
+            _ => return Err(bad()),
         }
         body.finish()?;
         let _operation = digest(&mut d)?;
         d.finish()?;
-        Ok(RosterEvent {
+        Ok(ControlEvent {
             group,
             author,
             grant,
@@ -470,33 +518,54 @@ impl Roster {
             heads,
             personal,
             bindings,
+            roster_revision,
+            previous_roster,
+            addition,
+            reach,
         })
     }
-    /// Verify the signed event and its node bindings; causal admission is performed by the
-    /// retained-history fold before this roster can become effective policy.
-    pub fn read(
-        &self,
-        manager: &Digest32,
-        group: &Digest32,
-    ) -> Result<(u64, Option<Digest32>, Vec<Binding>)> {
-        self.signed.verify(b"vox/computer-control/v1\0", manager)?;
+    fn verify(&self, group: &Digest32) -> Result<ControlEvent> {
         let e = self.event()?;
-        if e.author != *manager || e.group != *group {
+        self.signed
+            .verify(b"vox/computer-control/v1\0", &e.author)?;
+        if e.group != *group {
             return Err(bad());
         }
         let mut seen = std::collections::BTreeSet::new();
         for b in &e.bindings {
-            if !seen.insert(b.verify(manager, group)?) {
+            if !seen.insert(b.verify(&e.author, group)?) {
                 return Err(bad());
             }
         }
         if e.personal.is_some_and(|p| !seen.contains(&p)) {
             return Err(bad());
         }
-        Ok((e.sequence, e.personal, e.bindings))
+        if let Some(a) = &e.addition {
+            a.verify(true)?;
+            if a.group != Some(*group)
+                || a.computers[0].fingerprint()? != e.author
+                || a.grants[0] != e.grant
+            {
+                return Err(Error::SignatureInvalid);
+            }
+        }
+        Ok(e)
+    }
+    /// The node roster is effective only after its complete control ancestry is authenticated.
+    pub fn read(
+        &self,
+        manager: &Digest32,
+        group: &Digest32,
+    ) -> Result<(u64, Option<Digest32>, Vec<Binding>)> {
+        let e = self.verify(group)?;
+        if e.author != *manager || e.roster_revision == 0 {
+            return Err(bad());
+        }
+        Ok((e.roster_revision, e.personal, e.bindings))
     }
 }
-struct RosterEvent {
+#[derive(Clone)]
+struct ControlEvent {
     group: Digest32,
     author: Digest32,
     grant: Digest32,
@@ -505,6 +574,54 @@ struct RosterEvent {
     heads: Vec<Digest32>,
     personal: Option<Digest32>,
     bindings: Vec<Binding>,
+    roster_revision: u64,
+    previous_roster: Digest32,
+    addition: Option<Enrollment>,
+    reach: Option<Reach>,
+}
+/// Current authenticated contact facts, carried by the same author chain as membership.
+/// The independent token authorizes exact management transport pairs, never room access.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Reach {
+    endpoints: crate::nat::multiaddr::EndpointList,
+    anchors: crate::nat::bootstrap::BootstrapSet,
+    token: Digest32,
+}
+impl Reach {
+    fn encode(&self) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(3).array(self.endpoints.len());
+        for a in self.endpoints.addrs() {
+            e.text(&a.to_string());
+        }
+        e.bytes(&self.anchors.to_bytes()).bytes(&self.token);
+        e.finish()
+    }
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut d = Decoder::new(bytes);
+        arity(&mut d, 3)?;
+        let n = d.array()?;
+        if n > 8 {
+            return Err(bad());
+        }
+        let mut endpoints = Vec::new();
+        for _ in 0..n {
+            endpoints.push(crate::nat::multiaddr::Multiaddr::parse(d.text()?)?);
+        }
+        let result = Self {
+            endpoints: crate::nat::multiaddr::EndpointList::new(endpoints)?,
+            anchors: crate::nat::bootstrap::BootstrapSet::from_bytes(d.bytes()?)?,
+            token: digest(&mut d)?,
+        };
+        d.finish()?;
+        Ok(result)
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Grant {
+    computer: Description,
+    sponsor: Option<Digest32>,
+    event: Digest32,
 }
 
 #[derive(Clone)]
@@ -583,9 +700,13 @@ pub(crate) struct AppliedPolicy {
 
 #[derive(Clone)]
 pub(crate) struct State {
+    links: Vec<Zeroizing<String>>,
+    group_genesis: Option<Enrollment>,
+    members: BTreeMap<Digest32, Grant>,
+    reaches: BTreeMap<Digest32, Reach>,
     pub cancelled_links: Vec<Zeroizing<String>>,
-    pub cancelled: BTreeMap<Digest32, Genesis>,
-    pub history: BTreeMap<Digest32, Roster>,
+    pub cancelled: BTreeMap<Digest32, Enrollment>,
+    pub history: BTreeMap<Digest32, Control>,
     pub quarantined: std::collections::BTreeSet<Digest32>,
     pub pair_link: Option<Zeroizing<String>>,
     pub pending_expires: u64,
@@ -594,136 +715,127 @@ pub(crate) struct State {
     pub description: Description,
     pub revision: u64,
     pub invitations: Vec<Invitation>,
-    pub genesis: Option<Genesis>,
-    pub rosters: BTreeMap<Digest32, Roster>,
+    pub genesis: Option<Enrollment>,
+    pub rosters: BTreeMap<Digest32, Control>,
     /// A pending intent, including approvals already made, survives a crash before both arrive.
-    pub pending: Option<Genesis>,
+    pub pending: Option<Enrollment>,
     /// Exact local policy application revision for each attached node; never a distributed clock.
     pub applied: BTreeMap<Digest32, AppliedPolicy>,
 }
 impl State {
-    fn heads(&self) -> Vec<Digest32> {
-        let group = self
-            .genesis
+    fn group(&self) -> Option<Digest32> {
+        self.genesis
             .as_ref()
+            .or(self.group_genesis.as_ref())
             .or(self.pending.as_ref())
-            .map(Genesis::incarnation);
-        let current: Vec<_> = self
-            .history
-            .iter()
-            .filter(|(_, r)| r.event().ok().is_some_and(|e| Some(e.group) == group))
-            .collect();
-        let mut heads: BTreeMap<Digest32, ()> = current.iter().map(|(id, _)| (**id, ())).collect();
-        for (_, r) in current {
-            if let Ok(e) = r.event() {
-                for h in e.heads {
-                    heads.remove(&h);
-                }
-            }
-        }
-        heads.into_keys().collect()
+            .map(Enrollment::incarnation)
     }
-
-    fn history_complete(&self) -> bool {
-        let Some(g) = self.genesis.as_ref().or(self.pending.as_ref()) else {
-            return true;
-        };
-        let mut known = std::collections::BTreeSet::from([g.incarnation()]);
-        let mut pending: Vec<_> = self
+    fn grant(&self, author: &Digest32) -> Option<Digest32> {
+        if self.quarantined.contains(author) {
+            return None;
+        }
+        self.members
+            .iter()
+            .find(|(_, g)| g.computer.fingerprint().ok() == Some(*author))
+            .map(|(id, _)| *id)
+            .or_else(|| {
+                self.pending
+                    .as_ref()
+                    .filter(|g| self.genesis.is_none() && g.group.is_none())
+                    .and_then(|g| {
+                        g.computers
+                            .iter()
+                            .position(|d| d.fingerprint().ok() == Some(*author))
+                            .map(|i| g.grants[i])
+                    })
+            })
+    }
+    fn descriptions(&self) -> BTreeMap<Digest32, Description> {
+        self.members
+            .values()
+            .filter_map(|g| {
+                g.computer
+                    .fingerprint()
+                    .ok()
+                    .map(|id| (id, g.computer.clone()))
+            })
+            .collect()
+    }
+    fn heads(&self) -> Vec<Digest32> {
+        let current: Vec<_> = self
             .history
             .iter()
             .filter_map(|(id, r)| {
                 r.event()
                     .ok()
-                    .filter(|e| e.group == g.incarnation())
+                    .filter(|e| Some(e.group) == self.group())
                     .map(|e| (*id, e))
             })
             .collect();
-        loop {
-            let before = pending.len();
-            pending.retain(|(id, event)| {
-                if event.heads.iter().all(|h| known.contains(h)) {
-                    known.insert(*id);
-                    false
-                } else {
-                    true
-                }
-            });
-            if pending.is_empty() {
-                return true;
-            }
-            if pending.len() == before {
-                return false;
+        let mut heads: std::collections::BTreeSet<_> = current.iter().map(|(id, _)| *id).collect();
+        for (_, e) in current {
+            for h in e.heads {
+                heads.remove(&h);
             }
         }
+        heads.into_iter().collect()
     }
-
-    /// Retain evidence before folding it. A missing causal parent gives no authority; conflicting
-    /// correctly signed author events quarantine the author durably instead of choosing a winner.
-    fn retain_roster(&mut self, r: Roster) -> Result<()> {
+    fn history_complete(&self) -> bool {
+        self.derive().map(|v| v.complete).unwrap_or(false)
+    }
+    fn retain_roster(&mut self, r: Control) -> Result<()> {
         if self.history.contains_key(&r.id()) {
             return Ok(());
         }
-        let g = self
-            .genesis
-            .as_ref()
-            .or(self.pending.as_ref())
-            .ok_or_else(bad)?;
-        let e = r.event()?;
-        r.read(&e.author, &g.incarnation())?;
-        let at = g
-            .computers
-            .iter()
-            .position(|c| c.fingerprint().ok() == Some(e.author))
-            .ok_or(Error::SignatureInvalid)?;
-        if g.grants[at] != e.grant {
-            return Err(Error::SignatureInvalid);
-        }
+        r.verify(&self.group().ok_or_else(bad)?)?;
         if self.history.len() >= MAX_RECORDS {
             return Err(Error::Profile(HISTORY_FULL));
         }
         self.history.insert(r.id(), r);
         self.fold_history()
     }
-
-    fn fold_history(&mut self) -> Result<()> {
-        let Some(g) = self.genesis.as_ref().or(self.pending.as_ref()) else {
-            if self.history.is_empty() {
-                return Ok(());
-            }
-            return Err(bad());
+    fn derive(&self) -> Result<Authority> {
+        let Some(g) = self
+            .genesis
+            .as_ref()
+            .or(self.group_genesis.as_ref())
+            .or(self.pending.as_ref().filter(|g| g.group.is_none()))
+        else {
+            return Ok(Authority::default());
         };
-        let before_quarantine = self.quarantined.clone();
-        let mut seqs = BTreeMap::new();
+        let group = g.incarnation();
         let mut events = BTreeMap::new();
         for (id, r) in &self.history {
-            let e = r.event()?;
-            if e.group != g.incarnation() {
-                continue;
+            if r.event()?.group == group {
+                events.insert(*id, r.verify(&group)?);
             }
-            r.read(&e.author, &g.incarnation())?;
-            let at = g
-                .computers
-                .iter()
-                .position(|c| c.fingerprint().ok() == Some(e.author))
-                .ok_or(Error::SignatureInvalid)?;
-            if g.grants[at] != e.grant {
-                return Err(Error::SignatureInvalid);
-            }
-            if seqs.insert((e.author, e.sequence), *id).is_some() {
-                self.quarantined.insert(e.author);
-            }
-            events.insert(*id, e);
         }
-        let mut accepted = std::collections::BTreeSet::from([g.incarnation()]);
+        let initial: Vec<_> = g
+            .grants
+            .iter()
+            .zip(&g.computers)
+            .map(|(id, c)| {
+                (
+                    *id,
+                    Grant {
+                        computer: c.clone(),
+                        sponsor: None,
+                        event: group,
+                    },
+                )
+            })
+            .collect();
+        let mut accepted = std::collections::BTreeSet::new();
+        let mut ancestry: BTreeMap<Digest32, std::collections::BTreeSet<Digest32>> =
+            BTreeMap::new();
+        let mut grants = initial.clone();
         let mut pending: std::collections::BTreeSet<_> = events.keys().copied().collect();
-        let mut rosters = BTreeMap::new();
         loop {
             let before = pending.len();
-            pending.retain(|id| {
-                let e = &events[id];
-                if e.heads.iter().any(|h| !accepted.contains(h)) {
-                    return true;
+            for id in pending.clone() {
+                let e = &events[&id];
+                if e.heads.iter().any(|h| *h != group && !accepted.contains(h)) {
+                    continue;
                 }
                 let chain = if e.sequence == 1 {
                     e.previous == [0; 32]
@@ -733,53 +845,172 @@ impl State {
                     })
                 };
                 if !chain {
-                    self.quarantined.insert(e.author);
-                    return false;
+                    return Err(bad());
                 }
-                accepted.insert(*id);
-                if !self.quarantined.contains(&e.author) {
-                    let replace = rosters
-                        .get(&e.author)
-                        .and_then(|id| events.get(id))
-                        .is_none_or(|old| old.sequence < e.sequence);
-                    if replace {
-                        rosters.insert(e.author, *id);
+                let mut prefix = std::collections::BTreeSet::new();
+                for h in &e.heads {
+                    if *h != group {
+                        prefix.insert(*h);
+                        prefix.extend(ancestry[h].iter().copied());
                     }
                 }
-                false
-            });
+                let available: Vec<_> = grants
+                    .iter()
+                    .filter(|(_, v)| v.event == group || prefix.contains(&v.event))
+                    .map(|(k, v)| (*k, v.clone()))
+                    .collect();
+                let (active, _) = exclude_forks(&events, &ancestry, &prefix, available)?;
+                if !active.iter().any(|(id, a)| {
+                    *id == e.grant && a.computer.fingerprint().ok() == Some(e.author)
+                }) {
+                    return Err(Error::SignatureInvalid);
+                }
+                if let Some(add) = &e.addition {
+                    let target = add.computers[1].fingerprint()?;
+                    if active
+                        .iter()
+                        .any(|(_, a)| a.computer.fingerprint().ok() == Some(target))
+                    {
+                        return Err(Error::Profile("computer is already enrolled in this group"));
+                    }
+                    let grant = Grant {
+                        computer: add.computers[1].clone(),
+                        sponsor: Some(e.grant),
+                        event: id,
+                    };
+                    // Retain grants by ADD event until fork exclusion. Two independently
+                    // valid branches can carry the same approved intent/grant: neither branch
+                    // may discard the other's transferable fork evidence at insertion.
+                    grants.push((add.grants[1], grant));
+                }
+                if e.roster_revision > 0 {
+                    let old = prefix
+                        .iter()
+                        .filter_map(|h| {
+                            let p = &events[h];
+                            (p.author == e.author && p.roster_revision > 0).then_some((*h, p))
+                        })
+                        .max_by_key(|(_, p)| p.sequence);
+                    if old
+                        .map(|(h, p)| (p.roster_revision + 1, h))
+                        .unwrap_or((1, [0; 32]))
+                        != (e.roster_revision, e.previous_roster)
+                    {
+                        return Err(bad());
+                    }
+                }
+                ancestry.insert(id, prefix);
+                accepted.insert(id);
+                pending.remove(&id);
+            }
             if pending.len() == before {
                 break;
             }
         }
-        // A node key claimed by both management identities is a whole-computer fault.
+        let (mut members, mut quarantined) = exclude_forks(&events, &ancestry, &accepted, grants)?;
+        // Closing an expired local intent cannot withdraw a signature elsewhere. Retain that
+        // signed ADD and its ancestry, but its exact grant cannot activate on this installation.
+        // A different fresh operation/grant is unaffected by replay of this local close.
+        let mut retired: std::collections::BTreeSet<_> = self
+            .cancelled
+            .values()
+            .filter(|intent| intent.group == Some(group))
+            .map(|intent| intent.grants[1])
+            .collect();
+        loop {
+            let before = retired.len();
+            for (id, grant) in &members {
+                if grant
+                    .sponsor
+                    .is_some_and(|sponsor| retired.contains(&sponsor))
+                {
+                    retired.insert(*id);
+                }
+            }
+            if retired.len() == before {
+                break;
+            }
+        }
+        members.retain(|(id, _)| !retired.contains(id));
+        let mut unique = BTreeMap::new();
+        for (id, grant) in members {
+            if unique.insert(id, grant).is_some() {
+                return Err(bad());
+            }
+        }
+        let members = unique;
+        let active: std::collections::BTreeSet<_> = members
+            .values()
+            .filter_map(|g| g.computer.fingerprint().ok())
+            .collect();
+        let mut rosters = BTreeMap::new();
+        let mut reaches = BTreeMap::new();
+        for id in &accepted {
+            let e = &events[id];
+            if !active.contains(&e.author) {
+                continue;
+            }
+            if e.roster_revision > 0
+                && rosters
+                    .get(&e.author)
+                    .is_none_or(|old| events[old].sequence < e.sequence)
+            {
+                rosters.insert(e.author, *id);
+            }
+            if e.reach.is_some()
+                && reaches
+                    .get(&e.author)
+                    .is_none_or(|old| events[old].sequence < e.sequence)
+            {
+                reaches.insert(e.author, *id);
+            }
+        }
         let mut managers = BTreeMap::new();
         for (manager, id) in &rosters {
             for b in &events[id].bindings {
-                let node = b.verify(manager, &g.incarnation())?;
+                let node = b.verify(manager, &group)?;
                 if let Some(other) = managers.insert(node, *manager) {
                     if other != *manager {
-                        self.quarantined.insert(other);
-                        self.quarantined.insert(*manager);
+                        quarantined.insert(other);
+                        quarantined.insert(*manager);
                     }
                 }
             }
         }
-        let next: BTreeMap<_, _> = rosters
-            .into_iter()
-            .filter(|(author, _)| !self.quarantined.contains(author))
-            .map(|(author, id)| (author, self.history[&id].clone()))
-            .collect();
-        if self.rosters != next || self.quarantined != before_quarantine {
-            self.rosters = next;
+        Ok(Authority {
+            members,
+            quarantined,
+            rosters: rosters
+                .into_iter()
+                .map(|(k, id)| (k, self.history[&id].clone()))
+                .collect(),
+            reaches: reaches
+                .into_iter()
+                .filter_map(|(k, id)| events[&id].reach.clone().map(|reach| (k, reach)))
+                .collect(),
+            complete: pending.is_empty(),
+        })
+    }
+    fn fold_history(&mut self) -> Result<()> {
+        let next = self.derive()?;
+        if self.members != next.members
+            || self.rosters != next.rosters
+            || self.quarantined != next.quarantined
+            || self.reaches != next.reaches
+        {
+            self.members = next.members;
+            self.rosters = next.rosters;
+            self.quarantined = next.quarantined;
+            self.reaches = next.reaches;
             self.revision = self.revision.checked_add(1).ok_or_else(bad)?;
             self.receipts.clear();
         }
         Ok(())
     }
+
     fn body(&self) -> Vec<u8> {
         let mut e = Encoder::for_secrets();
-        e.array(15)
+        e.array(17)
             .bytes(&self.description.encode())
             .uint(self.revision)
             .array(self.invitations.len());
@@ -790,7 +1021,7 @@ impl State {
             &self
                 .genesis
                 .as_ref()
-                .map(Genesis::encode)
+                .map(Enrollment::encode)
                 .unwrap_or_default(),
         )
         .array(self.rosters.len());
@@ -801,7 +1032,7 @@ impl State {
             &self
                 .pending
                 .as_ref()
-                .map(Genesis::encode)
+                .map(Enrollment::encode)
                 .unwrap_or_default(),
         )
         .array(self.applied.len());
@@ -843,11 +1074,22 @@ impl State {
         for link in &self.cancelled_links {
             e.text(link);
         }
+        e.bytes(
+            &self
+                .group_genesis
+                .as_ref()
+                .map(Enrollment::encode)
+                .unwrap_or_default(),
+        )
+        .array(self.links.len());
+        for link in &self.links {
+            e.text(link);
+        }
         e.finish()
     }
     fn read(vault: Vec<u8>, body: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(body);
-        arity(&mut d, 15)?;
+        arity(&mut d, 17)?;
         let description = Description::decode(d.bytes()?)?;
         let revision = d.uint()?;
         let n = count(&mut d)?;
@@ -859,8 +1101,11 @@ impl State {
         let genesis = if b.is_empty() {
             None
         } else {
-            let g = Genesis::decode(b)?;
+            let g = Enrollment::decode(b)?;
             g.verify(true)?;
+            if g.group.is_some() {
+                return Err(bad());
+            }
             Some(g)
         };
         let n = count(&mut d)?;
@@ -871,7 +1116,7 @@ impl State {
             if rosters
                 .insert(
                     id,
-                    Roster {
+                    Control {
                         signed: Signed::decode(d.bytes()?)?,
                     },
                 )
@@ -884,7 +1129,7 @@ impl State {
         let pending = if b.is_empty() {
             None
         } else {
-            Some(Genesis::decode(b)?)
+            Some(Enrollment::decode(b)?)
         };
         let n = count(&mut d)?;
         let mut applied = BTreeMap::new();
@@ -937,7 +1182,7 @@ impl State {
         for _ in 0..n {
             arity(&mut d, 2)?;
             let id = digest(&mut d)?;
-            let r = Roster {
+            let r = Control {
                 signed: Signed::decode(d.bytes()?)?,
             };
             if r.id() != id || history.insert(id, r).is_some() {
@@ -956,8 +1201,8 @@ impl State {
         for _ in 0..n {
             arity(&mut d, 2)?;
             let id = digest(&mut d)?;
-            let g = Genesis::decode(d.bytes()?)?;
-            if id != g.incarnation() || cancelled.insert(id, g).is_some() {
+            let g = Enrollment::decode(d.bytes()?)?;
+            if id != g.operation() || cancelled.insert(id, g).is_some() {
                 return Err(bad());
             }
         }
@@ -966,8 +1211,27 @@ impl State {
         for _ in 0..n {
             cancelled_links.push(Zeroizing::new(d.text()?.to_owned()));
         }
+        let bytes = d.bytes()?;
+        let group_genesis = if bytes.is_empty() {
+            None
+        } else {
+            let g = Enrollment::decode(bytes)?;
+            g.verify(true)?;
+            if g.group.is_some() {
+                return Err(bad());
+            }
+            Some(g)
+        };
+        let mut links = Vec::new();
+        for _ in 0..count(&mut d)? {
+            links.push(Zeroizing::new(d.text()?.to_owned()));
+        }
         d.finish()?;
         let mut s = Self {
+            links,
+            group_genesis,
+            members: BTreeMap::new(),
+            reaches: BTreeMap::new(),
             cancelled_links,
             cancelled,
             history,
@@ -984,40 +1248,93 @@ impl State {
             pending,
             applied,
         };
-        // Restart verifies the retained evidence and recomputes exactly the saved authority.
-        // Cancelled intents remain evidence, but can never authorize the active incarnation.
+        // Recompute authority from retained signed bytes, checking the saved effective roster.
         for r in s.history.values() {
             let e = r.event()?;
-            let g = s
-                .genesis
-                .as_ref()
-                .or(s.pending.as_ref())
-                .filter(|g| g.incarnation() == e.group)
-                .or_else(|| s.cancelled.get(&e.group))
+            let group = s
+                .group()
+                .filter(|g| *g == e.group)
+                .or_else(|| {
+                    s.cancelled
+                        .values()
+                        .find(|g| g.incarnation() == e.group)
+                        .map(Enrollment::incarnation)
+                })
                 .ok_or_else(bad)?;
-            let at = g
-                .computers
-                .iter()
-                .position(|c| c.fingerprint().ok() == Some(e.author))
-                .ok_or_else(bad)?;
-            if e.grant != g.grants[at] {
-                return Err(bad());
-            }
-            r.read(&e.author, &e.group)?;
+            r.verify(&group)?;
         }
-        if s.genesis.is_some() || s.pending.is_some() {
-            let rosters = s.rosters.clone();
-            let quarantined = s.quarantined.clone();
-            let revision = s.revision;
-            s.fold_history()?;
-            if s.rosters != rosters || s.quarantined != quarantined || s.revision != revision {
+        if s.genesis.is_some() || s.group_genesis.is_some() || s.pending.is_some() {
+            let derived = s.derive()?;
+            if derived.rosters != s.rosters || derived.quarantined != s.quarantined {
                 return Err(bad());
             }
+            s.members = derived.members;
+            s.reaches = derived.reaches;
         } else if !s.rosters.is_empty() {
             return Err(bad());
         }
         Ok(s)
     }
+}
+
+#[derive(Default)]
+struct Authority {
+    members: BTreeMap<Digest32, Grant>,
+    rosters: BTreeMap<Digest32, Control>,
+    reaches: BTreeMap<Digest32, Reach>,
+    quarantined: std::collections::BTreeSet<Digest32>,
+    complete: bool,
+}
+type EventGrants = Vec<(Digest32, Grant)>;
+
+/// Fork exclusion follows sponsor edges, preserving additions on the shared safe prefix.
+fn exclude_forks(
+    events: &BTreeMap<Digest32, ControlEvent>,
+    ancestry: &BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
+    selected: &std::collections::BTreeSet<Digest32>,
+    mut grants: EventGrants,
+) -> Result<(EventGrants, std::collections::BTreeSet<Digest32>)> {
+    let mut forks = BTreeMap::new();
+    let mut seqs = BTreeMap::new();
+    for id in selected {
+        let e = &events[id];
+        if let Some(old) = seqs.insert((e.author, e.sequence), *id) {
+            let p = &events[&old];
+            if p.previous == e.previous {
+                forks
+                    .entry(e.author)
+                    .and_modify(|v: &mut (u64, Digest32)| {
+                        if e.sequence < v.0 {
+                            *v = (e.sequence, e.previous);
+                        }
+                    })
+                    .or_insert((e.sequence, e.previous));
+            }
+        }
+    }
+    let mut denied = std::collections::BTreeSet::new();
+    for (author, (_, previous)) in &forks {
+        let mut safe = ancestry.get(previous).cloned().unwrap_or_default();
+        safe.insert(*previous);
+        let mut invalid: std::collections::BTreeSet<_> = grants
+            .iter()
+            .filter_map(|(id, g)| (g.computer.fingerprint().ok() == Some(*author)).then_some(*id))
+            .collect();
+        loop {
+            let before = invalid.len();
+            for (id, g) in &grants {
+                if g.sponsor.is_some_and(|s| invalid.contains(&s)) && !safe.contains(&g.event) {
+                    invalid.insert(*id);
+                }
+            }
+            if before == invalid.len() {
+                break;
+            }
+        }
+        denied.extend(invalid);
+    }
+    grants.retain(|(id, _)| !denied.contains(id));
+    Ok((grants, forks.into_keys().collect()))
 }
 
 /// A complete replacement for the covered part of one node's keyring.
@@ -1096,18 +1413,18 @@ impl Computer {
                     || s.history.values().any(|r| {
                         r.event().ok().is_some_and(|e| {
                             e.author == local
+                                && e.roster_revision > 0
                                 && Some(e.group)
                                     == s.genesis
                                         .as_ref()
                                         .or(s.pending.as_ref())
-                                        .map(Genesis::incarnation)
+                                        .map(Enrollment::incarnation)
                         })
                     })
                 {
                     return Ok(());
                 }
-                let g = s.genesis.as_ref().or(s.pending.as_ref()).ok_or_else(bad)?;
-                let r = Roster::create(g, None, s.heads(), &[], None, self.signer.as_ref())?;
+                let r = Control::create(s, &[], None, self.signer.as_ref())?;
                 s.retain_roster(r)?;
             }
             Ok(())
@@ -1117,11 +1434,18 @@ impl Computer {
     /// The signed group whose local operator has approved management bindings.
     pub fn binding_group(&self) -> Option<Digest32> {
         let s = lock(&self.state);
-        let g = s.genesis.as_ref().or(s.pending.as_ref())?;
+        let local = self.signer.fingerprint();
+        if s.genesis.is_some() && s.grant(&local).is_some() {
+            return s.group();
+        }
+        let g = s.pending.as_ref()?;
+        if g.group.is_some() {
+            return None;
+        }
         let at = g
             .computers
             .iter()
-            .position(|d| d.fingerprint().ok() == Some(self.signer.fingerprint()))?;
+            .position(|d| d.fingerprint().ok() == Some(local))?;
         g.approvals[at].as_ref()?;
         Some(g.incarnation())
     }
@@ -1168,15 +1492,7 @@ impl Computer {
             changed |= selection != old_personal;
             if changed {
                 bindings.sort_by_key(|b| sha256(&b.node.public));
-                let g = s.genesis.as_ref().or(s.pending.as_ref()).ok_or_else(bad)?;
-                let r = Roster::create(
-                    g,
-                    s.rosters.get(&local),
-                    s.heads(),
-                    &bindings,
-                    selection,
-                    self.signer.as_ref(),
-                )?;
+                let r = Control::create(s, &bindings, selection, self.signer.as_ref())?;
                 s.retain_roster(r)?;
             }
             Ok(())
@@ -1368,6 +1684,10 @@ impl Computer {
         };
         Description::decode(&description.encode())?;
         let state = State {
+            links: Vec::new(),
+            group_genesis: None,
+            members: BTreeMap::new(),
+            reaches: BTreeMap::new(),
             cancelled_links: Vec::new(),
             cancelled: BTreeMap::new(),
             history: BTreeMap::new(),
