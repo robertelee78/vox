@@ -348,6 +348,8 @@ TEST_RUNNER_VOX_PROOF_APP="$APP" TEST_RUNNER_VOX_PROOF_SCRATCH="$SCRATCH" \
     TEST_RUNNER_VOX_PROOF_STAGER_TOKEN="$TOKEN" \
     TEST_RUNNER_VOX_PROOF_FROM="${VOX_PROOF_FROM:-}" \
     TEST_RUNNER_VOX_PROOF_KNOBS_VOX="$ROOT/target/proof-knobs/release/vox" \
+    TEST_RUNNER_VOX_PROOF_NATIVE_NODE="${VOX_PROOF_NATIVE_NODE:-/Users/admin/vox-app-proofs/apparatus/node}" \
+    TEST_RUNNER_VOX_PROOF_OPENCODE_HOST="$ROOT/crates/vox-tui/tests/support/opencode_plugin_host.mjs" \
     TEST_RUNNER_VOX_PROOF_CONTINUE="${VOX_PROOF_CONTINUE:-}" \
     xcodebuild -project apps/macos/Vox.xcodeproj -scheme Vox -configuration Release \
     -derivedDataPath "$DERIVED" -resultBundlePath "$RESULTS/AppProofs.xcresult" \

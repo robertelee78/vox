@@ -83,6 +83,18 @@ final class Stager {
 
     func stop(_ id: Int) { _ = try? ask(["op": "stop", "id": id]) }
 
+    /// Own an existing native harness apparatus speaking one JSON reply per stdin line.
+    /// Its stderr remains separate from the protocol, in this journey's scratch log.
+    func jsonHost(_ args: [String], env: [String: String], cwd: String,
+                  stderr: String) throws -> StagedJSONHost {
+        let reply = try ask(["op": "json-host-start", "args": args, "env": env,
+                             "cwd": cwd, "stderr": stderr], within: 30)
+        guard let handle = reply["handle"] as? String, !handle.isEmpty else {
+            throw Apparatus("the stager returned no owned native host handle")
+        }
+        return StagedJSONHost(stager: self, handle: handle)
+    }
+
     func write(_ data: Data, to path: String) throws {
         _ = try ask(["op": "write", "path": path, "base64": data.base64EncodedString()])
     }
@@ -102,4 +114,34 @@ struct Started {
     let id: Int
     func terminate() { stager.stop(id) }
     func waitUntilExit() {}
+}
+
+/// An opaque child owned by the stager, never an arbitrary process ID.
+/// A failed or timed-out conversation is retired before any subsequent command.
+final class StagedJSONHost {
+    private let stager: Stager
+    private let handle: String
+
+    fileprivate init(stager: Stager, handle: String) {
+        self.stager = stager
+        self.handle = handle
+    }
+
+    func command(_ line: String, within seconds: Double = 30) throws -> [String: Any] {
+        guard seconds.isFinite, seconds > 0, seconds <= 120 else {
+            throw Apparatus("native host response bound must be between 0 and 120 seconds")
+        }
+        let answer = try stager.ask(["op": "json-host-command", "handle": handle,
+                                     "command": line, "within": seconds], within: seconds + 10)
+        guard let reply = answer["reply"] as? [String: Any] else {
+            throw Apparatus("the native host's response is not a JSON object")
+        }
+        return reply
+    }
+
+    func terminate() {
+        _ = try? stager.ask(["op": "json-host-stop", "handle": handle], within: 10)
+    }
+
+    deinit { terminate() }
 }

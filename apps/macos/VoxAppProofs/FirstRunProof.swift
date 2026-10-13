@@ -1635,6 +1635,156 @@ final class FirstRunProof: XCTestCase {
         XCTAssertEqual(appliedB["state"] as? String, "confirmed", "PRODUCT: reviewing computer must be applied")
         pairingUI.terminate()
         print("[proof] Add Computer: zero-node invitation; authenticated review; one-sided waiting; protected-node pending; ordinary attach; both confirmed; existing room and repo binding retained")
+        // Native OpenCode Session driving uses the existing plugin host apparatus, with no
+        // model or room override. Actual room joins and the saved repo binding remain authority.
+        guard let nativeNode = env["VOX_PROOF_NATIVE_NODE"],
+              let nativeHostSource = env["VOX_PROOF_OPENCODE_HOST"],
+              stager.run(["/bin/test", "-x", nativeNode], env: [:]).status == 0,
+              stager.run(["/bin/test", "-r", nativeHostSource], env: [:]).status == 0 else {
+            throw Apparatus("the existing native OpenCode host and Node executable must be staged before this journey")
+        }
+        for name in ["paired-personal", "paired-ordinary"] {
+            try staged(vox, ["node", "create", name],
+                       env: computerA.merging(["VOX_IDENTITY_PASSPHRASE": "protected pairing identity"]) { $1 })
+            try staged(vox, ["node", "attach", name, "--passphrase-file", computerPass], env: computerA)
+        }
+        let keptLink = try line(staged(vox, ["room", "link", "--node", "protected", keptRoom], env: computerB)) {
+            $0.hasPrefix("vox://")
+        }
+        for name in ["paired-personal", "paired-ordinary"] {
+            try staged(vox, ["room", "join", "--node", name, "--passphrase-file", computerPass, keptLink], env: computerA)
+            let joined = try staged(vox, ["room", "list", "--node", name], env: computerA)
+            guard joined.contains(keptRoom) else { throw Apparatus("native drive node \(name) did not join the retained room: \(joined)") }
+        }
+        pairingUI.launchEnvironment = computerA
+        try launchVox(pairingUI, appPath, env: computerA, scratch: scratchPath)
+        tap(pairingUI, Key.id("node-paired-personal"), "Choose paired-personal as the personal node")
+        guard present(pairingUI, Key.id("room-pairing-kept"), timeout: 30,
+                      "the selected personal node must show its joined retained room") else { return }
+        tap(pairingUI, Key.id("room-pairing-kept"), "Open the joined retained room")
+        let personalFp = try line(staged(vox, ["id", "--node", "paired-personal"], env: computerA)) { $0.count == 52 }
+        let ordinaryFp = try line(staged(vox, ["id", "--node", "paired-ordinary"], env: computerA)) { $0.count == 52 }
+        let rosterUntil = Date().addingTimeInterval(30)
+        var nativeRoster = ""
+        while Date() < rosterUntil {
+            nativeRoster = try staged(vox, ["room", "roster", "--node", "protected", keptRoom], env: computerB)
+            if nativeRoster.contains(personalFp) && nativeRoster.contains(ordinaryFp) { break }
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        guard nativeRoster.contains(personalFp) && nativeRoster.contains(ordinaryFp) else {
+            throw Apparatus("native drive's exact personal and ordinary identities are not both room members: \(nativeRoster)")
+        }
+        // A short, uniquely owned scratch temp directory lets the real plugin's Unix sockets fit.
+        let nativeTempResult = stager.run(["/usr/bin/mktemp", "-d", "/tmp/vox-799-native.XXXXXXXX"], env: [:])
+        let nativeTemp = nativeTempResult.out.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard nativeTempResult.status == 0, nativeTemp.hasPrefix("/tmp/vox-799-native."), !nativeTemp.contains("\n") else {
+            throw Apparatus("cannot stage the native plugin's private temporary directory: \(nativeTempResult.out)")
+        }
+        defer { _ = stager.run(["/bin/rm", "-rf", nativeTemp], env: [:]) }
+        let nativeSession = "ses_799_pair_drive_0001"
+        let nativePlugin = computerRoot.appendingPathComponent("native-plugin.mjs").path
+        let pluginText = try staged(vox, ["agent", "plugin", "opencode", "--node", "protected"], env: computerB)
+        try stager.write(Data(pluginText.utf8), to: nativePlugin)
+        let nativeEnv = computerB.merging(["PATH": "/usr/bin:/bin", "TMPDIR": nativeTemp,
+                                          "VOX_BIN": vox, "VOX_IDENTITY_PASSPHRASE": "protected pairing identity"]) { $1 }
+        let nativeHost = try stager.jsonHost([nativeNode, nativeHostSource, nativePlugin, nativeSession],
+                                            env: nativeEnv, cwd: repo,
+                                            stderr: computerRoot.appendingPathComponent("native-host.stderr").path)
+        defer { nativeHost.terminate() }
+        _ = try nativeHost.command("title Pairing native OpenCode")
+        _ = try nativeHost.command("turn NATIVE-799-INITIAL")
+        func nativeEvent(_ object: [String: Any]) throws {
+            let json = try JSONSerialization.data(withJSONObject: object)
+            _ = try nativeHost.command("event " + String(decoding: json, as: UTF8.self))
+        }
+        let initialUser: [String: Any] = ["type": "message.updated", "properties": ["info":
+            ["id": "msg_799_user", "sessionID": nativeSession, "role": "user"]]]
+        let initialText: [String: Any] = ["type": "message.part.updated", "properties": ["part":
+            ["id": "part_799_user", "messageID": "msg_799_user", "sessionID": nativeSession,
+             "type": "text", "text": "NATIVE-799-INITIAL"]]]
+        let nativeInitialUntil = Date().addingTimeInterval(60)
+        var nativeInitial = ""
+        while Date() < nativeInitialUntil {
+            try nativeEvent(initialUser); try nativeEvent(initialText)
+            nativeInitial = run(vox, ["room", "session", "--node", "paired-personal", keptRoom, nativeSession], env: computerA).out
+            if nativeInitial.contains("NATIVE-799-INITIAL") { break }
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        guard nativeInitial.contains("NATIVE-799-INITIAL") else {
+            throw Apparatus("the repo-bound native Session was not established for the personal receiver: \(nativeInitial)")
+        }
+        tap(pairingUI, Key.id("session-\(nativeSession.prefix(8))"), "The native OpenCode Session in the joined room")
+        guard present(pairingUI, Key.id("session-compose"), timeout: 30,
+                      "the selected personal node must be able to drive a covered ordinary node's native Session") else { return }
+        words(pairingUI, Key.id("session-compose-as"), timeout: 10,
+              "native Session input must be sent as the selected personal node", until: { $0.contains("paired-personal") })
+        type(pairingUI, Key.id("session-compose"), "NATIVE-799-APP-SAY\r", "Say into the native OpenCode Session")
+        guard words(pairingUI, Key.id("session-said"), timeout: 30,
+                    "the native Session must report accepted app input", until: { $0.hasSuffix(": typed") }) != nil else { return }
+        let nativeCalls = try nativeHost.command("calls 30 1", within: 40)
+        let acceptedCalls = nativeCalls["calls"] as? [[String: Any]] ?? []
+        XCTAssertTrue(acceptedCalls.contains { call in
+            let parts = (call["body"] as? [String: Any])?["parts"] as? [[String: Any]]
+            return call["method"] as? String == "POST" && call["url"] as? String == "/session/\(nativeSession)/prompt_async"
+                && parts?.first?["text"] as? String == "NATIVE-799-APP-SAY"
+        }, "PRODUCT: app say must reach exactly the native recipient Session as prompt_async; host read \(nativeCalls)")
+        try nativeEvent(["type": "message.updated", "properties": ["info":
+            ["id": "msg_799_reply", "sessionID": nativeSession, "role": "assistant", "providerID": "opencode", "modelID": "apparatus"]]])
+        try nativeEvent(["type": "message.part.updated", "properties": ["part":
+            ["id": "part_799_reply", "messageID": "msg_799_reply", "sessionID": nativeSession,
+             "type": "text", "text": "NATIVE-799-REPLY"]]])
+        try nativeEvent(["type": "session.idle", "properties": ["sessionID": nativeSession]])
+        let nativeTimeline = pairingUI.scrollViews.matching(identifier: "timeline").firstMatch
+        guard nativeTimeline.waitForExistence(timeout: 10) else {
+            throw Apparatus("the selected native Session has no public timeline for reading its returned step")
+        }
+        let nativeReplyLines = nativeTimeline.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND (label CONTAINS %@ OR CAST(value, 'NSString') CONTAINS %@)",
+            "entry-line-", "NATIVE-799-REPLY", "NATIVE-799-REPLY"))
+        func nativeReplyVisible(_ line: XCUIElement) -> Bool {
+            let body = line.frame, clip = nativeTimeline.frame, window = pairingUI.windows.firstMatch.frame
+            return [body.minX, body.minY, body.width, body.height,
+                    clip.minX, clip.minY, clip.width, clip.height,
+                    window.minX, window.minY, window.width, window.height].allSatisfy { $0.isFinite }
+                && body.width > 0 && body.height > 0 && clip.width > 0 && clip.height > 0
+                && clip.contains(body) && window.contains(body)
+        }
+        let nativeReplyUntil = Date().addingTimeInterval(30)
+        while Date() < nativeReplyUntil {
+            let line = nativeReplyLines.firstMatch
+            if line.exists && nativeReplyVisible(line) { break }
+            let clip = nativeTimeline.frame
+            guard clip.width > 0, clip.height > 0, clip.height.isFinite else {
+                throw Apparatus("the native Session's timeline has no finite positive viewport: \(clip)")
+            }
+            if line.exists, !line.frame.isEmpty {
+                nativeTimeline.scroll(byDeltaX: 0, deltaY: max(-200, min(200, clip.midY - line.frame.midY)))
+            } else {
+                // Realize the newest native entry through normal public scrolling.
+                nativeTimeline.scroll(byDeltaX: 0, deltaY: -min(200, clip.height * 0.75))
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        let nativeReplyLine = nativeReplyLines.firstMatch
+        guard nativeReplyLine.exists else {
+            keepTree(pairingUI, "native reply absent from the selected Session entry lines")
+            throw Product("the native Session's returned NATIVE-799-REPLY step must appear as its own timeline entry, not a sidebar preview")
+        }
+        guard nativeReplyVisible(nativeReplyLine) else {
+            keepTree(pairingUI, "native returned step could not be brought inside its timeline")
+            throw Apparatus("cannot stage the native returned step visibly: entry \(nativeReplyLine.frame), timeline \(nativeTimeline.frame), window \(pairingUI.windows.firstMatch.frame)")
+        }
+        let ordinarySay = run(vox, ["room", "session", "--node", "paired-ordinary", keptRoom, nativeSession,
+                                   "--say", "NATIVE-799-ORDINARY-MUST-NOT-ARRIVE"], env: computerA)
+        XCTAssertTrue(ordinarySay.status != 0 && ordinarySay.out.contains("does not trust you with drive"),
+                      "PRODUCT: a covered ordinary room member must actually be refused native Session drive; \(ordinarySay.out)")
+        let callsAfterRefusal = try nativeHost.command("calls 2 2", within: 5)
+        XCTAssertEqual((callsAfterRefusal["calls"] as? [[String: Any]])?.count, acceptedCalls.count,
+                       "PRODUCT: refused ordinary-node input must not reach the native recipient; \(callsAfterRefusal)")
+        nativeHost.terminate()
+        pairingUI.terminate()
+        print("[proof] paired selected personal node drove the repo-bound native OpenCode Session through app say; recipient received exact prompt and returned visible step; joined ordinary node refused with no recipient call")
+
         // The ordinary app must explain a real storage refusal, not retain its old confirmation.
         try staged(vox, ["node", "create", "storage-failure"],
                    env: computerB.merging(["VOX_IDENTITY_PASSPHRASE": "protected pairing identity"]) { $1 })
