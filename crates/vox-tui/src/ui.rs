@@ -361,7 +361,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
     }
     let listing = ui.screen == Screen::ChannelList;
     let title = if listing {
-        "Rooms (Enter: open · Ctrl-N: next room to you · : command)"
+        "Rooms (Enter: open · : command)"
     } else {
         "Rooms"
     };
