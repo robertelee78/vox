@@ -15,13 +15,16 @@ struct RootView: View {
                 MainWindow(model: node)
                     .font(Theme.text)
             } else {
-                setup
+                // The setup form can be taller than the first-run window. Let it scroll
+                // inside the space left by the hook notice, keeping Dismiss in the window.
+                ScrollView { setup }
             }
         }
         .safeAreaInset(edge: .bottom) {
             if let said = model.agentSetupSaid {
                 HStack(alignment: .top) {
                     Text(said).font(Theme.text).textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
                         .accessibilityIdentifier("agent-hooks-installed")
                     Spacer()
                     Button("Dismiss") { model.agentSetupSaid = nil }
