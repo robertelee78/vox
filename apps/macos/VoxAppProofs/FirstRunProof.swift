@@ -4937,13 +4937,11 @@ final class FirstRunProof: XCTestCase {
             let body = e.frame
             let clip = timeline.frame
             guard !body.isEmpty && !clip.isEmpty else { break }
-            if body.minY < clip.minY {
-                timeline.scroll(byDeltaX: 0, deltaY: 200)
-            } else if body.maxY > clip.maxY {
-                timeline.scroll(byDeltaX: 0, deltaY: -200)
-            } else {
-                break
-            }
+            guard body.minY < clip.minY || body.maxY > clip.maxY else { break }
+            // A fixed 200-point scroll can leap across a 115-point timeline forever.
+            // Move toward the viewport's center by the observed distance, as a person does.
+            let distance = clip.midY - body.midY
+            timeline.scroll(byDeltaX: 0, deltaY: max(-200, min(200, distance)))
             print("[proof] copy staging \(what): body \(body) → \(e.frame), timeline \(timeline.frame)")
         }
         guard visible() else {
