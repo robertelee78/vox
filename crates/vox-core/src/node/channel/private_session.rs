@@ -692,7 +692,7 @@ impl ChannelState {
             return false;
         }
         let mut saw_author = false;
-        for (author, target, epoch, generation) in self.drive.floors.keys() {
+        for ((author, target, epoch, generation), (_, _, author_start)) in &self.drive.floors {
             if *author != h.author_id
                 || author != target
                 || (*epoch, *generation) < (h.epoch, h.chain_id)
@@ -704,10 +704,19 @@ impl ChannelState {
                 .drive
                 .floors
                 .get(&(*author, *recipient, *epoch, *generation))
-                .is_none_or(|(m, _, _)| *m != membership)
+                .is_none_or(|(m, from, first_seq)| {
+                    *m != membership
+                        || ((*epoch, *generation) > (h.epoch, h.chain_id)
+                            && (*from != 0 || first_seq > author_start))
+                })
             {
                 return false;
             }
+            // Continuing holders are marked at iteration zero before the author's own floor
+            // is published. A later grant in any intervening generation breaks continuity:
+            // its key position may be later, or it may still be zero if nobody has written
+            // yet. The signed public position distinguishes that second case. Merely having
+            // a floor again must never revive permission to fetch the former grant's bodies.
         }
         saw_author
     }

@@ -1,5 +1,5 @@
 //! **ADR-029 SC-2, SC-2a, SC-2b (#543) — a Session is read only by the members its node trusts
-//! with drive**, through the shipped `vox` binary: a `vox node` anchor and three `vox daemon`s.
+//! with drive**, through the shipped `vox` binary: a `vox node` anchor and four `vox daemon`s.
 //!
 //! ## The claims
 //! 1. **Read only with drive** (SC-2, SC-2a, SC-4). Alice's node trusts bob with read + drive
@@ -33,6 +33,11 @@
 //!    alice's drive key in both rooms at once, each as a key-package in that room's log. Carol's
 //!    own `vox status` says how many one-time prekeys her node has used: exactly two more. Two
 //!    packages naming one prekey use one, and the second is opened as a replay, last-resort.
+//! 6. **A late join discovers the ongoing Session, starting with its grant** (#787). Dave joins
+//!    after earlier activity, sees the open Session and reads only its subsequent steps. After
+//!    losing and regaining drive he keeps previously read history, misses the revoked interval,
+//!    and reads new steps. Raw requests to both the author and an authorized relay return no
+//!    ciphertext from before his first grant or from an earlier grant after regrant.
 //!
 //! ## The staging
 //! - Every `vox` is the shipped binary in a scratch `VOX_DATA_DIR`/`VOX_CONFIG_DIR`; every step a
@@ -67,6 +72,11 @@
 //! - **No rotation on losing drive** (claim 2): `rotate_drive_if_lost` in
 //!   `crates/vox-core/src/node/channel.rs` returns the lost members without changing the key. Bob's
 //!   node opens the entries written after his downgrade: red PRODUCT.
+//! - **No opening refresh on a new reader's consent** (claim 6): Dave reads fresh chat but the
+//!   ongoing Session is missing from `vox room sessions`: red PRODUCT.
+//! - **Regrant treated as continuous permission** (claim 6): ignore the start of a recipient's
+//!   grant in later generations in `private_permitted`. The author returns old ciphertext to
+//!   Dave's raw request after regrant: red PRODUCT.
 #![cfg(unix)]
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -503,7 +513,7 @@ fn fetch_as(
 }
 
 #[test]
-#[ignore = "an anchor and three daemons with production Argon2id; CI runs it in release"]
+#[ignore = "an anchor and four daemons with production Argon2id; CI runs it in release"]
 fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key() {
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
@@ -982,6 +992,143 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         before,
         "PRODUCT: Bob's restart after drive loss changed the steps he had already read"
     );
+
+    // A fourth member joins the already-running Session with drive. Its room admission and
+    // later regrant each begin a new readable interval; neither releases earlier ciphertext.
+    let mut dave = member(tmp.path(), "dave", &spec);
+    alice.trust(&dave, true);
+    dave.trust(&alice, false);
+    carol.trust(&dave, false);
+    dave.trust(&carol, false);
+    let (ok, o, e) = dave.vox(
+        &["room", "join", "--passphrase-file", "-", link.trim()],
+        Some(&format!("{ROOM_PASS}\n")),
+    );
+    assert!(
+        ok,
+        "PRODUCT: drive-enabled late member could not join: {o}{e}"
+    );
+    assert!(
+        posts_until_read(&alice, &dave, &room, "READY-LATE-MEMBER"),
+        "APPARATUS: late member never read its ordinary control post"
+    );
+    assert!(
+        until(Duration::from_secs(60), || can_drive(&dave, &room)
+            == Some(true)),
+        "PRODUCT: late member with drive did not discover the ongoing Session"
+    );
+    private_wire_refused(&mut dave, &[&alice, &carol], id, &spec);
+    assert!(
+        opened(&dave, &room).is_empty(),
+        "PRODUCT: late member read pre-admission Session history"
+    );
+
+    let append = |seq, text: &str| {
+        assert!(
+            matches!(
+                rt.block_on(alice.socket(&rt).request(&Request::AppendSession {
+                    channel_id: id,
+                    session_id: SESSION.to_owned(),
+                    body: reply(seq, text),
+                })),
+                Ok(Frame::Appended { .. })
+            ),
+            "PRODUCT: owner could not append {text}"
+        );
+    };
+    let joined = "AFTER-LATE-ROOM-JOIN";
+    append(101, joined);
+    assert!(
+        until(Duration::from_secs(60), || opened(&dave, &room) == [joined]),
+        "PRODUCT: late member must read only its post-admission step; got {:?}",
+        opened(&dave, &room)
+    );
+    let (ok, o, e) = alice.vox(
+        &[
+            "trust",
+            "read",
+            &dave.fp,
+            "--identity-passphrase-file",
+            alice.pass(),
+        ],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: owner could not revoke late member's drive: {o}{e}"
+    );
+    let absent = "WHILE-LATE-MEMBER-REVOKED";
+    append(102, absent);
+    assert!(
+        until(Duration::from_secs(60), || opened(&carol, &room)
+            == [late, joined, absent]),
+        "PRODUCT: continuously authorized relay did not receive the intervening step"
+    );
+    assert!(
+        posts_until_read(&alice, &dave, &room, "AFTER-LATE-MEMBER-REVOKE"),
+        "APPARATUS: revoked late member never read its ordinary control post"
+    );
+    assert_eq!(
+        opened(&dave, &room),
+        [joined],
+        "PRODUCT: revoking late member's drive erased old history or released a new step"
+    );
+    assert_eq!(
+        can_drive(&dave, &room),
+        Some(false),
+        "PRODUCT: revoked late member still advertises drive"
+    );
+
+    let (ok, o, e) = alice.vox(
+        &[
+            "trust",
+            "drive",
+            &dave.fp,
+            "--identity-passphrase-file",
+            alice.pass(),
+        ],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: owner could not regrant late member's drive: {o}{e}"
+    );
+    assert!(
+        until(Duration::from_secs(60), || can_drive(&dave, &room)
+            == Some(true)),
+        "PRODUCT: regranted member did not regain its ongoing Session"
+    );
+    // The relay has the missed step. The regranted member asks both it and the owner before
+    // any new step is written: neither may backfill even encrypted earlier records.
+    private_wire_refused(&mut dave, &[&alice, &carol], id, &spec);
+    let regranted = "AFTER-LATE-MEMBER-REGRANT";
+    append(103, regranted);
+    assert!(
+        until(Duration::from_secs(60), || opened(&dave, &room)
+            == [joined, regranted]),
+        "PRODUCT: regrant must preserve held history and add only new activity; got {:?}",
+        opened(&dave, &room)
+    );
+    assert!(
+        posts_until_read(&alice, &dave, &room, "AFTER-REGRANT-CONTROL"),
+        "APPARATUS: regranted member never read its ordinary control post"
+    );
+    for member in [&bob, &carol, &dave] {
+        let (ok, shown, err) = member.vox(&["room", "read", &room], None);
+        assert!(
+            ok && !shown.contains("not received yet")
+                && [late, joined, absent, regranted]
+                    .iter()
+                    .all(|text| !shown.contains(text)),
+            "PRODUCT: {}'s General exposed Session content or withheld placeholders: {shown}{err}",
+            member.name
+        );
+    }
+    assert_eq!(
+        opened(&bob, &room),
+        before,
+        "PRODUCT: another member's join and regrant changed Bob's already-read history"
+    );
     legacy_placeholder_journey(&mut alice, &mut bob, id, &room, &spec);
 }
 
@@ -1079,7 +1226,7 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
             let more = d.uint().expect("PRODUCT: private Session page integer");
             let records = d.array().expect("PRODUCT: private Session page array");
             assert_eq!(records, 0,
-                "PRODUCT: {name} served {records} encrypted Session records to {} without current drive", member.name);
+                "PRODUCT: {name} served {records} encrypted Session records to {} outside its current grant", member.name);
             d.finish()
                 .expect("PRODUCT: extra bytes in private Session page");
             if more == 0 {
