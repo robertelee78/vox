@@ -185,23 +185,41 @@ computer-identity feature to use placement the operator already knows.
 
 ### Make the handoff usable
 
-Check reachability, required read visibility, the intended live session and artifact availability:
+At the handoff boundary, use bounded supported checks of the room, delivery capability, required
+read visibility, intended session and artifacts. Do not start a polling loop or invent a timeout:
 
 ```bash
-vox room ping <room> <member>                  # daemon reachability and its sessions
-vox room sessions <room> --json                # live Sessions and your can_drive for each
+vox room board <room>                        # current claims and pending handoffs
+vox room ping <room> <member>                 # daemon response and reported delivery capability
+vox room sessions <room> --json               # Session records and can_drive, not responsiveness
+vox room read <room>                          # delivered room answers
 vox room roster <room>                        # membership, not reciprocal trust
 vox trust list                               # your node's grants and local names
 vox agent doctor --node <your node> --room <room>  # your wiring for this room
 ```
 
-A successful ping, queued message or delivery receipt is **not the worker accepting the task**.
-The recipient must explicitly acknowledge the scope in the room. A receipt-only `ack` is not
-agreement. If acknowledgement is missing, leave the handoff unresolved; do not duplicate work,
-widen trust or bypass the claim/takeover rules above. Use the post's directional visibility report
-and the recipient's answer; seeing their message does not establish that they can read yours.
-Confirm that the intended worker can obtain the needed candidate and proof artifacts, not merely
-that a temporary path exists on your machine.
+Distinguish three things: room/daemon delivery, the harness's reported delivery capability
+while its session is active or idle, and **the model accepting this scope**. An open Session record, successful
+ping, queued receipt or old activity does not establish that a model is live, responsive or working.
+Read the reported delivery capability; where current activity is unknown, say so. Codex reads room
+messages at its next turn and cannot be woken from idle by a room post. Report a next-turn or queued
+status as such, not as model acceptance. Do not launch another worker/model, drive a Session or ask
+the operator to prompt it just to simulate a wake. Runtime attention/wake changes belong to
+[Vox #812](https://github.com/robertelee78/vox/issues/812); this skill handles the current limitation.
+
+The recipient must explicitly acknowledge the scope in the room; a receipt-only `ack` is not
+agreement. Use the post's directional visibility report and the recipient's answer; seeing their
+message does not establish that they can read yours. Confirm that the worker can obtain the needed
+candidate and proof artifacts, not merely that a temporary path exists on your machine.
+
+If there is no model acceptance and the board shows the work is unclaimed and unreserved, explicitly
+close/cancel that offer in the room with `--re` before redirecting it. Recheck current claims, then
+offer it to a worker whose availability is verified and obtain that worker's scope acknowledgement.
+A late acknowledgement does not reopen the cancelled offer or create a second owner: tell the late
+recipient it was closed and reconcile against the current board. Closing an offer never revokes
+accepted, claimed or reserved work; preserve the existing handoff and takeover rules above. Until
+resolved, do not count it as accepted, duplicate its work or widen trust. Continue other independent
+work while the handoff is unresolved.
 
 Include in the handoff:
 

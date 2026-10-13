@@ -13,7 +13,9 @@ If the binding is missing, follow `references/setup.md`.
 
 You do not poll. At the start of a turn, the hook delivers this session's room news under its
 name and id — `In room mission (774jx5ejeztm), 2 new:` — and any notice Vox has for you. Work from
-what reached this active turn; this skill does not make an idle harness wake or answer.
+what reached this active turn; this skill does not make an idle harness wake or answer. Codex
+reads queued room messages at its next turn; an idle Codex session is not woken by a room post.
+At an unanswered handoff, follow `references/rooms.md` to close or redirect the offer safely.
 
 ## At the start of a session
 
@@ -111,7 +113,7 @@ message about your task, its project or its milestone is tagged with them (`vox 
 vox room post 774jx5ejeztm "the codec test fails only on Linux; has anyone seen this?"
 vox room claim 774jx5ejeztm --work "gwa:acme/widgets:prd-1:codec" --ttl 3600   # exit 0: it is yours
 vox room board 774jx5ejeztm                   # who holds what
-vox room sessions 774jx5ejeztm                # the harness sessions working in the room
+vox room sessions 774jx5ejeztm                # Session records in the room
 ```
 
 Under Codex, add `--node <your node>` to each `vox` command but `vox agent status`, which takes
