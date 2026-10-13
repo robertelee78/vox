@@ -1489,17 +1489,30 @@ final class FirstRunProof: XCTestCase {
              "VOX_PROXY": "127.0.0.1:0",
              "HOME": computerRoot.appendingPathComponent(name + "/home").path]
         }
-        let computerA = computerEnv("a"), computerB = computerEnv("b")
+        let computerA = computerEnv("a").merging([
+            "VOX_TEST_KEYCHAIN": computerRoot.appendingPathComponent("a/pairing.keychain-db").path
+        ]) { $1 }
+        let computerB = computerEnv("b").merging([
+            "VOX_TEST_KEYCHAIN": computerRoot.appendingPathComponent("b/pairing.keychain-db").path
+        ]) { $1 }
         for environment in [computerA, computerB] {
             let madeHome = stager.run(["/bin/mkdir", "-p", environment["HOME"]!], env: [:])
             guard madeHome.status == 0 else {
                 throw Apparatus("cannot create pairing account's scratch HOME: \(madeHome.out)")
             }
+            let madeKeychain = stager.run(["/usr/bin/security", "create-keychain", "-p", "",
+                                          environment["VOX_TEST_KEYCHAIN"]!],
+                                         env: ["HOME": environment["HOME"]!])
+            guard madeKeychain.status == 0 else {
+                throw Apparatus("cannot create pairing account's private Keychain: \(madeKeychain.out)")
+            }
         }
-        let hostA = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: computerA,
+        // Only these owned apparatus daemons use the private Keychains for remembered unlocks.
+        // Keep each account's Keychain across app restarts; app and bundled CLI stay ordinary.
+        let hostA = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: computerA,
                               until: "vox daemon: control socket")
         defer { hostA.terminate() }
-        let hostB = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: computerB,
+        let hostB = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: computerB,
                               until: "vox daemon: control socket")
         defer { hostB.terminate() }
         for environment in [computerA, computerB] {
@@ -1545,11 +1558,13 @@ final class FirstRunProof: XCTestCase {
         defer { pairingUI.terminate() }
         func openComputers(_ environment: [String: String]) throws {
             pairingUI.launchEnvironment = environment
-            try launchVox(pairingUI, appPath, env: environment, scratch: scratchPath)
-            pairingUI.typeKey(",", modifierFlags: .command)
-            guard tap(pairingUI, Key.id("settings-add-computer"), "Settings > Add Computer") else {
-                throw Product("Settings must offer Add Computer without a personal node")
+            let account = try computerStatus(environment)
+            guard let identity = account["this_computer"] as? [String: Any],
+                  let fingerprint = identity["fingerprint"] as? String, fingerprint.count == 52 else {
+                throw Apparatus("the scratch account's public computer fingerprint is absent: \(account)")
             }
+            try launchVox(pairingUI, appPath, env: environment, scratch: scratchPath,
+                          computerFingerprint: fingerprint)
             guard present(pairingUI, Key.id("computer-trust-sheet"), timeout: 15,
                           "Add Computer must open its account-owned view") else { throw Product("Add Computer did not open") }
         }
@@ -5270,9 +5285,11 @@ final class FirstRunProof: XCTestCase {
     /// Before: no Vox.app runs, so the proof cannot drive another. After: exactly one Vox runs,
     /// this app's executable; and within 30 s the app shows this run's scratch path or a node
     /// staged only here, or asks the first-run question the account's own config has answered.
-    /// The account's data root shown, or none of these, stops the case.
+    /// When requested for a zero-node account, its read-only Add Computer view must instead
+    /// show the exact full computer fingerprint read from this scratch account's public CLI.
+    /// The account's data root shown, or the required clue absent, stops the case.
     private func launchVox(_ ui: XCUIApplication, _ appPath: String, env: [String: String],
-                           scratch: String) throws {
+                           scratch: String, computerFingerprint: String? = nil) throws {
         try scratchOnly(env, under: scratch)
         let appExe = resolved(appPath + "/Contents/MacOS/Vox")
         if let running = proofApps().first {
@@ -5305,6 +5322,10 @@ final class FirstRunProof: XCTestCase {
         let realRoot = Key.showing("Library/Application Support/vox")
         let scratchSigns: [Key] = [Key.showing(resolved(scratch)), Key.showing(scratch),
                                    Key.id("node-alice"), Key.showing("node alice"), Key.showing("alice")]
+        // Zero-node accounts have no node/path clue in Welcome. Open only the read-only
+        // account view: no invitation, approval or other pairing action precedes verification.
+        if computerFingerprint != nil { ui.typeKey(",", modifierFlags: .command) }
+        var openedComputerView = false
         let until = Date().addingTimeInterval(30)
         while Date() < until {
             if let real = locate(ui, realRoot) {
@@ -5312,6 +5333,21 @@ final class FirstRunProof: XCTestCase {
                 keepTree(ui, "Vox.app showed the account's data root")
                 ui.terminate()
                 throw Apparatus("Vox.app is on the account's real profile, not this run's scratch one: it shows \(said); stopped before any step")
+            }
+            if let fingerprint = computerFingerprint {
+                if !openedComputerView, let button = locate(ui, Key.id("settings-add-computer")), button.isHittable {
+                    button.click()
+                    openedComputerView = true
+                }
+                let sheet = ui.descendants(matching: .any).matching(identifier: "computer-trust-sheet").firstMatch
+                let identity = sheet.descendants(matching: .staticText)
+                    .matching(NSPredicate(format: "label == %@ OR CAST(value, 'NSString') == %@", fingerprint, fingerprint)).firstMatch
+                if sheet.exists, identity.exists {
+                    print("[guard] Vox.app (pid \(pid)) shows this scratch account's exact public computer fingerprint: \(fingerprint)")
+                    return
+                }
+                Thread.sleep(forTimeInterval: 0.5)
+                continue
             }
             if let sign = scratchSigns.first(where: { locate(ui, $0) != nil }) {
                 print("[guard] Vox.app (pid \(pid)) is on this run's scratch profile: it shows \(sign)")
@@ -5325,7 +5361,9 @@ final class FirstRunProof: XCTestCase {
         }
         keepTree(ui, "Vox.app could not be shown on the scratch profile")
         ui.terminate()
-        throw Apparatus("Vox.app could not be shown to be on this run's scratch profile within 30 s (no scratch path, no node staged here, nor a first-run question the account has answered); stopped before any step")
+        let missingClue = computerFingerprint.map { "the read-only Add Computer view did not show the required scratch computer fingerprint \($0)" }
+            ?? "no scratch path, no node staged here, nor a first-run question the account has answered"
+        throw Apparatus("Vox.app could not be shown to be on this run's scratch profile within 30 s (\(missingClue)); stopped before any pairing or other product step")
     }
 
     /// The proof hides (⌘H) or quits (⌘Q) Vox itself: what takes the foreground next is handed
