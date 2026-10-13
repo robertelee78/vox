@@ -479,6 +479,10 @@ impl Management {
                 }
                 s.pending_expires = 0;
                 s.rosters.clear();
+                // Fault exclusion is permanent within this retired incarnation. Retain its
+                // signed evidence, but do not carry its derived fault into a fresh enrollment.
+                s.quarantined.clear();
+                s.receipts.clear();
             }
             Ok(locally_approved)
         })?;
