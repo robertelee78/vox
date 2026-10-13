@@ -413,7 +413,12 @@ final class AppModel: ObservableObject {
             if signedInAs == name {
                 await shown?.refreshMachineState()
                 guard ownsNodeRequest(client, generation), self.node === shown else { return }
-                phase = .detached(node: name)
+                if fresh.first(where: { $0.name == name })?.status == "Ready",
+                   shown?.nodeStatus == "Ready", let shown {
+                    phase = .attached(node: name, fingerprint: shown.me)
+                } else {
+                    phase = .detached(node: name)
+                }
             }
         } catch {
             guard ownsNodeRequest(client, generation) else { return }
@@ -467,6 +472,10 @@ final class AppModel: ObservableObject {
                 attachNodeAsk = name
             } else if let shown = self.node, shown.node == name {
                 await shown.refreshMachineState()
+                guard ownsNodeRequest(client, generation), self.node === shown else { return }
+                if shown.nodeStatus == "Ready" {
+                    phase = .attached(node: name, fingerprint: shown.me)
+                }
             } else {
                 await use(node)
             }
