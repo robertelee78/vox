@@ -349,6 +349,8 @@ final class NodeModel: ObservableObject {
     @Published private(set) var peers = 0
     /// Last-known states are never presented as current while the daemon cannot be reached.
     @Published private(set) var daemonReachable = true
+    private var nodeObservationEpoch = UUID()
+    @Published private(set) var machineStateKnown = false
     @Published private(set) var daemonFailure: String?
     var peerWords: String { daemonReachable ? (peers == 1 ? "1 peer" : "\(peers) peers") : "peers unknown" }
     struct HealthNotice: Decodable, Identifiable, Equatable {
@@ -615,20 +617,33 @@ final class NodeModel: ObservableObject {
 
     /// The keyring, the nodes on this Mac, the peers and the keyring window, assigned only when
     /// they changed; and who trusts back, while the keyring is on screen.
+    var nodeStatus: String? {
+        guard daemonReachable, machineStateKnown else { return nil }
+        return nodes.first(where: { $0.name == node })?.status
+    }
+
+    func refreshMachineState() async { await readFacts() }
+
     private func readFacts() async {
+        let epoch = nodeObservationEpoch
         // Reachability first: failed reads must not leave stale node/peer states visible.
         do {
             let fresh = try await client.nodes()
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             let recovering = !daemonReachable
+            machineStateKnown = true
             daemonFailure = nil
             if fresh != nodes { nodes = fresh }
             if fresh.first(where: { $0.name == node })?.state != "attached" {
+                nodeObservationEpoch = UUID()
                 daemonReachable = true
-                ended = "Node \(node) is detached."
+                ended = fresh.first(where: { $0.name == node })?.status == "Locked"
+                    ? "Node \(node) is Locked." : "Node \(node) is unavailable."
                 peers = 0
                 return
             }
             let view = try await client.view()
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             daemonReachable = true
             if Int(view.peers) != peers { peers = Int(view.peers) }
             if view.keyring != keyring { keyring = view.keyring }
@@ -648,19 +663,30 @@ final class NodeModel: ObservableObject {
                 }
                 if outcome?.operation == "" { outcome = nil }
                 try await client.subscribe(listener: Listener(model: self))
+                guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
                 lastRead.removeAll()
                 await refresh()
+                guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
                 await reconcileUnread()
+                guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             }
         } catch {
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             daemonReachable = false
+            machineStateKnown = false
+            nodeObservationEpoch = UUID()
             daemonFailure = sentence(error)
             reportBackground(error)
             return
         }
-        if let keyring = try? await client.trustList(), keyring != trusted { trusted = keyring }
-        if let waiting = try? await client.pendingOffers(), waiting != offers { offers = waiting }
+        let currentTrust = try? await client.trustList()
+        guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+        if let currentTrust, currentTrust != trusted { trusted = currentTrust }
+        let currentOffers = try? await client.pendingOffers()
+        guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+        if let currentOffers, currentOffers != offers { offers = currentOffers }
         await readRoomAsks()
+        guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
         // Each room counts the offers from its members (K-15), shown in it.
         for i in rooms.indices {
             let here = offers.filter { $0.rooms.contains { $0.id == rooms[i].id } }
@@ -1965,30 +1991,51 @@ final class NodeModel: ObservableObject {
     }
 
     fileprivate func stopped(_ text: String) {
+        nodeObservationEpoch = UUID()
         roomReadGeneration = UUID()
         rejectedRoomMark = nil
         roomNeedsPage = false
-        ended = text
-        // A detach is delivered by a live daemon; a stopped event stream cannot report
-        // the daemon's current state. The word "daemon" occurs in both sentences.
+        // An ended stream does not establish whether a protected node is Locked or a
+        // passphraseless node is already Ready again. Display only the fresh snapshot.
+        ended = "Node \(node) is unavailable."
+        machineStateKnown = false
         daemonReachable = text.localizedCaseInsensitiveContains("detached")
+            || text.localizedCaseInsensitiveContains("Locked")
+        if !daemonReachable { daemonFailure = text }
+        Task { [weak self] in await self?.readFacts() }
     }
 
-    /// Attach this node again after it stopped, with `secret` if it needs its passphrase, and
-    /// follow it as before: the window and its drafts stay.
-    func attachAgain(_ secret: Secret?) async {
-        let operation = "attach"
-        let attempt = begin(operation)
-        defer { end(attempt) }
-        do {
-            let passphrase = try secret?.passphrase()
-            defer { passphrase?.wipe() }
-            _ = try await client.attach(node: node, passphrase: passphrase)
-            ended = nil
-            await start()
-        } catch {
-            report(error, operation: operation)
+    /// Resume the same window after its owner has unlocked the node. Credentials and
+    /// the unlock mutation belong to AppModel; this only restores observation.
+    func resumeAfterUnlock(currentOwner: @MainActor () -> Bool) async throws -> Bool {
+        let epoch = nodeObservationEpoch
+        guard currentOwner(), nodeObservationEpoch == epoch, !Task.isCancelled else { return false }
+        let fresh = try await client.nodes()
+        guard currentOwner(), nodeObservationEpoch == epoch, !Task.isCancelled else { return false }
+        guard fresh.first(where: { $0.name == node })?.status == "Ready" else { return false }
+        let view = try await client.view()
+        guard currentOwner(), nodeObservationEpoch == epoch, !Task.isCancelled else { return false }
+        try await client.subscribe(listener: Listener(model: self))
+        guard currentOwner(), nodeObservationEpoch == epoch, !Task.isCancelled else { return false }
+        nodes = fresh
+        machineStateKnown = true
+        daemonReachable = true
+        daemonFailure = nil
+        peers = Int(view.peers)
+        keyring = view.keyring
+        ended = nil
+        // These install owned tasks synchronously; no old request can start them after
+        // ownership has changed at an awaited boundary.
+        if case let .room(room) = selection {
+            roomReadGeneration = UUID()
+            roomNeedsPage = true
+            watching?.cancel()
+            stepRetentionRead = UUID()
+            stepRetentionLoading = false
+            watchReads(room)
         }
+        follow()
+        return true
     }
 
     private func name(of room: RoomSummary) -> String {

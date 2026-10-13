@@ -484,7 +484,7 @@ fn keychain(plan: &mut Plan, account: &Account) {
         ),
         move || {
             for a in &accounts {
-                crate::keychain::forget(a);
+                crate::keychain::forget(a)?;
             }
             crate::setup::write_whole(&file, &rest)
                 .map_err(|e| format!("{} was not updated: {e}", file.display()))?;

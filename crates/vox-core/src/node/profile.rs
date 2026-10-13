@@ -62,21 +62,32 @@ impl std::fmt::Debug for Profile {
 
 /// Write the node's public `fingerprint` file (P8), from a profile whose identity is proved: made
 /// here, or unlocked. It names the `vault.cbor` beside it by hash, so it is never shown for
-/// another one. Atomic; rewritten only when it says something else. For display only, so a
-/// failure to write it costs only that display, and is not an error of the create or unlock.
-fn note_fingerprint(paths: &Paths, fingerprint: &Digest32) {
-    let Ok(vault) = std::fs::read(paths.vault_file()) else {
-        return;
-    };
+/// another one. The passphrase fact only selects an empty-credential attempt on restart; the
+/// vault must still open before the node can be Ready. A failed write is reported, never guessed.
+fn note_fingerprint(
+    paths: &Paths,
+    fingerprint: &Digest32,
+    requires_passphrase: bool,
+) -> Result<()> {
+    let vault = std::fs::read(paths.vault_file()).map_err(|e| Error::Path {
+        op: "read the identity file for its public facts",
+        detail: format!("{}: {e}", paths.vault_file().display()),
+    })?;
     let text = format!(
-        "{}\n{:?}\n",
+        "{}\n{:?}\n{}\n",
         crate::node::link::b32_encode(fingerprint),
-        crate::hash::Hex(&crate::hash::sha256(&vault))
+        crate::hash::Hex(&crate::hash::sha256(&vault)),
+        if requires_passphrase {
+            "passphrase"
+        } else {
+            "none"
+        }
     );
     let file = paths.fingerprint_file();
     if std::fs::read_to_string(&file).ok().as_deref() != Some(text.as_str()) {
-        let _ = crate::node::paths::write_private_file_unique(&file, text.as_bytes());
+        crate::node::paths::write_private_file_unique(&file, text.as_bytes())?;
     }
+    Ok(())
 }
 
 impl Profile {
@@ -106,7 +117,7 @@ impl Profile {
     }
 
     /// A new node's identity, as `vox node create` and the app's first run make it: the profile
-    /// at `paths`, sealed under `passphrase` (refused when empty), with its prekey ring made with
+    /// at `paths`, sealed under `passphrase` (empty means no passphrase), with its prekey ring made with
     /// it, so the ring's age is the identity's (V210-77). Returns its fingerprint. `now_ms` is the
     /// node's own clock; `waiting` is called once if another vox holds the profile's lock.
     ///
@@ -215,6 +226,7 @@ impl Profile {
                     other => other,
                 },
             )?;
+            note_fingerprint(&paths, &fingerprint, !passphrase.is_empty())?;
             Ok(store)
         });
         // **A failed attempt leaves nothing behind** (V210-77): the store it made holds only
@@ -227,6 +239,7 @@ impl Profile {
             Ok(store) => store,
             Err(e) => {
                 let _ = std::fs::remove_file(paths.vault_file());
+                let _ = std::fs::remove_file(paths.fingerprint_file());
                 let _ = std::fs::remove_file(&store_file);
                 if let Some(from) = aside {
                     let _ = std::fs::rename(&from, &store_file);
@@ -234,7 +247,6 @@ impl Profile {
                 return Err(e);
             }
         };
-        note_fingerprint(&paths, &fingerprint);
         let signer = VaultRootSigner::from_backup(&backup)?;
         drop(backup);
         Ok(Self {
@@ -302,10 +314,10 @@ impl Profile {
             return Err(Error::Profile("vault identity does not match the store"));
         }
         // Only now, with the passphrase proved, may the profile be written.
+        note_fingerprint(&self.paths, &self.fingerprint, !passphrase.is_empty())?;
         self.store.make_writable()?;
         drop(backup);
         self.unlocked = Some(Arc::new(signer));
-        note_fingerprint(&self.paths, &self.fingerprint);
         Ok(())
     }
 

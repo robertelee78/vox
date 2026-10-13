@@ -106,7 +106,9 @@ final class ShareModel: ObservableObject {
         do {
             let nodes = try await client.nodes()
             guard nodes.contains(where: { $0.name == node && $0.state == "attached" }) else {
-                phase = .refused("Open Vox to attach node \(node) first.")
+                let status = nodes.first(where: { $0.name == node })?.status
+                phase = .refused(status == "Locked" ? "Open Vox to Unlock node \(node) first."
+                                   : "Node \(node) is unavailable. Open Vox to try again.")
                 return
             }
             // Joins the attachment the app holds; attaches nothing new, and asks for nothing.

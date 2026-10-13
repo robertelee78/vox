@@ -261,9 +261,13 @@ fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
         "node {} · {}",
         vm.node,
         if vm.attached {
-            "attached"
+            "Ready"
         } else {
-            "not attached"
+            vm.machine_nodes
+                .iter()
+                .find(|(name, _)| *name == vm.node)
+                .and_then(|(_, status)| status.as_deref())
+                .unwrap_or("…")
         }
     ))];
     // **A trust offer waits under needs you** (ADR-028 K-15, K-18), before the rooms there.
@@ -356,10 +360,10 @@ fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
             ListItem::new("nodes on this machine")
                 .style(Style::default().add_modifier(Modifier::BOLD)),
         );
-        for (name, attached) in &vm.machine_nodes {
+        for (name, status) in &vm.machine_nodes {
             items.push(ListItem::new(format!(
                 "  {name}  {}",
-                if *attached { "attached" } else { "detached" }
+                status.as_deref().unwrap_or("…")
             )));
         }
     }
@@ -1425,12 +1429,18 @@ fn render_status_bar(frame: &mut Frame, area: Rect, vm: &ViewModel) {
     let node = if vm.attached {
         format!("node {}", vm.node)
     } else {
-        format!("node {} (not attached)", vm.node)
+        let status = vm
+            .machine_nodes
+            .iter()
+            .find(|(name, _)| *name == vm.node)
+            .and_then(|(_, status)| status.as_deref())
+            .unwrap_or("…");
+        format!("node {} ({status})", vm.node)
     };
     let lock = if vm.nodes.is_empty() {
-        format!("{node}  ·  attached: none")
+        format!("{node}  ·  Ready: none")
     } else {
-        format!("{node}  ·  attached: {}", vm.nodes.join(", "))
+        format!("{node}  ·  Ready: {}", vm.nodes.join(", "))
     };
     // The keyring window (ADR-028 K-9): whether a keyring change will ask for the passphrase.
     let keyring = if vm.attached {
@@ -1487,7 +1497,7 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
     }
     match ui.screen {
         Screen::ChannelList => {
-            " ↑/↓ select · Enter open · t tunnels · k keyring · d decisions · :new <name> · :join · :attach · Ctrl-C quit"
+            " ↑/↓ select · Enter open · t tunnels · k keyring · d decisions · :new <name> · :join · :unlock · Ctrl-C quit"
         }
         Screen::Channel if ui.focus == Focus::Sessions => {
             " A step is one thing an agent did in its Session: a message, a command it ran, or a file it edited. · ↑/↓ select · Enter open · Tab switch pane · :general · :all · Esc back"

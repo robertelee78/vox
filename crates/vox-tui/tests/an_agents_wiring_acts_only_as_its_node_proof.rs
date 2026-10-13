@@ -687,7 +687,7 @@ fn setup_makes_a_node_for_each_installed_harness() {
     for node in ["my-claude", opencode.as_str()] {
         let line = d.listed(node);
         assert!(
-            line.contains(" attached"),
+            line.contains(" Ready"),
             "PRODUCT: `vox setup` must attach node {node} at once: `vox node list` says {line:?}"
         );
     }
@@ -723,13 +723,13 @@ fn setup_makes_a_node_for_each_installed_harness() {
     for (node, how) in back_by_itself {
         let back = Instant::now() + Duration::from_secs(60);
         let mut line = d.listed(&node);
-        while !line.contains(" attached") && Instant::now() < back {
+        while !line.contains(" Ready") && Instant::now() < back {
             std::thread::sleep(Duration::from_millis(200));
             line = d.listed(&node);
         }
         println!("[proof] after a restart, with nobody typing ({how}): {line:?}");
         assert!(
-            line.contains(" attached"),
+            line.contains(" Ready"),
             "PRODUCT: node {node}, {how}, must be attached again by the daemon's own start, \
              with nobody typing: `vox node list` says {line:?}\nlog:\n{}",
             std::fs::read_to_string(d.root.join("d/.daemon/log")).unwrap_or_default()
@@ -819,7 +819,7 @@ fn setup_makes_a_node_for_each_installed_harness() {
         });
         let staged = d.listed(rollback_node);
         assert!(
-            staged.contains(" detached") && staged.contains("(kept)"),
+            staged.contains(" Locked") && staged.contains("(remembered)"),
             "APPARATUS: remembered detached node not staged: {staged}"
         );
         // A macOS delete ACL blocks moving this directory while allowing the store inside to
@@ -857,7 +857,7 @@ fn setup_makes_a_node_for_each_installed_harness() {
             "APPARATUS: the source-directory ACL did not stage an OS rename failure: {refused}"
         );
         assert!(refused.contains("its previous attachment and remembered state were restored")
-        && retained.contains(" detached") && retained.contains("(kept)")
+        && retained.contains(" Locked") && retained.contains("(remembered)")
         && d.listed("rename-cannot-land").is_empty(),
         "PRODUCT: a denied rename must restore the old detached, remembered node: {refused}; node list: {retained}");
         let pid = d
@@ -882,11 +882,11 @@ fn setup_makes_a_node_for_each_installed_harness() {
         assert!(ok, "PRODUCT: restart after refused rename: {out}{err}");
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut restored = d.listed(rollback_node);
-        while !restored.contains(" attached") && Instant::now() < deadline {
+        while !restored.contains(" Ready") && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(200));
             restored = d.listed(rollback_node);
         }
-        assert!(restored.contains(" attached") && restored.contains("(kept)"),
+        assert!(restored.contains(" Ready") && restored.contains("(remembered)"),
         "PRODUCT: after a failed rename the original remembered node must attach on restart without typing: {restored}");
         drop(rt);
     }
@@ -996,7 +996,7 @@ fn setup_makes_a_node_for_each_installed_harness() {
     let renamed = d.listed("claude-m5max-work");
     let (_, after, _) = d.vox(&["id", "--node", "claude-m5max-work"]);
     assert!(
-        renamed.contains(" attached")
+        renamed.contains(" Ready")
             && d.listed("my-claude").is_empty()
             && !fp.is_empty()
             && after.trim() == fp,
@@ -1092,12 +1092,12 @@ fn setup_makes_a_node_for_each_installed_harness() {
         assert!(ok, "PRODUCT (staging): vox daemon --detach: {out}{err}");
         let back = Instant::now() + Duration::from_secs(60);
         let mut line = d.listed("claude-m5max-work");
-        while !line.contains(" attached") && Instant::now() < back {
+        while !line.contains(" Ready") && Instant::now() < back {
             std::thread::sleep(Duration::from_millis(200));
             line = d.listed("claude-m5max-work");
         }
         assert!(
-            line.contains(" attached"),
+            line.contains(" Ready"),
             "PRODUCT: renamed, claude-m5max-work must be attached again by the daemon's own \
              start, its passphrase in the Keychain under its new name: {line:?}\nlog:\n{}",
             std::fs::read_to_string(d.root.join("d/.daemon/log")).unwrap_or_default()
@@ -1116,8 +1116,8 @@ fn setup_makes_a_node_for_each_installed_harness() {
         println!("[proof] vox node create, on a Mac with no keychain, said:\n{said}");
         assert!(
             status.success()
-                && said.contains("node plainmac is attached; this Mac has no keychain to remember it in; the node will need its passphrase after a restart")
-                && bare.listed("plainmac").contains(" attached"),
+                && said.contains("node plainmac is Ready but not remembered; this Mac has no keychain to remember it in; the node will need its passphrase after a restart")
+                && bare.listed("plainmac").contains(" Ready"),
             "PRODUCT: on a Mac with no keychain, `vox node create` at a terminal must attach the \
              node and say, in one plain line, that this Mac has no keychain to remember it in \
              ({status:?}):\n{said}"

@@ -28,7 +28,7 @@ needs:
       forward vox forward mffm4sohl2j7kaefpvwk3jwrwc3xoynh3q2w5xesjcoteicf26ua.ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a.gkpeyuly4m4ezlidyid3vocosfzpec2o7um5dleicv2aacz6z2ja.vox 127.0.0.1:2222
       then    ssh -p 2222 $USER@127.0.0.1
       ✓ proxy configured
-      ✓ node attached
+      ✓ node Ready
       ✓ robertgpt trusts you
       ✓ robertgpt online
 ```
@@ -115,7 +115,7 @@ on the port. The kind never comes from the port number or the name you gave.
 
 ## Reach it through the local proxy
 
-While a node is attached, the daemon runs a SOCKS5 proxy on `127.0.0.1:1080` that resolves `.vox`
+While a node is Ready, the daemon runs a SOCKS5 proxy on `127.0.0.1:1080` that resolves `.vox`
 addresses. Nothing else needs starting. On ann's machine, run this to see where the proxy listens;
 it starts nothing:
 
@@ -205,10 +205,10 @@ A node uses every anchor it learns from these three sources together:
   A node reads `nodes/NAME/config/anchors` in the data root if it exists, and otherwise the
   account's `anchors` in the config directory: `~/Library/Application Support/vox/anchors` on a
   Mac, `~/.config/vox/anchors` on Linux. `VOX_CONFIG_DIR`, or `XDG_CONFIG_HOME`, moves it. The
-  daemon reads the file when the node attaches and every 30 seconds after. A line it cannot use is
-  skipped, and named with its line number by the command that attached the node and in the
+  daemon reads the file when the node becomes Ready and every 30 seconds after. A line it cannot use is
+  skipped, and named with its line number by the command that made the node Ready and in the
   daemon's log.
-- **`--anchor FINGERPRINT@ADDRESS`**, repeatable, on any command that attaches a node or starts the
+- **`--anchor FINGERPRINT@ADDRESS`**, repeatable, on any command that makes a node Ready or starts the
   daemon, such as `vox node unlock`, `vox serve`, `vox connect`, `vox up`, `vox forward` and
   `vox daemon`. `VOX_ANCHORS` takes a comma-separated list.
 - **The room link.** A link names the anchors its sharer uses. Joining with it keeps them for that

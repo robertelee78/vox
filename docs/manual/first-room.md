@@ -41,11 +41,11 @@ other lines:
 vox: created node robertgpt
 ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a
 vox: there is no backup of a node: if this machine is lost, so is this node; make a new one, and ask everyone who trusts this one to remove it from their keyring and trust the new one
-vox: node robertgpt attached (kept)
+vox: node robertgpt is Ready (remembered)
 ```
 
 The second line is the node's fingerprint, the public name of its keys. The node is now
-**attached**: Vox's **daemon**, a background program, runs it, and attaches it again by itself
+**Ready**: Vox's **daemon**, a background program, runs it, and makes it Ready again by itself
 after a restart.
 
 ## 3. Both of you compare fingerprints

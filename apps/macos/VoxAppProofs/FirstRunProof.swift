@@ -1,4 +1,4 @@
-// ADR-014 M-6, ADR-028 A-4 and M-7 — first run to an attached node, and quit detaching it, proved
+// ADR-031 CW-2/3 — first Unlock to Ready, and quitting leaves remembered nodes Ready, proved
 // by real use of the built Vox.app (ADR-018, ADR-014 M-30).
 //
 // Run by `scripts/app-proofs.sh`, which builds the app, puts the release `vox` in it, and passes
@@ -65,8 +65,8 @@
 // 11. Untrust cuts a live forward (ADR-014 M-31, ADR-028 K-6, E-5): bob forwards to a service
 //     alice shares and carries bytes through it; alice removes bob in the keyring view, and that
 //     live connection is cut within 30 s.
-// 12. Quitting the app (⌘Q) detaches it: `vox node list` says `detached`.
-// 13. What came while the app was closed (ADR-028 R-8): alice's node, attached by hand, takes
+// 12. Quitting the app (⌘Q) leaves remembered alice Ready.
+// 13. What came while the app was closed (ADR-028 R-8): alice's Ready node takes
 //     bob's message to her while no app runs; opened again, the app lists mission under "needs
 //     you (1)" at once, from what her node recorded as read.
 // 14. The keyboard (WCAG 2.1.1, 2.4.7; #450), run with Full Keyboard Access on (set around the
@@ -502,27 +502,10 @@ final class FirstRunProof: XCTestCase {
         print("[proof] login item: quoted \"\(quoted)\"; after Turn Keep Running Off the answer is \(answer.debugDescription)")
     }
 
-    /// The first-run question (proposal 2): it says what Keep Running does and where to turn it
-    /// off, and Return answers nothing, so only choosing Keep Running adds a login item.
-    /// Keep Running is reachable while Vox runs (#571), not only on the screen shown when the
-    /// daemon is unreachable: with Keep Running chosen at first run and the node attached (and
-    /// kept, M-6), the Vox menu offers Turn Keep Running Off; chosen, the answer is kept as Not
-    /// Now, the login item is unregistered, and the node is no longer kept, still attached while
-    /// the app acts as it; the menu then offers Keep Running While Logged In, which turns it on.
-    ///
-    /// **No login item is ever registered here.** A real one runs the bundle's `vox daemon` under
-    /// launchd without this run's scratch directories, on the person's real profile. The app under
-    /// proof is built by app-proofs.sh with its login item replaced by a stand-in that registers
-    /// nothing and records what was asked (`ProofBackgroundItem`, `<config>/app/proof-login-item`); the
-    /// case refuses to start unless the executable carries that stand-in, and checks no login item
-    /// is loaded at the end. Approving a real login item stays the manual check manual.login_item.
-    /// Its own case: the other cases answer Not Now, and the unreachable case never reaches a
-    /// running app. Mutations: Keep Running the first run's default button again → red at "Return at
-    /// the first-run question must answer nothing"; the Vox menu without the item → red at "Turn
-    /// Keep Running Off"; Off without unkeeping the node → red at "must stop keeping node alice";
-    /// On without offering to keep the attached node → red at "must offer to keep her".
-    /// On, with the node attached and not kept, offers to keep it at once (its passphrase stored
-    /// in the Keychain, M-6); declined here, and the app must say what that leaves.
+    /// Keep Running changes only its login item, independently of Ready/Locked node credentials.
+    /// Return still answers nothing. The existing stand-in prevents real launchd registration.
+    /// This journey proves restart, protected Forget/Unlock, retained room contents and
+    /// passphraseless readiness. Actual update and reboot remain pending, separate outcomes.
     func testKeepRunningCanBeTurnedOffAndOnWhileVoxRuns() throws {
         let env = ProcessInfo.processInfo.environment
         guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
@@ -553,7 +536,7 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("cannot create this journey's private Keychain: \(madeKeychain.out)")
         }
         let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0",
-                      "VOX_TEST_KEYCHAIN": keychain]
+                      "VOX_TEST_KEYCHAIN": keychain, "HOME": home]
         // The owned apparatus daemon stores supplied secrets in this scratch Keychain through
         // real Security APIs. The app and CLI remain ordinary; the first-run question is unanswered.
         daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
@@ -562,6 +545,18 @@ final class FirstRunProof: XCTestCase {
         try stager.write(Data("alice identity\n".utf8), to: pass)
         try staged(vox, ["node", "create", "alice", "--passphrase-file", pass], env: voxEnv)
         try staged(vox, ["node", "attach", "alice", "--keep", "--passphrase-file", pass], env: voxEnv)
+        let plainPass = root.appendingPathComponent("plain-empty.pass").path
+        try stager.write(Data(), to: plainPass)
+        try staged(vox, ["node", "create", "plain", "--passphrase-file", plainPass], env: voxEnv)
+        try staged(vox, ["node", "unlock", "plain", "--passphrase-file", plainPass], env: voxEnv)
+        let roomPass = root.appendingPathComponent("room.pass").path
+        try stager.write(Data("lifecycle room\n".utf8), to: roomPass)
+        try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", roomPass,
+                         "--name", "lifecycle"], env: voxEnv)
+        let room = try line(staged(vox, ["room", "list", "--node", "alice"], env: voxEnv)) {
+            $0.contains(" lifecycle")
+        }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        try staged(vox, ["room", "post", "--node", "alice", room, "LIFECYCLE-BODY-PRESERVED"], env: voxEnv)
         try stager.write(Data("alice\n".utf8), to: config + "/app/node")
         // A file's words, or "" when there is none (its absence is what Return must leave).
         func read(_ name: String) -> String {
@@ -576,6 +571,18 @@ final class FirstRunProof: XCTestCase {
                 got = read(name)
             }
             return got
+        }
+
+        // The control socket serves while remembered nodes are still restoring. Read the
+        // public result until it settles, within the same bound as the app's Ready recovery.
+        func restoredNodes(_ want: (String) -> Bool) throws -> String {
+            let until = Date().addingTimeInterval(90)
+            var listed = try staged(vox, ["node", "list"], env: voxEnv)
+            while !want(listed) && Date() < until {
+                Thread.sleep(forTimeInterval: 0.25)
+                listed = try staged(vox, ["node", "list"], env: voxEnv)
+            }
+            return listed
         }
 
         let ui = voxApp(appPath)
@@ -603,37 +610,31 @@ final class FirstRunProof: XCTestCase {
         present(ui, Key.id("attached"), timeout: 60,
                 "with Keep Running chosen and alice kept and attached, the app must open acting as alice")
 
-        // The node as `vox node list` shows it: " (kept)" when the daemon keeps it (M-6).
+        // Public Ready is the staging premise; restart below proves remembered credentials.
         func aliceLine() -> String {
             run(vox, ["node", "list"], env: voxEnv).out.split(separator: "\n")
                 .map(String.init).first { $0.hasPrefix("alice") } ?? ""
         }
         let keptBefore = aliceLine()
-        guard keptBefore.hasSuffix("(kept)") else {
-            throw Apparatus("staging not achieved: node alice is not kept before the case; `vox node list` says \(keptBefore.debugDescription)")
+        guard keptBefore.contains("Ready") else {
+            throw Apparatus("staging not achieved: node alice is not Ready before the case; `vox node list` says \(keptBefore.debugDescription)")
         }
 
         let voxMenu = ui.menuBars.menuBarItems["Vox"]
         guard voxMenu.waitForExistence(timeout: 10) else {
             throw Apparatus("XCTest finds no Vox menu in the menu bar")
         }
-        // Off: the answer, the login item and the node (M-6: Not Now keeps no node).
+        // Off changes only the login item, independently of node readiness.
         voxMenu.click()
         tap(ui, Key.menuItem("Turn Keep Running Off"), "Vox > Turn Keep Running Off while Vox runs")
         let answerOff = settle("login-item") { $0 == "no" }
         let itemOff = settle("proof-login-item") { $0.hasPrefix("unregistered") }
-        var nodeOff = aliceLine()
-        let until = Date().addingTimeInterval(10)
-        while nodeOff.hasSuffix("(kept)") && Date() < until {
-            Thread.sleep(forTimeInterval: 0.25)
-            nodeOff = aliceLine()
-        }
-        let keepFile = stager.run(["/bin/cat", data + "/.daemon/attach"], env: [:]).out
         XCTAssertTrue(answerOff == "no" && itemOff.hasPrefix("unregistered"),
-                      "PRODUCT: Vox > Turn Keep Running Off must keep the answer as Not Now and unregister the login item; the answer is \(answerOff.debugDescription), the login item was left \(itemOff.debugDescription)")
-        XCTAssertTrue(nodeOff.contains("attached") && !nodeOff.hasSuffix("(kept)")
-                        && !keepFile.split(separator: "\n").contains { $0.hasPrefix("alice\t") },
-                      "PRODUCT: Vox > Turn Keep Running Off must stop keeping node alice, as Not Now does (M-6), while the app still acts as her: `vox node list` says \(nodeOff.debugDescription), and the daemon's attach file says \(keepFile.debugDescription)")
+                      "PRODUCT: Keep Running Off must unregister only the login item")
+        let offNodes = try staged(vox, ["node", "list"], env: voxEnv)
+        XCTAssertTrue(nodeLine(offNodes, "alice")?.contains("Ready") == true
+                      && nodeLine(offNodes, "plain")?.contains("Ready") == true,
+                      "PRODUCT: Keep Running Off must leave both protected and passphraseless nodes Ready; \(offNodes)")
         // On again.
         voxMenu.click()
         tap(ui, Key.menuItem("Keep Running While Logged In"),
@@ -642,38 +643,121 @@ final class FirstRunProof: XCTestCase {
         let itemOn = settle("proof-login-item") { $0.hasPrefix("registered") }
         XCTAssertTrue(answerOn == "keep" && itemOn.hasPrefix("registered"),
                       "PRODUCT: Vox > Keep Running While Logged In must keep the answer as Keep Running and register the login item; the answer is \(answerOn.debugDescription), the login item was left \(itemOn.debugDescription)")
-        // On with alice attached and not kept: the app offers to keep her at once, with her
-        // passphrase in the Keychain, saying what declining leaves. Declined here: the Keychain is
-        // the person's, never a proof's (storing is manual.keep_running).
-        let offer = Key.id("keep-node-why")
-        words(ui, offer, timeout: 10,
-              "turning Keep Running on with node alice attached and not kept must offer to keep her, saying what that takes and what declining leaves",
-              until: { $0.contains("node alice") && $0.contains("Keychain")
-                  && $0.contains("after a restart it needs its passphrase") })
-        tap(ui, Key.id("keep-node-not-now"), "Not Now in the offer to keep node alice")
-        words(ui, Key.showing("node alice is not kept"), timeout: 10,
-              "declining must say plainly that node alice is not kept and needs her passphrase after a restart",
-              until: { $0.contains("after a restart Vox asks for its passphrase again") })
-        // The alert's own OK, in its sheet or dialog: `ui.buttons["OK"]` also finds the Touch Bar's
-        // copy of it, which XCTest cannot click (rooms2's run, APPARATUS).
-        let okUntil = Date().addingTimeInterval(5)
-        var ok: XCUIElement?
-        repeat {
-            ok = [ui.sheets, ui.dialogs, ui.windows].lazy
-                .map { $0.buttons["OK"].firstMatch }
-                .first { $0.exists && $0.isHittable }
-            if ok == nil { Thread.sleep(forTimeInterval: 0.25) }
-        } while ok == nil && Date() < okUntil
-        if let ok { ok.click() } else {
-            XCTFail("APPARATUS: XCTest finds no clickable OK in the alert's sheet or dialog (only, perhaps, the Touch Bar's)")
-        }
-        let notKept = aliceLine()
-        XCTAssertTrue(notKept.contains("attached") && !notKept.hasSuffix("(kept)"),
-                      "PRODUCT: declining the offer must leave node alice attached and not kept; `vox node list` says \(notKept.debugDescription)")
+        XCTAssertNil(locate(ui, Key.id("keep-node-why")),
+                     "PRODUCT: Keep Running must not offer optional credential storage")
         voxMenu.click()
-        present(ui, Key.menuItem("Turn Keep Running Off"), timeout: 10,
-                "with Keep Running on again, the Vox menu must offer Turn Keep Running Off")
+        tap(ui, Key.menuItem("Turn Keep Running Off"), "Keep Running Off before restarting")
+        guard settle("login-item", { $0 == "no" }) == "no",
+              settle("proof-login-item", { $0.hasPrefix("unregistered") }).hasPrefix("unregistered") else {
+            throw Product("Keep Running must be Off before testing remembered-node restart")
+        }
+        // Restart the actual owned daemon with the same private Security keychain. This is
+        // restart evidence only; update and reboot are still separate pending journeys.
+        daemon?.terminate()
+        daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+                           until: "vox daemon: control socket")
+        let restarted = try restoredNodes {
+            nodeLine($0, "alice")?.contains("Ready") == true
+                && nodeLine($0, "plain")?.contains("Ready") == true
+        }
+        XCTAssertTrue(nodeLine(restarted, "alice")?.contains("Ready") == true
+                      && nodeLine(restarted, "plain")?.contains("Ready") == true,
+                      "PRODUCT: remembered nodes must return Ready within 90 s after restart; \(restarted)")
+        words(ui, Key.id("machine-alice"), timeout: 90,
+              "the app must recover alice Ready after restart with Keep Running Off",
+              until: { $0 == "alice Ready" })
+        words(ui, Key.id("machine-plain"), timeout: 60,
+              "the app must recover the passphraseless node Ready after restart",
+              until: { $0 == "plain Ready" })
+        // Query metadata only in this owned Keychain: never ask Security to print a secret.
+        let keychainAccount = data + "/nodes/alice"
+        func storedCredential() -> (status: Int32, out: String) {
+            let result = stager.run(["/usr/bin/security", "find-generic-password", "-s", "us.vox.node",
+                                     "-a", keychainAccount, keychain], env: ["HOME": home])
+            return (result.status, result.out)
+        }
+        guard storedCredential().status == 0 else {
+            throw Apparatus("the protected node's credential was not staged in this private Keychain")
+        }
+        ui.menuBars.menuBarItems["Node"].click()
+        tap(ui, Key.menuItem("Forget"), "Forget this window's protected node")
+        guard present(ui, Key.showing("Node alice is Locked."), timeout: 30,
+                      "Forget must keep this window's identity and say Locked") else { return }
+        let removedCredential = storedCredential()
+        XCTAssertTrue(removedCredential.status == 44
+                        && removedCredential.out.contains("could not be found"),
+                      "PRODUCT: Forget must remove the stored credential from this private Keychain; Security status \(removedCredential.status), \(removedCredential.out)")
+        daemon?.terminate()
+        daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+                           until: "vox daemon: control socket")
+        let forgotten = try restoredNodes { nodeLine($0, "alice")?.contains("Locked") == true }
+        XCTAssertTrue(nodeLine(forgotten, "alice")?.contains("Locked") == true,
+                      "PRODUCT: Forget must remain Locked across restart; \(forgotten)")
+        tap(ui, Key.id("attach-again"), "Unlock the same node")
+        guard present(ui, Key.id("attach-node-passphrase"), timeout: 20,
+                      "Unlock must open this node's passphrase sheet") else { return }
+        type(ui, Key.id("attach-node-passphrase"), "wrong identity", "wrong Unlock passphrase")
+        tap(ui, Key.id("attach-node"), "Unlock with the wrong passphrase")
+        guard present(ui, Key.id("attach-node-passphrase"), timeout: 20,
+                      "wrong passphrase must keep Unlock available") else { return }
+        XCTAssertTrue(nodeLine(try staged(vox, ["node", "list"], env: voxEnv), "alice")?.contains("Locked") == true,
+                      "PRODUCT: wrong Unlock passphrase must leave alice Locked")
+        tap(ui, Key.id("attach-node-passphrase"), "replace the wrong passphrase")
+        ui.typeKey("a", modifierFlags: .command)
+        el(ui, Key.id("attach-node-passphrase")).typeText("alice identity")
+        tap(ui, Key.id("attach-node"), "Unlock with the correct passphrase")
+        guard present(ui, Key.id("attached"), timeout: 60,
+                      "correct Unlock must return the same window to Ready") else { return }
+        let preserved = try staged(vox, ["room", "read", "--node", "alice", room], env: voxEnv)
+        XCTAssertTrue(preserved.contains("LIFECYCLE-BODY-PRESERVED"),
+                      "PRODUCT: Forget and Unlock must preserve the original room body; \(preserved)")
+        try staged(vox, ["node", "lock", "plain"], env: voxEnv)
+        daemon?.terminate()
+        daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+                           until: "vox daemon: control socket")
+        let plainAfterForget = try restoredNodes {
+            nodeLine($0, "plain")?.contains("Ready") == true
+                && nodeLine($0, "alice")?.contains("Ready") == true
+        }
+        XCTAssertTrue(nodeLine(plainAfterForget, "plain")?.contains("Ready") == true,
+                      "PRODUCT: a passphraseless node must remain Ready through Forget and restart; \(plainAfterForget)")
+        XCTAssertTrue(nodeLine(plainAfterForget, "alice")?.contains("Ready") == true,
+                      "PRODUCT: Unlock in the app must remember alice even with Keep Running Off; \(plainAfterForget)")
+        words(ui, Key.id("machine-alice"), timeout: 90,
+              "alice unlocked in the app must return Ready after restart without another passphrase",
+              until: { $0 == "alice Ready" })
+        XCTAssertEqual(read("login-item"), "no", "PRODUCT: Unlock must leave Keep Running Off")
+        tap(ui, Key.id("room-lifecycle"), "Open the retained room after the app's remembered Unlock and restart")
+        present(ui, Key.showing("LIFECYCLE-BODY-PRESERVED"), timeout: 30,
+                "alice's original complete message must remain visible after remembered Unlock and restart")
+        handOff(ui, "q")
+        guard ui.wait(for: .notRunning, timeout: 15) else {
+            throw Product("public Quit must stop Alice's window before staging the plain-node client")
+        }
+        // As in the initial fixture, select the next scratch client's saved node before launch.
+        // This stages the acting identity; it does not claim Forget changes a window's identity.
+        try stager.write(Data("plain\n".utf8), to: config + "/app/node")
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        guard words(ui, Key.id("attached"), timeout: 60,
+                    "the next client must actually act as the passphraseless node Ready",
+                    until: { $0 == "node plain, Ready" }) != nil else { return }
+        ui.menuBars.menuBarItems["Node"].click()
+        tap(ui, Key.menuItem("Forget"), "Forget the acting passphraseless node")
+        guard words(ui, Key.id("attached"), timeout: 30,
+                    "native Forget must keep the same passphraseless node's usable Ready window",
+                    until: { $0 == "node plain, Ready" }) != nil else { return }
+        guard present(ui, Key.id("sidebar-add"), timeout: 10,
+                      "the passphraseless Ready window must retain its room controls") else { return }
+        tap(ui, Key.id("sidebar-add"), "Use the passphraseless window after Forget")
+        tap(ui, Key.id("sidebar-new-room"), "New Room after Forget")
+        guard present(ui, Key.id("room-form-name"), timeout: 20,
+                      "native Forget must leave the passphraseless node's room workflow usable") else { return }
         ui.typeKey(.escape, modifierFlags: [])
+        XCTAssertNil(locate(ui, Key.showing("Node plain is Locked.")),
+                     "PRODUCT: a passphraseless node must never become Locked after native Forget")
+        let nativePlain = try staged(vox, ["node", "list"], env: voxEnv)
+        XCTAssertTrue(nodeLine(nativePlain, "plain")?.contains("Ready") == true,
+                      "PRODUCT: native Forget must leave the acting passphraseless node Ready; \(nativePlain)")
         // Nothing here registered a real login item: none is loaded for this user.
         let uid = stager.run(["/usr/bin/id", "-u"], env: [:]).out.trimmingCharacters(in: .whitespacesAndNewlines)
         // Only the proof build's own: the person's own Vox (us.vox.app) may have its login item
@@ -807,6 +891,9 @@ final class FirstRunProof: XCTestCase {
         let itemOff = settle("proof-login-item") { $0.hasPrefix("unregistered") }
         XCTAssertTrue(answerOff == "no" && itemOff.hasPrefix("unregistered"),
                       "PRODUCT: turning Keep Running off in Settings must keep the answer as Not Now and unregister the login item; the answer is \(answerOff.debugDescription), the login item was left \(itemOff.debugDescription)")
+        let nodesAfterOff = try staged(vox, ["node", "list"], env: voxEnv)
+        XCTAssertTrue(nodeLine(nodesAfterOff, "alice")?.contains("Ready") == true,
+                      "PRODUCT: Settings Keep Running Off must leave alice Ready; \(nodesAfterOff)")
         let voxMenu = ui.menuBars.menuBarItems["Vox"]
         guard voxMenu.waitForExistence(timeout: 10) else {
             throw Apparatus("XCTest finds no Vox menu in the menu bar")
@@ -939,13 +1026,8 @@ final class FirstRunProof: XCTestCase {
     /// 255 per channel. Mutations: the inspector without bg.raised → red at "inspector"; the
     /// hairline the system's divider again → red at "line.hair"; a sheet title in Inter Display →
     /// red at "title"; Set the default again → red at "Retention"; the keyring's drive button back
-    /// → red at "no way to give". Then Node > Sign Out…: the chooser lists alice, detached, with her fingerprint and
-    /// "Everything you post, trust and share will be as alice."; `vox node list` shows the same
-    /// fingerprint; and with bob's vault copied over hers, it shows none (P8). Before that, the
-    /// sidebar opens with "node alice, attached" and ends with ON THIS MACHINE listing bob as
-    /// attached, below Services (G5; mutation: the footer gone → red at "foot"). Mutations: the
-    /// fingerprint file not written → red at "chooser must show"; its vault hash not checked → red
-    /// at "stale".
+    /// → red at "no way to give". Forget preserves this window's identity and Locked fingerprint;
+    /// correct Unlock returns Ready. A replacement vault must never retain a stale fingerprint.
     func testTheLookIsTheTokensAndReturnNeverGivesWhatItShouldNot() throws {
         let env = ProcessInfo.processInfo.environment
         guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
@@ -1143,44 +1225,42 @@ final class FirstRunProof: XCTestCase {
 
         // G5: the sidebar opens with who you are, and ends with this Mac's nodes and their state.
         words(ui, Key.id("attached"), timeout: 10, "the sidebar must open with the acting node (G5)",
-              until: { $0 == "node alice, attached" })
+              until: { $0 == "node alice, Ready" })
         words(ui, Key.id("machine-bob"), timeout: 10, "the sidebar's foot must list bob and his state (G5)",
-              until: { $0 == "bob attached" })
+              until: { $0 == "bob Ready" })
         let foot = locate(ui, Key.id("on-this-machine"))?.frame ?? .null
         let lastAbove = locate(ui, Key.id("services"))?.frame ?? .null
         XCTAssertTrue(!foot.isNull && !lastAbove.isNull && foot.minY > lastAbove.maxY,
                       "PRODUCT: \"ON THIS MACHINE\" must be at the sidebar's foot, below Services (G5); it is at \(foot), Services at \(lastAbove)")
 
-        // P8: Node > Sign Out… and its confirm, and the chooser lists alice, now detached, with her
-        // fingerprint (from her fingerprint file) and what choosing her means; `vox node list`
-        // shows it too. Then a vault copied over hers, as a restore would: her fingerprint is not
-        // known, never stale. (Node > Detach no longer leads here: since E-4 a detached window
-        // offers only Attach Again, 34289e0ef; Sign Out is the way to the chooser.)
+        // CW-4 supersedes Sign Out: Forget keeps this window's identity and all data.
         ui.menuBars.menuBarItems["Node"].click()
-        tap(ui, Key.menuItem("Sign Out…"), "Node > Sign Out…")
-        tap(ui, Key.id("sign-out-confirm"), "Sign Out in its confirm sheet")
+        tap(ui, Key.menuItem("Forget"), "Forget alice without changing this window's identity")
+        guard present(ui, Key.showing("Node alice is Locked."), timeout: 30,
+                      "Forget must keep this window acting as alice and say Locked") else { return }
+        XCTAssertNil(locate(ui, Key.showing("Which node are you?")),
+                     "PRODUCT: Forget must not replace this window with a node chooser")
         let plain = { (s: String) in s.lowercased().filter { $0.isLetter || $0.isNumber } }
-        // The chooser has no status bar, so a missing row is said here, against its heading.
-        present(ui, Key.showing("Which node are you?"), timeout: 30,
-                "after Sign Out, the app must show the node chooser")
-        func chooserWords(_ id: String) -> String? {
-            let end = Date().addingTimeInterval(10)
-            repeat {
-                if let e = locate(ui, Key.id(id)) { return shown(e) }
-                Thread.sleep(forTimeInterval: 0.25)
-            } while Date() < end
-            return nil
-        }
-        let fingerprintShown = chooserWords("node-fingerprint-alice") ?? ""
-        XCTAssertEqual(plain(fingerprintShown), plain(aliceFp),
-                       "PRODUCT: the chooser must show detached alice's fingerprint, \(aliceFp) (P8); \(fingerprintShown.isEmpty ? "it has no fingerprint row for her" : "it shows \(fingerprintShown.debugDescription)")")
-        let actingAs = chooserWords("node-acting-as-alice") ?? ""
-        XCTAssertEqual(actingAs, "Everything you post, trust and share will be as alice.",
-                       "PRODUCT: the chooser must say what choosing alice means (P8); it says \(actingAs.debugDescription)")
-        let listed = run(vox, ["node", "list"], env: voxEnv).out
+        let listed = try staged(vox, ["node", "list"], env: voxEnv)
         let aliceLine = nodeLine(listed, "alice") ?? ""
-        XCTAssertTrue(aliceLine.contains(" detached ") && plain(aliceLine).contains(plain(aliceFp)),
-                      "PRODUCT: `vox node list` must show detached alice with her fingerprint; it says \(aliceLine.debugDescription)")
+        XCTAssertTrue(aliceLine.contains("Locked") && plain(aliceLine).contains(plain(aliceFp)),
+                      "PRODUCT: Forget must preserve Locked alice's fingerprint; \(aliceLine)")
+        tap(ui, Key.id("attach-again"), "Unlock alice in the same window")
+        guard present(ui, Key.id("attach-node-passphrase"), timeout: 20,
+                      "Unlock must open this node's passphrase sheet") else { return }
+        type(ui, Key.id("attach-node-passphrase"), "alice identity", "alice's identity passphrase")
+        tap(ui, Key.id("attach-node"), "Unlock alice")
+        guard words(ui, Key.id("attached"), timeout: 60,
+                    "correct Unlock must restore alice Ready in this window",
+                    until: { $0 == "node alice, Ready" }) != nil else { return }
+        let unlocked = try staged(vox, ["node", "list"], env: voxEnv)
+        XCTAssertTrue(nodeLine(unlocked, "alice")?.contains("Ready") == true,
+                      "PRODUCT: correct Unlock must restore alice Ready; \(unlocked)")
+        // Leave the vault genuinely Locked before staging a person's replacement vault.
+        ui.menuBars.menuBarItems["Node"].click()
+        tap(ui, Key.menuItem("Forget"), "Forget alice before restoring another vault")
+        guard present(ui, Key.showing("Node alice is Locked."), timeout: 30,
+                      "alice must be Locked before replacing its vault") else { return }
         guard stager.run(["/bin/cp", data + "/nodes/bob/vault.cbor", data + "/nodes/alice/vault.cbor"],
                          env: [:]).status == 0 else {
             throw Apparatus("staging not achieved: bob's vault.cbor could not be copied over alice's")
@@ -1188,7 +1268,7 @@ final class FirstRunProof: XCTestCase {
         let restored = nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "alice") ?? ""
         XCTAssertFalse(plain(restored).contains(plain(aliceFp)) || plain(restored).contains(plain(bobFp)),
                        "PRODUCT: with another vault in alice's place, `vox node list` must not show a fingerprint for her, stale or otherwise; it says \(restored.debugDescription)")
-        print("[proof] look: \(read.joined(separator: "; ")); title \(titleHeight) high; retention kept by Return; bob \(capability.debugDescription), no drive control; chooser shows alice \(fingerprintShown.debugDescription); node list \(aliceLine.debugDescription), then with bob's vault \(restored.debugDescription)")
+        print("[proof] look: \(read.joined(separator: "; ")); title \(titleHeight) high; retention kept by Return; bob \(capability.debugDescription), no drive control; Forget preserved alice; node list \(aliceLine.debugDescription), then with bob's vault \(restored.debugDescription)")
     }
 
     /// `key` gone within `timeout`: PRODUCT naming what still shows it.
@@ -1644,8 +1724,7 @@ final class FirstRunProof: XCTestCase {
               "a node without a passphrase must be Ready and remembered",
               until: { $0.contains("opencode-app") && $0.contains("Ready and remembered") })
         let unprotected = run(vox, ["node", "list"], env: voxEnv).out
-        XCTAssertTrue(nodeLine(unprotected, "opencode-app")?.contains(" attached ") == true
-                        && nodeLine(unprotected, "opencode-app")?.hasSuffix("(kept)") == true,
+        XCTAssertTrue(nodeLine(unprotected, "opencode-app")?.contains("Ready") == true,
                       "PRODUCT: setup with no passphrase must make a remembered Ready node; got \(unprotected)")
         ui.typeKey(",", modifierFlags: .command)
         tap(ui, Key.id("settings-agent-setup-opencode"), "Reopen already-Ready OpenCode setup")
@@ -1685,7 +1764,7 @@ final class FirstRunProof: XCTestCase {
         present(ui, Key.id("attached"), timeout: 90,
                 "made in the app, node alice must be attached in its window")
         let listed = run(vox, ["node", "list"], env: voxEnv).out
-        XCTAssertTrue(nodeLine(listed, "alice")?.contains(" attached ") ?? false,
+        XCTAssertTrue(nodeLine(listed, "alice")?.contains("Ready") ?? false,
                       "PRODUCT: the app's new node must be alice, attached, as `vox node list` lists it; it says \(listed)")
 
         // Choosing a node can install its harness hooks and publish another paths notice.
@@ -1754,56 +1833,33 @@ final class FirstRunProof: XCTestCase {
         ui.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
         print("[proof] new person: node alice made and attached in the app, room \(room) made from the empty window, HELLO-FIRST-RUN posted, room second made from the sidebar's +; New Room… in Room, not File; no screen named Terminal or a vox command")
 
-        // **Sign Out, then sign in as a new node (ADR-028 E-4, the decider 2026-10-08).** Alice is
-        // kept as Keep Running keeps a node (`--keep`, from a scratch file: the Keychain is the
-        // person's, never a proof's). Node › Sign Out… says what it does; confirmed, alice is
-        // detached, no longer kept, and the app's choice of her forgotten, her room still on disk;
-        // the sign-in lists her with her fingerprint and offers New Node…, which makes and attaches
-        // bob, and the app acts as bob.
-        let alicePass = root.appendingPathComponent("alice.pass").path
-        try stager.write(Data("alice identity\n".utf8), to: alicePass)
-        try staged(vox, ["node", "attach", "alice", "--keep", "--passphrase-file", alicePass], env: voxEnv)
+        // CW-4 replaces Sign Out: Forget locks this window's node and preserves its data.
+        // Node creation was proved above; this leg keeps the same personal identity for setup.
         let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
-        func aliceLine() -> String { nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "alice") ?? "" }
-        guard aliceLine().hasSuffix("(kept)") else {
-            throw Apparatus("staging not achieved: node alice is not kept before Sign Out; `vox node list` says \(aliceLine().debugDescription)")
-        }
-        let nodeMenu = ui.menuBars.menuBarItems["Node"]
-        guard nodeMenu.waitForExistence(timeout: 10) else { throw Apparatus("XCTest finds no Node menu") }
-        nodeMenu.click()
-        tap(ui, Key.menuItem("Sign Out…"), "Node › Sign Out…")
-        words(ui, Key.id("sign-out-effect"), timeout: 10,
-              "Sign Out… must say what it does before it does it",
-              until: { $0.contains("stay on this Mac") && $0.contains("Keychain") })
-        tap(ui, Key.id("sign-out-confirm"), "Sign Out")
-        let signIn = Key.id("node-alice")
-        let listedAlice = words(ui, signIn, timeout: 30,
-                                "signed out, the app must offer the sign-in, listing node alice with her fingerprint",
-                                until: { $0.contains("Act as node alice") && $0.contains(String(aliceFp.prefix(4))) }) ?? ""
-        let out = aliceLine()
-        let keepFile = stager.run(["/bin/sh", "-c", "cat \"$0\" 2>/dev/null", data + "/.daemon/attach"], env: [:]).out
-        let choice = stager.run(["/bin/sh", "-c", "cat \"$0\" 2>/dev/null", config + "/app/node"], env: [:]).out
-        XCTAssertTrue(!out.contains(" attached") && !out.hasSuffix("(kept)")
-                        && !keepFile.split(separator: "\n").contains { $0.hasPrefix("alice\t") },
-                      "PRODUCT: signed out, node alice must be detached and no longer kept: `vox node list` says \(out.debugDescription), the attach file \(keepFile.debugDescription)")
-        XCTAssertTrue(choice.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                      "PRODUCT: signed out, the app must forget it opens node alice; its choice file says \(choice.debugDescription)")
-        let aliceDir = stager.run(["/bin/ls", data + "/nodes/alice"], env: [:])
-        XCTAssertEqual(aliceDir.status, 0, "PRODUCT: signed out, node alice must stay on disk: \(aliceDir.out)")
-        tap(ui, Key.id("new-node"), "New Node… in the sign-in")
-        if tap(ui, name, "the node's name field") {
-            ui.typeKey("a", modifierFlags: .command)
-            el(ui, name).typeText("bob")
-        }
-        type(ui, Key.id("new-node-passphrase"), "bob identity", "the passphrase field")
-        type(ui, Key.id("new-node-passphrase-again"), "bob identity", "the passphrase again field")
-        tap(ui, Key.id("new-node-make"), "Make Node")
-        present(ui, Key.id("attached"), timeout: 90, "made at the sign-in, node bob must be attached in the window")
-        let nodes = run(vox, ["node", "list"], env: voxEnv).out
-        let chosen = stager.run(["/bin/sh", "-c", "cat \"$0\" 2>/dev/null", config + "/app/node"], env: [:]).out
-        XCTAssertTrue((nodeLine(nodes, "bob")?.contains(" attached ") ?? false)
-                        && chosen.trimmingCharacters(in: .whitespacesAndNewlines) == "bob",
-                      "PRODUCT: signed in as the new node bob, the app must act as bob: `vox node list` says \(nodes), its choice \(chosen.debugDescription)")
+        ui.menuBars.menuBarItems["Node"].click()
+        tap(ui, Key.menuItem("Forget"), "Forget alice without removing her rooms or messages")
+        guard present(ui, Key.showing("Node alice is Locked."), timeout: 30,
+                      "Forget must keep this window's identity and show alice Locked") else { return }
+        XCTAssertNil(locate(ui, Key.showing("Which node are you?")),
+                     "PRODUCT: Forget must keep the window acting as alice, without a node chooser")
+        let locked = try staged(vox, ["node", "list"], env: voxEnv)
+        let normalized = { (value: String) in value.lowercased().filter { $0.isLetter || $0.isNumber } }
+        XCTAssertTrue(nodeLine(locked, "alice")?.contains("Locked") == true
+                        && normalized(nodeLine(locked, "alice") ?? "").contains(normalized(aliceFp)),
+                      "PRODUCT: Forget must preserve alice's Locked identity; \(locked)")
+        tap(ui, Key.id("attach-again"), "Unlock the same personal node")
+        guard present(ui, Key.id("attach-node-passphrase"), timeout: 20,
+                      "Unlock must ask for alice's passphrase in its sheet") else { return }
+        type(ui, Key.id("attach-node-passphrase"), "alice identity", "alice's identity passphrase")
+        tap(ui, Key.id("attach-node"), "Unlock alice")
+        guard words(ui, Key.id("attached"), timeout: 60,
+                    "Unlock must restore the same personal node Ready",
+                    until: { $0 == "node alice, Ready" }) != nil else { return }
+        tap(ui, Key.id("room-first"), "Reopen alice's original room after Forget and Unlock")
+        guard present(ui, Key.showing("HELLO-FIRST-RUN"), timeout: 30,
+                      "Forget and Unlock must preserve the original complete message") else { return }
+        let restoredFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
+        XCTAssertEqual(restoredFp, aliceFp, "PRODUCT: Unlock must preserve alice's original identity")
 
         // HK-3/4 and NC-2/3: a real agent command returns before the person answers; all secret
         // input remains in this app. Declining this explicit request is reported once, whereas
@@ -1869,10 +1925,9 @@ final class FirstRunProof: XCTestCase {
         words(ui, Key.id("agent-hooks-installed"), timeout: 90,
               "the app must say the agent node is Ready and remembered",
               until: { $0.contains("claude-app") && $0.contains("Ready and remembered") })
-        let afterSetup = run(vox, ["node", "list"], env: voxEnv).out
-        XCTAssertTrue(nodeLine(afterSetup, "claude-app")?.contains(" attached ") == true
-                        && nodeLine(afterSetup, "claude-app")?.hasSuffix("(kept)") == true,
-                      "PRODUCT: app setup must make and remember the Ready agent node; got \(afterSetup)")
+        let afterSetup = try staged(vox, ["node", "list"], env: voxEnv)
+        XCTAssertTrue(nodeLine(afterSetup, "claude-app")?.contains("Ready") == true,
+                      "PRODUCT: app setup must make the agent node Ready; got \(afterSetup)")
         let ready = light("claude", setupSession)
         XCTAssertTrue(ready.contains("claude-app is made and Ready")
                         && ready.split(separator: "\n").count == 1,
@@ -1882,7 +1937,7 @@ final class FirstRunProof: XCTestCase {
                         && !wiredHook.out.contains("agent hook --light claude"),
                       "PRODUCT: Set Up must replace the light hook with the made node's hook; got \(wiredHook.out)")
         let stillPersonal = stager.run(["/bin/cat", config + "/app/node"], env: [:]).out
-        XCTAssertEqual(stillPersonal.trimmingCharacters(in: .whitespacesAndNewlines), "bob",
+        XCTAssertEqual(stillPersonal.trimmingCharacters(in: .whitespacesAndNewlines), "alice",
                        "PRODUCT: making the agent node must not select it as the person's app node")
         let otherRequest = run(vox, ["agent", "setup", "claude", "--node", "unwanted"], env: agentEnv)
         XCTAssertTrue(otherRequest.status == 0 && otherRequest.out.contains("left as it is"),
@@ -1909,11 +1964,21 @@ final class FirstRunProof: XCTestCase {
                         && !ready.contains(setupSecret) && !agentEnv.values.contains(setupSecret),
                       "PRODUCT: the app's passphrase must appear in no agent output, environment or plaintext file; leaks: \(leaks.out)")
 
+        // Remembering is demonstrated by the actual owned daemon restart, not raw attach files.
+        daemon?.terminate()
+        daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+                           until: "vox daemon: control socket")
+        let setupRestarted = try staged(vox, ["node", "list"], env: voxEnv)
+        XCTAssertTrue(nodeLine(setupRestarted, "claude-app")?.contains("Ready") == true,
+                      "PRODUCT: the app-created agent node must return Ready after daemon restart; \(setupRestarted)")
+        guard words(ui, Key.id("machine-claude-app"), timeout: 90,
+                    "the actual app must show its remembered agent node Ready after restart",
+                    until: { $0 == "claude-app Ready" }) != nil else { return }
         _ = run(vox, ["node", "detach", "opencode-app"], env: voxEnv)
         _ = run(vox, ["node", "detach", "claude-app"], env: voxEnv)
         print("[proof] agent setup: returned before answer; pending/declined/Ready hook outcomes; persistent Not Now; app-only passphrase; node kept; personal node unchanged")
-        _ = run(vox, ["node", "detach", "bob"], env: voxEnv)
-        print("[proof] sign out: \(out.debugDescription) after; sign-in listed \(listedAlice.debugDescription); signed in as new node bob")
+        _ = run(vox, ["node", "lock", "alice"], env: voxEnv)
+        print("[proof] Forget and Unlock: original alice identity, room and message preserved; agent setup left the personal node unchanged")
     }
 
     /// Red when what the app shows sends a person to Terminal or names a `vox` command: every
@@ -2876,7 +2941,7 @@ final class FirstRunProof: XCTestCase {
         print("[proof] transport: unavailable retained timeline; same room recovered roster; later remote retention reached header")
     }
 
-    func testFirstRunAttachesTheNodeAndQuitDetachesIt() throws {
+    func testFirstRunUnlocksTheNodeAndQuitLeavesItReady() throws {
         let env = ProcessInfo.processInfo.environment
         guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
             throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are set by scripts/app-proofs.sh")
@@ -3029,7 +3094,7 @@ final class FirstRunProof: XCTestCase {
         present(ui, Key.id("attached"), timeout: 60,
                 "the right passphrase must attach node alice")
         listed = run(vox, ["node", "list"], env: voxEnv).out
-        XCTAssertTrue(nodeLine(listed, "alice")?.contains(" attached ") ?? false,
+        XCTAssertTrue(nodeLine(listed, "alice")?.contains("Ready") ?? false,
                       "PRODUCT: `vox node list` must say alice is attached; it said: \(listed)")
 
         // (3) The main window groups the room by what it needs from alice. Bob is a second node of
@@ -3839,33 +3904,38 @@ final class FirstRunProof: XCTestCase {
               "vox://attach-node?node=bob, with Vox in front, must open the Attach sheet for node bob",
               until: { $0.contains("node bob") })
         tap(ui, Key.id("attach-node-cancel"), "Cancel on bob's Attach sheet")
-        // Forget Passphrase in place of `vox node forget-passphrase` (#666): Node > Forget
-        // Passphrase ends the keep of alice, the node this window acts as, kept here by a
-        // supplied passphrase, remembered on this account's private scratch Keychain.
-        try staged(vox, ["node", "attach", "alice", "--keep", "--passphrase-file", alicePass], env: voxEnv)
-        let keptUntil = Date().addingTimeInterval(15)
-        while Date() < keptUntil && !(nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "alice")?.contains("(kept)") ?? false) {
-            Thread.sleep(forTimeInterval: 0.3)
+        // CW-4: Forget replaces the old credential-only action, preserving identity and drafts.
+        try staged(vox, ["node", "unlock", "alice", "--passphrase-file", alicePass], env: voxEnv)
+        let readyBeforeForget = try staged(vox, ["node", "list"], env: voxEnv)
+        guard nodeLine(readyBeforeForget, "alice")?.contains("Ready") == true else {
+            throw Apparatus("alice must be Ready before Forget; \(readyBeforeForget)")
         }
-        let keptBefore = nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "alice") ?? ""
-        guard keptBefore.contains("(kept)") else {
-            throw Apparatus("alice must be kept before Forget Passphrase is chosen, so that its end can be seen; `vox node list` says \(keptBefore)")
-        }
+        type(ui, Key.id("compose"), "DRAFT-KEPT-FORGET-666", "draft before Forget")
         ui.menuBars.menuBarItems["Node"].click()
-        tap(ui, Key.menuItem("Forget Passphrase"), "Node > Forget Passphrase")
-        let forgotUntil = Date().addingTimeInterval(15)
-        var bobLine = ""
-        repeat {
-            bobLine = nodeLine(run(vox, ["node", "list"], env: voxEnv).out, "alice") ?? ""
-            if !bobLine.contains("(kept)") { break }
-            Thread.sleep(forTimeInterval: 0.3)
-        } while Date() < forgotUntil
-        XCTAssertFalse(bobLine.contains("(kept)"),
-                       "PRODUCT: Node > Forget Passphrase must stop keeping alice; `vox node list` says \(bobLine)")
-        ui.typeKey(.return, modifierFlags: []) // the Forget Passphrase alert's OK
+        tap(ui, Key.menuItem("Forget"), "Node > Forget")
+        guard present(ui, Key.showing("Node alice is Locked."), timeout: 30,
+                      "Forget must say alice Locked in the same window") else { return }
+        let forgotten = try staged(vox, ["node", "list"], env: voxEnv)
+        let normalizeFingerprint = { (value: String) in value.lowercased().filter { $0.isLetter || $0.isNumber } }
+        XCTAssertTrue(nodeLine(forgotten, "alice")?.contains("Locked") == true
+                      && normalizeFingerprint(nodeLine(forgotten, "alice") ?? "").contains(normalizeFingerprint(aliceFp)),
+                      "PRODUCT: Forget must preserve alice's Locked fingerprint; \(forgotten)")
+        tap(ui, Key.id("attach-again"), "Unlock alice after Forget")
+        guard present(ui, Key.id("attach-node-passphrase"), timeout: 20,
+                      "Unlock must show alice's passphrase sheet") else { return }
+        type(ui, Key.id("attach-node-passphrase"), "alice identity", "alice's Unlock passphrase")
+        tap(ui, Key.id("attach-node"), "Unlock alice")
+        guard words(ui, Key.id("attached"), timeout: 60,
+                    "Unlock must restore the same node Ready",
+                    until: { $0 == "node alice, Ready" }) != nil else { return }
+        XCTAssertEqual(el(ui, Key.id("compose")).value as? String, "DRAFT-KEPT-FORGET-666",
+                       "PRODUCT: Unlock must retain the draft preserved by Forget")
+        tap(ui, Key.id("compose"), "clear the retained draft for later Session claims")
+        ui.typeKey("a", modifierFlags: .command)
+        ui.typeKey(.delete, modifierFlags: [])
         // Back to General, as 4f expects to find bob's Session not yet shown.
         tap(ui, Key.id("session-general"), "General in mission's Sessions")
-        print("[proof] #666: drive command \(grant) copied; attach-node opened bob's sheet; Node > Forget Passphrase: \(bobLine)")
+        print("[proof] #666: drive command \(grant) copied; bob's Unlock sheet; alice Forget/Locked/Unlock/Ready preserved fingerprint and draft")
 
         // (4f) ↑/↓ reach a Session's entries (P14): bob grants alice drive, so she reads inside his
         // Session; with it shown, View > Focus Timeline selects its newest entry and ↑ the one
@@ -4101,21 +4171,37 @@ final class FirstRunProof: XCTestCase {
                            "PRODUCT: the composer's field must name the room it posts to")
         }
 
-        // A stopped node shows as detached, keeps what was typed, and attaches again.
+        // A publicly Locked node preserves the draft and unlocks in the same window.
         tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         type(ui, Key.id("compose"), "DRAFT-KEPT-P12", "the composer")
-        try staged(vox, ["node", "detach", "alice"], env: voxEnv)
+        try staged(vox, ["node", "lock", "alice"], env: voxEnv)
         words(ui, Key.id("node-stopped"), timeout: 30,
-              "node alice was detached from outside: the window must say so",
-              until: { $0.contains("detached") })
-        present(ui, Key.id("detached"), timeout: 10, "the sidebar must say node alice is detached")
+              "node alice was Locked from outside: the window must say so",
+              until: { $0.contains("Locked") })
+        present(ui, Key.id("detached"), timeout: 10, "the sidebar must say node alice is Locked")
         XCTAssertEqual(el(ui, Key.id("compose")).value as? String, "DRAFT-KEPT-P12",
-                       "PRODUCT: what was typed must stay while the node is detached")
-        type(ui, Key.id("node-stopped-passphrase"), "alice identity", "the passphrase field")
-        tap(ui, Key.id("node-stopped-attach"), "Attach Again")
-        present(ui, Key.id("attached"), timeout: 60, "Attach Again must attach node alice again")
+                       "PRODUCT: what was typed must stay while the node is Locked")
+        type(ui, Key.id("node-stopped-passphrase"), "wrong identity", "wrong inline Unlock passphrase")
+        tap(ui, Key.id("node-stopped-attach"), "Unlock with the wrong inline passphrase")
+        guard words(ui, Key.id("node-stopped-unlock-error"), timeout: 20,
+                    "wrong inline Unlock must explain its refusal on the initiating surface",
+                    until: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) != nil else { return }
+        let wrongInline = try staged(vox, ["node", "list"], env: voxEnv)
+        XCTAssertTrue(nodeLine(wrongInline, "alice")?.contains("Locked") == true,
+                      "PRODUCT: wrong inline Unlock must leave alice Locked; \(wrongInline)")
         XCTAssertEqual(el(ui, Key.id("compose")).value as? String, "DRAFT-KEPT-P12",
-                       "PRODUCT: what was typed must still be there once the node is attached again")
+                       "PRODUCT: failed inline Unlock must preserve the original draft")
+        tap(ui, Key.id("node-stopped-passphrase"), "replace the wrong inline passphrase")
+        ui.typeKey("a", modifierFlags: .command)
+        el(ui, Key.id("node-stopped-passphrase")).typeText("alice identity")
+        tap(ui, Key.id("node-stopped-attach"), "Unlock with the correct inline passphrase")
+        guard words(ui, Key.id("attached"), timeout: 60,
+                    "correct inline Unlock must restore alice Ready",
+                    until: { $0 == "node alice, Ready" }) != nil else { return }
+        missingWithin(ui, Key.id("node-stopped-unlock-error"), 10,
+                      "successful inline Unlock must retire its previous refusal")
+        XCTAssertEqual(el(ui, Key.id("compose")).value as? String, "DRAFT-KEPT-P12",
+                       "PRODUCT: what was typed must still be there once the node is Ready again")
         // The draft goes, so later steps start from an empty composer.
         tap(ui, Key.id("compose"), "the composer")
         ui.typeKey("a", modifierFlags: .command)
@@ -4738,25 +4824,16 @@ final class FirstRunProof: XCTestCase {
                       "PRODUCT: alice untrusted bob in the keyring view; bob's live connection into her service must be cut within 30 s, and it was not")
         print("[proof] untrust cut bob's live forward into alice's notes service")
 
-        // (12) Quitting detaches it.
+        // (12) Quit releases this client, independently of remembered node readiness (CW-3).
         handOff(ui, "q")
         XCTAssertTrue(ui.wait(for: .notRunning, timeout: 30), "PRODUCT: ⌘Q did not quit the app")
-        var after = ""
-        let until = Date().addingTimeInterval(30)
-        while Date() < until {
-            after = run(vox, ["node", "list"], env: voxEnv).out
-            if nodeLine(after, "alice")?.contains(" detached") ?? false { break }
-            Thread.sleep(forTimeInterval: 0.25)
-        }
-        XCTAssertTrue(nodeLine(after, "alice")?.contains(" detached") ?? false,
-                      "PRODUCT: once the app quit, node alice must be detached; `vox node list` said: \(after)")
-        print("[proof] while attached: \(listed)[proof] after quit: \(after)")
+        let after = try staged(vox, ["node", "list"], env: voxEnv)
+        XCTAssertTrue(nodeLine(after, "alice")?.contains("Ready") == true,
+                      "PRODUCT: quitting the app must leave remembered alice Ready; \(after)")
+        print("[proof] after quit alice remains Ready: \(after)")
 
-        // (13) What came while the app was closed is counted when it opens (ADR-028 R-8). Alice's
-        // node, attached by hand and trusting bob again, takes bob's message to her while no app
-        // runs; opened again, the app lists mission under "needs you (1)" from what her node
-        // recorded as read, with nothing arriving after it opened.
-        try staged(vox, ["node", "attach", "alice", "--passphrase-file", alicePass], env: voxEnv)
+        // (13) While the app is closed, the remembered Ready node receives Bob's message.
+        // Reopening counts it from the node's read position, without another arriving message.
         try staged(vox, ["trust", "add", "--node", "alice", bobFp, "--name", "bob",
                          "--identity-passphrase-file", alicePass], env: voxEnv)
         try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "WHILE-APP-CLOSED"],
@@ -5030,35 +5107,30 @@ final class FirstRunProof: XCTestCase {
                            "once bob's node is back and holds WHERE-15, it must say it is on 1 of the members' nodes, \"on 1 of N members' nodes\"",
                            until: { $0.hasPrefix("on 1 of ") && $0.hasSuffix(" members' nodes") }) ?? ""
         print("[proof] whereabouts: \(alone) → \(spread)")
-        // (15d, D17) Node > Detach leaves the window alice's: Attach again (or Quit), never another
-        // node of this Mac's.
+        // CW-4 supersedes Detach: Forget keeps this window alice's and preserves the draft.
+        type(ui, Key.id("compose"), "DRAFT-KEPT-FORGET-D17", "draft before Forget")
         ui.menuBars.menuBarItems["Node"].click()
-        tap(ui, Key.menuItem("Detach"), "Node > Detach")
-        var offered = ""
-        let detachedUntil = Date().addingTimeInterval(30)
-        while Date() < detachedUntil && offered.isEmpty {
-            if locate(ui, Key.id("node-carol")) != nil || locate(ui, Key.id("node-bob")) != nil {
-                offered = "another node"
-            } else if locate(ui, Key.id("attach-again")) != nil {
-                offered = "attach again"
-            } else {
-                Thread.sleep(forTimeInterval: 0.25)
-            }
-        }
-        XCTAssertEqual(offered, "attach again",
-                       "PRODUCT: after Node > Detach the window must offer only to attach alice again (E-4); it offered \(offered.isEmpty ? "neither within 30 s" : offered): \(onScreen(ui))")
-        tap(ui, Key.id("attach-again"), "Attach alice Again")
-        let again = Key.id("passphrase")
-        if present(ui, again, timeout: 15, "Attach alice Again must ask for her passphrase") {
-            type(ui, again, "alice identity", "the passphrase field")
-            noKeychain(ui)
-            tap(ui, Key.id("attach"), "Attach")
-        }
-        present(ui, Key.id("attached"), timeout: 60, "attached again, the window must be alice's")
-        let fp = run(vox, ["node", "list"], env: voxEnv).out
-        XCTAssertTrue(nodeLine(fp, "alice")?.contains(" attached ") ?? false,
-                      "PRODUCT: attached again, `vox node list` must say alice is attached: \(fp)")
-        print("[proof] after Detach: \(offered); attached again")
+        tap(ui, Key.menuItem("Forget"), "Node > Forget")
+        guard present(ui, Key.showing("Node alice is Locked."), timeout: 30,
+                      "Forget must leave this window alice's and say Locked") else { return }
+        XCTAssertNil(locate(ui, Key.id("node-carol")),
+                     "PRODUCT: Forget must not offer a different node for this window")
+        XCTAssertNil(locate(ui, Key.id("node-bob")),
+                     "PRODUCT: Forget must not offer bob for this window")
+        tap(ui, Key.id("attach-again"), "Unlock alice in the same window")
+        guard present(ui, Key.id("attach-node-passphrase"), timeout: 20,
+                      "Unlock must ask for alice's passphrase in its sheet") else { return }
+        type(ui, Key.id("attach-node-passphrase"), "alice identity", "alice's Unlock passphrase")
+        tap(ui, Key.id("attach-node"), "Unlock alice")
+        guard words(ui, Key.id("attached"), timeout: 60,
+                    "Unlock must restore alice Ready in this window",
+                    until: { $0 == "node alice, Ready" }) != nil else { return }
+        let fp = try staged(vox, ["node", "list"], env: voxEnv)
+        XCTAssertTrue(nodeLine(fp, "alice")?.contains("Ready") == true,
+                      "PRODUCT: Unlock must restore alice Ready; \(fp)")
+        XCTAssertEqual(el(ui, Key.id("compose")).value as? String, "DRAFT-KEPT-FORGET-D17",
+                       "PRODUCT: Forget and Unlock must preserve the original draft")
+        print("[proof] Forget and Unlock kept the window alice's and preserved its draft")
         handOff(ui, "q")
         _ = ui.wait(for: .notRunning, timeout: 30)
         _ = run(vox, ["node", "detach", "alice"], env: voxEnv)

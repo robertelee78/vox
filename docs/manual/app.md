@@ -9,7 +9,7 @@ and macOS 13 or later, and the installer installs it with `vox` ([Install and up
 Vox.app is a window onto your account's Vox daemon, the same daemon the `vox` commands and the
 terminal interface use. The app acts as **one node** on this Mac, which you make or choose the
 first time you open it. Everything you post, trust and share in the app is that node's. The other
-nodes on this Mac are listed under **ON THIS MACHINE**, with **Attach…** for each one that is not attached.
+nodes on this Mac are listed under **ON THIS MACHINE**, with **Unlock…** for each Locked node.
 
 ## The first run
 
@@ -24,32 +24,28 @@ nodes on this Mac are listed under **ON THIS MACHINE**, with **Attach…** for e
    node.
 3. **Which node are you?** With several nodes on this Mac, pick the one you post, trust and share
    as. With one, the app uses it.
-4. **Attach node NAME.** For a node that is not attached, type its identity passphrase, or leave it
-   empty for a node made with none. **Remember the passphrase in the Keychain** is on unless you
-   turn it off. With it on, the node attaches again by itself after Vox quits or the Mac restarts,
-   and anyone who can unlock this Mac's login keychain can attach it. With it off, your rooms are
-   reachable only while Vox is open.
+4. **Unlock node NAME.** For a Locked node, type its identity passphrase. Unlock always remembers
+   it in the Keychain so Vox can make the node Ready after a daemon restart, update or reboot.
+   A node with no passphrase becomes Ready without an unlock form.
 
 A new node is in no room yet. Its window offers **New Room…** and **Join Room…**.
 
 If the app cannot reach the daemon, it shows a card with a headline, a likely cause and **Try
 Again**. **DETAILS** holds the daemon's own sentence, with **Copy** for a report.
 
-## Open, quit and detach
+## Open, quit and lock
 
-- **Opening** the app attaches its node. A node already attached is used as it is.
-- **Quitting** (⌘Q) lets go of the node. The daemon detaches it unless something else keeps it:
-  a remembered passphrase, a running `vox tui`, `vox serve` or `vox forward`, or a node attached
-  by hand.
-- **Node > Detach** detaches the node at once and forgets its passphrase. The window then offers
-  **Attach NAME Again** and **Quit Vox**.
-- **Node > Forget Passphrase** removes the passphrase from the Keychain. The node stays attached
-  until it is detached, and the daemon stops attaching it by itself.
-- **Node > Sign Out…** detaches the node, forgets its passphrase, and makes the app forget it chose
-  it. Its rooms and messages stay on this Mac.
+- **Opening** the app uses your Ready node, or offers Unlock for a Locked node.
+- **Quitting** (⌘Q) closes the window. Remembered nodes resume whenever the daemon starts.
+  **Keep Running** controls whether the daemon keeps running while the app is closed; turning
+  it off does not forget any node's passphrase.
+- **Node > Lock** closes a protected node's connections and forgets its passphrase. Its rooms
+  and messages stay on this Mac; Unlock makes it Ready again.
+- **Forget Passphrase** removes the remembered passphrase and locks a protected node at once.
+  Its rooms and messages stay. A node with no passphrase stays Ready because there is no secret
+  that can lock it.
 
-If the node stops while the window is open, a banner says why, with **Attach Again** and **Start
-Over**. What you typed is kept.
+If the node's work stops while the window is open, Vox says why. What you typed is kept.
 
 ## The main window
 
@@ -57,7 +53,7 @@ The window has a sidebar, the room on screen, the room's members beside it, and 
 
 ### The sidebar
 
-- At the top: your node's mark, its name and `node attached`, and a **+** with **New Room…** and
+- At the top: your node's mark, its name and **Ready**, and a **+** with **New Room…** and
   **Join Room…**.
 - Your rooms, in one list, newest message first. Each row shows the room's name and the time of
   its newest message, then that message as `who: text`, and a badge with the unread count. The
@@ -65,8 +61,8 @@ The window has a sidebar, the room on screen, the room's members beside it, and 
   Session waiting on you, or a trust offer. The second line then says what waits, such as
   `a Session needs you` or `f7l2q44… joined — trust?`.
 - **Keyring**, **Decision record** and **Services**.
-- At the foot, **ON THIS MACHINE**: every node on this Mac, `attached` or `detached`. A node that
-  is not attached has **Attach…**, which asks for its passphrase and remembers it. Right-click a
+- At the foot, **ON THIS MACHINE**: every node on this Mac, **Ready** or **Locked**. A node that
+  is Locked has **Unlock…**, which asks for its passphrase and remembers it. Right-click a
   remembered node for **Forget Passphrase**.
 
 A message stops being unread once at least half of it has been in view, with the window in front.
@@ -122,7 +118,7 @@ ann…**.
 
 To share a file, drop it on the timeline, paste it, or choose **File > Attach File…** (⌘O). The
 app asks for **To:** and a **Note**, then **Share** sends one share. From the Finder or another
-app, choose **Share > Vox**. This works while the app's node is attached, even with the app
+app, choose **Share > Vox**. This works while the app's node is Ready, even with the app
 closed.
 
 ### Members and trust
@@ -231,8 +227,8 @@ sound. Clicking a notification opens the room, Session or request.
 
 Two notifications ask something of you:
 
-- `Node NAME needs its passphrase`, when a node on this Mac waits for it. **Attach…** opens the
-  sheet that attaches it.
+- `Node NAME needs its passphrase`, when a node on this Mac waits for it. **Unlock…** opens the
+  sheet that unlocks it.
 - `Which room is this repo in?`, when an agent session starts in a repository with no room.
 
 To change whether Vox may notify, use System Settings, Notifications, Vox.

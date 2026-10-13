@@ -30,7 +30,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         center.delegate = self
         center.setNotificationCategories([
             UNNotificationCategory(identifier: Notifier.attachCategory,
-                                   actions: [UNNotificationAction(identifier: "attach", title: "Attach…",
+                                   actions: [UNNotificationAction(identifier: "attach", title: "Unlock…",
                                                                   options: [.foreground])],
                                    intentIdentifiers: [], options: []),
         ])
@@ -74,7 +74,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     func postAttach(node: String) {
         let content = UNMutableNotificationContent()
         content.title = "Node \(node) needs its passphrase"
-        content.body = "It is not attached, so nothing reaches it. Attach it in Vox."
+        content.body = "This node is unavailable. Unlock it in Vox."
         content.categoryIdentifier = Notifier.attachCategory
         content.userInfo = ["attachNode": node]
         content.sound = .default

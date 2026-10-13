@@ -2,6 +2,7 @@
 
 import AppKit
 import Foundation
+import Combine
 import ServiceManagement
 @MainActor
 final class AppModel: ObservableObject {
@@ -81,7 +82,14 @@ final class AppModel: ObservableObject {
         MenuBarChoice.set(on)
     }
     /// The node acted as, once attached: what the main window shows.
-    @Published private(set) var node: NodeModel?
+    private var nodeChanges: AnyCancellable?
+    @Published private(set) var node: NodeModel? {
+        didSet {
+            nodeChanges = node?.objectWillChange.sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+        }
+    }
     private var client: VoxClient?
     /// Changed harness configuration files, reported by the launch's light-hook installation.
     @Published var agentSetupSaid: String?
@@ -149,17 +157,22 @@ final class AppModel: ObservableObject {
     /// Reach the daemon (the login item's, else one started as `vox` does), then attach the node
     /// chosen at first run, or ask which.
     func reach() async {
+        let generation = beginNodeRequest()
         phase = .starting
         do {
             let client = try await Daemon.reach()
+            guard nodeRequestGeneration == generation else { return }
             self.client = client
             let nodes = try await client.nodes()
+            guard ownsNodeRequest(client, generation) else { return }
             if let chosen = chosenNode(client), let node = nodes.first(where: { $0.name == chosen }) {
-                await use(node)
+                guard ownsNodeRequest(client, generation) else { return }
+            await use(node)
             } else {
                 await offerNodes(nodes)
             }
         } catch {
+            guard nodeRequestGeneration == generation else { return }
             // Refused for an earlier release's node directories: said plainly, with a way on.
             if let dirs = try? oldLayout(dataRoot: ""), !dirs.isEmpty {
                 phase = .oldLayout(dirs: dirs, said: nil)
@@ -202,11 +215,14 @@ final class AppModel: ObservableObject {
 
     /// Restart the same account's daemon using this app's bundled version (ADR-034 UP-2).
     func restartDaemon() async {
+        let generation = beginNodeRequest()
         phase = .starting
         do {
             _ = try await Daemon.command(["daemon", "--restart"], patience: 45)
+            guard nodeRequestGeneration == generation else { return }
             await reach()
         } catch {
+            guard nodeRequestGeneration == generation else { return }
             phase = .unreachable(StartFailure(error))
         }
     }
@@ -245,8 +261,31 @@ final class AppModel: ObservableObject {
     /// First run with no node: make node `name` here, as `vox node create` does, under the
     /// identity passphrase typed twice, then attach it with that passphrase. The bytes go into a
     /// `Passphrase` at once and are wiped (M-5).
+    private var nodeActionInProgress = false
+    private var nodeRequestGeneration: UInt64 = 0
+
+    private func beginNodeRequest() -> UInt64 {
+        nodeRequestGeneration &+= 1
+        return nodeRequestGeneration
+    }
+
+    private func ownsNodeRequest(_ client: VoxClient, _ generation: UInt64) -> Bool {
+        self.client === client && nodeRequestGeneration == generation
+    }
+
+    private func refreshNodeState(_ client: VoxClient, generation: UInt64) async throws {
+        let shown = node
+        let fresh = try await client.nodes()
+        guard ownsNodeRequest(client, generation) else { return }
+        nodeList = fresh
+        await shown?.refreshMachineState()
+    }
+
     func createNode(_ name: String, passphrase secret: Secret, again: Secret) async {
-        guard let client else { return }
+        guard let client, !nodeActionInProgress else { secret.wipe(); again.wipe(); return }
+        let generation = beginNodeRequest()
+        nodeActionInProgress = true
+        defer { nodeActionInProgress = false }
         let same = secret.matches(again)
         again.wipe()
         guard same else {
@@ -259,21 +298,30 @@ final class AppModel: ObservableObject {
         do {
             passphrase = try secret.passphrase()
         } catch {
+            guard ownsNodeRequest(client, generation) else { return }
             phase = .welcome(said: sentence(error))
             return
         }
         defer { passphrase.wipe() }
         do {
             _ = try await client.createNode(node: name, passphrase: passphrase)
+            guard ownsNodeRequest(client, generation) else { return }
         } catch {
+            guard ownsNodeRequest(client, generation) else { return }
             phase = .welcome(said: sentence(error))
             return
         }
         do {
+            try await client.keep(node: name, passphrase: passphrase)
+            guard ownsNodeRequest(client, generation) else { return }
             let fingerprint = try await client.attach(node: name, passphrase: passphrase)
+            guard ownsNodeRequest(client, generation) else { return }
+            try await refreshNodeState(client, generation: generation)
+            guard ownsNodeRequest(client, generation) else { return }
             remember(name, client)
             enter(name, fingerprint, client)
         } catch {
+            guard ownsNodeRequest(client, generation) else { return }
             // Made, but not attached: it is asked for as any node is.
             phase = .passphrase(node: name, said: sentence(error))
         }
@@ -283,65 +331,102 @@ final class AppModel: ObservableObject {
     /// becomes another (E-4).
     func choose(_ name: String) async {
         guard let client, case .choosing = phase else { return }
+        let generation = beginNodeRequest()
         do {
             let nodes = try await client.nodes()
+            guard ownsNodeRequest(client, generation) else { return }
             guard let node = nodes.first(where: { $0.name == name }) else {
                 await offerNodes(nodes)
                 return
             }
+            guard ownsNodeRequest(client, generation) else { return }
             await use(node)
         } catch {
+            guard nodeRequestGeneration == generation else { return }
             phase = .unreachable(StartFailure(error))
         }
     }
 
     /// Attach `node` with the passphrase typed for it; the bytes go into a `Passphrase` at once
     /// and are not kept here (M-5).
-    func attach(_ node: String, passphrase secret: Secret, keepInKeychain: Bool = false) async {
-        guard let client else { return }
+    func attach(_ node: String, passphrase secret: Secret) async {
+        guard let client, !nodeActionInProgress else { secret.wipe(); return }
+        let generation = beginNodeRequest()
+        nodeActionInProgress = true
+        defer { nodeActionInProgress = false }
         phase = .attaching(node: node)
         let passphrase: Passphrase
         do {
             passphrase = try secret.passphrase()
         } catch {
+            guard ownsNodeRequest(client, generation) else { return }
             phase = .passphrase(node: node, said: sentence(error))
             return
         }
         defer { passphrase.wipe() }
         do {
-            // Remembered (K-10 as amended, #666; on unless turned off): the daemon attaches it
-            // with the passphrase, stores that in the login keychain, and keeps it attached past
-            // this app's quit and attaches it again at its every start.
-            if keepInKeychain {
-                try await client.keep(node: node, passphrase: passphrase)
-            }
+            // Unlock always remembers credentials, independently of Keep Running.
+            try await client.keep(node: node, passphrase: passphrase)
+            guard ownsNodeRequest(client, generation) else { return }
             let fingerprint = try await client.attach(node: node, passphrase: passphrase)
+            guard ownsNodeRequest(client, generation) else { return }
+            try await refreshNodeState(client, generation: generation)
+            guard ownsNodeRequest(client, generation) else { return }
             remember(node, client)
             enter(node, fingerprint, client)
         } catch VoxError.WrongPassphrase(let reason) {
+            guard ownsNodeRequest(client, generation) else { return }
             phase = .passphrase(node: node, said: reason)
         } catch {
+            guard ownsNodeRequest(client, generation) else { return }
             // No passphrase fixes it (busy, gone, not answering): said as what it is (P4).
             phase = .unreachable(StartFailure(error))
         }
     }
 
-    /// Detach the node from the daemon now (Node > Detach): its connections close and its keys
-    /// are wiped. The window stays this node's (ADR-028 E-4): it offers to attach it again, and
-    /// Quit; never a choice of another node on this Mac.
+    /// Forget the window's node credentials and release its live keys, preserving its data.
     func detachNode() async {
-        guard let client, case let .attached(node, _) = phase else { return }
+        guard let name = signedInAs else { return }
+        await lockNode(name)
+    }
+
+    func lockNode(_ name: String) async {
+        guard let client, !nodeActionInProgress else { return }
+        let shown = self.node
+        let generation = beginNodeRequest()
+        nodeActionInProgress = true
+        defer { nodeActionInProgress = false }
         do {
-            try await client.detach(node: node)
-            self.node = nil
-            phase = .detached(node: node)
+            let current = try await client.nodes()
+            guard ownsNodeRequest(client, generation) else { return }
+            guard current.first(where: { $0.name == name })?.status == "Ready" else {
+                try await refreshNodeState(client, generation: generation)
+                return
+            }
+            try await client.unkeep(node: name)
+            guard ownsNodeRequest(client, generation) else { return }
+            try await client.detach(node: name)
+            guard ownsNodeRequest(client, generation) else { return }
+            let fresh = try await client.nodes()
+            guard ownsNodeRequest(client, generation) else { return }
+            nodeList = fresh
+            if signedInAs == name {
+                await shown?.refreshMachineState()
+                guard ownsNodeRequest(client, generation), self.node === shown else { return }
+                if fresh.first(where: { $0.name == name })?.status == "Ready",
+                   shown?.nodeStatus == "Ready", let shown {
+                    phase = .attached(node: name, fingerprint: shown.me)
+                } else {
+                    phase = .detached(node: name)
+                }
+            }
         } catch {
-            phase = .unreachable(StartFailure(error))
+            guard ownsNodeRequest(client, generation) else { return }
+            forgotSaid = sentence(error)
+            try? await refreshNodeState(client, generation: generation)
         }
     }
 
-    /// Whether Node › Sign Out… asks the person to confirm.
-    @Published var signingOut = false
     /// The nodes on this Mac, with their fingerprints, as the sign-in choice lists them (P8).
     @Published private(set) var nodeList: [NodeSummary] = []
 
@@ -353,45 +438,49 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Sign out of the node (ADR-028 E-4, the decider 2026-10-08): detach it, and forget all that
-    /// would bring it back without the person: its keep and the passphrase kept for it in the
-    /// Keychain (the daemon's unkeep), and this app's remembered node. The node, its rooms and its
-    /// messages stay on this Mac. Then the sign-in: choose a node, or make one.
-    func signOut() async {
-        guard let client, let name = signedInAs else { return }
-        signingOut = false
-        do {
-            try await client.unkeep(node: name)
-            await client.release()
-            self.node = nil
-            // Not attached is as good: it is detached either way.
-            try? await client.detach(node: name)
-            forget(name, client)
-            let nodes = try await client.nodes()
-            nodeList = nodes
-            phase = .choosing(nodes.map(\.name))
-        } catch {
-            phase = .unreachable(StartFailure(error))
+    var selectedNodeStatus: String? {
+        guard let name = signedInAs else { return nil }
+        if let shown = node {
+            guard shown.node == name else { return nil }
+            return shown.nodeStatus
         }
+        return nodeList.first(where: { $0.name == name })?.status
     }
 
     /// The sign-in's New Node…: make one here, as at first run.
     func newNode() {
         guard case .choosing = phase else { return }
+        _ = beginNodeRequest()
         phase = .welcome(said: nil)
     }
 
     /// Attach again the node this window was opened with, after Detach (E-4): at once if it needs
     /// no passphrase, else its passphrase is asked for.
     func attachAgain() async {
-        guard let client, case let .detached(name) = phase else { return }
+        guard let client, let name = signedInAs else { return }
+        let generation = beginNodeRequest()
         do {
-            guard let node = try await client.nodes().first(where: { $0.name == name }) else {
+            let nodes = try await client.nodes()
+            guard ownsNodeRequest(client, generation) else { return }
+            guard let node = nodes.first(where: { $0.name == name }) else {
                 phase = .unreachable(StartFailure(kind: .other, said: "node \(name) is no longer on this Mac"))
                 return
             }
-            await use(node)
+            guard ownsNodeRequest(client, generation) else { return }
+            nodeList = nodes
+            if node.status == "Locked" {
+                attachNodeAsk = name
+            } else if let shown = self.node, shown.node == name {
+                await shown.refreshMachineState()
+                guard ownsNodeRequest(client, generation), self.node === shown else { return }
+                if shown.nodeStatus == "Ready" {
+                    phase = .attached(node: name, fingerprint: shown.me)
+                }
+            } else {
+                await use(node)
+            }
         } catch {
+            guard nodeRequestGeneration == generation else { return }
             phase = .unreachable(StartFailure(error))
         }
     }
@@ -412,7 +501,7 @@ final class AppModel: ObservableObject {
         }
         keepRunning = false
         await reach()
-        await stopKeepingNode()
+
     }
 
     /// A vox:// room link the system opened the app with, held until a node is attached: it fills
@@ -433,7 +522,7 @@ final class AppModel: ObservableObject {
         // **A node on this Mac waits for its passphrase** (#666): `vox` opens
         // vox://attach-node?node=N where it would have printed "run in a terminal"; the person
         // gets a notification with Attach…, which opens the Attach sheet for it.
-        if url.host?.lowercased() == "attach-node" {
+        if ["unlock-node", "attach-node"].contains(url.host?.lowercased() ?? "") {
             let named = URLComponents(url: url, resolvingAgainstBaseURL: false)?
                 .queryItems?.first { $0.name == "node" }?.value
             if let named, !named.isEmpty {
@@ -460,25 +549,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Not Now also for the node (M-6): the daemon stops keeping the node chosen at first run, so
-    /// it is not attached again at the daemon's next start and detaches when the app lets go of
-    /// it. Before this, Turn Keep Running Off left the node kept (#571).
-    private func stopKeepingNode() async {
-        guard let client, let name = chosenNode(client) else { return }
-        do {
-            try await client.unkeep(node: name)
-        } catch {
-            keepRunningSaid = sentence(error)
-        }
-    }
-
-    /// Keep Running, turned on or off while Vox runs (Vox > Keep Running While Logged In, #571),
-    /// not only at first run or from the unreachable screen.
-    ///
-    /// On: the answer is kept, and the login item is registered; macOS's approval is asked for in
-    /// System Settings, as at first run (M-8). Off: the login item is unregistered, the answer
-    /// kept as Not Now, and the node no longer kept (M-6). If the daemon this app talks to was the
-    /// login item's and stopped with it, the daemon is reached again as `vox` starts it.
+    /// Keep Running changes the login item only. Remembered node credentials are independent.
     func setKeepRunning(_ on: Bool) async {
         guard on != keepRunning else { return }
         if on {
@@ -491,7 +562,6 @@ final class AppModel: ObservableObject {
                 keepRunningSaid = sentence(error)
                 return
             }
-            await offerToKeepNode()
             return
         }
         do {
@@ -504,43 +574,30 @@ final class AppModel: ObservableObject {
         var answers = false
         if let client { answers = (try? await client.nodes()) != nil }
         if !answers { await reach() }
-        await stopKeepingNode()
+
     }
 
-    /// Keep Running turned on while a node is attached: the node is kept at once, as the person
-    /// expects ("Vox stays on with me while I'm logged in"). Every node has a passphrase
-    /// (ADR-028 K-11), and the daemon keeps a node only with its passphrase in the Keychain
-    /// (M-6), which the app never holds (M-5): so the app asks for it once, to store it, checked
-    /// against the node's vault by the daemon; or, declined, says plainly what that leaves.
-    private func offerToKeepNode() async {
-        guard let client, case let .attached(name, _) = phase else { return }
-        let kept = (try? await client.nodes())?.first { $0.name == name }?.keep ?? false
-        if !kept { keepNodeAsk = name }
-    }
+    /// Why unlocking a saved node failed.
+    @Published private(set) var keepNodeSaid: (node: String, message: String)?
 
-    /// The node Keep Running offers to keep, asking for its passphrase to store it; nil when no
-    /// offer is open.
-    @Published var keepNodeAsk: String?
-    /// Why storing it failed, in the daemon's words, shown in the offer.
-    @Published private(set) var keepNodeSaid: String?
+    func dismissKeepNodeError(_ node: String) {
+        guard keepNodeSaid?.node == node else { return }
+        keepNodeSaid = nil
+    }
 
     /// A node on this Mac whose Attach… was chosen under ON THIS MACHINE (#666), its passphrase
     /// asked for; nil when none is asked.
-    @Published var attachNodeAsk: String?
-    /// What Forget Passphrase did, or why it could not; nil once read.
+    @Published var attachNodeAsk: String? {
+        didSet {
+            if attachNodeAsk != oldValue { _ = beginNodeRequest() }
+        }
+    }
+    /// Why Forget could not finish; nil once read.
     @Published var forgotSaid: String?
 
-    /// Forget node `node`'s remembered passphrase (#666), as `vox node forget-passphrase` does:
-    /// the daemon stops keeping it, and the Keychain item goes. Attached now, it stays attached.
+    /// Forget node `node` credentials and release its live keys without removing data.
     func forgetPassphrase(_ node: String) async {
-        guard let client else { return }
-        do {
-            try await client.unkeep(node: node)
-            forgotSaid = "Node \(node)'s passphrase is forgotten: nothing is stored for it in the "
-                + "Keychain, and Vox no longer attaches it by itself after a restart."
-        } catch {
-            forgotSaid = sentence(error)
-        }
+        await lockNode(node)
     }
 
     /// Keep `node` with its passphrase in the Keychain (M-6, ADR-028 K-10): the daemon attaches
@@ -548,25 +605,48 @@ final class AppModel: ObservableObject {
     /// attached after quit and is attached again when the daemon starts. An empty passphrase, for
     /// a node made with none, stores nothing.
     func keepNode(_ node: String, passphrase secret: Secret) async {
-        guard let client else { return }
+        guard let client, !nodeActionInProgress else { secret.wipe(); return }
+        let generation = beginNodeRequest()
+        keepNodeSaid = nil
+        nodeActionInProgress = true
+        defer { nodeActionInProgress = false }
         do {
             let passphrase = try secret.passphrase()
             defer { passphrase.wipe() }
             try await client.keep(node: node, passphrase: passphrase)
-            keepNodeAsk = nil
+            guard ownsNodeRequest(client, generation) else { return }
+            let fresh = try await client.nodes()
+            guard ownsNodeRequest(client, generation), attachNodeAsk == node || signedInAs == node else { return }
+            nodeList = fresh
+            if signedInAs == node, let shown = self.node {
+                let fingerprint = try await client.attach(node: node, passphrase: nil)
+                guard ownsNodeRequest(client, generation), self.node === shown else { return }
+                guard fingerprint == shown.me else {
+                    enter(node, fingerprint, client)
+                    attachNodeAsk = nil
+                    keepNodeSaid = nil
+                    return
+                }
+                let resumed = try await shown.resumeAfterUnlock { [weak self, weak shown] in
+                    guard let self, let shown else { return false }
+                    return self.ownsNodeRequest(client, generation) && self.node === shown
+                }
+                guard ownsNodeRequest(client, generation), self.node === shown else { return }
+                guard resumed else { throw VoxError.Detached(reason: "The node is not Ready yet. Try Unlock again.") }
+                phase = .attached(node: node, fingerprint: fingerprint)
+            }
+            if signedInAs == node, self.node == nil {
+                let fingerprint = try await client.attach(node: node, passphrase: nil)
+                guard ownsNodeRequest(client, generation), signedInAs == node else { return }
+                enter(node, fingerprint, client)
+            }
             attachNodeAsk = nil
             keepNodeSaid = nil
         } catch {
-            keepNodeSaid = sentence(error)
+            guard ownsNodeRequest(client, generation) else { return }
+            keepNodeSaid = (node, sentence(error))
+            try? await refreshNodeState(client, generation: generation)
         }
-    }
-
-    /// The offer declined: the node is not kept, and the app says what that leaves.
-    func declineToKeepNode(_ node: String) {
-        keepNodeAsk = nil
-        keepNodeSaid = nil
-        keepRunningSaid = "Keep Running is on, but node \(node) is not kept: it stays attached "
-            + "while Vox is open, and after a restart Vox asks for its passphrase again."
     }
 
     /// Why turning Keep Running on or off failed, in macOS's or the daemon's words; nil once read.
@@ -574,7 +654,10 @@ final class AppModel: ObservableObject {
 
     /// Let go of the node and end the client (A-4).
     func quit() async {
-        await client?.close()
+        let generation = beginNodeRequest()
+        guard let original = client else { return }
+        await original.close()
+        guard ownsNodeRequest(original, generation) else { return }
         client = nil
     }
 
@@ -583,28 +666,38 @@ final class AppModel: ObservableObject {
     /// attaches (M-6).
     private func use(_ node: NodeSummary) async {
         guard let client else { return }
-        if node.state != "attached" && keepRunning {
+        let generation = beginNodeRequest()
+        if !node.keep {
             // Refused for a node that has a passphrase, which is then asked for; but a daemon that
             // no longer answers is said as that, not as a passphrase to type.
             if (try? await client.keep(node: node.name, passphrase: nil)) == nil {
+                guard ownsNodeRequest(client, generation) else { return }
                 do {
                     _ = try await client.nodes()
+                    guard ownsNodeRequest(client, generation) else { return }
                     phase = .passphrase(node: node.name, said: nil)
                 } catch {
+                    guard ownsNodeRequest(client, generation) else { return }
                     phase = .unreachable(StartFailure(error))
                 }
                 return
             }
         }
+        guard ownsNodeRequest(client, generation) else { return }
         phase = .attaching(node: node.name)
         do {
             let fingerprint = try await client.attach(node: node.name, passphrase: nil)
+            guard ownsNodeRequest(client, generation) else { return }
+            try await refreshNodeState(client, generation: generation)
+            guard ownsNodeRequest(client, generation) else { return }
             remember(node.name, client)
             enter(node.name, fingerprint, client)
         } catch VoxError.Busy(let reason) {
+            guard ownsNodeRequest(client, generation) else { return }
             // Another process holds the node: no passphrase fixes that (P4).
             phase = .unreachable(StartFailure(kind: .busy, said: reason))
         } catch {
+            guard ownsNodeRequest(client, generation) else { return }
             // A node not attached that wants its passphrase: asked for, with nothing said yet.
             phase = .passphrase(node: node.name,
                                 said: node.state == "attached" ? sentence(error) : nil)

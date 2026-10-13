@@ -38,7 +38,7 @@ use vox_core::node::actor::{ActorEnd, Bind, Node, NodeConfig, NodeHandle};
 use vox_core::node::api::{Fault, NodeCommand, Outcome, Secret};
 use vox_core::node::daemonipc::{
     AnchorInfo, AnchorSource, DaemonEvent, DaemonFrame, DaemonRequest, DaemonStatus, DetachCause,
-    KeepSource, NodeInfo, NodeState, Refusal, UseNode,
+    KeepSource, NodeInfo, NodeState, NodeStatus, Refusal, UseNode,
 };
 use vox_core::node::ipc::{Dispatch, Lease};
 use vox_core::node::paths::{Account, NodeName, Paths};
@@ -135,14 +135,17 @@ fn handed(h: crate::session_sink::Handed) -> Result<String, String> {
     }
 }
 
+/// A detach is pending until its actor and remembered-state cleanup have an outcome.
+type DetachOutcome = Option<Result<(), Refusal>>;
+
 /// One node's place in its life (L-1). A node with no slot is detached.
 enum Slot {
     /// Being attached; the outcome arrives here.
     Attaching(watch::Receiver<Option<Result<(), Refusal>>>),
     /// Running.
     Attached(Box<Attached>),
-    /// Being detached; `true` arrives once it is gone.
-    Detaching(watch::Receiver<bool>),
+    /// Being detached; the outcome arrives after its remembered-state cleanup finishes.
+    Detaching(watch::Receiver<DetachOutcome>),
 }
 
 /// An attached node.
@@ -153,6 +156,9 @@ struct Attached {
     generation: u64,
     /// Attached implicitly: it detaches when its last holder goes (L-3).
     implicit: bool,
+    /// The actual credential that opened this identity was empty (or this is a headless node).
+    /// Such a node cannot be Locked and does not end with its last client (ADR-031 CW-5).
+    unprotected: bool,
     /// Recorded in `.daemon/attach`, with its passphrase source (L-4).
     keep: Option<KeepSource>,
     /// Connections holding it (L-7).
@@ -234,7 +240,7 @@ impl Drop for HolderGuard {
             };
             let node = self.node.clone();
             inner.rt.spawn(async move {
-                router
+                let _ = router
                     .finish_detach(node, a, done, DetachCause::LastHolder)
                     .await;
             });
@@ -253,8 +259,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 fn begin_detach(
     slots: &mut BTreeMap<NodeName, Slot>,
     node: &NodeName,
-) -> Option<(Box<Attached>, watch::Sender<bool>)> {
-    let (tx, rx) = watch::channel(false);
+) -> Option<(Box<Attached>, watch::Sender<DetachOutcome>)> {
+    let (tx, rx) = watch::channel(None);
     match slots.insert(node.clone(), Slot::Detaching(rx)) {
         Some(Slot::Attached(a)) => Some((a, tx)),
         Some(other) => {
@@ -572,6 +578,61 @@ impl Router {
             .collect()
     }
 
+    /// The public list verifies a stopped node's persisted fact before giving it a label.
+    /// A passphrase-free node is made Ready by a real unlock, never by changing its label.
+    async fn public_nodes(&self) -> Result<Vec<NodeInfo>, Refusal> {
+        if let Err(e) = read_attach_file_checked(&self.inner.account.attach_file()) {
+            let node = match self.inner.account.nodes_on_disk().into_iter().next() {
+                Some(node) => node,
+                None => NodeName::parse("default").map_err(|e| Refusal::BadName {
+                    given: "default".into(),
+                    why: e.to_string(),
+                })?,
+            };
+            return Err(Refusal::Failed {
+                node,
+                why: format!("cannot read remembered nodes: {e}; the saved file was not changed"),
+            });
+        }
+        let mut nodes = self.nodes();
+        for info in &mut nodes {
+            if info.state == NodeState::Detached {
+                if self.no_passphrase(&info.name)? {
+                    *info = self
+                        .want(
+                            &info.name,
+                            Want::Explicit(None),
+                            None,
+                            Vec::new(),
+                            Vec::new(),
+                        )
+                        .await?
+                        .info;
+                } else {
+                    info.status = Some(NodeStatus::Locked);
+                }
+            }
+        }
+        Ok(nodes)
+    }
+
+    /// This persisted fact is only a hint to try no credential, never an unlock authority.
+    fn no_passphrase(&self, node: &NodeName) -> Result<bool, Refusal> {
+        let paths = self.inner.account.node_paths_as_they_are(node);
+        if !paths.vault_file().is_file()
+            && vox_core::node::headless::identity_file(&paths).is_file()
+        {
+            return Ok(true);
+        }
+        paths
+            .requires_passphrase()
+            .map(|required| !required)
+            .map_err(|e| Refusal::Failed {
+                node: node.clone(),
+                why: e.to_string(),
+            })
+    }
+
     /// The attached nodes, as the hello says them.
     #[must_use]
     pub fn attached(&self) -> Vec<NodeInfo> {
@@ -635,7 +696,13 @@ impl Router {
                 Some(Slot::Attached(a)) if a.generation == g.generation => {
                     g.info = self.grant(node, a, Want::Explicit(keep)).info;
                 }
-                _ => return Err(Refusal::NotAttached { node: node.clone() }),
+                _ => {
+                    return Err(Refusal::Failed {
+                        node: node.clone(),
+                        why: "its work ended before the unlock could be remembered; try again"
+                            .into(),
+                    })
+                }
             }
         }
         self.write_attach_file_held(None, was)
@@ -707,9 +774,9 @@ impl Router {
     /// **Kept with its passphrase in the Keychain** (ADR-028 K-10, ADR-014 M-6): stored only once
     /// the passphrase is proved, so a passphrase nothing checked is never stored. Attaching the
     /// node with it proves it; a node attached already, by another client or by hand, has it
-    /// checked against its vault first. A store that fails leaves the node attached but not
-    /// kept, and nothing in the Keychain, so the same request can simply be made again. The
-    /// daemon names the item by the node's own directory.
+    /// checked against its vault first. A failed store or cleanup reports what could not be
+    /// confirmed, so the person can repair the storage and retry. The daemon names the item by
+    /// the node's own directory.
     async fn keep_in_keychain(
         &self,
         node: &NodeName,
@@ -732,6 +799,15 @@ impl Router {
         self.verify_kept_passphrase(node, &g, &secret).await?;
         let account = self.keychain_account(node);
         let _file = self.inner.keep_file.lock().await;
+        // The verified grant may have ended while another writer held the file lock. Never
+        // let that old Unlock store over credentials belonging to a newer generation.
+        if !matches!(lock(&self.inner.slots).get(node),
+            Some(Slot::Attached(a)) if a.generation == g.generation)
+        {
+            return Err(failed(format!(
+                "node {node}'s state changed before its passphrase could be remembered; retry Unlock"
+            )));
+        }
         let was = self.kept_record(node)?;
         let stored = {
             let account = account.clone();
@@ -758,16 +834,25 @@ impl Router {
             }
         };
         if !kept {
-            self.forget_unrecorded_keychain(&account).await;
-            return Err(failed(format!(
-                "node {node} was detached while it was being kept, so nothing is kept"
-            )));
+            let cleanup = self.forget_unrecorded_keychain(&account).await;
+            let mut why = format!("node {node}'s state changed while its passphrase was being remembered; retry Unlock");
+            if let Err(e) = cleanup {
+                why.push_str(&format!(
+                    "; its saved passphrase could not be cleaned up: {e}"
+                ));
+            }
+            return Err(failed(why));
         }
         // Persist before forgetting a Keychain item: a failed write may leave its old entry.
         let saved = self.write_attach_file_held(None, was).await;
         if let Err(e) = saved {
-            self.forget_unrecorded_keychain(&account).await;
+            let cleanup = self.forget_unrecorded_keychain(&account).await;
             let mut refusal = self.remember_failed(node, e);
+            if let (Err(cleanup), Refusal::Failed { why, .. }) = (cleanup, &mut refusal) {
+                why.push_str(&format!(
+                    "; its saved passphrase could not be cleaned up: {cleanup}"
+                ));
+            }
             if let (Err(store), Refusal::Failed { why, .. }) = (&stored, &mut refusal) {
                 // A failed Keychain store may itself have lost the secret. Retaining the
                 // recorded entry is not a claim that its secret was restored.
@@ -776,12 +861,14 @@ impl Router {
             return Err(refusal);
         }
         if let Err(e) = stored {
-            self.forget_unrecorded_keychain(&account).await;
+            self.forget_unrecorded_keychain(&account).await.map_err(|cleanup| {
+                failed(format!("node {node} is Ready, but its passphrase could not be stored ({e}) or cleaned up ({cleanup}); correct the Keychain problem and retry"))
+            })?;
             g.notes.push(if e == crate::keychain::NO_KEYCHAIN {
-                format!("node {node} is attached; {e}")
+                format!("node {node} is Ready; {e}")
             } else {
                 format!(
-                    "node {node} is attached, but not kept: its passphrase could not be stored \
+                    "node {node} is Ready, but not remembered: its passphrase could not be stored \
                      in the Keychain: {e}"
                 )
             });
@@ -789,25 +876,28 @@ impl Router {
         Ok((g.info, g.notes))
     }
 
-    async fn forget_unrecorded_keychain(&self, account: &str) {
+    async fn forget_unrecorded_keychain(&self, account: &str) -> Result<(), String> {
         let path = self.inner.account.attach_file();
-        let Ok(recorded) = read_attach_file_checked(&path) else {
-            // An unreadable record is not evidence that its secret is unneeded.
-            return;
-        };
+        // An unreadable record is not evidence that its secret is unneeded.
+        let recorded = read_attach_file_checked(&path).map_err(|e| {
+            format!(
+                "could not read {} before deleting its saved passphrase: {e}",
+                path.display()
+            )
+        })?;
         if !recorded
             .iter()
             .any(|(_, source)| matches!(source, KeepSource::Keychain(saved) if saved == account))
         {
-            forget_in_keychain(account.to_owned()).await;
+            forget_in_keychain(account.to_owned()).await?;
         }
+        Ok(())
     }
 
-    /// Stop keeping `node` (ADR-014 M-6, #571): Vox.app's Keep Running turned off. Its line leaves
-    /// the attach file, and with it any Keychain item it names, so the daemon does not attach it
-    /// again at its next start. Attached and held by a client, it becomes a held node, detached
-    /// when its last holder goes; it is not detached now, so the app that turned Keep Running off
-    /// goes on acting as it.
+    /// Forget `node`'s restart credentials (ADR-031 CW-4). Its line leaves the attach file and
+    /// its saved Keychain item is deleted. This does not stop a held node: Lock and the app's
+    /// Forget follow successful credential removal with a requested detach. A passphrase-free
+    /// node stays Ready without stored credentials.
     ///
     /// # Errors
     /// [`Refusal::NoSuchNode`] for a node that is not on disk.
@@ -820,7 +910,7 @@ impl Router {
         {
             let mut slots = lock(&self.inner.slots);
             if let Some(Slot::Attached(a)) = slots.get_mut(node) {
-                if a.keep.take().is_some() && a.holders > 0 {
+                if a.keep.take().is_some() && a.holders > 0 && !a.unprotected {
                     a.implicit = true;
                 }
             }
@@ -829,7 +919,7 @@ impl Router {
             .await
             .map_err(|why| Refusal::Failed {
                 node: node.clone(),
-                why: format!("could not forget node {node}'s remembered state: {why}; the node was not locked; correct the storage problem and retry"),
+                why: format!("could not forget node {node}'s remembered state: {why}; this request did not stop the node; correct the storage problem and retry"),
             })?;
         Ok(())
     }
@@ -1110,9 +1200,9 @@ impl Router {
             .account
             .node_paths(node)
             .map_err(|e| failed(e.to_string()))?;
-        let handle = self
-            .handle_of(node)
-            .ok_or_else(|| Refusal::NotAttached { node: node.clone() })?;
+        let handle = self.handle_of(node).ok_or_else(|| {
+            failed("its work is not running; try again when the node is Ready".into())
+        })?;
         vox_core::node::link::b32_decode(room, "room").map_err(|e| failed(e.to_string()))?;
         let before = crate::wake::store_room(&paths, session, room)
             .ok_or_else(|| failed(format!("no session {session} is registered")))?;
@@ -1129,7 +1219,9 @@ impl Router {
                 .nodes()
                 .into_iter()
                 .find(|n| n.name == *node)
-                .ok_or_else(|| Refusal::NotAttached { node: node.clone() })?,
+                .ok_or_else(|| {
+                    failed("its record disappeared before the session could be moved".into())
+                })?,
             room: Some(room.to_owned()),
             new: false,
             joining,
@@ -1222,7 +1314,7 @@ impl Router {
         for node in &nodes {
             let Some(handle) = self.handle_of(node) else {
                 return no(format!(
-                    "node {node} is not attached, so it cannot join room {short}; nothing more \
+                    "node {node} is Locked, so it cannot join room {short}; nothing more \
                      was changed"
                 ));
             };
@@ -1972,7 +2064,8 @@ impl Router {
         let (was, going) = going;
         match going {
             Some((a, done)) => {
-                self.finish_detach(node.clone(), a, done, DetachCause::LastHolder)
+                let _ = self
+                    .finish_detach(node.clone(), a, done, DetachCause::LastHolder)
                     .await;
                 (was, true)
             }
@@ -1985,6 +2078,22 @@ impl Router {
     /// # Errors
     /// [`Refusal::NotAttached`] for a node that is not attached and not detaching.
     pub async fn detach(&self, node: &NodeName, cause: DetachCause) -> Result<(), Refusal> {
+        let unprotected = match lock(&self.inner.slots).get(node) {
+            Some(Slot::Attached(a)) => Some(a.unprotected),
+            _ => None,
+        };
+        if matches!(cause, DetachCause::Requested)
+            && match unprotected {
+                Some(yes) => yes,
+                None => self.no_passphrase(node)?,
+            }
+        {
+            // Forget removes remembered credentials separately. With no credential to forget,
+            // the node remains genuinely Ready; shutdown and rename still stop it normally.
+            self.want(node, Want::Explicit(None), None, Vec::new(), Vec::new())
+                .await?;
+            return Ok(());
+        }
         loop {
             let step = {
                 let mut slots = lock(&self.inner.slots);
@@ -1995,23 +2104,37 @@ impl Router {
                     },
                     Some(Slot::Attaching(rx)) => DStep::WaitAttach(rx.clone()),
                     Some(Slot::Detaching(rx)) => DStep::WaitDetach(rx.clone()),
+                    None if matches!(cause, DetachCause::Requested) => {
+                        // A previous cleanup may have failed after the actor stopped. Reserve
+                        // its place while retrying, so a new Unlock cannot be erased by it.
+                        let (tx, rx) = watch::channel(None);
+                        slots.insert(node.clone(), Slot::Detaching(rx));
+                        DStep::Forget(tx)
+                    }
                     None => DStep::NotAttached,
                 }
             };
             match step {
                 DStep::Go((a, done)) => {
-                    self.finish_detach(node.clone(), a, done, cause).await;
-                    return Ok(());
+                    return self.finish_detach(node.clone(), a, done, cause).await;
                 }
+                DStep::Forget(done) => return self.finish_forgetting(node, done).await,
                 DStep::WaitAttach(mut rx) => {
                     let _ = rx.wait_for(Option::is_some).await;
                 }
                 DStep::WaitDetach(mut rx) => {
-                    let _ = rx.wait_for(|d| *d).await;
-                    return Ok(());
+                    return match rx.wait_for(Option::is_some).await {
+                        Ok(result) => result
+                            .clone()
+                            .unwrap_or_else(|| Err(detach_interrupted(node))),
+                        Err(_) => Err(detach_interrupted(node)),
+                    };
                 }
                 DStep::NotAttached => {
-                    return Err(Refusal::NotAttached { node: node.clone() });
+                    return Err(Refusal::Failed {
+                        node: node.clone(),
+                        why: "its work was already stopped".into(),
+                    });
                 }
             }
         }
@@ -2078,31 +2201,43 @@ impl Router {
     /// List every node the attach file keeps as attaching (#666), and return them with their
     /// keeps. **Called before the control socket serves**, so no client ever sees a kept node as
     /// detached in the moment before [`Self::attach_kept`] starts it; idempotent.
-    pub fn mark_kept_attaching(&self) -> Vec<(NodeName, KeepSource)> {
-        let kept = read_attach_file(&self.inner.account.attach_file());
-        lock(&self.inner.starting).extend(kept.iter().map(|(n, _)| n.clone()));
-        kept
+    pub fn mark_kept_attaching(&self) -> Vec<(NodeName, Option<KeepSource>)> {
+        let mut kept: BTreeMap<_, _> = read_attach_file(&self.inner.account.attach_file())
+            .into_iter()
+            .map(|(node, source)| (node, Some(source)))
+            .collect();
+        for node in self.inner.account.nodes_on_disk() {
+            match self.no_passphrase(&node) {
+                Ok(true) => {
+                    kept.entry(node).or_insert(None);
+                }
+                Ok(false) => {}
+                Err(e) => eprintln!("vox daemon: {e}"),
+            }
+        }
+        lock(&self.inner.starting).extend(kept.keys().cloned());
+        kept.into_iter().collect()
     }
 
     /// Attach kept node `node` from its keep `source`, as [`Self::attach_kept`] does each.
-    async fn attach_one_kept(&self, node: &NodeName, source: KeepSource) {
+    async fn attach_one_kept(&self, node: &NodeName, source: Option<KeepSource>) {
         let (passphrase, rooms) = match &source {
-            KeepSource::None => (None, Vec::new()),
+            None | Some(KeepSource::None) => (None, Vec::new()),
             // Off the runtime's workers: a Keychain that asks (locked, or the item made by
             // another vox) blocks until someone answers, and two of these would otherwise leave
             // the daemon answering no one meanwhile.
-            KeepSource::Keychain(account) => match read_in_keychain(account.clone()).await {
+            Some(KeepSource::Keychain(account)) => match read_in_keychain(account.clone()).await {
                 Ok(p) => (Some(p), Vec::new()),
                 Err(e) => {
                     eprintln!(
-                        "vox daemon: could not attach kept node {node}: its passphrase in the \
+                        "vox daemon: could not make remembered node {node} Ready: its passphrase in the \
                          Keychain: {e}"
                     );
                     self.needs_passphrase(node).await;
                     return;
                 }
             },
-            KeepSource::File(path) => match crate::tunnel_cli::passphrase_file_text(path) {
+            Some(KeepSource::File(path)) => match crate::tunnel_cli::passphrase_file_text(path) {
                 Ok(text) => split_passphrases(&text),
                 Err(e) => {
                     let command = vox_text::shell::command(&[
@@ -2114,7 +2249,7 @@ impl Router {
                         &path.to_string_lossy(),
                     ]);
                     eprintln!(
-                        "vox daemon: node {node} is Locked: its remembered passphrase file {} \
+                        "vox daemon: node {node} could not become Ready: its remembered passphrase file {} \
                          is unavailable: {e}; restore the file, then run `{command}`",
                         path.display()
                     );
@@ -2123,18 +2258,12 @@ impl Router {
             },
         };
         match self
-            .want(
-                node,
-                Want::Explicit(Some(source)),
-                passphrase,
-                rooms,
-                Vec::new(),
-            )
+            .want(node, Want::Explicit(source), passphrase, rooms, Vec::new())
             .await
         {
-            Ok(_) => eprintln!("vox daemon: attached kept node {node}"),
+            Ok(_) => eprintln!("vox daemon: node {node} is Ready"),
             Err(r) => {
-                eprintln!("vox daemon: could not attach kept node {node}: {r}");
+                eprintln!("vox daemon: could not make remembered node {node} Ready: {r}");
                 self.needs_passphrase(node).await;
             }
         }
@@ -2151,7 +2280,7 @@ impl Router {
             crate::notify::needs_passphrase(
                 &paths,
                 node.as_str(),
-                &format!("It did not attach by itself. Run in a terminal: vox node unlock {node}"),
+                &format!("It could not become Ready by itself. Run in a terminal: vox node unlock {node}"),
             );
         })
         .await;
@@ -2167,6 +2296,9 @@ impl Router {
         rooms: Vec<Zeroizing<String>>,
         anchors: Vec<String>,
     ) -> Result<Granted, Refusal> {
+        if matches!(want, Want::IfAttached | Want::Session(_)) {
+            self.started(node).await;
+        }
         let mut want = Some(want);
         loop {
             let step = {
@@ -2184,15 +2316,18 @@ impl Router {
                     }
                     Some(Slot::Attaching(rx)) => Step::WaitAttach(rx.clone()),
                     Some(Slot::Detaching(rx)) => Step::WaitDetach(rx.clone()),
-                    // Neither a one-shot verb nor an agent's session attaches a node (L-2;
-                    // ADR-028 K-13).
-                    None if matches!(want, Some(Want::IfAttached | Want::Session(_))) => {
-                        Step::NotAttached
-                    }
                     None => {
-                        let (tx, rx) = watch::channel(None);
-                        slots.insert(node.clone(), Slot::Attaching(rx));
-                        Step::Mine(tx)
+                        // A protected node needs the person's Unlock. A passphrase-free
+                        // node can start only through the same real credential check below.
+                        if matches!(want, Some(Want::IfAttached | Want::Session(_)))
+                            && !self.no_passphrase(node)?
+                        {
+                            Step::NotAttached
+                        } else {
+                            let (tx, rx) = watch::channel(None);
+                            slots.insert(node.clone(), Slot::Attaching(rx));
+                            Step::Mine(tx)
+                        }
                     }
                 }
             };
@@ -2213,11 +2348,15 @@ impl Router {
                 Step::WaitDetach(mut rx) => {
                     let waited = tokio::time::timeout(
                         vox_core::node::daemonipc::DETACHING_PATIENCE,
-                        rx.wait_for(|d| *d),
+                        rx.wait_for(Option::is_some),
                     )
                     .await;
-                    if waited.is_err() {
-                        return Err(Refusal::StillDetaching { node: node.clone() });
+                    match waited {
+                        Err(_) => return Err(Refusal::StillDetaching { node: node.clone() }),
+                        Ok(Err(_)) => return Err(detach_interrupted(node)),
+                        Ok(Ok(result)) => result
+                            .clone()
+                            .unwrap_or_else(|| Err(detach_interrupted(node)))?,
                     }
                 }
                 Step::NotAttached => return Err(Refusal::NotAttached { node: node.clone() }),
@@ -2245,7 +2384,7 @@ impl Router {
                     let mut slots = lock(&self.inner.slots);
                     return match started {
                         Ok(mut a) => {
-                            a.implicit = !matches!(w, Want::Explicit(_));
+                            a.implicit = !a.unprotected && !matches!(w, Want::Explicit(_));
                             let mut granted = self.grant(node, &mut a, w);
                             // This request attached it: what that said goes back to its client.
                             granted.notes = a.notes.clone();
@@ -2267,7 +2406,7 @@ impl Router {
                                 .fetch_add(1, Ordering::Relaxed);
                             let _ = tx.send(Some(Ok(())));
                             eprintln!(
-                                "vox daemon: node {node} attached{}",
+                                "vox daemon: node {node} is Ready{}",
                                 if granted.info.implicit {
                                     " (implicitly)"
                                 } else {
@@ -2524,7 +2663,7 @@ impl Router {
             crate::app::open_rooms_by_line(&handle, line).await;
         }
         if *ended.borrow() {
-            return Err(failed("its actor stopped while it attached".into()));
+            return Err(failed("its work ended before it became Ready".into()));
         }
         // An anchor wakes no agent and notifies nobody. Manual machine anchors are followed by
         // the shared registry for every node; a node never dials its own identity.
@@ -2537,6 +2676,7 @@ impl Router {
             paths,
             generation,
             implicit: true,
+            unprotected: anchor.is_some() || pass.is_empty(),
             keep: None,
             holders: 0,
             sessions: BTreeSet::new(),
@@ -2561,7 +2701,7 @@ impl Router {
             }
         };
         if let Some((a, done)) = going {
-            self.finish_detach(node.clone(), a, done, cause).await;
+            let _ = self.finish_detach(node.clone(), a, done, cause).await;
         }
     }
 
@@ -2571,9 +2711,9 @@ impl Router {
         &self,
         node: NodeName,
         mut a: Box<Attached>,
-        done: watch::Sender<bool>,
+        done: watch::Sender<DetachOutcome>,
         cause: DetachCause,
-    ) {
+    ) -> Result<(), Refusal> {
         let _ = a.detached.send(true);
         // A panicked actor never ran its own stop (ADR-026 L-6): the presence takes the node off
         // the exchange and closes its connections, and only its own (D-5).
@@ -2603,28 +2743,50 @@ impl Router {
         if !stopped {
             self.inner.unfinished_stop.store(true, Ordering::SeqCst);
         }
-        let forget_keep = matches!(cause, DetachCause::Requested) && a.keep.is_some();
         drop(a);
-        lock(&self.inner.slots).remove(&node);
         self.inner
             .metrics
             .nodes_attached
             .fetch_sub(1, Ordering::Relaxed);
         // Detached by hand: its line goes, and with it a passphrase kept for it in the Keychain,
         // before an attach waiting for this detach can keep it again.
-        if forget_keep {
-            if let Err(e) = self.write_attach_file(Some(&node)).await {
-                eprintln!("vox daemon: could not forget node {node}: {e}");
-            }
-        }
-        let _ = done.send(true);
+        let result = if matches!(cause, DetachCause::Requested) {
+            self.finish_forgetting(&node, done).await
+        } else {
+            lock(&self.inner.slots).remove(&node);
+            let _ = done.send(Some(Ok(())));
+            Ok(())
+        };
         if !matches!(cause, DetachCause::DaemonStopping) {
-            eprintln!("vox daemon: node {node} detached ({})", cause_words(&cause));
+            eprintln!(
+                "vox daemon: node {node} finished its work ({})",
+                cause_words(&cause)
+            );
         }
         let _ = self
             .inner
             .events
             .send(DaemonEvent::Detached { node, cause });
+        result
+    }
+
+    /// Finish a requested stop (or retry one), retaining its Detaching reservation until the
+    /// registry and Keychain cleanup is over. A later Unlock may then keep its own generation.
+    async fn finish_forgetting(
+        &self,
+        node: &NodeName,
+        done: watch::Sender<DetachOutcome>,
+    ) -> Result<(), Refusal> {
+        let result = self.write_attach_file(Some(node)).await.map_err(|why| Refusal::Failed {
+            node: node.clone(),
+            why: format!("node {node} is Locked, but its remembered credentials could not be forgotten: {why}; correct the storage problem and retry"),
+        });
+        if let Err(e) = &result {
+            eprintln!("vox daemon: {e}");
+        }
+        lock(&self.inner.slots).remove(node);
+        let _ = done.send(Some(result.clone()));
+        result
     }
 
     /// Rewrite `.daemon/attach` from the kept nodes attached now and the lines already there for
@@ -2719,12 +2881,28 @@ impl Router {
                 _ => None,
             })
             .collect();
-        for k in was.values() {
-            if let KeepSource::Keychain(account) = k {
-                if !named.contains(account.as_str()) {
-                    forget_in_keychain(account.clone()).await;
+        let mut removed: BTreeSet<String> = was
+            .values()
+            .filter_map(|k| match k {
+                KeepSource::Keychain(account) => Some(account.clone()),
+                _ => None,
+            })
+            .collect();
+        // The registry removal can succeed before Keychain deletion fails. Always retry the
+        // node's canonical account, even when there is no longer a line naming its secret.
+        if let Some(node) = forget {
+            removed.insert(self.keychain_account(node));
+        }
+        let mut errors = Vec::new();
+        for account in removed {
+            if !named.contains(account.as_str()) {
+                if let Err(e) = forget_in_keychain(account).await {
+                    errors.push(e);
                 }
             }
+        }
+        if !errors.is_empty() {
+            return Err(errors.join("; "));
         }
         Ok(())
     }
@@ -2738,23 +2916,34 @@ async fn read_in_keychain(account: String) -> Result<Zeroizing<String>, String> 
 }
 
 /// Remove what the Keychain holds for `account`, off the runtime's workers.
-async fn forget_in_keychain(account: String) {
-    let _ = tokio::task::spawn_blocking(move || crate::keychain::forget(&account)).await;
+async fn forget_in_keychain(account: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::keychain::forget(&account))
+        .await
+        .unwrap_or_else(|e| Err(format!("the Keychain deletion was cut short: {e}")))
 }
 
 enum DStep {
-    Go((Box<Attached>, watch::Sender<bool>)),
+    Go((Box<Attached>, watch::Sender<DetachOutcome>)),
+    Forget(watch::Sender<DetachOutcome>),
     WaitAttach(watch::Receiver<Option<Result<(), Refusal>>>),
-    WaitDetach(watch::Receiver<bool>),
+    WaitDetach(watch::Receiver<DetachOutcome>),
     NotAttached,
 }
 
 enum Step {
     Have(Box<Granted>),
     WaitAttach(watch::Receiver<Option<Result<(), Refusal>>>),
-    WaitDetach(watch::Receiver<bool>),
+    WaitDetach(watch::Receiver<DetachOutcome>),
     NotAttached,
     Mine(watch::Sender<Option<Result<(), Refusal>>>),
+}
+
+fn detach_interrupted(node: &NodeName) -> Refusal {
+    Refusal::Failed {
+        node: node.clone(),
+        why: "the stop was interrupted before its cleanup result was known; retry the request"
+            .into(),
+    }
 }
 
 /// Stop a node's actor and wait for its task to end, however long what it is doing takes.
@@ -2797,6 +2986,7 @@ fn info_of_attached(name: &NodeName, a: &Attached) -> NodeInfo {
     NodeInfo {
         name: name.clone(),
         state: NodeState::Attached,
+        status: Some(NodeStatus::Ready),
         fingerprint: a.fingerprint,
         implicit: a.implicit,
         keep: a.keep.is_some(),
@@ -2814,6 +3004,7 @@ fn info_of(name: &NodeName, slot: Option<&Slot>) -> NodeInfo {
                 _ => NodeState::Detached,
             },
             fingerprint: None,
+            status: None,
             implicit: false,
             keep: false,
         },
@@ -2844,21 +3035,35 @@ fn read_attach_file_checked(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
-    Ok(text
-        .lines()
-        .filter_map(|line| {
-            let (name, source) = line.split_once('\t')?;
-            let name = NodeName::parse(name).ok()?;
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(i, line)| {
+            let malformed = || {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: malformed remembered-node entry on line {}",
+                        path.display(),
+                        i + 1
+                    ),
+                )
+            };
+            let (name, source) = line.split_once('\t').ok_or_else(malformed)?;
+            let name = NodeName::parse(name).map_err(|_| malformed())?;
             let source = if source == "none" {
                 KeepSource::None
-            } else if let Some(account) = source.strip_prefix("keychain:") {
+            } else if let Some(account) = source.strip_prefix("keychain:").filter(|s| !s.is_empty())
+            {
                 KeepSource::Keychain(account.to_owned())
+            } else if let Some(file) = source.strip_prefix("file:").filter(|s| !s.is_empty()) {
+                KeepSource::File(file.into())
             } else {
-                KeepSource::File(source.strip_prefix("file:")?.into())
+                return Err(malformed());
             };
-            Some((name, source))
+            Ok((name, source))
         })
-        .collect())
+        .collect()
 }
 
 impl Dispatch for Router {
@@ -2887,7 +3092,10 @@ impl Dispatch for Router {
             | DaemonRequest::ComputerPreview { .. }
             | DaemonRequest::ComputerApprove { .. }
             | DaemonRequest::ComputerCancel { .. } => self.computer_request(request).await,
-            DaemonRequest::Nodes => DaemonFrame::Nodes(self.nodes()),
+            DaemonRequest::Nodes => match self.public_nodes().await {
+                Ok(nodes) => DaemonFrame::Nodes(nodes),
+                Err(r) => refused(r),
+            },
             DaemonRequest::Attach {
                 node,
                 passphrase,
@@ -2964,13 +3172,16 @@ impl Dispatch for Router {
                 passphrase,
             } => self.room_bind(&dir, &link, passphrase).await,
             DaemonRequest::RoomDecline { dir } => self.room_decline(&dir),
-            DaemonRequest::Status => DaemonFrame::Status(DaemonStatus {
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-                pid: std::process::id(),
-                listen: self.inner.defaults.listen.clone(),
-                nodes: self.nodes(),
-                panics: self.inner.metrics.node_panics.load(Ordering::Relaxed),
-            }),
+            DaemonRequest::Status => match self.public_nodes().await {
+                Ok(nodes) => DaemonFrame::Status(DaemonStatus {
+                    version: env!("CARGO_PKG_VERSION").to_owned(),
+                    pid: std::process::id(),
+                    listen: self.inner.defaults.listen.clone(),
+                    nodes,
+                    panics: self.inner.metrics.node_panics.load(Ordering::Relaxed),
+                }),
+                Err(r) => refused(r),
+            },
             DaemonRequest::Metrics => {
                 let mut out = vox_core::node::status::Families::default();
                 self.inner.metrics.to_prometheus_rows(&mut out);

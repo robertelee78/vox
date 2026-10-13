@@ -655,9 +655,9 @@ mod journey {
                 .filter(|n| {
                     o.said.lines().any(|l| {
                         l.split_whitespace().next() == Some(**n)
-                            && l.contains("attached")
+                            && l.contains("Ready")
                             && !l.contains("not attached")
-                            && !l.contains("detached")
+                            && !l.contains("Locked")
                     })
                 })
                 .map(|n| (*n).to_owned())

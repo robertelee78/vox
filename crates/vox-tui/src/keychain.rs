@@ -117,19 +117,35 @@ mod mac {
     }
 
     /// Remove what is stored for `account`; nothing stored is not an error.
-    pub fn forget(account: &str) {
+    pub fn forget(account: &str) -> Result<(), String> {
         quiet();
         #[cfg(feature = "test-knobs")]
         if let Some(k) = test_keychain() {
-            if let Ok((_, item)) = k.and_then(|k| {
-                k.find_generic_password(super::SERVICE, account)
-                    .map_err(|e| e.to_string())
-            }) {
-                item.delete();
-            }
-            return;
+            use security_framework::item::{ItemClass, ItemSearchOptions};
+            return deleted(
+                ItemSearchOptions::new()
+                    .keychains(&[k?])
+                    .class(ItemClass::generic_password())
+                    .service(super::SERVICE)
+                    .account(account)
+                    .delete(),
+            );
         }
-        let _ = security_framework::passwords::delete_generic_password(super::SERVICE, account);
+        deleted(security_framework::passwords::delete_generic_password(
+            super::SERVICE,
+            account,
+        ))
+    }
+
+    fn deleted(result: Result<(), security_framework::base::Error>) -> Result<(), String> {
+        match result {
+            // errSecItemNotFound: the requested absence is already satisfied.
+            Ok(()) => Ok(()),
+            Err(e) if e.code() == -25300 => Ok(()),
+            Err(e) => Err(format!(
+                "the Keychain did not delete the saved passphrase: {e}"
+            )),
+        }
     }
 }
 
@@ -161,4 +177,6 @@ pub fn read(_account: &str) -> Result<zeroize::Zeroizing<String>, String> {
 
 /// Nothing is stored on this platform.
 #[cfg(not(target_os = "macos"))]
-pub fn forget(_account: &str) {}
+pub fn forget(_account: &str) -> Result<(), String> {
+    Ok(())
+}

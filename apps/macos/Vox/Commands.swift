@@ -160,19 +160,10 @@ struct VoxCommands: Commands {
         CommandGroup(replacing: .newItem) { items("File") }
         CommandMenu("Room") { items("Room") }
         CommandMenu("Node") {
-            Button("Attach…") { Task { await app.start() } }
-                .disabled(app.node != nil)
-            Button("Detach") { Task { await app.detachNode() } }
-                .disabled(app.node == nil)
-            // #666: in place of printing `vox node forget-passphrase`.
-            Button("Forget Passphrase") {
-                if let node = app.signedInAs { Task { await app.forgetPassphrase(node) } }
-            }
-            .disabled(app.signedInAs == nil)
-            Hairline()
-            // E-4: the one way to act as another node: sign out, then sign in.
-            Button("Sign Out…") { app.signingOut = true }
-                .disabled(app.signedInAs == nil)
+            Button("Unlock…") { Task { await app.attachAgain() } }
+                .disabled(app.selectedNodeStatus != "Locked")
+            Button("Forget") { Task { await app.detachNode() } }
+                .disabled(app.selectedNodeStatus != "Ready")
             items("Node")
         }
         CommandMenu("Keyring") { items("Keyring") }

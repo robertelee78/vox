@@ -657,25 +657,25 @@ pub struct DaemonArgs {
     /// counters name every peer and room this node talks to.
     #[arg(long)]
     pub metrics: Option<SocketAddr>,
-    /// The node to attach in the foreground. Without it: the only node on disk,
+    /// The node to make Ready in the foreground. Without it: the only node on disk,
     /// else `default` when there is none, else no node (the daemon runs with none).
     #[arg(long, env = "VOX_NODE")]
     pub node: Option<String>,
     /// Start the daemon in the background and return once it answers; its output goes to
-    /// `<data root>/.daemon/log`. It exits once it has no attached node and no client.
+    /// `<data root>/.daemon/log`. It exits once it has no Ready node and no client.
     #[arg(long, conflicts_with_all = ["keep", "passphrase_file"])]
     pub detach: bool,
-    /// Keep the foreground node attached across daemon restarts (`.daemon/attach`).
+    /// Remember how to make the foreground node Ready after daemon restarts (`.daemon/attach`).
     /// Its passphrase comes from `--passphrase-file` then, or it has none.
     #[arg(long)]
     pub keep: bool,
     /// For a service manager, such as the macOS login item: no foreground node and nothing
-    /// asked for, running until stopped; kept nodes attach as always. With a daemon already
+    /// asked for, running until stopped; remembered nodes become Ready as always. With a daemon already
     /// running for this data root it says so and waits, serving once that one stops.
     #[arg(long, conflicts_with_all = ["node", "keep", "passphrase_file", "detach"])]
     pub no_node: bool,
     /// How a client starts the daemon: its own session, no foreground node, and an
-    /// exit once nothing is attached and no client is connected.
+    /// exit once nothing is Ready and no client is connected.
     #[arg(long = "as-detached", hide = true)]
     pub as_detached: bool,
     /// How the macOS app's login item runs it (launchd, which restarts it after a failed exit):
@@ -684,7 +684,7 @@ pub struct DaemonArgs {
     /// start it again every ten seconds; the app quotes that line.
     #[arg(long = "login-item", hide = true)]
     pub login_item: bool,
-    /// Where the `.vox` SOCKS5 proxy listens while a node is attached. Loopback only.
+    /// Where the `.vox` SOCKS5 proxy listens while a node is Ready. Loopback only.
     #[arg(long, env = "VOX_PROXY", default_value = crate::daemon_proxy::DEFAULT_PROXY)]
     pub proxy: SocketAddr,
 }
@@ -1005,20 +1005,20 @@ enum AgentCmd {
     /// Run from a harness session at its start (the agent skill says to), when no hook has
     /// brought Vox's news: it only reads, and says the first thing missing with the one command
     /// the operator runs for it in a terminal of their own — `vox agent setup` when no node is
-    /// wired to the harness, `vox node unlock` when its node is not attached, the room ask with
+    /// wired to the harness, `vox node unlock` when its node is Locked, the room ask with
     /// `vox room join … --bind` when the directory is bound to no room — or that nothing is.
     ///
     /// For example:
     ///
     /// vox agent status --harness claude
     Status(AgentStatusArgs),
-    /// Make a node for a harness (or take one that exists), wire the harness to it, and attach it.
+    /// Make a node for a harness (or take one that exists), wire the harness to it, and unlock it.
     ///
     /// What `vox setup` does for one harness: the suggested name is <harness>-<host>, or the
     /// name you choose with --node. Type the passphrase twice in your own terminal, outside an
     /// agent session; it is never read from a file or environment variable. The harness's hook
     /// goes in its own settings with the agent skill beside it (other Vox hook entries there are
-    /// replaced, nothing else), and the node is attached. It says what it is to do first. Start
+    /// replaced, nothing else), and the node is Ready. It says what it is to do first. Start
     /// a new session of the harness afterwards.
     ///
     /// For example:
@@ -1606,7 +1606,7 @@ pub struct AccountArgs {
     /// Address the daemon binds when this command starts it.
     #[arg(long, env = "VOX_LISTEN", default_value = crate::client::DEFAULT_LISTEN)]
     pub listen: SocketAddr,
-    /// Anchors a node is attached with (`<fingerprint>@<multiaddr>`, repeatable).
+    /// Anchors a node is Ready with (`<fingerprint>@<multiaddr>`, repeatable).
     #[arg(long = "anchor", env = "VOX_ANCHORS", value_delimiter = ',')]
     pub anchors: Vec<String>,
 }
@@ -1628,7 +1628,8 @@ impl AccountArgs {
 #[derive(Subcommand, Debug, Clone)]
 pub enum NodeCmd {
     /// Make a new node: an identity with its own rooms, trust and services. Its files are
-    /// written here, and it is attached and remembered at once, as `vox node unlock` does. The
+    /// written here. At a terminal it becomes Ready; a scripted protected node stays Locked.
+    /// A node with no passphrase becomes Ready immediately. The
     /// passphrase comes from `--passphrase-file`, `VOX_IDENTITY_PASSPHRASE`, or is asked twice;
     /// an empty one gives the node none, and says that its key is then kept unencrypted.
     Create {
@@ -1657,6 +1658,7 @@ pub enum NodeCmd {
         account: AccountArgs,
     },
     /// Renamed to `vox node unlock`; unlock always remembers the node.
+    #[command(hide = true)]
     Attach {
         /// The node.
         name: String,
@@ -1669,8 +1671,8 @@ pub enum NodeCmd {
         #[command(flatten)]
         account: AccountArgs,
     },
-    /// Rename a node on this machine: detached if attached, its directory, its remembered
-    /// passphrase and every harness wired to it moved to the new name, and attached again. Its
+    /// Rename a node on this machine: stop its work, move its directory, its remembered
+    /// passphrase and every harness wired to it to the new name, and resume its work. Its
     /// identity stays: the fingerprint, and all that peers see, are the same.
     Rename {
         /// The node's name now.
@@ -1681,7 +1683,8 @@ pub enum NodeCmd {
         account: AccountArgs,
     },
     /// Forget a node's remembered passphrase: it is removed from the Keychain, and the daemon no
-    /// longer attaches the node by itself when it starts. An attached node stays attached.
+    /// longer makes the node Ready by itself when it starts. A Ready node stays Ready.
+    #[command(hide = true)]
     ForgetPassphrase {
         /// The node.
         name: String,
@@ -1689,7 +1692,8 @@ pub enum NodeCmd {
         account: AccountArgs,
     },
     /// Lock a node and forget what brings it back: its remembered passphrase and restart state.
-    /// Its rooms, messages and keys stay on disk. It stays Locked until unlocked again.
+    /// Its rooms, messages and keys stay on disk. A protected node stays Locked until Unlock;
+    /// a node with no passphrase stays Ready.
     Lock {
         /// The node.
         name: String,
@@ -1697,6 +1701,7 @@ pub enum NodeCmd {
         account: AccountArgs,
     },
     /// Renamed to `vox node lock`; lock also forgets what brings the node back.
+    #[command(hide = true)]
     Detach {
         /// The node.
         name: String,
@@ -1706,13 +1711,14 @@ pub enum NodeCmd {
     /// Sign a node out: detach it, stop keeping it (its `.daemon/attach` line and Keychain
     /// passphrase go), and forget the app's choice of it, so nothing brings it back without you.
     /// Its rooms and messages stay on disk; `vox node unlock` uses it again.
+    #[command(hide = true)]
     Signout {
         /// The node.
         name: String,
         #[command(flatten)]
         account: AccountArgs,
     },
-    /// Every node in this data root, with whether it is attached.
+    /// Every node in this data root, with whether it is Ready.
     List {
         #[command(flatten)]
         account: AccountArgs,
@@ -2072,8 +2078,8 @@ pub struct ForwardArgs {
     /// **Refused.** Use `--identity-passphrase-file`, `VOX_IDENTITY_PASSPHRASE`, or the prompt.
     #[arg(long)]
     pub identity_passphrase: Option<String>,
-    /// Read the identity passphrase from this file (first line), for attaching this node when
-    /// it is not attached.
+    /// Read the identity passphrase from this file (first line), for unlocking this node when
+    /// it is Locked.
     #[arg(long)]
     pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
@@ -2155,7 +2161,7 @@ pub struct UpArgs {
     #[command(flatten)]
     pub profile: NodeArgs,
     /// One room to open, with its passphrase, if it is closed. The proxy carries every room
-    /// the daemon's attached nodes hold: `ssh user@ssh.nas.family.vox` reaches service `ssh`
+    /// the daemon's Ready nodes hold: `ssh user@ssh.nas.family.vox` reaches service `ssh`
     /// on the node you call `nas` in room `family`, for any node you trust, in any room.
     pub room: Option<String>,
     /// **Refused**, as on every room verb: use `--passphrase-file`, or let it prompt
@@ -2205,15 +2211,15 @@ enum Cmd {
     /// Runs until stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops it cleanly.
     Node(AnchorArgs),
     /// Run this data root's daemon in the foreground: the machine's Vox presence, which the
-    /// nodes in this data root attach to.
+    /// nodes in this data root run on.
     ///
     /// There is one daemon per data root (`VOX_DATA_DIR`). It holds the one UDP port, the
     /// control socket every other `vox` command talks to (`<data root>/.daemon/vox.sock`) and
-    /// the nodes that are attached. It is not a node itself and can run with none attached.
-    /// A node is an identity; while attached it runs in full, and it stops only when it is
-    /// detached (`vox node lock`) or the daemon stops.
+    /// the Ready nodes. It is not a node itself and can run with no Ready nodes.
+    /// A node is an identity; while Ready it runs in full, and it stops only when it is
+    /// locked (`vox node lock`, for a protected node) or the daemon stops.
     ///
-    /// With `--node`, or when the data root holds exactly one node, that node is attached in
+    /// With `--node`, or when the data root holds exactly one node, that node is Ready in
     /// the foreground once its passphrase is given: from `--passphrase-file`, else
     /// `VOX_IDENTITY_PASSPHRASE`, else asked for at the terminal without echo, else read from
     /// stdin:
@@ -2223,7 +2229,7 @@ enum Cmd {
     /// echo 'my passphrase' | vox daemon --node alice
     ///
     /// `--keep` attaches that node again whenever the daemon starts. When a daemon already runs
-    /// for this data root, a `vox daemon --node <name>` attaches the node to it instead.
+    /// for this data root, a `vox daemon --node <name>` makes the node Ready to it instead.
     ///
     /// You rarely need to start it by hand: `vox serve`, `connect`, `up`, `forward`,
     /// `lan up`, `vox node unlock` and the TUI start one in the background when none runs, and
@@ -2247,7 +2253,7 @@ enum Cmd {
     Serve(ServeArgs),
     /// Join a room from the address you were given, and print the name its services
     /// answer on. One-shot: joining is durable, so there is nothing to keep
-    /// running: the daemon's proxy resolves the name while a node is attached (`vox up` says
+    /// running: the daemon's proxy resolves the name while a node is Ready (`vox up` says
     /// where it listens).
     Connect(ConnectArgs),
     /// Offer a local TCP service to a room, or list what is offered.
@@ -2266,8 +2272,8 @@ enum Cmd {
     /// Progress and its proofs (attempt starts, candidates, verdicts, delivery) are
     /// recorded on the GitHub issue through awa; `--work` carries awa's work key.
     ///
-    /// These never attach a node: they ask the vox daemon as a node that is already
-    /// attached (`vox node unlock`, or a verb or agent session holding it), which is how
+    /// These ask the vox daemon as a Ready node (`vox node unlock` makes a protected
+    /// node Ready; a passphrase-free node is Ready automatically), which is how
     /// several agent sessions share one identity per machine. None of them takes the
     /// identity passphrase; `join` and `create` take the room passphrase at a terminal, or
     /// from stdin with `--passphrase-file -`.
@@ -2310,7 +2316,7 @@ enum Cmd {
     #[command(subcommand)]
     Computer(crate::computer_cli::ComputerCmd),
     /// Say where the local entry point for rooms' services is: the vox daemon's SOCKS5 proxy,
-    /// which resolves `.vox` names and runs while any node is attached.
+    /// which resolves `.vox` names and runs while any node is Ready.
     ///
     /// This is how a tool reaches a room-bound service by name — the same shape a Tor user
     /// reaches a `.onion` through, and for the same reason: it needs no privilege of any
@@ -2393,8 +2399,8 @@ enum Cmd {
     /// update` made is replaced in place; a build from source is refused, not overwritten.
     ///
     /// On a Mac, Vox.app is replaced whole. A running vox daemon is then restarted onto the new
-    /// version: a node whose passphrase the daemon keeps is attached again, and any other node
-    /// it had attached is named, with the `vox node unlock` that attaches it again. A daemon
+    /// version: a node whose passphrase the daemon keeps is Ready again, and any other node
+    /// it had been running is named, with the `vox node unlock` that makes it Ready again. A daemon
     /// run by hand (`vox daemon` in a terminal) is left running, and you are told.
     Update {
         /// Report whether a newer release exists, and change nothing.

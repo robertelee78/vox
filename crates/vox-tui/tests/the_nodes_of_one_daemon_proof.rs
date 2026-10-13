@@ -385,7 +385,7 @@ fn a_one_shot_verb_refuses_an_unattached_node() {
         err.trim()
     );
     assert!(
-        !ok && err.contains("node b is not attached") && err.contains("vox node unlock b"),
+        !ok && err.contains("node b is Locked") && err.contains("vox node unlock b"),
         "PRODUCT: a one-shot verb for an unattached node must refuse, saying how to attach it; \
          ok={ok}: {out}{err}"
     );
@@ -430,7 +430,7 @@ fn a_foreground_serve_exits_when_its_daemon_stops() {
         // The daemon detaches its nodes as it stops, so the held verb hears either.
         !status.success()
             && (said.contains("the vox daemon stopped, so this stopped")
-                || said.contains("was detached from the vox daemon, so this stopped")),
+                || said.contains("ended, so this operation ended")),
         "PRODUCT: vox serve must exit non-zero saying its daemon stopped; it exited {status}:\n{said}"
     );
 }

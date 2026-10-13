@@ -307,7 +307,7 @@ def unlock(t):
     # A prompt, as the TUI draws one ("identity passphrase (1/1):"): not the word anywhere, since
     # the status bar says "keyring asks for the passphrase" once its window has closed.
     asks = lambda: re.search(r"passphrase \(\d+/\d+\):", t.text()) is not None
-    t.until(lambda: asks() or "attached: default" in t.text(), 20, 0.5)
+    t.until(lambda: asks() or "Ready: default" in t.text(), 20, 0.5)
     if asks():
         t.key("id pass\r", 4)
     t.key("\r", 2)
@@ -1075,8 +1075,8 @@ try:
         under = next((r for r in rows if not r.lstrip("▶ ").startswith(("offer: ", "not in keyring"))), "")
         return (bool(heads) and s[heads[0]] == f"needs you ({1 + len(offers)})"
                 and under.lstrip("▶ ").startswith("family ") and "to you 1" in under
-                and "spare  detached" in s and "default  attached" in s
-                and bool(s) and s[0] == "node default · attached")
+                and "spare  Locked" in s and "default  Ready" in s
+                and bool(s) and s[0] == "node default · Ready")
     tui.until(regions, 30, 1)
     before_ctrl_n = "\n".join(tui.display())
     if "Rooms (Enter: open" not in before_ctrl_n:
@@ -1146,7 +1146,7 @@ try:
         apparatus(f"bob's `vox tui` (pid {tui.pid}) could not be stopped to open it again")
     dt = run("bob", "node", "detach", "default")
     if dt.returncode != 0: product(f"bob's `vox node detach default` failed: {dt.stderr.strip()}")
-    default_detached = lambda: any(l.split()[:1] == ["default"] and "detached" in l
+    default_detached = lambda: any(l.split()[:1] == ["default"] and "Locked" in l
                                    for l in run("bob", "node", "list").stdout.splitlines())
     if not until(default_detached, 30, 1):
         product("bob's node never read as detached within 30 s: " + run("bob", "node", "list").stdout)
@@ -1278,7 +1278,7 @@ try:
     tui.pump(3)  # time for the window to have taken spare, were it going to
     bar, top = tui.display()[-2], (side() or [""])[0]
     claim("onenode", said and "node default" in bar and "node spare" not in bar
-          and top == "node default · attached",
+          and top == "node default · Ready",
           f"answer: {tui.display()[-1].strip()!r}; status bar: {bar.strip()!r}; sidebar: {top!r}")
     stage("to")
     # To: and urgent in the composer (ADR-028 W-4): the message carries them, as `vox room post

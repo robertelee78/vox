@@ -83,7 +83,7 @@ async fn first_missing(args: &NodeArgs, key: &str, dir: &Path) -> Result<String,
             "Vox: {what}, so this session is in no Vox room. Tell the operator, in these words: \
              \"{} has no Vox node on this machine. Choose a name for it and run this in a \
              terminal of your own; it asks there for the new node's passphrase, makes the node, \
-             wires {}'s hook to it in {} with the agent skill beside it, and attaches it. Then \
+             wires {}'s hook to it in {} with the agent skill beside it, and makes it Ready. Then \
              start a new session.\"\n    vox agent setup {} --node {name}\n\
              Never run it yourself, and never ask for the passphrase here.\n",
             h.name,
@@ -107,12 +107,18 @@ async fn first_missing(args: &NodeArgs, key: &str, dir: &Path) -> Result<String,
             ),
         ));
     }
-    if !crate::client::attached(&account, &node).await? {
+    let status = crate::client::node_status(args, &node).await?;
+    if status.is_none() {
         return Ok(format!(
-            "Vox: {} is node {node} here, and {node} is not attached, so this session is in no \
-             Vox room. Tell the operator, in these words: \"Node {node} is not attached. Run \
+            "Vox is preparing node {node}; start a new session once it is Ready.\n"
+        ));
+    }
+    if status == Some(vox_core::node::daemonipc::NodeStatus::Locked) {
+        return Ok(format!(
+            "Vox: {} is node {node} here, and {node} is Locked, so this session is in no \
+             Vox room. Tell the operator, in these words: \"Node {node} is Locked. Run \
              this in a terminal of your own; it asks there for the node's passphrase once, and \
-             Vox then remembers it and attaches the node by itself after every restart. Then \
+             Vox then remembers it and makes the node Ready by itself after every restart. Then \
              start a new session.\"\n    vox node unlock {node}\n\
              Never run it yourself, and never ask for the passphrase here.\n",
             h.name
@@ -122,7 +128,7 @@ async fn first_missing(args: &NodeArgs, key: &str, dir: &Path) -> Result<String,
     if let Some(e) = crate::room_map::resolve(&entries, dir) {
         return Ok(if e.room == crate::room_map::DECLINED {
             format!(
-                "Vox: {} is node {node}, attached; the operator said no to a room for this repo \
+                "Vox: {} is node {node}, Ready; the operator said no to a room for this repo \
                  ({}), so nothing is to be asked.\n",
                 h.name,
                 dir.display()
@@ -133,7 +139,7 @@ async fn first_missing(args: &NodeArgs, key: &str, dir: &Path) -> Result<String,
     }
     let ask = crate::room_map::note(None, true, None, &account.data_root, dir, node.as_str())
         .unwrap_or_default();
-    Ok(format!("Vox: {} is node {node}, attached.\n{ask}", h.name))
+    Ok(format!("Vox: {} is node {node}, Ready.\n{ask}", h.name))
 }
 
 /// What status says of a repo the room map binds to the room `link` names: that it works there
@@ -172,11 +178,11 @@ async fn in_bound_room(
     };
     match held {
         Ok(true) => format!(
-            "Vox: {harness} is node {node}, attached; this repo ({}) works in room {short}.\n",
+            "Vox: {harness} is node {node}, Ready; this repo ({}) works in room {short}.\n",
             dir.display()
         ),
         Ok(false) => format!(
-            "Vox: {harness} is node {node}, attached; this repo ({}) is bound to room {short}, \
+            "Vox: {harness} is node {node}, Ready; this repo ({}) is bound to room {short}, \
              and {node} is not in it, so this session cannot post there. {node} joins it by \
              itself, with the room map's passphrase, when a session starts here; if that failed, \
              Vox asks the operator (Vox.app dialog), or they run at a terminal: {}\n",
@@ -184,7 +190,7 @@ async fn in_bound_room(
             vox_text::shell::command(&["vox", "room", "join", link, "--node", node.as_str()]),
         ),
         Err(why) => format!(
-            "Vox: {harness} is node {node}, attached; this repo ({}) is bound to room {short}, \
+            "Vox: {harness} is node {node}, Ready; this repo ({}) is bound to room {short}, \
              and whether {node} is in it could not be read: {why}\n",
             dir.display()
         ),
@@ -261,9 +267,9 @@ pub async fn setup(args: &NodeArgs, key: &str, name: Option<&str>) -> Result<(),
         h.name,
         if exists { "the existing" } else { "a new" },
         if exists {
-            ", attached with its passphrase"
+            ", unlocked with its passphrase"
         } else {
-            ", made with a passphrase you type twice and attached"
+            ", made with a passphrase you type twice and made Ready"
         }
     );
     for line in wiring.effects(&name) {

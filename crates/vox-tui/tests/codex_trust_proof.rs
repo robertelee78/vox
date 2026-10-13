@@ -325,7 +325,7 @@ fn setup_replaces_light_hook(home: &Path) {
     println!("[proof] operator SSH terminal setup said:\n{said}");
     assert!(ok && said.contains(&format!("suggested node name {node}"))
         && said.contains(&format!("passphrase for {node} (Enter alone for none):"))
-        && said.contains("again:") && said.contains(&format!("node {node} attached"))
+        && said.contains("again:") && said.contains(&format!("node {node} Ready"))
         && !said.contains(secret) && !said.contains("vox agent connect")
         && !said.contains("next, run `vox agent trust"),
         "PRODUCT: terminal setup must suggest a valid harness-host name, ask for its passphrase twice without echoing it, and attach it with no extra trust step: {said}");

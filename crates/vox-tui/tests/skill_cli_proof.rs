@@ -942,13 +942,13 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
         );
         let want = [
             "VOX STATUS SAID:".to_owned(),
-            format!("{name} is node {node}, attached."),
+            format!("{name} is node {node}, Ready."),
             ASK.to_owned(),
             bind.clone(),
         ];
         assert!(
             want.iter().all(|w| said.contains(w.as_str())),
-            "PRODUCT: {name}'s session with node {node} attached and no room did not say so: \
+            "PRODUCT: {name}'s session with node {node} Ready and no room did not say so: \
              `vox agent status`, run as the pack says, was to print {want:?}; the session \
              printed:\n{said}"
         );

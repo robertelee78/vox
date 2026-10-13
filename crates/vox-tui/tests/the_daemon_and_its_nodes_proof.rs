@@ -88,6 +88,7 @@ impl Account {
         let data = tmp.path().join("d");
         let cfg = tmp.path().join("c");
         std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(tmp.path().join("home")).unwrap();
         // Every new unlock remembers: use only this proof's private Keychain on a Mac.
         if cfg!(target_os = "macos") {
             test_knobs::require(&["VOX_TEST_KEYCHAIN"]);
@@ -130,7 +131,7 @@ impl Account {
         c.env_clear()
             // A proof's daemon never takes port 1080 (.cargo/config.toml).
             .env("VOX_PROXY", "127.0.0.1:0");
-        for key in ["PATH", "HOME", "TMPDIR"] {
+        for key in ["PATH", "TMPDIR"] {
             if let Some(v) = std::env::var_os(key) {
                 c.env(key, v);
             }
@@ -145,6 +146,7 @@ impl Account {
                 .arg(self._tmp.path().join("identity.pass"));
         }
         c.env("VOX_TEST_KEYCHAIN", self._tmp.path().join("k.keychain-db"))
+            .env("HOME", self._tmp.path().join("home"))
             .env("VOX_NOTIFY_COMMAND", self._tmp.path().join("notify"))
             .env("VOX_DATA_DIR", &self.data)
             .env("VOX_CONFIG_DIR", &self.cfg)
@@ -350,7 +352,7 @@ fn one_nodes_panic_detaches_it_and_the_other_node_goes_on() {
         "PRODUCT (staging): vox node attach b failed: {out}{err}"
     );
     d.expect("node b attached", Duration::from_secs(30), |l| {
-        l.starts_with("vox daemon: node b attached")
+        l.starts_with("vox daemon: node b is Ready")
     });
     let (ok, _, err) = a.hook("b", "s-b", "UserPromptSubmit");
     assert!(ok, "PRODUCT: b's hook failed: {err}");
@@ -367,9 +369,9 @@ fn one_nodes_panic_detaches_it_and_the_other_node_goes_on() {
     );
     eprintln!("[proof] the post that panics node a exited ok={posted}");
     d.expect(
-        "that node a detached because its actor panicked",
+        "that node a finished its work because its actor panicked",
         Duration::from_secs(20),
-        |l| l.starts_with("vox daemon: node a detached (its actor panicked"),
+        |l| l.starts_with("vox daemon: node a finished its work (its actor panicked"),
     );
     let (b_ok, b_out, b_err) = a.run(&["room", "list", "--node", "b"], "");
     assert!(
@@ -455,7 +457,7 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
     assert!(
         !a.log()
             .lines()
-            .any(|l| l.starts_with("vox daemon: node agent attached")),
+            .any(|l| l.starts_with("vox daemon: node agent is Ready")),
         "PRODUCT: a hook attached its node (ADR-028 K-13)\nlog:\n{}",
         a.log()
     );
@@ -548,6 +550,26 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
 #[test]
 #[ignore = "real binaries with production Argon2id; run in release"]
 fn a_kept_node_and_its_room_come_back_after_a_restart() {
+    // Observe the saved-credential outcome through macOS's public Keychain tool. Never request
+    // the password (-w/-g), and never search a real or default Keychain.
+    fn saved_item(a: &Account, keychain: &Path) -> std::process::Output {
+        let accessible = Command::new("/usr/bin/security")
+            .args(["unlock-keychain", "-p", ""])
+            .arg(keychain)
+            .output()
+            .expect("APPARATUS: open this proof's private Keychain");
+        assert!(
+            accessible.status.success(),
+            "APPARATUS: private Keychain is not accessible: {}",
+            String::from_utf8_lossy(&accessible.stderr)
+        );
+        Command::new("/usr/bin/security")
+            .args(["find-generic-password", "-s", "us.vox.node", "-a"])
+            .arg(a.data.join("nodes/default"))
+            .arg(keychain)
+            .output()
+            .expect("APPARATUS: query saved credential in private Keychain")
+    }
     // Keep the old attach file readable while refusing atomic replacement on a Mac. Elsewhere
     // a directory at the destination stages unreadable-record refusal; its old file is restored
     // before retry. Drop restores either fixture even if a PRODUCT assertion panics.
@@ -642,8 +664,8 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         let (_, shown, err) = a.run(&["node", "list"], "");
         assert!(
             shown.lines().any(|l| l.starts_with("default ")
-                && l.contains("attached")
-                && !l.contains("(kept)")),
+                && l.contains("Ready")
+                && !l.contains("(remembered)")),
             "PRODUCT: a failed first remember must not appear kept: {shown}{err}"
         );
     }
@@ -671,7 +693,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         "APPARATUS: temporarily forget the Ready node: {out}{err}"
     );
     let (_, listed, err) = a.run(&["node", "list"], "");
-    assert!(listed.lines().any(|l| l.starts_with("default ") && l.contains("attached") && !l.contains("(kept)")),
+    assert!(listed.lines().any(|l| l.starts_with("default ") && l.contains("Ready") && !l.contains("(remembered)")),
         "APPARATUS: empty-input refusal needs a protected Ready but unremembered node: {listed}{err}");
     let empty = pass.with_extension("empty");
     std::fs::write(&empty, "\n").expect("APPARATUS: empty passphrase input");
@@ -689,9 +711,9 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         "PRODUCT: a Ready protected node must reject empty input instead of remembering no passphrase: {out}{err}");
     let (_, listed, err) = a.run(&["node", "list"], "");
     assert!(
-        listed
-            .lines()
-            .any(|l| l.starts_with("default ") && l.contains("attached") && !l.contains("(kept)")),
+        listed.lines().any(|l| l.starts_with("default ")
+            && l.contains("Ready")
+            && !l.contains("(remembered)")),
         "PRODUCT: rejected empty input must leave the Ready node unremembered: {listed}{err}"
     );
     let (ok, out, err) = a.run(
@@ -743,7 +765,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         "PRODUCT: the kept node's room did not come back after the restart\nlog:\n{log}"
     );
     assert!(
-        log.contains("vox daemon: attached kept node default"),
+        log.contains("vox daemon: node default is Ready"),
         "PRODUCT: the restart did not say it attached the kept node\nlog:\n{log}"
     );
 
@@ -761,9 +783,9 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
     assert!(ok, "APPARATUS: restart after lock: {out}{err}");
     let (_, listed, err) = a.run(&["node", "list"], "");
     assert!(
-        listed
-            .lines()
-            .any(|l| l.starts_with("default ") && l.contains("detached") && !l.contains("(kept)")),
+        listed.lines().any(|l| l.starts_with("default ")
+            && l.contains("Locked")
+            && !l.contains("(remembered)")),
         "PRODUCT: lock must survive a daemon restart: {listed}{err}"
     );
     let (ok, out, err) = a.run(
@@ -788,8 +810,9 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         "PRODUCT: lock/unlock must preserve the room and its messages: {out}{err}"
     );
 
-    // A remembered node whose secret is unavailable is already stopped. Lock must still forget
-    // its restart entry; restoring that secret later must not bring it back.
+    // A remembered node whose secret is unavailable is already stopped. A missing Keychain
+    // cannot confirm deletion: Lock must report that failure, then permit a retry after it is
+    // restored even though the restart entry was already removed.
     stop_pid(
         a.lock_pid()
             .expect("APPARATUS: daemon before missing secret"),
@@ -800,6 +823,14 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         pass.clone()
     };
     let away = remembered.with_extension("away");
+    if cfg!(target_os = "macos") {
+        let item = saved_item(&a, &remembered);
+        assert!(
+            item.status.success(),
+            "APPARATUS: the saved credential to forget is absent: {}",
+            String::from_utf8_lossy(&item.stderr)
+        );
+    }
     std::fs::rename(&remembered, &away).expect("APPARATUS: temporarily remove remembered secret");
     let (ok, out, err) = a.run(&["daemon", "--detach"], "");
     assert!(
@@ -810,7 +841,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         wait_until(Duration::from_secs(30), || {
             let (_, shown, _) = a.run(&["node", "list"], "");
             shown.lines().any(|l| {
-                l.starts_with("default ") && l.contains("detached") && l.contains("(kept)")
+                l.starts_with("default ") && l.contains("Locked") && l.contains("(remembered)")
             })
         }),
         "APPARATUS: the missing secret did not leave a remembered, stopped node: {}",
@@ -825,17 +856,48 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         );
     }
     let (ok, out, err) = a.run(&["node", "detach", "default"], "");
+    if cfg!(target_os = "macos") {
+        assert!(!ok && err.contains("could not forget") && err.contains("keychain")
+            && err.contains("retry") && !out.contains("Locked and forgotten"),
+            "PRODUCT: an unavailable Keychain must refuse full forgotten success and explain retry: {out}{err}");
+        let (_, shown, err) = a.run(&["node", "list"], "");
+        assert!(shown.lines().any(|l| l.starts_with("default ") && l.contains("Locked") && !l.contains("(remembered)")),
+            "PRODUCT: failed secret deletion must show that the restart entry was removed: {shown}{err}");
+    } else {
+        assert!(
+            ok && out.contains("Locked and forgotten"),
+            "PRODUCT: detach must forget an already-stopped node's restart file: {out}{err}"
+        );
+    }
     assert!(
-        ok && err.contains("`vox node detach` is now `vox node lock`")
-            && out.contains("Locked and forgotten"),
-        "PRODUCT: detach must forget an already-stopped node and print the lock alias: {out}{err}"
+        err.contains("`vox node detach` is now `vox node lock`"),
+        "PRODUCT: detach must print the lock alias: {out}{err}"
     );
-    stop_pid(a.lock_pid().expect("APPARATUS: stopped node's daemon"));
     std::fs::rename(&away, &remembered).expect("APPARATUS: restore remembered secret");
+    if cfg!(target_os = "macos") {
+        let item = saved_item(&a, &remembered);
+        assert!(
+            item.status.success(),
+            "APPARATUS: restore did not make the saved credential available: {}",
+            String::from_utf8_lossy(&item.stderr)
+        );
+    }
+    let (ok, out, err) = a.run(&["node", "lock", "default"], "");
+    assert!(ok && out.contains("Locked and forgotten"),
+        "PRODUCT: after restoring secret storage, Lock must retry cleanup without a restart entry: {out}{err}");
+    if cfg!(target_os = "macos") {
+        let item = saved_item(&a, &remembered);
+        // security exposes errSecItemNotFound (-25300) as exit status 44. An access/OS error
+        // is not absence, and finding the item means Vox falsely claimed it was forgotten.
+        assert_eq!(item.status.code(), Some(44),
+            "PRODUCT: successful Lock must delete the saved Keychain credential, not only its restart entry: status={} {}",
+            item.status, String::from_utf8_lossy(&item.stderr));
+    }
+    stop_pid(a.lock_pid().expect("APPARATUS: stopped node's daemon"));
     let (ok, out, err) = a.run(&["daemon", "--detach"], "");
     assert!(ok, "APPARATUS: restart after restoring secret: {out}{err}");
     let (_, shown, err) = a.run(&["node", "list"], "");
-    assert!(shown.lines().any(|l| l.starts_with("default ") && l.contains("detached") && !l.contains("(kept)")),
+    assert!(shown.lines().any(|l| l.starts_with("default ") && l.contains("Locked") && !l.contains("(remembered)")),
         "PRODUCT: locking an already-stopped node must survive secret restoration and restart: {shown}{err}");
     let (ok, out, err) = a.run(
         &[
@@ -873,10 +935,14 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
                 && !out.contains("Ready and remembered") && !out.contains("Locked and forgotten"),
                 "PRODUCT: unreadable remembered state must be refused without claiming a change: {out}{err}");
         }
-        let (_, shown, err) = a.run(&["node", "list"], "");
-        assert!(shown.lines().any(|l| l.starts_with("default ") && l.contains("attached") && l.contains("(kept)")),
-            "PRODUCT: an unreadable file must not erase the last known remembered state: {shown}{err}");
+        let (ok, shown, err) = a.run(&["node", "list"], "");
+        assert!(!ok && err.contains("cannot read remembered nodes")
+            && err.contains("the saved file was not changed") && !shown.contains("Ready"),
+            "PRODUCT: an unreadable remembered-state file must refuse a public listing rather than guess: {shown}{err}");
     }
+    let (ok, shown, err) = a.run(&["node", "list"], "");
+    assert!(ok && shown.lines().any(|l| l.starts_with("default ") && l.contains("Ready") && l.contains("(remembered)")),
+        "PRODUCT: restoring the unreadable fixture must show the unchanged Ready and remembered node: {shown}{err}");
     {
         let _blocked = UnwritableAttach::new(attach_file.clone(), false);
         let (ok, out, err) = a.run(&["node", "lock", "default"], "");
@@ -890,8 +956,8 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
             "PRODUCT: failed persistence must not claim lock forgot the node: {out}{err}"
         );
         let (_, shown, err) = a.run(&["node", "list"], "");
-        assert!(shown.lines().any(|l| l.starts_with("default ") && l.contains("attached")
-            && (!cfg!(target_os = "macos") || l.contains("(kept)"))),
+        assert!(shown.lines().any(|l| l.starts_with("default ") && l.contains("Ready")
+            && (!cfg!(target_os = "macos") || l.contains("(remembered)"))),
             "PRODUCT: failed forgetting must leave the node Ready and show its surviving remembered state: {shown}{err}");
     }
     stop_pid(a.lock_pid().expect("APPARATUS: daemon after failed lock"));
@@ -937,12 +1003,13 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
             "",
         );
         assert!(
-            !ok && err.contains("Ready but not remembered")
+            !ok && err.contains("Ready, but remembering could not be confirmed")
+                && err.contains("keychain")
                 && !out.contains("Ready and remembered"),
             "PRODUCT: a failed remember must fail unlock and name its partial state: {out}{err}"
         );
         let (_, listed, err) = a.run(&["node", "list"], "");
-        assert!(listed.lines().any(|l| l.starts_with("default ") && l.contains("attached") && !l.contains("(kept)")),
+        assert!(listed.lines().any(|l| l.starts_with("default ") && l.contains("Ready") && !l.contains("(remembered)")),
             "PRODUCT: failed Keychain storage must clear the previous remembered state: {listed}{err}");
         stop_pid(
             a.lock_pid()
@@ -954,8 +1021,8 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         let (_, listed, err) = a.run(&["node", "list"], "");
         assert!(
             listed.lines().any(|l| l.starts_with("default ")
-                && l.contains("detached")
-                && !l.contains("(kept)")),
+                && l.contains("Locked")
+                && !l.contains("(remembered)")),
             "PRODUCT: the cleared remembered state must survive restart: {listed}{err}"
         );
         let (ok, out, err) = a.run(
@@ -1006,7 +1073,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
          {attach}"
     );
     assert!(
-        !line.contains(" attached") && !line.contains("(kept)"),
+        !line.contains(" Ready") && !line.contains("(remembered)"),
         "PRODUCT: signed out, `vox node list` must say default is detached and not kept: {line:?}"
     );
     assert!(
@@ -1047,7 +1114,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
     let log = a.log();
     stop_pid(pid);
     assert!(
-        !again.contains(" attached"),
+        !again.contains(" Ready"),
         "PRODUCT: signed out, node default must not be attached again by a daemon's start: \
          {again:?}\nlog:\n{log}"
     );
@@ -1433,7 +1500,7 @@ fn a_detach_answers_only_after_the_seal_in_flight_ends() {
     assert!(
         a.log()
             .lines()
-            .any(|l| l.starts_with("vox daemon: node agent detached (asked to)")),
+            .any(|l| l.starts_with("vox daemon: node agent finished its work (asked to)")),
         "PRODUCT: the detach was not said\nlog:\n{}",
         a.log()
     );
@@ -1523,7 +1590,7 @@ fn a_hook_is_answered_within_its_bound_while_its_node_detaches() {
             a.log()
         );
         assert!(
-            out.contains("node agent is still detaching; this turn reads nothing"),
+            out.contains("node agent's work is still stopping; this turn reads nothing"),
             "PRODUCT: the hook's one line does not say the node is still detaching: {out}"
         );
         let (_, _, _) = seal.join().unwrap();
@@ -1669,8 +1736,7 @@ fn a_hook_answers_within_a_second_while_the_daemon_attaches_its_kept_nodes() {
     assert!(
         ok && took < Duration::from_secs(1)
             && said.contains(
-                "Vox: node kept1 is attaching (the vox daemon has just started); this session \
-                 joins it once it is attached, and your rooms show from your next turn."
+                "Vox is preparing node kept1; this session joins it once it is Ready, and your rooms show from your next turn."
             ),
         "PRODUCT: with no daemon running, a hook as a kept node must answer within 1 s, saying \
          the node is attaching and the rooms show from the next turn; it took {took:?} and \
@@ -1681,7 +1747,7 @@ fn a_hook_answers_within_a_second_while_the_daemon_attaches_its_kept_nodes() {
         a.run(&["node", "list"], "")
             .1
             .lines()
-            .any(|l| l.starts_with("kept1 ") && l.contains(" attached"))
+            .any(|l| l.starts_with("kept1 ") && l.contains(" Ready"))
     });
     assert!(
         attached,
@@ -1942,7 +2008,7 @@ fn the_daemons_log_is_bounded_counted_and_named_in_status() {
     );
     let detached: Vec<_> = log
         .lines()
-        .filter(|l| l.contains("node default detached"))
+        .filter(|l| l.contains("node default finished its work"))
         .collect();
     assert_eq!(
         detached.len(),

@@ -9,6 +9,7 @@ import SwiftUI
 
 struct MainWindow: View {
     @ObservedObject var model: NodeModel
+    @ObservedObject private var app = AppModel.shared
     /// The sidebar's width at launch, the one last kept, read once for this window.
     @State private var sidebarIdeal = Columns.width(.sidebar)
 
@@ -16,6 +17,22 @@ struct MainWindow: View {
         VStack(spacing: 0) {
             if model.ended != nil || !model.daemonReachable {
                 NodeStopped(model: model)
+                Divider()
+            }
+            if let said = app.keepNodeSaid, said.node == model.node, app.attachNodeAsk == nil {
+                HStack(alignment: .top, spacing: Space.s12) {
+                    Text(said.message).foregroundStyle(.red)
+                        .textSelection(.enabled)
+                        .accessibilityIdentifier("node-stopped-unlock-error")
+                    Spacer()
+                    if model.nodeStatus != "Locked" {
+                        Button("Retry Unlock…") { app.attachNodeAsk = model.node }
+                            .accessibilityIdentifier("node-unlock-retry")
+                    }
+                    Button("Dismiss") { app.dismissKeepNodeError(model.node) }
+                        .accessibilityIdentifier("node-unlock-error-dismiss")
+                }
+                .padding(Space.s12)
                 Divider()
             }
             if model.daemonReachable && (!model.health.isEmpty || !model.recovered.isEmpty) {
@@ -139,7 +156,7 @@ private struct Sidebar: View {
             // + that makes a room or joins one, as Room > New Room… and Join Room… do.
             Section {
                 HStack {
-                    NodeIdentity(name: model.node, attached: model.ended == nil, known: model.daemonReachable)
+                    NodeIdentity(name: model.node, status: model.nodeStatus)
                         .copyMenu([("Copy Name", model.node)])
                         .accessibilityIdentifier(model.ended == nil ? "attached" : "detached")
                     Spacer()
@@ -179,7 +196,9 @@ private struct Sidebar: View {
         }
         .listStyle(.sidebar)
         // The nodes on this Mac, at the sidebar's foot (G5), whatever the rooms above scroll to.
-        .safeAreaInset(edge: .bottom, spacing: 0) { OnThisMachine(nodes: model.nodes, known: model.daemonReachable) }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            OnThisMachine(nodes: model.nodes, known: model.daemonReachable && model.machineStateKnown)
+        }
         // On bg.panel, not the system's sidebar material (L-6), drawn where the sidebar's
         // vibrancy cannot tint it (PanelFill).
         .scrollContentBackground(.hidden)
@@ -278,10 +297,9 @@ private struct SelectionFill: NSViewRepresentable {
 /// attached", the dot in the accent because attached is live (L-3).
 private struct NodeIdentity: View {
     let name: String
-    /// False once the node stopped or was detached from outside (P12): said, not hidden.
-    var attached = true
-    var known = true
-    private var state: String { known ? (attached ? "attached" : "detached") : "unknown" }
+    /// The daemon supplies Ready or Locked; unavailable remains distinct.
+    var status: String? = nil
+    private var state: String { status ?? "unavailable" }
 
     var body: some View {
         HStack(alignment: .center, spacing: Space.s8) {
@@ -289,7 +307,7 @@ private struct NodeIdentity: View {
             VStack(alignment: .leading, spacing: Space.s4) {
                 Text(name).fontWeight(.semibold)
                 HStack(spacing: Space.s4) {
-                    Circle().fill(known && attached ? VoxTokens.Colors.accent : VoxTokens.Colors.danger)
+                    Circle().fill(status == "Ready" ? VoxTokens.Colors.accent : VoxTokens.Colors.danger)
                         .frame(width: 6, height: 6)
                     Text("node \(state)").secondaryText()
                 }
@@ -324,10 +342,10 @@ private struct OnThisMachine: View {
                     HStack {
                         Text(node.name)
                         Spacer()
-                        Text(known ? node.state : "unknown").secondaryText()
+                        Text(known ? (node.status ?? "unavailable") : "unavailable").secondaryText()
                     }
                     .accessibilityElement(children: .ignore)
-                    .accessibilityLabel("\(node.name) \(known ? node.state : "unknown")")
+                    .accessibilityLabel("\(node.name) \(known ? (node.status ?? "unavailable") : "unavailable")")
                     .contextMenu {
                         Button("Copy Name") { Self.copy(node.name) }
                         if !node.fingerprint.isEmpty {
@@ -335,20 +353,21 @@ private struct OnThisMachine: View {
                             Button("Copy Name and Fingerprint") { Self.copy("\(node.name) <\(node.fingerprint)>") }
                         }
                         // #666: in place of printing `vox node forget-passphrase`.
-                        if node.keep {
-                            Button("Forget Passphrase") {
+                        if known {
+                            Button("Forget") {
                                 Task { await AppModel.shared.forgetPassphrase(node.name) }
                             }
                             .accessibilityIdentifier("machine-forget-\(node.name)")
+                            .disabled(node.status != "Ready")
                         }
                     }
                     .accessibilityIdentifier("machine-\(node.name)")
                     // A node that waits for its passphrase is attached from here, and remembered
                     // (#666): it then attaches by itself after every restart.
-                    if known && node.state != "attached" {
-                        Button("Attach…") { AppModel.shared.attachNodeAsk = node.name }
+                    if known && node.status == "Locked" {
+                        Button("Unlock…") { AppModel.shared.attachNodeAsk = node.name }
                             .buttonStyle(.link)
-                            .accessibilityLabel("Attach node \(node.name)")
+                            .accessibilityLabel("Unlock node \(node.name)")
                             .accessibilityIdentifier("machine-attach-\(node.name)")
                     }
                 }
@@ -1823,7 +1842,7 @@ private struct NodeStopped: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             StateMark(kind: .danger, words: model.daemonReachable
-                      ? (model.ended ?? "Node \(model.node) is detached.")
+                      ? (model.ended ?? "Node \(model.node) is unavailable.")
                       : (model.daemonFailure ?? "The daemon cannot be reached. Node states and peers are unknown; Vox is reconnecting."))
                 .textSelection(.enabled)
                 .accessibilityIdentifier("node-stopped")
@@ -1831,20 +1850,20 @@ private struct NodeStopped: View {
                 Button("Restart Daemon") { Task { await AppModel.shared.restartDaemon() } }
                     .accessibilityIdentifier("node-stopped-restart-daemon")
             }
-            if model.daemonReachable {
-                Text("Nothing you typed is lost. Type node \(model.node)'s identity passphrase to attach "
-                    + "it again; leave it empty if it needs none.")
+            if model.nodeStatus == "Locked" {
+                Text("Nothing you typed is lost. Unlock node \(model.node) with its identity passphrase.")
                     .secondaryText()
                 HStack {
                     SecureInput(holder: field) { again() }
                         .frame(width: Theme.scaled(260))
                         .accessibilityIdentifier("node-stopped-passphrase")
                         .accessibilityLabel("Identity passphrase for node \(model.node)")
-                    Button("Attach Again") { again() }
+                    Button("Unlock…") { again() }
                         .accessibilityIdentifier("node-stopped-attach")
-                    Button("Start Over") { Task { await AppModel.shared.start() } }
-                        .accessibilityIdentifier("node-stopped-start-over")
                 }
+            } else {
+                Button("Try Again") { Task { await model.refreshMachineState() } }
+                    .accessibilityIdentifier("node-stopped-start-over")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1852,8 +1871,8 @@ private struct NodeStopped: View {
     }
 
     private func again() {
-        let secret = field.take()
-        Task { await model.attachAgain(secret) }
+        guard let secret = field.take() else { return }
+        Task { await AppModel.shared.keepNode(model.node, passphrase: secret) }
     }
 }
 
