@@ -207,6 +207,12 @@ status as such, not as model acceptance. Do not launch another worker/model, dri
 the operator to prompt it just to simulate a wake. Runtime attention/wake changes belong to
 [Vox #812](https://github.com/robertelee78/vox/issues/812); this skill handles the current limitation.
 
+Model-capacity errors and pending permission prompts can stall an open Session. Name a reported
+or observed cause; do not infer it from silence. Recover within existing authority and supported
+capabilities, including an authorized model change, without bypassing permissions. After the fix,
+obtain a fresh activity and scope acknowledgement, and reconcile the existing or cancelled
+assignment before counting the worker available.
+
 The recipient must explicitly acknowledge the scope in the room; a receipt-only `ack` is not
 agreement. Use the post's directional visibility report and the recipient's answer; seeing their
 message does not establish that they can read yours. Confirm that the worker can obtain the needed
