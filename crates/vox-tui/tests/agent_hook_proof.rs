@@ -4939,7 +4939,8 @@ fn room_ask_step() {
     );
     assert!(ok, "APPARATUS: public agent status command failed: {err}");
     assert!(
-        !asks.contains(&repo.to_string_lossy().to_string())
+        asks.contains("the operator said no to a room for this repo")
+            && asks.contains("so nothing is to be asked")
             && !next.contains("isn't tied to a Vox room"),
         "PRODUCT: declined repo must not ask the next Session again: {next}; {asks}{err}"
     );
