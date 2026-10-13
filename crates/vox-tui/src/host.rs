@@ -37,8 +37,8 @@ use vox_core::nat::bootstrap::BootstrapSet;
 use vox_core::node::actor::{ActorEnd, Bind, Node, NodeConfig, NodeHandle};
 use vox_core::node::api::{Fault, NodeCommand, Outcome, Secret};
 use vox_core::node::daemonipc::{
-    DaemonEvent, DaemonFrame, DaemonRequest, DaemonStatus, DetachCause, KeepSource, NodeInfo,
-    NodeState, Refusal, UseNode,
+    AnchorInfo, AnchorSource, DaemonEvent, DaemonFrame, DaemonRequest, DaemonStatus, DetachCause,
+    KeepSource, NodeInfo, NodeState, Refusal, UseNode,
 };
 use vox_core::node::ipc::{Dispatch, Lease};
 use vox_core::node::paths::{Account, NodeName, Paths};
@@ -60,9 +60,9 @@ pub struct Defaults {
     /// Where a node binds when it attaches (ADR-026 D-3): the daemon's one presence once it is
     /// shared; `None` attaches a node off the network.
     pub bind: BindFor,
-    /// The daemon's anchors (`--anchor`), given to every node beside its own anchors file.
+    /// The startup command-line anchors, already validated.
     pub anchors: BootstrapSet,
-    /// The specs the anchors came from, which a node's anchor follow re-resolves.
+    /// The command-line specs, which the machine refresh re-resolves.
     pub anchor_specs: Vec<String>,
     /// The address the daemon listens on, as its status says it.
     pub listen: String,
@@ -83,6 +83,9 @@ struct Inner {
     account: Account,
     rt: Handle,
     defaults: Defaults,
+    /// One machine set, serializing refresh and attachment so every node receives the same
+    /// complete manual configuration. Room anchors remain owned by their rooms.
+    manual_anchors: tokio::sync::Mutex<MachineAnchors>,
     slots: Mutex<BTreeMap<NodeName, Slot>>,
     /// For a headless node in the anchor role, the creators whose rooms it serves; absent, any
     /// room (`vox node --serve`, ADR-026 N-5).
@@ -116,6 +119,12 @@ struct Inner {
     codex: Arc<crate::codex_mirror::CodexMirror>,
     /// OpenCode sessions' activity, read through Vox's OpenCode plugin (ADR-029 #542).
     opencode: Arc<crate::opencode_mirror::OpenCodeMirror>,
+}
+
+struct MachineAnchors {
+    specs: Vec<String>,
+    set: BootstrapSet,
+    skipped: Vec<String>,
 }
 
 /// A member's answer as the sink took it: handed to the harness, or why not.
@@ -288,6 +297,11 @@ impl Router {
                     opencode,
                     account,
                     rt,
+                    manual_anchors: tokio::sync::Mutex::new(MachineAnchors {
+                        specs: defaults.anchor_specs.clone(),
+                        set: defaults.anchors.clone(),
+                        skipped: Vec::new(),
+                    }),
                     defaults,
                     slots: Mutex::new(BTreeMap::new()),
                     events: broadcast::channel(256).0,
@@ -309,9 +323,77 @@ impl Router {
             }),
         };
         router.follow_attached_with_the_proxy();
+        router.follow_machine_anchors();
         router.follow_local_trust();
         router.follow_computer_trust();
         router
+    }
+
+    /// Re-read and re-resolve manual inputs once for this daemon, including removals. DNS runs
+    /// on a blocking worker. The task holds the router weakly and ends when the daemon stops.
+    fn follow_machine_anchors(&self) {
+        let weak = Arc::downgrade(&self.inner);
+        self.inner.rt.spawn(async move {
+            loop {
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                if inner.stopping.load(Ordering::SeqCst) {
+                    return;
+                }
+                Router { inner }.refresh_manual_anchors(&[]).await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+    }
+
+    /// Command-line anchors are manual machine inputs for this daemon's life. Every refreshed
+    /// set replaces the previous set on every attached node, including an empty set.
+    async fn refresh_manual_anchors(&self, extra: &[String]) -> (BootstrapSet, Vec<String>) {
+        let mut state = self.inner.manual_anchors.lock().await;
+        for spec in extra.iter().filter(|spec| !spec.trim().is_empty()) {
+            if !state.specs.contains(spec) {
+                state.specs.push(spec.clone());
+            }
+        }
+        let (account, specs) = (self.inner.account.clone(), state.specs.clone());
+        let resolved = tokio::task::spawn_blocking(move || {
+            let mut set = BootstrapSet::new();
+            let mut skipped = vox_core::node::link::merge_machine_anchors(&mut set, &account)
+                .unwrap_or_else(|error| vec![error.to_string()]);
+            for spec in specs {
+                if let Err(error) = vox_core::node::link::merge_anchor_spec(&mut set, &spec) {
+                    skipped.push(format!("anchor {spec} is skipped: {error}"));
+                }
+            }
+            (set, skipped)
+        })
+        .await;
+        let (set, skipped) = match resolved {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let said = format!("machine anchor refresh did not finish: {error}");
+                eprintln!("vox daemon: {said}");
+                return (state.set.clone(), vec![said]);
+            }
+        };
+        if skipped != state.skipped {
+            for line in &skipped {
+                eprintln!("vox daemon: {line}");
+            }
+        }
+        state.set = set;
+        state.skipped = skipped;
+        // Keep the refresh lock until delivery finishes: an older refresh cannot overwrite a
+        // newer one, and a node becoming attached is installed under this same lock.
+        for (_, node) in self.attached_handles() {
+            let _ = node
+                .apply(NodeCommand::SetAnchors {
+                    anchors: state.set.clone(),
+                })
+                .await;
+        }
+        (state.set.clone(), state.skipped.clone())
     }
 
     /// The proxy runs while any node is attached: bound at the first attach, stopped at the last
@@ -361,6 +443,98 @@ impl Router {
                 _ => None,
             })
             .collect()
+    }
+
+    /// One machine display list, including last-known provenance from locked nodes and closed
+    /// rooms. Saved observations never enter the manual set delivered to node actors.
+    async fn anchor_list(&self) -> Result<Vec<AnchorInfo>, Refusal> {
+        let manual = self.inner.manual_anchors.lock().await;
+        let mut all = BTreeMap::new();
+        for anchor in manual.set.nodes() {
+            all.insert(
+                anchor.id,
+                AnchorInfo {
+                    fingerprint: anchor.id,
+                    addresses: anchor
+                        .endpoints
+                        .addrs()
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    sources: vec![AnchorSource::AddedByHand],
+                },
+            );
+        }
+        drop(manual);
+        let attached: BTreeMap<_, _> = self.attached_handles().into_iter().collect();
+        let mut rooms = Vec::new();
+        let mut names = BTreeMap::<Digest32, (bool, u64, String)>::new();
+        for node in self.nodes() {
+            let inventory = if let Some(handle) = attached.get(node.name.as_str()) {
+                let view = handle.view();
+                if let Some(why) = view.anchor_inventory_error {
+                    return Err(Refusal::Failed {
+                        node: node.name,
+                        why: format!("cannot read the anchor inventory: {why}"),
+                    });
+                }
+                view.room_anchors
+            } else {
+                let paths = self.inner.account.node_paths_as_they_are(&node.name);
+                vox_core::node::anchor_inventory::load(&paths).map_err(|error| Refusal::Failed {
+                    node: node.name,
+                    why: format!("cannot read the anchor inventory: {error}"),
+                })?
+            };
+            for room in inventory {
+                // Every saved local copy contributes its own observed anchors. One node leaving
+                // must not remove another node's saved-room provenance. Prefer a live shared
+                // name, then the latest observed change, without discarding either anchor set.
+                let observation = (
+                    !room.stale,
+                    room.observed_at,
+                    room.name.clone().unwrap_or_default(),
+                );
+                if names.get(&room.room).is_none_or(|old| observation > *old) {
+                    names.insert(room.room, observation);
+                }
+                rooms.push(room);
+            }
+        }
+        for room in rooms {
+            for anchor in room.anchors.nodes() {
+                let entry = all.entry(anchor.id).or_insert_with(|| AnchorInfo {
+                    fingerprint: anchor.id,
+                    addresses: Vec::new(),
+                    sources: Vec::new(),
+                });
+                entry
+                    .addresses
+                    .extend(anchor.endpoints.addrs().iter().map(ToString::to_string));
+                if let Some(AnchorSource::Room { stale, .. }) = entry.sources.iter_mut().find(
+                    |source| matches!(source, AnchorSource::Room { room: id, .. } if *id == room.room),
+                ) {
+                    // A union that contains any last-known observation is marked as such,
+                    // including an old address held by a locked local copy of the same room.
+                    *stale |= room.stale;
+                } else {
+                    entry.sources.push(AnchorSource::Room {
+                        room: room.room,
+                        name: names.get(&room.room).map_or_else(String::new, |row| row.2.clone()),
+                        stale: room.stale,
+                    });
+                }
+            }
+        }
+        Ok(all
+            .into_values()
+            .map(|mut anchor| {
+                anchor.addresses.sort();
+                anchor.addresses.dedup();
+                anchor.sources.sort();
+                anchor
+            })
+            .collect())
     }
 
     /// Every node: each on disk, and any slot besides, with its state.
@@ -2006,7 +2180,7 @@ impl Router {
                             Some(Want::Checked) | None => Want::IfAttached,
                             Some(w) => w,
                         };
-                        return Ok(self.grant(node, a, w));
+                        Step::Have(Box::new(self.grant(node, a, w)))
                     }
                     Some(Slot::Attaching(rx)) => Step::WaitAttach(rx.clone()),
                     Some(Slot::Detaching(rx)) => Step::WaitDetach(rx.clone()),
@@ -2023,6 +2197,13 @@ impl Router {
                 }
             };
             match step {
+                Step::Have(mut granted) => {
+                    if !anchors.is_empty() {
+                        let (_, notes) = self.refresh_manual_anchors(&anchors).await;
+                        granted.notes.extend(notes);
+                    }
+                    return Ok(*granted);
+                }
                 Step::WaitAttach(mut rx) => {
                     let _ = rx.wait_for(Option::is_some).await;
                 }
@@ -2048,6 +2229,19 @@ impl Router {
                     let started = self
                         .start(node, passphrase.as_ref(), &rooms, &anchors)
                         .await;
+                    // A failed attach must not change the machine inputs of running nodes.
+                    if started.is_ok() && !anchors.is_empty() {
+                        self.refresh_manual_anchors(&anchors).await;
+                    }
+                    let manual = self.inner.manual_anchors.lock().await;
+                    if let Ok(a) = &started {
+                        let _ = a
+                            .handle
+                            .apply(NodeCommand::SetAnchors {
+                                anchors: manual.set.clone(),
+                            })
+                            .await;
+                    }
                     let mut slots = lock(&self.inner.slots);
                     return match started {
                         Ok(mut a) => {
@@ -2066,6 +2260,7 @@ impl Router {
                             self.serve_drive(node, &a.handle, a.detached.subscribe());
                             slots.insert(node.clone(), Slot::Attached(a));
                             drop(slots);
+                            drop(manual);
                             self.inner
                                 .metrics
                                 .nodes_attached
@@ -2088,6 +2283,7 @@ impl Router {
                         Err(r) => {
                             slots.remove(node);
                             drop(slots);
+                            drop(manual);
                             let _ = tx.send(Some(Err(r.clone())));
                             Err(r)
                         }
@@ -2160,7 +2356,7 @@ impl Router {
             .account
             .node_paths(node)
             .map_err(|e| failed(e.to_string()))?;
-        // The daemon's anchors, the node's own anchors file, and what this attach names.
+        // The daemon's one manual machine set, freshly read for this attach.
         //
         // **What the file could not give is said, here** (V210-107, under ADR-026): each skipped
         // line, and that a file naming no usable anchor leaves the node with none, which it
@@ -2169,21 +2365,34 @@ impl Router {
         // whose file named a host that no longer resolves with nothing said anywhere (#410: the
         // wholly-bad anchors file proof). It is logged, and kept as the attach's notes, which go
         // back to the verb that attached the node, to print in its person's own terminal (R23).
-        let mut set = self.inner.defaults.anchors.clone();
-        let file = paths.anchors_file();
-        let mut notes = vox_core::node::link::merge_anchors_file(&mut set, &file)
-            .unwrap_or_else(|e| vec![e.to_string()]);
+        let (set, notes) = self.refresh_manual_anchors(&[]).await;
+        let specs = anchors.to_vec();
+        let (set, mut notes) = tokio::task::spawn_blocking(move || {
+            let (mut set, mut notes) = (set, notes);
+            for spec in specs.iter().filter(|spec| !spec.trim().is_empty()) {
+                if let Err(error) = vox_core::node::link::merge_anchor_spec(&mut set, spec) {
+                    notes.push(format!("anchor {spec} is skipped: {error}"));
+                }
+            }
+            (set, notes)
+        })
+        .await
+        .map_err(|error| failed(format!("its anchor resolution did not finish: {error}")))?;
+        let files = paths
+            .account()
+            .anchor_input_files()
+            .iter()
+            .map(|file| file.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         let skipped = notes.len();
-        for spec in anchors {
-            let _ = vox_core::node::link::merge_anchor_spec(&mut set, spec);
-        }
         if set.is_empty() && skipped > 0 {
             let is_anchor = !paths.vault_file().is_file()
                 && vox_core::node::headless::identity_file(&paths).is_file();
             notes.push(format!(
                 "node {node}: {}; {}",
                 vox_core::error::Error::AnchorsFileUnusable {
-                    path: file.display().to_string(),
+                    path: files,
                     skipped,
                 },
                 if is_anchor {
@@ -2317,15 +2526,11 @@ impl Router {
         if *ended.borrow() {
             return Err(failed("its actor stopped while it attached".into()));
         }
-        // An anchor wakes no agent, notifies nobody and follows no anchor of its own: it is one.
-        let tasks = anchor.is_none().then(|| {
-            NodeTasks::start(
-                &self.inner.rt,
-                &handle,
-                &paths,
-                self.inner.defaults.anchor_specs.clone(),
-            )
-        });
+        // An anchor wakes no agent and notifies nobody. Manual machine anchors are followed by
+        // the shared registry for every node; a node never dials its own identity.
+        let tasks = anchor
+            .is_none()
+            .then(|| NodeTasks::start(&self.inner.rt, &handle, &paths));
         let fingerprint = anchor.or_else(|| handle.view().identity.map(|i| i.fingerprint));
         Ok(Box::new(Attached {
             handle,
@@ -2545,6 +2750,7 @@ enum DStep {
 }
 
 enum Step {
+    Have(Box<Granted>),
     WaitAttach(watch::Receiver<Option<Result<(), Refusal>>>),
     WaitDetach(watch::Receiver<bool>),
     NotAttached,
@@ -2672,6 +2878,10 @@ impl Dispatch for Router {
     async fn daemon(&self, request: DaemonRequest) -> DaemonFrame {
         let refused = DaemonFrame::Refused;
         match request {
+            DaemonRequest::Anchors => match self.anchor_list().await {
+                Ok(anchors) => DaemonFrame::Anchors(anchors),
+                Err(why) => refused(why),
+            },
             DaemonRequest::ComputerStatus
             | DaemonRequest::ComputerBegin
             | DaemonRequest::ComputerPreview { .. }

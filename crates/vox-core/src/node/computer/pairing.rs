@@ -1022,8 +1022,16 @@ impl Management {
                 let anchor = anchor.clone();
                 let lease = lease.clone();
                 attempts.spawn(async move {
+                    // This transport lease authorizes its anchor for this computer reach only;
+                    // it is neither a room source nor a machine-wide manual anchor.
+                    let helpers = crate::node::network::HelperContext {
+                        extra_helpers: [anchor.id].into_iter().collect(),
+                        ..crate::node::network::HelperContext::default()
+                    };
                     me.transport_at(anchor, lease, true).await?;
-                    me.net.reach(target, &EndpointList::default()).await
+                    me.net
+                        .reach(target, &EndpointList::default(), &helpers)
+                        .await
                 });
             }
             let mut last = Error::Unreachable("no anchor configured for this computer pairing");

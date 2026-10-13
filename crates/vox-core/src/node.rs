@@ -25,6 +25,7 @@
 
 pub mod actor;
 pub mod agreestream;
+pub mod anchor_inventory;
 pub mod api;
 pub mod app;
 pub mod appipc;

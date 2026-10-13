@@ -10,68 +10,31 @@
 //! the name is right, and the client says only that it cannot reach a peer. Nothing in
 //! that points at a stale address.
 //!
-//! **What this drives, with real binaries.** A daemon (alice) starts with an anchors file
-//! naming an anchor that is not there. While it runs, the file is rewritten to name the
-//! real one — the same edit a dynamic-DNS update amounts to from the node's point of view,
-//! since both change what the configuration resolves to. Alice must pick it up without
-//! being restarted, and the proof of that is a room joined *through* the anchor
-//! afterwards, not a log line saying it noticed:
+//! **Real-binary journey.** Alice starts with eight dead addresses and a bad line in
+//! its manual anchor file. While its daemon runs, that file changes to the real anchor.
+//! `vox anchor list --json` must report only the new address and its hand-added source.
+//! Alice's room link must keep that machine input out of the room's sources. The apparatus
+//! supplies Bob a link containing only the moved anchor and the original responder pin:
+//! Bob must join through it, then render Alice's nonce-bearing message after mutual trust.
+//! That delivery proves Alice actually reached and published to the moved anchor; a list
+//! projection alone cannot prove it. Bob's machine list must identify the learned room source.
 //!
-//! 1. Alice creates a room after the rewrite, and `vox room link` must come to name the
-//!    anchor's real port. That shows only that the room's *record* took the new address
-//!    (the record is filled from configuration whether or not anything was reached), so it
-//!    is a step, not the claim.
-//! 2. A second profile (bob: `vox id`, `vox daemon` with **no anchor of its own**) joins
-//!    with that invite, and alice and bob trust each other with `vox trust add`. The invite
-//!    also names alice herself, last, with her own addresses; on loopback those are always
-//!    reachable (behind a home NAT they are not), so bob is handed the link with every
-//!    entry but the anchor's removed. The only way bob can find the room is then the moved
-//!    anchor at the address the link carries.
-//! 3. Alice posts a line carrying a per-run nonce until bob's `vox room read` renders it.
-//!    That needs alice to have dialled the anchor at its new address and registered the
-//!    room there: a daemon that records the new address but never reaches it leaves bob
-//!    with nothing to join through.
+//! This consolidates the former single-address, eight-address and bad-line runs into one
+//! journey. It also attaches Carol before refresh and requires both identities to report their own
+//! reach. Dave then creates an unrelated room on Bob’s daemon, where both identities must dial
+//! a separate hand-added anchor: its public status must
+//! show only the separate machine anchor and no live connection to Bob’s room anchor, and the machine list must
+//! retain only the original room source. This is an observed status claim, not a claim
+//! that no future helper traffic can occur. It does not prove live DNS-record changes, helper
+//! isolation or previous-release migration. Dave then joins Bob's room with one additional
+//! anchor address and locks: the list must union both local observations, deduplicate the room
+//! source, prefer Bob's live renamed label, and mark the union last-known. Dave leaving must
+//! remove only his contribution. The journey then keeps Bob's provenance through node lock and
+//! daemon restart, and removes it when Bob leaves.
 //!
-//! **What it does not prove.** A name whose A record moves while the file is untouched
-//! is the same code path — the refresh re-reads and re-parses, and parsing is what
-//! resolves — but this machine has no DNS record it can move, so that step is reasoned
-//! rather than measured. Closing it needs a resolver the proof owns. Recorded here
-//! rather than implied by a passing test.
-//!
-//! **Every participant is the shipped binary**: the anchor is `vox node`, each identity is
-//! made by `vox id`, and alice and bob are `vox daemon`s. Nothing in this process runs a
-//! node.
-//!
-//! **Mutations that must turn it red.**
-//! - Make the daemon's anchor refresh (`ANCHOR_REFRESH` in `app.rs`) an hour, or drop the
-//!   refresh task: red at step 1 after `FOLLOW_PATIENCE`, the invite never names the real
-//!   port.
-//! - Let the refresh reach the room's record but never dial the new address
-//!   (`NodeCommand::AddAnchors` neither merges nor redials, and `adopt_channel_anchors`
-//!   records and returns before dialling): step 1 stays green, and step 2 or 3 goes red —
-//!   bob cannot join, or never renders alice's post.
-//! - Dial the moved anchor but publish no room to it (`NetEvent::AnchorConnected` skips
-//!   `publish_channel_to_anchor`): red at step 2 or 3 for the same reason.
-//!
-//! **V210-75 (#266): the addresses are replaced, and a bad line is skipped.** Two more cases
-//! run the same scene:
-//! - [`a_daemon_follows_an_anchor_that_had_eight_addresses`]: the file first names the anchor at
-//!   **eight** dead addresses, the most one anchor may have. A refresh used to *add* the new
-//!   address to the old ones, so the ninth did not fit, the refresh failed every 30 s, and the
-//!   anchor could not be followed at all.
-//! - [`a_bad_anchors_file_line_is_skipped_and_named`]: both versions of the file start with a
-//!   line whose host does not resolve (`.invalid`, RFC 2606). One such line used to fail the whole
-//!   file: the daemon would not start, and the refresh skipped every update. Now the daemon must
-//!   start, follow the anchor, and say `line 1 is skipped` on its stderr.
-//!
-//! In every case the invite's entry for the anchor must name **only** the real port: the dead
-//! addresses are replaced, not kept first in line to be dialled before it.
-//!
-//! **Mutations that must turn these red (V210-75).**
-//! - `BootstrapSet::merge_endpoints` appends addresses again (the union): the eight-address case
-//!   is red at step 1 (never follows), and the other two at the only-the-real-port check.
-//! - `merge_anchors_file` fails the file on a bad line again (`?`): the bad-line case is red, the
-//!   daemon does not start.
+//! Mutants must fail the corresponding product assertion: disable refresh, retain old
+//! addresses, fail the whole file on its bad line, carry manual anchors in issued room links,
+//! drop room publication, or lose the room source in the machine projection.
 
 #![cfg(unix)]
 
@@ -80,6 +43,9 @@ mod watchdog;
 
 #[path = "support/typed.rs"]
 mod typed;
+
+#[path = "support/attach.rs"]
+mod attach;
 
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
@@ -114,9 +80,13 @@ fn vox_stdin(
     input: Option<&str>,
 ) -> (bool, String, String) {
     let mut cmd = Command::new(VOX);
-    cmd.args(args)
+    cmd.args(attach::persistent_args(data, args, IDENTITY))
+        .env("HOME", data)
+        .env("VOX_TEST_KEYCHAIN", attach::keychain(data))
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", cfg)
+        .env("VOX_NODE", "default")
+        .env_remove("VOX_ANCHORS")
         // In the environment, not argv: a command line is world-readable (ADR-015).
         .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
         .env_remove("VOX_ROOM");
@@ -152,50 +122,35 @@ fn vox_stdin(
 #[test]
 #[ignore = "production Argon2id, a real anchor and a 30s refresh; CI runs it in release"]
 fn a_daemon_picks_up_an_anchor_that_moved_under_it() {
-    follow(&[9], false);
+    // Eight addresses and a bad line cover the old separate runs in the same journey.
+    follow(&[9, 10, 11, 12, 13, 14, 15, 16], true);
 }
 
-#[test]
-#[ignore = "production Argon2id, a real anchor and a 30s refresh; CI runs it in release"]
-fn a_daemon_follows_an_anchor_that_had_eight_addresses() {
-    // Eight: the most addresses one anchor may have (`MAX_ENDPOINTS`), written out here so a
-    // changed constant does not silently change what this case measures.
-    follow(&[9, 10, 11, 12, 13, 14, 15, 16], false);
-}
-
-#[test]
-#[ignore = "production Argon2id, a real anchor and a 30s refresh; CI runs it in release"]
-fn a_bad_anchors_file_line_is_skipped_and_named() {
-    follow(&[9], true);
-}
-
-/// The scene: the daemon starts with the anchor at `dead_ports`, the file is rewritten to name
-/// its real one, and the daemon must follow. With `bad_line`, both versions of the file start with
-/// a line whose host does not resolve.
-fn follow(dead_ports: &[u16], bad_line: bool) {
-    watchdog::arm();
-    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
-
-    // ---- a real anchor, on a port nobody knew at startup ----
-    let anchor_data = tmp.path().join("anchor-data");
-    let anchor_cfg = tmp.path().join("anchor-cfg");
+/// A real headless anchor; return its published route and keep its process alive.
+fn start_anchor(root: &std::path::Path, name: &str) -> (Proc, String) {
+    let anchor_data = root.join(format!("{name}-data"));
+    let anchor_cfg = root.join(format!("{name}-cfg"));
     std::fs::create_dir_all(&anchor_cfg).expect("APPARATUS: harness file I/O");
-    let mut anchor = Proc(
+    let anchor = Proc(
         Command::new(VOX)
             .args(["node", "--listen", "127.0.0.1:0"])
+            .env("HOME", &anchor_data)
+            .env("VOX_TEST_KEYCHAIN", attach::keychain(&anchor_data))
             .env("VOX_DATA_DIR", &anchor_data)
             .env("VOX_CONFIG_DIR", &anchor_cfg)
+            .env("VOX_NODE", "default")
+            .env_remove("VOX_ANCHORS")
             // To a file, never a pipe nobody reads: `vox node` prints a status line each
             // time its peers change, and once the read end of a pipe is gone that print
             // fails and takes the anchor down. An earlier version of this proof dropped
             // the pipe, so the anchor died the moment the daemon reached it — hidden only
             // because the joiner then went to the daemon directly.
             .stdout(Stdio::from(
-                std::fs::File::create(tmp.path().join("anchor.out"))
+                std::fs::File::create(root.join(format!("{name}.out")))
                     .expect("APPARATUS: harness file I/O"),
             ))
             .stderr(Stdio::from(
-                std::fs::File::create(tmp.path().join("anchor.err"))
+                std::fs::File::create(root.join(format!("{name}.err")))
                     .expect("APPARATUS: harness file I/O"),
             ))
             .spawn()
@@ -209,7 +164,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
             std::time::Instant::now() < deadline,
             "PRODUCT (staging): the anchor never wrote its spec to {}; its stderr: {:?}",
             anchors_file.display(),
-            std::fs::read_to_string(tmp.path().join("anchor.err")).unwrap_or_default()
+            std::fs::read_to_string(root.join(format!("{name}.err"))).unwrap_or_default()
         );
         if let Ok(text) = std::fs::read_to_string(&anchors_file) {
             if let Some(line) = text
@@ -222,6 +177,18 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     };
+
+    (anchor, real_spec)
+}
+
+/// The scene: the daemon starts with the anchor at `dead_ports`, the file is rewritten to name
+/// its real one, and the daemon must follow. With `bad_line`, both versions of the file start with
+/// a line whose host does not resolve.
+fn follow(dead_ports: &[u16], bad_line: bool) {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
+
+    let (mut anchor, real_spec) = start_anchor(tmp.path(), "anchor");
 
     // ---- a client profile, and an anchors file pointing at nothing ----
     let data = tmp.path().join("data");
@@ -262,8 +229,12 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     // ---- the daemon starts against the address that is wrong ----
     let mut daemon = Command::new(VOX)
         .args(["daemon", "--listen", "127.0.0.1:0"])
+        .env("HOME", &data)
+        .env("VOX_TEST_KEYCHAIN", attach::keychain(&data))
         .env("VOX_DATA_DIR", &data)
         .env("VOX_CONFIG_DIR", &cfg)
+        .env("VOX_NODE", "default")
+        .env_remove("VOX_ANCHORS")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::from(
@@ -296,14 +267,125 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
+    // A second identity attaches before refresh. It owns no room, but the shared
+    // hand-added anchor must provide its own reach too, rather than only Alice's.
+    let (ok, _, err) = vox_stdin(
+        &data,
+        &cfg,
+        &["node", "create", "carol", "--passphrase-file", "-"],
+        Some(IDENTITY),
+    );
+    assert!(ok, "PRODUCT: creating the second node failed: {err}");
+    let (ok, _, err) = vox_stdin(
+        &data,
+        &cfg,
+        &["node", "unlock", "carol", "--passphrase-file", "-"],
+        Some(IDENTITY),
+    );
+    assert!(ok, "PRODUCT: attaching the second node failed: {err}");
+
     // ---- the anchor moves: the configuration is rewritten under the running daemon ----
     std::fs::write(anchors_file_for(&cfg), format!("{bad}{real_spec}\n"))
         .expect("APPARATUS: harness file I/O");
 
     // ---- it must reach the anchor without being restarted ----
-    // Creating a room and getting an invite that names the anchor is the observable
-    // consequence: a link carries the anchors the node has actually reached, so an
-    // invite naming this one is the node saying it followed.
+    // First inspect the public machine list; actual reach is proven by Bob's join
+    // and message delivery below, rather than inferred from this configuration view.
+    // **The address, not the identity.** The wrong spec names the same identity on a
+    // dead port — that is what makes it a stand-in for an anchor that moved — so looking
+    // for the fingerprint in the list proves nothing: it is there either way. A first
+    // version of this gate did exactly that and passed in 1.8 seconds, which is less
+    // than the refresh interval and therefore could not have been a follow at all.
+    let real_port = real_spec
+        .rsplit('/')
+        .next()
+        .unwrap_or_else(|| panic!("PRODUCT (staging): no port in the anchor's spec {real_spec:?}"))
+        .to_owned();
+    assert!(
+        !dead_ports.iter().any(|p| p.to_string() == real_port),
+        "APPARATUS: the specs must differ by address, or this gate measures nothing"
+    );
+    let started = std::time::Instant::now();
+    let mut last = String::new();
+    let followed = loop {
+        if started.elapsed() > FOLLOW_PATIENCE {
+            break false;
+        }
+        let (_, out, _) = vox(&data, &cfg, &["anchor", "list", "--json"]);
+        last = out.clone();
+        if out.contains(&format!("/udp/{real_port}")) {
+            break true;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    };
+
+    println!(
+        "[proof] followed={followed} after {:?}: started against {wrong_spec}, file rewritten to {real_spec}",
+        started.elapsed()
+    );
+    assert!(
+        followed,
+        "PRODUCT: the machine list never reported the anchor address its configuration now names, after {:?}. It \
+         started against {wrong_spec}, the file was rewritten to {real_spec} while it ran, \
+         and an anchor spec may be a NAME precisely so it can move — a node that resolves \
+         once holds the address it got at startup for ever. The machine list said: {last:?}\n\
+         daemon stderr: {:?}",
+        started.elapsed(),
+        std::fs::read_to_string(tmp.path().join("daemon.err")).unwrap_or_default()
+    );
+
+    let projection: serde_json::Value = serde_json::from_str(&last).unwrap_or_else(|error| {
+        panic!("PRODUCT: anchor list returned invalid JSON: {error}: {last:?}")
+    });
+    let listed = projection["anchors"]
+        .as_array()
+        .and_then(|anchors| {
+            anchors
+                .iter()
+                .find(|anchor| anchor["fingerprint"] == anchor_id)
+        })
+        .unwrap_or_else(|| panic!("PRODUCT: anchor list omitted the moved anchor: {last:?}"));
+    let addresses = listed["addresses"]
+        .as_array()
+        .unwrap_or_else(|| panic!("PRODUCT: anchor list omitted addresses: {last:?}"));
+    assert!(
+        addresses.len() == 1
+            && addresses[0]
+                .as_str()
+                .is_some_and(|address| address.ends_with(&format!("/udp/{real_port}"))),
+        "PRODUCT: moved anchor retained old addresses instead of replacing them: {last:?}"
+    );
+    assert_eq!(
+        listed["sources"],
+        serde_json::json!([{"kind": "added-by-hand"}]),
+        "PRODUCT: a hand-added machine anchor acquired a room source: {last:?}"
+    );
+
+    // The public list describes inputs, not reach. Wait for the node's public status
+    // to say the anchor is reached, then create: create waits for its initial publish
+    // rounds. Thus Bob's one-shot join follows a real product readiness boundary.
+    let deadline = std::time::Instant::now() + FOLLOW_PATIENCE;
+    for node in ["default", "carol"] {
+        loop {
+            let (ok, report, err) = vox(&data, &cfg, &["status", "--json", "--node", node]);
+            let reached = ok
+                && serde_json::from_str::<serde_json::Value>(&report)
+                    .ok()
+                    .and_then(|value| value["anchors"].as_array().cloned())
+                    .is_some_and(|anchors| {
+                        anchors
+                            .iter()
+                            .any(|anchor| anchor["id"] == anchor_id && anchor["reached"] == true)
+                    });
+            if reached {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline,
+                "PRODUCT: attached node {node} never reported its own reach to the moved machine anchor: {report:?} {err:?}");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        println!("[proof] attached node {node} reached the refreshed machine anchor");
+    }
     let (ok, _, err) = vox_stdin(
         &data,
         &cfg,
@@ -331,90 +413,22 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
             .to_owned()
     };
 
-    // **The address, not the identity.** The wrong spec names the same identity on a
-    // dead port — that is what makes it a stand-in for an anchor that moved — so looking
-    // for the fingerprint in the invite proves nothing: it is there either way. A first
-    // version of this gate did exactly that and passed in 1.8 seconds, which is less
-    // than the refresh interval and therefore could not have been a follow at all.
-    let real_port = real_spec
-        .rsplit('/')
-        .next()
-        .unwrap_or_else(|| panic!("PRODUCT (staging): no port in the anchor's spec {real_spec:?}"))
-        .to_owned();
+    // ---- step 2: a second daemon joins through the moved anchor ----
+    let (ok, issued, err) = vox(&data, &cfg, &["room", "link", &room]);
+    assert!(ok, "PRODUCT: room link failed: {err}");
+    let issued = issued.trim();
     assert!(
-        !dead_ports.iter().any(|p| p.to_string() == real_port),
-        "APPARATUS: the specs must differ by address, or this gate measures nothing"
+        !issued.contains(&format!("a={anchor_id}")),
+        "PRODUCT: room link carried the hand-added machine anchor: {issued:?}"
     );
-    let started = std::time::Instant::now();
-    let mut last = String::new();
-    let followed = loop {
-        if started.elapsed() > FOLLOW_PATIENCE {
-            break false;
-        }
-        let (_, out, _) = vox(&data, &cfg, &["room", "link", &room]);
-        last = out.clone();
-        if out.contains(&format!("/udp/{real_port}")) {
-            break true;
-        }
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    };
-
-    println!(
-        "[proof] followed={followed} after {:?}: started against {wrong_spec}, file rewritten to {real_spec}",
-        started.elapsed()
-    );
-    assert!(
-        followed,
-        "PRODUCT: the daemon never reached the anchor its configuration now names, after {:?}. It \
-         started against {wrong_spec}, the file was rewritten to {real_spec} while it ran, \
-         and an anchor spec may be a NAME precisely so it can move — a node that resolves \
-         once holds the address it got at startup for ever. The invite said: {last:?}\n\
-         daemon stderr: {:?}",
-        started.elapsed(),
-        std::fs::read_to_string(tmp.path().join("daemon.err")).unwrap_or_default()
-    );
-
-    // ---- step 2: a second daemon joins through the moved anchor, with that link ----
-    let issued = last.trim().to_owned();
-    assert!(
-        issued.contains(&format!("/udp/{real_port}")) && !issued.contains('\n'),
-        "PRODUCT (staging): the invite is not one link naming the real port: {issued:?}"
-    );
-    // **Only the anchor.** An invite also names the issuing node itself, last, with its
-    // own addresses — and on loopback those are always reachable, so bob could join
-    // alice directly and never touch the anchor (a first version of this step stayed
-    // green against a daemon that never dialled the moved anchor, for exactly that
-    // reason). Behind a home NAT that entry is what does not work; the anchor is what
-    // does. So bob gets the link with every entry but the anchor's removed, which is the
-    // link as a NATed joiner can use it.
-    let (link, dropped) = only_anchor(&issued, anchor_id);
-    println!(
-        "[proof] invite carried {} anchor entr(ies); kept the moved anchor's, dropped {dropped}",
-        dropped + 1
-    );
-    assert!(
-        link.contains(&format!("a={anchor_id}")) && link.contains(&format!("/udp/{real_port}")),
-        "PRODUCT (staging): the stripped link does not name the anchor at its new address: \
-         {link:?} (from {issued:?})"
-    );
-    // **Replaced, not accumulated** (V210-75): the anchor's entry names the address it has now,
-    // and none of the ones it had. Kept, they would stay first in line to be dialled.
-    let addresses: Vec<&str> = link
-        .split('&')
-        .filter_map(|p| p.strip_prefix("b="))
-        .collect();
-    println!(
-        "[proof] the anchor's entry names {} address(es) after the move (it had {}): {addresses:?}",
-        addresses.len(),
-        dead_ports.len()
-    );
-    assert!(
-        addresses.len() == 1 && addresses[0].ends_with(&format!("/udp/{real_port}")),
-        "PRODUCT: the invite's entry for the moved anchor must name only its new address, port \
-         {real_port}; it names {addresses:?}. The {} address(es) it had before the move were \
-         kept beside the new one rather than replaced.",
-        dead_ports.len()
-    );
+    // An explicitly supplied room-link anchor is permitted existing input. Keep only
+    // the original room/responder pin, then provide that anchor at its current address.
+    // Removing Alice's directly reachable member address forces Bob through the anchor.
+    let (base, _) = only_anchor(issued, anchor_id);
+    let (_, address) = real_spec
+        .split_once('@')
+        .expect("APPARATUS: anchor spec was checked above");
+    let link = format!("{base}&a={anchor_id}&b={address}");
     if bad_line {
         let stderr = std::fs::read_to_string(tmp.path().join("daemon.err")).unwrap_or_default();
         let named = stderr
@@ -448,8 +462,12 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     let bob_err = tmp.path().join("bob.daemon.err");
     let mut bob = Command::new(VOX)
         .args(["daemon", "--listen", "127.0.0.1:0"])
+        .env("HOME", &bob_data)
+        .env("VOX_TEST_KEYCHAIN", attach::keychain(&bob_data))
         .env("VOX_DATA_DIR", &bob_data)
         .env("VOX_CONFIG_DIR", &bob_cfg)
+        .env("VOX_NODE", "default")
+        .env_remove("VOX_ANCHORS")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::from(
@@ -461,7 +479,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     pipe.write_all(format!("{IDENTITY}\n").as_bytes())
         .expect("APPARATUS: write bob's passphrase");
     drop(pipe);
-    let _bob = Proc(bob);
+    let mut bob_daemon = Proc(bob);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !vox(&bob_data, &bob_cfg, &["room", "list"]).0 {
         assert!(
@@ -472,26 +490,6 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
-    // **Bob joins once alice says the anchor has the room.** When the invite was issued before the
-    // anchor took the room, alice said "anchor … has not taken room … yet … this node will say when
-    // it has", and a guest who joins before then is turned away by design. So the proof waits for
-    // her own "anchor … has taken room …", then joins once: no retry past a refusal. Alice never
-    // saying so is the product's (she did not register the room at the anchor's new address).
-    let alice_err = tmp.path().join("daemon.err");
-    let owed = std::time::Instant::now() + FOLLOW_PATIENCE;
-    loop {
-        let said = std::fs::read_to_string(&alice_err).unwrap_or_default();
-        if said.contains("has taken room") || !said.contains("has not taken room") {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < owed,
-            "PRODUCT: alice said the anchor at {real_spec} had not taken the room, and never said \
-             it had within {FOLLOW_PATIENCE:?}: she did not register it at the anchor's new \
-             address\nalice's stderr: {said:?}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(250));
-    }
     // One attempt: a join that fails is the product failing, and retrying past it would hide it.
     let join_started = std::time::Instant::now();
     let (joined, _, join_error) = vox_stdin(
@@ -506,7 +504,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     );
     assert!(
         joined,
-        "PRODUCT: bob could not join the room through the link alice issued after the anchor \
+        "PRODUCT: bob could not join the room through the supplied anchor-only link after the anchor \
          moved. The link names the anchor at {real_spec}, bob has no other anchor, so alice \
          must have reached the anchor at its new address and registered the room there. The \
          join said: {:?}\nalice's stderr: {:?}\nbob's stderr: {:?}",
@@ -514,6 +512,158 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         std::fs::read_to_string(tmp.path().join("daemon.err")).unwrap_or_default(),
         std::fs::read_to_string(&bob_err).unwrap_or_default()
     );
+
+    let (ok, bob_list, err) = vox(&bob_data, &bob_cfg, &["anchor", "list", "--json"]);
+    assert!(ok, "PRODUCT: Bob's anchor list failed after joining: {err}");
+    let bob_projection: serde_json::Value =
+        serde_json::from_str(&bob_list).unwrap_or_else(|error| {
+            panic!("PRODUCT: Bob's anchor list returned invalid JSON: {error}: {bob_list:?}")
+        });
+    let learned = bob_projection["anchors"]
+        .as_array()
+        .and_then(|anchors| {
+            anchors
+                .iter()
+                .find(|anchor| anchor["fingerprint"] == anchor_id)
+        })
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: Bob's machine list omitted the room-link anchor: {bob_list:?}")
+        });
+    let sources = learned["sources"]
+        .as_array()
+        .unwrap_or_else(|| panic!("PRODUCT: Bob's room-link anchor has no sources: {bob_list:?}"));
+    assert!(
+        sources.len() == 1
+            && sources[0]["kind"] == "room"
+            && sources[0]["room"]
+                .as_str()
+                .is_some_and(|id| id.starts_with(&room)),
+        "PRODUCT: Bob's room-link anchor was not sourced to the joined room alone: {bob_list:?}"
+    );
+
+    // The exact acceptance scene: on Bob's daemon, both Bob and Dave dial a
+    // separate hand-added anchor, while the joined room's original anchor stays local.
+    let (_machine_anchor, machine_spec) = start_anchor(tmp.path(), "machine");
+    let machine_id = machine_spec
+        .split_once('@')
+        .expect("APPARATUS: machine anchor printed a route")
+        .0;
+    assert_ne!(
+        machine_id, anchor_id,
+        "APPARATUS: the two anchors must have distinct identities"
+    );
+    std::fs::write(anchors_file_for(&bob_cfg), format!("{machine_spec}\n"))
+        .expect("APPARATUS: write Bob's manual anchor input");
+
+    // A room-link anchor belongs to Bob's joined room. A second identity on this
+    // daemon creates an unrelated room without inheriting that room's input.
+    let (ok, _, err) = vox_stdin(
+        &bob_data,
+        &bob_cfg,
+        &["node", "create", "dave", "--passphrase-file", "-"],
+        Some(IDENTITY),
+    );
+    assert!(ok, "PRODUCT: creating Bob's second node failed: {err}");
+    let (ok, _, err) = vox_stdin(
+        &bob_data,
+        &bob_cfg,
+        &["node", "unlock", "dave", "--passphrase-file", "-"],
+        Some(IDENTITY),
+    );
+    assert!(ok, "PRODUCT: attaching Bob's second node failed: {err}");
+    let (ok, _, err) = vox_stdin(
+        &bob_data,
+        &bob_cfg,
+        &[
+            "room",
+            "create",
+            "--node",
+            "dave",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "unrelated",
+        ],
+        Some(ROOM_PASS),
+    );
+    assert!(
+        ok,
+        "PRODUCT: second node could not create its unrelated room without the other room’s anchor: {err}"
+    );
+    let deadline = std::time::Instant::now() + FOLLOW_PATIENCE;
+    for node in ["default", "dave"] {
+        loop {
+            let (ok, report, err) = vox(&bob_data, &bob_cfg, &["status", "--node", node, "--json"]);
+            let reached = ok
+                && serde_json::from_str::<serde_json::Value>(&report)
+                    .ok()
+                    .and_then(|status| status["anchors"].as_array().cloned())
+                    .is_some_and(|anchors| {
+                        anchors
+                            .iter()
+                            .any(|anchor| anchor["id"] == machine_id && anchor["reached"] == true)
+                    });
+            if reached {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline,
+                "PRODUCT: node {node} did not reach the separate hand-added machine anchor: {report:?} {err:?}");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        println!("[proof] Bob daemon node {node} reached the separate hand-added anchor");
+    }
+    let (ok, report, err) = vox(&bob_data, &bob_cfg, &["status", "--node", "dave", "--json"]);
+    assert!(ok, "PRODUCT: second node's public status failed: {err}");
+    let status: serde_json::Value = serde_json::from_str(&report).unwrap_or_else(|error| {
+        panic!("PRODUCT: second node returned invalid status JSON: {error}: {report:?}")
+    });
+    assert!(
+        status["anchors"]
+            .as_array()
+            .is_some_and(|anchors| anchors.len() == 1 && anchors[0]["id"] == machine_id),
+        "PRODUCT: unrelated node's status inherited another node's room anchor: {report:?}"
+    );
+    assert!(status["peers"].as_array().is_some_and(|peers|
+        peers.iter().all(|peer| peer["id"] != anchor_id)),
+        "PRODUCT: unrelated node's status shows a connection to another node's room anchor: {report:?}");
+    let (ok, after, err) = vox(&bob_data, &bob_cfg, &["anchor", "list", "--json"]);
+    assert!(
+        ok,
+        "PRODUCT: machine list failed after unrelated room creation: {err}"
+    );
+    let after: serde_json::Value = serde_json::from_str(&after)
+        .unwrap_or_else(|error| panic!("PRODUCT: machine list returned invalid JSON: {error}"));
+    let recorded = after["anchors"]
+        .as_array()
+        .and_then(|anchors| {
+            anchors
+                .iter()
+                .find(|anchor| anchor["fingerprint"] == anchor_id)
+        })
+        .unwrap_or_else(|| panic!("PRODUCT: machine list lost Bob's joined-room anchor: {after}"));
+    let recorded_sources = recorded["sources"]
+        .as_array()
+        .expect("PRODUCT: the room anchor has no source list");
+    assert!(
+        recorded_sources.len() == 1
+            && recorded_sources[0]["kind"] == "room"
+            && recorded_sources[0]["room"] == learned["sources"][0]["room"],
+        "PRODUCT: unrelated room acquired Bob's joined-room anchor source: {after}"
+    );
+    let manual = after["anchors"]
+        .as_array()
+        .and_then(|anchors| {
+            anchors
+                .iter()
+                .find(|anchor| anchor["fingerprint"] == machine_id)
+        })
+        .unwrap_or_else(|| panic!("PRODUCT: machine list omitted the hand-added anchor: {after}"));
+    assert_eq!(
+        manual["sources"],
+        serde_json::json!([{"kind": "added-by-hand"}]),
+        "PRODUCT: the hand-added anchor acquired a room source: {after}"
+    );
+    println!("[proof] unrelated node created its room without inheriting Bob's room anchor");
 
     // Trust after the join, as `support/room.rs` does (forward-only rooms release a key
     // at once to a member trusted after joining).
@@ -573,6 +723,227 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         std::fs::read_to_string(&bob_err).unwrap_or_default()
     );
 
+    // A second local copy of the same room may hold a different address observation. Supply
+    // that input through the public join command, just as Bob's invitation supplied its anchor.
+    // The extra, old address need not answer: the link still carries the real current route.
+    let extra_address = format!("/ip4/127.0.0.1/udp/{}", dead_ports[0]);
+    let dave_link = format!("{link}&b={extra_address}");
+    let (ok, out, err) = vox_stdin(
+        &bob_data,
+        &bob_cfg,
+        &[
+            "room",
+            "join",
+            "--node",
+            "dave",
+            "--passphrase-file",
+            "-",
+            &dave_link,
+        ],
+        Some(ROOM_PASS),
+    );
+    assert!(
+        ok,
+        "PRODUCT: Dave could not join Bob's room on the same daemon: {out}{err}"
+    );
+    let mut union_addresses = vec![address.to_owned(), extra_address];
+    union_addresses.sort();
+    let union_addresses = serde_json::json!(union_addresses);
+    let joined = machine_list(&bob_data, &bob_cfg);
+    assert_saved_source(
+        &joined,
+        anchor_id,
+        &room,
+        "mission",
+        false,
+        &union_addresses,
+    );
+    let (ok, out, err) = vox(&bob_data, &bob_cfg, &["node", "lock", "dave"]);
+    assert!(
+        ok,
+        "PRODUCT: locking Dave's shared-room copy failed: {out}{err}"
+    );
+
+    // Bob observes the rename live while Dave keeps the old name and extra address on disk.
+    // The union must keep that address, prefer the live name, and still say it is last-known.
+    let renamed = "mission-renamed";
+    let (ok, out, err) = vox(&data, &cfg, &["room", "rename", &room, renamed]);
+    assert!(ok, "PRODUCT: renaming the shared room failed: {out}{err}");
+    let deadline = std::time::Instant::now() + READ_PATIENCE;
+    loop {
+        let inventory = machine_list(&bob_data, &bob_cfg);
+        if room_source(&inventory, anchor_id).is_some_and(|source| source["name"] == renamed) {
+            assert_saved_source(
+                &inventory,
+                anchor_id,
+                &room,
+                renamed,
+                true,
+                &union_addresses,
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "PRODUCT: the machine inventory did not follow the room's shared name: {inventory}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    println!("[proof] live and locked copies union their addresses and room source, with the live name and last-known marking");
+
+    // Leaving one local copy removes only its contribution, while Bob still holds the room.
+    let (ok, out, err) = vox(&bob_data, &bob_cfg, &["node", "unlock", "dave"]);
+    assert!(
+        ok,
+        "PRODUCT: unlocking Dave's shared-room copy failed: {out}{err}"
+    );
+    let (ok, out, err) = vox(
+        &bob_data,
+        &bob_cfg,
+        &["room", "leave", "--node", "dave", &room],
+    );
+    assert!(
+        ok,
+        "PRODUCT: Dave could not leave his shared-room copy: {out}{err}"
+    );
+    let left_copy = machine_list(&bob_data, &bob_cfg);
+    assert_saved_source(
+        &left_copy,
+        anchor_id,
+        &room,
+        renamed,
+        false,
+        &learned["addresses"],
+    );
+    println!("[proof] Dave leaving removes his extra address while Bob's live room source remains");
+
+    // The inventory also keeps Bob's remaining saved-room observation when both nodes lock.
+    for node in ["default", "dave"] {
+        let (ok, out, err) = vox(&bob_data, &bob_cfg, &["node", "lock", node]);
+        assert!(ok, "PRODUCT: locking {node} failed: {out}{err}");
+    }
+    let locked = machine_list(&bob_data, &bob_cfg);
+    assert_saved_source(
+        &locked,
+        anchor_id,
+        &room,
+        renamed,
+        true,
+        &learned["addresses"],
+    );
+    let (ok, shown, err) = vox(&bob_data, &bob_cfg, &["anchor", "list"]);
+    assert!(
+        ok && shown.contains(renamed) && shown.contains("last known"),
+        "PRODUCT: anchor list did not show the locked room's last-known provenance: {shown}{err}"
+    );
+    println!("[proof] room provenance and renamed label remain visible with both nodes locked");
+
+    // A fresh daemon starts with no node: the observation must come from saved display data,
+    // and must not unlock a node or make a room-only anchor a machine input.
+    bob_daemon
+        .0
+        .kill()
+        .expect("APPARATUS: stop the scratch Bob daemon for restart");
+    bob_daemon
+        .0
+        .wait()
+        .expect("APPARATUS: reap the scratch Bob daemon");
+    bob_daemon = Proc(
+        Command::new(VOX)
+            .args(["daemon", "--no-node", "--listen", "127.0.0.1:0"])
+            .env("HOME", &bob_data)
+            .env("VOX_TEST_KEYCHAIN", attach::keychain(&bob_data))
+            .env("VOX_DATA_DIR", &bob_data)
+            .env("VOX_CONFIG_DIR", &bob_cfg)
+            .env_remove("VOX_NODE")
+            .env_remove("VOX_ANCHORS")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(
+                std::fs::File::create(&bob_err).expect("APPARATUS: restart log"),
+            ))
+            .spawn()
+            .expect("APPARATUS: restart the scratch Bob daemon"),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let (ok, _, err) = vox(&bob_data, &bob_cfg, &["anchor", "list", "--json"]);
+        if ok {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "PRODUCT: the restarted daemon did not expose its saved anchor list: {err}; {:?}",
+            std::fs::read_to_string(&bob_err).unwrap_or_default()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let restarted = machine_list(&bob_data, &bob_cfg);
+    assert_saved_source(
+        &restarted,
+        anchor_id,
+        &room,
+        renamed,
+        true,
+        &learned["addresses"],
+    );
+    let (ok, nodes, err) = vox(&bob_data, &bob_cfg, &["node", "list"]);
+    assert!(
+        ok && ["default", "dave"].iter().all(|node| nodes
+            .lines()
+            .any(|line| line.split_whitespace().take(2).eq([*node, "detached"]))),
+        "PRODUCT: reading saved anchor provenance unlocked a node: {nodes}{err}"
+    );
+    println!("[proof] a restarted daemon lists the saved room while its node stays locked");
+
+    let (ok, out, err) = vox(&bob_data, &bob_cfg, &["node", "unlock", "default"]);
+    assert!(
+        ok,
+        "PRODUCT: unlocking Bob after restart failed: {out}{err}"
+    );
+    let deadline = std::time::Instant::now() + READ_PATIENCE;
+    loop {
+        let inventory = machine_list(&bob_data, &bob_cfg);
+        if room_source(&inventory, anchor_id).is_some_and(|source| source["stale"] == false) {
+            assert_saved_source(
+                &inventory,
+                anchor_id,
+                &room,
+                renamed,
+                false,
+                &learned["addresses"],
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "PRODUCT: the reopened room's anchor observation stayed stale: {inventory}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let (ok, out, err) = vox(&bob_data, &bob_cfg, &["room", "leave", &room]);
+    assert!(
+        ok,
+        "PRODUCT: Bob could not leave the room after reopening: {out}{err}"
+    );
+    let left = machine_list(&bob_data, &bob_cfg);
+    assert!(
+        left["anchors"].as_array().is_some_and(|anchors| anchors
+            .iter()
+            .all(|anchor| anchor["fingerprint"] != anchor_id)),
+        "PRODUCT: a removed saved room left its anchor/provenance in the machine list: {left}"
+    );
+    assert!(
+        left["anchors"].as_array().is_some_and(|anchors| anchors
+            .iter()
+            .any(|anchor| anchor["fingerprint"] == machine_id
+                && anchor["sources"] == serde_json::json!([{"kind": "added-by-hand"}]))),
+        "PRODUCT: leaving a room removed the independent hand-added anchor: {left}"
+    );
+    println!("[proof] leaving removes room provenance and preserves the independent manual input");
+    // Keep the restarted process guard alive through the whole journey.
+    let _bob_daemon = bob_daemon;
+
     // The anchor must still be the one serving: a join that went anywhere else would
     // not be the claim.
     let alive = anchor
@@ -589,6 +960,63 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         alive,
         "PRODUCT (staging): the anchor exited during the run. stdout: {anchor_out:?} stderr: {:?}",
         std::fs::read_to_string(tmp.path().join("anchor.err")).unwrap_or_default()
+    );
+}
+
+/// The actual public machine-list output, not the cache format.
+fn machine_list(data: &std::path::Path, cfg: &std::path::Path) -> serde_json::Value {
+    let (ok, shown, err) = vox(data, cfg, &["anchor", "list", "--json"]);
+    assert!(ok, "PRODUCT: machine anchor list failed: {shown}{err}");
+    serde_json::from_str(&shown).unwrap_or_else(|error| {
+        panic!("PRODUCT: machine anchor list returned invalid JSON: {error}: {shown}")
+    })
+}
+
+fn room_source<'a>(
+    inventory: &'a serde_json::Value,
+    anchor: &str,
+) -> Option<&'a serde_json::Value> {
+    inventory["anchors"]
+        .as_array()?
+        .iter()
+        .find(|row| row["fingerprint"] == anchor)?["sources"]
+        .as_array()?
+        .iter()
+        .find(|source| source["kind"] == "room")
+}
+
+fn assert_saved_source(
+    inventory: &serde_json::Value,
+    anchor: &str,
+    room: &str,
+    name: &str,
+    stale: bool,
+    addresses: &serde_json::Value,
+) {
+    let source = room_source(inventory, anchor)
+        .unwrap_or_else(|| panic!("PRODUCT: saved room's anchor disappeared: {inventory}"));
+    assert!(
+        source["room"]
+            .as_str()
+            .is_some_and(|id| id.starts_with(room))
+            && source["name"] == name
+            && source["stale"] == stale,
+        "PRODUCT: saved room's provenance/name/freshness is wrong: {inventory}"
+    );
+    let row = inventory["anchors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["fingerprint"] == anchor)
+        .unwrap();
+    assert_eq!(
+        &row["addresses"], addresses,
+        "PRODUCT: saved room's anchor address union is wrong: {inventory}"
+    );
+    assert_eq!(
+        row["sources"].as_array().unwrap().len(),
+        1,
+        "PRODUCT: saved room anchor has duplicate or machine dialing provenance: {inventory}"
     );
 }
 
