@@ -46,7 +46,10 @@
 //!   line, by his name for her: "alice renamed the room to family" (ADR-028 R-1, E-5);
 //! - `quote`: Alice posts q-root, q-mid replying to it, and 50 lines; Bob selects q-mid, presses
 //!   Ctrl-R and sends q-answer. His post's `re` names q-mid, and the TUI shows it under "┆ alice:
-//!   q-mid…", one level, never q-root, while q-mid itself is off screen (ADR-028 R-9, #485);
+//!   q-mid…", one level, never q-root, while q-mid itself is off screen (ADR-028 R-9, #485).
+//!   Both replies' `thread` names q-root without passing --thread (ADR-033 TH-1, TH-3);
+//! - `thread`: Bob replies to q-mid with @alice; the shipped post answers q-mid, stays in
+//!   q-root's thread, and addresses Alice (ADR-033 TH-1, TH-3, #753);
 //! - `jump`: Bob selects q-answer and presses Enter, and q-mid is scrolled to and selected;
 //! - `address`: a canonical address Alice posts reads as Bob's node writes it, "open
 //!   nas-web.alice.family.vox please" (ADR-028 S-1a, #488);
@@ -102,13 +105,10 @@
 //!   show on the composer as "To: alice · urgent", and the message Bob then sends, through the
 //!   one path `vox room post --to … --urgent` takes, reaches Alice with `to` naming her and
 //!   `urgent` (W-4, #513);
-//! - `sessions`: Alice's node, through Claude Code's hook in a session a person is at, opens two
-//!   Sessions and ends one: Bob's Sessions pane lists the open one by the label `vox room sessions`
-//!   gives it and the ended one apart under "Ended (1)"; `:all` shows each opening and end among
-//!   the room's messages; `:session <short id>`, without drive, shows only that it exists, that
-//!   its name and id are alice's node's claim ("<label> — name and id as alice says", MD-3) and
-//!   "Only members alice trusts with drive see inside this Session.", with no composer, and
-//!   `:send` there is refused and reaches nobody (ADR-029 CL-2, CL-3, #553);
+//! - `sessions`: Alice's hooks open two Sessions and end one. Before Alice grants Bob drive,
+//!   neither the CLI nor TUI exposes them (ADR-031 SA-1–SA-3); after the terminal grant, Bob's
+//!   Sessions pane lists the open one and keeps the ended one apart, All shows their lifecycle,
+//!   and the open Session names its source and offers a composer;
 //! - `session-order`: Alice posts, then her hook opens a new Session, within one wall-clock second:
 //!   in Bob's All the post reads first and "<label> opened" under it (#562: a Session's opened line
 //!   follows no message, so it is placed by its time, kept in milliseconds);
@@ -183,13 +183,13 @@
 //! another node again, a copied command that is not the service's canonical address (`copies`), or
 //! a pasted fingerprint that is not the node's let through to the keyring (`trust`), an image
 //! drawn before this node's copy is verified (`inline`), a member's keyring capability not
-//! drawn (`capability`), a read of a hung-up terminal that never returns (`gone`), a Session without drive
-//! offering a composer or not saying whose claim its name and id are (`sessions`), a member with drive shown only that the Session exists
+//! drawn (`capability`), a read of a hung-up terminal that never returns (`gone`), a Session exposed
+//! without drive or hidden after the grant (`sessions`), a member with drive shown only that the Session exists
 //! (`drive`), `a` sending a rejection (`approve`),
 //! `:interrupt` sent as a stop (`steer`),
 //! a Session's `:share` sending the path as text (`share`), notices placed by time again
 //! (`order`), or times rounded to the second (`session-order`). It passes only on the script's PASS with
-//! all 50 claims ok. Also: the dismissals not kept across a restart (`offer`), a dismissal kept
+//! all 51 claims ok. Also: the dismissals not kept across a restart (`offer`), a dismissal kept
 //! against the member rather than its join, so no offer when it joins again (`reoffer`), or no
 //! offer from a consent grant, so no offer back (`offerback`).
 //!
@@ -288,7 +288,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (50 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (51 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -302,8 +302,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (50, 50),
-                "APPARATUS: the driver said PASS without all 50 claims ok: {said}"
+                (51, 51),
+                "APPARATUS: the driver said PASS without all 51 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),

@@ -56,6 +56,12 @@
 //! (`test-knobs`). `--no-card` posts the link and fetches nothing. Mutant: fetch the card on the
 //! reader (red: the server counts bob's requests).
 //!
+//! The same three-member conversation proves Reply in Thread (ADR-033 TH-1, TH-3, #753):
+//! a plain General root and an addressed root, CLI replies and nested replies keep the original
+//! root; a retry posts once, and an unaddressed third member reads the whole thread. A conflicting
+//! explicit root is refused. Mutant: omit `Draft.thread` in `post_structured`; the reply's
+//! `room read --json` has no root and the thread assertion is PRODUCT red.
+//!
 //! **A room made before Vox's times were milliseconds still opens, reads and takes a post**
 //! ([`a_room_made_when_times_were_seconds_still_opens_reads_and_takes_a_post`], #562). The
 //! fixture `fixtures/seconds-format-room.tar.gz` is a node's data directory made by `vox` at
@@ -992,7 +998,7 @@ fn base64(bytes: &[u8]) -> String {
 }
 
 #[test]
-#[ignore = "an anchor and two vox daemons with production Argon2id; CI runs it in release"]
+#[ignore = "an anchor and three vox daemons with production Argon2id; CI runs it in release"]
 fn a_link_card_is_fetched_by_the_senders_node_alone() {
     test_knobs::require(&["VOX_TEST_CARD_ALLOW"]);
     let tmp = tempfile::tempdir().expect("APPARATUS: a temp dir");
@@ -1007,7 +1013,7 @@ fn a_link_card_is_fetched_by_the_senders_node_alone() {
         .enable_all()
         .build()
         .expect("APPARATUS: a tokio runtime");
-    let r = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
+    let mut r = rt.block_on(support::room(tmp.path(), &["alice", "bob", "carol"]));
     let (alice, bob) = (&r.workers[0], &r.workers[1]);
     let room = r.id.clone();
     let count = |s: &std::sync::Arc<std::sync::Mutex<Vec<String>>>| s.lock().unwrap().clone();
@@ -1118,6 +1124,264 @@ fn a_link_card_is_fetched_by_the_senders_node_alone() {
         "PRODUCT: `--no-card` must post the link with no card, fetching nothing; the card read \
          {card3}"
     );
+
+    // A thread has the room's readers, not just its addressed participants. Resolve its root
+    // before --op deduplication, so the same reply can safely be retried (ADR-033 TH-1, TH-3).
+    let thread_post = |author: &support::Worker, args: &[&str]| {
+        let mut argv = vec!["room", "post", &room, "--json"];
+        argv.extend_from_slice(args);
+        let out = author.vox(None, &argv);
+        let row = out.expect_ok("post in the thread journey").json();
+        row["entry_hash"]
+            .as_str()
+            .unwrap_or_else(|| panic!("PRODUCT: a successful post named no entry: {out:?}"))
+            .to_owned()
+    };
+    let plain = thread_post(alice, &["THREAD-PLAIN-ROOT"]);
+    let plain_reply = thread_post(alice, &["--re", &plain, "THREAD-PLAIN-REPLY"]);
+    let upper = thread_post(
+        alice,
+        &[
+            "--re",
+            &plain.to_ascii_uppercase(),
+            "--thread",
+            &plain,
+            "THREAD-UPPERCASE-REPLY",
+        ],
+    );
+    let root = thread_post(alice, &["--to", "bob", "THREAD-ROOT @bob status please"]);
+    support::until(
+        bob,
+        None,
+        "the addressed root to reach bob",
+        &["room", "read", &room],
+        |o| o.stdout.contains("THREAD-ROOT"),
+    );
+    let reply_args = [
+        "--re",
+        &root,
+        "--session",
+        "bob-agent",
+        "--op",
+        "thread-reply-753",
+        "THREAD-REPLY working on it",
+    ];
+    let reply = thread_post(bob, &reply_args);
+    assert_eq!(
+        thread_post(bob, &reply_args),
+        reply,
+        "PRODUCT: retrying --op must name the same reply entry"
+    );
+    support::until(
+        alice,
+        None,
+        "bob's reply to reach alice",
+        &["room", "read", &room],
+        |o| o.stdout.contains("THREAD-REPLY"),
+    );
+    let nested = thread_post(alice, &["--re", &reply, "THREAD-NESTED thank you"]);
+    let contradiction = alice.vox(
+        None,
+        &[
+            "room",
+            "post",
+            &room,
+            "--re",
+            &reply,
+            "--thread",
+            &reply,
+            "THREAD-CONTRADICTION",
+        ],
+    );
+    let shared = tmp.path().join("thread-note.txt");
+    std::fs::write(&shared, "the work behind the reply").expect("APPARATUS: write shared note");
+    alice
+        .vox(
+            None,
+            &[
+                "share",
+                &room,
+                shared.to_str().expect("APPARATUS: UTF-8 scratch"),
+                "--re",
+                &reply,
+                "-m",
+                "THREAD-FILE",
+            ],
+        )
+        .expect_ok("share a file in the thread");
+    for reader in &r.workers {
+        let read = support::until(
+            reader,
+            None,
+            "the thread and its file to reach every reader",
+            &["room", "read", &room, "--json"],
+            |o| {
+                o.stdout.contains("THREAD-FILE")
+                    && [&plain_reply, &upper, &root, &reply, &nested]
+                        .iter()
+                        .all(|id| o.stdout.contains(id.as_str()))
+            },
+        );
+        let rows = read.ndjson();
+        for (entry, parent, thread) in [
+            (&plain_reply, &plain, &plain),
+            (&upper, &plain, &plain),
+            (&reply, &root, &root),
+            (&nested, &reply, &root),
+        ] {
+            let env = rows
+                .iter()
+                .find(|r| r["entry_hash"] == entry.as_str())
+                .map(|r| r["envelope"].clone())
+                .unwrap_or_default();
+            assert!(env["re"].as_str().is_some_and(|re| re.eq_ignore_ascii_case(parent))
+                    && env["thread"] == thread.as_str(),
+                    "PRODUCT: {} must read reply {entry} answering {parent} in thread {thread}; got {env}",
+                    reader.name);
+        }
+        let addressed = rows
+            .iter()
+            .find(|r| r["entry_hash"] == root.as_str())
+            .unwrap_or_else(|| {
+                panic!(
+                    "PRODUCT: {} read the thread but not its root: {read:?}",
+                    reader.name
+                )
+            });
+        assert_eq!(
+            addressed["envelope"]["to"],
+            serde_json::json!([bob.b32()]),
+            "PRODUCT: the root must address bob on every reader"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["entry_hash"] == reply.as_str())
+                .count(),
+            1,
+            "PRODUCT: a retried reply must appear once for every reader"
+        );
+        let file = rows
+            .iter()
+            .find(|r| {
+                r["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("THREAD-FILE"))
+            })
+            .map(|r| r["envelope"].clone())
+            .unwrap_or_default();
+        assert!(
+            file["re"] == reply && file["thread"] == root,
+            "PRODUCT: {} must read the file reply in the original thread; got {file}",
+            reader.name
+        );
+        assert!(
+            !rows.iter().any(|r| r["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("THREAD-CONTRADICTION"))),
+            "PRODUCT: the refused contradictory reply must not reach {}",
+            reader.name
+        );
+        eprintln!("[proof] {} reads plain, addressed, nested and file replies in their original threads; retry appears once", reader.name);
+    }
+    assert!(
+        !contradiction.ok && contradiction.stderr.contains("contradicts"),
+        "PRODUCT: a known reply cannot be put in a different explicit thread: {contradiction:?}"
+    );
+
+    // A reply queued while its parent is unavailable keeps its operation's original meaning
+    // when the parent arrives. Freeze only this fixture's peers while Bob comes back online.
+    r.stop(1);
+    let late_root = thread_post(&r.workers[0], &["THREAD-LATE-ROOT"]);
+    let late_parent = thread_post(&r.workers[0], &["--re", &late_root, "THREAD-LATE-PARENT"]);
+    struct Frozen(u32);
+    impl Drop for Frozen {
+        fn drop(&mut self) {
+            let _ = Command::new("kill")
+                .args(["-CONT", &self.0.to_string()])
+                .status();
+        }
+    }
+    let frozen: Vec<_> = [
+        r.anchor_pid(),
+        r.workers[0]
+            .daemon_pid()
+            .expect("APPARATUS: Alice's daemon"),
+        r.workers[2]
+            .daemon_pid()
+            .expect("APPARATUS: Carol's daemon"),
+    ]
+    .into_iter()
+    .map(|pid| {
+        let stopped = Command::new("kill")
+            .args(["-STOP", &pid.to_string()])
+            .status()
+            .expect("APPARATUS: send SIGSTOP to a fixture peer");
+        assert!(
+            stopped.success(),
+            "APPARATUS: could not pause fixture peer {pid}"
+        );
+        Frozen(pid)
+    })
+    .collect();
+    r.restart(1);
+    let bob = &r.workers[1];
+    let before = bob.vox(None, &["room", "read", &room, "--json"]);
+    assert!(
+        !before
+            .expect_ok("read offline Bob's room")
+            .ndjson()
+            .iter()
+            .any(|row| row["entry_hash"] == late_parent),
+        "APPARATUS: Bob already holds the deliberately unavailable parent"
+    );
+    let args = [
+        "--re",
+        &late_parent,
+        "--op",
+        "thread-late-retry-753",
+        "THREAD-LATE-REPLY",
+    ];
+    let queued = thread_post(bob, &args);
+    let explicit_args = [
+        "--re",
+        &late_parent,
+        "--thread",
+        &late_parent,
+        "--op",
+        "thread-explicit-retry-753",
+        "THREAD-EXPLICIT-LATE-REPLY",
+    ];
+    let explicit_queued = thread_post(bob, &explicit_args);
+    drop(frozen);
+    support::until(
+        bob,
+        None,
+        "the previously missing parent to reach Bob",
+        &["room", "read", &room, "--json"],
+        |o| {
+            o.ndjson()
+                .iter()
+                .any(|row| row["entry_hash"] == late_parent)
+        },
+    );
+    assert_eq!(
+        thread_post(bob, &args),
+        queued,
+        "PRODUCT: the same --op reply must stay a retry when its previously missing parent arrives"
+    );
+    assert_eq!(thread_post(bob, &explicit_args), explicit_queued,
+               "PRODUCT: an identical explicit --thread retry must keep its original entry after the parent arrives");
+    let after = bob.vox(None, &["room", "read", &room, "--json"]);
+    let rows = after.expect_ok("read the retried reply").ndjson();
+    let replies: Vec<_> = rows
+        .iter()
+        .filter(|row| row["entry_hash"] == queued)
+        .collect();
+    assert!(
+        replies.len() == 1 && replies[0]["envelope"]["thread"] == late_parent,
+        "PRODUCT: the retried reply must appear once with its original root: {replies:?}"
+    );
+    eprintln!("[proof] a missing parent arrived; retry kept the original entry and thread");
 }
 
 /// The room the fixture holds, as `vox` at integrate 48b1c743 made it: its id is its genesis hash.

@@ -80,7 +80,7 @@ extension VoxAction {
             VoxAction("Room", "Rename…", enabled: inRoom) { node?.sheet = .rename },
             VoxAction("Room", "Retention…", enabled: inRoom) { node?.sheet = .retention },
             VoxAction("Room", "Admins…", enabled: inRoom) { node?.sheet = .admins },
-            VoxAction("Room", "Reply to Selected Message", "r",
+            VoxAction("Room", "Reply in Thread", "r",
                       enabled: inRoom && node?.messages.contains { $0.id == node?.selectedMessage } == true) {
                 node?.replyTo = node?.messages.first { $0.id == node?.selectedMessage }
             },

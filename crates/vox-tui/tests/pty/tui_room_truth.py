@@ -29,6 +29,7 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             lines. Bob selects q-mid (Up), presses Ctrl-R and sends q-answer: his post's `re` names
             q-mid, and the TUI shows it under "┆ alice: q-mid…", one level, not q-root, with q-mid
             itself off screen (ADR-028 R-9, #485);
+  thread    An @alice reply to q-mid stays in q-root's thread and addresses Alice (#753).
   jump      Bob selects q-answer and presses Enter: the view moves to q-mid, selected;
   address   a canonical address Alice posts reads as Bob's node writes it: "open
             nas-web.alice.family.vox please" (ADR-028 S-1a, #488);
@@ -108,13 +109,9 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             still acts as default: its status bar and sidebar say so (ADR-028 E-4, #470);
   to        `:to alice` and `:urgent` show on the composer as "To: alice · urgent", and the
             message Bob then sends reaches Alice with `to` naming her and `urgent` (W-4, #513);
-  sessions  Alice's node, through Claude Code's hook in a session a person is at, opens two
-            Sessions and ends one: Bob's Sessions pane lists the open one by `vox room sessions`'s
-            label and the ended one apart under "Ended (1)"; `:all` shows each opening and end
-            among the room's messages; `:session <short id>`, without drive, shows only that it
-            exists, "<label> — name and id as alice says" (MD-3) and "Only members alice trusts
-            with drive see inside this Session.", with no
-            composer, and `:send` there is refused, reaching nobody (ADR-029 CL-2, CL-3, #553);
+  sessions  Alice's hooks open two Sessions and end one. Bob sees neither without drive;
+            after Alice's terminal grant he sees the open/ended Sessions and their lifecycle,
+            and the open Session offers its composer (ADR-031 SA-1–SA-3).
   session-order  Alice posts, then her hook opens a new Session, within one second: in Bob's All the
             post reads first and "<label> opened" under it (#562: times in milliseconds);
   drive     once Alice gives Bob drive (`vox trust drive`, at a terminal) and her open Session
@@ -546,8 +543,8 @@ try:
         p = run("alice", "room", "post", room, "--json", "--session", "quote-proof", *args)
         if p.returncode != 0: product(f"alice's `vox room post {' '.join(args)}` failed: {p.stderr.strip()}")
         return json.loads(p.stdout.strip().splitlines()[-1])["entry_hash"]
-    q_root = alice_posts("q-root what shall we build")
-    q_mid = alice_posts("--re", q_root, "--thread", q_root, "q-mid the lexer first")
+    q_root = alice_posts("--to", fp["bob"], "q-root @bob what shall we build")
+    q_mid = alice_posts("--re", q_root, "q-mid the lexer first")
     FILL = 50  # more lines than the pane holds, so q-mid is off screen under the reply
     for i in range(1, FILL + 1):
         p = run("alice", "room", "post", room, f"f-{i:03d}")
@@ -581,7 +578,7 @@ try:
     shown = rows()
     at = next(i for i, r in enumerate(shown) if "you: q-answer" in r)
     above = shown[at - 1] if at else ""
-    def bob_reply_re():
+    def bob_message(body):
         r = run("bob", "room", "read", room, "--json", "--limit", "500")
         for line in r.stdout.splitlines():
             try:
@@ -589,14 +586,17 @@ try:
             except ValueError:
                 continue
             env = row.get("envelope") or {}
-            if env.get("body") == "q-answer on it":
-                return env.get("re")
-        return None
-    wrote = bob_reply_re()
+            if env.get("body") == body:
+                return env
+        return {}
+    wrote = bob_message("q-answer on it")
+    mid = bob_message("q-mid the lexer first")
     mid_off = not any("alice: q-mid" in r and "┆" not in r for r in shown)
-    claim("quote", wrote == q_mid and "┆ alice: q-mid the lexer first" in above and "q-root" not in above
+    claim("quote", wrote.get("re") == q_mid and wrote.get("thread") == q_root
+          and mid.get("thread") == q_root and "┆ alice: q-mid the lexer first" in above and "q-root" not in above
           and mid_off,
-          f"bob's reply's re names q-mid: {wrote == q_mid} (re {wrote!r}); the row above it: "
+          f"bob's reply: re {wrote.get('re')!r}, thread {wrote.get('thread')!r}; "
+          f"q-mid's thread {mid.get('thread')!r}, expected root {q_root!r}; the row above it: "
           f"{above.strip()!r}; q-mid itself off screen: {mid_off}")
 
     stage("jump")
@@ -607,6 +607,18 @@ try:
     jumped = tui.until(lambda: "alice: q-mid" in selected() and "┆" not in selected(), 5, 0.2)
     claim("jump", "q-answer" in sel_reply and jumped,
           f"selected before Enter: {sel_reply.strip()!r}; after: {selected().strip()!r}")
+    # An @addressed reply uses the same rule as the plain reply, even to a reply rather than
+    # General's root. Its To: addresses Alice but does not create a separate/private thread.
+    stage("thread")
+    tui.key("\x12", 0.3)
+    tui.key("@alice q-addressed on it", 0.3)
+    tui.key("\r", 1)
+    tui.key("\x1b[F", 0.5)
+    tui.until(lambda: bool(bob_message("@alice q-addressed on it")), 30, 0.5)
+    addressed = bob_message("@alice q-addressed on it")
+    claim("thread", addressed.get("re") == q_mid and addressed.get("thread") == q_root
+          and addressed.get("to") == [fp["alice"]],
+          f"@alice reply must answer q-mid in q-root's thread and address alice; got {addressed!r}")
     tui.key("\x1b[F", 0)  # End
     tui.until(lambda: has(timeline(), f"f-{FILL:03d}"), 5, 0.2)
     focus("Timeline")  # where the stages below begin
@@ -1294,8 +1306,8 @@ try:
     # session a person is at, opens two Sessions in the room and ends one with a real `SessionEnd`.
     # Bob's TUI lists the open one by the label `vox room sessions` gives it, the ended one apart
     # under "Ended (1)"; All merges each Session's opening and end among the room's messages; a
-    # Session opened without drive (Alice gives Bob none) shows only that it exists and why
-    # nothing more, and offers no composer: `:send` there is refused.
+    # Before drive neither Session is visible (ADR-031 SA-1–SA-3); after drive both are listed
+    # and the open Session offers its composer.
     def hook(w, payload):
         e = env(w)
         e["CLAUDE_CODE_ENTRYPOINT"] = "cli"  # a session a person is at, not a headless run
@@ -1310,10 +1322,25 @@ try:
     hook("alice", claude(OPEN_ID, "UserPromptSubmit", prompt="port the codec"))
     hook("alice", claude(ENDED_ID, "UserPromptSubmit", prompt="look at the tests"))
     hook("alice", claude(ENDED_ID, "SessionEnd", reason="prompt_input_exit"))
-    def cli_labels():
-        r = run("bob", "room", "sessions", room, "--json")
+    def cli_labels(w="bob"):
+        r = run(w, "room", "sessions", room, "--json")
+        if r.returncode != 0:
+            product(f"{w}'s room sessions refused: {r.stderr.strip()}")
         rows = [json.loads(l) for l in r.stdout.splitlines() if l.strip()]
         return {x["id"]: x for x in rows}
+    if not until(lambda: {OPEN_ID, ENDED_ID} <= set(cli_labels("alice")), 60):
+        product(f"alice's own Sessions never opened: {cli_labels('alice')!r}")
+    # SA-1–SA-3 supersede the old read-only Session listing. Both the CLI and the TUI must
+    # hide these Sessions until Alice grants Bob drive. The existing drive action moves here.
+    private = not ({OPEN_ID, ENDED_ID} & set(cli_labels()))
+    private = private and not any(OPEN_ID[:8] in row or ENDED_ID[:8] in row for row in tui.display())
+    t = Tui([VOX, "trust", "drive", fp["bob"]], env("alice"))
+    t.until(lambda: t.closed or "passphrase" in t.text().lower(), 20, 0.5)
+    if not t.closed and "passphrase" in t.text().lower():
+        t.key("id pass\r", 0.5)
+    t.until(lambda: t.closed, 60, 0.5)
+    granted = t.text()
+    t.stop()
     if not until(lambda: {OPEN_ID, ENDED_ID} <= set(cli_labels()) and not cli_labels()[ENDED_ID]["open"], 60):
         product(f"bob's `vox room sessions --json` never listed alice's two Sessions, one ended, within 60 s: "
                 f"{cli_labels()!r}")
@@ -1336,29 +1363,12 @@ try:
     titled = any(f"Timeline — {open_label} · open" in r for r in screen)
     # The Session's name and id are alice's node's claim, and the TUI says so (ADR-029 MD-3).
     claimed = any(f"{open_label} — name and id as alice says" in r for r in screen)
-    # The pane wraps its lines: read it as one text without the spaces a wrap took.
-    nodrive = ("Only members alice trusts with drive see inside this Session.".replace(" ", "")
-               in inside.replace(" ", ""))
-    no_composer = not any("Composer" in r for r in screen)
-    tui.key(":send DRIVE-WITHOUT-DRIVE\r", 1)
-    refused = " ".join(r.strip() for r in tui.display()[-3:])
-    told = f"not sent: this is {open_label}; :general writes to the room" in refused
-    # A file sent into a Session is driving it (DR-1.7): without drive, refused, and nothing sent.
-    with open(f"{S}/nodrive-file.txt", "w") as f:
-        f.write("NODRIVE-FILE\n")
-    tui.key(f":share {S}/nodrive-file.txt\r", 2)
-    share_refused = " ".join(r.strip() for r in tui.display()[-3:])
-    share_told = "you cannot drive this Session: alice has not given you drive" in share_refused
+    composer = any("Composer" in row for row in screen)
+    claim("sessions", private and listed and apart and merged and titled and claimed and composer,
+          f"Sessions hidden before drive: {private}; after drive, Sessions pane: {listed_rows!r} "
+          f"(open listed: {listed}, ended apart: {apart}); All merged openings/end: {merged}; "
+          f"selected Session titled: {titled}, source named: {claimed}, composer offered: {composer}")
     tui.key(":general\r", 2)
-    leaked = "DRIVE-WITHOUT-DRIVE" in run("alice", "room", "read", room).stdout
-    claim("sessions", listed and apart and merged and titled and claimed and nodrive and no_composer and told
-          and not leaked and share_told,
-          f"Sessions pane: {listed_rows!r} (open listed: {listed}, ended apart: {apart}); All merged the "
-          f"openings and end among the messages: {merged}; `:session` titled {titled}, said whose claim its "
-          f"name and id are {claimed}, said no drive "
-          f"{nodrive}, no composer {no_composer}; `:send` there said {refused!r}, reached the room: "
-          f"{leaked}; `:share` there said {share_refused!r}" + ("" if merged else f"; All showed: {all_rows!r}")
-          + ("" if titled and nodrive else "; screen:\n" + "\n".join(screen)))
 
     stage("session-order")
     # A Session that opens just after a post, within the same second, reads after it in All (#562,
@@ -1397,18 +1407,11 @@ try:
           f"{'precedes' if in_order else 'does not precede'} the opened line: {tail_rows!r}")
 
     stage("drive")
-    # A Session read from inside (ADR-029 SC-1, CL-1, #553): Alice gives Bob drive, as a person
-    # does at a terminal, and her open Session runs one turn through Claude Code's hook: a tool
+    # A Session read from inside (ADR-029 SC-1, CL-1, #553): Alice gave Bob drive at the terminal
+    # above, and her open Session runs one turn through Claude Code's hook: a tool
     # call, its result in the transcript, the reply. Bob's `:session` then shows the turn, line for
     # line as his `vox room session` prints it, and no "Only members …" sentence; the tool call's
     # Details (`d` on its line) hold its whole output.
-    t = Tui([VOX, "trust", "drive", fp["bob"]], env("alice"))
-    t.until(lambda: t.closed or "passphrase" in t.text().lower(), 20, 0.5)
-    if not t.closed and "passphrase" in t.text().lower():
-        t.key("id pass\r", 0.5)
-    t.until(lambda: t.closed, 60, 0.5)
-    granted = t.text()
-    t.stop()
     work = f"{S}/alice-work"
     os.makedirs(work, exist_ok=True)
     transcript = f"{work}/{OPEN_ID}.jsonl"

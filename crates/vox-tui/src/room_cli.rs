@@ -605,7 +605,7 @@ pub(crate) async fn post_structured(
             data.insert("attempt".into(), a);
         }
     }
-    let (re, hops_of_reply) = answers(
+    let (re, hops_of_reply, known_thread) = answers(
         &mut client,
         cid,
         paths,
@@ -615,12 +615,47 @@ pub(crate) async fn post_structured(
         opts.urgent,
     )
     .await?;
+    // An operation keeps the root its first post used even if a missing parent arrives, or
+    // retention removes one, before a retry. Changed --re/--thread still goes through normal
+    // refusal and semantic conflict checks; post_once checks every other semantic field.
+    let prior = if re.is_some() {
+        coord::op_group(&mut client, cid, &op)
+            .await?
+            .into_iter()
+            .find(|p| p.author == snap.me && p.envelope.re == re)
+    } else {
+        None
+    };
+    let retry_thread = prior
+        .filter(|p| {
+            opts.thread.as_deref().is_none_or(|explicit| {
+                p.envelope
+                    .thread
+                    .as_deref()
+                    .is_some_and(|old| old.eq_ignore_ascii_case(explicit.trim()))
+            })
+        })
+        .map(|p| p.envelope.thread);
+    let thread = if let Some(original) = retry_thread {
+        original
+    } else {
+        match (known_thread, &opts.thread) {
+            (Some(root), Some(explicit)) if !root.eq_ignore_ascii_case(explicit.trim()) => {
+                return Err(AppError::Usage(format!(
+                    "--thread {explicit} contradicts the message being replied to: its thread is {root}"
+                )));
+            }
+            (Some(root), _) => Some(root),
+            (None, Some(explicit)) => Some(explicit.clone()),
+            (None, None) => re.clone(),
+        }
+    };
     let draft = Draft {
         kind,
         to,
         urgent: opts.urgent,
         re: re.clone(),
-        thread: opts.thread.clone(),
+        thread,
         // **A reply spends a hop** (ADR-020 §9): what it may still travel is its parent's
         // budget less one, so an urgent reply chain ends at zero instead of looping.
         hops: hops_of_reply,
@@ -1355,7 +1390,7 @@ pub(crate) fn shown_tags(tags: &[String]) -> String {
         .join(" ")
 }
 
-/// What a post answers and the hop budget it starts with, by the one rule `vox room post` and
+/// What a post answers, its hop budget and its known thread root, by the rule `vox room post` and
 /// `vox share` follow (V210-121, ADR-020 §9): `re` if given, else the one unanswered message that
 /// woke `session`; and that parent's budget less one.
 ///
@@ -1370,7 +1405,7 @@ pub(crate) async fn answers(
     me: &Digest32,
     re: Option<&str>,
     urgent: bool,
-) -> Result<(Option<String>, Option<u32>), AppError> {
+) -> Result<(Option<String>, Option<u32>, Option<String>), AppError> {
     // **A woken session's post answers what woke it** (V210-121). With no `--re` it started a
     // chain of its own with a fresh hop budget, and two agents answering each other urgently
     // that way woke each other for ever. When exactly one wake is unanswered, that is the reply;
@@ -1411,14 +1446,21 @@ pub(crate) async fn answers(
     };
     // **A reply spends a hop** (ADR-020 §9): what it may still travel is its parent's budget
     // less one. Its parents are fetched by entry hash (V210-120), not by reading the room.
-    let hops_of_reply = match &re {
-        Some(re) => Some(crate::wake::reply_hops(
-            re,
-            &coord::reply_chain(client, cid, re).await?,
-        )),
-        None => None,
+    let (hops_of_reply, thread) = match &re {
+        Some(re) => {
+            let chain = coord::reply_chain(client, cid, re).await?;
+            let thread = vox_agentcomms::envelope::reply_thread_by(re, |h| {
+                let hash = vox_core::node::link::b32_decode(h.trim(), "re").ok()?;
+                chain
+                    .iter()
+                    .find(|r| r.entry_hash == hash)
+                    .map(|r| r.text.clone())
+            });
+            (Some(crate::wake::reply_hops(re, &chain)), thread)
+        }
+        None => (None, None),
     };
-    Ok((re, hops_of_reply))
+    Ok((re, hops_of_reply, thread))
 }
 
 /// What `vox room read --tag` filters a room by (#636): the tags every message shown carries,

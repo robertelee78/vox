@@ -2302,10 +2302,13 @@ impl VoxClient {
             // parent's budget less one, read up the `re` chain from the log.
             if let Some(re) = env.re.clone() {
                 let chain = reply_chain(c, channel_id, &re).await?;
-                env.hops = vox_agentcomms::envelope::reply_hops_by(&re, |h| {
+                let parent = |h: &str| {
                     let hash = vox_core::node::link::b32_decode(h.trim(), "re").ok()?;
                     chain.get(&hash).cloned()
-                });
+                };
+                env.hops = vox_agentcomms::envelope::reply_hops_by(&re, parent);
+                env.thread =
+                    Some(vox_agentcomms::envelope::reply_thread_by(&re, parent).unwrap_or(re));
             }
             let text = env.to_text();
             // A link card, fetched by this node (ADR-028 F-10).
@@ -3019,10 +3022,13 @@ impl VoxClient {
             // **A share is a post, and follows a post's hop rule** (ADR-020 §9), as `vox share`.
             if let Some(re) = env.re.clone() {
                 let chain = reply_chain(c, channel_id, &re).await?;
-                env.hops = vox_agentcomms::envelope::reply_hops_by(&re, |h| {
+                let parent = |h: &str| {
                     let hash = vox_core::node::link::b32_decode(h.trim(), "re").ok()?;
                     chain.get(&hash).cloned()
-                });
+                };
+                env.hops = vox_agentcomms::envelope::reply_hops_by(&re, parent);
+                env.thread =
+                    Some(vox_agentcomms::envelope::reply_thread_by(&re, parent).unwrap_or(re));
             }
             let req = Request::Share {
                 channel_id,
