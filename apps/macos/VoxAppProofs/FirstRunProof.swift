@@ -1955,6 +1955,12 @@ final class FirstRunProof: XCTestCase {
         // The first run answered (Not Now) and the node chosen: the app opens as alice.
         try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
         try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+        // An ordinary empty room map is the known baseline for the wrong-passphrase check.
+        try stager.write(Data(), to: data + "/rooms")
+        let mapMode = stager.run(["/bin/chmod", "600", data + "/rooms"], env: [:])
+        guard mapMode.status == 0 else {
+            throw Apparatus("the scratch room map's private permissions could not be staged: \(mapMode.out)")
+        }
         daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
         for (name, words) in [("alice", "alice identity"), ("claude-a", "agent identity")] {
@@ -2134,8 +2140,11 @@ final class FirstRunProof: XCTestCase {
                 let r = stager.run(["/usr/bin/git", "-c", "user.name=proof", "-c", "user.email=proof@example.invalid"] + args, env: [:])
                 guard r.status == 0 else { throw Apparatus("scratch git repository failed: \(r.out)") }
             }
-            let canonical = stager.run(["/bin/sh", "-c", "cd \"$1\" && pwd -P", "repo", repo], env: [:]).out
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let physical = stager.run(["/bin/sh", "-c", "cd \"$1\" && pwd -P", "repo", repo], env: [:])
+            let canonical = physical.out.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard physical.status == 0, canonical.hasPrefix("/") else {
+                throw Apparatus("scratch repository's physical directory could not be staged: \(physical.out)")
+            }
             return (canonical, tree)
         }
         func repoTurn(_ session: String, _ dir: String, _ prompt: String) throws -> String {
@@ -2191,19 +2200,26 @@ final class FirstRunProof: XCTestCase {
         }
         other.click()
         let map = data + "/rooms"
-        let before = stager.run(["/bin/cat", map], env: [:]).out
+        func readMap() throws -> String {
+            let read = stager.run(["/bin/cat", map], env: [:])
+            guard read.status == 0 else {
+                throw Apparatus("the scratch room map could not be read: \(read.out)")
+            }
+            return read.out
+        }
+        let before = try readMap()
         type(ui, Key.id("room-ask-passphrase"), "wrong room passphrase", "the room's passphrase field")
         tap(ui, Key.id("room-ask-bind"), "Bind with the wrong passphrase")
         words(ui, Key.id("room-ask-failed"), timeout: 60, "a wrong passphrase must be named and refused before map write",
               until: { $0.contains("passphrase") && $0.contains("not bound") })
-        XCTAssertEqual(stager.run(["/bin/cat", map], env: [:]).out, before,
+        XCTAssertEqual(try readMap(), before,
                        "PRODUCT: a wrong passphrase must leave the room map unchanged, even when the waiting node holds the room")
         tap(ui, Key.id("room-ask-passphrase"), "the refused room passphrase")
         ui.typeKey("a", modifierFlags: .command)
         el(ui, Key.id("room-ask-passphrase")).typeText("work room")
         tap(ui, Key.id("room-ask-bind"), "Bind")
         leftDialog()
-        let mapText = stager.run(["/bin/cat", map], env: [:]).out
+        let mapText = try readMap()
         XCTAssertTrue(mapText.components(separatedBy: "repo " + repo + "\n").count == 2
                           && !mapText.contains("repo " + tree + "\n") && mapText.contains("passphrase work room"),
                       "PRODUCT: Bind must save one canonical repository block and its verified passphrase: \(mapText)")
@@ -2238,7 +2254,7 @@ final class FirstRunProof: XCTestCase {
         let admins = run(vox, ["room", "admin", "list", "--node", "alice", createdRoom], env: voxEnv).out
         XCTAssertTrue(admins.contains(String(aliceFp.prefix(12))) && !admins.contains(String(agentFp.prefix(12))),
                       "PRODUCT: the created room's founding admin must be alice, not the harness node: \(admins)")
-        let createdMap = stager.run(["/bin/cat", map], env: [:]).out
+        let createdMap = try readMap()
         XCTAssertTrue(createdMap.components(separatedBy: "repo " + createRepo + "\n").count == 2
                           && !createdMap.contains("repo " + createTree + "\n"),
                       "PRODUCT: Create Room must bind the canonical repository once in the room map: \(createdMap)")
@@ -2257,7 +2273,7 @@ final class FirstRunProof: XCTestCase {
         leftDialog()
         let declined = try repoTurn("59000000-4c0e-4f00-9a1b-0c0ffee54009", noTree, "later session")
         XCTAssertFalse(declined.contains("isn't tied to a Vox room"), "PRODUCT: a declined repository asked a later worktree session again: \(declined)")
-        let noMap = stager.run(["/bin/cat", map], env: [:]).out
+        let noMap = try readMap()
         XCTAssertTrue(noMap.contains("repo " + noRepo + "\n    room       none"),
                       "PRODUCT: Not This Repo must save the canonical repository's no: \(noMap)")
         leftDialog()
