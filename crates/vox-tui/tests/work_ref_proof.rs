@@ -36,6 +36,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/pty_driver.rs"]
+mod pty_driver;
 #[path = "support/room.rs"]
 mod support;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -95,9 +97,10 @@ fn a_work_reference_has_one_shape_and_an_attempt_id_is_seeded_from_the_log() {
         .build()
         .expect("APPARATUS: could not build the test's tokio runtime");
     let tmp = tempfile::tempdir().expect("APPARATUS: could not make a temp dir");
-    let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
+    let mut room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
+    let room_id = room.id.clone();
     let alice = &room.workers[0];
-    let r = room.id.as_str();
+    let r = room_id.as_str();
 
     // ---- (1) the tracker's own key, colons and all, is carried unchanged ----
     let ok = post(alice, "other", r, &["--work", KEY], "reading the ADR");
@@ -453,4 +456,508 @@ fn a_work_reference_has_one_shape_and_an_attempt_id_is_seeded_from_the_log() {
         "PRODUCT: a `failed` whose operation is void must seed nothing: the id stays the last \
          real failure's, {first_failed}; the next post seeded {seeded}"
     );
+    // ADR-033 TH-5 (#756): each reply gets the starting message's three opaque tags,
+    // including a nested reply. An intermediate reply's extra tag is not the root's tag.
+    let root = post_as(
+        alice,
+        "holder",
+        r,
+        "say",
+        &[
+            "--task",
+            "#756",
+            "--project",
+            "literal-project",
+            "--milestone",
+            "literal-milestone",
+        ],
+        "TAG-ROOT",
+    );
+    assert!(root.ok, "PRODUCT: tagged starting post failed: {root:?}");
+    let root_age = std::time::Instant::now();
+    let root_hash = root.json()["entry_hash"]
+        .as_str()
+        .expect("PRODUCT: root hash")
+        .to_owned();
+    let first = post_as(
+        alice,
+        "holder",
+        r,
+        "say",
+        &[
+            "--re",
+            &root_hash,
+            "--project",
+            "reply-extra",
+            "--work",
+            KEY,
+            "--op",
+            "inherited-tags",
+        ],
+        "TAG-FIRST",
+    );
+    assert!(first.ok, "PRODUCT: tagged reply failed: {first:?}");
+    let first_hash = first.json()["entry_hash"]
+        .as_str()
+        .expect("PRODUCT: reply hash")
+        .to_owned();
+    let nested = post_as(
+        alice,
+        "other",
+        r,
+        "say",
+        &["--re", &first_hash],
+        "TAG-NESTED",
+    );
+    assert!(nested.ok, "PRODUCT: nested reply failed: {nested:?}");
+    let inherited = serde_json::json!([
+        "milestone:literal-milestone",
+        "project:literal-project",
+        "task:#756"
+    ]);
+    let read = rows(alice, r);
+    let envelope = |hash: &serde_json::Value| {
+        read.iter()
+            .find(|row| &row["entry_hash"] == hash)
+            .expect("PRODUCT: posted tagged reply absent")["envelope"]
+            .clone()
+    };
+    let first_env = envelope(&first.json()["entry_hash"]);
+    let nested_env = envelope(&nested.json()["entry_hash"]);
+    assert!(
+        inherited
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tag| first_env["tags"]
+                .as_array()
+                .is_some_and(|tags| tags.contains(tag)))
+            && first_env["tags"]
+                .as_array()
+                .is_some_and(|tags| tags.contains(&serde_json::json!("project:reply-extra")))
+            && first_env["data"]["work"] == KEY
+            && first_env["from"] == "holder"
+            && first_env["re"] == root_hash,
+        "PRODUCT: CLI reply must inherit all root tags and preserve explicit metadata: {first_env}"
+    );
+    assert!(nested_env["tags"] == inherited && nested_env["thread"] == root_hash && nested_env["re"] == first_hash,
+        "PRODUCT: nested CLI reply must inherit the starting message's tags, not its parent's extra tags: {nested_env}");
+    let retry = post_as(
+        alice,
+        "holder",
+        r,
+        "say",
+        &[
+            "--re",
+            &root_hash,
+            "--project",
+            "reply-extra",
+            "--work",
+            KEY,
+            "--op",
+            "inherited-tags",
+        ],
+        "TAG-FIRST",
+    );
+    assert!(
+        retry.ok && retry.json()["entry_hash"] == first.json()["entry_hash"],
+        "PRODUCT: the same reply operation must keep its tags and identity: {retry:?}"
+    );
+
+    let raw = serde_json::json!({"v":1,"type":"say","re":first_hash,"thread":root_hash,
+        "body":"RAW-TAG-REPLY","data":{"opaque":"unchanged"}})
+    .to_string();
+    let raw_post = alice.vox_in(None, &["room", "post", r, "-"], Some(&raw));
+    assert!(
+        raw_post.ok,
+        "PRODUCT: pasted envelope reply refused: {raw_post:?}"
+    );
+    let raw_row = rows(alice, r)
+        .into_iter()
+        .find(|row| row["envelope"]["body"] == "RAW-TAG-REPLY")
+        .expect("PRODUCT: pasted reply absent");
+    assert!(
+        raw_row["envelope"]["tags"] == inherited
+            && raw_row["envelope"]["data"]["opaque"] == "unchanged",
+        "PRODUCT: pasted reply must inherit root tags without rewriting its payload: {raw_row}"
+    );
+
+    let shared_path = tmp.path().join("thread-note.txt");
+    std::fs::write(&shared_path, "A file in the tagged thread")
+        .expect("APPARATUS: write shared file");
+    let shared = alice.vox(
+        Some("holder"),
+        &[
+            "share",
+            r,
+            shared_path.to_str().expect("APPARATUS: shared path"),
+            "--re",
+            &first_hash,
+            "-m",
+            "TAGGED-FILE-REPLY",
+        ],
+    );
+    assert!(shared.ok, "PRODUCT: file reply refused: {shared:?}");
+    let file_row = rows(alice, r)
+        .into_iter()
+        .find(|row| row["envelope"]["body"] == "TAGGED-FILE-REPLY")
+        .expect("PRODUCT: file reply absent");
+    assert!(
+        file_row["envelope"]["tags"] == inherited
+            && file_row["envelope"]["thread"] == root_hash
+            && file_row["envelope"]["re"] == first_hash,
+        "PRODUCT: a shared file reply must carry the starting tags and thread: {file_row}"
+    );
+
+    let tui_root = post_as(
+        alice,
+        "holder",
+        r,
+        "say",
+        &[
+            "--task",
+            "#756",
+            "--project",
+            "literal-project",
+            "--milestone",
+            "literal-milestone",
+        ],
+        "TUI-TAG-ROOT",
+    );
+    assert!(
+        tui_root.ok,
+        "PRODUCT: TUI thread staging failed: {tui_root:?}"
+    );
+    let driver = tmp.path().join("reply-without-tags.py");
+    std::fs::write(&driver, TUI_REPLY).expect("APPARATUS: write existing PTY apparatus caller");
+    let driven = pty_driver::run(
+        driver.to_str().expect("APPARATUS: driver path"),
+        &[
+            support::VOX,
+            alice.data.to_str().expect("APPARATUS: data path"),
+            alice.cfg.to_str().expect("APPARATUS: config path"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty"),
+        ],
+    );
+    assert!(
+        driven.code == Some(0)
+            && driven.has_verdict("thread-tags")
+            && driven
+                .stdout
+                .contains("thread-tags PASS: TUI posted its reply"),
+        "{}: TUI reply journey: {}{}",
+        if driven.code == Some(2) {
+            "APPARATUS"
+        } else {
+            "PRODUCT"
+        },
+        driven.stdout,
+        driven.stderr
+    );
+    let tui_reply = rows(alice, r)
+        .into_iter()
+        .find(|row| row["envelope"]["body"] == "TUI-REPLY-WITHOUT-TAGS")
+        .expect("PRODUCT: TUI's posted reply is absent from room read --json");
+    assert!(tui_reply["envelope"]["tags"] == inherited && tui_reply["envelope"]["thread"] == tui_root.json()["entry_hash"],
+        "PRODUCT: a reply typed in the TUI with no tags must carry all three starting tags: {tui_reply}");
+    eprintln!("[proof] #756 CLI and TUI replies carry starting tags: {inherited}");
+
+    // The caller cannot manufacture the binary-owned snapshot, through flags or raw JSON.
+    let spoof = post_as(
+        alice,
+        "holder",
+        r,
+        "say",
+        &[
+            "--re",
+            &root_hash,
+            "--data",
+            r#"{"thread_tags":["task:forged"]}"#,
+        ],
+        "SPOOFED-SNAPSHOT",
+    );
+    assert!(
+        !spoof.ok && spoof.stderr.contains("thread_tags"),
+        "PRODUCT: caller-supplied inheritance must be refused: {spoof:?}"
+    );
+    let raw_spoof = serde_json::json!({"v":1,"type":"say","re":root_hash,
+        "body":"RAW-SPOOFED-SNAPSHOT","data":{"thread_tags":[]}})
+    .to_string();
+    let spoof = alice.vox_in(None, &["room", "post", r, "-"], Some(&raw_spoof));
+    assert!(
+        !spoof.ok && spoof.stderr.contains("thread_tags"),
+        "PRODUCT: a pasted inheritance snapshot must be refused: {spoof:?}"
+    );
+
+    // Reuse the existing room-verbs journey's offline-peer apparatus: the binary queues a
+    // reply while its starting message is missing, then retries after that message arrives.
+    room.stop(1);
+    let late = post_as(
+        &room.workers[0],
+        "holder",
+        r,
+        "say",
+        &["--task", "late-root"],
+        "LATE-TAG-ROOT",
+    );
+    assert!(late.ok, "PRODUCT: late tagged root refused: {late:?}");
+    let late_hash = late.json()["entry_hash"]
+        .as_str()
+        .expect("PRODUCT: late root hash")
+        .to_owned();
+    struct Frozen(u32);
+    impl Drop for Frozen {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("kill")
+                .args(["-CONT", &self.0.to_string()])
+                .status();
+        }
+    }
+    let frozen: Vec<_> = [
+        room.anchor_pid(),
+        room.workers[0]
+            .daemon_pid()
+            .expect("APPARATUS: Alice daemon"),
+    ]
+    .into_iter()
+    .map(|pid| {
+        let stopped = std::process::Command::new("kill")
+            .args(["-STOP", &pid.to_string()])
+            .status()
+            .expect("APPARATUS: pause fixture peer");
+        assert!(
+            stopped.success(),
+            "APPARATUS: could not pause fixture peer {pid}"
+        );
+        Frozen(pid)
+    })
+    .collect();
+    room.restart(1);
+    let bob = &room.workers[1];
+    assert!(
+        !rows(bob, r)
+            .iter()
+            .any(|row| row["entry_hash"] == late_hash),
+        "APPARATUS: offline Bob already holds the deliberately missing root"
+    );
+    let late_flags = [
+        "--re",
+        &late_hash,
+        "--op",
+        "late-tags-retry-756",
+        "--project",
+        "explicit",
+    ];
+    let thread_flags = [
+        "--thread",
+        &late_hash,
+        "--op",
+        "late-thread-tags-756",
+        "--project",
+        "explicit",
+    ];
+    let queued = post_as(bob, "retrying", r, "say", &late_flags, "LATE-TAG-REPLY");
+    let thread_queued = post_as(
+        bob,
+        "retrying",
+        r,
+        "say",
+        &thread_flags,
+        "LATE-THREAD-REPLY",
+    );
+    assert!(
+        queued.ok && thread_queued.ok,
+        "PRODUCT: offline replies refused: {queued:?}; {thread_queued:?}"
+    );
+    let queued_row = rows(bob, r)
+        .into_iter()
+        .find(|row| row["entry_hash"] == queued.json()["entry_hash"])
+        .expect("PRODUCT: queued reply absent");
+    assert!(
+        queued_row["envelope"]["data"]["thread_tags"] == serde_json::json!([]),
+        "PRODUCT: an unavailable root must record empty inheritance: {queued_row}"
+    );
+    drop(frozen);
+    support::until(
+        bob,
+        None,
+        "late tagged root to arrive",
+        &["room", "read", r, "--json"],
+        |out| {
+            out.ndjson()
+                .iter()
+                .any(|row| row["entry_hash"] == late_hash)
+        },
+    );
+    for (flags, original) in [
+        (&late_flags[..], &queued),
+        (&thread_flags[..], &thread_queued),
+    ] {
+        let retry = post_as(
+            bob,
+            "retrying",
+            r,
+            "say",
+            flags,
+            "same operation after root arrival",
+        );
+        assert!(
+            retry.ok && retry.json()["entry_hash"] == original.json()["entry_hash"],
+            "PRODUCT: root arrival must not change the reply operation's inherited tags: {retry:?}"
+        );
+    }
+    let changed = post_as(
+        bob,
+        "retrying",
+        r,
+        "say",
+        &[
+            "--re",
+            &late_hash,
+            "--op",
+            "late-tags-retry-756",
+            "--project",
+            "changed",
+        ],
+        "changed tag",
+    );
+    assert!(
+        changed.code == Some(4),
+        "PRODUCT: changed explicit tags must conflict after root arrival: {changed:?}"
+    );
+    let removed = post_as(
+        bob,
+        "retrying",
+        r,
+        "say",
+        &["--thread", &late_hash, "--op", "late-thread-tags-756"],
+        "removed tag",
+    );
+    assert!(
+        removed.code == Some(4),
+        "PRODUCT: removing an explicit tag must conflict: {removed:?}"
+    );
+
+    // Keep the reply while retention removes its older root. The wait creates that age gap;
+    // the product's room read, not elapsed time, is the staging verdict.
+    std::thread::sleep(std::time::Duration::from_secs(17).saturating_sub(root_age.elapsed()));
+    let alice = &room.workers[0];
+    let retained_flags = [
+        "--re",
+        &root_hash,
+        "--op",
+        "retained-tags-756",
+        "--project",
+        "explicit",
+    ];
+    let retained = post_as(
+        alice,
+        "holder",
+        r,
+        "say",
+        &retained_flags,
+        "RETAINED-TAG-REPLY",
+    );
+    assert!(
+        retained.ok,
+        "PRODUCT: reply before root retention refused: {retained:?}"
+    );
+    let retention = alice.vox(None, &["room", "retention", r, "15"]);
+    assert!(
+        retention.ok,
+        "PRODUCT: retention command failed: {retention:?}"
+    );
+    support::until(
+        alice,
+        None,
+        "old root to expire while its reply remains",
+        &["room", "read", r, "--json"],
+        |out| {
+            let rows = out.ndjson();
+            !rows.iter().any(|row| row["entry_hash"] == root_hash)
+                && rows
+                    .iter()
+                    .any(|row| row["entry_hash"] == retained.json()["entry_hash"])
+        },
+    );
+    let retry = post_as(
+        alice,
+        "holder",
+        r,
+        "say",
+        &retained_flags,
+        "same operation after root retention",
+    );
+    assert!(retry.ok && retry.json()["entry_hash"] == retained.json()["entry_hash"],
+        "PRODUCT: losing the root must not remove inherited tags from an identical retry: {retry:?}");
+    let retained_row = rows(alice, r)
+        .into_iter()
+        .find(|row| row["entry_hash"] == retained.json()["entry_hash"])
+        .expect("PRODUCT: retained reply absent");
+    assert!(
+        retained_row["envelope"]["data"]["thread_tags"] == inherited,
+        "PRODUCT: recorded inherited tags must survive the root: {retained_row}"
+    );
+    let changed = post_as(
+        alice,
+        "holder",
+        r,
+        "say",
+        &["--re", &root_hash, "--op", "retained-tags-756"],
+        "removed explicit tag",
+    );
+    assert!(
+        changed.code == Some(4),
+        "PRODUCT: losing the root must not hide an explicit tag change: {changed:?}"
+    );
+    eprintln!("[proof] #756 inherited tags stay fixed across late root arrival and root retention; explicit changes conflict");
 }
+
+/// A bounded caller of the existing terminal apparatus, within this same real-binary journey.
+const TUI_REPLY: &str = r#"
+import os, re, sys, traceback
+sys.dont_write_bytecode = True
+vox, data, cfg, helpers = sys.argv[1:]
+sys.path.insert(0, helpers)
+from vox_pty import Tui, arm, disarm, pane, pyte, stage
+if pyte is None:
+    print('APPARATUS: pyte is unavailable'); sys.exit(2)
+env = {k: os.environ[k] for k in ('PATH', 'HOME', 'TMPDIR', 'USER') if k in os.environ}
+env.update(VOX_DATA_DIR=data, VOX_CONFIG_DIR=cfg, TERM='xterm-256color', VOX_PROXY='127.0.0.1:0')
+tui = None
+code = 2
+class Product(Exception): pass
+def need(ok, why):
+    if not ok: raise Product(why + '\n' + tui.text())
+arm(120, 'thread-tags')
+try:
+    stage('open tagged thread')
+    tui = Tui([vox, 'tui', '--listen', '127.0.0.1:0'], env)
+    tui.pump(2)
+    if 'passphrase' in tui.text().lower(): tui.key('identity passphrase\r', 2)
+    tui.key('\r', 1)
+    need(tui.until(lambda: 'TUI-TAG-ROOT' in tui.text(), 30), 'TUI never drew the starting message')
+    for _ in range(6):
+        if any(re.search(r'┌Timeline[^┐]*\[focus\]', line) for line in tui.display()): break
+        tui.key('\t', .2)
+    selected = lambda: next((line for line in pane(tui.display(), 'Timeline') if '▶ ' in line), '')
+    tui.key('\x1b[F', .2)
+    tui.key('\x1b[A', .2)
+    need('TUI-TAG-ROOT' in selected(), 'Up did not select the starting message')
+    stage('type untagged reply')
+    tui.key('\x12', .2)
+    tui.key('TUI-REPLY-WITHOUT-TAGS', .2)
+    tui.key('\r', .5)
+    tui.key('\x1b[F', .5)  # End: follow the posted reply
+    need(tui.until(lambda: 'you: TUI-REPLY-WITHOUT-TAGS' in tui.text(), 30), 'TUI did not show its posted reply')
+    print('thread-tags PASS: TUI posted its reply'); code = 0
+except Product as e:
+    print('thread-tags RED PRODUCT:', e); code = 1
+except Exception:
+    print('thread-tags APPARATUS:', traceback.format_exc()); code = 2
+finally:
+    if tui is not None and not tui.stop():
+        print('APPARATUS: TUI could not be reaped'); code = 2
+    disarm()
+sys.exit(code)
+"#;

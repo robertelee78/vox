@@ -634,3 +634,32 @@ pub fn reply_thread_by(re: &str, mut parent: impl FnMut(&str) -> Option<String>)
             .to_ascii_lowercase(),
     )
 }
+
+/// Add the General message's task/project/milestone tags to a reply (ADR-033 TH-5).
+/// Tags are opaque text. Explicit tags survive; duplicates do not consume the existing limit.
+///
+/// # Errors
+/// The combined set exceeds the envelope's existing eight-tag limit.
+pub fn inherit_thread_tags(tags: &[String], starting: &str) -> Result<Vec<String>, String> {
+    let inherited = Envelope::parse(starting)
+        .map(|e| e.tags)
+        .unwrap_or_default();
+    merge_thread_tags(tags, &inherited)
+}
+
+/// Combine explicit reply tags with its recorded inherited tags.
+///
+/// # Errors
+/// The combined set exceeds the envelope's existing eight-tag limit.
+pub fn merge_thread_tags(tags: &[String], inherited: &[String]) -> Result<Vec<String>, String> {
+    let mut merged = tags.to_vec();
+    merged.extend_from_slice(inherited);
+    merged.sort();
+    merged.dedup();
+    if merged.len() > MAX_TAGS {
+        return Err(format!(
+            "reply and starting message together carry more than {MAX_TAGS} tags"
+        ));
+    }
+    Ok(merged)
+}

@@ -534,6 +534,23 @@ fn render_row(
         &addressed(&r.text, me, crate::ident::names()),
         &words(&r.text),
     );
+    if let Some(root) = thread_of(r) {
+        let label = parents
+            .rows
+            .iter()
+            .find(|p| p.entry_hash == root && !p.owed)
+            .map(|p| {
+                let text = words(&p.text);
+                preview_line(text.split(is_line_break).next().unwrap_or_default())
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "[{}], starting message not available",
+                    &b32_encode(&root)[..8]
+                )
+            });
+        row.push_str(&format!("  ↳ thread: {label}\n"));
+    }
     if let Some(line) = share_line(r, me, parents) {
         row.push_str(&line);
     }
@@ -814,6 +831,8 @@ struct Reader {
     /// The entries this session posted that the drain's replies answer, found by hash: a reply to
     /// one older than the cursor is still known for one.
     posted: std::collections::HashSet<Digest32>,
+    /// Threads this exact session or its whole node posted in or was named in.
+    threads: std::collections::HashSet<Digest32>,
     /// The resources this session handed off, which a `decline` refusing one names.
     handed_off: std::collections::BTreeSet<String>,
 }
@@ -865,6 +884,38 @@ fn for_a_sibling(row: &vox_core::node::api::MessageRow, reader: &Reader) -> bool
         vox_agentcomms::envelope::Envelope::parse(&row.text)
             .is_ok_and(|e| e.is_for_a_sibling_of(fp, &reader.session))
     })
+}
+
+/// A thread address is carried by the envelope, never guessed from a reply's body.
+fn thread_of(row: &vox_core::node::api::MessageRow) -> Option<Digest32> {
+    vox_agentcomms::envelope::Envelope::parse(&row.text)
+        .ok()?
+        .thread
+        .and_then(|h| b32_decode(h.trim(), "thread").ok())
+}
+
+fn other_thread(row: &vox_core::node::api::MessageRow, reader: &Reader) -> bool {
+    thread_of(row).is_some_and(|root| !reader.threads.contains(&root))
+}
+
+/// A session-scoped post or address includes only that session, never all of its node's siblings.
+fn thread_participant(
+    row: &vox_core::node::api::MessageRow,
+    me: Option<Digest32>,
+    session: &str,
+) -> bool {
+    if row.owed {
+        return false;
+    }
+    let env = vox_agentcomms::envelope::Envelope::parse(&row.text).ok();
+    (me == Some(row.author)
+        && env
+            .as_ref()
+            .is_none_or(|e| e.from.is_empty() || e.from == session))
+        || me.is_some_and(|fp| {
+            env.as_ref()
+                .is_some_and(|e| e.is_addressed_to_session(&b32_encode(&fp), session))
+        })
 }
 
 /// The one line that stands for the messages to this node's other sessions a room's drain
@@ -1009,16 +1060,26 @@ fn render(
         out.push_str(n);
         out.push('\n');
     }
-    let counts_any = rows
-        .iter()
-        .any(|r| chatter_kind(r, reader).is_some() || for_a_sibling(r, reader));
+    let counts_any = rows.iter().any(|r| {
+        chatter_kind(r, reader).is_some() || for_a_sibling(r, reader) || other_thread(r, reader)
+    });
     let overhead = out.len() + NOTE_RESERVE + if counts_any { CHATTER_RESERVE } else { 0 };
     let mut body = String::new();
     // `shown` is how many of `rows`, from the start, this carries; `full` how many in full.
     let (mut shown, mut full) = (0usize, 0usize);
     let mut chatter = std::collections::BTreeMap::<String, usize>::new();
     let mut siblings = 0usize;
+    let mut other_threads = 0usize;
     for r in rows {
+        if other_thread(r, reader) {
+            if !budget.first && overhead + body.len() > budget.bytes {
+                break;
+            }
+            other_threads += 1;
+            shown += 1;
+            budget.first = false;
+            continue;
+        }
         if for_a_sibling(r, reader) {
             if !budget.first && overhead + body.len() > budget.bytes {
                 break;
@@ -1068,6 +1129,9 @@ fn render(
     }
     if siblings > 0 {
         out.push_str(&siblings_line(room_label, siblings));
+    }
+    if other_threads > 0 {
+        out.push_str(&format!("{other_threads} reply(s) in other threads, not shown; `vox room read {room_label}` has them\n"));
     }
     let rest = rows.len() - shown + beyond;
     if rest > 0 {
@@ -2463,9 +2527,39 @@ async fn read_room(
         None => (Vec::new(), None),
     };
 
+    // Participation may precede the cursor or the bounded fresh page. Read only the threads
+    // named by this page, using the daemon's index, plus their General roots by hash.
+    let roots: std::collections::BTreeSet<Digest32> = fresh.iter().filter_map(thread_of).collect();
+    let root_rows = crate::coord::find(
+        client,
+        channel_id,
+        &roots.iter().copied().collect::<Vec<_>>(),
+    )
+    .await?;
+    let mut threads = std::collections::HashSet::new();
+    for root in roots {
+        let history = match client
+            .read_thread(channel_id, root)
+            .await
+            .map_err(|e| AppError::Usage(e.to_string()))?
+        {
+            vox_core::node::ipc::Frame::Rows { rows } => rows,
+            other => return Err(crate::client::unexpected(&other)),
+        };
+        if root_rows
+            .iter()
+            .filter(|r| r.entry_hash == root)
+            .chain(history.iter())
+            .any(|r| thread_participant(r, me, &input.session_id))
+        {
+            threads.insert(root);
+        }
+    }
+
     // Who this session is (V030-18): its own entries among those the news answers or this read
     // returned, and the resources it handed off, from the board.
     let reader = Reader {
+        threads,
         me_fp: me_fp.clone(),
         me,
         session: input.session_id.clone(),
@@ -2489,6 +2583,7 @@ async fn read_room(
         }),
     };
     let mut parent_rows = targets;
+    parent_rows.extend(root_rows);
     parent_rows.extend(rows.iter().cloned());
     let pulled: Vec<vox_core::node::pulls::Pulled> = vox_core::node::pulls::recorded(paths)
         .into_iter()

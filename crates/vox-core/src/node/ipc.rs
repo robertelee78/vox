@@ -320,6 +320,8 @@ const T_FIND: u64 = 121;
 const T_COUNT_REQ: u64 = 122;
 // #636: a room's messages by tag, and by tag and sender. Numbered by its story.
 const T_TAGGED: u64 = 636;
+/// A thread's readable replies, by its root (ADR-033 TH-4).
+const T_THREAD: u64 = 755;
 // ADR-028 RR-1: entries shown or drained, for a read record. Numbered by its story (#503).
 const T_MARK_READ: u64 = 503;
 // V210-164: leaving a room over the socket, as joining and creating one are. Numbered by its item,
@@ -868,6 +870,16 @@ pub enum Request {
         /// Return only matching rows **after** this one. Absent reads from the first.
         since: Option<Digest32>,
     },
+    /// A thread's replies, indexed by its General message, in arrival order. The root is
+    /// read with `Find`. Existing row pages bound each reply; nothing reads another room.
+    Thread {
+        /// The room.
+        channel_id: Digest32,
+        /// The General message's entry hash.
+        root: Digest32,
+        /// Only replies after this matching row.
+        since: Option<Digest32>,
+    },
     /// How many rows of a room follow `since` (all of them when absent), as [`Frame::Count`]
     /// (V210-120): what a reader that reads a page at a time says is still waiting.
     Count {
@@ -963,6 +975,17 @@ impl Request {
                 }
                 e.bytes(from.as_ref().map_or(&[][..], |d| &d[..]));
                 e.bytes(since.as_ref().map_or(&[][..], |d| &d[..]));
+            }
+            Request::Thread {
+                channel_id,
+                root,
+                since,
+            } => {
+                e.array(4)
+                    .uint(T_THREAD)
+                    .bytes(channel_id)
+                    .bytes(root)
+                    .bytes(since.as_ref().map_or(&[][..], |d| &d[..]));
             }
             Request::Count { channel_id, since } => {
                 e.array(3)
@@ -1495,6 +1518,18 @@ impl Request {
                     channel_id,
                     tags,
                     from,
+                    since,
+                })
+            }
+            (T_THREAD, 4) => {
+                let channel_id = digest(&mut d)?;
+                let root = digest(&mut d)?;
+                let since = optional_digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Thread {
+                    channel_id,
+                    root,
                     since,
                 })
             }
@@ -5123,6 +5158,32 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             }
             Frame::Rows { rows }
         }
+        Request::Thread { channel_id, root, since } => {
+            let view = handle.view();
+            let Some(detail) = view.open_channels.iter().find(|d| d.channel_id == channel_id) else {
+                return Frame::Error { reason: "room not open".into() };
+            };
+            let mut matched: Vec<&MessageRow> = detail.structured.by_thread.get(&root)
+                .into_iter().flat_map(|positions| positions.iter())
+                .filter_map(|i| detail.timeline.get(*i as usize)).collect();
+            matched.sort_by_key(|r| r.arrival);
+            if let Some(cursor) = since {
+                let Some(mark) = matched.iter().find(|r| r.entry_hash == cursor && !r.owed)
+                    .map(|r| r.arrival) else {
+                    return Frame::Error { reason: "cursor not among this room's thread replies".into() };
+                };
+                matched.retain(|r| r.arrival > mark);
+            }
+            let mut rows = Vec::new();
+            let mut bytes = 0usize;
+            for r in matched {
+                let cost = r.text.len() + ROW_OVERHEAD;
+                if !rows.is_empty() && bytes + cost > rows_budget() { break; }
+                bytes += cost;
+                rows.push(r.clone());
+            }
+            Frame::Rows { rows }
+        }
         // #636: a room's messages by tag, found through the room's index of the tags of the
         // messages this node can read; never the whole room.
         Request::Tagged {
@@ -6468,6 +6529,37 @@ impl IpcClient {
                     channel_id,
                     types: types.iter().map(|t| (*t).to_owned()).collect(),
                     ops: ops.to_vec(),
+                    since: cursor,
+                })
+                .await?
+            {
+                Frame::Rows { rows } => {
+                    let Some(last) = rows.last() else {
+                        return Ok(Frame::Rows { rows: all });
+                    };
+                    if cursor == Some(last.entry_hash) {
+                        return Err(Error::MalformedIpc("ipc rows page did not advance"));
+                    }
+                    cursor = Some(last.entry_hash);
+                    all.extend(rows);
+                }
+                other => return Ok(other),
+            }
+        }
+    }
+
+    /// Read the replies of one thread through the room's index, across bounded row pages.
+    ///
+    /// # Errors
+    /// If the daemon refuses, disconnects, or does not advance its page.
+    pub async fn read_thread(&mut self, channel_id: Digest32, root: Digest32) -> Result<Frame> {
+        let mut all = Vec::new();
+        let mut cursor = None;
+        loop {
+            match self
+                .request(&Request::Thread {
+                    channel_id,
+                    root,
                     since: cursor,
                 })
                 .await?

@@ -2309,6 +2309,30 @@ impl VoxClient {
                 env.hops = vox_agentcomms::envelope::reply_hops_by(&re, parent);
                 env.thread =
                     Some(vox_agentcomms::envelope::reply_thread_by(&re, parent).unwrap_or(re));
+                if let Some(root) = env.thread.as_deref().and_then(|h| digest(h, "thread").ok()) {
+                    match ask(
+                        c,
+                        &Request::Find {
+                            channel_id,
+                            entries: vec![root],
+                        },
+                    )
+                    .await?
+                    {
+                        Frame::Rows { rows } => {
+                            if let Some(starting) =
+                                rows.iter().find(|r| r.entry_hash == root && !r.owed)
+                            {
+                                env.tags = vox_agentcomms::envelope::inherit_thread_tags(
+                                    &env.tags,
+                                    &starting.text,
+                                )
+                                .map_err(failed)?;
+                            }
+                        }
+                        other => return Err(unexpected(&other)),
+                    }
+                }
             }
             let text = env.to_text();
             // A link card, fetched by this node (ADR-028 F-10).
@@ -3029,6 +3053,30 @@ impl VoxClient {
                 env.hops = vox_agentcomms::envelope::reply_hops_by(&re, parent);
                 env.thread =
                     Some(vox_agentcomms::envelope::reply_thread_by(&re, parent).unwrap_or(re));
+                if let Some(root) = env.thread.as_deref().and_then(|h| digest(h, "thread").ok()) {
+                    match ask(
+                        c,
+                        &Request::Find {
+                            channel_id,
+                            entries: vec![root],
+                        },
+                    )
+                    .await?
+                    {
+                        Frame::Rows { rows } => {
+                            if let Some(starting) =
+                                rows.iter().find(|r| r.entry_hash == root && !r.owed)
+                            {
+                                env.tags = vox_agentcomms::envelope::inherit_thread_tags(
+                                    &env.tags,
+                                    &starting.text,
+                                )
+                                .map_err(failed)?;
+                            }
+                        }
+                        other => return Err(unexpected(&other)),
+                    }
+                }
             }
             let req = Request::Share {
                 channel_id,
