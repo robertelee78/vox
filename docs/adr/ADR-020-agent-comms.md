@@ -387,8 +387,10 @@ they are not a defence against one that lies.
     The receiving worker MUST explicitly acknowledge its scope before the sender treats it as
     accepted. A missing acknowledgement stays unresolved; it does not justify duplicate work,
     fabricated acceptance, a trust change or bypassing the existing claim/takeover rules.
-  - **8.6d. Handoff.** A handoff MUST identify the exact work key, candidate and base, accepted
-    scope and remaining proof or review work, integration/acceptance owner, and tracker writer.
+  - **8.6d. Handoff.** A handoff MUST identify the exact work key, base and required outcome.
+    Review/result handoffs MUST also identify the immutable candidate when one exists, accepted
+    scope and remaining proof or review work. Each handoff MUST name its integration/acceptance
+    owner and tracker writer; an initial implementation assignment MUST NOT invent a candidate.
     It MUST link the existing required evidence and its awa manifest or pending reconciliation
     when those are needed by the next worker. These are the existing work records, not a new
     evidence system. Claims and coordination stay in the room; durable progress, proofs and
