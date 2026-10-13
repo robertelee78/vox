@@ -1708,8 +1708,9 @@ final class FirstRunProof: XCTestCase {
         present(ui, Key.id("agent-setup-name"), timeout: 10, "the initial offer must have its own window")
         // An explicit request arrives while that offer is open. Its actual directory/name must
         // replace the old offer before the person answers; the requesting session gets the answer.
+        let requestedDirectory = root.resolvingSymlinksInPath().path
         let setupRequest = stager.run(["/bin/sh", "-c", "cd \"$1\" && exec \"$2\" agent setup claude --node claude-app",
-                                      "agent-setup", root.path, vox],
+                                      "agent-setup", requestedDirectory, vox],
                                      env: agentEnv)
         XCTAssertTrue(setupRequest.status == 0 && setupRequest.out.contains("Vox has asked the person"),
                       "PRODUCT: agent setup must return with the app handoff before any answer; got \(setupRequest.out)")
@@ -1718,7 +1719,7 @@ final class FirstRunProof: XCTestCase {
         words(ui, Key.id("agent-setup-harness"), timeout: 5, "the window must name Claude Code",
               until: { $0.contains("Claude Code") })
         words(ui, Key.id("agent-setup-directory"), timeout: 5, "the window must name the requesting directory",
-              until: { $0 == "Directory: \(root.path)" })
+              until: { $0 == "Directory: \(requestedDirectory)" })
         words(ui, Key.id("agent-setup-name"), timeout: 5, "the window must name the proposed node",
               until: { $0.contains("claude-app") })
         func light(_ harness: String, _ session: String) -> String {
