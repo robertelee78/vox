@@ -1572,6 +1572,36 @@ final class FirstRunProof: XCTestCase {
             guard present(pairingUI, Key.id("computer-trust-sheet"), timeout: 15,
                           "Add Computer must open its account-owned view") else { throw Product("Add Computer did not open") }
         }
+        func quitComputerAccount() throws {
+            let computerView = pairingUI.scrollViews.matching(identifier: "computer-trust-sheet").firstMatch
+            if computerView.exists {
+                let done = pairingUI.buttons.matching(identifier: "computer-done").firstMatch
+                guard done.exists, done.isHittable, inView(pairingUI, done) else {
+                    keepTree(pairingUI, "the computer account's Done action could not be delivered")
+                    XCTFail("APPARATUS: the visible computer view’s Done button could not be staged for account switching")
+                    throw Apparatus("the visible computer view's Done button could not be staged for account switching")
+                }
+                done.click()
+                let closedUntil = Date().addingTimeInterval(5)
+                while done.exists && Date() < closedUntil { Thread.sleep(forTimeInterval: 0.2) }
+                guard !done.exists else {
+                    keepTree(pairingUI, "Done did not close the computer view")
+                    XCTFail("PRODUCT: Done must close the computer view before quitting this account")
+                    throw Product("Done must close the computer view before quitting this account")
+                }
+            }
+            guard pairingUI.state == .runningForeground else {
+                keepTree(pairingUI, "the computer account app was not foreground for Quit")
+                XCTFail("APPARATUS: Command-Q could not be delivered to a foreground Vox account")
+                throw Apparatus("Command-Q could not be delivered to a foreground Vox account")
+            }
+            pairingUI.typeKey("q", modifierFlags: .command)
+            guard pairingUI.wait(for: .notRunning, timeout: 15) else {
+                keepTree(pairingUI, "public Quit did not stop the computer account app")
+                XCTFail("PRODUCT: Command-Q must quit Vox before switching accounts")
+                throw Product("Command-Q must quit Vox before switching accounts")
+            }
+        }
         try openComputers(computerA)
         tap(pairingUI, Key.id("computer-pairing-begin"), "Create an unused invitation")
         guard present(pairingUI, Key.id("computer-pairing-code"), timeout: 20,
@@ -1595,7 +1625,7 @@ final class FirstRunProof: XCTestCase {
                        "PRODUCT: inviting must keep the account's management identity")
         XCTAssertEqual(try staged(vox, ["node", "list"], env: computerA), noNodes,
                        "PRODUCT: Add Computer must not create or infer a personal chat node")
-        pairingUI.terminate()
+        try quitComputerAccount()
         try openComputers(computerB)
         type(pairingUI, Key.id("computer-pairing-input"), code, "the other computer's pairing code")
         tap(pairingUI, Key.id("computer-pairing-preview"), "Review Computer before approval")
@@ -1617,12 +1647,12 @@ final class FirstRunProof: XCTestCase {
                      "PRODUCT: a signed approval must not offer a live Cancel action")
         XCTAssertNil(locateEverywhere(pairingUI, Key.id("computer-trust-confirmed")),
                      "PRODUCT: one-sided approval must not claim confirmed")
-        pairingUI.terminate()
+        try quitComputerAccount()
         try openComputers(computerA)
         tap(pairingUI, Key.id("computer-pairing-approve"), "Explicit approval on the inviting computer")
         guard present(pairingUI, Key.id("computer-trust-applying"), timeout: 30,
                       "the second signed approval must be recorded before leaving this computer") else { return }
-        pairingUI.terminate()
+        try quitComputerAccount()
         try openComputers(computerB)
         guard words(pairingUI, Key.id("computer-pending-nodes"), timeout: 30,
                     "a protected detached node must remain pending until ordinary attach", until: { $0.contains("protected") }) != nil else { return }
@@ -1645,14 +1675,14 @@ final class FirstRunProof: XCTestCase {
         let keptSessions = try staged(vox, ["room", "sessions", "--node", "protected", keptRoom], env: computerB)
         XCTAssertTrue(keptSessions.contains(mapSession.prefix(8)),
                       "PRODUCT: the existing repository binding must still open its session in the retained room; \(keptSessions)")
-        pairingUI.terminate()
+        try quitComputerAccount()
         try openComputers(computerA)
         guard present(pairingUI, Key.id("computer-trust-confirmed"), timeout: 45,
                       "both computers must show confirmed only after policy application") else { return }
         let appliedA = try computerStatus(computerA), appliedB = try computerStatus(computerB)
         XCTAssertEqual(appliedA["state"] as? String, "confirmed", "PRODUCT: inviting computer must be applied")
         XCTAssertEqual(appliedB["state"] as? String, "confirmed", "PRODUCT: reviewing computer must be applied")
-        pairingUI.terminate()
+        try quitComputerAccount()
         print("[proof] Add Computer: zero-node invitation; authenticated review; one-sided waiting; protected-node pending; ordinary attach; both confirmed; existing room and repo binding retained")
         // Native OpenCode Session driving uses the existing plugin host apparatus, with no
         // model or room override. Actual room joins and the saved repo binding remain authority.
@@ -1801,7 +1831,7 @@ final class FirstRunProof: XCTestCase {
         XCTAssertEqual((callsAfterRefusal["calls"] as? [[String: Any]])?.count, acceptedCalls.count,
                        "PRODUCT: refused ordinary-node input must not reach the native recipient; \(callsAfterRefusal)")
         nativeHost.terminate()
-        pairingUI.terminate()
+        try quitComputerAccount()
         print("[proof] paired selected personal node drove the repo-bound native OpenCode Session through app say; recipient received exact prompt and returned visible step; joined ordinary node refused with no recipient call")
 
         // The ordinary app must explain a real storage refusal, not retain its old confirmation.
@@ -1825,7 +1855,7 @@ final class FirstRunProof: XCTestCase {
                     "storage suspension must explain the storage problem", until: { $0.contains("storage") }) != nil else { return }
         XCTAssertNil(locateEverywhere(pairingUI, Key.id("computer-trust-confirmed")),
                      "PRODUCT: a storage failure must not leave the app claiming confirmed")
-        pairingUI.terminate()
+        try quitComputerAccount()
 
         // Existing clock apparatus writes a past authenticated deadline. Restarting with normal
         // clocks makes it genuinely expired to the ordinary app and both ordinary daemons.
@@ -1900,7 +1930,7 @@ final class FirstRunProof: XCTestCase {
                        "PRODUCT: retrying closure of the expired intent must not cancel or replace the fresh invitation")
         XCTAssertTrue(afterOldClose["pairing"] is NSNull,
                       "PRODUCT: retired expired intent must not replace the fresh invitation's state; \(afterOldClose)")
-        pairingUI.terminate()
+        try quitComputerAccount()
         print("[proof] Add Computer: unused invitation cancelled; signed expiry closed with local-only warning and fresh invitation preserved; storage refusal visibly suspends confirmation")
 
         let ui = voxApp(appPath)
