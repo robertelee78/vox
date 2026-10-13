@@ -1597,6 +1597,39 @@ macro_rules! on_held {
 }
 
 impl VoxClient {
+    async fn oldest_retained_room_entry(
+        &self,
+        channel_id: Digest32,
+        entries: &[Digest32],
+    ) -> Result<Option<String>, VoxError> {
+        let entries = entries.to_vec();
+        on_held!(self, |c| {
+            let mut boundary = None;
+            for chunk in entries.chunks(vox_core::node::ipc::MAX_FIND) {
+                let rows = match ask(
+                    c,
+                    &Request::Find {
+                        channel_id,
+                        entries: chunk.to_vec(),
+                    },
+                )
+                .await?
+                {
+                    Frame::Rows { rows } => rows,
+                    other => return Err(unexpected(&other)),
+                };
+                if let Some(id) = chunk
+                    .iter()
+                    .find(|id| rows.iter().any(|r| r.entry_hash == **id))
+                {
+                    boundary = Some(b32_encode(id));
+                    break;
+                }
+            }
+            Ok(boundary)
+        })
+    }
+
     async fn room_page_read(
         &self,
         room: String,
@@ -2173,58 +2206,46 @@ impl VoxClient {
             .iter()
             .map(|id| digest(id, "entry"))
             .collect::<Result<Vec<_>, _>>()?;
-        let boundary = on_held!(self, |c| {
-            let mut boundary = None;
-            for chunk in entries.chunks(vox_core::node::ipc::MAX_FIND) {
-                let rows = match ask(
-                    c,
-                    &Request::Find {
-                        channel_id,
-                        entries: chunk.to_vec(),
-                    },
-                )
-                .await?
-                {
-                    Frame::Rows { rows } => rows,
-                    other => return Err(unexpected(&other)),
-                };
-                if let Some(id) = chunk
-                    .iter()
-                    .find(|id| rows.iter().any(|r| r.entry_hash == **id))
-                {
-                    boundary = Some(b32_encode(id));
-                    break;
-                }
-            }
-            Ok(boundary)
-        })?;
+        let mut boundary = self
+            .oldest_retained_room_entry(channel_id, &entries)
+            .await?;
         let mut page = self.room_read(room.clone()).await?;
-        if let Some(boundary) = boundary {
-            let mut cursors = std::collections::HashSet::new();
-            while !page.messages.iter().any(|row| row.id == boundary) {
-                let Some(before) = page.before.clone() else {
-                    break;
-                };
-                if !cursors.insert(before.clone()) {
-                    return Err(VoxError::Failed {
-                        reason: "Room history did not advance while recovering its page.".into(),
-                    });
-                }
-                let older = self.room_read_older(room.clone(), before).await?;
-                let held: std::collections::HashSet<_> =
-                    page.messages.iter().map(|row| row.id.clone()).collect();
-                let mut rows: Vec<_> = older
-                    .messages
-                    .into_iter()
-                    .filter(|row| !held.contains(&row.id))
-                    .collect();
-                rows.extend(page.messages);
-                page = FfiRoomRead {
-                    messages: rows,
-                    older: older.older,
-                    before: older.before,
-                };
+        let mut cursors = std::collections::HashSet::new();
+        while let Some(ref oldest) = boundary {
+            if page.messages.iter().any(|row| &row.id == oldest) {
+                break;
             }
+            // Retention can prune the selected boundary between Find and pagination.
+            // Recompute it before every older page rather than walking to the room start.
+            boundary = self
+                .oldest_retained_room_entry(channel_id, &entries)
+                .await?;
+            let Some(ref oldest) = boundary else { break };
+            if page.messages.iter().any(|row| &row.id == oldest) {
+                break;
+            }
+            let Some(before) = page.before.clone() else {
+                break;
+            };
+            if !cursors.insert(before.clone()) {
+                return Err(VoxError::Failed {
+                    reason: "Room history did not advance while recovering its page.".into(),
+                });
+            }
+            let older = self.room_read_older(room.clone(), before).await?;
+            let held: std::collections::HashSet<_> =
+                page.messages.iter().map(|row| row.id.clone()).collect();
+            let mut rows: Vec<_> = older
+                .messages
+                .into_iter()
+                .filter(|row| !held.contains(&row.id))
+                .collect();
+            rows.extend(page.messages);
+            page = FfiRoomRead {
+                messages: rows,
+                older: older.older,
+                before: older.before,
+            };
         }
         Ok(page)
     }
