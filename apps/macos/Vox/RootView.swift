@@ -18,6 +18,19 @@ struct RootView: View {
                 setup
             }
         }
+        .safeAreaInset(edge: .bottom) {
+            if let said = model.agentSetupSaid {
+                HStack(alignment: .top) {
+                    Text(said).font(Theme.text).textSelection(.enabled)
+                        .accessibilityIdentifier("agent-hooks-installed")
+                    Spacer()
+                    Button("Dismiss") { model.agentSetupSaid = nil }
+                        .accessibilityIdentifier("agent-hooks-dismiss")
+                }
+                .padding(Space.s16)
+                .panelSurface()
+            }
+        }
         // Node › Sign Out…: what it does, said first (E-5), done only when confirmed.
         .sheet(isPresented: $model.signingOut) {
             if let node = model.signedInAs {

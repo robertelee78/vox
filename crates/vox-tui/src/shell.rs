@@ -444,6 +444,11 @@ pub fn run(remove: bool) -> std::process::ExitCode {
             .errors
             .push("the agent skill pack was not installed for every harness here".into());
     }
+    if !remove && !crate::setup::install_light_hooks() {
+        report
+            .errors
+            .push("light hooks could not be installed for every harness here".into());
+    }
     for line in &report.lines {
         println!("vox shell-setup: {line}");
     }

@@ -932,7 +932,7 @@ enum AgentCmd {
     /// can be announced, and prints nothing; on `SessionEnd` it removes the session's
     /// registration.
     Hook(AgentHookArgs),
-    /// Print the integration a harness needs to run `vox agent hook` every turn.
+    /// Print a node's harness integration, or install missing light hooks with `--install`.
     ///
     /// Whatever the harness wants, this prints it: Claude Code and Codex take a
     /// hook entry in their own settings, so they get a JSON snippet; OpenCode has
@@ -1137,11 +1137,14 @@ pub struct AgentTrustArgs {
 pub struct AgentPluginArgs {
     /// The harness to print an integration for. Only `opencode` needs one today;
     /// Claude Code and Codex are configured with a hook command instead.
-    pub harness: String,
+    #[arg(required_unless_present = "install", conflicts_with = "install")]
+    pub harness: Option<String>,
     /// The agent's own node, which the printed hooks act as (`vox agent hook --node <name>`).
-    /// Required: an agent never uses a person's node.
-    #[arg(long, required = true)]
-    pub node: String,
+    #[arg(long, required_unless_present = "install", conflicts_with = "install")]
+    pub node: Option<String>,
+    /// Install a quiet, node-free hook in every harness here without a Vox hook.
+    #[arg(long)]
+    pub install: bool,
 }
 
 /// `vox agent send`
@@ -1188,10 +1191,12 @@ pub struct AgentRoomArgs {
 pub struct AgentHookArgs {
     #[command(flatten)]
     pub profile: AccountArgs,
-    /// The node this hook acts as: the agent's own node. Required, and
-    /// never taken from the environment or any other node: a hook without it refuses.
-    #[arg(long, required = true)]
-    pub node: String,
+    /// The agent's own node. Never inferred from the environment or another node.
+    #[arg(long, required_unless_present = "light", conflicts_with = "light")]
+    pub node: Option<String>,
+    /// A quiet onboarding hook: no node, no daemon, and no room drain.
+    #[arg(long, value_parser = ["claude", "codex", "opencode"])]
+    pub light: Option<String>,
     /// Drain only this room (its id, or a unique prefix). Without it the hook drains every
     /// room the node holds, each under its own heading.
     #[arg(long)]
@@ -3012,7 +3017,14 @@ pub fn run() -> ExitCode {
             }
         }
         Cmd::Agent(AgentCmd::Hook(args)) => {
-            let node = match vox_core::node::paths::NodeName::parse(&args.node) {
+            // HK-2: a light hook never resolves an account or enters node/daemon code.
+            // HK-3/4's onboarding notice and Not Now state are a separate outcome (#721).
+            if args.light.is_some() {
+                return ExitCode::SUCCESS;
+            }
+            let node = match vox_core::node::paths::NodeName::parse(
+                args.node.as_deref().unwrap_or_default(),
+            ) {
                 Ok(n) => n,
                 Err(e) => {
                     eprintln!("vox: --node: {e}");
@@ -3213,14 +3225,29 @@ pub fn run() -> ExitCode {
             }
         },
         Cmd::Agent(AgentCmd::Plugin(args)) => {
-            let node = match vox_core::node::paths::NodeName::parse(&args.node) {
+            if args.install {
+                return if crate::setup::install_light_hooks() {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                };
+            }
+            let node = match vox_core::node::paths::NodeName::parse(
+                args.node.as_deref().unwrap_or_default(),
+            ) {
                 Ok(n) => n,
                 Err(e) => {
                     eprintln!("vox: --node: {e}");
                     return ExitCode::FAILURE;
                 }
             };
-            match args.harness.to_ascii_lowercase().as_str() {
+            match args
+                .harness
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str()
+            {
                 "opencode" => {
                     print!("{}", crate::agent_hook::opencode_plugin(&node));
                     eprintln!(
