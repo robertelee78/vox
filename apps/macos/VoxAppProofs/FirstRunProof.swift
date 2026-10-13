@@ -4662,19 +4662,48 @@ final class FirstRunProof: XCTestCase {
         print("[proof] keyboard: Space and Return opened Quick Look; ↑ ↑ ↓ selected KEYS-B, KEYS-A, KEYS-B; Tab reached the composer in \(tabs)")
 
         // (15) Who trusts whom, from a member (ADR-028 K-5, K-7, R-5, R-6, E-4; D4, D9, D10, D17).
-        // Dave, a node made here, is trusted by bob before he joins, so bob's grant to him is on
-        // mission's log once he is in.
+        // Dave is remote and unpaired: the local automatic trust policy cannot pretrust him.
+        // Bob trusts him before he joins, so Bob's grant is on mission's log once he is in.
+        let daveRoot = scratch.appendingPathComponent("dave-host")
+        let daveHome = daveRoot.appendingPathComponent("home").path
+        let daveKeychain = daveRoot.appendingPathComponent("identity.keychain-db").path
+        let madeDaveHome = stager.run(["/bin/mkdir", "-p", daveHome], env: [:])
+        let madeDaveKeychain = stager.run(["/usr/bin/security", "create-keychain", "-p", "", daveKeychain],
+                                         env: ["HOME": daveHome])
+        guard madeDaveHome.status == 0, madeDaveKeychain.status == 0 else {
+            throw Apparatus("the remote Dave account's private HOME/Keychain could not be staged")
+        }
+        let daveEnv = ["VOX_DATA_DIR": daveRoot.appendingPathComponent("data").path,
+                       "VOX_CONFIG_DIR": daveRoot.appendingPathComponent("config").path,
+                       "VOX_PROXY": "127.0.0.1:0", "HOME": daveHome, "VOX_TEST_KEYCHAIN": daveKeychain]
+        let daveDaemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: daveEnv,
+                                   until: "vox daemon: control socket")
+        defer { daveDaemon.terminate() }
         let davePass = scratch.appendingPathComponent("dave.pass").path
         try stager.write(Data("dave identity\n".utf8), to: davePass)
         try staged(vox, ["node", "create", "dave"],
-                   env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "dave identity"]) { $1 })
-        try staged(vox, ["node", "attach", "dave", "--passphrase-file", davePass], env: voxEnv)
-        let daveFp = try line(staged(vox, ["id", "--node", "dave"], env: voxEnv)) { $0.count == 52 }
+                   env: daveEnv.merging(["VOX_IDENTITY_PASSPHRASE": "dave identity"]) { $1 })
+        try staged(vox, ["node", "attach", "dave", "--passphrase-file", davePass], env: daveEnv)
+        let daveFp = try line(staged(vox, ["id", "--node", "dave"], env: daveEnv)) { $0.count == 52 }
         try staged(vox, ["trust", "add", "--node", "bob", daveFp, "--name", "dave",
                          "--identity-passphrase-file", bobPass], env: voxEnv)
         tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         try staged(vox, ["room", "join", "--node", "dave", "--passphrase-file", roomPass, missionLink],
-                   env: voxEnv)
+                   env: daveEnv)
+        let davePremiseUntil = Date().addingTimeInterval(30)
+        var daveOffers = ""
+        var aliceTrustBeforeDave = ""
+        while Date() < davePremiseUntil {
+            aliceTrustBeforeDave = try staged(vox, ["trust", "list", "--node", "alice"], env: voxEnv)
+            daveOffers = try staged(vox, ["trust", "offers", "--node", "alice"], env: voxEnv)
+            if !aliceTrustBeforeDave.split(separator: "\n").contains(where: { $0.hasPrefix(daveFp + " ") })
+                && daveOffers.contains("Name it presents: dave · \(daveFp) (not in keyring)") { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        guard !aliceTrustBeforeDave.split(separator: "\n").contains(where: { $0.hasPrefix(daveFp + " ") }),
+              daveOffers.contains("Name it presents: dave · \(daveFp) (not in keyring)") else {
+            throw Apparatus("remote Dave must be genuinely untrusted with authenticated name/full fingerprint before the app claims: trust=\(aliceTrustBeforeDave); offers=\(daveOffers)")
+        }
         // (15a, D10) The join is said in mission's timeline with who alice trusts that trusts dave.
         let daveNamed = "\(daveFp.prefix(26)) (not in keyring)"
         let joinSaid = words(ui, Key.id("join-\(daveFp)"), timeout: 90,
@@ -4685,7 +4714,7 @@ final class FirstRunProof: XCTestCase {
         // each direction and trusts him from there; the room's banner naming who does not read
         // her yet is P2's TrustBanner, proved at 5d.
         try staged(vox, ["trust", "add", "--node", "dave", aliceFp, "--name", "alice",
-                         "--identity-passphrase-file", davePass], env: voxEnv)
+                         "--identity-passphrase-file", davePass], env: daveEnv)
         let daveRow = Key.id("member-dave · \(daveFp.prefix(12))")
         let rowSaid = words(ui, daveRow, timeout: 60,
                             "dave trusts alice and she has not trusted him: her member pane must say \"not in keyring, trusts you\"",
@@ -4777,7 +4806,7 @@ final class FirstRunProof: XCTestCase {
         print("[proof] keyring card: \(ringHead); \(theirs); \(rooms); \(removal.prefix(40))…")
         // (15c, D9) A message of alice's no member's node holds says so, then where it is.
         try staged(vox, ["node", "detach", "bob"], env: voxEnv)
-        try staged(vox, ["node", "detach", "dave"], env: voxEnv)
+        try staged(vox, ["node", "detach", "dave"], env: daveEnv)
         // erin and fay joined in (5) and hold what alice posts; detached too, no member's node is
         // up to take WHERE-15.
         try staged(vox, ["node", "detach", "erin"], env: voxEnv)
