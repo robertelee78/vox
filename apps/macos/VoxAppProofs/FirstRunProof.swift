@@ -244,8 +244,10 @@ enum Key: ExpressibleByStringLiteral, CustomStringConvertible {
             return container.descendants(matching: .any)
                 .matching(NSPredicate(format: "identifier BEGINSWITH %@", p))
         case let .showing(w):
+            // Checkbox values are numbers. CONTAINS on one throws inside the app's
+            // snapshot evaluator, leaving XCTest waiting for a reply until timeout.
             return container.descendants(matching: .any)
-                .matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", w, w))
+                .matching(NSPredicate(format: "label CONTAINS %@ OR CAST(value, 'NSString') CONTAINS %@", w, w))
         case let .menuItem(t):
             return container.descendants(matching: .menuItem)
                 .matching(NSPredicate(format: "title == %@ OR label == %@", t, t))
@@ -1391,7 +1393,7 @@ final class FirstRunProof: XCTestCase {
                    env: bobSession)
         let centre = XCUIApplication(bundleIdentifier: "com.apple.notificationcenterui")
         let banner = centre.descendants(matching: .any)
-            .matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", "bob wrote to you",
+            .matching(NSPredicate(format: "label CONTAINS %@ OR CAST(value, 'NSString') CONTAINS %@", "bob wrote to you",
                                   "bob wrote to you")).firstMatch
         if !banner.waitForExistence(timeout: 30) {
             let there = centre.descendants(matching: .any).allElementsBoundByIndex.prefix(30).map(shown)
@@ -1403,7 +1405,7 @@ final class FirstRunProof: XCTestCase {
             }
         }
         let leaked = centre.descendants(matching: .any)
-            .matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@",
+            .matching(NSPredicate(format: "label CONTAINS %@ OR CAST(value, 'NSString') CONTAINS %@",
                                   "SECRET-TEXT-8", "SECRET-TEXT-8")).firstMatch
         // Only where the banner itself was read: a query that reads nothing in Notification Center
         // would pass this for nothing.
