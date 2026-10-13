@@ -38,6 +38,7 @@
 //! same layout.
 
 mod legacy_session;
+mod legacy_session_sender;
 pub(crate) mod session_floor;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -874,6 +875,8 @@ pub struct ChannelState {
     pending_reads: Vec<(ReadRow, u64)>,
     /// Sealed exact-hash subtype evidence; never a permission or recovery eligibility decision.
     legacy_sessions: legacy_session::LegacySessions,
+    /// Last verified own-feed sequence covered by emitted legacy Session declarations.
+    legacy_announced: Option<u64>,
     /// How far each other member's node holds this identity's feed here, by its own word in its
     /// last sync with this node (ADR-028 R-6): the highest seq of the feed its frontier named.
     /// Persisted as [`SEG_HELD`].
@@ -1776,6 +1779,7 @@ impl ChannelState {
             reads: BTreeMap::new(),
             pending_reads: Vec::new(),
             legacy_sessions: legacy_session::LegacySessions::default(),
+            legacy_announced: None,
             held: BTreeMap::new(),
             owed: BTreeSet::new(),
             owed_asked_to: None,
@@ -2290,6 +2294,7 @@ impl ChannelState {
             reads,
             pending_reads: Vec::new(),
             legacy_sessions: legacy_session::LegacySessions::default(),
+            legacy_announced: None,
             held,
             owed,
             owed_asked_to: None,
@@ -2545,6 +2550,7 @@ impl ChannelState {
             reads: BTreeMap::new(),
             pending_reads: Vec::new(),
             legacy_sessions: legacy_session::LegacySessions::default(),
+            legacy_announced: None,
             held: BTreeMap::new(),
             owed: BTreeSet::new(),
             owed_asked_to: None,

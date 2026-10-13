@@ -16117,6 +16117,11 @@ impl Node {
                 return;
             };
             let mut ch = shared.lock().await;
+            // Ordinary-key declarations name only this node's authenticated legacy hashes.
+            // They let read-only peers identify withheld steps without granting drive.
+            if ch.announce_legacy_sessions(profile, now_millis).is_err() {
+                return;
+            }
             if ch
                 .rotate_drive_if_lost(profile.store(), holders, now_ms)
                 .is_err()
