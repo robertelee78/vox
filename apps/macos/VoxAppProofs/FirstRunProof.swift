@@ -2201,10 +2201,34 @@ final class FirstRunProof: XCTestCase {
                     until: { $0.contains("members unavailable") }) != nil else { return }
         guard timelineBody("RECOVERY-KEPT", timeout: 10,
                            "a transport interruption must preserve the displayed retained timeline") else { return }
+        // A changed remote roster makes recovery distinguishable from the retained old view.
+        try staged(vox, ["node", "create", "charlie"],
+                   env: bob.merging(["VOX_IDENTITY_PASSPHRASE": "recovery pass"]) { $1 })
+        try staged(vox, ["node", "attach", "charlie", "--passphrase-file", pass], env: bob)
+        let charlieFp = try line(staged(vox, ["id", "--node", "charlie"], env: bob)) { $0.count == 52 }
+        try staged(vox, ["room", "join", "--node", "charlie", "--passphrase-file", pass, link], env: bob)
+        let expectedRoster = Set([aliceFp, bobFp, charlieFp])
+        let rosterUntil = Date().addingTimeInterval(30)
+        var rosterSaid = ""
+        var changedRoster = false
+        while Date() < rosterUntil {
+            let roster = run(vox, ["room", "roster", "--node", "bob", room], env: bob)
+            rosterSaid = roster.out
+            let fingerprints = Set(roster.out.split(whereSeparator: \.isNewline)
+                .map { $0.trimmingCharacters(in: .whitespaces) }.filter { $0.count == 52 })
+            if roster.status == 0 && fingerprints == expectedRoster {
+                changedRoster = true
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        guard changedRoster else {
+            throw Apparatus("the remote three-member roster was not staged before Alice resumed: \(rosterSaid)")
+        }
         try local.resume()
         guard words(ui, Key.id("room-header-meta"), timeout: 45,
-                    "the same room must recover its authoritative two-member roster without reopening",
-                    until: { $0.contains("2 members") && $0.contains("forever") }) != nil else { return }
+                    "the same room must recover the changed authoritative three-member roster without reopening",
+                    until: { $0.contains("3 members") && $0.contains("forever") }) != nil else { return }
         guard present(ui, Key.id("member-bob"), timeout: 10,
                       "the recovered room must retain its actual remote member") else { return }
         guard timelineBody("RECOVERY-KEPT", timeout: 10,
@@ -2223,7 +2247,7 @@ final class FirstRunProof: XCTestCase {
         }
         guard words(ui, Key.id("room-header-meta"), timeout: 15,
                     "the recovered room's live watcher must show Bob's later retention change without reopening",
-                    until: { $0.contains("2 members") && $0.contains("1 hour") }) != nil else { return }
+                    until: { $0.contains("3 members") && $0.contains("1 hour") }) != nil else { return }
         print("[proof] transport: unavailable retained timeline; same room recovered roster; later remote retention reached header")
     }
 
