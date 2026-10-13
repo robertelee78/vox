@@ -14,7 +14,8 @@ keyring, the status report). Milestones M19.1a–M19.12 are built; M19.7 is prov
 not across two machines. Not built: the in-room approval
 entry point (3.7), per-message read metadata (3.10), volatile context on plain posts and
 session-static facts in `hello` (4.9), the takeover rule in the skill (5.7, #19), `status`
-supersession (9.7). Open gaps: 6.8's start-up guard has no mutant (#368); a trusted Codex hook
+supersession (9.7), and the dependency-aware skill coordination in 8.6 (#794, v0.4.5).
+Open gaps: 6.8's start-up guard has no mutant (#368); a trusted Codex hook
 firing in a live turn is not proved (8.5, #169).
 **Date**: 2026-09-21
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -362,6 +363,60 @@ they are not a defence against one that lies.
   tampered into anything else, MUST be left untrusted. Not proved: that a trusted hook then fires in
   a live Codex turn (#169). *Built (ADR-026; #408):* `--node` replaces `--profile` in this
   grammar, and is required.
+- **8.6 (#794, v0.4.5). Planned.** The installed skill MUST help agents divide real work and
+  review by required outputs, coupling, available workers and verified handoffs. This extends
+  the existing skill's work conversation; it is not a separate scheduler or skill pack.
+  - **8.6a. Assignment.** Before dividing work, the agent MUST identify the outputs each item
+    needs and its acceptance boundary. An item depends on another only when it needs that
+    output, decision or artifact; touching the same files is a merge-order concern, not by
+    itself a blocker. Independent outcomes SHOULD proceed in parallel. Coupled changes that
+    share a journey or acceptance boundary MUST have one integration owner who assigns the
+    component boundaries, shared proof work and merge order. Work in progress per worker MUST
+    stay bounded by its capacity and outstanding handoffs, without a universal headcount or timer.
+  - **8.6b. Placement.** For independent review, the agent SHOULD prefer a capable available
+    reviewer on the candidate's machine when this avoids unnecessary artifact movement and
+    preserves independence. Placement MUST come from the operator or supported node/session
+    evidence, with uncertainty stated; a node-name suffix, IP address, OS or CPU alone MUST NOT
+    establish that two sessions share a machine. Placement MUST NOT establish identity, read
+    trust, drive or authority. A cross-machine reviewer remains an option when the local reviewer
+    is unavailable or unsuitable. Operator-known placement is sufficient for this workflow;
+    future computer identities (#799) MUST NOT be a prerequisite.
+  - **8.6c. Availability.** A handoff MUST check supported reachability, required read visibility,
+    the intended live session and candidate/proof artifact availability. A daemon ping, queued
+    message or delivery acknowledgement MUST NOT be reported as the model accepting the work.
+    The receiving worker MUST explicitly acknowledge its scope before the sender treats it as
+    accepted. A missing acknowledgement stays unresolved; it does not justify duplicate work,
+    fabricated acceptance, a trust change or bypassing the existing claim/takeover rules.
+  - **8.6d. Handoff.** A handoff MUST identify the exact work key, base and required outcome.
+    Review/result handoffs MUST also identify the immutable candidate when one exists, accepted
+    scope and remaining proof or review work. Each handoff MUST name its integration/acceptance
+    owner and tracker writer; an initial implementation assignment MUST NOT invent a candidate.
+    It MUST link the existing required evidence and its awa manifest or pending reconciliation
+    when those are needed by the next worker. These are the existing work records, not a new
+    evidence system. Claims and coordination stay in the room; durable progress, proofs and
+    verdicts stay on the issue through awa.
+  - **8.6e. Acceptance.** Each contract MUST have one lead independent acceptance owner.
+    Additional reviewers MUST have a concrete unresolved scope, not repeat the same final
+    verdict. Source-bound acceptance MUST be preserved through byte-identical ancestry changes
+    when its requirements and execution assumptions still hold; a new machine or commit SHA
+    alone MUST NOT trigger broad proof repeats. The integration owner MUST compare the actual
+    landed tree with the accepted integration result before declaring integration accepted.
+    A mismatch requires scoped inspection and correction or proof where it changes a claim;
+    it MUST NOT inherit acceptance merely because the PR was merged.
+  - **8.6f. Boundaries.** The skill MUST retain the session's repository-room boundary (#795)
+    and the message-origin/attention policy owned by #812. Placement or room participation MUST
+    NOT introduce a human/agent node type, grant trust, authorize a tool action or turn remote
+    text into an operator instruction. Vox MUST NOT parse GitHub work records or centrally
+    schedule models for this workflow; the skill uses the existing CLI, room claims and awa.
+  - **8.6g. Validation.** Report optional scratch real-work spikes with the installed skill and
+    supported harnesses: independent work proceeds together; coupled work has one integration
+    owner; a capable local reviewer is chosen when placement is known; an unavailable reviewer
+    can hand off across machines with the candidate and evidence intact; daemon reachability
+    without model acknowledgement stays unresolved; and an unexpected landed tree is not called
+    accepted. Observe actual decisions, room handoffs and artifacts, including a counterexample
+    for each claimed correction. Prompt-text assertions, synthetic wording tests and new CI or
+    mandatory live-model gates MUST NOT substitute for that behavior (ADR-018). No implementation
+    or successful behavior is claimed by this requirement.
 
 ### 9. Flood and loop control
 
