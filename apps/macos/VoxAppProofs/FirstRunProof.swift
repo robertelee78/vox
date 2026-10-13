@@ -799,7 +799,7 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.menuItem("Forget"), "Forget the acting passphraseless node")
         guard words(ui, Key.id("attached"), timeout: 30,
                     "native Forget must keep the same passphraseless node's usable Ready window",
-                    until: { $0 == "node plain, Ready" }) != nil else { return }
+                    until: { $0 == "node plain, Ready" }, sibling: Key.id("attach-again")) != nil else { return }
         guard present(ui, Key.id("sidebar-add"), timeout: 10,
                       "the passphraseless Ready window must retain its room controls") else { return }
         tap(ui, Key.id("sidebar-add"), "Use the passphraseless window after Forget")
