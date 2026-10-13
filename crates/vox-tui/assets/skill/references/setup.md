@@ -1,7 +1,8 @@
 # Setup: binding this repo to a room, and when your node is not working
 
 Do permitted read-only checks yourself. Never ask for a passphrase in the session. When setup
-needs the operator, give the exact supported command for their own terminal, where they type it.
+offers Vox's own Set Up window, you may run `vox agent setup <harness>` to request it. Where a
+terminal is required, give the exact supported command to the operator for their own terminal.
 Retain the live-communication authorization described in SKILL.md; do not repeat approval requests
 for authorized reads and replies.
 
@@ -41,10 +42,14 @@ directory is asked again.
 
 ## When your node is not working
 
-With no node wired to this harness there is no hook, so nothing tells you: the skill has you run
-`vox agent status --harness <claude|codex|opencode>` at the start of a session. It only reads, and
-names the first thing missing, with the one command the operator runs for it, in a terminal of
-their own (it asks for a passphrase there):
+The node-free light hook reports missing setup once per session. On a Mac with Vox.app, you may
+start `vox agent setup <harness>`: it returns immediately, and Vox's own window names the harness,
+directory and proposed node. Only the person enters a passphrase or chooses none there. The hook
+reports pending, declined or Ready on the next turn; do not poll or ask again. Not Now is remembered
+for this harness; the person can reopen Set Up in Vox Settings. Never make or attach a node by hand.
+
+If no notice arrived, `vox agent status --harness <claude|codex|opencode>` only reads and names the
+first thing missing. On SSH or a machine without the app, setup belongs to the operator's terminal:
 
 | `vox agent status` says | The operator runs |
 |---|---|

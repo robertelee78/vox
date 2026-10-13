@@ -333,6 +333,38 @@ fn a_hook_never_attaches_its_node_and_says_how_to() {
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (data, cfg) = (tmp.path().join("data"), tmp.path().join("cfg"));
+    // HK-3: a real Codex turn, before a node exists, gets one exact next step once. SSH on a
+    // Mac is the terminal path too; no app or person's harness configuration is touched.
+    let light_args = ["agent", "hook", "--light", "codex", "--format", "text"];
+    let turn = |session: &str| {
+        hook_env(
+            &data,
+            &cfg,
+            &light_args,
+            &codex_input(session),
+            &[
+                ("SSH_CONNECTION", "127.0.0.1 1 127.0.0.1 2"),
+                ("HOME", tmp.path().to_str().expect("APPARATUS: UTF-8 HOME")),
+            ],
+        )
+    };
+    let (ok, first, err) = turn("light-first");
+    assert!(ok && first.trim_end().lines().count() == 1
+        && first.contains("codex has no Vox node")
+        && first.contains("`vox agent setup codex` in a terminal outside this session")
+        && !first.contains("room"),
+        "PRODUCT: a node-free Codex turn must get only its one setup line, never room guidance; got {first:?}{err}");
+    let (ok, second, err) = turn("light-first");
+    assert!(
+        ok && second.is_empty(),
+        "PRODUCT: a second turn in the same node-free session must be silent; got {second:?}{err}"
+    );
+    let (ok, next, err) = turn("light-next");
+    assert!(
+        ok && next == first,
+        "PRODUCT: a new node-free session must get its own one-line next step; got {next:?}{err}"
+    );
+
     std::fs::create_dir_all(&cfg).expect("APPARATUS: cannot make the profile directory");
     let pass = tmp.path().join("identity.pass");
     std::fs::write(&pass, "identity passphrase\n")

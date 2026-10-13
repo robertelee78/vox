@@ -111,14 +111,8 @@ enum Daemon {
         let build = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "")
             + " " + (Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "")
         let key = "skillPackInstalledFor"
-        var env = ProcessInfo.processInfo.environment
-        #if VOX_PROOF_STUB_SERVICES
-        guard let dir = try? configDir(dataRoot: "") else { return }
-        env["HOME"] = URL(fileURLWithPath: dir).appendingPathComponent("app/home").path
-        for name in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME"] {
-            env[name] = nil
-        }
-        #else
+        let env = harnessEnvironment()
+        #if !VOX_PROOF_STUB_SERVICES
         if UserDefaults.standard.string(forKey: key) == build { return }
         #endif
         let environment = env
@@ -152,6 +146,23 @@ enum Daemon {
             }
             if succeeded { UserDefaults.standard.set(build, forKey: key) }
         }
+    }
+
+    /// Commands the app owns carry no agent-session mark or secret. Proof builds wire only
+    /// their scratch harness HOME, exactly as first-run hook installation does.
+    static func harnessEnvironment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        for name in ["VOX_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "VOX_NODE",
+                     "VOX_IDENTITY_PASSPHRASE"] { env[name] = nil }
+        #if VOX_PROOF_STUB_SERVICES
+        if let dir = try? configDir(dataRoot: "") {
+            env["HOME"] = URL(fileURLWithPath: dir).appendingPathComponent("app/home").path
+        }
+        for name in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME"] {
+            env[name] = nil
+        }
+        #endif
+        return env
     }
 
     /// A client of the account's daemon. When none answers, the bundle's `vox` starts one as
@@ -207,7 +218,8 @@ enum Daemon {
 
     /// Run the bundled command with an independent process deadline. Output goes to a private
     /// temporary file so a full pipe cannot deadlock the command or this app.
-    static func command(_ arguments: [String], patience: TimeInterval) async throws -> String {
+    static func command(_ arguments: [String], patience: TimeInterval,
+                        environment: [String: String]? = nil) async throws -> String {
         try await Task.detached {
             let output = FileManager.default.temporaryDirectory
                 .appendingPathComponent("vox-app-\(UUID().uuidString)")
@@ -221,6 +233,7 @@ enum Daemon {
             let process = Process()
             process.executableURL = vox
             process.arguments = arguments
+            process.environment = environment
             process.standardInput = FileHandle.nullDevice
             process.standardOutput = file
             process.standardError = file

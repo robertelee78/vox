@@ -1386,14 +1386,21 @@ pub async fn run(
             if let Some(ev) = &mirrored {
                 crate::session_mirror::hook(daemon, ev, &input.session_id).await;
             }
-            let note = crate::room_map::note(
-                answer.room.as_deref(),
-                answer.new,
-                answer.joining.as_deref(),
-                &daemon.account.data_root,
-                std::path::Path::new(&input.cwd),
-                daemon.node.as_str(),
+            let setup_note = crate::agent_onboarding::outcome(
+                &daemon.account,
+                harness_key(&input),
+                &input.session_id,
             );
+            let note = setup_note.or_else(|| {
+                crate::room_map::note(
+                    answer.room.as_deref(),
+                    answer.new,
+                    answer.joining.as_deref(),
+                    &daemon.account.data_root,
+                    std::path::Path::new(&input.cwd),
+                    daemon.node.as_str(),
+                )
+            });
             drain(
                 paths,
                 room_arg,
@@ -1486,10 +1493,24 @@ fn harness_name(input: &HookInput) -> &'static str {
     }
 }
 
+fn harness_key(input: &HookInput) -> &'static str {
+    if input.codex {
+        "codex"
+    } else if input.claude {
+        "claude"
+    } else {
+        "opencode"
+    }
+}
+
 /// Whether this is the first time in `session` that the hook for `node` says a thing it says
 /// once per session (#666), recorded under the account's daemon directory: the node itself may
 /// not be on this machine. A record that cannot be written says it again rather than never.
-fn first_in_session(account: &vox_core::node::paths::Account, node: &str, session: &str) -> bool {
+pub(crate) fn first_in_session(
+    account: &vox_core::node::paths::Account,
+    node: &str,
+    session: &str,
+) -> bool {
     let key = vox_core::hash::sha256(format!("{node}\n{session}").as_bytes());
     let file = account
         .daemon_dir()
@@ -2684,6 +2705,45 @@ pub fn light_hooks(harness: &str) -> String {
         "type": "command", "command": format!("vox agent hook --light {harness}"), "async": false
     }]}]}});
     format!("{}\n", serde_json::to_string_pretty(&v).unwrap_or_default())
+}
+
+/// Node-free onboarding: read the harness payload, emit at most one line, and never enter the
+/// daemon or any node's code. A malformed payload or unwritable notice cannot fail a turn.
+pub(crate) fn light(args: &crate::cli::AgentHookArgs, harness: &str) {
+    let Some(harness) = crate::agent_onboarding::key(harness) else {
+        return;
+    };
+    let Ok(account) = vox_core::node::paths::Account::of(
+        args.profile.data_dir.as_deref(),
+        args.profile.config_dir.as_deref(),
+    ) else {
+        return;
+    };
+    let mut raw = String::new();
+    if args.session.is_none() {
+        let _ = std::io::stdin().read_to_string(&mut raw);
+    }
+    let input = parse_input(&raw);
+    if input.event != "UserPromptSubmit" {
+        return;
+    }
+    let named = crate::coord::session(args.session.as_deref());
+    if named.is_none() && input.session_id == "unknown-session" {
+        return;
+    }
+    let session = named.unwrap_or_else(|| input.session_id.clone());
+    let Some(words) = crate::agent_onboarding::light_words(
+        &account,
+        harness,
+        &session,
+        std::path::Path::new(&input.cwd),
+    ) else {
+        return;
+    };
+    let Ok(format) = args.format.parse() else {
+        return;
+    };
+    emit(format, &raw, &input.event, &format!("{words}\n"), "");
 }
 
 /// OpenCode's node-free shim: no wake socket, room drain, model or daemon is started.
