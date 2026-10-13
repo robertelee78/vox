@@ -560,6 +560,12 @@ impl UiState {
                             act,
                         });
                     }
+                    // The typed tokens stay visible and editable until Enter. A leading `!`,
+                    // also after leading @names, marks urgency rather than message text (CO-3).
+                    let (text, typed_urgent) = composer_message(&text);
+                    if text.is_empty() {
+                        return Action::Redraw;
+                    }
                     // `@alias` addresses a member (ADR-028 K-4): the whole fingerprint goes into
                     // `to`. One that names nobody, or more than one, keeps the text to fix.
                     let members: Vec<Digest32> = vm
@@ -586,9 +592,9 @@ impl UiState {
                     let re = self.replying.take();
                     // Addressed or urgent, the message goes the one way a structured message is
                     // posted, as `vox room post --to … --urgent` posts it (ADR-028 W-4).
-                    if !self.to.is_empty() || self.urgent {
+                    if !self.to.is_empty() || self.urgent || typed_urgent {
                         let to = std::mem::take(&mut self.to);
-                        let urgent = std::mem::replace(&mut self.urgent, false);
+                        let urgent = std::mem::replace(&mut self.urgent, false) || typed_urgent;
                         return Action::Dispatch(Command::PostAddressed {
                             channel_id,
                             text,
@@ -1960,6 +1966,29 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
         _ => return None,
     };
     Some(Parsed::Core(cmd))
+}
+
+/// Normal room composition only: Session input is delivered verbatim before this is called.
+/// Keep @names in the message, as before; consume only the leading urgency marker. Punctuation
+/// later in the message remains text, and deleting the marker in the field removes urgency.
+fn composer_message(text: &str) -> (String, bool) {
+    let mut content = text;
+    while content.starts_with('@') {
+        let Some(end) = content.find(char::is_whitespace) else {
+            break;
+        };
+        content = content[end..].trim_start();
+    }
+    match content.strip_prefix('!') {
+        Some(body) => {
+            let prefix = &text[..text.len() - content.len()];
+            (
+                format!("{prefix}{}", body.trim_start()).trim().to_owned(),
+                true,
+            )
+        }
+        None => (text.to_owned(), false),
+    }
 }
 
 /// The status line for a room passphrase left empty: it is accepted, and one is encouraged
