@@ -1203,7 +1203,8 @@ fn close_expired_pairing() {
             ["problem"]
             .as_str()
             .is_some_and(|p| p.contains("closed locally"))),
-        "PRODUCT: late completed intent was not refused after the other computer closed it"
+        "PRODUCT: late completed intent was not refused after the other computer closed it: {}",
+        computer(&b, &["status"])
     );
     let after = computer(&a, &["status"]);
     assert!(

@@ -1468,6 +1468,18 @@ fn merge(s: &mut State, bytes: &[u8], peer: Digest32, signer: &dyn RootSigner) -
     };
     let genesis = read(d.bytes()?)?;
     let incoming = read(d.bytes()?)?;
+    // A fresh invitation has no current intent to compare with. Recognize an exact retired
+    // operation before the group/current-intent checks so its late result keeps the truthful
+    // local-close outcome instead of turning into an unexplained authentication refusal.
+    if genesis
+        .iter()
+        .chain(incoming.iter())
+        .any(|g| s.cancelled.contains_key(&g.operation()))
+    {
+        return Err(Error::Profile(
+            "this enrollment attempt was closed locally; its retained intent cannot activate",
+        ));
+    }
     let local = s.description.fingerprint()?;
     let candidate = s.pending.as_ref().is_some_and(|p| side(p, &peer).is_ok());
     let previously_enrolled = s.grant(&peer).is_some();
