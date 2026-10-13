@@ -125,7 +125,7 @@ struct ComputerTrustView: View {
 
     @ViewBuilder private func pairing(_ status: ComputerStatus) -> some View {
         if status.state == "quarantined" {
-            Text("Computer trust is suspended because signed computer records conflict.")
+            Text("Computer trust is suspended.")
                 .accessibilityIdentifier("computer-trust-quarantined")
         } else if status.state == "confirmed", model.reachable {
             Text("Computer trust is confirmed.")
@@ -138,7 +138,9 @@ struct ComputerTrustView: View {
             Divider()
             identity(preview.peer, title: "Computer to add")
             if expired(preview.expiresMs), !preview.approvedHere || !preview.approvedThere {
-                Text("This pairing code expired before both computers approved. Cancel it and create a new one.")
+                Text(preview.approvedHere
+                     ? "The approval window has ended. You can close this attempt here. The other computer may have recorded approval; closing here does not remove its trust."
+                     : "This pairing code expired before both computers approved. Cancel it and create a new one.")
                     .secondaryText()
                     .accessibilityIdentifier("computer-pairing-expired")
             } else if preview.approvedHere {
@@ -203,14 +205,23 @@ struct ComputerTrustView: View {
             .disabled(model.busy || !model.reachable || link.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             .accessibilityIdentifier("computer-pairing-preview")
         }
+        let approvedHere = status.pairing?.approvedHere == true
+        let closeExpired = approvedHere && status.pairing?.approvedThere != true
+            && status.pairing.map { expired($0.expiresMs) } == true
         if status.state != "confirmed", status.state != "applying", status.state != "quarantined",
+           !approvedHere || closeExpired,
            let operation = status.pairing?.operationId ?? status.inviteId {
-            Button("Cancel Pairing") {
+            Button(closeExpired ? "Close Expired Attempt" : "Cancel Pairing") {
                 Task { await model.perform { try await $0.cancelComputerPairing(operationId: operation) } }
             }
             .disabled(model.busy || !model.reachable)
             .accessibilityIdentifier("computer-pairing-cancel")
-            Text("Closing this window leaves the pairing pending. Cancel Pairing withdraws it.")
+            Text(closeExpired
+                 ? "Closing this attempt lets you start a new pairing here. It cannot withdraw the approval already sent to the other computer."
+                 : "Closing this window leaves the pairing pending. Cancel Pairing cancels this unused code.")
+                .secondaryText()
+        } else if approvedHere, status.state != "confirmed", status.state != "quarantined" {
+            Text("Your approval has been sent and cannot be withdrawn here. You can close this window while pairing finishes.")
                 .secondaryText()
         }
     }
