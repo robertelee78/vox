@@ -367,6 +367,9 @@ const T_ROOM_ANCHORS: u64 = 781;
 const T_ROOM_ANCHORS_READ: u64 = 782;
 /// The exact room-owned anchors returned by [`Request::RoomAnchors`].
 const T_ROOM_ANCHORS_CONFIG: u64 = 783;
+/// Creation's exact link preview, with no search, dial or room mutation (ADR-032 AN-10).
+const T_LINK_PREVIEW_REQ: u64 = 7850;
+const T_LINK_PREVIEW: u64 = 7851;
 /// `NodeEvent::RoomEnded` and `NodeEvent::RoomRemoved` (V030-08). Additive.
 const T_ROOM_ENDED: u64 = 2440;
 const T_ROOM_REMOVED: u64 = 2441;
@@ -798,6 +801,11 @@ pub enum Request {
         channel_id: Digest32,
         /// Seconds a Session step is kept; zero means forever, still bounded by messages.
         seconds: u64,
+    },
+    /// Preview the link routes for explicitly selected anchors on this node.
+    LinkPreview {
+        /// The full proposed room configuration; the preview alone applies the link cap.
+        anchors: crate::nat::bootstrap::BootstrapSet,
     },
     /// Read an open room's own signed anchors, answered as [`Frame::RoomAnchors`].
     /// Stale or unavailable observations are errors, never an empty configuration.
@@ -1331,6 +1339,11 @@ impl Request {
                     .text(passphrase)
                     .bytes(&anchors.to_bytes());
             }
+            Request::LinkPreview { anchors } => {
+                e.array(2)
+                    .uint(T_LINK_PREVIEW_REQ)
+                    .bytes(&anchors.to_bytes());
+            }
             Request::RoomAnchors { channel_id } => {
                 e.array(2).uint(T_ROOM_ANCHORS_READ).bytes(channel_id);
             }
@@ -1770,6 +1783,12 @@ impl Request {
                     petname,
                     identity_passphrase,
                 })
+            }
+            (T_LINK_PREVIEW_REQ, 2) => {
+                let anchors = crate::nat::bootstrap::BootstrapSet::from_bytes(d.bytes()?)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::LinkPreview { anchors })
             }
             (T_ROOM_ANCHORS_READ, 2) => {
                 let channel_id = digest(&mut d)?;
@@ -2297,7 +2316,16 @@ pub enum Frame {
         /// The bound local address.
         local: String,
     },
-    /// One room's signed anchor configuration, with no machine or other-room union.
+    /// Exact creation link routes, without adding machine or other-room anchors.
+    LinkPreview {
+        /// The node whose current direct route is included, when it has one.
+        node: Digest32,
+        /// Ordered room anchors followed by this node's direct route, at most four.
+        routes: Vec<crate::nat::bootstrap::BootstrapNode>,
+        /// Room anchors retained in configuration but outside the link cap.
+        omitted: usize,
+    },
+    /// The room's complete signed anchor configuration.
     RoomAnchors {
         /// The room-owned fingerprints and their exact addresses.
         anchors: crate::nat::bootstrap::BootstrapSet,
@@ -2490,6 +2518,20 @@ impl Frame {
                 for (h, clock) in entries {
                     e.array(2).bytes(h).uint(*clock);
                 }
+            }
+            Frame::LinkPreview {
+                node,
+                routes,
+                omitted,
+            } => {
+                e.array(4)
+                    .uint(T_LINK_PREVIEW)
+                    .bytes(node)
+                    .array(routes.len());
+                for route in routes {
+                    route.encode_into(&mut e);
+                }
+                e.uint(*omitted as u64);
             }
             Frame::RoomAnchors { anchors } => {
                 e.array(2)
@@ -3189,6 +3231,26 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 entries.push((h, clock));
             }
             return Ok(Frame::Order { entries });
+        }
+        (T_LINK_PREVIEW, 4) => {
+            let node = digest(d)?;
+            let n = d.array()?;
+            if n > crate::node::link::MAX_LINK_ANCHORS {
+                return Err(Error::MalformedIpc("link preview route count"));
+            }
+            let mut routes = Vec::with_capacity(n);
+            for _ in 0..n {
+                routes.push(crate::nat::bootstrap::BootstrapNode::decode_from(d)?);
+            }
+            let omitted = d.uint()?;
+            if omitted > crate::nat::bootstrap::MAX_BOOTSTRAP_NODES as u64 {
+                return Err(Error::MalformedIpc("link preview omitted count"));
+            }
+            return Ok(Frame::LinkPreview {
+                node,
+                routes,
+                omitted: omitted as usize,
+            });
         }
         (T_ROOM_ANCHORS_CONFIG, 2) => {
             return Ok(Frame::RoomAnchors {
@@ -5174,6 +5236,22 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 },
             },
         },
+        Request::LinkPreview { anchors } => {
+            let view = handle.view();
+            let Some(identity) = view.identity.filter(|_| !view.locked && !view.locking) else {
+                return Frame::Error { reason: "the creating node is not ready".into() };
+            };
+            let endpoints = view.listening.iter()
+                .map(|a| crate::nat::multiaddr::Multiaddr::parse(a))
+                .collect::<Result<Vec<_>>>()
+                .and_then(crate::nat::multiaddr::EndpointList::new);
+            let endpoints = match endpoints {
+                Ok(endpoints) => Some(endpoints),
+                Err(e) => return Frame::Error { reason: format!("the node's link addresses could not be read: {e}") },
+            };
+            let (routes, omitted) = crate::node::link::preview_routes(&anchors, identity.fingerprint, endpoints);
+            Frame::LinkPreview { node: identity.fingerprint, routes, omitted }
+        }
         Request::RoomAnchors { channel_id } => {
             let view = handle.view();
             if !view.open_channels.iter().any(|room| room.channel_id == channel_id) {
