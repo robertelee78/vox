@@ -13,7 +13,7 @@ enum Showing: Hashable {
     case all
     case session(node: String, id: String)
     /// The room's messages tagged so (#636): a thread of one task, project or milestone.
-    case tag(String)
+    case tag(key: String, label: String)
 }
 
 extension NodeModel {
@@ -48,7 +48,7 @@ extension NodeModel {
         case .general: shown = "General"
         case .all: shown = "All"
         case .session: shown = shownSession?.label ?? "a Session"
-        case .tag(let tag): shown = "tagged \(tag)"
+        case .tag(_, let label): shown = "tagged \(label)"
         }
         let roster = !daemonReachable ? "members unavailable"
             : roomMembersPending ? "members loading"
@@ -58,8 +58,10 @@ extension NodeModel {
 
     /// Every tag the room's messages on hand carry, sorted (#636): what the header's filter offers.
     /// Only messages this node can read carry any.
-    var roomTags: [String] {
-        Array(Set(messages.flatMap(\.tags))).sorted()
+    var roomTags: [FfiMessageTag] {
+        var tags: [String: FfiMessageTag] = [:]
+        for message in messages { for tag in message.tagSelectors { tags[tag.key] = tag } }
+        return tags.values.sorted { $0.label == $1.label ? $0.key < $1.key : $0.label < $1.label }
     }
 
     var showingSession: Bool {

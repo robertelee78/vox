@@ -235,6 +235,21 @@ final class NodeModel: ObservableObject {
     @Published var showing: Showing = .general {
         didSet {
             guard showing != oldValue else { return }
+            roomReadGeneration = UUID()
+            messages = []
+            roomInstance = nil
+            roomBefore = nil
+            roomOlder = 0
+            roomHasNewer = false
+            roomReloadNeeded = false
+            roomReadingOlder = false
+            roomNeedsPage = true
+            roomOlderRead = UUID()
+            messageFooters = [:]
+            messageFooterErrors = [:]
+            footerCursors = [:]
+            footerRead = UUID()
+            messageFootersLoading = false
             if showing != .general { closeThread() }
             // Another Session's entries are never drawn, nor acted on, under this one's header
             // while it loads (D3): cleared, and said to be loading.
@@ -258,6 +273,7 @@ final class NodeModel: ObservableObject {
             Task {
                 await readSelectedSessionMetadata()
                 await readSession()
+                if !showingSession { await readNewOnScreen() }
             }
         }
     }
@@ -731,12 +747,21 @@ final class NodeModel: ObservableObject {
     /// came as an event to the reopened app).
     /// Retained UTF-8/binary payload, separately from SwiftUI/allocator footprint.
     /// One legal oversized message remains readable instead of truncating its body.
+    private var selectedRoomView: RoomView {
+        switch showing {
+        case .general, .session: return .general
+        case .all: return .all
+        case .tag(let key, _): return .tag(key: key)
+        }
+    }
+
     private static let roomWindowBytes = 8 * 1024 * 1024
 
     private static func roomPayloadBytes(_ row: RoomMessage) -> Int {
         var size = 512 + row.id.utf8.count + row.author.utf8.count + row.authorName.utf8.count
             + row.kind.utf8.count + row.text.utf8.count + row.re.utf8.count + row.thread.utf8.count
         for value in row.to + row.tags { size += value.utf8.count }
+        for tag in row.tagSelectors { size += tag.key.utf8.count + tag.label.utf8.count }
         if let file = row.file {
             size += file.name.utf8.count + file.sha256.utf8.count + file.note.utf8.count
             for value in file.to { size += value.utf8.count }
@@ -766,12 +791,18 @@ final class NodeModel: ObservableObject {
         return newest ? Array(kept.reversed()) : kept
     }
 
-    private func retainedRoomEntries(room: String, instance: Data, ids: [String],
+    private func retainedRoomEntries(room: String, view: RoomView? = nil, instance: Data, ids: [String],
                                      current: () -> Bool) async throws -> [RoomMessage] {
         guard current(), !Task.isCancelled else { throw CancellationError() }
         do {
-            let page = try await client.roomReadRetaining(room: room, node: me,
-                instance: instance, loaded: ids)
+            let page: FfiRoomRead
+            if let view {
+                page = try await client.roomViewReadRetaining(room: room, view: view, node: me,
+                    instance: instance, loaded: ids)
+            } else {
+                // Independently held thread replies use exact generic ids, not General's domain.
+                page = try await client.roomReadRetaining(room: room, node: me, instance: instance, loaded: ids)
+            }
             guard current(), !Task.isCancelled else { throw CancellationError() }
             guard page.instance == instance else {
                 throw VoxError.Failed(reason: "The saved room changed while refreshing its messages.")
@@ -784,27 +815,28 @@ final class NodeModel: ObservableObject {
                 throw error
             }
             let middle = ids.count / 2
-            let left = try await retainedRoomEntries(room: room, instance: instance,
+            let left = try await retainedRoomEntries(room: room, view: view, instance: instance,
                 ids: Array(ids[..<middle]), current: current)
-            let right = try await retainedRoomEntries(room: room, instance: instance,
+            let right = try await retainedRoomEntries(room: room, view: view, instance: instance,
                 ids: Array(ids[middle...]), current: current)
             return left + right
         }
     }
 
     private func readNewOnScreen() async {
-        guard case let .room(id) = selection, ended == nil, !roomReloadNeeded else { return }
+        guard case let .room(id) = selection, ended == nil, !showingSession, !roomReloadNeeded else { return }
         let generation = roomReadGeneration, epoch = nodeObservationEpoch
+        let view = selectedRoomView, displayed = showing
         let revision = roomMessageRevision, follows = timelineFollowingNewest
         let loaded = messages.map(\.id), instance = roomInstance
         func current() -> Bool {
-            selection == .room(id) && ended == nil && generation == roomReadGeneration
+            selection == .room(id) && showing == displayed && ended == nil && generation == roomReadGeneration
                 && epoch == nodeObservationEpoch && revision == roomMessageRevision
                 && follows == timelineFollowingNewest
         }
         do {
             if !follows, let instance, !loaded.isEmpty {
-                let rows = try await retainedRoomEntries(room: id, instance: instance,
+                let rows = try await retainedRoomEntries(room: id, view: view, instance: instance,
                     ids: loaded, current: current)
                 guard current() else { return }
                 let bounded = Self.boundedRoomRows(rows, newest: false)
@@ -812,7 +844,7 @@ final class NodeModel: ObservableObject {
                 messages = bounded
                 // Exact selection's zero metadata is not a new history cursor/count.
             } else {
-                let page = try await client.roomRead(room: id)
+                let page = try await client.roomViewRead(room: id, view: view)
                 guard current() else { return }
                 roomInstance = page.instance
                 roomOlder = page.older
@@ -848,20 +880,22 @@ final class NodeModel: ObservableObject {
             return
         }
         guard let room = roomOnScreen, let before = roomBefore, !roomReadingOlder, ended == nil else { return }
+        guard let instance = roomInstance else { return }
+        let view = selectedRoomView, displayed = showing
         let generation = roomReadGeneration, epoch = nodeObservationEpoch
         timelineFollowingNewest = false
         let revision = roomMessageRevision, request = UUID()
         roomOlderRead = request
         roomReadingOlder = true
         func current() -> Bool {
-            generation == roomReadGeneration && epoch == nodeObservationEpoch
+            showing == displayed && generation == roomReadGeneration && epoch == nodeObservationEpoch
                 && revision == roomMessageRevision && roomOlderRead == request
                 && roomOnScreen == room && roomBefore == before
                 && !timelineFollowingNewest && ended == nil
         }
         defer { if roomOlderRead == request { roomReadingOlder = false } }
         do {
-            let page = try await client.roomReadOlder(room: room, before: before)
+            let page = try await client.roomViewReadOlder(room: room, view: view, instance: instance, before: before)
             guard current() else { return }
             let held = Set(messages.map(\.id))
             guard roomInstance == page.instance else {
@@ -1200,6 +1234,7 @@ final class NodeModel: ObservableObject {
             decisionEvents = await decisions()
         }
         guard case let .room(id) = selection, ended == nil else { return }
+        let view = selectedRoomView
         let generation = roomReadGeneration
         let messageRevision = roomMessageRevision
         let metadataToken = sessionsMetadataRead
@@ -1211,7 +1246,7 @@ final class NodeModel: ObservableObject {
             // What was unread as the room came on screen, before showing it marks it read: the
             // timeline's unread line goes above the first of it (ADR-028 R-8).
             let unread = try await readUnreadSummary(id)
-            let page = try await client.roomRead(room: id)
+            let page = try await client.roomViewRead(room: id, view: view)
             let read = page.messages
             guard generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
             let services = try await client.servicesPage(room: id, after: nil, revision: nil)
@@ -2829,28 +2864,21 @@ final class NodeModel: ObservableObject {
             let preview = Preview(message, me: me)
             if rooms[i].last != preview { rooms[i].last = preview }
         }
-        if case .room(room) = selection, !roomReloadNeeded {
-            // A message already shown is replaced: one whose body had not arrived ("not received
-            // yet", owed) is shown, and read, once it has; before, it stayed owed until the room
-            // was opened again, and was never read.
-            if let i = messages.firstIndex(where: { $0.id == message.id }) {
-                var updated = messages
-                updated[i] = message
-                let bounded = Self.boundedRoomRows(updated, newest: timelineFollowingNewest)
-                if timelineFollowingNewest {
-                    roomOlder += UInt64(updated.count - bounded.count)
-                    if roomOlder > 0 { roomBefore = bounded.first?.id }
-                } else if bounded.count < updated.count { roomHasNewer = true }
-                messages = bounded
-            } else if timelineFollowingNewest {
-                let updated = messages + [message]
-                let bounded = Self.boundedRoomRows(updated, newest: true)
-                roomOlder += UInt64(updated.count - bounded.count)
-                if roomOlder > 0 { roomBefore = bounded.first?.id }
-                messages = bounded
-            } else {
-                roomHasNewer = true
+        if case .room(room) = selection, !roomReloadNeeded, !showingSession {
+            // Ask for the captured view's bounded page instead of appending a generic event
+            // that may be a thread reply or a message belonging to another raw tag.
+            if !timelineFollowingNewest {
+                switch showing {
+                case .general, .all:
+                    if message.thread.isEmpty { roomHasNewer = true }
+                case .tag(let key, _):
+                    if message.tagSelectors.contains(where: { $0.key == key }) { roomHasNewer = true }
+                case .session: break
+                }
             }
+            await readNewOnScreen()
+            guard acceptsObservation(epoch, actor: actor) else { return false }
+            scheduleThreadRefresh()
         }
         // Unread until drawn in view (this node's own never are), the room on screen too.
         guard message.author != me else { return true }

@@ -56,7 +56,7 @@ extension NodeModel {
             guard let s = shownSession else { return "Timeline — a Session this room no longer lists" }
             let kept = stepRetention.map { " · steps kept \(Retention.words($0.effectiveSeconds))" } ?? ""
             return "Timeline — \(s.label)\(s.open ? " · open" : " · ended")\(kept)"
-        case .tag(let tag): return "Timeline — tagged \(tag) · ⏱ \(retention)"
+        case .tag(_, let label): return "Timeline — tagged \(label) · ⏱ \(retention)"
         }
     }
 
@@ -104,9 +104,9 @@ extension NodeModel {
                 items.insert(line, at: items.firstIndex { $0.millis > line.millis } ?? items.count)
             }
             return items
-        case .tag(let tag):
-            // A thread (#636): the room's messages carrying the tag, in the room's order.
-            return withEarlierRoomEntries(messages.filter { $0.tags.contains(tag) }.map(TimelineItem.message))
+        case .tag:
+            // The server selected the exact raw tag before applying its page budget.
+            return withEarlierRoomEntries(messages.map(TimelineItem.message))
         case .session:
             guard let s = shownSession else { return [] }
             var lines = TimelineItem.openedAndEnded(s)
