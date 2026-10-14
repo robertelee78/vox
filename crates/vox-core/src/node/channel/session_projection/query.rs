@@ -97,6 +97,7 @@ pub(crate) enum Query {
         node: Digest32,
     },
     Page {
+        open_only: bool,
         after: Option<Digest32>,
         revision: Option<Revision>,
         limit: usize,
@@ -204,14 +205,26 @@ fn descriptor(read: &Read<'_>, id: u64) -> Result<Descriptor> {
     Ok(row)
 }
 
-fn next(read: &Read<'_>, authors: &[Digest32], after: u64) -> Result<Option<(u64, Descriptor)>> {
+fn next(
+    read: &Read<'_>,
+    authors: &[Digest32],
+    after: u64,
+    open_only: bool,
+) -> Result<Option<(u64, Descriptor)>> {
     let mut next = None;
     // Current drive holders are keyring-bounded. Each lookup walks one sealed
     // path; revoked authors' histories do not have to be scanned and discarded.
     for author in authors {
         let mut key = hash_key(author);
         key[32..40].copy_from_slice(&after.to_be_bytes());
-        if let Some((found, id)) = read.next(Tree::AuthorOpenings, Some(key))? {
+        if let Some((found, id)) = read.next(
+            if open_only {
+                Tree::OpenSessions
+            } else {
+                Tree::AuthorOpenings
+            },
+            Some(key),
+        )? {
             if found[..32] == author[..] && next.is_none_or(|old| id < old) {
                 next = Some(id);
             }
@@ -572,6 +585,7 @@ impl ChannelState {
                     ))
                 }
                 Query::Page {
+                    open_only,
                     after,
                     revision: previous,
                     limit,
@@ -593,7 +607,7 @@ impl ChannelState {
                     };
                     let mut rows = Vec::new();
                     let mut bytes = 0u64;
-                    let mut candidate = next(&read, &authors, cursor)?;
+                    let mut candidate = next(&read, &authors, cursor, open_only)?;
                     while let Some((id, row)) = candidate {
                         let cost = 256u64
                             .saturating_add(row.name.map_or(0, |f| f.bytes))
@@ -611,7 +625,7 @@ impl ChannelState {
                         bytes = bytes.saturating_add(cost);
                         cursor = id;
                         rows.push(Row::from(row));
-                        candidate = next(&read, &authors, cursor)?;
+                        candidate = next(&read, &authors, cursor, open_only)?;
                     }
                     Ok(Reply::Page {
                         rows,

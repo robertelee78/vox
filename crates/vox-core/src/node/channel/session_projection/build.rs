@@ -446,6 +446,7 @@ fn fold(index: &mut Write<'_, '_>, event: Event) -> Result<()> {
     key[..32].copy_from_slice(&row.node);
     key[32..40].copy_from_slice(&id.to_be_bytes());
     index.set(Tree::AuthorOpenings, key, Some(id))?;
+    index.set(Tree::OpenSessions, key, is_open.then_some(id))?;
     index.set(
         Tree::Lifecycle,
         super::query::lifecycle_key(&row.node, row.position.created, id, false),
