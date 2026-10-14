@@ -107,15 +107,27 @@ struct SessionsList: View {
                 row(s.pending > 0 ? "! \(s.label) · waiting on you" : "● \(s.label)",
                     .session(node: s.nodeFingerprint, id: s.sessionId), id: "session-\(s.shortId)")
             }
+            HStack {
+                Button("First open Sessions") { Task { await model.firstOpenSessions() } }
+                if model.sessionsOpenNext != nil {
+                    Button("More open Sessions") { Task { await model.nextOpenSessions() } }
+                }
+            }.disabled(model.sessionsMetadataLoading)
             let ended = model.endedSessions
-            if !ended.isEmpty {
+            if !ended.isEmpty || model.sessionsHistoryNext != nil {
                 Button { endedOpen.toggle() } label: {
-                    Label("Ended (\(ended.count))", systemImage: endedOpen ? "chevron.down" : "chevron.right")
+                    Label("Session history (\(ended.count) ended on this page)", systemImage: endedOpen ? "chevron.down" : "chevron.right")
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("sessions-ended")
                 .accessibilityValue(endedOpen ? "expanded" : "collapsed")
                 if endedOpen {
+                    HStack {
+                        Button("First history page") { Task { await model.firstSessionHistory() } }
+                        if model.sessionsHistoryNext != nil {
+                            Button("Next history page") { Task { await model.nextSessionHistory() } }
+                        }
+                    }.disabled(model.sessionsMetadataLoading)
                     ForEach(ended, id: \.self) { s in
                         row("\(s.label) · ended", .session(node: s.nodeFingerprint, id: s.sessionId),
                             id: "session-\(s.shortId)")

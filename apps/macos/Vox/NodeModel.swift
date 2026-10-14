@@ -254,6 +254,12 @@ final class NodeModel: ObservableObject {
     private var waitingSeen = false
     /// The room on screen's Sessions, open and ended (ADR-029 CL-2).
     @Published private(set) var sessions: [FfiSession] = []
+    @Published private(set) var sessionsOpenNext: String?
+    @Published private(set) var sessionsHistoryNext: String?
+    @Published private(set) var sessionsMetadataLoading = false
+    private var sessionsOpenAfter: String?
+    private var sessionsHistoryAfter: String?
+    private var sessionsMetadataRead = UUID()
     @Published private(set) var selectedSessionMetadata: FfiSession?
     @Published private(set) var selectedSessionMetadataKnown = false
     /// The Session on screen's entries, oldest first, to a member with drive (SC-1): its newest
@@ -1031,6 +1037,12 @@ final class NodeModel: ObservableObject {
         governancePageError = nil
         governanceRead = UUID()
         sessions = []
+        sessionsOpenAfter = nil
+        sessionsHistoryAfter = nil
+        sessionsOpenNext = nil
+        sessionsHistoryNext = nil
+        sessionsMetadataRead = UUID()
+        sessionsMetadataLoading = false
         sessionPages.clear()
         selectedEarlierRequest = nil
         sessionNote = nil
@@ -1075,7 +1087,8 @@ final class NodeModel: ObservableObject {
             let kept = (try? await client.retention(room: id)) ?? ""
             let keptSecs = try? await client.retentionSecs(room: id)
             let done = try await client.noticesPage(room: id, before: nil, revision: nil)
-            let listed = (try? await client.sessions(room: id)) ?? []
+            let livePage = try await client.sessionsOpenPage(room: id, after: nil)
+            let historyPage = try await client.sessionsPage(room: id, after: nil)
             guard generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
             guard messageRevision == roomMessageRevision else { return }
             // The page and its inspector replace the prior view together, after both reads
@@ -1097,7 +1110,9 @@ final class NodeModel: ObservableObject {
             notices = done.rows
             noticesBefore = done.before
             noticesRevision = done.revision
-            sessions = listed
+            sessions = livePage.sessions + historyPage.sessions.filter { !$0.open }
+            sessionsOpenNext = livePage.next
+            sessionsHistoryNext = historyPage.next
             await loadStepRetention()
             guard !Task.isCancelled, generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
             await loadRoomAnchorState()
@@ -2429,10 +2444,11 @@ final class NodeModel: ObservableObject {
                 await self.loadRoomAnchorState()
                 guard !Task.isCancelled, self.roomReadGeneration == generation,
                       self.selection == .room(room), self.ended == nil else { return }
-                let listed = try? await self.client.sessions(room: room)
+                await self.refreshSessionMetadata()
+                let listed = self.sessions
                 guard !Task.isCancelled, self.roomReadGeneration == generation,
                       self.selection == .room(room), self.ended == nil else { return }
-                if let listed, listed != self.sessions { self.sessions = listed }
+                if listed != self.sessions { self.sessions = listed }
                 if let reads {
                     let now = Dictionary(uniqueKeysWithValues: reads.map { ($0.id, $0.names) })
                     if now != self.readBy { self.readBy = now }
@@ -2642,6 +2658,53 @@ private final class Listener: ClientListener, @unchecked Sendable {
 
 // A room's Sessions (ADR-029): read when one is shown, and again when the node says it changed.
 extension NodeModel {
+    /// One open page and one history page are retained, never the complete descriptor log.
+    func refreshSessionMetadata() async {
+        guard let room = roomOnScreen else { return }
+        let epoch = nodeObservationEpoch, generation = roomReadGeneration, token = UUID()
+        let liveAfter = sessionsOpenAfter, historyAfter = sessionsHistoryAfter
+        sessionsMetadataRead = token
+        sessionsMetadataLoading = true
+        defer { if sessionsMetadataRead == token { sessionsMetadataLoading = false } }
+        do {
+            let live = try await client.sessionsOpenPage(room: room, after: liveAfter)
+            let history = try await client.sessionsPage(room: room, after: historyAfter)
+            guard token == sessionsMetadataRead, epoch == nodeObservationEpoch,
+                  generation == roomReadGeneration, roomOnScreen == room else { return }
+            sessions = live.sessions + history.sessions.filter { !$0.open }
+            sessionsOpenNext = live.next
+            sessionsHistoryNext = history.next
+        } catch {
+            guard token == sessionsMetadataRead, epoch == nodeObservationEpoch,
+                  generation == roomReadGeneration, roomOnScreen == room else { return }
+            reportBackground(error)
+        }
+    }
+
+    func nextOpenSessions() async {
+        guard !sessionsMetadataLoading, let next = sessionsOpenNext else { return }
+        sessionsOpenAfter = next
+        await refreshSessionMetadata()
+    }
+
+    func firstOpenSessions() async {
+        guard !sessionsMetadataLoading else { return }
+        sessionsOpenAfter = nil
+        await refreshSessionMetadata()
+    }
+
+    func nextSessionHistory() async {
+        guard !sessionsMetadataLoading, let next = sessionsHistoryNext else { return }
+        sessionsHistoryAfter = next
+        await refreshSessionMetadata()
+    }
+
+    func firstSessionHistory() async {
+        guard !sessionsMetadataLoading else { return }
+        sessionsHistoryAfter = nil
+        await refreshSessionMetadata()
+    }
+
     /// Exact selected metadata stays independent of the bounded tab/history pages.
     func readSelectedSessionMetadata() async {
         guard let room = roomOnScreen, case let .session(node, id) = showing else {
@@ -2961,15 +3024,12 @@ extension NodeModel {
 
     /// A Session in `room` opened, ended or was renamed, or what waits on this node changed.
     fileprivate func sessionsChanged(in room: String) async {
-        if let listed = try? await client.sessions(room: room),
-           let i = rooms.firstIndex(where: { $0.id == room }) {
-            let n = listed.reduce(0) { $0 + Int($1.pending) }
-            if rooms[i].waiting != n { rooms[i].waiting = n }
-        }
+        if let count = try? await client.sessionsWaiting(room: room), let n = Int(exactly: count),
+           let i = rooms.firstIndex(where: { $0.id == room }) { rooms[i].waiting = n }
         await noteWaiting()
-        guard roomOnScreen == room, let listed = try? await client.sessions(room: room),
-              roomOnScreen == room else { return }
-        if listed != sessions { sessions = listed }
+        guard roomOnScreen == room else { return }
+        await refreshSessionMetadata()
+        await readSelectedSessionMetadata()
         await readSession()
     }
 
