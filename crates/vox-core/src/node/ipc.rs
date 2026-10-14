@@ -496,7 +496,7 @@ pub enum Request {
         /// (see the server): paging the room by `since` would skip every late arrival that
         /// landed above the page boundary. Only with no `since`.
         after: Option<Digest32>,
-        /// Cap on rows returned; 0 means no cap.
+        /// Cap on rows returned; 0 uses the server's row and byte page bounds.
         limit: u64,
     },
     /// Every entry the node holds for a room, in the room's one order (ADR-023
@@ -2404,6 +2404,17 @@ pub enum Frame {
     },
 }
 
+fn encode_row(e: &mut Encoder, row: &MessageRow) {
+    e.array(7)
+        .bytes(&row.entry_hash)
+        .bytes(&row.author)
+        .uint(row.created_millis)
+        .text(&row.text)
+        .uint(row.arrival)
+        .uint(u64::from(row.late))
+        .uint(u64::from(row.owed));
+}
+
 impl Frame {
     /// Canonical CBOR body (unframed).
     #[must_use]
@@ -2468,14 +2479,7 @@ impl Frame {
             Frame::Rows { rows } => {
                 e.array(2).uint(T_ROWS).array(rows.len());
                 for r in rows {
-                    e.array(7)
-                        .bytes(&r.entry_hash)
-                        .bytes(&r.author)
-                        .uint(r.created_millis)
-                        .text(&r.text)
-                        .uint(r.arrival)
-                        .uint(u64::from(r.late))
-                        .uint(u64::from(r.owed));
+                    encode_row(&mut e, r);
                 }
             }
             Frame::RoomDisplayRevision { revision } => {
@@ -3931,6 +3935,119 @@ pub(crate) async fn write_reply(s: &mut UnixStream, body: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// One exact Find answer, encoded a row at a time. Only the selected hashes survive a
+/// client wait; no history snapshot or room lock does. A changed room aborts the answer
+/// explicitly rather than returning a partial or falsely absent result.
+async fn write_found(
+    stream: &mut UnixStream,
+    handle: &NodeHandle,
+    channel_id: Digest32,
+    entries: Vec<Digest32>,
+    writing: &std::sync::atomic::AtomicBool,
+) -> Result<bool> {
+    use crate::node::channel::history::{Query, Reply};
+    let located = tokio::select! {
+        result = handle.room_history(channel_id, Query::Locate { entries }) => result,
+        () = subscriber_gone(stream) => return Ok(false),
+    };
+    let (entries, revision) = match located {
+        Ok(Reply::Located { entries, revision }) => (entries, revision),
+        Ok(_) => return Err(Error::MalformedIpc("unexpected room history answer")),
+        Err(reason) => {
+            found_frame(stream, &Frame::Error { reason }.to_bytes(), writing).await?;
+            return Ok(true);
+        }
+    };
+    let mut header = Encoder::new();
+    header.array(2).uint(T_ROWS).array(entries.len());
+    if entries.is_empty() {
+        found_frame(stream, &header.finish(), writing).await?;
+        return Ok(true);
+    }
+    let mut offset = 0usize;
+    reply_part(stream, &header.finish(), &mut offset, true, writing).await?;
+    for (i, entry) in entries.iter().enumerate() {
+        // reply_part consumed the preceding ReplyNext before this actor wait. Client
+        // cancellation must not race that cursor read or consume stream framing.
+        let exact = tokio::select! {
+            result = handle.room_history(
+                channel_id,
+                Query::Exact {
+                    entry: *entry,
+                    revision: revision.clone(),
+                },
+            ) => result,
+            () = subscriber_gone(stream) => return Ok(false),
+        };
+        let row = match exact {
+            Ok(Reply::Exact(row)) => row,
+            Ok(_) => return Err(Error::MalformedIpc("unexpected room history answer")),
+            Err(reason) => {
+                found_frame(stream, &Frame::Error { reason }.to_bytes(), writing).await?;
+                return Ok(true);
+            }
+        };
+        let mut encoded = Encoder::new();
+        encode_row(&mut encoded, &row);
+        drop(row);
+        let encoded = encoded.finish();
+        let mut start = 0;
+        while start < encoded.len() {
+            let end = start.saturating_add(rows_budget()).min(encoded.len());
+            let more = end < encoded.len() || i + 1 < entries.len();
+            reply_part(stream, &encoded[start..end], &mut offset, more, writing).await?;
+            start = end;
+        }
+    }
+    Ok(true)
+}
+
+async fn reply_part(
+    stream: &mut UnixStream,
+    bytes: &[u8],
+    offset: &mut usize,
+    more: bool,
+    writing: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    let mut encoded = Encoder::new();
+    encoded
+        .array(4)
+        .uint(T_REPLY_PAGE)
+        .uint(*offset as u64)
+        .uint(u64::from(more))
+        .bytes(bytes);
+    found_frame(stream, &encoded.finish(), writing).await?;
+    *offset = offset
+        .checked_add(bytes.len())
+        .ok_or(Error::SizeLimitExceeded("ipc reply offset"))?;
+    if more {
+        let next = read_frame(stream)
+            .await?
+            .ok_or(Error::Ipc(IpcHandshake::Cut))?;
+        let mut d = Decoder::new(&next);
+        if !matches!((d.array(), d.uint(), d.uint()), (Ok(2), Ok(T_REPLY_NEXT), Ok(cursor)) if cursor == *offset as u64)
+            || d.finish().is_err()
+        {
+            return Err(Error::MalformedIpc("ipc reply page cursor"));
+        }
+    }
+    Ok(())
+}
+
+// A detach may cancel either of write_frame's writes. Track that interval so the
+// caller closes a possibly partial frame instead of appending another frame inside it.
+async fn found_frame(
+    stream: &mut UnixStream,
+    bytes: &[u8],
+    writing: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    writing.store(true, Relaxed);
+    let result = write_frame(stream, bytes).await;
+    writing.store(false, Relaxed);
+    result
+}
+
 /// Read a collection's pages, joining a row that crosses a frame without dropping any bytes.
 pub(crate) async fn read_reply(s: &mut UnixStream) -> Result<Option<Vec<u8>>> {
     let Some(mut body) = read_frame(s).await? else {
@@ -3940,7 +4057,11 @@ pub(crate) async fn read_reply(s: &mut UnixStream) -> Result<Option<Vec<u8>>> {
     loop {
         let mut d = Decoder::new(&body);
         if !matches!((d.array(), d.uint()), (Ok(4), Ok(T_REPLY_PAGE))) {
-            return if joined.is_empty() {
+            return if joined.is_empty()
+                || matches!(
+                    Frame::from_bytes(&body),
+                    Ok(Frame::Error { .. } | Frame::NodeDetached { .. })
+                ) {
                 Ok(Some(body))
             } else {
                 Err(Error::MalformedIpc("ipc reply page missing"))
@@ -4382,6 +4503,29 @@ async fn serve_requests(
                 r = pump(stream, events) => r,
                 () = node_detached(&mut watch) => Ok(()),
             };
+        }
+        if let Request::Find {
+            channel_id,
+            entries,
+        } = request
+        {
+            let writing = std::sync::atomic::AtomicBool::new(false);
+            tokio::select! {
+                result = write_found(&mut stream, handle, channel_id, entries, &writing) => {
+                    if !result? {
+                        return Ok(());
+                    }
+                }
+                () = node_detached(&mut watch) => {
+                    if !writing.load(std::sync::atomic::Ordering::Relaxed) {
+                        if let Some(b) = gone(&node) {
+                            let _ = write_frame(&mut stream, &b).await;
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+            continue;
         }
         let intent = Held::intent(&request);
         let what = request_name(&request);
@@ -4969,64 +5113,15 @@ fn one_line(text: &str) -> String {
 /// and be able to ask something else.
 async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
     let frame = match request {
-        Request::RoomPage {
-            channel_id,
-            before,
-            limit,
-        } => {
-            let view = handle.view();
-            let Some(detail) = view
-                .open_channels
-                .iter()
-                .find(|d| d.channel_id == channel_id)
-            else {
-                return Frame::Error {
-                    reason: "room not open".into(),
-                };
+        Request::RoomPage { channel_id, before, limit } => {
+            use crate::node::channel::history::{Query, Reply};
+            let limit = if limit == 0 { SESSION_PAGE_ROWS } else {
+                usize::try_from(limit).unwrap_or(usize::MAX).min(SESSION_PAGE_ROWS)
             };
-            let end = match before {
-                None => detail.timeline.len(),
-                Some(hash) => {
-                    let prefix = u64::from_be_bytes([hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7]]);
-                    let Some(at) = detail.row_index.find(prefix).into_iter().find(|at| {
-                        detail
-                            .timeline
-                            .get(*at as usize)
-                            .is_some_and(|r| r.entry_hash == hash)
-                    }) else {
-                        return Frame::Error {
-                            reason: "cursor not in this room's timeline".into(),
-                        };
-                    };
-                    at as usize
-                }
-            };
-            let max_rows = if limit == 0 {
-                SESSION_PAGE_ROWS
-            } else {
-                usize::try_from(limit)
-                    .unwrap_or(usize::MAX)
-                    .min(SESSION_PAGE_ROWS)
-            };
-            let mut rows = Vec::new();
-            let mut bytes = 0;
-            let mut start = end;
-            while start > 0 && rows.len() < max_rows {
-                let Some(row) = detail.timeline.get(start - 1) else {
-                    break;
-                };
-                let cost = row.text.len() + ROW_OVERHEAD;
-                if !rows.is_empty() && bytes + cost > rows_budget() {
-                    break;
-                }
-                bytes += cost;
-                rows.push(row.clone());
-                start -= 1;
-            }
-            rows.reverse();
-            Frame::RoomPage {
-                rows,
-                older: start as u64,
+            match handle.room_history(channel_id, Query::Older { before, limit }).await {
+                Ok(Reply::Older { rows, older }) => Frame::RoomPage { rows, older },
+                Ok(_) => Frame::Error { reason: "unexpected room history answer".into() },
+                Err(reason) => Frame::Error { reason },
             }
         }
         // Handled by the caller; the connection becomes a stream.
@@ -5324,95 +5419,16 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 }
             }
         }
-        Request::Read {
-            channel_id,
-            since,
-            after,
-            limit,
-        } => {
-            let view = handle.view();
-            let Some(detail) = view
-                .open_channels
-                .iter()
-                .find(|d| d.channel_id == channel_id)
-            else {
-                return Frame::Error {
-                    reason: "room not open".into(),
-                };
+        Request::Read { channel_id, since, after, limit } => {
+            use crate::node::channel::history::{Query, Reply};
+            let limit = if limit == 0 { PAGE_ENTRIES } else {
+                usize::try_from(limit).unwrap_or(usize::MAX).min(PAGE_ENTRIES)
             };
-            // The cursor is an entry hash the client already has; everything that
-            // **arrived** after it is what it has not seen. A cursor this node does not
-            // hold is an error rather than "from the start", which would silently
-            // re-deliver the whole room.
-            //
-            // Arrival, not position: the timeline is in the room's order (ADR-023
-            // decision 1), where a late arrival lands *above* rows already shown, and
-            // "everything below the cursor" would skip it for good. So a read from a
-            // cursor is a feed: what this node rendered after the cursor, in the order it
-            // rendered them, which makes the last line always the right next cursor. A
-            // read with no cursor is the room, in the room's order, and `after` is where
-            // its next page starts in that order.
-            let candidates: Vec<&MessageRow> = match (since, after) {
-                (Some(_), Some(_)) => {
-                    return Frame::Error {
-                        reason: "a read takes a cursor or a page mark, not both".into(),
-                    }
-                }
-                (Some(cursor), None) => {
-                    // A message not received yet has no arrival to read on from (V030-10): as a
-                    // cursor its `0` would re-deliver the whole room.
-                    // Searched from the end: a tail's cursor is the last row it read, at or near
-                    // the end (V210-113).
-                    let Some(mark) = detail
-                        .timeline
-                        .iter()
-                        .rev()
-                        .find(|r| r.entry_hash == cursor && !r.owed)
-                        .map(|r| r.arrival)
-                    else {
-                        return Frame::Error {
-                            reason: "cursor not in this room's timeline".into(),
-                        };
-                    };
-                    let mut newer: Vec<&MessageRow> = detail
-                        .timeline
-                        .iter()
-                        .filter(|r| r.arrival > mark)
-                        .collect();
-                    newer.sort_by_key(|r| r.arrival);
-                    newer
-                }
-                (None, None) => detail.timeline.iter().collect(),
-                (None, Some(mark)) => {
-                    let Some(i) = detail.timeline.iter().position(|r| r.entry_hash == mark) else {
-                        return Frame::Error {
-                            reason: "page mark not in this room's timeline".into(),
-                        };
-                    };
-                    detail.timeline.iter_from(i + 1).collect()
-                }
-            };
-            // **One reply is bounded by bytes, never the whole room.** A reply was every row
-            // after `since`, in one frame, and the client refuses a frame over `MAX_FRAME`:
-            // so a room past 256 KiB of history could not be read, tailed, posted to with
-            // `--op` or board'ed at all ("declared size exceeds hard limit: ipc frame
-            // length"). A reply now stops at `ROWS_BUDGET`, always carrying at least one
-            // row, and `IpcClient::read_rows` asks again from the last row it got.
-            let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-            let mut rows: Vec<MessageRow> = Vec::new();
-            let mut bytes = 0usize;
-            for r in candidates {
-                if limit > 0 && rows.len() >= limit {
-                    break;
-                }
-                let cost = r.text.len() + ROW_OVERHEAD;
-                if !rows.is_empty() && bytes + cost > rows_budget() {
-                    break;
-                }
-                bytes += cost;
-                rows.push(r.clone());
+            match handle.room_history(channel_id, Query::Read { since, after, limit }).await {
+                Ok(Reply::Rows(rows)) => Frame::Rows { rows },
+                Ok(_) => Frame::Error { reason: "unexpected room history answer".into() },
+                Err(reason) => Frame::Error { reason },
             }
-            Frame::Rows { rows }
         }
         Request::Order { channel_id } => {
             let view = handle.view();
@@ -5607,47 +5623,11 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             Frame::Rows { rows }
         }
         Request::Count { channel_id, since } => {
-            let view = handle.view();
-            let Some(detail) = view
-                .open_channels
-                .iter()
-                .find(|d| d.channel_id == channel_id)
-            else {
-                return Frame::Error {
-                    reason: "room not open".into(),
-                };
-            };
-            // Counted by arrival, as a read from the cursor delivers (ADR-023 decision 1), and
-            // `last` is the row that arrived last, the cursor such a read ends on. A message not
-            // received yet (V030-10) has no arrival and is neither.
-            let len = detail.timeline.len();
-            let last = detail
-                .timeline
-                .iter()
-                .filter(|r| !r.owed)
-                .max_by_key(|r| r.arrival)
-                .map(|r| r.entry_hash);
-            match since {
-                None => Frame::Count {
-                    n: len as u64,
-                    last,
-                },
-                // From the newest row back: a reader's cursor is usually near the end.
-                Some(cursor) => match detail
-                    .timeline
-                    .iter()
-                    .rev()
-                    .find(|r| r.entry_hash == cursor && !r.owed)
-                    .map(|r| r.arrival)
-                {
-                    Some(mark) => Frame::Count {
-                        n: detail.timeline.iter().filter(|r| r.arrival > mark).count() as u64,
-                        last,
-                    },
-                    None => Frame::Error {
-                        reason: "cursor not in this room's timeline".into(),
-                    },
-                },
+            use crate::node::channel::history::{Query, Reply};
+            match handle.room_history(channel_id, Query::Count { since }).await {
+                Ok(Reply::Count { n, last }) => Frame::Count { n, last },
+                Ok(_) => Frame::Error { reason: "unexpected room history answer".into() },
+                Err(reason) => Frame::Error { reason },
             }
         }
         // Searched from the newest row back: what a client looks up (a reply's parent) is
@@ -5679,34 +5659,8 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             rows.reverse();
             Frame::Rows { rows }
         }
-        Request::Find {
-            channel_id,
-            entries,
-        } => {
-            let view = handle.view();
-            let Some(detail) = view
-                .open_channels
-                .iter()
-                .find(|d| d.channel_id == channel_id)
-            else {
-                return Frame::Error {
-                    reason: "room not open".into(),
-                };
-            };
-            let mut want: std::collections::BTreeSet<Digest32> = entries.into_iter().collect();
-            let mut rows: Vec<MessageRow> = Vec::new();
-            for r in detail.timeline.iter().rev() {
-                if want.is_empty() {
-                    break;
-                }
-                if want.remove(&r.entry_hash) {
-                    rows.push(r.clone());
-                }
-            }
-            // Every named row is returned; byte pages carry long bodies whole.
-            rows.reverse();
-            Frame::Rows { rows }
-        }
+        // The server streams exact Find rows without materializing all requested bodies.
+        Request::Find { .. } => Frame::Error { reason: "Find requires a reply stream".into() },
         // Open or not by the node's own count, not by whether the view has caught up with an
         // open (V210-149): the one-shot form asks the same question the same way.
         Request::Share {

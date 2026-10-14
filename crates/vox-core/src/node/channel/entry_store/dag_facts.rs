@@ -71,6 +71,34 @@ impl OrderView<'_> {
     pub fn previous(&self, before: Option<OrderKey>) -> Result<Option<OrderKey>> {
         self.read.order_previous(before)
     }
+    /// Authenticated-entry reads sharing this view's roots and transaction.
+    pub(crate) fn entries(&self) -> &Read<'_> {
+        &self.read
+    }
+
+    /// Open one rendering using the very same snapshot as the published order roots.
+    pub(crate) fn cache(&self, id: u64) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        self.read.source().open(
+            self.read.sek,
+            self.read.channel,
+            SegmentKind::PlaintextCache,
+            id,
+        )
+    }
+    /// Advance the local arrival cursor without collecting the remaining cache.
+    pub(crate) fn cache_after(
+        &self,
+        after: Option<u64>,
+    ) -> Result<Option<(u64, Zeroizing<Vec<u8>>)>> {
+        self.read
+            .snapshot
+            .segment_after(self.read.channel, SegmentKind::PlaintextCache, after)?
+            .map(|(id, sealed)| {
+                open_segment(self.read.sek, SegmentKind::PlaintextCache, id, &sealed)
+                    .map(|body| (id, body))
+            })
+            .transpose()
+    }
     /// Read exactly one published entry, without exposing an unsigned provisional tail.
     pub fn entry(&self, hash: &Digest32) -> Result<Option<Entry>> {
         if self.read.clock(hash)?.is_none() {

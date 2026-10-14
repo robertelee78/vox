@@ -702,6 +702,34 @@ impl Snapshot {
             .map(|v| sealed_segment_from_slice(v.value()))
             .transpose()
     }
+    /// The next sealed row in this pinned snapshot, without materializing the remaining range.
+    pub(crate) fn segment_after(
+        &self,
+        channel: &Digest32,
+        kind: SegmentKind,
+        after: Option<u64>,
+    ) -> Result<Option<(u64, SealedSegment)>> {
+        use std::ops::Bound::{Excluded, Included};
+        let table = self
+            .txn
+            .open_table(SEGMENTS)
+            .map_err(storage("open segments"))?;
+        let low = match after {
+            Some(id) => Excluded((*channel, kind_code(kind), id)),
+            None => Included((*channel, kind_code(kind), 0)),
+        };
+        let high = Included((*channel, kind_code(kind), u64::MAX));
+        let mut rows = table
+            .range((low, high))
+            .map_err(storage("range segments"))?;
+        let result = rows
+            .next()
+            .transpose()
+            .map_err(storage("iterate segments"))?
+            .map(|(key, value)| Ok((key.value().2, sealed_segment_from_slice(value.value())?)))
+            .transpose();
+        result
+    }
 }
 
 /// An open write transaction over the store (see [`Store::batch`]).
