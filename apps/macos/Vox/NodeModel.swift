@@ -938,9 +938,12 @@ final class NodeModel: ObservableObject {
 
                 try await client.subscribe(listener: Listener(model: self))
                 guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
-                observationNeedsRestart = false
-                await refresh()
+                let refreshed = await refresh(restartObservation: false)
                 guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+                // Reachability and installed observation do not establish a published inventory.
+                // Keep recovery owned by the follow loop until the authoritative refresh lands.
+                guard refreshed else { observationNeedsRestart = true; return }
+                observationNeedsRestart = false
                 await reconcileUnread()
                 guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             }
@@ -1066,11 +1069,12 @@ final class NodeModel: ObservableObject {
     }
 
     /// The rooms, the keyring, the nodes on this Mac and the peers, read again.
-    func refresh() async {
+    @discardableResult
+    func refresh(restartObservation: Bool = true) async -> Bool {
         let epoch = nodeObservationEpoch
         do {
             let fresh = try await client.rooms()
-            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return false }
             let now = fresh.map { r in
                 var room = Room(id: r.id, name: name(of: r), open: r.open)
                 if let held = rooms.first(where: { $0.id == r.id }) {
@@ -1089,18 +1093,20 @@ final class NodeModel: ObservableObject {
             if now != rooms { rooms = now }
             for room in now {
                 await readLast(room.id)
-                guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+                guard epoch == nodeObservationEpoch, !Task.isCancelled else { return false }
             }
             await readWaiting()
-            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
-            await readFacts()
-            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return false }
+            await readFacts(restartObservation: restartObservation)
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return false }
             let back = await readTrustsBack()
-            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return false }
             if back != trustsBack { trustsBack = back }
+            return true
         } catch {
-            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return false }
             reportBackground(error)
+            return false
         }
     }
 
