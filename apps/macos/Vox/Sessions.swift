@@ -1,16 +1,12 @@
-// A room's Sessions (ADR-029 §8, CL-1 to CL-3): listed beside its conversation, above its
-// members, in the TUI's words. General is the room's own conversation; All merges it with each
-// Session's opening and end; a Session shows itself, its entries to a member with drive, and to
-// one without only that it is there.
+// A room's authorized Sessions in its principal tab row (ADR-033 LY-1–3).
+// General is the room conversation; ended Sessions are reached from the row's menu.
 
 import AppKit
 import SwiftUI
 
-/// What the room's timeline shows (CL-2): its own conversation, that and every Session's opening
-/// and end, or one Session, by its node and id.
+/// What the room's timeline shows: its conversation, a selected tag, or one Session by node and id.
 enum Showing: Hashable {
     case general
-    case all
     case session(node: String, id: String)
     /// The room's messages tagged so (#636): a thread of one task, project or milestone.
     case tag(key: String, label: String)
@@ -19,15 +15,14 @@ enum Showing: Hashable {
 extension NodeModel {
     /// The room's open Sessions, newest opening first (CL-2).
     var openSessions: [FfiSession] {
-        sessions.filter { $0.open }.sorted { $0.openedAtMs > $1.openedAtMs }
+        sessions.filter { $0.open && $0.canDrive }.sorted { $0.openedAtMs > $1.openedAtMs }
     }
 
     /// The room's ended Sessions, newest end first.
     var endedSessions: [FfiSession] {
-        sessions.filter { !$0.open }.sorted { ($0.endedAtMs ?? 0) > ($1.endedAtMs ?? 0) }
+        sessions.filter { !$0.open && $0.canDrive }.sorted { ($0.endedAtMs ?? 0) > ($1.endedAtMs ?? 0) }
     }
 
-    /// Whether one Session is on screen, rather than the room's conversation or All.
     /// What needs the person, as the sidebar's NEEDS YOU counts it: its rooms and trust offers.
     /// An offer counts in the room it came from (K-15), and alone only when it came from none.
     var needsYouCount: Int {
@@ -40,20 +35,21 @@ extension NodeModel {
         rooms.first { $0.id == room }?.name ?? String(room.prefix(12))
     }
 
-    /// The room header's facts: members, what is shown, and the retention, always (R-7).
-    var roomHeaderMeta: String {
-        let people = members.count + 1
-        let shown: String
-        switch showing {
-        case .general: shown = "General"
-        case .all: shown = "All"
-        case .session: shown = shownSession?.label ?? "a Session"
-        case .tag(_, let label): shown = "tagged \(label)"
-        }
-        let roster = !daemonReachable ? "members unavailable"
-            : roomMembersPending ? "members loading"
-            : people == 1 ? "1 member" : "\(people) members"
-        return "\(roster) · \(shown) · ⏱ \(retention)"
+    var roomRosterWords: String {
+        guard daemonReachable else { return "members unavailable" }
+        guard !roomMembersPending else { return "members loading" }
+        let count = members.count + 1
+        return count == 1 ? "1 member" : "\(count) members"
+    }
+
+    func sessionTabLabel(_ session: FfiSession, includeName: Bool = false) -> String {
+        let alias = session.nodeAlias.isEmpty
+            ? (session.nodeFingerprint == me ? node : String(session.nodeFingerprint.prefix(12)))
+            : session.nodeAlias
+        let several = openSessions.filter { $0.nodeFingerprint == session.nodeFingerprint }.count > 1
+        guard includeName || several else { return alias }
+        let name = session.name.flatMap { $0.isEmpty ? nil : $0 } ?? session.sessionId
+        return "\(alias) · \(name)"
     }
 
     /// Every tag the room's messages on hand carry, sorted (#636): what the header's filter offers.
@@ -69,7 +65,7 @@ extension NodeModel {
         return false
     }
 
-    /// The Session on screen, if one is and the room still lists it.
+    /// Exact selected metadata remains usable when its descriptor is outside the current page.
     var shownSession: FfiSession? {
         guard case let .session(node, id) = showing else { return nil }
         if selectedSessionMetadataKnown && selectedSessionMetadata == nil { return nil }
@@ -89,73 +85,96 @@ extension NodeModel {
     }
 }
 
-/// The room's Sessions, above its members (CL-2): General, All, the open Sessions (one waiting on
-/// this node marked "!", CL-2), and the ended ones under "Ended (N)", folded until opened.
-struct SessionsList: View {
+/// The room's principal line: truthful roster, General and authorized Session tabs (LY-1–3).
+private struct RoomSessionTab: Identifiable {
+    let room: String
+    let session: FfiSession
+    var id: String { "\(room)/\(session.nodeFingerprint)/\(session.sessionId)" }
+}
+
+struct RoomTabs: View {
     @ObservedObject var model: NodeModel
-    /// Its own SESSIONS heading; off where the heading is drawn above it (the inspector pins it).
-    var heading = true
-    @State private var endedOpen = false
+    let room: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Space.s4) {
-            if heading {
-                Text("SESSIONS").eyebrow().secondaryText()
-                    .accessibilityAddTraits(.isHeader)
-            }
-            row("General", .general, id: "session-general")
-            row("All", .all, id: "session-all")
-            ForEach(model.openSessions, id: \.self) { s in
-                row(s.pending > 0 ? "! \(s.label) · waiting on you" : "● \(s.label)",
-                    .session(node: s.nodeFingerprint, id: s.sessionId), id: "session-\(s.shortId)")
-            }
-            HStack {
-                Button("First open Sessions") { Task { await model.firstOpenSessions() } }
-                if model.sessionsOpenNext != nil {
-                    Button("More open Sessions") { Task { await model.nextOpenSessions() } }
-                }
-            }.disabled(model.sessionsMetadataLoading)
-            let ended = model.endedSessions
-            if !ended.isEmpty || model.sessionsHistoryNext != nil || model.sessionsHistoryPaged {
-                Button { endedOpen.toggle() } label: {
-                    Label("Session history (\(ended.count) ended on this page)", systemImage: endedOpen ? "chevron.down" : "chevron.right")
-                }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("sessions-ended")
-                .accessibilityValue(endedOpen ? "expanded" : "collapsed")
-                if endedOpen {
-                    HStack {
-                        Button("First history page") { Task { await model.firstSessionHistory() } }
-                        if model.sessionsHistoryNext != nil {
-                            Button("Next history page") { Task { await model.nextSessionHistory() } }
+        HStack(spacing: Space.s8) {
+            Text(model.roomName(room)).fontWeight(.semibold)
+                .lineLimit(1).accessibilityIdentifier("room-tab-name")
+            Text(model.roomRosterWords).secondaryText()
+                .accessibilityIdentifier("room-tab-members")
+            Divider().frame(height: 20)
+            ScrollView(.horizontal, showsIndicators: true) {
+                HStack(spacing: Space.s8) {
+                    tab("General", .general, id: "session-general")
+                    ForEach(model.openSessions.map { RoomSessionTab(room: room, session: $0) }) { item in
+                        let session = item.session
+                        Divider().frame(height: 20)
+                        tab(session.pending > 0 ? "! " + model.sessionTabLabel(session) + " · waiting on you"
+                                                : model.sessionTabLabel(session),
+                            .session(node: session.nodeFingerprint, id: session.sessionId),
+                            id: "session-\(session.shortId)")
+                    }
+                    if model.sessionsOpenNext != nil || model.sessionsOpenPaged {
+                        Menu("Open Sessions") {
+                            Button("First open Sessions") { Task { await model.firstOpenSessions() } }
+                                .disabled(!model.sessionsOpenPaged)
+                            if model.sessionsOpenNext != nil {
+                                Button("More open Sessions") { Task { await model.nextOpenSessions() } }
+                            }
                         }
-                    }.disabled(model.sessionsMetadataLoading)
-                    ForEach(ended, id: \.self) { s in
-                        row("\(s.label) · ended", .session(node: s.nodeFingerprint, id: s.sessionId),
-                            id: "session-\(s.shortId)")
+                        .disabled(model.sessionsMetadataLoading)
+                        .accessibilityIdentifier("sessions-open-pages")
+                    }
+                    if !model.endedSessions.isEmpty || model.sessionsHistoryNext != nil || model.sessionsHistoryPaged {
+                        Divider().frame(height: 20)
+                        Menu("Ended (\(model.endedSessions.count) on this page)") {
+                            Button("First history page") { Task { await model.firstSessionHistory() } }
+                                .disabled(model.sessionsMetadataLoading || !model.sessionsHistoryPaged)
+                            if model.sessionsHistoryNext != nil {
+                                Button("Next history page") { Task { await model.nextSessionHistory() } }
+                                    .disabled(model.sessionsMetadataLoading)
+                            }
+                            Divider()
+                            ForEach(model.endedSessions.map { RoomSessionTab(room: room, session: $0) }) { item in
+                                let session = item.session
+                                Button(model.sessionTabLabel(session, includeName: true)) {
+                                    model.showing = .session(node: session.nodeFingerprint, id: session.sessionId)
+                                }.accessibilityIdentifier("session-\(session.shortId)")
+                            }
+                        }.accessibilityIdentifier("sessions-ended")
                     }
                 }
+            }.accessibilityIdentifier("room-session-tabs")
+            if !model.roomTags.isEmpty || tagShown != nil {
+                Menu {
+                    Button("All messages") { model.showing = .general }
+                    ForEach(model.roomTags, id: \.key) { tag in
+                        Button(tag.label) { model.showing = .tag(key: tag.key, label: tag.label) }
+                    }
+                } label: { Label(tagShown ?? "Tags", systemImage: "tag") }
+                .menuStyle(.borderlessButton).fixedSize()
+                .accessibilityIdentifier("room-tag-filter")
             }
         }
+        .padding(.horizontal, 12).padding(.vertical, 8)
         .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("sessions")
+        .accessibilityIdentifier("room-tabs")
     }
 
-    private func row(_ words: String, _ showing: Showing, id: String) -> some View {
-        let on = model.showing == showing
+    private var tagShown: String? {
+        if case .tag(_, let label) = model.showing { return label }
+        return nil
+    }
+
+    private func tab(_ words: String, _ showing: Showing, id: String) -> some View {
+        let selected = model.showing == showing
         return Button { model.showing = showing } label: {
-            // Two lines, not cut: a label's middle is the Session's name.
-            Text(words).lineLimit(2)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .selectionMark(on)
-                .contentShape(Rectangle())
+            Text(words).lineLimit(1).fixedSize()
+                .selectionMark(selected).contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .help(words)
-        .accessibilityIdentifier(id)
-        .accessibilityLabel(words)
-        .accessibilityAddTraits(on ? .isSelected : [])
+        .buttonStyle(.plain).help(words)
+        .accessibilityIdentifier(id).accessibilityLabel(words)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 

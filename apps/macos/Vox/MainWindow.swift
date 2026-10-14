@@ -943,7 +943,10 @@ private struct RoomTimelineView: View {
         // kept from last time.
         HStack(spacing: 0) {
             VStack(spacing: 0) {
-                RoomHeader(model: model, room: room)
+                // The interactive tab row belongs to the content, outside title-bar dragging.
+                RoomTabs(model: model, room: room)
+                    .navigationTitle("")
+                    .navigationSubtitle("")
                 Divider()
                 if !model.roomServices.isEmpty || model.roomServicesNext != nil {
                     ScrollView(.horizontal, showsIndicators: false) {
@@ -2020,63 +2023,6 @@ private struct TrustBanner: View {
 enum DockBadge {
     static func show(_ count: Int) {
         NSApp.dockTile.badgeLabel = count > 0 ? "\(count)" : nil
-    }
-}
-
-/// The room's own header, pinned above its timeline: its name, how many members it has, what the
-/// timeline shows (General, All, or a Session), and its retention, which is always said (R-7).
-/// The window takes the room's name as its title, so the Window menu and ⌘` say which room it is.
-private struct RoomHeader: View {
-    @ObservedObject var model: NodeModel
-    let room: String
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 8) {
-            facts
-            // The room by tag (#636): a thread of one task, project or milestone, from the tags of
-            // the messages this node can read.
-            if !model.roomTags.isEmpty || tagShown != nil {
-                Menu {
-                    Button("All messages") { model.showing = .general }
-                        .disabled(tagShown == nil)
-                    Divider()
-                    ForEach(model.roomTags, id: \.key) { tag in
-                        Button(tag.label) { model.showing = .tag(key: tag.key, label: tag.label) }
-                    }
-                } label: {
-                    Label(tagShown ?? "Tags", systemImage: "tag")
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .help("Show only the messages carrying a tag")
-                .accessibilityIdentifier("room-tag-filter")
-            }
-        }
-        .padding(.horizontal, 12).padding(.vertical, 8)
-        .navigationTitle(model.roomName(room))
-        .navigationSubtitle(model.roomHeaderMeta)
-    }
-
-    /// The tag whose thread is on screen, if one is.
-    private var tagShown: String? {
-        if case .tag(_, let label) = model.showing { return label }
-        return nil
-    }
-
-    private var facts: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text("ROOM").eyebrow().secondaryText()
-            Text(model.roomName(room)).fontWeight(.semibold)
-                .lineLimit(1).truncationMode(.middle)
-                .textSelection(.enabled)
-                .accessibilityIdentifier("room-header-name")
-                .accessibilityAddTraits(.isHeader)
-            Text(model.roomHeaderMeta)
-                .secondaryText()
-                .lineLimit(1).truncationMode(.middle)
-                .accessibilityIdentifier("room-header-meta")
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

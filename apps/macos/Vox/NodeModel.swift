@@ -302,7 +302,8 @@ final class NodeModel: ObservableObject {
     @Published private(set) var sessionsOpenNext: String?
     @Published private(set) var sessionsHistoryNext: String?
     @Published private(set) var sessionsMetadataLoading = false
-    private var sessionsOpenAfter: String?
+    @Published private var sessionsOpenAfter: String?
+    var sessionsOpenPaged: Bool { sessionsOpenAfter != nil }
     @Published private var sessionsHistoryAfter: String?
     var sessionsHistoryPaged: Bool { sessionsHistoryAfter != nil }
     private var sessionsMetadataRead = UUID()
@@ -799,7 +800,6 @@ final class NodeModel: ObservableObject {
     private var selectedRoomView: RoomView {
         switch showing {
         case .general, .session: return .general
-        case .all: return .all
         case .tag(let key, _): return .tag(key: key)
         }
     }
@@ -2997,7 +2997,7 @@ final class NodeModel: ObservableObject {
             // that may be a thread reply or a message belonging to another raw tag.
             if !timelineFollowingNewest {
                 switch showing {
-                case .general, .all:
+                case .general:
                     if message.thread.isEmpty { roomHasNewer = true }
                 case .tag(let key, _):
                     if message.tagSelectors.contains(where: { $0.key == key }) { roomHasNewer = true }
