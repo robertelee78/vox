@@ -1,6 +1,6 @@
 //! Bounded encrypted entry locators. LogDb remains the authoritative wire storage.
 //!
-//! Both trees use immutable, SEK-sealed pages. Only page ids appear outside ciphertext;
+//! Entry locators and DAG facts use immutable, SEK-sealed pages. Only page ids appear outside ciphertext;
 //! authors, hashes, sequence numbers, separator keys and locations are all encrypted.
 //! A reader pins one redb snapshot for the directory, every page and the final entry.
 //! A writer reads its own Batch. Roots are installed only by its durable commit.
@@ -24,7 +24,18 @@ const CACHE_BYTES: usize = 4 * 1024 * 1024;
 const CACHE_ITEMS: usize = 128;
 const MAX_DEPTH: usize = 64;
 const DIRECTORY: u64 = 0;
-type Key = [u8; 40];
+type Key = [u8; 64];
+
+mod dag_facts;
+pub use dag_facts::OrderView;
+
+fn flag(d: &mut Decoder<'_>) -> Result<bool> {
+    match d.uint()? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(invalid("entry directory boolean")),
+    }
+}
 
 fn invalid(why: &'static str) -> Error {
     Error::MalformedAtRest(why)
@@ -41,32 +52,17 @@ impl Locator {
     fn write(self, e: &mut Encoder) {
         e.array(3).bytes(&self.author).uint(self.seq).uint(self.log);
     }
-    fn read(d: &mut Decoder<'_>) -> Result<Self> {
-        if d.array()? != 3 {
-            return Err(invalid("entry locator arity"));
-        }
-        let author = d
-            .bytes()?
-            .try_into()
-            .map_err(|_| invalid("entry locator author"))?;
-        let seq = d.uint()?;
-        let log = d.uint()?;
-        if seq == 0 || log == 0 {
-            return Err(invalid("zero entry location"));
-        }
-        Ok(Self { author, seq, log })
-    }
 }
 
 fn position(author: &Digest32, seq: u64) -> Key {
-    let mut key = [0; 40];
+    let mut key = [0; 64];
     key[..32].copy_from_slice(author);
-    key[32..].copy_from_slice(&seq.to_be_bytes());
+    key[32..40].copy_from_slice(&seq.to_be_bytes());
     key
 }
 
 fn hashed(hash: &Digest32) -> Key {
-    let mut key = [0; 40];
+    let mut key = [0; 64];
     key[..32].copy_from_slice(hash);
     key
 }
@@ -75,19 +71,34 @@ fn hashed(hash: &Digest32) -> Key {
 pub(crate) struct Roots {
     sequence: u64,
     hash: u64,
+    clock: u64,
+    order: u64,
+    children: u64,
+    referenced: u64,
 }
 
 impl Roots {
     fn write(self, e: &mut Encoder) {
-        e.array(2).uint(self.sequence).uint(self.hash);
+        e.array(6)
+            .uint(self.sequence)
+            .uint(self.hash)
+            .uint(self.clock)
+            .uint(self.order)
+            .uint(self.children)
+            .uint(self.referenced);
     }
     fn read(d: &mut Decoder<'_>) -> Result<Self> {
-        if d.array()? != 2 {
+        let arity = d.array()?;
+        if arity != 2 && arity != 6 {
             return Err(invalid("entry roots arity"));
         }
         Ok(Self {
             sequence: d.uint()?,
             hash: d.uint()?,
+            clock: if arity == 6 { d.uint()? } else { 0 },
+            order: if arity == 6 { d.uint()? } else { 0 },
+            children: if arity == 6 { d.uint()? } else { 0 },
+            referenced: if arity == 6 { d.uint()? } else { 0 },
         })
     }
 }
@@ -119,6 +130,8 @@ struct Promotion {
     first_page: u64,
     after_page: u64,
     retired: u64,
+    bodyless_prefix: bool,
+    reordered: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +143,10 @@ struct Directory {
     revision: u64,
     phase: Phase,
     promotion: Option<Promotion>,
+    graph_ready: bool,
+    origin: Option<u64>,
+    order_revision: u64,
+    work: dag_facts::Work,
 }
 
 impl Default for Directory {
@@ -142,6 +159,10 @@ impl Default for Directory {
             revision: 0,
             phase: Phase::Rebuilding,
             promotion: None,
+            graph_ready: true,
+            origin: None,
+            order_revision: 0,
+            work: dag_facts::Work::default(),
         }
     }
 }
@@ -149,7 +170,7 @@ impl Default for Directory {
 impl Directory {
     fn bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
-        e.array(8).uint(1);
+        e.array(12).uint(2);
         self.active.write(&mut e);
         self.provisional.write(&mut e);
         e.uint(self.next_page)
@@ -166,7 +187,7 @@ impl Directory {
                 e.array(0);
             }
             Some(p) => {
-                e.array(14)
+                e.array(16)
                     .bytes(&p.author)
                     .uint(p.from)
                     .uint(p.through)
@@ -180,9 +201,22 @@ impl Directory {
                     .uint(p.after_log)
                     .uint(p.first_page)
                     .uint(p.after_page)
-                    .uint(p.retired);
+                    .uint(p.retired)
+                    .uint(u64::from(p.bodyless_prefix))
+                    .uint(p.reordered);
             }
         }
+        e.uint(u64::from(self.graph_ready));
+        match self.origin {
+            Some(origin) => {
+                e.array(1).uint(origin);
+            }
+            None => {
+                e.array(0);
+            }
+        }
+        e.uint(self.order_revision);
+        self.work.write(&mut e);
         Zeroizing::new(e.finish())
     }
     fn parse(bytes: &[u8]) -> Result<Self> {
@@ -190,7 +224,9 @@ impl Directory {
             return Err(invalid("entry directory exceeds page bound"));
         }
         let mut d = Decoder::new(bytes);
-        if d.array()? != 8 || d.uint()? != 1 {
+        let arity = d.array()?;
+        let version = d.uint()?;
+        if !matches!((arity, version), (8, 1) | (12, 2)) {
             return Err(invalid("entry directory format"));
         }
         let active = Roots::read(&mut d)?;
@@ -205,9 +241,10 @@ impl Directory {
             3 => Phase::Switched,
             _ => return Err(invalid("entry directory phase")),
         };
-        let promotion = match d.array()? {
+        let promotion_arity = d.array()?;
+        let promotion = match promotion_arity {
             0 => None,
-            14 => Some(Promotion {
+            14 | 16 => Some(Promotion {
                 author: d
                     .bytes()?
                     .try_into()
@@ -231,8 +268,30 @@ impl Directory {
                 first_page: d.uint()?,
                 after_page: d.uint()?,
                 retired: d.uint()?,
+                bodyless_prefix: if promotion_arity == 16 {
+                    flag(&mut d)?
+                } else {
+                    true
+                },
+                reordered: if promotion_arity == 16 { d.uint()? } else { 0 },
             }),
             _ => return Err(invalid("promotion arity")),
+        };
+        let graph_ready = if version == 2 { flag(&mut d)? } else { false };
+        let origin = if version == 2 {
+            match d.array()? {
+                0 => None,
+                1 => Some(d.uint()?),
+                _ => return Err(invalid("DAG origin arity")),
+            }
+        } else {
+            None
+        };
+        let order_revision = if version == 2 { d.uint()? } else { 0 };
+        let work = if version == 2 {
+            dag_facts::Work::read(&mut d)?
+        } else {
+            dag_facts::Work::default()
         };
         d.finish()?;
         if next_page == 0
@@ -240,11 +299,16 @@ impl Directory {
             || [
                 active.sequence,
                 active.hash,
+                active.clock,
+                active.order,
+                active.children,
+                active.referenced,
                 provisional.sequence,
                 provisional.hash,
             ]
             .iter()
             .any(|id| *id >= next_page)
+            || !work.valid_for(next_page, phase)
             || matches!(phase, Phase::Building | Phase::Switched) != promotion.is_some()
         {
             return Err(invalid("entry directory bounds"));
@@ -263,6 +327,10 @@ impl Directory {
                 || p.after_page > next_page
                 || p.work.sequence >= next_page
                 || p.work.hash >= next_page
+                || p.work.clock >= next_page
+                || p.work.order >= next_page
+                || p.work.children >= next_page
+                || p.work.referenced >= next_page
                 || p.retired >= next_page
             {
                 return Err(invalid("promotion bounds"));
@@ -276,6 +344,10 @@ impl Directory {
             revision,
             phase,
             promotion,
+            graph_ready,
+            origin,
+            order_revision,
+            work,
         })
     }
 }
@@ -317,9 +389,54 @@ impl PageCache {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Value {
+    Entry(Locator),
+    Number(u64),
+    Present,
+}
+impl Value {
+    fn locator(self) -> Result<Locator> {
+        match self {
+            Self::Entry(at) => Ok(at),
+            _ => Err(invalid("entry locator value kind")),
+        }
+    }
+    fn write(self, e: &mut Encoder) {
+        match self {
+            Self::Entry(at) => at.write(e),
+            Self::Number(number) => {
+                e.array(2).uint(1).uint(number);
+            }
+            Self::Present => {
+                e.array(1).uint(2);
+            }
+        }
+    }
+    fn read(d: &mut Decoder<'_>) -> Result<Self> {
+        match d.array()? {
+            3 => {
+                let author = d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| invalid("entry locator author"))?;
+                let seq = d.uint()?;
+                let log = d.uint()?;
+                if seq == 0 || log == 0 {
+                    return Err(invalid("zero entry location"));
+                }
+                Ok(Self::Entry(Locator { author, seq, log }))
+            }
+            2 if d.uint()? == 1 => Ok(Self::Number(d.uint()?)),
+            1 if d.uint()? == 2 => Ok(Self::Present),
+            _ => Err(invalid("entry page value kind")),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum Page {
-    Leaf(Vec<(Key, Locator)>),
+    Leaf(Vec<(Key, Value)>),
     Branch(Vec<(Key, u64)>),
 }
 
@@ -375,16 +492,18 @@ impl Page {
             if d.array()? != 2 {
                 return Err(invalid("entry page row arity"));
             }
-            let key: Key = d
-                .bytes()?
-                .try_into()
-                .map_err(|_| invalid("entry page key"))?;
+            let encoded_key = d.bytes()?;
+            if !matches!(encoded_key.len(), 40 | 64) {
+                return Err(invalid("entry page key"));
+            }
+            let mut key = [0; 64];
+            key[..encoded_key.len()].copy_from_slice(encoded_key);
             if previous.is_some_and(|p| p >= key) {
                 return Err(invalid("entry page key order"));
             }
             previous = Some(key);
             match kind {
-                0 => leaves.push((key, Locator::read(&mut d)?)),
+                0 => leaves.push((key, Value::read(&mut d)?)),
                 1 => {
                     let id = d.uint()?;
                     if id == 0 {
@@ -443,13 +562,13 @@ impl Source<'_> {
         }
         Ok(page)
     }
-    fn find(
+    fn find_value(
         &self,
         sek: &Sek,
         channel: &Digest32,
         mut root: u64,
         key: &Key,
-    ) -> Result<Option<Locator>> {
+    ) -> Result<Option<Value>> {
         if root == 0 {
             return Ok(None);
         }
@@ -469,6 +588,11 @@ impl Source<'_> {
         }
         Err(invalid("entry index cycle or depth"))
     }
+    fn find(&self, sek: &Sek, channel: &Digest32, root: u64, key: &Key) -> Result<Option<Locator>> {
+        self.find_value(sek, channel, root, key)?
+            .map(Value::locator)
+            .transpose()
+    }
     fn first(
         &self,
         sek: &Sek,
@@ -476,7 +600,7 @@ impl Source<'_> {
         root: u64,
         key: &Key,
         depth: usize,
-    ) -> Result<Option<(Key, Locator)>> {
+    ) -> Result<Option<(Key, Value)>> {
         if root == 0 {
             return Ok(None);
         }
@@ -644,6 +768,40 @@ fn find_hash(
 }
 
 impl EntryRead for Read<'_> {
+    fn clock(&self, hash: &Digest32) -> Result<Option<u64>> {
+        if !self.directory.graph_ready {
+            return Err(invalid("DAG facts not yet rebuilt"));
+        }
+        self.source().number(
+            self.sek,
+            self.channel,
+            self.directory.active.clock,
+            &hashed(hash),
+        )
+    }
+    fn order_next(&self, after: Option<(u64, Digest32)>) -> Result<Option<(u64, Digest32)>> {
+        self.source()
+            .order_next(self.sek, self.channel, self.directory.active.order, after)
+    }
+    fn order_previous(&self, before: Option<(u64, Digest32)>) -> Result<Option<(u64, Digest32)>> {
+        self.source()
+            .order_previous(self.sek, self.channel, self.directory.active.order, before)
+    }
+    fn referenced(&self, author: &Digest32, other: &Digest32) -> Result<u64> {
+        let mut key = [0; 64];
+        key[..32].copy_from_slice(author);
+        key[32..].copy_from_slice(other);
+        Ok(self
+            .source()
+            .number(
+                self.sek,
+                self.channel,
+                self.directory.active.referenced,
+                &key,
+            )?
+            .unwrap_or(0))
+    }
+
     fn get(&self, author: &Digest32, seq: u64) -> Result<Option<Entry>> {
         find_position(
             &self.source(),
@@ -765,7 +923,7 @@ impl Write<'_, '_> {
         &mut self,
         root: u64,
         key: Key,
-        value: Option<Locator>,
+        value: Option<Value>,
         depth: usize,
     ) -> Result<Vec<(Key, u64)>> {
         if depth >= MAX_DEPTH {
@@ -822,13 +980,16 @@ impl Write<'_, '_> {
         }
         Ok(parts)
     }
-    fn change(&mut self, root: u64, key: Key, value: Option<Locator>) -> Result<u64> {
+    fn change_value(&mut self, root: u64, key: Key, value: Option<Value>) -> Result<u64> {
         let parts = self.replace(root, key, value, 0)?;
         match parts.as_slice() {
             [] => Ok(0),
             [(_, id)] => Ok(*id),
             _ => Ok(self.put_page(&Page::Branch(parts))?.1),
         }
+    }
+    fn change(&mut self, root: u64, key: Key, value: Option<Locator>) -> Result<u64> {
+        self.change_value(root, key, value.map(Value::Entry))
     }
     fn index(&mut self, mut roots: Roots, entry: &Entry, log: u64) -> Result<Roots> {
         let at = Locator {
@@ -859,12 +1020,31 @@ impl Write<'_, '_> {
         if self.directory.phase != Phase::Rebuilding {
             return Err(invalid("not rebuilding entry index"));
         }
+        if !self.directory.work.is_empty() {
+            return Err(invalid("DAG rebuild incomplete"));
+        }
+        self.directory.graph_ready =
+            self.directory.active.sequence == 0 || self.directory.active.clock != 0;
         self.directory.phase = Phase::Idle;
         Ok(())
     }
     pub(crate) fn put_committed(&mut self, entry: &Entry, log: u64) -> Result<()> {
         if self.directory.phase != Phase::Idle {
             return Err(invalid("entry index publication in progress"));
+        }
+        let prior = Source::Batch(self.batch)
+            .find(
+                self.sek,
+                self.channel,
+                self.directory.active.hash,
+                &hashed(&entry.entry_hash()),
+            )?
+            .ok_or(invalid("new entry requires prepared DAG publication"))?;
+        if prior.log != log
+            || prior.author != entry.skeleton.author_id
+            || prior.seq != entry.skeleton.seq
+        {
+            return Err(invalid("entry rewrite location differs"));
         }
         let sealed = seal_segment(self.sek, SegmentKind::LogDb, log, &entry.to_wire())?;
         self.batch
@@ -929,19 +1109,32 @@ impl Write<'_, '_> {
     }
 }
 
+/// One verified feed interval to publish with its entry effects and DAG facts.
+pub(crate) struct Publication<'a> {
+    pub witness: &'a Entry,
+    pub from: u64,
+    pub first_log: u64,
+    pub received_ms: u64,
+    pub bodyless_prefix: bool,
+    pub origin: u64,
+}
+
 const PROMOTION_ENTRIES: usize = 64;
 const PROMOTION_BYTES: usize = 1024 * 1024;
 
 impl Write<'_, '_> {
     /// The caller already checked the complete feed linkage and the successor's signature.
     /// The signed witness stays in the provisional store until publication and cleanup finish.
-    pub(crate) fn begin_promotion(
-        &mut self,
-        witness: &Entry,
-        from: u64,
-        first_log: u64,
-        received_ms: u64,
-    ) -> Result<()> {
+    pub(crate) fn begin_promotion(&mut self, publication: Publication<'_>) -> Result<()> {
+        let Publication {
+            witness,
+            from,
+            first_log,
+            received_ms,
+            bodyless_prefix,
+            origin,
+        } = publication;
+        self.set_origin(origin)?;
         if self.directory.phase != Phase::Idle
             || !witness.is_signed()
             || from == 0
@@ -1007,6 +1200,8 @@ impl Write<'_, '_> {
             first_page: self.directory.next_page,
             after_page: self.directory.next_page,
             retired: 0,
+            bodyless_prefix,
+            reordered: 0,
         });
         self.directory.phase = Phase::Building;
         Ok(())
@@ -1048,7 +1243,10 @@ impl Write<'_, '_> {
             if entry.skeleton.author_id != p.author
                 || entry.skeleton.seq != p.cursor
                 || entry.skeleton.channel_id != *self.channel
-                || (p.cursor < p.through && (entry.is_signed() || entry.payload.is_some()))
+                || (p.cursor < p.through
+                    && p.bodyless_prefix
+                    && (entry.is_signed() || entry.payload.is_some()))
+                || (!p.bodyless_prefix && !entry.is_signed())
                 || (p.cursor == p.through
                     && (!entry.is_signed() || entry.entry_hash() != p.witness_hash))
             {
@@ -1088,7 +1286,7 @@ impl Write<'_, '_> {
                 .put_segment(self.channel, SegmentKind::LogDb, log, &sealed)?;
             // Bodyless skeletons have no decrypt/ratchet effect. Their first-seen facts still
             // land with their wire and locator; the witness effects are queued at publication.
-            if p.cursor < p.through {
+            if p.cursor < p.through && p.bodyless_prefix {
                 let seen = seal_segment(
                     self.sek,
                     SegmentKind::Index,
@@ -1099,6 +1297,7 @@ impl Write<'_, '_> {
                     .put_segment(self.channel, SegmentKind::Index, log, &seen)?;
             }
             p.work = self.index(p.work, &entry, log)?;
+            self.enqueue_fact(entry.entry_hash())?;
             p.after_log = log
                 .checked_add(1)
                 .ok_or(invalid("promotion log overflow"))?;
@@ -1132,12 +1331,13 @@ impl Write<'_, '_> {
             .promotion
             .as_ref()
             .ok_or(invalid("promotion missing"))?;
-        if p.cursor <= p.through {
-            return Err(invalid("promotion suffix incomplete"));
+        if p.cursor <= p.through || !self.directory.work.is_empty() {
+            return Err(invalid("promotion suffix or DAG facts incomplete"));
         }
         let result = (p.through - p.from + 1, p.after_log);
         let from = p.from;
         self.directory.active = p.work;
+        self.directory.order_revision = self.directory.order_revision.wrapping_add(p.reordered);
         self.directory.phase = Phase::Switched;
         self.directory
             .promotion
@@ -1172,6 +1372,7 @@ impl Write<'_, '_> {
                     } else {
                         self.directory.phase = Phase::Idle;
                         self.directory.promotion = None;
+                        self.directory.work = dag_facts::Work::default();
                         return Ok(true);
                     }
                 }
@@ -1225,7 +1426,13 @@ impl Write<'_, '_> {
 impl EntryIndex {
     /// Complete crash cleanup before a caller scans authoritative LogDb. An absent derived
     /// index is rebuilt from sealed wire entries; no saved entry, key or first-seen fact is reset.
-    pub(crate) fn prepare(&self, store: &Store, sek: &Sek, channel: &Digest32) -> Result<()> {
+    pub(crate) fn prepare(
+        &self,
+        store: &Store,
+        sek: &Sek,
+        channel: &Digest32,
+        origin: u64,
+    ) -> Result<()> {
         loop {
             let mut batch = store.batch()?;
             let mut writer = self.write(&mut batch, sek, channel)?;
@@ -1264,7 +1471,10 @@ impl EntryIndex {
                     batch.delete_segment(channel, SegmentKind::EntryIndex, id)?;
                     removed += 1;
                 }
-                let fresh = Directory::default();
+                let fresh = Directory {
+                    origin: Some(origin),
+                    ..Directory::default()
+                };
                 let sealed = seal_segment(sek, SegmentKind::EntryIndex, DIRECTORY, &fresh.bytes())?;
                 batch.put_segment(channel, SegmentKind::EntryIndex, DIRECTORY, &sealed)?;
                 batch.commit()?;
@@ -1297,7 +1507,10 @@ impl EntryIndex {
                 }
                 Ok(())
             })?;
-            let mut batch = batch.ok_or(invalid("entry rebuild batch missing"))?;
+            batch
+                .ok_or(invalid("entry rebuild batch missing"))?
+                .commit()?;
+            let mut batch = store.batch()?;
             let mut writer = self.write(&mut batch, sek, channel)?;
             writer.finish_rebuild()?;
             writer.seal()?;
@@ -1327,10 +1540,11 @@ impl EntryIndex {
             for _ in 0..PROMOTION_ENTRIES {
                 let roots = writer.directory.provisional;
                 let first =
-                    Source::Batch(writer.batch).first(sek, channel, roots.sequence, &[0; 40], 0)?;
-                let Some((key, at)) = first else {
+                    Source::Batch(writer.batch).first(sek, channel, roots.sequence, &[0; 64], 0)?;
+                let Some((key, value)) = first else {
                     break;
                 };
+                let at = value.locator()?;
                 let wire = Source::Batch(writer.batch)
                     .open(sek, channel, SegmentKind::ProvisionalLog, at.log)?
                     .ok_or(invalid("provisional entry missing"))?;
@@ -1354,6 +1568,47 @@ impl EntryIndex {
 }
 
 impl EntryRead for Write<'_, '_> {
+    fn clock(&self, hash: &Digest32) -> Result<Option<u64>> {
+        if !self.directory.graph_ready {
+            return Err(invalid("DAG facts not yet rebuilt"));
+        }
+        Source::Batch(self.batch).number(
+            self.sek,
+            self.channel,
+            self.directory.active.clock,
+            &hashed(hash),
+        )
+    }
+    fn order_next(&self, after: Option<(u64, Digest32)>) -> Result<Option<(u64, Digest32)>> {
+        Source::Batch(self.batch).order_next(
+            self.sek,
+            self.channel,
+            self.directory.active.order,
+            after,
+        )
+    }
+    fn order_previous(&self, before: Option<(u64, Digest32)>) -> Result<Option<(u64, Digest32)>> {
+        Source::Batch(self.batch).order_previous(
+            self.sek,
+            self.channel,
+            self.directory.active.order,
+            before,
+        )
+    }
+    fn referenced(&self, author: &Digest32, other: &Digest32) -> Result<u64> {
+        let mut key = [0; 64];
+        key[..32].copy_from_slice(author);
+        key[32..].copy_from_slice(other);
+        Ok(Source::Batch(self.batch)
+            .number(
+                self.sek,
+                self.channel,
+                self.directory.active.referenced,
+                &key,
+            )?
+            .unwrap_or(0))
+    }
+
     fn get(&self, author: &Digest32, seq: u64) -> Result<Option<Entry>> {
         find_position(
             &Source::Batch(self.batch),
@@ -1524,6 +1779,49 @@ impl View<'_, '_> {
     }
 }
 impl EntryRead for View<'_, '_> {
+    fn clock(&self, hash: &Digest32) -> Result<Option<u64>> {
+        if !self.directory.graph_ready {
+            return Err(invalid("DAG facts not yet rebuilt"));
+        }
+        self.transaction.source().number(
+            self.sek,
+            self.channel,
+            self.directory.active.clock,
+            &hashed(hash),
+        )
+    }
+    fn order_next(&self, after: Option<(u64, Digest32)>) -> Result<Option<(u64, Digest32)>> {
+        self.transaction.source().order_next(
+            self.sek,
+            self.channel,
+            self.directory.active.order,
+            after,
+        )
+    }
+    fn order_previous(&self, before: Option<(u64, Digest32)>) -> Result<Option<(u64, Digest32)>> {
+        self.transaction.source().order_previous(
+            self.sek,
+            self.channel,
+            self.directory.active.order,
+            before,
+        )
+    }
+    fn referenced(&self, author: &Digest32, other: &Digest32) -> Result<u64> {
+        let mut key = [0; 64];
+        key[..32].copy_from_slice(author);
+        key[32..].copy_from_slice(other);
+        Ok(self
+            .transaction
+            .source()
+            .number(
+                self.sek,
+                self.channel,
+                self.directory.active.referenced,
+                &key,
+            )?
+            .unwrap_or(0))
+    }
+
     fn get(&self, author: &Digest32, seq: u64) -> Result<Option<Entry>> {
         find_position(
             &self.transaction.source(),
@@ -1569,6 +1867,27 @@ impl EntryIndex {
     }
 }
 impl EntryRead for Staging<'_> {
+    fn clock(&self, hash: &Digest32) -> Result<Option<u64>> {
+        self.index
+            .read(self.store, self.sek, self.channel)?
+            .clock(hash)
+    }
+    fn order_next(&self, after: Option<(u64, Digest32)>) -> Result<Option<(u64, Digest32)>> {
+        self.index
+            .read(self.store, self.sek, self.channel)?
+            .order_next(after)
+    }
+    fn order_previous(&self, before: Option<(u64, Digest32)>) -> Result<Option<(u64, Digest32)>> {
+        self.index
+            .read(self.store, self.sek, self.channel)?
+            .order_previous(before)
+    }
+    fn referenced(&self, author: &Digest32, other: &Digest32) -> Result<u64> {
+        self.index
+            .read(self.store, self.sek, self.channel)?
+            .referenced(author, other)
+    }
+
     fn get_by_hash(&self, hash: &Digest32) -> Result<Option<Entry>> {
         self.index
             .read(self.store, self.sek, self.channel)?

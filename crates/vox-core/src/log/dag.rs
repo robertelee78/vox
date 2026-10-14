@@ -62,7 +62,7 @@
 //!   (the decryptor is M4/M6).
 //!
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
@@ -187,16 +187,6 @@ pub struct Dag {
     /// Authors frozen by an attributable fork proof; their later entries are
     /// refused (ADR-008 — members revoke/rotate to exclude the equivocator).
     frozen: HashMap<Digest32, ForkProof>,
-    /// entry hash -> its hybrid logical clock (module docs).
-    clock: HashMap<Digest32, u64>,
-    /// Every stored entry keyed `(clock, entry_hash)`: iterating it **is** the order.
-    ordered: BTreeSet<(u64, Digest32)>,
-    /// hash -> the stored entries whose `seen` names it. Kept for hashes not held
-    /// yet too: that is how a late parent finds the children it has to lift.
-    seen_by: HashMap<Digest32, Vec<Digest32>>,
-    /// `(author, other author)` -> the highest seq of `other` that one of `author`'s
-    /// entries names in its `seen`. What [`Dag::seen_for`] need not name again.
-    referenced: HashMap<(Digest32, Digest32), u64>,
     /// author -> the highest checkpoint its own signed feed carries: `(seq, entry_hash)`
     /// (ADR-023 decision 3).
     checkpoints: HashMap<Digest32, (u64, Digest32)>,
@@ -212,12 +202,11 @@ pub struct Dag {
     /// Bumped whenever an already-stored entry's clock moves (a late parent arrived),
     /// so a timeline can tell a re-sort is due without recomputing anything.
     reorder_generation: u64,
+    /// One published tail clock, refreshed with the durable order revision.
+    newest_clock: Option<u64>,
     /// Body presence changed without replacing a signed skeleton. Display projections must
     /// notice this even if the caller's later persistence or rendering step fails.
     body_generation: u64,
-    /// The room's genesis time in ms, the anchor for an entry with no parent
-    /// ([`Dag::for_room`]).
-    origin_ms: Option<u64>,
     /// How many entries this node has refused as at or below their author's checkpoint since
     /// it loaded the room. Counted so the refusal can be *seen*: from outside it looks exactly
     /// like a fork whose held side cannot incriminate (both are dropped and the session goes
@@ -240,16 +229,11 @@ impl Dag {
         Self::default()
     }
 
-    /// An empty DAG for a room created at `origin_ms` (its genesis time): an entry with no
-    /// parent is capped at [`MAX_LEAD_MS`] past it, as every other entry is capped past its
-    /// latest parent. Without an origin such an entry's claimed time stands uncapped, which is
-    /// right only where nothing is shown from the order (an anchor's ciphertext copy).
+    /// An empty room DAG. The durable entry index owns the genesis time used to cap
+    /// root clocks; it publishes those facts atomically with each accepted prefix.
     #[must_use]
-    pub fn for_room(origin_ms: u64) -> Self {
-        Self {
-            origin_ms: Some(origin_ms),
-            ..Self::default()
-        }
+    pub fn for_room(_origin_ms: u64) -> Self {
+        Self::default()
     }
 
     /// The number of entries stored across all authors.
@@ -620,7 +604,6 @@ impl Dag {
                 *held = (cp.seq, cp.entry_hash);
             }
         }
-        self.place(entries, hash).map_err(Rejected::Local)?;
         Ok(hash)
     }
 
@@ -634,16 +617,9 @@ impl Dag {
             let Some(feed) = self.feeds.get_mut(&author) else {
                 continue;
             };
-            removed += feed.truncate_from(entries, from, |entry| {
-                let h = entry.entry_hash();
-                if let Some(c) = self.clock.remove(&h) {
-                    self.ordered.remove(&(c, h));
-                }
-            })?;
+            removed += feed.truncate_from(entries, from, |_| {})?;
         }
-        if removed > 0 {
-            self.reorder_generation = self.reorder_generation.wrapping_add(1);
-        }
+        // Provisional rows never enter the published display order.
         Ok(removed)
     }
 
@@ -723,90 +699,6 @@ impl Dag {
         Ok(dropped)
     }
 
-    /// Give a just-stored entry its clock, record its `seen` edges, and lift every
-    /// stored entry that was waiting for it (module docs, "The one order").
-    fn place(&mut self, entries: &impl EntryRead, hash: Digest32) -> Result<()> {
-        let Some(entry) = self.get_by_hash(entries, &hash)? else {
-            return Err(Error::MalformedAtRest("new DAG entry missing"));
-        };
-        let author = entry.skeleton.author_id;
-        let seq = entry.skeleton.seq;
-        let seen = entry.skeleton.seen.clone();
-        for parent in &seen {
-            if let Some((other, other_seq)) = self.position(entries, parent)? {
-                let r = self.referenced.entry((author, other)).or_insert(0);
-                *r = (*r).max(other_seq);
-            }
-            self.seen_by.entry(*parent).or_default().push(hash);
-        }
-        let clock = self.clock_of(entries, &hash)?;
-        self.clock.insert(hash, clock);
-        self.ordered.insert((clock, hash));
-
-        // Children that named this entry before it arrived: their clocks are recomputed with
-        // it held, and whatever moves takes its descendants along.
-        let waiting = self.seen_by.get(&hash).cloned().unwrap_or_default();
-        for child in &waiting {
-            if let Some((child_author, _)) = self.position(entries, child)? {
-                let r = self.referenced.entry((child_author, author)).or_insert(0);
-                *r = (*r).max(seq);
-            }
-        }
-        let mut work = waiting;
-        while let Some(h) = work.pop() {
-            let Some(old) = self.clock.get(&h).copied() else {
-                continue;
-            };
-            let new = self.clock_of(entries, &h)?;
-            if new <= old {
-                continue;
-            }
-            self.ordered.remove(&(old, h));
-            self.ordered.insert((new, h));
-            self.clock.insert(h, new);
-            self.reorder_generation = self.reorder_generation.wrapping_add(1);
-            if let Some((a, s)) = self.position(entries, &h)? {
-                if let Some(succ) = self
-                    .feeds
-                    .get(&a)
-                    .map(|f| f.get(entries, s + 1))
-                    .transpose()?
-                    .flatten()
-                {
-                    work.push(succ.entry_hash());
-                }
-            }
-            if let Some(children) = self.seen_by.get(&h) {
-                work.extend(children.iter().copied());
-            }
-        }
-        Ok(())
-    }
-
-    /// An entry's clock from its parents' clocks as currently held (module docs, "The one
-    /// order"): its claimed time, capped at [`MAX_LEAD_MS`] past the latest parent — or past
-    /// the room's origin when it has none — and never below one past any parent.
-    ///
-    /// Monotone in the parents' clocks, so recomputing a child when a parent rises only ever
-    /// raises it, and the fixpoint is the same whatever order entries arrived in.
-    fn clock_of(&self, entries: &impl EntryRead, hash: &Digest32) -> Result<u64> {
-        let Some(entry) = self.get_by_hash(entries, hash)? else {
-            return Ok(0);
-        };
-        let sk = &entry.skeleton;
-        let parents = sk.seen.iter().chain((sk.seq > 1).then_some(&sk.prev_hash));
-        let latest_parent = parents.filter_map(|p| self.clock.get(p).copied()).max();
-        let anchor = latest_parent.or(self.origin_ms);
-        let claimed = match anchor {
-            Some(a) => sk.claimed_ms.min(a.saturating_add(MAX_LEAD_MS)),
-            None => sk.claimed_ms,
-        };
-        Ok(match latest_parent {
-            Some(p) => claimed.max(p.saturating_add(1)),
-            None => claimed,
-        })
-    }
-
     /// What an entry `author` writes now should list in `seen`: the head of every
     /// other author's feed that none of `author`'s entries has named yet, at most
     /// [`MAX_SEEN`], in canonical (ascending) order.
@@ -816,38 +708,45 @@ impl Dag {
     /// the rest. When more than [`MAX_SEEN`] feeds moved, the most recent by the order
     /// are named; the others stay unnamed and are picked up by the next entry, so
     /// nothing is lost, only deferred.
-    #[must_use]
-    pub fn seen_for(&self, author: &Digest32) -> Vec<Digest32> {
-        let mut heads: Vec<(u64, Digest32)> = self
-            .feeds
-            .iter()
-            .filter(|(other, _)| *other != author)
-            .filter_map(|(other, feed)| {
-                let head = feed.max_seq();
-                let named = self
-                    .referenced
-                    .get(&(*author, *other))
-                    .copied()
-                    .unwrap_or(0);
-                if head == 0 || head <= named {
-                    return None;
+    pub fn seen_for(&self, entries: &impl EntryRead, author: &Digest32) -> Result<Vec<Digest32>> {
+        let mut heads = std::collections::BTreeSet::new();
+        for (other, feed) in &self.feeds {
+            if other == author {
+                continue;
+            }
+            let head = self.verified_head(other);
+            if head == 0 || head <= entries.referenced(author, other)? {
+                continue;
+            }
+            let hash = feed
+                .get(entries, head)?
+                .ok_or(Error::MalformedAtRest("seen head missing"))?
+                .entry_hash();
+            if let Some(clock) = entries.clock(&hash)? {
+                heads.insert((clock, hash));
+                if heads.len() > MAX_SEEN {
+                    heads.pop_first();
                 }
-                let h = feed.head_hash();
-                Some((self.clock.get(&h).copied().unwrap_or(0), h))
-            })
-            .collect();
-        heads.sort_unstable_by(|a, b| b.cmp(a));
-        heads.truncate(MAX_SEEN);
-        let mut seen: Vec<Digest32> = heads.into_iter().map(|(_, h)| h).collect();
+            }
+        }
+        let mut seen: Vec<_> = heads.into_iter().map(|(_, hash)| hash).collect();
         seen.sort_unstable();
-        seen
+        Ok(seen)
     }
 
-    /// The entry's position key in [`Dag::causal_order`]: `(clock, entry_hash)`.
-    /// Comparing two keys compares the two entries' places in the room's order.
-    #[must_use]
-    pub fn order_key(&self, hash: &Digest32) -> Option<(u64, Digest32)> {
-        self.clock.get(hash).map(|c| (*c, *hash))
+    /// Read one published display key. Absence and local read failure are distinct.
+    pub fn order_key(
+        &self,
+        entries: &impl EntryRead,
+        hash: &Digest32,
+    ) -> Result<Option<(u64, Digest32)>> {
+        Ok(entries.clock(hash)?.map(|clock| (clock, *hash)))
+    }
+
+    /// Install the durable late-parent revision only after its root publication commits.
+    pub(crate) fn set_order_revision(&mut self, revision: u64, newest: Option<u64>) {
+        self.reorder_generation = revision;
+        self.newest_clock = newest;
     }
 
     /// How many times an already-stored entry has moved in the order (a parent it
@@ -871,48 +770,44 @@ impl Dag {
         a: &Digest32,
         b: &Digest32,
     ) -> Result<bool> {
-        let (Some(ca), Some(cb)) = (self.clock.get(a).copied(), self.clock.get(b).copied()) else {
-            return Ok(false);
-        };
-        // An ancestor's clock is strictly below its descendant's.
-        if ca >= cb {
-            return Ok(false);
-        }
         let Some((a_author, a_seq)) = self.position(entries, a)? else {
             return Ok(false);
         };
-        let mut visited: HashSet<Digest32> = HashSet::new();
-        let mut stack = vec![*b];
-        while let Some(h) = stack.pop() {
-            if !visited.insert(h) {
+        let Some((b_author, b_seq)) = self.position(entries, b)? else {
+            return Ok(false);
+        };
+        if a_author == b_author {
+            return Ok(a_seq < b_seq);
+        }
+        // Reaching an author's position reaches its complete prefix. Scan each newly reached
+        // interval once; the work maps have one high-water per author, never one row per entry.
+        // This also works during authenticated provisional acceptance, before display clocks
+        // are published, and never substitutes display order for causal authority.
+        let mut pending = BTreeMap::from([(b_author, b_seq)]);
+        let mut scanned: BTreeMap<Digest32, u64> = BTreeMap::new();
+        while let Some((author, through)) = pending.pop_first() {
+            let from = scanned.get(&author).copied().unwrap_or(0).saturating_add(1);
+            if from > through {
                 continue;
             }
-            let Some(entry) = self.get_by_hash(entries, &h)? else {
-                continue;
-            };
-            let sk = &entry.skeleton;
-            // Reaching `a`'s feed at or past `a` means `a` precedes it on that chain.
-            if h != *b && sk.author_id == a_author && sk.seq >= a_seq {
-                return Ok(true);
-            }
-            if h == *b && sk.author_id == a_author {
-                return Ok(sk.seq > a_seq);
-            }
-            let parents = sk
-                .seen
-                .iter()
-                .copied()
-                .chain((sk.seq > 1).then_some(sk.prev_hash));
-            for p in parents {
-                // Anything at or below `a`'s clock cannot have `a` as an ancestor
-                // (unless it is `a`, which the feed check above catches).
-                if p == *a {
-                    return Ok(true);
-                }
-                if self.clock.get(&p).is_some_and(|c| *c > ca) {
-                    stack.push(p);
+            for seq in from..=through {
+                let entry = entries
+                    .get(&author, seq)?
+                    .ok_or(Error::MalformedAtRest("causal prefix missing"))?;
+                for parent in &entry.skeleton.seen {
+                    let Some((other, reached)) = self.position(entries, parent)? else {
+                        continue;
+                    };
+                    if other == a_author && reached >= a_seq {
+                        return Ok(true);
+                    }
+                    if reached > scanned.get(&other).copied().unwrap_or(0) {
+                        let at = pending.entry(other).or_insert(0);
+                        *at = (*at).max(reached);
+                    }
                 }
             }
+            scanned.insert(author, through);
         }
         Ok(false)
     }
@@ -933,22 +828,31 @@ impl Dag {
     /// `(clock, entry_hash)` — a topological order of the DAG whose ties between
     /// concurrent entries fall to the authors' claimed milliseconds, then the hash
     /// (module docs). Identical on every replica holding the same entry set.
-    #[must_use]
-    pub fn causal_order(&self) -> Vec<Digest32> {
-        self.ordered.iter().map(|(_, h)| *h).collect()
+    pub fn causal_order(&self, entries: &impl EntryRead) -> Result<Vec<Digest32>> {
+        let mut rows = Vec::new();
+        let mut cursor = None;
+        while let Some(key) = entries.order_next(cursor)? {
+            rows.push(key.1);
+            cursor = Some(key);
+        }
+        Ok(rows)
     }
 
-    /// The newest entry's clock in the room's order, ms: when the room last saw anything said
-    /// (V030-08's idle end). `None` for an empty log.
+    /// Newest published clock, without collecting the order.
     #[must_use]
     pub fn newest_clock(&self) -> Option<u64> {
-        self.ordered.last().map(|(c, _)| *c)
+        self.newest_clock
     }
 
-    /// [`Dag::causal_order`] with each entry's clock: `(entry_hash, clock_ms)`, first to last.
-    #[must_use]
-    pub fn order_keys(&self) -> Vec<(Digest32, u64)> {
-        self.ordered.iter().map(|(c, h)| (*h, *c)).collect()
+    /// Transitional whole-view caller. New consumers use the pinned one-row order cursor.
+    pub fn order_keys(&self, entries: &impl EntryRead) -> Result<Vec<(Digest32, u64)>> {
+        let mut rows = Vec::new();
+        let mut cursor = None;
+        while let Some(key) = entries.order_next(cursor)? {
+            rows.push((key.1, key.0));
+            cursor = Some(key);
+        }
+        Ok(rows)
     }
 
     /// Render-gating seam (ADR-008): attempt to decrypt+render the payload of the
