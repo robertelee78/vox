@@ -2285,43 +2285,75 @@ final class NodeModel: ObservableObject {
     /// The messages drawn on screen are read (R-6): the node is told, as the TUI tells it what it
     /// draws, once each, in batches. This node's own, and those not received yet, are not.
     func drawn(_ message: RoomMessage, in room: String) {
-        guard case .room(room) = selection, byID[message.id] != nil, message.author != me,
-              !message.owed, !marked.contains(message.id) else {
-            readLog.debug("""
-                not drawn: \(message.id, privacy: .public) on screen \(self.roomOnScreen ?? "none", privacy: .public) \
-                known \(self.byID[message.id] != nil) mine \(message.author == self.me) owed \(message.owed) \
-                marked \(self.marked.contains(message.id))
-                """)
-            return
+        if readMarkEpoch != nodeObservationEpoch {
+            // Let a prior actor's in-flight request settle before admitting another batch.
+            guard flushing == nil else { return }
+            marked.removeAll()
+            markedOrder.removeAll()
+            unmarked.removeAll()
+            readRoomOrder.removeAll()
+            pendingReadIDs.removeAll()
+            readMarkEpoch = nodeObservationEpoch
         }
-        readLog.debug("drawn: \(message.id, privacy: .public) in \(room, privacy: .public)")
-        marked.insert(message.id)
+        guard case .room(room) = selection, byID[message.id] != nil, message.author != me,
+              !message.owed, !marked.contains(message.id),
+              !pendingReadIDs.contains(message.id) else { return }
+        // Backpressure leaves the row unread. A later visible-row pass retries it;
+        // no unread badge is decremented and no successful mark is claimed here.
+        guard pendingReadIDs.count < Self.pendingReadLimit else { return }
+        pendingReadIDs.insert(message.id)
+        if unmarked[room] == nil { readRoomOrder.append(room) }
         unmarked[room, default: []].append(message.id)
         guard flushing == nil else { return }
+        let epoch = nodeObservationEpoch
         flushing = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 300_000_000)
             guard let self else { return }
-            // Batched by room: a switch inside the batch tells each room only its own.
-            let batches = self.unmarked
-            self.unmarked = [:]
-            self.flushing = nil
-            for (room, ids) in batches {
+            defer {
+                self.flushing = nil
+                if epoch != self.nodeObservationEpoch {
+                    self.unmarked.removeAll()
+                    self.readRoomOrder.removeAll()
+                    self.pendingReadIDs.removeAll()
+                }
+            }
+            // One worker, including its awaited acknowledgement. IDs in flight retain
+            // their slots in the shared 1024 budget, so a slow daemon cannot grow a backlog.
+            while epoch == self.nodeObservationEpoch, !Task.isCancelled,
+                  !self.readRoomOrder.isEmpty {
+                let room = self.readRoomOrder.removeFirst()
+                guard let ids = self.unmarked.removeValue(forKey: room) else { continue }
                 do {
                     try await self.client.markRead(room: room, ids: ids)
+                    guard epoch == self.nodeObservationEpoch, !Task.isCancelled else { return }
+                    for id in ids {
+                        if self.marked.insert(id).inserted { self.markedOrder.append(id) }
+                    }
+                    while self.markedOrder.count > Self.recentReadLimit {
+                        self.marked.remove(self.markedOrder.removeFirst())
+                    }
                     self.scheduleUnread(room)
                     readLog.debug("marked read: \(ids.count) in \(room, privacy: .public)")
                 } catch {
-                    readLog.debug("mark read failed in \(room, privacy: .public): \(sentence(error), privacy: .public)")
-                    // Not recorded: drawn again, it is told again.
-                    ids.forEach { self.marked.remove($0) }
-                    self.reportBackground(error)
+                    if epoch == self.nodeObservationEpoch && !Task.isCancelled {
+                        self.reportBackground(error)
+                    }
                 }
+                self.pendingReadIDs.subtract(ids)
             }
         }
     }
 
+    /// Recent successful deduplication only. Evicted IDs may be marked again idempotently;
+    /// durable read state belongs to the node, not this bounded client cache.
+    private static let recentReadLimit = 1024
+    private static let pendingReadLimit = 1024
+    private var readMarkEpoch = UUID()
     private var marked: Set<String> = []
+    private var markedOrder: [String] = []
+    private var pendingReadIDs: Set<String> = []
     private var unmarked: [String: [String]] = [:]
+    private var readRoomOrder: [String] = []
     private var flushing: Task<Void, Never>?
 
     /// The members of `room` other than this node, with the trust each has here.
