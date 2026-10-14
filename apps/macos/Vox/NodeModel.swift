@@ -2545,6 +2545,19 @@ extension NodeModel {
                     && self.nodeObservationEpoch == epoch && self.ended == nil
             }
             do {
+                if self.threadRootMessage == nil {
+                    // Recovery must not reuse the body discarded on a read refusal. This
+                    // existing authoritative retained-page API revalidates the exact root's
+                    // presence/readability and never substitutes a cached General body.
+                    let page = try await self.client.roomReadRetaining(room: room, loaded: [root])
+                    guard current() else { return }
+                    guard let readable = page.messages.first(where: {
+                        $0.id == root && !$0.owed && $0.thread.isEmpty
+                    }) else {
+                        throw VoxError.Failed(reason: "The thread's starting message is no longer readable or retained.")
+                    }
+                    self.threadRootMessage = readable
+                }
                 var next = cursor
                 var result: [RoomMessage] = []
                 let pages = replacing ? self.threadPagesLoaded : 1
