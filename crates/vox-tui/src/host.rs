@@ -413,7 +413,7 @@ impl Router {
         // Lookup is bounded network work outside the writer lock; only its verified result is
         // committed. A supplied fingerprint is an offline configuration input, not reach proof.
         let add = match add {
-            Some(input) => Some(self.resolve_manual_anchor(&input).await?),
+            Some(input) => Some(self.resolve_anchor_input(&input).await?),
             None => None,
         };
         let mut state = self.inner.manual_anchors.lock().await;
@@ -450,7 +450,7 @@ impl Router {
         })
     }
 
-    async fn resolve_manual_anchor(&self, input: &str) -> Result<String, String> {
+    async fn resolve_anchor_input(&self, input: &str) -> Result<String, String> {
         let input = input.trim().to_owned();
         if input.contains('@') {
             let checked = input.clone();
@@ -3174,6 +3174,12 @@ impl Dispatch for Router {
                 Ok(anchors) => DaemonFrame::Anchors(anchors),
                 Err(why) => refused(why),
             },
+            DaemonRequest::AnchorResolve { input } => {
+                match self.resolve_anchor_input(&input).await {
+                    Ok(spec) => DaemonFrame::AnchorResolved(spec),
+                    Err(why) => DaemonFrame::AnchorFailed(why),
+                }
+            }
             DaemonRequest::AnchorAdd { input } => {
                 match self.change_manual_anchor(Some(input), None).await {
                     Ok(anchors) => DaemonFrame::Anchors(anchors),
