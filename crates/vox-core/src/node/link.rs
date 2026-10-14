@@ -60,6 +60,27 @@ use crate::nat::multiaddr::{EndpointList, Multiaddr, MAX_ENDPOINTS};
 /// of introducers is what it needs, and a longer one is not a link.
 pub const MAX_LINK_ANCHORS: usize = 4;
 
+/// Select exactly the routes a link carries, in dial order (ADR-032 AN-10/AN-11).
+/// Room creation previews and minted links share this selection; it never changes the
+/// room's complete signed anchor set. This node's current route survives the cap.
+#[must_use]
+pub fn preview_routes(
+    room: &crate::nat::bootstrap::BootstrapSet,
+    node: Digest32,
+    endpoints: Option<EndpointList>,
+) -> (Vec<BootstrapNode>, usize) {
+    let direct = endpoints.and_then(|eps| BootstrapNode::new(node, eps).ok());
+    let selected = room.nodes().iter().filter(|a| a.id != node);
+    let count = selected.clone().count();
+    let mut routes: Vec<_> = selected
+        .take(MAX_LINK_ANCHORS - usize::from(direct.is_some()))
+        .cloned()
+        .collect();
+    let omitted = count - routes.len();
+    routes.extend(direct);
+    (routes, omitted)
+}
+
 /// The URL scheme, including the separator.
 pub const LINK_SCHEME: &str = "vox://";
 
