@@ -53,7 +53,7 @@ pub(super) fn visible(index: &mut Write<'_, '_>, f: &Fact) -> Result<()> {
     let Some(part_group) = f.part_group else {
         return Ok(());
     };
-    if let Some(reference) = f.reference {
+    if let Some(reference) = f.outcome_reference() {
         if matches!(f.kind, Kind::ToolDone | Kind::Resolved | Kind::DriveResult) {
             index.activity_set(
                 T::Outcomes,
@@ -78,6 +78,8 @@ pub(super) fn visible(index: &mut Write<'_, '_>, f: &Fact) -> Result<()> {
                 Some(f.arrival),
             )?;
         }
+    }
+    if let Some(reference) = f.reference {
         if matches!(f.kind, Kind::Approval | Kind::Question | Kind::Resolved) {
             let authored = authored_reference(f, &reference);
             let rank = plus(index, T::RequestCount, hash_key(&authored), 1)?;
@@ -145,7 +147,7 @@ pub(super) fn pending(index: &mut Write<'_, '_>, f: &Fact) -> Result<bool> {
         }
     }
     index.activity_set(T::PendingLast, group_key, Some(f.arrival))?;
-    let Some(reference) = f.reference else {
+    let Some(reference) = f.outcome_reference() else {
         return Ok(true);
     };
     let authored = authored_reference(f, &reference);

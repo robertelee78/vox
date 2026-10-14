@@ -440,7 +440,7 @@ impl ChannelState {
                             continue;
                         }
                         let reference = f
-                            .reference
+                            .outcome_reference()
                             .ok_or(Error::MalformedAtRest("Session pending request reference"))?;
                         if read
                             .activity_find(

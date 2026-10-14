@@ -32,6 +32,9 @@ pub(super) struct Fact {
     /// Absent for malformed/non-object JSON; raw listings still retain that row.
     pub part_group: Option<Digest32>,
     pub reference: Option<Digest32>,
+    /// Request occurrence, separate from the plain reference used by exact-ref listings.
+    /// Older unbound facts retain their original reference-scoped indexes.
+    pub association: Option<Digest32>,
     pub part: Option<(u64, u64)>,
     pub answerable: bool,
     pub direct_action: bool,
@@ -57,6 +60,27 @@ pub(super) fn member_key(group: &Digest32, id: u64) -> Key {
     let mut key = hash_key(group);
     key[32..40].copy_from_slice(&id.to_be_bytes());
     key
+}
+
+fn request_association(
+    session: &str,
+    kind: &str,
+    reference: &str,
+    occurrence: &str,
+) -> Option<Digest32> {
+    (matches!(kind, "approval" | "question") && !reference.is_empty() && !occurrence.is_empty())
+        .then(|| {
+            sha256_concat(&[
+                b"vox/session-activity/request/v1",
+                &(session.len() as u64).to_be_bytes(),
+                session.as_bytes(),
+                &(kind.len() as u64).to_be_bytes(),
+                kind.as_bytes(),
+                &(reference.len() as u64).to_be_bytes(),
+                reference.as_bytes(),
+                occurrence.as_bytes(),
+            ])
+        })
 }
 
 impl Fact {
@@ -86,9 +110,28 @@ impl Fact {
                 reference_text.as_bytes(),
             ])
         });
+        let request_kind = match kind {
+            "approval" | "question" => kind,
+            "resolved" => text("of"),
+            _ => "",
+        };
+        let association = request_association(
+            &row.session_id,
+            request_kind,
+            reference_text,
+            text("occurrence"),
+        );
         // Length prefixes keep unlike (session, kind, ref) tuples distinct. No
         // member-written kind/reference string is copied into a descriptor.
         let part_group = object.map(|_| {
+            if let Some(association) = association {
+                return sha256_concat(&[
+                    b"vox/session-activity/request-parts/v1",
+                    &row.author,
+                    kind.as_bytes(),
+                    &association,
+                ]);
+            }
             sha256_concat(&[
                 b"vox/session-activity/parts/v1",
                 &row.author,
@@ -124,6 +167,7 @@ impl Fact {
             },
             part_group,
             reference,
+            association,
             part,
             answerable: object
                 .and_then(|b| b.get("answerable"))
@@ -144,6 +188,9 @@ impl Fact {
     pub fn group(&self) -> Digest32 {
         group(&self.session, &self.author)
     }
+    pub fn outcome_reference(&self) -> Option<Digest32> {
+        self.association.or(self.reference)
+    }
     pub fn created_key(&self) -> Key {
         let mut key = hash_key(&self.group());
         key[32..40].copy_from_slice(&self.created.to_be_bytes());
@@ -153,8 +200,8 @@ impl Fact {
     }
     fn bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(16)
-            .uint(2)
+        e.array(17)
+            .uint(3)
             .uint(self.arrival)
             .bytes(&self.hash)
             .bytes(&self.author)
@@ -172,12 +219,15 @@ impl Fact {
             .uint(u64::from(self.direct_action))
             .uint(u64::from(self.succeeded))
             .uint(self.bytes)
-            .uint(u64::from(self.file_out));
+            .uint(u64::from(self.file_out))
+            .bytes(self.association.as_ref().map_or(&[][..], |h| h.as_slice()));
         e.finish()
     }
     pub fn read(bytes: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(bytes);
-        if d.array()? != 16 || d.uint()? != 2 {
+        let arity = d.array()?;
+        let version = d.uint()?;
+        if !matches!((arity, version), (16, 2) | (17, 3)) {
             return Err(Error::MalformedAtRest("Session activity fact format"));
         }
         let arrival = d.uint()?;
@@ -237,6 +287,11 @@ impl Fact {
         let succeeded = boolean(&mut d)?;
         let bytes = d.uint()?;
         let file_out = boolean(&mut d)?;
+        let association = if version == 3 {
+            optional(&mut d)?
+        } else {
+            None
+        };
         d.finish()?;
         if arrival == 0 {
             return Err(Error::MalformedAtRest("Session activity arrival"));
@@ -251,6 +306,7 @@ impl Fact {
             kind,
             part_group,
             reference,
+            association,
             part,
             answerable,
             direct_action,

@@ -100,6 +100,13 @@ fn id(key: &Key) -> u64 {
 fn authored(reference: &Digest32, author: &Digest32) -> Digest32 {
     crate::hash::sha256_concat(&[b"vox/session-activity/authored-ref/v1", author, reference])
 }
+fn outcome_authors<'a>(origin: &'a Fact, authors: &'a [Digest32]) -> &'a [Digest32] {
+    if origin.association.is_some() {
+        std::slice::from_ref(&origin.author)
+    } else {
+        authors
+    }
+}
 /// Each applicable author contributes one indexed predecessor, not its whole
 /// transcript. The greatest arrival is the room's next raw/visible origin.
 fn previous(
@@ -156,8 +163,8 @@ fn cost(
         bytes = bytes
             .checked_add(byte_prefix(read, T::PartBytes, &origin.hash, boundary)?)
             .ok_or_else(bad)?;
-        if let Some(reference) = origin.reference {
-            for author in authors {
+        if let Some(reference) = origin.outcome_reference() {
+            for author in outcome_authors(origin, authors) {
                 bytes = bytes
                     .checked_add(byte_prefix(
                         read,
@@ -190,8 +197,8 @@ fn physical_rows(
                     .unwrap_or(0),
             )
             .ok_or(Error::StreamRefused(crate::node::ipc::SESSION_READ_LIMIT))?;
-        if let Some(reference) = origin.reference {
-            for author in authors {
+        if let Some(reference) = origin.outcome_reference() {
+            for author in outcome_authors(origin, authors) {
                 // OutcomeCount's producer uses (reference, author), unlike OutcomeBytes'
                 // authored-reference hash. Keep this identical to activity_fold::visible.
                 let mut key = hash_key(&reference);
@@ -232,7 +239,10 @@ fn already_in(read: &Read<'_>, origins: &[u64], f: &Fact) -> Result<bool> {
         {
             return Ok(true);
         }
-        if let Some(reference) = old.reference {
+        if let Some(reference) = old.outcome_reference() {
+            if old.association.is_some() && old.author != f.author {
+                continue;
+            }
             if read
                 .activity_find(
                     T::Outcomes,
@@ -284,8 +294,8 @@ fn next_companion(
         }
         2 => {
             let mut next = None;
-            if let Some(reference) = original.reference {
-                for author in authors {
+            if let Some(reference) = original.outcome_reference() {
+                for author in outcome_authors(&original, authors) {
                     let group = authored(&reference, author);
                     let bound = cursor
                         .after

@@ -209,6 +209,8 @@ struct Ask {
     ticket: Arc<()>,
     /// `approval` or `question`.
     of: String,
+    /// Public binding shared by this request's parts and every outcome for this observation.
+    occurrence: String,
     /// Who waits for the first answer, until it is handed one or released.
     waiter: Option<Waiter>,
     /// The member whose answer Vox handed over, and what it was.
@@ -221,6 +223,21 @@ struct Ask {
 /// Opaque identity of one admitted adapter request. An old observer cannot retire a newer
 /// request merely because its harness reused the same visible reference.
 pub struct RequestTicket(Arc<()>);
+
+fn request_occurrence() -> Option<String> {
+    let mut bytes = [0; 16];
+    if let Err(error) = getrandom::fill(&mut bytes) {
+        eprintln!("vox daemon: cannot identify a Session request: {error}");
+        return None;
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut token = String::with_capacity(32);
+    for byte in bytes {
+        token.push(char::from(HEX[usize::from(byte >> 4)]));
+        token.push(char::from(HEX[usize::from(byte & 15)]));
+    }
+    Some(token)
+}
 
 /// Who waits for a request's first answer.
 enum Waiter {
@@ -753,6 +770,8 @@ impl Sink {
             .and_then(Value::as_str)
             .unwrap_or("approval")
             .to_owned();
+        let occurrence = request_occurrence()?;
+        entry.insert("occurrence".into(), json!(occurrence));
         let transcript = PathBuf::from(transcript);
         let usable =
             transcript.is_absolute() && transcript.extension().is_some_and(|e| e == "jsonl");
@@ -785,6 +804,7 @@ impl Sink {
                         Ask {
                             ticket: Arc::clone(&ticket),
                             of: of.clone(),
+                            occurrence: occurrence.clone(),
                             waiter: Some(Waiter::Hook(tx)),
                             given: None,
                             transcript: Some(Arc::new(Mutex::new(TranscriptScan::new(
@@ -933,7 +953,7 @@ impl Sink {
         );
         Some(
             json!({"v": crate::session_mirror::VERSION, "session": session,
-            "kind": "resolved", "ref": id, "of": ask.of, "outcome": "unobserved",
+            "kind": "resolved", "ref": id, "of": ask.of, "occurrence": ask.occurrence, "outcome": "unobserved",
             "why": why})
             .to_string(),
         )
@@ -1002,7 +1022,8 @@ impl Sink {
             o => o,
         };
         let by = by_whom(&ask, outcome, answers.as_ref(), said);
-        let entry = resolved(session, id, &ask.of, outcome, answers, by.as_deref());
+        let mut entry = resolved(session, id, &ask.of, outcome, answers, by.as_deref());
+        entry.insert("occurrence".into(), json!(ask.occurrence));
         // The waiter, if still waiting, has nothing to give: the harness has settled it.
         if let Some(Waiter::Hook(h)) = ask.waiter.take() {
             let _ = h.send(None);
@@ -1013,7 +1034,7 @@ impl Sink {
             "already answered at the terminal"
         };
         self.remember(node, session, id, late);
-        Some(entry)
+        Some(Value::Object(entry).to_string())
     }
 
     fn remember(&self, node: &NodeName, session: &str, id: &str, late: &str) {
@@ -1054,7 +1075,7 @@ impl Sink {
         entry: String,
     ) -> Option<(oneshot::Receiver<Given>, RequestTicket)> {
         (self.room_of)(node, session)?;
-        let Ok(Value::Object(m)) = serde_json::from_str::<Value>(&entry) else {
+        let Ok(Value::Object(mut m)) = serde_json::from_str::<Value>(&entry) else {
             return None;
         };
         let id = m.get("ref").and_then(Value::as_str)?.to_owned();
@@ -1063,6 +1084,8 @@ impl Sink {
             .and_then(Value::as_str)
             .unwrap_or("approval")
             .to_owned();
+        let occurrence = request_occurrence()?;
+        m.insert("occurrence".into(), json!(occurrence));
         let (tx, rx) = oneshot::channel();
         let ticket = Arc::new(());
         let installed = self.with(|all| {
@@ -1075,6 +1098,7 @@ impl Sink {
                 Ask {
                     ticket: Arc::clone(&ticket),
                     of,
+                    occurrence,
                     waiter: Some(Waiter::Adapter(tx)),
                     given: None,
                     transcript: None,
@@ -1085,7 +1109,9 @@ impl Sink {
         if !installed {
             return None;
         }
-        let admission = self.post_numbered(node, session, vec![entry]).await;
+        let admission = self
+            .post_numbered(node, session, vec![Value::Object(m).to_string()])
+            .await;
         if !matches!(
             admission,
             SessionAdmission::Committed { .. } | SessionAdmission::Held(_)
@@ -1170,13 +1196,13 @@ impl Sink {
                 "the session moved on before Vox could observe this request's outcome",
             );
             json!({"v": crate::session_mirror::VERSION, "session": session,
-                "kind": "resolved", "ref": id, "of": ask.of, "outcome": "unobserved",
+                "kind": "resolved", "ref": id, "of": ask.of, "occurrence": ask.occurrence, "outcome": "unobserved",
                 "why": "the session moved on before transcript observation caught up"})
             .to_string()
         } else {
             self.remember(node, session, id, "the request expired before an answer");
             json!({"v": crate::session_mirror::VERSION, "session": session,
-                "kind": "resolved", "ref": id, "of": ask.of, "outcome": "expired"})
+                "kind": "resolved", "ref": id, "of": ask.of, "occurrence": ask.occurrence, "outcome": "expired"})
             .to_string()
         }
     }
@@ -1559,7 +1585,7 @@ fn resolved(
     outcome: &str,
     answers: Option<Value>,
     by: Option<&str>,
-) -> String {
+) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("v".into(), json!(crate::session_mirror::VERSION));
     m.insert("session".into(), json!(session));
@@ -1571,7 +1597,7 @@ fn resolved(
         m.insert("answers".into(), a);
     }
     m.insert("by".into(), json!(by.unwrap_or("terminal")));
-    Value::Object(m).to_string()
+    m
 }
 
 // Every producer gets truthful logging even if it has no replay cursor and cannot retain a

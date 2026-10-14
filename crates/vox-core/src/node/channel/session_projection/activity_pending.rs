@@ -54,7 +54,7 @@ pub(super) fn prefix(read: &Read<'_>, groups: &[Digest32], before: u64) -> Resul
     Ok(total)
 }
 pub(super) fn observe(index: &mut Write<'_, '_>, f: &Fact) -> Result<()> {
-    let Some(reference) = f.reference else {
+    let Some(reference) = f.outcome_reference() else {
         return Ok(());
     };
     if !matches!(f.kind, Kind::Approval | Kind::Question | Kind::Resolved) {
@@ -97,7 +97,7 @@ pub(super) fn advance(index: &mut Write<'_, '_>, limit: usize) -> Result<bool> {
             .ok_or_else(bad)?;
         let f = Fact::read(&index.descriptor(descriptor)?)?;
         if f.arrival != arrival
-            || f.reference
+            || f.outcome_reference()
                 .map(|r| super::activity_fold::authored_reference(&f, &r))
                 != Some(authored)
         {
