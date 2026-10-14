@@ -1963,7 +1963,7 @@ impl ChannelState {
         // Each entry held without its body, `(author, seq, claimed_ms)`: owed again unless it has
         // expired here (V030-10).
         let mut held_bare: Vec<(Digest32, u64, u64)> = Vec::new();
-        for (id, seg) in store.segments(channel_id, SegmentKind::LogDb)? {
+        store.visit_segments(channel_id, SegmentKind::LogDb, |id, seg| {
             next_log_id = id.saturating_add(1);
             let wire = open_segment(&sek, SegmentKind::LogDb, id, &seg)?;
             let entry = Entry::from_wire(&wire)?;
@@ -2074,7 +2074,8 @@ impl ChannelState {
                 Err(crate::log::dag::Rejected::Feed(_)) => unlinked.push((at, entry, kind, key)),
                 Err(_) => return Err(Error::MalformedAtRest("stored entry failed acceptance")),
             }
-        }
+            Ok(())
+        })?;
         // Retried until a pass links nothing more: a predecessor logged later links then.
         loop {
             let before = unlinked.len();
@@ -2148,7 +2149,7 @@ impl ChannelState {
         let mut timeline = Vec::new();
         let (mut read_records, mut reads) = (BTreeMap::new(), BTreeMap::new());
         let mut sessions = Vec::new();
-        for (id, seg) in store.segments(channel_id, SegmentKind::PlaintextCache)? {
+        store.visit_segments(channel_id, SegmentKind::PlaintextCache, |id, seg| {
             next_log_id = next_log_id.max(id.saturating_add(1));
             let row = open_segment(&sek, SegmentKind::PlaintextCache, id, &seg)?;
             match parse_cache(&row)? {
@@ -2175,7 +2176,8 @@ impl ChannelState {
                     }
                 }
             }
-        }
+            Ok(())
+        })?;
         // The cache is in the order rows were rendered; the timeline is in the room's.
         sort_timeline(&dag, &mut timeline);
         let timeline_generation = dag.reorder_generation();
