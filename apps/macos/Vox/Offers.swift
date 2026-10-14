@@ -77,6 +77,7 @@ struct OfferCard: View {
             Text(card.grouped).font(Theme.mono).textSelection(.enabled)
                 .accessibilityIdentifier("offer-fingerprint")
             .task(id: offer.presentedName) { if alias.isEmpty { alias = offer.presentedName } }
+            .task(id: offer.fingerprint) { await model.refreshIndividualTrustEligibility(offer.fingerprint) }
         }
         if !offer.presentedName.isEmpty { Text("Name it presents: \(offer.presentedName)").accessibilityIdentifier("offer-presented-name") }
         Text(offer.said).accessibilityIdentifier("offer-said")
@@ -123,6 +124,7 @@ struct OfferCard: View {
         // While the passphrase form for this offer is open, its Trust and Cancel are the only
         // buttons; Cancel brings these back (one Trust on screen, never two).
         if model.keyringPending?.fingerprint != offer.fingerprint {
+            if model.canManageIndividualTrust(offer.fingerprint) {
             HStack {
                 Button("Trust") {
                     let name = alias
@@ -132,6 +134,10 @@ struct OfferCard: View {
                 .accessibilityIdentifier("offer-accept")
                 Button("Dismiss") { Task { await model.dismiss(offer) } }
                     .accessibilityIdentifier("offer-dismiss")
+            }
+            } else {
+                Text(model.individualTrustReason(offer.fingerprint)).secondaryText()
+                    .accessibilityIdentifier("offer-trust-reason")
             }
         }
     }
