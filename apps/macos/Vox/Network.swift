@@ -165,6 +165,7 @@ struct RoomAnchorInput: View {
     var body: some View {
         HStack {
             TextField("fingerprint@address or host:port", text: $input)
+                .disabled(busy)
                 .accessibilityIdentifier("room-anchor-input")
                 .onSubmit { if allowed && !busy { add() } }
             Button("Add Anchor", action: add)
