@@ -630,6 +630,14 @@ pub trait EntryRead {
     fn get(&self, author: &Digest32, seq: u64) -> Result<Option<Entry>>;
     /// Resolve an exact entry hash through the authenticated entry index.
     fn locate(&self, hash: &Digest32) -> Result<Option<(Digest32, u64)>>;
+    /// Published display clock for an exact hash; never a provisional tail's clock.
+    fn clock(&self, hash: &Digest32) -> Result<Option<u64>>;
+    /// Published display key strictly after the cursor; `None` starts at the first key.
+    fn order_next(&self, after: Option<(u64, Digest32)>) -> Result<Option<(u64, Digest32)>>;
+    /// Published display key strictly before the cursor; `None` starts at the last key.
+    fn order_previous(&self, before: Option<(u64, Digest32)>) -> Result<Option<(u64, Digest32)>>;
+    /// Highest published sequence of `other` already named by `author`.
+    fn referenced(&self, author: &Digest32, other: &Digest32) -> Result<u64>;
     /// Resolve and read one exact entry.
     fn get_by_hash(&self, hash: &Digest32) -> Result<Option<Entry>> {
         match self.locate(hash)? {

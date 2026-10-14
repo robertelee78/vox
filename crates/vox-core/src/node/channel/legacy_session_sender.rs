@@ -175,8 +175,7 @@ impl ChannelState {
             &cursor.finish(),
         )?;
         let persisted = (|| -> Result<Option<(Digest32, u64)>> {
-            let mut batch = profile.store().batch()?;
-            let posted = if let Some(plaintext) = plaintext {
+            let prepared = if let Some(plaintext) = plaintext {
                 let signer = profile.signer()?;
                 let payload = self.sender.encrypt(&plaintext)?.to_wire();
                 let skeleton = self.next_skeleton(profile.store(), &me, &payload, now_ms)?;
@@ -196,7 +195,20 @@ impl ChannelState {
                     id,
                     &first_seen_bytes(now_ms, false),
                 )?;
-                self.accept_into(&mut batch, entry, EntryKind::Content, &signer.public_key())?;
+                self.prepare_entry(
+                    profile.store(),
+                    &entry,
+                    EntryKind::Content,
+                    &signer.public_key(),
+                    now_ms,
+                )?;
+                Some((hash, id, log, sender, seen))
+            } else {
+                None
+            };
+            let mut batch = profile.store().batch()?;
+            let posted = if let Some((hash, id, log, sender, seen)) = prepared {
+                self.publish_entry_into(&mut batch)?;
                 batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log)?;
                 batch.put_segment(&self.channel_id, SegmentKind::Index, id, &seen)?;
                 batch.put_segment(
@@ -244,6 +256,7 @@ impl ChannelState {
                 },
             );
             self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.finish_entry_publication(profile.store())?;
         }
         Ok(count)
     }

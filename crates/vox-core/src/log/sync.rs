@@ -985,9 +985,13 @@ pub trait SessionRoom {
     fn generation(&self) -> std::result::Result<u64, WireError>;
 }
 
-/// How many received entries are staged before a batch is applied. Bounds what a session holds in
-/// memory between locks; each batch is one short hold of the room.
+/// Maximum received entries in one apply batch; its wire buffers are also byte-bounded.
 pub const MAX_STAGED: usize = 256;
+
+/// Ordinary received wire-buffer capacity held between room locks. A single legal entry larger
+/// than this is applied alone, preserving the entry-size contract without multiplying it by
+/// [`MAX_STAGED`]. The transport frame and its decode are separately bounded by one legal entry.
+pub const MAX_STAGED_BYTES: usize = 1024 * 1024;
 
 /// What one received entry turned out to be (ADR-025 D3), from the predicates the DAG has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1281,6 +1285,7 @@ where
     // Drained with no lock held; applied a batch at a time under a fresh one.
     let deadline = std::time::Instant::now() + DRAIN_BUDGET;
     let mut staged: Vec<Vec<u8>> = Vec::new();
+    let mut staged_bytes = 0usize;
     let mut positions: Vec<(Digest32, u64)> = Vec::new();
     let apply = |staged: Vec<Vec<u8>>,
                  positions: Vec<(Digest32, u64)>,
@@ -1309,55 +1314,120 @@ where
             None => Ok(()),
         }
     };
-    while let Some(frame) = recv(t)? {
-        if std::time::Instant::now() >= deadline {
-            // **What arrived is kept, and the stop says why** (V210-71). This used to return at
-            // once, dropping every staged entry — up to `MAX_STAGED` verified entries thrown away
-            // and fetched again — and reported "sync mode unsupported", which names a protocol
-            // mismatch that did not happen.
-            if !staged.is_empty() {
-                apply(
-                    std::mem::take(&mut staged),
-                    std::mem::take(&mut positions),
+    let flush = |staged: &mut Vec<Vec<u8>>,
+                 positions: &mut Vec<(Digest32, u64)>,
+                 staged_bytes: &mut usize,
+                 coverage: &mut Coverage,
+                 out: &mut RoomSession|
+     -> std::result::Result<(), SessionError> {
+        if staged.is_empty() {
+            return Ok(());
+        }
+        *staged_bytes = 0;
+        apply(
+            std::mem::take(staged),
+            std::mem::take(positions),
+            coverage,
+            out,
+        )
+    };
+    loop {
+        let frame = match recv(t) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(error) => {
+                // A later transport failure does not discard a valid received prefix.
+                flush(
+                    &mut staged,
+                    &mut positions,
+                    &mut staged_bytes,
                     &mut coverage,
                     out,
                 )?;
+                return Err(error);
             }
+        };
+        if std::time::Instant::now() >= deadline {
+            // What arrived is kept, and the stop says why (V210-71).
+            flush(
+                &mut staged,
+                &mut positions,
+                &mut staged_bytes,
+                &mut coverage,
+                out,
+            )?;
             return Err(SessionError::DrainBudget(DRAIN_BUDGET.as_secs()));
         }
         match decode_frame(&frame) {
             Ok(SyncFrame::Entry(wire)) => {
-                let entry = Entry::from_wire(&wire).map_err(|e| local(wire_error_for(&e)))?;
-                let (author, seq) = (entry.skeleton.author_id, entry.skeleton.seq);
-                if !coverage.admit(author, seq, &entry.entry_hash()) {
-                    // Nothing staged before it is lost: apply that first, then refuse.
-                    if !staged.is_empty() {
-                        apply(
-                            std::mem::take(&mut staged),
-                            std::mem::take(&mut positions),
+                let entry = match Entry::from_wire(&wire) {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        flush(
+                            &mut staged,
+                            &mut positions,
+                            &mut staged_bytes,
                             &mut coverage,
                             out,
                         )?;
+                        return Err(local(wire_error_for(&error)));
                     }
+                };
+                let (author, seq) = (entry.skeleton.author_id, entry.skeleton.seq);
+                if !coverage.admit(author, seq, &entry.entry_hash()) {
+                    flush(
+                        &mut staged,
+                        &mut positions,
+                        &mut staged_bytes,
+                        &mut coverage,
+                        out,
+                    )?;
                     return Err(SessionError::ProtocolViolation);
                 }
+                // Keep no decoded payload copy while applying the owned wire batch.
+                drop(entry);
+                let charge = wire.capacity();
+                if staged_bytes.saturating_add(charge) > MAX_STAGED_BYTES {
+                    flush(
+                        &mut staged,
+                        &mut positions,
+                        &mut staged_bytes,
+                        &mut coverage,
+                        out,
+                    )?;
+                }
+                staged_bytes = staged_bytes.saturating_add(charge);
                 staged.push(wire);
                 positions.push((author, seq));
-                if staged.len() >= MAX_STAGED {
-                    apply(
-                        std::mem::take(&mut staged),
-                        std::mem::take(&mut positions),
+                if staged.len() >= MAX_STAGED || staged_bytes >= MAX_STAGED_BYTES {
+                    flush(
+                        &mut staged,
+                        &mut positions,
+                        &mut staged_bytes,
                         &mut coverage,
                         out,
                     )?;
                 }
             }
-            Ok(_) | Err(_) => return Err(local(WireError::SyncModeUnsupported)),
+            Ok(_) | Err(_) => {
+                flush(
+                    &mut staged,
+                    &mut positions,
+                    &mut staged_bytes,
+                    &mut coverage,
+                    out,
+                )?;
+                return Err(local(WireError::SyncModeUnsupported));
+            }
         }
     }
-    if !staged.is_empty() {
-        apply(staged, positions, &mut coverage, out)?;
-    }
+    flush(
+        &mut staged,
+        &mut positions,
+        &mut staged_bytes,
+        &mut coverage,
+        out,
+    )?;
     t.finish_serving().map_err(|e| session_err(&e))?;
     out.complete = coverage.complete();
     out.gen_end = room.generation().ok();
@@ -1793,8 +1863,8 @@ pub fn range_reconcile_exchange<R: AuthorResolver>(
         SYNC_MODE_FRONTIER | SYNC_MODE_RANGE_RECONCILIATION,
     )?;
 
-    let a_items = negentropy::items_from_ids(&hashes_of(a));
-    let b_items = negentropy::items_from_ids(&hashes_of(b));
+    let a_items = negentropy::items_from_ids(&hashes_of(a, a_entries).map_err(ApplyError::Local)?);
+    let b_items = negentropy::items_from_ids(&hashes_of(b, b_entries).map_err(ApplyError::Local)?);
 
     // a initiates; messages bounce until a's response is empty. a collects the
     // have/need diff (have = a-only hashes, need = b-only hashes).
@@ -1832,8 +1902,8 @@ pub fn range_reconcile_exchange<R: AuthorResolver>(
 }
 
 /// All entry hashes in a DAG, in causal order (deterministic).
-fn hashes_of(dag: &Dag) -> Vec<Digest32> {
-    dag.causal_order()
+fn hashes_of(dag: &Dag, entries: &impl EntryRead) -> Result<Vec<Digest32>> {
+    dag.causal_order(entries)
 }
 
 /// Decode a `NEG` frame into a Negentropy message.

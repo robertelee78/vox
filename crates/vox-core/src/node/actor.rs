@@ -310,6 +310,9 @@ fn detail_of(
     now: crate::time::Ms,
     sequence: &std::sync::atomic::AtomicU64,
 ) -> crate::error::Result<ChannelDetail> {
+    if ch.is_poisoned() {
+        return Err(ch.save_failure());
+    }
     let (frozen, refused_below_checkpoint) = ch.fork_watch();
     let (timeline, structured, row_index, display_stamp, display_revision) = if let Some(p) =
         prev.filter(|p| ch.display_is_current(&p.display_stamp))
@@ -380,14 +383,14 @@ fn detail_of(
     Ok(ChannelDetail {
         channel_id: ch.channel_id(),
         name: ch.name().map(str::to_owned),
-        notices: ch.notices(),
+        notices: ch.notices(store)?,
         epoch: ch.epoch(),
         members: ch.members(),
         timeline,
         display_stamp,
         display_revision,
         row_index,
-        order: ch.order_keys(),
+        order: ch.order_keys(store)?,
         structured,
         services: ch
             .services()
@@ -16077,12 +16080,18 @@ impl Node {
         let profile = self.profile.as_ref()?;
         let signer = profile.signer().ok()?;
         let shared = self.channels.get(channel_id).map(Arc::clone)?;
-        let ch = shared.lock().await;
+        let mut ch = shared.lock().await;
         let me = ch.me();
         if me != ch.genesis().creator_pubkey().fingerprint() {
             return None;
         }
-        let stamp = ch.admin_change_clock()?;
+        let stamp = match ch.admin_change_clock(profile.store()) {
+            Ok(stamp) => stamp?,
+            Err(error) => {
+                ch.poison(&error);
+                return None;
+            }
+        };
         let admins: Vec<Digest32> = ch
             .admins(self.now_ms())
             .into_iter()

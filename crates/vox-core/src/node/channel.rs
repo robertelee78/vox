@@ -43,6 +43,7 @@ mod legacy_session_sender;
 mod private_session;
 pub(crate) mod session_floor;
 
+pub use entry_store::OrderView;
 use entry_store::Transaction;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1617,12 +1618,20 @@ fn index_read(
 /// Sort rendered rows into the room's one order ([`Dag::order_key`]) and mark the late
 /// ones. A row the DAG does not hold cannot be in a timeline (every row is render-gated
 /// by it); it would sort last rather than panic.
-fn sort_timeline(dag: &Dag, timeline: &mut [Rendered]) {
-    timeline.sort_by_cached_key(|r| {
-        dag.order_key(&r.entry_hash)
-            .unwrap_or((u64::MAX, r.entry_hash))
+fn sort_timeline(dag: &Dag, entries: &impl EntryRead, timeline: &mut [Rendered]) -> Result<()> {
+    let mut failure = None;
+    timeline.sort_by_cached_key(|r| match dag.order_key(entries, &r.entry_hash) {
+        Ok(key) => key.unwrap_or((u64::MAX, r.entry_hash)),
+        Err(error) => {
+            failure.get_or_insert(error);
+            (u64::MAX, r.entry_hash)
+        }
     });
+    if let Some(error) = failure {
+        return Err(error);
+    }
     mark_late(timeline);
+    Ok(())
 }
 
 /// Mark each row placed above a row the reader had already been shown — shown at least
@@ -1957,8 +1966,9 @@ impl ChannelState {
         let entries = entry_store::EntryIndex::default();
         // Recover unpublished work before reading authoritative LogDb; rebuild only derived
         // locators when absent. No unsigned suffix is replayed after a crash.
-        entries.prepare(store, &sek, channel_id)?;
+        entries.prepare(store, &sek, channel_id, genesis.body.created_ms)?;
         let mut entry_read = entries.read(store, &sek, channel_id)?;
+
         let mut next_log_id = 1u64;
         let mut gov_entries = Vec::new();
         let mut retention = RetentionIndex::default();
@@ -2156,6 +2166,13 @@ impl ChannelState {
         // Replay's EntryWrite never deletes disk rows. Any unsigned tail is corrupt durable
         // history and returns the same refusal, rather than making it an authentic prefix.
         dag.discard_unverified(&mut entry_read)?;
+        drop(entry_read);
+        entries.prepare_facts(store, &sek, channel_id, &dag, genesis.body.created_ms)?;
+        let entry_read = entries.read(store, &sek, channel_id)?;
+        dag.set_order_revision(
+            entry_read.order_revision(),
+            entry_read.order_previous(None)?.map(|(clock, _)| clock),
+        );
 
         // How far each member's node holds this identity's feed (ADR-028 R-6).
         let held = match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_HELD)? {
@@ -2239,7 +2256,7 @@ impl ChannelState {
             Ok(())
         })?;
         // The cache is in the order rows were rendered; the timeline is in the room's.
-        sort_timeline(&dag, &mut timeline);
+        sort_timeline(&dag, &entry_read, &mut timeline)?;
         let timeline_generation = dag.reorder_generation();
 
         let sender_seg = store
@@ -3288,51 +3305,80 @@ impl ChannelState {
         std::mem::take(&mut self.inbound_packages)
     }
 
-    fn accept_into(
+    /// Validate and prepare unpublished entry/DAG roots before opening the effects Batch.
+    /// A late parent may touch any number of descendants, so that work commits in bounded
+    /// chunks while the previous active roots and authority remain intact.
+    fn prepare_entry(
         &mut self,
-        batch: &mut crate::node::store::Batch<'_>,
-        entry: Entry,
+        store: &Store,
+        entry: &Entry,
         kind: EntryKind,
         key: &CompositePublicKey,
+        now_ms: u64,
     ) -> Result<()> {
         use crate::log::dag::Rejected;
-        let result = (|| -> std::result::Result<(), Rejected> {
-            let mut index = self
-                .entries
-                .write(batch, &self.sek, &self.channel_id)
-                .map_err(Rejected::Local)?;
-            index.committing(self.next_log_id);
+        let prepared = (|| -> Result<()> {
+            let mut staging = self.entries.staging(store, &self.sek, &self.channel_id);
             self.dag
-                .accept(&mut index, entry, kind, key, &self.admission)?;
-            index.seal().map_err(Rejected::Local)
+                .accept(&mut staging, entry.clone(), kind, key, &self.admission)
+                .map_err(|why| match why {
+                    Rejected::Local(error) => error,
+                    Rejected::PreCheckpoint => {
+                        Error::MalformedGovernance("entry is at or below its author's checkpoint")
+                    }
+                    _ => Error::MalformedGovernance("entry failed the acceptance predicate"),
+                })?;
+            self.entries.prepare_publication(
+                store,
+                &self.sek,
+                &self.channel_id,
+                entry_store::Publication {
+                    witness: entry,
+                    from: entry.skeleton.seq,
+                    first_log: self.next_log_id,
+                    received_ms: now_ms,
+                    bodyless_prefix: false,
+                    origin: self.genesis.body.created_ms,
+                },
+            )
         })();
-        result.map_err(|why| match why {
-            Rejected::Local(error) => {
-                self.poisoned = true;
-                self.save_error = Some(error.to_string());
-                error
-            }
-            Rejected::PreCheckpoint => {
-                Error::MalformedGovernance("entry is at or below its author's checkpoint")
-            }
-            _ => Error::MalformedGovernance("entry failed the acceptance predicate"),
-        })
+        if let Err(ref error) = prepared {
+            self.poison(error);
+        }
+        prepared
     }
 
-    fn finish_entry_publication(&self, store: &Store) -> Result<()> {
-        loop {
-            let mut batch = store.batch()?;
-            let mut index = self
-                .entries
-                .write(&mut batch, &self.sek, &self.channel_id)?;
-            let done = index.cleanup_chunk()?;
-            index.seal()?;
-            batch.commit()?;
-            self.entries.committed();
-            if done {
-                return Ok(());
+    fn publish_entry_into(&mut self, batch: &mut crate::node::store::Batch<'_>) -> Result<()> {
+        let mut index = self.entries.write(batch, &self.sek, &self.channel_id)?;
+        index.publish_promotion()?;
+        index.seal()
+    }
+
+    fn finish_entry_publication(&mut self, store: &Store) -> Result<()> {
+        let result = (|| -> Result<()> {
+            loop {
+                let mut batch = store.batch()?;
+                let mut index = self
+                    .entries
+                    .write(&mut batch, &self.sek, &self.channel_id)?;
+                let done = index.cleanup_chunk()?;
+                index.seal()?;
+                batch.commit()?;
+                self.entries.committed();
+                if done {
+                    let read = self.entries.read(store, &self.sek, &self.channel_id)?;
+                    self.dag.set_order_revision(
+                        read.order_revision(),
+                        read.order_previous(None)?.map(|(clock, _)| clock),
+                    );
+                    return Ok(());
+                }
             }
+        })();
+        if let Err(ref error) = result {
+            self.poison(error);
         }
+        result
     }
 
     fn discard_unverified(&mut self, store: &Store) -> Result<usize> {
@@ -3420,8 +3466,15 @@ impl ChannelState {
         let key = signer.public_key();
 
         let persisted = (|| -> Result<()> {
+            self.prepare_entry(
+                profile.store(),
+                &entry,
+                EntryKind::Content,
+                &key,
+                now_millis,
+            )?;
             let mut batch = profile.store().batch()?;
-            self.accept_into(&mut batch, entry, EntryKind::Content, &key)?;
+            self.publish_entry_into(&mut batch)?;
             batch.commit()
         })();
         if let Err(e) = persisted {
@@ -3434,6 +3487,7 @@ impl ChannelState {
         self.entries.committed();
         self.next_log_id = id.saturating_add(1);
         self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.finish_entry_publication(profile.store())?;
         Ok(entry_hash)
     }
 
@@ -4954,11 +5008,17 @@ impl ChannelState {
         }
         let mut rows: Vec<Rendered> = self.timeline.iter().cloned().chain(owed).collect();
         // Sorted only: the `late` marks are the timeline's, and an owed row was never shown.
-        rows.sort_by_cached_key(|r| {
-            self.dag
-                .order_key(&r.entry_hash)
-                .unwrap_or((u64::MAX, r.entry_hash))
+        let mut failure = None;
+        rows.sort_by_cached_key(|r| match self.dag.order_key(&entries, &r.entry_hash) {
+            Ok(key) => key.unwrap_or((u64::MAX, r.entry_hash)),
+            Err(error) => {
+                failure.get_or_insert(error);
+                (u64::MAX, r.entry_hash)
+            }
         });
+        if let Some(error) = failure {
+            return Err(error);
+        }
         Ok((Cow::Owned(rows), stamp))
     }
 
@@ -5186,8 +5246,9 @@ impl ChannelState {
         let id = self.next_log_id;
 
         let persisted = (|| -> Result<()> {
+            self.prepare_entry(profile.store(), &entry, kind, &signer.public_key(), now_ms)?;
             let mut batch = profile.store().batch()?;
-            self.accept_into(&mut batch, entry, kind, &signer.public_key())?;
+            self.publish_entry_into(&mut batch)?;
             batch.commit()
         })();
         if let Err(e) = persisted {
@@ -5202,6 +5263,7 @@ impl ChannelState {
         // it arrived kept every signature below it (ADR-023 decision 3), and a conflicting entry
         // there was not refused as pre-checkpoint (R10).
         self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.finish_entry_publication(profile.store())?;
         Ok(())
     }
 
@@ -5466,14 +5528,16 @@ impl ChannelState {
         // signed entry and continue its author's feed while skipping the unknown subtype.
         let kind = classify_payload(payload)?;
 
-        let written = profile.store().batch().and_then(|mut batch| {
-            self.accept_into(&mut batch, entry, kind, &key)?;
+        let written = (|| -> Result<()> {
+            self.prepare_entry(profile.store(), &entry, kind, &key, now_ms)?;
+            let mut batch = profile.store().batch()?;
+            self.publish_entry_into(&mut batch)?;
             batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
             for (row, seg) in rows {
                 batch.put_segment(&self.channel_id, SegmentKind::KeyMaterial, *row, seg)?;
             }
             batch.commit()
-        });
+        })();
         if let Err(e) = written {
             self.poisoned = true;
             self.save_error = Some(e.to_string());
@@ -5482,6 +5546,7 @@ impl ChannelState {
         self.entries.committed();
         self.next_log_id = id.saturating_add(1);
         self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.finish_entry_publication(profile.store())?;
         self.gov_entries.push(gov);
         self.refresh_evaluator_after_change(profile.store(), now_ms)?;
         Ok(hash)
@@ -5754,14 +5819,17 @@ impl ChannelState {
                     .checked_add(1)
                     .ok_or(Error::MalformedAtRest("feed sequence exhausted"))?;
                 while from <= through {
-                    // Ordinary signed entries publish together in a bounded batch, retaining
-                    // the grouped governance fold. Only an unsigned prefix needs COW promotion.
+                    // Ordinary signed entries keep their bounded grouped governance fold.
+                    // Their unpublished DAG work is prepared first: one late parent may lift
+                    // arbitrarily many old descendants even when this input batch is tiny.
                     let first = self
                         .entries
                         .read(store, &self.sek, &self.channel_id)?
                         .get(author, from)?
                         .ok_or(Error::MalformedAtRest("verified suffix missing"))?;
                     if first.is_signed() {
+                        let first_log = self.next_log_id;
+                        let mut witness = None;
                         let mut arrived = Vec::new();
                         let mut bytes = 0usize;
                         let mut seq = from;
@@ -5786,13 +5854,30 @@ impl ChannelState {
                             self.next_log_id = id
                                 .checked_add(1)
                                 .ok_or(Error::MalformedAtRest("log allocator exhausted"))?;
+                            witness = Some(entry.clone());
                             arrived.push((*author, entry.entry_hash(), entry.payload, Some(id)));
                             bytes = bytes.saturating_add(size);
                             seq = seq
                                 .checked_add(1)
                                 .ok_or(Error::MalformedAtRest("feed sequence exhausted"))?;
                         }
-                        let got = self.absorb_batch(store, arrived, now_ms, None)?;
+                        let witness = witness
+                            .ok_or(Error::MalformedAtRest("signed batch witness missing"))?;
+                        self.entries.prepare_publication(
+                            store,
+                            &self.sek,
+                            &self.channel_id,
+                            entry_store::Publication {
+                                witness: &witness,
+                                from,
+                                first_log,
+                                received_ms: now_ms,
+                                bodyless_prefix: false,
+                                origin: self.genesis.body.created_ms,
+                            },
+                        )?;
+                        let count = arrived.len() as u64;
+                        let got = self.absorb_batch(store, arrived, now_ms, Some(count))?;
                         out.applied += got.applied;
                         out.rendered += got.rendered;
                         out.governance += got.governance;
@@ -5834,27 +5919,19 @@ impl ChannelState {
                     let after_log = witness_log
                         .checked_add(1)
                         .ok_or(Error::MalformedAtRest("log allocator exhausted"))?;
-                    {
-                        let mut batch = store.batch()?;
-                        let mut index =
-                            self.entries
-                                .write(&mut batch, &self.sek, &self.channel_id)?;
-                        index.begin_promotion(&witness, from, self.next_log_id, now_ms)?;
-                        index.seal()?;
-                        batch.commit()?;
-                    }
-                    loop {
-                        let mut batch = store.batch()?;
-                        let mut index =
-                            self.entries
-                                .write(&mut batch, &self.sek, &self.channel_id)?;
-                        let done = index.promotion_chunk()?;
-                        index.seal()?;
-                        batch.commit()?;
-                        if done {
-                            break;
-                        }
-                    }
+                    self.entries.prepare_publication(
+                        store,
+                        &self.sek,
+                        &self.channel_id,
+                        entry_store::Publication {
+                            witness: &witness,
+                            from,
+                            first_log: self.next_log_id,
+                            received_ms: now_ms,
+                            bodyless_prefix: true,
+                            origin: self.genesis.body.created_ms,
+                        },
+                    )?;
                     // Reserve all log ids before rendering the witness can allocate a cache id.
                     self.next_log_id = after_log;
                     let got = self.absorb_batch(
@@ -6170,7 +6247,7 @@ impl ChannelState {
         out.rendered += rendered_rows.len();
         self.place_committed(store, rendered_rows, &expired)?;
         // An entry that arrived may be a parent others named before it: rows move.
-        self.settle_timeline();
+        self.settle_timeline(store)?;
         // Reconciliation done; only now surface a session failure, with its coded
         // reason preserved (ADR-008 never downgrades a failure silently).
         Ok(out)
@@ -6218,7 +6295,6 @@ impl ChannelState {
             let mut ch = shared.blocking_lock();
             let cleanup = ch.discard_unverified(store);
             match cleanup {
-                Ok(n) if n > 0 => ch.settle_timeline(),
                 Ok(_) => {}
                 Err(error) => {
                     ch.poisoned = true;
@@ -7268,7 +7344,7 @@ impl ChannelState {
                 rendered.created_millis,
                 rendered.arrival,
             );
-            self.place_rendered(rendered);
+            self.place_rendered(store, rendered)?;
         }
         let settled = (|| -> Result<()> {
             if !expired.is_empty() {
@@ -7321,34 +7397,70 @@ impl ChannelState {
     /// room per step, so one that stalls on a peer can span rows posted meanwhile: a post it
     /// delivers late was stamped as shown before them, and was never marked late (measured on
     /// the v0.3.0 integration). "When the reader could first see it" is this moment.
-    fn place_rendered(&mut self, mut rendered: Rendered) {
+    fn place_rendered(&mut self, store: &Store, mut rendered: Rendered) -> Result<()> {
         rendered.shown_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-        self.settle_timeline();
-        let dag = &self.dag;
-        let key = dag.order_key(&rendered.entry_hash);
-        let at = self
-            .timeline
-            .partition_point(|r| dag.order_key(&r.entry_hash) <= key);
+        let position = (|| -> Result<usize> {
+            self.settle_timeline(store)?;
+            if self.poisoned {
+                return Err(self.save_failure());
+            }
+            let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
+            let key = self.dag.order_key(&entries, &rendered.entry_hash)?;
+            let mut failure = None;
+            let at = self.timeline.partition_point(|r| {
+                match self.dag.order_key(&entries, &r.entry_hash) {
+                    Ok(old) => old <= key,
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                        false
+                    }
+                }
+            });
+            match failure {
+                Some(error) => Err(error),
+                None => Ok(at),
+            }
+        })();
+        let at = match position {
+            Ok(at) => at,
+            Err(error) => {
+                // The row is already durable. Keep its receipt for the local poster, but the
+                // poisoned room publishes no replacement view until recovery reopens it.
+                self.timeline.push(rendered);
+                self.poison(&error);
+                return Err(error);
+            }
+        };
         let appended = at == self.timeline.len();
         self.timeline.insert(at, rendered);
         let remarked = mark_late(&mut self.timeline);
         if !appended || remarked {
             self.invalidate_display();
         }
+        Ok(())
     }
 
-    /// Re-sort the timeline if any stored entry moved in the order since it was last
-    /// sorted: a parent named in `seen` arrived after its children and lifted them
-    /// ([`Dag::reorder_generation`]). Cheap when nothing moved, which is nearly always.
-    fn settle_timeline(&mut self) {
-        let generation = self.dag.reorder_generation();
-        if generation != self.timeline_generation {
-            sort_timeline(&self.dag, &mut self.timeline);
-            self.timeline_generation = generation;
-            self.invalidate_display();
+    fn settle_timeline(&mut self, store: &Store) -> Result<()> {
+        let result = (|| -> Result<()> {
+            if self.poisoned {
+                return Err(self.save_failure());
+            }
+            let generation = self.dag.reorder_generation();
+            if generation != self.timeline_generation {
+                let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
+                sort_timeline(&self.dag, &entries, &mut self.timeline)?;
+                drop(entries);
+                self.timeline_generation = generation;
+                self.invalidate_display();
+            }
+            Ok(())
+        })();
+        if let Err(ref error) = result {
+            self.poison(error);
         }
+        result
     }
 
     /// Whether `a` happened before `b` in this room: `a` is a causal ancestor of `b`
@@ -7356,6 +7468,9 @@ impl ChannelState {
     /// ([`Dag::happened_before`]). `false` means concurrent or not yet known to be
     /// ordered. The seam claims are to be built on (PRD-001 R17).
     pub fn happened_before(&self, store: &Store, a: &Digest32, b: &Digest32) -> Result<bool> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
         self.dag.happened_before(
             &self.entries.read(store, &self.sek, &self.channel_id)?,
             a,
@@ -7366,15 +7481,30 @@ impl ChannelState {
     /// Every entry this node holds for the room — readable or not, body pruned or not —
     /// in the room's one order (PRD-001 R13). The timeline is this sequence restricted
     /// to the rows this node can render.
-    #[must_use]
-    pub fn causal_order(&self) -> Vec<Digest32> {
-        self.dag.causal_order()
+    pub fn causal_order(&self, store: &Store) -> Result<Vec<Digest32>> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        self.dag
+            .causal_order(&self.entries.read(store, &self.sek, &self.channel_id)?)
     }
 
-    /// [`ChannelState::causal_order`] with each entry's clock (ms): the key that placed it.
-    #[must_use]
-    pub fn order_keys(&self) -> Vec<(Digest32, u64)> {
-        self.dag.order_keys()
+    /// [`ChannelState::causal_order`] with each entry's clock. Transitional view consumer;
+    /// bounded query callers use [`Self::order_view`] instead of collecting history.
+    pub fn order_keys(&self, store: &Store) -> Result<Vec<(Digest32, u64)>> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        self.dag
+            .order_keys(&self.entries.read(store, &self.sek, &self.channel_id)?)
+    }
+
+    /// Pin published DAG roots for a bounded query. Drop the view before a client/network wait.
+    pub fn order_view(&self, store: &Store) -> Result<OrderView<'_>> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        self.entries.order_view(store, &self.sek, &self.channel_id)
     }
 
     /// Accept an entry authored by **another** member (M14.5; the bytes arrive from
@@ -7443,8 +7573,9 @@ impl ChannelState {
         let id = self.next_log_id;
 
         let persisted = (|| -> Result<()> {
+            self.prepare_entry(store, &entry, kind, &key, now_ms)?;
             let mut batch = store.batch()?;
-            self.accept_into(&mut batch, entry, kind, &key)?;
+            self.publish_entry_into(&mut batch)?;
             batch.commit()
         })();
         if let Err(e) = persisted {
@@ -7455,8 +7586,9 @@ impl ChannelState {
         self.entries.committed();
         self.next_log_id = id.saturating_add(1);
         self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.finish_entry_publication(store)?;
         // It may be a parent rows already shown named before it arrived.
-        self.settle_timeline();
+        self.settle_timeline(store)?;
         if kind == EntryKind::Checkpoint {
             return Ok(Accepted::Checkpoint);
         }
@@ -7646,8 +7778,15 @@ impl ChannelState {
         let key = signer.public_key();
 
         let persisted = (|| -> Result<()> {
+            self.prepare_entry(
+                profile.store(),
+                &entry,
+                EntryKind::Content,
+                &key,
+                now_millis,
+            )?;
             let mut batch = profile.store().batch()?;
-            self.accept_into(&mut batch, entry, EntryKind::Content, &key)?;
+            self.publish_entry_into(&mut batch)?;
             batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
             batch.put_segment(
                 &self.channel_id,
@@ -7670,6 +7809,7 @@ impl ChannelState {
             return Err(e);
         }
         self.entries.committed();
+        let _ = self.finish_entry_publication(profile.store());
         self.next_log_id = id.saturating_add(1);
         self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if !skipped.is_empty() {
@@ -7690,7 +7830,8 @@ impl ChannelState {
         );
         // Its `seen` names every head this node holds, so it sorts after all of them;
         // placed through the same path as any row all the same.
-        self.place_rendered(rendered);
+        // Persistence succeeded; a later ordering read failure reports storage health, not an unsent post.
+        let _ = self.place_rendered(profile.store(), rendered);
         self.timeline
             .iter()
             .find(|r| r.entry_hash == entry_hash)
@@ -7914,8 +8055,15 @@ impl ChannelState {
         let key = signer.public_key();
 
         let persisted = (|| -> Result<()> {
+            self.prepare_entry(
+                profile.store(),
+                &entry,
+                EntryKind::Content,
+                &key,
+                now_millis,
+            )?;
             let mut batch = profile.store().batch()?;
-            self.accept_into(&mut batch, entry, EntryKind::Content, &key)?;
+            self.publish_entry_into(&mut batch)?;
             batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
             batch.put_segment(
                 &self.channel_id,
@@ -7940,6 +8088,7 @@ impl ChannelState {
         self.entries.committed();
         self.next_log_id = id.saturating_add(1);
         self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.finish_entry_publication(profile.store())?;
         self.retention.track(
             entry_hash,
             Tracked {
@@ -7997,7 +8146,10 @@ impl ChannelState {
                 payload_len: payload.len() as u64,
                 end_of_feed: false,
                 claimed_ms,
-                seen: self.dag.seen_for(author),
+                seen: self.dag.seen_for(
+                    &self.entries.read(store, &self.sek, &self.channel_id)?,
+                    author,
+                )?,
             })
         })();
         if let Err(ref error) = result {
@@ -8026,8 +8178,7 @@ impl ChannelState {
     /// What a person is told happened to the room, in the room's order (ADR-028 E-5): each name
     /// an admin gave it, and each change of its retention (R-7). One line each in the timeline,
     /// never a message: no reader, cursor or agent counts them.
-    #[must_use]
-    pub fn notices(&self) -> Vec<RoomNotice> {
+    pub fn notices(&self, store: &Store) -> Result<Vec<RoomNotice>> {
         let at = |h: &Digest32| {
             self.gov_entries
                 .iter()
@@ -8072,7 +8223,15 @@ impl ChannelState {
             .chain(retention)
             .collect();
         // In the room's order, and each after the newest row that precedes it there.
-        let key = |h: &Digest32| self.dag.order_key(h).unwrap_or((u64::MAX, *h));
+        let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
+        let failure = std::cell::RefCell::new(None);
+        let key = |h: &Digest32| match self.dag.order_key(&entries, h) {
+            Ok(key) => key.unwrap_or((u64::MAX, *h)),
+            Err(error) => {
+                failure.borrow_mut().get_or_insert(error);
+                (u64::MAX, *h)
+            }
+        };
         all.sort_by_key(|n| key(&n.entry_hash));
         for n in &mut all {
             let k = key(&n.entry_hash);
@@ -8083,7 +8242,10 @@ impl ChannelState {
                 .find(|r| key(&r.entry_hash) < k)
                 .map(|r| r.entry_hash);
         }
-        all
+        match failure.into_inner() {
+            Some(error) => Err(error),
+            None => Ok(all),
+        }
     }
 
     /// Whether `who` may name the room: its creator or an admin (ADR-028 R-1).
@@ -8535,14 +8697,24 @@ impl ChannelState {
 
     /// When the room's admins last changed, on the room's own clock (V030-14): the newest admin
     /// certificate or revocation on the log. `None` when the room never had one.
-    #[must_use]
-    pub fn admin_change_clock(&self) -> Option<u64> {
+    pub fn admin_change_clock(&self, store: &Store) -> Result<Option<u64>> {
         use crate::governance::entry::GovBody;
-        self.gov_entries
-            .iter()
-            .filter(|e| matches!(e.body, GovBody::AdminCert(_) | GovBody::AdminRevocation(_)))
-            .filter_map(|e| self.dag.order_key(&e.entry_hash).map(|(c, _)| c))
-            .max()
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
+        let mut latest = None;
+        for entry in &self.gov_entries {
+            if matches!(
+                entry.body,
+                GovBody::AdminCert(_) | GovBody::AdminRevocation(_)
+            ) {
+                if let Some((clock, _)) = self.dag.order_key(&entries, &entry.entry_hash)? {
+                    latest = Some(latest.map_or(clock, |old: u64| old.max(clock)));
+                }
+            }
+        }
+        Ok(latest)
     }
 
     /// The room's admins, the creator first (V030-08).
