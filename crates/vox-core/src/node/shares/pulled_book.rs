@@ -46,7 +46,7 @@ impl PulledBook {
         at: u64,
     ) -> std::result::Result<(), String> {
         use std::os::unix::fs::FileExt;
-        if at % 32 != 0 {
+        if !at.is_multiple_of(32) {
             return Err("invalid completed-pull recipient position".into());
         }
         let file = std::fs::File::open(dir.join("recipients")).map_err(|e| e.to_string())?;
@@ -83,8 +83,12 @@ impl PulledBook {
     ) -> std::result::Result<Option<(Digest32, Digest32)>, String> {
         match Self::small_file(&dir.join("identity"), 64) {
             Ok(bytes) if bytes.len() == 64 => Ok(Some((
-                bytes[..32].try_into().unwrap(),
-                bytes[32..].try_into().unwrap(),
+                bytes[..32]
+                    .try_into()
+                    .map_err(|_| "invalid completed-pull receipt identity")?,
+                bytes[32..]
+                    .try_into()
+                    .map_err(|_| "invalid completed-pull receipt identity")?,
             ))),
             Ok(_) => Err("invalid completed-pull receipt identity".into()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -120,7 +124,9 @@ impl PulledBook {
     ) -> std::result::Result<Option<u64>, String> {
         match Self::small_file(&Self::marker(dir, member), 8) {
             Ok(bytes) if bytes.len() == 8 => {
-                Ok(Some(u64::from_be_bytes(bytes.try_into().unwrap())))
+                Ok(Some(u64::from_be_bytes(bytes.try_into().map_err(
+                    |_| "invalid completed-pull recipient position",
+                )?)))
             }
             Ok(_) => Err("invalid completed-pull recipient position".into()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -206,7 +212,7 @@ impl PulledBook {
         };
         let end = file.metadata().map_err(|e| e.to_string())?.len();
         let mut at = after.unwrap_or(0);
-        if end % 32 != 0 || at % 32 != 0 || at > end {
+        if !end.is_multiple_of(32) || !at.is_multiple_of(32) || at > end {
             return Err("invalid completed-pull page; saved bytes retained".into());
         }
         file.seek(SeekFrom::Start(at)).map_err(|e| e.to_string())?;
