@@ -172,6 +172,52 @@ fn cost(
     Ok(bytes)
 }
 
+/// Conservative physical-row cost from sealed counters. Selection always uses the current
+/// published boundary, so these totals include every companion eligible for that selection.
+/// Shared outcomes may be charged to several origins: a narrower page can be requested, but
+/// counting an oversized origin must never first walk its accumulated history.
+fn physical_rows(
+    read: &Read<'_>,
+    origin: &Fact,
+    authors: &[Digest32],
+    visible: bool,
+) -> Result<u64> {
+    let mut rows = 1u64;
+    if visible {
+        rows = rows
+            .checked_add(
+                read.activity_find(T::PartCount, &hash_key(&origin.hash))?
+                    .unwrap_or(0),
+            )
+            .ok_or(Error::StreamRefused(crate::node::ipc::SESSION_READ_LIMIT))?;
+        if let Some(reference) = origin.reference {
+            for author in authors {
+                // OutcomeCount's producer uses (reference, author), unlike OutcomeBytes'
+                // authored-reference hash. Keep this identical to activity_fold::visible.
+                let mut key = hash_key(&reference);
+                key[32..].copy_from_slice(author);
+                rows = rows
+                    .checked_add(read.activity_find(T::OutcomeCount, &key)?.unwrap_or(0))
+                    .ok_or(Error::StreamRefused(crate::node::ipc::SESSION_READ_LIMIT))?;
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn bound_selection(rows: u64, bytes: u64) -> Result<()> {
+    let encoded = rows
+        .checked_mul(crate::node::ipc::ROW_OVERHEAD as u64)
+        .and_then(|overhead| overhead.checked_add(bytes))
+        .and_then(|bytes| bytes.checked_add(128));
+    if rows > crate::node::ipc::SESSION_READ_ROWS as u64
+        || encoded.is_none_or(|bytes| bytes > crate::node::ipc::SESSION_READ_BYTES as u64)
+    {
+        return Err(Error::StreamRefused(crate::node::ipc::SESSION_READ_LIMIT));
+    }
+    Ok(())
+}
+
 /// Test membership in an earlier selected origin instead of retaining a set of
 /// every emitted part. The number of selected origins has the public page bound.
 fn already_in(read: &Read<'_>, origins: &[u64], f: &Fact) -> Result<bool> {
@@ -527,6 +573,7 @@ impl ChannelState {
                         }
                         let mut origins = Vec::new();
                         let mut bytes = 0u64;
+                        let mut rows = 0u64;
                         for hash in entries {
                             let Some(arrival) = super::private_index::find(
                                 &snapshot,
@@ -572,6 +619,12 @@ impl ChannelState {
                             bytes = bytes
                                 .checked_add(cost(&read, &f, &authors, true, revision.boundary)?)
                                 .ok_or_else(bad)?;
+                            rows = rows
+                                .checked_add(physical_rows(&read, &f, &authors, true)?)
+                                .ok_or(Error::StreamRefused(
+                                    crate::node::ipc::SESSION_READ_LIMIT,
+                                ))?;
+                            bound_selection(rows, bytes)?;
                             origins.push(arrival);
                         }
                         // As for ordinary pages, one legal oversized logical activity is
@@ -632,6 +685,7 @@ impl ChannelState {
                     let mut origins = Vec::new();
                     let mut cursor = bound;
                     let mut bytes = 0u64;
+                    let mut rows = 0u64;
                     while origins.len() < max_rows.clamp(1, crate::node::ipc::SESSION_PAGE_ROWS) {
                         let Some((arrival, _)) = previous(&read, tree, &groups, cursor)? else {
                             break;
@@ -642,6 +696,10 @@ impl ChannelState {
                             break;
                         }
                         bytes = bytes.checked_add(cost).ok_or_else(bad)?;
+                        rows = rows
+                            .checked_add(physical_rows(&read, &f, &authors, visible)?)
+                            .ok_or(Error::StreamRefused(crate::node::ipc::SESSION_READ_LIMIT))?;
+                        bound_selection(rows, bytes)?;
                         origins.push(arrival);
                         cursor = arrival;
                     }

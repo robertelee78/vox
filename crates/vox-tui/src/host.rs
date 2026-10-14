@@ -4398,6 +4398,12 @@ struct TranscriptTitle {
     made: Option<String>,
 }
 
+/// A hook uses the same streaming title reader as the daemon. Tool-result lines are
+/// skipped from fixed-size buffers, never allocated as a complete transcript line.
+pub(crate) fn transcript_name(path: &std::path::Path) -> Option<String> {
+    Titles::default().read(path).name()
+}
+
 impl Titles {
     fn read(mut self, path: &std::path::Path) -> Self {
         use std::io::{Read as _, Seek as _, SeekFrom};

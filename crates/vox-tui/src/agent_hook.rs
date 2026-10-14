@@ -1818,30 +1818,10 @@ pub struct Registered {
 /// custom title wins, else the last made one. Codex's and OpenCode's names are to be read by their
 /// own hooks (harness2).
 fn session_name(input: &HookInput) -> Option<String> {
-    use std::io::BufRead as _;
     if !input.claude || input.transcript.is_empty() {
         return None;
     }
-    let file = std::fs::File::open(&input.transcript).ok()?;
-    let (mut custom, mut made) = (None, None);
-    for line in std::io::BufReader::new(file).lines() {
-        let Ok(line) = line else { break };
-        if !line.contains("-title\"") {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        match v["type"].as_str() {
-            Some("custom-title") => custom = v["customTitle"].as_str().map(str::to_owned),
-            Some("ai-title") => made = v["aiTitle"].as_str().map(str::to_owned),
-            _ => {}
-        }
-    }
-    custom
-        .or(made)
-        .map(|n| n.trim().to_owned())
-        .filter(|n| !n.is_empty())
+    crate::host::transcript_name(std::path::Path::new(&input.transcript))
 }
 
 /// The room this session works in (ADR-029 §6), and, for a room the node is not a member of, the

@@ -425,6 +425,12 @@ const T_ROOM_PAGE: u64 = 5493;
 /// At most this many entries in one page of a Session (ADR-034 FR-7): bytes bound a page too.
 pub const SESSION_PAGE_ROWS: usize = 200;
 
+/// A logical activity may be larger than an ordinary page, but never unbounded.
+/// Raw Session pages remain available when stored parts or outcomes exceed this limit.
+pub(crate) const SESSION_READ_ROWS: usize = 4096;
+pub(crate) const SESSION_READ_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const SESSION_READ_LIMIT: &str = "this Session activity exceeds the bounded reader limit; use vox room session ROOM SESSION --raw, then --before ENTRY for older raw pages";
+
 /// At most this many Sessions in one page of a room's Sessions list: each costs the daemon a look
 /// at its newest entries ([`SessionSummary`]).
 pub const SESSIONS_PAGE_ROWS: usize = 64;
@@ -1134,6 +1140,8 @@ pub const MAX_FIND: usize = 64;
 
 #[path = "ipc_governance.rs"]
 mod governance_page;
+#[path = "ipc_session_activity.rs"]
+mod session_activity;
 
 impl Request {
     /// Canonical CBOR body (unframed).
@@ -3524,6 +3532,9 @@ fn decode_session_rows(d: &mut Decoder<'_>) -> Result<Vec<crate::node::drive::Se
     let count = d
         .array()
         .map_err(|_| Error::MalformedIpc("ipc session entries array"))?;
+    if count > SESSION_READ_ROWS {
+        return Err(Error::StreamRefused(SESSION_READ_LIMIT));
+    }
     let mut rows = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
         if d.array()
@@ -3539,6 +3550,12 @@ fn decode_session_rows(d: &mut Decoder<'_>) -> Result<Vec<crate::node::drive::Se
             .map_err(|_| Error::MalformedIpc("ipc session entry time"))?;
         let session_id = text(d, "ipc session id")?;
         let body = text(d, "ipc session entry body")?;
+        if session_id.is_empty()
+            || session_id.len() > crate::node::content::MAX_SESSION_ID_LEN
+            || body.len() > crate::node::content::MAX_TEXT_LEN
+        {
+            return Err(Error::MalformedIpc("ipc Session record exceeds its bound"));
+        }
         rows.push(crate::node::drive::SessionRow {
             entry_hash,
             author,
@@ -4965,9 +4982,8 @@ async fn write_found(
     Ok(true)
 }
 
-/// Count and stream just one selected activity page. A legal multipart activity
-/// may cross any number of wire frames; only its fixed origins and one bounded
-/// locator page survive a client wait. No room snapshot crosses an await.
+/// Validate and stream one bounded activity page. The preflight retains only bounded
+/// multipart coordinates, and emission retains one row; no room snapshot crosses an await.
 async fn write_session_activity(
     stream: &mut UnixStream,
     handle: &NodeHandle,
@@ -5054,7 +5070,7 @@ async fn write_session_activity(
         .await?;
         return Ok(true);
     }
-    let mut count = 0usize;
+    let mut preflight = session_activity::Preflight::new(plan.visible);
     let mut cursor = Cursor::default();
     loop {
         let Reply::Companions { arrivals, next } = answer!(Query::Companions {
@@ -5063,14 +5079,46 @@ async fn write_session_activity(
         }) else {
             return Err(Error::MalformedIpc("unexpected Session activity locators"));
         };
-        count = count
-            .checked_add(arrivals.len())
-            .ok_or(Error::SizeLimitExceeded("Session activity row count"))?;
+        for arrival in arrivals {
+            let Reply::Row(row) = answer!(Query::Row {
+                plan: plan.clone(),
+                arrival
+            }) else {
+                return Err(Error::MalformedIpc("unexpected Session activity row"));
+            };
+            if let Err(reason) = preflight.push(&row) {
+                found_frame(
+                    stream,
+                    &Frame::Error {
+                        reason: reason.into(),
+                    }
+                    .to_bytes(),
+                    writing,
+                )
+                .await?;
+                return Ok(true);
+            }
+        }
         match next {
             Some(next) => cursor = next,
             None => break,
         }
     }
+    let count = match preflight.finish() {
+        Ok(count) => count,
+        Err(reason) => {
+            found_frame(
+                stream,
+                &Frame::Error {
+                    reason: reason.into(),
+                }
+                .to_bytes(),
+                writing,
+            )
+            .await?;
+            return Ok(true);
+        }
+    };
     let mut prefix = Encoder::new();
     prefix
         .array(if whole { 2 } else { 4 })
@@ -5489,6 +5537,7 @@ pub(crate) async fn read_reply(s: &mut UnixStream) -> Result<Option<Vec<u8>>> {
         return Ok(None);
     };
     let mut joined = Vec::new();
+    let mut bounded_session = None;
     loop {
         let mut d = Decoder::new(&body);
         if !matches!((d.array(), d.uint()), (Ok(4), Ok(T_REPLY_PAGE))) {
@@ -5513,7 +5562,27 @@ pub(crate) async fn read_reply(s: &mut UnixStream) -> Result<Option<Vec<u8>>> {
         if cursor != joined.len() as u64 || (more && part.is_empty()) {
             return Err(bad());
         }
+        if bounded_session != Some(false)
+            && joined
+                .len()
+                .checked_add(part.len())
+                .is_none_or(|bytes| bytes > SESSION_READ_BYTES)
+        {
+            // No ReplyNext follows a refused aggregate. Close so a reused client cannot
+            // confuse a partly consumed response with a later request's response.
+            let _ = s.shutdown().await;
+            return Err(Error::StreamRefused(SESSION_READ_LIMIT));
+        }
         joined.extend_from_slice(part);
+        if bounded_session.is_none() {
+            // A transport page may split even the prefix. Keep the conservative bound until
+            // enough bytes identify this reply, instead of trusting its first fragment.
+            let mut prefix = Decoder::new(&joined);
+            if let (Ok(_), Ok(tag)) = (prefix.array(), prefix.uint()) {
+                // A malformed arity is still bounded before the full decoder refuses it.
+                bounded_session = Some(matches!(tag, T_SESSION_ROWS | T_SESSION_PAGE));
+            }
+        }
         d.finish().map_err(|_| bad())?;
         if !more {
             return Ok(Some(joined));

@@ -47,7 +47,7 @@ impl Names for ByIdent {
     }
 }
 
-/// `vox room session ROOM SESSION [--details] [--json] [--before ENTRY]`: one page of the
+/// `vox room session ROOM SESSION [--details | --raw] [--json] [--before ENTRY]`: one page of the
 /// Session, the newest or the one before ENTRY, and under it how to print the page before it
 /// (ADR-034 FR-4): never the whole history.
 ///
@@ -60,6 +60,7 @@ pub async fn show(
     session: &str,
     details: bool,
     json: bool,
+    raw: bool,
     before: Option<&str>,
 ) -> Result<(), crate::app::AppError> {
     use crate::app::AppError;
@@ -93,7 +94,11 @@ pub async fn show(
         .map(|b| vox_core::node::link::b32_decode(b.trim(), "entry"))
         .transpose()
         .map_err(|_| AppError::Usage(format!("--before {}: not an entry", before.unwrap_or(""))))?;
-    let which = vox_core::node::drive::SessionFilter::Session(named);
+    let which = if raw {
+        vox_core::node::drive::SessionFilter::SessionRaw(named.clone())
+    } else {
+        vox_core::node::drive::SessionFilter::Session(named.clone())
+    };
     let (rows, older) = match client.session_page(channel_id, which, before).await {
         Ok(Frame::SessionPage { rows, older, .. }) => (rows, older),
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
@@ -103,6 +108,33 @@ pub async fn show(
     let first = rows
         .first()
         .map(|r| vox_core::node::link::b32_encode(&r.entry_hash));
+    if raw {
+        if let (Some(first), true) = (&first, older > 0) {
+            eprintln!("{older} older raw records not shown: vox room session {} {} --raw{} --before {first}",
+                room.trim(), named, if json { " --json" } else { "" });
+        }
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        for row in rows {
+            let entry = vox_core::node::link::b32_encode(&row.entry_hash);
+            let author = vox_core::node::link::b32_encode(&row.author);
+            if json {
+                writeln!(
+                    out,
+                    "{}",
+                    serde_json::json!({
+                        "entry": entry, "author": author, "created_millis": row.created_millis,
+                        "session": row.session_id, "body": row.body,
+                    })
+                )
+                .map_err(|e| AppError::Usage(e.to_string()))?;
+            } else {
+                writeln!(out, "{entry} {author} {}\n{}", row.created_millis, row.body)
+                    .map_err(|e| AppError::Usage(e.to_string()))?;
+            }
+        }
+        return Ok(());
+    }
     let read =
         vox_core::node::session_view::read(&sessions, rows, session, None, &label_of, &ByIdent)
             .map_err(AppError::Usage)?;

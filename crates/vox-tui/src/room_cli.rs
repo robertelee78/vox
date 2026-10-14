@@ -3735,7 +3735,7 @@ pub async fn board(
             .collect();
         let by_hash: std::collections::BTreeMap<[u8; 32], &Posted> =
             snap.posted.iter().map(|p| (p.entry_hash, p)).collect();
-        let violations: Vec<serde_json::Value> = snap
+        let violations = snap
             .fold
             .outcomes
             .iter()
@@ -3749,8 +3749,7 @@ pub async fn board(
                     "type": p.map(|p| p.envelope.kind.clone()),
                     "outcome": outcome_json(Some(o)),
                 })
-            })
-            .collect();
+            });
         let participants: Vec<serde_json::Value> = snap
             .table
             .participants
@@ -3766,26 +3765,36 @@ pub async fn board(
                 })
             })
             .collect();
-        println!(
-            "{}",
-            serde_json::json!({
-                "schema": "vox.room.board/1",
-                "room": room_key,
-                "me": { "author": claim::b32(&snap.me), "session": session },
-                "version": coord::VERSION,
-                "coordination": if snap.table.refused() { "refused" } else { "ok" },
-                "participants": participants,
-                "resources": resources,
-                "violations": violations,
-                "position": {
-                    // A cursor, so never a message not received yet (V030-10): the node's
-                    // `last` is the row that arrived last.
-                    "entries": entries,
-                    "last": last.map(|h| claim::b32(&h)),
-                },
-                "now_millis": snap.now_millis,
-            })
-        );
+        let mut header = serde_json::json!({
+            "schema": "vox.room.board/1",
+            "room": room_key,
+            "me": { "author": claim::b32(&snap.me), "session": session },
+            "version": coord::VERSION,
+            "coordination": if snap.table.refused() { "refused" } else { "ok" },
+            "participants": participants,
+            "resources": resources,
+            "position": {
+                // A cursor, so never a message not received yet (V030-10): the node's
+                // `last` is the row that arrived last.
+                "entries": entries,
+                "last": last.map(|h| claim::b32(&h)),
+            },
+            "now_millis": snap.now_millis,
+        })
+        .to_string();
+        // Each conflicted operation lists its whole group for every member. Keep that
+        // output schema, but stream one violation at a time rather than building a
+        // quadratic JSON value in memory before printing any of it.
+        header.pop();
+        let mut out = std::io::stdout().lock();
+        write!(out, "{header},\"violations\":[")?;
+        for (index, violation) in violations.enumerate() {
+            if index != 0 {
+                write!(out, ",")?;
+            }
+            write!(out, "{violation}")?;
+        }
+        writeln!(out, "]}}")?;
         return Ok(());
     }
 

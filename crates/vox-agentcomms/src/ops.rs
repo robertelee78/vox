@@ -20,7 +20,7 @@
 //! and every one of them is reported. Conflict is monotone: an operation can go from
 //! ok to conflicted, and never back.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::envelope::Envelope;
 
@@ -139,12 +139,14 @@ pub enum Verdict {
     },
 }
 
-/// One entry, as the operation index needs it.
-#[derive(Debug, Clone)]
-struct Member {
-    entry_hash: [u8; 32],
-    created_millis: u64,
-    semantic: String,
+/// One operation's scalar verdict and ordered identities. Repeated content is kept
+/// once; inserting a retry neither sorts the whole group nor duplicates its body.
+#[derive(Debug, Clone, Default)]
+struct Group {
+    members: BTreeSet<(u64, [u8; 32])>,
+    hashes: BTreeSet<[u8; 32]>,
+    semantic: Option<String>,
+    conflict: bool,
 }
 
 /// Every operation id seen, grouped by `(author, op)`.
@@ -153,7 +155,7 @@ struct Member {
 /// turned an earlier, already-delivered entry into a conflict.
 #[derive(Debug, Clone, Default)]
 pub struct OpIndex {
-    groups: BTreeMap<([u8; 32], String), Vec<Member>>,
+    groups: BTreeMap<([u8; 32], String), Group>,
 }
 
 impl OpIndex {
@@ -179,21 +181,23 @@ impl OpIndex {
             return false;
         };
         let group = self.groups.entry((author, op.to_owned())).or_default();
-        if group.iter().any(|m| m.entry_hash == entry_hash) {
+        if !group.hashes.insert(entry_hash) {
             return false;
         }
-        let was_conflict = is_conflict(group);
-        group.push(Member {
-            entry_hash,
-            created_millis,
-            semantic: semantic(env),
-        });
-        group.sort_by(|a, b| {
-            a.created_millis
-                .cmp(&b.created_millis)
-                .then_with(|| a.entry_hash.cmp(&b.entry_hash))
-        });
-        !was_conflict && is_conflict(group)
+        let was_conflict = group.conflict;
+        if !group.conflict {
+            let content = semantic(env);
+            if let Some(first) = &group.semantic {
+                group.conflict = *first != content;
+            } else {
+                group.semantic = Some(content);
+            }
+            if group.conflict {
+                group.semantic = None;
+            }
+        }
+        group.members.insert((created_millis, entry_hash));
+        !was_conflict && group.conflict
     }
 
     /// The canonical verdict on one entry, or `None` if it carries no operation id or
@@ -207,15 +211,15 @@ impl OpIndex {
     ) -> Option<Verdict> {
         let op = op_of(env)?;
         let group = self.groups.get(&(author, op.to_owned()))?;
-        if !group.iter().any(|m| m.entry_hash == entry_hash) {
+        if !group.hashes.contains(&entry_hash) {
             return None;
         }
-        if is_conflict(group) {
+        if group.conflict {
             return Some(Verdict::Conflict {
-                group: group.iter().map(|m| m.entry_hash).collect(),
+                group: group.members.iter().map(|(_, hash)| *hash).collect(),
             });
         }
-        let first = group[0].entry_hash;
+        let first = group.members.first()?.1;
         Some(if first == entry_hash {
             Verdict::Effective
         } else {
@@ -228,13 +232,7 @@ impl OpIndex {
     pub fn group_of(&self, author: [u8; 32], env: &Envelope) -> Vec<[u8; 32]> {
         op_of(env)
             .and_then(|op| self.groups.get(&(author, op.to_owned())))
-            .map(|g| g.iter().map(|m| m.entry_hash).collect())
+            .map(|g| g.members.iter().map(|(_, hash)| *hash).collect())
             .unwrap_or_default()
     }
-}
-
-fn is_conflict(group: &[Member]) -> bool {
-    group
-        .first()
-        .is_some_and(|f| group.iter().any(|m| m.semantic != f.semantic))
 }

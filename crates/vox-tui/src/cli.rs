@@ -1319,6 +1319,9 @@ pub struct RoomSessionArgs {
     /// Print each entry's full input and output under its line.
     #[arg(long)]
     pub details: bool,
+    /// Print saved records without joining multipart activities. Pages remain bounded.
+    #[arg(long, conflicts_with = "details")]
+    pub raw: bool,
     /// Print one JSON object per line instead.
     #[arg(long)]
     pub json: bool,
@@ -2764,6 +2767,7 @@ pub fn run() -> ExitCode {
                                     &a.session,
                                     a.details,
                                     a.json,
+                                    a.raw,
                                     a.before.as_deref(),
                                 )
                                 .await
