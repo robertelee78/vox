@@ -250,6 +250,23 @@ final class NodeModel: ObservableObject {
     // ---- what the menus, keys and palette ask for (M-19–M-21) ---------------------------------
 
     /// The sheet a menu, key or palette action opened.
+    @Published private(set) var roomAnchorAuthority: RoomAnchorAuthority?
+    @Published private(set) var roomAnchorEntries: [AnchorSummary] = []
+    @Published private(set) var roomAnchorError: String?
+    @Published private(set) var roomAnchorLoading = false
+    @Published private(set) var roomAnchorChanging = false
+    private var roomAnchorRead = UUID()
+    private var roomAnchorAction = UUID()
+    private var roomAnchorAuthorityEpoch: UUID?
+    private var roomAnchorAuthorityGeneration: UUID?
+    var canManageRoomAnchors: Bool {
+        guard let room = roomOnScreen, ended == nil, daemonReachable,
+              let authority = roomAnchorAuthority else { return false }
+        return authority.room == room && authority.node == me && authority.canManage
+            && roomAnchorAuthorityEpoch == nodeObservationEpoch
+            && roomAnchorAuthorityGeneration == roomReadGeneration
+    }
+
     @Published var sheet: NodeSheet?
     /// Whether the room's inspector shows (View > Hide Inspector, ⌥⌘I), kept across launches.
     @Published var inspectorShown = Columns.inspectorShown {
@@ -702,6 +719,7 @@ final class NodeModel: ObservableObject {
             if fresh != nodes { nodes = fresh }
             if fresh.first(where: { $0.name == node })?.state != "attached" {
                 nodeObservationEpoch = UUID()
+                invalidateRoomAnchorState()
                 daemonReachable = true
                 ended = fresh.first(where: { $0.name == node })?.status == "Locked"
                     ? "Node \(node) is Locked." : "Node \(node) is unavailable."
@@ -983,6 +1001,8 @@ final class NodeModel: ObservableObject {
             notices = done
             sessions = listed
             await loadStepRetention()
+            guard !Task.isCancelled, generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
+            await loadRoomAnchorState()
             guard generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
             // A Session restored as this room's last view is read once the room lists it (D12).
             if showingSession { await readSession() }
@@ -1622,6 +1642,101 @@ final class NodeModel: ObservableObject {
         }
     }
 
+    private func invalidateRoomAnchorState() {
+        roomAnchorRead = UUID()
+        roomAnchorAction = UUID()
+        roomAnchorAuthority = nil
+        roomAnchorAuthorityEpoch = nil
+        roomAnchorAuthorityGeneration = nil
+        roomAnchorEntries = []
+        roomAnchorError = nil
+        roomAnchorLoading = false
+        roomAnchorChanging = false
+        if sheet == .roomAnchors { sheet = nil }
+    }
+
+    func loadRoomAnchorState() async {
+        guard let room = roomOnScreen, ended == nil else { return }
+        let generation = roomReadGeneration, epoch = nodeObservationEpoch, request = UUID()
+        roomAnchorRead = request
+        roomAnchorLoading = true
+        defer { if roomAnchorRead == request { roomAnchorLoading = false } }
+        @MainActor func current() -> Bool {
+            !Task.isCancelled && roomAnchorRead == request && roomReadGeneration == generation
+                && nodeObservationEpoch == epoch && roomOnScreen == room && ended == nil
+        }
+        do {
+            let authority = try await client.roomAnchorAuthority(room: room)
+            guard current() else { return }
+            guard authority.room == room, authority.node == me else {
+                throw VoxError.Failed(reason: "The room-anchor authority belongs to another room or node.")
+            }
+            roomAnchorAuthority = authority
+            roomAnchorAuthorityEpoch = epoch
+            roomAnchorAuthorityGeneration = generation
+            let entries = try await client.anchors()
+            guard current() else { return }
+            roomAnchorEntries = entries.filter { $0.sources.contains { $0.room == room } }
+            roomAnchorError = nil
+        } catch {
+            guard current() else { return }
+            roomAnchorAuthority = nil
+            roomAnchorError = sentence(error)
+        }
+    }
+
+    func openRoomAnchors() async {
+        let room = roomOnScreen, generation = roomReadGeneration, epoch = nodeObservationEpoch
+        roomAnchorAuthority = nil
+        await loadRoomAnchorState()
+        guard !Task.isCancelled, roomOnScreen == room, roomReadGeneration == generation,
+              nodeObservationEpoch == epoch, canManageRoomAnchors else { return }
+        sheet = .roomAnchors
+    }
+
+    /// Resolve input without a manual write; only the held actor signs this room's change.
+    @discardableResult
+    func changeRoomAnchor(input: String? = nil, removing: String? = nil) async -> Bool {
+        guard let room = roomOnScreen, ended == nil, !roomAnchorChanging,
+              (input != nil) != (removing != nil) else { return false }
+        let generation = roomReadGeneration, epoch = nodeObservationEpoch, request = UUID()
+        roomAnchorAction = request
+        roomAnchorChanging = true
+        roomAnchorAuthority = nil
+        roomAnchorError = nil
+        defer { if roomAnchorAction == request { roomAnchorChanging = false } }
+        @MainActor func current() -> Bool {
+            !Task.isCancelled && roomAnchorAction == request && roomReadGeneration == generation
+                && nodeObservationEpoch == epoch && roomOnScreen == room && ended == nil
+        }
+        do {
+            let authority = try await client.roomAnchorAuthority(room: room)
+            guard current() else { return false }
+            guard authority.room == room, authority.node == me, authority.canManage else {
+                throw VoxError.Failed(reason: "Only the room's creator or an admin can change its anchors.")
+            }
+            roomAnchorAuthority = authority
+            roomAnchorAuthorityEpoch = epoch
+            roomAnchorAuthorityGeneration = generation
+            if let input {
+                let spec = try await client.resolveAnchor(input: input)
+                guard current() else { return false }
+                try await client.addRoomAnchorPinned(room: room, spec: spec)
+            } else if let removing {
+                try await client.removeRoomAnchor(room: room, fingerprint: removing)
+            }
+            guard current() else { return false }
+            await loadRoomAnchorState()
+            guard current() else { return false }
+            return true
+        } catch {
+            guard current() else { return false }
+            roomAnchorAuthority = nil
+            roomAnchorError = sentence(error)
+            return false
+        }
+    }
+
     /// Separate room step policy and this node's effective limit, read together with who may
     /// change the room rule. Failures stay in the Retention sheet with a retry.
     func loadStepRetention() async {
@@ -1986,6 +2101,9 @@ final class NodeModel: ObservableObject {
                 if let kept, kept != self.retention { self.retention = kept }
                 if let keptSecs, keptSecs != self.retentionSecs { self.retentionSecs = keptSecs }
                 await self.loadStepRetention()
+                guard !Task.isCancelled, self.roomReadGeneration == generation,
+                      self.selection == .room(room), self.ended == nil else { return }
+                await self.loadRoomAnchorState()
                 guard !Task.isCancelled, self.roomReadGeneration == generation,
                       self.selection == .room(room), self.ended == nil else { return }
                 if let done, done != self.notices { self.notices = done }

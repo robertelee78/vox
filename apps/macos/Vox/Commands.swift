@@ -11,7 +11,7 @@ extension Notification.Name {
 
 /// A sheet a menu, key or palette action opens.
 enum NodeSheet: String, Identifiable {
-    case palette, newRoom, joinRoom, repoRoom, fingerprint, rename, retention, admins, leave, end
+    case palette, newRoom, joinRoom, repoRoom, fingerprint, rename, retention, admins, roomAnchors, leave, end
     var id: String { rawValue }
 }
 
@@ -81,6 +81,9 @@ extension VoxAction {
             VoxAction("Room", "Rename…", enabled: inRoom) { node?.sheet = .rename },
             VoxAction("Room", "Retention…", enabled: inRoom) { node?.sheet = .retention },
             VoxAction("Room", "Admins…", enabled: inRoom) { node?.sheet = .admins },
+            VoxAction("Room", "Anchors…", enabled: inRoom && node?.canManageRoomAnchors == true) {
+                Task { await node?.openRoomAnchors() }
+            },
             VoxAction("Room", "Reply in Thread", "r",
                       enabled: inRoom && node?.messages.contains { $0.id == node?.selectedMessage } == true) {
                 node?.replyTo = node?.messages.first { $0.id == node?.selectedMessage }
@@ -268,6 +271,7 @@ struct NodeSheets: View {
             case .rename: RenameSheet(model: model)
             case .retention: RetentionSheet(model: model)
             case .admins: AdminsSheet(model: model)
+            case .roomAnchors: RoomAnchorEditor(model: model)
             case .leave: LeaveSheet(model: model, ending: false)
             case .end: LeaveSheet(model: model, ending: true)
             }

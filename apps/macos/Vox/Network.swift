@@ -153,3 +153,76 @@ struct RoomAnchorsView: View {
         .task { await model.follow() }
     }
 }
+
+
+/// One explicit input field is reusable by New Room once its authenticated search/creation
+/// handoff (#782) exists. Typing here alone never dials or writes a manual anchor.
+struct RoomAnchorInput: View {
+    @Binding var input: String
+    let busy: Bool
+    let allowed: Bool
+    let add: () -> Void
+    var body: some View {
+        HStack {
+            TextField("fingerprint@address or host:port", text: $input)
+                .accessibilityIdentifier("room-anchor-input")
+                .onSubmit { if allowed && !busy { add() } }
+            Button("Add Anchor", action: add)
+                .disabled(!allowed || busy || input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .accessibilityIdentifier("room-anchor-add")
+        }
+    }
+}
+
+/// Only selected-room signed governance is changed; machine manual sources remain independent.
+struct RoomAnchorEditor: View {
+    @ObservedObject var model: NodeModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var input = ""
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.s16) {
+            Text("Room Anchors").font(.title2)
+            Text("Anchors bridge peers that cannot connect directly. Changes apply to this room's members only; direct connections do not need one.")
+                .secondaryText().fixedSize(horizontal: false, vertical: true)
+            RoomAnchorInput(input: $input, busy: model.roomAnchorChanging,
+                            allowed: model.canManageRoomAnchors) {
+                let value = input.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !value.isEmpty else { return }
+                Task { if await model.changeRoomAnchor(input: value) { input = "" } }
+            }
+            ScrollView {
+                VStack(alignment: .leading, spacing: Space.s16) {
+                    if model.roomAnchorEntries.isEmpty && model.roomAnchorError == nil && !model.roomAnchorLoading {
+                        Text("This room has no anchors.").secondaryText()
+                    }
+                    ForEach(model.roomAnchorEntries, id: \.fingerprint) { anchor in
+                        HStack(alignment: .top) {
+                            VStack(alignment: .leading, spacing: Space.s4) {
+                                Text(anchor.fingerprint).font(Theme.mono).textSelection(.enabled)
+                                AnchorNetworkRow(anchor: anchor, reachable: model.daemonReachable && model.roomAnchorError == nil)
+                            }
+                            Spacer()
+                            Button("Remove from Room") {
+                                Task { await model.changeRoomAnchor(removing: anchor.fingerprint) }
+                            }
+                            .disabled(!model.canManageRoomAnchors || model.roomAnchorChanging)
+                            .accessibilityIdentifier("room-anchor-remove-" + anchor.fingerprint)
+                        }
+                    }
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if model.roomAnchorChanging || model.roomAnchorLoading { ProgressView("Checking with Vox…") }
+            if let problem = model.roomAnchorError {
+                Text(problem).foregroundStyle(VoxTokens.Colors.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("room-anchor-problem")
+            }
+            HStack { Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
+        }
+        .padding(Space.s24)
+        .frame(width: Theme.scaled(600), height: Theme.scaled(480))
+        .contentSurface()
+        .accessibilityIdentifier("room-anchor-editor")
+        .task { await model.loadRoomAnchorState() }
+    }
+}
