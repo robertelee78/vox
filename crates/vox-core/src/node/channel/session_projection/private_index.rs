@@ -162,6 +162,172 @@ pub(in crate::node::channel) fn next_expired(
     Ok(None)
 }
 
+/// Authenticated observations only. A generation is never a permission or key, and expiry
+/// cannot lower it. `through` distinguishes a complete negative lookup from pending repair.
+#[derive(Default, Clone, Copy)]
+pub(in crate::node::channel) struct Control {
+    pub generation: Option<u64>,
+    pub support: Option<Digest32>,
+    pub through: u64,
+}
+impl Control {
+    fn read(bytes: &[u8]) -> Result<Self> {
+        let mut d = crate::cbor::Decoder::new(bytes);
+        if d.array()? != 4 || d.uint()? != 1 {
+            return Err(Error::MalformedAtRest("Session control fact"));
+        }
+        let generation = match d.array()? {
+            0 => None,
+            1 => Some(d.uint()?),
+            _ => return Err(Error::MalformedAtRest("Session generation fact")),
+        };
+        let support = match d.bytes()? {
+            [] => None,
+            b => Some(
+                b.try_into()
+                    .map_err(|_| Error::MalformedAtRest("Session support fact"))?,
+            ),
+        };
+        let through = d.uint()?;
+        d.finish()?;
+        Ok(Self {
+            generation,
+            support,
+            through,
+        })
+    }
+    fn bytes(self) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(4)
+            .uint(1)
+            .array(usize::from(self.generation.is_some()));
+        if let Some(generation) = self.generation {
+            e.uint(generation);
+        }
+        e.bytes(self.support.as_ref().map_or(&[][..], |h| &h[..]))
+            .uint(self.through);
+        e.finish()
+    }
+}
+
+pub(in crate::node::channel) fn control(
+    snapshot: &Snapshot,
+    sek: &Sek,
+    room: &Digest32,
+    author: &Digest32,
+) -> Result<Control> {
+    let Some(read) = Read::existing(snapshot, sek, room)? else {
+        return Ok(Control::default());
+    };
+    let Some(id) = read.find(Tree::Controls, &hash_key(author))? else {
+        return Ok(Control::default());
+    };
+    Control::read(&read.descriptor(id)?)
+}
+
+pub(in crate::node::channel) fn control_in(
+    batch: &Batch<'_>,
+    sek: &Sek,
+    room: &Digest32,
+    author: &Digest32,
+) -> Result<Control> {
+    let Some(id) = super::storage::find_in(batch, sek, room, Tree::Controls, &hash_key(author))?
+    else {
+        return Ok(Control::default());
+    };
+    let sealed = batch
+        .get_segment(room, crate::atrest::store::SegmentKind::SessionIndex, id)?
+        .ok_or(Error::MalformedAtRest("Session control descriptor missing"))?;
+    if sealed.ciphertext.len() > 128 + crate::atrest::sek::TAG_LEN {
+        return Err(Error::MalformedAtRest("Session control descriptor size"));
+    }
+    Control::read(&crate::atrest::store::open_segment(
+        sek,
+        crate::atrest::store::SegmentKind::SessionIndex,
+        id,
+        &sealed,
+    )?)
+}
+
+fn merge_control(index: &mut Write<'_, '_>, author: &Digest32, seen: Control) -> Result<()> {
+    let key = hash_key(author);
+    let old_id = index.find(Tree::Controls, &key)?;
+    let old = old_id
+        .map(|id| index.descriptor(id).and_then(|bytes| Control::read(&bytes)))
+        .transpose()?
+        .unwrap_or_default();
+    let merged = Control {
+        generation: old.generation.into_iter().chain(seen.generation).max(),
+        support: old.support.or(seen.support),
+        through: old.through.max(seen.through),
+    };
+    if old.generation == merged.generation
+        && old.support == merged.support
+        && old.through == merged.through
+    {
+        return Ok(());
+    }
+    let id = match old_id {
+        Some(id) => {
+            index.replace_descriptor(id, &merged.bytes())?;
+            id
+        }
+        None => index.put_descriptor(&merged.bytes())?,
+    };
+    index.set(Tree::Controls, key, Some(id))
+}
+
+pub(in crate::node::channel) fn observe_control(
+    batch: &mut Batch<'_>,
+    sek: &Sek,
+    room: &Digest32,
+    author: &Digest32,
+    seen: Control,
+) -> Result<()> {
+    let mut index = Write::open(batch, sek, room)?;
+    merge_control(&mut index, author, seen)?;
+    index.seal()
+}
+
+/// Caller has authenticated this exact entry and publishes it in the same Batch. This helper
+/// must never run on an unpublished promotion chunk. Bodyless gaps are caught up separately.
+pub(in crate::node::channel) fn observe_public(
+    batch: &mut Batch<'_>,
+    sek: &Sek,
+    room: &Digest32,
+    entry: &crate::log::entry::Entry,
+) -> Result<()> {
+    if entry.skeleton.channel_id != *room {
+        return Err(Error::MalformedAtRest("Session control room binding"));
+    }
+    let author = entry.skeleton.author_id;
+    let mut index = Write::open(batch, sek, room)?;
+    let old = index
+        .find(Tree::Controls, &hash_key(&author))?
+        .map(|id| index.descriptor(id).and_then(|bytes| Control::read(&bytes)))
+        .transpose()?
+        .unwrap_or_default();
+    let mut seen = Control::default();
+    if old.through.checked_add(1) == Some(entry.skeleton.seq) {
+        seen.through = entry.skeleton.seq;
+    }
+    if let Some(body) = &entry.payload {
+        if body.as_slice() == super::super::private_session::support_body(room, &author) {
+            seen.support = Some(entry.entry_hash());
+        }
+        if let Ok(message) = crate::group::message::GroupMessage::from_wire(body) {
+            if message.header.channel_id == crate::node::drive::drive_channel(room)
+                && message.header.author_id == author
+                && message.header.epoch == entry.skeleton.epoch
+            {
+                seen.generation = Some(message.header.chain_id);
+            }
+        }
+    }
+    merge_control(&mut index, &author, seen)?;
+    index.seal()
+}
+
 fn candidate(saved: &Stored, id: u64) -> Option<Source> {
     let row = saved.row.as_ref()?;
     if !crate::node::sessions::is_record(&row.body) && !row.body.contains("session_name") {
@@ -197,6 +363,14 @@ pub(in crate::node::channel) fn put(
             .ok_or(Error::MalformedAtRest(
                 "Session activity revision exhausted",
             ))?;
+    merge_control(
+        &mut index,
+        &saved.record.message.header.author_id,
+        Control {
+            generation: Some(saved.record.message.header.chain_id),
+            ..Control::default()
+        },
+    )?;
     let hash = saved.record.hash();
     if id == 0 {
         return Err(Error::MalformedAtRest("private Session id is zero"));

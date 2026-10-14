@@ -308,7 +308,7 @@ impl ChannelState {
                 continue;
             }
             self.learn_session_floor(&entry);
-            self.observe_legacy_drive_generation(&entry);
+            self.observe_legacy_drive_generation(&entry)?;
         }
         let me = self.me();
         for wire in staged {
