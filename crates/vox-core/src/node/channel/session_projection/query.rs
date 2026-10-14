@@ -80,6 +80,11 @@ pub(crate) struct TextPage {
 
 #[derive(Clone)]
 pub(crate) enum Query {
+    Lifecycle {
+        before: Option<crate::node::sessions::LifecycleCursor>,
+        not_before: Option<u64>,
+        limit: usize,
+    },
     HasOpen {
         node: Digest32,
     },
@@ -108,6 +113,11 @@ pub(crate) enum Query {
 }
 
 pub(crate) enum Reply {
+    Lifecycle {
+        rows: Vec<(Row, crate::node::sessions::LifecycleCursor)>,
+        older: bool,
+        revision: Revision,
+    },
     HasOpen(bool),
     Page {
         rows: Vec<Row>,
@@ -137,6 +147,42 @@ fn hash_key(hash: &Digest32) -> Key {
     let mut key = [0; 64];
     key[..32].copy_from_slice(hash);
     key
+}
+
+pub(super) fn lifecycle_key(author: &Digest32, at: u64, id: u64, ended: bool) -> Key {
+    let mut key = hash_key(author);
+    key[32..40].copy_from_slice(&at.to_be_bytes());
+    key[40..48].copy_from_slice(&id.to_be_bytes());
+    key[48] = u8::from(ended);
+    key
+}
+
+fn previous_lifecycle(
+    read: &Read<'_>,
+    authors: &[Digest32],
+    before: Option<(u64, u64, bool)>,
+) -> Result<Option<(Key, u64)>> {
+    let mut selected: Option<(Key, u64)> = None;
+    for author in authors {
+        let bound = before.map_or_else(
+            || {
+                let mut key = [255; 64];
+                key[..32].copy_from_slice(author);
+                key
+            },
+            |(time, id, ended)| lifecycle_key(author, time, id, ended),
+        );
+        if let Some((key, id)) = read.previous(Tree::Lifecycle, Some(bound))? {
+            if key[..32] == author[..]
+                && selected
+                    .as_ref()
+                    .is_none_or(|(old, _)| key[32..] > old[32..])
+            {
+                selected = Some((key, id));
+            }
+        }
+    }
+    Ok(selected)
 }
 
 fn descriptor(read: &Read<'_>, id: u64) -> Result<Descriptor> {
@@ -248,6 +294,74 @@ impl ChannelState {
                 Ok(())
             };
             match query {
+                Query::Lifecycle {
+                    before,
+                    not_before,
+                    limit,
+                } => {
+                    let mut cursor = match before {
+                        None => None,
+                        Some(cursor) => {
+                            let id = read
+                                .find(Tree::OpeningHash, &hash_key(&cursor.opening))?
+                                .ok_or(Failure::Request(CHANGED))?;
+                            let row = descriptor(&read, id)?;
+                            let time = if cursor.ended {
+                                row.ended.map(|e| e.position.created)
+                            } else {
+                                Some(row.position.created)
+                            };
+                            if !authors.contains(&row.node) || time != Some(cursor.at_millis) {
+                                return Err(Failure::Request(CHANGED));
+                            }
+                            Some((cursor.at_millis, id, cursor.ended))
+                        }
+                    };
+                    let mut rows = Vec::new();
+                    let mut bytes = 0u64;
+                    let mut older = false;
+                    while let Some((key, id)) = previous_lifecycle(&read, &authors, cursor)? {
+                        let time = u64::from_be_bytes(
+                            key[32..40]
+                                .try_into()
+                                .map_err(|_| Error::MalformedAtRest("Session lifecycle time"))?,
+                        );
+                        if not_before.is_some_and(|lower| time < lower) {
+                            break;
+                        }
+                        let row = descriptor(&read, id)?;
+                        let ended = key[48] == 1;
+                        if key[48] > 1 || key != lifecycle_key(&row.node, time, id, ended) {
+                            return Err(
+                                Error::MalformedAtRest("Session lifecycle index binding").into()
+                            );
+                        }
+                        let cost = 256u64
+                            .saturating_add(row.name.map_or(0, |f| f.bytes))
+                            .saturating_add(row.harness.map_or(0, |f| f.bytes));
+                        if !rows.is_empty()
+                            && (rows.len() >= limit.clamp(1, PAGE_ROWS)
+                                || bytes.saturating_add(cost) > max_bytes as u64)
+                        {
+                            older = true;
+                            break;
+                        }
+                        bytes = bytes.saturating_add(cost);
+                        cursor = Some((time, id, ended));
+                        let cursor = crate::node::sessions::LifecycleCursor {
+                            at_millis: time,
+                            opening: row.opening.position.hash,
+                            ended,
+                        };
+                        rows.push((Row::from(row), cursor));
+                    }
+                    rows.reverse();
+                    Ok(Reply::Lifecycle {
+                        rows,
+                        older,
+                        revision,
+                    })
+                }
                 Query::HasOpen { node } => {
                     if !authors.contains(&node) {
                         return Err(Failure::Request("this node cannot read that Session"));

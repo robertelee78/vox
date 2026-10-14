@@ -121,6 +121,9 @@ pub(in crate::node::channel) fn put(
             return Err(Error::MalformedAtRest("Session file hash binding"));
         }
     }
+    if let Some(row) = &saved.row {
+        super::activity_index::put(&mut index, id, row)?;
+    }
     index.seal()
 }
 
@@ -132,6 +135,7 @@ pub(in crate::node::channel) fn remove(
     saved: &Stored,
 ) -> Result<()> {
     let mut index = Write::open(batch, sek, room)?;
+    super::activity_index::remove(&mut index, id)?;
     index.header.activity_generation =
         index
             .header

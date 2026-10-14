@@ -393,6 +393,8 @@ const T_SESSIONS_PAGE_REQ: u64 = 5437;
 const T_SESSIONS_PAGE: u64 = 5438;
 /// Exact Session metadata, using the existing bounded SessionsPage reply.
 const T_SESSION_LOOKUP: u64 = 8721;
+const T_SESSION_LIFECYCLE_REQ: u64 = 8724;
+const T_SESSION_LIFECYCLE: u64 = 8725;
 const T_ROOM_PAGE_REQ: u64 = 5492;
 const T_ROOM_PAGE: u64 = 5493;
 
@@ -652,6 +654,16 @@ pub enum Request {
         node: Digest32,
         /// The complete harness Session id.
         id: String,
+    },
+    /// Chronological opening/end notices for All, bounded independently of the
+    /// metadata list. No ordinary-message lower bound is needed in Session-only rooms.
+    SessionLifecycle {
+        /// The room.
+        channel_id: Digest32,
+        /// Strictly older than this notice, or newest when absent.
+        before: Option<crate::node::sessions::LifecycleCursor>,
+        /// Inclusive lower time bound of the loaded ordinary-message page.
+        not_before: Option<u64>,
     },
     /// Pull the file the message `entry` of a room offers, now, as `vox room get` does (ADR-028
     /// F-3; D5): whoever it is addressed to, verified before it is kept. Answered
@@ -1201,6 +1213,21 @@ impl Request {
                     .bytes(channel_id)
                     .bytes(node)
                     .text(id);
+            }
+            Request::SessionLifecycle {
+                channel_id,
+                before,
+                not_before,
+            } => {
+                e.array(4).uint(T_SESSION_LIFECYCLE_REQ).bytes(channel_id);
+                e.array(usize::from(before.is_some()));
+                if let Some(cursor) = before {
+                    put_lifecycle_cursor(&mut e, cursor);
+                }
+                e.array(usize::from(not_before.is_some()));
+                if let Some(lower) = not_before {
+                    e.uint(*lower);
+                }
             }
             Request::SessionsPage { channel_id, after } => {
                 e.array(3)
@@ -1960,6 +1987,25 @@ impl Request {
                     id,
                 })
             }
+            (T_SESSION_LIFECYCLE_REQ, 4) => {
+                let channel_id = digest(&mut d)?;
+                let before = match d.array()? {
+                    0 => None,
+                    1 => Some(read_lifecycle_cursor(&mut d)?),
+                    _ => return Err(Error::MalformedIpc("Session lifecycle cursor option")),
+                };
+                let not_before = match d.array()? {
+                    0 => None,
+                    1 => Some(d.uint()?),
+                    _ => return Err(Error::MalformedIpc("Session lifecycle lower bound")),
+                };
+                d.finish()?;
+                Ok(Request::SessionLifecycle {
+                    channel_id,
+                    before,
+                    not_before,
+                })
+            }
             (T_SESSIONS_PAGE_REQ, 3) => {
                 let channel_id = digest(&mut d)?;
                 let after = optional_digest(&mut d)?;
@@ -2397,6 +2443,13 @@ pub enum Frame {
         /// Whether more follow the last: ask again with its opening as `after`.
         more: bool,
     },
+    /// A bounded opening/end notice page, oldest first within this page.
+    SessionLifecyclePage {
+        /// Complete current labels and exact lifecycle positions.
+        rows: Vec<crate::node::sessions::LifecycleRow>,
+        /// More older notices remain within the request's inclusive lower bound.
+        older: bool,
+    },
     /// Where a [`Request::Pull`] put the verified copy.
     Pulled {
         /// Its path.
@@ -2668,6 +2721,18 @@ impl Frame {
                         .uint(u64::from(s.waiting));
                 }
                 e.uint(u64::from(*more));
+            }
+            Frame::SessionLifecyclePage { rows, older } => {
+                e.array(4).uint(T_SESSION_LIFECYCLE);
+                e.array(rows.len());
+                for row in rows {
+                    crate::node::sessions::put_row(&mut e, &row.session);
+                }
+                e.array(rows.len());
+                for row in rows {
+                    put_lifecycle_cursor(&mut e, &row.cursor);
+                }
+                e.uint(u64::from(*older));
             }
             Frame::Decisions { events } => {
                 e.array(2).uint(T_DECISIONS).array(events.len());
@@ -3511,7 +3576,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
         }
         (T_SESSIONS_PAGE, 4) => {
             let bad = || Error::MalformedIpc("ipc session summary");
-            let sessions = crate::node::sessions::read_rows(d)?;
+            let sessions = crate::node::sessions::read_rows_bounded(d, SESSIONS_PAGE_ROWS)?;
             let n = d.array().map_err(|_| bad())?;
             if n != sessions.len() {
                 return Err(bad());
@@ -3536,6 +3601,30 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 summaries,
                 more,
             });
+        }
+        (T_SESSION_LIFECYCLE, 4) => {
+            let sessions = crate::node::sessions::read_rows_bounded(d, SESSIONS_PAGE_ROWS)?;
+            let n = d.array()?;
+            if n != sessions.len() || n > SESSIONS_PAGE_ROWS {
+                return Err(Error::MalformedIpc("Session lifecycle rows"));
+            }
+            let mut rows = Vec::with_capacity(n);
+            for session in sessions {
+                let cursor = read_lifecycle_cursor(d)?;
+                if cursor.opening != session.opening
+                    || Some(cursor.at_millis)
+                        != if cursor.ended {
+                            session.ended_millis
+                        } else {
+                            Some(session.opened_millis)
+                        }
+                {
+                    return Err(Error::MalformedIpc("Session lifecycle row binding"));
+                }
+                rows.push(crate::node::sessions::LifecycleRow { session, cursor });
+            }
+            let older = flag(d, "Session lifecycle older")?;
+            return Ok(Frame::SessionLifecyclePage { rows, older });
         }
         (T_DECISIONS, 2) => {
             let bad = || Error::MalformedIpc("ipc decisions");
@@ -4102,6 +4191,23 @@ fn text_header(bytes: u64) -> Vec<u8> {
     header
 }
 
+fn put_lifecycle_cursor(e: &mut Encoder, cursor: &crate::node::sessions::LifecycleCursor) {
+    e.array(3)
+        .uint(cursor.at_millis)
+        .bytes(&cursor.opening)
+        .uint(u64::from(cursor.ended));
+}
+fn read_lifecycle_cursor(d: &mut Decoder<'_>) -> Result<crate::node::sessions::LifecycleCursor> {
+    if d.array()? != 3 {
+        return Err(Error::MalformedIpc("Session lifecycle cursor"));
+    }
+    Ok(crate::node::sessions::LifecycleCursor {
+        at_millis: d.uint()?,
+        opening: digest(d)?,
+        ended: flag(d, "Session lifecycle ended")?,
+    })
+}
+
 /// Existing SessionsPage wire bytes, produced from at most one logical page of
 /// compact references. Arbitrarily large metadata is decoded a bounded chunk at
 /// a time, with current room/drive checks before every continuation.
@@ -4112,27 +4218,44 @@ async fn write_sessions(
     after: Option<Digest32>,
     whole: bool,
     exact: Option<(Digest32, String)>,
+    lifecycle: Option<(Option<crate::node::sessions::LifecycleCursor>, Option<u64>)>,
     writing: &std::sync::atomic::AtomicBool,
 ) -> Result<bool> {
     use crate::node::channel::session_projection::{FieldKind, Query, Reply};
-    let query = match exact {
-        Some((node, id)) => Query::Exact { node, id },
-        None => Query::Page {
-            after,
-            revision: None,
+    let query = if let Some((before, not_before)) = lifecycle {
+        Query::Lifecycle {
+            before,
+            not_before,
             limit: SESSIONS_PAGE_ROWS,
-        },
+        }
+    } else {
+        match exact {
+            Some((node, id)) => Query::Exact { node, id },
+            None => Query::Page {
+                after,
+                revision: None,
+                limit: SESSIONS_PAGE_ROWS,
+            },
+        }
     };
     let selected = tokio::select! {
         result = session_projection(handle, room, query) => result,
         () = subscriber_gone(stream) => return Ok(false),
     };
-    let (rows, more, revision) = match selected {
+    let (rows, more, revision, cursors) = match selected {
         Ok(Reply::Page {
             rows,
             more,
             revision,
-        }) => (rows, more, revision),
+        }) => (rows, more, revision, None),
+        Ok(Reply::Lifecycle {
+            rows,
+            older,
+            revision,
+        }) => {
+            let (rows, cursors): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+            (rows, older, revision, Some(cursors))
+        }
         Ok(_) => return Err(Error::MalformedIpc("unexpected Session selection answer")),
         Err(reason) => {
             found_frame(stream, &Frame::Error { reason }.to_bytes(), writing).await?;
@@ -4156,7 +4279,13 @@ async fn write_sessions(
     let mut prefix = Encoder::new();
     prefix
         .array(if whole { 2 } else { 4 })
-        .uint(if whole { T_SESSIONS } else { T_SESSIONS_PAGE })
+        .uint(if whole {
+            T_SESSIONS
+        } else if cursors.is_some() {
+            T_SESSION_LIFECYCLE
+        } else {
+            T_SESSIONS_PAGE
+        })
         .array(rows.len());
     let mut offset = 0usize;
     if rows.is_empty() && whole {
@@ -4231,7 +4360,7 @@ async fn write_sessions(
                 return Ok(true);
             }
         }
-        if !whole {
+        if !whole && cursors.is_none() {
             // The summary currently uses the activity index; no metadata string is
             // needed for its identity, count or permission decision.
             summaries.push(
@@ -4273,13 +4402,20 @@ async fn write_sessions(
     }
     if !whole {
         let mut suffix = Encoder::new();
-        suffix.array(summaries.len());
-        for summary in summaries {
-            suffix
-                .array(3)
-                .uint(summary.entries)
-                .bytes(summary.newest.as_ref().map_or(&[][..], |hash| &hash[..]))
-                .uint(u64::from(summary.waiting));
+        if let Some(cursors) = cursors {
+            suffix.array(cursors.len());
+            for cursor in cursors {
+                put_lifecycle_cursor(&mut suffix, &cursor);
+            }
+        } else {
+            suffix.array(summaries.len());
+            for summary in summaries {
+                suffix
+                    .array(3)
+                    .uint(summary.entries)
+                    .bytes(summary.newest.as_ref().map_or(&[][..], |hash| &hash[..]))
+                    .uint(u64::from(summary.waiting));
+            }
         }
         suffix.uint(u64::from(more));
         reply_part(stream, &suffix.finish(), &mut offset, false, writing).await?;
@@ -4790,19 +4926,26 @@ async fn serve_requests(
             };
         }
         let sessions = match &request {
-            Request::Sessions { channel_id } => Some((*channel_id, None, true, None)),
-            Request::SessionsPage { channel_id, after } => Some((*channel_id, *after, false, None)),
+            Request::Sessions { channel_id } => Some((*channel_id, None, true, None, None)),
+            Request::SessionsPage { channel_id, after } => {
+                Some((*channel_id, *after, false, None, None))
+            }
             Request::SessionLookup {
                 channel_id,
                 node,
                 id,
-            } => Some((*channel_id, None, false, Some((*node, id.clone())))),
+            } => Some((*channel_id, None, false, Some((*node, id.clone())), None)),
+            Request::SessionLifecycle {
+                channel_id,
+                before,
+                not_before,
+            } => Some((*channel_id, None, false, None, Some((*before, *not_before)))),
             _ => None,
         };
-        if let Some((room, after, whole, exact)) = sessions {
+        if let Some((room, after, whole, exact, lifecycle)) = sessions {
             let writing = std::sync::atomic::AtomicBool::new(false);
             tokio::select! {
-                result = write_sessions(&mut stream, handle, room, after, whole, exact, &writing) => {
+                result = write_sessions(&mut stream, handle, room, after, whole, exact, lifecycle, &writing) => {
                     if !result? { return Ok(()); }
                 },
                 () = node_detached(&mut watch) => {
@@ -4885,6 +5028,7 @@ async fn serve_requests(
                 | Frame::SessionPage { .. }
                 | Frame::Sessions { .. }
                 | Frame::SessionsPage { .. }
+                | Frame::SessionLifecyclePage { .. }
                 | Frame::PullStates { .. }
                 | Frame::Decisions { .. }
                 | Frame::Offers { .. }
@@ -5918,7 +6062,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 reason: other.to_string(),
             },
         },
-        Request::Sessions { .. } | Request::SessionsPage { .. } | Request::SessionLookup { .. } => Frame::Error {
+        Request::Sessions { .. } | Request::SessionsPage { .. } | Request::SessionLookup { .. } | Request::SessionLifecycle { .. } => Frame::Error {
             reason: "Sessions require a reply stream".into(),
         },
         Request::Services { channel_id } => match handle.open_detail(channel_id).await {
@@ -7067,6 +7211,27 @@ impl IpcClient {
     ) -> Result<Frame> {
         let reply = self
             .request(&Request::SessionsPage { channel_id, after })
+            .await?;
+        Ok(self.older_daemon(reply))
+    }
+
+    /// One bounded chronological lifecycle page for the All timeline. The oldest
+    /// returned cursor continues backward; `older` is scoped to `not_before`.
+    ///
+    /// # Errors
+    /// The node cannot be reached or answers with a malformed frame.
+    pub async fn session_lifecycle(
+        &mut self,
+        channel_id: Digest32,
+        before: Option<crate::node::sessions::LifecycleCursor>,
+        not_before: Option<u64>,
+    ) -> Result<Frame> {
+        let reply = self
+            .request(&Request::SessionLifecycle {
+                channel_id,
+                before,
+                not_before,
+            })
             .await?;
         Ok(self.older_daemon(reply))
     }

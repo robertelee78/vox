@@ -40,9 +40,15 @@ pub(super) enum Tree {
     Counts,
     AuthorOpenings,
     OpenCounts,
+    ActivityFacts,
+    ActivityRaw,
+    ActivityCounts,
+    ActivitySessions,
+    ActivityCreated,
+    Lifecycle,
 }
 
-const TREES: usize = 20;
+const TREES: usize = 26;
 
 impl Tree {
     fn index(self) -> usize {
@@ -67,6 +73,12 @@ impl Tree {
             Self::Counts => 17,
             Self::AuthorOpenings => 18,
             Self::OpenCounts => 19,
+            Self::ActivityFacts => 20,
+            Self::ActivityRaw => 21,
+            Self::ActivityCounts => 22,
+            Self::ActivitySessions => 23,
+            Self::ActivityCreated => 24,
+            Self::Lifecycle => 25,
         }
     }
 }
@@ -535,6 +547,7 @@ impl<'a, 's> Write<'a, 's> {
             Tree::Counts,
             Tree::AuthorOpenings,
             Tree::OpenCounts,
+            Tree::Lifecycle,
         ] {
             std::mem::swap(
                 &mut self.header.roots[tree.index()],
@@ -573,6 +586,12 @@ impl<'a, 's> Write<'a, 's> {
             Tree::Counts,
             Tree::AuthorOpenings,
             Tree::OpenCounts,
+            Tree::ActivityFacts,
+            Tree::ActivityRaw,
+            Tree::ActivityCounts,
+            Tree::ActivitySessions,
+            Tree::ActivityCreated,
+            Tree::Lifecycle,
         ];
         self.working = true;
         for _ in 0..limit {
@@ -600,6 +619,11 @@ impl<'a, 's> Write<'a, 's> {
                         | Tree::Counts
                         | Tree::AuthorOpenings
                         | Tree::OpenCounts
+                        | Tree::ActivityRaw
+                        | Tree::ActivityCounts
+                        | Tree::ActivitySessions
+                        | Tree::ActivityCreated
+                        | Tree::Lifecycle
                 ) {
                     self.delete_descriptor(id)?;
                 }

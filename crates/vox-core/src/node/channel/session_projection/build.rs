@@ -445,7 +445,20 @@ fn fold(index: &mut Write<'_, '_>, event: Event) -> Result<()> {
     let mut key = [0; 64];
     key[..32].copy_from_slice(&row.node);
     key[32..40].copy_from_slice(&id.to_be_bytes());
-    index.set(Tree::AuthorOpenings, key, Some(id))
+    index.set(Tree::AuthorOpenings, key, Some(id))?;
+    index.set(
+        Tree::Lifecycle,
+        super::query::lifecycle_key(&row.node, row.position.created, id, false),
+        Some(id),
+    )?;
+    if let Some(end) = row.ended {
+        index.set(
+            Tree::Lifecycle,
+            super::query::lifecycle_key(&row.node, end.position.created, id, true),
+            Some(id),
+        )?;
+    }
+    Ok(())
 }
 
 fn advance_phase(index: &mut Write<'_, '_>, phase: u8) -> Result<()> {

@@ -35,6 +35,26 @@ pub struct SessionRow {
     pub can_drive: bool,
 }
 
+/// A position in the chronological opening/end notices of one saved room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LifecycleCursor {
+    /// The opening or end time, in milliseconds.
+    pub at_millis: u64,
+    /// The Session's opening entry, used to validate the retained position.
+    pub opening: Digest32,
+    /// An end notice rather than an opening.
+    pub ended: bool,
+}
+
+/// One lifecycle notice with complete current metadata for its usual label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleRow {
+    /// Complete metadata; large fields are carried across bounded transport chunks.
+    pub session: SessionRow,
+    /// This notice's exact position and kind.
+    pub cursor: LifecycleCursor,
+}
+
 /// The room's currently visible Sessions, oldest opening first: this node's own and those of
 /// authors granting it drive (ADR-031 SA-1/SA-2). Retained records alone never grant discovery.
 /// Each `session` entry opens one; a later `session-end` from the same node and session ends it.
@@ -461,18 +481,22 @@ async fn post(
 pub(crate) fn put_rows(e: &mut crate::cbor::Encoder, rows: &[SessionRow]) {
     e.array(rows.len());
     for r in rows {
-        e.array(10)
-            .bytes(&r.node)
-            .text(&r.id)
-            .text(r.name.as_deref().unwrap_or_default())
-            .text(&r.harness)
-            .uint(u64::from(r.open))
-            .uint(r.opened_millis)
-            .uint(r.ended_millis.unwrap_or(0))
-            .bytes(&r.opening)
-            .bytes(r.ended.as_ref().map_or(&[][..], |d| &d[..]))
-            .uint(u64::from(r.can_drive));
+        put_row(e, r);
     }
+}
+
+pub(crate) fn put_row(e: &mut crate::cbor::Encoder, r: &SessionRow) {
+    e.array(10)
+        .bytes(&r.node)
+        .text(&r.id)
+        .text(r.name.as_deref().unwrap_or_default())
+        .text(&r.harness)
+        .uint(u64::from(r.open))
+        .uint(r.opened_millis)
+        .uint(r.ended_millis.unwrap_or(0))
+        .bytes(&r.opening)
+        .bytes(r.ended.as_ref().map_or(&[][..], |d| &d[..]))
+        .uint(u64::from(r.can_drive));
 }
 
 /// Read what [`put_rows`] wrote.
@@ -480,12 +504,22 @@ pub(crate) fn put_rows(e: &mut crate::cbor::Encoder, rows: &[SessionRow]) {
 /// # Errors
 /// [`crate::error::Error::MalformedIpc`] for anything else.
 pub(crate) fn read_rows(d: &mut crate::cbor::Decoder<'_>) -> crate::error::Result<Vec<SessionRow>> {
+    read_rows_bounded(d, usize::MAX)
+}
+
+pub(crate) fn read_rows_bounded(
+    d: &mut crate::cbor::Decoder<'_>,
+    limit: usize,
+) -> crate::error::Result<Vec<SessionRow>> {
     use crate::error::Error;
     let bad = |what: &'static str| move |_| Error::MalformedIpc(what);
     let digest = |b: &[u8]| {
         Digest32::try_from(b).map_err(|_| Error::MalformedIpc("ipc session digest length"))
     };
     let n = d.array().map_err(bad("ipc sessions"))?;
+    if n > limit {
+        return Err(Error::MalformedIpc("ipc Session page row count"));
+    }
     let mut rows = Vec::with_capacity(n.min(1024));
     for _ in 0..n {
         if d.array().map_err(bad("ipc session row"))? != 10 {
