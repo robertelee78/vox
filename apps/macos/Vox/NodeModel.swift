@@ -42,6 +42,7 @@ final class NodeModel: ObservableObject {
         /// Other unread messages: new to the room, and coordination traffic.
         var new = 0
         var coordination = 0
+        var unreadScanLimited = false
         /// Approvals and questions waiting on this node in Sessions it may drive here (ADR-029
         /// CL-2).
         var waiting = 0
@@ -874,61 +875,68 @@ final class NodeModel: ObservableObject {
     /// Rooms whose unread was counted from what the node recorded as read.
     private var seeded: Set<String> = []
 
-    /// Each open room's unread, the first time it is seen, from what the node recorded as read
-    /// (ADR-028 R-8): what came while the app was closed. The node's events count from there.
+    /// Only scalar facts are retained; unread bodies remain in the node's store.
     func seedUnread() async {
         for room in rooms where room.open && !seeded.contains(room.id) {
-            guard let rows = try? await client.unread(room: room.id) else { continue }
-            seeded.insert(room.id)
-            for message in rows { count(message, in: room.id) }
+            do { _ = try await readUnreadSummary(room.id) }
+            catch { reportBackground(error) }
         }
     }
 
-    /// Events missed while the daemon was away are reconciled with its current read state.
-    /// This also removes messages another client marked read during the outage.
     private func reconcileUnread() async {
         for room in rooms where room.open {
-            do {
-                let rows = try await client.unread(room: room.id)
-                let ids = Set(rows.map(\.id))
-                for id in Array(counted[room.id]?.keys ?? Dictionary<String, RoomMessage>().keys)
-                    where !ids.contains(id) { uncount(id, in: room.id) }
-                for message in rows { count(message, in: room.id) }
-                seeded.insert(room.id)
-            } catch { reportBackground(error) }
+            do { _ = try await readUnreadSummary(room.id) }
+            catch { reportBackground(error) }
         }
     }
 
-    /// Each room's unread messages, by id: counted once each, from what the node recorded as
-    /// unread and from what arrives, and no longer counted once drawn in view with the window in
-    /// front ([`drawn`]). Selecting a room reads nothing (ADR-028 R-6; the app panel's D18).
-    private var counted: [String: [String: RoomMessage]] = [:]
+    @discardableResult
+    private func readUnreadSummary(_ room: String) async throws -> RoomUnread {
+        let epoch = nodeObservationEpoch
+        let facts = try await client.unreadSummary(room: room)
+        guard epoch == nodeObservationEpoch, !Task.isCancelled,
+              let i = rooms.firstIndex(where: { $0.id == room && $0.open }) else {
+            throw CancellationError()
+        }
+        rooms[i].addressed = Int(clamping: facts.addressed)
+        rooms[i].urgent = Int(clamping: facts.urgent)
+        rooms[i].new = Int(clamping: facts.new)
+        rooms[i].coordination = Int(clamping: facts.coordination)
+        rooms[i].unreadScanLimited = facts.scanLimited
+        seeded.insert(room)
+        return facts
+    }
 
-    /// `message` counted unread in `room`, once: never this node's own.
+    /// Coalesce live events to one reader, rather than a body cache or a task per message.
+    /// The pending set contains only identities of currently open rooms, never message IDs.
+    private var unreadDirty: Set<String> = []
+    private var unreadRefreshing: Task<Void, Never>?
+
+    private func scheduleUnread(_ room: String) {
+        guard rooms.contains(where: { $0.id == room && $0.open }) else { return }
+        unreadDirty.insert(room)
+        guard unreadRefreshing == nil else { return }
+        let epoch = nodeObservationEpoch
+        unreadRefreshing = Task { [weak self] in
+            guard let self else { return }
+            defer { self.unreadRefreshing = nil }
+            while epoch == self.nodeObservationEpoch, !Task.isCancelled,
+                  let id = self.unreadDirty.first {
+                self.unreadDirty.remove(id)
+                do { _ = try await self.readUnreadSummary(id) }
+                catch {
+                    if epoch == self.nodeObservationEpoch && !Task.isCancelled {
+                        self.reportBackground(error)
+                    }
+                }
+            }
+            if epoch != self.nodeObservationEpoch { self.unreadDirty.removeAll() }
+        }
+    }
+
     private func count(_ message: RoomMessage, in room: String) {
-        guard message.author != me, counted[room]?[message.id] == nil,
-              let i = rooms.firstIndex(where: { $0.id == room }) else { return }
-        counted[room, default: [:]][message.id] = message
-        switch message.level {
-        case .toYou:
-            rooms[i].addressed += 1
-            if message.urgent { rooms[i].urgent += 1 }
-        case .new: rooms[i].new += 1
-        case .coordination: rooms[i].coordination += 1
-        }
-    }
-
-    /// Message `id` seen in `room`: no longer counted.
-    private func uncount(_ id: String, in room: String) {
-        guard let message = counted[room]?.removeValue(forKey: id),
-              let i = rooms.firstIndex(where: { $0.id == room }) else { return }
-        switch message.level {
-        case .toYou:
-            rooms[i].addressed = max(0, rooms[i].addressed - 1)
-            if message.urgent { rooms[i].urgent = max(0, rooms[i].urgent - 1) }
-        case .new: rooms[i].new = max(0, rooms[i].new - 1)
-        case .coordination: rooms[i].coordination = max(0, rooms[i].coordination - 1)
-        }
+        guard message.author != me else { return }
+        scheduleUnread(room)
     }
 
     /// The rooms, the keyring, the nodes on this Mac and the peers, read again.
@@ -942,6 +950,7 @@ final class NodeModel: ObservableObject {
                     room.urgent = held.urgent
                     room.new = held.new
                     room.coordination = held.coordination
+                    room.unreadScanLimited = held.unreadScanLimited
                     room.waiting = held.waiting
                     room.offered = held.offered
                     room.offerSaid = held.offerSaid
@@ -1036,20 +1045,15 @@ final class NodeModel: ObservableObject {
         let generation = roomReadGeneration
         let messageRevision = roomMessageRevision
         roomNeedsPage = true
-        if !seeded.contains(id), let rows = try? await client.unread(room: id) {
-            seeded.insert(id)
-            for message in rows { count(message, in: id) }
-        }
         do {
             // Each read lands only if the room is still the one on screen: a quick switch must not
             // draw one room's messages under another.
             // What was unread as the room came on screen, before showing it marks it read: the
             // timeline's unread line goes above the first of it (ADR-028 R-8).
-            let unread = ((try? await client.unread(room: id)) ?? []).filter { $0.author != me }
+            let unread = try await readUnreadSummary(id)
             let page = try await client.roomRead(room: id)
             let read = page.messages
             guard generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
-            let unreadIDs = Set(unread.map(\.id))
             let services = try await client.servicesPage(room: id, after: nil, revision: nil)
             let rows = try await memberRows(id)
             let kept = (try? await client.retention(room: id)) ?? ""
@@ -1062,8 +1066,8 @@ final class NodeModel: ObservableObject {
             // have succeeded. An ordinary refresh must not publish a half-empty room.
             roomOlder = page.older
             roomBefore = page.before
-            unreadFrom = read.first { unreadIDs.contains($0.id) }?.id
-            unreadCount = unread.count
+            unreadFrom = unread.first
+            unreadCount = Int(clamping: unread.addressed + unread.new + unread.coordination)
             messages = read
             roomNeedsPage = false
             roomServices = services.shared
@@ -2290,7 +2294,6 @@ final class NodeModel: ObservableObject {
         }
         readLog.debug("drawn: \(message.id, privacy: .public) in \(room, privacy: .public)")
         marked.insert(message.id)
-        uncount(message.id, in: room)
         unmarked[room, default: []].append(message.id)
         guard flushing == nil else { return }
         flushing = Task { [weak self] in
@@ -2303,6 +2306,7 @@ final class NodeModel: ObservableObject {
             for (room, ids) in batches {
                 do {
                     try await self.client.markRead(room: room, ids: ids)
+                    self.scheduleUnread(room)
                     readLog.debug("marked read: \(ids.count) in \(room, privacy: .public)")
                 } catch {
                     readLog.debug("mark read failed in \(room, privacy: .public): \(sentence(error), privacy: .public)")

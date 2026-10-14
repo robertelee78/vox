@@ -484,6 +484,9 @@ private struct RoomRow: View {
                         .foregroundStyle(waits ? VoxTokens.Colors.bgBase : VoxTokens.Colors.textPrimary)
                         .padding(.horizontal, 6).frame(minWidth: 18, minHeight: 18)
                         .background(Capsule().fill(waits ? VoxTokens.Colors.accent : VoxTokens.Colors.accentDeep))
+                        .help(room.unreadScanLimited
+                              ? "Unread messages in the newest 1,000 rows; older activity has not been counted."
+                              : "Unread messages and waiting requests.")
                         .accessibilityIdentifier("room-badge-\(room.name)")
                 }
             }
