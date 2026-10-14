@@ -28,6 +28,7 @@ type Key = [u8; 64];
 
 mod dag_facts;
 mod render_facts;
+mod retention_facts;
 pub(crate) mod session_tree;
 pub use dag_facts::OrderView;
 pub(crate) use render_facts::{Filter, RenderFact, RenderView};
@@ -79,11 +80,12 @@ pub(crate) struct Roots {
     children: u64,
     referenced: u64,
     rendered: render_facts::Roots,
+    retained: retention_facts::Roots,
 }
 
 impl Roots {
     fn write(self, e: &mut Encoder) {
-        e.array(7)
+        e.array(8)
             .uint(self.sequence)
             .uint(self.hash)
             .uint(self.clock)
@@ -91,10 +93,11 @@ impl Roots {
             .uint(self.children)
             .uint(self.referenced);
         self.rendered.write(e);
+        self.retained.write(e);
     }
     fn read(d: &mut Decoder<'_>) -> Result<Self> {
         let arity = d.array()?;
-        if !matches!(arity, 2 | 6 | 7) {
+        if !matches!(arity, 2 | 6 | 7 | 8) {
             return Err(invalid("entry roots arity"));
         }
         Ok(Self {
@@ -104,10 +107,15 @@ impl Roots {
             order: if arity >= 6 { d.uint()? } else { 0 },
             children: if arity >= 6 { d.uint()? } else { 0 },
             referenced: if arity >= 6 { d.uint()? } else { 0 },
-            rendered: if arity == 7 {
+            rendered: if arity >= 7 {
                 render_facts::Roots::read(d)?
             } else {
                 render_facts::Roots::default()
+            },
+            retained: if arity >= 8 {
+                retention_facts::Roots::read(d)?
+            } else {
+                retention_facts::Roots::default()
             },
         })
     }
@@ -161,6 +169,8 @@ struct Directory {
     render_ready: bool,
     render_cursor: Option<u64>,
     history_instance: [u8; 16],
+    retention_stage: u8,
+    retention_cursor: Option<u64>,
 }
 
 impl Default for Directory {
@@ -181,6 +191,8 @@ impl Default for Directory {
             render_ready: false,
             render_cursor: None,
             history_instance: [0; 16],
+            retention_stage: 0,
+            retention_cursor: None,
         }
     }
 }
@@ -197,7 +209,7 @@ impl Directory {
     }
     fn bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
-        e.array(16).uint(4);
+        e.array(18).uint(5);
         self.active.write(&mut e);
         self.provisional.write(&mut e);
         e.uint(self.next_page)
@@ -253,7 +265,16 @@ impl Directory {
                 e.array(0);
             }
         }
-        e.bytes(&self.history_instance);
+        e.bytes(&self.history_instance)
+            .uint(u64::from(self.retention_stage));
+        match self.retention_cursor {
+            Some(id) => {
+                e.array(1).uint(id);
+            }
+            None => {
+                e.array(0);
+            }
+        }
         Zeroizing::new(e.finish())
     }
     fn parse(bytes: &[u8]) -> Result<Self> {
@@ -263,7 +284,10 @@ impl Directory {
         let mut d = Decoder::new(bytes);
         let arity = d.array()?;
         let version = d.uint()?;
-        if !matches!((arity, version), (8, 1) | (12, 2) | (15, 3) | (16, 4)) {
+        if !matches!(
+            (arity, version),
+            (8, 1) | (12, 2) | (15, 3) | (16, 4) | (18, 5)
+        ) {
             return Err(invalid("entry directory format"));
         }
         let active = Roots::read(&mut d)?;
@@ -353,8 +377,24 @@ impl Directory {
         } else {
             [0; 16]
         };
+        let retention_stage = if version >= 5 {
+            u8::try_from(d.uint()?).map_err(|_| invalid("retention stage"))?
+        } else {
+            0
+        };
+        let retention_cursor = if version >= 5 {
+            match d.array()? {
+                0 => None,
+                1 => Some(d.uint()?),
+                _ => return Err(invalid("retention cursor")),
+            }
+        } else {
+            None
+        };
         d.finish()?;
-        if next_page == 0
+        if retention_stage > 2
+            || (retention_stage == 2 && retention_cursor.is_some())
+            || next_page == 0
             || next_provisional == 0
             || [
                 active.sequence,
@@ -369,6 +409,7 @@ impl Directory {
             .iter()
             .any(|id| *id >= next_page)
             || !active.rendered.valid_for(next_page)
+            || !active.retained.valid_for(next_page)
             || !work.valid_for(next_page, phase)
             || matches!(phase, Phase::Building | Phase::Switched) != promotion.is_some()
         {
@@ -393,6 +434,7 @@ impl Directory {
                 || p.work.children >= next_page
                 || p.work.referenced >= next_page
                 || !p.work.rendered.valid_for(next_page)
+                || !p.work.retained.valid_for(next_page)
                 || p.retired >= next_page
             {
                 return Err(invalid("promotion bounds"));
@@ -414,6 +456,8 @@ impl Directory {
             render_ready,
             render_cursor,
             history_instance,
+            retention_stage,
+            retention_cursor,
         })
     }
 }
@@ -462,6 +506,7 @@ enum Value {
     Present,
     Rendered(RenderFact),
     Owed(render_facts::OwedFact),
+    Retained(crate::node::retention::Tracked),
 }
 impl Value {
     fn locator(self) -> Result<Locator> {
@@ -481,6 +526,7 @@ impl Value {
             }
             Self::Rendered(fact) => fact.write(e),
             Self::Owed(fact) => fact.write(e),
+            Self::Retained(fact) => retention_facts::write_fact(fact, e),
         }
     }
     fn read(d: &mut Decoder<'_>) -> Result<Self> {
@@ -501,6 +547,7 @@ impl Value {
             1 if d.uint()? == 2 => Ok(Self::Present),
             5 if d.uint()? == 3 => Ok(Self::Rendered(RenderFact::read(d)?)),
             4 if d.uint()? == 4 => Ok(Self::Owed(render_facts::OwedFact::read(d)?)),
+            6 if d.uint()? == 5 => Ok(Self::Retained(retention_facts::read_fact(d)?)),
             _ => Err(invalid("entry page value kind")),
         }
     }

@@ -286,8 +286,7 @@ impl ChannelState {
                 "Session declaration has no log page",
             ))?;
         let first_seen = self
-            .retention
-            .get(&declaration)
+            .retention_get_in(transaction, &declaration)?
             .map_or(now_ms, |t| t.first_seen_ms);
         self.legacy_sessions.put(
             page_id(log_id, true)?,

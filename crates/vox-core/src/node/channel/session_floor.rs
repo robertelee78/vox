@@ -261,14 +261,26 @@ impl ChannelState {
         store: &Store,
         peer: &Digest32,
         wants: &[crate::log::sync::WantRange],
+        now_ms: u64,
     ) -> Result<Vec<Vec<u8>>> {
+        self.now_hint = self.now_hint.max(now_ms);
         self.index_session_floors(store)?;
         let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
         crate::log::sync::entries_for_wants(&self.dag, &entries, wants)?
             .into_iter()
             .map(|wire| {
                 let mut entry = Entry::from_wire(&wire)?;
-                if !self.session_body_allowed(&entry, peer) {
+                // Physical expiry is page-bounded. The saved age still withholds an
+                // expired body immediately, including while a shorter TTL drains a backlog.
+                let expired = entries.retention(&entry.entry_hash())?.is_some_and(|t| {
+                    let ttl = if t.steps {
+                        self.effective_step_retention()
+                    } else {
+                        self.effective_retention()
+                    };
+                    expired_at(t.base(), self.now_hint, ttl)
+                });
+                if expired || !self.session_body_allowed(&entry, peer) {
                     entry.payload = None;
                 }
                 Ok(entry.to_wire())
