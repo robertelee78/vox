@@ -558,34 +558,9 @@ impl Store {
     /// many rows went. The freed pages still hold the old bytes until the space is reused; a
     /// caller that must leave none follows with [`Store::rewrite_fresh`].
     pub fn purge_channel(&self, channel: &Digest32) -> Result<usize> {
-        let txn = self.begin_write()?;
-        let mut gone = 0usize;
-        {
-            let mut t = txn.open_table(SEGMENTS).map_err(storage("open segments"))?;
-            let lo: SegmentKey = (*channel, 0, 0);
-            let hi: SegmentKey = (*channel, u8::MAX, u64::MAX);
-            let keys: Vec<SegmentKey> = t
-                .range(lo..=hi)
-                .map_err(storage("range segments"))?
-                .map(|item| item.map(|(k, _)| k.value()))
-                .collect::<std::result::Result<_, _>>()
-                .map_err(storage("iterate segments"))?;
-            for k in keys {
-                if t.remove(k).map_err(storage("delete segment"))?.is_some() {
-                    gone += 1;
-                }
-            }
-            let mut w = txn
-                .open_table(SEK_WRAPS)
-                .map_err(storage("open sek_wraps"))?;
-            if w.remove(*channel)
-                .map_err(storage("delete sek wrap"))?
-                .is_some()
-            {
-                gone += 1;
-            }
-        }
-        txn.commit().map_err(storage("commit"))?;
+        let mut batch = self.batch()?;
+        let gone = batch.purge_channel(channel)?;
+        batch.commit()?;
         Ok(gone)
     }
 
@@ -783,6 +758,49 @@ impl Batch<'_> {
             .map(|(key, value)| Ok((key.value().2, sealed_segment_from_slice(value.value())?)))
             .transpose();
         result
+    }
+
+    /// Delete one room's rows and wrap in this transaction, one key at a time.
+    /// Callers can commit a bounded cleanup receipt with the deletion itself.
+    pub(crate) fn purge_channel(&mut self, channel: &Digest32) -> Result<usize> {
+        let mut gone = 0usize;
+        let mut table = self
+            .txn
+            .open_table(SEGMENTS)
+            .map_err(storage("open segments"))?;
+        let low: SegmentKey = (*channel, 0, 0);
+        let high: SegmentKey = (*channel, u8::MAX, u64::MAX);
+        loop {
+            let next = table
+                .range(low..=high)
+                .map_err(storage("range segments"))?
+                .next()
+                .transpose()
+                .map_err(storage("iterate segments"))?
+                .map(|(key, _)| key.value());
+            let Some(key) = next else {
+                break;
+            };
+            if table
+                .remove(key)
+                .map_err(storage("delete segment"))?
+                .is_some()
+            {
+                gone += 1;
+            }
+        }
+        let mut wraps = self
+            .txn
+            .open_table(SEK_WRAPS)
+            .map_err(storage("open sek_wraps"))?;
+        if wraps
+            .remove(*channel)
+            .map_err(storage("delete sek wrap"))?
+            .is_some()
+        {
+            gone += 1;
+        }
+        Ok(gone)
     }
 
     /// Queue a sealed segment write.

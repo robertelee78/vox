@@ -5540,6 +5540,7 @@ impl Node {
                         continue;
                     }
                     let outcome = self.handle(command).await;
+                    self.resume_session_retirements();
                     if self
                         .drive_changed
                         .swap(false, std::sync::atomic::Ordering::Relaxed)
@@ -5587,6 +5588,7 @@ impl Node {
                     }
                     self.note_peers_seen();
                     self.recover_storage();
+                    self.resume_session_retirements();
                     ingress_wake.notify_one();
                     self.retry_upgrades_if_due().await;
                     self.maintain_prekeys();
@@ -5762,7 +5764,7 @@ impl Node {
                     .as_ref()
                     .ok_or(crate::error::Error::Profile("the node is locked"))
                     .and_then(|profile| {
-                        crate::node::session_ingress::purge_room(profile, &channel_id)
+                        crate::node::session_ingress::complete_retirement(profile, &channel_id)
                     });
                 if result.is_ok() {
                     self.session_rooms_retiring.remove(&channel_id);
@@ -10551,6 +10553,21 @@ impl Node {
                     let _ = reply.send(Outcome::Failed(f));
                     return;
                 }
+            }
+        }
+        // A prior deletion's owner must finish clearing its saved bindings before the same
+        // room can be rejoined; otherwise that cleanup could erase the new binding.
+        if let Some(profile) = self.profile.as_ref() {
+            match crate::node::session_ingress::retirements(profile) {
+                Ok(rooms) if rooms.contains(&parsed.channel_id) => {
+                    let _ = reply.send(Outcome::Failed(Fault::SessionCleanupBusy));
+                    return;
+                }
+                Err(error) => {
+                    let _ = reply.send(Outcome::Failed(fault_of(&error)));
+                    return;
+                }
+                Ok(_) => {}
             }
         }
         if self.channels.contains_key(&parsed.channel_id) {
@@ -16455,11 +16472,16 @@ impl Node {
         }
         // Accepted Session activity is node-scoped so it survives detach, but the operator's
         // explicit deletion of its captured room removes it with that room's other data.
-        if let Err(e) = crate::node::session_ingress::purge_room(profile, channel_id) {
+        if let Err(e) =
+            crate::node::session_ingress::remove_room(profile, channel_id, retirement.is_some())
+        {
             return Outcome::Failed(fault_of(&e));
         }
-        if let Err(e) = profile.store().purge_channel(channel_id) {
-            return Outcome::Failed(fault_of(&e));
+        if let Some(retirement) = retirement {
+            // The corresponding bounded receipt is already durable with the deletion.
+            // Notify before rewrite_fresh: failure there must not strand owner cleanup.
+            self.session_rooms_retiring.insert(*channel_id);
+            retirement.send(*channel_id);
         }
         if let Err(e) = profile.store().rewrite_fresh() {
             return Outcome::Failed(fault_of(&e));
@@ -16472,12 +16494,6 @@ impl Node {
         // Published before it is said: whoever is told the room is deleted and then looks
         // (`vox room list`) must not still see it.
         self.publish().await;
-        if let Some(retirement) = retirement {
-            // This is transient handoff state, bounded by the owner's capacity plus one
-            // notification it is processing. Later queued admissions cannot race deletion.
-            self.session_rooms_retiring.insert(*channel_id);
-            retirement.send(*channel_id);
-        }
         let _ = self.event_tx.send(NodeEvent::RoomRemoved {
             channel_id: *channel_id,
         });
@@ -17785,6 +17801,46 @@ impl Node {
                 })
                 .await;
         });
+    }
+
+    /// Re-send durable room-deletion cleanups after unlock, without accepting old-room work.
+    fn resume_session_retirements(&mut self) {
+        let Some(profile) = self
+            .profile
+            .as_ref()
+            .filter(|profile| profile.is_unlocked())
+        else {
+            return;
+        };
+        let Some(owner) = &self.session_room_removed else {
+            return;
+        };
+        let rooms = match crate::node::session_ingress::retirements(profile) {
+            Ok(rooms) => rooms,
+            Err(error) => {
+                self.session_ingress_error =
+                    Some(format!("Session room cleanup cannot recover: {error}"));
+                return;
+            }
+        };
+        for room in rooms {
+            if self.session_rooms_retiring.contains(&room) {
+                continue;
+            }
+            match owner.clone().try_reserve_owned() {
+                Ok(permit) => {
+                    self.session_rooms_retiring.insert(room);
+                    permit.send(room);
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => break,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.session_ingress_error = Some(
+                        "Session room cleanup owner is unavailable; restart the daemon".into(),
+                    );
+                    break;
+                }
+            }
+        }
     }
 
     /// Append one Session entry under this node's drive key (ADR-029 SC-1, SC-2), then release

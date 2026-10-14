@@ -55,6 +55,8 @@ pub type AdmissionResult = std::result::Result<Committed, AdmissionError>;
 struct Directory {
     bytes: u64,
     active: Vec<Digest32>,
+    /// Only explicit room deletions awaiting daemon registration cleanup.
+    retiring: Vec<Digest32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -132,7 +134,12 @@ fn directory(batch: &Batch<'_>, key: &Sek, node: &Digest32) -> Result<Directory>
 }
 
 fn check_directory(d: &Directory) -> Result<()> {
-    if d.active.len() > MAX_PENDING_SESSIONS
+    if d.retiring.len() > 2
+        || d.retiring
+            .iter()
+            .enumerate()
+            .any(|(i, id)| d.retiring[..i].contains(id))
+        || d.active.len() > MAX_PENDING_SESSIONS
         || d.bytes > MAX_PENDING_BYTES
         || d.active
             .iter()
@@ -182,6 +189,9 @@ pub fn admit(
     let scope = scope(profile, name);
     let mut batch = profile.store().batch()?;
     let mut directory = directory(&batch, &key, &node)?;
+    if directory.retiring.contains(&room) {
+        return Err(Error::Profile("this room was removed; its Session cleanup is pending").into());
+    }
     let mut session = session_in(&batch, &key, &scope, name)?;
     if session.head == session.next {
         if directory.active.contains(&scope) {
@@ -335,19 +345,20 @@ pub fn pending(profile: &Profile, cursor: &mut usize) -> Result<Option<Pending>>
     }))
 }
 
-/// Erase accepted pending bodies for a room the operator explicitly deletes. Other rooms and
-/// every session's next sequence survive. The inbox is capped at 64 MiB; this transaction
-/// visits one sealed item at a time and keeps only its at-most-256 scheduling directory.
-pub(crate) fn purge_room(profile: &Profile, room: &Digest32) -> Result<()> {
-    let key = key(profile)?;
-    let node = profile.fingerprint();
-    let mut batch = profile.store().batch()?;
-    let mut d = directory(&batch, &key, &node)?;
+// Other rooms and every session's next sequence survive. The inbox is capped at 64 MiB;
+// visits retain one sealed item and the at-most-256 scheduling directory.
+fn purge_pending(
+    profile: &Profile,
+    key: &Sek,
+    batch: &mut Batch<'_>,
+    d: &mut Directory,
+    room: &Digest32,
+) -> Result<()> {
     for scope in d.active.clone() {
         let segment = batch
             .get_segment(&scope, SegmentKind::SessionIngress, HEADER)?
             .ok_or(bad())?;
-        let mut session: Session = decode(&key, &scope, HEADER, &segment)?;
+        let mut session: Session = decode(key, &scope, HEADER, &segment)?;
         if session.head == 0
             || session.head >= session.next
             || scope != self::scope(profile, &session.name)
@@ -362,7 +373,7 @@ pub(crate) fn purge_room(profile: &Profile, room: &Digest32) -> Result<()> {
             if id < session.head || id >= session.next {
                 return Err(bad());
             }
-            let item: Item = decode(&key, &scope, id, &segment)?;
+            let item: Item = decode(key, &scope, id, &segment)?;
             if item.room == *room {
                 if !batch.delete_segment(&scope, SegmentKind::SessionIngress, id)? {
                     return Err(bad());
@@ -380,8 +391,44 @@ pub(crate) fn purge_room(profile: &Profile, room: &Digest32) -> Result<()> {
         if session.head == session.next {
             d.active.retain(|id| *id != scope);
         }
-        put(&mut batch, &key, &scope, HEADER, &session)?;
+        put(batch, key, &scope, HEADER, &session)?;
     }
+    Ok(())
+}
+
+/// Explicit deletion and its outstanding owner cleanup share one atomic transaction.
+pub(crate) fn remove_room(profile: &Profile, room: &Digest32, hosted: bool) -> Result<()> {
+    let key = key(profile)?;
+    let node = profile.fingerprint();
+    let mut batch = profile.store().batch()?;
+    let mut d = directory(&batch, &key, &node)?;
+    if hosted && !d.retiring.contains(room) {
+        if d.retiring.len() == 2 {
+            return Err(Error::Profile("earlier Session room cleanup is pending"));
+        }
+        d.retiring.push(*room);
+    }
+    purge_pending(profile, &key, &mut batch, &mut d, room)?;
+    batch.purge_channel(room)?;
+    put(&mut batch, &key, &node, HEADER, &d)?;
+    batch.commit()
+}
+
+/// Resume the at-most-two outstanding owner cleanups after unlock/restart.
+pub(crate) fn retirements(profile: &Profile) -> Result<Vec<Digest32>> {
+    let snapshot = profile.store().snapshot()?;
+    Ok(from_snapshot(&snapshot, &key(profile)?, &profile.fingerprint())?.retiring)
+}
+
+/// The daemon already cleared matching registration bindings and volatile tails. Preserve
+/// the durable marker on every failure; ending the actor alone never completes retirement.
+pub(crate) fn complete_retirement(profile: &Profile, room: &Digest32) -> Result<()> {
+    let key = key(profile)?;
+    let node = profile.fingerprint();
+    let mut batch = profile.store().batch()?;
+    let mut d = directory(&batch, &key, &node)?;
+    purge_pending(profile, &key, &mut batch, &mut d, room)?;
+    d.retiring.retain(|id| id != room);
     put(&mut batch, &key, &node, HEADER, &d)?;
     batch.commit()
 }

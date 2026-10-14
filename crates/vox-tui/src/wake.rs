@@ -445,7 +445,9 @@ pub fn clear_room_bindings(paths: &Paths, room: &str) -> Result<usize, String> {
     for entry in entries {
         let path = entry.map_err(|e| e.to_string())?.path();
         // Unique atomic-write staging files are never registrations.
-        if path.extension().is_some_and(|x| x == "tmp") {
+        if path.file_name().is_some_and(|name| name == NOTICES_DIR)
+            || path.extension().is_some_and(|x| x == "tmp")
+        {
             continue;
         }
         let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
@@ -466,9 +468,17 @@ pub fn clear_room_bindings(paths: &Paths, room: &str) -> Result<usize, String> {
 /// [`register`], the client's half being [`Session::from_env`]. When the session was first seen
 /// is kept from its earlier record; this turn is its last drain.
 pub fn store(paths: &Paths, reg: &Session) {
-    let Some(_lock) = registration_write(paths) else {
-        return;
-    };
+    if let Err(why) = store_checked(paths, reg) {
+        eprintln!("vox: session registration was not changed: {why}");
+    }
+}
+
+/// Store a registration before the daemon acknowledges that the session holds its node.
+///
+/// # Errors
+/// Lock contention or a failed registration write leaves the request refused.
+pub fn store_checked(paths: &Paths, reg: &Session) -> Result<(), String> {
+    let _lock = registration_lock(paths)?;
     let mut reg = reg.clone();
     let session = reg.session.clone();
     let session = session.as_str();
@@ -503,14 +513,10 @@ pub fn store(paths: &Paths, reg: &Session) {
     if let Some(mine) = reg.tmux.as_ref() {
         unbind_pane(paths, session, &mine.socket, &mine.pane);
     }
-    let dir = paths.session_dir();
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-    if let Ok(body) = serde_json::to_vec(&reg) {
-        let _ =
-            vox_core::node::paths::write_private_file_unique(&paths.session_file(session), &body);
-    }
+    vox_core::node::paths::create_private_dir(&paths.session_dir()).map_err(|e| e.to_string())?;
+    let body = serde_json::to_vec(&reg).map_err(|e| e.to_string())?;
+    vox_core::node::paths::write_private_file_unique(&paths.session_file(session), &body)
+        .map_err(|e| e.to_string())
 }
 
 /// Name `session`'s registration `name`, as its harness now calls it (ADR-029 MD-1): what an
@@ -825,13 +831,30 @@ pub fn record_idle(paths: &Paths, session: &str) {
 /// `SessionEnd`, V030-20): a session that has ended is never woken again. Its cursors stay, for a
 /// session resumed later.
 pub fn end(paths: &Paths, session: &str) {
-    let Some(_lock) = registration_write(paths) else {
-        return;
-    };
-    let _ = std::fs::remove_file(paths.session_file(session));
-    let _ = std::fs::remove_file(notices_file(paths, session));
-    let _ = std::fs::remove_file(woke_file(paths, session));
-    let _ = std::fs::remove_file(said_detached_file(paths, session));
+    if let Err(why) = end_checked(paths, session) {
+        eprintln!("vox: session end was not confirmed: {why}");
+    }
+}
+
+/// Remove the saved binding before the daemon acknowledges SessionEnd or drops its holder.
+///
+/// # Errors
+/// Lock contention or a failed removal is reported; absence already satisfies the removal.
+pub fn end_checked(paths: &Paths, session: &str) -> Result<(), String> {
+    let _lock = registration_lock(paths)?;
+    for path in [
+        paths.session_file(session),
+        notices_file(paths, session),
+        woke_file(paths, session),
+        said_detached_file(paths, session),
+    ] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(())
 }
 
 fn said_detached_file(paths: &Paths, session: &str) -> std::path::PathBuf {
