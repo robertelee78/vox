@@ -1316,13 +1316,17 @@ private struct RoomTimelineView: View {
                     .onChange(of: model.messages) { _ in markSeen() }
                     // A file dropped on the timeline, or pasted into it, is attached (M-24, F-1).
                     .onDrop(of: [.fileURL], isTargeted: nil) { providers in
-                        firstFile(in: providers) {
+                        let context = model.roomPostContext
+                        return firstFile(in: providers) {
+                            guard model.roomPostContext == context else { return }
                             tokenizeDraft(finish: true)
                             attaching = Attaching(url: $0)
                         }
                     }
                     .onPasteCommand(of: [.fileURL]) { providers in
+                        let context = model.roomPostContext
                         _ = firstFile(in: providers) {
+                            guard model.roomPostContext == context else { return }
                             tokenizeDraft(finish: true)
                             attaching = Attaching(url: $0)
                         }
@@ -1413,7 +1417,9 @@ private struct RoomTimelineView: View {
             // After the update, not inside it: a modal panel run from within a view update did
             // not open (⌘O, seen in the QE pass). The room's sheet only while the room is shown.
             guard !model.showingSession else { return }
+            let context = model.roomPostContext
             DispatchQueue.main.async {
+                guard model.roomPostContext == context else { return }
                 tokenizeDraft(finish: true)
                 if let url = chooseFile() { attaching = Attaching(url: url) }
             }
