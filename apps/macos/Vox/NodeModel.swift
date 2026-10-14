@@ -177,6 +177,9 @@ final class NodeModel: ObservableObject {
 
     @Published private(set) var roomOlder: UInt64 = 0
     private var roomBefore: String?
+    private var roomInstance: Data?
+    @Published private var roomHasNewer = false
+    private static let roomWindowLimit = 128
     @Published private var roomReadingOlder = false
 
     /// The room on screen's messages by id, for what is in view.
@@ -269,7 +272,7 @@ final class NodeModel: ObservableObject {
     /// Scroll position, independent of whether the app's window is foreground.
     @Published var timelineFollowingNewest = true
     private var sessionWindowRevision = UUID()
-    var hasNewerTimeline: Bool { showingSession && sessionPages.hasNewer }
+    var hasNewerTimeline: Bool { showingSession ? sessionPages.hasNewer : roomHasNewer }
     @Published private var sessionPages = SessionPages()
     var sessionEntries: [FfiSessionEntry] { sessionPages.entries }
     /// A notification may point to a request before the newest page. It is shown separately,
@@ -693,56 +696,64 @@ final class NodeModel: ObservableObject {
     /// not bring added as if it had: a missed or dead event stream hides a message for one turn of
     /// this loop at most (the walkthrough's WHERE-15, posted while every peer was offline, never
     /// came as an event to the reopened app).
+    private func retainedRoomEntries(room: String, instance: Data, ids: [String],
+                                     current: () -> Bool) async throws -> [RoomMessage] {
+        guard current(), !Task.isCancelled else { throw CancellationError() }
+        do {
+            let page = try await client.roomReadRetaining(room: room, node: me,
+                instance: instance, loaded: ids)
+            guard current(), !Task.isCancelled else { throw CancellationError() }
+            guard page.instance == instance else {
+                throw VoxError.Failed(reason: "The saved room changed while refreshing its messages.")
+            }
+            return page.messages
+        } catch {
+            guard current(), !Task.isCancelled else { throw CancellationError() }
+            guard ids.count > 1, case let VoxError.Failed(reason) = error,
+                  reason == "The held room selection exceeds one window's byte budget. Refresh fewer messages." else {
+                throw error
+            }
+            let middle = ids.count / 2
+            let left = try await retainedRoomEntries(room: room, instance: instance,
+                ids: Array(ids[..<middle]), current: current)
+            let right = try await retainedRoomEntries(room: room, instance: instance,
+                ids: Array(ids[middle...]), current: current)
+            return left + right
+        }
+    }
+
     private func readNewOnScreen() async {
         guard case let .room(id) = selection, ended == nil else { return }
-        let generation = roomReadGeneration
-        let messageRevision = roomMessageRevision
-        let loaded = messages.map(\.id)
+        let generation = roomReadGeneration, epoch = nodeObservationEpoch
+        let revision = roomMessageRevision, follows = timelineFollowingNewest
+        let loaded = messages.map(\.id), instance = roomInstance
+        func current() -> Bool {
+            selection == .room(id) && ended == nil && generation == roomReadGeneration
+                && epoch == nodeObservationEpoch && revision == roomMessageRevision
+                && follows == timelineFollowingNewest
+        }
         do {
-            let rows: [RoomMessage]
-            var recovery: FfiRoomRead?
-            if !roomNeedsPage, let after = messages.last?.id, after != rejectedRoomMark {
-                do {
-                    rows = try await client.read(room: id, after: after, limit: 0)
-                } catch where Self.rejectedForwardMark(error) {
-                    guard generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
-                    rejectedRoomMark = after
-                    let page = try await client.roomReadRetaining(room: id, loaded: loaded)
-                    rows = page.messages
-                    recovery = page
-                }
+            if !follows, let instance, !loaded.isEmpty {
+                let rows = try await retainedRoomEntries(room: id, instance: instance,
+                    ids: loaded, current: current)
+                guard current() else { return }
+                messages = rows
+                // Exact selection's zero metadata is not a new history cursor/count.
             } else {
-                let page = try await client.roomReadRetaining(room: id, loaded: loaded)
-                rows = page.messages
-                recovery = page
-            }
-            guard generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
-            var recoveredMembers: (rows: [MemberRow], trustsMe: Set<String>, presented: [String: String])?
-            if recovery != nil { recoveredMembers = try await memberRows(id) }
-            guard generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
-            // An event may have delivered a new body or row while the page or roster awaited.
-            // Keep that visible result and retry reanchoring instead of replacing it with an
-            // earlier snapshot. IDs alone cannot detect an owed row gaining its body.
-            if recovery != nil && messageRevision != roomMessageRevision { return }
-            let new = rows.filter { byID[$0.id] == nil && !$0.owed }
-            if let page = recovery {
-                // Keep the valid view until this same selection's replacement is ready.
+                let page = try await client.roomRead(room: id)
+                guard current() else { return }
+                roomInstance = page.instance
                 roomOlder = page.older
                 roomBefore = page.before
                 messages = page.messages
-                if let recoveredMembers {
-                    members = recoveredMembers.rows
-                    trustsMe = recoveredMembers.trustsMe
-                    for (fingerprint, name) in recoveredMembers.presented { rememberPresentation(fingerprint, name) }
-                }
-                rejectedRoomMark = nil
+                roomHasNewer = false
                 roomNeedsPage = false
+                rejectedRoomMark = nil
                 lastRead[id] = page.messages.last?.id
                 watchReads(id)
             }
-            for message in new { arrived(message, in: id) }
         } catch {
-            guard generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
+            guard current() else { return }
             reportBackground(error)
         }
     }
@@ -762,13 +773,19 @@ final class NodeModel: ObservableObject {
         }
         guard let room = roomOnScreen, let before = roomBefore, !roomReadingOlder, ended == nil else { return }
         let generation = roomReadGeneration
+        timelineFollowingNewest = false
         roomReadingOlder = true
         defer { if generation == roomReadGeneration { roomReadingOlder = false } }
         do {
             let page = try await client.roomReadOlder(room: room, before: before)
             guard generation == roomReadGeneration, roomOnScreen == room, roomBefore == before, ended == nil else { return }
             let held = Set(messages.map(\.id))
-            messages = page.messages.filter { !held.contains($0.id) } + messages
+            guard roomInstance == page.instance else {
+                throw VoxError.Failed(reason: "The saved room changed while loading older messages.")
+            }
+            let joined = page.messages.filter { !held.contains($0.id) } + messages
+            if joined.count > Self.roomWindowLimit { roomHasNewer = true }
+            messages = Array(joined.prefix(Self.roomWindowLimit))
             roomOlder = page.older
             roomBefore = page.before
         } catch {
@@ -1014,6 +1031,8 @@ final class NodeModel: ObservableObject {
         roomReadingOlder = false
         roomOlder = 0
         roomBefore = nil
+        roomInstance = nil
+        roomHasNewer = false
         unreadFrom = nil
         unreadCount = 0
         readBy = [:]
@@ -1097,6 +1116,8 @@ final class NodeModel: ObservableObject {
             guard messageRevision == roomMessageRevision else { return }
             // The page and its inspector replace the prior view together, after both reads
             // have succeeded. An ordinary refresh must not publish a half-empty room.
+            roomInstance = page.instance
+            roomHasNewer = false
             roomOlder = page.older
             roomBefore = page.before
             unreadFrom = unread.first
@@ -2529,8 +2550,16 @@ final class NodeModel: ObservableObject {
             // was opened again, and was never read.
             if let i = messages.firstIndex(where: { $0.id == message.id }) {
                 messages[i] = message
-            } else {
+            } else if timelineFollowingNewest {
                 messages.append(message)
+                if messages.count > Self.roomWindowLimit {
+                    let dropped = messages.count - Self.roomWindowLimit
+                    messages = Array(messages.suffix(Self.roomWindowLimit))
+                    roomOlder += UInt64(dropped)
+                    roomBefore = messages.first?.id
+                }
+            } else {
+                roomHasNewer = true
             }
         }
         // Unread until drawn in view (this node's own never are), the room on screen too.
@@ -2580,6 +2609,8 @@ final class NodeModel: ObservableObject {
         messages = []
         roomOlder = 0
         roomBefore = nil
+        roomInstance = nil
+        roomHasNewer = false
         unreadFrom = nil
         unreadCount = 0
         sessionPages.clear()
