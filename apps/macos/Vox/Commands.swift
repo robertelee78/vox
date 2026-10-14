@@ -11,7 +11,7 @@ extension Notification.Name {
 
 /// A sheet a menu, key or palette action opens.
 enum NodeSheet: String, Identifiable {
-    case palette, newRoom, joinRoom, repoRoom, fingerprint, rename, retention, admins, roomAnchors, leave, end
+    case palette, newRoom, joinRoom, repoRoom, fingerprint, rename, retention, admins, roomAnchors, pause, resume, leave, end
     var id: String { rawValue }
 }
 
@@ -78,6 +78,8 @@ extension VoxAction {
             VoxAction("Room", "Copy Room Link", "l", enabled: inRoom) {
                 Task { await node?.copyRoomLink() }
             },
+            VoxAction("Room", "Pause…", enabled: inRoom) { node?.sheet = .pause },
+            VoxAction("Room", "Resume…", enabled: inRoom) { node?.sheet = .resume },
             VoxAction("Room", "Rename…", enabled: inRoom) { node?.sheet = .rename },
             VoxAction("Room", "Retention…", enabled: inRoom) { node?.sheet = .retention },
             VoxAction("Room", "Admins…", enabled: inRoom) { node?.sheet = .admins },
@@ -274,6 +276,8 @@ struct NodeSheets: View {
             case .retention: RetentionSheet(model: model)
             case .admins: AdminsSheet(model: model)
             case .roomAnchors: RoomAnchorEditor(model: model)
+            case .pause: RoomPauseSheet(model: model, pausing: true)
+            case .resume: RoomPauseSheet(model: model, pausing: false)
             case .leave: LeaveSheet(model: model, ending: false)
             case .end: EndRoomSheet(model: model)
             }
