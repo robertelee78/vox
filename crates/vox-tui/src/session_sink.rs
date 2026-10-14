@@ -51,6 +51,24 @@ pub struct Posted {
     pub fresh: bool,
 }
 
+/// Authority observed when one source event arrived. Held admission carries this bounded
+/// snapshot with its first part, so recovery cannot affect a later request or delivery.
+pub struct SourceEffects {
+    requests: Vec<Arc<()>>,
+    expire: bool,
+    echo: Option<Arc<()>>,
+}
+
+impl SourceEffects {
+    /// Conservative allocation charge for the existing bounded volatile hold.
+    pub fn charge(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.requests.capacity()
+                * (std::mem::size_of::<Arc<()>>() + 3 * std::mem::size_of::<usize>())
+            + usize::from(self.echo.is_some()) * 3 * std::mem::size_of::<usize>()
+    }
+}
+
 impl From<SessionAdmission> for Posted {
     fn from(admission: SessionAdmission) -> Self {
         Self {
@@ -67,6 +85,7 @@ pub type Poster = Arc<
             String,
             vox_core::hash::Digest32,
             Vec<String>,
+            Option<SourceEffects>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Posted> + Send>>
         + Send
         + Sync,
@@ -94,7 +113,7 @@ struct Session {
     /// Requests waiting, by the call they are tied to.
     asks: BTreeMap<String, Ask>,
     /// Text drivers typed into the session lately, and when (see [`Sink::delivered_text`]).
-    delivered: Vec<(String, std::time::Instant)>,
+    delivered: Vec<(String, std::time::Instant, Arc<()>)>,
     /// Requests settled lately, with what a late answer to each is told.
     settled: std::collections::VecDeque<(String, String)>,
 }
@@ -193,6 +212,16 @@ impl Sink {
         session: &str,
         bodies: Vec<String>,
     ) -> Posted {
+        self.post_with_effects(node, session, bodies, None).await
+    }
+
+    async fn post_with_effects(
+        &self,
+        node: &NodeName,
+        session: &str,
+        bodies: Vec<String>,
+        mut effects: Option<SourceEffects>,
+    ) -> Posted {
         use vox_core::node::session_ingress::{MAX_BATCH_BYTES, MAX_BATCH_ITEMS};
         let invalid = bodies.iter().find_map(|body| {
             if !serde_json::from_str::<Value>(body).is_ok_and(|v| v.is_object()) {
@@ -222,6 +251,7 @@ impl Sink {
                     session.to_owned(),
                     room,
                     std::mem::take(&mut batch),
+                    effects.take(),
                 )
                 .await;
                 fresh |= next.fresh;
@@ -238,7 +268,7 @@ impl Sink {
             batch.push(body);
         }
         if !batch.is_empty() {
-            let next = (self.post)(node.clone(), session.to_owned(), room, batch).await;
+            let next = (self.post)(node.clone(), session.to_owned(), room, batch, effects).await;
             fresh |= next.fresh;
             result = combine(result, next.admission);
         }
@@ -294,8 +324,23 @@ impl Sink {
             )
             .into();
         }
-        let suppressed = echo.is_some_and(|text| {
-            self.delivered_match(node, session, &json!({"kind": "user", "text": text}), false)
+        let echo = echo.and_then(|text| {
+            self.delivered_ticket(node, session, &json!({"kind": "user", "text": text}), false)
+        });
+        let suppressed = echo.is_some();
+        let expire = first.get("kind").and_then(Value::as_str) == Some("user");
+        let requests = self.with(|all| {
+            all.get(&(node.clone(), session.to_owned()))
+                .into_iter()
+                .flat_map(|s| &s.asks)
+                .filter(|(id, _)| {
+                    !suppressed
+                        && (expire
+                            || (first.get("kind").and_then(Value::as_str) == Some("tool-done")
+                                && first.get("ref").and_then(Value::as_str) == Some(id.as_str())))
+                })
+                .map(|(_, ask)| Arc::clone(&ask.ticket))
+                .collect()
         });
         if suppressed {
             for body in &mut bodies {
@@ -320,34 +365,78 @@ impl Sink {
                 *body = value.to_string();
             }
         }
-        let mut result = self.post_numbered_result(node, session, bodies).await;
-        if suppressed && result.fresh {
-            if let Some(text) = echo {
-                self.delivered_match(node, session, &json!({"kind": "user", "text": text}), true);
-            }
+        let mut result = self
+            .post_with_effects(
+                node,
+                session,
+                bodies,
+                Some(SourceEffects {
+                    requests,
+                    expire,
+                    echo,
+                }),
+            )
+            .await;
+        if suppressed {
             result.fresh = false;
-            return result;
-        }
-        if !result.fresh {
-            return result;
-        }
-        let settled = match first.get("kind").and_then(Value::as_str) {
-            Some("user") => self.expired_entries(node, session),
-            Some("tool-done") => first
-                .get("ref")
-                .and_then(Value::as_str)
-                .and_then(|id| self.settled_entry(node, session, id).1)
-                .into_iter()
-                .collect(),
-            _ => Vec::new(),
-        };
-        if !settled.is_empty() {
-            result.admission = combine(
-                result.admission,
-                self.post_numbered(node, session, settled).await,
-            );
         }
         result
+    }
+
+    /// Apply one confirmed fresh source's original authority snapshot. This never calls the
+    /// Poster: the host saves returned resolution rows through its existing bounded hold.
+    pub fn committed_source(
+        &self,
+        node: &NodeName,
+        session: &str,
+        effects: SourceEffects,
+    ) -> Vec<String> {
+        let targets: Vec<_> = self.with(|all| {
+            let Some(s) = all.get_mut(&(node.clone(), session.to_owned())) else {
+                return Vec::new();
+            };
+            if let Some(echo) = effects.echo {
+                s.delivered
+                    .retain(|(_, _, ticket)| !Arc::ptr_eq(ticket, &echo));
+            }
+            s.asks
+                .iter()
+                .filter(|(_, ask)| {
+                    effects
+                        .requests
+                        .iter()
+                        .any(|ticket| Arc::ptr_eq(ticket, &ask.ticket))
+                })
+                .map(|(id, ask)| (id.clone(), Arc::clone(&ask.ticket)))
+                .collect()
+        });
+        let mut entries = Vec::new();
+        for (id, ticket) in targets {
+            let (waiting, settled) = self.settled_entry_if(node, session, &id, Some(&ticket));
+            entries.extend(settled);
+            if !effects.expire || !waiting {
+                continue;
+            }
+            let ask = self.with(|all| {
+                let s = all.get_mut(&(node.clone(), session.to_owned()))?;
+                s.asks
+                    .get(&id)
+                    .filter(|ask| Arc::ptr_eq(&ask.ticket, &ticket))?;
+                s.asks.remove(&id)
+            });
+            if let Some(mut ask) = ask {
+                if let Some(Waiter::Hook(h)) = ask.waiter.take() {
+                    let _ = h.send(None);
+                }
+                self.remember(node, session, &id, "the request expired before an answer");
+                entries.push(
+                    json!({"v": crate::session_mirror::VERSION, "session": session,
+                    "kind":"resolved", "ref":id, "of":ask.of, "outcome":"expired"})
+                    .to_string(),
+                );
+            }
+        }
+        entries
     }
 
     /// A harness's activity ([`vox_core::node::daemonipc::DaemonRequest::SessionActivity`]).
@@ -450,38 +539,46 @@ impl Sink {
     pub fn delivered_text(&self, node: &NodeName, session: &str, text: &str) {
         self.with(|all| {
             let s = all.entry((node.clone(), session.to_owned())).or_default();
-            s.delivered.retain(|(_, at)| at.elapsed() < DELIVERED_FOR);
             s.delivered
-                .push((text.trim().to_owned(), std::time::Instant::now()));
+                .retain(|(_, at, _)| at.elapsed() < DELIVERED_FOR);
+            s.delivered.push((
+                text.trim().to_owned(),
+                std::time::Instant::now(),
+                Arc::new(()),
+            ));
         });
     }
 
     /// Whether `body` is the harness's prompt event for text a driver delivered; that delivery is
     /// then used up.
     fn was_delivered(&self, node: &NodeName, session: &str, body: &Value) -> bool {
-        self.delivered_match(node, session, body, true)
+        self.delivered_ticket(node, session, body, true).is_some()
     }
 
-    fn delivered_match(&self, node: &NodeName, session: &str, body: &Value, consume: bool) -> bool {
+    fn delivered_ticket(
+        &self,
+        node: &NodeName,
+        session: &str,
+        body: &Value,
+        consume: bool,
+    ) -> Option<Arc<()>> {
         if body.get("kind").and_then(Value::as_str) != Some("user") || body.get("part").is_some() {
-            return false;
+            return None;
         }
-        let Some(text) = body.get("text").and_then(Value::as_str) else {
-            return false;
-        };
+        let text = body.get("text").and_then(Value::as_str)?;
         self.with(|all| {
-            let Some(s) = all.get_mut(&(node.clone(), session.to_owned())) else {
-                return false;
-            };
-            s.delivered.retain(|(_, at)| at.elapsed() < DELIVERED_FOR);
-            match s.delivered.iter().position(|(t, _)| t == text.trim()) {
+            let s = all.get_mut(&(node.clone(), session.to_owned()))?;
+            s.delivered
+                .retain(|(_, at, _)| at.elapsed() < DELIVERED_FOR);
+            match s.delivered.iter().position(|(t, _, _)| t == text.trim()) {
                 Some(i) => {
+                    let ticket = Arc::clone(&s.delivered[i].2);
                     if consume {
                         s.delivered.remove(i);
                     }
-                    true
+                    Some(ticket)
                 }
-                None => false,
+                None => None,
             }
         })
     }
@@ -607,9 +704,20 @@ impl Sink {
     /// Retire `id`'s request if the transcript records its result. Returns whether it is still
     /// waiting.
     fn settled_entry(&self, node: &NodeName, session: &str, id: &str) -> (bool, Option<String>) {
+        self.settled_entry_if(node, session, id, None)
+    }
+
+    fn settled_entry_if(
+        &self,
+        node: &NodeName,
+        session: &str,
+        id: &str,
+        ticket: Option<&Arc<()>>,
+    ) -> (bool, Option<String>) {
         let path = self.with(|all| {
             all.get(&(node.clone(), session.to_owned()))
                 .and_then(|s| s.asks.get(id))
+                .filter(|ask| ticket.is_none_or(|ticket| Arc::ptr_eq(ticket, &ask.ticket)))
                 .map(|a| a.transcript.clone())
         });
         let Some(path) = path else {
@@ -624,7 +732,7 @@ impl Sink {
         let outcome = if r.is_error { "denied" } else { "" };
         (
             false,
-            self.retired_entry(node, session, id, outcome, r.answers, &r.text),
+            self.retired_entry_if(node, session, (id, ticket), outcome, r.answers, &r.text),
         )
     }
 
@@ -664,9 +772,25 @@ impl Sink {
         answers: Option<Value>,
         said: &str,
     ) -> Option<String> {
+        self.retired_entry_if(node, session, (id, None), outcome, answers, said)
+    }
+
+    fn retired_entry_if(
+        &self,
+        node: &NodeName,
+        session: &str,
+        request: (&str, Option<&Arc<()>>),
+        outcome: &str,
+        answers: Option<Value>,
+        said: &str,
+    ) -> Option<String> {
+        let (id, ticket) = request;
         let ask = self.with(|all| {
-            all.get_mut(&(node.clone(), session.to_owned()))
-                .and_then(|s| s.asks.remove(id))
+            let s = all.get_mut(&(node.clone(), session.to_owned()))?;
+            s.asks
+                .get(id)
+                .filter(|ask| ticket.is_none_or(|ticket| Arc::ptr_eq(ticket, &ask.ticket)))?;
+            s.asks.remove(id)
         });
         let mut ask = ask?;
         let outcome = match outcome {

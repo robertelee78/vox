@@ -28,10 +28,11 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use vox_core::node::paths::NodeName;
 
 use crate::codex_mirror::Steer;
@@ -43,13 +44,27 @@ fn split(m: Map<String, Value>, big: &str) -> Vec<String> {
 }
 use crate::session_sink::{Given, Sink};
 
-/// The longest line the plugin may write; an event longer than this is dropped, not buffered.
+/// A larger event stops observation explicitly; accepted activity is never quietly truncated.
 const MAX_LINE: usize = 4 << 20;
+const MAX_FOLLOWS: usize = 64;
+const MAX_TEXT_PARTS: usize = 128;
+const MAX_TEXT_BYTES: usize = 8 << 20;
+const MAX_ASKS: usize = 64;
+const MAX_ASK_BYTES: usize = 4 << 20;
+const MAX_COMMANDS: usize = 32;
+const MAX_COMMAND_BYTES: usize = 64 << 10;
+const CALL_WITHIN: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct Connection {
+    commands: mpsc::Sender<Cmd>,
+    stop: Arc<Notify>,
+}
 
 /// The daemon's OpenCode followers, one connection per session.
 pub struct OpenCodeMirror {
     sink: Arc<Sink>,
-    conns: Mutex<BTreeMap<String, mpsc::UnboundedSender<Cmd>>>,
+    conns: Mutex<BTreeMap<String, Connection>>,
 }
 
 enum Cmd {
@@ -57,11 +72,6 @@ enum Cmd {
         steer: Steer,
         reply: oneshot::Sender<Result<String, String>>,
     },
-    Answer {
-        request: String,
-        given: Given,
-    },
-    End,
 }
 
 impl OpenCodeMirror {
@@ -74,7 +84,7 @@ impl OpenCodeMirror {
         })
     }
 
-    fn conns(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, mpsc::UnboundedSender<Cmd>>> {
+    fn conns(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Connection>> {
         self.conns
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -84,11 +94,23 @@ impl OpenCodeMirror {
     /// followed.
     pub fn watch(self: &Arc<Self>, node: &NodeName, session: &str, endpoint: &str, token: &str) {
         let mut conns = self.conns();
-        if conns.get(session).is_some_and(|tx| !tx.is_closed()) {
+        conns.retain(|_, conn| !conn.commands.is_closed());
+        if conns.contains_key(session) {
             return;
         }
-        let (tx, rx) = mpsc::unbounded_channel();
-        conns.insert(session.to_owned(), tx.clone());
+        if conns.len() >= MAX_FOLLOWS {
+            eprintln!("vox daemon: {node}: OpenCode Session {session} observation refused: {MAX_FOLLOWS} live followers already active");
+            return;
+        }
+        let (tx, rx) = mpsc::channel(MAX_COMMANDS);
+        let stop = Arc::new(Notify::new());
+        conns.insert(
+            session.to_owned(),
+            Connection {
+                commands: tx.clone(),
+                stop: Arc::clone(&stop),
+            },
+        );
         let follow = Follow {
             node: node.clone(),
             session: session.to_owned(),
@@ -102,34 +124,64 @@ impl OpenCodeMirror {
             title: None,
             next_id: 1,
             calls: BTreeMap::new(),
-            answers: tx,
         };
         let (endpoint, token) = (endpoint.to_owned(), token.to_owned());
-        tokio::spawn(follow.run(endpoint, token, rx));
+        let owner = Arc::downgrade(self);
+        let session = session.to_owned();
+        tokio::spawn(async move {
+            follow.run(endpoint, token, rx, stop).await;
+            if let Some(owner) = owner.upgrade() {
+                let mut conns = owner.conns();
+                if conns
+                    .get(&session)
+                    .is_some_and(|conn| conn.commands.same_channel(&tx))
+                {
+                    conns.remove(&session);
+                }
+            }
+        });
     }
 
     /// The session ended: stop following it.
     pub fn end(&self, session: &str) {
-        if let Some(tx) = self.conns().remove(session) {
-            let _ = tx.send(Cmd::End);
+        if let Some(conn) = self.conns().remove(session) {
+            conn.stop.notify_one();
         }
     }
 
     /// Steer `session` (#544): what was done, in words, or why it was refused (DR-6).
     ///
     /// # Errors
-    /// Why nothing reached the session.
+    /// Why the control was refused, or why its outcome could not be confirmed.
     pub async fn steer(&self, session: &str, steer: Steer) -> Result<String, String> {
         let tx = self.conns().get(session).cloned().ok_or_else(|| {
             "Vox is not connected to this OpenCode session: it ended, or its OpenCode has not run \
              a turn since Vox started"
                 .to_owned()
         })?;
+        let size = match &steer {
+            Steer::Text(text) => text.len(),
+            Steer::Slash { cmd, args } => cmd.len().saturating_add(args.len()),
+            Steer::Interrupt | Steer::Stop => 0,
+        };
+        if size > MAX_COMMAND_BYTES {
+            return Err(format!(
+                "OpenCode control exceeds {MAX_COMMAND_BYTES} bytes; nothing was sent"
+            ));
+        }
         let (reply, rx) = oneshot::channel();
-        tx.send(Cmd::Steer { steer, reply })
-            .map_err(|_| "Vox's connection to this OpenCode session has closed".to_owned())?;
-        rx.await
-            .unwrap_or_else(|_| Err("Vox's connection to this OpenCode session closed".to_owned()))
+        tx.commands
+            .try_send(Cmd::Steer { steer, reply })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    "OpenCode's control queue is full; nothing was sent".to_owned()
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    "Vox's connection to this OpenCode session has closed; nothing was sent"
+                        .to_owned()
+                }
+            })?;
+        rx.await.unwrap_or_else(|_| Err("OpenCode's connection closed; the control outcome is unknown, do not assume it is safe to repeat".to_owned()))
     }
 }
 
@@ -141,6 +193,8 @@ struct Ask {
     answered: Option<Given>,
     /// The answers sent to OpenCode, in its shape.
     sent: Option<Value>,
+    /// Exactly this request's first-answer waiter; no detached forwarding task survives it.
+    receiver: Option<oneshot::Receiver<Given>>,
 }
 
 struct Follow {
@@ -163,9 +217,31 @@ struct Follow {
     /// rename, and only a new title renames the Session.
     title: Option<String>,
     next_id: u64,
-    calls: BTreeMap<u64, (oneshot::Sender<Result<String, String>>, String)>,
-    /// Where a member's first answer comes back to this loop.
-    answers: mpsc::UnboundedSender<Cmd>,
+    calls: BTreeMap<u64, PendingCall>,
+}
+
+struct PendingCall {
+    reply: oneshot::Sender<Result<String, String>>,
+    done: String,
+    expires: tokio::time::Instant,
+}
+
+fn given_bytes(given: &Given) -> usize {
+    match given {
+        Given::Approve { why, .. } => why.as_ref().map_or(0, String::len),
+        Given::Answer(answers) => answers.iter().fold(0usize, |n, (q, a)| {
+            n.saturating_add(q.len()).saturating_add(a.len())
+        }),
+    }
+}
+
+fn ask_bytes(id: &str, ask: &Ask) -> usize {
+    id.len()
+        .saturating_add(serde_json::to_vec(&ask.questions).map_or(MAX_ASK_BYTES, |v| v.len()))
+        .saturating_add(ask.answered.as_ref().map_or(0, given_bytes))
+        .saturating_add(ask.sent.as_ref().map_or(0, |value| {
+            serde_json::to_vec(value).map_or(MAX_ASK_BYTES, |v| v.len())
+        }))
 }
 
 fn now_ms() -> u64 {
@@ -192,69 +268,130 @@ fn typed(text: &str) -> Option<&str> {
 }
 
 impl Follow {
-    async fn run(mut self, endpoint: String, token: String, mut rx: mpsc::UnboundedReceiver<Cmd>) {
-        let Ok(stream) = tokio::net::UnixStream::connect(&endpoint).await else {
-            return;
-        };
+    async fn run(
+        mut self,
+        endpoint: String,
+        token: String,
+        mut rx: mpsc::Receiver<Cmd>,
+        stop: Arc<Notify>,
+    ) {
+        let stream =
+            match tokio::time::timeout(CALL_WITHIN, tokio::net::UnixStream::connect(&endpoint))
+                .await
+            {
+                Ok(Ok(stream)) => stream,
+                _ => {
+                    self.fail("the plugin connection could not be opened").await;
+                    return;
+                }
+            };
         let (read, mut write) = stream.into_split();
         let hello = format!(
             "{}\n{}\n",
             json!({"type": "auth", "token": token}),
             json!({"type": "subscribe", "session": self.session})
         );
-        if write.write_all(hello.as_bytes()).await.is_err() {
+        if !Self::write(&mut write, &hello).await {
+            self.fail("the plugin handshake failed").await;
             return;
         }
         let mut lines = BufReader::new(read);
         let mut line = Vec::new();
-        let mut oversized = false;
+        let mut timer = tokio::time::interval(Duration::from_millis(250));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            // A cancelled read may already have filled its bounded prefix. Retire it here
-            // before constructing the next Take, so zero remaining bytes is not read as EOF.
             if line.len() > MAX_LINE {
-                oversized = !line.ends_with(b"\n");
-                line.clear();
+                self.fail("an OpenCode event exceeds the 4 MiB line bound")
+                    .await;
+                break;
             }
             let remaining = (MAX_LINE + 1 - line.len()) as u64;
             tokio::select! {
+                _ = stop.notified() => break,
                 cmd = rx.recv() => match cmd {
-                    None | Some(Cmd::End) => break,
+                    None => break,
                     Some(Cmd::Steer { steer, reply }) => {
                         if let Some(call) = self.steer_call(steer, reply) {
-                            if write.write_all(call.as_bytes()).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    Some(Cmd::Answer { request, given }) => {
-                        if let Some(call) = self.answer_call(&request, given) {
-                            if write.write_all(call.as_bytes()).await.is_err() {
+                            if !Self::write(&mut write, &call).await {
+                                self.fail("a control write failed; its outcome is unknown, do not assume it is safe to repeat").await;
                                 break;
                             }
                         }
                     }
                 },
+                _ = timer.tick(), if !self.asks.is_empty() || !self.calls.is_empty() => {
+                    if self.calls.values().any(|call| call.expires <= tokio::time::Instant::now()) {
+                        self.fail("OpenCode did not answer a control within 30 seconds; its outcome is unknown, do not assume it is safe to repeat").await;
+                        break;
+                    }
+                    // At most 64 exact waiters examined and one answer sent per turn.
+                    if let Some((id, given)) = self.take_answer() {
+                        if given_bytes(&given) > MAX_COMMAND_BYTES {
+                            self.fail("an answer exceeds the control byte bound; it was not sent to OpenCode").await;
+                            break;
+                        }
+                        let Some(call) = self.answer_call(&id, given) else {
+                            self.fail("an accepted answer could not enter the bounded control queue; it was not sent to OpenCode").await;
+                            break;
+                        };
+                        if !Self::write(&mut write, &call).await {
+                            self.fail("an answer write failed; its outcome is unknown").await;
+                            break;
+                        }
+                    }
+                },
                 n = async { (&mut lines).take(remaining).read_until(b'\n', &mut line).await } => {
                     match n {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) if line.len() > MAX_LINE || oversized => {
-                            oversized = !line.ends_with(b"\n");
+                        Ok(0) | Err(_) => { self.fail("the plugin connection closed; pending control outcomes are unknown").await; break; }
+                        Ok(_) if line.len() > MAX_LINE => {
+                            self.fail("an OpenCode event exceeds the 4 MiB line bound").await;
+                            break;
                         }
                         Ok(_) => {
-                            if let Ok(v) = serde_json::from_slice::<Value>(&line) {
-                                self.line(&v).await;
-                                if self.failed { break; }
+                            match serde_json::from_slice::<Value>(&line) {
+                                Ok(v) => self.line(&v).await,
+                                Err(_) => self.fail("the plugin supplied malformed event JSON").await,
                             }
+                            if self.failed { break; }
                         }
                     }
                     line.clear();
                 }
             }
         }
-        // OpenCode exited, or the session ended: every call waiting is told.
-        for (_, (reply, _)) in std::mem::take(&mut self.calls) {
-            let _ = reply.send(Err("the OpenCode session's connection closed".into()));
+        for (_, call) in std::mem::take(&mut self.calls) {
+            let _ = call.reply.send(Err("the OpenCode connection closed; the control outcome is unknown, do not assume it is safe to repeat".into()));
         }
+    }
+
+    async fn write(write: &mut tokio::net::unix::OwnedWriteHalf, line: &str) -> bool {
+        matches!(
+            tokio::time::timeout(CALL_WITHIN, write.write_all(line.as_bytes())).await,
+            Ok(Ok(()))
+        )
+    }
+
+    fn take_answer(&mut self) -> Option<(String, Given)> {
+        let mut answer = None;
+        self.asks.retain(|id, ask| {
+            let Some(receiver) = ask.receiver.as_mut() else {
+                return true;
+            };
+            if answer.is_some() {
+                return true;
+            }
+            match receiver.try_recv() {
+                Ok(given) => {
+                    ask.receiver = None;
+                    answer = Some((id.clone(), given));
+                    true
+                }
+                Err(oneshot::error::TryRecvError::Empty) => true,
+                // Sink retired this exact waiter; no later same-ID request is touched.
+                Err(oneshot::error::TryRecvError::Closed) => false,
+            }
+        });
+        answer
     }
 
     fn call(
@@ -262,13 +399,39 @@ impl Follow {
         mut body: Map<String, Value>,
         reply: oneshot::Sender<Result<String, String>>,
         done: String,
-    ) -> String {
+    ) -> Option<String> {
+        if self.calls.len() >= MAX_COMMANDS {
+            let _ = reply.send(Err(
+                "OpenCode has 32 unanswered controls; nothing was sent".into()
+            ));
+            return None;
+        }
         let id = self.next_id;
-        self.next_id += 1;
+        let Some(next) = id.checked_add(1) else {
+            let _ = reply.send(Err(
+                "OpenCode control sequence exhausted; nothing was sent".into()
+            ));
+            return None;
+        };
+        self.next_id = next;
         body.insert("type".into(), json!("call"));
         body.insert("id".into(), json!(id));
-        self.calls.insert(id, (reply, done));
-        format!("{}\n", Value::Object(body))
+        let line = format!("{}\n", Value::Object(body));
+        if line.len() > MAX_COMMAND_BYTES {
+            let _ = reply.send(Err(
+                "encoded OpenCode control exceeds 64 KiB; nothing was sent".into(),
+            ));
+            return None;
+        }
+        self.calls.insert(
+            id,
+            PendingCall {
+                reply,
+                done,
+                expires: tokio::time::Instant::now() + CALL_WITHIN,
+            },
+        );
+        Some(line)
     }
 
     fn steer_call(
@@ -326,7 +489,7 @@ impl Follow {
                 }
             },
         };
-        Some(self.call(m, reply, done))
+        self.call(m, reply, done)
     }
 
     fn answer_call(&mut self, request: &str, given: Given) -> Option<String> {
@@ -365,9 +528,17 @@ impl Follow {
             _ => return None,
         }
         ask.answered = Some(given);
+        if self
+            .asks
+            .iter()
+            .fold(0usize, |n, (id, ask)| n.saturating_add(ask_bytes(id, ask)))
+            > MAX_ASK_BYTES
+        {
+            return None;
+        }
         // Its result is OpenCode's `permission.replied` / `question.replied`, not this call's.
         let (reply, _) = oneshot::channel();
-        Some(self.call(m, reply, String::new()))
+        self.call(m, reply, String::new())
     }
 
     async fn line(&mut self, v: &Value) {
@@ -380,23 +551,29 @@ impl Follow {
                 self.fail(why).await;
             }
             Some("result") => {
-                let Some((reply, done)) = v
+                let Some(call) = v
                     .get("id")
                     .and_then(Value::as_u64)
                     .and_then(|id| self.calls.remove(&id))
                 else {
                     return;
                 };
-                let _ = reply.send(if v.get("ok").and_then(Value::as_bool) == Some(true) {
-                    Ok(done)
+                let result = if v.get("ok").and_then(Value::as_bool) == Some(true) {
+                    Ok(call.done.clone())
                 } else {
                     Err(format!(
-                        "OpenCode refused it: {}",
+                        "OpenCode did not confirm the control: {}",
                         v.get("error")
                             .and_then(Value::as_str)
                             .unwrap_or("no reason given")
                     ))
-                });
+                };
+                if call.done.is_empty() {
+                    if let Err(why) = &result {
+                        self.fail(why).await;
+                    }
+                }
+                let _ = call.reply.send(result);
             }
             Some("event") => self.event(&v["event"]).await,
             _ => {}
@@ -554,13 +731,15 @@ impl Follow {
             "message.part.updated" => {
                 let info = &p["voxMessage"];
                 let part = &p["part"];
+                let Some(role @ ("user" | "assistant")) = info.get("role").and_then(Value::as_str)
+                else {
+                    self.fail("a part arrived without its authoritative message role")
+                        .await;
+                    return;
+                };
                 if info.get("id").and_then(Value::as_str)
                     != part.get("messageID").and_then(Value::as_str)
                     || info.get("sessionID").and_then(Value::as_str) != Some(sid.as_str())
-                    || !matches!(
-                        info.get("role").and_then(Value::as_str),
-                        Some("user" | "assistant")
-                    )
                 {
                     self.fail("a part arrived without its authoritative message role")
                         .await;
@@ -578,8 +757,7 @@ impl Follow {
                         self.model = Some((provider.to_owned(), model.to_owned()));
                     }
                 }
-                self.part(&sid, part, info["role"].as_str().expect("checked role"))
-                    .await;
+                self.part(&sid, part, role).await;
             }
             // **A rename is the Session's name at once** (ADR-029 MD-1): OpenCode's title, set by
             // `/rename`, by Vox's own rename, or made by OpenCode itself, arrives only here.
@@ -671,29 +849,45 @@ impl Follow {
                         e.insert("text".into(), json!(text));
                         self.post_source(sid, pid, e, "text").await;
                     }
-                    "assistant" => match self
-                        .texts
-                        .iter_mut()
-                        .find(|(of, id, _, _)| of == sid && id == pid)
-                    {
-                        Some(slot) => {
-                            slot.2 = text.to_owned();
-                            slot.3 = self
-                                .agent
-                                .as_ref()
-                                .filter(|(of, _)| of == sid)
-                                .map(|(_, name)| name.clone());
+                    "assistant" => {
+                        let agent = self
+                            .agent
+                            .as_ref()
+                            .filter(|(of, _)| of == sid)
+                            .map(|(_, name)| name.clone());
+                        let slot = self
+                            .texts
+                            .iter()
+                            .position(|(of, id, _, _)| of == sid && id == pid);
+                        let used = self
+                            .texts
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| Some(*i) != slot)
+                            .fold(0usize, |n, (_, (s, p, t, a))| {
+                                n.saturating_add(s.len())
+                                    .saturating_add(p.len())
+                                    .saturating_add(t.len())
+                                    .saturating_add(a.as_ref().map_or(0, String::len))
+                            });
+                        let added = sid
+                            .len()
+                            .saturating_add(pid.len())
+                            .saturating_add(text.len())
+                            .saturating_add(agent.as_ref().map_or(0, String::len));
+                        if (slot.is_none() && self.texts.len() >= MAX_TEXT_PARTS)
+                            || added > MAX_TEXT_BYTES.saturating_sub(used)
+                        {
+                            self.fail("live assistant text exceeds 128 parts or 8 MiB; observation must restart").await;
+                            return;
                         }
-                        None => self.texts.push((
-                            sid.to_owned(),
-                            pid.to_owned(),
-                            text.to_owned(),
-                            self.agent
-                                .as_ref()
-                                .filter(|(of, _)| of == sid)
-                                .map(|(_, name)| name.clone()),
-                        )),
-                    },
+                        let part = (sid.to_owned(), pid.to_owned(), text.to_owned(), agent);
+                        if let Some(slot) = slot {
+                            self.texts[slot] = part;
+                        } else {
+                            self.texts.push(part);
+                        }
+                    }
                     _ => unreachable!("checked role"),
                 }
             }
@@ -834,24 +1028,38 @@ impl Follow {
     }
 
     async fn ask(&mut self, id: String, of: &'static str, questions: Vec<Value>, entry: String) {
+        if self.asks.contains_key(&id) {
+            return;
+        }
+        let used = self
+            .asks
+            .iter()
+            .fold(0usize, |n, (id, ask)| n.saturating_add(ask_bytes(id, ask)));
+        let added = id
+            .len()
+            .saturating_add(serde_json::to_vec(&questions).map_or(MAX_ASK_BYTES, |v| v.len()));
+        if self.asks.len() >= MAX_ASKS
+            || added > MAX_ASK_BYTES.saturating_sub(used)
+            || entry.len() > MAX_LINE
+        {
+            self.fail("pending requests exceed 64 requests or 4 MiB; no permission was answered, observation must restart").await;
+            return;
+        }
         let Some(rx) = self.sink.request(&self.node, &self.session, entry).await else {
+            self.fail("a pending request could not be admitted; no permission was answered")
+                .await;
             return;
         };
         self.asks.insert(
-            id.clone(),
+            id,
             Ask {
                 of,
                 questions,
                 answered: None,
                 sent: None,
+                receiver: Some(rx),
             },
         );
-        let tx = self.answers.clone();
-        tokio::spawn(async move {
-            if let Ok(given) = rx.await {
-                let _ = tx.send(Cmd::Answer { request: id, given });
-            }
-        });
     }
 }
 

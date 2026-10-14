@@ -297,14 +297,15 @@ impl Router {
                         move |node: NodeName,
                               session: String,
                               room: Digest32,
-                              bodies: Vec<String>| {
+                              bodies: Vec<String>,
+                              effects: Option<crate::session_sink::SourceEffects>| {
                             let weak = weak.clone();
                             Box::pin(async move {
                                 match weak.upgrade() {
                                     Some(inner) => {
                                         let mut fresh = false;
                                         let admission = Router { inner }
-                                            .post_session(&node, &session, room, bodies, &mut fresh)
+                                            .post_session(&node, &session, room, bodies, effects, &mut fresh)
                                             .await;
                                         crate::session_sink::Posted { admission, fresh }
                                     }
@@ -2219,6 +2220,7 @@ impl Router {
         session: &str,
         room: Digest32,
         bodies: Vec<String>,
+        effects: Option<crate::session_sink::SourceEffects>,
         fresh: &mut bool,
     ) -> vox_core::node::daemonipc::SessionAdmission {
         use vox_core::node::{
@@ -2264,30 +2266,43 @@ impl Router {
             // Try the retained tail first after recovery. One bounded batch frees enough room
             // for one ordinary admission; if a room boundary needs more work, refuse the new
             // batch truthfully rather than evicting old work while saving is possible.
-            let (removed, progressed) = flush_session_hold(&handle, &key, session_hold).await;
-            let still_held = !session_hold.items.is_empty();
-            let would_overflow = session_hold.bytes + bodies.iter().map(held_charge).sum::<usize>()
-                > HELD_BYTES
-                || session_hold.items.len() + bodies.len() > HELD_ITEMS;
+            let (removed, progressed, committed) =
+                flush_session_hold(&handle, &key, session_hold).await;
+            let empty = session_hold.items.is_empty();
             held.bytes -= removed;
-            if !still_held {
+            if empty {
                 held.sessions.remove(&key);
-            } else if progressed && would_overflow {
-                return SessionAdmission::Refused(
-                    "earlier Session activity is recovering; this batch was not retained".into(),
-                );
-            } else {
+            }
+            if let Some((saved_room, effects)) = committed {
+                let resolutions = self.inner.sink.committed_source(node, session, effects);
+                save_source_resolutions(&handle, &mut held, &key, saved_room, resolutions).await;
+            }
+            if let Some(session_hold) = held.sessions.get(&key) {
+                let would_overflow = session_hold.bytes
+                    + bodies.iter().map(held_charge).sum::<usize>()
+                    + effects
+                        .as_ref()
+                        .map_or(0, crate::session_sink::SourceEffects::charge)
+                    > HELD_BYTES
+                    || session_hold.items.len() + bodies.len() > HELD_ITEMS;
+                if progressed && would_overflow {
+                    return SessionAdmission::Refused(
+                        "earlier Session activity is recovering; this batch was not retained"
+                            .into(),
+                    );
+                }
                 return held.hold(
                     key,
                     room,
                     bodies,
                     "earlier activity is held only in memory".into(),
+                    effects,
                 );
             }
         }
         // Reserve enough volatile capacity for a lost receipt before handing ownership to
         // the actor. An ambiguous copy must stay bounded and must never be retried.
-        if !held.can_hold_new(&key, &bodies) {
+        if !held.can_hold_new(&key, &bodies, effects.as_ref()) {
             return SessionAdmission::Refused(
                 "Session admission recovery capacity is full; this batch was not retained".into(),
             );
@@ -2295,6 +2310,12 @@ impl Router {
         match save_session_batch(&handle, room, session, bodies.clone()).await {
             Ok(saved) => {
                 *fresh = saved.fresh;
+                if saved.fresh {
+                    if let Some(effects) = effects {
+                        let resolutions = self.inner.sink.committed_source(node, session, effects);
+                        save_source_resolutions(&handle, &mut held, &key, room, resolutions).await;
+                    }
+                }
                 if saved.first == 0 && saved.last == 0 {
                     SessionAdmission::Skipped
                 } else {
@@ -2307,10 +2328,10 @@ impl Router {
             Err(SessionSaveError::Save(error))
                 if matches!(error, vox_core::error::Error::Storage { .. }) =>
             {
-                held.hold(key, room, bodies, error.to_string())
+                held.hold(key, room, bodies, error.to_string(), effects)
             }
             Err(SessionSaveError::Save(error)) => SessionAdmission::Refused(error.to_string()),
-            Err(SessionSaveError::Unconfirmed(why)) => held.freeze(key, room, bodies, why),
+            Err(SessionSaveError::Unconfirmed(why)) => held.freeze(key, room, bodies, why, effects),
         }
     }
 
@@ -2412,10 +2433,14 @@ impl Router {
                     continue;
                 };
                 let Some(held) = holds.sessions.get_mut(&key) else { continue; };
-                let (removed, made_progress) = flush_session_hold(&handle, &key, held).await;
+                let (removed, made_progress, committed) = flush_session_hold(&handle, &key, held).await;
                 let empty = held.items.is_empty();
                 holds.bytes -= removed;
                 if empty { holds.sessions.remove(&key); }
+                if let Some((room, effects)) = committed {
+                    let resolutions = router.inner.sink.committed_source(&key.0, &key.1, effects);
+                    save_source_resolutions(&handle, &mut holds, &key, room, resolutions).await;
+                }
                 progressed = made_progress;
             }
         });
@@ -3770,6 +3795,13 @@ fn held_charge(body: &String) -> usize {
     body.capacity()
         .saturating_add(4 * std::mem::size_of::<HeldItem>() + 32)
 }
+fn held_item_charge(item: &HeldItem) -> usize {
+    held_charge(&item.body)
+        + item
+            .effects
+            .as_ref()
+            .map_or(0, crate::session_sink::SourceEffects::charge)
+}
 const HELD_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Default)]
@@ -3791,6 +3823,7 @@ struct HeldItem {
     room: vox_core::hash::Digest32,
     body: String,
     ordinal: u64,
+    effects: Option<crate::session_sink::SourceEffects>,
 }
 struct HeldLoss {
     room: vox_core::hash::Digest32,
@@ -3807,7 +3840,7 @@ impl SessionHolds {
             let before = held.bytes;
             held.items.retain(|item| item.room != *room);
             held.items.shrink_to_fit();
-            held.bytes = held.items.iter().map(|item| held_charge(&item.body)).sum();
+            held.bytes = held.items.iter().map(held_item_charge).sum();
             self.bytes -= before - held.bytes;
             if held.loss.as_ref().is_some_and(|loss| loss.room == *room) { held.loss = None; }
             if held.unconfirmed_room == Some(*room) { held.unconfirmed_room = None; }
@@ -3831,8 +3864,14 @@ impl SessionHolds {
         });
     }
 
-    fn can_hold_new(&self, key: &(NodeName, String), bodies: &[String]) -> bool {
-        let added = bodies.iter().map(held_charge).sum::<usize>();
+    fn can_hold_new(
+        &self,
+        key: &(NodeName, String),
+        bodies: &[String],
+        effects: Option<&crate::session_sink::SourceEffects>,
+    ) -> bool {
+        let added = bodies.iter().map(held_charge).sum::<usize>()
+            + effects.map_or(0, crate::session_sink::SourceEffects::charge);
         (self.sessions.contains_key(key) || self.sessions.len() < HELD_SESSIONS)
             && added <= HELD_BYTES
             && bodies.len() <= HELD_ITEMS
@@ -3853,8 +3892,9 @@ impl SessionHolds {
         room: vox_core::hash::Digest32,
         bodies: Vec<String>,
         why: String,
+        effects: Option<crate::session_sink::SourceEffects>,
     ) -> vox_core::node::daemonipc::SessionAdmission {
-        let _ = self.hold(key.clone(), room, bodies, why.clone());
+        let _ = self.hold(key.clone(), room, bodies, why.clone(), effects);
         if let Some(held) = self.sessions.get_mut(&key) {
             held.unconfirmed_room = Some(room);
         }
@@ -3867,6 +3907,7 @@ impl SessionHolds {
         room: vox_core::hash::Digest32,
         bodies: Vec<String>,
         why: String,
+        mut effects: Option<crate::session_sink::SourceEffects>,
     ) -> vox_core::node::daemonipc::SessionAdmission {
         use vox_core::node::daemonipc::SessionAdmission;
         if !self.sessions.contains_key(&key) && self.sessions.len() == HELD_SESSIONS {
@@ -3882,7 +3923,10 @@ impl SessionHolds {
                 ));
             }
         }
-        let added: usize = bodies.iter().map(held_charge).sum();
+        let added = bodies.iter().map(held_charge).sum::<usize>()
+            + effects
+                .as_ref()
+                .map_or(0, crate::session_sink::SourceEffects::charge);
         let prior = self.sessions.get(&key).map_or(0, |s| s.bytes);
         let retained = prior.saturating_add(added).min(HELD_BYTES);
         let prior_count = self.sessions.get(&key).map_or(0, |held| held.items.len());
@@ -3910,11 +3954,23 @@ impl SessionHolds {
                 if must_drop == 0 && must_drop_items == 0 {
                     break;
                 }
+                // Exact source admission requires every accepted split coordinate. Losing
+                // an earlier part would pin later retained parts at the retry head forever.
+                // This entire loop is preflight: refuse the newcomer before dropping even
+                // an unkeyed row that precedes the protected source or its effects ticket.
+                if serde_json::from_str::<serde_json::Value>(&item.body)
+                    .is_ok_and(|value| value.get("_vox_source").is_some())
+                {
+                    return SessionAdmission::Refused(
+                        "source activity fills the volatile hold; this new batch was not retained"
+                            .into(),
+                    );
+                }
                 if loss_room.is_some_and(|old| old != item.room) {
                     return SessionAdmission::Refused("unsaved activity from an earlier room fills the volatile hold; this batch was not retained".into());
                 }
                 loss_room = Some(item.room);
-                must_drop = must_drop.saturating_sub(held_charge(&item.body));
+                must_drop = must_drop.saturating_sub(held_item_charge(item));
                 must_drop_items = must_drop_items.saturating_sub(1);
             }
         }
@@ -3922,20 +3978,22 @@ impl SessionHolds {
         held.why = why.clone();
         for body in bodies {
             held.ordinal = held.ordinal.saturating_add(1);
-            held.bytes += held_charge(&body);
-            self.bytes += held_charge(&body);
-            held.items.push_back(HeldItem {
+            let item = HeldItem {
                 room,
                 body,
                 ordinal: held.ordinal,
-            });
+                effects: effects.take(),
+            };
+            held.bytes += held_item_charge(&item);
+            self.bytes += held_item_charge(&item);
+            held.items.push_back(item);
         }
         while held.bytes > HELD_BYTES || held.items.len() > HELD_ITEMS {
             let Some(old) = held.items.pop_front() else {
                 break;
             };
-            held.bytes -= held_charge(&old.body);
-            self.bytes -= held_charge(&old.body);
+            held.bytes -= held_item_charge(&old);
+            self.bytes -= held_item_charge(&old);
             let v = serde_json::from_str::<serde_json::Value>(&old.body).unwrap_or_default();
             let named = format!(
                 "{} at {} (uncommitted held item {})",
@@ -3967,12 +4025,16 @@ async fn flush_session_hold(
     handle: &vox_core::node::actor::NodeHandle,
     key: &(NodeName, String),
     held: &mut HeldSession,
-) -> (usize, bool) {
+) -> (
+    usize,
+    bool,
+    Option<(Digest32, crate::session_sink::SourceEffects)>,
+) {
     if held.unconfirmed_room.is_some() {
-        return (0, false);
+        return (0, false, None);
     }
     let Some(front) = held.items.front() else {
-        return (0, false);
+        return (0, false, None);
     };
     let room = held.loss.as_ref().map_or(front.room, |loss| loss.room);
     let notice = held.loss.as_ref().map(|loss| serde_json::json!({
@@ -3988,6 +4050,9 @@ async fn flush_session_hold(
     } else {
         for item in &held.items {
             if item.room != room
+                // Freshness is one boolean for the admission. An item carrying source
+                // effects gets its own receipt, never a duplicate/new-source mixture.
+                || (!bodies.is_empty() && (front.effects.is_some() || item.effects.is_some()))
                 || bytes + item.body.len() > vox_core::node::session_ingress::MAX_BATCH_BYTES
                 || bodies.len() == vox_core::node::session_ingress::MAX_BATCH_ITEMS
             {
@@ -3999,32 +4064,96 @@ async fn flush_session_hold(
     }
     let count = bodies.len();
     match save_session_batch(handle, room, &key.1, bodies).await {
-        Ok(_) => {
+        Ok(saved) => {
             if notice_only {
                 held.loss = None;
-                return (0, true);
+                return (0, true, None);
             }
             let mut released = 0;
+            let mut committed = None;
             for _ in 0..count {
-                if let Some(item) = held.items.pop_front() {
-                    released += held_charge(&item.body);
+                if let Some(mut item) = held.items.pop_front() {
+                    released += held_item_charge(&item);
+                    if saved.fresh {
+                        committed = item.effects.take().map(|effects| (item.room, effects));
+                    }
                 }
             }
             // Returning credits also releases now-unused deque slots; a drained queue cannot
             // keep a history-sized allocation while lending those credits to another session.
             held.items.shrink_to_fit();
             held.bytes -= released;
-            (released, true)
+            (released, true, committed)
         }
         Err(SessionSaveError::Save(error)) => {
             held.why = error.to_string();
-            (0, false)
+            (0, false, None)
         }
         Err(SessionSaveError::Unconfirmed(why)) => {
             held.unconfirmed_room = Some(room);
             held.why = why;
-            (0, false)
+            (0, false, None)
         }
+    }
+}
+
+// Source admission has already committed. Retiring its exact request tickets is not undone
+// by a later transcript-storage problem. Resolution rows use the existing charged hold and
+// one bounded storage attempt; this path never re-enters the Poster/admission mutex.
+async fn save_source_resolutions(
+    handle: &NodeHandle,
+    holds: &mut SessionHolds,
+    key: &(NodeName, String),
+    room: Digest32,
+    bodies: Vec<String>,
+) {
+    use vox_core::node::daemonipc::SessionAdmission;
+    if bodies.is_empty() {
+        return;
+    }
+    // An ask may still be awaiting its own admission when the source snapshot is captured.
+    // Refuse an unpublishable resolution explicitly rather than pinning the retry head with
+    // a row that can never pass the same Session size/shape checks as ordinary activity.
+    for body in &bodies {
+        let checked = serde_json::from_str::<serde_json::Value>(body)
+            .map_err(|error| error.to_string())
+            .and_then(|mut value| {
+                let object = value.as_object_mut().ok_or("resolution is not an object")?;
+                object.insert("seq".into(), u64::MAX.into());
+                object.insert("session".into(), key.1.clone().into());
+                vox_core::node::content::SessionEntry::new(0, &key.1, &value.to_string())
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(why) = checked {
+            eprintln!("vox daemon: {}: session {}: source activity is committed, but its request resolutions cannot be saved: {why}", key.0, key.1);
+            return;
+        }
+    }
+    let already_held = holds.sessions.contains_key(key);
+    let outcome = holds.hold(
+        key.clone(),
+        room,
+        bodies,
+        "source activity committed; its request resolutions are awaiting storage".into(),
+        None,
+    );
+    if !matches!(outcome, SessionAdmission::Held(_)) {
+        eprintln!("vox daemon: {}: session {}: source activity is committed, but its request resolutions were not saved: {outcome:?}", key.0, key.1);
+        return;
+    }
+    if !already_held {
+        if let Some(held) = holds.sessions.get_mut(key) {
+            let (removed, _, _) = flush_session_hold(handle, key, held).await;
+            let empty = held.items.is_empty();
+            holds.bytes -= removed;
+            if empty {
+                holds.sessions.remove(key);
+            }
+        }
+    }
+    if let Some(held) = holds.sessions.get(key) {
+        eprintln!("vox daemon: {}: session {}: source activity is committed; request resolutions remain only in the bounded volatile hold: {}", key.0, key.1, held.why);
     }
 }
 
@@ -4119,8 +4248,9 @@ async fn enqueue_session_end(
             room,
             bodies,
             "earlier activity is held only in memory".into(),
+            None,
         )
-    } else if !held.can_hold_new(&key, &bodies) {
+    } else if !held.can_hold_new(&key, &bodies, None) {
         vox_core::node::daemonipc::SessionAdmission::Refused(
             "Session admission recovery capacity is full; end record was not retained".into(),
         )
@@ -4133,12 +4263,12 @@ async fn enqueue_session_end(
             Err(SessionSaveError::Save(error))
                 if matches!(error, vox_core::error::Error::Storage { .. }) =>
             {
-                held.hold(key, room, bodies, error.to_string())
+                held.hold(key, room, bodies, error.to_string(), None)
             }
             Err(SessionSaveError::Save(error)) => {
                 vox_core::node::daemonipc::SessionAdmission::Refused(error.to_string())
             }
-            Err(SessionSaveError::Unconfirmed(why)) => held.freeze(key, room, bodies, why),
+            Err(SessionSaveError::Unconfirmed(why)) => held.freeze(key, room, bodies, why, None),
         }
     };
     if !matches!(
@@ -4276,8 +4406,9 @@ impl Titles {
             if file.seek(SeekFrom::Start(self.offset)).is_err() {
                 break;
             }
-            let take = usize::try_from((end - self.offset).min(bytes.len() as u64))
-                .expect("a transcript chunk fits usize");
+            let take = bytes
+                .len()
+                .min(usize::try_from(end - self.offset).unwrap_or(usize::MAX));
             let n = match file.read(&mut bytes[..take]) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
