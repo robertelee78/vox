@@ -27,7 +27,10 @@ const DIRECTORY: u64 = 0;
 type Key = [u8; 64];
 
 mod dag_facts;
+mod render_facts;
+pub(crate) mod session_tree;
 pub use dag_facts::OrderView;
+pub(crate) use render_facts::{Filter, RenderFact, RenderView};
 
 fn flag(d: &mut Decoder<'_>) -> Result<bool> {
     match d.uint()? {
@@ -75,30 +78,37 @@ pub(crate) struct Roots {
     order: u64,
     children: u64,
     referenced: u64,
+    rendered: render_facts::Roots,
 }
 
 impl Roots {
     fn write(self, e: &mut Encoder) {
-        e.array(6)
+        e.array(7)
             .uint(self.sequence)
             .uint(self.hash)
             .uint(self.clock)
             .uint(self.order)
             .uint(self.children)
             .uint(self.referenced);
+        self.rendered.write(e);
     }
     fn read(d: &mut Decoder<'_>) -> Result<Self> {
         let arity = d.array()?;
-        if arity != 2 && arity != 6 {
+        if !matches!(arity, 2 | 6 | 7) {
             return Err(invalid("entry roots arity"));
         }
         Ok(Self {
             sequence: d.uint()?,
             hash: d.uint()?,
-            clock: if arity == 6 { d.uint()? } else { 0 },
-            order: if arity == 6 { d.uint()? } else { 0 },
-            children: if arity == 6 { d.uint()? } else { 0 },
-            referenced: if arity == 6 { d.uint()? } else { 0 },
+            clock: if arity >= 6 { d.uint()? } else { 0 },
+            order: if arity >= 6 { d.uint()? } else { 0 },
+            children: if arity >= 6 { d.uint()? } else { 0 },
+            referenced: if arity >= 6 { d.uint()? } else { 0 },
+            rendered: if arity == 7 {
+                render_facts::Roots::read(d)?
+            } else {
+                render_facts::Roots::default()
+            },
         })
     }
 }
@@ -147,6 +157,9 @@ struct Directory {
     origin: Option<u64>,
     order_revision: u64,
     work: dag_facts::Work,
+    render_epoch: u64,
+    render_ready: bool,
+    render_cursor: Option<u64>,
 }
 
 impl Default for Directory {
@@ -163,6 +176,9 @@ impl Default for Directory {
             origin: None,
             order_revision: 0,
             work: dag_facts::Work::default(),
+            render_epoch: 0,
+            render_ready: false,
+            render_cursor: None,
         }
     }
 }
@@ -170,7 +186,7 @@ impl Default for Directory {
 impl Directory {
     fn bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
-        e.array(12).uint(2);
+        e.array(15).uint(3);
         self.active.write(&mut e);
         self.provisional.write(&mut e);
         e.uint(self.next_page)
@@ -217,6 +233,15 @@ impl Directory {
         }
         e.uint(self.order_revision);
         self.work.write(&mut e);
+        e.uint(self.render_epoch).uint(u64::from(self.render_ready));
+        match self.render_cursor {
+            Some(cursor) => {
+                e.array(1).uint(cursor);
+            }
+            None => {
+                e.array(0);
+            }
+        }
         Zeroizing::new(e.finish())
     }
     fn parse(bytes: &[u8]) -> Result<Self> {
@@ -226,7 +251,7 @@ impl Directory {
         let mut d = Decoder::new(bytes);
         let arity = d.array()?;
         let version = d.uint()?;
-        if !matches!((arity, version), (8, 1) | (12, 2)) {
+        if !matches!((arity, version), (8, 1) | (12, 2) | (15, 3)) {
             return Err(invalid("entry directory format"));
         }
         let active = Roots::read(&mut d)?;
@@ -277,8 +302,8 @@ impl Directory {
             }),
             _ => return Err(invalid("promotion arity")),
         };
-        let graph_ready = if version == 2 { flag(&mut d)? } else { false };
-        let origin = if version == 2 {
+        let graph_ready = if version >= 2 { flag(&mut d)? } else { false };
+        let origin = if version >= 2 {
             match d.array()? {
                 0 => None,
                 1 => Some(d.uint()?),
@@ -287,11 +312,22 @@ impl Directory {
         } else {
             None
         };
-        let order_revision = if version == 2 { d.uint()? } else { 0 };
-        let work = if version == 2 {
+        let order_revision = if version >= 2 { d.uint()? } else { 0 };
+        let work = if version >= 2 {
             dag_facts::Work::read(&mut d)?
         } else {
             dag_facts::Work::default()
+        };
+        let render_epoch = if version >= 3 { d.uint()? } else { 0 };
+        let render_ready = version >= 3 && flag(&mut d)?;
+        let render_cursor = if version >= 3 {
+            match d.array()? {
+                0 => None,
+                1 => Some(d.uint()?),
+                _ => return Err(invalid("render rebuild cursor")),
+            }
+        } else {
+            None
         };
         d.finish()?;
         if next_page == 0
@@ -308,6 +344,7 @@ impl Directory {
             ]
             .iter()
             .any(|id| *id >= next_page)
+            || !active.rendered.valid_for(next_page)
             || !work.valid_for(next_page, phase)
             || matches!(phase, Phase::Building | Phase::Switched) != promotion.is_some()
         {
@@ -331,6 +368,7 @@ impl Directory {
                 || p.work.order >= next_page
                 || p.work.children >= next_page
                 || p.work.referenced >= next_page
+                || !p.work.rendered.valid_for(next_page)
                 || p.retired >= next_page
             {
                 return Err(invalid("promotion bounds"));
@@ -348,6 +386,9 @@ impl Directory {
             origin,
             order_revision,
             work,
+            render_epoch,
+            render_ready,
+            render_cursor,
         })
     }
 }
@@ -394,6 +435,8 @@ enum Value {
     Entry(Locator),
     Number(u64),
     Present,
+    Rendered(RenderFact),
+    Owed(render_facts::OwedFact),
 }
 impl Value {
     fn locator(self) -> Result<Locator> {
@@ -411,6 +454,8 @@ impl Value {
             Self::Present => {
                 e.array(1).uint(2);
             }
+            Self::Rendered(fact) => fact.write(e),
+            Self::Owed(fact) => fact.write(e),
         }
     }
     fn read(d: &mut Decoder<'_>) -> Result<Self> {
@@ -429,6 +474,8 @@ impl Value {
             }
             2 if d.uint()? == 1 => Ok(Self::Number(d.uint()?)),
             1 if d.uint()? == 2 => Ok(Self::Present),
+            5 if d.uint()? == 3 => Ok(Self::Rendered(RenderFact::read(d)?)),
+            4 if d.uint()? == 4 => Ok(Self::Owed(render_facts::OwedFact::read(d)?)),
             _ => Err(invalid("entry page value kind")),
         }
     }
@@ -438,6 +485,7 @@ impl Value {
 enum Page {
     Leaf(Vec<(Key, Value)>),
     Branch(Vec<(Key, u64)>),
+    Ranked(Vec<(Key, u64, render_facts::Summary)>),
 }
 
 impl Page {
@@ -445,6 +493,7 @@ impl Page {
         match self {
             Self::Leaf(rows) => rows.last().map(|r| r.0),
             Self::Branch(rows) => rows.last().map(|r| r.0),
+            Self::Ranked(rows) => rows.last().map(|r| r.0),
         }
         .ok_or(invalid("empty entry page"))
     }
@@ -463,6 +512,13 @@ impl Page {
                 e.uint(1).array(rows.len());
                 for (key, id) in rows {
                     e.array(2).bytes(key).uint(*id);
+                }
+            }
+            Self::Ranked(rows) => {
+                e.uint(2).array(rows.len());
+                for (key, id, summary) in rows {
+                    e.array(3).bytes(key).uint(*id);
+                    summary.write(&mut e);
                 }
             }
         }
@@ -488,8 +544,9 @@ impl Page {
         let mut previous = None;
         let mut leaves = Vec::new();
         let mut branches = Vec::new();
+        let mut ranked = Vec::new();
         for _ in 0..count {
-            if d.array()? != 2 {
+            if d.array()? != if kind == 2 { 3 } else { 2 } {
                 return Err(invalid("entry page row arity"));
             }
             let encoded_key = d.bytes()?;
@@ -511,14 +568,21 @@ impl Page {
                     }
                     branches.push((key, id));
                 }
+                2 => {
+                    let id = d.uint()?;
+                    if id == 0 {
+                        return Err(invalid("render child id"));
+                    }
+                    ranked.push((key, id, render_facts::Summary::read(&mut d)?));
+                }
                 _ => return Err(invalid("entry page kind")),
             }
         }
         d.finish()?;
-        Ok(if kind == 0 {
-            Self::Leaf(leaves)
-        } else {
-            Self::Branch(branches)
+        Ok(match kind {
+            0 => Self::Leaf(leaves),
+            1 => Self::Branch(branches),
+            _ => Self::Ranked(ranked),
         })
     }
 }
@@ -527,6 +591,8 @@ enum Source<'a> {
     Snapshot(&'a Snapshot),
     Cached(&'a Snapshot, &'a RefCell<PageCache>),
     Batch(&'a Batch<'a>),
+    OtherSnapshot(&'a Snapshot, SegmentKind),
+    OtherBatch(&'a Batch<'a>, SegmentKind),
 }
 
 impl Source<'_> {
@@ -538,10 +604,12 @@ impl Source<'_> {
         id: u64,
     ) -> Result<Option<Zeroizing<Vec<u8>>>> {
         let sealed = match self {
-            Self::Snapshot(snapshot) | Self::Cached(snapshot, _) => {
-                snapshot.get_segment(channel, kind, id)?
+            Self::Snapshot(snapshot)
+            | Self::Cached(snapshot, _)
+            | Self::OtherSnapshot(snapshot, _) => snapshot.get_segment(channel, kind, id)?,
+            Self::Batch(batch) | Self::OtherBatch(batch, _) => {
+                batch.get_segment(channel, kind, id)?
             }
-            Self::Batch(batch) => batch.get_segment(channel, kind, id)?,
         };
         sealed
             .map(|value| open_segment(sek, kind, id, &value))
@@ -553,8 +621,12 @@ impl Source<'_> {
                 return Page::parse(&bytes);
             }
         }
+        let kind = match self {
+            Self::OtherSnapshot(_, kind) | Self::OtherBatch(_, kind) => *kind,
+            _ => SegmentKind::EntryIndex,
+        };
         let bytes = self
-            .open(sek, channel, SegmentKind::EntryIndex, id)?
+            .open(sek, channel, kind, id)?
             .ok_or(invalid("entry index page missing"))?;
         let page = Page::parse(&bytes)?;
         if let Self::Cached(_, cache) = self {
@@ -584,6 +656,10 @@ impl Source<'_> {
                     Some((_, next)) => root = *next,
                     None => return Ok(None),
                 },
+                Page::Ranked(rows) => match rows.iter().find(|r| r.0 >= *key) {
+                    Some((_, next, _)) => root = *next,
+                    None => return Ok(None),
+                },
             }
         }
         Err(invalid("entry index cycle or depth"))
@@ -609,6 +685,16 @@ impl Source<'_> {
         }
         match self.page(sek, channel, root)? {
             Page::Leaf(rows) => Ok(rows.into_iter().find(|r| r.0 >= *key)),
+            Page::Ranked(rows) => {
+                for (max, child, _) in rows {
+                    if max >= *key {
+                        if let Some(row) = self.first(sek, channel, child, key, depth + 1)? {
+                            return Ok(Some(row));
+                        }
+                    }
+                }
+                Ok(None)
+            }
             Page::Branch(rows) => {
                 for (max, child) in rows {
                     if max >= *key {
@@ -843,6 +929,7 @@ impl EntryWrite for Read<'_> {
 /// A write context sees only its own Batch, including earlier tree splits. Dropping the Batch
 /// discards its directory as well: no root or cache is changed before commit.
 pub(crate) struct Write<'a, 's> {
+    kind: SegmentKind,
     batch: &'a mut Batch<'s>,
     sek: &'a Sek,
     channel: &'a Digest32,
@@ -863,6 +950,7 @@ impl EntryIndex {
                 None => Directory::default(),
             };
         Ok(Write {
+            kind: SegmentKind::EntryIndex,
             batch,
             sek,
             channel,
@@ -889,9 +977,9 @@ impl Write<'_, '_> {
     fn put_page(&mut self, page: &Page) -> Result<(Key, u64)> {
         let bytes = page.bytes()?;
         let id = self.allocate()?;
-        let sealed = seal_segment(self.sek, SegmentKind::EntryIndex, id, &bytes)?;
+        let sealed = seal_segment(self.sek, self.kind, id, &bytes)?;
         self.batch
-            .put_segment(self.channel, SegmentKind::EntryIndex, id, &sealed)?;
+            .put_segment(self.channel, self.kind, id, &sealed)?;
         Ok((page.max()?, id))
     }
     fn retire(&mut self, id: u64) -> Result<()> {
@@ -905,17 +993,16 @@ impl Write<'_, '_> {
             let mut e = Encoder::new();
             e.array(4).uint(1).uint(2).uint(previous).uint(id);
             let ledger = self.allocate()?;
-            let sealed = seal_segment(self.sek, SegmentKind::EntryIndex, ledger, &e.finish())?;
+            let sealed = seal_segment(self.sek, self.kind, ledger, &e.finish())?;
             self.batch
-                .put_segment(self.channel, SegmentKind::EntryIndex, ledger, &sealed)?;
+                .put_segment(self.channel, self.kind, ledger, &sealed)?;
             self.directory
                 .promotion
                 .as_mut()
                 .ok_or(invalid("promotion missing"))?
                 .retired = ledger;
         } else {
-            self.batch
-                .delete_segment(self.channel, SegmentKind::EntryIndex, id)?;
+            self.batch.delete_segment(self.channel, self.kind, id)?;
         }
         Ok(())
     }
@@ -932,7 +1019,7 @@ impl Write<'_, '_> {
         let old = if root == 0 {
             Page::Leaf(Vec::new())
         } else {
-            Source::Batch(self.batch).page(self.sek, self.channel, root)?
+            Source::OtherBatch(self.batch, self.kind).page(self.sek, self.channel, root)?
         };
         let mut parts = Vec::with_capacity(2);
         match old {
@@ -959,6 +1046,7 @@ impl Write<'_, '_> {
                     parts.push(self.put_page(&Page::Leaf(rows))?);
                 }
             }
+            Page::Ranked(_) => return Err(invalid("ranked page in entry tree")),
             Page::Branch(mut rows) => {
                 let at = rows
                     .iter()

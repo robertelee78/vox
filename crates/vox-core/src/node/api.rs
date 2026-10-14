@@ -556,6 +556,25 @@ pub struct Offer {
     pub trusted_by: Vec<Digest32>,
 }
 
+/// One bounded arrival-ordered history result. An explicit scan continuation may
+/// accompany an empty filtered page; only its absence marks the end of this scan.
+#[derive(Debug, Clone)]
+pub struct MessagePage {
+    /// Owned readable rows in this page.
+    pub rows: Vec<MessageRow>,
+    /// Continue strictly after this arrival id, even when there were no matching rows.
+    pub next: Option<u64>,
+}
+
+/// One bounded display page and the exact number of earlier visible rows.
+#[derive(Debug, Clone)]
+pub struct HistoryPage {
+    /// Oldest first within this page, including owed placeholders.
+    pub rows: Vec<MessageRow>,
+    /// Rows strictly before the first returned row.
+    pub older: u64,
+}
+
 /// An open channel's full state for display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelDetail {
@@ -573,6 +592,8 @@ pub struct ChannelDetail {
     /// IPC read page takes one — used to copy every room's whole timeline (V210-71); and a new
     /// message adds its row without rebuilding the rest (V210-120).
     pub timeline: Timeline,
+    /// The newest readable local arrival; used to start bounded subscribers.
+    pub last_arrival: Option<u64>,
     /// Local reuse stamp for the already-built display; never serialized or sent to peers.
     pub(crate) display_stamp: crate::node::channel::DisplayStamp,
     /// Node-local change token for the published timeline, unchanged on projection reuse.

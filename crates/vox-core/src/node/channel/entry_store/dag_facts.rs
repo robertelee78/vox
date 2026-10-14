@@ -7,13 +7,13 @@ use crate::log::dag::MAX_LEAD_MS;
 /// Published display order: hybrid clock, then exact entry hash.
 pub type OrderKey = (u64, Digest32);
 
-fn ordered((clock, hash): OrderKey) -> Key {
+pub(super) fn ordered((clock, hash): OrderKey) -> Key {
     let mut key = [0; 64];
     key[..8].copy_from_slice(&clock.to_be_bytes());
     key[8..40].copy_from_slice(&hash);
     key
 }
-fn order_key(key: Key) -> Result<OrderKey> {
+pub(super) fn order_key(key: Key) -> Result<OrderKey> {
     if key[40..].iter().any(|b| *b != 0) {
         return Err(invalid("DAG order key padding"));
     }
@@ -27,7 +27,7 @@ fn pair(first: &Digest32, second: &Digest32) -> Key {
     key[32..].copy_from_slice(second);
     key
 }
-fn successor(mut key: Key) -> Option<Key> {
+pub(super) fn successor(mut key: Key) -> Option<Key> {
     for byte in key.iter_mut().rev() {
         if *byte != u8::MAX {
             *byte += 1;
@@ -37,7 +37,7 @@ fn successor(mut key: Key) -> Option<Key> {
     }
     None
 }
-fn predecessor(mut key: Key) -> Option<Key> {
+pub(super) fn predecessor(mut key: Key) -> Option<Key> {
     for byte in key.iter_mut().rev() {
         if *byte != 0 {
             *byte -= 1;
@@ -203,7 +203,7 @@ impl Source<'_> {
             _ => Err(invalid("DAG numeric fact kind")),
         }
     }
-    fn last(
+    pub(super) fn last(
         &self,
         sek: &Sek,
         channel: &Digest32,
@@ -219,6 +219,17 @@ impl Source<'_> {
         }
         match self.page(sek, channel, root)? {
             Page::Leaf(rows) => Ok(rows.into_iter().rev().find(|r| r.0 <= *key)),
+            Page::Ranked(rows) => {
+                for i in (0..rows.len()).rev() {
+                    if i != 0 && rows[i - 1].0 >= *key {
+                        continue;
+                    }
+                    if let Some(row) = self.last(sek, channel, rows[i].1, key, depth + 1)? {
+                        return Ok(Some(row));
+                    }
+                }
+                Ok(None)
+            }
             Page::Branch(rows) => {
                 for i in (0..rows.len()).rev() {
                     // This child's minimum exceeds the preceding child's maximum.
@@ -450,6 +461,7 @@ impl Write<'_, '_> {
         if old.is_none_or(|old| clock > old) {
             if let Some(old) = old {
                 roots.order = self.change_value(roots.order, ordered((old, hash)), None)?;
+                self.move_rendered(&mut roots, hash, old, clock)?;
                 if let Some(p) = &mut self.directory.promotion {
                     p.reordered = p.reordered.wrapping_add(1);
                 } else {

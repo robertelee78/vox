@@ -387,6 +387,7 @@ fn detail_of(
         epoch: ch.epoch(),
         members: ch.members(),
         timeline,
+        last_arrival: ch.last_arrival(store)?,
         display_stamp,
         display_revision,
         row_index,
@@ -419,9 +420,9 @@ fn detail_of(
         received_key_generations: ch.received_key_generations(),
         frozen,
         refused_below_checkpoint,
-        read_by: ch.read_by_own(),
+        read_by: ch.read_by_own(store)?,
         held: ch.held_own(store)?,
-        unread: ch.unread(),
+        unread: ch.unread(store)?,
         drive_from: ch.drive_from(store)?,
         session_files: ch.session_files(),
         session_records: ch.session_records(),
@@ -4087,22 +4088,21 @@ impl NodeHandle {
         rx.await.ok()?
     }
 
+    /// A bounded history reader that does not hold this node alive.
+    #[must_use]
+    pub fn history_reader(&self) -> HistoryReader {
+        HistoryReader {
+            tx: self.net_tx.downgrade(),
+        }
+    }
+
     /// One bounded selected-room query. No snapshot or room lock crosses this reply.
     pub(crate) async fn room_history(
         &self,
         channel_id: Digest32,
         query: crate::node::channel::history::Query,
     ) -> std::result::Result<crate::node::channel::history::Reply, String> {
-        let (reply, rx) = oneshot::channel();
-        self.net_tx
-            .send(NetEvent::RoomHistory {
-                channel_id,
-                query,
-                reply,
-            })
-            .await
-            .map_err(|_| "the node has stopped".to_owned())?;
-        rx.await.map_err(|_| "the node has stopped".to_owned())?
+        query_history(&self.net_tx, channel_id, query).await
     }
 
     /// Borrow metadata directly: cloning NodeView also clones every room's complete order.
@@ -5358,6 +5358,9 @@ impl Node {
             node.paths.clone(),
             cmd_tx.downgrade(),
             node.view_tx.subscribe(),
+            HistoryReader {
+                tx: handle_net_tx.downgrade(),
+            },
             handle_event_tx.clone(),
         );
         let paths = node.paths.clone();
@@ -13225,9 +13228,15 @@ impl Node {
         let view = self.view_tx.subscribe();
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
-            let r = agree_round(net, tx, view, question, members, skipped).await;
-            let _ = report.send(r);
-            let _ = reply.send(Outcome::Done);
+            match agree_round(net, tx, view, question, members, skipped).await {
+                Ok(r) => {
+                    let _ = report.send(r);
+                    let _ = reply.send(Outcome::Done);
+                }
+                Err(fault) => {
+                    let _ = reply.send(Outcome::Failed(fault));
+                }
+            }
         });
     }
 
@@ -13379,16 +13388,27 @@ impl Node {
         }
         let mut view = self.view_tx.subscribe();
         let clock = Arc::clone(&self.millis_clock);
-        let held = listed(&view.borrow_and_update(), &ask, clock()).is_some();
-        if !held {
-            self.sync_with(&ask.channel_id, &[peer]).await;
-        }
+        let tx = self.net_tx.clone();
         tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + crate::node::agreestream::HOLD_PATIENCE;
+            let mut fetched = false;
             let a = loop {
-                let now = listed(&view.borrow_and_update(), &ask, clock());
-                if let Some(a) = now {
-                    break a;
+                match tokio::time::timeout_at(deadline, listed(&tx, &ask, clock())).await {
+                    Ok(Ok(Some(answer))) => break answer,
+                    Ok(Ok(None)) => {}
+                    Err(_) => break Answer::NotReceived,
+                    // The room's query records/poisons local storage failure. Do not invent
+                    // NotReceived or a held set from a failed local read.
+                    Ok(Err(_)) => return,
+                }
+                if !fetched {
+                    let _ = tx
+                        .send(NetEvent::AgreeFetch {
+                            channel_id: ask.channel_id,
+                            peers: vec![peer],
+                        })
+                        .await;
+                    fetched = true;
                 }
                 match tokio::time::timeout_at(deadline, view.changed()).await {
                     Ok(Ok(())) => {}
@@ -17592,7 +17612,13 @@ impl Node {
                 continue;
             };
             let shown: Vec<Digest32> = pending.iter().copied().collect();
-            let mut read = ch.unrecorded_reads(&me, &shown);
+            let mut read = match ch.unrecorded_reads(profile.store(), &me, &shown) {
+                Ok(read) => read,
+                Err(error) => {
+                    ch.poison(&error);
+                    continue;
+                }
+            };
             read.truncate(crate::node::content::MAX_READ_HASHES);
             if read.is_empty() {
                 pending.clear();
@@ -17921,7 +17947,7 @@ impl Node {
         // ordering inversion this change exists to remove.
         let now_millis = (self.millis_clock)();
         let appended = match ch.append_text(profile, text, now_millis) {
-            Ok(r) => row_of(r),
+            Ok(r) => row_of(&r),
             Err(e) => return Outcome::Failed(fault_of(&e)),
         };
         // ADR-006's scheduled rotation: at `N` messages or `T` elapsed the sender key
@@ -18952,6 +18978,173 @@ async fn test_admission_gate() {
     }
 }
 
+/// A bounded reader of the selected node's room history. It owns no room, profile,
+/// snapshot, or keys and cannot keep a stopped node alive.
+#[derive(Clone)]
+pub struct HistoryReader {
+    tx: mpsc::WeakSender<NetEvent>,
+}
+impl HistoryReader {
+    async fn query(
+        &self,
+        room: Digest32,
+        query: crate::node::channel::history::Query,
+    ) -> std::result::Result<crate::node::channel::history::Reply, String> {
+        let tx = self
+            .tx
+            .upgrade()
+            .ok_or_else(|| "the node has stopped".to_owned())?;
+        query_history(&tx, room, query).await
+    }
+    /// The newest readable arrival, without loading a message body.
+    pub async fn latest_arrival(&self, room: Digest32) -> std::result::Result<Option<u64>, String> {
+        use crate::node::channel::history::{Query, Reply};
+        match self.query(room, Query::LatestArrival).await? {
+            Reply::LatestArrival(last) => Ok(last),
+            _ => Err("unexpected latest-arrival answer".into()),
+        }
+    }
+    /// One display-ordered page, newest when `before` is absent.
+    pub async fn older_page(
+        &self,
+        room: Digest32,
+        before: Option<Digest32>,
+        limit: usize,
+    ) -> std::result::Result<crate::node::api::HistoryPage, String> {
+        use crate::node::channel::history::{Query, Reply};
+        match self
+            .query(
+                room,
+                Query::Older {
+                    before,
+                    limit: limit.clamp(1, crate::node::ipc::PAGE_ENTRIES),
+                },
+            )
+            .await?
+        {
+            Reply::Older { rows, older } => Ok(crate::node::api::HistoryPage { rows, older }),
+            _ => Err("unexpected older history answer".into()),
+        }
+    }
+    /// Read one arrival page; errors distinguish a failed local read from an empty result.
+    pub async fn arrival_page(
+        &self,
+        room: Digest32,
+        after: Option<u64>,
+        limit: usize,
+    ) -> std::result::Result<crate::node::api::MessagePage, String> {
+        use crate::node::channel::history::{Query, Reply};
+        match self
+            .query(
+                room,
+                Query::Arrival {
+                    after,
+                    limit: limit.clamp(1, crate::node::ipc::PAGE_ENTRIES),
+                },
+            )
+            .await?
+        {
+            Reply::Page { rows, next } => Ok(crate::node::api::MessagePage { rows, next }),
+            _ => Err("unexpected history page answer".into()),
+        }
+    }
+    /// Read one page of these structured types, selected by the sealed room index.
+    pub async fn typed_page(
+        &self,
+        room: Digest32,
+        types: Vec<String>,
+        after: Option<u64>,
+        limit: usize,
+    ) -> std::result::Result<crate::node::api::MessagePage, String> {
+        use crate::node::channel::history::{Filter, Query, Reply, Selection};
+        match self
+            .query(
+                room,
+                Query::Filtered {
+                    selection: Selection::Any(types.into_iter().map(Filter::Type).collect()),
+                    since: None,
+                    resume: after,
+                    limit: limit.clamp(1, crate::node::ipc::PAGE_ENTRIES),
+                },
+            )
+            .await?
+        {
+            Reply::Page { rows, next } => Ok(crate::node::api::MessagePage { rows, next }),
+            _ => Err("unexpected history page answer".into()),
+        }
+    }
+    /// A bounded page of possible wake/reply notices; ordinary chat is not scanned.
+    pub async fn notice_page(
+        &self,
+        room: Digest32,
+        after: Option<u64>,
+    ) -> std::result::Result<crate::node::api::MessagePage, String> {
+        use crate::node::channel::history::{Filter, Query, Reply, Selection};
+        match self
+            .query(
+                room,
+                Query::Filtered {
+                    selection: Selection::Any(vec![Filter::NoticeCandidates]),
+                    since: None,
+                    resume: after,
+                    limit: crate::node::ipc::PAGE_ENTRIES,
+                },
+            )
+            .await?
+        {
+            Reply::Page { rows, next } => Ok(crate::node::api::MessagePage { rows, next }),
+            _ => Err("unexpected notice page answer".into()),
+        }
+    }
+    /// Resolve bounded exact hashes. Missing is absent; owed rows retain their owed flag;
+    /// a storage/revision error discards the whole partial answer.
+    pub async fn exact(
+        &self,
+        room: Digest32,
+        hashes: Vec<Digest32>,
+    ) -> std::result::Result<Vec<MessageRow>, String> {
+        use crate::node::channel::history::{Query, Reply};
+        let Reply::Located { entries, revision } =
+            self.query(room, Query::Locate { entries: hashes }).await?
+        else {
+            return Err("unexpected exact history answer".into());
+        };
+        let mut rows = Vec::new();
+        for entry in entries {
+            let Reply::Exact(row) = self
+                .query(
+                    room,
+                    Query::Exact {
+                        entry,
+                        revision: revision.clone(),
+                    },
+                )
+                .await?
+            else {
+                return Err("unexpected exact history row".into());
+            };
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+}
+
+async fn query_history(
+    tx: &mpsc::Sender<NetEvent>,
+    channel_id: Digest32,
+    query: crate::node::channel::history::Query,
+) -> std::result::Result<crate::node::channel::history::Reply, String> {
+    let (reply, rx) = oneshot::channel();
+    tx.send(NetEvent::RoomHistory {
+        channel_id,
+        query,
+        reply,
+    })
+    .await
+    .map_err(|_| "the node has stopped".to_owned())?;
+    rx.await.map_err(|_| "the node has stopped".to_owned())?
+}
+
 /// The posts of `ask.types` this node's view of a room holds, once it holds `ask.entry`; `None`
 /// while it does not (V210-168).
 ///
@@ -18961,55 +19154,59 @@ async fn test_admission_gate() {
 /// clock is more than that behind this node's skipped this node's posts when it stamped, so its
 /// claim can sort before one this node already holds. Agreeing then could tell two claimants "you
 /// hold it"; the answer says the clocks are apart instead.
-fn listed(
-    view: &crate::node::api::NodeView,
+async fn listed(
+    tx: &mpsc::Sender<NetEvent>,
     ask: &crate::node::agreestream::Ask,
     now_millis: u64,
-) -> Option<crate::node::agreestream::Answer> {
-    use crate::node::agreestream::{Answer, MAX_LISTED, STAMP_LEAD_LIMIT_MILLIS};
+) -> std::result::Result<Option<crate::node::agreestream::Answer>, String> {
+    use crate::node::{
+        agreestream::{Answer, STAMP_LEAD_LIMIT_MILLIS},
+        channel::history::{Query, Reply},
+    };
     if now_millis.abs_diff(ask.sent_millis) > STAMP_LEAD_LIMIT_MILLIS {
-        return Some(Answer::ClocksApart);
+        return Ok(Some(Answer::ClocksApart));
     }
-    let d = view
-        .open_channels
-        .iter()
-        .find(|d| d.channel_id == ask.channel_id)?;
-    let asked = d
-        .timeline
-        .iter()
-        .rev()
-        .find(|r| r.entry_hash == ask.entry)?;
-    if asked.created_millis > now_millis.saturating_add(STAMP_LEAD_LIMIT_MILLIS) {
-        return Some(Answer::ClocksApart);
+    match query_history(
+        tx,
+        ask.channel_id,
+        Query::Agreement {
+            entry: Some(ask.entry),
+            types: ask.types.clone(),
+            now: now_millis,
+        },
+    )
+    .await?
+    {
+        Reply::Agreement(answer) => Ok(answer),
+        _ => Err("unexpected agreement history answer".into()),
     }
-    let at = d.structured.positions(&ask.types, &[]);
-    if at.len() > MAX_LISTED {
-        return Some(Answer::TooMany);
-    }
-    Some(Answer::Holds(
-        at.iter()
-            .filter_map(|i| d.timeline.get(*i as usize).map(|r| r.entry_hash))
-            .collect(),
-    ))
 }
 
-/// The posts of `types` this node's view of a room holds.
-fn own_listed(
-    view: &crate::node::api::NodeView,
-    channel_id: &Digest32,
+async fn own_listed(
+    tx: &mpsc::Sender<NetEvent>,
+    channel_id: Digest32,
     types: &[String],
-) -> Vec<Digest32> {
-    view.open_channels
-        .iter()
-        .find(|d| d.channel_id == *channel_id)
-        .map(|d| {
-            d.structured
-                .positions(types, &[])
-                .iter()
-                .filter_map(|i| d.timeline.get(*i as usize).map(|r| r.entry_hash))
-                .collect()
-        })
-        .unwrap_or_default()
+) -> std::result::Result<Vec<Digest32>, Fault> {
+    use crate::node::{
+        agreestream::Answer,
+        channel::history::{Query, Reply},
+    };
+    match query_history(
+        tx,
+        channel_id,
+        Query::Agreement {
+            entry: None,
+            types: types.to_vec(),
+            now: 0,
+        },
+    )
+    .await
+    .map_err(|_| Fault::Storage)?
+    {
+        Reply::Agreement(Some(Answer::Holds(entries))) => Ok(entries),
+        Reply::Agreement(Some(Answer::TooMany)) => Err(Fault::TooLong),
+        _ => Err(Fault::Internal),
+    }
 }
 
 /// **One agreement round** (V210-168; see [`crate::node::agreestream`]): reach and ask every
@@ -19028,7 +19225,7 @@ async fn agree_round(
     question: crate::node::agreestream::Ask,
     members: Vec<(Digest32, crate::nat::multiaddr::EndpointList)>,
     skipped: Vec<Digest32>,
-) -> crate::node::agreestream::Report {
+) -> std::result::Result<crate::node::agreestream::Report, Fault> {
     use crate::node::agreestream::{self as agree, Agreement, Answer, Asking};
     let deadline = tokio::time::Instant::now() + agree::ASK_PATIENCE;
     let mut asking = tokio::task::JoinSet::new();
@@ -19098,20 +19295,13 @@ async fn agree_round(
 
     // **Pull what members hold and this node does not**, so the client can fold their sets: a
     // claim that crossed this one is usually exactly that.
-    let lacking = |view: &crate::node::api::NodeView| -> Vec<Digest32> {
-        let mine: BTreeSet<Digest32> = own_listed(view, &question.channel_id, &question.types)
-            .into_iter()
-            .collect();
-        asked
-            .iter()
-            .filter(|(_, a)| {
-                matches!(a, Asking::Answered(Answer::Holds(list))
-                    if list.iter().any(|h| !mine.contains(h)))
-            })
-            .map(|(m, _)| *m)
-            .collect()
+    let lacking = |mine: &[Digest32]| -> Vec<Digest32> {
+        let mine: BTreeSet<_> = mine.iter().copied().collect();
+        asked.iter().filter(|(_,a)|matches!(a,Asking::Answered(Answer::Holds(list)) if list.iter().any(|h|!mine.contains(h))))
+            .map(|(m,_)|*m).collect()
     };
-    let peers = lacking(&view.borrow_and_update());
+    let mut mine = own_listed(&tx, question.channel_id, &question.types).await?;
+    let peers = lacking(&mine);
     if !peers.is_empty() {
         let _ = tx
             .send(NetEvent::AgreeFetch {
@@ -19120,17 +19310,16 @@ async fn agree_round(
             })
             .await;
         let by = tokio::time::Instant::now() + agree::FETCH_PATIENCE;
-        while !lacking(&view.borrow_and_update()).is_empty() {
+        while !lacking(&mine).is_empty() {
             if !matches!(
                 tokio::time::timeout_at(by, view.changed()).await,
                 Ok(Ok(()))
             ) {
                 break;
             }
+            mine = own_listed(&tx, question.channel_id, &question.types).await?;
         }
     }
-
-    let mine = own_listed(&view.borrow(), &question.channel_id, &question.types);
     let mut members: Vec<(Digest32, Agreement)> = asked
         .into_iter()
         .map(|(m, a)| {
@@ -19150,10 +19339,10 @@ async fn agree_round(
     // can sort before it although it was made after, so whatever the members answered, the claim
     // is not agreed. Its author is named, this node itself included, beside its answer.
     members.extend(skipped.into_iter().map(|a| (a, Agreement::StampedAhead)));
-    agree::Report {
+    Ok(agree::Report {
         mine: mine.len() as u64,
         members,
-    }
+    })
 }
 
 /// The [`Fault`] a person is told for `e`: one mapping, shared by the actor and by a client verb

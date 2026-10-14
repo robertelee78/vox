@@ -13,7 +13,7 @@ do {
     let node = try await VoxNode.start(dataDir: dir, passphrase: "ios smoke", listen: "127.0.0.1:0")
     let room = try await node.createRoom(name: "smoke", passphrase: "room passphrase")
     try await node.post(room: room, text: "hello from iOS")
-    let read = try node.read(room: room)
+    let read = try await node.readPage(room: room, before: nil).messages
     print("IOS OK fp=\(node.fingerprint()) room=\(room) messages=\(read.count) first=\(read.first?.text ?? "")")
     await node.stop()
 } catch {

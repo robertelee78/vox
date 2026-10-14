@@ -235,6 +235,7 @@ const T_RETENTION_ABOVE_ROOM: u64 = 3803;
 const T_OK: u64 = 3;
 const T_ERROR: u64 = 4;
 const T_ROWS: u64 = 5;
+const T_FILTERED_ROWS: u64 = 87201;
 const T_MEMBERS: u64 = 6;
 /// [`Frame::Consents`] (V030-17).
 const T_CONSENTS: u64 = 3271;
@@ -498,6 +499,10 @@ pub enum Request {
     Order {
         /// The room.
         channel_id: Digest32,
+        /// Exclusive canonical key from the previous page.
+        after: Option<(u64, Digest32)>,
+        /// The previous page's ordering revision; a change requires an explicit restart.
+        revision: Option<u64>,
     },
     /// The members of a room.
     Roster {
@@ -899,6 +904,8 @@ pub enum Request {
         from: Option<Digest32>,
         /// Return only matching rows **after** this one. Absent reads from the first.
         since: Option<Digest32>,
+        /// Scan continuation from the preceding bounded filtered page, even if it had no match.
+        resume: Option<u64>,
     },
     /// A thread's readable replies, indexed by its General message, in arrival order. The
     /// root is read with `Find`. Opaque owed rows cannot establish thread membership and
@@ -1011,8 +1018,9 @@ impl Request {
                 tags,
                 from,
                 since,
+                resume,
             } => {
-                e.array(5)
+                e.array(6)
                     .uint(T_TAGGED)
                     .bytes(channel_id)
                     .array(tags.len());
@@ -1021,6 +1029,7 @@ impl Request {
                 }
                 e.bytes(from.as_ref().map_or(&[][..], |d| &d[..]));
                 e.bytes(since.as_ref().map_or(&[][..], |d| &d[..]));
+                encode_optional_u64(&mut e, *resume);
             }
             Request::Thread {
                 channel_id,
@@ -1131,8 +1140,14 @@ impl Request {
             Request::Consents { channel_id } => {
                 e.array(2).uint(T_CONSENTS_REQ).bytes(channel_id);
             }
-            Request::Order { channel_id } => {
-                e.array(2).uint(T_ORDER).bytes(channel_id);
+            Request::Order {
+                channel_id,
+                after,
+                revision,
+            } => {
+                e.array(4).uint(T_ORDER).bytes(channel_id);
+                encode_order_cursor(&mut e, *after);
+                encode_optional_u64(&mut e, *revision);
             }
             Request::Services { channel_id } => {
                 e.array(2).uint(T_SERVICES_REQ).bytes(channel_id);
@@ -1526,11 +1541,17 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Consents { channel_id })
             }
-            (T_ORDER, 2) => {
+            (T_ORDER, 4) => {
                 let channel_id = digest(&mut d)?;
+                let after = order_cursor(&mut d)?;
+                let revision = optional_u64(&mut d)?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
-                Ok(Request::Order { channel_id })
+                Ok(Request::Order {
+                    channel_id,
+                    after,
+                    revision,
+                })
             }
             (T_SERVICES_REQ, 2) => {
                 let channel_id = digest(&mut d)?;
@@ -1581,7 +1602,7 @@ impl Request {
                     since,
                 })
             }
-            (T_TAGGED, 5) => {
+            (T_TAGGED, 6) => {
                 let channel_id = digest(&mut d)?;
                 let n = d.array().map_err(|_| Error::MalformedIpc("ipc tags"))?;
                 if n == 0 || n > vox_agentcomms::envelope::MAX_TAGS {
@@ -1593,6 +1614,7 @@ impl Request {
                 }
                 let from = optional_digest(&mut d)?;
                 let since = optional_digest(&mut d)?;
+                let resume = optional_u64(&mut d)?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Tagged {
@@ -1600,6 +1622,7 @@ impl Request {
                     tags,
                     from,
                     since,
+                    resume,
                 })
             }
             (T_THREAD, 4) => {
@@ -2202,6 +2225,13 @@ pub enum Frame {
         revision: Digest32,
     },
     /// The rows a [`Request::Read`] asked for, oldest first.
+    /// One bounded filtered page; `next` advances the index scan even with no matching rows.
+    FilteredRows {
+        /// Readable matches in this page.
+        rows: Vec<MessageRow>,
+        /// Resume strictly after this local arrival id, or finish when absent.
+        next: Option<u64>,
+    },
     Rows {
         /// The rendered entries.
         rows: Vec<MessageRow>,
@@ -2210,6 +2240,10 @@ pub enum Frame {
     Order {
         /// `(entry hash, clock in ms)`, first to last.
         entries: Vec<(Digest32, u64)>,
+        /// Next exclusive key, absent at the end.
+        next: Option<(u64, Digest32)>,
+        /// Revision binding all pages of this read.
+        revision: u64,
     },
     /// The members a [`Request::Roster`] asked for.
     Members {
@@ -2414,6 +2448,13 @@ impl Frame {
                 }
                 e.bytes(next_author.as_ref().map_or(&[][..], |d| &d[..]));
             }
+            Frame::FilteredRows { rows, next } => {
+                e.array(3).uint(T_FILTERED_ROWS).array(rows.len());
+                for row in rows {
+                    encode_row(&mut e, row);
+                }
+                encode_optional_u64(&mut e, *next);
+            }
             Frame::Rows { rows } => {
                 e.array(2).uint(T_ROWS).array(rows.len());
                 for r in rows {
@@ -2423,11 +2464,17 @@ impl Frame {
             Frame::RoomDisplayRevision { revision } => {
                 e.array(2).uint(T_ROOM_DISPLAY_REVISION).bytes(revision);
             }
-            Frame::Order { entries } => {
-                e.array(2).uint(T_ORDER_ROWS).array(entries.len());
+            Frame::Order {
+                entries,
+                next,
+                revision,
+            } => {
+                e.array(4).uint(T_ORDER_ROWS).array(entries.len());
                 for (h, clock) in entries {
                     e.array(2).bytes(h).uint(*clock);
                 }
+                encode_order_cursor(&mut e, *next);
+                e.uint(*revision);
             }
             Frame::Members { members } => {
                 e.array(2).uint(T_MEMBERS).array(members.len());
@@ -2625,6 +2672,52 @@ impl Frame {
 fn digest(d: &mut Decoder<'_>) -> Result<Digest32> {
     let b = d.bytes().map_err(|_| Error::MalformedIpc("ipc digest"))?;
     Digest32::try_from(b).map_err(|_| Error::MalformedIpc("ipc digest length"))
+}
+
+fn encode_order_cursor(e: &mut Encoder, cursor: Option<(u64, Digest32)>) {
+    match cursor {
+        Some((clock, hash)) => {
+            e.array(2).uint(clock).bytes(&hash);
+        }
+        None => {
+            e.array(0);
+        }
+    }
+}
+fn order_cursor(d: &mut Decoder<'_>) -> Result<Option<(u64, Digest32)>> {
+    match d.array().map_err(|_| Error::MalformedIpc("order cursor"))? {
+        0 => Ok(None),
+        2 => Ok(Some((
+            d.uint()
+                .map_err(|_| Error::MalformedIpc("order cursor clock"))?,
+            digest(d)?,
+        ))),
+        _ => Err(Error::MalformedIpc("order cursor arity")),
+    }
+}
+
+fn encode_optional_u64(e: &mut Encoder, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            e.array(1).uint(value);
+        }
+        None => {
+            e.array(0);
+        }
+    }
+}
+fn optional_u64(d: &mut Decoder<'_>) -> Result<Option<u64>> {
+    match d
+        .array()
+        .map_err(|_| Error::MalformedIpc("ipc scalar cursor"))?
+    {
+        0 => Ok(None),
+        1 => Ok(Some(
+            d.uint()
+                .map_err(|_| Error::MalformedIpc("ipc scalar cursor"))?,
+        )),
+        _ => Err(Error::MalformedIpc("ipc scalar cursor arity")),
+    }
 }
 
 /// A page cursor: empty bytes for "from the start", else a digest.
@@ -3074,6 +3167,15 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 .map_err(|_| Error::MalformedIpc("ipc room page older"))?;
             return Ok(Frame::RoomPage { rows, older });
         }
+        (T_FILTERED_ROWS, 3) => {
+            let Frame::Rows { rows } = decode_body(d, T_ROWS, 2)? else {
+                return Err(Error::MalformedIpc("filtered rows"));
+            };
+            return Ok(Frame::FilteredRows {
+                rows,
+                next: optional_u64(d)?,
+            });
+        }
         (T_ROWS, 2) => {
             let n = d.array().map_err(|_| Error::MalformedIpc("ipc rows"))?;
             let mut rows = Vec::with_capacity(n.min(1024));
@@ -3099,7 +3201,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             }
             return Ok(Frame::Rows { rows });
         }
-        (T_ORDER_ROWS, 2) => {
+        (T_ORDER_ROWS, 4) => {
             let n = d.array().map_err(|_| Error::MalformedBundle("ipc order"))?;
             let mut entries = Vec::with_capacity(n.min(1024));
             for _ in 0..n {
@@ -3115,7 +3217,15 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                     .map_err(|_| Error::MalformedBundle("ipc order clock"))?;
                 entries.push((h, clock));
             }
-            return Ok(Frame::Order { entries });
+            let next = order_cursor(d)?;
+            let revision = d
+                .uint()
+                .map_err(|_| Error::MalformedIpc("order revision"))?;
+            return Ok(Frame::Order {
+                entries,
+                next,
+                revision,
+            });
         }
         (T_MEMBERS, 2) => {
             let n = d.array().map_err(|_| Error::MalformedIpc("ipc members"))?;
@@ -3858,12 +3968,12 @@ async fn write_found(
     stream: &mut UnixStream,
     handle: &NodeHandle,
     channel_id: Digest32,
-    entries: Vec<Digest32>,
+    selection: crate::node::channel::history::Query,
     writing: &std::sync::atomic::AtomicBool,
 ) -> Result<bool> {
     use crate::node::channel::history::{Query, Reply};
     let located = tokio::select! {
-        result = handle.room_history(channel_id, Query::Locate { entries }) => result,
+        result = handle.room_history(channel_id, selection) => result,
         () = subscriber_gone(stream) => return Ok(false),
     };
     let (entries, revision) = match located {
@@ -4420,14 +4530,26 @@ async fn serve_requests(
                 () = node_detached(&mut watch) => Ok(()),
             };
         }
-        if let Request::Find {
-            channel_id,
-            entries,
-        } = request
-        {
+        let found = match &request {
+            Request::Find {
+                channel_id,
+                entries,
+            } => Some((
+                *channel_id,
+                crate::node::channel::history::Query::Locate {
+                    entries: entries.clone(),
+                },
+            )),
+            Request::Unread { channel_id } => Some((
+                *channel_id,
+                crate::node::channel::history::Query::LocateUnread,
+            )),
+            _ => None,
+        };
+        if let Some((channel_id, selection)) = found {
             let writing = std::sync::atomic::AtomicBool::new(false);
             tokio::select! {
-                result = write_found(&mut stream, handle, channel_id, entries, &writing) => {
+                result = write_found(&mut stream, handle, channel_id, selection, &writing) => {
                     if !result? {
                         return Ok(());
                     }
@@ -4465,6 +4587,7 @@ async fn serve_requests(
         if matches!(
             reply,
             Frame::Rows { .. }
+                | Frame::FilteredRows { .. }
                 | Frame::RoomPage { .. }
                 | Frame::Order { .. }
                 | Frame::Members { .. }
@@ -5332,110 +5455,30 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 Err(reason) => Frame::Error { reason },
             }
         }
-        Request::Order { channel_id } => {
-            let view = handle.view();
-            match view
-                .open_channels
-                .iter()
-                .find(|d| d.channel_id == channel_id)
-            {
-                Some(detail) => Frame::Order {
-                    entries: detail.order.clone(),
-                },
-                None => Frame::Error {
-                    reason: "room not open".into(),
-                },
+        Request::Order {channel_id,after,revision} => {
+            use crate::node::channel::history::{Query,Reply};
+            match handle.room_history(channel_id,Query::Order {after,revision,limit:PAGE_ENTRIES}).await {
+                Ok(Reply::Order {entries,next,revision}) => Frame::Order {entries,next,revision},
+                Ok(_) => Frame::Error {reason:"unexpected room order answer".into()},
+                Err(reason) => Frame::Error {reason},
             }
         }
         // V210-120: only the rows asked for, found through the room's index of structured posts,
         // so a client after a room's coordination posts no longer reads every row of the room.
-        Request::Structured {
-            channel_id,
-            types,
-            ops,
-            since,
-        } => {
-            let view = handle.view();
-            let Some(detail) = view
-                .open_channels
-                .iter()
-                .find(|d| d.channel_id == channel_id)
-            else {
-                return Frame::Error {
-                    reason: "room not open".into(),
-                };
-            };
-            // Arrival order, as a read from a cursor is (ADR-023 decision 1): a late post lands
-            // above rows already shown, so "the posts below the cursor" would skip it for good. On
-            // a room where nothing arrived late this is the timeline's own order.
-            let mut matched: Vec<&MessageRow> = detail
-                .structured
-                .positions(&types, &ops)
-                .into_iter()
-                .filter_map(|i| detail.timeline.get(i as usize))
-                .collect();
-            matched.sort_by_key(|r| r.arrival);
-            if let Some(cursor) = since {
-                let Some(mark) = matched
-                    .iter()
-                    .rev()
-                    .find(|r| r.entry_hash == cursor && !r.owed)
-                    .map(|r| r.arrival)
-                else {
-                    return Frame::Error {
-                        reason: "cursor not among this room's structured posts".into(),
-                    };
-                };
-                matched.retain(|r| r.arrival > mark);
+        Request::Structured {channel_id,types,ops,since} => {
+            use crate::node::channel::{history::{Query,Reply,Selection,Filter}};
+            let filters=types.into_iter().map(Filter::Type).chain(ops.into_iter().map(Filter::Op)).collect();
+            match handle.room_history(channel_id,Query::Filtered {selection:Selection::Any(filters),since,resume:None,limit:PAGE_ENTRIES}).await {
+                Ok(Reply::Page {rows,..})=>Frame::Rows {rows},
+                Ok(_)=>Frame::Error {reason:"unexpected history answer".into()},Err(reason)=>Frame::Error {reason},
             }
-            let mut rows: Vec<MessageRow> = Vec::new();
-            let mut bytes = 0usize;
-            for r in matched {
-                let cost = r.text.len() + ROW_OVERHEAD;
-                if !rows.is_empty() && bytes + cost > rows_budget() {
-                    break;
-                }
-                bytes += cost;
-                rows.push(r.clone());
-            }
-            Frame::Rows { rows }
         }
-        Request::Thread { channel_id, root, since } => {
-            let view = handle.view();
-            let Some(detail) = view.open_channels.iter().find(|d| d.channel_id == channel_id) else {
-                return Frame::Error { reason: "room not open".into() };
-            };
-            let positions = detail.structured.by_thread.get(&root);
-            let mark = if let Some(cursor) = since {
-                let Some(mark) = positions.into_iter().flat_map(|p| p.iter())
-                    .filter_map(|i| detail.timeline.get(*i as usize))
-                    .find(|r| r.entry_hash == cursor && !r.owed && r.entry_hash != root)
-                    .map(|r| r.arrival) else {
-                    return Frame::Error { reason: "cursor not among this room's thread replies".into() };
-                };
-                Some(mark)
-            } else { None };
-            // Select one page without allocating/sorting every reply in a long thread.
-            // The position breaks arrival ties in the same order as the room's index.
-            let mut page = std::collections::BTreeSet::new();
-            for i in positions.into_iter().flat_map(|p| p.iter()) {
-                let Some(r) = detail.timeline.get(*i as usize) else { continue };
-                if r.owed || r.entry_hash == root || mark.is_some_and(|m| r.arrival <= m) {
-                    continue;
-                }
-                page.insert((r.arrival, *i));
-                if page.len() > PAGE_ENTRIES { page.pop_last(); }
+        Request::Thread {channel_id,root,since} => {
+            use crate::node::channel::{history::{Query,Reply,Selection,Filter}};
+            match handle.room_history(channel_id,Query::Filtered {selection:Selection::Any(vec![Filter::Thread(root)]),since,resume:None,limit:PAGE_ENTRIES}).await {
+                Ok(Reply::Page {rows,..})=>Frame::Rows {rows},
+                Ok(_)=>Frame::Error {reason:"unexpected history answer".into()},Err(reason)=>Frame::Error {reason},
             }
-            let mut rows = Vec::new();
-            let mut bytes = 0usize;
-            for (_, i) in page {
-                let Some(r) = detail.timeline.get(i as usize) else { continue };
-                let cost = r.text.len() + ROW_OVERHEAD;
-                if !rows.is_empty() && bytes + cost > rows_budget() { break; }
-                bytes += cost;
-                rows.push(r.clone());
-            }
-            Frame::Rows { rows }
         }
         Request::RoomDisplayRevision { channel_id } => {
             match handle.room_display_revision(&channel_id) {
@@ -5443,86 +5486,20 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 None => Frame::Error { reason: "room not open".into() },
             }
         }
-        Request::ThreadSummary { channel_id, root, after_author } => {
-            let view = handle.view();
-            let Some(detail) = view.open_channels.iter().find(|d| d.channel_id == channel_id) else {
-                return Frame::Error { reason: "room not open".into() };
-            };
-            let mut reply_count = 0u64;
-            let mut last_reply_millis = 0;
-            let mut authors = std::collections::BTreeSet::new();
-            for row in detail.structured.by_thread.get(&root).into_iter()
-                .flat_map(|positions| positions.iter())
-                .filter_map(|i| detail.timeline.get(*i as usize))
-                .filter(|r| !r.owed && r.entry_hash != root)
-            {
-                reply_count += 1;
-                last_reply_millis = last_reply_millis.max(row.created_millis);
-                if after_author.is_none_or(|after| row.author > after) {
-                    authors.insert(row.author);
-                    // One lookahead author establishes whether another page exists; the
-                    // aggregate never allocates a list of every reply or every author.
-                    if authors.len() > PAGE_ENTRIES + 1 { authors.pop_last(); }
-                }
-            }
-            let more = authors.len() > PAGE_ENTRIES;
-            if more { authors.pop_last(); }
-            let next_author = if more { authors.last().copied() } else { None };
-            Frame::ThreadSummary {
-                reply_count, last_reply_millis, authors: authors.into_iter().collect(), next_author,
+        Request::ThreadSummary {channel_id,root,after_author} => {
+            use crate::node::channel::history::{Query,Reply};
+            match handle.room_history(channel_id,Query::ThreadSummary {root,after_author}).await {
+                Ok(Reply::ThreadSummary {count,last,authors,next})=>Frame::ThreadSummary {reply_count:count,last_reply_millis:last,authors,next_author:next},
+                Ok(_)=>Frame::Error {reason:"unexpected history answer".into()},Err(reason)=>Frame::Error {reason},
             }
         }
-        // #636: a room's messages by tag, found through the room's index of the tags of the
-        // messages this node can read; never the whole room.
-        Request::Tagged {
-            channel_id,
-            tags,
-            from,
-            since,
-        } => {
-            let view = handle.view();
-            let Some(detail) = view
-                .open_channels
-                .iter()
-                .find(|d| d.channel_id == channel_id)
-            else {
-                return Frame::Error {
-                    reason: "room not open".into(),
-                };
-            };
-            // Arrival order, as a read from a cursor is (ADR-023 decision 1).
-            let mut matched: Vec<&MessageRow> = detail
-                .structured
-                .tagged(&tags)
-                .into_iter()
-                .filter_map(|i| detail.timeline.get(i as usize))
-                .filter(|r| from.is_none_or(|f| r.author == f))
-                .collect();
-            matched.sort_by_key(|r| r.arrival);
-            if let Some(cursor) = since {
-                let Some(mark) = matched
-                    .iter()
-                    .rev()
-                    .find(|r| r.entry_hash == cursor && !r.owed)
-                    .map(|r| r.arrival)
-                else {
-                    return Frame::Error {
-                        reason: "cursor not among this room's tagged messages".into(),
-                    };
-                };
-                matched.retain(|r| r.arrival > mark);
+        Request::Tagged {channel_id,tags,from,since,resume} => {
+            use crate::node::channel::{history::{Query,Reply,Selection,Filter}};
+            let filters=tags.into_iter().map(Filter::Tag).chain(from.map(Filter::Author)).collect();
+            match handle.room_history(channel_id,Query::Filtered {selection:Selection::All(filters),since,resume,limit:PAGE_ENTRIES}).await {
+                Ok(Reply::Page {rows,next})=>Frame::FilteredRows {rows,next},
+                Ok(_)=>Frame::Error {reason:"unexpected history answer".into()},Err(reason)=>Frame::Error {reason},
             }
-            let mut rows: Vec<MessageRow> = Vec::new();
-            let mut bytes = 0usize;
-            for r in matched {
-                let cost = r.text.len() + ROW_OVERHEAD;
-                if !rows.is_empty() && bytes + cost > rows_budget() {
-                    break;
-                }
-                bytes += cost;
-                rows.push(r.clone());
-            }
-            Frame::Rows { rows }
         }
         Request::Count { channel_id, since } => {
             use crate::node::channel::history::{Query, Reply};
@@ -5535,32 +5512,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         // Searched from the newest row back: what a client looks up (a reply's parent) is
         // usually recent.
         // The rows the view says are unread here, as the timeline holds them (ADR-028 R-8).
-        Request::Unread { channel_id } => {
-            let view = handle.view();
-            let Some(detail) = view
-                .open_channels
-                .iter()
-                .find(|d| d.channel_id == channel_id)
-            else {
-                return Frame::Error {
-                    reason: "room not open".into(),
-                };
-            };
-            let mut want: std::collections::BTreeSet<Digest32> =
-                detail.unread.iter().copied().collect();
-            let mut rows: Vec<MessageRow> = Vec::new();
-            for r in detail.timeline.iter().rev() {
-                if want.is_empty() {
-                    break;
-                }
-                if want.remove(&r.entry_hash) {
-                    rows.push(r.clone());
-                }
-            }
-            // Every unread row, carried across reply pages, oldest first (ADR-034 FR-7).
-            rows.reverse();
-            Frame::Rows { rows }
-        }
+        Request::Unread {..} => Frame::Error {reason:"Unread requires a reply stream".into()},
         // The server streams exact Find rows without materializing all requested bodies.
         Request::Find { .. } => Frame::Error { reason: "Find requires a reply stream".into() },
         // Open or not by the node's own count, not by whether the view has caught up with an
@@ -6824,19 +6776,20 @@ impl IpcClient {
                     channel_id,
                     tags: tags.to_vec(),
                     from,
-                    since: cursor,
+                    since: None,
+                    resume: cursor,
                 })
                 .await?
             {
-                Frame::Rows { rows } => {
-                    let Some(last) = rows.last() else {
+                Frame::FilteredRows { rows, next } => {
+                    all.extend(rows);
+                    let Some(next) = next else {
                         return Ok(Frame::Rows { rows: all });
                     };
-                    if cursor == Some(last.entry_hash) {
-                        return Err(Error::MalformedIpc("ipc rows page did not advance"));
+                    if cursor.is_some_and(|old| next <= old) {
+                        return Err(Error::MalformedIpc("filtered page did not advance"));
                     }
-                    cursor = Some(last.entry_hash);
-                    all.extend(rows);
+                    cursor = Some(next);
                 }
                 other => return Ok(other),
             }

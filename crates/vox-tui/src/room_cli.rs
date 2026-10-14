@@ -1887,17 +1887,39 @@ async fn equivocations_in(paths: &Paths, room: &Digest32) -> Vec<(Digest32, u64)
 pub async fn order(paths: &Paths, room: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
-    match client.request(&Request::Order { channel_id }).await {
-        Ok(Frame::Order { entries }) => {
-            let mut out = std::io::stdout().lock();
-            for (h, clock) in entries {
-                let _ = writeln!(out, "{} {clock}", id(&h));
+    let mut after = None;
+    let mut revision = None;
+    loop {
+        match client
+            .request(&Request::Order {
+                channel_id,
+                after,
+                revision,
+            })
+            .await
+        {
+            Ok(Frame::Order {
+                entries,
+                next,
+                revision: current,
+            }) => {
+                {
+                    let mut out = std::io::stdout().lock();
+                    for (h, clock) in entries {
+                        let _ = writeln!(out, "{} {clock}", id(&h));
+                    }
+                }
+                let Some(next) = next else { return Ok(()) };
+                if after.is_some_and(|prior| next <= prior) {
+                    return Err(AppError::Usage("room order page did not advance".into()));
+                }
+                after = Some(next);
+                revision = Some(current);
             }
-            Ok(())
+            Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+            Ok(other) => return Err(crate::client::unexpected(&other)),
+            Err(e) => return Err(AppError::Usage(e.to_string())),
         }
-        Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(crate::client::unexpected(&other)),
-        Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
 

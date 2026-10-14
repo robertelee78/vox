@@ -336,7 +336,7 @@ impl Session {
 
     /// Whether `other` is this same registration: the same session, room and endpoint. What the
     /// harness says about its turns does not make it another one.
-    fn same(&self, other: &Session) -> bool {
+    pub(crate) fn same(&self, other: &Session) -> bool {
         self.session == other.session
             && self.harness == other.harness
             && self.endpoint == other.endpoint

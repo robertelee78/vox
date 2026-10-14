@@ -423,6 +423,8 @@ pub(crate) struct Pulls {
     paths: Paths,
     cmd: mpsc::WeakSender<(NodeCommand, oneshot::Sender<Outcome>)>,
     view: watch::Receiver<NodeView>,
+    history: crate::node::actor::HistoryReader,
+    cursor: Mutex<(Option<Digest32>, Option<u64>)>,
     events: tokio::sync::broadcast::Sender<crate::node::api::NodeEvent>,
     /// Entries held back for want of room on the disk, already said once.
     short: Mutex<HashSet<Digest32>>,
@@ -701,9 +703,12 @@ impl Pulls {
         paths: Paths,
         cmd: mpsc::WeakSender<(NodeCommand, oneshot::Sender<Outcome>)>,
         view: watch::Receiver<NodeView>,
+        history: crate::node::actor::HistoryReader,
         events: tokio::sync::broadcast::Sender<crate::node::api::NodeEvent>,
     ) -> Arc<Self> {
         let pulls = Arc::new(Self {
+            history,
+            cursor: Mutex::new((None, None)),
             events,
             short: Mutex::new(HashSet::new()),
             settled: Mutex::new(recorded(&paths).into_iter().map(|p| p.entry).collect()),
@@ -768,7 +773,7 @@ impl Pulls {
                 .find(|p| p.room == room && p.entry == entry && p.path.exists())
                 .map(|p| p.path)
         };
-        let offer = self.offer_of(&room, &entry)?;
+        let offer = self.offer_of(&room, &entry).await?;
         loop {
             if let Some(path) = landed(&self.paths) {
                 return Ok(path);
@@ -816,7 +821,13 @@ impl Pulls {
     }
 
     /// The offer `entry` of `room` makes, whoever it is addressed to.
-    fn offer_of(&self, room: &Digest32, entry: &Digest32) -> Result<Offer, String> {
+    async fn offer_of(&self, room: &Digest32, entry: &Digest32) -> Result<Offer, String> {
+        let row = self
+            .history
+            .exact(*room, vec![*entry])
+            .await?
+            .into_iter()
+            .next();
         let now = now_ms();
         let view = self.view.borrow();
         let me = view.identity.as_ref().map(|i| i.fingerprint);
@@ -825,17 +836,16 @@ impl Pulls {
             .iter()
             .find(|d| d.channel_id == *room)
             .ok_or("the room is not open on this node")?;
-        let (author, created, fields) =
-            if let Some(r) = d.timeline.iter().find(|r| r.entry_hash == *entry) {
-                if r.owed {
-                    return Err("that message has not arrived yet".into());
-                }
-                (r.author, r.created_millis, offer_fields(&r.text, None))
-            } else if let Some(r) = d.session_files.iter().find(|r| r.entry_hash == *entry) {
-                (r.author, r.created_millis, offer_in_session(&r.body))
-            } else {
-                return Err("no message in this room has that id".into());
-            };
+        let (author, created, fields) = if let Some(r) = row.as_ref() {
+            if r.owed {
+                return Err("that message has not arrived yet".into());
+            }
+            (r.author, r.created_millis, offer_fields(&r.text, None))
+        } else if let Some(r) = d.session_files.iter().find(|r| r.entry_hash == *entry) {
+            (r.author, r.created_millis, offer_in_session(&r.body))
+        } else {
+            return Err("no message in this room has that id".into());
+        };
         if Some(author) == me {
             return Err("it is this node's own share".into());
         }
@@ -881,6 +891,52 @@ impl Pulls {
     /// Look over every open room, and start what is due.
     async fn scan(self: Arc<Self>) {
         let now = now_ms();
+        // One room and one bounded offer page per turn. A completed cycle starts again,
+        // so granting trust later still discovers an older offer.
+        let (room, after) = {
+            let cursor = self.cursor.lock().await;
+            let view = self.view.borrow();
+            if view.locked || view.identity.is_none() {
+                return;
+            }
+            let chosen = match cursor.0 {
+                Some(room)
+                    if cursor.1.is_some()
+                        && view.open_channels.iter().any(|d| d.channel_id == room) =>
+                {
+                    Some(room)
+                }
+                prior => view
+                    .open_channels
+                    .iter()
+                    .filter(|d| prior.is_none_or(|p| d.channel_id > p))
+                    .map(|d| d.channel_id)
+                    .min()
+                    .or_else(|| view.open_channels.iter().map(|d| d.channel_id).min()),
+            };
+            let Some(room) = chosen else { return };
+            (
+                room,
+                if cursor.0 == Some(room) {
+                    cursor.1
+                } else {
+                    None
+                },
+            )
+        };
+        let page = match self
+            .history
+            .typed_page(room, vec![crate::node::shares::FILE.to_owned()], after, 64)
+            .await
+        {
+            Ok(page) => page,
+            Err(e) => {
+                let _ = self.events.send(crate::node::api::NodeEvent::NodeNote {
+                    note: format!("could not read file offers; will retry: {e}"),
+                });
+                return;
+            }
+        };
         let mut found: Vec<Offer> = Vec::new();
         let mut never: Vec<Digest32> = Vec::new();
         {
@@ -893,31 +949,21 @@ impl Pulls {
                 return;
             }
             let me_b32 = b32_encode(&me);
-            for d in &view.open_channels {
-                for r in d.timeline.iter() {
-                    if r.owed || settled.contains(&r.entry_hash) {
-                        continue;
-                    }
-                    if r.author == me {
-                        never.push(r.entry_hash);
+            if let Some(d) = view.open_channels.iter().find(|d| d.channel_id == room) {
+                for r in &page.rows {
+                    if r.owed || settled.contains(&r.entry_hash) || r.author == me {
                         continue;
                     }
                     let Some((name, size, sha256, tag, http, files)) = offer_in(&r.text, &me_b32)
                     else {
-                        never.push(r.entry_hash);
                         continue;
                     };
-                    // Its age runs from the author's time, never later than now (retention.rs):
-                    // a future-dated share must not outlive its message.
                     let created = r.created_millis.min(now);
-                    // Expired under the room's retention: there is nothing left to pull.
                     if d.retention > 0
                         && now >= created.saturating_add(d.retention.saturating_mul(1_000))
                     {
-                        never.push(r.entry_hash);
                         continue;
                     }
-                    // From a member this node has not trusted: not yet. A later trust pulls it.
                     if !view.trusted.iter().any(|(fp, _)| *fp == r.author) {
                         continue;
                     }
@@ -970,6 +1016,7 @@ impl Pulls {
                 }
             }
         }
+        *self.cursor.lock().await = (Some(room), page.next);
         self.settled.lock().await.extend(never);
         let mut pending = self.pending.lock().await;
         let mut running = pending

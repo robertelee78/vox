@@ -931,6 +931,7 @@ pub struct ChannelState {
     /// Rendered rows in the room's one order ([`Dag::causal_order`]), never in the
     /// order they arrived (PRD-001 R13).
     timeline: Vec<Rendered>,
+    projection_state: history::State,
     /// The [`Dag::reorder_generation`] the timeline was last sorted at.
     timeline_generation: u64,
     /// Changes that cannot extend the previous rendered prefix. Pure end appends are
@@ -1638,6 +1639,12 @@ fn sort_timeline(dag: &Dag, entries: &impl EntryRead, timeline: &mut [Rendered])
 /// Mark each row placed above a row the reader had already been shown — shown at least
 /// [`LATE_AFTER_MS`] before this one arrived (see [`Rendered::late`]). One pass from the
 /// bottom, tracking the earliest time any row below was shown.
+fn shown_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 fn mark_late(timeline: &mut [Rendered]) -> bool {
     let mut earliest_below = u64::MAX;
     let mut changed = false;
@@ -1803,6 +1810,7 @@ impl ChannelState {
         let entries = entry_store::EntryIndex::default();
         let mut index = entries.write(&mut batch, &sek, &channel_id)?;
         index.finish_rebuild()?;
+        index.empty_rendered()?;
         index.seal()?;
         batch.commit()?;
 
@@ -1838,6 +1846,7 @@ impl ChannelState {
             owed_asked_to: None,
             now_hint: now_ms,
             timeline: Vec::new(),
+            projection_state: history::State::default(),
             timeline_generation: 0,
             display_rewrite: 0,
             entries,
@@ -2413,6 +2422,7 @@ impl ChannelState {
             owed_asked_to: None,
             now_hint: now_ms,
             timeline,
+            projection_state: history::State::default(),
             timeline_generation,
             display_rewrite: 0,
             entries,
@@ -2446,6 +2456,10 @@ impl ChannelState {
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeMap::new(),
         };
+        room.entries
+            .prepare_rendered(store, &room.sek, &room.channel_id, |hash, id| {
+                room.retention.get(hash).and_then(|r| r.cache_id) == Some(id)
+            })?;
         // Apply the new default while upgrading an existing room, before publishing any
         // cached Session rows or permitting a sync to send its old encrypted bodies.
         room.restore_legacy_sessions(store, now.0)?;
@@ -2463,6 +2477,7 @@ impl ChannelState {
         }
         room.private_sessions.upgrading = !room.private_sessions.legacy_pending.is_empty();
         room.sweep_retention(store, now)?;
+        while !room.refresh_projection(store)? {}
         Ok(room)
     }
 
@@ -2648,6 +2663,7 @@ impl ChannelState {
         let entries = entry_store::EntryIndex::default();
         let mut index = entries.write(&mut batch, &sek, channel_id)?;
         index.finish_rebuild()?;
+        index.empty_rendered()?;
         index.seal()?;
         batch.commit()?;
 
@@ -2684,6 +2700,7 @@ impl ChannelState {
             owed_asked_to: None,
             now_hint: now_ms,
             timeline: Vec::new(),
+            projection_state: history::State::default(),
             timeline_generation: 0,
             display_rewrite: 0,
             entries,
@@ -4793,25 +4810,32 @@ impl ChannelState {
     /// Drop from the owed bodies every one that has arrived, or has expired here since.
     fn forget_settled_owed(&mut self, store: &Store) -> Result<()> {
         use std::ops::Bound::{Excluded, Unbounded};
-        let before = self.owed.len();
-        let mut cursor = self.owed.first().copied();
         let result = (|| -> Result<()> {
-            let snapshot = store.snapshot()?;
-            while let Some(position) = cursor {
-                cursor = self
-                    .owed
-                    .range((Excluded(position), Unbounded))
-                    .next()
-                    .copied();
-                let entries = self.entries.view(
-                    Transaction::Snapshot(&snapshot),
-                    &self.sek,
-                    &self.channel_id,
-                )?;
-                let entry = match self.dag.feed(&position.0) {
-                    Some(feed) => feed.get(&entries, position.1)?,
-                    None => None,
-                };
+            let start = self
+                .projection_state
+                .cleanup_cursor
+                .map_or(Unbounded, Excluded);
+            let positions: Vec<_> = self
+                .owed
+                .range((start, Unbounded))
+                .take(64)
+                .copied()
+                .collect();
+            self.projection_state.cleanup_cursor = if positions.len() == 64 {
+                positions.last().copied()
+            } else {
+                None
+            };
+            if positions.is_empty() {
+                return Ok(());
+            }
+            let mut batch = store.batch()?;
+            let mut writer = self
+                .entries
+                .write(&mut batch, &self.sek, &self.channel_id)?;
+            let mut changed = false;
+            for position in positions {
+                let entry = writer.get(&position.0, position.1)?;
                 let keep = entry.as_ref().is_some_and(|e| {
                     e.payload.is_none()
                         && !self.private_sessions.contains(&e.entry_hash())
@@ -4822,14 +4846,21 @@ impl ChannelState {
                         )
                 });
                 if !keep {
+                    if let Some(entry) = entry {
+                        writer.set_owed(entry.entry_hash(), None)?;
+                    }
                     self.owed.remove(&position);
+                    changed = true;
                 }
+            }
+            if changed {
+                writer.seal()?;
+                batch.commit()?;
+                self.entries.committed();
+                self.invalidate_display();
             }
             Ok(())
         })();
-        if self.owed.len() != before {
-            self.invalidate_display();
-        }
         if let Err(ref error) = result {
             self.poison(error);
         }
@@ -5102,6 +5133,8 @@ impl ChannelState {
         let now_ms = now.get();
         self.now_hint = self.now_hint.max(now_ms);
         self.forget_settled_owed(store)?;
+        self.refresh_projection(store)?;
+        self.drain_backfill(store, now_ms)?;
         let ttl = self.effective_retention();
         if self.poisoned {
             return Ok(0);
@@ -5336,6 +5369,7 @@ impl ChannelState {
                         .entries
                         .write(&mut batch, &self.sek, &self.channel_id)?;
                     index.committing(self.next_log_id);
+                    index.remove_rendered(hash)?;
                     self.dag.prune_payload(&mut index, hash)?;
                     if shed {
                         self.dag.drop_signature_if_checkpointed(&mut index, hash)?;
@@ -5935,6 +5969,7 @@ impl ChannelState {
                     )?;
                     // Reserve all log ids before rendering the witness can allocate a cache id.
                     self.next_log_id = after_log;
+                    self.projection_state.owed_range(*author, from, seq);
                     let got = self.absorb_batch(
                         store,
                         vec![(
@@ -6119,8 +6154,21 @@ impl ChannelState {
                         {
                             self.invalidate_display();
                         }
+                        let visibility = self.owed_visibility(&held);
+                        let mut writer =
+                            self.entries
+                                .write(&mut batch, &self.sek, &self.channel_id)?;
+                        writer.set_owed(entry_hash, visibility)?;
+                        writer.seal()?;
                         return Ok(Ok(Vec::new()));
                     };
+                    {
+                        let mut writer =
+                            self.entries
+                                .write(&mut batch, &self.sek, &self.channel_id)?;
+                        writer.set_owed(entry_hash, None)?;
+                        writer.seal()?;
+                    }
                     if self.owed.remove(&(author, seq)) {
                         self.invalidate_display();
                     }
@@ -6899,7 +6947,9 @@ impl ChannelState {
         if self.poisoned {
             return Ok(0);
         }
-        let rendered: BTreeSet<Digest32> = self.timeline.iter().map(|r| r.entry_hash).collect();
+        let rendered = self
+            .entries
+            .render_view(store, &self.sek, &self.channel_id)?;
         let authors: BTreeSet<Digest32> = self.receivers.keys().map(|(a, _)| *a).collect();
         let mut gone: Vec<(Digest32, u64)> = Vec::new();
         for author in authors {
@@ -6940,7 +6990,7 @@ impl ChannelState {
                 };
                 let c = msg.header.chain_id;
                 newest = Some(newest.map_or(c, |n| n.max(c)));
-                if !rendered.contains(&entry.entry_hash()) {
+                if rendered.fact(&entry.entry_hash())?.is_none() {
                     unrendered.insert(c);
                 }
             }
@@ -7003,10 +7053,11 @@ impl ChannelState {
                 now_ms,
                 &mut expired,
             )?;
-            if rows.is_empty() && expired.is_empty() && !self.chains_advanced {
-                return Ok(());
+            // Even an unrendered page advances the durable work cursor. Do not discard it
+            // merely because this chunk did not hold a newly readable body.
+            if self.chains_advanced {
+                self.queue_receivers(&mut batch)?;
             }
-            self.queue_receivers(&mut batch)?;
             batch.commit()
         })();
         if let Err(e) = result {
@@ -7036,25 +7087,29 @@ impl ChannelState {
             .into_iter()
             .filter(|a| !could_read.contains(a))
             .collect();
-        let mut rows = Vec::new();
-        for author in newly {
-            rows.extend(self.backfill_into(batch, &author, skip, now_ms, expired)?);
+        {
+            let mut writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
+            for author in newly {
+                writer.queue_backfill(author, Some(1))?;
+            }
+            writer.seal()?;
         }
-        Ok(rows)
+        self.drain_backfill_into(batch, skip, now_ms, expired)
     }
 
     fn backfill(&mut self, store: &Store, author: &Digest32, now_ms: u64) -> Result<usize> {
-        // One durable commit for the whole backfill (see `render_content_into`).
+        // Commit one bounded backfill chunk and its continuation together.
         let mut rows: Vec<Rendered> = Vec::new();
         let mut expired: Vec<(Digest32, Tracked)> = Vec::new();
         let result = (|| -> Result<()> {
             let mut batch = store.batch()?;
             rows =
                 self.backfill_into(&mut batch, author, &BTreeSet::new(), now_ms, &mut expired)?;
-            if rows.is_empty() && expired.is_empty() && !self.chains_advanced {
-                return Ok(());
+            // Even an unrendered page advances the durable work cursor. Do not discard it
+            // merely because this chunk did not hold a newly readable body.
+            if self.chains_advanced {
+                self.queue_receivers(&mut batch)?;
             }
-            self.queue_receivers(&mut batch)?;
             batch.commit()
         })();
         if let Err(e) = result {
@@ -7078,40 +7133,123 @@ impl ChannelState {
         now_ms: u64,
         expired: &mut Vec<(Digest32, Tracked)>,
     ) -> Result<Vec<Rendered>> {
-        let already: BTreeSet<Digest32> = self
-            .timeline
-            .iter()
-            .map(|r| r.entry_hash)
-            .chain(self.read_records.keys().copied())
-            .chain(self.drive.sessions.rows().iter().map(|r| r.entry_hash))
-            .collect();
-        let head = self.dag.feed(author).map_or(0, |feed| feed.max_seq());
+        {
+            let mut writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
+            writer.queue_backfill(*author, Some(1))?;
+            writer.seal()?;
+        }
+        self.drain_backfill_into(batch, skip, now_ms, expired)
+    }
+
+    fn drain_backfill_into(
+        &mut self,
+        batch: &mut crate::node::store::Batch<'_>,
+        skip: &BTreeSet<Digest32>,
+        now_ms: u64,
+        expired: &mut Vec<(Digest32, Tracked)>,
+    ) -> Result<Vec<Rendered>> {
         let mut rows = Vec::new();
-        for seq in 1..=head {
-            let Some(entry) = self
-                .entries
-                .in_batch(batch, &self.sek, &self.channel_id)?
-                .get(author, seq)?
-            else {
-                continue;
+        let mut bytes = 0usize;
+        for _ in 0..64 {
+            let mut writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
+            let Some((author, seq)) = writer.next_backfill()? else {
+                break;
             };
-            let hash = entry.entry_hash();
-            if already.contains(&hash) || skip.contains(&hash) {
+            let head = self.dag.verified_head(&author);
+            if seq > head {
+                writer.queue_backfill(author, None)?;
+                writer.seal()?;
                 continue;
             }
-            let Some(payload) = entry.payload else {
+            let entry = writer
+                .get(&author, seq)?
+                .ok_or(Error::MalformedAtRest("backfill entry missing"))?;
+            let hash = entry.entry_hash();
+            let cost = entry.payload.as_ref().map_or(0, Vec::len);
+            if bytes != 0 && bytes.saturating_add(cost) > 1024 * 1024 {
+                break;
+            }
+            bytes = bytes.saturating_add(cost);
+            let already = writer.has_rendered(&hash)?
+                || self.read_records.contains_key(&hash)
+                || self
+                    .pending_reads
+                    .iter()
+                    .any(|(row, _)| row.entry_hash == hash)
+                || self
+                    .drive
+                    .sessions
+                    .rows()
+                    .iter()
+                    .any(|row| row.entry_hash == hash)
+                || self
+                    .drive
+                    .pending
+                    .iter()
+                    .any(|(row, _)| row.entry_hash == hash)
+                || skip.contains(&hash);
+            writer.queue_backfill(
+                author,
+                if seq == head {
+                    None
+                } else {
+                    Some(
+                        seq.checked_add(1)
+                            .ok_or(Error::MalformedAtRest("backfill sequence exhausted"))?,
+                    )
+                },
+            )?;
+            writer.seal()?;
+            // The Batch owns all tree changes; release its short writer before decryption.
+            let payload = entry.payload;
+            if already {
+                continue;
+            }
+            let Some(payload) = payload else {
                 continue;
             };
             if !matches!(classify_payload(&payload), Ok(EntryKind::Content)) {
                 continue;
             }
             if let Some(row) =
-                self.render_content_into(batch, *author, hash, &payload, now_ms, expired)?
+                self.render_content_into(batch, author, hash, &payload, now_ms, expired)?
             {
                 rows.push(row);
             }
         }
         Ok(rows)
+    }
+
+    fn drain_backfill(&mut self, store: &Store, now_ms: u64) -> Result<usize> {
+        let mut expired = Vec::new();
+        let result = (|| -> Result<Vec<Rendered>> {
+            if !self
+                .entries
+                .render_view(store, &self.sek, &self.channel_id)?
+                .has_backfill()
+            {
+                return Ok(Vec::new());
+            }
+            let mut batch = store.batch()?;
+            let rows =
+                self.drain_backfill_into(&mut batch, &BTreeSet::new(), now_ms, &mut expired)?;
+            if self.chains_advanced {
+                self.queue_receivers(&mut batch)?;
+            }
+            batch.commit()?;
+            Ok(rows)
+        })();
+        let rows = match result {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.poison(&error);
+                return Err(error);
+            }
+        };
+        self.chains_advanced = false;
+        let rendered = rows.len();
+        self.place_committed(store, rows, &expired)?;
+        Ok(rendered)
     }
 
     /// Try to decrypt one stored content payload and, on success, render it into the
@@ -7311,6 +7449,11 @@ impl ChannelState {
             id,
             &cache_seg,
         )?;
+        {
+            let mut index = self.entries.write(batch, &self.sek, &self.channel_id)?;
+            index.put_rendered(&rendered, shown_now())?;
+            index.seal()?;
+        }
         // A cache row, not an entry: the generation counts entries only (ADR-025 D1).
         self.next_log_id = id.saturating_add(1);
         Ok(Some(rendered))
@@ -7652,26 +7795,13 @@ impl ChannelState {
     /// one member's wrong clock must not carry every later post in the room into the future. Such
     /// a post is skipped, so the new post can sort before it although it was made after; its
     /// author is returned, and a claim made so is not called agreed.
-    fn stamp_after_held(&self, now_millis: u64) -> (u64, Vec<Digest32>) {
-        let limit = now_millis.saturating_add(STAMP_LEAD_LIMIT_MILLIS);
-        let stamp = self
-            .timeline
-            .iter()
-            .map(|r| r.created_millis)
-            .filter(|m| *m <= limit)
-            .max()
-            .map_or(now_millis, |latest| {
-                now_millis.max(latest.saturating_add(1))
-            });
-        let mut skipped: Vec<Digest32> = self
-            .timeline
-            .iter()
-            .filter(|r| r.created_millis > limit)
-            .map(|r| r.author)
-            .collect();
-        skipped.sort_unstable();
-        skipped.dedup();
-        (stamp, skipped)
+    fn stamp_after_held(&self, store: &Store, now_millis: u64) -> Result<(u64, Vec<Digest32>)> {
+        self.entries
+            .render_view(store, &self.sek, &self.channel_id)?
+            .stamp_info(
+                now_millis,
+                now_millis.saturating_add(STAMP_LEAD_LIMIT_MILLIS),
+            )
     }
 
     /// The authors of the posts this node held, stamped later than its own post `entry`, when it
@@ -7697,7 +7827,7 @@ impl ChannelState {
         // converted at the call site: this value becomes half the ADR-020 claim ordering key, and a
         // caller still thinking in seconds should fail to compile rather than stamp 1970.
         now_millis: u64,
-    ) -> Result<&Rendered> {
+    ) -> Result<Rendered> {
         if self.poisoned {
             return Err(self.save_failure());
         }
@@ -7715,7 +7845,7 @@ impl ChannelState {
         if self.ended(now_millis).is_some() {
             return Err(Error::Profile("this room has ended"));
         }
-        let (now_millis, skipped) = self.stamp_after_held(now_millis);
+        let (now_millis, skipped) = self.stamp_after_held(profile.store(), now_millis)?;
         let content = Content::text(now_millis, text)?;
         let plaintext = Zeroizing::new(content.to_canonical_vec());
         let msg = self.sender.encrypt(&plaintext)?;
@@ -7795,6 +7925,13 @@ impl ChannelState {
                 id,
                 &cache_seg,
             )?;
+            {
+                let mut index = self
+                    .entries
+                    .write(&mut batch, &self.sek, &self.channel_id)?;
+                index.put_rendered(&rendered, shown_now())?;
+                index.seal()?;
+            }
             batch.put_segment(
                 &self.channel_id,
                 SegmentKind::KeyMaterial,
@@ -7832,11 +7969,8 @@ impl ChannelState {
         // Its `seen` names every head this node holds, so it sorts after all of them;
         // placed through the same path as any row all the same.
         // Persistence succeeded; a later ordering read failure reports storage health, not an unsent post.
-        let _ = self.place_rendered(profile.store(), rendered);
-        self.timeline
-            .iter()
-            .find(|r| r.entry_hash == entry_hash)
-            .ok_or(Error::Profile("timeline lost the appended row"))
+        self.place_rendered(profile.store(), rendered.clone())?;
+        Ok(rendered)
     }
 
     /// Take a read record pruned by retention out of the index (RR-2).
@@ -7895,18 +8029,22 @@ impl ChannelState {
     pub fn held_own(&self, store: &Store) -> Result<Vec<(Digest32, u64)>> {
         let me = self.me();
         let others: Vec<_> = self.members().into_iter().filter(|m| *m != me).collect();
-        let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
+        let rendered = self
+            .entries
+            .render_view(store, &self.sek, &self.channel_id)?;
+        let mut cursor = None;
         let mut out = Vec::new();
-        for row in self
-            .timeline
-            .iter()
-            .rev()
-            .filter(|r| r.author == me)
-            .take(READ_BY_SHOWN)
-        {
-            let Some(entry) = self.dag.get_by_hash(&entries, &row.entry_hash)? else {
-                continue;
+        for _ in 0..READ_BY_SHOWN {
+            let Some((key, _)) =
+                rendered.step(Some(&entry_store::Filter::Author(me)), true, cursor, true)?
+            else {
+                break;
             };
+            cursor = Some(key);
+            let entry = rendered
+                .order()
+                .entry(&key.1)?
+                .ok_or(Error::MalformedAtRest("rendered entry missing"))?;
             let n = others
                 .iter()
                 .filter(|m| {
@@ -7915,7 +8053,7 @@ impl ChannelState {
                         .is_some_and(|head| *head >= entry.skeleton.seq)
                 })
                 .count();
-            out.push((row.entry_hash, n as u64));
+            out.push((key.1, n as u64));
         }
         out.reverse();
         Ok(out)
@@ -7925,41 +8063,55 @@ impl ChannelState {
     /// one this node recorded as read, oldest first — rendered, not owed, written by someone else,
     /// and named by no read record of this node's. A room this node never recorded anything read
     /// in counts from its first row. At most [`UNREAD_LOOKED`] rows from the newest are looked at.
-    #[must_use]
-    pub fn unread(&self) -> Vec<Digest32> {
+    pub fn unread(&self, store: &Store) -> Result<Vec<Digest32>> {
         let me = self.me();
-        let mut out: Vec<Digest32> = Vec::new();
-        for r in self.timeline.iter().rev().take(UNREAD_LOOKED) {
-            if self.read_by(&r.entry_hash).contains(&me) {
+        let mut out = Vec::new();
+        let rendered = self
+            .entries
+            .render_view(store, &self.sek, &self.channel_id)?;
+        let mut cursor = None;
+        for _ in 0..UNREAD_LOOKED {
+            let Some((key, _)) = rendered.step(None, true, cursor, true)? else {
+                break;
+            };
+            cursor = Some(key);
+            if self.read_by(&key.1).contains(&me) {
                 break;
             }
-            if r.author != me && !r.owed {
-                out.push(r.entry_hash);
+            let entry = rendered
+                .order()
+                .entry(&key.1)?
+                .ok_or(Error::MalformedAtRest("rendered entry missing"))?;
+            if entry.skeleton.author_id != me {
+                out.push(key.1);
             }
         }
         out.reverse();
-        out
+        Ok(out)
     }
 
     /// [`Self::read_by`] for this identity's own newest [`READ_BY_SHOWN`] messages here, those
     /// anyone is known to have read, oldest first: what a client shows under each message it sent
     /// (ADR-028 R-6).
-    #[must_use]
-    pub fn read_by_own(&self) -> Vec<(Digest32, Vec<Digest32>)> {
-        let me = self.me();
-        let mut out: Vec<(Digest32, Vec<Digest32>)> = self
-            .timeline
-            .iter()
-            .rev()
-            .filter(|r| r.author == me)
-            .take(READ_BY_SHOWN)
-            .filter_map(|r| {
-                let readers = self.read_by(&r.entry_hash);
-                (!readers.is_empty()).then_some((r.entry_hash, readers))
-            })
-            .collect();
+    pub fn read_by_own(&self, store: &Store) -> Result<Vec<(Digest32, Vec<Digest32>)>> {
+        let rendered = self
+            .entries
+            .render_view(store, &self.sek, &self.channel_id)?;
+        let filter = entry_store::Filter::Author(self.me());
+        let mut cursor = None;
+        let mut out = Vec::new();
+        for _ in 0..READ_BY_SHOWN {
+            let Some((key, _)) = rendered.step(Some(&filter), true, cursor, true)? else {
+                break;
+            };
+            cursor = Some(key);
+            let readers = self.read_by(&key.1);
+            if !readers.is_empty() {
+                out.push((key.1, readers));
+            }
+        }
         out.reverse();
-        out
+        Ok(out)
     }
 
     /// Of `shown`, the entries a read record of this identity's should name: rows of the timeline
@@ -7971,24 +8123,35 @@ impl ChannelState {
     /// other's records every 5 seconds for as long as both are open, a storm nobody sees but
     /// whose cost every member pays in storage and traffic. A record's hash is refused here,
     /// whatever a client says it showed, besides never being a row to show.
-    #[must_use]
-    pub fn unrecorded_reads(&self, me: &Digest32, shown: &[Digest32]) -> Vec<Digest32> {
-        let shown: BTreeSet<&Digest32> = shown
-            .iter()
-            .filter(|h| !self.read_records.contains_key(*h))
-            .collect();
-        self.timeline
-            .iter()
-            .filter(|r| r.author != *me && shown.contains(&r.entry_hash))
-            .map(|r| r.entry_hash)
-            .filter(|h| {
-                self.reads
-                    .get(h)
-                    .is_none_or(|readers| !readers.contains_key(me))
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
+    pub fn unrecorded_reads(
+        &self,
+        store: &Store,
+        me: &Digest32,
+        shown: &[Digest32],
+    ) -> Result<Vec<Digest32>> {
+        let rendered = self
+            .entries
+            .render_view(store, &self.sek, &self.channel_id)?;
+        let mut out = BTreeSet::new();
+        for hash in shown {
+            if self.read_records.contains_key(hash)
+                || rendered.fact(hash)?.is_none()
+                || self
+                    .reads
+                    .get(hash)
+                    .is_some_and(|readers| readers.contains_key(me))
+            {
+                continue;
+            }
+            let entry = rendered
+                .order()
+                .entry(hash)?
+                .ok_or(Error::MalformedAtRest("rendered entry missing"))?;
+            if entry.skeleton.author_id != *me {
+                out.insert(*hash);
+            }
+        }
+        Ok(out.into_iter().collect())
     }
 
     /// Author a read record naming `read` (ADR-028 RR-2): sealed under this identity's sender key
@@ -8018,7 +8181,7 @@ impl ChannelState {
         if self.ended(now_millis).is_some() {
             return Err(Error::Profile("this room has ended"));
         }
-        let (now_millis, _) = self.stamp_after_held(now_millis);
+        let (now_millis, _) = self.stamp_after_held(profile.store(), now_millis)?;
         let record = crate::node::content::ReadRecord::new(now_millis, read)?;
         let plaintext = Zeroizing::new(record.to_canonical_vec());
         let msg = self.sender.encrypt(&plaintext)?;
@@ -8234,14 +8397,14 @@ impl ChannelState {
             }
         };
         all.sort_by_key(|n| key(&n.entry_hash));
+        let rendered = self
+            .entries
+            .render_view(store, &self.sek, &self.channel_id)?;
         for n in &mut all {
             let k = key(&n.entry_hash);
-            n.after = self
-                .timeline
-                .iter()
-                .rev()
-                .find(|r| key(&r.entry_hash) < k)
-                .map(|r| r.entry_hash);
+            n.after = rendered
+                .step(None, true, Some(k), true)?
+                .map(|(key, _)| key.1);
         }
         match failure.into_inner() {
             Some(error) => Err(error),

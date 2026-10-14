@@ -1194,6 +1194,9 @@ pub(crate) struct Owed {
     pub room_label: String,
     /// The room's local name, or empty.
     pub room_name: String,
+    /// Exact counts, independent of the distinct sender names.
+    pub urgent_count: usize,
+    pub reply_count: usize,
     /// The senders of the urgent messages addressed to this node.
     pub urgent: Vec<String>,
     /// The senders of the replies to this session's posts.
@@ -1229,19 +1232,19 @@ pub(crate) fn render_wake(owed: &[Owed]) -> String {
         .iter()
         .map(|o| {
             let mut said = Vec::new();
-            if !o.urgent.is_empty() {
+            if o.urgent_count != 0 {
                 said.push(format!(
                     "{} urgent message{} addressed to you from {}",
-                    o.urgent.len(),
-                    if o.urgent.len() == 1 { "" } else { "s" },
+                    o.urgent_count,
+                    if o.urgent_count == 1 { "" } else { "s" },
                     from(&o.urgent)
                 ));
             }
-            if !o.replies.is_empty() {
+            if o.reply_count != 0 {
                 said.push(format!(
                     "{} repl{} to your messages from {}",
-                    o.replies.len(),
-                    if o.replies.len() == 1 { "y" } else { "ies" },
+                    o.reply_count,
+                    if o.reply_count == 1 { "y" } else { "ies" },
                     from(&o.replies)
                 ));
             }
