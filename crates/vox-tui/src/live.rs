@@ -45,7 +45,8 @@ use zeroize::Zeroizing;
 use crate::app::CoreHandle;
 use crate::viewmodel::{
     ChannelSummary, ChannelView, Command, CommandStatus, ImageView, MemberView, MessageView,
-    NoticeView, QuoteView, Reachability, SyncStatus, Trust, UiError, ViewModel,
+    NoticeView, QuoteView, Reachability, SyncStatus, ThreadSummaryView, ThreadView, Trust, UiError,
+    ViewModel,
 };
 use vox_agentcomms::attention::{group, RoomGroup};
 
@@ -183,6 +184,13 @@ pub struct DaemonCore {
     clashes_said: std::collections::BTreeSet<String>,
     /// The room on screen's rows, as read.
     timeline: Option<Timeline>,
+    /// Summaries are refreshed with room changes, never from a draw or a loaded-row count.
+    thread_summaries: BTreeMap<Digest32, ThreadSummary>,
+    threads_stale: bool,
+    /// Only roots actually drawn (and the expanded root) need summaries resident here.
+    thread_roots: BTreeSet<Digest32>,
+    /// Only the explicitly opened thread's current bounded page is retained.
+    thread: Option<OpenThread>,
     /// The messages already told to the node as shown (ADR-028 RR-1).
     marked: std::collections::BTreeSet<Digest32>,
     /// Image shares whose pulled copy has been checked off this thread, and what it came to
@@ -252,6 +260,35 @@ struct Timeline {
     /// The machine each member's newest `hello` here says it runs on (ADR-020 §4.9b), and when
     /// that hello was posted: folded as rows arrive, so a frame never reads the room for it.
     machines: std::collections::HashMap<Digest32, (u64, String)>,
+}
+
+#[derive(PartialEq, Eq)]
+struct ThreadSummary {
+    replies: u64,
+    last_reply: u64,
+    authors: Vec<Digest32>,
+    more_authors: bool,
+}
+
+struct OpenThread {
+    root: Digest32,
+    since: Option<Digest32>,
+    next: bool,
+    rows: Vec<MessageRow>,
+    projected: Option<Projected>,
+    stale: bool,
+    more: bool,
+}
+
+/// The same canonical field used by the daemon's thread index. An owed row reveals no metadata.
+fn thread_root(row: &MessageRow) -> Option<Digest32> {
+    if row.owed {
+        return None;
+    }
+    vox_agentcomms::envelope::Envelope::parse(&row.text)
+        .ok()?
+        .thread
+        .and_then(|root| b32_decode(root.trim(), "thread").ok())
 }
 
 /// Fold `row` into `machines` if it is a `hello` that says which machine it runs on, newer than
@@ -461,6 +498,10 @@ impl DaemonCore {
             joined: None,
             clashes_said: std::collections::BTreeSet::new(),
             timeline: None,
+            thread_summaries: BTreeMap::new(),
+            threads_stale: true,
+            thread_roots: BTreeSet::new(),
+            thread: None,
             marked: std::collections::BTreeSet::new(),
             images: BTreeMap::new(),
             checked: std::collections::BTreeSet::new(),
@@ -599,6 +640,10 @@ impl DaemonCore {
                 self.has_identity = true;
                 self.asked = None;
                 self.timeline = None;
+                self.thread = None;
+                self.thread_summaries.clear();
+                self.thread_roots.clear();
+                self.threads_stale = true;
                 if notes.is_empty() {
                     return CommandStatus::Done;
                 }
@@ -758,6 +803,9 @@ impl DaemonCore {
         self.conn = None;
         self.active = None;
         self.timeline = None;
+        self.thread = None;
+        self.thread_summaries.clear();
+        self.thread_roots.clear();
         self.snapshot = NodeSnapshot::default();
         self.room_save_errors.clear();
         self.recovered_rooms.clear();
@@ -835,6 +883,7 @@ impl DaemonCore {
             match ev {
                 Ev::Node(ev) => self.on_node_event(ev),
                 Ev::Lagged => {
+                    self.threads_stale = true;
                     self.asked = None;
                     // Events were lost: a Session's news among them, maybe.
                     self.session_stale = true;
@@ -881,6 +930,7 @@ impl DaemonCore {
         self.asked = None;
         let rows_in = |me: &mut Self, channel_id: Digest32, n: usize| {
             if me.active == Some(channel_id) {
+                me.threads_stale = true;
                 if let Some(t) = me.timeline.as_mut() {
                     t.stale = true;
                 }
@@ -1095,6 +1145,18 @@ impl DaemonCore {
             Ok(reply) => match NodeSnapshot::from_bytes(&reply) {
                 Ok(Some(s)) => {
                     let before = std::mem::replace(&mut self.snapshot, s);
+                    if let Some(cid) = self.active {
+                        let revision = |snapshot: &NodeSnapshot| {
+                            snapshot
+                                .open
+                                .iter()
+                                .find(|room| room.channel_id == cid)
+                                .map(|room| room.display_revision)
+                        };
+                        if revision(&before) != revision(&self.snapshot) {
+                            self.threads_stale = true;
+                        }
+                    }
                     self.note_joins(&before);
                     self.check_pulls();
                 }
@@ -1591,6 +1653,7 @@ impl DaemonCore {
                         t.rows = rows;
                         t.older = older;
                         t.projected = None;
+                        self.threads_stale = true;
                     }
                 }
             }
@@ -1646,6 +1709,7 @@ impl DaemonCore {
                 .map(|r| r.entry_hash)
         };
         let rows_full = !rows.is_empty();
+        self.threads_stale |= rows_full;
         match self.timeline.as_mut() {
             Some(t) if !fresh => {
                 if rows.iter().any(|r| r.late) {
@@ -1671,6 +1735,7 @@ impl DaemonCore {
                 t.stale = rows_full;
             }
             _ => {
+                self.threads_stale = true;
                 let mut machines = std::collections::HashMap::new();
                 for row in &rows {
                     note_machine(&mut machines, row);
@@ -1689,6 +1754,122 @@ impl DaemonCore {
         }
     }
 
+    /// Read summaries for General's loaded roots and one explicitly opened reply page.
+    /// Nothing drains a thread, and a failed read never leaves old replies looking current.
+    fn read_threads(&mut self) {
+        let Some(cid) = self.active else {
+            self.thread = None;
+            self.thread_summaries.clear();
+            return;
+        };
+        let changed = std::mem::take(&mut self.threads_stale);
+        if changed {
+            if let Some(thread) = self.thread.as_mut().filter(|_| changed) {
+                thread.stale = true;
+            }
+            // Only on-screen roots, not every loaded message or the whole room.
+            let mut roots = self.thread_roots.clone();
+            roots.extend(self.thread.as_ref().map(|t| t.root));
+            self.thread_summaries.retain(|root, _| roots.contains(root));
+            for root in roots {
+                let Some(conn) = self.conn.as_mut() else {
+                    return;
+                };
+                let Some(answer) = until_stopped(
+                    &self.rt,
+                    &self.stop,
+                    conn.client.request(&Request::ThreadSummary {
+                        channel_id: cid,
+                        root,
+                        after_author: None,
+                    }),
+                ) else {
+                    return;
+                };
+                match self.answered(answer) {
+                    Ok(Frame::ThreadSummary {
+                        reply_count,
+                        last_reply_millis,
+                        authors,
+                        next_author,
+                    }) => {
+                        let summary = ThreadSummary {
+                            replies: reply_count,
+                            last_reply: last_reply_millis,
+                            authors,
+                            more_authors: next_author.is_some(),
+                        };
+                        if self.thread_summaries.get(&root) != Some(&summary) {
+                            if let Some(t) = self.thread.as_mut().filter(|t| t.root == root) {
+                                t.stale = true;
+                            }
+                        }
+                        self.thread_summaries.insert(root, summary);
+                    }
+                    Ok(Frame::Error { reason }) => {
+                        self.thread_summaries.remove(&root);
+                        self.notice = Some(format!("thread summary unavailable: {reason}"));
+                    }
+                    _ => {
+                        self.thread_summaries.remove(&root);
+                    }
+                }
+            }
+        }
+        let Some(thread) = self.thread.as_ref().filter(|t| t.stale) else {
+            return;
+        };
+        let (root, since, next) = (
+            thread.root,
+            if thread.next {
+                thread.rows.last().map(|r| r.entry_hash)
+            } else {
+                thread.since
+            },
+            thread.next,
+        );
+        let Some(conn) = self.conn.as_mut() else {
+            return;
+        };
+        let Some(answer) = until_stopped(
+            &self.rt,
+            &self.stop,
+            conn.client.request(&Request::Thread {
+                channel_id: cid,
+                root,
+                since,
+            }),
+        ) else {
+            return;
+        };
+        match self.answered(answer) {
+            Ok(Frame::Rows { rows }) => {
+                if let Some(thread) = self.thread.as_mut() {
+                    thread.stale = false;
+                    thread.next = false;
+                    if next && rows.is_empty() {
+                        thread.more = false;
+                        self.notice = Some("No further replies in this thread".to_owned());
+                    } else {
+                        thread.since = since;
+                        thread.rows = rows.into_iter().filter(|r| r.entry_hash != root).collect();
+                        thread.projected = None;
+                        thread.more = !thread.rows.is_empty();
+                    }
+                }
+            }
+            Ok(Frame::Error { reason }) => {
+                self.thread = None;
+                self.notice = Some(format!(
+                    "thread unavailable: {reason}; open it again to read its first page"
+                ));
+            }
+            _ => {
+                self.thread = None;
+            }
+        }
+    }
+
     /// The room on screen's rows for the UI: only the rows added since the last frame are
     /// projected, unless who the authors are changed (a keyring rename) or a row was replaced.
     fn project_timeline(
@@ -1697,13 +1878,25 @@ impl DaemonCore {
         trusted: &[(Digest32, String)],
         own: &Own,
         names: &vox_core::node::resolver::VoxResolver,
+        thread: bool,
     ) -> std::sync::Arc<Vec<MessageView>> {
         let shown_names = crate::ident::display_names(trusted, &self.presented);
         let images = &self.images;
-        let Some(t) = self.timeline.as_mut() else {
-            return std::sync::Arc::default();
+        let (held, projected, general) = if thread {
+            let Some(t) = self.thread.as_mut() else {
+                return std::sync::Arc::default();
+            };
+            (
+                &t.rows,
+                &mut t.projected,
+                self.timeline.as_ref().map(|t| &t.rows),
+            )
+        } else {
+            let Some(t) = self.timeline.as_mut() else {
+                return std::sync::Arc::default();
+            };
+            (&t.rows, &mut t.projected, None)
         };
-        let (held, projected) = (&t.rows, &mut t.projected);
         // **An image a message shares** (ADR-028 F-9, F-11): as announced, with this node's copy
         // once it is verified here.
         let image_of = |r: &MessageRow| {
@@ -1737,6 +1930,7 @@ impl DaemonCore {
                 .and_then(|re| b32_decode(&re.trim().to_ascii_lowercase(), "re").ok())?;
             let text = held
                 .iter()
+                .chain(general.into_iter().flat_map(|rows| rows.iter()))
                 .find(|p| p.entry_hash == re && !p.owed)
                 .map(|p| {
                     let words = crate::agent_hook::words(&p.text);
@@ -1831,6 +2025,7 @@ impl DaemonCore {
             quote: if r.owed { None } else { quote_of(r) },
             image: if r.owed { None } else { image_of(r) },
             tags: vox_core::node::api::message_tags(&r.text),
+            thread: thread_root(r),
         };
         // A quote whose message arrives after its reply is projected again with it.
         let quoted_late = |p: &Projected| {
@@ -1987,6 +2182,7 @@ impl DaemonCore {
         let machine_nodes = self.machine_nodes.clone();
         // This node's names, for every address the views write readable (ADR-028 S-1a).
         let names = vox_core::node::resolver::VoxResolver::of_snapshot(&snap);
+        let mut thread_replies = std::sync::Arc::default();
         let timeline = self.active.and_then(|cid| {
             let room = snap.open.iter().find(|d| d.channel_id == cid)?;
             let own = Own {
@@ -1995,7 +2191,8 @@ impl DaemonCore {
                 pulled_by: room.pulled_by.clone(),
                 others: room.members.iter().filter(|m| me != Some(**m)).count() as u64,
             };
-            Some(self.project_timeline(me, &snap.trusted, &own, &names))
+            thread_replies = self.project_timeline(me, &snap.trusted, &own, &names, true);
+            Some(self.project_timeline(me, &snap.trusted, &own, &names, false))
         });
         let active = self.active.and_then(|cid| {
             snap.open
@@ -2089,6 +2286,38 @@ impl DaemonCore {
                         })
                         .collect(),
                     timeline: timeline.clone().unwrap_or_default(),
+                    threads: self
+                        .thread_summaries
+                        .iter()
+                        .map(|(root, summary)| {
+                            (
+                                *root,
+                                ThreadSummaryView {
+                                    replies: summary.replies,
+                                    last_reply: summary.last_reply,
+                                    authors: summary
+                                        .authors
+                                        .iter()
+                                        .map(|author| {
+                                            if me == Some(*author) {
+                                                "you".to_owned()
+                                            } else {
+                                                self.member_name(author)
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(", "),
+                                    more_authors: summary.more_authors,
+                                },
+                            )
+                        })
+                        .collect(),
+                    expanded_thread: self.thread.as_ref().map(|t| ThreadView {
+                        root: t.root,
+                        replies: std::sync::Arc::clone(&thread_replies),
+                        first_page: t.since.is_none(),
+                        more: t.more,
+                    }),
                     room_older: self
                         .timeline
                         .as_ref()
@@ -2530,6 +2759,7 @@ impl CoreHandle for DaemonCore {
             }
         }
         self.read_timeline();
+        self.read_threads();
         self.read_session();
         self.count_waiting();
         self.count_unread();
@@ -2544,6 +2774,18 @@ impl CoreHandle for DaemonCore {
         let Some(cid) = self.active else {
             return;
         };
+        let roots = self
+            .timeline
+            .as_ref()
+            .into_iter()
+            .flat_map(|t| t.rows.iter())
+            .filter(|r| entries.contains(&r.entry_hash) && !r.owed && thread_root(r).is_none())
+            .map(|r| r.entry_hash)
+            .collect();
+        if self.thread_roots != roots {
+            self.thread_roots = roots;
+            self.threads_stale = true;
+        }
         // Each message is told to the node once; the node keeps what it has recorded.
         let new: Vec<Digest32> = entries
             .iter()
@@ -2753,6 +2995,7 @@ impl CoreHandle for DaemonCore {
                 channel_id,
                 session,
             } => {
+                self.thread = None;
                 self.shown_session = session.map(|(node, id)| (channel_id, node, id));
                 self.session_lines.clear();
                 self.session_rows.clear();
@@ -2780,7 +3023,38 @@ impl CoreHandle for DaemonCore {
                 }
                 CommandStatus::Done
             }
+            Command::ShowThread { channel_id, root } => {
+                if self.active == Some(channel_id) {
+                    self.thread = root.map(|root| OpenThread {
+                        root,
+                        since: None,
+                        next: false,
+                        rows: Vec::new(),
+                        projected: None,
+                        stale: true,
+                        more: false,
+                    });
+                }
+                CommandStatus::Done
+            }
+            Command::NextThreadPage { channel_id, root } => {
+                if self.active == Some(channel_id) {
+                    if let Some(t) = self.thread.as_mut().filter(|t| t.root == root && t.more) {
+                        if !t.rows.is_empty() {
+                            t.next = true;
+                            t.stale = true;
+                        }
+                    }
+                }
+                CommandStatus::Done
+            }
             Command::SelectChannel { channel_id } => {
+                if self.active != channel_id {
+                    self.thread = None;
+                    self.thread_summaries.clear();
+                    self.thread_roots.clear();
+                    self.threads_stale = true;
+                }
                 // The room left counts from the newest row it showed: nothing seen is unread.
                 if let Some(t) = self
                     .timeline

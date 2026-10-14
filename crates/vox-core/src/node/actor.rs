@@ -304,9 +304,10 @@ fn detail_of(
     ch: &ChannelState,
     prev: Option<&ChannelDetail>,
     now: crate::time::Ms,
+    sequence: &std::sync::atomic::AtomicU64,
 ) -> ChannelDetail {
     let (frozen, refused_below_checkpoint) = ch.fork_watch();
-    let (timeline, structured, row_index, display_stamp) = if let Some(p) =
+    let (timeline, structured, row_index, display_stamp, display_revision) = if let Some(p) =
         prev.filter(|p| ch.display_is_current(&p.display_stamp))
     {
         (
@@ -314,6 +315,7 @@ fn detail_of(
             p.structured.clone(),
             p.row_index.clone(),
             p.display_stamp.clone(),
+            p.display_revision,
         )
     } else {
         let (rows, stamp) = ch.display_timeline();
@@ -360,7 +362,13 @@ fn detail_of(
                 })
                 .collect(),
         );
-        (timeline, structured, row_index, stamp)
+        (
+            timeline,
+            structured,
+            row_index,
+            stamp,
+            sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )
     };
     // Who trusts each member (ADR-028 K-7), once: this identity's own entry is `consenting`.
     let trusted_by = ch.trusted_by();
@@ -373,6 +381,7 @@ fn detail_of(
         members: ch.members(),
         timeline,
         display_stamp,
+        display_revision,
         row_index,
         order: ch.order_keys(),
         structured,
@@ -4231,6 +4240,8 @@ pub struct Node {
     bind: Option<Bind>,
     computer: Option<Arc<crate::node::computer::Computer>>,
     computer_revision: Arc<std::sync::atomic::AtomicU64>,
+    /// One sequence for this actor, including rooms closed and reopened between snapshots.
+    display_sequence: std::sync::atomic::AtomicU64,
     /// The headless transport identity, if this node runs without a vault.
     headless: Option<Arc<crate::identity::composite::SoftwareRootSigner>>,
     /// See [`NodeConfig::anchor_boards`].
@@ -4942,6 +4953,7 @@ impl Node {
             bind,
             computer,
             computer_revision: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            display_sequence: std::sync::atomic::AtomicU64::new(1),
             anchor_ids: anchors.nodes().iter().map(|n| n.id).collect(),
             room_anchors: BTreeMap::new(),
             anchor_inventory,
@@ -15492,7 +15504,10 @@ impl Node {
             if written.is_ok() {
                 self.fresh_details.insert(
                     channel_id,
-                    (summary_of(&ch), detail_of(&ch, None, self.now_ms())),
+                    (
+                        summary_of(&ch),
+                        detail_of(&ch, None, self.now_ms(), &self.display_sequence),
+                    ),
                 );
             }
             written
@@ -15771,7 +15786,10 @@ impl Node {
             }
             self.fresh_details.insert(
                 *channel_id,
-                (summary_of(&ch), detail_of(&ch, None, self.now_ms())),
+                (
+                    summary_of(&ch),
+                    detail_of(&ch, None, self.now_ms(), &self.display_sequence),
+                ),
             );
         }
         self.note_local_append(channel_id);
@@ -15808,7 +15826,10 @@ impl Node {
             }
             self.fresh_details.insert(
                 *channel_id,
-                (summary_of(&ch), detail_of(&ch, None, self.now_ms())),
+                (
+                    summary_of(&ch),
+                    detail_of(&ch, None, self.now_ms(), &self.display_sequence),
+                ),
             );
         }
         self.note_local_append(channel_id);
@@ -15833,7 +15854,10 @@ impl Node {
             }
             self.fresh_details.insert(
                 *channel_id,
-                (summary_of(&ch), detail_of(&ch, None, self.now_ms())),
+                (
+                    summary_of(&ch),
+                    detail_of(&ch, None, self.now_ms(), &self.display_sequence),
+                ),
             );
         }
         self.note_local_append(channel_id);
@@ -17394,6 +17418,7 @@ impl Node {
                     .iter()
                     .find(|d| d.channel_id == *channel_id),
                 self.now_ms(),
+                &self.display_sequence,
             )
         };
         self.fresh_details
@@ -17672,6 +17697,7 @@ impl Node {
                     .filter(|detail| ch.display_is_current(&detail.display_stamp))
                     .or_else(|| prev.open_channels.iter().find(|d| d.channel_id == *id)),
                 self.now_ms(),
+                &self.display_sequence,
             ));
         }
         let mut channels = Vec::with_capacity(known.len());
