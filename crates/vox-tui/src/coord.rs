@@ -554,7 +554,12 @@ pub async fn read_upto(
                     return Ok(Some(rows));
                 }
             }
-            Frame::Error { .. } if since.is_some() && rows.is_empty() && cursor == since => {
+            Frame::Error { reason }
+                if reason == "cursor not in this room's timeline"
+                    && since.is_some()
+                    && rows.is_empty()
+                    && cursor == since =>
+            {
                 return Ok(None)
             }
             Frame::Error { reason } => return Err(AppError::Usage(reason)),

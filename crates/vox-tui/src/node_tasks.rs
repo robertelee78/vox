@@ -95,8 +95,8 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
     // once, from the event or from the view, whichever comes first. The view is the record: the
     // event reaches no subscriber started after it (a room opened before this loop subscribed)
     // nor one that fell behind, and the notice is said all the same.
-    let mut said_above: std::collections::HashSet<(vox_core::hash::Digest32, u64, u64)> =
-        std::collections::HashSet::new();
+    let mut said_above: std::collections::HashMap<vox_core::hash::Digest32, (u64, u64)> =
+        std::collections::HashMap::new();
     say_retention_above_room(&node.view(), &mut said_above, &paths);
     // Counted at once, not at the first tick.
     if !deaf {
@@ -120,7 +120,7 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
                             node: asked,
                             room,
                         } => {
-                            if said_above.insert((*channel_id, *asked, *room)) {
+                            if said_above.insert(*channel_id, (*asked, *room)) != Some((*asked, *room)) {
                                 crate::tunnel_cli::say_failure_for_node(&ev, paths.profile_dir.file_name().and_then(|n| n.to_str()));
                             }
                         }
@@ -204,12 +204,17 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
 /// Say, once each, every room whose retention this node's own file asks to exceed (V030-32).
 fn say_retention_above_room(
     view: &vox_core::node::api::NodeView,
-    said: &mut std::collections::HashSet<(vox_core::hash::Digest32, u64, u64)>,
+    said: &mut std::collections::HashMap<vox_core::hash::Digest32, (u64, u64)>,
     paths: &Paths,
 ) {
+    said.retain(|room, _| {
+        view.open_channels
+            .iter()
+            .any(|d| d.channel_id == *room && d.retention_above_room.is_some())
+    });
     for d in &view.open_channels {
         if let Some((asked, room)) = d.retention_above_room {
-            if said.insert((d.channel_id, asked, room)) {
+            if said.insert(d.channel_id, (asked, room)) != Some((asked, room)) {
                 crate::tunnel_cli::say_failure_for_node(
                     &vox_core::node::api::NodeEvent::RetentionAboveRoom {
                         channel_id: d.channel_id,
@@ -427,7 +432,7 @@ impl NoticeCount {
 struct NoticeFold {
     registration: crate::wake::Session,
     cursor: Option<vox_core::hash::Digest32>,
-    ahead: std::collections::BTreeSet<vox_core::hash::Digest32>,
+    ahead: crate::agent_hook::SavedHashes,
     next: vox_core::node::api::HistoryCursor,
     through: u64,
     revision: vox_core::node::api::NoticeRevision,
@@ -447,7 +452,7 @@ impl NoticeFold {
         room: vox_core::hash::Digest32,
         registration: &crate::wake::Session,
         cursor: Option<vox_core::hash::Digest32>,
-        ahead: std::collections::BTreeSet<vox_core::hash::Digest32>,
+        ahead: crate::agent_hook::SavedHashes,
     ) -> Result<Self, String> {
         let state = history.notice_state(room).await?;
         let after = match cursor {
@@ -505,7 +510,11 @@ impl NoticeFold {
                     break;
                 }
                 self.expires = sooner(self.expires, item.expires);
-                if !self.ahead.contains(&row.entry_hash) {
+                if !self
+                    .ahead
+                    .contains(&row.entry_hash)
+                    .map_err(|e| e.to_string())?
+                {
                     if let Ok(envelope) = vox_agentcomms::envelope::Envelope::parse(&row.text) {
                         let own = me == Some(row.author)
                             && !envelope.from.is_empty()
@@ -593,6 +602,8 @@ async fn tend(
         .retain(|id, _| registrations.iter().any(|s| &s.session == id));
     t.starting_sessions
         .retain(|id| registrations.iter().any(|s| &s.session == id));
+    t.said_held
+        .retain(|id| registrations.iter().any(|s| &s.session == id));
     for session in registrations {
         if !crate::wake::wakeable(&session.harness) {
             continue;
@@ -616,8 +627,14 @@ async fn tend(
             continue;
         }
         // Only the saved room can contribute unread, a cursor, or reply eligibility.
-        let cursor = crate::agent_hook::load_cursor(paths, room, &session.session);
-        let ahead = crate::agent_hook::delivered_ahead(paths, room, &session.session);
+        let ahead = match crate::agent_hook::delivered_ahead(paths, room, &session.session) {
+            Ok(ahead) => ahead,
+            Err(e) => {
+                eprintln!("vox daemon: could not read shown-ahead state; will retry: {e}");
+                continue;
+            }
+        };
+        let cursor = ahead.cursor();
         let sent_cursor = format!(
             "{room}={}",
             cursor
@@ -662,8 +679,8 @@ async fn tend(
         // No cursor, room move or endpoint change that happened during an actor wait may
         // make an old count update a new binding's notices.
         if !crate::wake::registration(paths, &session.session).is_some_and(|now| session.same(&now))
-            || crate::agent_hook::load_cursor(paths, room, &session.session) != cursor
-            || crate::agent_hook::delivered_ahead(paths, room, &session.session) != ahead
+            || !crate::agent_hook::delivered_ahead(paths, room, &session.session)
+                .is_ok_and(|now| now == ahead)
         {
             continue;
         }
