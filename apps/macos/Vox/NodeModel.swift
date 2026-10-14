@@ -228,6 +228,7 @@ final class NodeModel: ObservableObject {
             selectedRequest = nil
             selectionAnchor = nil
             selectedSessionMetadata = nil
+            selectedSessionMetadataKnown = false
             Task {
                 await readSelectedSessionMetadata()
                 await readSession()
@@ -254,6 +255,7 @@ final class NodeModel: ObservableObject {
     /// The room on screen's Sessions, open and ended (ADR-029 CL-2).
     @Published private(set) var sessions: [FfiSession] = []
     @Published private(set) var selectedSessionMetadata: FfiSession?
+    @Published private(set) var selectedSessionMetadataKnown = false
     /// The Session on screen's entries, oldest first, to a member with drive (SC-1): its newest
     /// page, and the older pages the person scrolled up to (ADR-034 FR-4); never its whole
     /// history.
@@ -2563,6 +2565,7 @@ final class NodeModel: ObservableObject {
         sessionWindowRevision = UUID()
         selectedEarlierRequest = nil
         selectedSessionMetadata = nil
+        selectedSessionMetadataKnown = false
         sessionNote = nil
         sessionLoading = false
         readBy = [:]
@@ -2643,6 +2646,7 @@ extension NodeModel {
     func readSelectedSessionMetadata() async {
         guard let room = roomOnScreen, case let .session(node, id) = showing else {
             selectedSessionMetadata = nil
+            selectedSessionMetadataKnown = false
             return
         }
         let epoch = nodeObservationEpoch, generation = roomReadGeneration
@@ -2654,9 +2658,19 @@ extension NodeModel {
             let found = try await client.session(room: room, node: node, sessionId: id)
             guard current() else { return }
             selectedSessionMetadata = found
+            selectedSessionMetadataKnown = true
+            if found == nil {
+                sessionPages.clear()
+                sessionWindowRevision = UUID()
+                selectedEarlierRequest = nil
+                sessionNote = "This Session's opening is no longer available."
+                sessionLoading = false
+            }
         } catch {
             guard current() else { return }
             selectedSessionMetadata = nil
+            selectedSessionMetadataKnown = true
+            sessionLoading = false
             sessionPages.clear()
             sessionWindowRevision = UUID()
             selectedEarlierRequest = nil
@@ -2667,6 +2681,7 @@ extension NodeModel {
 
     /// The Session on screen's entries, to a member with drive; nothing to one without (SC-3).
     func readSession() async {
+        if showingSession && selectedSessionMetadataKnown && selectedSessionMetadata == nil { return }
         guard let room = roomOnScreen, let s = shownSession, s.canDrive else {
             sessionPages.clear()
             selectedEarlierRequest = nil
