@@ -320,10 +320,15 @@ final class AppModel: ObservableObject {
             let selected = try await connection.selectPersonalNode(node: name)
             committed = true
             guard ownsNodeRequest(original, generation), self.node === old else {
+                // The role committed while another request superseded this one. Capture that
+                // request's generation: never revive this choice or write its local mirror.
+                let reconciliationGeneration = nodeRequestGeneration
                 await connection.close()
-                // A superseding lifecycle request must consult the daemon's saved selection;
-                // it must not write an obsolete app choice after this authoritative commit.
-                if ownsNodeRequest(original, generation), self.node === old { await reach() }
+                guard !Task.isCancelled, nodeRequestGeneration == reconciliationGeneration,
+                      self.client === original, self.node === old else { return }
+                // Some superseding requests leave the old actor on screen. Start a new
+                // authoritative reach so it cannot indefinitely contradict the saved role.
+                await reach()
                 return
             }
             guard selected.selectedNode == expected, selected.selectedName == name else {
