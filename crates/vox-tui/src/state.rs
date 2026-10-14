@@ -302,7 +302,8 @@ pub fn room_messages<'a>(
         .filter(move |message| match showing {
             Showing::General => message.thread.is_none(),
             Showing::Tag(tag) => message.tags.contains(tag),
-            _ => true,
+            Showing::All => true,
+            Showing::Session(..) => false,
         })
         .flat_map(move |message| {
             let replies = channel
@@ -898,12 +899,8 @@ impl UiState {
                     && !matches!(self.showing, Showing::Session(..))
                 {
                     if let Some(active) = vm.active.as_ref().filter(|c| c.room_older > 0) {
-                        if self.selected_message.is_some()
-                            && self.selected_message
-                                == room_messages(active, &self.showing)
-                                    .next()
-                                    .map(|r| r.entry_hash)
-                        {
+                        let first = room_messages(active, &self.showing).next();
+                        if first.is_none_or(|row| self.selected_message == Some(row.entry_hash)) {
                             if let Some(channel_id) = self.active_channel_id(vm) {
                                 return Action::Dispatch(Command::OlderRoom { channel_id });
                             }
