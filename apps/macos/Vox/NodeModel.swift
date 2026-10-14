@@ -2877,7 +2877,8 @@ final class NodeModel: ObservableObject {
                 }
             }
             await readNewOnScreen()
-            guard acceptsObservation(epoch, actor: actor) else { return false }
+            guard acceptsObservation(epoch, actor: actor), acceptsArrivalInstance(instance, room: room),
+                  rooms.contains(where: { $0.id == room }) else { return false }
             scheduleThreadRefresh()
         }
         // Unread until drawn in view (this node's own never are), the room on screen too.
