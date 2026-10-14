@@ -1465,7 +1465,7 @@ private struct RoomView: View {
             .accessibilityIdentifier("attach")
             // Who posts (E-4): the node this window acts as, before the field.
             // No label of its own (a selectable Text with one recurses); the field says "as ann".
-            Text("\(model.node) ▸").font(Theme.mono).secondaryText()
+            Text("\(model.node) ▸").font(Theme.text).secondaryText()
                 .accessibilityIdentifier("compose-as")
             // Up to 12 lines, so a long message is read before it goes; Return sends, ⇧↩ (or ⌥↩)
             // adds a line (P19).
@@ -1792,7 +1792,7 @@ private struct MessageRow: View {
                 // No label of its own: a selectable Text with one sends SwiftUI's accessibility into
                 // endless recursion (the detail pane is selectable).
                 Text(TimelineTime.short(message.createdMillis))
-                    .font(Theme.mono).secondaryText()
+                    .voxFont(VoxTokens.Fonts.appSmall).monospacedDigit().secondaryText()
                     .help(TimelineTime.full(message.createdMillis))
                     .accessibilityIdentifier("time-\(message.id)")
                 if message.urgent { StateMark(kind: .attention, words: "urgent") }
@@ -1823,6 +1823,7 @@ private struct MessageRow: View {
             }
             if message.file == nil || !(message.file?.note.isEmpty ?? true) {
                 Text(message.owed ? "not received yet" : shownText)
+                    .voxFont(VoxTokens.Fonts.appText)
                     .textSelection(.enabled)
             }
             if let card = message.card {
@@ -1860,11 +1861,21 @@ private struct MessageRow: View {
                     .accessibilityIdentifier("whereabouts-\(message.id)")
             }
         }
+        .padding(.leading, addressedToMe ? Space.s8 * scale : 0)
+        .overlay(alignment: .leading) {
+            if addressedToMe {
+                Rectangle().fill(VoxTokens.Colors.accent)
+                    .frame(width: 3 * scale)
+                    .allowsHitTesting(false).accessibilityHidden(true)
+            }
+        }
         // VoiceOver reads the row first as one sentence, in the order it is drawn; its parts
         // (the file's buttons, the link) stay reachable inside it (WCAG 1.3.1, 4.1.2).
         .accessibilityElement(children: .contain)
         .accessibilityLabel(spoken)
     }
+
+    private var addressedToMe: Bool { message.to.contains(me) || message.level == .toYou }
 
     /// The row as one sentence: who, to whom, how, what, and what became of it.
     private var spoken: String {
@@ -2149,7 +2160,8 @@ private struct FileCard: View {
                 DisclosureGroup("Details", isExpanded: $details) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("SHA-256 \(file.sha256)").font(Theme.mono).textSelection(.enabled)
-                        Text("Shared by \(sharer) (\(message.author))").font(Theme.mono)
+                        Text("Shared by \(sharer) (\(Text(message.author).font(Theme.font(VoxTokens.Fonts.appMono, scale: scale))))")
+                            .voxFont(VoxTokens.Fonts.appText)
                             .textSelection(.enabled)
                     }
                     .secondaryText()
@@ -2400,7 +2412,7 @@ private struct FamilyLan: View {
         Text(model.lanOn.contains(room) ? "On" : "Off")
             .accessibilityIdentifier("family-lan-status")
         if let said = model.lanSaid[room] {
-            Text(said).font(Theme.mono).secondaryText().textSelection(.enabled)
+            Text(said).font(Theme.text).secondaryText().textSelection(.enabled)
                 .accessibilityIdentifier("family-lan-said")
         }
         if let failed = model.lanFailed[room] {
@@ -2500,7 +2512,7 @@ private struct StatusBar: View {
                 .accessibilityIdentifier("status-dismiss")
             }
         }
-        .font(Theme.mono)
+        .font(Theme.text)
         .padding(.horizontal, Space.s12)
         .padding(.vertical, Space.s8)
         // A container, so "notifications-off" keeps its identifier; its label says the whole bar.
