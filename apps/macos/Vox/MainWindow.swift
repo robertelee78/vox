@@ -452,6 +452,12 @@ private struct RoomRow: View {
     /// The badge's number: what is unread, else what waits.
     private var count: Int { unread > 0 ? unread : room.waiting + room.offered }
 
+    /// MK-1: the mark supplements the count. A trust offer alone is not an addressed message.
+    private var attention: String? {
+        if room.waiting > 0 || (room.addressed > 0 && room.urgent > 0) { return "@!" }
+        return room.addressed > 0 ? "@" : nil
+    }
+
     private var preview: String {
         if room.offered > 0 { return room.offerSaid }
         if room.waiting > 0 { return room.waiting == 1 ? "a Session needs you" : "\(room.waiting) Session requests need you" }
@@ -466,6 +472,15 @@ private struct RoomRow: View {
             }
             HStack(alignment: .firstTextBaseline, spacing: Space.s8) {
                 Text(room.name).fontWeight(.semibold).lineLimit(1).truncationMode(.tail)
+                if let attention {
+                    Text(attention)
+                        .font(Theme.small).fontWeight(.semibold)
+                        .foregroundStyle(VoxTokens.Colors.textPrimary)
+                        .fixedSize()
+                        .help(room.words)
+                        .accessibilityHint(room.words)
+                        .accessibilityIdentifier("room-attention-\(room.name)")
+                }
                 Spacer(minLength: Space.s4)
                 if let last = room.last {
                     Text(RoomTime.words(last.millis))
