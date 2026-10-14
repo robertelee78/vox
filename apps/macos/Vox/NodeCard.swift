@@ -48,7 +48,7 @@ struct NodeActions: ViewModifier {
                 }
             }
         }
-        .task(id: fingerprint + "/" + (model.roomOnScreen ?? "")) { await model.refreshIndividualTrustEligibility(fingerprint) }
+        .task(id: fingerprint + "/" + (model.roomOnScreen ?? "")) { await model.refreshIndividualTrustEligibility(fingerprint, invalidate: true) }
     }
 }
 
@@ -203,7 +203,7 @@ struct NodeCard: View {
         .accessibilityIdentifier("node-card")
         .onAppear { act = node.act }
         .task(id: node.fingerprint) {
-            await model.refreshIndividualTrustEligibility(node.fingerprint)
+            await model.refreshIndividualTrustEligibility(node.fingerprint, invalidate: true)
             if let name = await model.presentedName(node.fingerprint), alias.isEmpty { alias = name }
         }
     }
