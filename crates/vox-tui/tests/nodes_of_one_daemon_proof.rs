@@ -1771,14 +1771,31 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
     computer(&a, &["personal", "old-personal"]);
     computer(&b, &["personal", "remote-personal"]);
     let enroll = |sponsor: &Account, incoming: &Account| {
-        let offer = computer(sponsor, &["invite"]);
-        let preview = computer(
+        let staging = |account: &Account, args: &[&str]| {
+            let args: Vec<_> = [vec!["computer"], args.to_vec(), vec!["--json"]].concat();
+            let (ok, out, err) = account.run(&args, "");
+            assert!(ok, "APPARATUS: enrollment staging {args:?}: {out}{err}");
+            serde_json::from_str::<serde_json::Value>(&out)
+                .unwrap_or_else(|e| panic!("APPARATUS: enrollment status: {e}: {out}"))
+        };
+        let offer = staging(sponsor, &["invite"]);
+        let preview = staging(
             incoming,
             &["pair", offer["invite_link"].as_str().unwrap(), "--preview"],
         );
         let op = preview["pairing"]["operation_id"].as_str().unwrap();
-        computer(incoming, &["approve", op]);
-        computer(sponsor, &["approve", op]);
+        staging(incoming, &["approve", op]);
+        staging(sponsor, &["approve", op]);
+        assert!(
+            wait_until(Duration::from_secs(60), || {
+                [sponsor, incoming].into_iter().all(|account| {
+                    let status = staging(account, &["status"]);
+                    status["pairing"].is_null()
+                        && status["computers"].as_array().is_some_and(|v| v.len() >= 2)
+                })
+            }),
+            "APPARATUS: enrollment did not complete before the next setup operation"
+        );
     };
     enroll(&a, &b);
     enroll(&b, &c);
